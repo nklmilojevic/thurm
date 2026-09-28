@@ -10,7 +10,7 @@ with Metal and CoreText. Quitting the app leaves your shells running (unless
 
 - An Apple silicon Mac with macOS 14 (Sonoma) or newer. Thurm is built for arm64 only.
 - Xcode 26 or newer
-- Rust (edition 2024, 1.85+) and Zig 0.16: `nix develop` (or `direnv allow`) provides both,
+- Rust (edition 2024, 1.88+) and Zig 0.16: `nix develop` (or `direnv allow`) provides both,
   from the repository's `flake.nix`
 
 ## Build

@@ -837,12 +837,16 @@ impl Vt {
         let rgba = match format {
             ffi::KittyImageFormat::RGBA => px.to_vec(),
             ffi::KittyImageFormat::RGB => px
-                .chunks_exact(3)
-                .flat_map(|p| [p[0], p[1], p[2], 255])
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|&[r, g, b]| [r, g, b, 255])
                 .collect(),
             ffi::KittyImageFormat::GRAY_ALPHA => px
-                .chunks_exact(2)
-                .flat_map(|p| [p[0], p[0], p[0], p[1]])
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|&[g, a]| [g, g, g, a])
                 .collect(),
             ffi::KittyImageFormat::GRAY => px.iter().flat_map(|&g| [g, g, g, 255]).collect(),
             _ => return None,
