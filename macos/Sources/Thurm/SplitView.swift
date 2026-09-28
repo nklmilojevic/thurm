@@ -325,7 +325,7 @@ final class TabContentView: NSView {
         // Theme background under the titlebar and tab bar.
         let cfg = SessionManager.shared.config
         let area = paneArea
-        colorFromRGB(cfg.theme.background, alpha: cfg.opacity).setFill()
+        colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity).setFill()
         NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: area.minY - bounds.minY).fill()
         guard zoomedPane == nil else { return }
         SessionManager.shared.config.dividerColor.setFill()

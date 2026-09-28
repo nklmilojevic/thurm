@@ -502,7 +502,8 @@ final class TerminalView: NSView, NSTextInputClient {
                                   cursorThickness: max(1, Int((config.cursorThickness * backingScale).rounded())),
                                   dim: dim,
                                   flash: flash,
-                                  opacity: Float(config.opacity),
+                                  opacity: Float((window?.windowController as? TerminalWindowController)?.opacity
+                                      ?? config.opacity),
                                   themeBackground: config.theme.background,
                                   themeForeground: config.theme.foreground,
                                   hoverLink: hoverLink,

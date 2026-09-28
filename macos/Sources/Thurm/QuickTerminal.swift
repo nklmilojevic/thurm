@@ -20,6 +20,10 @@ final class QuickTerminalWindow: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 
+    /// Ordering front would pull the panel onto the screen, so the slide would start where it
+    /// ends. QuickTerminal places it on the screen itself.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+
     /// There is no close button, which makes AppKit's performClose beep: Close Tab (⌘⇧W).
     override func performClose(_ sender: Any?) {
         if delegate?.windowShouldClose?(self) ?? true { close() }

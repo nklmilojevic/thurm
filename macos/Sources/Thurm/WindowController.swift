@@ -181,26 +181,32 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
 
     var focusedPane: UInt64 { content.focusedPane }
 
+    /// Background opacity: `window.opacity`, or the quick terminal's own.
+    var opacity: CGFloat {
+        let cfg = SessionManager.shared.config
+        return isQuick ? cfg.quickOpacity ?? cfg.opacity : cfg.opacity
+    }
+
     /// Window background / opacity from the config.
     func applyConfig() {
         guard let window = window else { return }
         let cfg = SessionManager.shared.config
         // Chrome follows the terminal theme, not the system, so glass over a dark theme is dark.
         window.appearance = NSAppearance(named: cfg.theme.isDark ? .darkAqua : .aqua)
-        (window as? TerminalWindow)?.titlebarColor = colorFromRGB(cfg.theme.background, alpha: cfg.opacity)
+        (window as? TerminalWindow)?.titlebarColor = colorFromRGB(cfg.theme.background, alpha: opacity)
         applyTabStyle()
         // A step off the terminal background (darker, like Catppuccin's mantle): solid, so it
         // doesn't pick up the desktop through the window.
-        let base = colorFromRGB(cfg.theme.background, alpha: cfg.opacity)
+        let base = colorFromRGB(cfg.theme.background, alpha: opacity)
         sidebar?.backgroundColor = base.shadow(withLevel: cfg.theme.isDark ? 0.18 : 0.05) ?? base
-        if cfg.opacity < 1 {
+        if opacity < 1 {
             window.isOpaque = false
             window.backgroundColor = colorFromRGB(cfg.theme.background, alpha: 0.001)
         } else {
             window.isOpaque = true
             window.backgroundColor = colorFromRGB(cfg.theme.background)
         }
-        applyBlur(cfg.opacity < 1 && cfg.blur > 0)
+        applyBlur(opacity < 1 && cfg.blur > 0)
         content.applyUpdateBadgeTheme()
         content.needsDisplay = true
     }

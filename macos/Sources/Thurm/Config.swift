@@ -164,6 +164,8 @@ final class AppConfig {
     /// "main": the screen with the menu bar, else the one with the mouse pointer.
     var quickOnMainScreen = false
     var quickAnimationDuration: TimeInterval = 0.2
+    /// nil: `opacity` (the window's).
+    var quickOpacity: CGFloat?
 
     var theme = Theme.fallback
     /// `colors.theme`, split into its light and dark halves (equal for a single theme).
@@ -289,6 +291,7 @@ final class AppConfig {
             quickAutohide = jsonBool(q["autohide"]) ?? quickAutohide
             quickOnMainScreen = jsonString(q["screen"]) == "main"
             quickAnimationDuration = max(0, jsonDouble(q["animation_duration"]) ?? quickAnimationDuration)
+            quickOpacity = jsonDouble(q["opacity"]).map { CGFloat(min(1, max(0.05, $0))) }
         }
     }
 

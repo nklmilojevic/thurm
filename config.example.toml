@@ -205,6 +205,8 @@ autohide = true
 screen = "mouse"
 # The slide animation length in seconds. Use 0 for no animation.
 animation_duration = 0.2
+# Background opacity from 0 to 1. When not set, window.opacity is used.
+# opacity = 0.9
 
 [keybindings]
 # Map a key combination to an action name.

@@ -472,6 +472,8 @@ pub struct QuickTerminalConfig {
     pub screen: QuickTerminalScreen,
     /// Slide animation length in seconds (0 = none).
     pub animation_duration: f64,
+    /// Background opacity (0..1); unset: `window.opacity`.
+    pub opacity: Option<f64>,
 }
 
 impl Default for QuickTerminalConfig {
@@ -483,6 +485,7 @@ impl Default for QuickTerminalConfig {
             autohide: true,
             screen: QuickTerminalScreen::Mouse,
             animation_duration: 0.2,
+            opacity: None,
         }
     }
 }
@@ -1085,6 +1088,9 @@ mod tests {
         assert_eq!(c.hotkey, "ctrl+grave");
         assert_eq!(c.position, QuickTerminalPosition::Bottom);
         assert_eq!(c.screen, QuickTerminalScreen::Main);
+        assert_eq!(c.opacity, None);
+        let c = Config::parse("[quick_terminal]\nopacity = 0.85").unwrap();
+        assert_eq!(c.quick_terminal.opacity, Some(0.85));
         assert!(Config::parse("[quick_terminal]\nposition = \"diagonal\"").is_err());
         let c = Config::parse(DEFAULT_CONFIG_TOML).unwrap();
         assert_eq!(c.quick_terminal, QuickTerminalConfig::default());

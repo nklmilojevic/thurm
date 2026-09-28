@@ -164,6 +164,8 @@ autohide = true
 screen = "mouse"
 # Slide animation in seconds (0 = none).
 animation_duration = 0.2
+# Background opacity (0..1), when it should differ from window.opacity.
+# opacity = 0.9
 
 [keybindings]
 # "cmd+shift+d" = "split_down"
