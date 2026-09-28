@@ -50,7 +50,7 @@ jobs:
             echo 'No published releases. Publish documentation without an update feed.'
           fi
           touch site/.nojekyll
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
   deploy:
