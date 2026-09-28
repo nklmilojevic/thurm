@@ -389,7 +389,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
 
     /// Cmd+1...9 (tag = number; 9 selects the last tab).
     @objc func selectTabByNumber(_ sender: Any?) {
-        guard let item = sender as? NSMenuItem, let window = window else { return }
+        guard let item = sender as? NSMenuItem, window != nil else { return }
         let windows = orderedTabs
         guard !windows.isEmpty else { return }
         let index = item.tag >= 9 ? windows.count - 1 : item.tag - 1

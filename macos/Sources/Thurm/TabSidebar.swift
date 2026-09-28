@@ -415,7 +415,9 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         guard row >= 0, let box = outline.item(atRow: row) as? TabBox,
               let w = box.tab.controller?.window else { return }
         w.makeKeyAndOrderFront(nil)
-        box.tab.controller?.content.focusedView.map { w.makeFirstResponder($0) }
+        if let view = box.tab.controller?.content.focusedView {
+            w.makeFirstResponder(view)
+        }
     }
 
     private func rowMenu() -> NSMenu {
