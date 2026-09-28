@@ -96,18 +96,15 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     private func connectAndHello() -> Bool {
-        guard Core.shared.connect() else { return false }
+        guard Core.shared.connect() else {
+            // The client says Hello while connecting, so a daemon on another protocol fails here.
+            if let e = Core.shared.lastError, e.contains("protocol mismatch") { return helloRefused(e) }
+            return false
+        }
         let resp = Core.shared.request(object: ["Hello": ["client": "Thurm.app", "version": thurm_protocol_version(), "ui": true]])
         if let d = resp as? [String: Any], let e = d["error"] as? String {
-            tlog("Hello rejected: \(e)")
             Core.shared.disconnect()
-            if e.contains("protocol mismatch") {
-                // After an update: the daemon still runs the previous build.
-                if upgradeDaemonInPlace() { return connectAndHello() }
-                helloRefusedForVersion = true
-            }
-            Core.shared.lastError = "The running thurmd refused the connection: \(e). Quit Thurm and run `thurm daemon stop` (layout and scrollback are restored), then open Thurm again."
-            return false
+            return helloRefused(e)
         }
         guard resp != nil else { return false }
         if let hello = (resp as? [String: Any])?["Hello"] as? [String: Any],
@@ -122,6 +119,18 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         sendAppearance()
         return true
+    }
+
+    /// The daemon refused our Hello. After an update it still runs the previous build: replace
+    /// it in place, or (too old for that) have `connectOrAsk` offer a restart.
+    private func helloRefused(_ e: String) -> Bool {
+        tlog("Hello rejected: \(e)")
+        if e.contains("protocol mismatch") {
+            if upgradeDaemonInPlace() { return connectAndHello() }
+            helloRefusedForVersion = true
+        }
+        Core.shared.lastError = "The running thurmd refused the connection: \(e). Quit Thurm and run `thurm daemon stop` (layout and scrollback are restored), then open Thurm again."
+        return false
     }
 
     /// Tried once per launch: a daemon that did not upgrade won't on a second try.
