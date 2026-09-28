@@ -1,0 +1,4 @@
+module CThurm [system] {
+    header "../../../crates/thurm-ffi/include/thurm.h"
+    export *
+}

@@ -1,0 +1,14 @@
+[package]
+name = "thurm-config"
+description = "Thurm configuration (TOML) shared by the daemon and the GUI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+dirs.workspace = true
+thurm-proto.workspace = true

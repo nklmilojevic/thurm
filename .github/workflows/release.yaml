@@ -1,0 +1,230 @@
+name: Release
+
+# Two update channels, one appcast (GitHub Pages):
+#   tip      every push to main, once CI passed: rolling `tip` prerelease, <sparkle:channel>tip
+#   release  a published GitHub release `vX.Y.Z` (gh release create vX.Y.Z): default channel
+# Both build Apple silicon only, sign with Developer ID, notarize, and regenerate the appcast
+# from all releases (macos/release/appcast.py). One-time setup: macos/release/setup-github.sh.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }})
+    if: >-
+      (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.event == 'push')
+      || (github.event_name == 'release' && !github.event.release.prerelease)
+    runs-on: macos-26
+    timeout-minutes: 90
+    concurrency:
+      # A newer main commit supersedes a tip build in progress; releases always finish.
+      group: release-build-${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }}
+      cancel-in-progress: ${{ github.event_name != 'release' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      THURM_FEED_URL: ${{ vars.SPARKLE_FEED_URL || format('https://{0}.github.io/{1}/appcast.xml', github.repository_owner, github.event.repository.name) }}
+      THURM_SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.event.workflow_run.head_sha }}
+          fetch-depth: 0 # the build number is the commit count
+
+      - name: Channel and version
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [[ "${{ github.event_name }}" == release ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+            if [[ "$TAG" != "v$VERSION" ]]; then
+              echo "::error::Tag $TAG does not match the workspace version $VERSION in Cargo.toml. Bump it, merge, then tag v$VERSION."
+              exit 1
+            fi
+            CHANNEL=release
+          else
+            TAG=tip
+            CHANNEL=tip
+          fi
+          {
+            echo "channel=$CHANNEL"
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "build_number=$(git rev-list --count HEAD)"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check the signing configuration
+        env:
+          HAVE_CERT: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
+          HAVE_NOTARY: ${{ secrets.NOTARY_API_KEY_P8 != '' }}
+          HAVE_SPARKLE: ${{ secrets.SPARKLE_PRIVATE_KEY != '' }}
+        run: |
+          missing=()
+          [[ "$HAVE_CERT" == true ]] || missing+=(secret:MACOS_CERTIFICATE_P12)
+          [[ "$HAVE_NOTARY" == true ]] || missing+=(secret:NOTARY_API_KEY_P8)
+          [[ "$HAVE_SPARKLE" == true ]] || missing+=(secret:SPARKLE_PRIVATE_KEY)
+          [[ -n "$THURM_SPARKLE_PUBLIC_KEY" ]] || missing+=(variable:SPARKLE_PUBLIC_KEY)
+          if (( ${#missing[@]} )); then
+            echo "::error::Release signing is not configured: ${missing[*]} (see macos/release/setup-github.sh)"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+          sw_vers
+
+      - name: Import the Developer ID certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          IDENTITY_OVERRIDE: ${{ vars.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          IDENTITY="$(macos/release/ci-keychain.sh create "$RUNNER_TEMP/thurm-signing.keychain-db")"
+          IDENTITY="${IDENTITY_OVERRIDE:-$IDENTITY}"
+          [[ -n "$IDENTITY" ]] || { echo "::error::No Developer ID Application identity in MACOS_CERTIFICATE_P12"; exit 1; }
+          echo "Signing as: $IDENTITY"
+          echo "THURM_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Write the notarization and update keys
+        env:
+          NOTARY_API_KEY_P8: ${{ secrets.NOTARY_API_KEY_P8 }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$NOTARY_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle-ed25519"
+          echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+          echo "SPARKLE_KEY_FILE=$RUNNER_TEMP/sparkle-ed25519" >> "$GITHUB_ENV"
+
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          NOTES="$RUNNER_TEMP/notes.md"
+          if [[ "${{ steps.meta.outputs.channel }}" == release ]]; then
+            gh release view "${{ steps.meta.outputs.tag }}" --repo "$REPO" --json body -q .body > "$NOTES"
+          else
+            SHA="${{ steps.meta.outputs.sha }}"
+            {
+              echo "**Tip build** of [\`${SHA:0:7}\`](https://github.com/$REPO/commit/$SHA)"
+              echo
+              git log -1 --format='%s%n%n%b' "$SHA"
+            } > "$NOTES"
+          fi
+          echo "THURM_NOTES_FILE=$NOTES" >> "$GITHUB_ENV"
+
+      - name: Build, sign and notarize
+        env:
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+          THURM_VERSION: ${{ steps.meta.outputs.version }}
+          THURM_BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
+          THURM_DOWNLOAD_BASE: https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.tag }}
+        run: macos/release/build-release.sh "${{ steps.meta.outputs.channel }}"
+
+      - name: Publish the release assets
+        if: steps.meta.outputs.channel == 'release'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          cd macos/build/dist
+          # sparkle.json last: the appcast only lists a release once it carries one.
+          gh release upload "$TAG" --repo "$REPO" --clobber Thurm-*.dmg Thurm-*.zip
+          gh release upload "$TAG" --repo "$REPO" --clobber sparkle.json
+
+      - name: Publish the tip build
+        if: steps.meta.outputs.channel == 'tip'
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.meta.outputs.sha }}"
+          # The `tip` tag follows main.
+          if gh api "repos/$REPO/git/refs/tags/tip" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/tags/tip" -f sha="$SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref=refs/tags/tip -f sha="$SHA" >/dev/null
+          fi
+          NOTES="$RUNNER_TEMP/tip-release.md"
+          {
+            echo "Automatic build of \`main\` at [\`${SHA:0:7}\`](https://github.com/$REPO/commit/$SHA). Apple silicon, macOS 14 or later."
+            echo
+            echo "Download **Thurm-tip.dmg**, or choose *Thurm › Update Channel › Tip* in any Thurm to get these builds automatically."
+          } > "$NOTES"
+          if gh release view tip --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit tip --repo "$REPO" --title "Tip" --notes-file "$NOTES" --prerelease
+          else
+            gh release create tip --repo "$REPO" --verify-tag --prerelease --latest=false \
+              --title "Tip" --notes-file "$NOTES"
+          fi
+          cd macos/build/dist
+          gh release upload tip --repo "$REPO" --clobber Thurm-tip-*.zip Thurm-tip.dmg
+          gh release upload tip --repo "$REPO" --clobber sparkle.json
+          # Keep the three newest update archives (an app may still be downloading an older one).
+          gh release view tip --repo "$REPO" --json assets -q '.assets[].name' \
+            | { grep -E '^Thurm-tip-[0-9]+\.zip$' || true; } \
+            | sort -t- -k3 -n -r | tail -n +4 \
+            | while read -r old; do gh release delete-asset tip "$old" --repo "$REPO" --yes; done
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          macos/release/ci-keychain.sh delete "$RUNNER_TEMP/thurm-signing.keychain-db"
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/sparkle-ed25519"
+
+  appcast:
+    name: Appcast
+    needs: build
+    runs-on: ubuntu-latest
+    # Serialized. A pending run may be replaced by a newer one, which is fine: every run
+    # rebuilds the appcast from all published releases.
+    concurrency:
+      group: appcast
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}appcast.xml
+    steps:
+      - uses: actions/checkout@v7
+      - name: Generate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site
+          python3 macos/release/appcast.py --repo "${{ github.repository }}" --output site/appcast.xml
+          touch site/.nojekyll
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v5

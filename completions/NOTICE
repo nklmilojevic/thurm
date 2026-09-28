@@ -1,0 +1,8 @@
+Command completion specs (<command>.json) for Thurm's tab completion.
+
+These files come from tty7 (https://github.com/l0ng-ai/tty7, assets/completions), Apache
+License 2.0 (see LICENSE-tty7-Apache-2.0), which generated them from Fig's autocomplete spec
+corpus (https://github.com/withfig/autocomplete, MIT License, Copyright (c) 2021 Hercules Labs
+Inc. (Fig)). They are used unmodified.
+
+Add or override specs in ~/.config/thurm/completions/<command>.json.

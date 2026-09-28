@@ -1,0 +1,145 @@
+# Thurm configuration. Every setting is optional; the values below are the defaults.
+# Changes are picked up with "Reload Configuration" (⌘⇧,) or `thurm reload`.
+
+[font]
+# A family or a face name ("TX-02 Retina ExtraCondensed"). JetBrains Mono ships with Thurm.
+family = "JetBrains Mono"
+# Optional faces for styled text; derived from `family` when unset.
+# family_bold = "JetBrains Mono ExtraBold"
+# family_italic = "..."
+# family_bold_italic = "..."
+size = 13.0
+# Programming ligatures (=>, !=, ->, ...). Needs a font that ships them.
+ligatures = true
+# Extra OpenType features, e.g. ["ss01", "zero", "cv02"]. Prefix with "-" to disable.
+features = []
+line_height = 1.0
+letter_spacing = 0.0
+# Thicker strokes (CoreText font smoothing), and how much: 0-255.
+thicken = true
+thicken_strength = 255
+fallback = ["SF Mono", "Menlo"]
+# Icons from the bundled Symbols Nerd Font when the font has none (Starship, lsd, eza...).
+nerd_font_symbols = true
+
+[window]
+padding_x = 8.0
+padding_y = 6.0
+opacity = 1.0
+# Blur what is behind the window when opacity < 1 (any value > 0 turns it on).
+blur = 0
+# Treat Option as Alt/Meta: "none", "left", "right" or "both".
+option_as_alt = "none"
+columns = 110
+rows = 32
+confirm_close = true
+# Quit when the last window closes (like most macOS terminals, off: the app stays in the Dock).
+quit_after_last_window = false
+unfocused_split_dim = 0.25
+pane_headers = false
+# Tabs: "native" (in the titlebar) or "sidebar" (vertical, grouped by repository). View > Tabs.
+tab_style = "native"
+sidebar_width = 240.0
+
+[cursor]
+style = "block"   # block | beam | underline
+blink = false
+thickness = 2.0
+
+[colors]
+# Built-in: thurm, thurm-light, tokyo-night, catppuccin-mocha, catppuccin-latte,
+# gruvbox-dark, dracula, nord, solarized-dark, plus 600 more by name ("Catppuccin Frappe",
+# "Rose Pine"...; `thurm theme` lists them). Or a path to a theme file (Thurm's TOML, or the
+# `palette = N=#rrggbb` format those use).
+# Follow the system appearance with "light:NAME,dark:NAME". View > Theme sets this too.
+# theme = "thurm"
+# theme = "light:catppuccin-latte,dark:catppuccin-mocha"
+# background = "#0e1116"
+# palette = ["#1b2029", "#e06c75", ...]
+bold_is_bright = false
+
+[terminal]
+scrollback = 10000
+# shell = ["/opt/homebrew/bin/fish", "-l"]
+term = "xterm-256color"
+shell_integration = true
+osc52 = "copy"           # disabled | copy | paste | copy-paste
+kitty_keyboard = true
+kitty_graphics = true
+image_memory_mib = 320
+copy_on_select = false
+# Lines scrolled per line of wheel/trackpad movement.
+scroll_multiplier = 3.0
+# Trackpad scrolling moves by fractions of a line (primary screen, no mouse reporting).
+smooth_scroll = true
+# Tab at a prompt opens Thurm's completion menu (needs shell integration); otherwise the
+# shell's own completion runs.
+tab_completion = true
+
+[terminal.env]
+# EDITOR = "nvim"
+
+[session]
+# Keep layout, working directories and scrollback across app restarts and reboots.
+persist = true
+scrollback_lines = 4000
+snapshot_interval_secs = 15
+# "detach": quitting the app leaves shells running and reattaches next launch.
+# "terminate": quitting kills the shells (layout and scrollback are still restored).
+quit = "detach"
+# Re-run an agent's resume command (e.g. `claude --continue`) when restoring after a reboot.
+resume_agents = true
+daemon_idle_exit_secs = 0
+
+[security]
+# Enable Secure Keyboard Entry while a password prompt is detected (echo off).
+auto_secure_input = true
+secure_input_indicator = true
+confirm_multiline_paste = true
+
+[notifications]
+enabled = true
+agent_needs_input = true
+# When an agent finishes a turn (Claude Code / Codex hooks: `thurm hooks install`).
+agent_done = true
+command_finished_secs = 15
+program_notifications = true
+bell_badge = true
+
+[agents]
+detect = true
+idle_after_ms = 1500
+# Name tabs after what the agent session is about (Claude Code's own session title, or the
+# name given with /rename). Needs `thurm hooks install`.
+session_titles = true
+# Launch presets for the command palette (default: every detected agent CLI on PATH).
+# presets = [{ name = "Claude (plan mode)", command = ["claude", "--permission-mode", "plan"] }]
+
+# Teach Thurm about another agent:
+# [[agents.define]]
+# kind = "mybot"
+# name = "My Bot"
+# processes = ["mybot"]
+# working = ["esc to interrupt"]
+# attention = ["Approve?"]
+# launch = ["mybot"]
+# resume = ["mybot", "--continue"]
+
+[ai]
+# Apple Intelligence's on-device model (macOS 26+, Apple silicon, Apple Intelligence turned
+# on in System Settings). Nothing leaves the Mac. Off until enabled; the switches below pick
+# the features.
+enabled = false
+# Name agent tabs after the task when the agent gives the session no title.
+titles = true
+# For agents without hooks: ask the model whether a quiet agent waits for an answer that no
+# `attention` pattern caught.
+status = true
+# Say what an agent asks for, and sum up finished turns, in notifications and the switcher.
+notifications = true
+# Edit > Explain Last Command and `thurm explain`.
+explain = true
+
+[keybindings]
+# "cmd+shift+d" = "split_down"
+# "cmd+d" = "split_right"

@@ -1,0 +1,17 @@
+[package]
+name = "thurm-cli"
+description = "thurm: control Thurm panes from the command line (for humans and coding agents)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "thurm"
+path = "src/main.rs"
+
+[dependencies]
+thurm-proto.workspace = true
+thurm-config.workspace = true
+thurm-client.workspace = true
+clap.workspace = true
+serde_json.workspace = true

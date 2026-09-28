@@ -1,0 +1,1040 @@
+import AppKit
+import CThurm
+
+/// Owns the connection lifecycle, every window/tab/split, pane metadata and layout
+/// persistence. All methods run on the main thread.
+final class SessionManager: NSObject, CoreDelegate {
+    static let shared = SessionManager()
+
+    var config = AppConfig()
+    /// Cmd+Plus / Cmd+Minus override of `config.fontSize` (not persisted).
+    private(set) var fontSizeOverride: CGFloat?
+    var effectiveFontSize: CGFloat { fontSizeOverride ?? config.fontSize }
+
+    private(set) var controllers: [TerminalWindowController] = []
+    /// Every workspace (see Workspaces.swift).
+    var workspaces: [Workspace] = []
+    private(set) var panes: [UInt64: PaneInfo] = [:]
+    /// Panes waiting for input that the user has looked at since they started waiting; they
+    /// don't count toward the Dock badge until the agent asks again.
+    private var seenWaiting: Set<UInt64> = []
+    private weak var lastKeyController: TerminalWindowController?
+
+    private(set) var isTerminating = false
+    /// Layout saving starts only after the initial restore, so a failed start never
+    /// overwrites the stored layout with an empty one.
+    private var sessionReady = false
+    private var lastLayoutJSON: String?
+    private var periodicTimer: Timer?
+    private var reconnectAttempt = 0
+    private var appearanceObservation: NSKeyValueObservation?
+    /// The last Hello was refused because the daemon speaks another protocol version.
+    private var helloRefusedForVersion = false
+
+    private override init() {
+        super.init()
+    }
+
+    // MARK: - Startup
+
+    func start() {
+        config = AppConfig.load()
+        if let err = config.loadError { tlog("config: \(err)") }
+        Core.shared.delegate = self
+        NotificationCenter.default.addObserver(self, selector: #selector(secureInputChanged(_:)),
+                                               name: SecureInput.didChangeNotification, object: nil)
+        guard connectOrAsk() else { return }
+        appearanceObservation = NSApp.observe(\.effectiveAppearance) { _, _ in
+            DispatchQueue.main.async { SessionManager.shared.appearanceChanged() }
+        }
+        // The reconnect timer keeps running during connectOrAsk's alerts: it may have restored
+        // the session already (restoring twice opens every window twice).
+        if !sessionReady { restoreSession() }
+        // Safety net only: tab changes save through the tab group's KVO.
+        periodicTimer = Timer.scheduledTimer(timeInterval: 15, target: self, selector: #selector(periodicSave),
+                                             userInfo: nil, repeats: true)
+        if let err = config.loadError {
+            currentController?.content.focusedView?.showToast("Config error: \(err)", duration: 8)
+        }
+    }
+
+    /// Connects, asking the user to retry or quit when the daemon is unreachable.
+    private func connectOrAsk() -> Bool {
+        while true {
+            if connectAndHello() { return true }
+            if helloRefusedForVersion {
+                helloRefusedForVersion = false
+                let alert = NSAlert()
+                alert.messageText = "Restart the session daemon?"
+                alert.informativeText = "Thurm was updated, but the session daemon still runs the previous "
+                    + "version. Restarting it closes the programs running in your tabs; tabs, splits, "
+                    + "scrollback and working directories come back."
+                alert.addButton(withTitle: "Restart Daemon")
+                alert.addButton(withTitle: "Quit")
+                let restart = alert.runModal() == .alertFirstButtonReturn
+                // Reconnect timers keep running during the alert and may have started a
+                // compatible daemon already (if the old one went away meanwhile).
+                if Core.shared.isConnected || connectAndHello() { return true }
+                if restart {
+                    if !thurm_terminate_daemon() { tlog("could not stop the old daemon") }
+                    continue
+                }
+                NSApp.terminate(nil)
+                return false
+            }
+            let alert = NSAlert()
+            alert.messageText = "Cannot connect to the Thurm session daemon"
+            alert.informativeText = Core.shared.lastError ?? "thurmd could not be started."
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "Retry")
+            alert.addButton(withTitle: "Quit")
+            if alert.runModal() != .alertFirstButtonReturn {
+                NSApp.terminate(nil)
+                return false
+            }
+        }
+    }
+
+    private func connectAndHello() -> Bool {
+        guard Core.shared.connect() else { return false }
+        let resp = Core.shared.request(object: ["Hello": ["client": "Thurm.app", "version": thurm_protocol_version(), "ui": true]])
+        if let d = resp as? [String: Any], let e = d["error"] as? String {
+            tlog("Hello rejected: \(e)")
+            Core.shared.disconnect()
+            if e.contains("protocol mismatch") {
+                // After an update: the daemon still runs the previous build.
+                if upgradeDaemonInPlace() { return connectAndHello() }
+                helloRefusedForVersion = true
+            }
+            Core.shared.lastError = "The running thurmd refused the connection: \(e). Quit Thurm and run `thurm daemon stop` (layout and scrollback are restored), then open Thurm again."
+            return false
+        }
+        guard resp != nil else { return false }
+        if let hello = (resp as? [String: Any])?["Hello"] as? [String: Any],
+           let build = hello["build"] as? String, build != Core.buildId
+        {
+            tlog("thurmd runs build \(build), this app \(Core.buildId)")
+            Core.shared.disconnect()
+            if upgradeDaemonInPlace() { return connectAndHello() }
+            // Compatible, just older: carry on with it.
+            guard Core.shared.connect() else { return false }
+            Core.shared.request(object: ["Hello": ["client": "Thurm.app", "version": thurm_protocol_version(), "ui": true]])
+        }
+        sendAppearance()
+        return true
+    }
+
+    /// Tried once per launch: a daemon that did not upgrade won't on a second try.
+    private var daemonUpgradeTried = false
+
+    /// Replaces the running daemon with the bundled one; every pane keeps its processes.
+    /// Blocks until the new daemon answers (normally well under a second).
+    private func upgradeDaemonInPlace() -> Bool {
+        guard !daemonUpgradeTried, let path = Core.daemonPath else { return false }
+        daemonUpgradeTried = true
+        let rc = path.withCString { thurm_upgrade_daemon($0) }
+        tlog(rc == 0 ? "thurmd upgraded in place" : "in-place daemon upgrade not possible (\(rc))")
+        return rc == 0
+    }
+
+    // MARK: - Appearance and themes
+
+    private var lastSentDark: Bool?
+
+    private func sendAppearance() {
+        let dark = systemIsDark
+        lastSentDark = dark
+        Core.shared.send(object: ["SetAppearance": ["dark": dark]])
+    }
+
+    /// System light/dark switch: the daemon re-resolves colors (and broadcasts
+    /// ConfigReloaded) when the theme follows the appearance.
+    func appearanceChanged() {
+        guard systemIsDark != lastSentDark else { return }
+        sendAppearance()
+        if config.followsAppearance {
+            reloadConfig(notifyDaemon: false)
+        }
+    }
+
+    /// Writes `colors.theme` through the daemon, which reloads every client.
+    @discardableResult
+    func setTheme(_ spec: String) -> Bool {
+        let resp = Core.shared.request(object: ["SetTheme": ["spec": spec]])
+        if let d = resp as? [String: Any], let e = d["error"] as? String {
+            currentController?.content.focusedView?.showToast("Theme: \(e)", duration: 6)
+            return false
+        }
+        return resp != nil
+    }
+
+    // MARK: Theme picker
+
+    /// Shows `name` in every window without saving it (nil: back to the configured theme).
+    /// Only colors change, so this is cheap enough to follow the arrow keys.
+    func previewTheme(_ name: String?) {
+        guard let json = Core.shared.previewTheme(name),
+              let t = JSON.decode(json) as? [String: Any] else { return }
+        config.theme = Theme(json: t)
+        for c in liveControllers {
+            c.applyConfig()
+            for view in c.content.views.values { view.needsRender = true }
+        }
+    }
+
+    /// View > Theme > Browse Themes…: every theme in a filterable list. Moving through it shows
+    /// each one live; Enter keeps it (saved like choosing it from the menu), Escape goes back.
+    func showThemePicker() {
+        let current = config.followsAppearance ? (config.theme.isDark ? config.themeDark : config.themeLight)
+            : config.theme.name
+        let items = config.themes.map { t in
+            CommandPalette.Item(title: t.name,
+                                detail: (t.dark ? "Dark" : "Light") + (t.own ? " · Thurm" : ""),
+                                shortcut: t.name == current ? "current" : "",
+                                preview: { [weak self] in self?.previewTheme(t.name) },
+                                action: { [weak self] in
+                                    guard let self else { return }
+                                    // Saving reloads the config, which ends the preview.
+                                    if !self.chooseTheme(t.name) { self.previewTheme(nil) }
+                                })
+        }
+        let row = config.themes.firstIndex { $0.name == current } ?? 0
+        CommandPalette.shared.show(items: items, over: currentController?.window,
+                                   placeholder: "Search \(items.count) themes…",
+                                   footer: "↑↓ preview · ↩ keep · esc cancel", initialRow: row,
+                                   onCancel: { [weak self] in self?.previewTheme(nil) })
+    }
+
+    /// Picks `name`. When following the appearance, it replaces the half it belongs to.
+    @discardableResult
+    func chooseTheme(_ name: String) -> Bool {
+        guard config.followsAppearance else {
+            return setTheme(name)
+        }
+        let dark = config.themes.first { $0.name == name }?.dark ?? true
+        let light = dark ? config.themeLight : name
+        let darkName = dark ? name : config.themeDark
+        return setTheme("light:\(light),dark:\(darkName)")
+    }
+
+    func toggleFollowAppearance() {
+        if config.followsAppearance {
+            setTheme(config.theme.name)
+            return
+        }
+        let current = config.themeDark
+        let isDark = config.themes.first { $0.name == current }?.dark ?? true
+        let partner = SessionManager.themePartner(current, wantDark: !isDark)
+        let light = isDark ? partner : current
+        let dark = isDark ? current : partner
+        setTheme("light:\(light),dark:\(dark)")
+    }
+
+    /// The light (or dark) sibling of a theme, for turning on "Match System Appearance".
+    static func themePartner(_ name: String, wantDark: Bool) -> String {
+        let pairs = [("thurm-light", "thurm"), ("catppuccin-latte", "catppuccin-mocha")]
+        for (light, dark) in pairs {
+            if name == light || name == dark { return wantDark ? dark : light }
+        }
+        return wantDark ? "thurm" : "thurm-light"
+    }
+
+    // MARK: - Daemon queries
+
+    func fetchPanes() -> [PaneInfo] {
+        guard let v = JSON.variant(Core.shared.request("\"ListPanes\"")), v.name == "Panes",
+              let list = v.payload as? [Any]
+        else { return [] }
+        return list.compactMap { PaneInfo(json: $0) }
+    }
+
+    func fetchPaneInfo(_ id: UInt64) -> PaneInfo? {
+        guard let v = JSON.variant(Core.shared.request(object: ["PaneInfo": ["pane": NSNumber(value: id)]])),
+              v.name == "PaneInfo"
+        else { return nil }
+        return PaneInfo(json: v.payload)
+    }
+
+    func fetchLayout() -> Layout? {
+        guard let v = JSON.variant(Core.shared.request("\"GetLayout\"")), v.name == "Layout",
+              let json = v.payload as? String
+        else { return nil }
+        return Layout.from(json: json)
+    }
+
+    /// Creates a pane in the daemon. Returns its id.
+    func createPane(cols: Int, rows: Int, inheritFrom: UInt64?, preset: String? = nil,
+                    forkFrom: UInt64? = nil) -> UInt64? {
+        let request: [String: Any] = ["CreatePane": [
+            "fork_from": orNull(forkFrom.map { NSNumber(value: $0) }),
+            "command": NSNull(),
+            "cwd": NSNull(),
+            "env": [Any](),
+            "size": paneSizeObject(cols: cols, rows: rows),
+            "agent_preset": orNull(preset),
+            "inherit_cwd_from": orNull(inheritFrom.map { NSNumber(value: $0) }),
+            "hold": false,
+        ] as [String: Any]]
+        let resp = Core.shared.request(object: request)
+        guard let v = JSON.variant(resp), v.name == "PaneCreated",
+              let payload = v.payload as? [String: Any], let id = jsonUInt64(payload["pane"])
+        else {
+            showError(forkFrom != nil ? "Could not fork the agent session" : "Could not start a new shell",
+                      response: resp)
+            return nil
+        }
+        if let info = fetchPaneInfo(id) { panes[id] = info }
+        return id
+    }
+
+    private func paneSizeObject(cols: Int, rows: Int) -> [String: Any] {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let shaper = FontShaper.shared(scale: scale)
+        return [
+            "cols": NSNumber(value: max(2, min(1000, cols))),
+            "rows": NSNumber(value: max(1, min(1000, rows))),
+            "cell_width": NSNumber(value: shaper?.cellWidth ?? 8),
+            "cell_height": NSNumber(value: shaper?.cellHeight ?? 16),
+        ]
+    }
+
+    /// Grid size that fits in `size` points.
+    func gridSize(forPoints size: NSSize) -> (cols: Int, rows: Int) {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        guard let s = FontShaper.shared(scale: scale), size.width > 0, size.height > 0 else {
+            return (config.columns, config.rows)
+        }
+        let w = size.width * scale - 2 * (config.paddingX * scale).rounded()
+        let h = size.height * scale - 2 * (config.paddingY * scale).rounded()
+        return (max(2, Int(w / CGFloat(s.cellWidth))), max(1, Int(h / CGFloat(s.cellHeight))))
+    }
+
+    /// Content size of a new window: `columns`×`rows` cells plus padding.
+    func defaultContentSize() -> NSSize {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        guard let s = FontShaper.shared(scale: scale) else { return NSSize(width: 900, height: 600) }
+        let w = CGFloat(config.columns * s.cellWidth) / scale + 2 * config.paddingX + 1
+        let h = CGFloat(config.rows * s.cellHeight) / scale + 2 * config.paddingY + 1
+        return NSSize(width: ceil(w), height: ceil(h))
+    }
+
+    // MARK: - Restore
+
+    private func restoreSession() {
+        let infos = fetchPanes()
+        panes = [:]
+        for info in infos { panes[info.id] = info }
+        let alive = Set(infos.filter { $0.alive }.map { $0.id })
+
+        // A pane shows in one place. Skip the ones a window already shows, and the ones an
+        // earlier window of the layout claimed (a layout saved after a double restore lists
+        // them twice).
+        var placed = Set(liveControllers.flatMap { $0.content.paneIds })
+        var layout = fetchLayout() ?? Layout(windows: [])
+        layout.retainPanes { alive.contains($0) && !placed.contains($0) }
+        workspaces = layout.workspaces.map { Workspace(layout: $0) }
+
+        // Hidden workspaces' panes are in use too (they run until a window shows them).
+        var used = Set(layout.workspaces.flatMap { $0.tabs.flatMap { $0.root.panes } })
+        for var w in layout.windows {
+            w.tabs = w.tabs.filter { tab in tab.root.panes.allSatisfy { !placed.contains($0) } }
+            placed.formUnion(w.tabs.flatMap { $0.root.panes })
+            restoreWindow(w)
+            used.formUnion(w.tabs.flatMap { $0.root.panes })
+        }
+
+        // Panes that exist but are not in the layout: tabs of one extra window.
+        let orphans = infos.filter { $0.alive && !used.contains($0.id) }.map { $0.id }.sorted()
+        var first: TerminalWindowController?
+        var previous: TerminalWindowController?
+        let orphanWorkspace = orphans.isEmpty ? nil : makeWorkspace()
+        for id in orphans {
+            let c = makeController(root: .leaf(id), focused: id, zoomed: nil, title: nil, frame: nil)
+            c.workspaceID = orphanWorkspace?.id ?? 0
+            if let prev = previous {
+                attachAsTab(c, to: prev)
+            } else {
+                showAsNewWindow(c, frame: nil)
+                first = c
+            }
+            previous = c
+        }
+        first?.window?.makeKeyAndOrderFront(nil)
+
+        if liveControllers.isEmpty {
+            if let ws = workspacesByRecency.first(where: { !$0.hiddenTabs.isEmpty }) {
+                openWorkspaceInNewWindow(ws)
+            } else {
+                newWindow()
+            }
+        }
+        sessionReady = true
+        saveLayoutNow(force: true)
+        focusChanged()
+    }
+
+    private func restoreWindow(_ w: WindowLayout) {
+        var frame: NSRect?
+        if let f = w.frame, f.count == 4, f[2] > 50, f[3] > 50 {
+            frame = clampToScreens(NSRect(x: f[0], y: f[1], width: f[2], height: f[3]))
+        }
+        var created: [TerminalWindowController] = []
+        // Older layouts have no workspaces, and two windows can't show the same one.
+        var ws = workspace(w.workspace)
+        if ws == nil || (ws.map { isShown($0) } ?? false) { ws = makeWorkspace() }
+        for tab in w.tabs {
+            let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focused, zoomed: tab.zoomed,
+                                   title: tab.title, frame: frame)
+            c.workspaceID = ws?.id ?? 0
+            if let prev = created.last {
+                attachAsTab(c, to: prev)
+            } else {
+                showAsNewWindow(c, frame: frame)
+            }
+            created.append(c)
+        }
+        guard !created.isEmpty else { return }
+        let selected = created[min(max(0, w.selectedTab), created.count - 1)]
+        selected.window?.makeKeyAndOrderFront(nil)
+        if w.fullscreen, let win = selected.window, !win.styleMask.contains(.fullScreen) {
+            win.toggleFullScreen(nil)
+        }
+    }
+
+    /// Keeps restored windows on a connected screen.
+    private func clampToScreens(_ frame: NSRect) -> NSRect {
+        let screens = NSScreen.screens
+        if screens.contains(where: { $0.visibleFrame.intersects(frame) }) { return frame }
+        guard let screen = NSScreen.main ?? screens.first else { return frame }
+        let vf = screen.visibleFrame
+        let w = min(frame.width, vf.width)
+        let h = min(frame.height, vf.height)
+        return NSRect(x: vf.midX - w / 2, y: vf.midY - h / 2, width: w, height: h)
+    }
+
+    // MARK: - Windows and tabs
+
+    var liveControllers: [TerminalWindowController] {
+        controllers.filter { !$0.isClosed }
+    }
+
+    /// The controller of the key window, else the last key one.
+    var currentController: TerminalWindowController? {
+        if let c = NSApp.keyWindow?.windowController as? TerminalWindowController, !c.isClosed { return c }
+        if let c = NSApp.mainWindow?.windowController as? TerminalWindowController, !c.isClosed { return c }
+        if let c = lastKeyController, !c.isClosed { return c }
+        return liveControllers.last
+    }
+
+    func controller(for pane: UInt64) -> TerminalWindowController? {
+        liveControllers.first { $0.content.root.contains(pane) }
+    }
+
+    func view(for pane: UInt64) -> TerminalView? {
+        controller(for: pane)?.content.views[pane]
+    }
+
+    func makeController(root: SplitNode, focused: UInt64, zoomed: UInt64?, title: String?,
+                                frame: NSRect?) -> TerminalWindowController {
+        let c = TerminalWindowController(root: root, focused: focused, zoomed: zoomed, title: title,
+                                         contentSize: defaultContentSize())
+        if let frame = frame {
+            c.window?.setFrame(frame, display: false)
+        }
+        controllers.append(c)
+        return c
+    }
+
+    func attachAsTab(_ c: TerminalWindowController, to host: TerminalWindowController) {
+        c.workspaceID = host.workspaceID
+        guard let hostWindow = host.window, let w = c.window else { return }
+        w.setFrame(hostWindow.frame, display: false)
+        hostWindow.addTabbedWindow(w, ordered: .above)
+    }
+
+    /// Shows a window as its own window (never auto-tabbed into another one).
+    func showAsNewWindow(_ c: TerminalWindowController, frame: NSRect?) {
+        guard let w = c.window else { return }
+        if let frame = frame {
+            w.setFrame(frame, display: false)
+        } else if let key = currentController?.window, key !== w, key.isVisible {
+            w.setFrameTopLeftPoint(NSPoint(x: key.frame.minX + 26, y: key.frame.maxY - 26))
+        } else {
+            w.center()
+        }
+        w.tabbingMode = .disallowed
+        w.makeKeyAndOrderFront(nil)
+        w.tabbingMode = .preferred
+    }
+
+    /// Cmd+N: a new window with a new shell (or an existing pane), showing a new workspace.
+    func newWindow(pane existing: UInt64? = nil, preset: String? = nil, workspace ws: Workspace? = nil) {
+        var id = existing
+        if id == nil {
+            let size = gridSize(forPoints: defaultContentSize())
+            id = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, preset: preset)
+        }
+        guard let pane = id else { return }
+        let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
+        c.workspaceID = (ws ?? makeWorkspace()).id
+        showAsNewWindow(c, frame: nil)
+        scheduleLayoutSave()
+    }
+
+    /// Cmd+T: a new tab next to `host`, inheriting the focused pane's cwd.
+    func newTab(from hostIn: TerminalWindowController?, pane existing: UInt64? = nil, preset: String? = nil) {
+        let host = hostIn ?? currentController
+        var id = existing
+        if id == nil {
+            let size = gridSize(forPoints: host?.content.bounds.size ?? defaultContentSize())
+            id = createPane(cols: size.cols, rows: size.rows, inheritFrom: host?.focusedPane, preset: preset)
+        }
+        guard let pane = id else { return }
+        let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
+        if let host = host, let hostWindow = host.window, hostWindow.isVisible {
+            attachAsTab(c, to: host)
+            c.window?.makeKeyAndOrderFront(nil)
+        } else {
+            c.workspaceID = makeWorkspace().id
+            showAsNewWindow(c, frame: nil)
+        }
+        scheduleLayoutSave()
+    }
+
+    /// Cmd+D / Cmd+Shift+D.
+    func splitFocused(in c: TerminalWindowController, direction: SplitDirName, preset: String? = nil,
+                      fork: Bool = false) {
+        let target = c.focusedPane
+        var size = gridSize(forPoints: c.content.focusedView?.frame.size ?? c.content.bounds.size)
+        if direction == .right || direction == .left {
+            size.cols = max(2, size.cols / 2)
+        } else {
+            size.rows = max(1, size.rows / 2)
+        }
+        guard let id = createPane(cols: size.cols, rows: size.rows, inheritFrom: target, preset: preset,
+                                  forkFrom: fork ? target : nil) else { return }
+        c.content.split(target: target, newPane: id, direction: direction)
+        scheduleLayoutSave()
+    }
+
+    /// Cmd+W: close the focused pane (confirming when a program is running).
+    func userClosePane(_ id: UInt64) {
+        if config.confirmClose, let info = panes[id], info.hasRunningProcess {
+            let alert = NSAlert()
+            alert.messageText = "Close this pane?"
+            alert.informativeText = "\(info.foregroundName ?? "A process") is still running and will be terminated."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Close")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        sendClosePane(id)
+        removePaneFromUI(id)
+    }
+
+    func sendClosePane(_ id: UInt64) {
+        Core.shared.send(object: ["ClosePane": ["pane": NSNumber(value: id)]])
+        panes.removeValue(forKey: id)
+    }
+
+    /// Removes a pane's view; closes the tab when it was the last pane.
+    func removePaneFromUI(_ id: UInt64) {
+        guard let c = controller(for: id) else { return }
+        let empty = c.content.remove(pane: id)
+        if empty {
+            c.closingWithoutConfirmation = true
+            c.window?.close()
+        } else {
+            c.updateTitle()
+        }
+        focusChanged()
+        scheduleLayoutSave()
+    }
+
+    func controllerDidClose(_ c: TerminalWindowController) {
+        c.isClosed = true
+        refreshSidebars()
+        if lastKeyController === c { lastKeyController = nil }
+        // Drop our reference after AppKit is done with the window delegate callbacks.
+        DispatchQueue.main.async {
+            SessionManager.shared.controllers.removeAll { $0 === c }
+        }
+        if !isTerminating {
+            scheduleLayoutSave()
+            focusChanged()
+        }
+    }
+
+    func controllerBecameKey(_ c: TerminalWindowController) {
+        lastKeyController = c
+        workspace(c.workspaceID)?.lastActive = Date()
+        focusChanged()
+        scheduleLayoutSave()
+    }
+
+    /// Focuses a pane, bringing its tab to the front.
+    func focusPane(_ id: UInt64, activate: Bool) {
+        guard let c = controller(for: id) else { return }
+        c.window?.makeKeyAndOrderFront(nil)
+        c.content.focus(id)
+        if activate { NSApp.activate() }
+    }
+
+    func isPaneFocused(_ id: UInt64) -> Bool {
+        guard NSApp.isActive, let c = NSApp.keyWindow?.windowController as? TerminalWindowController else {
+            return false
+        }
+        return c.content.focusedPane == id
+    }
+
+    // MARK: - Focus side effects (secure input, badges)
+
+    func focusChanged() {
+        updateSecureInput()
+        updateDockBadge()
+        refreshSidebars()
+    }
+
+    private var sidebarRefreshPending = false
+
+    /// Reload every vertical tab sidebar on the next main-loop turn (coalesced).
+    func refreshSidebars() {
+        guard config.sidebarTabs, !sidebarRefreshPending else { return }
+        sidebarRefreshPending = true
+        DispatchQueue.main.async {
+            self.sidebarRefreshPending = false
+            for c in self.liveControllers { c.sidebar?.reload() }
+        }
+    }
+
+    /// View > Tabs in Sidebar: switch `window.tab_style` (persisted; every window follows).
+    func toggleSidebarTabs() {
+        let next = config.sidebarTabs ? "native" : "sidebar"
+        let resp = Core.shared.request(object: ["SetSetting": ["key": "window.tab_style", "value": "\"\(next)\""]])
+        if let d = resp as? [String: Any], let e = d["error"] as? String {
+            currentController?.content.focusedView?.showToast("Tabs: \(e)", duration: 6)
+        }
+    }
+
+    func updateSecureInput() {
+        var requested = false
+        if config.autoSecureInput, let c = currentController, let info = panes[c.focusedPane] {
+            requested = info.passwordInput
+        }
+        SecureInput.shared.setScoped(requested)
+        refreshLockBadges()
+    }
+
+    @objc private func secureInputChanged(_ note: Notification) {
+        refreshLockBadges()
+    }
+
+    func refreshLockBadges() {
+        let show = SecureInput.shared.isActive && config.secureInputIndicator
+        let key = NSApp.keyWindow?.windowController as? TerminalWindowController
+        for c in liveControllers {
+            for (id, view) in c.content.views {
+                view.setLockBadgeVisible(show && c === key && id == c.content.focusedPane)
+            }
+        }
+    }
+
+    func updateDockBadge() {
+        // On screen in the active window's tab counts as read.
+        if NSApp.isActive, let c = NSApp.keyWindow?.windowController as? TerminalWindowController {
+            for id in c.content.visiblePaneIds where panes[id]?.agent?.status == .needsInput {
+                seenWaiting.insert(id)
+            }
+        }
+        seenWaiting = seenWaiting.filter { panes[$0]?.agent?.status == .needsInput }
+        let count = panes.values.filter { info in
+            info.agent?.status == .needsInput && !seenWaiting.contains(info.id)
+        }.count
+        NSApp.dockTile.badgeLabel = count > 0 ? "\(count)" : nil
+    }
+
+    func appDidBecomeActive() {
+        SecureInput.shared.setAppActive(true)
+        for c in liveControllers { c.content.focusedView?.reportFocus() }
+        focusChanged()
+    }
+
+    func appDidResignActive() {
+        SecureInput.shared.setAppActive(false)
+        for c in liveControllers { c.content.focusedView?.reportFocus() }
+        refreshLockBadges()
+    }
+
+    // MARK: - Config and fonts
+
+    func reloadConfig(notifyDaemon: Bool) {
+        if notifyDaemon {
+            Core.shared.request("\"ReloadConfig\"")
+        }
+        config = AppConfig.load()
+        applyConfigToUI()
+        let view = currentController?.content.focusedView
+        if let err = config.loadError {
+            view?.showToast("Config error: \(err)", duration: 8)
+        } else if notifyDaemon {
+            view?.showToast("Configuration reloaded")
+        }
+    }
+
+    private func applyConfigToUI() {
+        FontShaper.invalidateAll()
+        for c in liveControllers {
+            c.applyConfig()
+            for view in c.content.views.values {
+                view.metricsChanged()
+            }
+            c.content.needsDisplay = true
+        }
+        updateSecureInput()
+    }
+
+    func changeFontSize(by delta: CGFloat) {
+        fontSizeOverride = max(6, min(72, effectiveFontSize + delta))
+        applyConfigToUI()
+    }
+
+    func resetFontSize() {
+        fontSizeOverride = nil
+        applyConfigToUI()
+    }
+
+    func openConfigFile() {
+        var path = config.configPath
+        if path.isEmpty, let raw = thurm_config_path() {
+            path = String(cString: raw)
+            thurm_string_free(raw)
+        }
+        guard !path.isEmpty else { return }
+        if !FileManager.default.fileExists(atPath: path) {
+            _ = AppConfig.load() // writes the commented default config
+        }
+        let url = URL(fileURLWithPath: path)
+        if !NSWorkspace.shared.open(url) {
+            let textEdit = URL(fileURLWithPath: "/System/Applications/TextEdit.app")
+            NSWorkspace.shared.open([url], withApplicationAt: textEdit,
+                                    configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+        }
+    }
+
+    // MARK: - Command palette
+
+    /// ⌘⇧P: every command of the main menu (as enabled for the front window, with its
+    /// shortcut), plus agent launch presets and forking the focused agent's session.
+    func showCommandPalette() {
+        var items = CommandPalette.menuCommands(NSApp.mainMenu)
+        if let c = currentController, let agent = panes[c.focusedPane]?.agent, agent.sessionId != nil {
+            items.append(CommandPalette.Item(title: "Fork \(agent.name) Session", detail: "in a split") {
+                SessionManager.shared.splitFocused(in: c, direction: .right, fork: true)
+            })
+        }
+        for preset in config.agentPresets {
+            let name = preset.name
+            let detail = preset.command.joined(separator: " ")
+            items.append(CommandPalette.Item(title: "Launch \(name)", detail: detail) {
+                SessionManager.shared.newTab(from: SessionManager.shared.currentController, preset: name)
+            })
+            items.append(CommandPalette.Item(title: "Launch \(name) in Split", detail: detail) {
+                if let c = SessionManager.shared.currentController {
+                    SessionManager.shared.splitFocused(in: c, direction: .right, preset: name)
+                } else {
+                    SessionManager.shared.newWindow(preset: name)
+                }
+            })
+        }
+        CommandPalette.shared.show(items: items, over: currentController?.window)
+    }
+
+    // MARK: - Layout persistence
+
+    func buildLayout() -> Layout {
+        let live = liveControllers
+        // Front-to-back window order first, then the rest.
+        var ordered: [TerminalWindowController] = []
+        for w in NSApp.orderedWindows {
+            if let c = w.windowController as? TerminalWindowController, !c.isClosed,
+               !ordered.contains(where: { $0 === c }) {
+                ordered.append(c)
+            }
+        }
+        for c in live where !ordered.contains(where: { $0 === c }) {
+            ordered.append(c)
+        }
+
+        // Window groups (tab groups), front to back.
+        var groups: [[TerminalWindowController]] = []
+        var selectedWindows: [NSWindow] = []
+        var seen = Set<ObjectIdentifier>()
+        for c in ordered {
+            guard let w = c.window, !seen.contains(ObjectIdentifier(w)) else { continue }
+            let group: [NSWindow] = w.tabGroup?.windows ?? [w]
+            group.forEach { seen.insert(ObjectIdentifier($0)) }
+            seen.insert(ObjectIdentifier(w))
+            let tcs = group.compactMap { $0.windowController as? TerminalWindowController }
+                .filter { !$0.isClosed && !$0.content.isEmpty }
+            guard !tcs.isEmpty else { continue }
+            groups.append(tcs)
+            selectedWindows.append(w.tabGroup?.selectedWindow ?? w)
+        }
+        let selectedControllers = zip(groups, selectedWindows).map { g, sw in
+            g.first { $0.window === sw } ?? g[0]
+        }
+        normalizeWorkspaces(groups: groups, selected: selectedControllers)
+
+        var windows: [WindowLayout] = []
+        for (g, selectedWindow) in zip(groups, selectedWindows) {
+            let tabs = g.map { $0.content.tabLayout(title: $0.titleOverride) }
+            let selected = g.firstIndex { $0.window === selectedWindow } ?? 0
+            let f = selectedWindow.frame
+            windows.append(WindowLayout(frame: [Double(f.minX), Double(f.minY), Double(f.width), Double(f.height)],
+                                        tabs: tabs, selectedTab: selected,
+                                        fullscreen: selectedWindow.styleMask.contains(.fullScreen),
+                                        workspace: g[0].workspaceID))
+        }
+        return Layout(windows: windows, workspaces: workspaceLayouts())
+    }
+
+    /// Sends the layout to the daemon when it changed (or always with `force`).
+    func saveLayoutNow(force: Bool = false, blocking: Bool = false) {
+        guard sessionReady, Core.shared.isConnected else { return }
+        guard let json = buildLayout().jsonString() else { return }
+        if !force && json == lastLayoutJSON { return }
+        lastLayoutJSON = json
+        let request: [String: Any] = ["SetLayout": ["json": json]]
+        if blocking {
+            Core.shared.request(object: request)
+        } else {
+            Core.shared.send(object: request)
+        }
+    }
+
+    /// Debounced (500 ms) layout save.
+    func scheduleLayoutSave() {
+        guard !isTerminating else { return }
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(debouncedSave), object: nil)
+        perform(#selector(debouncedSave), with: nil, afterDelay: 0.5)
+    }
+
+    @objc private func debouncedSave() {
+        saveLayoutNow()
+    }
+
+    /// Catches changes without a notification (e.g. tabs reordered by dragging).
+    @objc private func periodicSave() {
+        if !isTerminating { saveLayoutNow() }
+    }
+
+    // MARK: - Termination
+
+    func prepareForTermination() {
+        guard !isTerminating else { return }
+        NSObject.cancelPreviousPerformRequests(withTarget: self)
+        saveLayoutNow(force: true, blocking: true)
+        isTerminating = true
+        periodicTimer?.invalidate()
+        periodicTimer = nil
+        if config.quitTerminates {
+            Core.shared.request(object: ["Shutdown": ["kill_panes": true]])
+        }
+        for c in liveControllers {
+            c.content.detachAll()
+        }
+        Core.shared.disconnect()
+        SecureInput.shared.releaseAll()
+    }
+
+    // MARK: - Reconnect
+
+    private func handleDisconnect() {
+        guard !isTerminating else { return }
+        tlog("lost connection to thurmd; reconnecting")
+        Core.shared.disconnect()
+        reconnectAttempt = 0
+        currentController?.content.focusedView?.showToast("Daemon connection lost, reconnecting…", duration: 3)
+        attemptReconnect()
+    }
+
+    @objc private func attemptReconnect() {
+        guard !isTerminating, !Core.shared.isConnected else { return }
+        if connectAndHello() {
+            resync()
+            return
+        }
+        reconnectAttempt += 1
+        let delay = min(5.0, 0.25 * pow(2.0, Double(reconnectAttempt)))
+        perform(#selector(attemptReconnect), with: nil, afterDelay: delay)
+    }
+
+    /// After reconnecting: drop views of vanished panes, resubscribe the rest.
+    private func resync() {
+        let infos = fetchPanes()
+        panes = [:]
+        for info in infos { panes[info.id] = info }
+        for c in liveControllers {
+            for id in c.content.paneIds where panes[id] == nil {
+                removePaneFromUI(id)
+            }
+        }
+        let live = liveControllers
+        if live.isEmpty {
+            sessionReady = false
+            restoreSession()
+            return
+        }
+        for c in live {
+            for view in c.content.views.values {
+                view.resubscribe()
+            }
+            c.updateTitle()
+        }
+        currentController?.content.focusedView?.showToast("Reconnected")
+        saveLayoutNow(force: true)
+        focusChanged()
+    }
+
+    // MARK: - Events
+
+    func coreDidReceiveEvent(_ name: String, payload: Any?) {
+        guard !isTerminating else { return }
+        let dict = payload as? [String: Any]
+        switch name {
+        case "PaneInfo":
+            if let info = PaneInfo(json: payload) { paneInfoUpdated(info) }
+        case "PaneExited", "PaneClosed":
+            if let id = jsonUInt64(dict?["pane"]) {
+                panes.removeValue(forKey: id)
+                removePaneFromUI(id)
+                updateDockBadge()
+            }
+        case "Bell":
+            if let id = jsonUInt64(dict?["pane"]) {
+                view(for: id)?.flash()
+                if !NSApp.isActive || !isPaneFocused(id) {
+                    NSApp.requestUserAttention(.informationalRequest)
+                }
+            }
+        case "Notify":
+            if let id = jsonUInt64(dict?["pane"]) {
+                let title = jsonString(dict?["title"]) ?? "Thurm"
+                let body = jsonString(dict?["body"]) ?? ""
+                if config.notificationsEnabled && (!NSApp.isActive || !isPaneFocused(id)) {
+                    Notifications.shared.post(pane: id, title: title, body: body)
+                }
+            }
+        case "ClipboardStore":
+            if let text = jsonString(dict?["text"]) {
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(text, forType: .string)
+            }
+        case "ClipboardRequest":
+            if let id = jsonUInt64(dict?["pane"]) {
+                let text = NSPasteboard.general.string(forType: .string) ?? ""
+                Core.shared.send(object: ["ClipboardReply": ["pane": NSNumber(value: id), "text": text]])
+            }
+        case "Ui":
+            handleUi(payload)
+        case "ConfigReloaded":
+            reloadConfig(notifyDaemon: false)
+        case "Disconnected":
+            handleDisconnect()
+        default:
+            // Attach / Output / Resized are consumed by the Rust core.
+            break
+        }
+    }
+
+    private func paneInfoUpdated(_ info: PaneInfo) {
+        let old = panes[info.id]
+        panes[info.id] = info
+        if let c = controller(for: info.id) {
+            c.updateTitle()
+            c.content.views[info.id]?.maybeShowRestoredToast()
+            if old?.progress != info.progress { c.content.views[info.id]?.setProgress(info.progress) }
+        }
+        let wasWaiting = old?.agent?.status == .needsInput
+        let waiting = info.agent?.status == .needsInput
+        // A new request (or a different one) is unread again.
+        if !waiting || !wasWaiting || old?.agent?.message != info.agent?.message {
+            seenWaiting.remove(info.id)
+        }
+        if waiting && !wasWaiting && !isPaneFocused(info.id) {
+            NSApp.requestUserAttention(.informationalRequest)
+        }
+        updateDockBadge()
+        // The sidebar's agent list covers every pane, including hidden workspaces'.
+        if old?.agent != info.agent { refreshSidebars() }
+        if old?.passwordInput != info.passwordInput {
+            updateSecureInput()
+        }
+    }
+
+    /// Commands sent by the `thurm` CLI through the daemon.
+    private func handleUi(_ payload: Any?) {
+        guard let v = JSON.variant(payload), let d = v.payload as? [String: Any] else { return }
+        switch v.name {
+        case "NewTab":
+            guard let pane = jsonUInt64(d["pane"]) else { return }
+            if controller(for: pane) != nil {
+                focusPane(pane, activate: true)
+                return
+            }
+            if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
+            if jsonBool(d["new_window"]) ?? false {
+                newWindow(pane: pane)
+            } else {
+                newTab(from: currentController, pane: pane)
+            }
+            NSApp.activate()
+        case "Split":
+            guard let pane = jsonUInt64(d["pane"]) else { return }
+            if controller(for: pane) != nil {
+                focusPane(pane, activate: true)
+                return
+            }
+            if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
+            let dir = SplitDirName(rawValue: jsonString(d["dir"]) ?? "right") ?? .right
+            let target = jsonUInt64(d["target"])
+            let host = target.flatMap { controller(for: $0) } ?? currentController
+            if let host = host {
+                host.content.split(target: target, newPane: pane, direction: dir)
+                scheduleLayoutSave()
+            } else {
+                newWindow(pane: pane)
+            }
+        case "Focus":
+            if let pane = jsonUInt64(d["pane"]) { focusPane(pane, activate: true) }
+        case "Scroll":
+            // The viewport lives in the app's copy of the terminal.
+            if let pane = jsonUInt64(d["pane"]), let scroll = d["scroll"] {
+                Core.shared.send(object: ["Scroll": ["pane": NSNumber(value: pane), "scroll": scroll]])
+            }
+        case "SetTabTitle":
+            if let pane = jsonUInt64(d["pane"]), let c = controller(for: pane) {
+                let title = jsonString(d["title"])
+                c.titleOverride = (title?.isEmpty ?? true) ? nil : title
+                scheduleLayoutSave()
+            }
+        default:
+            tlog("unknown UI command \(v.name)")
+        }
+    }
+
+    // MARK: - Errors
+
+    private func showError(_ message: String, response: Any?) {
+        let alert = NSAlert()
+        alert.messageText = message
+        if let d = response as? [String: Any], let e = d["error"] as? String {
+            alert.informativeText = e
+        } else if response == nil {
+            alert.informativeText = "Not connected to the Thurm daemon."
+        }
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+}

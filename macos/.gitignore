@@ -1,0 +1,5 @@
+.build/
+build/
+.swiftpm/
+# Copied from crates/thurm-ffi/include by build.sh
+Sources/CThurm/include/thurm.h

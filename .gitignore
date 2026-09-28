@@ -1,0 +1,7 @@
+/target
+/macos/.build
+/macos/build
+*.xcuserstate
+.DS_Store
+/macos/.sign-identity
+/.direnv

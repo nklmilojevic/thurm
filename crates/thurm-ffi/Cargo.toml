@@ -1,0 +1,19 @@
+[package]
+name = "thurm-ffi"
+description = "C ABI bridge between the Thurm macOS app and the Rust core (see include/thurm.h)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "thurm_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+thurm-proto.workspace = true
+thurm-config.workspace = true
+thurm-client.workspace = true
+thurm-term.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+log.workspace = true

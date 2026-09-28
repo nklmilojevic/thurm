@@ -1,0 +1,185 @@
+# Thurm example configuration.
+# Copy this file to ~/.config/thurm/config.toml, or use `thurm config-path`
+# to find the active path. Run `thurm reload` after you make changes.
+# All settings are optional. Active values below match the defaults.
+# Optional overrides and custom entries are commented out. Remove the leading
+# "# " from an example setting to use it.
+
+[font]
+# Use a font family or face name. Sizes and spacing are in points.
+family = "JetBrains Mono"
+size = 13.0
+# These faces are selected from the font family when not set.
+# family_bold = "JetBrains Mono Bold"
+# family_italic = "JetBrains Mono Italic"
+# family_bold_italic = "JetBrains Mono Bold Italic"
+ligatures = true
+# OpenType features, for example ["ss01", "zero", "-dlig"].
+# A leading minus sign disables a feature.
+features = []
+# Multiply the font line height by this value.
+line_height = 1.0
+letter_spacing = 0.0
+# Use CoreText font smoothing. Strength: 0 to 255.
+thicken = true
+thicken_strength = 255
+fallback = ["SF Mono", "Menlo"]
+# Use the included Symbols Nerd Font Mono for missing icons.
+nerd_font_symbols = true
+
+[window]
+# Padding and sidebar width are in points.
+padding_x = 8.0
+padding_y = 6.0
+# Opacity: 0.0 to 1.0. Blur needs opacity below 1.0.
+opacity = 1.0
+# Any value above 0 enables blur.
+blur = 0
+# Treat the Option key as Alt: "none", "left", "right", or "both".
+option_as_alt = "none"
+# Initial window size in terminal cells.
+columns = 110
+rows = 32
+confirm_close = true
+quit_after_last_window = false
+# Dim panes without focus: 0.0 disables dimming; 1.0 gives full dimming.
+unfocused_split_dim = 0.25
+pane_headers = false
+# Tab location: "native" or "sidebar".
+tab_style = "native"
+sidebar_width = 240.0
+
+[cursor]
+# Shape: "block", "beam", or "underline".
+style = "block"
+blink = false
+# Beam and underline thickness in points.
+thickness = 2.0
+
+[colors]
+# Use a theme name or a path to a theme file. `thurm theme` lists names.
+# To follow system appearance, use "light:NAME,dark:NAME".
+# theme = "light:catppuccin-latte,dark:catppuccin-mocha"
+# Colors use hexadecimal RGB values. Unset colors come from the theme.
+# foreground = "#d8dee9"
+# background = "#0e1116"
+# cursor = "#d8dee9"
+# cursor_text = "#0e1116"
+# selection_foreground = "#ffffff"
+# selection_background = "#434c5e"
+# Override up to 16 ANSI colors, starting at index 0.
+# For example: palette = ["#1b2029", "#e06c75"].
+palette = []
+bold_is_bright = false
+
+[terminal]
+# Scrollback lines kept in memory per pane.
+scrollback = 10000
+# Use the login shell when no shell command is set.
+# shell = ["/bin/zsh", "-l"]
+term = "xterm-256color"
+# Add prompt marks and working directory tracking for zsh, bash, and fish.
+shell_integration = true
+# Clipboard access through OSC 52: "disabled", "copy", "paste", or "copy-paste".
+osc52 = "copy"
+kitty_keyboard = true
+kitty_graphics = true
+# Maximum memory for kitty graphics per pane, in MiB.
+image_memory_mib = 320
+# Characters that end a word during selection with a double click.
+word_separators = ",│`|:\"' ()[]{}<>\t"
+copy_on_select = false
+# Lines moved per line of wheel or trackpad input.
+scroll_multiplier = 3.0
+smooth_scroll = true
+# Show completion choices at a shell prompt. Requires shell integration.
+tab_completion = true
+
+[terminal.env]
+# Set environment variables for shell processes.
+# EDITOR = "nvim"
+
+[session]
+# Save the layout, working directories, and scrollback to disk.
+persist = true
+scrollback_lines = 4000
+snapshot_interval_secs = 15
+# "detach" keeps shells running when the app quits.
+# "terminate" stops shells when the app quits.
+quit = "detach"
+# Run configured agent resume commands when a saved session is restored.
+resume_agents = true
+# Exit the daemon this many seconds after the last pane closes. 0 disables this.
+daemon_idle_exit_secs = 0
+
+[security]
+# Enable Secure Keyboard Entry when a password prompt is detected.
+auto_secure_input = true
+secure_input_indicator = true
+# Ask before a paste with multiple lines outside bracketed paste mode.
+confirm_multiline_paste = true
+
+[notifications]
+enabled = true
+# Notify when an agent in a pane without focus needs input.
+agent_needs_input = true
+# Notify when an agent turn ends in a pane without focus. Requires agent hooks.
+agent_done = true
+# Notify when a command takes at least this many seconds and ends without focus.
+# Set to 0 to disable these command notifications.
+command_finished_secs = 15
+# Allow OSC 9, OSC 99, and OSC 777 notifications from programs.
+program_notifications = true
+bell_badge = true
+
+[agents]
+detect = true
+# Mark a working agent as idle after this many milliseconds without output.
+idle_after_ms = 1500
+# Use agent session titles for tabs. Requires agent hooks.
+session_titles = true
+# Empty presets use the installed built-in agents.
+# Replace [] with entries that each contain a name and command, for example:
+# [{ name = "My Bot", command = ["mybot"] }]
+presets = []
+
+# Add an agent definition, or use an existing kind to override it.
+# Remove the comment prefix from the full block to enable this example.
+# Replace the commands and matching text with values for your agent.
+# The default list of custom definitions is empty.
+# [[agents.define]]
+# kind = "mybot"
+# name = "My Bot"
+# processes = ["mybot"]
+# argv = ["mybot/cli"]
+# working = ["Working"]
+# attention = ["Approve?"]
+# launch = ["mybot"]
+# resume = ["mybot", "--continue"]
+# resume_session = ["mybot", "--resume", "{session}"]
+# fork_session = ["mybot", "--fork", "{session}"]
+# processes matches executable names; argv matches parts of process arguments.
+# working and attention match text on the screen.
+# launch, resume, resume_session, and fork_session are optional commands.
+# {session} is replaced with the session ID reported by agent hooks.
+
+[ai]
+# Use the on-device Apple Intelligence model. Requires macOS 26 or later, Apple silicon,
+# and Apple Intelligence turned on in System Settings. Text never leaves the Mac.
+# The features below take effect only when enabled is true.
+enabled = false
+# Name agent tabs after the task when the agent does not provide a session title.
+titles = true
+# Detect agents waiting for an answer when no attention pattern matches.
+# Applies to agents without hooks.
+status = true
+# Describe agent requests and summarize finished turns in notifications
+# and the agent switcher.
+notifications = true
+# Allow Edit > Explain Last Command and `thurm explain`.
+explain = true
+
+[keybindings]
+# Map a key combination to an action name.
+# "cmd+shift+d" = "split_down"
+# "cmd+d" = "split_right"

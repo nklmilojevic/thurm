@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = ["vendor/libghostty-vt-sys"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+thurm-proto = { path = "crates/thurm-proto" }
+thurm-config = { path = "crates/thurm-config" }
+thurm-term = { path = "crates/thurm-term" }
+thurm-client = { path = "crates/thurm-client" }
+# Vendored (vendor/libghostty-vt-sys): upstream's crate, pinned to a newer Ghostty.
+libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
+bitflags = "2"
+memchr = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+postcard = { version = "1.1", features = ["use-std"] }
+toml = "0.9"
+toml_edit = "0.23"
+dirs = "6"
+flate2 = "1"
+png = "0.18"
+base64 = "0.22"
+regex = "1"
+libc = "0.2"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+signal-hook = "0.3"
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

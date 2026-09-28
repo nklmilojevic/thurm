@@ -1,0 +1,20 @@
+[package]
+name = "thurm-term"
+description = "Thurm terminal engine: libghostty-vt plus kitty graphics, OSC extensions and input encoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libghostty-vt-sys.workspace = true
+bitflags.workspace = true
+memchr.workspace = true
+thurm-proto.workspace = true
+thurm-config.workspace = true
+flate2.workspace = true
+png.workspace = true
+base64.workspace = true
+regex.workspace = true
+log.workspace = true
+unicode-width.workspace = true
+libc.workspace = true

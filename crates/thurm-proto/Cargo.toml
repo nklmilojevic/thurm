@@ -1,0 +1,11 @@
+[package]
+name = "thurm-proto"
+description = "Wire protocol shared by the Thurm daemon, CLI and GUI bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true

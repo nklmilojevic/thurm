@@ -1,0 +1,1906 @@
+//! Daemon state: panes, clients, frame pump, monitor loop and request handling.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::os::fd::RawFd;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use parking_lot::{Mutex, RwLock};
+
+use thurm_config::{AgentDef, Config};
+use thurm_proto::{
+    AgentState, AgentStatus, CreatePane, Event, Layout, PROTOCOL_VERSION, PaneId, PaneInfo,
+    PaneSize, Request, Response, ServerMessage, WaitCondition, WaitOutcome,
+};
+use thurm_term::{EngineConfig, MouseOutcome, TermEvent, Terminal};
+
+use crate::agents::{self, AgentTracker, AiWant};
+use crate::ai;
+use crate::persist::{self, PaneSnapshot, SessionSnapshot, Store};
+use crate::procinfo;
+use crate::pty::{self, Pty};
+use crate::shell;
+use crate::upgrade;
+
+/// Messages queued for a client before its subscriptions switch to re-sync (it stops getting
+/// output and gets a fresh `Attach` once it caught up).
+const OUTPUT_BACKLOG: usize = 4096;
+
+/// PTY output read ahead of the parser. A macOS PTY buffers only a few KiB, so a program that
+/// writes faster than we parse would stall on every chunk; with the read-ahead it keeps
+/// writing while the parser catches up, and still blocks once this much is pending.
+const READ_AHEAD: usize = 8 * 1024 * 1024;
+/// Read-ahead buffer capacity kept between bursts.
+const KEEP_BUFFER: usize = 256 * 1024;
+/// Most output parsed (and forwarded) under one pane lock.
+const PARSE_SLICE: usize = 256 * 1024;
+/// A read this long after the previous one is interactive output (an echo), which the reader
+/// parses itself instead of handing it to the parser thread; bulk output reads back to back.
+const QUIET: Duration = Duration::from_millis(2);
+
+/// Screen lines the model reads for titles, requests and turn summaries.
+const AI_SCREEN_LINES: usize = 60;
+
+/// Work for the on-device model (`[ai]`), done one at a time by `ai_worker`.
+enum AiJob {
+    Title {
+        pane: PaneId,
+        agent: String,
+        prompt: Option<String>,
+        screen: String,
+    },
+    Status {
+        pane: PaneId,
+        hash: u64,
+        agent: String,
+        screen: String,
+    },
+    /// What the agent asks for (or, `done`, what its turn did), for `episode` of its status;
+    /// then the notification that waited for it (title, body without the detail).
+    Detail {
+        pane: PaneId,
+        episode: u64,
+        done: bool,
+        agent: String,
+        hint: Option<String>,
+        screen: String,
+        notify: Option<(String, String)>,
+    },
+}
+
+/// Bytes read from a pane's PTY that its parser hasn't taken yet.
+#[derive(Default)]
+struct ReadAhead {
+    state: Mutex<ReadAheadState>,
+    /// The parser has data (or EOF) waiting.
+    ready: parking_lot::Condvar,
+    /// The reader has room again.
+    room: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct ReadAheadState {
+    data: Vec<u8>,
+    eof: bool,
+    /// The parser is working through a batch it took.
+    parsing: bool,
+}
+
+/// A client subscribed to a pane's output.
+#[derive(Default)]
+pub struct Subscriber {
+    /// Fell behind: waiting to be re-attached.
+    resync: bool,
+}
+
+pub struct Client {
+    pub id: u64,
+    pub tx: Sender<ServerMessage>,
+    pub ui: AtomicBool,
+    pub name: Mutex<String>,
+}
+
+impl Client {
+    pub fn send(&self, msg: ServerMessage) {
+        let _ = self.tx.send(msg);
+    }
+}
+
+pub struct Pane {
+    pub id: PaneId,
+    pub state: Mutex<PaneState>,
+    input: Sender<Vec<u8>>,
+}
+
+impl Pane {
+    pub fn write(&self, data: Vec<u8>) {
+        if !data.is_empty() {
+            let _ = self.input.send(data);
+        }
+    }
+}
+
+pub struct PaneState {
+    pub term: Terminal,
+    pub pty: Pty,
+    pub info: PaneInfo,
+    pub command: Option<Vec<String>>,
+    pub hold: bool,
+    pub subscribers: HashMap<u64, Subscriber>,
+    pub agent: AgentTracker,
+    osc_cwd: Option<String>,
+    command_started: Option<Instant>,
+    command_line: Option<String>,
+    last_history: Option<Vec<u8>>,
+    saved_generation: u64,
+    pending_input: Option<(Instant, Vec<u8>)>,
+    shell_integration_seen: bool,
+    /// Last git probe: when, for which directory, and whether one is in flight.
+    git_probe: Option<(Instant, String)>,
+    git_pending: bool,
+}
+
+/// What [`Daemon::install_pane`] needs: a new pane, or one handed over by the previous daemon.
+struct InstallPane {
+    term: Terminal,
+    pty: Pty,
+    info: PaneInfo,
+    command: Option<Vec<String>>,
+    hold: bool,
+    osc_cwd: Option<String>,
+    shell_integration_seen: bool,
+}
+
+pub struct Daemon {
+    pub config: RwLock<Config>,
+    engine: RwLock<EngineConfig>,
+    /// System appearance reported by the GUI (dark until told otherwise).
+    dark: AtomicBool,
+    agent_defs: RwLock<Vec<AgentDef>>,
+    panes: Mutex<HashMap<PaneId, Arc<Pane>>>,
+    clients: Mutex<HashMap<u64, Arc<Client>>>,
+    layout: Mutex<Option<String>>,
+    next_pane: AtomicU64,
+    next_client: AtomicU64,
+    git_tx: crossbeam_channel::Sender<(PaneId, String)>,
+    git_rx: crossbeam_channel::Receiver<(PaneId, String)>,
+    ai: ai::Model,
+    ai_tx: Sender<AiJob>,
+    ai_rx: Receiver<AiJob>,
+    store: Option<Store>,
+    pub socket: PathBuf,
+    integration_dir: Option<PathBuf>,
+    session_dirty: AtomicBool,
+    restored: AtomicBool,
+    pub shutdown: AtomicBool,
+    /// SIGTERM/SIGINT arrived. Shells dying from here on are part of the teardown (quitting
+    /// the app that spawned us signals its whole tree at once) and stay in the saved session.
+    pub stopping: Arc<AtomicBool>,
+    last_activity: Mutex<Instant>,
+}
+
+impl Daemon {
+    pub fn new(
+        config: Config,
+        socket: PathBuf,
+        state_dir: PathBuf,
+        stopping: Arc<AtomicBool>,
+    ) -> Arc<Daemon> {
+        let integration_dir = shell::install_integration(&state_dir)
+            .map_err(|e| log::warn!("shell integration unavailable: {e}"))
+            .ok();
+        let store = config
+            .session
+            .persist
+            .then(|| Store::new(state_dir.clone()));
+        let git_channel = crossbeam_channel::bounded(256);
+        let ai_channel = crossbeam_channel::bounded(64);
+        Arc::new(Daemon {
+            engine: RwLock::new(EngineConfig::from_config(&config, true)),
+            dark: AtomicBool::new(true),
+            agent_defs: RwLock::new(config.agent_defs()),
+            config: RwLock::new(config),
+            panes: Mutex::new(HashMap::new()),
+            clients: Mutex::new(HashMap::new()),
+            layout: Mutex::new(None),
+            next_pane: AtomicU64::new(1),
+            next_client: AtomicU64::new(1),
+            git_tx: git_channel.0,
+            git_rx: git_channel.1,
+            ai: ai::Model::new(),
+            ai_tx: ai_channel.0,
+            ai_rx: ai_channel.1,
+            store,
+            socket,
+            integration_dir,
+            session_dirty: AtomicBool::new(false),
+            restored: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            stopping,
+            last_activity: Mutex::new(Instant::now()),
+        })
+    }
+
+    pub fn pane(&self, id: PaneId) -> Option<Arc<Pane>> {
+        self.panes.lock().get(&id).cloned()
+    }
+
+    fn all_panes(&self) -> Vec<Arc<Pane>> {
+        let mut v: Vec<_> = self.panes.lock().values().cloned().collect();
+        v.sort_by_key(|p| p.id);
+        v
+    }
+
+    fn broadcast(&self, event: Event, ui_only: bool) {
+        let clients: Vec<_> = self.clients.lock().values().cloned().collect();
+        for c in clients {
+            if !ui_only || c.ui.load(Ordering::Relaxed) {
+                c.send(ServerMessage::Event(event.clone()));
+            }
+        }
+    }
+
+    fn has_ui_clients(&self) -> bool {
+        self.clients
+            .lock()
+            .values()
+            .any(|c| c.ui.load(Ordering::Relaxed))
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Clients
+    // -----------------------------------------------------------------------------------------
+
+    pub fn add_client(&self) -> (Arc<Client>, Receiver<ServerMessage>) {
+        let (tx, rx) = unbounded();
+        let id = self.next_client.fetch_add(1, Ordering::Relaxed);
+        let client = Arc::new(Client {
+            id,
+            tx,
+            ui: AtomicBool::new(false),
+            name: Mutex::new(String::new()),
+        });
+        self.clients.lock().insert(id, client.clone());
+        *self.last_activity.lock() = Instant::now();
+        (client, rx)
+    }
+
+    pub fn remove_client(&self, id: u64) {
+        self.clients.lock().remove(&id);
+        for p in self.all_panes() {
+            p.state.lock().subscribers.remove(&id);
+        }
+        *self.last_activity.lock() = Instant::now();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Panes
+    // -----------------------------------------------------------------------------------------
+
+    /// The command forking the agent session in pane `src`, and that pane's directory.
+    fn fork_command(&self, src: PaneId) -> anyhow::Result<(Vec<String>, Option<String>)> {
+        let pane = self
+            .pane(src)
+            .ok_or_else(|| anyhow::anyhow!("no such pane: {src}"))?;
+        let (agent, cwd) = {
+            let st = pane.state.lock();
+            (st.info.agent.clone(), st.info.cwd.clone())
+        };
+        let agent = agent.ok_or_else(|| anyhow::anyhow!("no agent is running in pane {src}"))?;
+        let session = agent.session_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} hasn't reported its session id; install the hooks with `thurm hooks install`",
+                agent.name
+            )
+        })?;
+        let template = self
+            .agent_defs
+            .read()
+            .iter()
+            .find(|d| d.kind == agent.kind)
+            .and_then(|d| d.fork_session.clone())
+            .ok_or_else(|| anyhow::anyhow!("{} can't fork sessions", agent.name))?;
+        let cmd = template
+            .iter()
+            .map(|a| a.replace("{session}", &session))
+            .collect();
+        Ok((cmd, cwd))
+    }
+
+    fn resolve_command(&self, req: &CreatePane) -> Option<Vec<String>> {
+        if let Some(name) = &req.agent_preset {
+            let cfg = self.config.read();
+            if let Some(p) = cfg.agent_presets().into_iter().find(|p| &p.name == name) {
+                return Some(p.command);
+            }
+            if let Some(d) = cfg
+                .agent_defs()
+                .into_iter()
+                .find(|d| &d.kind == name || &d.name == name)
+            {
+                return d.launch;
+            }
+        }
+        req.command.clone()
+    }
+
+    /// Create a pane. `restore` carries the id and saved scrollback when restoring a session.
+    pub fn create_pane(
+        self: &Arc<Self>,
+        req: CreatePane,
+        restore: Option<(PaneId, Option<Vec<u8>>)>,
+    ) -> anyhow::Result<PaneId> {
+        let id = match &restore {
+            Some((id, _)) => {
+                self.next_pane.fetch_max(id + 1, Ordering::Relaxed);
+                *id
+            }
+            None => self.next_pane.fetch_add(1, Ordering::Relaxed),
+        };
+        let mut req = req;
+        if let Some(src) = req.fork_from {
+            let (cmd, cwd) = self.fork_command(src)?;
+            req.command = Some(cmd);
+            req.agent_preset = None;
+            if req.cwd.is_none() {
+                req.cwd = cwd;
+            }
+        }
+        let command = self.resolve_command(&req);
+        let cwd = req.cwd.clone().or_else(|| {
+            let from = self.pane(req.inherit_cwd_from?)?;
+            let st = from.state.lock();
+            st.info.cwd.clone()
+        });
+        let size = sanitize_size(req.size);
+        let cfg = self.config.read().clone();
+        let opts = shell::spawn_options(shell::PaneLaunch {
+            id,
+            command: command.clone(),
+            cwd: cwd.clone(),
+            extra_env: req.env.clone(),
+            size,
+            config: &cfg,
+            socket: &self.socket,
+            integration_dir: self.integration_dir.as_deref(),
+        });
+        let mut term = Terminal::new(size, self.engine.read().clone());
+        let restored = restore.is_some();
+        if let Some((_, Some(history))) = &restore {
+            term.replay(history);
+            term.print(&format!(
+                "\r\n\x1b[2m── session restored · {} ──\x1b[0m\r\n",
+                cwd.as_deref().unwrap_or("~")
+            ));
+        }
+        let pty = Pty::spawn(opts)?;
+        let pid = pty.pid();
+        let info = PaneInfo {
+            id,
+            title: command
+                .as_ref()
+                .and_then(|c| c.first().cloned())
+                .unwrap_or_else(|| "shell".into()),
+            cwd: cwd.clone(),
+            pid: Some(pid),
+            alive: true,
+            size,
+            restored,
+            ..Default::default()
+        };
+        self.install_pane(
+            InstallPane {
+                term,
+                pty,
+                info,
+                command,
+                hold: req.hold,
+                osc_cwd: None,
+                shell_integration_seen: false,
+            },
+            true,
+        )?;
+        log::info!("pane {id} created (pid {pid})");
+        Ok(id)
+    }
+
+    /// Registers a pane around its terminal and PTY and starts its threads (the reader only
+    /// when `read` is set: an exited pane has nothing left to read).
+    fn install_pane(self: &Arc<Self>, p: InstallPane, read: bool) -> anyhow::Result<()> {
+        let id = p.info.id;
+        let reader = p.pty.reader()?;
+        let writer = p.pty.writer()?;
+        let (input_tx, input_rx) = unbounded::<Vec<u8>>();
+        let pane = Arc::new(Pane {
+            id,
+            input: input_tx,
+            state: Mutex::new(PaneState {
+                term: p.term,
+                pty: p.pty,
+                info: p.info,
+                command: p.command,
+                hold: p.hold,
+                subscribers: HashMap::new(),
+                agent: AgentTracker::default(),
+                osc_cwd: p.osc_cwd,
+                command_started: None,
+                command_line: None,
+                last_history: None,
+                saved_generation: 0,
+                pending_input: None,
+                shell_integration_seen: p.shell_integration_seen,
+                git_probe: None,
+                git_pending: false,
+            }),
+        });
+        self.panes.lock().insert(id, pane.clone());
+        self.session_dirty.store(true, Ordering::Relaxed);
+
+        spawn_writer(id, writer, input_rx);
+        if read {
+            let daemon = self.clone();
+            std::thread::Builder::new()
+                .name(format!("pane-{id}-reader"))
+                .spawn(move || daemon.reader_loop(pane, reader))?;
+        }
+        Ok(())
+    }
+
+    /// Reads the PTY as fast as it delivers, into the read-ahead; parsing happens on a
+    /// second thread, so the program never waits for the parser.
+    fn reader_loop(self: Arc<Self>, pane: Arc<Pane>, mut reader: File) {
+        interactive_qos();
+        let pipe = Arc::new(ReadAhead::default());
+        let parser = {
+            let (daemon, pane, pipe) = (self.clone(), pane.clone(), pipe.clone());
+            std::thread::Builder::new()
+                .name(format!("pane-{}-parser", pane.id))
+                .spawn(move || daemon.parser_loop(pane, pipe))
+        };
+        if let Err(e) = parser {
+            log::warn!("pane {}: cannot start parser: {e}", pane.id);
+            return self.pane_exited(&pane);
+        }
+        if let Err(e) = pty::set_nonblocking(&reader) {
+            log::warn!("pane {}: PTY stays blocking: {e}", pane.id);
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut last_read = Instant::now();
+        loop {
+            let n = match pty::read_pty(&mut reader, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    log::warn!("pane {} read error: {e}", pane.id);
+                    break;
+                }
+            };
+            let quiet = last_read.elapsed() >= QUIET;
+            last_read = Instant::now();
+            let mut st = pipe.state.lock();
+            if quiet && st.data.is_empty() && !st.parsing {
+                // Output after a pause (an echo, a prompt): parse it right here rather than
+                // waking the parser, which is idle and has nothing queued. Nothing else can be
+                // appended meanwhile, so the order holds.
+                drop(st);
+                self.parse_output(&pane, &buf[..n]);
+                continue;
+            }
+            while st.data.len() >= READ_AHEAD {
+                pipe.room.wait(&mut st);
+            }
+            // A burst outgrew the small buffer: go straight to the full size in one allocation
+            // (doubling would leave a trail of freed blocks the allocator keeps; one big block
+            // is its own mapping, returned to the system when freed).
+            if st.data.len() + n > st.data.capacity() && st.data.capacity() >= KEEP_BUFFER {
+                let len = st.data.len();
+                st.data.reserve_exact(READ_AHEAD + buf.len() - len);
+            }
+            st.data.extend_from_slice(&buf[..n]);
+            pipe.ready.notify_one();
+        }
+        pipe.state.lock().eof = true;
+        pipe.ready.notify_one();
+    }
+
+    /// Parses what the reader collected, a batch at a time.
+    fn parser_loop(self: Arc<Self>, pane: Arc<Pane>, pipe: Arc<ReadAhead>) {
+        interactive_qos();
+        let mut batch = Vec::new();
+        loop {
+            {
+                let mut st = pipe.state.lock();
+                st.parsing = false;
+                while st.data.is_empty() && !st.eof {
+                    pipe.ready.wait(&mut st);
+                }
+                if st.data.is_empty() {
+                    break;
+                }
+                // Swap buffers: the reader keeps appending into the (emptied) previous batch.
+                std::mem::swap(&mut st.data, &mut batch);
+                st.parsing = true;
+                pipe.room.notify_one();
+            }
+            self.parse_output(&pane, &batch);
+            batch.clear();
+            // After a burst, give the memory back rather than keep megabytes per pane (the
+            // reader's buffer is this one after the next swap).
+            if batch.capacity() > KEEP_BUFFER {
+                batch = Vec::new();
+            }
+        }
+        self.pane_exited(&pane);
+    }
+
+    /// Feeds PTY output to the pane's terminal and forwards it to subscribers, a slice per
+    /// lock so that requests for the pane are not held up by a long batch.
+    fn parse_output(&self, pane: &Arc<Pane>, bytes: &[u8]) {
+        for slice in bytes.chunks(PARSE_SLICE) {
+            let events = {
+                let mut st = pane.state.lock();
+                if st.subscribers.is_empty() {
+                    st.term.advance(slice);
+                } else {
+                    let data = st.term.advance_forward(slice);
+                    self.forward_output(pane.id, &mut st, data);
+                }
+                st.term.drain_events()
+            };
+            self.handle_term_events(pane, events);
+        }
+    }
+
+    /// Sends PTY output to the pane's subscribers, in stream order (called with the pane
+    /// locked). A client that falls behind is re-attached with fresh state once it caught up,
+    /// rather than getting a stream with holes.
+    fn forward_output(&self, pane: PaneId, st: &mut PaneState, data: Vec<u8>) {
+        let clients = self.clients.lock().clone();
+        let mut plan = Vec::new();
+        let mut need_state = false;
+        for (cid, sub) in st.subscribers.iter_mut() {
+            let Some(c) = clients.get(cid) else { continue };
+            let backlog = c.tx.len();
+            if sub.resync {
+                if backlog < OUTPUT_BACKLOG / 2 {
+                    sub.resync = false;
+                    need_state = true;
+                    plan.push((c.clone(), true));
+                }
+            } else if backlog > OUTPUT_BACKLOG {
+                log::warn!("client {cid} fell behind on pane {pane}; re-syncing");
+                sub.resync = true;
+            } else {
+                plan.push((c.clone(), false));
+            }
+        }
+        // The state already includes this chunk.
+        let state = need_state.then(|| st.term.serialize_state());
+        let size = st.term.size();
+        // The last output event takes the buffer; only the others copy it.
+        let last_output = plan.iter().rposition(|(_, attach)| !attach);
+        let mut data = Some(data);
+        for (i, (c, attach)) in plan.into_iter().enumerate() {
+            let ev = if attach {
+                Event::Attach {
+                    pane,
+                    size,
+                    state: state.clone().unwrap_or_default(),
+                }
+            } else if data.as_ref().is_none_or(|d| d.is_empty()) {
+                continue;
+            } else {
+                let data = if Some(i) == last_output {
+                    data.take().unwrap_or_default()
+                } else {
+                    data.clone().unwrap_or_default()
+                };
+                Event::Output { pane, data }
+            };
+            c.send(ServerMessage::Event(ev));
+        }
+    }
+
+    /// Re-sends the full state to a pane's subscribers after a change that isn't part of the
+    /// output stream (clearing the scrollback, a reset).
+    fn send_subscribers(&self, st: &PaneState, ev: Event) {
+        let clients = self.clients.lock();
+        for cid in st.subscribers.keys() {
+            if let Some(c) = clients.get(cid) {
+                c.send(ServerMessage::Event(ev.clone()));
+            }
+        }
+    }
+
+    fn reattach(&self, pane: PaneId) {
+        let Some(p) = self.pane(pane) else { return };
+        let mut st = p.state.lock();
+        if st.subscribers.is_empty() {
+            return;
+        }
+        let state = st.term.serialize_state();
+        let size = st.term.size();
+        let clients = self.clients.lock();
+        for cid in st.subscribers.keys() {
+            if let Some(c) = clients.get(cid) {
+                c.send(ServerMessage::Event(Event::Attach {
+                    pane,
+                    size,
+                    state: state.clone(),
+                }));
+            }
+        }
+    }
+
+    fn handle_term_events(&self, pane: &Arc<Pane>, events: Vec<TermEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let cfg = self.config.read().notifications.clone();
+        let mut info_changed = false;
+        let mut outgoing = Vec::new();
+        {
+            let mut st = pane.state.lock();
+            for ev in events {
+                match ev {
+                    TermEvent::PtyWrite(b) => pane.write(b),
+                    TermEvent::Title(t) => {
+                        if let Some(t) = t {
+                            st.info.title = t;
+                        }
+                        info_changed = true;
+                    }
+                    TermEvent::Bell => outgoing.push(Event::Bell { pane: pane.id }),
+                    TermEvent::ClipboardStore(text) => outgoing.push(Event::ClipboardStore {
+                        pane: pane.id,
+                        text,
+                    }),
+                    TermEvent::ClipboardLoad => {
+                        outgoing.push(Event::ClipboardRequest { pane: pane.id })
+                    }
+                    TermEvent::Notify { title, body } => {
+                        st.agent.flag_attention();
+                        if cfg.enabled && cfg.program_notifications {
+                            let title = if title.is_empty() {
+                                st.agent
+                                    .state()
+                                    .map(|a| a.name.clone())
+                                    .unwrap_or_else(|| st.info.title.clone())
+                            } else {
+                                title
+                            };
+                            outgoing.push(Event::Notify {
+                                pane: pane.id,
+                                title,
+                                body,
+                            });
+                        }
+                    }
+                    TermEvent::Cwd(d) => {
+                        st.shell_integration_seen = true;
+                        if st.osc_cwd.as_deref() != Some(&d) {
+                            st.osc_cwd = Some(d.clone());
+                            st.info.cwd = Some(d);
+                            info_changed = true;
+                        }
+                    }
+                    TermEvent::PromptStart => {
+                        st.shell_integration_seen = true;
+                        if !st.info.at_prompt {
+                            st.info.at_prompt = true;
+                            info_changed = true;
+                        }
+                        // Whatever reported progress is done (or died without clearing it).
+                        if st.info.progress.take().is_some() {
+                            info_changed = true;
+                        }
+                        if let Some((_, input)) = st.pending_input.take() {
+                            pane.write(input);
+                        }
+                    }
+                    TermEvent::CommandStart => {
+                        st.info.at_prompt = false;
+                        st.command_started = Some(Instant::now());
+                        info_changed = true;
+                    }
+                    TermEvent::CommandLine(c) => st.command_line = Some(c),
+                    TermEvent::CommandFinished(code) => {
+                        st.info.last_exit_status = code;
+                        info_changed = true;
+                        if let Some(start) = st.command_started.take() {
+                            let secs = cfg.command_finished_secs;
+                            if cfg.enabled
+                                && secs > 0
+                                && start.elapsed() >= Duration::from_secs(secs)
+                            {
+                                let what =
+                                    st.command_line.take().unwrap_or_else(|| "Command".into());
+                                let status = match code {
+                                    Some(0) | None => "finished".to_owned(),
+                                    Some(c) => format!("failed (exit {c})"),
+                                };
+                                outgoing.push(Event::Notify {
+                                    pane: pane.id,
+                                    title: format!("{what} {status}"),
+                                    body: format!("after {}s", start.elapsed().as_secs()),
+                                });
+                            }
+                        }
+                    }
+                    TermEvent::Progress(p) => {
+                        st.info.progress = p;
+                        info_changed = true;
+                    }
+                    // Subscribers run their own copy of the terminal and free images there.
+                    TermEvent::ImageFreed(_) => {}
+                }
+            }
+            if info_changed {
+                outgoing.push(Event::PaneInfo(st.info.clone()));
+            }
+        }
+        for ev in outgoing {
+            self.broadcast(ev, true);
+        }
+    }
+
+    fn pane_exited(&self, pane: &Arc<Pane>) {
+        if self.stopping.load(Ordering::Relaxed) {
+            log::info!("pane {} ended with the daemon", pane.id);
+            return;
+        }
+        let (code, hold) = {
+            let mut st = pane.state.lock();
+            // Give the kernel a moment to deliver the exit status.
+            let mut code = None;
+            for _ in 0..50 {
+                if let Some(c) = st.pty.try_wait() {
+                    code = c;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            st.info.alive = false;
+            st.info.exit_code = code;
+            if st.hold {
+                let msg = match code {
+                    Some(c) => format!("\r\n\x1b[2m[process exited with code {c}]\x1b[0m"),
+                    None => "\r\n\x1b[2m[process exited]\x1b[0m".to_owned(),
+                };
+                st.term.print(&msg);
+            }
+            (code, st.hold)
+        };
+        if self.pane(pane.id).is_none() {
+            // Closed explicitly; ClosePane already notified clients.
+            return;
+        }
+        log::info!("pane {} exited ({code:?})", pane.id);
+        self.broadcast(
+            Event::PaneExited {
+                pane: pane.id,
+                code,
+            },
+            false,
+        );
+        if hold {
+        } else {
+            self.panes.lock().remove(&pane.id);
+            self.session_dirty.store(true, Ordering::Relaxed);
+            self.broadcast(Event::PaneClosed { pane: pane.id }, false);
+        }
+    }
+
+    pub fn close_pane(&self, id: PaneId) -> bool {
+        let Some(pane) = self.panes.lock().remove(&id) else {
+            return false;
+        };
+        pane.state.lock().pty.hangup();
+        self.session_dirty.store(true, Ordering::Relaxed);
+        self.broadcast(Event::PaneClosed { pane: id }, false);
+        true
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Frame pump
+    // -----------------------------------------------------------------------------------------
+
+    /// Runs the git probes requested by the monitor, one at a time.
+    pub fn git_worker(self: Arc<Self>) {
+        while let Ok((id, cwd)) = self.git_rx.recv() {
+            let info = crate::git::probe(&cwd);
+            let Some(pane) = self.pane(id) else { continue };
+            let changed = {
+                let mut st = pane.state.lock();
+                st.git_pending = false;
+                (st.info.git != info).then(|| {
+                    st.info.git = info;
+                    st.info.clone()
+                })
+            };
+            if let Some(info) = changed {
+                self.broadcast(Event::PaneInfo(info), false);
+            }
+        }
+    }
+
+    /// Asks the on-device model what the monitor queued, one question at a time.
+    pub fn ai_worker(self: Arc<Self>) {
+        while let Ok(job) = self.ai_rx.recv() {
+            match job {
+                AiJob::Title {
+                    pane,
+                    agent,
+                    prompt,
+                    screen,
+                } => {
+                    let topic = self
+                        .ai
+                        .ask(&ai::title(&agent, prompt.as_deref(), &screen))
+                        .ok()
+                        .and_then(|t| ai::clean_title(&t));
+                    self.update_agent(pane, |st| st.agent.set_ai_topic(topic));
+                }
+                AiJob::Status {
+                    pane,
+                    hash,
+                    agent,
+                    screen,
+                } => {
+                    let waiting = self
+                        .ai
+                        .ask(&ai::status(&agent, &screen))
+                        .is_ok_and(|a| a.trim() == ai::WAITING);
+                    // The next monitor tick uses the answer.
+                    if let Some(p) = self.pane(pane) {
+                        p.state.lock().agent.set_ai_waiting(hash, waiting);
+                    }
+                }
+                AiJob::Detail {
+                    pane,
+                    episode,
+                    done,
+                    agent,
+                    hint,
+                    screen,
+                    notify,
+                } => {
+                    let ask = if done {
+                        ai::summary(&agent, &screen)
+                    } else {
+                        ai::attention(&agent, hint.as_deref(), &screen)
+                    };
+                    let detail = self.ai.ask(&ask).ok().and_then(|t| ai::clean_detail(&t));
+                    let mut current = false;
+                    self.update_agent(pane, |st| {
+                        current = st.agent.episode() == episode;
+                        if let Some(d) = &detail {
+                            st.agent.set_ai_detail(episode, d.clone());
+                        }
+                    });
+                    // The user already answered (or the agent moved on): old news.
+                    if let (Some((title, body)), true) = (notify, current) {
+                        let body = match (&detail, done) {
+                            (Some(d), true) => format!("{d} ({body})"),
+                            (Some(d), false) => d.clone(),
+                            (None, _) => body,
+                        };
+                        self.broadcast(Event::Notify { pane, title, body }, true);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies `f` to a pane's state, then re-derives its agent state and title and tells
+    /// clients when they changed.
+    fn update_agent(&self, pane: PaneId, f: impl FnOnce(&mut PaneState)) {
+        let Some(p) = self.pane(pane) else { return };
+        let info = {
+            let mut st = p.state.lock();
+            f(&mut st);
+            st.agent.refresh().map(|new| {
+                st.info.agent = new;
+                st.info.title = pane_title(&st, st.info.foreground.as_ref());
+                st.info.clone()
+            })
+        };
+        if let Some(info) = info {
+            self.broadcast(Event::PaneInfo(info), false);
+        }
+    }
+
+    /// Queues what the model should look at for the pane's agent (see `AgentTracker::ai_wants`).
+    fn queue_ai(
+        &self,
+        pane: PaneId,
+        st: &mut PaneState,
+        cfg: &thurm_config::AiConfig,
+        screen: &str,
+    ) {
+        let Some(agent) = st.agent.state().map(|a| a.name.clone()) else {
+            return;
+        };
+        if st.info.password_input || self.ai.unavailable().is_some() {
+            return;
+        }
+        let tail = agents::tail(screen, 20);
+        let title = st.term.title().map(str::to_owned);
+        for want in st
+            .agent
+            .ai_wants(cfg.titles(), cfg.status(), &tail, title.as_deref())
+        {
+            let job = match want {
+                AiWant::Title { prompt } => AiJob::Title {
+                    pane,
+                    agent: agent.clone(),
+                    prompt,
+                    screen: agents::tail(screen, AI_SCREEN_LINES),
+                },
+                AiWant::Status { hash } => AiJob::Status {
+                    pane,
+                    hash,
+                    agent: agent.clone(),
+                    screen: tail.clone(),
+                },
+            };
+            if self.ai_tx.try_send(job).is_err() {
+                log::debug!("pane {pane}: model queue full");
+                // Asked again after the next turn.
+                st.agent.set_ai_topic(None);
+            }
+        }
+    }
+
+    fn explain(&self, pane: PaneId) -> Result<String, String> {
+        if !self.config.read().ai.explain() {
+            return Err(
+                "explaining needs the on-device model: set `enabled = true` under [ai] \
+                 in the config (`thurm set ai.enabled true`)"
+                    .into(),
+            );
+        }
+        let (output, exit) = self.with_pane(pane, |_, st| {
+            (st.term.last_command(150), st.info.last_exit_status)
+        })?;
+        let output = output.ok_or(
+            "no finished command to explain (shell integration marks where commands start)",
+        )?;
+        let text = self.ai.ask(&ai::explain(&output, exit))?;
+        Ok(text.trim().to_owned())
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Monitor: foreground process, agents, password prompts, cwd, autosave
+    // -----------------------------------------------------------------------------------------
+
+    pub fn monitor(self: Arc<Self>) {
+        let mut last_save = Instant::now();
+        let mut tick: u64 = 0;
+        while !self.shutdown.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(500));
+            tick += 1;
+            let (idle_after, interval, detect, ai_cfg) = {
+                let c = self.config.read();
+                (
+                    Duration::from_millis(c.agents.idle_after_ms),
+                    Duration::from_secs(c.session.snapshot_interval_secs.max(1)),
+                    c.agents.detect,
+                    c.ai.clone(),
+                )
+            };
+            let defs = self.agent_defs.read().clone();
+            for pane in self.all_panes() {
+                let mut events = Vec::new();
+                {
+                    let mut st = pane.state.lock();
+                    if !st.info.alive {
+                        continue;
+                    }
+                    if st.term.sync_deadline().is_some_and(|d| d <= Instant::now()) {
+                        st.term.flush_sync();
+                    }
+                    let before = st.info.clone();
+                    let fg = st.pty.foreground_pgrp().and_then(procinfo::process_info);
+                    st.info.password_input = st.pty.password_mode();
+                    if (st.osc_cwd.is_none() || !st.shell_integration_seen)
+                        && let Some(pid) = st.info.pid
+                    {
+                        // The shell's cwd (login(1) on macOS execs into the shell, same pid).
+                        if let Some(c) = procinfo::cwd(pid) {
+                            st.info.cwd = Some(c);
+                        }
+                    }
+                    let idle = st.term.last_output.elapsed();
+                    st.info.idle_ms = idle.as_millis().min(u64::MAX as u128) as u64;
+                    if detect {
+                        let is_agent = fg
+                            .as_ref()
+                            .is_some_and(|p| defs.iter().any(|d| d.matches(&p.name, &p.argv)));
+                        let screen = if is_agent || st.agent.state().is_some() {
+                            st.term.screen_text()
+                        } else {
+                            String::new()
+                        };
+                        let tail = agents::tail(&screen, 20);
+                        if let Some(new) =
+                            st.agent.update(&defs, fg.as_ref(), &tail, idle, idle_after)
+                        {
+                            events.extend(self.agent_notifications(
+                                pane.id,
+                                &st,
+                                before.agent.as_ref(),
+                                new.as_ref(),
+                            ));
+                            st.info.agent = new;
+                        }
+                        if ai_cfg.enabled {
+                            self.queue_ai(pane.id, &mut st, &ai_cfg, &screen);
+                        }
+                    }
+                    if let Some(p) = &fg {
+                        if !procinfo::is_shell(&p.name) {
+                            st.info.at_prompt = false;
+                        } else if !st.shell_integration_seen {
+                            st.info.at_prompt = true;
+                        }
+                    }
+                    if let Some(cwd) = st.info.cwd.clone()
+                        && !st.git_pending
+                    {
+                        // Re-probe on a directory change, else every 5 s in a repository
+                        // (the diff moves while agents edit) and every 30 s elsewhere.
+                        let every = Duration::from_secs(if st.info.git.is_some() { 5 } else { 30 });
+                        let due = match &st.git_probe {
+                            Some((at, dir)) => dir != &cwd || at.elapsed() >= every,
+                            None => true,
+                        };
+                        if due && self.git_tx.try_send((pane.id, cwd.clone())).is_ok() {
+                            st.git_pending = true;
+                            st.git_probe = Some((Instant::now(), cwd));
+                        }
+                    }
+                    st.info.title = pane_title(&st, fg.as_ref());
+                    st.info.foreground = fg;
+                    if let Some((due, _)) = &st.pending_input
+                        && Instant::now() >= *due
+                        && let Some((_, input)) = st.pending_input.take()
+                    {
+                        pane.write(input);
+                    }
+                    // idle_ms changes every tick; only report it along with other changes, or
+                    // every 2 s for clients that display it.
+                    let mut cmp = st.info.clone();
+                    cmp.idle_ms = before.idle_ms;
+                    if cmp != before || tick.is_multiple_of(4) {
+                        events.push(Event::PaneInfo(st.info.clone()));
+                    }
+                }
+                for ev in events {
+                    self.broadcast(ev, true);
+                }
+            }
+            if self.store.is_some()
+                && (self.session_dirty.load(Ordering::Relaxed)
+                    && last_save.elapsed() > Duration::from_secs(1)
+                    || last_save.elapsed() > interval)
+            {
+                self.save_session();
+                last_save = Instant::now();
+            }
+            let idle_exit = self.config.read().session.daemon_idle_exit_secs;
+            if idle_exit > 0
+                && self.panes.lock().is_empty()
+                && self.clients.lock().is_empty()
+                && self.last_activity.lock().elapsed() > Duration::from_secs(idle_exit)
+            {
+                log::info!("idle, exiting");
+                self.shutdown.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Persistence
+    // -----------------------------------------------------------------------------------------
+
+    fn sanitized_layout(&self) -> Option<String> {
+        let raw = self.layout.lock().clone()?;
+        let mut layout: Layout = serde_json::from_str(&raw).ok()?;
+        let panes = self.panes.lock();
+        layout.retain_panes(&|id| panes.contains_key(&id));
+        serde_json::to_string(&layout).ok()
+    }
+
+    pub fn save_session(&self) {
+        let Some(store) = &self.store else { return };
+        let lines = self.config.read().session.scrollback_lines;
+        let mut panes = Vec::new();
+        let mut scrollbacks = Vec::new();
+        for pane in self.all_panes() {
+            let mut st = pane.state.lock();
+            if !st.info.alive {
+                continue;
+            }
+            let generation = st.term.generation();
+            if generation != st.saved_generation || st.last_history.is_none() {
+                if let Some(h) = st.term.serialize_history(lines) {
+                    st.last_history = Some(h);
+                }
+                if let Some(h) = &st.last_history {
+                    scrollbacks.push((pane.id, h.clone()));
+                }
+                st.saved_generation = generation;
+            }
+            panes.push(PaneSnapshot {
+                id: pane.id,
+                cwd: st.info.cwd.clone(),
+                title: st.info.title.clone(),
+                command: st.command.clone(),
+                agent: st.agent.state().map(|a| a.kind.clone()),
+                agent_session: st
+                    .agent
+                    .state()
+                    .and(st.agent.session_id())
+                    .map(str::to_owned),
+                size: st.info.size.into(),
+            });
+        }
+        let snap = SessionSnapshot {
+            version: persist::SNAPSHOT_VERSION,
+            saved_at: persist::now_secs(),
+            layout: self.sanitized_layout(),
+            panes,
+            next_pane_id: self.next_pane.load(Ordering::Relaxed),
+        };
+        match store.save(&snap, &scrollbacks) {
+            Ok(()) => self.session_dirty.store(false, Ordering::Relaxed),
+            Err(e) => log::warn!("failed to save session: {e}"),
+        }
+    }
+
+    /// Everything the next image needs to carry on (see `upgrade.rs`). The PTY fds stay owned
+    /// by the panes; they only become the new image's through exec.
+    pub fn handoff(&self, listener_fd: RawFd, log_to_file: bool) -> upgrade::Handoff {
+        let mut panes = Vec::new();
+        for pane in self.all_panes() {
+            let mut st = pane.state.lock();
+            let exited = st.pty.try_wait().or(st.pty.exit_status());
+            let state = st.term.serialize_state();
+            panes.push(upgrade::PaneHandoff {
+                id: pane.id,
+                fd: st.pty.master_fd(),
+                pid: st.pty.pid(),
+                size: st.info.size.into(),
+                title: st.info.title.clone(),
+                cwd: st.info.cwd.clone(),
+                command: st.command.clone(),
+                hold: st.hold,
+                restored: st.info.restored,
+                exited: exited.or((!st.info.alive).then_some(st.info.exit_code)),
+                osc_cwd: st.osc_cwd.clone(),
+                shell_integration_seen: st.shell_integration_seen,
+                state: upgrade::PaneHandoff::encode_state(&state),
+            });
+        }
+        upgrade::Handoff {
+            version: upgrade::HANDOFF_VERSION,
+            listener_fd,
+            log_to_file,
+            layout: self.layout.lock().clone(),
+            next_pane_id: self.next_pane.load(Ordering::Relaxed),
+            restored: self.restored.load(Ordering::Relaxed),
+            panes,
+        }
+    }
+
+    /// Takes over the panes of the image we replaced.
+    pub fn adopt(self: &Arc<Self>, h: upgrade::Handoff) {
+        let mut adopted = 0;
+        for p in h.panes {
+            let size = sanitize_size(p.size.into());
+            let pty = match Pty::adopt(p.fd, p.pid, p.exited) {
+                Ok(pty) => pty,
+                Err(e) => {
+                    log::warn!("pane {}: cannot adopt fd {}: {e}", p.id, p.fd);
+                    continue;
+                }
+            };
+            let mut term = Terminal::new(size, self.engine.read().clone());
+            term.replay(&p.state_bytes());
+            let alive = p.exited.is_none();
+            let info = PaneInfo {
+                id: p.id,
+                title: p.title,
+                cwd: p.cwd,
+                pid: Some(p.pid),
+                alive,
+                exit_code: p.exited.flatten(),
+                size,
+                restored: p.restored,
+                ..Default::default()
+            };
+            self.next_pane.fetch_max(p.id + 1, Ordering::Relaxed);
+            let installed = self.install_pane(
+                InstallPane {
+                    term,
+                    pty,
+                    info,
+                    command: p.command,
+                    hold: p.hold,
+                    osc_cwd: p.osc_cwd,
+                    shell_integration_seen: p.shell_integration_seen,
+                },
+                alive,
+            );
+            match installed {
+                Ok(()) => adopted += 1,
+                Err(e) => log::warn!("pane {}: {e}", p.id),
+            }
+        }
+        self.next_pane.fetch_max(h.next_pane_id, Ordering::Relaxed);
+        *self.layout.lock() = h.layout;
+        self.restored.store(h.restored, Ordering::Relaxed);
+        log::info!("adopted {adopted} panes from the previous daemon");
+    }
+
+    /// Recreate panes from the last snapshot (after a reboot or daemon restart).
+    pub fn restore_session(self: &Arc<Self>) {
+        let Some(store) = &self.store else { return };
+        let Some(snap) = store.load() else { return };
+        let cfg = self.config.read().clone();
+        let defs = cfg.agent_defs();
+        let mut restored = 0;
+        for p in &snap.panes {
+            let history = store.load_scrollback(p.id);
+            let req = CreatePane {
+                command: p.command.clone(),
+                cwd: p.cwd.clone(),
+                size: p.size.into(),
+                ..Default::default()
+            };
+            match self.create_pane(req, Some((p.id, history))) {
+                Ok(id) => {
+                    restored += 1;
+                    if cfg.session.resume_agents && p.command.is_none() {
+                        let def = p
+                            .agent
+                            .as_ref()
+                            .and_then(|k| defs.iter().find(|d| &d.kind == k));
+                        // The exact session when hooks reported one, else "the last one here".
+                        let resume =
+                            def.and_then(|d| match (&d.resume_session, &p.agent_session) {
+                                (Some(cmd), Some(id)) => {
+                                    Some(cmd.iter().map(|a| a.replace("{session}", id)).collect())
+                                }
+                                _ => d.resume.clone(),
+                            });
+                        if let (Some(cmd), Some(pane)) = (resume, self.pane(id)) {
+                            let line = cmd
+                                .iter()
+                                .map(|a| shell::shell_quote(a))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            pane.state.lock().pending_input = Some((
+                                Instant::now() + Duration::from_millis(2500),
+                                format!("{line}\r").into_bytes(),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => log::warn!("failed to restore pane {}: {e}", p.id),
+            }
+        }
+        self.next_pane
+            .fetch_max(snap.next_pane_id, Ordering::Relaxed);
+        *self.layout.lock() = snap.layout;
+        if restored > 0 {
+            self.restored.store(true, Ordering::Relaxed);
+            log::info!("restored {restored} panes from snapshot");
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Requests
+    // -----------------------------------------------------------------------------------------
+
+    pub fn handle(self: &Arc<Self>, client: &Arc<Client>, id: u64, req: Request) {
+        *self.last_activity.lock() = Instant::now();
+        let result = match req {
+            Request::Wait {
+                pane,
+                until,
+                timeout_ms,
+            } => {
+                let daemon = self.clone();
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    let outcome = daemon.wait(pane, until, timeout_ms);
+                    if id != 0 {
+                        client.send(ServerMessage::Response {
+                            id,
+                            result: outcome.map(Response::Wait),
+                        });
+                    }
+                });
+                return;
+            }
+            Request::Explain { pane } => {
+                let daemon = self.clone();
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    let result = daemon.explain(pane).map(Response::Text);
+                    if id != 0 {
+                        client.send(ServerMessage::Response { id, result });
+                    }
+                });
+                return;
+            }
+            other => self.dispatch(client, other),
+        };
+        if id != 0 {
+            client.send(ServerMessage::Response { id, result });
+        }
+    }
+
+    /// Notifications for an agent status change: needs input, and (hooks) finished a turn.
+    /// With `ai.notifications` the model first says what the agent asks for or did (shown in
+    /// the agent switcher too), and the notification waits for it.
+    fn agent_notifications(
+        &self,
+        pane: PaneId,
+        st: &PaneState,
+        before: Option<&AgentState>,
+        after: Option<&AgentState>,
+    ) -> Vec<Event> {
+        let (n, ai_cfg) = {
+            let c = self.config.read();
+            (c.notifications.clone(), c.ai.clone())
+        };
+        let Some(a) = after else {
+            return Vec::new();
+        };
+        let was = before.map(|b| b.status);
+        let (done, body) = match a.status {
+            AgentStatus::NeedsInput if was != Some(AgentStatus::NeedsInput) => (
+                false,
+                (n.enabled && n.agent_needs_input).then(|| {
+                    a.message
+                        .clone()
+                        .unwrap_or_else(|| "is waiting for your input".into())
+                }),
+            ),
+            AgentStatus::Done if was != Some(AgentStatus::Done) => (
+                true,
+                (n.enabled && n.agent_done).then(|| match a.turn_ms {
+                    Some(ms) => format!("finished after {}", agents::human_duration(ms)),
+                    None => "finished".into(),
+                }),
+            ),
+            _ => return Vec::new(),
+        };
+        let notify = body.map(|body| (a.name.clone(), body));
+        if ai_cfg.notifications() && !st.info.password_input && self.ai.unavailable().is_none() {
+            let job = AiJob::Detail {
+                pane,
+                episode: st.agent.episode(),
+                done,
+                agent: a.name.clone(),
+                hint: a.message.clone(),
+                screen: agents::tail(&st.term.screen_text(), AI_SCREEN_LINES),
+                notify: notify.clone(),
+            };
+            if self.ai_tx.try_send(job).is_ok() {
+                return Vec::new();
+            }
+        }
+        notify
+            .map(|(title, body)| Event::Notify { pane, title, body })
+            .into_iter()
+            .collect()
+    }
+
+    fn with_pane<T>(
+        &self,
+        id: PaneId,
+        f: impl FnOnce(&Arc<Pane>, &mut PaneState) -> T,
+    ) -> Result<T, String> {
+        let pane = self.pane(id).ok_or_else(|| format!("no such pane: {id}"))?;
+        let mut st = pane.state.lock();
+        Ok(f(&pane, &mut st))
+    }
+
+    fn dispatch(self: &Arc<Self>, client: &Arc<Client>, req: Request) -> Result<Response, String> {
+        match req {
+            Request::Hello {
+                client: name,
+                version,
+                ui,
+            } => {
+                if version != PROTOCOL_VERSION {
+                    return Err(format!(
+                        "protocol mismatch: daemon {PROTOCOL_VERSION}, client {version}"
+                    ));
+                }
+                client.ui.store(ui, Ordering::Relaxed);
+                *client.name.lock() = name;
+                Ok(Response::Hello {
+                    version: PROTOCOL_VERSION,
+                    daemon_pid: std::process::id(),
+                    restored: self.restored.load(Ordering::Relaxed),
+                    build: thurm_proto::BUILD.to_owned(),
+                })
+            }
+            Request::CreatePane(req) => self
+                .create_pane(req, None)
+                .map(|pane| Response::PaneCreated { pane })
+                .map_err(|e| e.to_string()),
+            Request::ClosePane { pane } => {
+                if self.close_pane(pane) {
+                    Ok(Response::Ok)
+                } else {
+                    Err(format!("no such pane: {pane}"))
+                }
+            }
+            Request::Complete { pane } => {
+                let (line, cwd, at_prompt, path) = self.with_pane(pane, |_, st| {
+                    (
+                        st.term.input_line(),
+                        st.info.cwd.clone(),
+                        st.info.at_prompt,
+                        st.term.shell_path().map(str::to_owned),
+                    )
+                })?;
+                let Some(line) = line.filter(|_| at_prompt) else {
+                    return Ok(Response::Completions(thurm_proto::Completions::default()));
+                };
+                let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+                Ok(Response::Completions(crate::complete::complete(
+                    &line,
+                    &cwd,
+                    path.as_deref(),
+                )))
+            }
+            Request::Processes { pane } => {
+                let roots: Vec<(PaneId, u32)> = self
+                    .all_panes()
+                    .iter()
+                    .filter(|p| pane.is_none_or(|id| id == p.id))
+                    .filter_map(|p| Some((p.id, p.state.lock().info.pid?)))
+                    .collect();
+                let table = procinfo::process_table();
+                let trees: Vec<(PaneId, Vec<procinfo::ProcRow>)> = roots
+                    .iter()
+                    .map(|&(id, pid)| (id, procinfo::descendants(&table, pid)))
+                    .collect();
+                let pids: Vec<u32> = trees
+                    .iter()
+                    .flat_map(|(_, t)| t.iter().map(|p| p.0))
+                    .collect();
+                let ports = procinfo::listening_ports(&pids);
+                Ok(Response::Processes(
+                    trees
+                        .into_iter()
+                        .map(|(id, tree)| thurm_proto::PaneProcesses {
+                            pane: id,
+                            processes: tree
+                                .into_iter()
+                                .map(|(pid, ppid, command)| thurm_proto::ProcEntry {
+                                    pid,
+                                    ppid,
+                                    command,
+                                    ports: ports.get(&pid).cloned().unwrap_or_default(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                ))
+            }
+            Request::ListPanes => {
+                let panes = self
+                    .all_panes()
+                    .iter()
+                    .map(|p| p.state.lock().info.clone())
+                    .collect();
+                Ok(Response::Panes(panes))
+            }
+            Request::PaneInfo { pane } => {
+                self.with_pane(pane, |_, st| Response::PaneInfo(st.info.clone()))
+            }
+            Request::Resize { pane, size } => {
+                let size = sanitize_size(size);
+                self.with_pane(pane, |_, st| {
+                    if st.info.size != size {
+                        st.pty.resize(size);
+                        st.term.resize(size);
+                        st.info.size = size;
+                        self.send_subscribers(st, Event::Resized { pane, size });
+                    }
+                })?;
+                Ok(Response::Ok)
+            }
+            Request::Input { pane, data } => {
+                self.with_pane(pane, |p, st| {
+                    st.agent.user_answer(&data);
+                    p.write(data);
+                })?;
+                Ok(Response::Ok)
+            }
+            Request::Paste { pane, text } => {
+                self.with_pane(pane, |p, st| {
+                    st.agent.user_input();
+                    p.write(st.term.paste(&text));
+                })?;
+                Ok(Response::Ok)
+            }
+            Request::Key { pane, key } => {
+                self.with_pane(pane, |p, st| {
+                    let bytes = st.term.key(&key);
+                    if !bytes.is_empty() {
+                        st.agent.user_answer(&bytes);
+                        p.write(bytes);
+                    }
+                })?;
+                Ok(Response::Ok)
+            }
+            Request::Mouse { pane, event } => {
+                let copy_on_select = self.config.read().terminal.copy_on_select;
+                let text = self.with_pane(pane, |p, st| {
+                    let (outcome, bytes) = st.term.mouse(&event);
+                    p.write(bytes);
+                    (outcome == MouseOutcome::SelectionDone && copy_on_select)
+                        .then(|| st.term.selection_text())
+                })?;
+                if let Some(text) = text.filter(|t| !t.is_empty()) {
+                    client.send(ServerMessage::Event(Event::ClipboardStore { pane, text }));
+                }
+                Ok(Response::Ok)
+            }
+            Request::Wheel {
+                pane,
+                lines,
+                col,
+                row,
+                mods,
+            } => {
+                self.with_pane(pane, |p, st| p.write(st.term.wheel(lines, col, row, mods)))?;
+                Ok(Response::Ok)
+            }
+            Request::Scroll { pane, scroll } => {
+                // The viewport the user sees lives in the app.
+                self.with_pane(pane, |_, st| st.term.scroll(scroll))?;
+                self.broadcast(
+                    Event::Ui(thurm_proto::UiCommand::Scroll { pane, scroll }),
+                    false,
+                );
+                Ok(Response::Ok)
+            }
+            Request::Focus { pane, focused } => {
+                let info = self.with_pane(pane, |p, st| {
+                    if let Some(b) = st.term.focus(focused) {
+                        p.write(b);
+                    }
+                    // Looking at a finished agent acknowledges it (Done → Idle).
+                    if focused {
+                        st.agent.acknowledge();
+                        if let Some(new) = st.agent.refresh() {
+                            st.info.agent = new;
+                            return Some(st.info.clone());
+                        }
+                    }
+                    None
+                })?;
+                if let Some(info) = info {
+                    self.broadcast(Event::PaneInfo(info), false);
+                }
+                Ok(Response::Ok)
+            }
+            Request::Subscribe { pane } => {
+                // Under the pane lock, so no output slips in between the state and the stream.
+                self.with_pane(pane, |_, st| {
+                    let state = st.term.serialize_state();
+                    let size = st.term.size();
+                    client.send(ServerMessage::Event(Event::Attach { pane, size, state }));
+                    st.subscribers.insert(client.id, Subscriber::default());
+                })?;
+                Ok(Response::Ok)
+            }
+            Request::Unsubscribe { pane } => {
+                self.with_pane(pane, |_, st| {
+                    st.subscribers.remove(&client.id);
+                })?;
+                Ok(Response::Ok)
+            }
+            Request::Selection { pane, op } => {
+                self.with_pane(pane, |_, st| st.term.selection(op))?;
+                Ok(Response::Ok)
+            }
+            Request::CopySelection { pane } => {
+                self.with_pane(pane, |_, st| Response::Text(st.term.selection_text()))
+            }
+            Request::Search {
+                pane,
+                query,
+                direction,
+            } => {
+                let found =
+                    self.with_pane(pane, |_, st| st.term.search(query.as_deref(), direction))?;
+                Ok(Response::Search { found })
+            }
+            Request::Capture { pane, opts } => {
+                self.with_pane(pane, |_, st| Response::Text(st.term.capture(&opts)))
+            }
+            Request::Wait { .. } | Request::Explain { .. } => unreachable!("handled in handle()"),
+            Request::SetLayout { json } => {
+                serde_json::from_str::<Layout>(&json)
+                    .map_err(|e| format!("invalid layout: {e}"))?;
+                *self.layout.lock() = Some(json);
+                self.session_dirty.store(true, Ordering::Relaxed);
+                Ok(Response::Ok)
+            }
+            Request::GetLayout => Ok(Response::Layout(self.sanitized_layout())),
+            Request::Ui(cmd) => {
+                if !self.has_ui_clients() {
+                    return Err("no Thurm window is open".into());
+                }
+                self.broadcast(Event::Ui(cmd), true);
+                Ok(Response::Ok)
+            }
+            Request::ClipboardReply { pane, text } => {
+                let events = self.with_pane(pane, |_, st| {
+                    st.term.clipboard_reply(&text);
+                    st.term.drain_events()
+                })?;
+                let pane = self.pane(pane).ok_or("pane vanished")?;
+                self.handle_term_events(&pane, events);
+                Ok(Response::Ok)
+            }
+            Request::ClearScrollback { pane } => {
+                self.with_pane(pane, |_, st| st.term.clear_scrollback())?;
+                self.reattach(pane);
+                Ok(Response::Ok)
+            }
+            Request::ClearScreen { pane } => {
+                self.with_pane(pane, |_, st| st.term.clear_screen())?;
+                self.reattach(pane);
+                Ok(Response::Ok)
+            }
+            Request::Reset { pane } => {
+                self.with_pane(pane, |_, st| st.term.reset())?;
+                self.reattach(pane);
+                Ok(Response::Ok)
+            }
+            Request::ReloadConfig => {
+                let cfg = Config::load().map_err(|e| e.to_string())?;
+                self.apply_config(cfg);
+                Ok(Response::Ok)
+            }
+            Request::SaveSnapshot => {
+                self.save_session();
+                Ok(Response::Ok)
+            }
+            Request::Shutdown { kill_panes } => {
+                log::info!("shutdown requested (kill panes: {kill_panes})");
+                self.save_session();
+                self.shutdown.store(true, Ordering::Relaxed);
+                Ok(Response::Ok)
+            }
+            Request::ListAgentPresets => {
+                Ok(Response::AgentPresets(self.config.read().agent_presets()))
+            }
+            Request::AgentHook {
+                pane,
+                agent,
+                event,
+                session_id,
+                message,
+                transcript_path,
+            } => {
+                let titles = self.config.read().agents.session_titles;
+                let name = self
+                    .agent_defs
+                    .read()
+                    .iter()
+                    .find(|d| d.kind == agent)
+                    .map_or_else(|| agent.clone(), |d| d.name.clone());
+                let (info, events) = self.with_pane(pane, |_, st| {
+                    let before = st.info.agent.clone();
+                    st.agent
+                        .apply_hook(&agent, &name, &event, session_id, message);
+                    st.agent.titles = titles;
+                    // Hooks without a path (Notification) keep following the current file.
+                    // Followed even without titles: it is where interrupts show up.
+                    if transcript_path.is_some() || event == "session-start" {
+                        st.agent.read_transcript(transcript_path.as_deref());
+                    }
+                    let mut events = Vec::new();
+                    let mut info = None;
+                    if let Some(new) = st.agent.refresh() {
+                        events = self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
+                        st.info.agent = new;
+                        st.info.title = pane_title(st, st.info.foreground.as_ref());
+                        info = Some(st.info.clone());
+                    }
+                    (info, events)
+                })?;
+                if let Some(info) = info {
+                    self.broadcast(Event::PaneInfo(info), false);
+                }
+                for ev in events {
+                    self.broadcast(ev, true);
+                }
+                self.session_dirty.store(true, Ordering::Relaxed);
+                Ok(Response::Ok)
+            }
+            Request::SetAppearance { dark } => {
+                let changed = self.dark.swap(dark, Ordering::Relaxed) != dark;
+                let cfg = self.config.read().clone();
+                if changed && cfg.theme_spec().follows_appearance() {
+                    self.apply_config(cfg);
+                }
+                Ok(Response::Ok)
+            }
+            Request::SetSetting { key, value } => {
+                thurm_config::write_setting(&key, &value)?;
+                let cfg = Config::load().map_err(|e| e.to_string())?;
+                self.apply_config(cfg);
+                Ok(Response::Ok)
+            }
+            Request::SetTheme { spec } => {
+                let spec = thurm_config::ThemeSpec::parse(&spec);
+                spec.validate()?;
+                thurm_config::write_theme(&spec)?;
+                let cfg = Config::load().map_err(|e| e.to_string())?;
+                self.apply_config(cfg);
+                Ok(Response::Ok)
+            }
+        }
+    }
+
+    pub fn apply_config(&self, cfg: Config) {
+        if cfg.ai != self.config.read().ai {
+            // Turned off, or on again: ask the model afresh (it may have become available).
+            self.ai.stop();
+        }
+        *self.engine.write() = EngineConfig::from_config(&cfg, self.dark.load(Ordering::Relaxed));
+        *self.agent_defs.write() = cfg.agent_defs();
+        *self.config.write() = cfg;
+        let engine = self.engine.read().clone();
+        for pane in self.all_panes() {
+            let mut st = pane.state.lock();
+            st.term.set_config(engine.clone());
+            drop(st);
+        }
+        self.broadcast(Event::ConfigReloaded, false);
+    }
+
+    fn wait(
+        &self,
+        pane: PaneId,
+        until: WaitCondition,
+        timeout_ms: Option<u64>,
+    ) -> Result<WaitOutcome, String> {
+        let deadline = timeout_ms.map(|t| Instant::now() + Duration::from_millis(t));
+        let regex = match &until {
+            WaitCondition::Match { regex } => {
+                Some(regex::Regex::new(regex).map_err(|e| e.to_string())?)
+            }
+            _ => None,
+        };
+        // Conditions about "becoming" free need the pane to have been busy first, otherwise
+        // `wait --prompt` right after `send` would return before the command even started.
+        let started = Instant::now();
+        loop {
+            let Some(p) = self.pane(pane) else {
+                return Ok(WaitOutcome::Exited { code: None });
+            };
+            {
+                let st = p.state.lock();
+                if !st.info.alive {
+                    return Ok(WaitOutcome::Exited {
+                        code: st.info.exit_code,
+                    });
+                }
+                let settle = started.elapsed() > Duration::from_millis(300);
+                let ok = match &until {
+                    WaitCondition::Idle { quiet_ms } => {
+                        st.term.last_output.elapsed() >= Duration::from_millis(*quiet_ms)
+                    }
+                    WaitCondition::Prompt => settle && st.info.at_prompt,
+                    WaitCondition::Exit => false,
+                    WaitCondition::Match { .. } => regex
+                        .as_ref()
+                        .is_some_and(|r| r.is_match(&st.term.screen_text())),
+                    WaitCondition::AgentStatus(want) => {
+                        st.agent.state().is_some_and(|a| a.status == *want)
+                    }
+                    WaitCondition::AgentFree => {
+                        settle
+                            && match st.agent.state() {
+                                Some(a) => a.status != AgentStatus::Working,
+                                None => st.info.at_prompt,
+                            }
+                    }
+                };
+                if ok {
+                    return Ok(WaitOutcome::Satisfied);
+                }
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok(WaitOutcome::Timeout);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// PTY threads run at interactive priority: on macOS a daemon's threads otherwise may land on
+/// efficiency cores and throttle output.
+fn interactive_qos() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+fn pane_title(st: &PaneState, fg: Option<&thurm_proto::ProcessInfo>) -> String {
+    // What the agent session is about beats the agent's own generic title ("✳ Claude Code").
+    if let Some(topic) = st.agent.state().and_then(|a| a.topic.as_ref()) {
+        return topic.clone();
+    }
+    if let Some(t) = st.term.title().filter(|t| !t.trim().is_empty()) {
+        return t.to_owned();
+    }
+    if let Some(a) = st.agent.state() {
+        return a.name.clone();
+    }
+    if let Some(p) = fg
+        && !procinfo::is_shell(&p.name)
+    {
+        return p.name.clone();
+    }
+    match &st.info.cwd {
+        Some(c) => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            if !home.is_empty() && c == &home {
+                "~".into()
+            } else {
+                c.rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(c)
+                    .to_owned()
+            }
+        }
+        None => fg.map(|p| p.name.clone()).unwrap_or_else(|| "shell".into()),
+    }
+}
+
+fn sanitize_size(mut s: PaneSize) -> PaneSize {
+    s.cols = s.cols.clamp(2, 2000);
+    s.rows = s.rows.clamp(1, 1000);
+    if s.cell_width == 0 {
+        s.cell_width = 8;
+    }
+    if s.cell_height == 0 {
+        s.cell_height = 16;
+    }
+    s
+}
+
+fn spawn_writer(id: PaneId, mut writer: File, rx: Receiver<Vec<u8>>) {
+    let _ = std::thread::Builder::new()
+        .name(format!("pane-{id}-writer"))
+        .spawn(move || {
+            while let Ok(data) = rx.recv() {
+                if let Err(e) = pty::write_all(&mut writer, &data) {
+                    log::debug!("pane {id} write failed: {e}");
+                    break;
+                }
+            }
+        });
+}
