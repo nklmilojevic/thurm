@@ -1,7 +1,9 @@
 name: CI
 
 on:
+  # Branches are tested through their pull request; pushes only on main (Release follows it).
   push:
+    branches: [main]
   pull_request:
 
 env:
