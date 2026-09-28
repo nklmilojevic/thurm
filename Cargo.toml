@@ -21,7 +21,7 @@ memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 postcard = { version = "1.1", features = ["use-std"] }
-toml = "0.9"
+toml = "1.0"
 toml_edit = "0.25"
 dirs = "7"
 flate2 = "1"
