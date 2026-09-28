@@ -36,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag && SessionManager.shared.liveControllers.isEmpty {
+        if !flag && SessionManager.shared.regularControllers.isEmpty {
             SessionManager.shared.newWindow()
         }
         return true
@@ -111,6 +111,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     /// Cmd+B: collapse or expand the vertical tab sidebar of the front window.
     @objc func toggleTabSidebar(_ sender: Any?) {
         SessionManager.shared.currentController?.tabSplit?.toggleSidebarAnimated()
+    }
+
+    @objc func toggleQuickTerminal(_ sender: Any?) {
+        QuickTerminal.shared.toggle()
     }
 
     @objc func toggleSecureInput(_ sender: Any?) {

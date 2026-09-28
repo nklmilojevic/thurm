@@ -28,6 +28,7 @@ pub struct Config {
     pub agents: AgentsConfig,
     pub ai: AiConfig,
     pub updates: UpdatesConfig,
+    pub quick_terminal: QuickTerminalConfig,
     /// Extra key bindings: `"cmd+shift+d" = "split_down"`.
     pub keybindings: std::collections::BTreeMap<String, String>,
 }
@@ -452,6 +453,59 @@ pub enum UpdateChannel {
     Release,
     /// A build of every commit to main (and every release).
     Tip,
+}
+
+/// The quick terminal: a window that slides in from a screen edge on a global hotkey, read by
+/// the app.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuickTerminalConfig {
+    /// Global shortcut that shows and hides it, like `"ctrl+grave"`; empty for none (Window >
+    /// Quick Terminal still works).
+    pub hotkey: String,
+    pub position: QuickTerminalPosition,
+    /// Fraction of the screen it takes (its height at the top or bottom, its width at the
+    /// left or right, both in the center).
+    pub size: f64,
+    /// Hide it when another app or another Thurm window takes focus.
+    pub autohide: bool,
+    pub screen: QuickTerminalScreen,
+    /// Slide animation length in seconds (0 = none).
+    pub animation_duration: f64,
+}
+
+impl Default for QuickTerminalConfig {
+    fn default() -> Self {
+        Self {
+            hotkey: String::new(),
+            position: QuickTerminalPosition::Top,
+            size: 0.4,
+            autohide: true,
+            screen: QuickTerminalScreen::Mouse,
+            animation_duration: 0.2,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum QuickTerminalPosition {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Center,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum QuickTerminalScreen {
+    /// The screen with the mouse pointer.
+    #[default]
+    Mouse,
+    /// The screen with the menu bar.
+    Main,
 }
 
 #[derive(Debug)]
@@ -1016,6 +1070,24 @@ mod tests {
         assert!(c.ai.titles() && !c.ai.status() && c.ai.notifications() && c.ai.explain());
         let c = Config::parse(DEFAULT_CONFIG_TOML).unwrap();
         assert!(!c.ai.enabled);
+    }
+
+    #[test]
+    fn quick_terminal_settings() {
+        let c = Config::default().quick_terminal;
+        assert!(c.hotkey.is_empty() && c.autohide);
+        assert_eq!(c.position, QuickTerminalPosition::Top);
+        let c = Config::parse(
+            "[quick_terminal]\nhotkey = \"ctrl+grave\"\nposition = \"bottom\"\nscreen = \"main\"",
+        )
+        .unwrap()
+        .quick_terminal;
+        assert_eq!(c.hotkey, "ctrl+grave");
+        assert_eq!(c.position, QuickTerminalPosition::Bottom);
+        assert_eq!(c.screen, QuickTerminalScreen::Main);
+        assert!(Config::parse("[quick_terminal]\nposition = \"diagonal\"").is_err());
+        let c = Config::parse(DEFAULT_CONFIG_TOML).unwrap();
+        assert_eq!(c.quick_terminal, QuickTerminalConfig::default());
     }
 
     #[test]

@@ -437,30 +437,36 @@ func retainTabs(_ tabs: [TabLayout], _ keep: (UInt64) -> Bool) -> [TabLayout] {
 struct Layout: Codable, Equatable {
     var windows: [WindowLayout]
     var workspaces: [WorkspaceLayout] = []
+    /// The quick terminal's tab (see QuickTerminal.swift).
+    var quick: TabLayout?
 
     private enum CodingKeys: String, CodingKey {
-        case windows, workspaces
+        case windows, workspaces, quick
     }
 
-    init(windows: [WindowLayout], workspaces: [WorkspaceLayout] = []) {
+    init(windows: [WindowLayout], workspaces: [WorkspaceLayout] = [], quick: TabLayout? = nil) {
         self.windows = windows
         self.workspaces = workspaces
+        self.quick = quick
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         windows = try c.decodeIfPresent([WindowLayout].self, forKey: .windows) ?? []
         workspaces = try c.decodeIfPresent([WorkspaceLayout].self, forKey: .workspaces) ?? []
+        quick = try c.decodeIfPresent(TabLayout.self, forKey: .quick)
     }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(windows, forKey: .windows)
         try c.encode(workspaces, forKey: .workspaces)
+        try c.encodeIfPresent(quick, forKey: .quick)
     }
 
     var panes: [UInt64] {
-        (windows.flatMap { $0.tabs } + workspaces.flatMap { $0.tabs }).flatMap { $0.root.panes }
+        (windows.flatMap { $0.tabs } + workspaces.flatMap { $0.tabs } + (quick.map { [$0] } ?? []))
+            .flatMap { $0.root.panes }
     }
 
     /// Same semantics as `Layout::retain_panes` on the Rust side.
@@ -480,6 +486,7 @@ struct Layout: Codable, Equatable {
         }
         let shown = Set(windows.map { $0.workspace })
         workspaces.removeAll { $0.tabs.isEmpty && !shown.contains($0.id) }
+        quick = retainTabs(quick.map { [$0] } ?? [], keep).first
     }
 
     func jsonString() -> String? {

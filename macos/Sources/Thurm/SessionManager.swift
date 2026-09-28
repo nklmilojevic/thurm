@@ -19,6 +19,7 @@ final class SessionManager: NSObject, CoreDelegate {
     /// don't count toward the Dock badge until the agent asks again.
     private var seenWaiting: Set<UInt64> = []
     private weak var lastKeyController: TerminalWindowController?
+    private weak var lastRegularKeyController: TerminalWindowController?
 
     private(set) var isTerminating = false
     /// Layout saving starts only after the initial restore, so a failed start never
@@ -55,6 +56,8 @@ final class SessionManager: NSObject, CoreDelegate {
                                              userInfo: nil, repeats: true)
         if let err = config.loadError {
             currentController?.content.focusedView?.showToast("Config error: \(err)", duration: 8)
+        } else if let err = QuickTerminal.shared.configChanged() {
+            currentController?.content.focusedView?.showToast(err, duration: 8)
         }
     }
 
@@ -342,9 +345,15 @@ final class SessionManager: NSObject, CoreDelegate {
         var layout = fetchLayout() ?? Layout(windows: [])
         layout.retainPanes { alive.contains($0) && !placed.contains($0) }
         workspaces = layout.workspaces.map { Workspace(layout: $0) }
+        if let quick = layout.quick {
+            QuickTerminal.shared.restore(quick)
+            placed.formUnion(quick.root.panes)
+        }
 
-        // Hidden workspaces' panes are in use too (they run until a window shows them).
+        // Hidden workspaces' panes are in use too (they run until a window shows them), and
+        // the quick terminal's.
         var used = Set(layout.workspaces.flatMap { $0.tabs.flatMap { $0.root.panes } })
+        used.formUnion(layout.quick?.root.panes ?? [])
         for var w in layout.windows {
             w.tabs = w.tabs.filter { tab in tab.root.panes.allSatisfy { !placed.contains($0) } }
             placed.formUnion(w.tabs.flatMap { $0.root.panes })
@@ -370,7 +379,7 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         first?.window?.makeKeyAndOrderFront(nil)
 
-        if liveControllers.isEmpty {
+        if regularControllers.isEmpty {
             if let ws = workspacesByRecency.first(where: { !$0.hiddenTabs.isEmpty }) {
                 openWorkspaceInNewWindow(ws)
             } else {
@@ -427,12 +436,28 @@ final class SessionManager: NSObject, CoreDelegate {
         controllers.filter { !$0.isClosed }
     }
 
-    /// The controller of the key window, else the last key one.
+    /// Every live controller but the quick terminal's.
+    var regularControllers: [TerminalWindowController] {
+        liveControllers.filter { !$0.isQuick }
+    }
+
+    /// The controller of the key window, else the last key one (the quick terminal only while
+    /// it is on screen).
     var currentController: TerminalWindowController? {
         if let c = NSApp.keyWindow?.windowController as? TerminalWindowController, !c.isClosed { return c }
         if let c = NSApp.mainWindow?.windowController as? TerminalWindowController, !c.isClosed { return c }
-        if let c = lastKeyController, !c.isClosed { return c }
-        return liveControllers.last
+        if let c = lastKeyController, !c.isClosed, !c.isQuick || QuickTerminal.shared.isShown { return c }
+        return currentRegularController
+    }
+
+    /// `currentController`, or the last regular window's when that is the quick terminal: where
+    /// new tabs and workspaces go.
+    var currentRegularController: TerminalWindowController? {
+        if let c = NSApp.keyWindow?.windowController as? TerminalWindowController, !c.isClosed, !c.isQuick {
+            return c
+        }
+        if let c = lastRegularKeyController, !c.isClosed { return c }
+        return regularControllers.last
     }
 
     func controller(for pane: UInt64) -> TerminalWindowController? {
@@ -444,9 +469,9 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     func makeController(root: SplitNode, focused: UInt64, zoomed: UInt64?, title: String?,
-                                frame: NSRect?) -> TerminalWindowController {
+                        frame: NSRect?, quick: Bool = false) -> TerminalWindowController {
         let c = TerminalWindowController(root: root, focused: focused, zoomed: zoomed, title: title,
-                                         contentSize: defaultContentSize())
+                                         contentSize: defaultContentSize(), quick: quick)
         if let frame = frame {
             c.window?.setFrame(frame, display: false)
         }
@@ -492,7 +517,9 @@ final class SessionManager: NSObject, CoreDelegate {
 
     /// Cmd+T: a new tab next to `host`, inheriting the focused pane's cwd.
     func newTab(from hostIn: TerminalWindowController?, pane existing: UInt64? = nil, preset: String? = nil) {
-        let host = hostIn ?? currentController
+        // The quick terminal has one tab: new ones go to the last regular window.
+        var host = hostIn ?? currentController
+        if host?.isQuick ?? false { host = currentRegularController }
         var id = existing
         if id == nil {
             let size = gridSize(forPoints: host?.content.bounds.size ?? defaultContentSize())
@@ -562,6 +589,7 @@ final class SessionManager: NSObject, CoreDelegate {
 
     func controllerDidClose(_ c: TerminalWindowController) {
         c.isClosed = true
+        if c.isQuick { QuickTerminal.shared.controllerClosed(c) }
         refreshSidebars()
         if lastKeyController === c { lastKeyController = nil }
         // Drop our reference after AppKit is done with the window delegate callbacks.
@@ -576,6 +604,7 @@ final class SessionManager: NSObject, CoreDelegate {
 
     func controllerBecameKey(_ c: TerminalWindowController) {
         lastKeyController = c
+        if !c.isQuick { lastRegularKeyController = c }
         workspace(c.workspaceID)?.lastActive = Date()
         focusChanged()
         scheduleLayoutSave()
@@ -584,7 +613,11 @@ final class SessionManager: NSObject, CoreDelegate {
     /// Focuses a pane, bringing its tab to the front.
     func focusPane(_ id: UInt64, activate: Bool) {
         guard let c = controller(for: id) else { return }
-        c.window?.makeKeyAndOrderFront(nil)
+        if c.isQuick {
+            QuickTerminal.shared.show()
+        } else {
+            c.window?.makeKeyAndOrderFront(nil)
+        }
         c.content.focus(id)
         if activate { NSApp.activate() }
     }
@@ -683,9 +716,12 @@ final class SessionManager: NSObject, CoreDelegate {
         config = AppConfig.load()
         applyConfigToUI()
         Updater.shared.configChanged()
+        let quickError = QuickTerminal.shared.configChanged()
         let view = currentController?.content.focusedView
         if let err = config.loadError {
             view?.showToast("Config error: \(err)", duration: 8)
+        } else if let err = quickError {
+            view?.showToast(err, duration: 8)
         } else if notifyDaemon {
             view?.showToast("Configuration reloaded")
         }
@@ -766,12 +802,12 @@ final class SessionManager: NSObject, CoreDelegate {
         // Front-to-back window order first, then the rest.
         var ordered: [TerminalWindowController] = []
         for w in NSApp.orderedWindows {
-            if let c = w.windowController as? TerminalWindowController, !c.isClosed,
+            if let c = w.windowController as? TerminalWindowController, !c.isClosed, !c.isQuick,
                !ordered.contains(where: { $0 === c }) {
                 ordered.append(c)
             }
         }
-        for c in live where !ordered.contains(where: { $0 === c }) {
+        for c in live where !c.isQuick && !ordered.contains(where: { $0 === c }) {
             ordered.append(c)
         }
 
@@ -805,7 +841,7 @@ final class SessionManager: NSObject, CoreDelegate {
                                         fullscreen: selectedWindow.styleMask.contains(.fullScreen),
                                         workspace: g[0].workspaceID))
         }
-        return Layout(windows: windows, workspaces: workspaceLayouts())
+        return Layout(windows: windows, workspaces: workspaceLayouts(), quick: QuickTerminal.shared.tabLayout)
     }
 
     /// Sends the layout to the daemon when it changed (or always with `force`).

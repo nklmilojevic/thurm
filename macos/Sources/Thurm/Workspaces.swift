@@ -111,6 +111,15 @@ extension SessionManager {
     /// whose panes keep running in the (now hidden) previous workspace. When another window
     /// shows `target` already, that window comes to the front instead.
     func switchWorkspace(in c: TerminalWindowController, to target: Workspace) {
+        // The quick terminal shows no workspace: switch the last regular window.
+        if c.isQuick {
+            if let r = currentRegularController {
+                switchWorkspace(in: r, to: target)
+            } else {
+                openWorkspaceInNewWindow(target)
+            }
+            return
+        }
         guard target.id != c.workspaceID else { return }
         if let other = controllerShowing(target) {
             (other.window?.tabGroup?.selectedWindow ?? other.window)?.makeKeyAndOrderFront(nil)

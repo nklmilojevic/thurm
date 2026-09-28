@@ -164,6 +164,8 @@ enum MainMenu {
         menu.addItem(item("Merge All Windows", #selector(NSWindow.mergeAllWindows(_:))))
         menu.addItem(item("Move Tab to New Window", #selector(NSWindow.moveTabToNewWindow(_:))))
         menu.addItem(.separator())
+        menu.addItem(item("Quick Terminal", #selector(AppDelegate.toggleQuickTerminal(_:))))
+        menu.addItem(.separator())
         let workspaces = NSMenu(title: "Workspaces")
         workspaces.delegate = WorkspaceMenuDelegate.shared
         let workspacesItem = item("Workspaces", nil)

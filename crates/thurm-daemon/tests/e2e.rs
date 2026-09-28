@@ -282,6 +282,7 @@ fn panes_frames_persistence_and_restore() {
             workspace: 0,
         }],
         workspaces: vec![],
+        quick: None,
     };
     c.request(Request::SetLayout {
         json: serde_json_string(&layout),

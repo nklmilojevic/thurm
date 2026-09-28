@@ -16,6 +16,9 @@ pub struct Layout {
     /// panes still running.
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
+    /// The quick terminal's tab (shown on a global hotkey, outside any window or workspace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quick: Option<TabLayout>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -126,7 +129,8 @@ impl Layout {
     pub fn panes(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
         let tabs = self.windows.iter().flat_map(|w| &w.tabs);
-        for t in tabs.chain(self.workspaces.iter().flat_map(|w| &w.tabs)) {
+        let tabs = tabs.chain(self.workspaces.iter().flat_map(|w| &w.tabs));
+        for t in tabs.chain(&self.quick) {
             t.root.panes(&mut out);
         }
         out
@@ -151,6 +155,7 @@ impl Layout {
         let shown: Vec<u64> = self.windows.iter().map(|w| w.workspace).collect();
         self.workspaces
             .retain(|ws| !ws.tabs.is_empty() || shown.contains(&ws.id));
+        self.quick = retain_tabs(self.quick.take().into_iter().collect(), keep).pop();
     }
 }
 
@@ -222,22 +227,28 @@ mod tests {
                     selected_tab: 0,
                 },
             ],
+            quick: Some(TabLayout {
+                title: None,
+                root: LayoutNode::Pane { id: 5 },
+                focused: 5,
+                zoomed: None,
+            }),
         }
     }
 
     #[test]
     fn hidden_workspaces_hold_panes() {
         let mut l = sample();
-        assert_eq!(l.panes(), vec![1, 2, 3, 4]);
+        assert_eq!(l.panes(), vec![1, 2, 3, 4, 5]);
         // The hidden workspace goes with its last pane; the shown one stays with its window.
         l.retain_panes(&|id| id != 4);
         assert_eq!(l.workspaces.len(), 1);
         assert_eq!(l.workspaces[0].id, 1);
         l.retain_panes(&|_| false);
         assert!(l.windows.is_empty() && l.workspaces.is_empty());
-        // Older layouts without workspaces still parse.
+        // Older layouts without workspaces or a quick terminal still parse.
         let old: Layout = serde_json::from_str(r#"{"windows":[]}"#).unwrap();
-        assert!(old.workspaces.is_empty());
+        assert!(old.workspaces.is_empty() && old.quick.is_none());
     }
 
     #[test]
@@ -260,5 +271,16 @@ mod tests {
         assert_eq!(l.windows[0].selected_tab, 0);
         l.retain_panes(&|_| false);
         assert!(l.windows.is_empty());
+    }
+
+    #[test]
+    fn retain_drops_ended_quick_terminal() {
+        let mut l = sample();
+        l.retain_panes(&|id| id != 1);
+        assert_eq!(l.quick.as_ref().unwrap().focused, 5);
+        l.retain_panes(&|id| id != 5);
+        assert!(l.quick.is_none());
+        let json = serde_json::to_string(&l).unwrap();
+        assert!(!json.contains("quick"));
     }
 }

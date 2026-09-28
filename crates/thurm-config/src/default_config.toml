@@ -149,6 +149,22 @@ check_automatically = true
 # Download updates in the background and install them when Thurm quits.
 download_automatically = false
 
+[quick_terminal]
+# A terminal that slides in from a screen edge on a global shortcut, from any app or Space.
+# Its shell keeps running while it is hidden. Also under Window > Quick Terminal.
+# Shortcut, like "ctrl+grave" or "cmd+shift+t" (modifiers: cmd, ctrl, alt, shift); "" for none.
+hotkey = ""
+# "top", "bottom", "left", "right" or "center".
+position = "top"
+# Fraction of the screen it takes.
+size = 0.4
+# Hide it when another app or another Thurm window takes focus.
+autohide = true
+# Show it on the screen with the mouse pointer ("mouse") or with the menu bar ("main").
+screen = "mouse"
+# Slide animation in seconds (0 = none).
+animation_duration = 0.2
+
 [keybindings]
 # "cmd+shift+d" = "split_down"
 # "cmd+d" = "split_right"

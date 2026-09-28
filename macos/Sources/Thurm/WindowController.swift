@@ -90,26 +90,37 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     var workspaceID: UInt64 = 0
     /// Set once the window closed; the controller is about to be released.
     var isClosed = false
+    /// The quick terminal (see QuickTerminal.swift): one tab in a borderless panel, outside
+    /// the tab groups, workspaces and saved windows.
+    let isQuick: Bool
 
-    init(root: SplitNode, focused: UInt64, zoomed: UInt64?, title: String?, contentSize: NSSize) {
+    init(root: SplitNode, focused: UInt64, zoomed: UInt64?, title: String?, contentSize: NSSize,
+         quick: Bool = false) {
         content = TabContentView(root: root, focused: focused, zoomed: zoomed)
+        isQuick = quick
+        let rect = NSRect(origin: .zero, size: contentSize)
         // Tabs live in the titlebar, which is tinted with the theme (see TerminalWindow).
-        let window = TerminalWindow(contentRect: NSRect(origin: .zero, size: contentSize),
-                                    styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                                    backing: .buffered, defer: false)
+        let window: NSWindow = quick ? QuickTerminalWindow(contentRect: rect)
+            : TerminalWindow(contentRect: rect, styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                             backing: .buffered, defer: false)
         super.init(window: window)
         titleOverride = title
         shouldCascadeWindows = false
 
-        window.tabbingMode = .preferred
-        window.tabbingIdentifier = "Thurm"
+        if quick {
+            window.tabbingMode = .disallowed
+        } else {
+            window.tabbingMode = .preferred
+            window.tabbingIdentifier = "Thurm"
+            window.collectionBehavior.insert(.fullScreenPrimary)
+        }
         window.isRestorable = false
         window.isReleasedWhenClosed = false
-        window.collectionBehavior.insert(.fullScreenPrimary)
         window.minSize = NSSize(width: 240, height: 140)
         window.delegate = self
         content.controller = self
-        content.frame = NSRect(origin: .zero, size: contentSize)
+        content.frame = rect
+        if quick { window.contentView = content }
         applyTabStyle()
         window.initialFirstResponder = content.focusedView
         // The safe area changes when the tab bar appears or on full screen.
@@ -298,6 +309,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         return true
     }
 
+    func windowDidEndLiveResize(_ notification: Notification) {
+        if isQuick { QuickTerminal.shared.userResized() }
+    }
+
     func windowWillClose(_ notification: Notification) {
         content.detachAll()
         SessionManager.shared.controllerDidClose(self)
@@ -311,6 +326,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     func windowDidResignKey(_ notification: Notification) {
         content.focusedView?.reportFocus()
         SessionManager.shared.focusChanged()
+        if isQuick { QuickTerminal.shared.didResignKey() }
     }
 
     func windowDidMove(_ notification: Notification) {

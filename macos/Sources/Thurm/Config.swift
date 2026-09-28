@@ -6,6 +6,11 @@ enum OptionAsAlt: String {
     case none, left, right, both
 }
 
+/// `config.quick_terminal.position`: the screen edge the quick terminal slides in from.
+enum QuickTerminalPosition: String {
+    case top, bottom, left, right, center
+}
+
 /// Resolved color theme (colors are 0xRRGGBB).
 struct Theme {
     var name: String
@@ -151,6 +156,15 @@ final class AppConfig {
     var checkForUpdates = true
     var downloadUpdates = false
 
+    // [quick_terminal]
+    var quickHotkey = ""
+    var quickPosition: QuickTerminalPosition = .top
+    var quickSize: CGFloat = 0.4
+    var quickAutohide = true
+    /// "main": the screen with the menu bar, else the one with the mouse pointer.
+    var quickOnMainScreen = false
+    var quickAnimationDuration: TimeInterval = 0.2
+
     var theme = Theme.fallback
     /// `colors.theme`, split into its light and dark halves (equal for a single theme).
     var themeLight = Theme.fallback.name
@@ -267,6 +281,14 @@ final class AppConfig {
             updateChannel = jsonString(u["channel"]) ?? updateChannel
             checkForUpdates = jsonBool(u["check_automatically"]) ?? checkForUpdates
             downloadUpdates = jsonBool(u["download_automatically"]) ?? downloadUpdates
+        }
+        if let q = c["quick_terminal"] as? [String: Any] {
+            quickHotkey = jsonString(q["hotkey"]) ?? quickHotkey
+            if let p = jsonString(q["position"]).flatMap(QuickTerminalPosition.init(rawValue:)) { quickPosition = p }
+            quickSize = CGFloat(min(1, max(0.1, jsonDouble(q["size"]) ?? Double(quickSize))))
+            quickAutohide = jsonBool(q["autohide"]) ?? quickAutohide
+            quickOnMainScreen = jsonString(q["screen"]) == "main"
+            quickAnimationDuration = max(0, jsonDouble(q["animation_duration"]) ?? quickAnimationDuration)
         }
     }
 
