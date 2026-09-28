@@ -1,40 +1,99 @@
 name: Release
 
 # Two update channels, one appcast (GitHub Pages):
-#   tip      every push to main, once CI passed: rolling `tip` prerelease, <sparkle:channel>tip
+#   tip      nightly, or on demand (Actions › Release › Run workflow, or `gh workflow run Release`):
+#            the newest main commit that passed CI, as the rolling `tip` prerelease with
+#            <sparkle:channel>tip. Skipped when `tip` is already there or only docs/CI changed.
 #   release  a published GitHub release `vX.Y.Z` (gh release create vX.Y.Z): default channel
 # Both build Apple silicon only, sign with Developer ID, notarize, and upload to the GitHub
-# release. pages.yml then rebuilds the site (docs + appcast.xml from all releases, see
+# release. The build then starts pages.yml, which rebuilds the site (docs + appcast.xml from all releases, see
 # macos/release/appcast.py). One-time setup: macos/release/setup-github.sh.
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if tip is up to date or nothing in the app changed
+        type: boolean
+        default: false
   release:
     types: [published]
 
 permissions:
   contents: write
+  actions: write # start pages.yml after publishing
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  plan:
+    name: Plan tip
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      build: ${{ steps.plan.outputs.build }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      FORCE: ${{ inputs.force || false }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Pick the commit
+        id: plan
+        run: |
+          set -euo pipefail
+          SHA="$(gh run list --repo "$REPO" --workflow CI --branch main --event push --status success \
+            --limit 1 --json headSha -q '.[0].headSha // empty')"
+          if [[ -z "$SHA" ]]; then
+            echo "::error::No commit on main has passed CI."
+            exit 1
+          fi
+          HEAD="$(git rev-parse HEAD)"
+          if [[ "$SHA" != "$HEAD" ]]; then
+            echo "::notice::main is at ${HEAD:0:7}, which has not passed CI yet. Using ${SHA:0:7}."
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          TIP="$(git rev-parse -q --verify 'refs/tags/tip^{commit}' || true)"
+          BUILD=true
+          if [[ "$FORCE" != true && -n "$TIP" ]]; then
+            if [[ "$TIP" == "$SHA" ]]; then
+              echo "::notice::tip is already ${SHA:0:7}."
+              BUILD=false
+            elif git merge-base --is-ancestor "$TIP" "$SHA"; then
+              # Files that never reach the app. This workflow itself still counts.
+              APP="$(git diff --name-only "$TIP" "$SHA" \
+                | grep -vE '^(docs/|\.github/|README\.md$|LICENSE|renovate\.json$|flake\.(nix|lock)$|\.envrc$|\.gitignore$)' || true)"
+              if [[ -z "$APP" ]] && ! git diff --quiet "$TIP" "$SHA" -- .github/workflows/release.yaml; then
+                APP=.github/workflows/release.yaml
+              fi
+              if [[ -z "$APP" ]]; then
+                echo "::notice::Nothing in the app changed since tip (${TIP:0:7})."
+                BUILD=false
+              fi
+            fi
+          fi
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }})
+    needs: plan
     if: >-
-      (github.event_name == 'workflow_run'
-        && github.event.workflow_run.conclusion == 'success'
-        && github.event.workflow_run.event == 'push')
-      || (github.event_name == 'release' && !github.event.release.prerelease)
+      always()
+      && ((github.event_name == 'release' && !github.event.release.prerelease)
+        || (needs.plan.result == 'success' && needs.plan.outputs.build == 'true'))
     runs-on: macos-26
     timeout-minutes: 90
     concurrency:
-      # A newer main commit supersedes a tip build in progress; releases always finish.
+      # One build per channel at a time, never cancelled halfway through an upload.
       group: release-build-${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }}
-      cancel-in-progress: ${{ github.event_name != 'release' }}
+      cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -43,7 +102,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.event.workflow_run.head_sha }}
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || needs.plan.outputs.sha }}
           fetch-depth: 0 # the build number is the commit count
 
       - name: Channel and version
@@ -174,7 +233,7 @@ jobs:
           fi
           NOTES="$RUNNER_TEMP/tip-release.md"
           {
-            echo "Automatic build of \`main\` at [\`${SHA:0:7}\`](https://github.com/$REPO/commit/$SHA). Apple silicon, macOS 14 or later."
+            echo "Nightly build of \`main\` at [\`${SHA:0:7}\`](https://github.com/$REPO/commit/$SHA). Apple silicon, macOS 14 or later."
             echo
             echo "Download **Thurm-tip.dmg**, or choose *Thurm › Update Channel › Tip* in any Thurm to get these builds automatically."
           } > "$NOTES"
@@ -192,6 +251,10 @@ jobs:
             | { grep -E '^Thurm-tip-[0-9]+\.zip$' || true; } \
             | sort -t- -k3 -n -r | tail -n +4 \
             | while read -r old; do gh release delete-asset tip "$old" --repo "$REPO" --yes; done
+
+      # Only after something was published, so a night without a build deploys nothing.
+      - name: Update the site and feed
+        run: gh workflow run pages.yml --repo "$REPO" --ref main
 
       - name: Remove signing material
         if: always()

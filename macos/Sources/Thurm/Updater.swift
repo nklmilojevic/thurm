@@ -3,9 +3,9 @@ import Sparkle
 
 /// Automatic updates with Sparkle, from the appcast in `SUFeedURL` (set by release builds).
 ///
-/// Two channels: *release* gets tagged releases; *tip* also gets a build of every commit to
-/// main. `[updates]` in the config picks one (the menu writes it there); `auto`, the default,
-/// is the channel of the running build, so a tip build keeps getting tip builds. The appcast
+/// Two channels: *release* gets tagged releases; *tip* also gets the nightly build of main.
+/// `[updates]` in the config picks one (the menu writes it there); `auto`, the default, is the
+/// channel of the running build, so a tip build keeps getting tip builds. The appcast
 /// marks tip builds with `<sparkle:channel>tip</sparkle:channel>`, so the channel only changes
 /// which items Sparkle may pick. Development builds carry no feed or key, and never update.
 ///
@@ -24,7 +24,7 @@ final class Updater: NSObject, SPUUpdaterDelegate, SPUStandardUserDriverDelegate
         var title: String {
             switch self {
             case .release: "Release"
-            case .tip: "Tip (every commit to main)"
+            case .tip: "Tip (nightly builds of main)"
             }
         }
     }

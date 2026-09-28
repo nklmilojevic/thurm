@@ -47,7 +47,7 @@ Pages, in two channels:
 | Channel | Gets | Published by |
 | --- | --- | --- |
 | **Release** (default) | tagged releases | `gh release create vX.Y.Z` (the tag must match `version` in `Cargo.toml`) |
-| **Tip** | every commit to `main` | each push to `main` once CI passes; rolling `tip` prerelease |
+| **Tip** | the newest `main` commit that passed CI | nightly, or on demand (`gh workflow run Release`); rolling `tip` prerelease |
 
 The channel is `updates.channel` in the config: `auto` (the default) follows the installed
 build, so the tip DMG keeps getting tip builds and a release keeps getting releases; `release`
@@ -59,9 +59,9 @@ both channels. A tip build and a release of the same commit have the same number
 replaces the other.
 
 The Pages workflow publishes the documentation and update feed together.
-After every Release run, `.github/workflows/pages.yml` rebuilds the whole Pages site: the
-docs, plus `appcast.xml` generated from the `sparkle.json` asset of each release
-(`macos/release/appcast.py`). The feed holds no state of its own, and docs and feed are
+After every build it publishes, `release.yaml` starts `.github/workflows/pages.yml`, which
+rebuilds the whole Pages site: the docs, plus `appcast.xml` generated from the `sparkle.json`
+asset of each release (`macos/release/appcast.py`). The feed holds no state of its own, and docs and feed are
 deployed together, so neither overwrites the other.
 
 **The daemon across updates.** Sparkle replaces the bundle and relaunches the app. The new app

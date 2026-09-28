@@ -67,8 +67,9 @@ updates at the same site. With no published releases, it publishes only the
 docs. If releases exist but feed generation fails, deployment stops.
 
 Changes to docs and their build files on `main` publish automatically.
-A successful `Release` workflow also starts `Pages`, so releases made with the
-workflow token update the feed. Maintainers can start `Pages` manually from
+The `Release` workflow starts `Pages` after it publishes a build, so each
+release and tip build updates the feed. A night without a tip build deploys
+nothing. Maintainers can start `Pages` manually from
 the Actions tab. All deployments share one concurrency group.
 
 The release workflow only publishes release assets. It must not deploy a

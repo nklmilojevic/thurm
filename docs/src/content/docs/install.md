@@ -62,8 +62,8 @@ For a published DMG, open it and copy Thurm to Applications.
 
 Signed release builds use Sparkle for updates. Select **Thurm > Update Channel**
 to choose Release or Tip. By default, `updates.channel = "auto"` follows the
-installed build. Release receives tagged versions. Tip receives builds
-from `main` after CI and the release build succeed. Local builds do not have an
+installed build. Release receives tagged versions. Tip receives a nightly
+build of `main`, made from the newest commit that passed CI. Local builds do not have an
 update feed and public signing key unless you configure them during the build.
 See [update settings](/thurm/configuration/#updates) for background checks and downloads.
 
