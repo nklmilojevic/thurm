@@ -164,15 +164,31 @@ impl Pty {
         self.master.try_clone()
     }
 
-    pub fn resize(&self, size: PaneSize) {
+    /// Sets the terminal size, then reads it back: a size that did not stick is retried once,
+    /// and reported as an error if it still differs.
+    pub fn resize(&self, size: PaneSize) -> io::Result<()> {
         let ws = winsize(size);
-        unsafe {
-            libc::ioctl(
-                self.master.as_raw_fd(),
-                libc::TIOCSWINSZ,
-                &ws as *const libc::winsize,
-            );
+        let fd = self.master.as_raw_fd();
+        let mut last = io::Error::other("size did not change");
+        for _ in 0..2 {
+            if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws as *const libc::winsize) } != 0 {
+                last = io::Error::last_os_error();
+                continue;
+            }
+            let mut now: libc::winsize = unsafe { std::mem::zeroed() };
+            if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut now as *mut libc::winsize) } != 0 {
+                last = io::Error::last_os_error();
+                continue;
+            }
+            if (now.ws_row, now.ws_col) == (ws.ws_row, ws.ws_col) {
+                return Ok(());
+            }
+            last = io::Error::other(format!(
+                "size is {}x{} after setting {}x{}",
+                now.ws_col, now.ws_row, ws.ws_col, ws.ws_row
+            ));
         }
+        Err(last)
     }
 
     /// Non-blocking check for the child's exit status. `Some(code)` once exited

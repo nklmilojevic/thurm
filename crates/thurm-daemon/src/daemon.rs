@@ -1515,7 +1515,9 @@ impl Daemon {
                 let size = sanitize_size(size);
                 self.with_pane(pane, |_, st| {
                     if st.info.size != size {
-                        st.pty.resize(size);
+                        if let Err(e) = st.pty.resize(size) {
+                            log::warn!("pane {pane}: resize to {}x{}: {e}", size.cols, size.rows);
+                        }
                         st.term.resize(size);
                         st.info.size = size;
                         self.send_subscribers(st, Event::Resized { pane, size });
