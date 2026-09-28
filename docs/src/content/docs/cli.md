@@ -1,6 +1,8 @@
-# Command line
+---
+title: Command line
+---
 
-Install the CLI as described in [Install](install.md). Keep the app open for
+Install the CLI as described in [Install](/thurm/install/). Keep the app open for
 commands that create or focus tabs and splits.
 
 ```sh
@@ -68,7 +70,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `theme [SPEC]` | List themes, or select a theme |
 | `save` | Write a session snapshot |
 | `layout` | Print layout JSON |
-| `daemon ACTION` | Control the daemon; see [Sessions](sessions.md) |
+| `daemon ACTION` | Control the daemon; see [Sessions](/thurm/sessions/) |
 
 `--hold` keeps a pane open after its command exits. Use `--` before a command
 when you need to separate its flags from Thurm flags:

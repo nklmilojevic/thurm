@@ -5,9 +5,6 @@ on:
     branches: [main]
     paths:
       - 'docs/**'
-      - 'mkdocs.yml'
-      - 'requirements-docs.txt'
-      - 'scripts/prepare-docs.py'
       - 'config.example.toml'
       - 'macos/release/appcast.py'
       - '.github/workflows/pages.yml'
@@ -31,13 +28,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: main
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+        working-directory: docs
+      - run: bun run build
+        working-directory: docs
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: '3.12'
-          enable-cache: true
-          cache-dependency-glob: requirements-docs.txt
-      - run: uv run --no-project python scripts/prepare-docs.py
-      - run: uv run --no-project --with-requirements requirements-docs.txt mkdocs build --strict
       - name: Generate update feed when releases exist
         env:
           GH_TOKEN: ${{ github.token }}
@@ -45,14 +43,14 @@ jobs:
         run: |
           gh release list --repo "$REPO" --exclude-drafts --limit 1 --json tagName > "$RUNNER_TEMP/releases.json"
           if uv run --no-project python -c 'import json,sys; sys.exit(not bool(json.load(open(sys.argv[1]))))' "$RUNNER_TEMP/releases.json"; then
-            uv run --no-project python macos/release/appcast.py --repo "$REPO" --output site/appcast.xml
+            uv run --no-project python macos/release/appcast.py --repo "$REPO" --output docs/dist/appcast.xml
           else
             echo 'No published releases. Publish documentation without an update feed.'
           fi
-          touch site/.nojekyll
+          touch docs/dist/.nojekyll
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: site
+          path: docs/dist
   deploy:
     needs: build
     runs-on: ubuntu-latest

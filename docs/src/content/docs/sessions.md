@@ -1,4 +1,8 @@
-# Sessions and the daemon
+---
+title: Sessions and the daemon
+sidebar:
+  label: Sessions
+---
 
 The app is a client of `thurmd`. The daemon owns shell processes, terminal state,
 and the saved window, tab, and split layout.

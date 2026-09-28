@@ -1,4 +1,6 @@
-# Configuration
+---
+title: Configuration
+---
 
 Thurm uses TOML. All settings are optional. Unset settings use their defaults.
 Find the active file with:
@@ -32,7 +34,7 @@ theme = "light:catppuccin-latte,dark:catppuccin-mocha"
 quit = "detach"
 ```
 
-Use the [complete reference](configuration-reference.md) for defaults, value
+Use the [complete reference](/thurm/configuration-reference/) for defaults, value
 ranges, and optional settings. Copy only the sections you need. Do not repeat
 a TOML section header when you add more settings to that section.
 

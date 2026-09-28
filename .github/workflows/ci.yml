@@ -45,12 +45,11 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.2.0
-        with:
-          python-version: '3.12'
-          enable-cache: true
-          cache-dependency-glob: requirements-docs.txt
-      - run: uv run --no-project python scripts/prepare-docs.py
-      - run: uv run --no-project --with-requirements requirements-docs.txt mkdocs build --strict
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build

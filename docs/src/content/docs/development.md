@@ -1,4 +1,8 @@
-# Development and documentation
+---
+title: Development and documentation
+sidebar:
+  label: Development
+---
 
 ## Source layout
 
@@ -37,29 +41,22 @@ documentation. Build the app separately with `./macos/build.sh`.
 
 ## Edit and preview these docs
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
-Use Python 3.11 or later. CI uses Python 3.12. Run these commands from the
-repository root:
+The site uses [Starlight](https://starlight.astro.build/) with the
+[Catppuccin theme](https://github.com/catppuccin/starlight). Install
+[Bun](https://bun.sh/), or use `nix develop`. Run these commands from `docs/`:
 
 ```sh
-uv run --no-project python scripts/prepare-docs.py
-uv run --no-project --with-requirements requirements-docs.txt mkdocs serve
+bun install
+bun run dev
 ```
 
-uv manages the command environment and installs the documentation dependencies
-from `requirements-docs.txt`. No manual environment activation is needed.
+Open the local address printed by Astro. Before you commit, run
+`bun run build`. The build fails on broken internal links and anchors.
 
-Open the local address printed by MkDocs. Before you commit:
-
-```sh
-uv run --no-project python scripts/prepare-docs.py
-uv run --no-project --with-requirements requirements-docs.txt mkdocs build --strict
-```
-
-Edit Markdown in `docs/`. Add pages to `mkdocs.yml`. Use relative Markdown
-links so MkDocs can check them. Edit `config.example.toml` to change the
-configuration reference; `scripts/prepare-docs.py` generates that page on each
-build. Do not edit the generated page directly.
+Edit pages in `docs/src/content/docs/`. Each page needs a `title` in its
+frontmatter. Add new pages to `sidebar` in `docs/astro.config.mjs`. Link to other
+pages by their full path, such as `/thurm/usage/`. Edit `config.example.toml` to
+change the configuration reference; the page includes that file on each build.
 
 ## Publish to GitHub Pages
 
@@ -77,5 +74,4 @@ the Actions tab. All deployments share one concurrency group.
 The release workflow only publishes release assets. It must not deploy a
 separate site artifact, because a Pages deployment replaces the complete site.
 
-The site build uses [MkDocs](https://www.mkdocs.org/user-guide/configuration/)
-and the standard [GitHub Pages Actions workflow](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages).
+The site build uses the standard [GitHub Pages Actions workflow](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages).

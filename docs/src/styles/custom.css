@@ -1,0 +1,12 @@
+:root {
+  --sl-font: 'Inter Variable';
+  --sl-font-mono: 'JetBrains Mono Variable';
+}
+
+.sl-markdown-content :is(h1, h2, h3, h4) {
+  letter-spacing: -0.015em;
+}
+
+.sl-markdown-content :not(pre) > code {
+  font-size: 0.875em;
+}

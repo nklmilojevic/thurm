@@ -7,6 +7,7 @@
 /.direnv
 
 /site/
-/.venv-docs/
-/docs/configuration-reference.md
+/docs/node_modules/
+/docs/dist/
+/docs/.astro/
 __pycache__/

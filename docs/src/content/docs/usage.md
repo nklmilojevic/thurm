@@ -1,4 +1,6 @@
-# Use Thurm
+---
+title: Use Thurm
+---
 
 ## Tabs and split panes
 
@@ -21,7 +23,7 @@ panes. Use a new window when you need another group of tabs.
 | Agent switcher | Cmd+Shift+A |
 
 Closing a pane stops its process. Quitting the app keeps processes running by
-default. See [Sessions](sessions.md).
+default. See [Sessions](/thurm/sessions/).
 
 ## Workspaces and sidebar
 
