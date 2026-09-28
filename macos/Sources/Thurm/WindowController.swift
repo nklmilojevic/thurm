@@ -190,6 +190,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             window.backgroundColor = colorFromRGB(cfg.theme.background)
         }
         applyBlur(cfg.opacity < 1 && cfg.blur > 0)
+        content.applyUpdateBadgeTheme()
         content.needsDisplay = true
     }
 

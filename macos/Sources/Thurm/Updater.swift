@@ -9,9 +9,13 @@ import Sparkle
 /// marks tip builds with `<sparkle:channel>tip</sparkle:channel>`, so the channel only changes
 /// which items Sparkle may pick. Development builds carry no feed or key, and never update.
 ///
+/// Scheduled checks don't open Sparkle's window over the terminal: an `UpdateBadge` in the bottom
+/// right of each window says an update is waiting, and clicking it opens the window. Checks
+/// from the menu open the window right away.
+///
 /// After an update the new app finds the daemon still running the old build and replaces it
 /// in place (see `SessionManager.connectAndHello`), so the shells keep running.
-final class Updater: NSObject, SPUUpdaterDelegate, NSMenuItemValidation {
+final class Updater: NSObject, SPUUpdaterDelegate, SPUStandardUserDriverDelegate, NSMenuItemValidation {
     static let shared = Updater()
 
     enum Channel: String, CaseIterable {
@@ -26,6 +30,9 @@ final class Updater: NSObject, SPUUpdaterDelegate, NSMenuItemValidation {
     }
 
     private var controller: SPUStandardUpdaterController?
+
+    /// Text of the update badge while a scheduled update waits for the user, else nil.
+    private(set) var badgeText: String?
 
     /// `updates.channel`, with `auto` resolved to this build's channel.
     var channel: Channel {
@@ -46,7 +53,7 @@ final class Updater: NSObject, SPUUpdaterDelegate, NSMenuItemValidation {
             return
         }
         controller = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: self,
-                                                  userDriverDelegate: nil)
+                                                  userDriverDelegate: self)
         configChanged()
     }
 
@@ -64,6 +71,7 @@ final class Updater: NSObject, SPUUpdaterDelegate, NSMenuItemValidation {
 
     // MARK: Actions
 
+    /// Also brings a waiting scheduled update into focus (the badge's action).
     @objc func checkForUpdates(_ sender: Any?) {
         controller?.checkForUpdates(sender)
     }
@@ -117,5 +125,108 @@ final class Updater: NSObject, SPUUpdaterDelegate, NSMenuItemValidation {
 
     func allowedChannels(for updater: SPUUpdater) -> Set<String> {
         channel == .tip ? ["tip"] : []
+    }
+
+    // MARK: SPUStandardUserDriverDelegate
+
+    var supportsGentleScheduledUpdateReminders: Bool { true }
+
+    @objc(standardUserDriverShouldHandleShowingScheduledUpdate:andInImmediateFocus:)
+    func standardUserDriverShouldHandleShowingScheduledUpdate(_ update: SUAppcastItem,
+                                                              andInImmediateFocus immediateFocus: Bool) -> Bool {
+        false
+    }
+
+    @objc(standardUserDriverWillHandleShowingUpdate:forUpdate:state:)
+    func standardUserDriverWillHandleShowingUpdate(_ handleShowingUpdate: Bool, forUpdate update: SUAppcastItem,
+                                                   state: SPUUserUpdateState) {
+        guard !handleShowingUpdate else { return }
+        let version = update.displayVersionString
+        setBadge(state.stage == .notDownloaded ? "Update available: \(version)" : "Update ready: \(version)")
+    }
+
+    @objc(standardUserDriverDidReceiveUserAttentionForUpdate:)
+    func standardUserDriverDidReceiveUserAttention(forUpdate update: SUAppcastItem) {
+        setBadge(nil)
+    }
+
+    @objc(standardUserDriverWillFinishUpdateSession)
+    func standardUserDriverWillFinishUpdateSession() {
+        setBadge(nil)
+    }
+
+    private func setBadge(_ text: String?) {
+        badgeText = text
+        if let text { tlog("update badge: \(text)") }
+        for c in SessionManager.shared.liveControllers {
+            c.content.setUpdateBadge(text)
+        }
+    }
+}
+
+/// "Update available: 1.2.0" pill in the bottom right of a window; a click opens Sparkle's
+/// update window. Colors follow the terminal theme.
+final class UpdateBadge: NSView {
+    private let dot = NSView()
+    private let label = NSTextField(labelWithString: "")
+
+    var text: String {
+        get { label.stringValue }
+        set {
+            label.stringValue = newValue
+            toolTip = "\(newValue). Click to see what's new and install."
+            needsLayout = true
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 11
+        layer?.borderWidth = 1
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        addSubview(dot)
+        addSubview(label)
+        applyTheme()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    func applyTheme() {
+        let theme = SessionManager.shared.config.theme
+        let bg = colorFromRGB(theme.background)
+        let fg = colorFromRGB(theme.foreground)
+        layer?.backgroundColor = (theme.isDark ? bg.highlight(withLevel: 0.08) : bg.shadow(withLevel: 0.04))?.cgColor
+        layer?.borderColor = fg.withAlphaComponent(0.18).cgColor
+        label.textColor = fg
+        // ANSI green, like a finished agent.
+        let green = theme.palette.count > 2 ? colorFromRGB(theme.palette[2]) : NSColor.systemGreen
+        dot.layer?.backgroundColor = green.cgColor
+    }
+
+    override var fittingSize: NSSize {
+        let l = label.fittingSize
+        return NSSize(width: ceil(l.width) + 32, height: 22)
+    }
+
+    override func layout() {
+        super.layout()
+        let l = label.fittingSize
+        dot.frame = NSRect(x: 11, y: (bounds.height - 6) / 2, width: 6, height: 6)
+        label.frame = NSRect(x: 22, y: (bounds.height - l.height) / 2, width: ceil(l.width), height: l.height)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        Updater.shared.checkForUpdates(self)
     }
 }

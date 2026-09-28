@@ -115,6 +115,11 @@ thurm set updates.check_automatically true
 thurm set updates.download_automatically true
 ```
 
+Thurm checks for updates about once an hour. A background check does not
+open a window. When it finds an update, an **Update available** badge appears
+in the bottom-right corner of each window. Click the badge to read the release
+notes and install. **Thurm > Check for Updates…** shows the result right away.
+
 Automatic downloads install updates when Thurm quits. Use
 `thurm set updates.channel auto` to follow the installed build again.
 These settings require a build with an update feed and public signing key.

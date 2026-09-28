@@ -214,6 +214,7 @@ final class TabContentView: NSView {
     private(set) var zoomedPane: UInt64?
 
     private(set) var findBar: FindBar?
+    private var updateBadge: UpdateBadge?
     private var dragging: SplitDivider?
 
     static let gap: CGFloat = 1
@@ -226,6 +227,7 @@ final class TabContentView: NSView {
         super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         autoresizingMask = [.width, .height]
         syncViews()
+        setUpdateBadge(Updater.shared.badgeText)
     }
 
     required init?(coder: NSCoder) {
@@ -305,6 +307,11 @@ final class TabContentView: NSView {
             let width = min(max(size.width, 320), max(200, full.width - 24))
             bar.frame = NSRect(x: full.maxX - width - 12, y: full.minY + 8, width: width,
                                height: max(size.height, 34))
+        }
+        if let badge = updateBadge {
+            let size = badge.fittingSize
+            badge.frame = NSRect(x: full.maxX - size.width - 12, y: full.maxY - size.height - 10,
+                                 width: size.width, height: size.height)
         }
         needsDisplay = true
     }
@@ -541,6 +548,29 @@ final class TabContentView: NSView {
         if let view = views[focusedPane] {
             window?.makeFirstResponder(view)
         }
+    }
+
+    // MARK: Update badge
+
+    /// Shows `text` in the bottom right (see `Updater`), or removes the badge when nil.
+    func setUpdateBadge(_ text: String?) {
+        guard let text else {
+            updateBadge?.removeFromSuperview()
+            updateBadge = nil
+            return
+        }
+        let badge = updateBadge ?? UpdateBadge()
+        badge.text = text
+        if badge.superview !== self {
+            addSubview(badge, positioned: .above, relativeTo: nil)
+        }
+        updateBadge = badge
+        layoutPanes()
+        window?.invalidateCursorRects(for: badge)
+    }
+
+    func applyUpdateBadgeTheme() {
+        updateBadge?.applyTheme()
     }
 
     // MARK: Persistence
