@@ -199,7 +199,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         // doesn't pick up the desktop through the window.
         let base = colorFromRGB(cfg.theme.background, alpha: opacity)
         sidebar?.backgroundColor = base.shadow(withLevel: cfg.theme.isDark ? 0.18 : 0.05) ?? base
-        if opacity < 1 {
+        // The quick terminal's rounded corners need a transparent window.
+        if opacity < 1 || isQuick {
             window.isOpaque = false
             window.backgroundColor = colorFromRGB(cfg.theme.background, alpha: 0.001)
         } else {

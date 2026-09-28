@@ -29,6 +29,32 @@ final class QuickTerminalWindow: NSPanel {
         if delegate?.windowShouldClose?(self) ?? true { close() }
     }
 
+    /// Rounds the corners away from the screen edge it hangs from (all four in the center).
+    /// The frame view holds the terminal and the blur, so clipping it clips both.
+    func roundCorners(for position: QuickTerminalPosition) {
+        guard let frameView = contentView?.superview else { return }
+        frameView.wantsLayer = true
+        guard let layer = frameView.layer else { return }
+        let flipped = frameView.isFlipped
+        let top: CACornerMask = flipped ? [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+            : [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+        let bottom: CACornerMask = flipped ? [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+            : [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        let left: CACornerMask = [.layerMinXMinYCorner, .layerMinXMaxYCorner]
+        let right: CACornerMask = [.layerMaxXMinYCorner, .layerMaxXMaxYCorner]
+        switch position {
+        case .top: layer.maskedCorners = bottom
+        case .bottom: layer.maskedCorners = top
+        case .left: layer.maskedCorners = right
+        case .right: layer.maskedCorners = left
+        case .center: layer.maskedCorners = top.union(bottom)
+        }
+        layer.cornerRadius = 16
+        layer.cornerCurve = .continuous
+        layer.masksToBounds = true
+        invalidateShadow()
+    }
+
     override func toggleFullScreen(_ sender: Any?) {}
     override func mergeAllWindows(_ sender: Any?) {}
     override func moveTabToNewWindow(_ sender: Any?) {}
@@ -91,6 +117,7 @@ final class QuickTerminal {
         hiding = false
         let animate = config.quickAnimationDuration > 0
         let slides = config.quickPosition != .center
+        (w as? QuickTerminalWindow)?.roundCorners(for: config.quickPosition)
         if !w.isVisible {
             w.setFrame(animate && slides ? frames.hidden : frames.shown, display: false)
             w.alphaValue = animate && !slides ? 0 : 1
