@@ -22,6 +22,8 @@
           # libghostty-vt is built from source with Zig 0.16.
           zig_0_16
           python3
+          # Docs: uv run --with-requirements requirements-docs.txt mkdocs serve
+          uv
           gh
         ];
 

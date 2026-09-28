@@ -32,7 +32,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: '3.12'
       - name: Appcast tests
-        run: python3 -m unittest discover -s macos/release -v
+        run: uv run --no-project python -m unittest discover -s macos/release -v
       - name: Shell syntax
         run: for f in macos/build.sh macos/package-dmg.sh macos/release/*.sh; do bash -n "$f"; done
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: requirements-docs.txt
+      - run: uv run --no-project python scripts/prepare-docs.py
+      - run: uv run --no-project --with-requirements requirements-docs.txt mkdocs build --strict

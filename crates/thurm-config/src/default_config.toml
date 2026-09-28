@@ -140,6 +140,15 @@ notifications = true
 # Edit > Explain Last Command and `thurm explain`.
 explain = true
 
+[updates]
+# "release" (tagged releases), "tip" (a build of every commit to main), or "auto": the
+# channel of the installed build. Also under Thurm > Update Channel.
+channel = "auto"
+# Look for updates in the background (hourly).
+check_automatically = true
+# Download updates in the background and install them when Thurm quits.
+download_automatically = false
+
 [keybindings]
 # "cmd+shift+d" = "split_down"
 # "cmd+d" = "split_right"

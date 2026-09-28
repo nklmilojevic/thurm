@@ -1,5 +1,7 @@
 # Thurm
 
+[Documentation](https://nklmilojevic.github.io/thurm/) includes installation, user guides, configuration, and CLI commands.
+
 Thurm is a macOS terminal with tabs, split panes, and support for coding agents.
 It uses libghostty-vt for terminal state, AppKit for the interface, and Metal and
 CoreText to draw text and images.
@@ -160,7 +162,7 @@ The source is split into these parts:
 | `shell-integration/` | Shell scripts included in the daemon. |
 | `vendor/libghostty-vt-sys/` | Rust bindings and build code for the pinned Ghostty source. |
 
-CI runs the following Rust checks on macOS and Linux. Zig 0.16.0 must be available
+CI runs the following Rust checks on macOS. Zig 0.16.0 must be available
 on `PATH`. The macOS app is built separately with `./macos/build.sh`.
 
 ```sh

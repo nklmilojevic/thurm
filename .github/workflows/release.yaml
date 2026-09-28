@@ -3,8 +3,9 @@ name: Release
 # Two update channels, one appcast (GitHub Pages):
 #   tip      every push to main, once CI passed: rolling `tip` prerelease, <sparkle:channel>tip
 #   release  a published GitHub release `vX.Y.Z` (gh release create vX.Y.Z): default channel
-# Both build Apple silicon only, sign with Developer ID, notarize, and regenerate the appcast
-# from all releases (macos/release/appcast.py). One-time setup: macos/release/setup-github.sh.
+# Both build Apple silicon only, sign with Developer ID, notarize, and upload to the GitHub
+# release. pages.yml then rebuilds the site (docs + appcast.xml from all releases, see
+# macos/release/appcast.py). One-time setup: macos/release/setup-github.sh.
 
 on:
   workflow_run:
@@ -197,34 +198,3 @@ jobs:
         run: |
           macos/release/ci-keychain.sh delete "$RUNNER_TEMP/thurm-signing.keychain-db"
           rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/sparkle-ed25519"
-
-  appcast:
-    name: Appcast
-    needs: build
-    runs-on: ubuntu-latest
-    # Serialized. A pending run may be replaced by a newer one, which is fine: every run
-    # rebuilds the appcast from all published releases.
-    concurrency:
-      group: appcast
-      cancel-in-progress: false
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}appcast.xml
-    steps:
-      - uses: actions/checkout@v7
-      - name: Generate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p site
-          python3 macos/release/appcast.py --repo "${{ github.repository }}" --output site/appcast.xml
-          touch site/.nojekyll
-      - uses: actions/upload-pages-artifact@v5
-        with:
-          path: site
-      - id: deploy
-        uses: actions/deploy-pages@v5

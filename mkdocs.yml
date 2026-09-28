@@ -1,0 +1,32 @@
+site_name: Thurm
+site_description: A native macOS terminal with persistent sessions and coding agent controls.
+site_url: https://nklmilojevic.github.io/thurm/
+repo_url: https://github.com/nklmilojevic/thurm
+edit_uri: edit/main/docs/
+theme:
+  name: mkdocs
+  color_mode: auto
+  user_color_mode_toggle: true
+  navigation_depth: 2
+nav:
+  - Home: index.md
+  - Install: install.md
+  - Use Thurm: usage.md
+  - Configuration: configuration.md
+  - Configuration reference: configuration-reference.md
+  - Command line: cli.md
+  - Coding agents: agents.md
+  - Sessions: sessions.md
+  - Troubleshooting: troubleshooting.md
+  - Development: development.md
+markdown_extensions:
+  - fenced_code
+  - tables
+  - toc:
+      permalink: true
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    not_found: warn
+    anchors: warn

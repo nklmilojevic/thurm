@@ -1,0 +1,68 @@
+# Coding agents
+
+Thurm detects supported agent processes and shows their status. Launch presets
+start tools that are already installed. Thurm does not install those tools or
+configure their accounts.
+
+```sh
+thurm presets
+thurm launch Codex
+thurm agents
+```
+
+Use the preset name shown by `thurm presets`. Add `--split right` to launch in
+a split or `--cwd PATH` to select a working directory. Cmd+Shift+A opens the
+agent switcher.
+
+## Install hooks
+
+Claude Code and Codex hooks provide turn completion events and session IDs.
+Check and install them with:
+
+```sh
+thurm hooks status
+thurm hooks install --agent claude
+thurm hooks install --agent codex
+```
+
+These commands change the agent configuration files. Without `--agent`, Thurm
+selects supported agents whose configuration directories exist. Use
+`thurm hooks uninstall --agent codex` or `--agent claude` to remove Thurm hooks.
+Run agents inside Thurm so their processes inherit `THURM_PANE_ID`.
+
+Hooks support `thurm wait --agent-done --timeout 120`, session titles, and
+notifications when turns finish. Without hooks, detection uses process and
+screen information, which cannot provide the same completion signal.
+
+## Resume and fork
+
+With hooks and a known session ID, use `thurm fork --split right` from a Claude
+Code or Codex pane to create a separate branch of the agent session.
+Use `--pane ID` to select another source pane. Without `--split`, the fork
+opens in a new tab. The installed agent must support its configured fork command.
+
+Saved sessions can use agent resume commands after a daemon restart.
+See [Sessions](sessions.md) for the limits of restoration.
+
+## Custom presets and detection
+
+To replace the default preset list:
+
+```toml
+[agents]
+presets = [{ name = "My Bot", command = ["mybot"] }]
+```
+
+An empty preset list uses installed built-in agents. To define another agent,
+add an `[[agents.define]]` block. `processes` matches executable names; `argv`
+matches parts of process arguments. `working` and `attention` match screen text.
+Optional launch, resume, and fork commands control how Thurm starts that agent.
+See the [configuration reference](configuration-reference.md) for a full example.
+
+Agent notifications apply to panes without focus. Check macOS notification
+permissions and `[notifications]` if they do not appear. Optional AI summaries
+are separate and require `ai.enabled = true`.
+
+For agent authors, the repository includes a
+[Thurm skill](https://github.com/nklmilojevic/thurm/blob/main/skills/thurm/SKILL.md)
+with CLI procedures.

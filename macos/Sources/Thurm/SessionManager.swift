@@ -673,6 +673,7 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         config = AppConfig.load()
         applyConfigToUI()
+        Updater.shared.configChanged()
         let view = currentController?.content.focusedView
         if let err = config.loadError {
             view?.showToast("Config error: \(err)", duration: 8)

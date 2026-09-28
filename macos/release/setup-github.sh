@@ -41,13 +41,28 @@ done
     || die "--certificate, --certificate-password, --notary-key, --notary-key-id and --notary-issuer are required"
 command -v gh >/dev/null || die "gh not found"
 
-# Value of a 1Password reference or a file, on stdout.
-fetch() {
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+chmod 700 "$WORK"
+
+# A 1Password reference or a local file, copied byte for byte to $2 (op read's stdout is
+# text, which can mangle a binary file such as the certificate).
+fetch_file() {
+    if [[ "$1" == op://* ]]; then
+        op read --force --out-file "$2" "$1" >/dev/null
+    else
+        [[ -f "$1" ]] || die "$1 is not a file or an op:// reference"
+        cp "$1" "$2"
+    fi
+}
+
+# A short text value (a password, an id): from 1Password, or the first line of a file.
+fetch_text() {
     if [[ "$1" == op://* ]]; then
         op read --no-newline "$1"
     else
         [[ -f "$1" ]] || die "$1 is not a file or an op:// reference"
-        cat "$1"
+        head -n1 "$1" | tr -d '\r\n'
     fi
 }
 
@@ -55,13 +70,29 @@ REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 log "Configuring $REPO"
 
 log "Developer ID certificate"
-fetch "$CERT_REF" | base64 | gh secret set MACOS_CERTIFICATE_P12 --repo "$REPO"
-fetch "$CERT_PASS_REF" | gh secret set MACOS_CERTIFICATE_PASSWORD --repo "$REPO"
+CERT="$WORK/certificate"
+fetch_file "$CERT_REF" "$CERT"
+fetch_text "$CERT_PASS_REF" > "$CERT.pass"
+# Import it exactly as CI will, into a throwaway keychain, before storing anything.
+if ! IDENTITY="$(MACOS_CERTIFICATE_P12="$(base64 < "$CERT")" \
+    MACOS_CERTIFICATE_PASSWORD="$(cat "$CERT.pass")" \
+    "$HERE/ci-keychain.sh" create "$WORK/check.keychain-db")"; then
+    "$HERE/ci-keychain.sh" delete "$WORK/check.keychain-db"
+    die "the certificate does not open with that password (re-export it, or check the password item)"
+fi
+"$HERE/ci-keychain.sh" delete "$WORK/check.keychain-db"
+[[ -n "$IDENTITY" ]] || die "the certificate holds no Developer ID Application identity with its private key"
+log "Certificate OK: $IDENTITY"
+base64 < "$CERT" | gh secret set MACOS_CERTIFICATE_P12 --repo "$REPO"
+gh secret set MACOS_CERTIFICATE_PASSWORD --repo "$REPO" < "$CERT.pass"
 
 log "Notarization API key"
-fetch "$NOTARY_REF" | base64 | gh secret set NOTARY_API_KEY_P8 --repo "$REPO"
-fetch "$NOTARY_ID_REF" | gh secret set NOTARY_API_KEY_ID --repo "$REPO"
-fetch "$NOTARY_ISSUER_REF" | gh secret set NOTARY_API_ISSUER_ID --repo "$REPO"
+NOTARY="$WORK/notary"
+fetch_file "$NOTARY_REF" "$NOTARY"
+grep -q "BEGIN PRIVATE KEY" "$NOTARY" || die "the notary key is not an App Store Connect .p8 key"
+base64 < "$NOTARY" | gh secret set NOTARY_API_KEY_P8 --repo "$REPO"
+fetch_text "$NOTARY_ID_REF" | gh secret set NOTARY_API_KEY_ID --repo "$REPO"
+fetch_text "$NOTARY_ISSUER_REF" | gh secret set NOTARY_API_ISSUER_ID --repo "$REPO"
 
 log "Sparkle update signing key"
 (cd "$MACOS" && swift package resolve >/dev/null)
@@ -71,18 +102,14 @@ GENERATE_KEYS="$(find "$MACOS/.build/artifacts" -path '*/bin/generate_keys' -typ
 PUBLIC="$("$GENERATE_KEYS" --account thurm -p)"
 [[ -n "$PUBLIC" ]] || die "generate_keys printed no public key"
 gh variable set SPARKLE_PUBLIC_KEY --repo "$REPO" --body "$PUBLIC"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-chmod 700 "$WORK"
 "$GENERATE_KEYS" --account thurm -x "$WORK/sparkle" >/dev/null
 gh secret set SPARKLE_PRIVATE_KEY --repo "$REPO" < "$WORK/sparkle"
 
-log "GitHub Pages (appcast), deployed by the workflow"
+log "GitHub Pages (docs and appcast), deployed by pages.yml"
 if ! gh api -X POST "repos/$REPO/pages" -f build_type=workflow >/dev/null 2>&1; then
     gh api -X PUT "repos/$REPO/pages" -f build_type=workflow >/dev/null
 fi
-# Releases deploy the appcast from their tag, which the github-pages environment rejects by
-# default (main only): allow main and v* tags.
+# pages.yml deploys from main; v* tags are allowed too, for a deploy started from a release.
 gh api -X PUT "repos/$REPO/environments/github-pages" \
     -F 'deployment_branch_policy[protected_branches]=false' \
     -F 'deployment_branch_policy[custom_branch_policies]=true' >/dev/null
@@ -92,6 +119,6 @@ for policy in "main branch" "v* tag"; do
         -f name="$1" -f type="$2" >/dev/null 2>&1 || true # already there
 done
 URL="$(gh api "repos/$REPO/pages" -q .html_url)"
-log "Done. Appcast: ${URL}appcast.xml (published by the first run of the Release workflow)"
+log "Done. Appcast: ${URL}appcast.xml (published once the first Release run finishes)"
 echo "Apps built before a repository rename keep the old feed URL; set the SPARKLE_FEED_URL"
 echo "repository variable to pin it."

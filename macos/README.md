@@ -40,7 +40,7 @@ next to the executable (or is named by `$THURM_DAEMON`).
 
 ## Releases and updates
 
-`.github/workflows/release.yml` builds, signs (Developer ID), notarizes and publishes Thurm.
+`.github/workflows/release.yaml` builds, signs (Developer ID), notarizes and publishes Thurm.
 Users get updates through [Sparkle](https://sparkle-project.org) from one appcast on GitHub
 Pages, in two channels:
 
@@ -49,13 +49,20 @@ Pages, in two channels:
 | **Release** (default) | tagged releases | `gh release create vX.Y.Z` (the tag must match `version` in `Cargo.toml`) |
 | **Tip** | every commit to `main` | each push to `main` once CI passes; rolling `tip` prerelease |
 
-Users switch with *Thurm › Update Channel*. Tip items carry `<sparkle:channel>tip`, so a
+The channel is `updates.channel` in the config: `auto` (the default) follows the installed
+build, so the tip DMG keeps getting tip builds and a release keeps getting releases; `release`
+or `tip` pin one. *Thurm › Update Channel* and `thurm set updates.channel tip` write the same
+setting. `updates.check_automatically` and `updates.download_automatically` control
+background checks and downloads. Tip items carry `<sparkle:channel>tip`, so a
 release-channel app never sees them. `CFBundleVersion` is the commit count, so it grows across
 both channels. A tip build and a release of the same commit have the same number, so neither
 replaces the other.
 
-The appcast is regenerated on every publish from the `sparkle.json` asset of each release
-(`macos/release/appcast.py`), so it holds no state of its own.
+The Pages workflow publishes the documentation and update feed together.
+After every Release run, `.github/workflows/pages.yml` rebuilds the whole Pages site: the
+docs, plus `appcast.xml` generated from the `sparkle.json` asset of each release
+(`macos/release/appcast.py`). The feed holds no state of its own, and docs and feed are
+deployed together, so neither overwrites the other.
 
 **The daemon across updates.** Sparkle replaces the bundle and relaunches the app. The new app
 sees that `thurmd` reports another build (`Hello.build`) and upgrades it in place. It writes
@@ -172,7 +179,7 @@ macos/
 | Move divider | ⌃⌘ + arrows |
 | Zoom split / equalize splits | ⇧⌘↩ / ⌃⌘= |
 | Copy / paste / select all | ⌘C / ⌘V / ⌘A |
-| Clear scrollback | ⌘K |
+| Clear screen / scrollback | ⌘K / ⌥⌘K |
 | Find / next / previous | ⌘F / ⌘G / ⇧⌘G (in the bar: ↩ older, ⇧↩ newer, esc closes) |
 | Font size | ⌘+ / ⌘− / ⌘0 |
 | Command palette | ⇧⌘P |

@@ -5,3 +5,8 @@
 .DS_Store
 /macos/.sign-identity
 /.direnv
+
+/site/
+/.venv-docs/
+/docs/configuration-reference.md
+__pycache__/

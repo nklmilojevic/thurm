@@ -179,6 +179,15 @@ notifications = true
 # Allow Edit > Explain Last Command and `thurm explain`.
 explain = true
 
+[updates]
+# "auto" follows the installed build's channel: "release" or "tip".
+# Use "release" or "tip" to select a fixed channel.
+channel = "auto"
+# Check for updates in the background.
+check_automatically = true
+# Download updates in the background and install them when Thurm quits.
+download_automatically = false
+
 [keybindings]
 # Map a key combination to an action name.
 # "cmd+shift+d" = "split_down"

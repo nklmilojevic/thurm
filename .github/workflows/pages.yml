@@ -1,0 +1,68 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.txt'
+      - 'scripts/prepare-docs.py'
+      - 'config.example.toml'
+      - 'macos/release/appcast.py'
+      - '.github/workflows/pages.yml'
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: requirements-docs.txt
+      - run: uv run --no-project python scripts/prepare-docs.py
+      - run: uv run --no-project --with-requirements requirements-docs.txt mkdocs build --strict
+      - name: Generate update feed when releases exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release list --repo "$REPO" --exclude-drafts --limit 1 --json tagName > "$RUNNER_TEMP/releases.json"
+          if uv run --no-project python -c 'import json,sys; sys.exit(not bool(json.load(open(sys.argv[1]))))' "$RUNNER_TEMP/releases.json"; then
+            uv run --no-project python macos/release/appcast.py --repo "$REPO" --output site/appcast.xml
+          else
+            echo 'No published releases. Publish documentation without an update feed.'
+          fi
+          touch site/.nojekyll
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - id: deploy
+        uses: actions/deploy-pages@v4

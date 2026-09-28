@@ -27,6 +27,7 @@ pub struct Config {
     pub notifications: NotificationConfig,
     pub agents: AgentsConfig,
     pub ai: AiConfig,
+    pub updates: UpdatesConfig,
     /// Extra key bindings: `"cmd+shift+d" = "split_down"`.
     pub keybindings: std::collections::BTreeMap<String, String>,
 }
@@ -418,6 +419,39 @@ impl AiConfig {
     pub fn explain(&self) -> bool {
         self.enabled && self.explain
     }
+}
+
+/// Automatic updates (Sparkle), read by the app.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdatesConfig {
+    pub channel: UpdateChannel,
+    /// Look for updates in the background (hourly).
+    pub check_automatically: bool,
+    /// Download updates in the background and install them when Thurm quits.
+    pub download_automatically: bool,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            channel: UpdateChannel::Auto,
+            check_automatically: true,
+            download_automatically: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    /// The channel of the installed build: a tip build keeps getting tip builds.
+    #[default]
+    Auto,
+    /// Tagged releases.
+    Release,
+    /// A build of every commit to main (and every release).
+    Tip,
 }
 
 #[derive(Debug)]
@@ -849,6 +883,22 @@ mod tests {
     #[test]
     fn empty_is_default() {
         assert_eq!(Config::parse("").unwrap(), Config::default());
+    }
+
+    #[test]
+    fn update_settings() {
+        assert_eq!(Config::default().updates.channel, UpdateChannel::Auto);
+        let c =
+            Config::parse("[updates]\nchannel = \"tip\"\ndownload_automatically = true").unwrap();
+        assert_eq!(c.updates.channel, UpdateChannel::Tip);
+        assert!(c.updates.check_automatically && c.updates.download_automatically);
+        assert!(Config::parse("[updates]\nchannel = \"nightly\"").is_err());
+        // The menu writes the channel into configs from before [updates] existed.
+        let text = with_setting("[font]\nsize = 13\n", "updates.channel", "\"release\"").unwrap();
+        assert_eq!(
+            Config::parse(&text).unwrap().updates.channel,
+            UpdateChannel::Release
+        );
     }
 
     #[test]

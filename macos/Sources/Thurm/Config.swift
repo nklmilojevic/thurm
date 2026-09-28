@@ -146,6 +146,11 @@ final class AppConfig {
     // [ai]
     var aiExplain = false
 
+    // [updates]
+    var updateChannel = "auto"
+    var checkForUpdates = true
+    var downloadUpdates = false
+
     var theme = Theme.fallback
     /// `colors.theme`, split into its light and dark halves (equal for a single theme).
     var themeLight = Theme.fallback.name
@@ -257,6 +262,11 @@ final class AppConfig {
         }
         if let ai = c["ai"] as? [String: Any] {
             aiExplain = (jsonBool(ai["enabled"]) ?? false) && (jsonBool(ai["explain"]) ?? true)
+        }
+        if let u = c["updates"] as? [String: Any] {
+            updateChannel = jsonString(u["channel"]) ?? updateChannel
+            checkForUpdates = jsonBool(u["check_automatically"]) ?? checkForUpdates
+            downloadUpdates = jsonBool(u["download_automatically"]) ?? downloadUpdates
         }
     }
 
