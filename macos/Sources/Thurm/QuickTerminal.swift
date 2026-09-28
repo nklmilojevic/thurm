@@ -29,7 +29,8 @@ final class QuickTerminalWindow: NSPanel {
         if delegate?.windowShouldClose?(self) ?? true { close() }
     }
 
-    /// Rounds the corners away from the screen edge it hangs from (all four in the center).
+    /// Rounds the corners along the screen edge it hangs from, where the display's own corners
+    /// are round (all four in the center).
     /// The frame view holds the terminal and the blur, so clipping it clips both.
     func roundCorners(for position: QuickTerminalPosition) {
         guard let frameView = contentView?.superview else { return }
@@ -43,10 +44,10 @@ final class QuickTerminalWindow: NSPanel {
         let left: CACornerMask = [.layerMinXMinYCorner, .layerMinXMaxYCorner]
         let right: CACornerMask = [.layerMaxXMinYCorner, .layerMaxXMaxYCorner]
         switch position {
-        case .top: layer.maskedCorners = bottom
-        case .bottom: layer.maskedCorners = top
-        case .left: layer.maskedCorners = right
-        case .right: layer.maskedCorners = left
+        case .top: layer.maskedCorners = top
+        case .bottom: layer.maskedCorners = bottom
+        case .left: layer.maskedCorners = left
+        case .right: layer.maskedCorners = right
         case .center: layer.maskedCorners = top.union(bottom)
         }
         layer.cornerRadius = 16
