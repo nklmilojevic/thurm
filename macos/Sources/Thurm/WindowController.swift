@@ -433,7 +433,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         guard !windows.isEmpty else { return }
         let index = item.tag >= 9 ? windows.count - 1 : item.tag - 1
         guard index >= 0, index < windows.count else { return }
-        windows[index].makeKeyAndOrderFront(nil)
+        let target = windows[index]
+        target.makeKeyAndOrderFront(nil)
+        // Restore terminal focus if a sidebar or search field kept it.
+        if let controller = target.windowController as? TerminalWindowController,
+           let view = controller.content.focusedView {
+            target.makeFirstResponder(view)
+        }
     }
 
     /// The "+" button of the native tab bar.
