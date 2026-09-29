@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::install::{self, Plan};
-use crate::ssh::{PRELUDE, REMOTE_PATH, Ssh, SshError};
+use crate::ssh::{Ssh, SshError};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -155,10 +155,125 @@ pub fn run(
 ) -> Result<Report, SshError> {
     let plan = install::plan(ssh, socket, local_bins)?;
     let probe = parse(&ssh.run(PROBE, &[], None, Duration::from_secs(60))?);
-    Ok(Report {
-        checks: checks(name, &plan, &probe),
-        plan,
-    })
+    let mut checks = checks(name, &plan, &probe);
+    // Right after the daemon: the rest is moot while the app cannot connect.
+    let at = checks
+        .iter()
+        .position(|c| c.id == "daemon")
+        .map_or(0, |i| i + 1);
+    checks.insert(at, tunnel_check(ssh, &plan, socket));
+    Ok(Report { checks, plan })
+}
+
+/// Opens the forward the app's tunnel uses and pings the daemon through it. Some ssh servers
+/// accept a Unix-socket forward and close it at once (OrbStack's built-in one, Tailscale SSH
+/// before 1.98): everything else checks out, and the app still never connects. Starts the
+/// daemon when it is not running, as connecting would.
+fn tunnel_check(ssh: &Ssh, plan: &Plan, socket: Option<&str>) -> Check {
+    let mut c = check(
+        "tunnel",
+        "Tunnel",
+        State::Ok,
+        "forwards the daemon's socket",
+    );
+    let remote = socket
+        .map(str::to_owned)
+        .or_else(|| plan.host.info.as_ref().map(|i| i.socket.clone()));
+    let (true, Some(remote)) = (plan.host.thurm.is_some(), remote) else {
+        c.state = State::Skip;
+        c.detail = "needs Thurm".into();
+        return c;
+    };
+    if !plan.daemon.as_ref().is_some_and(|d| d.running)
+        && let Err(e) = crate::start_daemon(ssh, &remote)
+    {
+        c.state = State::Fail;
+        c.detail = format!("the daemon does not start: {e}");
+        return c;
+    }
+    match try_forward(ssh, &remote) {
+        Ok(()) => {}
+        Err(Forward::Failed(e)) => {
+            c.state = State::Fail;
+            c.detail = e;
+        }
+        Err(Forward::NoAnswer(e)) => {
+            c.state = State::Fail;
+            // Only when the daemon answers on the host is the forward itself to blame.
+            c.detail = if daemon_answers(ssh, &remote) {
+                format!(
+                    "the daemon answers on the host but not through the forward ({e}): the host's \
+                     ssh server likely cannot forward Unix sockets (OrbStack's built-in one and \
+                     Tailscale SSH before 1.98 cannot); connect to the host's OpenSSH instead"
+                )
+            } else {
+                format!("the daemon does not answer on {remote} ({e})")
+            };
+        }
+    }
+    c
+}
+
+/// `thurm daemon status` on the host, for the daemon on `socket`.
+const DAEMON_STATUS: &str = concat!(
+    "TH=\"${THURM_HOME:-$HOME}\"; ",
+    "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
+    "THURM_SOCKET=\"$1\" thurm daemon status --json 2>/dev/null | head -n 1"
+);
+
+fn daemon_answers(ssh: &Ssh, socket: &str) -> bool {
+    ssh.run(DAEMON_STATUS, &[socket], None, Duration::from_secs(30))
+        .ok()
+        .and_then(|out| serde_json::from_str::<Value>(out.trim()).ok())
+        .and_then(|v| v.get("running").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+enum Forward {
+    /// ssh would not set the forward up.
+    Failed(String),
+    /// The forward is there, the daemon does not answer through it.
+    NoAnswer(String),
+}
+
+fn try_forward(ssh: &Ssh, remote: &str) -> Result<(), Forward> {
+    use std::process::Stdio;
+    let local = thurm_config::remote_dir().join(format!("doctor-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&local);
+    let mut child = ssh
+        .tunnel_command(&local, remote)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Forward::Failed(format!("cannot run ssh: {e}")))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let result = loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            let mut err = String::new();
+            if let Some(mut e) = child.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut e, &mut err);
+            }
+            let last = last_line(&err).unwrap_or("ssh exited").to_owned();
+            break Err(Forward::Failed(format!(
+                "ssh could not forward the daemon's socket: {last}"
+            )));
+        }
+        if local.exists() {
+            break match crate::tunnel::ping(&local, Duration::from_secs(5)) {
+                Ok(_) | Err(crate::tunnel::PingError::Protocol(_)) => Ok(()),
+                Err(crate::tunnel::PingError::Unreachable(e)) => Err(Forward::NoAnswer(e)),
+            };
+        }
+        if std::time::Instant::now() > deadline {
+            break Err(Forward::Failed("timed out opening the forward".into()));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&local);
+    result
 }
 
 fn check(id: &str, title: &str, state: State, detail: impl Into<String>) -> Check {
@@ -355,7 +470,7 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
             } else if !probe.claude_login {
                 c.state = State::Warn;
                 c.detail = "not signed in: run it once there and sign in".into();
-                c.terminal = Some(format!("{PRELUDE}; {REMOTE_PATH}; exec claude"));
+                c.terminal = Some(sign_in_script(path.as_deref().unwrap_or("claude")));
             }
             out.push(c);
         }
@@ -522,11 +637,35 @@ pub fn fix(
                     .and_then(|a| a.installer)
                     .ok_or_else(|| FixError::NoFix(format!("Thurm cannot install {kind}")))?;
                 let out = ssh.run(AGENT_INSTALL, &[url], None, Duration::from_secs(600))?;
-                return Ok(out.lines().last().unwrap_or("installed").trim().to_owned());
+                return Ok(last_line(&out).unwrap_or("installed").to_owned());
             }
             Err(FixError::NoFix(format!("no fix for {id:?}")))
         }
     }
+}
+
+/// `exec` of the agent at `path` there. A path with characters a double-quoted word would
+/// expand (or that [`crate::ssh::quote`] refuses) is looked up on PATH instead.
+fn sign_in_script(path: &str) -> String {
+    let plain = !path.is_empty()
+        && path
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || " /._+-@".contains(ch));
+    if plain {
+        format!("exec \"{path}\"")
+    } else {
+        concat!(
+            "TH=\"${THURM_HOME:-$HOME}\"; ",
+            "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
+            "exec claude"
+        )
+        .to_owned()
+    }
+}
+
+/// The last line with text: an installer's closing message (ANSI colors and all).
+fn last_line(out: &str) -> Option<&str> {
+    out.lines().map(str::trim).rfind(|l| !l.is_empty())
 }
 
 #[cfg(test)]
@@ -534,6 +673,7 @@ mod tests {
     use super::*;
     use crate::HostInfo;
     use crate::install::{DaemonState, Method};
+    use crate::ssh::{PRELUDE, REMOTE_PATH};
 
     fn plan(installed: bool) -> Plan {
         Plan {
@@ -642,6 +782,45 @@ mod tests {
     }
 
     #[test]
+    fn sign_in_scripts_keep_the_path_one_word() {
+        assert_eq!(
+            sign_in_script("/home/me/.local/bin/claude"),
+            "exec \"/home/me/.local/bin/claude\""
+        );
+        assert_eq!(
+            sign_in_script("/home/my name/bin/claude"),
+            "exec \"/home/my name/bin/claude\""
+        );
+        // Anything a shell would expand inside double quotes: looked up on PATH instead.
+        for bad in [
+            "/x/$(rm -rf ~)/claude",
+            "/x/`id`/claude",
+            "/x/\"q/claude",
+            "/x/'q/claude",
+            "",
+        ] {
+            let s = sign_in_script(bad);
+            assert!(
+                s.ends_with("exec claude") && s.contains(REMOTE_PATH),
+                "{bad}: {s}"
+            );
+        }
+        for p in ["/home/my name/bin/claude", "/x/$(id)/claude"] {
+            crate::ssh::quote(&sign_in_script(p)).unwrap();
+        }
+        crate::ssh::quote(DAEMON_STATUS).unwrap();
+    }
+
+    #[test]
+    fn installers_are_quoted_by_their_last_words() {
+        assert_eq!(
+            last_line("Installing…\n✔ Claude Code installed\n\n  \n"),
+            Some("✔ Claude Code installed")
+        );
+        assert_eq!(last_line("\n \n"), None);
+    }
+
+    #[test]
     fn a_failed_installer_download_fails() {
         let dir = std::env::temp_dir().join(format!("thurm-installer-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -671,7 +850,5 @@ mod tests {
         }
         assert!(PROBE.contains(PRELUDE) && PROBE.contains(REMOTE_PATH));
         assert!(HOOKS.contains(REMOTE_PATH));
-        let login = format!("{PRELUDE}; {REMOTE_PATH}; exec claude");
-        crate::ssh::quote(&login).unwrap();
     }
 }

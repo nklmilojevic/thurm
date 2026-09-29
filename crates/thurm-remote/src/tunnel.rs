@@ -566,7 +566,10 @@ impl Inner {
                     Err(PingError::Protocol(v)) => return Ok((v, String::new())),
                     Err(PingError::Unreachable(e)) if Instant::now() > deadline => {
                         return Err(Failure::Transient(format!(
-                            "the tunnel is up but the daemon does not answer: {e}"
+                            "the tunnel is up but the daemon does not answer: {e} (an ssh server \
+                             that cannot forward Unix sockets looks like this; `thurm remote \
+                             doctor {}` checks)",
+                            self.remote.lock().name
                         )));
                     }
                     Err(_) => {}

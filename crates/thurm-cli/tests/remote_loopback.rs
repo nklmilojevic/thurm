@@ -391,6 +391,13 @@ fn remote_workspace_over_loopback_ssh() {
     let state = |r: &doctor::Report, id: &str| r.check(id).map(|c| c.state);
     assert_eq!(state(&r, "thurm"), Some(State::Ok), "{:#?}", r.checks);
     assert_eq!(state(&r, "daemon"), Some(State::Ok));
+    // OpenSSH forwards the daemon's socket: the forward is tried for real.
+    assert_eq!(
+        state(&r, "tunnel"),
+        Some(State::Ok),
+        "{:#?}",
+        r.check("tunnel")
+    );
     // No ~/.local/bin on the "host": `thurm` is not on PATH in plain ssh sessions.
     assert_eq!(state(&r, "path"), Some(State::Warn));
     assert_eq!(state(&r, "agent.claude"), Some(State::Warn));
