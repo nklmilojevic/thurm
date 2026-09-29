@@ -179,6 +179,9 @@ pub enum Request {
         message: Option<String>,
         /// The agent's session transcript (Claude Code), read for the session's title.
         transcript_path: Option<String>,
+        /// Process group of the hook command: the agent's, whatever runs in the foreground
+        /// by the time the request arrives.
+        pgrp: Option<u32>,
     },
     /// What happened in the pane's last finished command, from the on-device model
     /// (`ai.explain`). Answers `Text`.

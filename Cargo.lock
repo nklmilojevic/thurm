@@ -849,6 +849,7 @@ name = "thurm-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "parking_lot",
  "serde_json",
  "thurm-client",
