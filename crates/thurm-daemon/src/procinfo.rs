@@ -215,7 +215,68 @@ pub fn descendants(table: &[ProcRow], root: u32) -> Vec<ProcRow> {
     out
 }
 
+/// Listening TCP ports per pid: the LISTEN sockets in `/proc/net/tcp{,6}`, matched to each
+/// pid's open descriptors by inode.
+#[cfg(target_os = "linux")]
+pub fn listening_ports(pids: &[u32]) -> std::collections::HashMap<u32, Vec<u16>> {
+    let mut map: std::collections::HashMap<u32, Vec<u16>> = std::collections::HashMap::new();
+    if pids.is_empty() {
+        return map;
+    }
+    let mut ports_by_inode: std::collections::HashMap<u64, u16> = std::collections::HashMap::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(table) {
+            ports_by_inode.extend(listening_sockets(&text));
+        }
+    }
+    if ports_by_inode.is_empty() {
+        return map;
+    }
+    for &pid in pids {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let inode = target
+                .to_str()
+                .and_then(|t| t.strip_prefix("socket:["))
+                .and_then(|t| t.strip_suffix(']'))
+                .and_then(|t| t.parse::<u64>().ok());
+            if let Some(port) = inode.and_then(|i| ports_by_inode.get(&i)) {
+                let ports = map.entry(pid).or_default();
+                if !ports.contains(port) {
+                    ports.push(*port);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// `(inode, port)` of each LISTEN socket in a `/proc/net/tcp`-format table.
+#[cfg(any(target_os = "linux", test))]
+fn listening_sockets(table: &str) -> Vec<(u64, u16)> {
+    const LISTEN: &str = "0A";
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 10 || f[3] != LISTEN {
+                return None;
+            }
+            let port = u16::from_str_radix(f[1].rsplit(':').next()?, 16).ok()?;
+            let inode = f[9].parse::<u64>().ok()?;
+            (inode != 0).then_some((inode, port))
+        })
+        .collect()
+}
+
 /// Listening TCP ports per pid (one `lsof` call for all of them).
+#[cfg(not(target_os = "linux"))]
 pub fn listening_ports(pids: &[u32]) -> std::collections::HashMap<u32, Vec<u16>> {
     let mut map: std::collections::HashMap<u32, Vec<u16>> = std::collections::HashMap::new();
     if pids.is_empty() {
@@ -266,5 +327,15 @@ mod proc_tests {
             ports.get(&me).is_some_and(|p| p.contains(&port)),
             "{ports:?}"
         );
+    }
+
+    #[test]
+    fn listen_sockets_parsed_from_proc_net_tcp() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41234 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:A1B2 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 41235 1 0000000000000000 20 4 30 10 -1
+   2: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 100 0 0 10 0
+";
+        assert_eq!(listening_sockets(table), vec![(41234, 8080)]);
     }
 }
