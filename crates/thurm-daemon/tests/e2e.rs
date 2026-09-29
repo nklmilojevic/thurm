@@ -712,10 +712,14 @@ fn panes_killed_with_the_daemon_are_restored() {
         Response::PaneInfo(i) => i.pid.expect("shell pid"),
         other => panic!("{other:?}"),
     };
+    // The shell goes first, the worst order: the daemon sees it die before the signal lands.
     unsafe {
-        libc::kill(daemon.child.id() as libc::pid_t, libc::SIGTERM);
         libc::kill(-(shell as libc::pid_t), libc::SIGKILL);
         libc::kill(shell as libc::pid_t, libc::SIGKILL);
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    unsafe {
+        libc::kill(daemon.child.id() as libc::pid_t, libc::SIGTERM);
     }
     drop(c);
     daemon.wait_exit();
