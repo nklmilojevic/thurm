@@ -602,8 +602,24 @@ impl Inner {
             if self.reconfigured.swap(false, Ordering::SeqCst) {
                 return "the host's settings changed".into();
             }
-            if restart && ping(&local, Duration::from_secs(4)).is_err() {
-                return "the connection stopped answering".into();
+            if restart {
+                match ping(&local, Duration::from_secs(4)) {
+                    Ok((_, build)) => {
+                        // Still up, though the daemon may have been replaced in place (an
+                        // upgrade): say so again with its build, so a client whose connection
+                        // dropped with the old daemon connects again.
+                        let upgrade_available =
+                            !crate::install::same_build(thurm_proto::BUILD, &build);
+                        self.set(|s| {
+                            s.remote_build = Some(build);
+                            s.upgrade_available = upgrade_available;
+                        });
+                    }
+                    Err(PingError::Protocol(_)) => {
+                        return "the daemon there now speaks another protocol".into();
+                    }
+                    Err(_) => return "the connection stopped answering".into(),
+                }
             }
         }
     }

@@ -476,6 +476,22 @@ fn remote_workspace_over_loopback_ssh() {
     let c = connect(&local);
     wait_screen(&c, pane, "remote-42");
     drop(c);
+    // The app's connection dropped with the old daemon; its restart check finds the same
+    // tunnel healthy and says "connected" again, which is what makes the app reconnect.
+    let tunnel = sup.status().tunnel_pid;
+    let before = watch.seen.lock().len();
+    sup.kick(true);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let again = watch.seen.lock()[before..]
+            .iter()
+            .any(|s| s.phase == Phase::Connected && s.tunnel_pid == tunnel);
+        if again {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no status after a restart check");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     // 6b. The entry now names another socket: the connected tunnel is replaced, not kept
     //     because the old one still answers.
