@@ -21,6 +21,14 @@ struct SidebarTab {
     var selected: Bool
 }
 
+extension SidebarTab: Equatable {
+    static func == (a: SidebarTab, b: SidebarTab) -> Bool {
+        a.controller === b.controller && a.title == b.title && a.subtitle == b.subtitle && a.branch == b.branch
+            && a.added == b.added && a.removed == b.removed && a.status == b.status
+            && a.shortcut == b.shortcut && a.selected == b.selected
+    }
+}
+
 /// Tabs sharing a repository (or "Terminals" for the rest).
 final class SidebarGroup {
     let name: String
@@ -98,6 +106,7 @@ final class TabSplitViewController: NSSplitViewController {
         Self.collapsedByDefault = collapse
         let panes = (host.view as? TabContentView)?.views.values.map { $0 } ?? []
         panes.forEach { $0.holdGridSize = true }
+        sidebar.holdReloads = true
         togglingSidebar = true
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(saveWidth), object: nil)
         NSAnimationContext.runAnimationGroup({ ctx in
@@ -108,6 +117,7 @@ final class TabSplitViewController: NSSplitViewController {
             if !collapse { self?.placeDivider() }
             self?.view.layoutSubtreeIfNeeded()
             self?.togglingSidebar = false
+            self?.sidebar.holdReloads = false
             panes.forEach { $0.holdGridSize = false }
         })
     }
@@ -137,6 +147,19 @@ final class TabSplitViewController: NSSplitViewController {
 final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate {
     weak var controller: TerminalWindowController?
     var preferredWidth: CGFloat?
+    /// Set while the sidebar animates open or closed: a reload then would lay the rows out
+    /// again on every frame of the animation, so it waits for the end.
+    var holdReloads = false {
+        didSet {
+            guard oldValue, !holdReloads, reloadHeld else { return }
+            reloadHeld = false
+            reload()
+        }
+    }
+    private var reloadHeld = false
+    /// The rows as last shown: agents retitle their panes several times a second, which
+    /// mostly changes nothing the sidebar shows.
+    private var shown: (names: [String], tabs: [[SidebarTab]])?
 
     private let outline = NSOutlineView()
     private var groups: [SidebarGroup] = []
@@ -261,7 +284,12 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
 
     func reload() {
         guard isViewLoaded, let window = controller?.window else { return }
-        workspaceButton.title = controller.flatMap { SessionManager.shared.workspace($0.workspaceID)?.name } ?? ""
+        if holdReloads {
+            reloadHeld = true
+            return
+        }
+        let workspace = controller.flatMap { SessionManager.shared.workspace($0.workspaceID)?.name } ?? ""
+        if workspaceButton.title != workspace { workspaceButton.title = workspace }
         agents.controller = controller
         agents.reload()
         let windows = controller?.orderedTabs ?? [window]
@@ -309,6 +337,9 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             }
         }
         if !other.tabs.isEmpty { order.append(other) }
+        let names = order.map(\.name), tabs = order.map(\.tabs)
+        if let s = shown, s.names == names, s.tabs == tabs { return }
+        shown = (names, tabs)
         for g in order { g.boxes = g.tabs.map(TabBox.init) }
         groups = order
         showHeaders = groups.count > 1
@@ -536,7 +567,12 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     func reload() {
-        rows = agentRows()
+        let next = agentRows()
+        if next.count == rows.count,
+           zip(next, rows).allSatisfy({ $0.pane == $1.pane && $0.hiddenWorkspace == $1.hiddenWorkspace && $0.row == $1.row }) {
+            return
+        }
+        rows = next
         isHidden = rows.isEmpty
         let waiting = rows.filter { $0.row.status == .needsInput }.count
         let working = rows.filter { $0.row.status == .working }.count
