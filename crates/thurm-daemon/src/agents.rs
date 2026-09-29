@@ -197,6 +197,12 @@ impl AgentTracker {
         self.hook.as_ref().and_then(|h| h.session_id.as_deref())
     }
 
+    /// The pane's foreground process group now, for hooks that come between monitor ticks:
+    /// an agent can start and finish before the next one.
+    pub fn saw_foreground(&mut self, pgrp: Option<u32>) {
+        self.fg_pgrp = pgrp;
+    }
+
     /// Apply an agent hook event, sent from process group `pgrp` (the agent's). The next
     /// `update` (or `refresh`) reflects it.
     pub fn apply_hook(
@@ -544,6 +550,34 @@ mod tests {
             pid: pgrp,
             ..proc(name)
         }
+    }
+
+    #[test]
+    fn a_turn_between_monitor_ticks_is_seen() {
+        let defs = thurm_config::builtin_agents();
+        let mut t = AgentTracker::default();
+        let idle_after = Duration::from_millis(1500);
+        // The last tick saw the shell; the agent (`node …`, group 10) started after it.
+        t.update(
+            &defs,
+            Some(&proc_in("fish", 5)),
+            "",
+            Duration::ZERO,
+            idle_after,
+        );
+        t.saw_foreground(Some(10));
+        t.apply_hook(
+            Some(10),
+            "claude",
+            "Claude Code",
+            "prompt-submit",
+            None,
+            None,
+        );
+        assert_eq!(t.refresh().unwrap().unwrap().status, AgentStatus::Working);
+        t.saw_foreground(Some(10));
+        t.apply_hook(Some(10), "claude", "Claude Code", "stop", None, None);
+        assert_eq!(t.refresh().unwrap().unwrap().status, AgentStatus::Done);
     }
 
     #[test]

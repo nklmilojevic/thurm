@@ -1712,6 +1712,7 @@ impl Daemon {
                     .map_or_else(|| agent.clone(), |d| d.name.clone());
                 let (info, events) = self.with_pane(pane, |_, st| {
                     let before = st.info.agent.clone();
+                    st.agent.saw_foreground(st.pty.foreground_pgrp());
                     st.agent
                         .apply_hook(pgrp, &agent, &name, &event, session_id, message);
                     st.agent.titles = titles;
