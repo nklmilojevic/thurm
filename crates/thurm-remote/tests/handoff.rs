@@ -332,3 +332,69 @@ fn registry_round_trip() {
     assert!(reg.get(&h.id).is_none());
     assert_eq!(f.host.name(), "devbox");
 }
+
+#[test]
+fn concurrent_registry_writes_keep_every_handoff() {
+    let f = Fixture::new("registry-race");
+    let path = f.dir.join("state/handoffs.json");
+    let template = handoff::prepare(&f.host, &f.repo, None).unwrap();
+    std::thread::scope(|s| {
+        for t in 0..8 {
+            let (path, template) = (path.clone(), template.clone());
+            s.spawn(move || {
+                let reg = Registry { path };
+                for i in 0..20 {
+                    let mut h = template.clone();
+                    h.id = format!("{t}-{i}");
+                    reg.put(&h).unwrap();
+                    reg.update(&h.id, |h| h.pane = Some(i)).unwrap();
+                }
+            });
+        }
+    });
+    let all = Registry { path: path.clone() }.list();
+    assert_eq!(all.len(), 160);
+    assert!(all.iter().all(|h| h.pane.is_some()));
+    let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty());
+}
+
+#[test]
+fn a_fetch_neither_revives_a_removed_handoff_nor_resets_its_pane() {
+    let f = Fixture::new("registry-fetch");
+    let reg = Registry {
+        path: f.dir.join("state/handoffs.json"),
+    };
+    let mut h = handoff::prepare(&f.host, &f.repo, None).unwrap();
+    reg.put(&h).unwrap();
+    // The pane is recorded while a fetch that read the handoff earlier is still running.
+    reg.update(&h.id, |x| x.pane = Some(9)).unwrap();
+    handoff::fetch(&f.host, &mut h).unwrap();
+    let stored = reg.record_fetch(&h).unwrap().unwrap();
+    assert_eq!(stored.pane, Some(9));
+    assert_eq!(stored.fetched, h.fetched);
+    // Cleaned up meanwhile: it stays gone.
+    reg.remove(&h.id).unwrap();
+    assert!(reg.record_fetch(&h).unwrap().is_none());
+    assert!(reg.update(&h.id, |x| x.pane = None).unwrap().is_none());
+    assert!(reg.list().is_empty());
+}
+
+#[test]
+fn concurrent_snapshots_of_one_repository() {
+    let f = Fixture::new("snapshot-race");
+    std::fs::write(f.repo.join("README"), "edited\n").unwrap();
+    let snaps: Vec<_> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..6)
+            .map(|_| s.spawn(|| handoff::snapshot(&f.repo)))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap().unwrap()).collect()
+    });
+    let tree = |c: &str| git(&f.repo, &["rev-parse", &format!("{c}^{{tree}}")]);
+    let first = tree(&snaps[0].commit);
+    assert!(snaps.iter().all(|s| s.wip && tree(&s.commit) == first));
+}

@@ -308,7 +308,12 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         let manager = SessionManager.shared
         if manager.isTerminating || closingWithoutConfirmation { return true }
         let busy = content.paneIds.compactMap { manager.panes[$0] }.filter { $0.hasRunningProcess }
-        if manager.config.confirmClose && !busy.isEmpty {
+        var handoffChoice = SessionManager.HandoffClose.keepWorktree
+        if let handoff = handoffID, Remotes.shared.handoffs[handoff] != nil {
+            // Before any pane is closed: that stops the agent.
+            handoffChoice = manager.askHandoffTabClose(handoff)
+            if handoffChoice == .cancel { return false }
+        } else if manager.config.confirmClose && !busy.isEmpty {
             let names = busy.compactMap { $0.foregroundName }.joined(separator: ", ")
             let alert = NSAlert()
             alert.messageText = "Close this tab?"
@@ -321,9 +326,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         for id in content.paneIds {
             manager.sendClosePane(id)
         }
-        if let handoff = handoffID {
-            // After the window is gone: offer to remove the worktree on the host.
-            DispatchQueue.main.async { manager.handoffTabClosed(handoff) }
+        if let handoff = handoffID, handoffChoice == .removeWorktree {
+            DispatchQueue.main.async { manager.removeHandoffWorktree(handoff) }
         }
         return true
     }

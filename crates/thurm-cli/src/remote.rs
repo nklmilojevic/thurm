@@ -442,13 +442,13 @@ pub fn handoff_cmd(o: HandoffOptions, json: bool) -> R {
                     println!("{}", out.message);
                 }
                 Err(e) => {
-                    reg.put(&h)?;
+                    reg.record_fetch(&h)?;
                     return Err(format!("{e}; pass --force to remove it anyway").into());
                 }
             }
         } else {
             let res = handoff::fetch(&host, &mut h);
-            reg.put(&h)?;
+            reg.record_fetch(&h)?;
             let sha = res?;
             println!("{} → {sha}", h.tracking_ref());
         }

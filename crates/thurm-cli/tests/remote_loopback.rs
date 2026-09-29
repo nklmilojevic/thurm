@@ -432,6 +432,18 @@ fn remote_workspace_over_loopback_ssh() {
     wait_screen(&c, pane, "remote-42");
     drop(c);
 
+    // 6b. The entry now names another socket: the connected tunnel is replaced, not kept
+    //     because the old one still answers.
+    let moved = w.base.join("rrun/moved.sock");
+    let _moved = fake_old_daemon(&moved);
+    sup.update(remote("loop", Some(moved.display().to_string())))
+        .unwrap();
+    let s = watch.wait(&sup, Phase::UpgradeNeeded, 30);
+    assert!(
+        s.message.as_deref().unwrap_or("").contains("protocol 12"),
+        "{s:?}"
+    );
+
     // 7. The app goes away: the CLI says the host is not connected, and fails.
     drop(sup);
     let out = cli(&w, &["--remote", "loop", "agents"]);

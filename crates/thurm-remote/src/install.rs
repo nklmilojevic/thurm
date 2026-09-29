@@ -272,6 +272,8 @@ pub fn install(
                 "TH=\"${THURM_HOME:-$HOME}\"; ",
                 "PATH=\"$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:$PATH\"; export PATH; ",
                 "N=\"nix --extra-experimental-features nix-command --extra-experimental-features flakes\"; ",
+                // Build first: a failed fetch or build must not cost the working install.
+                "$N build --no-link \"$1\" || exit $?; ",
                 "$N profile remove thurm >/dev/null 2>&1; ",
                 "$N profile install \"$1\" && rm -f \"$TH/.local/share/thurm/bin/thurm\" \"$TH/.local/share/thurm/bin/thurmd\""
             );

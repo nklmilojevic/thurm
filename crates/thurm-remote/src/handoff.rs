@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -189,7 +190,13 @@ pub fn snapshot(repo: &Path) -> Result<Snapshot, String> {
     let head = git_out(repo, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])
         .map_err(|_| "the repository has no commits yet; commit something first".to_owned())?;
     let git_dir = PathBuf::from(git_out(repo, &["rev-parse", "--absolute-git-dir"])?);
-    let index = git_dir.join(format!("thurm-handoff-index-{}", std::process::id()));
+    // One index per snapshot: the app may snapshot the same repository concurrently.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let index = git_dir.join(format!(
+        "thurm-handoff-index-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     let with_index = |args: &[&str]| {
         let mut c = git(repo);
         c.env("GIT_INDEX_FILE", &index).args(args);
@@ -673,31 +680,96 @@ impl Registry {
 
     /// Inserts or replaces (by id).
     pub fn put(&self, h: &Handoff) -> Result<(), String> {
-        let mut all = self.list();
-        match all.iter_mut().find(|x| x.id == h.id) {
+        self.edit(|all| match all.iter_mut().find(|x| x.id == h.id) {
             Some(x) => *x = h.clone(),
             None => all.push(h.clone()),
-        }
-        self.write(all)
+        })
+    }
+
+    /// Changes the handoff `id` in place and answers it; `None` when it is gone (cleaned
+    /// up meanwhile), which it stays.
+    pub fn update(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut Handoff),
+    ) -> Result<Option<Handoff>, String> {
+        let mut out = None;
+        self.edit(|all| {
+            if let Some(h) = all.iter_mut().find(|h| h.id == id) {
+                f(h);
+                out = Some(h.clone());
+            }
+        })?;
+        Ok(out)
+    }
+
+    /// Keeps what a fetch (or a cleanup's final fetch) learned in `h`, leaving the rest of
+    /// the stored handoff (its pane, a deferred cleanup) as it is now.
+    pub fn record_fetch(&self, h: &Handoff) -> Result<Option<Handoff>, String> {
+        self.update(&h.id, |x| {
+            x.fetched = h.fetched.clone();
+            x.fetched_at = h.fetched_at;
+            x.fetch_error = h.fetch_error.clone();
+        })
     }
 
     pub fn remove(&self, id: &str) -> Result<(), String> {
-        let mut all = self.list();
-        all.retain(|h| h.id != id);
-        self.write(all)
+        self.edit(|all| all.retain(|h| h.id != id))
     }
 
-    fn write(&self, handoffs: Vec<Handoff>) -> Result<(), String> {
+    /// Read, change, write under an exclusive lock on `<path>.lock`, which the app's
+    /// threads and the CLI all take.
+    fn edit(&self, f: impl FnOnce(&mut Vec<Handoff>)) -> Result<(), String> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        let json =
-            serde_json::to_string_pretty(&RegistryFile { handoffs }).map_err(|e| e.to_string())?;
-        let tmp = self
-            .path
-            .with_extension(format!("json.tmp{}", std::process::id()));
+        let _lock = FileLock::acquire(&self.path.with_extension("json.lock"))?;
+        let mut all = self.list();
+        f(&mut all);
+        let json = serde_json::to_string_pretty(&RegistryFile { handoffs: all })
+            .map_err(|e| e.to_string())?;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tmp = self.path.with_extension(format!(
+            "json.tmp{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
+        std::fs::rename(&tmp, &self.path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })
+    }
+}
+
+/// `flock(LOCK_EX)` on a file, released on drop (and by the kernel if the process dies).
+struct FileLock(std::fs::File);
+
+impl FileLock {
+    fn acquire(path: &Path) -> Result<FileLock, String> {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(FileLock(file));
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(format!("locking {}: {e}", path.display()));
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 

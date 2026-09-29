@@ -89,8 +89,20 @@ final class Remotes {
     private(set) var statuses: [HostId: RemoteStatus] = [:]
     /// Agent presets of each connected host (its own config decides what runs there).
     var presets: [HostId: [AgentPreset]] = [:]
-    /// Panes closed while their host was offline: closed there once it is back.
-    var pendingCloses: [HostId: Set<UInt64>] = [:]
+    /// Panes closed while their host was offline: closed there once it is back. Kept across
+    /// launches, or a pane closed before quitting would come back as an unknown tab.
+    var pendingCloses: [HostId: Set<UInt64>] = Remotes.loadPendingCloses() {
+        didSet {
+            let plist = pendingCloses.filter { !$0.value.isEmpty }.mapValues { $0.map(String.init).sorted() }
+            UserDefaults.standard.set(plist, forKey: Remotes.pendingClosesKey)
+        }
+    }
+    private static let pendingClosesKey = "PendingRemotePaneCloses"
+
+    private static func loadPendingCloses() -> [HostId: Set<UInt64>] {
+        let saved = UserDefaults.standard.dictionary(forKey: pendingClosesKey) as? [String: [String]] ?? [:]
+        return saved.mapValues { Set($0.compactMap { UInt64($0) }) }
+    }
     private(set) var handoffs: [String: HandoffInfo] = [:]
     /// The last fetch of a handoff failed (shown on its tab until the next one succeeds).
     var handoffErrors: [String: String] = [:]
@@ -531,15 +543,30 @@ extension SessionManager {
     }
 
     /// A handoff tab closed: offer to remove its worktree on the host.
-    func handoffTabClosed(_ id: String) {
-        guard let h = Remotes.shared.handoffs[id] else { return }
+    enum HandoffClose { case cancel, removeWorktree, keepWorktree }
+
+    /// Asked before a handoff's tab closes: closing stops the agent, so the only way to keep
+    /// it running is not to close.
+    func askHandoffTabClose(_ id: String) -> HandoffClose {
+        guard let h = Remotes.shared.handoffs[id] else { return .keepWorktree }
         let alert = NSAlert()
-        alert.messageText = "Remove the handoff worktree on \(h.host)?"
-        alert.informativeText = "\(h.branch) in \(h.worktree). Committed work is fetched first; the branch stays "
-            + "on \(h.host) unless your default branch contains it."
-        alert.addButton(withTitle: "Remove Worktree")
-        alert.addButton(withTitle: "Keep")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        alert.messageText = "Close the handoff on \(h.host)?"
+        alert.informativeText = "Closing the tab stops the agent. You can also remove its worktree, "
+            + "\(h.branch) in \(h.worktree): committed work is fetched first, and the branch stays on "
+            + "\(h.host) unless your default branch contains it."
+        alert.addButton(withTitle: "Close and Remove Worktree")
+        alert.addButton(withTitle: "Close, Keep Worktree")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return .removeWorktree
+        case .alertSecondButtonReturn: return .keepWorktree
+        default: return .cancel
+        }
+    }
+
+    /// The handoff's tab closed and its worktree is to go.
+    func removeHandoffWorktree(_ id: String) {
+        guard let h = Remotes.shared.handoffs[id] else { return }
         guard Core.shared.isConnected(h.host) else {
             _ = Core.shared.remoteCall(["op": "handoff_defer", "id": id])
             currentController?.content.focusedView?.showToast(

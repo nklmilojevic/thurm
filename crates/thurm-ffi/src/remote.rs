@@ -281,15 +281,15 @@ fn call(c: Call) -> Result<Value, String> {
             json!(h)
         }
         Call::HandoffSetPane { id, pane } => {
-            let mut h = handoff(&id)?;
-            h.pane = pane;
-            reg.put(&h)?;
+            let h = reg
+                .update(&id, |h| h.pane = pane)?
+                .ok_or_else(|| format!("no handoff {id:?}"))?;
             json!(h)
         }
         Call::HandoffFetch { id } => {
             let mut h = handoff(&id)?;
             let res = handoff::fetch(&host_for(&h.host)?, &mut h);
-            reg.put(&h)?;
+            let h = reg.record_fetch(&h)?.unwrap_or(h);
             match res {
                 Ok(_) => json!(h),
                 Err(e) => return Err(e),
@@ -307,15 +307,15 @@ fn call(c: Call) -> Result<Value, String> {
                     json!(out)
                 }
                 Err(e) => {
-                    reg.put(&h)?;
+                    reg.record_fetch(&h)?;
                     return Err(e);
                 }
             }
         }
         Call::HandoffDefer { id } => {
-            let mut h = handoff(&id)?;
-            h.pending_cleanup = true;
-            reg.put(&h)?;
+            let h = reg
+                .update(&id, |h| h.pending_cleanup = true)?
+                .ok_or_else(|| format!("no handoff {id:?}"))?;
             json!(h)
         }
         Call::HandoffList => json!(reg.list()),

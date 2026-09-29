@@ -206,6 +206,8 @@ struct Inner {
     status: Mutex<Status>,
     /// Retry now; with `restart`, also drop a connected tunnel first.
     wake: Mutex<Option<bool>>,
+    /// The host or socket was edited: a connected tunnel goes to the old one, replace it.
+    reconfigured: AtomicBool,
     cond: Condvar,
     stop: AtomicBool,
     listener: Listener,
@@ -232,6 +234,7 @@ impl Supervisor {
             remote: Mutex::new(remote),
             ssh: Mutex::new(ssh),
             wake: Mutex::new(None),
+            reconfigured: AtomicBool::new(false),
             cond: Condvar::new(),
             stop: AtomicBool::new(false),
             listener: Box::new(listener),
@@ -265,18 +268,24 @@ impl Supervisor {
         self.inner.cond.notify_all();
     }
 
-    /// Picks up an edited `[[remote]]` entry (the tunnel restarts when the host changed).
+    /// Picks up an edited `[[remote]]` entry (the tunnel is replaced when the host or the
+    /// socket changed).
     pub fn update(&self, remote: RemoteConfig) -> Result<(), String> {
         let ssh = Ssh::new(&remote.host)?;
-        let changed = {
+        let (changed, moved) = {
             let mut cur = self.inner.remote.lock();
             let changed = *cur != remote;
-            *cur = remote;
-            changed
+            let moved = cur.host != remote.host || cur.socket != remote.socket;
+            *cur = remote.clone();
+            (changed, moved)
         };
-        if changed {
+        if moved {
             let extra = self.inner.ssh.lock().extra.clone();
             *self.inner.ssh.lock() = Ssh { extra, ..ssh };
+            self.inner.status.lock().host = remote.host;
+            self.inner.reconfigured.store(true, Ordering::SeqCst);
+        }
+        if changed {
             self.kick(true);
         }
         Ok(())
@@ -448,6 +457,8 @@ impl Inner {
     }
 
     fn connect(&self) -> Result<Tunnel, Failure> {
+        // This attempt uses the current settings.
+        self.reconfigured.store(false, Ordering::SeqCst);
         let ssh = self.ssh.lock().clone();
         let configured_socket = self.remote.lock().socket.clone();
         crate::ssh::prepare_dir().map_err(|e| Failure::Attention(e.to_string()))?;
@@ -587,6 +598,9 @@ impl Inner {
             }
             if !self.remote.lock().enabled {
                 return "disabled".into();
+            }
+            if self.reconfigured.swap(false, Ordering::SeqCst) {
+                return "the host's settings changed".into();
             }
             if restart && ping(&local, Duration::from_secs(4)).is_err() {
                 return "the connection stopped answering".into();

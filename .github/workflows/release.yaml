@@ -251,7 +251,8 @@ jobs:
           echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
           echo "SPARKLE_KEY_FILE=$RUNNER_TEMP/sparkle-ed25519" >> "$GITHUB_ENV"
 
-      - uses: actions/download-artifact@v5
+      # Pinned: this job holds the signing keys and a release-write token.
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           pattern: linux-*
           path: ${{ runner.temp }}/linux

@@ -619,6 +619,11 @@ final class SessionManager: NSObject, CoreDelegate {
 
     /// Cmd+W: close the focused pane (confirming when a program is running).
     func userClosePane(_ id: PaneKey) {
+        // A handoff tab's last pane: close the tab, which asks about the agent and its worktree.
+        if let c = controller(for: id), c.handoffID != nil, c.content.paneIds == [id] {
+            c.window?.performClose(nil)
+            return
+        }
         if config.confirmClose, let info = panes[id], info.hasRunningProcess {
             let alert = NSAlert()
             alert.messageText = "Close this pane?"
