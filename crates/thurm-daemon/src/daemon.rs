@@ -235,6 +235,9 @@ impl Daemon {
         v
     }
 
+    /// Sends `event` to every client (`ui_only`: the apps). A pane's state and notifications
+    /// are sent with the pane locked, so they arrive in the order they happened. Pane lock,
+    /// then client lock, never the other way round.
     fn broadcast(&self, event: Event, ui_only: bool) {
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
         for c in clients {
@@ -744,9 +747,9 @@ impl Daemon {
             if info_changed {
                 outgoing.push(Event::PaneInfo(st.info.clone()));
             }
-        }
-        for ev in outgoing {
-            self.broadcast(ev, true);
+            for ev in outgoing {
+                self.broadcast(ev, true);
+            }
         }
     }
 
@@ -816,16 +819,11 @@ impl Daemon {
         while let Ok((id, cwd)) = self.git_rx.recv() {
             let info = crate::git::probe(&cwd);
             let Some(pane) = self.pane(id) else { continue };
-            let changed = {
-                let mut st = pane.state.lock();
-                st.git_pending = false;
-                (st.info.git != info).then(|| {
-                    st.info.git = info;
-                    st.info.clone()
-                })
-            };
-            if let Some(info) = changed {
-                self.broadcast(Event::PaneInfo(info), false);
+            let mut st = pane.state.lock();
+            st.git_pending = false;
+            if st.info.git != info {
+                st.info.git = info;
+                self.broadcast(Event::PaneInfo(st.info.clone()), false);
             }
         }
     }
@@ -845,7 +843,10 @@ impl Daemon {
                         .ask(&ai::title(&agent, prompt.as_deref(), &screen))
                         .ok()
                         .and_then(|t| ai::clean_title(&t));
-                    self.update_agent(pane, |st| st.agent.set_ai_topic(topic));
+                    self.update_agent(pane, |st| {
+                        st.agent.set_ai_topic(topic);
+                        Vec::new()
+                    });
                 }
                 AiJob::Status {
                     pane,
@@ -877,32 +878,28 @@ impl Daemon {
                         ai::attention(&agent, hint.as_deref(), &screen)
                     };
                     let detail = self.ai.ask(&ask).ok().and_then(|t| ai::clean_detail(&t));
-                    let mut current = false;
-                    let mut permission = None;
                     self.update_agent(pane, |st| {
-                        current = st.agent.episode() == episode;
-                        permission = st.agent.permission_prompt();
+                        let current = st.agent.episode() == episode;
+                        let permission = st.agent.permission_prompt();
                         if let Some(d) = &detail {
                             st.agent.set_ai_detail(episode, d.clone());
                         }
-                    });
-                    // The user already answered (or the agent moved on): old news.
-                    if let (Some((title, body)), true) = (notify, current) {
+                        // The user already answered (or the agent moved on): old news.
+                        let Some((title, body)) = notify.filter(|_| current) else {
+                            return Vec::new();
+                        };
                         let body = match (&detail, done) {
                             (Some(d), true) => format!("{d} ({body})"),
                             (Some(d), false) => d.clone(),
                             (None, _) => body,
                         };
-                        self.broadcast(
-                            Event::Notify {
-                                pane,
-                                title,
-                                body,
-                                permission,
-                            },
-                            true,
-                        );
-                    }
+                        vec![Event::Notify {
+                            pane,
+                            title,
+                            body,
+                            permission,
+                        }]
+                    });
                 }
             }
         }
@@ -910,19 +907,17 @@ impl Daemon {
 
     /// Applies `f` to a pane's state, then re-derives its agent state and title and tells
     /// clients when they changed.
-    fn update_agent(&self, pane: PaneId, f: impl FnOnce(&mut PaneState)) {
+    fn update_agent(&self, pane: PaneId, f: impl FnOnce(&mut PaneState) -> Vec<Event>) {
         let Some(p) = self.pane(pane) else { return };
-        let info = {
-            let mut st = p.state.lock();
-            f(&mut st);
-            st.agent.refresh().map(|new| {
-                st.info.agent = new;
-                st.info.title = pane_title(&st, st.info.foreground.as_ref());
-                st.info.clone()
-            })
-        };
-        if let Some(info) = info {
-            self.broadcast(Event::PaneInfo(info), false);
+        let mut st = p.state.lock();
+        let events = f(&mut st);
+        if let Some(new) = st.agent.refresh() {
+            st.info.agent = new;
+            st.info.title = pane_title(&st, st.info.foreground.as_ref());
+            self.broadcast(Event::PaneInfo(st.info.clone()), false);
+        }
+        for ev in events {
+            self.broadcast(ev, true);
         }
     }
 
@@ -1091,9 +1086,11 @@ impl Daemon {
                     if cmp != before || tick.is_multiple_of(4) {
                         events.push(Event::PaneInfo(st.info.clone()));
                     }
-                }
-                for ev in events {
-                    self.broadcast(ev, true);
+                    // Under the pane's lock, as everywhere: a state taken before a hook's must
+                    // not reach clients after it.
+                    for ev in events {
+                        self.broadcast(ev, true);
+                    }
                 }
             }
             if self.store.is_some()
@@ -1603,7 +1600,7 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::Focus { pane, focused } => {
-                let info = self.with_pane(pane, |p, st| {
+                self.with_pane(pane, |p, st| {
                     if let Some(b) = st.term.focus(focused) {
                         p.write(b);
                     }
@@ -1612,14 +1609,10 @@ impl Daemon {
                         st.agent.acknowledge();
                         if let Some(new) = st.agent.refresh() {
                             st.info.agent = new;
-                            return Some(st.info.clone());
+                            self.broadcast(Event::PaneInfo(st.info.clone()), false);
                         }
                     }
-                    None
                 })?;
-                if let Some(info) = info {
-                    self.broadcast(Event::PaneInfo(info), false);
-                }
                 Ok(Response::Ok)
             }
             Request::Subscribe { pane } => {
@@ -1731,7 +1724,7 @@ impl Daemon {
                     .iter()
                     .find(|d| d.kind == agent)
                     .map_or_else(|| agent.clone(), |d| d.name.clone());
-                let (info, events) = self.with_pane(pane, |_, st| {
+                self.with_pane(pane, |_, st| {
                     let before = st.info.agent.clone();
                     st.agent.saw_foreground(st.pty.foreground_pgrp());
                     st.agent
@@ -1742,22 +1735,17 @@ impl Daemon {
                     if transcript_path.is_some() || event == "session-start" {
                         st.agent.read_transcript(transcript_path.as_deref());
                     }
-                    let mut events = Vec::new();
-                    let mut info = None;
                     if let Some(new) = st.agent.refresh() {
-                        events = self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
+                        let events =
+                            self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
                         st.info.agent = new;
                         st.info.title = pane_title(st, st.info.foreground.as_ref());
-                        info = Some(st.info.clone());
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                        for ev in events {
+                            self.broadcast(ev, true);
+                        }
                     }
-                    (info, events)
                 })?;
-                if let Some(info) = info {
-                    self.broadcast(Event::PaneInfo(info), false);
-                }
-                for ev in events {
-                    self.broadcast(ev, true);
-                }
                 self.session_dirty.store(true, Ordering::Relaxed);
                 Ok(Response::Ok)
             }
@@ -1789,6 +1777,7 @@ impl Daemon {
                         p.write(keys.to_vec());
                         answered = true;
                     }
+                    Vec::new()
                 });
                 if !answered {
                     return Err("that permission prompt is no longer showing".into());
