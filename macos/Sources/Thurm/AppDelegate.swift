@@ -80,6 +80,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         SessionManager.shared.reloadConfig(notifyDaemon: true)
     }
 
+    @objc func showRemotes(_ sender: Any?) {
+        RemotesWindow.shared.show()
+    }
+
     @objc func showProcesses(_ sender: Any?) {
         ProcessPanel.shared.show()
     }

@@ -5,6 +5,7 @@
 //! (0 ok, 1 error, 124 wait timeout).
 
 mod hooks;
+mod remote;
 
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
@@ -26,8 +27,52 @@ struct Cli {
     /// Machine readable JSON output.
     #[arg(long, global = true)]
     json: bool,
+    /// Talk to this `[[remote]]` host's daemon, through the tunnel Thurm keeps open to it.
+    #[arg(long, global = true, value_name = "NAME")]
+    remote: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// `--remote` is in effect: pane ids are the remote daemon's, so `$THURM_PANE_ID` (a pane of
+/// this machine) is not a default.
+static REMOTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn remote_mode() -> bool {
+    REMOTE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Subcommand)]
+enum RemoteCmd {
+    /// Add a host: checks the connection, offers to install Thurm there, writes `[[remote]]`.
+    Add {
+        name: String,
+        /// ssh target: a Host alias, user@host, or ssh://user@host:port.
+        target: String,
+        /// The daemon's socket there (default: what `thurm socket-path` prints there).
+        #[arg(long)]
+        socket: Option<String>,
+        /// Answer yes to every question.
+        #[arg(long, short = 'y', conflicts_with = "no")]
+        yes: bool,
+        /// Answer no to every question.
+        #[arg(long)]
+        no: bool,
+    },
+    /// List hosts and their connection state.
+    #[command(alias = "ls")]
+    List,
+    /// Forget a host (its daemon and panes keep running there).
+    #[command(alias = "rm")]
+    Remove { name: String },
+    /// Connection state of one host (or all).
+    Status { name: Option<String> },
+    /// Install this build of Thurm on a host, and upgrade its daemon in place.
+    Install {
+        name: String,
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -234,6 +279,42 @@ enum Cmd {
     },
     /// Print the config file path.
     ConfigPath,
+    /// Print the daemon socket path (what `thurmd` and `thurm` use by default).
+    SocketPath,
+    /// What this `thurm` is (build, protocol, socket) as JSON; read by the app over ssh.
+    #[command(hide = true)]
+    RemoteInfo,
+    /// Remote workspaces: thurmd on other machines, reached with ssh.
+    Remote {
+        #[command(subcommand)]
+        action: RemoteCmd,
+    },
+    /// Hand the repository here to an agent on a remote host: pushes a snapshot (uncommitted
+    /// changes included) to a worktree there and opens a tab running PRESET in it. Committed
+    /// results come back as refs/remotes/thurm-<host>/agent/<name>. Needs --remote.
+    Handoff {
+        /// Agent preset to start (see `thurm --remote NAME presets`); a shell when omitted.
+        #[arg(long)]
+        preset: Option<String>,
+        /// Branch to create: agent/<name> (default: a generated name).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Repository (default: the current directory).
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+        /// List handoffs.
+        #[arg(long, conflicts_with_all = ["fetch", "cleanup"])]
+        list: bool,
+        /// Fetch a handoff's committed work now.
+        #[arg(long, value_name = "ID", conflicts_with = "cleanup")]
+        fetch: Option<String>,
+        /// Remove a handoff's worktree on its host (after a final fetch).
+        #[arg(long, value_name = "ID")]
+        cleanup: Option<String>,
+        /// With --cleanup: remove even with uncommitted or unfetched work.
+        #[arg(long)]
+        force: bool,
+    },
     /// Install, remove or check the agent hooks that report status to Thurm
     /// (Claude Code: ~/.claude/settings.json).
     Hooks {
@@ -383,6 +464,12 @@ fn current_pane(p: Option<PaneId>) -> Result<PaneId, String> {
     if let Some(p) = p {
         return Ok(p);
     }
+    if remote_mode() {
+        return Err(
+            "with --remote, name the remote pane with --pane (see `thurm --remote NAME list`)"
+                .into(),
+        );
+    }
     std::env::var(ENV_PANE_ID)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -393,7 +480,82 @@ type R = Result<ExitCode, Box<dyn std::error::Error>>;
 
 fn run(cli: Cli) -> R {
     let json = cli.json;
+    let remote = cli.remote.clone();
+    if remote.is_some() {
+        REMOTE.store(true, std::sync::atomic::Ordering::Relaxed);
+        if matches!(
+            cli.cmd,
+            Cmd::PaneId
+                | Cmd::ConfigPath
+                | Cmd::SocketPath
+                | Cmd::RemoteInfo
+                | Cmd::Notify { .. }
+                | Cmd::Daemon { .. }
+                | Cmd::AgentHook { .. }
+                | Cmd::Hooks { .. }
+                | Cmd::Remote { .. }
+                | Cmd::Theme { .. }
+                | Cmd::Set { .. }
+                | Cmd::Reload
+        ) {
+            return Err(
+                "--remote works with commands that talk to a daemon's panes \
+                        (agents, list, capture, send, wait, launch, ...) and handoff"
+                    .into(),
+            );
+        }
+    }
     match cli.cmd {
+        Cmd::SocketPath => {
+            println!("{}", thurm_config::socket_path().display());
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::RemoteInfo => remote::remote_info(),
+        Cmd::Remote { action } => match action {
+            RemoteCmd::Add {
+                name,
+                target,
+                socket,
+                yes,
+                no,
+            } => remote::add(remote::AddOptions {
+                name,
+                target,
+                socket,
+                assume: if yes {
+                    Some(true)
+                } else if no {
+                    Some(false)
+                } else {
+                    None
+                },
+            }),
+            RemoteCmd::List => remote::list(json),
+            RemoteCmd::Remove { name } => remote::remove(&name),
+            RemoteCmd::Status { name } => remote::status(name.as_deref(), json),
+            RemoteCmd::Install { name, yes } => remote::install_cmd(&name, yes.then_some(true)),
+        },
+        Cmd::Handoff {
+            preset,
+            branch,
+            path,
+            list,
+            fetch,
+            cleanup,
+            force,
+        } => remote::handoff_cmd(
+            remote::HandoffOptions {
+                remote,
+                preset,
+                branch,
+                path,
+                list,
+                fetch,
+                cleanup,
+                force,
+            },
+            json,
+        ),
         Cmd::PaneId => {
             println!("{}", current_pane(None)?);
             Ok(ExitCode::SUCCESS)
@@ -445,7 +607,10 @@ fn run(cli: Cli) -> R {
             Ok(ExitCode::SUCCESS)
         }
         cmd => {
-            let client = connect(true)?;
+            let client = match &remote {
+                Some(name) => remote::connect_remote(name)?,
+                None => connect(true)?,
+            };
             run_connected(&client, cmd, json)
         }
     }
@@ -1110,6 +1275,10 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
         }
         Cmd::PaneId
         | Cmd::ConfigPath
+        | Cmd::SocketPath
+        | Cmd::RemoteInfo
+        | Cmd::Remote { .. }
+        | Cmd::Handoff { .. }
         | Cmd::Notify { .. }
         | Cmd::Daemon { .. }
         | Cmd::AgentHook { .. }
@@ -1148,9 +1317,8 @@ fn create(
     agent_preset: Option<String>,
 ) -> Result<PaneId, Box<dyn std::error::Error>> {
     let cwd = cwd.or_else(|| {
-        // Outside Thurm, default to the caller's directory.
-        inherit
-            .is_none()
+        // Outside Thurm, default to the caller's directory (not a path on a remote host).
+        (inherit.is_none() && !remote_mode())
             .then(|| {
                 std::env::current_dir()
                     .ok()
@@ -1331,5 +1499,29 @@ mod tests {
             _ => panic!(),
         }
         assert!(Cli::try_parse_from(["thurm", "wait", "--agent-free", "-t", "30"]).is_ok());
+        let c = Cli::try_parse_from(["thurm", "--remote", "devbox", "agents"]).unwrap();
+        assert_eq!(c.remote.as_deref(), Some("devbox"));
+        let c = Cli::try_parse_from([
+            "thurm",
+            "wait",
+            "--remote",
+            "devbox",
+            "--agent-done",
+            "-p",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(c.remote.as_deref(), Some("devbox"));
+        assert!(
+            Cli::try_parse_from(["thurm", "remote", "add", "devbox", "me@devbox", "-y"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "thurm", "handoff", "--remote", "devbox", "--preset", "claude", "--branch",
+                "agent/x"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["thurm", "handoff", "--list", "--fetch", "x"]).is_err());
     }
 }

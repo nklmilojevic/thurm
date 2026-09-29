@@ -2,17 +2,47 @@ import Foundation
 import QuartzCore
 import CThurm
 
+/// A daemon the app talks to: this Mac's (`localHost`) or a `[[remote]]` host's, by name.
+typealias HostId = String
+
+/// This Mac's own daemon.
+let localHost: HostId = "local"
+
+/// A pane is identified by its daemon and that daemon's id: two daemons number their panes
+/// independently, so ids alone collide.
+struct PaneKey: Hashable, CustomStringConvertible {
+    let host: HostId
+    let id: UInt64
+
+    init(_ host: HostId, _ id: UInt64) {
+        self.host = host
+        self.id = id
+    }
+
+    static func local(_ id: UInt64) -> PaneKey { PaneKey(localHost, id) }
+
+    var isRemote: Bool { host != localHost }
+    /// The id as request payloads carry it.
+    var number: NSNumber { NSNumber(value: id) }
+    var description: String { isRemote ? "\(host):\(id)" : "\(id)" }
+}
+
 /// Receives daemon events, always on the main thread.
 protocol CoreDelegate: AnyObject {
-    func coreDidReceiveEvent(_ name: String, payload: Any?)
+    func coreDidReceiveEvent(_ name: String, payload: Any?, host: HostId)
 }
 
 /// Identifies one connection. Passed as the C callback context so that events from an old,
-/// already replaced connection (e.g. its late "Disconnected") can be ignored.
+/// already replaced connection (e.g. its late "Disconnected") can be ignored, and so events
+/// and frames reach the right host's model.
 /// Tokens are intentionally never freed: the Rust side may still hold the pointer.
 final class ConnectionToken {
+    let host: HostId
     let epoch: Int
-    init(epoch: Int) { self.epoch = epoch }
+    init(host: HostId, epoch: Int) {
+        self.host = host
+        self.epoch = epoch
+    }
 }
 
 // C callbacks. They run on a Rust background thread; they must not capture context.
@@ -20,32 +50,45 @@ final class ConnectionToken {
 private let coreEventCallback: thurm_event_cb = { ctx, json in
     guard let ctx = ctx, let json = json else { return }
     let token = Unmanaged<ConnectionToken>.fromOpaque(ctx).takeUnretainedValue()
-    Core.shared.receiveEvent(String(cString: json), epoch: token.epoch)
+    Core.shared.receiveEvent(String(cString: json), host: token.host, epoch: token.epoch)
 }
 
-private let coreFrameCallback: thurm_frame_cb = { _, pane in
-    Core.shared.markDirty(pane)
+private let coreFrameCallback: thurm_frame_cb = { ctx, pane in
+    guard let ctx = ctx else { return }
+    let token = Unmanaged<ConnectionToken>.fromOpaque(ctx).takeUnretainedValue()
+    Core.shared.markDirty(PaneKey(token.host, pane))
 }
 
-/// Thin Swift wrapper around the `thurm_*` C API exported by the Rust core.
+/// Thin Swift wrapper around the `thurm_*` C API exported by the Rust core: one connection
+/// per daemon (this Mac's, and each connected remote host's through its tunnel).
 final class Core {
     static let shared = Core()
 
     weak var delegate: CoreDelegate?
 
-    /// The live connection, nil while disconnected.
-    private(set) var client: OpaquePointer?
+    private var clients: [HostId: OpaquePointer] = [:]
+    /// The last connection error of this Mac's daemon.
     var lastError: String?
 
-    private var epoch = 0
+    private var epochs: [HostId: Int] = [:]
     private var tokens: [ConnectionToken] = []
 
     private let dirtyLock = NSLock()
-    private var dirtyPanes = Set<UInt64>()
+    private var dirtyPanes = Set<PaneKey>()
 
     private init() {}
 
-    var isConnected: Bool { client != nil }
+    /// The live connection to this Mac's daemon, nil while disconnected.
+    var client: OpaquePointer? { clients[localHost] }
+
+    func client(for host: HostId) -> OpaquePointer? { clients[host] }
+
+    var isConnected: Bool { clients[localHost] != nil }
+
+    func isConnected(_ host: HostId) -> Bool { clients[host] != nil }
+
+    /// Remote hosts with a live connection.
+    var connectedRemotes: [HostId] { clients.keys.filter { $0 != localHost }.sorted() }
 
     /// `thurmd` in the bundle's `Contents/Helpers` (not `Contents/MacOS`: the CLI `thurm`
     /// would collide with `Thurm` on a case-insensitive volume), or `$THURM_DAEMON`.
@@ -59,20 +102,30 @@ final class Core {
         return fm.isExecutableFile(atPath: path) ? path : nil
     }
 
+    /// Where `thurm` and `thurmd` are, to copy onto another Mac.
+    static var helpersPath: String? {
+        daemonPath.map { ($0 as NSString).deletingLastPathComponent }
+    }
+
     /// This build's identifier; a daemon reporting another one is replaced in place.
     static let buildId = String(cString: thurm_build_id())
 
     // MARK: Connection
 
-    /// Connects (spawning the daemon when needed). Must be called on the main thread.
+    private func newToken(_ host: HostId) -> UnsafeMutableRawPointer {
+        let epoch = (epochs[host] ?? 0) + 1
+        epochs[host] = epoch
+        let token = ConnectionToken(host: host, epoch: epoch)
+        tokens.append(token)
+        return Unmanaged.passUnretained(token).toOpaque()
+    }
+
+    /// Connects to this Mac's daemon (spawning it when needed). Must be called on the main
+    /// thread.
     @discardableResult
     func connect() -> Bool {
         if client != nil { return true }
-        epoch += 1
-        let token = ConnectionToken(epoch: epoch)
-        tokens.append(token)
-        let ctx = Unmanaged.passUnretained(token).toOpaque()
-
+        let ctx = newToken(localHost)
         var err: UnsafeMutablePointer<CChar>? = nil
         var result: OpaquePointer? = nil
         if let path = Core.daemonPath {
@@ -91,22 +144,44 @@ final class Core {
             tlog("connect failed: \(lastError ?? "unknown error")")
             return false
         }
-        client = c
+        clients[localHost] = c
         lastError = nil
         return true
     }
 
+    /// Connects to `host`'s daemon through its tunnel's local socket. Returns the error.
+    @discardableResult
+    func connectRemote(_ host: HostId, socket: String) -> String? {
+        if clients[host] != nil { return nil }
+        let ctx = newToken(host)
+        var err: UnsafeMutablePointer<CChar>? = nil
+        let result = socket.withCString { sock in
+            thurm_connect_socket(sock, nil, "Thurm.app", coreEventCallback, coreFrameCallback, ctx, &err)
+        }
+        var message: String?
+        if let e = err {
+            message = String(cString: e)
+            thurm_string_free(e)
+        }
+        guard let c = result else { return message ?? "cannot connect" }
+        clients[host] = c
+        return nil
+    }
+
     /// Closes the connection on purpose. Panes keep running inside the daemon.
-    func disconnect() {
-        guard let c = client else { return }
-        client = nil
-        epoch += 1 // late events from the old connection are ignored
+    func disconnect(_ host: HostId = localHost) {
+        guard let c = clients.removeValue(forKey: host) else { return }
+        epochs[host] = (epochs[host] ?? 0) + 1 // late events from the old connection are ignored
         thurm_disconnect(c)
+    }
+
+    func disconnectAll() {
+        for host in Array(clients.keys) { disconnect(host) }
     }
 
     // MARK: Events
 
-    fileprivate func receiveEvent(_ text: String, epoch eventEpoch: Int) {
+    fileprivate func receiveEvent(_ text: String, host: HostId, epoch eventEpoch: Int) {
         // Parse on the callback thread, dispatch on main.
         guard let v = JSON.variant(JSON.decode(text)) else {
             tlog("unparseable event: \(text.prefix(200))")
@@ -116,12 +191,12 @@ final class Core {
         let payload = v.payload
         DispatchQueue.main.async {
             let core = Core.shared
-            guard eventEpoch == core.epoch else { return }
-            core.delegate?.coreDidReceiveEvent(name, payload: payload)
+            guard eventEpoch == core.epochs[host] else { return }
+            core.delegate?.coreDidReceiveEvent(name, payload: payload, host: host)
         }
     }
 
-    fileprivate func markDirty(_ pane: UInt64) {
+    fileprivate func markDirty(_ pane: PaneKey) {
         let now = Perf.enabled ? CACurrentMediaTime() : 0
         dirtyLock.lock()
         let first = dirtyPanes.insert(pane).inserted
@@ -140,16 +215,16 @@ final class Core {
 
     /// Perf: daemon frames received for `pane` since the last call, with the first and last
     /// arrival times.
-    private var arrivals: [UInt64: (count: Int, first: CFTimeInterval, last: CFTimeInterval)] = [:]
+    private var arrivals: [PaneKey: (count: Int, first: CFTimeInterval, last: CFTimeInterval)] = [:]
 
-    func takeArrivals(_ pane: UInt64) -> (count: Int, first: CFTimeInterval, last: CFTimeInterval)? {
+    func takeArrivals(_ pane: PaneKey) -> (count: Int, first: CFTimeInterval, last: CFTimeInterval)? {
         dirtyLock.lock()
         defer { dirtyLock.unlock() }
         return arrivals.removeValue(forKey: pane)
     }
 
     /// True (once) when a new frame arrived for `pane` since the last call.
-    func takeDirty(_ pane: UInt64) -> Bool {
+    func takeDirty(_ pane: PaneKey) -> Bool {
         dirtyLock.lock()
         let was = dirtyPanes.remove(pane) != nil
         dirtyLock.unlock()
@@ -158,84 +233,97 @@ final class Core {
 
     // MARK: Requests
 
-    /// Blocking request. Returns the decoded JSON response, or nil when disconnected.
+    /// Blocking request to `host`'s daemon. Returns the decoded JSON response, or nil when
+    /// disconnected.
     @discardableResult
-    func request(_ json: String) -> Any? {
-        guard let c = client else { return nil }
+    func request(_ json: String, host: HostId = localHost) -> Any? {
+        guard let c = clients[host] else { return nil }
         guard let raw = thurm_request(c, json) else { return nil }
         let text = String(cString: raw)
         thurm_string_free(raw)
         let value = JSON.decode(text)
         if let d = value as? [String: Any], let e = d["error"] as? String {
-            tlog("request failed: \(e) (\(json.prefix(120)))")
+            tlog("request to \(host) failed: \(e) (\(json.prefix(120)))")
         }
         return value
     }
 
     @discardableResult
-    func request(object: Any) -> Any? {
-        request(JSON.encode(object))
+    func request(object: Any, host: HostId = localHost) -> Any? {
+        request(JSON.encode(object), host: host)
     }
 
     /// Fire-and-forget request.
-    func send(_ json: String) {
-        guard let c = client else { return }
+    func send(_ json: String, host: HostId = localHost) {
+        guard let c = clients[host] else { return }
         thurm_send(c, json)
     }
 
-    func send(object: Any) {
-        send(JSON.encode(object))
+    func send(object: Any, host: HostId = localHost) {
+        send(JSON.encode(object), host: host)
     }
 
     // MARK: Hot paths
 
-    func subscribe(_ pane: UInt64) {
-        guard let c = client else { return }
-        thurm_subscribe(c, pane)
+    func subscribe(_ pane: PaneKey) {
+        guard let c = clients[pane.host] else { return }
+        thurm_subscribe(c, pane.id)
     }
 
-    func unsubscribe(_ pane: UInt64) {
-        guard let c = client else { return }
-        thurm_unsubscribe(c, pane)
+    func unsubscribe(_ pane: PaneKey) {
+        guard let c = clients[pane.host] else { return }
+        thurm_unsubscribe(c, pane.id)
     }
 
     /// Raw UTF-8 text straight to the PTY.
-    func input(_ pane: UInt64, text: String) {
-        guard let c = client, !text.isEmpty else { return }
+    func input(_ pane: PaneKey, text: String) {
+        guard let c = clients[pane.host], !text.isEmpty else { return }
         let bytes = Array(text.utf8)
         bytes.withUnsafeBufferPointer { buf in
-            thurm_input(c, pane, buf.baseAddress, buf.count)
+            thurm_input(c, pane.id, buf.baseAddress, buf.count)
         }
     }
 
     /// Shows every pane in theme `name` without saving it (nil: the configured theme again).
     /// Returns the theme now shown, as JSON; nil for an unknown theme.
     func previewTheme(_ name: String?) -> String? {
+        // Remote panes are drawn with this Mac's theme too.
+        for (host, c) in clients where host != localHost {
+            if let raw = thurm_preview_theme(c, name) { thurm_string_free(raw) }
+        }
         guard let c = client, let raw = thurm_preview_theme(c, name) else { return nil }
         defer { thurm_string_free(raw) }
         return String(cString: raw)
     }
 
-    func paste(_ pane: UInt64, text: String) {
-        guard let c = client else { return }
-        thurm_paste(c, pane, text)
+    /// This Mac's config changed: remote connections re-read it (the local daemon's
+    /// ConfigReloaded does that for its own).
+    func reloadRemoteEngines() {
+        for (host, c) in clients where host != localHost {
+            thurm_reload_engine(c)
+        }
     }
 
-    func resize(_ pane: UInt64, cols: Int, rows: Int, cellWidth: Int, cellHeight: Int) {
-        guard let c = client else { return }
-        thurm_resize(c, pane,
+    func paste(_ pane: PaneKey, text: String) {
+        guard let c = clients[pane.host] else { return }
+        thurm_paste(c, pane.id, text)
+    }
+
+    func resize(_ pane: PaneKey, cols: Int, rows: Int, cellWidth: Int, cellHeight: Int) {
+        guard let c = clients[pane.host] else { return }
+        thurm_resize(c, pane.id,
                      UInt16(clamping: cols), UInt16(clamping: rows),
                      UInt16(clamping: cellWidth), UInt16(clamping: cellHeight))
     }
 
-    func focus(_ pane: UInt64, focused: Bool) {
-        guard let c = client else { return }
-        thurm_focus(c, pane, focused)
+    func focus(_ pane: PaneKey, focused: Bool) {
+        guard let c = clients[pane.host] else { return }
+        thurm_focus(c, pane.id, focused)
     }
 
-    func key(_ pane: UInt64, kind: UInt32, code: UInt32, mods: UInt8, action: UInt8,
+    func key(_ pane: PaneKey, kind: UInt32, code: UInt32, mods: UInt8, action: UInt8,
              text: String?, shifted: UInt32, baseLayout: UInt32) {
-        guard let c = client else { return }
+        guard let c = clients[pane.host] else { return }
         var ev = thurm_key_event()
         ev.kind = kind
         ev.code = code
@@ -246,17 +334,17 @@ final class Core {
         if let text = text, !text.isEmpty {
             text.withCString { ptr in
                 ev.text = ptr
-                thurm_key(c, pane, &ev)
+                thurm_key(c, pane.id, &ev)
             }
         } else {
             ev.text = nil
-            thurm_key(c, pane, &ev)
+            thurm_key(c, pane.id, &ev)
         }
     }
 
-    func mouse(_ pane: UInt64, kind: UInt8, button: UInt8, mods: UInt8, clicks: Int,
+    func mouse(_ pane: PaneKey, kind: UInt8, button: UInt8, mods: UInt8, clicks: Int,
                col: Int, row: Int, rightHalf: Bool, x: Int, y: Int) {
-        guard let c = client else { return }
+        guard let c = clients[pane.host] else { return }
         var ev = thurm_mouse_event()
         ev.kind = kind
         ev.button = button
@@ -267,12 +355,44 @@ final class Core {
         ev.right_half = rightHalf
         ev.x = UInt32(clamping: max(0, x))
         ev.y = UInt32(clamping: max(0, y))
-        thurm_mouse(c, pane, &ev)
+        thurm_mouse(c, pane.id, &ev)
     }
 
-    func wheel(_ pane: UInt64, lines: Int, col: Int, row: Int, mods: UInt8) {
-        guard let c = client, lines != 0 else { return }
-        thurm_wheel(c, pane, Int32(clamping: lines),
+    func wheel(_ pane: PaneKey, lines: Int, col: Int, row: Int, mods: UInt8) {
+        guard let c = clients[pane.host], lines != 0 else { return }
+        thurm_wheel(c, pane.id, Int32(clamping: lines),
                     UInt16(clamping: max(0, col)), UInt16(clamping: max(0, row)), mods)
+    }
+
+    /// Writes `data` to a new private file on `host` (in its daemon's runtime directory).
+    /// Returns the path there, or the error.
+    func writeTempFile(host: HostId, name: String, data: Data) -> (path: String?, error: String?) {
+        guard let c = clients[host] else { return (nil, "\(host) is not connected") }
+        var err: UnsafeMutablePointer<CChar>? = nil
+        let raw: UnsafeMutablePointer<CChar>? = data.withUnsafeBytes { buf in
+            name.withCString { n in
+                thurm_write_temp_file(c, n, buf.bindMemory(to: UInt8.self).baseAddress, buf.count, &err)
+            }
+        }
+        if let raw {
+            defer { thurm_string_free(raw) }
+            return (String(cString: raw), nil)
+        }
+        var message = "cannot write the file"
+        if let e = err {
+            message = String(cString: e)
+            thurm_string_free(e)
+        }
+        return (nil, message)
+    }
+
+    // MARK: Remote operations
+
+    /// `thurm_remote_call`: blocking; ssh-backed operations belong off the main thread.
+    func remoteCall(_ object: [String: Any]) -> Any? {
+        let json = JSON.encode(object)
+        guard let raw = thurm_remote_call(json) else { return nil }
+        defer { thurm_string_free(raw) }
+        return JSON.decode(String(cString: raw))
     }
 }

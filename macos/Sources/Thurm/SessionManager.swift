@@ -14,10 +14,11 @@ final class SessionManager: NSObject, CoreDelegate {
     private(set) var controllers: [TerminalWindowController] = []
     /// Every workspace (see Workspaces.swift).
     var workspaces: [Workspace] = []
-    private(set) var panes: [UInt64: PaneInfo] = [:]
+    /// Every pane of every connected daemon (a disconnected host's keep their last state).
+    var panes: [PaneKey: PaneInfo] = [:]
     /// Panes waiting for input that the user has looked at since they started waiting; they
     /// don't count toward the Dock badge until the agent asks again.
-    private var seenWaiting: Set<UInt64> = []
+    private var seenWaiting: Set<PaneKey> = []
     private weak var lastKeyController: TerminalWindowController?
     private weak var lastRegularKeyController: TerminalWindowController?
 
@@ -51,6 +52,8 @@ final class SessionManager: NSObject, CoreDelegate {
         // The reconnect timer keeps running during connectOrAsk's alerts: it may have restored
         // the session already (restoring twice opens every window twice).
         if !sessionReady { restoreSession() }
+        // Remote hosts connect in the background; their tabs show "reconnecting" until then.
+        Remotes.shared.start()
         // Safety net only: tab changes save through the tab group's KVO.
         periodicTimer = Timer.scheduledTimer(timeInterval: 15, target: self, selector: #selector(periodicSave),
                                              userInfo: nil, repeats: true)
@@ -157,6 +160,12 @@ final class SessionManager: NSObject, CoreDelegate {
         let dark = systemIsDark
         lastSentDark = dark
         Core.shared.send(object: ["SetAppearance": ["dark": dark]])
+        for host in Core.shared.connectedRemotes { sendAppearance(to: host) }
+    }
+
+    /// Remote panes are drawn in this Mac's appearance too.
+    func sendAppearance(to host: HostId) {
+        Core.shared.send(object: ["SetAppearance": ["dark": systemIsDark]], host: host)
     }
 
     /// System light/dark switch: the daemon re-resolves colors (and broadcasts
@@ -253,18 +262,19 @@ final class SessionManager: NSObject, CoreDelegate {
 
     // MARK: - Daemon queries
 
-    func fetchPanes() -> [PaneInfo] {
-        guard let v = JSON.variant(Core.shared.request("\"ListPanes\"")), v.name == "Panes",
+    /// `host`'s panes; nil when it did not answer.
+    func fetchPanes(host: HostId = localHost) -> [PaneInfo]? {
+        guard let v = JSON.variant(Core.shared.request("\"ListPanes\"", host: host)), v.name == "Panes",
               let list = v.payload as? [Any]
-        else { return [] }
-        return list.compactMap { PaneInfo(json: $0) }
+        else { return nil }
+        return list.compactMap { PaneInfo(json: $0, host: host) }
     }
 
-    func fetchPaneInfo(_ id: UInt64) -> PaneInfo? {
-        guard let v = JSON.variant(Core.shared.request(object: ["PaneInfo": ["pane": NSNumber(value: id)]])),
+    func fetchPaneInfo(_ key: PaneKey) -> PaneInfo? {
+        guard let v = JSON.variant(Core.shared.request(object: ["PaneInfo": ["pane": key.number]], host: key.host)),
               v.name == "PaneInfo"
         else { return nil }
-        return PaneInfo(json: v.payload)
+        return PaneInfo(json: v.payload, host: key.host)
     }
 
     func fetchLayout() -> Layout? {
@@ -274,20 +284,30 @@ final class SessionManager: NSObject, CoreDelegate {
         return Layout.from(json: json)
     }
 
-    /// Creates a pane in the daemon. Returns its id.
-    func createPane(cols: Int, rows: Int, inheritFrom: UInt64?, preset: String? = nil,
-                    forkFrom: UInt64? = nil) -> UInt64? {
+    /// Creates a pane in `host`'s daemon (default: the host of the pane it inherits from).
+    /// Returns its key.
+    func createPane(cols: Int, rows: Int, inheritFrom: PaneKey?, preset: String? = nil,
+                    forkFrom: PaneKey? = nil, host: HostId? = nil, cwd: String? = nil) -> PaneKey? {
+        let host = host ?? forkFrom?.host ?? inheritFrom?.host ?? localHost
+        guard Core.shared.isConnected(host) else {
+            currentController?.content.focusedView?.showToast(
+                "\(host) is not connected (\(Remotes.shared.phaseLabel(host)))", duration: 4)
+            return nil
+        }
+        // Only a pane of the same daemon can pass on its directory or session.
+        let inherit = inheritFrom.flatMap { $0.host == host ? $0 : nil }
+        let fork = forkFrom.flatMap { $0.host == host ? $0 : nil }
         let request: [String: Any] = ["CreatePane": [
-            "fork_from": orNull(forkFrom.map { NSNumber(value: $0) }),
+            "fork_from": orNull(fork?.number),
             "command": NSNull(),
-            "cwd": NSNull(),
+            "cwd": orNull(cwd),
             "env": [Any](),
             "size": paneSizeObject(cols: cols, rows: rows),
             "agent_preset": orNull(preset),
-            "inherit_cwd_from": orNull(inheritFrom.map { NSNumber(value: $0) }),
+            "inherit_cwd_from": orNull(inherit?.number),
             "hold": false,
         ] as [String: Any]]
-        let resp = Core.shared.request(object: request)
+        let resp = Core.shared.request(object: request, host: host)
         guard let v = JSON.variant(resp), v.name == "PaneCreated",
               let payload = v.payload as? [String: Any], let id = jsonUInt64(payload["pane"])
         else {
@@ -295,8 +315,9 @@ final class SessionManager: NSObject, CoreDelegate {
                       response: resp)
             return nil
         }
-        if let info = fetchPaneInfo(id) { panes[id] = info }
-        return id
+        let key = PaneKey(host, id)
+        if let info = fetchPaneInfo(key) { panes[key] = info }
+        return key
     }
 
     private func paneSizeObject(cols: Int, rows: Int) -> [String: Any] {
@@ -333,17 +354,22 @@ final class SessionManager: NSObject, CoreDelegate {
     // MARK: - Restore
 
     private func restoreSession() {
-        let infos = fetchPanes()
-        panes = [:]
-        for info in infos { panes[info.id] = info }
-        let alive = Set(infos.filter { $0.alive }.map { $0.id })
+        let infos = fetchPanes() ?? []
+        panes = panes.filter { $0.key.isRemote }
+        for info in infos { panes[info.key] = info }
+        let alive = Set(infos.filter { $0.alive }.map { $0.key })
+        // Remote tabs come back as they were and attach once their host connects (tabs of a
+        // host no longer configured go).
+        let remotes = Set(config.remoteNames)
 
         // A pane shows in one place. Skip the ones a window already shows, and the ones an
         // earlier window of the layout claimed (a layout saved after a double restore lists
         // them twice).
         var placed = Set(liveControllers.flatMap { $0.content.paneIds })
         var layout = fetchLayout() ?? Layout(windows: [])
-        layout.retainPanes { alive.contains($0) && !placed.contains($0) }
+        layout.retainPanes { key in
+            !placed.contains(key) && (key.isRemote ? remotes.contains(key.host) : alive.contains(key))
+        }
         workspaces = layout.workspaces.map { Workspace(layout: $0) }
         if let quick = layout.quick {
             QuickTerminal.shared.restore(quick)
@@ -362,7 +388,8 @@ final class SessionManager: NSObject, CoreDelegate {
         }
 
         // Panes that exist but are not in the layout: tabs of one extra window.
-        let orphans = infos.filter { $0.alive && !used.contains($0.id) }.map { $0.id }.sorted()
+        let orphans = infos.filter { $0.alive && !used.contains($0.key) }.map { $0.key }
+            .sorted { $0.id < $1.id }
         var first: TerminalWindowController?
         var previous: TerminalWindowController?
         let orphanWorkspace = orphans.isEmpty ? nil : makeWorkspace()
@@ -399,11 +426,14 @@ final class SessionManager: NSObject, CoreDelegate {
         var created: [TerminalWindowController] = []
         // Older layouts have no workspaces, and two windows can't show the same one.
         var ws = workspace(w.workspace)
-        if ws == nil || (ws.map { isShown($0) } ?? false) { ws = makeWorkspace() }
+        if ws == nil || (ws.map { isShown($0) } ?? false) {
+            ws = makeWorkspace(host: w.tabs.first?.focusedKey.host ?? localHost)
+        }
         for tab in w.tabs {
-            let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focused, zoomed: tab.zoomed,
+            let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
                                    title: tab.title, frame: frame)
             c.workspaceID = ws?.id ?? 0
+            c.handoffID = tab.handoff
             if let prev = created.last {
                 attachAsTab(c, to: prev)
             } else {
@@ -460,15 +490,20 @@ final class SessionManager: NSObject, CoreDelegate {
         return regularControllers.last
     }
 
-    func controller(for pane: UInt64) -> TerminalWindowController? {
+    func controller(for pane: PaneKey) -> TerminalWindowController? {
         liveControllers.first { $0.content.root.contains(pane) }
     }
 
-    func view(for pane: UInt64) -> TerminalView? {
+    func view(for pane: PaneKey) -> TerminalView? {
         controller(for: pane)?.content.views[pane]
     }
 
-    func makeController(root: SplitNode, focused: UInt64, zoomed: UInt64?, title: String?,
+    /// Every view of `host`'s panes.
+    func views(of host: HostId) -> [TerminalView] {
+        liveControllers.flatMap { $0.content.views.values.filter { $0.pane.host == host } }
+    }
+
+    func makeController(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, title: String?,
                         frame: NSRect?, quick: Bool = false) -> TerminalWindowController {
         let c = TerminalWindowController(root: root, focused: focused, zoomed: zoomed, title: title,
                                          contentSize: defaultContentSize(), quick: quick)
@@ -502,39 +537,68 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     /// Cmd+N: a new window with a new shell (or an existing pane), showing a new workspace.
-    func newWindow(pane existing: UInt64? = nil, preset: String? = nil, workspace ws: Workspace? = nil) {
+    func newWindow(pane existing: PaneKey? = nil, preset: String? = nil, workspace ws: Workspace? = nil) {
+        let host = existing?.host ?? ws?.host ?? localHost
         var id = existing
         if id == nil {
             let size = gridSize(forPoints: defaultContentSize())
-            id = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, preset: preset)
+            id = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, preset: preset, host: host)
         }
         guard let pane = id else { return }
         let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
-        c.workspaceID = (ws ?? makeWorkspace()).id
+        c.workspaceID = (ws ?? makeWorkspace(host: host)).id
         showAsNewWindow(c, frame: nil)
         scheduleLayoutSave()
     }
 
-    /// Cmd+T: a new tab next to `host`, inheriting the focused pane's cwd.
-    func newTab(from hostIn: TerminalWindowController?, pane existing: UInt64? = nil, preset: String? = nil) {
+    /// Cmd+T: a new tab next to `host`, inheriting the focused pane's cwd. The pane runs on
+    /// the daemon of `host`'s workspace (a remote workspace's tabs are that host's panes).
+    @discardableResult
+    func newTab(from hostIn: TerminalWindowController?, pane existing: PaneKey? = nil, preset: String? = nil,
+                cwd: String? = nil, host daemonIn: HostId? = nil) -> TerminalWindowController? {
         // The quick terminal has one tab: new ones go to the last regular window.
         var host = hostIn ?? currentController
         if host?.isQuick ?? false { host = currentRegularController }
+        let daemon = daemonIn ?? existing?.host ?? host.flatMap { workspace($0.workspaceID)?.host } ?? host?.host
+            ?? localHost
         var id = existing
         if id == nil {
             let size = gridSize(forPoints: host?.content.bounds.size ?? defaultContentSize())
-            id = createPane(cols: size.cols, rows: size.rows, inheritFrom: host?.focusedPane, preset: preset)
+            id = createPane(cols: size.cols, rows: size.rows, inheritFrom: host?.focusedPane, preset: preset,
+                            host: daemon, cwd: cwd)
         }
-        guard let pane = id else { return }
+        guard let pane = id else { return nil }
         let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
-        if let host = host, let hostWindow = host.window, hostWindow.isVisible {
+        let sameHost = host.map { (workspace($0.workspaceID)?.host ?? $0.host) == pane.host } ?? false
+        if let host = host, let hostWindow = host.window, hostWindow.isVisible, sameHost {
             attachAsTab(c, to: host)
             c.window?.makeKeyAndOrderFront(nil)
+        } else if let shown = workspaces.first(where: { $0.host == pane.host && isShown($0) }),
+                  let other = controllerShowing(shown) {
+            // Another window shows this host's workspace: the tab goes there.
+            attachAsTab(c, to: other)
+            c.window?.makeKeyAndOrderFront(nil)
         } else {
-            c.workspaceID = makeWorkspace().id
-            showAsNewWindow(c, frame: nil)
+            c.workspaceID = (workspaces.first { $0.host == pane.host && !isShown($0) && pane.isRemote }
+                ?? makeWorkspace(host: pane.host)).id
+            if let ws = workspace(c.workspaceID), !ws.hiddenTabs.isEmpty {
+                // Its hidden tabs come along.
+                let frame = currentRegularController?.window?.frame
+                showAsNewWindow(c, frame: frame)
+                for tab in ws.hiddenTabs {
+                    let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey,
+                                           zoomed: tab.zoomedKey, title: tab.title, frame: nil)
+                    t.handoffID = tab.handoff
+                    attachAsTab(t, to: c)
+                }
+                ws.hiddenTabs = []
+                c.window?.makeKeyAndOrderFront(nil)
+            } else {
+                showAsNewWindow(c, frame: nil)
+            }
         }
         scheduleLayoutSave()
+        return c
     }
 
     /// Cmd+D / Cmd+Shift+D.
@@ -554,7 +618,12 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     /// Cmd+W: close the focused pane (confirming when a program is running).
-    func userClosePane(_ id: UInt64) {
+    func userClosePane(_ id: PaneKey) {
+        // A handoff tab's last pane: close the tab, which asks about the agent and its worktree.
+        if let c = controller(for: id), c.handoffID != nil, c.content.paneIds == [id] {
+            c.window?.performClose(nil)
+            return
+        }
         if config.confirmClose, let info = panes[id], info.hasRunningProcess {
             let alert = NSAlert()
             alert.messageText = "Close this pane?"
@@ -568,13 +637,18 @@ final class SessionManager: NSObject, CoreDelegate {
         removePaneFromUI(id)
     }
 
-    func sendClosePane(_ id: UInt64) {
-        Core.shared.send(object: ["ClosePane": ["pane": NSNumber(value: id)]])
+    func sendClosePane(_ id: PaneKey) {
+        if Core.shared.isConnected(id.host) {
+            Core.shared.send(object: ["ClosePane": ["pane": id.number]], host: id.host)
+        } else {
+            // Its host is offline: close it there once it is back.
+            Remotes.shared.pendingCloses[id.host, default: [:]][id.id] = panes[id]?.pid ?? 0
+        }
         panes.removeValue(forKey: id)
     }
 
     /// Removes a pane's view; closes the tab when it was the last pane.
-    func removePaneFromUI(_ id: UInt64) {
+    func removePaneFromUI(_ id: PaneKey) {
         guard let c = controller(for: id) else { return }
         let empty = c.content.remove(pane: id)
         if empty {
@@ -611,7 +685,7 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     /// Focuses a pane, bringing its tab to the front.
-    func focusPane(_ id: UInt64, activate: Bool) {
+    func focusPane(_ id: PaneKey, activate: Bool) {
         guard let c = controller(for: id) else { return }
         if c.isQuick {
             QuickTerminal.shared.show()
@@ -622,7 +696,7 @@ final class SessionManager: NSObject, CoreDelegate {
         if activate { NSApp.activate() }
     }
 
-    func isPaneFocused(_ id: UInt64) -> Bool {
+    func isPaneFocused(_ id: PaneKey) -> Bool {
         guard NSApp.isActive, let c = NSApp.keyWindow?.windowController as? TerminalWindowController else {
             return false
         }
@@ -690,7 +764,7 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         seenWaiting = seenWaiting.filter { panes[$0]?.agent?.status == .needsInput }
         let count = panes.values.filter { info in
-            info.agent?.status == .needsInput && !seenWaiting.contains(info.id)
+            info.agent?.status == .needsInput && !seenWaiting.contains(info.key)
         }.count
         NSApp.dockTile.badgeLabel = count > 0 ? "\(count)" : nil
     }
@@ -715,6 +789,8 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         config = AppConfig.load()
         applyConfigToUI()
+        Core.shared.reloadRemoteEngines()
+        Remotes.shared.configChanged()
         Updater.shared.configChanged()
         let quickError = QuickTerminal.shared.configChanged()
         let view = currentController?.content.focusedView
@@ -778,7 +854,8 @@ final class SessionManager: NSObject, CoreDelegate {
                 SessionManager.shared.splitFocused(in: c, direction: .right, fork: true)
             })
         }
-        for preset in config.agentPresets {
+        items += remotePaletteItems()
+        for preset in presets(for: currentHost) {
             let name = preset.name
             let detail = preset.command.joined(separator: " ")
             items.append(CommandPalette.Item(title: "Launch \(name)", detail: detail) {
@@ -889,14 +966,20 @@ final class SessionManager: NSObject, CoreDelegate {
         for c in liveControllers {
             c.content.detachAll()
         }
-        Core.shared.disconnect()
+        // Remote daemons keep their panes; only the tunnels close.
+        Remotes.shared.stop()
+        Core.shared.disconnectAll()
         SecureInput.shared.releaseAll()
     }
 
     // MARK: - Reconnect
 
-    private func handleDisconnect() {
+    private func handleDisconnect(host: HostId) {
         guard !isTerminating else { return }
+        if host != localHost {
+            Remotes.shared.connectionLost(host)
+            return
+        }
         tlog("lost connection to thurmd; reconnecting")
         Core.shared.disconnect()
         reconnectAttempt = 0
@@ -917,11 +1000,11 @@ final class SessionManager: NSObject, CoreDelegate {
 
     /// After reconnecting: drop views of vanished panes, resubscribe the rest.
     private func resync() {
-        let infos = fetchPanes()
-        panes = [:]
-        for info in infos { panes[info.id] = info }
+        let infos = fetchPanes() ?? []
+        panes = panes.filter { $0.key.isRemote }
+        for info in infos { panes[info.key] = info }
         for c in liveControllers {
-            for id in c.content.paneIds where panes[id] == nil {
+            for id in c.content.paneIds where !id.isRemote && panes[id] == nil {
                 removePaneFromUI(id)
             }
         }
@@ -932,7 +1015,7 @@ final class SessionManager: NSObject, CoreDelegate {
             return
         }
         for c in live {
-            for view in c.content.views.values {
+            for view in c.content.views.values where !view.pane.isRemote {
                 view.resubscribe()
             }
             c.updateTitle()
@@ -944,29 +1027,31 @@ final class SessionManager: NSObject, CoreDelegate {
 
     // MARK: - Events
 
-    func coreDidReceiveEvent(_ name: String, payload: Any?) {
+    func coreDidReceiveEvent(_ name: String, payload: Any?, host: HostId) {
         guard !isTerminating else { return }
         let dict = payload as? [String: Any]
+        let key = jsonUInt64(dict?["pane"]).map { PaneKey(host, $0) }
         switch name {
         case "PaneInfo":
-            if let info = PaneInfo(json: payload) { paneInfoUpdated(info) }
+            if let info = PaneInfo(json: payload, host: host) { paneInfoUpdated(info) }
         case "PaneExited", "PaneClosed":
-            if let id = jsonUInt64(dict?["pane"]) {
+            if let id = key {
                 Notifications.shared.withdrawPermission(pane: id)
                 panes.removeValue(forKey: id)
                 removePaneFromUI(id)
                 updateDockBadge()
             }
         case "Bell":
-            if let id = jsonUInt64(dict?["pane"]) {
+            if let id = key {
                 view(for: id)?.flash()
                 if !NSApp.isActive || !isPaneFocused(id) {
                     NSApp.requestUserAttention(.informationalRequest)
                 }
             }
         case "Notify":
-            if let id = jsonUInt64(dict?["pane"]) {
-                let title = jsonString(dict?["title"]) ?? "Thurm"
+            if let id = key {
+                var title = jsonString(dict?["title"]) ?? "Thurm"
+                if id.isRemote { title = "\(host) · \(title)" }
                 let body = jsonString(dict?["body"]) ?? ""
                 if config.notificationsEnabled && (!NSApp.isActive || !isPaneFocused(id)) {
                     Notifications.shared.post(pane: id, title: title, body: body,
@@ -974,47 +1059,53 @@ final class SessionManager: NSObject, CoreDelegate {
                 }
             }
         case "ClipboardStore":
-            if let text = jsonString(dict?["text"]) {
+            // The user's own selection always; a program's OSC 52 write per the Mac's policy.
+            if let text = jsonString(dict?["text"]),
+               jsonBool(dict?["user"]) == true || Remotes.shared.clipboardWriteAllowed(host) {
                 let pb = NSPasteboard.general
                 pb.clearContents()
                 pb.setString(text, forType: .string)
             }
         case "ClipboardRequest":
-            if let id = jsonUInt64(dict?["pane"]) {
-                let text = NSPasteboard.general.string(forType: .string) ?? ""
-                Core.shared.send(object: ["ClipboardReply": ["pane": NSNumber(value: id), "text": text]])
-            }
+            if let id = key { Remotes.shared.clipboardRequest(id) }
         case "Ui":
-            handleUi(payload)
+            handleUi(payload, host: host)
         case "ConfigReloaded":
-            reloadConfig(notifyDaemon: false)
+            // A remote daemon's config is its own business.
+            if host == localHost { reloadConfig(notifyDaemon: false) }
         case "Disconnected":
-            handleDisconnect()
+            handleDisconnect(host: host)
         default:
             // Attach / Output / Resized are consumed by the Rust core.
             break
         }
     }
 
-    private func paneInfoUpdated(_ info: PaneInfo) {
-        let old = panes[info.id]
-        panes[info.id] = info
-        if let c = controller(for: info.id) {
+    func paneInfoUpdated(_ info: PaneInfo) {
+        let key = info.key
+        let old = panes[key]
+        panes[key] = info
+        if let c = controller(for: key) {
             c.updateTitle()
-            c.content.views[info.id]?.maybeShowRestoredToast()
-            if old?.progress != info.progress { c.content.views[info.id]?.setProgress(info.progress) }
+            c.content.views[key]?.maybeShowRestoredToast()
+            if old?.progress != info.progress { c.content.views[key]?.setProgress(info.progress) }
+        }
+        // A handoff's agent finished or asks for something: bring its commits back.
+        if let status = info.agent?.status, status == .done || status == .needsInput,
+           old?.agent?.status != status {
+            Remotes.shared.agentSettled(key)
         }
         let wasWaiting = old?.agent?.status == .needsInput
         let waiting = info.agent?.status == .needsInput
         // A new request (or a different one) is unread again.
         if !waiting || !wasWaiting || old?.agent?.message != info.agent?.message {
-            seenWaiting.remove(info.id)
+            seenWaiting.remove(key)
         }
         // Answered, or retired by keys typed in the pane: its buttons would do nothing.
         if old?.agent?.permission != nil && old?.agent?.permission != info.agent?.permission {
-            Notifications.shared.withdrawPermission(pane: info.id)
+            Notifications.shared.withdrawPermission(pane: key)
         }
-        if waiting && !wasWaiting && !isPaneFocused(info.id) {
+        if waiting && !wasWaiting && !isPaneFocused(key) {
             NSApp.requestUserAttention(.informationalRequest)
         }
         updateDockBadge()
@@ -1025,12 +1116,13 @@ final class SessionManager: NSObject, CoreDelegate {
         }
     }
 
-    /// Commands sent by the `thurm` CLI through the daemon.
-    private func handleUi(_ payload: Any?) {
+    /// Commands sent by the `thurm` CLI through a daemon (`host`'s: its pane ids).
+    private func handleUi(_ payload: Any?, host daemon: HostId) {
         guard let v = JSON.variant(payload), let d = v.payload as? [String: Any] else { return }
+        let key = { (field: String) in jsonUInt64(d[field]).map { PaneKey(daemon, $0) } }
         switch v.name {
         case "NewTab":
-            guard let pane = jsonUInt64(d["pane"]) else { return }
+            guard let pane = key("pane") else { return }
             if controller(for: pane) != nil {
                 focusPane(pane, activate: true)
                 return
@@ -1039,19 +1131,22 @@ final class SessionManager: NSObject, CoreDelegate {
             if jsonBool(d["new_window"]) ?? false {
                 newWindow(pane: pane)
             } else {
-                newTab(from: currentController, pane: pane)
+                let c = newTab(from: currentController, pane: pane)
+                // `thurm handoff` opened it: tag and group it.
+                if let h = Remotes.shared.handoff(host: daemon, pane: pane.id) { c?.handoffID = h.id }
             }
             NSApp.activate()
         case "Split":
-            guard let pane = jsonUInt64(d["pane"]) else { return }
+            guard let pane = key("pane") else { return }
             if controller(for: pane) != nil {
                 focusPane(pane, activate: true)
                 return
             }
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
             let dir = SplitDirName(rawValue: jsonString(d["dir"]) ?? "right") ?? .right
-            let target = jsonUInt64(d["target"])
-            let host = target.flatMap { controller(for: $0) } ?? currentController
+            let target = key("target")
+            let host = target.flatMap { controller(for: $0) }
+                ?? (currentController?.host == daemon ? currentController : nil)
             if let host = host {
                 host.content.split(target: target, newPane: pane, direction: dir)
                 scheduleLayoutSave()
@@ -1059,14 +1154,14 @@ final class SessionManager: NSObject, CoreDelegate {
                 newWindow(pane: pane)
             }
         case "Focus":
-            if let pane = jsonUInt64(d["pane"]) { focusPane(pane, activate: true) }
+            if let pane = key("pane") { focusPane(pane, activate: true) }
         case "Scroll":
             // The viewport lives in the app's copy of the terminal.
-            if let pane = jsonUInt64(d["pane"]), let scroll = d["scroll"] {
-                Core.shared.send(object: ["Scroll": ["pane": NSNumber(value: pane), "scroll": scroll]])
+            if let pane = key("pane"), let scroll = d["scroll"] {
+                Core.shared.send(object: ["Scroll": ["pane": pane.number, "scroll": scroll]], host: daemon)
             }
         case "SetTabTitle":
-            if let pane = jsonUInt64(d["pane"]), let c = controller(for: pane) {
+            if let pane = key("pane"), let c = controller(for: pane) {
                 let title = jsonString(d["title"])
                 c.titleOverride = (title?.isEmpty ?? true) ? nil : title
                 scheduleLayoutSave()

@@ -2,6 +2,8 @@
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
+mod remote;
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
@@ -401,6 +403,60 @@ pub unsafe extern "C" fn thurm_connect(
     ctx: *mut c_void,
     err: *mut *mut c_char,
 ) -> *mut thurm_client {
+    let socket = thurm_config::socket_path();
+    unsafe {
+        connect_to(
+            socket,
+            daemon_path,
+            client_name,
+            on_event,
+            on_frame,
+            ctx,
+            err,
+        )
+    }
+}
+
+/// Like `thurm_connect`, to the daemon on `socket` (a remote host's, through its tunnel).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_connect_socket(
+    socket: *const c_char,
+    daemon_path: *const c_char,
+    client_name: *const c_char,
+    on_event: thurm_event_cb,
+    on_frame: thurm_frame_cb,
+    ctx: *mut c_void,
+    err: *mut *mut c_char,
+) -> *mut thurm_client {
+    let Some(socket) = (unsafe { opt_str(socket) }) else {
+        if !err.is_null() {
+            unsafe { *err = into_c("no socket".into()) };
+        }
+        return std::ptr::null_mut();
+    };
+    let socket = std::path::PathBuf::from(socket);
+    unsafe {
+        connect_to(
+            socket,
+            daemon_path,
+            client_name,
+            on_event,
+            on_frame,
+            ctx,
+            err,
+        )
+    }
+}
+
+unsafe fn connect_to(
+    socket: std::path::PathBuf,
+    daemon_path: *const c_char,
+    client_name: *const c_char,
+    on_event: thurm_event_cb,
+    on_frame: thurm_frame_cb,
+    ctx: *mut c_void,
+    err: *mut *mut c_char,
+) -> *mut thurm_client {
     let daemon = unsafe { opt_str(daemon_path) }.map(Path::new);
     let name = unsafe { opt_str(client_name) }
         .unwrap_or("Thurm.app")
@@ -413,10 +469,10 @@ pub unsafe extern "C" fn thurm_connect(
     let on_disc = move || emit_json(on_event, ctx, "\"Disconnected\"");
     match Client::connect(
         ConnectOptions {
+            socket,
             spawn_daemon: daemon,
             client_name: &name,
             ui: true,
-            ..Default::default()
         },
         on_ev,
         on_disc,
@@ -434,6 +490,46 @@ pub unsafe extern "C" fn thurm_connect(
             }
             std::ptr::null_mut()
         }
+    }
+}
+
+/// Writes `data` to a new private file in the daemon's runtime directory (on the daemon's
+/// machine) and returns its path, or NULL with `err` set. Free the result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_write_temp_file(
+    client: *mut thurm_client,
+    name: *const c_char,
+    data: *const u8,
+    len: usize,
+    err: *mut *mut c_char,
+) -> *mut c_char {
+    let fail = |e: String| {
+        if !err.is_null() {
+            unsafe { *err = into_c(e) };
+        }
+        std::ptr::null_mut()
+    };
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return fail("not connected".into());
+    };
+    if data.is_null() {
+        return fail("no data".into());
+    }
+    let name = unsafe { opt_str(name) }.unwrap_or("paste.bin").to_owned();
+    let data = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+    match c.client.request(Request::WriteTempFile { name, data }) {
+        Ok(Response::Text(path)) => into_c(path),
+        Ok(other) => fail(format!("unexpected response {other:?}")),
+        Err(e) => fail(e.to_string()),
+    }
+}
+
+/// Re-read this Mac's config into the connection's terminal copies (fonts aside, colors and
+/// terminal behavior): remote daemons don't send ConfigReloaded when the Mac's config changes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_reload_engine(client: *mut thurm_client) {
+    if let Some(c) = unsafe { client_ref(client) } {
+        c.shared.reload_engine(true);
     }
 }
 
@@ -907,10 +1003,11 @@ pub unsafe extern "C" fn thurm_mouse(
         (copy.then(|| l.term.selection_text()), bytes)
     };
     c.input(pane, bytes);
-    if let Some(text) = text.filter(|t| !t.is_empty())
-        && let Ok(json) = serde_json::to_string(&Event::ClipboardStore { pane, text })
-    {
-        emit_json(c.on_event, c.ctx, &json);
+    // The user's own selection (copy on select): no policy applies.
+    if let Some(text) = text.filter(|t| !t.is_empty()) {
+        let json =
+            serde_json::json!({"ClipboardStore": {"pane": pane, "text": text, "user": true}});
+        emit_json(c.on_event, c.ctx, &json.to_string());
     }
 }
 

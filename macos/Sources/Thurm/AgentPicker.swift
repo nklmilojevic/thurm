@@ -3,7 +3,7 @@ import AppKit
 /// A pane running a coding agent, wherever it is: a window (`controller`) or a workspace no
 /// window shows (`hidden`).
 struct AgentPane {
-    let pane: UInt64
+    let pane: PaneKey
     let info: PaneInfo
     let agent: AgentState
     let controller: TerminalWindowController?
@@ -14,9 +14,13 @@ struct AgentPane {
         agent.topic ?? Self.programTopic(info.title, agent: agent.name) ?? agent.name
     }
 
+    /// The remote host it runs on (nil on this Mac).
+    var hostLabel: String? { pane.isRemote ? pane.host : nil }
+
     /// Its repository or directory.
     var place: String? {
-        info.git.map { ($0.root as NSString).lastPathComponent } ?? info.cwd.map { abbreviatePath($0) }
+        info.git.map { ($0.root as NSString).lastPathComponent }
+            ?? info.cwd.map { pane.isRemote ? $0 : abbreviatePath($0) }
     }
 
     /// Its status in words ("Needs your permission to use Bash", "Done in 2m").
@@ -57,7 +61,7 @@ extension SessionManager {
         let mine = first.map { group(of: $0) } ?? []
         let others = liveControllers.filter { c in !mine.contains { $0 === c } }
         var out: [AgentPane] = []
-        func add(_ id: UInt64, in c: TerminalWindowController?, hidden: Workspace?) {
+        func add(_ id: PaneKey, in c: TerminalWindowController?, hidden: Workspace?) {
             guard let info = panes[id], let agent = info.agent else { return }
             out.append(AgentPane(pane: id, info: info, agent: agent, controller: c, hidden: hidden))
         }
@@ -97,16 +101,18 @@ extension SessionManager {
             .map(\.element)
         var items: [CommandPalette.Item] = agents.map { a in
             let here = host.map { $0 === a.controller && $0.focusedPane == a.pane } ?? false
-            let detail = [a.agent.name, a.place, a.hidden?.name, here ? "this pane" : a.statusDetail]
+            let detail = [a.hostLabel, a.agent.name, a.place, a.hidden?.name, here ? "this pane" : a.statusDetail]
                 .compactMap { $0 }
                 .joined(separator: " · ")
             return CommandPalette.Item(title: a.title, detail: detail) {
                 SessionManager.shared.focusAgent(a, from: host)
             }
         }
-        for preset in config.agentPresets {
+        let daemon = currentHost
+        for preset in presets(for: daemon) {
             let name = preset.name
-            items.append(CommandPalette.Item(title: "Launch \(name)", detail: preset.command.joined(separator: " ")) {
+            let on = daemon == localHost ? "" : " on \(daemon)"
+            items.append(CommandPalette.Item(title: "Launch \(name)\(on)", detail: preset.command.joined(separator: " ")) {
                 SessionManager.shared.newTab(from: host, preset: name)
             })
         }

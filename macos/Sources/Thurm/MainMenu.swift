@@ -47,6 +47,7 @@ enum MainMenu {
         menu.addItem(.separator())
         menu.addItem(item("Settings…", #selector(AppDelegate.openConfig(_:)), ","))
         menu.addItem(item("Reload Configuration", #selector(AppDelegate.reloadConfig(_:)), ",", [.command, .shift]))
+        menu.addItem(item("Remotes…", #selector(AppDelegate.showRemotes(_:))))
         let integrations = NSMenu(title: "Integrations")
         integrations.delegate = Integrations.shared
         let integrationsItem = item("Integrations", nil)

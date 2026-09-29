@@ -9,20 +9,25 @@ final class Workspace {
     /// Its tabs while no window shows it.
     var hiddenTabs: [TabLayout]
     var hiddenSelectedTab: Int
+    /// Whose panes it shows: this Mac's daemon, or a `[[remote]]` host's (a remote workspace).
+    let host: HostId
 
     init(id: UInt64, name: String, lastActive: Date = Date(), hiddenTabs: [TabLayout] = [],
-         hiddenSelectedTab: Int = 0) {
+         hiddenSelectedTab: Int = 0, host: HostId = localHost) {
         self.id = id
         self.name = name
         self.lastActive = lastActive
         self.hiddenTabs = hiddenTabs
         self.hiddenSelectedTab = hiddenSelectedTab
+        self.host = host
     }
 
     convenience init(layout l: WorkspaceLayout) {
         self.init(id: l.id, name: l.name, lastActive: Date(timeIntervalSince1970: TimeInterval(l.lastActive)),
-                  hiddenTabs: l.tabs, hiddenSelectedTab: l.selectedTab)
+                  hiddenTabs: l.tabs, hiddenSelectedTab: l.selectedTab, host: l.host ?? localHost)
     }
+
+    var isRemote: Bool { host != localHost }
 }
 
 /// Default workspace names ("quiet-otter"), like tty7's codenames.
@@ -79,9 +84,15 @@ extension SessionManager {
     }
 
     @discardableResult
-    func makeWorkspace(name: String? = nil) -> Workspace {
+    func makeWorkspace(name: String? = nil, host: HostId = localHost) -> Workspace {
         let id = (workspaces.map(\.id).max() ?? 0) + 1
-        let ws = Workspace(id: id, name: name ?? Codename.make(avoiding: Set(workspaces.map(\.name))))
+        let taken = Set(workspaces.map(\.name))
+        // A remote host's first workspace is named after it.
+        var fallback = Codename.make(avoiding: taken)
+        if host != localHost {
+            fallback = taken.contains(host) ? "\(host)-\(Codename.make(avoiding: taken))" : host
+        }
+        let ws = Workspace(id: id, name: name ?? fallback, host: host)
         workspaces.append(ws)
         return ws
     }
@@ -147,12 +158,14 @@ extension SessionManager {
             created.append(nc)
         }
         for tab in target.hiddenTabs {
-            add(makeController(root: SplitNode(layout: tab.root), focused: tab.focused, zoomed: tab.zoomed,
-                               title: tab.title, frame: nil))
+            let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
+                                   title: tab.title, frame: nil)
+            t.handoffID = tab.handoff
+            add(t)
         }
         if created.isEmpty {
             let size = gridSize(forPoints: c.content.bounds.size)
-            if let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil) {
+            if let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, host: target.host) {
                 add(makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil))
             }
         }
@@ -176,9 +189,10 @@ extension SessionManager {
         var previous: TerminalWindowController?
         var created: [TerminalWindowController] = []
         for tab in ws.hiddenTabs {
-            let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focused, zoomed: tab.zoomed,
+            let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
                                    title: tab.title, frame: frame)
             c.workspaceID = ws.id
+            c.handoffID = tab.handoff
             if let prev = previous { attachAsTab(c, to: prev) } else { showAsNewWindow(c, frame: frame) }
             previous = c
             created.append(c)
@@ -190,9 +204,9 @@ extension SessionManager {
         scheduleLayoutSave()
     }
 
-    /// ⌘⇧N: a new workspace with a fresh shell, in the front window.
-    func newWorkspace() {
-        let ws = makeWorkspace()
+    /// ⌘⇧N: a new workspace with a fresh shell (on `host`), in the front window.
+    func newWorkspace(host: HostId = localHost) {
+        let ws = makeWorkspace(host: host)
         if let c = currentController {
             switchWorkspace(in: c, to: ws)
         } else {
@@ -257,6 +271,7 @@ extension SessionManager {
         var items: [CommandPalette.Item] = workspacesByRecency.map { ws in
             let tabs = isShown(ws) ? (controllerShowing(ws).map { group(of: $0).count } ?? 0) : ws.hiddenTabs.count
             var detail = "\(tabs) \(tabs == 1 ? "tab" : "tabs")"
+            if ws.isRemote { detail = "\(ws.host) · \(Remotes.shared.phaseLabel(ws.host)) · " + detail }
             if ws.id == current {
                 detail += " · this window"
             } else if isShown(ws) {
@@ -279,6 +294,12 @@ extension SessionManager {
         items.append(CommandPalette.Item(title: "New Workspace", detail: "", shortcut: "⇧⌘N") {
             SessionManager.shared.newWorkspace()
         })
+        for host in config.remoteNames {
+            items.append(CommandPalette.Item(title: "New Workspace on \(host)",
+                                             detail: Remotes.shared.phaseLabel(host)) {
+                SessionManager.shared.newWorkspace(host: host)
+            })
+        }
         CommandPalette.shared.show(items: items, over: currentController?.window,
                                    placeholder: "Switch to workspace…", footer: "↩ switch   ⌘R rename")
     }
@@ -329,7 +350,7 @@ extension SessionManager {
         for gi in bySize {
             var id = selected[gi].workspaceID
             if id == 0 || workspace(id) == nil || owner[id] != nil {
-                id = makeWorkspace().id
+                id = makeWorkspace(host: selected[gi].host).id
             }
             owner[id] = gi
             assigned[gi] = id
@@ -343,14 +364,18 @@ extension SessionManager {
         let shown = Set(liveControllers.map(\.workspaceID))
         // Hidden workspaces lose panes that ended meanwhile, and go when none is left.
         for ws in workspaces where !shown.contains(ws.id) {
-            ws.hiddenTabs = retainTabs(ws.hiddenTabs) { panes[$0] != nil }
+            // An offline host's panes are unknown until it is back: keep them.
+            ws.hiddenTabs = retainTabs(ws.hiddenTabs) { key in
+                panes[key] != nil || (key.isRemote && !Core.shared.isConnected(key.host))
+            }
             ws.hiddenSelectedTab = min(ws.hiddenSelectedTab, max(0, ws.hiddenTabs.count - 1))
         }
         workspaces.removeAll { !shown.contains($0.id) && $0.hiddenTabs.isEmpty }
         return workspaces.map { ws in
             let hidden = !shown.contains(ws.id)
             return WorkspaceLayout(id: ws.id, name: ws.name, lastActive: UInt64(ws.lastActive.timeIntervalSince1970),
-                                   tabs: hidden ? ws.hiddenTabs : [], selectedTab: hidden ? ws.hiddenSelectedTab : 0)
+                                   tabs: hidden ? ws.hiddenTabs : [], selectedTab: hidden ? ws.hiddenSelectedTab : 0,
+                                   host: ws.isRemote ? ws.host : nil)
         }
     }
 }

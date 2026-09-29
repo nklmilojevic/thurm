@@ -32,6 +32,8 @@ typedef uint64_t thurm_pane_id;
  *   {"Ui":{"Split":{"target":1,"pane":4,"dir":"right"}}}
  *   "ConfigReloaded"                     (unit variants are bare strings)
  *   "Disconnected"                       (connection to the daemon was lost)
+ *   {"ClipboardStore":{"pane":1,"text":"...","user":true}}   (copy on select: the user's own
+ *                                        selection; without "user" it is a program's OSC 52)
  */
 typedef void (*thurm_event_cb)(void *ctx, const char *json);
 
@@ -47,8 +49,26 @@ thurm_client *thurm_connect(const char *daemon_path, const char *client_name,
                             thurm_event_cb on_event, thurm_frame_cb on_frame, void *ctx,
                             char **err);
 
+/* Like thurm_connect, to the daemon listening on `socket`: a remote host's daemon through the
+ * tunnel's local end (see thurm_remotes_start). Each connection has its own panes: pane ids
+ * are only unique per connection. `ctx` comes back with every callback, so it can say which
+ * connection an event or frame belongs to. */
+thurm_client *thurm_connect_socket(const char *socket, const char *daemon_path,
+                                   const char *client_name, thurm_event_cb on_event,
+                                   thurm_frame_cb on_frame, void *ctx, char **err);
+
 /* Close the connection. Panes keep running inside the daemon. */
 void thurm_disconnect(thurm_client *client);
+
+/* Write `data` to a new file (0600) in the daemon's runtime directory, on the daemon's machine,
+ * and return its path (NULL with `err` set on failure). An image pasted into a remote pane goes
+ * over like this, and the program gets a path it can read. Free the result. */
+char *thurm_write_temp_file(thurm_client *client, const char *name, const uint8_t *data,
+                            size_t len, char **err);
+
+/* Re-read this Mac's config into the connection's terminal copies. The local daemon's
+ * "ConfigReloaded" does this for its own connection; call it for remote connections. */
+void thurm_reload_engine(thurm_client *client);
 
 void thurm_string_free(char *s);
 
@@ -385,6 +405,54 @@ uint32_t thurm_protocol_version(void);
 
 /* Path of the config file. Free the result. */
 char *thurm_config_path(void);
+
+/* ---------------------------------------------------------------------------------------
+ * Remote workspaces (`[[remote]]` in the config).
+ * ------------------------------------------------------------------------------------- */
+
+/* A host's tunnel state changed: {"name":"devbox","host":"devbox","phase":"connected"|
+ * "connecting"|"reconnecting"|"needs_attention"|"not_installed"|"upgrade_needed"|"disabled"|
+ * "stopped","message":...,"socket":"<local socket>","retry_at":<unix s>|null,
+ * "remote_build":...,"remote_protocol":...,"upgrade_available":bool,"os":...,"arch":...,
+ * "linger":...}. Runs on a background thread. Connect with thurm_connect_socket(socket)
+ * once the phase is "connected"; the tunnel reconnects by itself otherwise. */
+typedef void (*thurm_remote_status_cb)(void *ctx, const char *json);
+
+/* Start a supervised ssh tunnel per enabled [[remote]]. Background retries never install
+ * anything on a host. */
+void thurm_remotes_start(thurm_remote_status_cb on_status, void *ctx);
+/* Pick up added, removed or changed [[remote]] entries. */
+void thurm_remotes_sync(void);
+/* Close every tunnel (the remote daemons keep their panes). */
+void thurm_remotes_stop(void);
+/* Retry `name` (NULL: all) now; with `restart`, also replace a tunnel that stopped answering
+ * (wake from sleep, network change). */
+void thurm_remote_kick(const char *name, bool restart);
+
+/* One remote operation, JSON in and out ({"error":"..."} on failure). Free the result.
+ * Operations that talk to a host run ssh and block: call them off the main thread.
+ *   {"op":"status"}                                       [status, ...]
+ *   {"op":"plan","name":"devbox","bins":"<Helpers dir>"}  {"methods":["copy"|"download"|"nix"],
+ *        "labels":[...],"problem":...,"installed":bool,"host":{...},"daemon":{"running":bool,
+ *        "protocol":n,"build":...,"hot_upgrade":bool}|null}
+ *   {"op":"install","name":"devbox","method":"download","bins":"..."}   {"build":...,...}
+ *   {"op":"upgrade_daemon","name":"devbox","allow_restart":false}
+ *        {"ok":true,"output":...} or {"ok":false,"would_stop_panes":true,"protocol":n}
+ *   {"op":"allow_clipboard","name":"devbox"}              "Ok" (clipboard_read = "always")
+ *   {"op":"clipboard_read","host":"devbox"|null}          "allow" | "deny" | "ask"
+ *   {"op":"clipboard_write","host":"devbox"|null}         "allow" | "deny"
+ *   {"op":"link","host":"devbox"|null,"url":"..."}        {"action":"open"|"ask"|"ignore"} or
+ *                                                         {"action":"copy_path","path":"..."}
+ *   {"op":"handoff_prepare","host":"devbox","path":"<repo>","branch":null}   handoff
+ *   {"op":"handoff_set_pane","id":"...","pane":7}          handoff
+ *   {"op":"handoff_fetch","id":"..."}                     handoff (fetched, fetch_error)
+ *   {"op":"handoff_check","id":"..."}                     {"uncommitted":bool,"unfetched":bool,...}
+ *   {"op":"handoff_cleanup","id":"...","force":false}     {"branch_deleted":bool,"message":...}
+ *   {"op":"handoff_defer","id":"..."}                     handoff (pending_cleanup)
+ *   {"op":"handoff_list"}                                 [handoff, ...]
+ * A handoff: {"id":"devbox/<repo id>/<slug>","host":...,"repo":"<local path>","branch":
+ * "agent/<slug>","worktree":"<remote path>","git_remote":"thurm-devbox","pane":n|null,...} */
+char *thurm_remote_call(const char *json);
 
 #ifdef __cplusplus
 }

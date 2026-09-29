@@ -81,11 +81,77 @@ jobs:
           fi
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
 
-  build:
-    name: Build (${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }})
+  linux:
+    # thurm and thurmd for Linux remote hosts, with the build id the app gets, so the app can
+    # install exactly its own build there (remote workspaces). Published by the build job,
+    # which also compiles their SHA-256 into the app.
+    name: Linux (${{ matrix.target }})
     needs: plan
     if: >-
       always()
+      && ((github.event_name == 'release' && !github.event.release.prerelease)
+        || (needs.plan.result == 'success' && needs.plan.outputs.build == 'true'))
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || needs.plan.outputs.sha }}
+          fetch-depth: 0 # the build number is the commit count
+      - name: Build id
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          NUMBER="$(git rev-list --count HEAD)"
+          # Same as macos/release/build-release.sh.
+          if [[ "${{ github.event_name }}" == release ]]; then
+            SHORT="$VERSION"
+          else
+            SHORT="$VERSION-tip.$(git rev-parse --short=7 HEAD)"
+          fi
+          BUILD="$SHORT+$NUMBER"
+          echo "THURM_BUILD=$BUILD" >> "$GITHUB_ENV"
+          echo "archive=thurm-${BUILD//+/-}-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p thurm-cli -p thurm-daemon
+      - name: Package
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/linux"
+          mkdir -p "$OUT"
+          tar -czf "$OUT/${{ steps.meta.outputs.archive }}" -C "target/${{ matrix.target }}/release" thurm thurmd
+          (cd "$OUT" && sha256sum "${{ steps.meta.outputs.archive }}" > "${{ steps.meta.outputs.archive }}.sha256")
+          cat "$OUT"/*.sha256
+      - uses: actions/upload-artifact@v5
+        with:
+          name: linux-${{ matrix.target }}
+          path: ${{ runner.temp }}/linux/*
+          retention-days: 3
+
+  build:
+    name: Build (${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }})
+    needs: [plan, linux]
+    if: >-
+      always()
+      && needs.linux.result == 'success'
       && ((github.event_name == 'release' && !github.event.release.prerelease)
         || (needs.plan.result == 'success' && needs.plan.outputs.build == 'true'))
     runs-on: macos-26
@@ -185,6 +251,26 @@ jobs:
           echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
           echo "SPARKLE_KEY_FILE=$RUNNER_TEMP/sparkle-ed25519" >> "$GITHUB_ENV"
 
+      # Pinned: this job holds the signing keys and a release-write token.
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          pattern: linux-*
+          path: ${{ runner.temp }}/linux
+          merge-multiple: true
+
+      # The app installs these on Linux remote hosts and checks them against these sums.
+      - name: Linux checksums
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/linux"
+          ls -l
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            SUM="$(cat ./*-"$t".tar.gz.sha256 | awk '{print $1}')"
+            [[ ${#SUM} -eq 64 ]] || { echo "::error::no checksum for $t"; exit 1; }
+            VAR="THURM_SHA256_$(echo "$t" | tr 'a-z-' 'A-Z_')"
+            echo "$VAR=$SUM" >> "$GITHUB_ENV"
+          done
+
       - name: Release notes
         run: |
           set -euo pipefail
@@ -216,6 +302,7 @@ jobs:
           set -euo pipefail
           TAG="${{ steps.meta.outputs.tag }}"
           cd macos/build/dist
+          gh release upload "$TAG" --repo "$REPO" --clobber "$RUNNER_TEMP"/linux/thurm-*
           # sparkle.json last: the appcast only lists a release once it carries one.
           gh release upload "$TAG" --repo "$REPO" --clobber Thurm-*.dmg Thurm-*.zip
           gh release upload "$TAG" --repo "$REPO" --clobber sparkle.json
@@ -243,6 +330,7 @@ jobs:
             gh release create tip --repo "$REPO" --verify-tag --prerelease --latest=false \
               --title "Tip" --notes-file "$NOTES"
           fi
+          gh release upload tip --repo "$REPO" --clobber "$RUNNER_TEMP"/linux/thurm-*
           cd macos/build/dist
           gh release upload tip --repo "$REPO" --clobber Thurm-tip-*.zip Thurm-tip.dmg
           gh release upload tip --repo "$REPO" --clobber sparkle.json
@@ -251,6 +339,16 @@ jobs:
             | { grep -E '^Thurm-tip-[0-9]+\.zip$' || true; } \
             | sort -t- -k3 -n -r | tail -n +4 \
             | while read -r old; do gh release delete-asset tip "$old" --repo "$REPO" --yes; done
+          # And the three newest Linux builds per target (a remote may be installing an older one).
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            gh release view tip --repo "$REPO" --json assets -q '.assets[].name' \
+              | { grep -E "^thurm-.*-[0-9]+-$t\.tar\.gz$" || true; } \
+              | sed -E "s/^(.*-([0-9]+)-$t\.tar\.gz)$/\2 \1/" | sort -n -r | tail -n +4 | cut -d' ' -f2 \
+              | while read -r old; do
+                  gh release delete-asset tip "$old" --repo "$REPO" --yes
+                  gh release delete-asset tip "$old.sha256" --repo "$REPO" --yes || true
+                done
+          done
 
       # Only after something was published, so a night without a build deploys nothing.
       - name: Update the site and feed

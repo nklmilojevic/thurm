@@ -41,7 +41,7 @@ export default defineConfig({
         },
         {
           label: 'Guides',
-          items: ['cli', 'agents', 'sessions'],
+          items: ['cli', 'agents', 'sessions', 'remote'],
         },
         {
           label: 'Help',

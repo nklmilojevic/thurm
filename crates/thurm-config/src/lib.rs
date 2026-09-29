@@ -31,6 +31,84 @@ pub struct Config {
     pub quick_terminal: QuickTerminalConfig,
     /// Extra key bindings: `"cmd+shift+d" = "split_down"`.
     pub keybindings: std::collections::BTreeMap<String, String>,
+    /// Other machines running `thurmd`, shown as remote workspaces (`[[remote]]`).
+    pub remote: Vec<RemoteConfig>,
+}
+
+/// A host whose `thurmd` the app attaches to over the system `ssh`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteConfig {
+    /// Shown in the sidebar and used by `thurm --remote NAME`: letters, digits, `-`, `_`.
+    pub name: String,
+    /// ssh target: a `Host` alias, `user@host` or `ssh://user@host:port`.
+    pub host: String,
+    /// The remote daemon's socket; discovered with `thurm socket-path` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// OSC 52 clipboard reads by this host's programs: ask every time, always allow, or never.
+    #[serde(default)]
+    pub clipboard_read: ClipboardRead,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardRead {
+    #[default]
+    Ask,
+    Always,
+    Never,
+}
+
+/// The name the app gives this machine's own daemon; no `[[remote]]` may use it.
+pub const LOCAL_HOST: &str = "local";
+
+/// Checks a `[[remote]]` name (it names files and appears in commands).
+pub fn validate_remote_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 32 {
+        return Err(format!("remote name {name:?} must be 1-32 characters"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "remote name {name:?} may only contain letters, digits, '-' and '_'"
+        ));
+    }
+    if name == LOCAL_HOST {
+        return Err(format!("{LOCAL_HOST:?} is reserved for this machine"));
+    }
+    Ok(())
+}
+
+impl Config {
+    pub fn remote(&self, name: &str) -> Option<&RemoteConfig> {
+        self.remote.iter().find(|r| r.name == name)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for r in &self.remote {
+            validate_remote_name(&r.name)?;
+            if r.host.trim().is_empty() {
+                return Err(format!("remote {:?} has an empty host", r.name));
+            }
+            if r.host.starts_with('-') {
+                return Err(format!("remote {:?}: host must not start with '-'", r.name));
+            }
+            if !seen.insert(r.name.as_str()) {
+                return Err(format!("remote {:?} is defined twice", r.name));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -576,6 +654,30 @@ pub fn socket_path() -> PathBuf {
     base.join(format!("thurm-{uid}")).join("thurmd.sock")
 }
 
+/// Where the app keeps its end of each remote tunnel (`<name>.sock`) and the tunnel's state
+/// (`<name>.state`, read by `thurm --remote`): `~/Library/Caches/Thurm/remote` on macOS,
+/// `$XDG_CACHE_HOME/thurm/remote` elsewhere. `THURM_REMOTE_DIR` overrides it.
+pub fn remote_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("THURM_REMOTE_DIR") {
+        return PathBuf::from(dir);
+    }
+    #[cfg(target_os = "macos")]
+    let base = dirs::cache_dir().map(|d| d.join("Thurm"));
+    #[cfg(not(target_os = "macos"))]
+    let base = dirs::cache_dir().map(|d| d.join("thurm"));
+    base.unwrap_or_else(std::env::temp_dir).join("remote")
+}
+
+/// The local end of `name`'s tunnel.
+pub fn remote_socket_path(name: &str) -> PathBuf {
+    remote_dir().join(format!("{name}.sock"))
+}
+
+/// The tunnel state the app writes for `name` (JSON, see `thurm-remote`).
+pub fn remote_state_path(name: &str) -> PathBuf {
+    remote_dir().join(format!("{name}.state"))
+}
+
 fn unsafe_uid() -> u32 {
     // Avoid a libc dependency for one call: the uid is only used to namespace the socket dir.
     #[cfg(unix)]
@@ -611,7 +713,9 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Config, String> {
-        toml::from_str(text).map_err(|e| e.to_string())
+        let cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     pub fn theme_spec(&self) -> ThemeSpec {
@@ -910,9 +1014,97 @@ pub fn write_theme(spec: &ThemeSpec) -> Result<(), String> {
 
 /// Persist one setting (see [`with_setting`]) in the config file.
 pub fn write_setting(key: &str, value: &str) -> Result<(), String> {
+    edit_config(|text| with_setting(text, key, value))
+}
+
+/// Returns `text` (a config file) with a `[[remote]]` entry for `remote` added, keeping
+/// comments and formatting. Fails when the name is taken or the result is invalid.
+pub fn with_remote_added(text: &str, remote: &RemoteConfig) -> Result<String, String> {
+    validate_remote_name(&remote.name)?;
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    let item = doc
+        .entry("remote")
+        .or_insert_with(|| toml_edit::Item::ArrayOfTables(Default::default()));
+    let tables = item
+        .as_array_of_tables_mut()
+        .ok_or("`remote` is not an array of tables ([[remote]])")?;
+    if tables
+        .iter()
+        .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(remote.name.as_str()))
+    {
+        return Err(format!("a remote named {:?} exists already", remote.name));
+    }
+    let mut t = toml_edit::Table::new();
+    t["name"] = toml_edit::value(remote.name.as_str());
+    t["host"] = toml_edit::value(remote.host.as_str());
+    if let Some(sock) = &remote.socket {
+        t["socket"] = toml_edit::value(sock.as_str());
+    }
+    if !remote.enabled {
+        t["enabled"] = toml_edit::value(false);
+    }
+    if remote.clipboard_read != ClipboardRead::Ask {
+        t["clipboard_read"] = toml_edit::value(match remote.clipboard_read {
+            ClipboardRead::Always => "always",
+            ClipboardRead::Never => "never",
+            ClipboardRead::Ask => "ask",
+        });
+    }
+    tables.push(t);
+    let out = doc.to_string();
+    Config::parse(&out)?;
+    Ok(out)
+}
+
+/// Returns `text` without the `[[remote]]` entry named `name`.
+pub fn with_remote_removed(text: &str, name: &str) -> Result<String, String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    let tables = doc
+        .get_mut("remote")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .ok_or_else(|| format!("no remote named {name:?}"))?;
+    let before = tables.len();
+    tables.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
+    if tables.len() == before {
+        return Err(format!("no remote named {name:?}"));
+    }
+    if tables.is_empty() {
+        doc.remove("remote");
+    }
+    let out = doc.to_string();
+    Config::parse(&out)?;
+    Ok(out)
+}
+
+/// Returns `text` with `key` of the `[[remote]]` named `name` set to `value` (a TOML literal).
+pub fn with_remote_setting(
+    text: &str,
+    name: &str,
+    key: &str,
+    value: &str,
+) -> Result<String, String> {
+    let value: toml_edit::Value = value.parse().map_err(|e| format!("{value:?}: {e}"))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    let table = doc
+        .get_mut("remote")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .and_then(|ts| {
+            ts.iter_mut()
+                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+        })
+        .ok_or_else(|| format!("no remote named {name:?}"))?;
+    table[key] = toml_edit::Item::Value(value);
+    let out = doc.to_string();
+    Config::parse(&out)?;
+    Ok(out)
+}
+
+/// Rewrites the config file with `edit` applied to its text (created from the default if
+/// missing), atomically.
+pub fn edit_config(edit: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
     let path = ensure_default_config().map_err(|e| e.to_string())?;
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let out = with_setting(&text, key, value)?;
+    let out = edit(&text)?;
     let tmp = path.with_extension(format!("toml.tmp{}", std::process::id()));
     std::fs::write(&tmp, out).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
@@ -936,6 +1128,65 @@ pub fn ensure_default_config() -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remotes_parse_and_validate() {
+        let cfg = Config::parse(
+            r#"
+[[remote]]
+name = "devbox"
+host = "nkl@devbox"
+
+[[remote]]
+name = "mini"
+host = "ssh://me@mini.local:2222"
+socket = "/tmp/x.sock"
+enabled = false
+clipboard_read = "always"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.remote.len(), 2);
+        let d = cfg.remote("devbox").unwrap();
+        assert!(d.enabled && d.socket.is_none() && d.clipboard_read == ClipboardRead::Ask);
+        let m = cfg.remote("mini").unwrap();
+        assert!(!m.enabled && m.clipboard_read == ClipboardRead::Always);
+        for bad in [
+            "[[remote]]\nname = \"local\"\nhost = \"x\"",
+            "[[remote]]\nname = \"a/b\"\nhost = \"x\"",
+            "[[remote]]\nname = \"a\"\nhost = \"-oProxyCommand=x\"",
+            "[[remote]]\nname = \"a\"\nhost = \"x\"\n[[remote]]\nname = \"a\"\nhost = \"y\"",
+            "[[remote]]\nname = \"a\"\nhost = \"x\"\nport = 1",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn remotes_added_and_removed_keeping_comments() {
+        let text = "# my config\n[font]\nsize = 14.0 # big\n";
+        let r = RemoteConfig {
+            name: "devbox".into(),
+            host: "devbox".into(),
+            socket: None,
+            enabled: true,
+            clipboard_read: ClipboardRead::Ask,
+        };
+        let added = with_remote_added(text, &r).unwrap();
+        assert!(added.starts_with("# my config") && added.contains("# big"));
+        assert_eq!(Config::parse(&added).unwrap().remote, vec![r.clone()]);
+        assert!(with_remote_added(&added, &r).is_err(), "names are unique");
+        let always = with_remote_setting(&added, "devbox", "clipboard_read", "\"always\"").unwrap();
+        assert_eq!(
+            Config::parse(&always).unwrap().remote[0].clipboard_read,
+            ClipboardRead::Always
+        );
+        assert!(with_remote_setting(&added, "devbox", "clipboard_read", "\"maybe\"").is_err());
+        let removed = with_remote_removed(&always, "devbox").unwrap();
+        assert!(Config::parse(&removed).unwrap().remote.is_empty());
+        assert!(!removed.contains("[[remote]]"));
+        assert!(with_remote_removed(&removed, "devbox").is_err());
+    }
 
     #[test]
     fn empty_is_default() {

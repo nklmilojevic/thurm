@@ -191,8 +191,12 @@ struct ProgressReport: Equatable {
 /// Swift view of `thurm_proto::PaneInfo`.
 struct PaneInfo {
     var id: UInt64
+    /// The daemon it came from.
+    var host: HostId
     var title: String
     var cwd: String?
+    /// The pane's process (its shell).
+    var pid: UInt32?
     var foregroundName: String?
     var agent: AgentState?
     var alive: Bool
@@ -202,11 +206,13 @@ struct PaneInfo {
     var progress: ProgressReport?
     var git: GitInfo?
 
-    init?(json: Any?) {
+    init?(json: Any?, host: HostId = localHost) {
         guard let d = json as? [String: Any], let id = jsonUInt64(d["id"]) else { return nil }
         self.id = id
+        self.host = host
         title = jsonString(d["title"]) ?? ""
         cwd = jsonString(d["cwd"])
+        pid = (d["pid"] as? NSNumber)?.uint32Value
         if let fg = d["foreground"] as? [String: Any] {
             foregroundName = jsonString(fg["name"])
         } else {
@@ -246,6 +252,8 @@ struct PaneInfo {
         }
     }
 
+    var key: PaneKey { PaneKey(host, id) }
+
     /// Title for tabs: program title, else the cwd's last path component.
     var displayTitle: String {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -277,11 +285,12 @@ enum SplitDirName: String, Codable {
 }
 
 indirect enum LayoutNode: Codable, Equatable {
-    case pane(id: UInt64)
+    /// A pane of this Mac's daemon, or (with `host`) of a remote one's.
+    case pane(PaneKey)
     case split(dir: SplitDirName, ratio: Double, first: LayoutNode, second: LayoutNode)
 
     private enum CodingKeys: String, CodingKey {
-        case type, id, dir, ratio, first, second
+        case type, id, host, dir, ratio, first, second
     }
 
     init(from decoder: Decoder) throws {
@@ -289,7 +298,8 @@ indirect enum LayoutNode: Codable, Equatable {
         let type = try c.decode(String.self, forKey: .type)
         switch type {
         case "pane":
-            self = .pane(id: try c.decode(UInt64.self, forKey: .id))
+            let host = try c.decodeIfPresent(String.self, forKey: .host) ?? localHost
+            self = .pane(PaneKey(host, try c.decode(UInt64.self, forKey: .id)))
         case "split":
             let dir = try c.decode(SplitDirName.self, forKey: .dir)
             let ratio = try c.decodeIfPresent(Double.self, forKey: .ratio) ?? 0.5
@@ -305,9 +315,10 @@ indirect enum LayoutNode: Codable, Equatable {
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .pane(let id):
+        case .pane(let key):
             try c.encode("pane", forKey: .type)
-            try c.encode(id, forKey: .id)
+            try c.encode(key.id, forKey: .id)
+            if key.isRemote { try c.encode(key.host, forKey: .host) }
         case .split(let dir, let ratio, let first, let second):
             try c.encode("split", forKey: .type)
             try c.encode(dir, forKey: .dir)
@@ -317,20 +328,20 @@ indirect enum LayoutNode: Codable, Equatable {
         }
     }
 
-    var panes: [UInt64] {
+    var panes: [PaneKey] {
         switch self {
-        case .pane(let id):
-            return [id]
+        case .pane(let key):
+            return [key]
         case .split(_, _, let first, let second):
             return first.panes + second.panes
         }
     }
 
     /// Drops panes for which `keep` is false, collapsing splits. Nil when nothing is left.
-    func retaining(_ keep: (UInt64) -> Bool) -> LayoutNode? {
+    func retaining(_ keep: (PaneKey) -> Bool) -> LayoutNode? {
         switch self {
-        case .pane(let id):
-            return keep(id) ? self : nil
+        case .pane(let key):
+            return keep(key) ? self : nil
         case .split(let dir, let ratio, let first, let second):
             let a = first.retaining(keep)
             let b = second.retaining(keep)
@@ -343,8 +354,21 @@ indirect enum LayoutNode: Codable, Equatable {
 struct TabLayout: Codable, Equatable {
     var title: String?
     var root: LayoutNode
+    /// A pane id of `root` (a tab's panes share one host).
     var focused: UInt64
     var zoomed: UInt64?
+    /// A handoff tab: the handoff's id (see `thurm handoff`).
+    var handoff: String? = nil
+
+    /// The panes of `root` that `focused` and `zoomed` name.
+    var focusedKey: PaneKey {
+        let panes = root.panes
+        return panes.first { $0.id == focused } ?? panes.first ?? .local(focused)
+    }
+
+    var zoomedKey: PaneKey? {
+        zoomed.flatMap { z in root.panes.first { $0.id == z } }
+    }
 }
 
 struct WindowLayout: Codable, Equatable {
@@ -399,19 +423,22 @@ struct WorkspaceLayout: Codable, Equatable {
     var lastActive: UInt64
     var tabs: [TabLayout]
     var selectedTab: Int
+    /// A remote workspace's host (nil: this Mac's).
+    var host: String? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, tabs
+        case id, name, tabs, host
         case lastActive = "last_active"
         case selectedTab = "selected_tab"
     }
 
-    init(id: UInt64, name: String, lastActive: UInt64, tabs: [TabLayout], selectedTab: Int) {
+    init(id: UInt64, name: String, lastActive: UInt64, tabs: [TabLayout], selectedTab: Int, host: String? = nil) {
         self.id = id
         self.name = name
         self.lastActive = lastActive
         self.tabs = tabs
         self.selectedTab = selectedTab
+        self.host = host
     }
 
     init(from decoder: Decoder) throws {
@@ -421,15 +448,26 @@ struct WorkspaceLayout: Codable, Equatable {
         lastActive = try c.decodeIfPresent(UInt64.self, forKey: .lastActive) ?? 0
         tabs = try c.decodeIfPresent([TabLayout].self, forKey: .tabs) ?? []
         selectedTab = try c.decodeIfPresent(Int.self, forKey: .selectedTab) ?? 0
+        host = try c.decodeIfPresent(String.self, forKey: .host)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(lastActive, forKey: .lastActive)
+        try c.encode(tabs, forKey: .tabs)
+        try c.encode(selectedTab, forKey: .selectedTab)
+        try c.encodeIfPresent(host, forKey: .host)
     }
 }
 
 /// Same semantics as `retain_tabs` on the Rust side.
-func retainTabs(_ tabs: [TabLayout], _ keep: (UInt64) -> Bool) -> [TabLayout] {
+func retainTabs(_ tabs: [TabLayout], _ keep: (PaneKey) -> Bool) -> [TabLayout] {
     tabs.compactMap { tab in
         var tab = tab
         guard let root = tab.root.retaining(keep) else { return nil }
-        let ids = root.panes
+        let ids = root.panes.map(\.id)
         if !ids.contains(tab.focused), let first = ids.first { tab.focused = first }
         if let z = tab.zoomed, !ids.contains(z) { tab.zoomed = nil }
         tab.root = root
@@ -467,13 +505,13 @@ struct Layout: Codable, Equatable {
         try c.encodeIfPresent(quick, forKey: .quick)
     }
 
-    var panes: [UInt64] {
+    var panes: [PaneKey] {
         (windows.flatMap { $0.tabs } + workspaces.flatMap { $0.tabs } + (quick.map { [$0] } ?? []))
             .flatMap { $0.root.panes }
     }
 
-    /// Same semantics as `Layout::retain_panes` on the Rust side.
-    mutating func retainPanes(_ keep: (UInt64) -> Bool) {
+    /// Same semantics as `Layout::retain_panes` on the Rust side (which only sees its own).
+    mutating func retainPanes(_ keep: (PaneKey) -> Bool) {
         for wi in windows.indices {
             windows[wi].tabs = retainTabs(windows[wi].tabs, keep)
             if windows[wi].selectedTab >= windows[wi].tabs.count {

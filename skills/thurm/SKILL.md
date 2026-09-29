@@ -68,6 +68,23 @@ Delegating to another agent: `thurm launch claude --split right`, type the task 
 `thurm send --pane ID --paste "..."`, then `thurm wait --pane ID --agent-done --timeout 1800` and
 read the result with `thurm capture --pane ID`.
 
+## Remote hosts
+
+Thurm can also run panes on other machines (`[[remote]]` hosts, see `thurm remote list`). Any
+pane command takes `--remote NAME`; pane ids are that host's, so always pass `--pane`:
+
+```sh
+thurm remote list                               # hosts and whether Thurm is connected
+thurm --remote devbox agents                    # agents running on devbox
+thurm --remote devbox launch claude             # start one there (its own presets)
+thurm --remote devbox wait --pane 3 --agent-done --timeout 1800
+thurm --remote devbox capture --pane 3 -n 80
+```
+
+`thurm handoff --remote devbox --preset claude` gives the current repository to an agent there
+(through git, in its own worktree); committed results come back as
+`refs/remotes/thurm-devbox/agent/NAME`. It changes the user's git remotes, so ask first.
+
 ## Misc
 
 ```sh

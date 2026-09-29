@@ -29,6 +29,50 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  linux:
+    # Remote hosts run the static musl builds of thurm and thurmd (remote workspaces).
+    name: Linux (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # libghostty-vt is cross-built for musl with Zig.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: musl and sshd
+        run: sudo apt-get update && sudo apt-get install -y musl-tools openssh-server openssh-client
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p thurm-cli -p thurm-daemon
+      - name: Static
+        run: |
+          for b in thurm thurmd; do
+            file "target/${{ matrix.target }}/release/$b"
+            file "target/${{ matrix.target }}/release/$b" | grep -Eq 'statically linked|static-pie linked'
+          done
+      # Ubuntu's AppArmor blocks unprivileged user namespaces; the port lookup is tested with
+      # a listener in its own network namespace.
+      - name: Allow user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # The daemon and terminal suites, and the remote ones (loopback ssh, handoffs).
+      - name: Test
+        env:
+          THURM_REQUIRE_NETNS: "1"
+        run: cargo test --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
+
   release-scripts:
     name: Release scripts
     runs-on: ubuntu-latest

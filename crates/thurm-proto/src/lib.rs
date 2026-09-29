@@ -28,6 +28,10 @@ pub const BUILD: &str = match option_env!("THURM_BUILD") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+/// What this build supports beyond [`PROTOCOL_VERSION`], exchanged in `Hello` so a later
+/// version can accept older peers by capability instead of by exact version.
+pub const CAPABILITIES: &[&str] = &["hello-capabilities", "temp-file", "remote-layout"];
+
 /// Environment variable exported into every pane with the pane's id.
 pub const ENV_PANE_ID: &str = "THURM_PANE_ID";
 /// Environment variable exported into every pane with the daemon socket path.
@@ -50,6 +54,10 @@ pub enum Request {
         client: String,
         version: u32,
         ui: bool,
+        /// The client's [`CAPABILITIES`]. Last field: daemons of protocol 13 decode the rest of
+        /// the Hello and answer with their version.
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     CreatePane(CreatePane),
     /// Kill the pane's process group and forget the pane.
@@ -211,6 +219,14 @@ pub enum Request {
         prompt: u64,
         allow: bool,
     },
+    /// Write `data` to a new 0600 file named after `name` in the daemon's runtime directory and
+    /// answer its path as [`Response::Text`] (an image pasted into a remote pane goes over as
+    /// bytes, and the program gets a path it can read).
+    WriteTempFile {
+        name: String,
+        #[serde(with = "bytes")]
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -271,6 +287,9 @@ pub enum Response {
         restored: bool,
         /// The daemon's [`BUILD`].
         build: String,
+        /// The daemon's [`CAPABILITIES`].
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     PaneCreated {
         pane: PaneId,

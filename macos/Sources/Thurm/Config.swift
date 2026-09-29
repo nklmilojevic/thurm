@@ -174,6 +174,8 @@ final class AppConfig {
     var followsAppearance: Bool { themeLight != themeDark }
     var themes: [ThemeChoice] = []
     var agentPresets: [AgentPreset] = []
+    /// `[[remote]]` hosts, by name (connected in the background; see Remote.swift).
+    var remoteNames: [String] = []
     var configPath = ""
     var loadError: String?
 
@@ -292,6 +294,9 @@ final class AppConfig {
             quickOnMainScreen = jsonString(q["screen"]) == "main"
             quickAnimationDuration = max(0, jsonDouble(q["animation_duration"]) ?? quickAnimationDuration)
             quickOpacity = jsonDouble(q["opacity"]).map { CGFloat(min(1, max(0.05, $0))) }
+        }
+        if let remotes = c["remote"] as? [[String: Any]] {
+            remoteNames = remotes.compactMap { jsonString($0["name"]) }
         }
     }
 

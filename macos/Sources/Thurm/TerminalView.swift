@@ -22,7 +22,7 @@ private struct CellPosition {
 /// One terminal pane: a CAMetalLayer backed view that renders the daemon's grid and forwards
 /// keyboard (NSTextInputClient, IME), mouse and scroll input.
 final class TerminalView: NSView, NSTextInputClient {
-    let pane: UInt64
+    let pane: PaneKey
 
     private let renderer = TerminalRenderer()
     private var shaper: FontShaper?
@@ -73,17 +73,19 @@ final class TerminalView: NSView, NSTextInputClient {
     private var toastView: NSView?
     private var restoredToastShown = false
     private var progressBar: ProgressBarView?
+    private var offlineOverlay: OfflineOverlay?
 
     private static let urlRegex: NSRegularExpression? = try? NSRegularExpression(
         pattern: "(?:https?|ftp|file)://[^\\s<>\"'`]+|mailto:[^\\s<>\"'`]+", options: [])
 
-    init(pane: UInt64) {
+    init(pane: PaneKey) {
         self.pane = pane
         super.init(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
         wantsLayer = true
         layerContentsPlacement = .topLeft
         registerForDraggedTypes([.fileURL, .URL, .png, .tiff, .string])
         setProgress(SessionManager.shared.panes[pane]?.progress)
+        if pane.isRemote { setOffline(SessionManager.shared.offlineMessage(for: pane.host)) }
     }
 
     required init?(coder: NSCoder) {
@@ -412,7 +414,7 @@ final class TerminalView: NSView, NSTextInputClient {
         let want = max(0, Int(floor(smoothPos + 0.0001)))
         if want != sentOffset {
             sentOffset = want
-            Core.shared.send(object: ["Scroll": ["pane": pane, "scroll": ["Offset": want]]])
+            Core.shared.send(object: ["Scroll": ["pane": pane.number, "scroll": ["Offset": want]]], host: pane.host)
         }
         let settled = smoothPos == smoothPos.rounded() && Int(info.display_offset) == sentOffset
         // Something else moved the scrollback (typing, new output while scrolled back).
@@ -532,6 +534,7 @@ final class TerminalView: NSView, NSTextInputClient {
         if let badge = lockBadge {
             badge.frame = NSRect(x: bounds.width - 26, y: 6, width: 18, height: 18)
         }
+        offlineOverlay?.frame = bounds
         if let toast = toastView {
             let size = toast.frame.size
             toast.setFrameOrigin(NSPoint(x: (bounds.width - size.width) / 2, y: bounds.height - size.height - 12))
@@ -567,6 +570,26 @@ final class TerminalView: NSView, NSTextInputClient {
         }
         progressBar?.report = report
     }
+
+    /// The pane's host is not connected: the last frame stays, under "Disconnected —
+    /// reconnecting…" (with the retry countdown), and input is blocked. nil: connected.
+    func setOffline(_ message: String?) {
+        guard let message else {
+            offlineOverlay?.removeFromSuperview()
+            offlineOverlay = nil
+            return
+        }
+        let overlay = offlineOverlay ?? OfflineOverlay()
+        overlay.message = message
+        if overlay.superview !== self {
+            addSubview(overlay, positioned: .above, relativeTo: nil)
+            offlineOverlay = overlay
+        }
+        layoutOverlays()
+    }
+
+    /// Input goes nowhere while the pane's host is disconnected.
+    var isOffline: Bool { offlineOverlay != nil }
 
     /// Small transient message at the bottom of the pane.
     func showToast(_ text: String, duration: TimeInterval = 2.5) {
@@ -663,7 +686,7 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     private func fetchCompletions() -> (String, [CompletionCandidate])? {
-        guard let resp = Core.shared.request(object: ["Complete": ["pane": NSNumber(value: pane)]]),
+        guard let resp = Core.shared.request(object: ["Complete": ["pane": pane.number]], host: pane.host),
               let v = JSON.variant(resp), v.name == "Completions", let d = v.payload as? [String: Any]
         else { return nil }
         let word = jsonString(d["word"]) ?? ""
@@ -785,6 +808,7 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     override func keyDown(with event: NSEvent) {
+        if isOffline { return }
         if Perf.enabled { Perf.shared.key(pane: pane) }
         NSCursor.setHiddenUntilMouseMoves(true)
         smoothActive = false
@@ -839,6 +863,7 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     override func keyUp(with event: NSEvent) {
+        if isOffline { return }
         if event.modifierFlags.contains(.command) || hasMarkedText() { return }
         let optionIsAlt = KeyMapping.optionActsAsAlt(event, setting: config.optionAsAlt)
         sendKey(event, action: KeyActionCode.release, text: nil, optionIsAlt: optionIsAlt)
@@ -846,6 +871,7 @@ final class TerminalView: NSView, NSTextInputClient {
 
     override func flagsChanged(with event: NSEvent) {
         updateHover(modifiers: event.modifierFlags)
+        if isOffline { return }
         let flags = event.modifierFlags
         let optionIsAlt = config.optionAsAlt != .none
         let mods = KeyMapping.mods(flags, optionIsAlt: optionIsAlt)
@@ -930,6 +956,7 @@ final class TerminalView: NSView, NSTextInputClient {
             return
         }
         // Outside keyDown (character palette, dictation, ...): plain text.
+        if isOffline { return }
         Core.shared.input(pane, text: text)
     }
 
@@ -985,7 +1012,7 @@ final class TerminalView: NSView, NSTextInputClient {
     // MARK: Edit actions
 
     @objc func copy(_ sender: Any?) {
-        guard let resp = Core.shared.request(object: ["CopySelection": ["pane": NSNumber(value: pane)]]),
+        guard let resp = Core.shared.request(object: ["CopySelection": ["pane": pane.number]], host: pane.host),
               let v = JSON.variant(resp), v.name == "Text",
               let text = v.payload as? String, !text.isEmpty
         else { return }
@@ -995,7 +1022,14 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     @objc func paste(_ sender: Any?) {
-        guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
+        if isOffline { return }
+        let pb = NSPasteboard.general
+        if pb.string(forType: .string) == nil, pb.availableType(from: [.png, .tiff]) != nil {
+            // An image: its file's path (on the pane's host).
+            if let path = imagePath(pb) { Core.shared.paste(pane, text: shellEscape(path) + " ") }
+            return
+        }
+        guard let text = pb.string(forType: .string), !text.isEmpty else { return }
         let bracketed = (snapshotModes & TermMode.bracketedPaste) != 0
         let multiline = text.unicodeScalars.contains { $0 == "\n" || $0 == "\r" }
         if config.confirmMultilinePaste && multiline && !bracketed {
@@ -1023,6 +1057,7 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        if isOffline { return false }
         guard let text = dropText(sender.draggingPasteboard, materialize: true) else { return false }
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
@@ -1035,12 +1070,15 @@ final class TerminalView: NSView, NSTextInputClient {
     /// writes that PNG; without it only the kind of content is checked.
     private func dropText(_ pb: NSPasteboard, materialize: Bool = false) -> String? {
         let fileOpts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
-        if let urls = pb.readObjects(forClasses: [NSURL.self], options: fileOpts) as? [URL], !urls.isEmpty {
+        // Mac paths mean nothing on a remote host: files dropped on a remote pane go by name only
+        // when they are images (copied over), else as their paths as text.
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: fileOpts) as? [URL], !urls.isEmpty,
+           !pane.isRemote || pb.availableType(from: [.png, .tiff]) == nil {
             return urls.map { shellEscape($0.path) }.joined(separator: " ") + " "
         }
         if pb.availableType(from: [.png, .tiff]) != nil {
             guard materialize else { return "" }
-            if let path = Self.saveDroppedImage(pb) { return shellEscape(path) + " " }
+            if let path = imagePath(pb) { return shellEscape(path) + " " }
         }
         if let url = pb.readObjects(forClasses: [NSURL.self], options: nil)?.first as? URL {
             return url.absoluteString
@@ -1049,12 +1087,30 @@ final class TerminalView: NSView, NSTextInputClient {
         return nil
     }
 
-    private static func saveDroppedImage(_ pb: NSPasteboard) -> String? {
+    /// The pasteboard's image as PNG.
+    private static func pngData(_ pb: NSPasteboard) -> Data? {
         var data = pb.data(forType: .png)
         if data == nil, let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff) {
             data = rep.representation(using: .png, properties: [:])
         }
-        guard let png = data else { return nil }
+        return data
+    }
+
+    /// Where the pasted or dropped image is now: a temporary PNG here, or, for a remote pane,
+    /// a private file on its host written through its daemon (only what the user pastes goes
+    /// over).
+    private func imagePath(_ pb: NSPasteboard) -> String? {
+        guard pane.isRemote else { return Self.saveDroppedImage(pb) }
+        guard let png = Self.pngData(pb) else { return nil }
+        let written = Core.shared.writeTempFile(host: pane.host, name: "paste.png", data: png)
+        if let e = written.error {
+            showToast("Could not copy the image to \(pane.host): \(e)", duration: 5)
+        }
+        return written.path
+    }
+
+    private static func saveDroppedImage(_ pb: NSPasteboard) -> String? {
+        guard let png = pngData(pb) else { return nil }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("thurm-drops", isDirectory: true)
         let file = dir.appendingPathComponent("image-\(UUID().uuidString.prefix(8)).png")
         do {
@@ -1067,17 +1123,17 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     @objc override func selectAll(_ sender: Any?) {
-        Core.shared.send(object: ["Selection": ["pane": NSNumber(value: pane), "op": "SelectAll"]])
+        Core.shared.send(object: ["Selection": ["pane": pane.number, "op": "SelectAll"]], host: pane.host)
     }
 
     /// Cmd+K: clear the screen and scrollback, keeping the prompt at the top.
     @objc func clearScreen(_ sender: Any?) {
-        Core.shared.send(object: ["ClearScreen": ["pane": NSNumber(value: pane)]])
+        Core.shared.send(object: ["ClearScreen": ["pane": pane.number]], host: pane.host)
         needsRender = true
     }
 
     @objc func clearScrollback(_ sender: Any?) {
-        Core.shared.send(object: ["ClearScrollback": ["pane": NSNumber(value: pane)]])
+        Core.shared.send(object: ["ClearScrollback": ["pane": pane.number]], host: pane.host)
         needsRender = true
     }
 
@@ -1085,7 +1141,7 @@ final class TerminalView: NSView, NSTextInputClient {
     @objc func explainLastCommand(_ sender: Any?) {
         let pane = self.pane
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let resp = Core.shared.request(object: ["Explain": ["pane": NSNumber(value: pane)]]) as? [String: Any]
+            let resp = Core.shared.request(object: ["Explain": ["pane": pane.number]], host: pane.host) as? [String: Any]
             DispatchQueue.main.async {
                 guard let self, let window = self.window else { return }
                 let alert = NSAlert()
@@ -1144,6 +1200,7 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     private func sendMouse(_ event: NSEvent, kind: UInt8, button: UInt8) {
+        if isOffline { return }
         let p = cellPosition(convert(event.locationInWindow, from: nil))
         let clicks = (event.type == .mouseMoved) ? 1 : max(1, event.clickCount)
         Core.shared.mouse(pane, kind: kind, button: button, mods: mouseMods(event.modifierFlags), clicks: clicks,
@@ -1158,7 +1215,7 @@ final class TerminalView: NSView, NSTextInputClient {
         if event.modifierFlags.contains(.command) {
             let p = cellPosition(point)
             if let url = linkURL(col: p.col, row: p.row) {
-                NSWorkspace.shared.open(url)
+                SessionManager.shared.openLink(url, from: pane, in: window)
                 return
             }
         }
@@ -1376,6 +1433,57 @@ final class TerminalView: NSView, NSTextInputClient {
         clearItem.target = self
         return menu
     }
+}
+
+/// "Disconnected — reconnecting…" over a remote pane whose host is not connected; the pane's
+/// last frame shows through.
+private final class OfflineOverlay: NSView {
+    private let label = NSTextField(wrappingLabelWithString: "")
+    private let box = NSView()
+
+    var message: String = "" {
+        didSet {
+            label.stringValue = message
+            needsLayout = true
+        }
+    }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(white: 0, alpha: 0.35).cgColor
+        box.wantsLayer = true
+        box.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.85).cgColor
+        box.layer?.cornerRadius = 9
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .white
+        label.alignment = .center
+        label.maximumNumberOfLines = 4
+        box.addSubview(label)
+        addSubview(box)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        let maxWidth = min(420, bounds.width - 32)
+        label.preferredMaxLayoutWidth = maxWidth - 24
+        let size = label.fittingSize
+        let w = min(maxWidth, size.width + 24)
+        let h = size.height + 16
+        box.frame = NSRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2, width: w, height: h)
+        label.frame = NSRect(x: 12, y: 8, width: w - 24, height: size.height)
+    }
+
+    // Swallows clicks (input is blocked), lets the view below keep the cursor.
+    override func mouseDown(with event: NSEvent) {}
+    override func rightMouseDown(with event: NSEvent) {}
+    override func scrollWheel(with event: NSEvent) {}
 }
 
 /// Thin bar at the top of a pane: filled to the reported percentage, or a segment sliding

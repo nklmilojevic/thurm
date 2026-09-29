@@ -215,7 +215,87 @@ pub fn descendants(table: &[ProcRow], root: u32) -> Vec<ProcRow> {
     out
 }
 
+/// Listening TCP ports per pid: the LISTEN sockets in the pid's own `/proc/<pid>/net/tcp{,6}`
+/// (its network namespace's, which may not be the daemon's), matched to its open descriptors
+/// by inode.
+#[cfg(target_os = "linux")]
+pub fn listening_ports(pids: &[u32]) -> std::collections::HashMap<u32, Vec<u16>> {
+    use std::collections::HashMap;
+    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
+    // Tables per network namespace: most pids share one.
+    let mut by_netns: HashMap<std::path::PathBuf, HashMap<u64, u16>> = HashMap::new();
+    for &pid in pids {
+        let netns = std::fs::read_link(format!("/proc/{pid}/ns/net")).ok();
+        let cached = netns.as_ref().and_then(|ns| by_netns.get(ns));
+        let own;
+        let ports_by_inode = match cached {
+            Some(t) => t,
+            None => {
+                // Only a complete read speaks for the namespace; after a failed one, the next
+                // pid in it tries again.
+                let tables: Option<Vec<String>> = ["tcp", "tcp6"]
+                    .iter()
+                    .map(|t| std::fs::read_to_string(format!("/proc/{pid}/net/{t}")).ok())
+                    .collect();
+                let Some(tables) = tables else { continue };
+                let parsed: HashMap<u64, u16> =
+                    tables.iter().flat_map(|t| listening_sockets(t)).collect();
+                match netns {
+                    Some(ns) => &*by_netns.entry(ns).or_insert(parsed),
+                    None => {
+                        own = parsed;
+                        &own
+                    }
+                }
+            }
+        };
+        if ports_by_inode.is_empty() {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let inode = target
+                .to_str()
+                .and_then(|t| t.strip_prefix("socket:["))
+                .and_then(|t| t.strip_suffix(']'))
+                .and_then(|t| t.parse::<u64>().ok());
+            if let Some(port) = inode.and_then(|i| ports_by_inode.get(&i)) {
+                let ports = map.entry(pid).or_default();
+                if !ports.contains(port) {
+                    ports.push(*port);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// `(inode, port)` of each LISTEN socket in a `/proc/net/tcp`-format table.
+#[cfg(any(target_os = "linux", test))]
+fn listening_sockets(table: &str) -> Vec<(u64, u16)> {
+    const LISTEN: &str = "0A";
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 10 || f[3] != LISTEN {
+                return None;
+            }
+            let port = u16::from_str_radix(f[1].rsplit(':').next()?, 16).ok()?;
+            let inode = f[9].parse::<u64>().ok()?;
+            (inode != 0).then_some((inode, port))
+        })
+        .collect()
+}
+
 /// Listening TCP ports per pid (one `lsof` call for all of them).
+#[cfg(not(target_os = "linux"))]
 pub fn listening_ports(pids: &[u32]) -> std::collections::HashMap<u32, Vec<u16>> {
     let mut map: std::collections::HashMap<u32, Vec<u16>> = std::collections::HashMap::new();
     if pids.is_empty() {
@@ -266,5 +346,64 @@ mod proc_tests {
             ports.get(&me).is_some_and(|p| p.contains(&port)),
             "{ports:?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ports_of_a_listener_in_another_network_namespace() {
+        // A new user + network namespace; skipped where that is not allowed.
+        let mut child = match std::process::Command::new("unshare")
+            .args(["-rn", "python3", "-c"])
+            .arg(
+                "import socket,sys,time\n\
+                 s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen()\n\
+                 print(s.getsockname()[1], flush=True); time.sleep(30)",
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("THURM_REQUIRE_NETNS").is_none(),
+                    "cannot run unshare: {e}"
+                );
+                return;
+            }
+        };
+        let mut line = String::new();
+        use std::io::BufRead;
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let Ok(port) = line.trim().parse::<u16>() else {
+            let _ = child.kill();
+            // CI allows user namespaces (see ci.yml): there, not running this is a failure.
+            assert!(
+                std::env::var_os("THURM_REQUIRE_NETNS").is_none(),
+                "cannot make a network namespace"
+            );
+            eprintln!("note: cannot make a network namespace here; skipped");
+            return;
+        };
+        let pid = child.id();
+        let ports = listening_ports(&[pid]);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            ports.get(&pid).is_some_and(|p| p.contains(&port)),
+            "{ports:?}"
+        );
+    }
+
+    #[test]
+    fn listen_sockets_parsed_from_proc_net_tcp() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41234 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:A1B2 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 41235 1 0000000000000000 20 4 30 10 -1
+   2: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 100 0 0 10 0
+";
+        assert_eq!(listening_sockets(table), vec![(41234, 8080)]);
     }
 }

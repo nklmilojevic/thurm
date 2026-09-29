@@ -344,6 +344,10 @@ impl Client {
             client: opts.client_name.to_owned(),
             version: PROTOCOL_VERSION,
             ui: opts.ui,
+            capabilities: thurm_proto::CAPABILITIES
+                .iter()
+                .map(|c| (*c).to_owned())
+                .collect(),
         })?;
         *client.hello.lock() = Some(hello);
         Ok(client)
@@ -440,6 +444,7 @@ mod tests {
                         daemon_pid: 1,
                         restored: false,
                         build: String::new(),
+                        capabilities: Vec::new(),
                     },
                     Request::ListPanes => {
                         codec::write_message(

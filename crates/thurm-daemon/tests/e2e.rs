@@ -273,9 +273,10 @@ fn panes_frames_persistence_and_restore() {
             frame: None,
             tabs: vec![TabLayout {
                 title: None,
-                root: LayoutNode::Pane { id: pane },
+                root: LayoutNode::local(pane),
                 focused: pane,
                 zoomed: None,
+                handoff: None,
             }],
             selected_tab: 0,
             fullscreen: false,

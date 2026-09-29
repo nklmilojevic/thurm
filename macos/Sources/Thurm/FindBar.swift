@@ -96,8 +96,8 @@ final class FindBar: NSView, NSSearchFieldDelegate {
     @objc func closeBar(_ sender: Any?) {
         if let pane = content?.focusedPane {
             Core.shared.send(object: [
-                "Search": ["pane": NSNumber(value: pane), "query": NSNull(), "direction": "Backward"],
-            ])
+                "Search": ["pane": pane.number, "query": NSNull(), "direction": "Backward"],
+            ], host: pane.host)
         }
         lastQuery = ""
         status.stringValue = ""
@@ -109,8 +109,8 @@ final class FindBar: NSView, NSSearchFieldDelegate {
         guard !query.isEmpty, let pane = content?.focusedPane else { return }
         lastQuery = query
         let resp = Core.shared.request(object: [
-            "Search": ["pane": NSNumber(value: pane), "query": query, "direction": direction],
-        ])
+            "Search": ["pane": pane.number, "query": query, "direction": direction],
+        ], host: pane.host)
         if let v = JSON.variant(resp), v.name == "Search",
            let payload = v.payload as? [String: Any], let found = jsonBool(payload["found"]) {
             status.stringValue = found ? "" : "No matches"

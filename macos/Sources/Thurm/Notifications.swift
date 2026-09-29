@@ -8,6 +8,7 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
     static let shared = Notifications()
 
     static let paneKey = "pane"
+    static let hostKey = "host"
     static let permissionKey = "permission"
 
     /// A coding agent's permission prompt, answerable from the notification.
@@ -54,15 +55,15 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
 
     /// Posts a notification for `pane`. Clicking it focuses the pane. With `permission` (the
     /// agent's permission prompt) it also offers to approve or deny it.
-    func post(pane: UInt64, title: String, body: String, permission: UInt64? = nil) {
+    func post(pane: PaneKey, title: String, body: String, permission: UInt64? = nil) {
         guard isAvailable else { return }
         requestAuthorizationIfNeeded()
         let content = UNMutableNotificationContent()
         content.title = title.isEmpty ? "Thurm" : title
         content.body = body
         content.sound = .default
-        content.userInfo = [Notifications.paneKey: NSNumber(value: pane)]
-        var identifier = "pane-\(pane)-\(UUID().uuidString)"
+        content.userInfo = [Notifications.paneKey: pane.number, Notifications.hostKey: pane.host]
+        var identifier = "pane-\(pane.host)-\(pane.id)-\(UUID().uuidString)"
         if let permission = permission {
             content.categoryIdentifier = Notifications.permissionCategory
             content.userInfo[Notifications.permissionKey] = NSNumber(value: permission)
@@ -77,10 +78,10 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
     }
 
     /// One per pane: a new prompt replaces the last one's notification.
-    private static func permissionIdentifier(pane: UInt64) -> String { "permission-\(pane)" }
+    private static func permissionIdentifier(pane: PaneKey) -> String { "permission-\(pane.host)-\(pane.id)" }
 
     /// The pane's permission prompt was answered (or went away): its buttons would do nothing.
-    func withdrawPermission(pane: UInt64) {
+    func withdrawPermission(pane: PaneKey) {
         guard isAvailable else { return }
         let id = Notifications.permissionIdentifier(pane: pane)
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
@@ -98,17 +99,19 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let info = response.notification.request.content.userInfo
-        let pane = jsonUInt64(info[Notifications.paneKey])
+        let id = jsonUInt64(info[Notifications.paneKey])
+        let host = (info[Notifications.hostKey] as? String) ?? localHost
         let permission = jsonUInt64(info[Notifications.permissionKey])
         let action = response.actionIdentifier
         DispatchQueue.main.async {
-            guard let pane = pane else { return }
+            guard let id else { return }
+            let pane = PaneKey(host, id)
             if let permission = permission,
                action == Notifications.approveAction || action == Notifications.denyAction {
                 let resp = Core.shared.request(object: ["AnswerPermission": [
-                    "pane": NSNumber(value: pane), "prompt": NSNumber(value: permission),
+                    "pane": pane.number, "prompt": NSNumber(value: permission),
                     "allow": action == Notifications.approveAction,
-                ]])
+                ]], host: pane.host)
                 // Answered in the terminal meanwhile, or the agent moved on: show what it is at.
                 if resp != nil && (resp as? [String: Any])?["error"] == nil { return }
             }

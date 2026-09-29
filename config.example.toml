@@ -212,3 +212,12 @@ animation_duration = 0.2
 # Map a key combination to an action name.
 # "cmd+shift+d" = "split_down"
 # "cmd+d" = "split_right"
+
+# Remote workspaces: thurmd on another machine, reached with the system ssh.
+# `thurm remote add devbox devbox` checks the connection and writes an entry.
+# [[remote]]
+# name = "devbox"
+# host = "devbox"          # an ssh Host alias, user@host, or ssh://user@host:port
+# socket = "/run/user/1000/thurm-1000/thurmd.sock"   # discovered when unset
+# enabled = true
+# clipboard_read = "ask"   # "ask", "always" or "never"

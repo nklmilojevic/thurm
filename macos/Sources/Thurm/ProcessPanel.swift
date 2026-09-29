@@ -7,7 +7,7 @@ final class ProcessPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate, 
     static let shared = ProcessPanel()
 
     private struct Row {
-        let pane: UInt64
+        let pane: PaneKey
         let pid: UInt64
         let ports: [Int]
         let command: String
@@ -75,9 +75,19 @@ final class ProcessPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate, 
     }
 
     private func refresh() {
-        guard let resp = Core.shared.request(object: ["Processes": ["pane": NSNull()]]),
+        var out: [Row] = []
+        // This Mac's panes, then each connected remote host's.
+        for host in [localHost] + Core.shared.connectedRemotes {
+            out += rows(host: host)
+        }
+        rows = out
+        table.reloadData()
+    }
+
+    private func rows(host: HostId) -> [Row] {
+        guard let resp = Core.shared.request(object: ["Processes": ["pane": NSNull()]], host: host),
               let v = JSON.variant(resp), v.name == "Processes", let list = v.payload as? [[String: Any]]
-        else { return }
+        else { return [] }
         var out: [Row] = []
         for pane in list {
             guard let id = jsonUInt64(pane["pane"]), let procs = pane["processes"] as? [[String: Any]] else { continue }
@@ -90,11 +100,11 @@ final class ProcessPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate, 
                 depth[pid] = d
                 let ports = (p["ports"] as? [Any])?.compactMap { jsonInt($0) } ?? []
                 if portsOnly.state == .on && ports.isEmpty { continue }
-                out.append(Row(pane: id, pid: pid, ports: ports, command: jsonString(p["command"]) ?? "", depth: d))
+                out.append(Row(pane: PaneKey(host, id), pid: pid, ports: ports, command: jsonString(p["command"]) ?? "",
+                               depth: d))
             }
         }
-        rows = out
-        table.reloadData()
+        return out
     }
 
     @objc private func togglePorts(_ sender: Any?) { refresh() }
@@ -108,7 +118,8 @@ final class ProcessPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate, 
 
     @objc private func doubleClicked(_ sender: Any?) {
         let r = table.clickedRow
-        guard r >= 0, r < rows.count, let port = rows[r].ports.first,
+        // A remote host's ports are not on this Mac's localhost.
+        guard r >= 0, r < rows.count, !rows[r].pane.isRemote, let port = rows[r].ports.first,
               let url = URL(string: "http://localhost:\(port)") else { return }
         NSWorkspace.shared.open(url)
     }

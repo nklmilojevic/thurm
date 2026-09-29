@@ -26,10 +26,10 @@ struct SplitDivider {
 
 /// Binary split tree of pane ids, mirroring `LayoutNode`.
 indirect enum SplitNode {
-    case leaf(UInt64)
+    case leaf(PaneKey)
     case split(axis: SplitAxis, ratio: CGFloat, first: SplitNode, second: SplitNode)
 
-    var panes: [UInt64] {
+    var panes: [PaneKey] {
         switch self {
         case .leaf(let id):
             return [id]
@@ -38,7 +38,7 @@ indirect enum SplitNode {
         }
     }
 
-    func contains(_ id: UInt64) -> Bool {
+    func contains(_ id: PaneKey) -> Bool {
         switch self {
         case .leaf(let leaf):
             return leaf == id
@@ -48,7 +48,7 @@ indirect enum SplitNode {
     }
 
     /// Splits `target`, putting `newPane` on the given side.
-    func inserting(_ newPane: UInt64, at target: UInt64, direction: SplitDirName) -> SplitNode {
+    func inserting(_ newPane: PaneKey, at target: PaneKey, direction: SplitDirName) -> SplitNode {
         switch self {
         case .leaf(let id):
             guard id == target else { return self }
@@ -66,7 +66,7 @@ indirect enum SplitNode {
     }
 
     /// Removes a pane; nil when the tree becomes empty.
-    func removing(_ id: UInt64) -> SplitNode? {
+    func removing(_ id: PaneKey) -> SplitNode? {
         switch self {
         case .leaf(let leaf):
             return leaf == id ? nil : self
@@ -79,7 +79,7 @@ indirect enum SplitNode {
     }
 
     /// Frames of every pane inside `rect`, leaving `gap` points for each divider.
-    func frames(in rect: CGRect, gap: CGFloat) -> [(UInt64, CGRect)] {
+    func frames(in rect: CGRect, gap: CGFloat) -> [(PaneKey, CGRect)] {
         switch self {
         case .leaf(let id):
             return [(id, rect)]
@@ -153,7 +153,7 @@ indirect enum SplitNode {
     }
 
     /// Moves the nearest divider of `axis` around `pane` by `delta` (fraction of the split).
-    func resizing(_ pane: UInt64, axis: SplitAxis, delta: CGFloat) -> (SplitNode, Bool) {
+    func resizing(_ pane: PaneKey, axis: SplitAxis, delta: CGFloat) -> (SplitNode, Bool) {
         guard case .split(let a, let ratio, let first, let second) = self else { return (self, false) }
         if first.contains(pane) {
             let (node, done) = first.resizing(pane, axis: axis, delta: delta)
@@ -193,7 +193,7 @@ indirect enum SplitNode {
     var layoutNode: LayoutNode {
         switch self {
         case .leaf(let id):
-            return .pane(id: id)
+            return .pane(id)
         case .split(let axis, let ratio, let first, let second):
             return .split(dir: axis == .horizontal ? .right : .down, ratio: Double(ratio),
                           first: first.layoutNode, second: second.layoutNode)
@@ -209,9 +209,9 @@ final class TabContentView: NSView {
     weak var controller: TerminalWindowController?
 
     private(set) var root: SplitNode
-    private(set) var views: [UInt64: TerminalView] = [:]
-    private(set) var focusedPane: UInt64
-    private(set) var zoomedPane: UInt64?
+    private(set) var views: [PaneKey: TerminalView] = [:]
+    private(set) var focusedPane: PaneKey
+    private(set) var zoomedPane: PaneKey?
 
     private(set) var findBar: FindBar?
     private var updateBadge: UpdateBadge?
@@ -219,7 +219,7 @@ final class TabContentView: NSView {
 
     static let gap: CGFloat = 1
 
-    init(root: SplitNode, focused: UInt64, zoomed: UInt64?) {
+    init(root: SplitNode, focused: PaneKey, zoomed: PaneKey?) {
         self.root = root
         let panes = root.panes
         self.focusedPane = panes.contains(focused) ? focused : (panes.first ?? focused)
@@ -236,12 +236,12 @@ final class TabContentView: NSView {
 
     override var isFlipped: Bool { true }
 
-    var paneIds: [UInt64] { root.panes }
+    var paneIds: [PaneKey] { root.panes }
     var isEmpty: Bool { views.isEmpty }
     var focusedView: TerminalView? { views[focusedPane] }
 
     /// Panes currently on screen (all panes, or only the zoomed one).
-    var visiblePaneIds: [UInt64] {
+    var visiblePaneIds: [PaneKey] {
         if let z = zoomedPane { return [z] }
         return root.panes
     }
@@ -394,7 +394,7 @@ final class TabContentView: NSView {
     // MARK: Tree operations
 
     /// Inserts `newPane` next to `target` (default: focused pane) and focuses it.
-    func split(target: UInt64? = nil, newPane: UInt64, direction: SplitDirName) {
+    func split(target: PaneKey? = nil, newPane: PaneKey, direction: SplitDirName) {
         let t = target.flatMap { root.contains($0) ? $0 : nil } ?? focusedPane
         zoomedPane = nil
         root = root.inserting(newPane, at: t, direction: direction)
@@ -406,7 +406,7 @@ final class TabContentView: NSView {
 
     /// Removes a pane's view. Returns true when the tab became empty.
     @discardableResult
-    func remove(pane: UInt64) -> Bool {
+    func remove(pane: PaneKey) -> Bool {
         guard root.contains(pane) else { return views.isEmpty }
         let wasFocused = pane == focusedPane
         if zoomedPane == pane { zoomedPane = nil }
@@ -435,7 +435,7 @@ final class TabContentView: NSView {
     }
 
     /// Makes `pane` the focused pane (and first responder when the window is visible).
-    func focus(_ pane: UInt64) {
+    func focus(_ pane: PaneKey) {
         guard let view = views[pane] else { return }
         if let z = zoomedPane, z != pane {
             zoomedPane = nil
@@ -447,7 +447,7 @@ final class TabContentView: NSView {
 
     /// Records the focused pane without touching the responder chain (called by the view
     /// itself when it becomes first responder).
-    func setFocusedPane(_ pane: UInt64) {
+    func setFocusedPane(_ pane: PaneKey) {
         guard views[pane] != nil else { return }
         let changed = pane != focusedPane
         focusedPane = pane
@@ -460,7 +460,7 @@ final class TabContentView: NSView {
     func moveFocus(_ direction: FocusDirection) {
         guard zoomedPane == nil, let current = views[focusedPane] else { return }
         let cur = current.frame
-        var best: (UInt64, CGFloat)?
+        var best: (PaneKey, CGFloat)?
         for (id, view) in views where id != focusedPane {
             let f = view.frame
             let overlap: Bool
@@ -576,6 +576,10 @@ final class TabContentView: NSView {
     // MARK: Persistence
 
     func tabLayout(title: String?) -> TabLayout {
-        TabLayout(title: title, root: root.layoutNode, focused: focusedPane, zoomed: zoomedPane)
+        TabLayout(title: title, root: root.layoutNode, focused: focusedPane.id, zoomed: zoomedPane?.id,
+                  handoff: controller?.handoffID)
     }
+
+    /// The host of this tab's panes.
+    var host: HostId { root.panes.first?.host ?? localHost }
 }
