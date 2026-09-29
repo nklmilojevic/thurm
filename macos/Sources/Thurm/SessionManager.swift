@@ -952,6 +952,7 @@ final class SessionManager: NSObject, CoreDelegate {
             if let info = PaneInfo(json: payload) { paneInfoUpdated(info) }
         case "PaneExited", "PaneClosed":
             if let id = jsonUInt64(dict?["pane"]) {
+                Notifications.shared.withdrawPermission(pane: id)
                 panes.removeValue(forKey: id)
                 removePaneFromUI(id)
                 updateDockBadge()
@@ -1009,7 +1010,8 @@ final class SessionManager: NSObject, CoreDelegate {
         if !waiting || !wasWaiting || old?.agent?.message != info.agent?.message {
             seenWaiting.remove(info.id)
         }
-        if wasWaiting && !waiting {
+        // Answered, or retired by keys typed in the pane: its buttons would do nothing.
+        if old?.agent?.permission != nil && old?.agent?.permission != info.agent?.permission {
             Notifications.shared.withdrawPermission(pane: info.id)
         }
         if waiting && !wasWaiting && !isPaneFocused(info.id) {

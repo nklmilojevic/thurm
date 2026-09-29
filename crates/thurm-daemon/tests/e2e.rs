@@ -585,12 +585,12 @@ fn permission_prompt_answered_from_notification() {
             let left = deadline.saturating_duration_since(Instant::now());
             if let Event::Notify {
                 pane: p,
-                permission,
+                permission: Some(prompt),
                 ..
-            } = rx.recv_timeout(left).expect("no notification")
+            } = rx.recv_timeout(left).expect("no notification with answers")
                 && p == pane
             {
-                return permission.expect("notification offers no answer");
+                return prompt;
             }
         }
     };
@@ -602,10 +602,14 @@ fn permission_prompt_answered_from_notification() {
         })
     };
 
-    let first = prompt();
+    // Already waiting on another request: the prompt still gets its own notification.
+    hook(&c, pane, "notification", None);
     assert_eq!(agent(&c, pane).unwrap().status, AgentStatus::NeedsInput);
+    let first = prompt();
+    assert_eq!(agent(&c, pane).unwrap().permission, Some(first));
     assert!(matches!(answer(first, true), Ok(Response::Ok)));
-    assert_eq!(agent(&c, pane).unwrap().status, AgentStatus::Working);
+    let a = agent(&c, pane).unwrap();
+    assert_eq!((a.status, a.permission), (AgentStatus::Working, None));
     assert!(answer(first, true).is_err(), "a prompt is answered once");
 
     hook(&c, pane, "tool-complete", None);

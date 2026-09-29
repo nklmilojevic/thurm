@@ -8,7 +8,8 @@
 //! `thurm agent-hook`; while the hooked agent is in the foreground that state wins over the
 //! screen heuristics, and adds a session id, a Done state and turn timing.
 
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thurm_config::AgentDef;
 use thurm_proto::{AgentState, AgentStatus, ProcessInfo};
@@ -31,8 +32,6 @@ pub struct AgentTracker {
     /// Bumped whenever the agent or its status changes: what the model said about one
     /// status (a request, a finished turn) must not stick to the next.
     episode: u64,
-    /// Numbers the permission prompts hooks reported, so an answer names the one it is for.
-    prompts: u64,
     ai: AiNotes,
 }
 
@@ -310,8 +309,7 @@ impl AgentTracker {
             "permission-prompt" => {
                 h.status = AgentStatus::NeedsInput;
                 h.message = message;
-                self.prompts += 1;
-                h.permission = Some(self.prompts);
+                h.permission = Some(next_prompt_id());
             }
             "stop" => {
                 h.status = AgentStatus::Done;
@@ -394,6 +392,7 @@ impl AgentTracker {
             turns: 0,
             hooked: true,
             topic: None,
+            permission: None,
         })
     }
 
@@ -405,6 +404,7 @@ impl AgentTracker {
             state.turn_ms = h.turn_ms;
             state.turns = h.turns;
             state.hooked = true;
+            state.permission = h.permission.filter(|_| h.status == AgentStatus::NeedsInput);
             state.topic = h
                 .transcript
                 .as_ref()
@@ -435,7 +435,10 @@ impl AgentTracker {
             self.last_kind = Some(n.kind.clone());
         }
         let key = |s: &Option<AgentState>| s.as_ref().map(|s| (s.kind.clone(), s.status));
-        if key(&next) != key(&self.current) {
+        let prompt = |s: &Option<AgentState>| s.as_ref().and_then(|s| s.permission);
+        // Another permission prompt is another request, even with the status unchanged.
+        let new_prompt = prompt(&next).is_some() && prompt(&next) != prompt(&self.current);
+        if key(&next) != key(&self.current) || new_prompt {
             self.episode += 1;
             self.ai.detail = None;
             if next
@@ -514,6 +517,7 @@ impl AgentTracker {
                 turns: 0,
                 hooked: false,
                 topic: None,
+                permission: None,
             }))
         });
         if next.is_none() {
@@ -546,6 +550,22 @@ pub fn human_duration(ms: u64) -> String {
 }
 
 /// "Claude is waiting for your input": sent after a minute without input, not for a request.
+/// Identifies a permission prompt. Unique across daemon restarts and in-place upgrades, whose
+/// trackers start afresh while notifications naming older prompts may still be answered: the
+/// clock in microseconds, kept increasing.
+fn next_prompt_id() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64);
+    let prev = LAST
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
+            Some(now.max(l + 1))
+        })
+        .unwrap_or_default();
+    now.max(prev + 1)
+}
+
 fn is_idle_reminder(message: &str) -> bool {
     message
         .to_ascii_lowercase()
@@ -1155,6 +1175,7 @@ mod tests {
             turns: 0,
             hooked: false,
             topic: None,
+            permission: None,
         };
         assert!(generic_title(None, &a));
         assert!(generic_title(Some("✳ Claude Code"), &a));
@@ -1205,6 +1226,12 @@ mod tests {
         t.user_answer(b"\x1b[B");
         assert_eq!(t.state().unwrap().status, AgentStatus::NeedsInput);
         assert_eq!(t.answer_permission(third, true), None);
+
+        // A tracker starting afresh (an in-place upgrade) never reuses a number that an old
+        // notification may still carry.
+        let mut fresh = AgentTracker::default();
+        fresh.update(&defs, Some(&claude), "> ", quiet, idle_after);
+        assert!(prompt(&mut fresh) > third);
 
         // So does any later hook.
         let fourth = prompt(&mut t);

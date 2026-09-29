@@ -166,6 +166,8 @@ struct AgentState: Equatable {
     var hooked = false
     /// What the session is about (the agent's own session title).
     var topic: String? = nil
+    /// The permission prompt showing, while a notification can still answer it.
+    var permission: UInt64? = nil
 }
 
 /// Swift view of `thurm_proto::GitInfo`.
@@ -221,7 +223,8 @@ struct PaneInfo {
                                turnMs: jsonUInt64(a["turn_ms"]),
                                turns: jsonInt(a["turns"]) ?? 0,
                                hooked: jsonBool(a["hooked"]) ?? false,
-                               topic: jsonString(a["topic"]))
+                               topic: jsonString(a["topic"]),
+                               permission: jsonUInt64(a["permission"]))
         } else {
             agent = nil
         }

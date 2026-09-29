@@ -475,6 +475,10 @@ pub struct AgentState {
     /// `/rename` title). Used as the pane's title.
     #[serde(default)]
     pub topic: Option<String>,
+    /// The permission prompt showing, while it can be answered with
+    /// [`Request::AnswerPermission`] (hooks only).
+    #[serde(default)]
+    pub permission: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

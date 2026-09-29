@@ -1377,8 +1377,11 @@ impl Daemon {
             return Vec::new();
         };
         let was = before.map(|b| b.status);
+        // A permission prompt right after another request is news too.
+        let new_prompt =
+            a.permission.is_some() && a.permission != before.and_then(|b| b.permission);
         let (done, body) = match a.status {
-            AgentStatus::NeedsInput if was != Some(AgentStatus::NeedsInput) => (
+            AgentStatus::NeedsInput if was != Some(AgentStatus::NeedsInput) || new_prompt => (
                 false,
                 (n.enabled && n.agent_needs_input).then(|| {
                     a.message
@@ -1410,7 +1413,7 @@ impl Daemon {
                 return Vec::new();
             }
         }
-        let permission = st.agent.permission_prompt().filter(|_| !done);
+        let permission = a.permission.filter(|_| !done);
         notify
             .map(|(title, body)| Event::Notify {
                 pane,
