@@ -5,6 +5,7 @@
 //! Skipped (with a note) when no `sshd` is found.
 
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,6 +17,7 @@ use thurm_client::{Client, ConnectOptions};
 use thurm_config::RemoteConfig;
 use thurm_proto::{CaptureOpts, CreatePane, Envelope, Request, Response, ServerMessage, codec};
 use thurm_remote::Ssh;
+use thurm_remote::doctor::{self, State};
 use thurm_remote::install::{self, Method};
 use thurm_remote::tunnel::{Phase, Status, Supervisor};
 
@@ -95,7 +97,6 @@ fn setup() -> Option<World> {
     ] {
         std::fs::create_dir_all(base.join(d)).unwrap();
     }
-    use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(base.join("rrun"), std::fs::Permissions::from_mode(0o700)).unwrap();
     let keys = base.join("keys");
     keygen(&keys.join("host"));
@@ -383,6 +384,41 @@ fn remote_workspace_over_loopback_ssh() {
     assert!(!s.upgrade_available);
     assert_eq!(s.remote_build.as_deref(), Some(thurm_proto::BUILD));
     let local = s.socket.clone();
+
+    // 2b. The doctor: what is left, and the fixes Thurm runs over ssh.
+    let bins = Some(w.bins.as_path());
+    let r = doctor::run(&w.ssh, "loop", None, bins).unwrap();
+    let state = |r: &doctor::Report, id: &str| r.check(id).map(|c| c.state);
+    assert_eq!(state(&r, "thurm"), Some(State::Ok), "{:#?}", r.checks);
+    assert_eq!(state(&r, "daemon"), Some(State::Ok));
+    // No ~/.local/bin on the "host": `thurm` is not on PATH in plain ssh sessions.
+    assert_eq!(state(&r, "path"), Some(State::Warn));
+    assert_eq!(state(&r, "agent.claude"), Some(State::Warn));
+    assert!(r.check("hooks.claude").is_none());
+    doctor::fix(&w.ssh, None, bins, "path", false).unwrap();
+    assert!(w.base.join("rhome/.local/bin/thurm").is_symlink());
+    // An agent shows up (installed after Thurm): its hooks are missing, then fixed.
+    let claude = w.base.join("rhome/.local/bin/claude");
+    std::fs::write(&claude, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = doctor::run(&w.ssh, "loop", None, bins).unwrap();
+    assert_eq!(state(&r, "path"), Some(State::Ok));
+    assert_eq!(state(&r, "agent.claude"), Some(State::Ok));
+    assert_eq!(state(&r, "hooks.claude"), Some(State::Fail));
+    let login = if r.plan.host.os == "Darwin" {
+        State::Skip
+    } else {
+        State::Warn
+    };
+    assert_eq!(state(&r, "login.claude"), Some(login));
+    let out = doctor::fix(&w.ssh, None, bins, "hooks.claude", false).unwrap();
+    assert!(out.contains("hooks installed"), "{out}");
+    let settings = std::fs::read_to_string(w.base.join("rhome/.claude/settings.json")).unwrap();
+    assert!(settings.contains("agent-hook claude"));
+    let r = doctor::run(&w.ssh, "loop", None, bins).unwrap();
+    assert_eq!(state(&r, "hooks.claude"), Some(State::Ok));
+    let argv = w.ssh.interactive_argv("exec claude").unwrap();
+    assert!(argv.contains(&"-t".to_owned()) && argv.last().unwrap().starts_with("sh -c "));
 
     // 3. Panes through the tunnel.
     let c = connect(&local);

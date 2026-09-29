@@ -287,7 +287,8 @@ final class SessionManager: NSObject, CoreDelegate {
     /// Creates a pane in `host`'s daemon (default: the host of the pane it inherits from).
     /// Returns its key.
     func createPane(cols: Int, rows: Int, inheritFrom: PaneKey?, preset: String? = nil,
-                    forkFrom: PaneKey? = nil, host: HostId? = nil, cwd: String? = nil) -> PaneKey? {
+                    forkFrom: PaneKey? = nil, host: HostId? = nil, cwd: String? = nil,
+                    command: [String]? = nil, hold: Bool = false) -> PaneKey? {
         let host = host ?? forkFrom?.host ?? inheritFrom?.host ?? localHost
         guard Core.shared.isConnected(host) else {
             currentController?.content.focusedView?.showToast(
@@ -299,13 +300,13 @@ final class SessionManager: NSObject, CoreDelegate {
         let fork = forkFrom.flatMap { $0.host == host ? $0 : nil }
         let request: [String: Any] = ["CreatePane": [
             "fork_from": orNull(fork?.number),
-            "command": NSNull(),
+            "command": orNull(command),
             "cwd": orNull(cwd),
             "env": [Any](),
             "size": paneSizeObject(cols: cols, rows: rows),
             "agent_preset": orNull(preset),
             "inherit_cwd_from": orNull(inherit?.number),
-            "hold": false,
+            "hold": hold,
         ] as [String: Any]]
         let resp = Core.shared.request(object: request, host: host)
         guard let v = JSON.variant(resp), v.name == "PaneCreated",
@@ -383,28 +384,22 @@ final class SessionManager: NSObject, CoreDelegate {
         for var w in layout.windows {
             w.tabs = w.tabs.filter { tab in tab.root.panes.allSatisfy { !placed.contains($0) } }
             placed.formUnion(w.tabs.flatMap { $0.root.panes })
-            restoreWindow(w)
+            // Thurm has one window: the front one of the layout. Older layouts' other windows
+            // come back as workspaces in the background.
+            if regularControllers.isEmpty {
+                restoreWindow(w)
+            } else {
+                hideWindowLayout(w)
+            }
             used.formUnion(w.tabs.flatMap { $0.root.panes })
         }
 
-        // Panes that exist but are not in the layout: tabs of one extra window.
+        // Panes that exist but are not in the layout: tabs of a workspace in the background.
         let orphans = infos.filter { $0.alive && !used.contains($0.key) }.map { $0.key }
             .sorted { $0.id < $1.id }
-        var first: TerminalWindowController?
-        var previous: TerminalWindowController?
-        let orphanWorkspace = orphans.isEmpty ? nil : makeWorkspace()
-        for id in orphans {
-            let c = makeController(root: .leaf(id), focused: id, zoomed: nil, title: nil, frame: nil)
-            c.workspaceID = orphanWorkspace?.id ?? 0
-            if let prev = previous {
-                attachAsTab(c, to: prev)
-            } else {
-                showAsNewWindow(c, frame: nil)
-                first = c
-            }
-            previous = c
+        if !orphans.isEmpty {
+            makeWorkspace().hiddenTabs = orphans.map { TabLayout(title: nil, root: .pane($0), focused: $0.id, zoomed: nil) }
         }
-        first?.window?.makeKeyAndOrderFront(nil)
 
         if regularControllers.isEmpty {
             if let ws = workspacesByRecency.first(where: { !$0.hiddenTabs.isEmpty }) {
@@ -416,6 +411,17 @@ final class SessionManager: NSObject, CoreDelegate {
         sessionReady = true
         saveLayoutNow(force: true)
         focusChanged()
+    }
+
+    /// A saved window's tabs as a workspace in the background.
+    private func hideWindowLayout(_ w: WindowLayout) {
+        guard !w.tabs.isEmpty else { return }
+        var ws = workspace(w.workspace)
+        if ws == nil || (ws.map { isShown($0) || !$0.hiddenTabs.isEmpty } ?? false) {
+            ws = makeWorkspace(host: w.tabs.first?.focusedKey.host ?? localHost)
+        }
+        ws?.hiddenTabs = w.tabs
+        ws?.hiddenSelectedTab = min(max(0, w.selectedTab), w.tabs.count - 1)
     }
 
     private func restoreWindow(_ w: WindowLayout) {
@@ -536,15 +542,24 @@ final class SessionManager: NSObject, CoreDelegate {
         w.tabbingMode = .preferred
     }
 
-    /// Cmd+N: a new window with a new shell (or an existing pane), showing a new workspace.
-    func newWindow(pane existing: PaneKey? = nil, preset: String? = nil, workspace ws: Workspace? = nil) {
+    /// A new shell (or an existing pane) in a new workspace (or `ws`). Thurm has one window: it
+    /// switches to that workspace, or with `background` keeps showing its own; the window is
+    /// made here when there is none.
+    func newWindow(pane existing: PaneKey? = nil, preset: String? = nil, workspace ws: Workspace? = nil,
+                   background: Bool = false) {
         let host = existing?.host ?? ws?.host ?? localHost
+        let window = currentRegularController.flatMap { $0.window == nil ? nil : $0 }
         var id = existing
         if id == nil {
-            let size = gridSize(forPoints: defaultContentSize())
+            let size = gridSize(forPoints: window?.content.bounds.size ?? defaultContentSize())
             id = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, preset: preset, host: host)
         }
         guard let pane = id else { return }
+        if let window {
+            let target = ws ?? makeWorkspace(host: host)
+            addHiddenTab(pane, handoff: nil, to: target, in: window, reveal: !background)
+            return
+        }
         let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
         c.workspaceID = (ws ?? makeWorkspace(host: host)).id
         showAsNewWindow(c, frame: nil)
@@ -552,10 +567,13 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     /// Cmd+T: a new tab next to `host`, inheriting the focused pane's cwd. The pane runs on
-    /// the daemon of `host`'s workspace (a remote workspace's tabs are that host's panes).
+    /// the daemon of `host`'s workspace (a remote workspace's tabs are that host's panes). A pane
+    /// of another host goes to a workspace of that host: the window switches to it with
+    /// `reveal`, else it waits in the background. Returns the pane.
     @discardableResult
     func newTab(from hostIn: TerminalWindowController?, pane existing: PaneKey? = nil, preset: String? = nil,
-                cwd: String? = nil, host daemonIn: HostId? = nil) -> TerminalWindowController? {
+                cwd: String? = nil, host daemonIn: HostId? = nil, handoff: String? = nil,
+                reveal: Bool = false) -> PaneKey? {
         // The quick terminal has one tab: new ones go to the last regular window.
         var host = hostIn ?? currentController
         if host?.isQuick ?? false { host = currentRegularController }
@@ -568,18 +586,22 @@ final class SessionManager: NSObject, CoreDelegate {
                             host: daemon, cwd: cwd)
         }
         guard let pane = id else { return nil }
-        let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
-        let sameHost = host.map { (workspace($0.workspaceID)?.host ?? $0.host) == pane.host } ?? false
-        if let host = host, let hostWindow = host.window, hostWindow.isVisible, sameHost {
-            attachAsTab(c, to: host)
-            c.window?.makeKeyAndOrderFront(nil)
-        } else if let shown = workspaces.first(where: { $0.host == pane.host && isShown($0) }),
-                  let other = controllerShowing(shown) {
-            // Another window shows this host's workspace: the tab goes there.
-            attachAsTab(c, to: other)
-            c.window?.makeKeyAndOrderFront(nil)
+        if let host, host.window != nil {
+            if (workspace(host.workspaceID)?.host ?? host.host) == pane.host {
+                let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
+                c.handoffID = handoff
+                attachAsTab(c, to: host)
+                c.window?.makeKeyAndOrderFront(nil)
+            } else {
+                let ws = workspacesByRecency.first { $0.host == pane.host && !isShown($0) }
+                    ?? makeWorkspace(host: pane.host)
+                addHiddenTab(pane, handoff: handoff, to: ws, in: host, reveal: reveal)
+            }
         } else {
-            c.workspaceID = (workspaces.first { $0.host == pane.host && !isShown($0) && pane.isRemote }
+            // No window yet: this tab's workspace opens in the one window.
+            let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
+            c.handoffID = handoff
+            c.workspaceID = (workspacesByRecency.first { $0.host == pane.host && !isShown($0) }
                 ?? makeWorkspace(host: pane.host)).id
             if let ws = workspace(c.workspaceID), !ws.hiddenTabs.isEmpty {
                 // Its hidden tabs come along.
@@ -598,7 +620,7 @@ final class SessionManager: NSObject, CoreDelegate {
             }
         }
         scheduleLayoutSave()
-        return c
+        return pane
     }
 
     /// Cmd+D / Cmd+Shift+D.
@@ -682,6 +704,8 @@ final class SessionManager: NSObject, CoreDelegate {
         workspace(c.workspaceID)?.lastActive = Date()
         focusChanged()
         scheduleLayoutSave()
+        // A tab dragged out into its own window: after AppKit is done with the drag.
+        if !c.isQuick { DispatchQueue.main.async { SessionManager.shared.foldExtraWindows() } }
     }
 
     /// Focuses a pane, bringing its tab to the front.
@@ -943,6 +967,7 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     @objc private func debouncedSave() {
+        foldExtraWindows()
         saveLayoutNow()
     }
 
@@ -1129,11 +1154,12 @@ final class SessionManager: NSObject, CoreDelegate {
             }
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
             if jsonBool(d["new_window"]) ?? false {
-                newWindow(pane: pane)
+                // `thurm new-tab --window`: its own workspace, in the background.
+                newWindow(pane: pane, background: true)
             } else {
-                let c = newTab(from: currentController, pane: pane)
                 // `thurm handoff` opened it: tag and group it.
-                if let h = Remotes.shared.handoff(host: daemon, pane: pane.id) { c?.handoffID = h.id }
+                newTab(from: currentController, pane: pane,
+                       handoff: Remotes.shared.handoff(host: daemon, pane: pane.id)?.id)
             }
             NSApp.activate()
         case "Split":
@@ -1151,7 +1177,7 @@ final class SessionManager: NSObject, CoreDelegate {
                 host.content.split(target: target, newPane: pane, direction: dir)
                 scheduleLayoutSave()
             } else {
-                newWindow(pane: pane)
+                newTab(from: currentController, pane: pane)
             }
         case "Focus":
             if let pane = key("pane") { focusPane(pane, activate: true) }

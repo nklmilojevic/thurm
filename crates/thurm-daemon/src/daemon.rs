@@ -366,6 +366,9 @@ impl Daemon {
         });
         let size = sanitize_size(req.size);
         let cfg = self.config.read().clone();
+        if restore.is_none() && cfg.agents.install_hooks {
+            ensure_hooks(command.as_deref());
+        }
         let opts = shell::spawn_options(shell::PaneLaunch {
             id,
             command: command.clone(),
@@ -2009,4 +2012,20 @@ fn write_temp_file(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<PathB
         }
     }
     Err(std::io::Error::other("no free file name"))
+}
+
+/// Before an agent starts (`claude`, `codex`): its status hooks, so a host where the agent
+/// was installed after Thurm reports Working / Needs input without `thurm hooks install`.
+/// Only adds our entries (a backup of the file is kept); `agents.install_hooks = false`
+/// turns it off.
+fn ensure_hooks(command: Option<&[String]>) {
+    let Some(agent) = command.and_then(thurm_config::hooks::agent_for_command) else {
+        return;
+    };
+    let path = thurm_config::hooks::settings_path(agent);
+    match thurm_config::hooks::ensure_at(agent, &path) {
+        Ok(true) => log::info!("installed {} hooks in {}", agent.name, path.display()),
+        Ok(false) => {}
+        Err(e) => log::warn!("{} hooks: {e}", agent.name),
+    }
 }

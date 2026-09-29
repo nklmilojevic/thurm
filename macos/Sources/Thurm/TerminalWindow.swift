@@ -140,6 +140,15 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         didSet { titleLabel.stringValue = title.isEmpty ? " " : title }
     }
 
+    /// Thurm has one window: a tab moved out goes to a new workspace, and there is nothing
+    /// to merge.
+    override func moveTabToNewWindow(_ sender: Any?) {
+        guard let c = windowController as? TerminalWindowController else { return }
+        SessionManager.shared.moveTabToNewWorkspace(c)
+    }
+
+    override func mergeAllWindows(_ sender: Any?) {}
+
     override func becomeMain() {
         super.becomeMain()
         titleLabel.textColor = .labelColor

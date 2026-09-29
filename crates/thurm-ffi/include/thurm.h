@@ -438,6 +438,14 @@ void thurm_remote_kick(const char *name, bool restart);
  *   {"op":"install","name":"devbox","method":"download","bins":"..."}   {"build":...,...}
  *   {"op":"upgrade_daemon","name":"devbox","allow_restart":false}
  *        {"ok":true,"output":...} or {"ok":false,"would_stop_panes":true,"protocol":n}
+ *   {"op":"add","name":"devbox","target":"me@devbox"}     {"name":...,"host":{...}} (checks ssh,
+ *        writes [[remote]]; installing is doctor_fix "thurm")
+ *   {"op":"doctor","name":"devbox","bins":"..."}          {"plan":{...},"checks":[{"id":...,
+ *        "title":...,"state":"ok"|"warn"|"fail"|"skip","detail":...,"fix":{"label":...,
+ *        "confirm":...|null}|null,"terminal":"<script>"|null}, ...]}
+ *   {"op":"doctor_fix","name":"devbox","id":"linger","bins":"...","allow_restart":false}
+ *        {"output":...}
+ *   {"op":"terminal_argv","name":"devbox","script":"..."}  ["ssh", ..., "-t", ...] (run it in a pane)
  *   {"op":"allow_clipboard","name":"devbox"}              "Ok" (clipboard_read = "always")
  *   {"op":"clipboard_read","host":"devbox"|null}          "allow" | "deny" | "ask"
  *   {"op":"clipboard_write","host":"devbox"|null}         "allow" | "deny"

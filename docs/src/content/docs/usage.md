@@ -5,11 +5,12 @@ title: Use Thurm
 ## Tabs and split panes
 
 Each pane has its own process and terminal state. A tab can contain several
-panes. Use a new window when you need another group of tabs.
+panes. Thurm has one window; use a new workspace when you need another group
+of tabs.
 
 | Action | Default shortcut |
 | --- | --- |
-| New tab / window | Cmd+T / Cmd+N |
+| New tab / workspace | Cmd+T / Cmd+N |
 | Close pane / tab | Cmd+W / Cmd+Shift+W |
 | Select tab 1 through 8 / last tab | Cmd+1 through Cmd+8 / Cmd+9 |
 | Previous / next tab | Cmd+Shift+[ / Cmd+Shift+] |
@@ -27,9 +28,12 @@ default. See [Sessions](/thurm/sessions/).
 
 ## Workspaces and sidebar
 
-A workspace is a named set of tabs. Use the workspace switcher to change the
-visible workspace. Shells in hidden workspaces continue to run. If another
-window already shows the selected workspace, Thurm brings that window forward.
+A workspace is a named set of tabs. The window shows one workspace at a time;
+use the workspace switcher to change it. Shells in hidden workspaces continue
+to run. A tab opened for another workspace, such as `thurm launch` on a remote
+host while the window shows a local workspace, goes to that workspace in the
+background, and the window says where. **Move Tab to New Workspace** (or
+dragging a tab out of the tab bar) moves a tab into a new workspace.
 
 To show tabs in a sidebar grouped by repository:
 

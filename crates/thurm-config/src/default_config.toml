@@ -114,6 +114,9 @@ idle_after_ms = 1500
 session_titles = true
 # Launch presets for the command palette (default: every detected agent CLI on PATH).
 # presets = [{ name = "Claude (plan mode)", command = ["claude", "--permission-mode", "plan"] }]
+# Add Thurm's status hooks to Claude Code's / Codex's settings when one is launched without
+# them (what `thurm hooks install` does).
+install_hooks = true
 
 # Teach Thurm about another agent:
 # [[agents.define]]
