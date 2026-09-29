@@ -342,18 +342,23 @@ extension SessionManager {
             Remotes.shared.connectionLost(host)
             return
         }
-        // Closes queued while it was away. One whose pane is gone, or runs another process now,
-        // is dropped; one the daemon doesn't confirm stays queued and its pane stays hidden.
+        // Closes queued while it was away. They apply to the pane still running the process
+        // it had, or restored from the daemon's session (same number, a new shell); any other
+        // pane under that number is a new one and the close is dropped. One the daemon doesn't
+        // confirm stays queued and its pane stays hidden.
         let pending = Remotes.shared.pendingCloses[host] ?? [:]
+        let isClosed = { (info: PaneInfo) -> Bool in
+            guard let pid = pending[info.id] else { return false }
+            return info.restored || (pid != 0 && info.pid == pid)
+        }
         var stillPending: [UInt64: UInt32] = [:]
-        for info in fetched where info.alive {
-            guard let pid = pending[info.id], pid != 0, info.pid == pid else { continue }
+        for info in fetched where info.alive && isClosed(info) {
             let answer = JSON.variant(Core.shared.request(object: ["ClosePane": ["pane": NSNumber(value: info.id)]],
                                                           host: host))
-            if answer?.name != "Ok" { stillPending[info.id] = pid }
+            if answer?.name != "Ok" { stillPending[info.id] = info.pid ?? pending[info.id] ?? 0 }
         }
         Remotes.shared.pendingCloses[host] = stillPending.isEmpty ? nil : stillPending
-        let infos = fetched.filter { pending[$0.id] == nil || pending[$0.id] != $0.pid }
+        let infos = fetched.filter { !isClosed($0) }
         let alive = Set(infos.filter { $0.alive }.map { $0.key })
         for key in panes.keys where key.host == host && !alive.contains(key) {
             panes.removeValue(forKey: key)
