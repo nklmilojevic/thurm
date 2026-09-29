@@ -45,6 +45,11 @@ const QUIET: Duration = Duration::from_millis(2);
 /// Screen lines the model reads for titles, requests and turn summaries.
 const AI_SCREEN_LINES: usize = 60;
 
+/// How long a pane whose shell died waits for a SIGTERM to the daemon before dropping out of
+/// the session. Quitting the app signals the daemon and the shells at once, and the reader can
+/// see the shell go before the signal handler has run.
+const TEARDOWN_GRACE: Duration = Duration::from_millis(200);
+
 /// Work for the on-device model (`[ai]`), done one at a time by `ai_worker`.
 enum AiJob {
     Title {
@@ -754,7 +759,7 @@ impl Daemon {
     }
 
     fn pane_exited(&self, pane: &Arc<Pane>) {
-        if self.stopping.load(Ordering::Relaxed) {
+        if self.stopping_within(TEARDOWN_GRACE) {
             log::info!("pane {} ended with the daemon", pane.id);
             return;
         }
@@ -797,6 +802,20 @@ impl Daemon {
             self.panes.lock().remove(&pane.id);
             self.session_dirty.store(true, Ordering::Relaxed);
             self.broadcast(Event::PaneClosed { pane: pane.id }, false);
+        }
+    }
+
+    /// Whether a SIGTERM/SIGINT arrives within `grace`.
+    fn stopping_within(&self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            if self.stopping.load(Ordering::Relaxed) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
