@@ -56,6 +56,19 @@ pub fn normalize_event(e: &str) -> String {
         .unwrap_or_else(|| e.to_ascii_lowercase())
 }
 
+/// Our event name for a hook event and the JSON payload the agent sent with it: Claude Code's
+/// permission dialog (a notification the notification can answer) is `permission-prompt`.
+pub fn hook_event(event: &str, payload: &Value) -> String {
+    let event = normalize_event(event);
+    let permission =
+        payload.get("notification_type").and_then(Value::as_str) == Some("permission_prompt");
+    if event == "notification" && permission {
+        "permission-prompt".into()
+    } else {
+        event
+    }
+}
+
 /// The file holding `agent`'s hooks.
 pub fn settings_path(agent: &HookAgent) -> PathBuf {
     match agent.kind {
@@ -226,5 +239,21 @@ mod tests {
         assert!(c.ends_with("; true"));
         assert_eq!(normalize_event("UserPromptSubmit"), "prompt-submit");
         assert_eq!(normalize_event("stop"), "stop");
+    }
+
+    #[test]
+    fn permission_prompts_are_told_apart() {
+        let payload = |t: &str| json!({ "notification_type": t, "message": "…" });
+        assert_eq!(
+            hook_event("Notification", &payload("permission_prompt")),
+            "permission-prompt"
+        );
+        assert_eq!(
+            hook_event("notification", &payload("idle_prompt")),
+            "notification"
+        );
+        assert_eq!(hook_event("Notification", &json!({})), "notification");
+        // Only notifications are reclassified.
+        assert_eq!(hook_event("Stop", &payload("permission_prompt")), "stop");
     }
 }

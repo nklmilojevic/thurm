@@ -1036,6 +1036,7 @@ final class SessionManager: NSObject, CoreDelegate {
             if let info = PaneInfo(json: payload, host: host) { paneInfoUpdated(info) }
         case "PaneExited", "PaneClosed":
             if let id = key {
+                Notifications.shared.withdrawPermission(pane: id)
                 panes.removeValue(forKey: id)
                 removePaneFromUI(id)
                 updateDockBadge()
@@ -1053,7 +1054,8 @@ final class SessionManager: NSObject, CoreDelegate {
                 if id.isRemote { title = "\(host) · \(title)" }
                 let body = jsonString(dict?["body"]) ?? ""
                 if config.notificationsEnabled && (!NSApp.isActive || !isPaneFocused(id)) {
-                    Notifications.shared.post(pane: id, title: title, body: body)
+                    Notifications.shared.post(pane: id, title: title, body: body,
+                                              permission: jsonUInt64(dict?["permission"]))
                 }
             }
         case "ClipboardStore":
@@ -1098,6 +1100,10 @@ final class SessionManager: NSObject, CoreDelegate {
         // A new request (or a different one) is unread again.
         if !waiting || !wasWaiting || old?.agent?.message != info.agent?.message {
             seenWaiting.remove(key)
+        }
+        // Answered, or retired by keys typed in the pane: its buttons would do nothing.
+        if old?.agent?.permission != nil && old?.agent?.permission != info.agent?.permission {
+            Notifications.shared.withdrawPermission(pane: key)
         }
         if waiting && !wasWaiting && !isPaneFocused(key) {
             NSApp.requestUserAttention(.informationalRequest)

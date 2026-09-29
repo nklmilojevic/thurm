@@ -65,6 +65,13 @@ Agent notifications apply to panes without focus. Check macOS notification
 permissions and `[notifications]` if they do not appear. Optional AI summaries
 are separate and require `ai.enabled = true`.
 
+With Claude Code hooks installed, a permission prompt's notification has
+**Approve** and **Deny** buttons. Approve picks the prompt's default choice
+(allow once) and needs the Mac unlocked. Deny declines, as Esc would. Either
+answers only the prompt the notification is about: once you answer in the
+terminal, press a key in the pane, or the agent moves on, the notification is
+withdrawn, and a button pressed in the meantime opens the pane instead.
+
 For agent authors, the repository includes a
 [Thurm skill](https://github.com/nklmilojevic/thurm/blob/main/skills/thurm/SKILL.md)
 with CLI procedures.
