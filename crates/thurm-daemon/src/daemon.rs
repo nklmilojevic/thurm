@@ -659,11 +659,14 @@ impl Daemon {
             for ev in events {
                 match ev {
                     TermEvent::PtyWrite(b) => pane.write(b),
-                    TermEvent::Title(t) => {
-                        if let Some(t) = t {
-                            st.info.title = t;
+                    TermEvent::Title(_) => {
+                        // Through `pane_title`: an agent's session topic stays put while the
+                        // agent repaints its own title ("◑ Fix login bug") with every frame.
+                        let title = pane_title(&st, st.info.foreground.as_ref());
+                        if title != st.info.title {
+                            st.info.title = title;
+                            info_changed = true;
                         }
-                        info_changed = true;
                     }
                     TermEvent::Bell => outgoing.push(Event::Bell { pane: pane.id }),
                     TermEvent::ClipboardStore(text) => outgoing.push(Event::ClipboardStore {

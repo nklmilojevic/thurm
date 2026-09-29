@@ -465,7 +465,7 @@ fn hook(c: &Client, pane: PaneId, event: &str, session: Option<&str>) {
 fn agent_hooks_drive_status_and_wait() {
     let env = Env::new("hooks");
     let _d = env.start();
-    let (c, _rx) = env.connect();
+    let (c, rx) = env.connect();
     let pane = create(&c, &env.dir);
     // A foreground program that isn't a known agent: the hook alone identifies it. The system
     // cat: a Nix dev shell's is coreutils' multi-call binary, which runs as `coreutils`.
@@ -545,6 +545,23 @@ fn agent_hooks_drive_status_and_wait() {
     match c.request(Request::PaneInfo { pane }).unwrap() {
         Response::PaneInfo(i) => assert_eq!(i.title, "Fix login bug"),
         other => panic!("{other:?}"),
+    }
+    // The agent repainting its own title (a spinner frame) doesn't flip the tab to it.
+    while rx.try_recv().is_ok() {}
+    c.request(Request::Input {
+        pane,
+        data: "\x1b]0;◑ Fix login bug\x07title-set\r".as_bytes().to_vec(),
+    })
+    .unwrap();
+    // Once in the echo, once in what cat wrote back.
+    wait_match(&c, pane, "title-set(.|\\n)*title-set");
+    let until = Instant::now() + Duration::from_millis(700);
+    while let Ok(ev) = rx.recv_deadline(until) {
+        if let Event::PaneInfo(i) = ev
+            && i.id == pane
+        {
+            assert_eq!(i.title, "Fix login bug");
+        }
     }
 
     // Back at the shell: the agent is gone.
