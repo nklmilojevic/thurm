@@ -89,19 +89,25 @@ final class Remotes {
     private(set) var statuses: [HostId: RemoteStatus] = [:]
     /// Agent presets of each connected host (its own config decides what runs there).
     var presets: [HostId: [AgentPreset]] = [:]
-    /// Panes closed while their host was offline: closed there once it is back. Kept across
+    /// Panes closed while their host was offline, by number with the pid of their process
+    /// (0 when unknown): closed there once it is back, while that number still runs that
+    /// process (a daemon that lost its session numbers new panes from 1 again). Kept across
     /// launches, or a pane closed before quitting would come back as an unknown tab.
-    var pendingCloses: [HostId: Set<UInt64>] = Remotes.loadPendingCloses() {
+    var pendingCloses: [HostId: [UInt64: UInt32]] = Remotes.loadPendingCloses() {
         didSet {
-            let plist = pendingCloses.filter { !$0.value.isEmpty }.mapValues { $0.map(String.init).sorted() }
+            let plist = pendingCloses.filter { !$0.value.isEmpty }.mapValues { closes in
+                Dictionary(uniqueKeysWithValues: closes.map { (String($0.key), NSNumber(value: $0.value)) })
+            }
             UserDefaults.standard.set(plist, forKey: Remotes.pendingClosesKey)
         }
     }
     private static let pendingClosesKey = "PendingRemotePaneCloses"
 
-    private static func loadPendingCloses() -> [HostId: Set<UInt64>] {
-        let saved = UserDefaults.standard.dictionary(forKey: pendingClosesKey) as? [String: [String]] ?? [:]
-        return saved.mapValues { Set($0.compactMap { UInt64($0) }) }
+    private static func loadPendingCloses() -> [HostId: [UInt64: UInt32]] {
+        let saved = UserDefaults.standard.dictionary(forKey: pendingClosesKey) as? [String: [String: NSNumber]] ?? [:]
+        return saved.mapValues { closes in
+            Dictionary(uniqueKeysWithValues: closes.compactMap { k, v in UInt64(k).map { ($0, v.uint32Value) } })
+        }
     }
     private(set) var handoffs: [String: HandoffInfo] = [:]
     /// The last fetch of a handoff failed (shown on its tab until the next one succeeds).
@@ -332,13 +338,22 @@ extension SessionManager {
     /// notifications are replayed).
     func remoteConnected(_ host: HostId) {
         sendAppearance(to: host)
-        for id in Remotes.shared.pendingCloses.removeValue(forKey: host) ?? [] {
-            Core.shared.send(object: ["ClosePane": ["pane": NSNumber(value: id)]], host: host)
-        }
-        guard let infos = fetchPanes(host: host) else {
+        guard let fetched = fetchPanes(host: host) else {
             Remotes.shared.connectionLost(host)
             return
         }
+        // Closes queued while it was away. One whose pane is gone, or runs another process now,
+        // is dropped; one the daemon doesn't confirm stays queued and its pane stays hidden.
+        let pending = Remotes.shared.pendingCloses[host] ?? [:]
+        var stillPending: [UInt64: UInt32] = [:]
+        for info in fetched where info.alive {
+            guard let pid = pending[info.id], pid != 0, info.pid == pid else { continue }
+            let answer = JSON.variant(Core.shared.request(object: ["ClosePane": ["pane": NSNumber(value: info.id)]],
+                                                          host: host))
+            if answer?.name != "Ok" { stillPending[info.id] = pid }
+        }
+        Remotes.shared.pendingCloses[host] = stillPending.isEmpty ? nil : stillPending
+        let infos = fetched.filter { pending[$0.id] == nil || pending[$0.id] != $0.pid }
         let alive = Set(infos.filter { $0.alive }.map { $0.key })
         for key in panes.keys where key.host == host && !alive.contains(key) {
             panes.removeValue(forKey: key)

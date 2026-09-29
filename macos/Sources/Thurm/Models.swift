@@ -193,6 +193,8 @@ struct PaneInfo {
     var host: HostId
     var title: String
     var cwd: String?
+    /// The pane's process (its shell).
+    var pid: UInt32?
     var foregroundName: String?
     var agent: AgentState?
     var alive: Bool
@@ -208,6 +210,7 @@ struct PaneInfo {
         self.host = host
         title = jsonString(d["title"]) ?? ""
         cwd = jsonString(d["cwd"])
+        pid = (d["pid"] as? NSNumber)?.uint32Value
         if let fg = d["foreground"] as? [String: Any] {
             foregroundName = jsonString(fg["name"])
         } else {

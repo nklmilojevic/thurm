@@ -642,7 +642,7 @@ final class SessionManager: NSObject, CoreDelegate {
             Core.shared.send(object: ["ClosePane": ["pane": id.number]], host: id.host)
         } else {
             // Its host is offline: close it there once it is back.
-            Remotes.shared.pendingCloses[id.host, default: []].insert(id.id)
+            Remotes.shared.pendingCloses[id.host, default: [:]][id.id] = panes[id]?.pid ?? 0
         }
         panes.removeValue(forKey: id)
     }
