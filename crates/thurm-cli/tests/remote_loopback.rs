@@ -210,6 +210,15 @@ fn binaries() -> PathBuf {
         if profile_release {
             c.arg("--release");
         }
+        // `<target dir>/<profile>`, or `<target dir>/<triple>/<profile>` under --target: build
+        // into the same place (cargo marks the target dir's root with CACHEDIR.TAG).
+        let up = dir.parent().unwrap();
+        if up.join("CACHEDIR.TAG").is_file() {
+            c.arg("--target-dir").arg(up);
+        } else if let Some(root) = up.parent().filter(|r| r.join("CACHEDIR.TAG").is_file()) {
+            c.arg("--target-dir").arg(root);
+            c.arg("--target").arg(up.file_name().unwrap());
+        }
         assert!(c.status().unwrap().success(), "building thurmd");
     }
     assert!(

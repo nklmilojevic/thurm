@@ -468,8 +468,12 @@ pub fn handoff_cmd(o: HandoffOptions, json: bool) -> R {
         ssh: Ssh::new(&r.host)?,
     };
     let mut h = handoff::prepare(&host, &path, o.branch.as_deref())?;
+    // The worktree exists on the host now: keep it findable for --fetch and --cleanup even
+    // when its pane never starts.
+    reg.put(&h)?;
+    let stranded = |e: String| format!("{e}; the handoff {} stays for --fetch or --cleanup", h.id);
     let cfg = Config::load().unwrap_or_default();
-    let pane = match client.request(Request::CreatePane(CreatePane {
+    let created = client.request(Request::CreatePane(CreatePane {
         cwd: Some(h.worktree.clone()),
         agent_preset: o.preset.clone(),
         size: PaneSize {
@@ -478,12 +482,14 @@ pub fn handoff_cmd(o: HandoffOptions, json: bool) -> R {
             ..Default::default()
         },
         ..Default::default()
-    }))? {
-        Response::PaneCreated { pane } => pane,
-        other => return Err(format!("unexpected response {other:?}").into()),
+    }));
+    let pane = match created {
+        Ok(Response::PaneCreated { pane }) => pane,
+        Ok(other) => return Err(stranded(format!("unexpected response {other:?}")).into()),
+        Err(e) => return Err(stranded(format!("creating the agent's pane: {e}")).into()),
     };
     h.pane = Some(pane);
-    reg.put(&h)?;
+    reg.update(&h.id, |x| x.pane = Some(pane))?;
     if let Err(e) = client.request(Request::Ui(UiCommand::NewTab {
         pane,
         new_window: false,
