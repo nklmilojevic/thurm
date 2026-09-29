@@ -21,8 +21,13 @@ thurm remote add devbox me@devbox.example.org
 ```
 
 `thurm remote add NAME SSH-TARGET` connects once, shows the host's platform,
-offers to install this build of Thurm there, offers to install the Claude Code
-and Codex hooks there, and writes the entry to your config:
+offers to install this build of Thurm there, and writes the entry to your
+config. Then it checks the rest the host needs (see
+[Check a host](#check-a-host)) and offers each fix. In the app, **Thurm ›
+Remotes… › Add Host…** does the same. Run without a terminal (from a script),
+it needs `--yes` or `--no`, and it says so instead of assuming "no".
+
+The entry it writes:
 
 ```toml
 [[remote]]
@@ -41,10 +46,29 @@ commands:
 | `thurm remote list` | Hosts and their connection state |
 | `thurm remote status [NAME]` | State, remote build, last error, retry countdown |
 | `thurm remote install NAME` | Install this build there, and upgrade its daemon in place |
+| `thurm remote doctor [NAME]` | Check what the host needs; `--fix` offers each fix, `--yes` runs them |
 | `thurm remote remove NAME` | Forget a host; its daemon and panes keep running there |
 
-**Thurm › Remotes…** lists the same hosts with their state and build, with
-**Retry** and **Install / Upgrade…**.
+**Thurm › Remotes…** lists the same hosts with their state and build, and the
+selected host's checklist with a **Fix** button for each problem.
+
+## Check a host
+
+`thurm remote doctor devbox`, and the checklist in **Thurm › Remotes…**, check:
+
+| Check | Fix |
+| --- | --- |
+| Thurm | Installs this build (see [Supported hosts](#supported-hosts)) |
+| Daemon | Replaces a daemon of another build in place |
+| Lingering | `loginctl enable-linger`, or in a tab on the host with `sudo` when that needs your password |
+| Command-line tool | Links `thurm` into `~/.local/bin`, so `ssh devbox thurm …` finds it |
+| Claude Code | Runs the official installer (`https://claude.ai/install.sh`), after asking |
+| Claude Code sign-in | Opens a tab running `claude` on the host, to sign in (Linux hosts) |
+| Claude Code / Codex hooks | Installs them for exact agent status |
+
+A fix that needs you at the host (a password, a sign-in) runs over `ssh -t`:
+in a tab of this Mac from the app, in your terminal from `thurm remote doctor
+--fix`.
 
 ## Supported hosts
 
@@ -74,17 +98,11 @@ confirm the install.
 - **Unix socket forwarding** in the host's `sshd` (`AllowStreamLocalForwarding
   yes`, the OpenSSH default).
 - **Lingering on systemd hosts.** The daemon's socket lives in
-  `$XDG_RUNTIME_DIR`, which logind deletes when your last session ends. Run
-  this once on the host:
-
-  ```sh
-  loginctl enable-linger $USER
-  ```
-
-  `thurm remote status` and the Remotes window warn when it is off.
+  `$XDG_RUNTIME_DIR`, which logind deletes when your last session ends. The
+  doctor's **Lingering** fix turns it on (`loginctl enable-linger $USER`).
 - **Agent hooks on the host**, for exact agent status (Working, Needs input,
-  Done): `thurm hooks install --agent claude` there. `thurm remote add` offers
-  to run it.
+  Done). The host's daemon adds them when it launches an agent without them,
+  and the doctor installs them for agents that are already there.
 
 Your `~/.ssh/config` applies as usual: Host aliases, `ProxyJump`, and the
 1Password `IdentityAgent`. Thurm refuses a host whose ssh config adds
@@ -128,7 +146,9 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
 
 - **Workspaces.** A host's panes open in a workspace named after it. ⌘⇧O
   lists **New Workspace on devbox**. New tabs and splits in a remote workspace
-  run on that host.
+  run on that host. A pane started on the host from elsewhere (`thurm --remote
+  devbox launch`) goes to its workspace in the background; the agent sidebar
+  and ⌘⇧A switch to it.
 - **Agents.** Sidebar and switcher rows show the host: `devbox · repo · Needs
   input`. Notifications follow the same focus rules as local panes. A status
   that changed while the host was unreachable shows when it is back; missed
@@ -229,7 +249,7 @@ reach the Mac's disk, clipboard, or credentials without you doing something:
 | State | What to do |
 | --- | --- |
 | needs attention | ssh needs you: read the message (host key, authentication, forwarding). Fix it, then **Retry** |
-| not installed | **Install / Upgrade…** in Thurm › Remotes…, or `thurm remote install NAME` |
+| not installed | **Fix** next to Thurm in Thurm › Remotes…, or `thurm remote install NAME` |
 | upgrade needed | The host runs another protocol version. Install this build; its daemon is replaced in place and its panes keep running (daemons too old for that are restarted after you confirm) |
 | reconnecting | The host is unreachable; Thurm retries on its own |
 

@@ -524,16 +524,16 @@ extension SessionManager {
                     return
                 }
                 Remotes.shared.reloadHandoffs()
-                guard let c = sm.newTab(from: sm.currentController, preset: preset, cwd: h.worktree, host: host)
+                // The window switches to the host's workspace: the task is typed there.
+                guard let pane = sm.newTab(from: sm.currentController, preset: preset, cwd: h.worktree, host: host,
+                                           handoff: h.id, reveal: true)
                 else { return }
-                c.handoffID = h.id
-                let pane = c.focusedPane
                 DispatchQueue.global(qos: .utility).async {
                     _ = Core.shared.remoteCall(["op": "handoff_set_pane", "id": h.id, "pane": pane.number])
                     DispatchQueue.main.async { Remotes.shared.reloadHandoffs() }
                 }
-                c.content.focusedView?.showToast("\(h.branch) on \(host): results come back as thurm-\(host)/\(h.branch)",
-                                                 duration: 5)
+                sm.view(for: pane)?.showToast("\(h.branch) on \(host): results come back as thurm-\(host)/\(h.branch)",
+                                              duration: 5)
                 sm.scheduleLayoutSave()
             }
         }
@@ -679,6 +679,7 @@ extension SessionManager {
             guard let d = daemon, jsonBool(d["running"]) == true,
                   jsonString(d["build"]) != Core.buildId else {
                 thurm_remote_kick(host, true)
+                RemotesWindow.shared.recheck(host)
                 return
             }
             let hot = jsonBool(d["hot_upgrade"]) ?? false
@@ -700,6 +701,7 @@ extension SessionManager {
                     }
                     thurm_remote_kick(host, true)
                     RemotesWindow.shared.reload()
+                    RemotesWindow.shared.recheck(host)
                 }
             }
         }
@@ -741,23 +743,32 @@ extension SessionManager {
 
 // MARK: - Remotes window
 
-/// Thurm › Remotes…: every `[[remote]]` host with its state and build (read-only; hosts are
-/// added with `thurm remote add` or in the config), with Retry and Install/Upgrade.
+/// Thurm › Remotes…: every `[[remote]]` host with its state and build, Add Host…, and for the
+/// selected host the checklist of `thurm remote doctor` (Thurm, daemon, lingering, PATH,
+/// agents, sign-in, hooks) with a Fix button per problem.
 final class RemotesWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
     static let shared = RemotesWindow()
 
     private var panel: NSPanel?
     private let table = NSTableView()
-    private let detail = NSTextField(wrappingLabelWithString: "")
+    private let status = NSTextField(wrappingLabelWithString: "")
+    private let checklist = NSStackView()
+    private let addHost = NSButton(title: "Add Host…", target: nil, action: nil)
+    private let recheckButton = NSButton(title: "Check Again", target: nil, action: nil)
     private let retry = NSButton(title: "Retry", target: nil, action: nil)
-    private let install = NSButton(title: "Install / Upgrade…", target: nil, action: nil)
     private var names: [String] = []
     private var busy: [HostId: String] = [:]
+    /// The last `doctor` answer per host.
+    private var reports: [HostId: [String: Any]] = [:]
+    private var checking: Set<HostId> = []
+    /// The check whose fix runs, per host.
+    private var fixing: [HostId: String] = [:]
 
     func show() {
         if panel == nil { build() }
         reload(force: true)
         panel?.makeKeyAndOrderFront(nil)
+        if let host = selectedHost, reports[host] == nil { recheck(host) }
     }
 
     func setBusy(_ host: HostId, _ text: String?) {
@@ -766,7 +777,7 @@ final class RemotesWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     }
 
     private func build() {
-        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 760, height: 320),
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
                         styleMask: [.titled, .closable, .resizable, .utilityWindow], backing: .buffered, defer: false)
         p.title = "Remotes"
         p.isFloatingPanel = false
@@ -786,18 +797,38 @@ final class RemotesWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
-        detail.font = .systemFont(ofSize: 11)
-        detail.textColor = .secondaryLabelColor
-        detail.maximumNumberOfLines = 6
+        status.font = .systemFont(ofSize: 11)
+        status.textColor = .secondaryLabelColor
+        status.maximumNumberOfLines = 4
+
+        checklist.orientation = .vertical
+        checklist.alignment = .leading
+        checklist.spacing = 8
+        checklist.edgeInsets = NSEdgeInsets(top: 4, left: 0, bottom: 4, right: 0)
+        let checks = NSScrollView()
+        checks.hasVerticalScroller = true
+        checks.drawsBackground = false
+        let flipped = FlippedView()
+        flipped.translatesAutoresizingMaskIntoConstraints = false
+        checklist.translatesAutoresizingMaskIntoConstraints = false
+        flipped.addSubview(checklist)
+        checks.documentView = flipped
+        NSLayoutConstraint.activate([
+            checklist.topAnchor.constraint(equalTo: flipped.topAnchor),
+            checklist.leadingAnchor.constraint(equalTo: flipped.leadingAnchor),
+            checklist.trailingAnchor.constraint(equalTo: flipped.trailingAnchor),
+            checklist.bottomAnchor.constraint(equalTo: flipped.bottomAnchor),
+            flipped.widthAnchor.constraint(equalTo: checks.contentView.widthAnchor),
+        ])
+
+        addHost.target = self
+        addHost.action = #selector(addClicked(_:))
+        recheckButton.target = self
+        recheckButton.action = #selector(recheckClicked(_:))
         retry.target = self
         retry.action = #selector(retryClicked(_:))
-        install.target = self
-        install.action = #selector(installClicked(_:))
-        let note = NSTextField(labelWithString: "Add hosts with `thurm remote add NAME SSH-TARGET` or [[remote]] in the config.")
-        note.font = .systemFont(ofSize: 11)
-        note.textColor = .tertiaryLabelColor
         let root = NSView()
-        for v in [scroll, detail, retry, install, note] as [NSView] {
+        for v in [scroll, status, checks, addHost, recheckButton, retry] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(v)
         }
@@ -805,16 +836,20 @@ final class RemotesWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate,
             scroll.topAnchor.constraint(equalTo: root.topAnchor),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: detail.topAnchor, constant: -8),
-            detail.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            detail.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
-            detail.bottomAnchor.constraint(equalTo: retry.topAnchor, constant: -8),
-            note.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            note.centerYAnchor.constraint(equalTo: retry.centerYAnchor),
-            install.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
-            install.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
-            retry.trailingAnchor.constraint(equalTo: install.leadingAnchor, constant: -8),
-            retry.centerYAnchor.constraint(equalTo: install.centerYAnchor),
+            scroll.heightAnchor.constraint(equalToConstant: 150),
+            status.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
+            status.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            status.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            checks.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 6),
+            checks.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            checks.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            checks.bottomAnchor.constraint(equalTo: retry.topAnchor, constant: -10),
+            addHost.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            addHost.centerYAnchor.constraint(equalTo: retry.centerYAnchor),
+            retry.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            retry.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
+            recheckButton.trailingAnchor.constraint(equalTo: retry.leadingAnchor, constant: -8),
+            recheckButton.centerYAnchor.constraint(equalTo: retry.centerYAnchor),
         ])
         p.contentView = root
         panel = p
@@ -839,35 +874,250 @@ final class RemotesWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         return r >= 0 && r < names.count ? names[r] : nil
     }
 
+    // MARK: Checklist
+
+    /// Runs `doctor` for `host` again (after a fix, an install, Check Again).
+    func recheck(_ host: HostId) {
+        guard !checking.contains(host) else { return }
+        checking.insert(host)
+        updateDetail()
+        let bins: Any = Core.helpersPath ?? NSNull()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = Core.shared.remoteCall(["op": "doctor", "name": host, "bins": bins])
+            DispatchQueue.main.async {
+                self.checking.remove(host)
+                self.reports[host] = (r as? [String: Any]) ?? ["error": "Unexpected answer."]
+                self.updateDetail()
+            }
+        }
+    }
+
     private func updateDetail() {
+        checklist.arrangedSubviews.forEach { $0.removeFromSuperview() }
         guard let host = selectedHost else {
-            detail.stringValue = ""
+            status.stringValue = names.isEmpty ? "No hosts yet: Add Host… connects to one over ssh." : ""
             retry.isEnabled = false
-            install.isEnabled = false
+            recheckButton.isEnabled = false
             return
         }
         let s = Remotes.shared.statuses[host]
         var lines: [String] = []
         if let b = busy[host] { lines.append(b) }
         if let m = s?.message { lines.append(m) }
-        if let os = s?.os, let arch = s?.arch { lines.append("\(os) \(arch)") }
-        if s?.linger == "no" {
-            lines.append("Lingering is off: run `loginctl enable-linger $USER` on \(host) so its daemon survives logout.")
-        }
-        if s?.upgradeAvailable == true { lines.append("Runs another build than this Mac (\(Core.buildId)).") }
-        detail.stringValue = lines.joined(separator: "\n")
+        status.stringValue = lines.joined(separator: "\n")
         retry.isEnabled = busy[host] == nil
-        install.isEnabled = busy[host] == nil
+        recheckButton.isEnabled = !checking.contains(host) && fixing[host] == nil
+
+        let report = reports[host]
+        if checking.contains(host) {
+            checklist.addArrangedSubview(note(report == nil ? "Checking \(host)…" : "Checking again…"))
+        }
+        if let e = report?["error"] as? String {
+            checklist.addArrangedSubview(row(state: "fail", title: "ssh", detail: e, buttons: []))
+            return
+        }
+        for c in report?["checks"] as? [[String: Any]] ?? [] {
+            checklist.addArrangedSubview(checkRow(host, c))
+        }
     }
+
+    private func note(_ text: String) -> NSView {
+        let l = NSTextField(labelWithString: text)
+        l.font = .systemFont(ofSize: 12)
+        l.textColor = .secondaryLabelColor
+        return l
+    }
+
+    private func checkRow(_ host: HostId, _ c: [String: Any]) -> NSView {
+        let id = jsonString(c["id"]) ?? ""
+        let title = jsonString(c["title"]) ?? id
+        let state = jsonString(c["state"]) ?? "skip"
+        var buttons: [NSButton] = []
+        let fix = c["fix"] as? [String: Any]
+        let terminal = jsonString(c["terminal"])
+        if fixing[host] == id {
+            buttons.append(BlockButton(title: "Fixing…") {})
+            buttons[0].isEnabled = false
+        } else if state == "fail" || state == "warn" {
+            if let fix, let label = jsonString(fix["label"]) {
+                let b = BlockButton(title: label) { [weak self] in
+                    self?.runFix(host, id: id, title: title, confirm: jsonString(fix["confirm"]), terminal: terminal)
+                }
+                b.isEnabled = fixing[host] == nil
+                buttons.append(b)
+            }
+            if let terminal {
+                buttons.append(BlockButton(title: fix == nil ? "Run in a Tab…" : "In a Tab…") { [weak self] in
+                    self?.runInTab(host, script: terminal, title: title)
+                })
+            }
+        }
+        return row(state: state, title: title, detail: jsonString(c["detail"]) ?? "", buttons: buttons)
+    }
+
+    private func row(state: String, title: String, detail: String, buttons: [NSButton]) -> NSView {
+        let (symbol, color): (String, NSColor) = switch state {
+        case "ok": ("checkmark.circle.fill", .systemGreen)
+        case "warn": ("exclamationmark.triangle.fill", .systemOrange)
+        case "fail": ("xmark.circle.fill", .systemRed)
+        default: ("minus.circle", .tertiaryLabelColor)
+        }
+        let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: state) ?? NSImage())
+        icon.contentTintColor = color
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        let t = NSTextField(labelWithString: title)
+        t.font = .systemFont(ofSize: 12, weight: .semibold)
+        t.textColor = state == "skip" ? .secondaryLabelColor : .labelColor
+        t.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        let d = NSTextField(wrappingLabelWithString: detail)
+        d.font = .systemFont(ofSize: 11)
+        d.textColor = .secondaryLabelColor
+        d.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        for b in buttons {
+            b.bezelStyle = .rounded
+            b.controlSize = .small
+            b.font = .systemFont(ofSize: 11)
+            b.setContentHuggingPriority(.required, for: .horizontal)
+        }
+        let h = NSStackView(views: [icon, t, d] + buttons)
+        h.orientation = .horizontal
+        h.alignment = .firstBaseline
+        h.spacing = 8
+        return h
+    }
+
+    private func runFix(_ host: HostId, id: String, title: String, confirm: String?, terminal: String?) {
+        // Installing and the daemon go through the install flow (it asks how, and about panes).
+        if id == "thurm" || id == "daemon" {
+            SessionManager.shared.installOnRemote(host)
+            return
+        }
+        if let confirm {
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = confirm
+            alert.addButton(withTitle: "Continue")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        fixing[host] = id
+        updateDetail()
+        let bins: Any = Core.helpersPath ?? NSNull()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = Core.shared.remoteCall(["op": "doctor_fix", "name": host, "id": id, "bins": bins])
+            DispatchQueue.main.async {
+                self.fixing[host] = nil
+                if let e = (r as? [String: Any])?["error"] as? String {
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText = "\(title) on \(host)"
+                    alert.informativeText = e
+                    alert.addButton(withTitle: "OK")
+                    if terminal != nil { alert.addButton(withTitle: "Run in a Tab…") }
+                    if alert.runModal() == .alertSecondButtonReturn, let terminal {
+                        self.runInTab(host, script: terminal, title: title)
+                    }
+                }
+                thurm_remote_kick(host, true)
+                self.recheck(host)
+            }
+        }
+    }
+
+    /// Runs `script` on `host` in a tab of this Mac (`ssh -t`): for what needs you there, a
+    /// sudo password or a sign-in.
+    private func runInTab(_ host: HostId, script: String, title: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = Core.shared.remoteCall(["op": "terminal_argv", "name": host, "script": script])
+            DispatchQueue.main.async {
+                guard let argv = r as? [String], !argv.isEmpty else {
+                    SessionManager.shared.remoteError("Could not run it on \(host)", r)
+                    return
+                }
+                let sm = SessionManager.shared
+                let size = sm.gridSize(forPoints: sm.currentRegularController?.content.bounds.size
+                    ?? sm.defaultContentSize())
+                guard let pane = sm.createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, host: localHost,
+                                               command: argv, hold: true) else { return }
+                sm.newTab(from: sm.currentRegularController, pane: pane, reveal: true)
+                sm.view(for: pane)?.showToast("\(title) on \(host): when it is done, Check Again in Thurm › Remotes…",
+                                              duration: 6)
+            }
+        }
+    }
+
+    // MARK: Add Host
+
+    @objc private func addClicked(_ sender: Any?) {
+        showAddHost(name: "", target: "")
+    }
+
+    private func showAddHost(name: String, target: String) {
+        let alert = NSAlert()
+        alert.messageText = "Add a Host"
+        alert.informativeText = "Thurm connects with the system ssh: the host needs a key that works "
+            + "without a prompt (an agent is fine). Connect once with ssh in a terminal to accept its host key."
+        let nameField = NSTextField(string: name)
+        nameField.placeholderString = "devbox"
+        let targetField = NSTextField(string: target)
+        targetField.placeholderString = "me@devbox, a Host alias, or ssh://me@devbox:2222"
+        let grid = NSGridView(views: [
+            [NSTextField(labelWithString: "Name:"), nameField],
+            [NSTextField(labelWithString: "SSH target:"), targetField],
+        ])
+        grid.column(at: 0).xPlacement = .trailing
+        grid.rowSpacing = 8
+        grid.frame = NSRect(x: 0, y: 0, width: 360, height: 56)
+        nameField.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        targetField.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        alert.accessoryView = grid
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = nameField
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let n = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = targetField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !n.isEmpty, !t.isEmpty else {
+            showAddHost(name: n, target: t)
+            return
+        }
+        addHost.isEnabled = false
+        status.stringValue = "Connecting to \(t)…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = Core.shared.remoteCall(["op": "add", "name": n, "target": t])
+            DispatchQueue.main.async {
+                self.addHost.isEnabled = true
+                if let e = (r as? [String: Any])?["error"] as? String {
+                    let err = NSAlert()
+                    err.alertStyle = .warning
+                    err.messageText = "Could not add \(n)"
+                    err.informativeText = e
+                    err.addButton(withTitle: "Edit")
+                    err.addButton(withTitle: "Cancel")
+                    self.updateDetail()
+                    if err.runModal() == .alertFirstButtonReturn { self.showAddHost(name: n, target: t) }
+                    return
+                }
+                SessionManager.shared.reloadConfig(notifyDaemon: false)
+                self.reload(force: true)
+                if let row = self.names.firstIndex(of: n) {
+                    self.table.selectRowIndexes([row], byExtendingSelection: false)
+                }
+                self.recheck(n)
+            }
+        }
+    }
+
+    // MARK: Actions
 
     @objc private func retryClicked(_ sender: Any?) {
         guard let host = selectedHost else { return }
         thurm_remote_kick(host, true)
     }
 
-    @objc private func installClicked(_ sender: Any?) {
+    @objc private func recheckClicked(_ sender: Any?) {
         guard let host = selectedHost else { return }
-        SessionManager.shared.installOnRemote(host)
+        recheck(host)
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { names.count }
@@ -897,6 +1147,31 @@ final class RemotesWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        if let host = selectedHost, reports[host] == nil { recheck(host) }
         updateDetail()
     }
+}
+
+/// A document view that lays out from the top.
+private final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+/// An NSButton that runs a closure.
+private final class BlockButton: NSButton {
+    private let block: () -> Void
+
+    init(title: String, block: @escaping () -> Void) {
+        self.block = block
+        super.init(frame: .zero)
+        self.title = title
+        target = self
+        action = #selector(run)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    @objc private func run() { block() }
 }

@@ -73,9 +73,13 @@ enum MainMenu {
 
     private static func shellMenu() -> NSMenu {
         let menu = NSMenu(title: "Shell")
-        menu.addItem(item("New Window", #selector(AppDelegate.newWindow(_:)), "n"))
         menu.addItem(item("New Tab", #selector(AppDelegate.newTab(_:)), "t"))
-        menu.addItem(item("New Workspace", #selector(AppDelegate.newWorkspace(_:)), "n", [.command, .shift]))
+        menu.addItem(item("New Workspace", #selector(AppDelegate.newWorkspace(_:)), "n"))
+        // ⇧⌘N, its shortcut before Thurm had one window.
+        let alias = item("New Workspace", #selector(AppDelegate.newWorkspace(_:)), "n", [.command, .shift])
+        alias.isHidden = true
+        alias.allowsKeyEquivalentWhenHidden = true
+        menu.addItem(alias)
         menu.addItem(item("Switch Workspace…", #selector(AppDelegate.switchWorkspace(_:)), "o", [.command, .shift]))
         menu.addItem(item("Switch to Agent…", #selector(AppDelegate.switchAgent(_:)), "a", [.command, .shift]))
         menu.addItem(item("Rename Workspace…", #selector(AppDelegate.renameWorkspace(_:))))
@@ -162,8 +166,7 @@ enum MainMenu {
                               tag: n))
         }
         menu.addItem(.separator())
-        menu.addItem(item("Merge All Windows", #selector(NSWindow.mergeAllWindows(_:))))
-        menu.addItem(item("Move Tab to New Window", #selector(NSWindow.moveTabToNewWindow(_:))))
+        menu.addItem(item("Move Tab to New Workspace", #selector(NSWindow.moveTabToNewWindow(_:))))
         menu.addItem(.separator())
         menu.addItem(item("Quick Terminal", #selector(AppDelegate.toggleQuickTerminal(_:))))
         menu.addItem(.separator())

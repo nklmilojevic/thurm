@@ -57,7 +57,7 @@ Use these shortcuts to start:
 | Action | Shortcut |
 | --- | --- |
 | New tab | Cmd+T |
-| New window | Cmd+N |
+| New workspace | Cmd+N |
 | Split right | Cmd+D |
 | Split down | Cmd+Shift+D |
 | Zoom split | Cmd+Shift+Return |
@@ -139,8 +139,9 @@ thurm hooks status
 ```
 
 Thurm detects supported agent processes. For Claude Code and Codex, hooks provide
-turn completion events and session IDs. Run `thurm hooks install` to add hooks to
-agent configuration files. Use `--agent claude` or `--agent codex` to select one.
+turn completion events and session IDs. Thurm adds its hooks to an agent's
+configuration when it launches the agent without them (`agents.install_hooks`);
+`thurm hooks install` does it by hand. Use `--agent claude` or `--agent codex` to select one.
 Run `thurm hooks uninstall` to remove them. Installed agent tools are required for
 launch presets.
 

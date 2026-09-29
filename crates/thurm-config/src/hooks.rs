@@ -4,7 +4,7 @@
 //! each of our entries runs `thurm agent-hook <agent> <event>` and is a no-op outside Thurm
 //! panes, so the same config works in any terminal.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
@@ -177,6 +177,56 @@ pub fn installed(agent: &HookAgent, settings: &str) -> usize {
         .count()
 }
 
+/// What [`write`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    Unchanged,
+    Changed,
+}
+
+/// Adds (`install`) or removes our hooks in `agent`'s file at `path`, keeping a one-time backup
+/// of what was there (`*.json.thurm-backup`) and replacing the file atomically.
+pub fn write_at(agent: &HookAgent, path: &Path, install: bool) -> Result<Written, String> {
+    let current = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let updated = apply(agent, &current, install)?;
+    if updated == current {
+        return Ok(Written::Unchanged);
+    }
+    let io = |e: std::io::Error| format!("{}: {e}", path.display());
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(io)?;
+    }
+    if !current.is_empty() {
+        let backup = path.with_extension("json.thurm-backup");
+        if !backup.exists() {
+            std::fs::write(&backup, &current).map_err(io)?;
+        }
+    }
+    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+    std::fs::write(&tmp, updated).map_err(io)?;
+    std::fs::rename(&tmp, path).map_err(io)?;
+    Ok(Written::Changed)
+}
+
+/// The hook agent a command line starts (`claude …`, `/path/to/codex …`), if any.
+pub fn agent_for_command(command: &[String]) -> Option<&'static HookAgent> {
+    let program = Path::new(command.first()?).file_name()?.to_str()?;
+    AGENTS.iter().find(|a| a.kind == program)
+}
+
+/// Installs `agent`'s hooks unless they all are there already. `Ok(true)`: the file changed.
+pub fn ensure_at(agent: &HookAgent, path: &Path) -> Result<bool, String> {
+    let current = std::fs::read_to_string(path).unwrap_or_default();
+    if installed(agent, &current) == agent.events.len() {
+        return Ok(false);
+    }
+    write_at(agent, path, true).map(|w| w == Written::Changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +280,49 @@ mod tests {
         assert_eq!(installed(codex, &claude_only), 0);
         assert_eq!(installed(&AGENTS[0], &claude_only), CLAUDE_EVENTS.len());
         assert!(both.contains("agent-hook codex stop"));
+    }
+
+    #[test]
+    fn ensure_installs_once_and_backs_up() {
+        let dir = std::env::temp_dir().join(format!("thurm-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(".claude/settings.json");
+        // No directory yet (the agent never ran): created.
+        assert!(ensure_at(&AGENTS[0], &path).unwrap());
+        assert!(!ensure_at(&AGENTS[0], &path).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(installed(&AGENTS[0], &text), CLAUDE_EVENTS.len());
+        assert!(!path.with_extension("json.thurm-backup").exists());
+
+        // An existing file is kept as the backup.
+        std::fs::write(&path, "{\"model\": \"opus\"}").unwrap();
+        assert!(ensure_at(&AGENTS[0], &path).unwrap());
+        let backup = std::fs::read_to_string(path.with_extension("json.thurm-backup")).unwrap();
+        assert!(backup.contains("opus"));
+        assert_eq!(
+            write_at(&AGENTS[0], &path, false).unwrap(),
+            Written::Changed
+        );
+        assert_eq!(
+            write_at(&AGENTS[0], &path, false).unwrap(),
+            Written::Unchanged
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agents_from_command_lines() {
+        let cmd = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            agent_for_command(&cmd(&["claude", "--resume"])).map(|a| a.kind),
+            Some("claude")
+        );
+        assert_eq!(
+            agent_for_command(&cmd(&["/opt/bin/codex"])).map(|a| a.kind),
+            Some("codex")
+        );
+        assert!(agent_for_command(&cmd(&["bash"])).is_none());
+        assert!(agent_for_command(&[]).is_none());
     }
 
     #[test]

@@ -138,6 +138,8 @@ detect = true
 idle_after_ms = 1500
 # Use agent session titles for tabs. Requires agent hooks.
 session_titles = true
+# Install the agent hooks (see `thurm hooks install`) when an agent launches without them.
+install_hooks = true
 # Empty presets use the installed built-in agents.
 # Replace [] with entries that each contain a name and command, for example:
 # [{ name = "My Bot", command = ["mybot"] }]

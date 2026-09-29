@@ -4,7 +4,6 @@
 //! (`$THURM_PANE_ID`), prints plain text, supports `--json`, and uses exit codes
 //! (0 ok, 1 error, 124 wait timeout).
 
-mod hooks;
 mod remote;
 
 use std::io::{IsTerminal, Read, Write};
@@ -12,6 +11,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use thurm_client::{Client, ClientError, ConnectOptions, find_daemon};
+use thurm_config::hooks;
 use thurm_proto::{
     CaptureOpts, CreatePane, ENV_PANE_ID, PaneId, PaneInfo, PaneSize, Request, Response, ScrollCmd,
     SplitDir, UiCommand, WaitCondition, WaitOutcome,
@@ -73,6 +73,17 @@ enum RemoteCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Check what a host needs (Thurm, lingering, PATH, agents, sign-in, hooks), and fix it.
+    Doctor {
+        /// Default: every host.
+        name: Option<String>,
+        /// Offer the fix for every problem found.
+        #[arg(long)]
+        fix: bool,
+        /// With --fix: run every fix without asking (fixes that need a terminal are listed).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -110,7 +121,7 @@ enum Cmd {
     NewTab {
         #[arg(long)]
         cwd: Option<String>,
-        /// Open in a new window instead of a tab.
+        /// Open in a new workspace (in the background) instead of a tab.
         #[arg(long)]
         window: bool,
         /// Keep the pane open after the command exits.
@@ -394,6 +405,7 @@ fn hooks_cmd(action: &str, only: Option<&str>, json: bool) -> R {
     }
     let mut ok = true;
     let mut report = Vec::new();
+    let mut seen = 0;
     for agent in agents {
         let path = hooks::settings_path(agent);
         let present = path.parent().is_some_and(|d| d.is_dir());
@@ -401,6 +413,7 @@ fn hooks_cmd(action: &str, only: Option<&str>, json: bool) -> R {
         if only.is_none() && !present && !(json && action == "status") {
             continue;
         }
+        seen += 1;
         let current = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -425,29 +438,23 @@ fn hooks_cmd(action: &str, only: Option<&str>, json: bool) -> R {
             continue;
         }
         let install = action == "install";
-        let updated = hooks::apply(agent, &current, install)?;
-        if updated == current {
+        if hooks::write_at(agent, &path, install)? == hooks::Written::Unchanged {
             println!("{}: nothing to change ({})", agent.name, path.display());
             continue;
         }
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        if !current.is_empty() {
-            let backup = path.with_extension("json.thurm-backup");
-            if !backup.exists() {
-                std::fs::write(&backup, &current)?;
-            }
-        }
-        let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
-        std::fs::write(&tmp, updated)?;
-        std::fs::rename(&tmp, &path)?;
         println!(
             "{}: hooks {} ({}). Restart running sessions to pick them up.",
             agent.name,
             if install { "installed" } else { "removed" },
             path.display()
         );
+    }
+    if seen == 0 {
+        // Nothing was said otherwise: an agent that never ran has no config directory yet.
+        eprintln!(
+            "thurm: no agent found (no ~/.claude or ~/.codex); run the agent once, or pass --agent claude"
+        );
+        return Ok(ExitCode::FAILURE);
     }
     if json && action == "status" {
         println!("{}", serde_json::Value::Array(report));
@@ -534,6 +541,9 @@ fn run(cli: Cli) -> R {
             RemoteCmd::Remove { name } => remote::remove(&name),
             RemoteCmd::Status { name } => remote::status(name.as_deref(), json),
             RemoteCmd::Install { name, yes } => remote::install_cmd(&name, yes.then_some(true)),
+            RemoteCmd::Doctor { name, fix, yes } => {
+                remote::doctor_cmd(name.as_deref(), fix, yes.then_some(true), json)
+            }
         },
         Cmd::Handoff {
             preset,
