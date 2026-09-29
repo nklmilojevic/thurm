@@ -266,12 +266,15 @@ pub fn title(agent: &str, prompt: Option<&str>, screen: &str) -> Ask {
 
 /// Is a quiet agent waiting for the user to answer something?
 pub fn status(agent: &str, screen: &str) -> Ask {
+    let screen = crate::agents::current_activity(agent, screen);
     Ask {
         instructions: "You classify terminal screens. Answer yes if the bottom of the screen \
-            asks the user a question or asks them to approve, confirm, or choose between \
+            has a CURRENT, UNANSWERED question or asks the user to approve, confirm, or choose between \
             options (for example 'Allow?', '(y/n)', 'Which do you prefer?', or a numbered list \
-            to pick from). Answer no if it only shows results, a banner, or an empty input \
-            line.",
+            to pick from). Earlier requests followed by command output or a completion message \
+            are already resolved: answer no. A completed command can contain a question in its \
+            text; that is not a pending request. Answer no for results, a banner, an input \
+            placeholder, or an empty input line. If no pending request is clear, answer no.",
         prompt: format!(
             "The screen of {agent}:\n{}\n\nDoes the bottom of this screen ask the user a \
              question, or to approve, confirm, or choose?",
@@ -284,6 +287,7 @@ pub fn status(agent: &str, screen: &str) -> Ask {
 
 /// What the agent asks the user for, in one line.
 pub fn attention(agent: &str, hint: Option<&str>, screen: &str) -> Ask {
+    let screen = crate::agents::current_activity(agent, screen);
     let hint = hint
         .map(|h| format!("The agent's own notification: {h}\n"))
         .unwrap_or_default();
@@ -292,7 +296,7 @@ pub fn attention(agent: &str, hint: Option<&str>, screen: &str) -> Ask {
             terminal may be waiting for the user. Look only at the bottom of the screen: if it \
             shows a pending question, approval prompt or list of options, say in one short \
             sentence (at most 15 words) what the agent needs, naming the exact command, file \
-            or choice shown there, e.g. \"Wants to run `rm -rf build` — approve?\" or \"Asks \
+            or choice shown there, e.g. \"Approve `rm -rf build`?\" or \"Asks \
             which database to use: Postgres or SQLite\". Earlier output and commands that \
             already ran don't count. If the bottom of the screen asks nothing, reply NONE. \
             Reply with the sentence or NONE only.",
@@ -446,6 +450,18 @@ mod tests {
     }
 
     #[test]
+    fn status_and_attention_exclude_completed_codex_requests() {
+        let screen = include_str!("../tests/fixtures/codex-completed-approval.txt");
+        for ask in [status("Codex", screen), attention("Codex", None, screen)] {
+            assert!(ask.prompt.contains("Pushed to main"));
+            assert!(!ask.prompt.contains("Would you like to run"));
+            assert!(!ask.prompt.contains("git commit"));
+        }
+        // Summaries still need the command results.
+        assert!(summary("Codex", screen).prompt.contains("git commit"));
+    }
+
+    #[test]
     fn prompts_fit_the_context() {
         let screen = "x".repeat(20_000);
         for ask in [
@@ -489,6 +505,11 @@ mod tests {
         assert_eq!(ask(status("Codex", permission)), WAITING);
         assert_eq!(ask(status("Codex", empty)), IDLE);
         assert_eq!(ask(status("Codex", turn)), IDLE);
+        let completed = include_str!("../tests/fixtures/codex-completed-approval.txt");
+        assert_eq!(ask(status("Codex", completed)), IDLE);
+        assert!(clean_detail(&ask(attention("Codex", None, completed))).is_none());
+        let question = "• Read the configuration.\n• Which database should I use?\n  1. Postgres\n  2. SQLite\n› ";
+        assert_eq!(ask(status("Codex", question)), WAITING);
         assert!(clean_title(&ask(title("Codex", None, turn))).is_some());
         assert!(
             clean_title(&ask(title(

@@ -1,0 +1,19 @@
+• I will commit the fix and push it to main.
+
+Would you like to run the following command?
+  $ git commit -m 'fix: restore terminal focus' && git push origin main
+  › 1. Yes, proceed
+    2. No, tell Codex what to do differently
+
+• Ran git commit -m 'fix: restore terminal focus' && git push origin main
+  └ [main 4600617] fix: restore terminal focus
+    1 file changed, 7 insertions(+), 1 deletion(-)
+    To https://github.com/nklmilojevic/thurm.git
+       11df7b4..4600617  main -> main
+
+• Pushed to main: 4600617 (fix: restore terminal focus).
+  Release build and diff checks passed.
+
+› Ask Codex to do anything
+  GPT-6-Astra high · ~/dev/personal/thurm · main
+  ← for agents · ? for shortcuts

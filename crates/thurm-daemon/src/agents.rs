@@ -189,6 +189,7 @@ impl AgentTracker {
         let Some(state) = &self.current else {
             return Vec::new();
         };
+        let tail = current_activity(&state.kind, tail);
         let mut out = Vec::new();
         if titles
             && state.topic.is_none()
@@ -490,6 +491,7 @@ impl AgentTracker {
             h.status = AgentStatus::Idle;
         }
         let next = def.map(|d| {
+            let screen_tail = current_activity(&d.kind, screen_tail);
             let attention =
                 self.attention_flag || d.attention.iter().any(|a| screen_tail.contains(a.as_str()));
             let working = d.working.iter().any(|w| screen_tail.contains(w.as_str()));
@@ -584,6 +586,18 @@ pub fn screen_hash(text: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
     h.finish()
+}
+
+/// Codex starts each activity with an unindented bullet. Earlier activities can
+/// contain approval requests that are already complete.
+pub fn current_activity<'a>(agent: &str, screen: &'a str) -> &'a str {
+    if agent.eq_ignore_ascii_case("codex")
+        && let Some(start) = screen.rfind("\n• ")
+    {
+        &screen[start + 1..]
+    } else {
+        screen
+    }
 }
 
 /// The last `n` non-empty lines of the screen.
@@ -955,6 +969,52 @@ mod tests {
                 prompt: Some("add CSV export".into())
             }]
         );
+    }
+
+    #[test]
+    fn completed_codex_approval_does_not_need_input() {
+        let defs = thurm_config::builtin_agents();
+        let mut t = AgentTracker::default();
+        let codex = proc("codex");
+        let quiet = Duration::from_secs(5);
+        let idle_after = Duration::from_secs(1);
+        let pending = "• I will push the fix.\nWould you like to run the following command?\n  › 1. Yes, proceed";
+        t.update(&defs, Some(&codex), pending, quiet, idle_after);
+        assert_eq!(t.state().unwrap().status, AgentStatus::NeedsInput);
+        t.set_ai_detail(t.episode(), "Asks to run git push".into());
+        let completed = include_str!("../tests/fixtures/codex-completed-approval.txt");
+        t.update(&defs, Some(&codex), completed, quiet, idle_after);
+        assert_eq!(t.state().unwrap().status, AgentStatus::Idle);
+        assert_eq!(t.state().unwrap().message, None);
+
+        // The model and the status check use the same current activity.
+        let wants = t.ai_wants(false, true, completed, None);
+        let [AiWant::Status { hash }] = wants[..] else {
+            panic!("{wants:?}")
+        };
+        assert_eq!(hash, screen_hash(current_activity("codex", completed)));
+        t.set_ai_waiting(hash, false);
+        t.update(&defs, Some(&codex), completed, quiet, idle_after);
+        assert_eq!(t.state().unwrap().status, AgentStatus::Idle);
+
+        let working = format!("{pending}\n• Running git push (esc to interrupt)");
+        t.update(&defs, Some(&codex), &working, quiet, idle_after);
+        assert_eq!(t.state().unwrap().status, AgentStatus::Working);
+
+        // A new approval request after the result still needs input.
+        let next = format!("{completed}\n{pending}");
+        t.update(&defs, Some(&codex), &next, quiet, idle_after);
+        assert_eq!(t.state().unwrap().status, AgentStatus::NeedsInput);
+    }
+
+    #[test]
+    fn current_activity_keeps_the_current_question_and_its_choices() {
+        let question = "• Which database should I use?\n  • Postgres\n  • SQLite\n› ";
+        let screen = format!("• Read the configuration.\n{question}");
+        assert_eq!(current_activity("codex", &screen), question);
+        assert_eq!(current_activity("Codex", &screen), question);
+        assert_eq!(current_activity("claude", &screen), screen);
+        assert_eq!(current_activity("codex", "Allow?\n(y/n)"), "Allow?\n(y/n)");
     }
 
     #[test]
