@@ -63,8 +63,14 @@ jobs:
             file "target/${{ matrix.target }}/release/$b"
             file "target/${{ matrix.target }}/release/$b" | grep -Eq 'statically linked|static-pie linked'
           done
+      # Ubuntu's AppArmor blocks unprivileged user namespaces; the port lookup is tested with
+      # a listener in its own network namespace.
+      - name: Allow user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       # The daemon and terminal suites, and the remote ones (loopback ssh, handoffs).
       - name: Test
+        env:
+          THURM_REQUIRE_NETNS: "1"
         run: cargo test --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
 
   release-scripts:

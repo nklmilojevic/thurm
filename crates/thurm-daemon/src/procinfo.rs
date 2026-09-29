@@ -225,15 +225,30 @@ pub fn listening_ports(pids: &[u32]) -> std::collections::HashMap<u32, Vec<u16>>
     // Tables per network namespace: most pids share one.
     let mut by_netns: HashMap<std::path::PathBuf, HashMap<u64, u16>> = HashMap::new();
     for &pid in pids {
-        let netns = std::fs::read_link(format!("/proc/{pid}/ns/net"))
-            .unwrap_or_else(|_| format!("pid:{pid}").into());
-        let ports_by_inode = by_netns.entry(netns).or_insert_with(|| {
-            ["tcp", "tcp6"]
-                .iter()
-                .filter_map(|t| std::fs::read_to_string(format!("/proc/{pid}/net/{t}")).ok())
-                .flat_map(|text| listening_sockets(&text))
-                .collect()
-        });
+        let netns = std::fs::read_link(format!("/proc/{pid}/ns/net")).ok();
+        let cached = netns.as_ref().and_then(|ns| by_netns.get(ns));
+        let own;
+        let ports_by_inode = match cached {
+            Some(t) => t,
+            None => {
+                // Only a complete read speaks for the namespace; after a failed one, the next
+                // pid in it tries again.
+                let tables: Option<Vec<String>> = ["tcp", "tcp6"]
+                    .iter()
+                    .map(|t| std::fs::read_to_string(format!("/proc/{pid}/net/{t}")).ok())
+                    .collect();
+                let Some(tables) = tables else { continue };
+                let parsed: HashMap<u64, u16> =
+                    tables.iter().flat_map(|t| listening_sockets(t)).collect();
+                match netns {
+                    Some(ns) => &*by_netns.entry(ns).or_insert(parsed),
+                    None => {
+                        own = parsed;
+                        &own
+                    }
+                }
+            }
+        };
         if ports_by_inode.is_empty() {
             continue;
         }
@@ -349,7 +364,13 @@ mod proc_tests {
             .spawn()
         {
             Ok(c) => c,
-            Err(_) => return,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("THURM_REQUIRE_NETNS").is_none(),
+                    "cannot run unshare: {e}"
+                );
+                return;
+            }
         };
         let mut line = String::new();
         use std::io::BufRead;
@@ -358,6 +379,11 @@ mod proc_tests {
             .unwrap();
         let Ok(port) = line.trim().parse::<u16>() else {
             let _ = child.kill();
+            // CI allows user namespaces (see ci.yml): there, not running this is a failure.
+            assert!(
+                std::env::var_os("THURM_REQUIRE_NETNS").is_none(),
+                "cannot make a network namespace"
+            );
             eprintln!("note: cannot make a network namespace here; skipped");
             return;
         };
