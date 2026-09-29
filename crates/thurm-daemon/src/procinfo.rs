@@ -215,24 +215,28 @@ pub fn descendants(table: &[ProcRow], root: u32) -> Vec<ProcRow> {
     out
 }
 
-/// Listening TCP ports per pid: the LISTEN sockets in `/proc/net/tcp{,6}`, matched to each
-/// pid's open descriptors by inode.
+/// Listening TCP ports per pid: the LISTEN sockets in the pid's own `/proc/<pid>/net/tcp{,6}`
+/// (its network namespace's, which may not be the daemon's), matched to its open descriptors
+/// by inode.
 #[cfg(target_os = "linux")]
 pub fn listening_ports(pids: &[u32]) -> std::collections::HashMap<u32, Vec<u16>> {
-    let mut map: std::collections::HashMap<u32, Vec<u16>> = std::collections::HashMap::new();
-    if pids.is_empty() {
-        return map;
-    }
-    let mut ports_by_inode: std::collections::HashMap<u64, u16> = std::collections::HashMap::new();
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        if let Ok(text) = std::fs::read_to_string(table) {
-            ports_by_inode.extend(listening_sockets(&text));
-        }
-    }
-    if ports_by_inode.is_empty() {
-        return map;
-    }
+    use std::collections::HashMap;
+    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
+    // Tables per network namespace: most pids share one.
+    let mut by_netns: HashMap<std::path::PathBuf, HashMap<u64, u16>> = HashMap::new();
     for &pid in pids {
+        let netns = std::fs::read_link(format!("/proc/{pid}/ns/net"))
+            .unwrap_or_else(|_| format!("pid:{pid}").into());
+        let ports_by_inode = by_netns.entry(netns).or_insert_with(|| {
+            ["tcp", "tcp6"]
+                .iter()
+                .filter_map(|t| std::fs::read_to_string(format!("/proc/{pid}/net/{t}")).ok())
+                .flat_map(|text| listening_sockets(&text))
+                .collect()
+        });
+        if ports_by_inode.is_empty() {
+            continue;
+        }
         let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
             continue;
         };
@@ -325,6 +329,44 @@ mod proc_tests {
         let ports = listening_ports(&[me]);
         assert!(
             ports.get(&me).is_some_and(|p| p.contains(&port)),
+            "{ports:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ports_of_a_listener_in_another_network_namespace() {
+        // A new user + network namespace; skipped where that is not allowed.
+        let mut child = match std::process::Command::new("unshare")
+            .args(["-rn", "python3", "-c"])
+            .arg(
+                "import socket,sys,time\n\
+                 s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen()\n\
+                 print(s.getsockname()[1], flush=True); time.sleep(30)",
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut line = String::new();
+        use std::io::BufRead;
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let Ok(port) = line.trim().parse::<u16>() else {
+            let _ = child.kill();
+            eprintln!("note: cannot make a network namespace here; skipped");
+            return;
+        };
+        let pid = child.id();
+        let ports = listening_ports(&[pid]);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            ports.get(&pid).is_some_and(|p| p.contains(&port)),
             "{ports:?}"
         );
     }
