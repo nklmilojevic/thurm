@@ -12,6 +12,7 @@ use std::sync::Arc;
 use thurm_client::{Client, ClientError, ConnectOptions};
 use thurm_config::{ClipboardRead, Config, RemoteConfig};
 use thurm_proto::{CreatePane, PaneSize, Request, Response, UiCommand};
+use thurm_remote::doctor::{self, Report, State};
 use thurm_remote::handoff::{self, Registry, SshHost};
 use thurm_remote::install;
 use thurm_remote::tunnel::{Phase, Status};
@@ -85,24 +86,28 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or(s)
 }
 
-fn ask(question: &str, default_yes: bool, assume: Option<bool>) -> bool {
+/// Asks on the terminal. Without one (and without `--yes`/`--no`) there is nobody to answer:
+/// that is an error naming the question, not a silent "no".
+fn ask(question: &str, default_yes: bool, assume: Option<bool>) -> Result<bool, String> {
     if let Some(a) = assume {
-        return a;
+        return Ok(a);
     }
     if !std::io::stdin().is_terminal() {
-        return false;
+        return Err(format!(
+            "{question}\n(not a terminal, so nobody can answer: rerun with --yes or --no, or in a terminal)"
+        ));
     }
     print!("{question} [{}] ", if default_yes { "Y/n" } else { "y/N" });
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     if std::io::stdin().lock().read_line(&mut line).is_err() {
-        return false;
+        return Ok(false);
     }
-    match line.trim().to_ascii_lowercase().as_str() {
+    Ok(match line.trim().to_ascii_lowercase().as_str() {
         "" => default_yes,
         "y" | "yes" => true,
         _ => false,
-    }
+    })
 }
 
 /// `thurm` and `thurmd` next to this executable (the app's Contents/Helpers, or the
@@ -166,27 +171,11 @@ pub fn add(o: AddOptions) -> R {
         thurm_config::config_path().display()
     );
 
-    if host.linger.as_deref() == Some("no") {
-        println!(
-            "note: lingering is off for your user on {}: the daemon's socket goes away when your \
-             last session there ends. Run `loginctl enable-linger $USER` there.",
-            o.name
-        );
-    }
-    if ask(
-        &format!("Install the Claude Code / Codex hooks on {}?", o.name),
-        true,
-        o.assume,
-    ) {
-        const HOOKS: &str = concat!(
-            "TH=\"${THURM_HOME:-$HOME}\"; ",
-            "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
-            "thurm hooks install"
-        );
-        match ssh.run(HOOKS, &[], None, std::time::Duration::from_secs(60)) {
-            Ok(out) => print!("{out}"),
-            Err(e) => eprintln!("thurm: installing hooks on {} failed: {e}", o.name),
-        }
+    // The rest the host needs (lingering, PATH, agents, hooks), fixed where you agree.
+    let report = doctor::run(&ssh, &o.name, o.socket.as_deref(), local_bins().as_deref())?;
+    print_report(&o.name, &o.target, &report);
+    if !settled(&report) {
+        fix_flow(&ssh, &o.name, o.socket.as_deref(), &report, o.assume)?;
     }
     reload_app();
     println!(
@@ -247,7 +236,7 @@ fn install_flow(
             ),
             true,
             assume,
-        ) {
+        )? {
             return Err(format!("{name} needs Thurm {} to connect", thurm_proto::BUILD).into());
         }
         let info: ThurmInfo = install::install(ssh, host, method, local_bins().as_deref())?;
@@ -269,12 +258,174 @@ fn install_flow(
         } else {
             format!("Upgrade the daemon on {name} in place (its panes keep running)?")
         };
-        if ask(&question, !restart, assume) {
+        if ask(&question, !restart, assume)? {
             let out = install::upgrade_daemon(ssh, socket, Some(d), restart)?;
             println!("{out}");
         }
     }
     Ok(())
+}
+
+/// Nothing left to offer: every problem is fixed or has no fix at all.
+fn settled(r: &Report) -> bool {
+    r.checks.iter().all(|c| {
+        matches!(c.state, State::Ok | State::Skip) || (c.fix.is_none() && c.terminal.is_none())
+    })
+}
+
+fn print_report(name: &str, target: &str, r: &Report) {
+    println!("{name} ({target})");
+    let width = r.checks.iter().map(|c| c.title.len()).max().unwrap_or(0);
+    for c in &r.checks {
+        let mark = match c.state {
+            State::Ok => "✓",
+            State::Warn => "!",
+            State::Fail => "✗",
+            State::Skip => "-",
+        };
+        println!("  {mark} {:<width$}  {}", c.title, c.detail);
+    }
+}
+
+/// Runs `script` on the host in this terminal (`ssh -t`).
+fn run_in_terminal(ssh: &Ssh, script: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let argv = ssh.interactive_argv(script)?;
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()?;
+    Ok(status.success())
+}
+
+/// Offers the fix for every problem of `report`, then checks again.
+fn fix_flow(
+    ssh: &Ssh,
+    name: &str,
+    socket: Option<&str>,
+    report: &Report,
+    assume: Option<bool>,
+) -> Result<Report, Box<dyn std::error::Error>> {
+    let tty = std::io::stdin().is_terminal();
+    let bins = local_bins();
+    let mut later: Vec<(String, String)> = Vec::new();
+    for c in &report.checks {
+        if matches!(c.state, State::Ok | State::Skip) {
+            continue;
+        }
+        let mut done = false;
+        if let Some(f) = &c.fix {
+            let question = match &f.confirm {
+                Some(q) => format!("{} {q} {}?", c.title, f.label),
+                None => format!("{}: {}?", c.title, f.label),
+            };
+            // Answered for scripts by --yes/--no; with neither and no terminal, only listed.
+            let yes = match (assume, tty) {
+                (Some(a), _) => a,
+                (None, true) => ask(&question, true, None)?,
+                (None, false) => false,
+            };
+            if yes {
+                let restart = f.confirm.is_some();
+                match doctor::fix(ssh, socket, bins.as_deref(), &c.id, restart) {
+                    Ok(out) => {
+                        println!(
+                            "  {}: {}",
+                            c.title,
+                            if out.is_empty() { "done" } else { &out }
+                        );
+                        done = true;
+                    }
+                    Err(e) => eprintln!("thurm: {}: {e}", c.title),
+                }
+            }
+        }
+        if done {
+            continue;
+        }
+        if let Some(script) = &c.terminal {
+            if tty
+                && ask(
+                    &format!("{}: run `{script}` on {name} here?", c.title),
+                    true,
+                    None,
+                )?
+            {
+                if !run_in_terminal(ssh, script)? {
+                    eprintln!("thurm: {}: the command failed", c.title);
+                }
+            } else {
+                later.push((c.title.clone(), script.clone()));
+            }
+        }
+    }
+    let after = doctor::run(ssh, name, socket, bins.as_deref())?;
+    println!();
+    print_report(name, &ssh.target, &after);
+    if !later.is_empty() {
+        println!("\nThese need you at a terminal on {name}:");
+        for (title, script) in later {
+            println!("  {title}: ssh -t {} '{script}'", ssh.target);
+        }
+    }
+    Ok(after)
+}
+
+pub fn doctor_cmd(name: Option<&str>, fix: bool, assume: Option<bool>, json: bool) -> R {
+    let names: Vec<String> = match name {
+        Some(n) => vec![remote_config(n)?.name],
+        None => Config::load()?
+            .remote
+            .iter()
+            .map(|r| r.name.clone())
+            .collect(),
+    };
+    if names.is_empty() {
+        println!("no remotes (add one with `thurm remote add <name> <ssh-target>`)");
+        return Ok(ExitCode::SUCCESS);
+    }
+    thurm_remote::ssh::prepare_dir()?;
+    let mut healthy = true;
+    let mut reports = Vec::new();
+    for (i, n) in names.iter().enumerate() {
+        let r = remote_config(n)?;
+        let ssh = Ssh::new(&r.host)?;
+        let mut report = match doctor::run(&ssh, n, r.socket.as_deref(), local_bins().as_deref()) {
+            Ok(rep) => rep,
+            Err(e) => {
+                healthy = false;
+                if json {
+                    reports.push(serde_json::json!({"name": n, "error": e.to_string()}));
+                } else {
+                    println!("{n} ({})\n  ✗ ssh  {e}", r.host);
+                }
+                continue;
+            }
+        };
+        if json {
+            reports.push(serde_json::json!({"name": n, "report": report}));
+            healthy &= report.healthy();
+            continue;
+        }
+        if i > 0 {
+            println!();
+        }
+        print_report(n, &r.host, &report);
+        if fix && !settled(&report) {
+            println!();
+            report = fix_flow(&ssh, n, r.socket.as_deref(), &report, assume)?;
+            reload_app();
+        } else if !settled(&report) {
+            println!("  fix: thurm remote doctor {n} --fix");
+        }
+        healthy &= report.healthy();
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    }
+    Ok(if healthy {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 pub fn install_cmd(name: &str, assume: Option<bool>) -> R {

@@ -3,7 +3,7 @@ import AppKit
 // Vertical tabs (config `window.tab_style = "sidebar"`), after tty7's sidebar: tabs grouped by
 // git repository, each row showing the agent status, the title and the branch with its diff
 // size. Tabs are still native window tabs underneath (one NSWindow per tab, with the native tab
-// bar suppressed), so restore, Cmd+1…9, "Move Tab to New Window" and merging keep working;
+// bar suppressed), so restore, Cmd+1…9 and "Move Tab to New Workspace" keep working;
 // every window of a tab group shows the same list. Below the tabs, an agents panel lists every
 // pane running a coding agent (in any window or workspace), so an agent in an unfocused split
 // is one click away; it has its own selection: the focused agent pane.
@@ -443,7 +443,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         let close = NSMenuItem(title: "Close Tab", action: #selector(closeClicked(_:)), keyEquivalent: "")
         close.target = self
         menu.addItem(close)
-        let move = NSMenuItem(title: "Move Tab to New Window", action: #selector(moveClicked(_:)), keyEquivalent: "")
+        let move = NSMenuItem(title: "Move Tab to New Workspace", action: #selector(moveClicked(_:)), keyEquivalent: "")
         move.target = self
         menu.addItem(move)
         return menu
@@ -460,8 +460,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     }
 
     @objc private func moveClicked(_ sender: Any?) {
-        guard let w = clickedTab()?.window else { return }
-        w.moveTabToNewWindow(nil)
+        guard let c = clickedTab() else { return }
+        SessionManager.shared.moveTabToNewWorkspace(c)
     }
 }
 

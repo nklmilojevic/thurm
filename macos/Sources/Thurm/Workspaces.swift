@@ -184,6 +184,72 @@ extension SessionManager {
         scheduleLayoutSave()
     }
 
+    /// Adds `pane` as a tab of `ws` (not shown). With `reveal`, `c`'s window switches to `ws` on
+    /// that tab; else the window says where it went.
+    func addHiddenTab(_ pane: PaneKey, handoff: String?, to ws: Workspace, in c: TerminalWindowController,
+                      reveal: Bool) {
+        ws.hiddenTabs.append(TabLayout(title: nil, root: .pane(pane), focused: pane.id, zoomed: nil, handoff: handoff))
+        if reveal {
+            ws.hiddenSelectedTab = ws.hiddenTabs.count - 1
+            switchWorkspace(in: c, to: ws)
+        } else {
+            let label = ws.isRemote ? "\(ws.name) (\(ws.host))" : ws.name
+            (currentRegularController ?? c).content.focusedView?.showToast(
+                "New tab in workspace \(label) · ⇧⌘O to switch", duration: 5)
+            refreshSidebars()
+            scheduleLayoutSave()
+        }
+    }
+
+    /// Moves `c`'s tab out of its window into a new workspace, in the background.
+    func moveTabToNewWorkspace(_ c: TerminalWindowController) {
+        guard !c.isQuick, group(of: c).count > 1 else {
+            NSSound.beep()
+            return
+        }
+        let ws = makeWorkspace(host: workspace(c.workspaceID)?.host ?? c.host)
+        ws.hiddenTabs = [c.content.tabLayout(title: c.titleOverride)]
+        c.closingWithoutConfirmation = true
+        c.window?.close()
+        currentRegularController?.content.focusedView?.showToast("Tab moved to workspace \(ws.name)", duration: 4)
+        refreshSidebars()
+        scheduleLayoutSave()
+    }
+
+    /// Thurm has one window. Another one (a tab dragged out of the tab bar) goes into a
+    /// workspace in the background: the window with the most tabs stays, on a tie the one that
+    /// is not key (a dragged-out tab becomes key).
+    func foldExtraWindows() {
+        var groups: [[TerminalWindowController]] = []
+        for c in regularControllers where c.window != nil && !groups.contains(where: { $0.contains { $0 === c } }) {
+            groups.append(group(of: c))
+        }
+        guard groups.count > 1 else { return }
+        let key = NSApp.keyWindow
+        func rank(_ g: [TerminalWindowController]) -> (Int, Int) {
+            (g.count, g.contains { $0.window === key } ? 0 : 1)
+        }
+        let keep = groups.indices.max { rank(groups[$0]) < rank(groups[$1]) } ?? 0
+        let keptWorkspace = groups[keep].first?.workspaceID
+        for (i, g) in groups.enumerated() where i != keep {
+            let tabs = g.filter { !$0.content.isEmpty }
+            var ws = g.first.flatMap { workspace($0.workspaceID) }
+            if ws == nil || ws?.id == keptWorkspace {
+                ws = makeWorkspace(host: g.first?.host ?? localHost)
+            }
+            for c in g {
+                c.closingWithoutConfirmation = true
+                c.window?.close()
+            }
+            guard let ws, !tabs.isEmpty else { continue }
+            ws.hiddenTabs += tabs.map { $0.content.tabLayout(title: $0.titleOverride) }
+            groups[keep].first?.content.focusedView?.showToast(
+                "\(tabs.count == 1 ? "Tab" : "Tabs") moved to workspace \(ws.name)", duration: 4)
+        }
+        refreshSidebars()
+        scheduleLayoutSave()
+    }
+
     /// Shows a hidden workspace in a new window (restore with no window left).
     func openWorkspaceInNewWindow(_ ws: Workspace, frame: NSRect? = nil) {
         var previous: TerminalWindowController?
@@ -291,7 +357,7 @@ extension SessionManager {
                 }
             }
         }
-        items.append(CommandPalette.Item(title: "New Workspace", detail: "", shortcut: "⇧⌘N") {
+        items.append(CommandPalette.Item(title: "New Workspace", detail: "", shortcut: "⌘N") {
             SessionManager.shared.newWorkspace()
         })
         for host in config.remoteNames {
@@ -326,7 +392,7 @@ extension SessionManager {
             menu.addItem(item)
         }
         menu.addItem(.separator())
-        menu.addItem(BlockMenuItem("New Workspace", key: "n", mods: [.command, .shift]) {
+        menu.addItem(BlockMenuItem("New Workspace", key: "n", mods: [.command]) {
             SessionManager.shared.newWorkspace()
         })
         menu.addItem(BlockMenuItem("Switch Workspace…", key: "o", mods: [.command, .shift]) {

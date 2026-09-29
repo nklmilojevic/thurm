@@ -5,6 +5,7 @@
 //! empty or missing file is a valid configuration.
 
 mod agents;
+pub mod hooks;
 mod themes;
 
 use std::path::{Path, PathBuf};
@@ -437,6 +438,9 @@ pub struct AgentsConfig {
     pub define: Vec<AgentDef>,
     /// Launch presets shown in the command palette. Defaults to the installed built-ins.
     pub presets: Vec<thurm_proto::AgentPreset>,
+    /// Add Thurm's status hooks to an agent's settings when it is launched without them
+    /// (`thurm hooks install` does the same by hand).
+    pub install_hooks: bool,
 }
 
 impl Default for AgentsConfig {
@@ -447,6 +451,7 @@ impl Default for AgentsConfig {
             session_titles: true,
             define: Vec::new(),
             presets: Vec::new(),
+            install_hooks: true,
         }
     }
 }

@@ -63,6 +63,9 @@ impl Env {
             .env("THURM_STATE_DIR", self.dir.join("state"))
             .env("SHELL", "/bin/sh")
             .env("THURM_LOG", "debug")
+            // Agents' settings (hooks installed on launch) stay in the test directory.
+            .env("CLAUDE_CONFIG_DIR", self.dir.join("claude"))
+            .env("CODEX_HOME", self.dir.join("codex"))
             .spawn()
             .expect("spawn daemon");
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -635,6 +638,37 @@ fn terminate_daemon_by_socket_peer() {
     assert!(std::os::unix::net::UnixStream::connect(&env.socket).is_err());
     // It saved the session on the way out.
     assert!(env.dir.join("state/session.json").exists());
+}
+
+#[test]
+fn launching_an_agent_installs_its_hooks() {
+    let env = Env::new("launch-hooks");
+    // A stand-in `claude` (hooks are chosen by the program's name).
+    let bin = env.dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(&claude, "#!/bin/sh\necho agent up; sleep 5\n").unwrap();
+    std::fs::set_permissions(&claude, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let _d = env.start();
+    let (c, _rx) = env.connect();
+    let settings = env.dir.join("claude/settings.json");
+    // A shell installs nothing.
+    create(&c, &env.dir);
+    assert!(!settings.exists());
+    let pane = match c
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec![claude.display().to_string()]),
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    wait_match(&c, pane, "agent up");
+    let text = std::fs::read_to_string(&settings).expect("hooks written before the agent ran");
+    assert!(text.contains("agent-hook claude stop"), "{text}");
+    assert!(!env.dir.join("codex/hooks.json").exists());
 }
 
 #[test]

@@ -44,7 +44,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `list` (alias `ls`) | List panes |
 | `pane-id` | Print the current pane ID |
 | `info --pane ID` | Show pane details |
-| `new-tab [COMMAND...]` | Open a tab; `--window`, `--cwd PATH`, `--hold` |
+| `new-tab [COMMAND...]` | Open a tab; `--window` (in a new workspace, in the background), `--cwd PATH`, `--hold` |
 | `split [COMMAND...]` | Split a pane; `--dir right\|down\|left\|up`, `--pane ID`, `--cwd PATH`, `--hold` |
 | `focus ID` | Focus a pane in the app |
 | `close [ID]` | Stop and close a pane; ID is positional |
@@ -73,6 +73,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `daemon ACTION` | Control the daemon; see [Sessions](/thurm/sessions/) |
 | `socket-path` | Print the daemon socket path |
 | `remote add\|list\|remove\|status\|install` | Manage remote hosts; see [Remote workspaces](/thurm/remote/) |
+| `remote doctor [NAME]` | Check what a host needs and offer fixes; `--fix`, `--yes` |
 | `handoff` | Hand the repository to a remote agent; `--remote NAME`, `--preset`, `--branch agent/NAME`, `--list`, `--fetch ID`, `--cleanup ID` |
 
 `--hold` keeps a pane open after its command exits. Use `--` before a command

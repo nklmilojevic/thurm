@@ -112,6 +112,17 @@ impl Ssh {
         Ok(cmd)
     }
 
+    /// `ssh … -t host sh -c '<script>' thurm` as an argument vector, for running `script` in a
+    /// terminal on this machine (a sudo password, a browser sign-in). Forwards nothing either.
+    pub fn interactive_argv(&self, script: &str) -> Result<Vec<String>, String> {
+        let mut argv = vec![self.program.display().to_string()];
+        argv.extend(self.base_args());
+        argv.extend(["-o", "ClearAllForwardings=yes", "-t"].map(str::to_owned));
+        argv.push(self.target.clone());
+        argv.push(format!("sh -c {} thurm", quote(script)?));
+        Ok(argv)
+    }
+
     /// Runs `script` remotely and returns its stdout. `input` is written to its stdin.
     pub fn run(
         &self,

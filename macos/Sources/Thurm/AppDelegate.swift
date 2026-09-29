@@ -56,17 +56,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "New Window", action: #selector(newWindow(_:)), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "New Tab", action: #selector(newTab(_:)), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "New Workspace", action: #selector(newWorkspace(_:)), keyEquivalent: ""))
         for item in menu.items { item.target = self }
         return menu
     }
 
     // MARK: Actions
-
-    @objc func newWindow(_ sender: Any?) {
-        SessionManager.shared.newWindow()
-    }
 
     @objc func newTab(_ sender: Any?) {
         SessionManager.shared.newTab(from: SessionManager.shared.currentController)

@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thurm_config::Config;
+use thurm_remote::doctor;
 use thurm_remote::handoff::{self, Registry, SshHost};
 use thurm_remote::install::{self, Method};
 use thurm_remote::tunnel::Supervisor;
@@ -140,6 +141,30 @@ enum Call {
         name: String,
         allow_restart: bool,
     },
+    /// Adds `[[remote]]` `name` after checking that ssh reaches `target` (Thurm › Remotes… ›
+    /// Add Host…). Installing and the rest are `doctor` and `doctor_fix`.
+    Add {
+        name: String,
+        target: String,
+    },
+    /// What the host needs, with fixes (`thurm remote doctor`).
+    Doctor {
+        name: String,
+        bins: Option<String>,
+    },
+    /// Runs the fix of check `id`.
+    DoctorFix {
+        name: String,
+        id: String,
+        bins: Option<String>,
+        #[serde(default)]
+        allow_restart: bool,
+    },
+    /// The ssh command line that runs `script` on `name` in a terminal (a pane of this Mac).
+    TerminalArgv {
+        name: String,
+        script: String,
+    },
     /// "Always for devbox": store `clipboard_read = "always"`.
     AllowClipboard {
         name: String,
@@ -256,6 +281,65 @@ fn call(c: Call) -> Result<Value, String> {
                 Err(e) => return Err(e.to_string()),
             }
         }
+        Call::Add { name, target } => {
+            thurm_config::validate_remote_name(&name)?;
+            if Config::load()
+                .map_err(|e| e.to_string())?
+                .remote(&name)
+                .is_some()
+            {
+                return Err(format!("a remote named {name:?} exists already"));
+            }
+            thurm_remote::ssh::prepare_dir().map_err(|e| e.to_string())?;
+            let ssh = Ssh::new(&target)?;
+            let effective = ssh.effective_config().map_err(|e| e.to_string())?;
+            thurm_remote::ssh::check_forwards(&effective)?;
+            let host = thurm_remote::probe(&ssh).map_err(|e| e.to_string())?;
+            let entry = thurm_config::RemoteConfig {
+                name: name.clone(),
+                host: target,
+                socket: None,
+                enabled: true,
+                clipboard_read: thurm_config::ClipboardRead::Ask,
+            };
+            thurm_config::edit_config(|t| thurm_config::with_remote_added(t, &entry))?;
+            if let Some(m) = MANAGER.lock().as_mut() {
+                sync(m);
+            }
+            json!({ "name": name, "host": host })
+        }
+        Call::Doctor { name, bins } => {
+            let (r, ssh) = ssh_for(&name)?;
+            let report = doctor::run(
+                &ssh,
+                &name,
+                r.socket.as_deref(),
+                bins.as_deref().map(std::path::Path::new),
+            )
+            .map_err(|e| e.to_string())?;
+            json!(report)
+        }
+        Call::DoctorFix {
+            name,
+            id,
+            bins,
+            allow_restart,
+        } => {
+            let (r, ssh) = ssh_for(&name)?;
+            let out = doctor::fix(
+                &ssh,
+                r.socket.as_deref(),
+                bins.as_deref().map(std::path::Path::new),
+                &id,
+                allow_restart,
+            )
+            .map_err(|e| e.to_string())?;
+            json!({ "output": out })
+        }
+        Call::TerminalArgv { name, script } => {
+            let (_, ssh) = ssh_for(&name)?;
+            json!(ssh.interactive_argv(&script)?)
+        }
         Call::AllowClipboard { name } => {
             thurm_config::edit_config(|t| {
                 thurm_config::with_remote_setting(t, &name, "clipboard_read", "\"always\"")
@@ -356,6 +440,10 @@ mod tests {
             r#"{"op":"handoff_prepare","host":"devbox","path":"/r","branch":null}"#,
             r#"{"op":"handoff_cleanup","id":"a/b/c","force":true}"#,
             r#"{"op":"handoff_list"}"#,
+            r#"{"op":"add","name":"pi","target":"me@pi"}"#,
+            r#"{"op":"doctor","name":"pi","bins":null}"#,
+            r#"{"op":"doctor_fix","name":"pi","id":"hooks.claude","bins":null}"#,
+            r#"{"op":"terminal_argv","name":"pi","script":"exec claude"}"#,
         ] {
             serde_json::from_str::<Call>(s).unwrap_or_else(|e| panic!("{s}: {e}"));
         }

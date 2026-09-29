@@ -32,6 +32,12 @@ selects supported agents whose configuration directories exist. Use
 `thurm hooks uninstall --agent codex` or `--agent claude` to remove Thurm hooks.
 Run agents inside Thurm so their processes inherit `THURM_PANE_ID`.
 
+You rarely need to run these yourself. When Thurm launches `claude` or `codex`
+and its hooks are missing, the daemon adds them first, keeping a backup of the
+file (`settings.json.thurm-backup`). This includes agents installed after
+Thurm, on this Mac or on a remote host. Set `agents.install_hooks = false` to
+turn it off.
+
 Hooks support `thurm wait --agent-done --timeout 120`, session titles, and
 notifications when turns finish. Without hooks, detection uses process and
 screen information, which cannot provide the same completion signal.
