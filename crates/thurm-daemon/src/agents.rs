@@ -197,8 +197,8 @@ impl AgentTracker {
         self.hook.as_ref().and_then(|h| h.session_id.as_deref())
     }
 
-    /// Apply an agent hook event, sent while `pgrp` is in the foreground. The next `update`
-    /// (or `refresh`) reflects it.
+    /// Apply an agent hook event, sent from process group `pgrp` (the agent's). The next
+    /// `update` (or `refresh`) reflects it.
     pub fn apply_hook(
         &mut self,
         pgrp: Option<u32>,
@@ -208,7 +208,6 @@ impl AgentTracker {
         session_id: Option<String>,
         message: Option<String>,
     ) {
-        self.fg_pgrp = pgrp;
         if event == "session-end" {
             self.hook = None;
             return;
@@ -555,7 +554,7 @@ mod tests {
         let quiet = Duration::from_secs(5);
         // A hooked agent under a name we don't know (`node …`), in process group 10.
         let node = proc_in("node", 10);
-        t.update(&defs, Some(&proc_in("fish", 5)), "", quiet, idle_after);
+        t.update(&defs, Some(&node), "> ", quiet, idle_after);
         t.apply_hook(
             Some(10),
             "claude",
@@ -565,10 +564,6 @@ mod tests {
             None,
         );
         assert!(t.refresh().unwrap().unwrap().hooked);
-        assert!(
-            t.update(&defs, Some(&node), "> ", quiet, idle_after)
-                .is_none()
-        );
 
         // It exits without session-end; the hook stays for resume.
         assert_eq!(
@@ -590,6 +585,13 @@ mod tests {
             None
         );
         assert_eq!(t.refresh(), None);
+        // A hook the agent sent before it exited, arriving late, names the agent's group.
+        t.apply_hook(Some(10), "claude", "Claude Code", "stop", None, None);
+        assert_eq!(t.refresh(), None);
+        assert_eq!(
+            t.update(&defs, Some(&proc_in("git", 11)), "", quiet, idle_after),
+            None
+        );
     }
 
     #[test]

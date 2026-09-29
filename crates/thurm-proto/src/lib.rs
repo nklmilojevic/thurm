@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Daemons speaking this protocol or later replace themselves in place on SIGUSR2 (see
 /// `thurm_client::upgrade_daemon`), keeping every pane's process running.
@@ -171,6 +171,9 @@ pub enum Request {
         message: Option<String>,
         /// The agent's session transcript (Claude Code), read for the session's title.
         transcript_path: Option<String>,
+        /// Process group of the hook command: the agent's, whatever runs in the foreground
+        /// by the time the request arrives.
+        pgrp: Option<u32>,
     },
     /// What happened in the pane's last finished command, from the on-device model
     /// (`ai.explain`). Answers `Text`.

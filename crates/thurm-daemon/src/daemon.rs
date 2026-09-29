@@ -1701,6 +1701,7 @@ impl Daemon {
                 session_id,
                 message,
                 transcript_path,
+                pgrp,
             } => {
                 let titles = self.config.read().agents.session_titles;
                 let name = self
@@ -1711,7 +1712,6 @@ impl Daemon {
                     .map_or_else(|| agent.clone(), |d| d.name.clone());
                 let (info, events) = self.with_pane(pane, |_, st| {
                     let before = st.info.agent.clone();
-                    let pgrp = st.pty.foreground_pgrp();
                     st.agent
                         .apply_hook(pgrp, &agent, &name, &event, session_id, message);
                     st.agent.titles = titles;
