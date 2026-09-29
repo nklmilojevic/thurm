@@ -338,19 +338,20 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         }
         if !other.tabs.isEmpty { order.append(other) }
         let names = order.map(\.name), tabs = order.map(\.tabs)
-        if let s = shown, s.names == names, s.tabs == tabs { return }
-        shown = (names, tabs)
-        for g in order { g.boxes = g.tabs.map(TabBox.init) }
-        groups = order
-        showHeaders = groups.count > 1
-        outline.reloadData()
-        let collapsed = Self.collapsed
-        for g in groups where !collapsed.contains(g.name) { outline.expandItem(g) }
-        // Select the row of this window's tab.
-        for row in 0..<outline.numberOfRows {
-            if let t = outline.item(atRow: row) as? TabBox, t.tab.selected {
-                outline.selectRowIndexes([row], byExtendingSelection: false)
-            }
+        if shown.map({ $0.names == names && $0.tabs == tabs }) != true {
+            shown = (names, tabs)
+            for g in order { g.boxes = g.tabs.map(TabBox.init) }
+            groups = order
+            showHeaders = groups.count > 1
+            outline.reloadData()
+            let collapsed = Self.collapsed
+            for g in groups where !collapsed.contains(g.name) { outline.expandItem(g) }
+        }
+        // Select the row of this window's tab, also when the rows are unchanged: a click on
+        // another tab's row selected that row here, and this window's tab is the one shown again.
+        let current = (0..<outline.numberOfRows).first { (outline.item(atRow: $0) as? TabBox)?.tab.selected == true }
+        if let row = current, outline.selectedRow != row {
+            outline.selectRowIndexes([row], byExtendingSelection: false)
         }
     }
 
@@ -570,6 +571,11 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let next = agentRows()
         if next.count == rows.count,
            zip(next, rows).allSatisfy({ $0.pane == $1.pane && $0.hiddenWorkspace == $1.hiddenWorkspace && $0.row == $1.row }) {
+            // A click selects its row even when it changes nothing shown: put the selection back.
+            let current = rows.firstIndex { $0.row.selected }
+            if table.selectedRow != (current ?? -1) {
+                if let i = current { table.selectRowIndexes([i], byExtendingSelection: false) } else { table.deselectAll(nil) }
+            }
             return
         }
         rows = next
