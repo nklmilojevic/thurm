@@ -544,9 +544,11 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
             .compactMap { $0 }.joined(separator: " · ")
         table.reloadData()
         // The source list style pads below the last row: size to the table itself, or the
-        // rows don't fit and scrolling to the selected one cuts off the first.
+        // rows don't fit and scrolling to the selected one cuts off the first. Its intrinsic
+        // height, not its frame: the frame stretches to fill the scroll view, so after the panel
+        // had more agents it would count the empty space as padding and never shrink.
         let visible = min(rows.count, Self.maxVisibleRows)
-        let padding = rows.isEmpty ? 0 : max(0, table.frame.height - table.rect(ofRow: rows.count - 1).maxY)
+        let padding = rows.isEmpty ? 0 : max(0, table.intrinsicContentSize.height - table.rect(ofRow: rows.count - 1).maxY)
         let content = visible == 0 ? 0 : table.rect(ofRow: visible - 1).maxY + padding
         height.constant = rows.isEmpty ? 0 : Self.headerHeight + content
         if let i = rows.firstIndex(where: { $0.row.selected }) {
