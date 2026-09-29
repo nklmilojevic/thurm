@@ -968,7 +968,8 @@ final class SessionManager: NSObject, CoreDelegate {
                 let title = jsonString(dict?["title"]) ?? "Thurm"
                 let body = jsonString(dict?["body"]) ?? ""
                 if config.notificationsEnabled && (!NSApp.isActive || !isPaneFocused(id)) {
-                    Notifications.shared.post(pane: id, title: title, body: body)
+                    Notifications.shared.post(pane: id, title: title, body: body,
+                                              permission: jsonUInt64(dict?["permission"]))
                 }
             }
         case "ClipboardStore":
@@ -1007,6 +1008,9 @@ final class SessionManager: NSObject, CoreDelegate {
         // A new request (or a different one) is unread again.
         if !waiting || !wasWaiting || old?.agent?.message != info.agent?.message {
             seenWaiting.remove(info.id)
+        }
+        if wasWaiting && !waiting {
+            Notifications.shared.withdrawPermission(pane: info.id)
         }
         if waiting && !wasWaiting && !isPaneFocused(info.id) {
             NSApp.requestUserAttention(.informationalRequest)

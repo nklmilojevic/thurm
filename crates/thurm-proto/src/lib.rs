@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Daemons speaking this protocol or later replace themselves in place on SIGUSR2 (see
 /// `thurm_client::upgrade_daemon`), keeping every pane's process running.
@@ -162,7 +162,8 @@ pub enum Request {
     /// Returns the agent launch presets from the config.
     ListAgentPresets,
     /// An agent hook fired inside `pane` (`thurm agent-hook`). `event` is one of
-    /// session-start, prompt-submit, notification, tool-complete, stop, session-end.
+    /// session-start, prompt-submit, notification, permission-prompt, tool-complete, stop,
+    /// session-end.
     AgentHook {
         pane: PaneId,
         agent: String,
@@ -202,6 +203,13 @@ pub enum Request {
     SetSetting {
         key: String,
         value: String,
+    },
+    /// Answer the agent's permission prompt `prompt` (from [`Event::Notify`]): approve with
+    /// its default choice or decline. Fails when that prompt is no longer the one showing.
+    AnswerPermission {
+        pane: PaneId,
+        prompt: u64,
+        allow: bool,
     },
 }
 
@@ -319,6 +327,9 @@ pub enum Event {
         pane: PaneId,
         title: String,
         body: String,
+        /// The agent's permission prompt this is about, answerable with
+        /// [`Request::AnswerPermission`].
+        permission: Option<u64>,
     },
     /// OSC 52 copy.
     ClipboardStore {

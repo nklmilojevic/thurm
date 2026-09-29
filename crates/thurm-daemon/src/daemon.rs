@@ -677,6 +677,7 @@ impl Daemon {
                                 pane: pane.id,
                                 title,
                                 body,
+                                permission: None,
                             });
                         }
                     }
@@ -727,6 +728,7 @@ impl Daemon {
                                     pane: pane.id,
                                     title: format!("{what} {status}"),
                                     body: format!("after {}s", start.elapsed().as_secs()),
+                                    permission: None,
                                 });
                             }
                         }
@@ -876,8 +878,10 @@ impl Daemon {
                     };
                     let detail = self.ai.ask(&ask).ok().and_then(|t| ai::clean_detail(&t));
                     let mut current = false;
+                    let mut permission = None;
                     self.update_agent(pane, |st| {
                         current = st.agent.episode() == episode;
+                        permission = st.agent.permission_prompt();
                         if let Some(d) = &detail {
                             st.agent.set_ai_detail(episode, d.clone());
                         }
@@ -889,7 +893,15 @@ impl Daemon {
                             (Some(d), false) => d.clone(),
                             (None, _) => body,
                         };
-                        self.broadcast(Event::Notify { pane, title, body }, true);
+                        self.broadcast(
+                            Event::Notify {
+                                pane,
+                                title,
+                                body,
+                                permission,
+                            },
+                            true,
+                        );
                     }
                 }
             }
@@ -1398,8 +1410,14 @@ impl Daemon {
                 return Vec::new();
             }
         }
+        let permission = st.agent.permission_prompt().filter(|_| !done);
         notify
-            .map(|(title, body)| Event::Notify { pane, title, body })
+            .map(|(title, body)| Event::Notify {
+                pane,
+                title,
+                body,
+                permission,
+            })
             .into_iter()
             .collect()
     }
@@ -1752,6 +1770,26 @@ impl Daemon {
                 thurm_config::write_setting(&key, &value)?;
                 let cfg = Config::load().map_err(|e| e.to_string())?;
                 self.apply_config(cfg);
+                Ok(Response::Ok)
+            }
+            Request::AnswerPermission {
+                pane,
+                prompt,
+                allow,
+            } => {
+                let mut answered = false;
+                let p = self
+                    .pane(pane)
+                    .ok_or_else(|| format!("no such pane: {pane}"))?;
+                self.update_agent(pane, |st| {
+                    if let Some(keys) = st.agent.answer_permission(prompt, allow) {
+                        p.write(keys.to_vec());
+                        answered = true;
+                    }
+                });
+                if !answered {
+                    return Err("that permission prompt is no longer showing".into());
+                }
                 Ok(Response::Ok)
             }
             Request::SetTheme { spec } => {

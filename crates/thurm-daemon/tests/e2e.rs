@@ -557,6 +557,65 @@ fn agent_hooks_drive_status_and_wait() {
 }
 
 #[test]
+fn permission_prompt_answered_from_notification() {
+    let env = Env::new("permission");
+    let _d = env.start();
+    let (c, rx) = env.connect();
+    let pane = create(&c, &env.dir);
+    c.request(Request::Subscribe { pane }).unwrap();
+    // A stand-in agent that shows what it is typed (the tty echoes Esc as `^[`).
+    c.request(Request::Input {
+        pane,
+        data: b"/bin/cat\r".to_vec(),
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(c.request(Request::PaneInfo { pane }), Ok(Response::PaneInfo(i))
+        if i.foreground.as_ref().is_some_and(|f| f.name == "cat"))
+    {
+        assert!(Instant::now() < deadline, "cat never became the foreground");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    hook(&c, pane, "prompt-submit", None);
+
+    let prompt = || {
+        hook(&c, pane, "permission-prompt", None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if let Event::Notify {
+                pane: p,
+                permission,
+                ..
+            } = rx.recv_timeout(left).expect("no notification")
+                && p == pane
+            {
+                return permission.expect("notification offers no answer");
+            }
+        }
+    };
+    let answer = |prompt, allow| {
+        c.request(Request::AnswerPermission {
+            pane,
+            prompt,
+            allow,
+        })
+    };
+
+    let first = prompt();
+    assert_eq!(agent(&c, pane).unwrap().status, AgentStatus::NeedsInput);
+    assert!(matches!(answer(first, true), Ok(Response::Ok)));
+    assert_eq!(agent(&c, pane).unwrap().status, AgentStatus::Working);
+    assert!(answer(first, true).is_err(), "a prompt is answered once");
+
+    hook(&c, pane, "tool-complete", None);
+    let second = prompt();
+    assert!(answer(first, false).is_err(), "an old notification");
+    assert!(matches!(answer(second, false), Ok(Response::Ok)));
+    wait_match(&c, pane, r"\^\[");
+}
+
+#[test]
 fn terminate_daemon_by_socket_peer() {
     let env = Env::new("terminate");
     let mut d = env.start();
@@ -873,6 +932,7 @@ fn next_notification(rx: &Receiver<Event>, pane: PaneId) -> (String, String) {
                 pane: p,
                 title,
                 body,
+                ..
             } if p == pane => return (title, body),
             _ => {}
         }

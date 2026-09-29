@@ -289,11 +289,17 @@ fn agent_hook(agent: Option<String>, event: Option<String>) {
     }
     let payload: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
     let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+    let mut event = hooks::normalize_event(&event);
+    // Claude Code's permission dialog: the notification can answer it.
+    if event == "notification" && field("notification_type").as_deref() == Some("permission_prompt")
+    {
+        event = "permission-prompt".into();
+    }
     let Ok(c) = connect(false) else { return };
     let _ = c.request(Request::AgentHook {
         pane,
         agent,
-        event: hooks::normalize_event(&event),
+        event,
         session_id: field("session_id"),
         // The prompt, on prompt-submit: it names the session when the agent doesn't.
         message: field("message").or_else(|| field("prompt")),
