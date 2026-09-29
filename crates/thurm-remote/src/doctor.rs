@@ -448,7 +448,13 @@ const HOOKS: &str = concat!(
     "HOME=\"$TH\" thurm hooks install --agent \"$1\""
 );
 
-const AGENT_INSTALL: &str = "curl -fsSL \"$1\" | bash";
+/// Downloaded first, so a failed download fails the fix (`curl | bash` would report the
+/// status of a `bash` that read nothing).
+const AGENT_INSTALL: &str = concat!(
+    "T=\"$(mktemp)\" || exit 1; ",
+    "if curl -fsSL \"$1\" -o \"$T\"; then bash \"$T\"; S=$?; else S=$?; fi; ",
+    "rm -f \"$T\"; exit $S"
+);
 
 /// Runs the fix for check `id` over ssh and returns what it printed. `allow_restart`
 /// confirms restarting a daemon too old to be replaced in place.
@@ -633,6 +639,29 @@ mod tests {
         let f = d.fix.as_ref().unwrap();
         assert_eq!(f.label, "Restart");
         assert!(f.confirm.is_some());
+    }
+
+    #[test]
+    fn a_failed_installer_download_fails() {
+        let dir = std::env::temp_dir().join(format!("thurm-installer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("install.sh");
+        std::fs::write(&script, "echo installed\n").unwrap();
+        let run = |url: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", AGENT_INSTALL, "thurm", url])
+                .output()
+                .unwrap()
+        };
+        let ok = run(&format!("file://{}", script.display()));
+        assert!(ok.status.success());
+        assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "installed");
+        let missing = run(&format!("file://{}", dir.join("nothing.sh").display()));
+        assert!(
+            !missing.status.success(),
+            "a download that failed must not look installed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -342,7 +342,9 @@ fn fix_flow(
             continue;
         }
         if let Some(script) = &c.terminal {
+            // Only asked in person: --yes and --no both leave these listed for later.
             if tty
+                && assume.is_none()
                 && ask(
                     &format!("{}: run `{script}` on {name} here?", c.title),
                     true,
@@ -378,6 +380,12 @@ pub fn doctor_cmd(name: Option<&str>, fix: bool, assume: Option<bool>, json: boo
             .map(|r| r.name.clone())
             .collect(),
     };
+    if json && fix {
+        // Fixes ask and report as they go, which JSON output can't carry.
+        return Err(
+            "--fix does not combine with --json: check with --json, then fix without it".into(),
+        );
+    }
     if names.is_empty() {
         println!("no remotes (add one with `thurm remote add <name> <ssh-target>`)");
         return Ok(ExitCode::SUCCESS);
