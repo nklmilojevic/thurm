@@ -525,6 +525,28 @@ pub fn fetch(host: &dyn Host, h: &mut Handoff) -> Result<String, String> {
     result
 }
 
+/// [`prepare`], then records the handoff in `reg`. When it cannot be recorded, the worktree
+/// just made on the host is removed again: nothing would find it for a fetch or a cleanup.
+pub fn prepare_registered(
+    host: &dyn Host,
+    path: &Path,
+    branch: Option<&str>,
+    reg: &Registry,
+) -> Result<Handoff, String> {
+    let mut h = prepare(host, path, branch)?;
+    if let Err(e) = reg.put(&h) {
+        let undone = match cleanup(host, &mut h, true) {
+            Ok(_) => "removed the new worktree again".to_owned(),
+            Err(c) => format!("{} is left on {} ({c})", h.worktree, host.name()),
+        };
+        return Err(format!(
+            "cannot record the handoff in {}: {e}; {undone}",
+            reg.path.display()
+        ));
+    }
+    Ok(h)
+}
+
 /// What closing a handoff would lose.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct CleanupCheck {

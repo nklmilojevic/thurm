@@ -272,12 +272,12 @@ fn call(c: Call) -> Result<Value, String> {
         }
         Call::Link { host, url } => json!(policy::link(host.as_deref(), &url)),
         Call::HandoffPrepare { host, path, branch } => {
-            let h = handoff::prepare(
+            let h = handoff::prepare_registered(
                 &host_for(&host)?,
                 std::path::Path::new(&path),
                 branch.as_deref(),
+                &reg,
             )?;
-            reg.put(&h)?;
             json!(h)
         }
         Call::HandoffSetPane { id, pane } => {

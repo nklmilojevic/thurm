@@ -398,3 +398,37 @@ fn concurrent_snapshots_of_one_repository() {
     let first = tree(&snaps[0].commit);
     assert!(snaps.iter().all(|s| s.wip && tree(&s.commit) == first));
 }
+
+#[test]
+fn an_unrecordable_handoff_leaves_no_worktree() {
+    let f = Fixture::new("unrecordable");
+    // The registry's directory is a file: writing it fails.
+    std::fs::write(f.dir.join("state"), "").unwrap();
+    let reg = Registry {
+        path: f.dir.join("state/handoffs.json"),
+    };
+    let err = handoff::prepare_registered(&f.host, &f.repo, None, &reg).unwrap_err();
+    assert!(err.contains("removed the new worktree again"), "{err}");
+    let worktrees = f.host.home.join(".local/share/thurm/worktrees");
+    let left: Vec<_> = walk_dirs(&worktrees);
+    assert!(left.is_empty(), "{left:?}");
+    // Where a handoff's worktree does land.
+    let h = handoff::prepare(&f.host, &f.repo, None).unwrap();
+    assert_eq!(walk_dirs(&worktrees), vec![PathBuf::from(&h.worktree)]);
+}
+
+/// Directories two levels down (`<repo id>/<slug>`).
+fn walk_dirs(root: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|repo| {
+            std::fs::read_dir(repo.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .map(|e| e.path())
+        .collect()
+}

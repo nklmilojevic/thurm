@@ -467,10 +467,9 @@ pub fn handoff_cmd(o: HandoffOptions, json: bool) -> R {
         name: r.name.clone(),
         ssh: Ssh::new(&r.host)?,
     };
-    let mut h = handoff::prepare(&host, &path, o.branch.as_deref())?;
-    // The worktree exists on the host now: keep it findable for --fetch and --cleanup even
-    // when its pane never starts.
-    reg.put(&h)?;
+    // Recorded as soon as the worktree exists on the host: findable for --fetch and
+    // --cleanup even when its pane never starts.
+    let mut h = handoff::prepare_registered(&host, &path, o.branch.as_deref(), &reg)?;
     let stranded = |e: String| format!("{e}; the handoff {} stays for --fetch or --cleanup", h.id);
     let cfg = Config::load().unwrap_or_default();
     let created = client.request(Request::CreatePane(CreatePane {
