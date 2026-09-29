@@ -436,6 +436,14 @@ fn agent(c: &Client, pane: PaneId) -> Option<AgentState> {
     }
 }
 
+/// The pane's foreground process group: where a hook the agent runs comes from.
+fn fg_pgrp(c: &Client, pane: PaneId) -> Option<u32> {
+    match c.request(Request::PaneInfo { pane }).unwrap() {
+        Response::PaneInfo(i) => i.foreground.map(|p| p.pid),
+        other => panic!("{other:?}"),
+    }
+}
+
 fn hook(c: &Client, pane: PaneId, event: &str, session: Option<&str>) {
     let r = c.request(Request::AgentHook {
         pane,
@@ -444,6 +452,7 @@ fn hook(c: &Client, pane: PaneId, event: &str, session: Option<&str>) {
         session_id: session.map(str::to_owned),
         message: None,
         transcript_path: None,
+        pgrp: fg_pgrp(c, pane),
     });
     assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
 }
@@ -522,6 +531,7 @@ fn agent_hooks_drive_status_and_wait() {
         session_id: None,
         message: None,
         transcript_path: Some(transcript.to_string_lossy().into_owned()),
+        pgrp: fg_pgrp(&c, pane),
     });
     assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
     assert_eq!(
@@ -899,6 +909,7 @@ fn on_device_model_features() {
             session_id: None,
             message: message.map(str::to_owned),
             transcript_path: None,
+            pgrp: fg_pgrp(&c, pane),
         });
         assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
     };

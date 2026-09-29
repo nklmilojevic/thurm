@@ -298,6 +298,7 @@ fn agent_hook(agent: Option<String>, event: Option<String>) {
         // The prompt, on prompt-submit: it names the session when the agent doesn't.
         message: field("message").or_else(|| field("prompt")),
         transcript_path: field("transcript_path"),
+        pgrp: Some(unsafe { libc::getpgrp() } as u32),
     });
 }
 
