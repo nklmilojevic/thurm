@@ -8,7 +8,8 @@
 //! `thurm agent-hook`; while the hooked agent is in the foreground that state wins over the
 //! screen heuristics, and adds a session id, a Done state and turn timing.
 
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use thurm_config::AgentDef;
 use thurm_proto::{AgentState, AgentStatus, ProcessInfo};
@@ -79,6 +80,8 @@ struct HookState {
     /// Foreground process group when the hook last reported: the agent's own. Another
     /// program run later in the pane (`git pull`) is not the agent.
     pgrp: Option<u32>,
+    /// The permission prompt showing (see [`AgentTracker::permission_prompt`]).
+    permission: Option<u64>,
 }
 
 impl AgentTracker {
@@ -95,6 +98,11 @@ impl AgentTracker {
 
     pub fn user_input(&mut self) {
         self.attention_flag = false;
+        // Whatever the keys did (answered, moved off the default choice), the prompt the
+        // notification names is not certain to be showing as it was.
+        if let Some(h) = &mut self.hook {
+            h.permission = None;
+        }
         self.ai.typed = true;
         self.acknowledge();
     }
@@ -114,6 +122,29 @@ impl AgentTracker {
             h.message = None;
             h.answered = true;
         }
+    }
+
+    /// The hooked agent's permission prompt, while it shows untouched: what a notification
+    /// offers to answer.
+    pub fn permission_prompt(&self) -> Option<u64> {
+        let h = self.hook.as_ref()?;
+        let shown = self
+            .current
+            .as_ref()
+            .is_some_and(|s| s.hooked && s.kind == h.kind && s.status == AgentStatus::NeedsInput);
+        h.permission
+            .filter(|_| shown && h.status == AgentStatus::NeedsInput)
+    }
+
+    /// Answer permission prompt `prompt` if it still shows: the bytes to type, Enter for the
+    /// dialog's default choice (allow once) or Esc (decline).
+    pub fn answer_permission(&mut self, prompt: u64, allow: bool) -> Option<&'static [u8]> {
+        if self.permission_prompt() != Some(prompt) {
+            return None;
+        }
+        let keys: &'static [u8] = if allow { b"\r" } else { b"\x1b" };
+        self.user_answer(keys);
+        Some(keys)
     }
 
     /// Current episode (see `episode`), to tag a question to the model with.
@@ -232,9 +263,11 @@ impl AgentTracker {
                 transcript: None,
                 answered: false,
                 pgrp: None,
+                permission: None,
             }),
         };
         h.answered = false;
+        h.permission = None;
         if pgrp.is_some() {
             h.pgrp = pgrp;
         }
@@ -272,6 +305,11 @@ impl AgentTracker {
             "notification" => {
                 h.status = AgentStatus::NeedsInput;
                 h.message = message;
+            }
+            "permission-prompt" => {
+                h.status = AgentStatus::NeedsInput;
+                h.message = message;
+                h.permission = Some(next_prompt_id());
             }
             "stop" => {
                 h.status = AgentStatus::Done;
@@ -354,6 +392,7 @@ impl AgentTracker {
             turns: 0,
             hooked: true,
             topic: None,
+            permission: None,
         })
     }
 
@@ -365,6 +404,7 @@ impl AgentTracker {
             state.turn_ms = h.turn_ms;
             state.turns = h.turns;
             state.hooked = true;
+            state.permission = h.permission.filter(|_| h.status == AgentStatus::NeedsInput);
             state.topic = h
                 .transcript
                 .as_ref()
@@ -395,7 +435,10 @@ impl AgentTracker {
             self.last_kind = Some(n.kind.clone());
         }
         let key = |s: &Option<AgentState>| s.as_ref().map(|s| (s.kind.clone(), s.status));
-        if key(&next) != key(&self.current) {
+        let prompt = |s: &Option<AgentState>| s.as_ref().and_then(|s| s.permission);
+        // Another permission prompt is another request, even with the status unchanged.
+        let new_prompt = prompt(&next).is_some() && prompt(&next) != prompt(&self.current);
+        if key(&next) != key(&self.current) || new_prompt {
             self.episode += 1;
             self.ai.detail = None;
             if next
@@ -474,6 +517,7 @@ impl AgentTracker {
                 turns: 0,
                 hooked: false,
                 topic: None,
+                permission: None,
             }))
         });
         if next.is_none() {
@@ -506,6 +550,22 @@ pub fn human_duration(ms: u64) -> String {
 }
 
 /// "Claude is waiting for your input": sent after a minute without input, not for a request.
+/// Identifies a permission prompt. Unique across daemon restarts and in-place upgrades, whose
+/// trackers start afresh while notifications naming older prompts may still be answered: the
+/// clock in microseconds, kept increasing.
+fn next_prompt_id() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64);
+    let prev = LAST
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
+            Some(now.max(l + 1))
+        })
+        .unwrap_or_default();
+    now.max(prev + 1)
+}
+
 fn is_idle_reminder(message: &str) -> bool {
     message
         .to_ascii_lowercase()
@@ -1115,11 +1175,76 @@ mod tests {
             turns: 0,
             hooked: false,
             topic: None,
+            permission: None,
         };
         assert!(generic_title(None, &a));
         assert!(generic_title(Some("✳ Claude Code"), &a));
         assert!(generic_title(Some("claude"), &a));
         assert!(!generic_title(Some("✳ Fix login bug"), &a));
+    }
+
+    #[test]
+    fn permission_prompts_are_answered_only_while_untouched() {
+        let defs = thurm_config::builtin_agents();
+        let mut t = AgentTracker::default();
+        let idle_after = Duration::from_millis(1500);
+        let quiet = Duration::from_secs(5);
+        let claude = proc("claude");
+        t.update(&defs, Some(&claude), "> ", quiet, idle_after);
+        let prompt = |t: &mut AgentTracker| {
+            t.apply_hook(
+                Some(1),
+                "claude",
+                "Claude Code",
+                "permission-prompt",
+                None,
+                Some("Claude needs your permission to use Bash".into()),
+            );
+            t.refresh();
+            t.permission_prompt().unwrap()
+        };
+
+        // A plain notification (a question, an elicitation) offers no answer.
+        t.apply_hook(Some(1), "claude", "Claude Code", "notification", None, None);
+        t.refresh();
+        assert_eq!(t.permission_prompt(), None);
+
+        let first = prompt(&mut t);
+        assert_eq!(t.state().unwrap().status, AgentStatus::NeedsInput);
+        assert_eq!(t.answer_permission(first, true), Some(&b"\r"[..]));
+        assert_eq!(t.refresh().unwrap().unwrap().status, AgentStatus::Working);
+        assert_eq!(t.answer_permission(first, true), None, "answered once");
+
+        // An old notification can't answer the next prompt.
+        let second = prompt(&mut t);
+        assert_ne!(first, second);
+        assert_eq!(t.answer_permission(first, false), None);
+        assert_eq!(t.answer_permission(second, false), Some(&b"\x1b"[..]));
+
+        // Keys typed in the pane (even an arrow off the default choice) retire it.
+        let third = prompt(&mut t);
+        t.user_answer(b"\x1b[B");
+        assert_eq!(t.state().unwrap().status, AgentStatus::NeedsInput);
+        assert_eq!(t.answer_permission(third, true), None);
+
+        // A tracker starting afresh (an in-place upgrade) never reuses a number that an old
+        // notification may still carry.
+        let mut fresh = AgentTracker::default();
+        fresh.update(&defs, Some(&claude), "> ", quiet, idle_after);
+        assert!(prompt(&mut fresh) > third);
+
+        // So does any later hook.
+        let fourth = prompt(&mut t);
+        t.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "tool-complete",
+            None,
+            None,
+        );
+        t.refresh();
+        assert_eq!(t.answer_permission(fourth, true), None);
     }
 
     #[test]
