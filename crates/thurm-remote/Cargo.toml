@@ -1,0 +1,17 @@
+[package]
+name = "thurm-remote"
+description = "Remote workspaces: ssh tunnels to thurmd on other machines, remote installs, git handoffs and the app-side policy for remote panes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thurm-proto.workspace = true
+thurm-config.workspace = true
+thurm-client.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+log.workspace = true
+libc.workspace = true
+sha2 = "0.10"

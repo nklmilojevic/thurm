@@ -195,8 +195,8 @@ final class QuickTerminal {
     /// From the saved layout, hidden until the hotkey shows it.
     func restore(_ tab: TabLayout) {
         guard controller == nil else { return }
-        controller = SessionManager.shared.makeController(root: SplitNode(layout: tab.root), focused: tab.focused,
-                                                          zoomed: tab.zoomed, title: tab.title, frame: nil,
+        controller = SessionManager.shared.makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey,
+                                                          zoomed: tab.zoomedKey, title: tab.title, frame: nil,
                                                           quick: true)
     }
 

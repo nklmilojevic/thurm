@@ -238,8 +238,9 @@ final class GridSnapshot {
     var rows: Int { Int(info.rows) }
 
     /// Pulls the latest grid. Returns true when anything changed.
-    func update(pane: UInt64) -> Bool {
-        guard let client = Core.shared.client else { return false }
+    func update(pane key: PaneKey) -> Bool {
+        guard let client = Core.shared.client(for: key.host) else { return false }
+        let pane = key.id
         var newInfo = thurm_grid_info()
         var ptr: UnsafePointer<thurm_cell>? = nil
         guard thurm_grid_lock(client, pane, &newInfo, &ptr) else { return false }
@@ -368,7 +369,7 @@ final class GridSnapshot {
 
 /// Everything besides the grid that affects a frame.
 struct RenderParams {
-    var pane: UInt64
+    var pane: PaneKey
     var shaper: FontShaper
     var padX: Int
     var padY: Int
@@ -769,9 +770,10 @@ final class TerminalRenderer {
         return (below, above)
     }
 
-    private func texture(for image: UInt32, pane: UInt64, device: MTLDevice) -> MTLTexture? {
+    private func texture(for image: UInt32, pane key: PaneKey, device: MTLDevice) -> MTLTexture? {
         if let tex = imageTextures[image] { return tex }
-        guard let client = Core.shared.client else { return nil }
+        guard let client = Core.shared.client(for: key.host) else { return nil }
+        let pane = key.id
         var width: UInt32 = 0
         var height: UInt32 = 0
         var pixels: UnsafePointer<UInt8>? = nil

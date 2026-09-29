@@ -14,6 +14,7 @@ thurm-proto = { path = "crates/thurm-proto" }
 thurm-config = { path = "crates/thurm-config" }
 thurm-term = { path = "crates/thurm-term" }
 thurm-client = { path = "crates/thurm-client" }
+thurm-remote = { path = "crates/thurm-remote" }
 # Vendored (vendor/libghostty-vt-sys): upstream's crate, pinned to a newer Ghostty.
 libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
 bitflags = "2"

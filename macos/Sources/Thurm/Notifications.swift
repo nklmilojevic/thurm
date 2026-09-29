@@ -8,6 +8,7 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
     static let shared = Notifications()
 
     static let paneKey = "pane"
+    static let hostKey = "host"
 
     private var authorizationRequested = false
     private(set) var authorized = false
@@ -38,15 +39,15 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
     }
 
     /// Posts a notification for `pane`. Clicking it focuses the pane.
-    func post(pane: UInt64, title: String, body: String) {
+    func post(pane: PaneKey, title: String, body: String) {
         guard isAvailable else { return }
         requestAuthorizationIfNeeded()
         let content = UNMutableNotificationContent()
         content.title = title.isEmpty ? "Thurm" : title
         content.body = body
         content.sound = .default
-        content.userInfo = [Notifications.paneKey: NSNumber(value: pane)]
-        let request = UNNotificationRequest(identifier: "pane-\(pane)-\(UUID().uuidString)",
+        content.userInfo = [Notifications.paneKey: pane.number, Notifications.hostKey: pane.host]
+        let request = UNNotificationRequest(identifier: "pane-\(pane.host)-\(pane.id)-\(UUID().uuidString)",
                                             content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request) { error in
             if let error = error {
@@ -67,10 +68,11 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let info = response.notification.request.content.userInfo
-        let pane = jsonUInt64(info[Notifications.paneKey])
+        let id = jsonUInt64(info[Notifications.paneKey])
+        let host = (info[Notifications.hostKey] as? String) ?? localHost
         DispatchQueue.main.async {
-            if let pane = pane {
-                SessionManager.shared.focusPane(pane, activate: true)
+            if let id {
+                SessionManager.shared.focusPane(PaneKey(host, id), activate: true)
             }
         }
         completionHandler()

@@ -37,11 +37,11 @@ final class TabBox {
 
 /// A pane running an agent, as the agents panel shows it.
 final class AgentBox {
-    let pane: UInt64
+    let pane: PaneKey
     /// The pane's workspace when no window shows it.
     let hiddenWorkspace: UInt64?
     let row: SidebarTab
-    init(pane: UInt64, hiddenWorkspace: UInt64?, row: SidebarTab) {
+    init(pane: PaneKey, hiddenWorkspace: UInt64?, row: SidebarTab) {
         self.pane = pane
         self.hiddenWorkspace = hiddenWorkspace
         self.row = row
@@ -233,13 +233,12 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     /// of their first tab, then the rest ("Terminals"). Numbers follow it, so they can change
     /// when a tab closes or moves to another repository.
     static func displayOrder(_ windows: [NSWindow]) -> [NSWindow] {
-        let panes = SessionManager.shared.panes
         var roots: [String] = []
         var byRoot: [String: [NSWindow]] = [:]
         var other: [NSWindow] = []
         for w in windows {
             guard let c = w.windowController as? TerminalWindowController, !c.isClosed else { continue }
-            if let root = panes[c.focusedPane]?.git?.root {
+            if let root = group(for: c)?.key {
                 if byRoot[root] == nil { roots.append(root) }
                 byRoot[root, default: []].append(w)
             } else {
@@ -247,6 +246,17 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             }
         }
         return roots.flatMap { byRoot[$0] ?? [] } + other
+    }
+
+    /// The group a tab is listed under: its repository ("devbox · repo" on a remote host), or
+    /// for a handoff tab the local repository it came from.
+    static func group(for c: TerminalWindowController) -> (key: String, name: String)? {
+        if let h = c.handoffID.flatMap({ Remotes.shared.handoffs[$0] }) {
+            return (h.repo, (h.repo as NSString).lastPathComponent)
+        }
+        guard let root = SessionManager.shared.panes[c.focusedPane]?.git?.root else { return nil }
+        let name = (root as NSString).lastPathComponent
+        return c.host == localHost ? (root, name) : ("\(c.host):\(root)", "\(c.host) · \(name)")
     }
 
     func reload() {
@@ -269,19 +279,27 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                 }
             }
             let git = info?.git
+            // Remote paths are the host's, not abbreviated against this Mac's home.
+            let dir = info?.cwd.map { c.host == localHost ? abbreviatePath($0) : "\(c.host):\($0)" }
             var tab = SidebarTab(controller: c,
                                  title: c.titleOverride ?? info?.displayTitle ?? "Thurm",
-                                 subtitle: info?.cwd.map(abbreviatePath),
+                                 subtitle: dir,
                                  status: status,
                                  shortcut: tabShortcut(index: index, count: windows.count),
                                  selected: w === window)
             if let g = git {
-                tab.branch = g.branch
+                tab.branch = c.host == localHost ? g.branch : "\(c.host) · \(g.branch)"
                 tab.added = g.added
                 tab.removed = g.removed
-                let group = byRoot[g.root] ?? {
-                    let n = SidebarGroup(name: (g.root as NSString).lastPathComponent)
-                    byRoot[g.root] = n
+            }
+            if let h = c.handoffID.flatMap({ Remotes.shared.handoffs[$0] }) {
+                // A handoff: where it runs, and whether its work came back.
+                tab.branch = "\(h.host) · \(h.branch)" + (Remotes.shared.handoffErrors[h.id] != nil ? " · fetch failed" : "")
+            }
+            if let (key, name) = Self.group(for: c) {
+                let group = byRoot[key] ?? {
+                    let n = SidebarGroup(name: name)
+                    byRoot[key] = n
                     order.append(n)
                     return n
                 }()
@@ -547,7 +565,7 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
             // so a long status is what gets cut.
             let row = SidebarTab(controller: a.controller,
                                  title: a.title,
-                                 subtitle: [a.place, a.hidden?.name, a.statusDetail].compactMap { $0 }
+                                 subtitle: [a.hostLabel, a.place, a.hidden?.name, a.statusDetail].compactMap { $0 }
                                      .joined(separator: " · "),
                                  status: a.agent.status,
                                  shortcut: nil,

@@ -46,37 +46,37 @@ final class Perf {
         var intervals: [Double] = []
     }
 
-    private var stats: [UInt64: Stats] = [:]
+    private var stats: [PaneKey: Stats] = [:]
     private var windowStart = CACurrentMediaTime()
 
-    func key(pane: UInt64) {
+    func key(pane: PaneKey) {
         stats[pane, default: Stats()].keys += 1
         if stats[pane]?.pendingKey == 0 { stats[pane]?.pendingKey = CACurrentMediaTime() }
     }
 
-    func tick(pane: UInt64, link: CADisplayLink) {
+    func tick(pane: PaneKey, link: CADisplayLink) {
         stats[pane, default: Stats()].ticks += 1
         stats[pane]?.tickCount += 1
         stats[pane]?.linkInterval = link.targetTimestamp - link.timestamp
         flushIfDue()
     }
 
-    func scrollEvent(pane: UInt64, lines: Int) {
+    func scrollEvent(pane: PaneKey, lines: Int) {
         stats[pane, default: Stats()].scrollEvents += 1
         stats[pane]?.scrollLines += abs(lines)
     }
 
-    func wheelSent(pane: UInt64) {
+    func wheelSent(pane: PaneKey) {
         stats[pane, default: Stats()].wheelSends += 1
     }
 
     /// Time spent pulling the grid (`update`) and building + encoding (`draw`) in one render.
-    func split(pane: UInt64, update: Double, draw: Double) {
+    func split(pane: PaneKey, update: Double, draw: Double) {
         stats[pane]?.updateTotal += update * 1000
         stats[pane]?.drawTotal += draw * 1000
     }
 
-    func rendered(pane: UInt64, start: CFTimeInterval, generation: UInt64) {
+    func rendered(pane: PaneKey, start: CFTimeInterval, generation: UInt64) {
         let ms = (CACurrentMediaTime() - start) * 1000
         var s = stats[pane, default: Stats()]
         s.renders += 1
@@ -137,9 +137,9 @@ final class Perf {
             let iv = s.intervals
             let mean = iv.isEmpty ? 0 : iv.reduce(0, +) / Double(iv.count)
             let sd = iv.isEmpty ? 0 : (iv.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(iv.count)).squareRoot()
-            write(String(format: "pacing pane %llu: new-frame interval mean %.2f ms sd %.2f ms (n=%d)", pane, mean, sd, iv.count))
+            write(String(format: "pacing pane %llu: new-frame interval mean %.2f ms sd %.2f ms (n=%d)", pane.id, mean, sd, iv.count))
             write(String(format: "perf pane %llu: ticks %.0f/s (link %.2f ms) renders %.0f/s new frames %.0f/s render avg %.2f ms (grid %.2f, draw %.2f) max %.2f ms | scroll events %.0f/s lines %.0f/s wheel sends %.0f/s | keys %.0f/s key->frame avg %.1f max %.1f ms | frame gaps 1:%d 2:%d 3+:%d | daemon frames %.0f/s (renders with >1: %d) key->arrival avg %.1f max %.1f, arrival->render avg %.1f max %.1f ms",
-                        pane, Double(s.ticks) / secs, s.linkInterval * 1000, n / secs,
+                        pane.id, Double(s.ticks) / secs, s.linkInterval * 1000, n / secs,
                         Double(s.newFrames) / secs, s.renderTotal / n, s.updateTotal / n, s.drawTotal / n, s.renderMax,
                         Double(s.scrollEvents) / secs, Double(s.scrollLines) / secs, Double(s.wheelSends) / secs,
                         Double(s.keys) / secs, s.keyLatencyCount > 0 ? s.keyLatencyTotal / Double(s.keyLatencyCount) : 0,

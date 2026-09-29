@@ -25,6 +25,10 @@
 #                               the daemon on another build replaces it in place (default:
 #                               version+commit)
 #   THURM_CHANNEL               release | tip | dev (default dev)
+#   THURM_DOWNLOAD_BASE         the release the build is published under; with
+#   THURM_SHA256_X86_64_UNKNOWN_LINUX_MUSL, THURM_SHA256_AARCH64_UNKNOWN_LINUX_MUSL
+#                               checksums of the Linux archives built alongside it, the app
+#                               installs itself on Linux remote hosts (Thurm > Remotes…)
 #   THURM_FEED_URL, THURM_SPARKLE_PUBLIC_KEY
 #                               Sparkle appcast and EdDSA public key; without both, the app
 #                               never checks for updates
@@ -85,6 +89,9 @@ if [[ "$CHANNEL" == dev ]] && ! git -C "$ROOT" diff --quiet HEAD 2>/dev/null; th
     DIRTY=".dirty"
 fi
 export THURM_BUILD="${THURM_BUILD:-$VERSION+$BUILD_NUMBER.$GIT_SHA$DIRTY}"
+# The commit, for installing this build on a Nix remote host (the flake at this revision).
+THURM_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+export THURM_COMMIT
 log "Thurm $VERSION ($BUILD_NUMBER), build $THURM_BUILD, channel $CHANNEL"
 
 # ---------------------------------------------------------------------------------------

@@ -88,13 +88,19 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     var closingWithoutConfirmation = false
     /// The workspace this tab belongs to (every tab of a window shows the same one).
     var workspaceID: UInt64 = 0
+    /// A handoff tab (a remote agent working on a local repository): the handoff's id.
+    var handoffID: String? {
+        didSet { SessionManager.shared.refreshSidebars() }
+    }
+    /// The daemon of this tab's panes.
+    var host: HostId { content.host }
     /// Set once the window closed; the controller is about to be released.
     var isClosed = false
     /// The quick terminal (see QuickTerminal.swift): one tab in a borderless panel, outside
     /// the tab groups, workspaces and saved windows.
     let isQuick: Bool
 
-    init(root: SplitNode, focused: UInt64, zoomed: UInt64?, title: String?, contentSize: NSSize,
+    init(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, title: String?, contentSize: NSSize,
          quick: Bool = false) {
         content = TabContentView(root: root, focused: focused, zoomed: zoomed)
         isQuick = quick
@@ -179,7 +185,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         fatalError("init(coder:) is not supported")
     }
 
-    var focusedPane: UInt64 { content.focusedPane }
+    var focusedPane: PaneKey { content.focusedPane }
 
     /// Background opacity: `window.opacity`, or the quick terminal's own.
     var opacity: CGFloat {
@@ -267,7 +273,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             case .idle: prefix = ""
             }
         }
-        window.title = prefix + base
+        // Remote tabs say where they run.
+        let hostPrefix = host == localHost ? "" : "\(host) · "
+        window.title = prefix + hostPrefix + base
         if let name = agentName, let status = status {
             window.tab.toolTip = "\(name): \(detail ?? status.rawValue)"
         } else {
@@ -312,6 +320,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         }
         for id in content.paneIds {
             manager.sendClosePane(id)
+        }
+        if let handoff = handoffID {
+            // After the window is gone: offer to remove the worktree on the host.
+            DispatchQueue.main.async { manager.handoffTabClosed(handoff) }
         }
         return true
     }

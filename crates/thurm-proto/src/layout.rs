@@ -1,5 +1,9 @@
 //! Window / tab / split layout. Owned by the GUI, persisted by the daemon.
 //!
+//! The local daemon stores the app's whole layout, remote workspaces included: a leaf with a
+//! `host` is a pane of that `[[remote]]` host's daemon, which this daemon knows nothing about
+//! and keeps as is.
+//!
 //! Always serialized as JSON (it crosses the FFI boundary to Swift as JSON and is stored
 //! on disk as JSON), so internally tagged enums are fine here.
 
@@ -34,6 +38,10 @@ pub struct Workspace {
     pub tabs: Vec<TabLayout>,
     #[serde(default)]
     pub selected_tab: usize,
+    /// The `[[remote]]` host whose panes it shows (a remote workspace); `None` for this
+    /// machine's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -58,10 +66,14 @@ pub struct TabLayout {
     #[serde(default)]
     pub title: Option<String>,
     pub root: LayoutNode,
+    /// A pane of `root` (ids are unique per host, and a tab's panes share one host).
     pub focused: PaneId,
     /// Pane shown zoomed (maximized within the tab).
     #[serde(default)]
     pub zoomed: Option<PaneId>,
+    /// A handoff tab: a remote agent working on a local repository (see `thurm handoff`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -69,6 +81,9 @@ pub struct TabLayout {
 pub enum LayoutNode {
     Pane {
         id: PaneId,
+        /// The `[[remote]]` host whose daemon runs the pane; `None` for this daemon's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
     },
     Split {
         dir: SplitDir,
@@ -90,9 +105,16 @@ pub enum SplitDir {
 }
 
 impl LayoutNode {
+    /// A leaf for one of this daemon's panes.
+    pub fn local(id: PaneId) -> Self {
+        LayoutNode::Pane { id, host: None }
+    }
+
+    /// This daemon's panes (leaves without a host).
     pub fn panes(&self, out: &mut Vec<PaneId>) {
         match self {
-            LayoutNode::Pane { id } => out.push(*id),
+            LayoutNode::Pane { id, host: None } => out.push(*id),
+            LayoutNode::Pane { .. } => {}
             LayoutNode::Split { first, second, .. } => {
                 first.panes(out);
                 second.panes(out);
@@ -100,11 +122,23 @@ impl LayoutNode {
         }
     }
 
-    /// Replace pane ids according to `map`, dropping panes that map to `None`.
-    /// Returns `None` if the whole subtree disappears.
+    /// Every leaf as (host, id).
+    pub fn leaves<'a>(&'a self, out: &mut Vec<(Option<&'a str>, PaneId)>) {
+        match self {
+            LayoutNode::Pane { id, host } => out.push((host.as_deref(), *id)),
+            LayoutNode::Split { first, second, .. } => {
+                first.leaves(out);
+                second.leaves(out);
+            }
+        }
+    }
+
+    /// Replace this daemon's pane ids according to `map`, dropping panes that map to `None`;
+    /// remote leaves stay. Returns `None` if the whole subtree disappears.
     pub fn remap(self, map: &dyn Fn(PaneId) -> Option<PaneId>) -> Option<LayoutNode> {
         match self {
-            LayoutNode::Pane { id } => map(id).map(|id| LayoutNode::Pane { id }),
+            LayoutNode::Pane { id, host: None } => map(id).map(LayoutNode::local),
+            remote @ LayoutNode::Pane { .. } => Some(remote),
             LayoutNode::Split {
                 dir,
                 ratio,
@@ -126,6 +160,7 @@ impl LayoutNode {
 }
 
 impl Layout {
+    /// This daemon's panes (remote leaves are left out).
     pub fn panes(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
         let tabs = self.windows.iter().flat_map(|w| &w.tabs);
@@ -136,8 +171,9 @@ impl Layout {
         out
     }
 
-    /// Drop panes for which `keep` returns false, removing empty tabs, windows and
-    /// workspaces (a workspace stays while it has tabs or a window shows it).
+    /// Drop this daemon's panes for which `keep` returns false (remote leaves stay), removing
+    /// empty tabs, windows and workspaces (a workspace stays while it has tabs or a window
+    /// shows it).
     pub fn retain_panes(&mut self, keep: &dyn Fn(PaneId) -> bool) {
         for w in &mut self.windows {
             w.tabs = retain_tabs(std::mem::take(&mut w.tabs), keep);
@@ -163,8 +199,9 @@ fn retain_tabs(tabs: Vec<TabLayout>, keep: &dyn Fn(PaneId) -> bool) -> Vec<TabLa
     tabs.into_iter()
         .filter_map(|mut t| {
             let root = t.root.remap(&|id| keep(id).then_some(id))?;
-            let mut ids = Vec::new();
-            root.panes(&mut ids);
+            let mut leaves = Vec::new();
+            root.leaves(&mut leaves);
+            let ids: Vec<PaneId> = leaves.iter().map(|(_, id)| *id).collect();
             if !ids.contains(&t.focused) {
                 t.focused = ids[0];
             }
@@ -191,17 +228,19 @@ mod tests {
                         root: LayoutNode::Split {
                             dir: SplitDir::Right,
                             ratio: 0.5,
-                            first: Box::new(LayoutNode::Pane { id: 1 }),
-                            second: Box::new(LayoutNode::Pane { id: 2 }),
+                            first: Box::new(LayoutNode::local(1)),
+                            second: Box::new(LayoutNode::local(2)),
                         },
                         focused: 2,
                         zoomed: None,
+                        handoff: None,
                     },
                     TabLayout {
                         title: Some("logs".into()),
-                        root: LayoutNode::Pane { id: 3 },
+                        root: LayoutNode::local(3),
                         focused: 3,
                         zoomed: None,
+                        handoff: None,
                     },
                 ],
                 selected_tab: 1,
@@ -220,18 +259,21 @@ mod tests {
                     last_active: 10,
                     tabs: vec![TabLayout {
                         title: None,
-                        root: LayoutNode::Pane { id: 4 },
+                        root: LayoutNode::local(4),
                         focused: 4,
                         zoomed: None,
+                        handoff: None,
                     }],
                     selected_tab: 0,
+                    host: None,
                 },
             ],
             quick: Some(TabLayout {
                 title: None,
-                root: LayoutNode::Pane { id: 5 },
+                root: LayoutNode::local(5),
                 focused: 5,
                 zoomed: None,
+                handoff: None,
             }),
         }
     }
@@ -264,7 +306,7 @@ mod tests {
     fn retain_collapses_splits() {
         let mut l = sample();
         l.retain_panes(&|id| id != 2);
-        assert_eq!(l.windows[0].tabs[0].root, LayoutNode::Pane { id: 1 });
+        assert_eq!(l.windows[0].tabs[0].root, LayoutNode::local(1));
         assert_eq!(l.windows[0].tabs[0].focused, 1);
         l.retain_panes(&|id| id == 1);
         assert_eq!(l.windows[0].tabs.len(), 1);
@@ -282,5 +324,46 @@ mod tests {
         assert!(l.quick.is_none());
         let json = serde_json::to_string(&l).unwrap();
         assert!(!json.contains("quick"));
+    }
+
+    #[test]
+    fn remote_leaves_survive_local_pruning() {
+        let remote = |id| LayoutNode::Pane {
+            id,
+            host: Some("devbox".into()),
+        };
+        let mut l = sample();
+        // Remote pane 1 collides with local pane 1; both live in their own tabs.
+        l.windows[0].tabs.push(TabLayout {
+            title: None,
+            root: LayoutNode::Split {
+                dir: SplitDir::Down,
+                ratio: 0.5,
+                first: Box::new(remote(1)),
+                second: Box::new(remote(7)),
+            },
+            focused: 7,
+            zoomed: None,
+            handoff: Some("agent/quiet-otter".into()),
+        });
+        l.workspaces[0].host = Some("devbox".into());
+        let json = serde_json::to_string(&l).unwrap();
+        assert!(json.contains(r#"{"type":"pane","id":1,"host":"devbox"}"#));
+        assert!(
+            json.contains(r#"{"type":"pane","id":1}"#),
+            "local leaves have no host"
+        );
+        assert_eq!(serde_json::from_str::<Layout>(&json).unwrap(), l);
+        // Only local panes count, and only they are pruned.
+        assert_eq!(l.panes(), vec![1, 2, 3, 4, 5]);
+        l.retain_panes(&|_| false);
+        assert_eq!(l.windows.len(), 1);
+        let tab = &l.windows[0].tabs[0];
+        let mut leaves = Vec::new();
+        tab.root.leaves(&mut leaves);
+        assert_eq!(leaves, vec![(Some("devbox"), 1), (Some("devbox"), 7)]);
+        assert_eq!(tab.focused, 7);
+        assert_eq!(tab.handoff.as_deref(), Some("agent/quiet-otter"));
+        assert_eq!(l.workspaces[0].host.as_deref(), Some("devbox"));
     }
 }

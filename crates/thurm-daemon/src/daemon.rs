@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -1420,6 +1420,7 @@ impl Daemon {
                 client: name,
                 version,
                 ui,
+                capabilities: _,
             } => {
                 if version != PROTOCOL_VERSION {
                     return Err(format!(
@@ -1433,6 +1434,10 @@ impl Daemon {
                     daemon_pid: std::process::id(),
                     restored: self.restored.load(Ordering::Relaxed),
                     build: thurm_proto::BUILD.to_owned(),
+                    capabilities: thurm_proto::CAPABILITIES
+                        .iter()
+                        .map(|c| (*c).to_owned())
+                        .collect(),
                 })
             }
             Request::CreatePane(req) => self
@@ -1760,6 +1765,16 @@ impl Daemon {
                 self.apply_config(cfg);
                 Ok(Response::Ok)
             }
+            Request::WriteTempFile { name, data } => {
+                let dir = self
+                    .socket
+                    .parent()
+                    .unwrap_or(Path::new("/tmp"))
+                    .join("paste");
+                write_temp_file(&dir, &name, &data)
+                    .map(|p| Response::Text(p.display().to_string()))
+                    .map_err(|e| format!("cannot write {}: {e}", dir.display()))
+            }
         }
     }
 
@@ -1905,4 +1920,42 @@ fn spawn_writer(id: PaneId, mut writer: File, rx: Receiver<Vec<u8>>) {
                 }
             }
         });
+}
+
+/// Writes `data` to a new file in `dir` (0700, created if needed) named after `name`'s
+/// extension, readable by the owner only.
+fn write_temp_file(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let ext: String = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin")
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .collect();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    for n in 0..100u32 {
+        let path = dir.join(format!("paste-{stamp}-{n}.{ext}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(data)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free file name"))
 }

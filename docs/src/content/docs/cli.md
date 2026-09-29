@@ -71,6 +71,9 @@ Use `thurm COMMAND --help` for the full argument list.
 | `save` | Write a session snapshot |
 | `layout` | Print layout JSON |
 | `daemon ACTION` | Control the daemon; see [Sessions](/thurm/sessions/) |
+| `socket-path` | Print the daemon socket path |
+| `remote add\|list\|remove\|status\|install` | Manage remote hosts; see [Remote workspaces](/thurm/remote/) |
+| `handoff` | Hand the repository to a remote agent; `--remote NAME`, `--preset`, `--branch agent/NAME`, `--list`, `--fetch ID`, `--cleanup ID` |
 
 `--hold` keeps a pane open after its command exits. Use `--` before a command
 when you need to separate its flags from Thurm flags:
@@ -103,6 +106,10 @@ not all saved scrollback.
 | `1` | Operation failed |
 | `2` | Invalid CLI arguments |
 | `124` | Wait timed out |
+
+`--remote NAME` is global: it sends the command to that host's daemon through
+the tunnel the app keeps open, and fails when the app is not connected to it.
+Pass `--pane` with it. See [Remote workspaces](/thurm/remote/#the-cli).
 
 `--json` is global. Use it for structured results where the command returns
 data. A command that only performs an action can return no output.
