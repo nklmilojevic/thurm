@@ -1711,8 +1711,9 @@ impl Daemon {
                     .map_or_else(|| agent.clone(), |d| d.name.clone());
                 let (info, events) = self.with_pane(pane, |_, st| {
                     let before = st.info.agent.clone();
+                    let pgrp = st.pty.foreground_pgrp();
                     st.agent
-                        .apply_hook(&agent, &name, &event, session_id, message);
+                        .apply_hook(pgrp, &agent, &name, &event, session_id, message);
                     st.agent.titles = titles;
                     // Hooks without a path (Notification) keep following the current file.
                     // Followed even without titles: it is where interrupts show up.

@@ -24,6 +24,8 @@ pub struct AgentTracker {
     attention_flag: bool,
     since: Option<Instant>,
     hook: Option<HookState>,
+    /// The pane's foreground process group, as last seen (monitor tick or hook event).
+    fg_pgrp: Option<u32>,
     /// Show the transcript's session title as the topic (`agents.session_titles`).
     pub titles: bool,
     /// Bumped whenever the agent or its status changes: what the model said about one
@@ -74,6 +76,9 @@ struct HookState {
     /// The user answered a request (NeedsInput → Working). No hook confirms it until the
     /// tool finishes, so a quiet screen without a working pattern means Idle instead.
     answered: bool,
+    /// Foreground process group when the hook last reported: the agent's own. Another
+    /// program run later in the pane (`git pull`) is not the agent.
+    pgrp: Option<u32>,
 }
 
 impl AgentTracker {
@@ -192,15 +197,18 @@ impl AgentTracker {
         self.hook.as_ref().and_then(|h| h.session_id.as_deref())
     }
 
-    /// Apply an agent hook event. The next `update` (or `refresh`) reflects it.
+    /// Apply an agent hook event, sent while `pgrp` is in the foreground. The next `update`
+    /// (or `refresh`) reflects it.
     pub fn apply_hook(
         &mut self,
+        pgrp: Option<u32>,
         kind: &str,
         name: &str,
         event: &str,
         session_id: Option<String>,
         message: Option<String>,
     ) {
+        self.fg_pgrp = pgrp;
         if event == "session-end" {
             self.hook = None;
             return;
@@ -218,9 +226,13 @@ impl AgentTracker {
                 turns: 0,
                 transcript: None,
                 answered: false,
+                pgrp: None,
             }),
         };
         h.answered = false;
+        if pgrp.is_some() {
+            h.pgrp = pgrp;
+        }
         if session_id.is_some() {
             h.session_id = session_id;
         }
@@ -305,13 +317,23 @@ impl AgentTracker {
     /// Re-derive the state from the hook alone (between monitor ticks). Returns
     /// `Some(new_state)` when it changed.
     pub fn refresh(&mut self) -> Option<Option<AgentState>> {
-        let mut base = self.current.clone().or_else(|| self.hook_state())?;
+        let mut base = self
+            .current
+            .clone()
+            .or_else(|| self.hook_state().filter(|_| self.hook_in_foreground()))?;
         if !base.hooked {
             // Re-derived by `with_ai`.
             base.message = None;
         }
         let next = Some(self.with_ai(self.with_hook(base)));
         self.set(next)
+    }
+
+    /// Whether the hooked agent's process group is the pane's foreground.
+    fn hook_in_foreground(&self) -> bool {
+        self.hook
+            .as_ref()
+            .is_some_and(|h| h.pgrp.is_some() && h.pgrp == self.fg_pgrp)
     }
 
     /// A state from the hook alone, for agents whose process we don't recognize.
@@ -399,11 +421,12 @@ impl AgentTracker {
         idle_after: Duration,
     ) -> Option<Option<AgentState>> {
         self.check_interrupt();
+        self.fg_pgrp = fg.map(|p| p.pid);
         let def = fg.and_then(|p| defs.iter().find(|d| d.matches(&p.name, &p.argv)));
         // Hooked agent running under a process name we don't know (a wrapper, `node …`):
-        // trust the hook while something other than the shell is in the foreground.
+        // trust the hook while the process group that sent it is in the foreground.
         let unknown_hooked = def.is_none()
-            && self.hook.is_some()
+            && self.hook_in_foreground()
             && fg.is_some_and(|p| !crate::procinfo::is_shell(&p.name));
         if unknown_hooked {
             let next = self.hook_state().map(|s| self.with_ai(self.with_hook(s)));
@@ -517,6 +540,58 @@ mod tests {
         }
     }
 
+    fn proc_in(name: &str, pgrp: u32) -> ProcessInfo {
+        ProcessInfo {
+            pid: pgrp,
+            ..proc(name)
+        }
+    }
+
+    #[test]
+    fn a_stale_hook_does_not_claim_other_programs() {
+        let defs = thurm_config::builtin_agents();
+        let mut t = AgentTracker::default();
+        let idle_after = Duration::from_millis(1500);
+        let quiet = Duration::from_secs(5);
+        // A hooked agent under a name we don't know (`node …`), in process group 10.
+        let node = proc_in("node", 10);
+        t.update(&defs, Some(&proc_in("fish", 5)), "", quiet, idle_after);
+        t.apply_hook(
+            Some(10),
+            "claude",
+            "Claude Code",
+            "session-start",
+            Some("abc".into()),
+            None,
+        );
+        assert!(t.refresh().unwrap().unwrap().hooked);
+        assert!(
+            t.update(&defs, Some(&node), "> ", quiet, idle_after)
+                .is_none()
+        );
+
+        // It exits without session-end; the hook stays for resume.
+        assert_eq!(
+            t.update(&defs, Some(&proc_in("fish", 5)), "", quiet, idle_after),
+            Some(None)
+        );
+        assert_eq!(t.session_id(), Some("abc"));
+        // Focusing the pane doesn't bring it back.
+        assert_eq!(t.refresh(), None);
+        // Nor does the next program run there.
+        assert_eq!(
+            t.update(
+                &defs,
+                Some(&proc_in("git", 11)),
+                "",
+                Duration::ZERO,
+                idle_after
+            ),
+            None
+        );
+        assert_eq!(t.refresh(), None);
+    }
+
     #[test]
     fn status_transitions() {
         let defs = thurm_config::builtin_agents();
@@ -594,7 +669,14 @@ mod tests {
         let quiet = Duration::from_secs(5);
         let claude = proc("claude");
         t.update(&defs, Some(&claude), "> ", quiet, idle_after);
-        t.apply_hook("claude", "Claude Code", "prompt-submit", None, None);
+        t.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "prompt-submit",
+            None,
+            None,
+        );
         t.read_transcript(path.to_str());
         assert_eq!(t.refresh().unwrap().unwrap().status, AgentStatus::Working);
         assert!(
@@ -621,6 +703,7 @@ mod tests {
         let claude = proc("claude");
         t.update(&defs, Some(&claude), "> ", quiet, idle_after);
         t.apply_hook(
+            Some(1),
             "claude",
             "Claude Code",
             "session-start",
@@ -633,7 +716,14 @@ mod tests {
         assert_eq!(s.status, AgentStatus::Idle);
 
         // Working per hook even though the screen is quiet.
-        t.apply_hook("claude", "Claude Code", "prompt-submit", None, None);
+        t.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "prompt-submit",
+            None,
+            None,
+        );
         assert_eq!(t.refresh().unwrap().unwrap().status, AgentStatus::Working);
         let s = t.update(&defs, Some(&claude), "> ", quiet, idle_after);
         assert!(
@@ -642,6 +732,7 @@ mod tests {
         );
 
         t.apply_hook(
+            Some(1),
             "claude",
             "Claude Code",
             "notification",
@@ -652,9 +743,16 @@ mod tests {
         assert_eq!(s.status, AgentStatus::NeedsInput);
         assert_eq!(s.message.as_deref(), Some("Claude needs your permission"));
 
-        t.apply_hook("claude", "Claude Code", "tool-complete", None, None);
+        t.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "tool-complete",
+            None,
+            None,
+        );
         assert_eq!(t.refresh().unwrap().unwrap().status, AgentStatus::Working);
-        t.apply_hook("claude", "Claude Code", "stop", None, None);
+        t.apply_hook(Some(1), "claude", "Claude Code", "stop", None, None);
         let s = t.refresh().unwrap().unwrap();
         assert_eq!(s.status, AgentStatus::Done);
         assert_eq!(s.turns, 1);
@@ -670,7 +768,7 @@ mod tests {
             Some(None)
         );
         assert_eq!(t.session_id(), Some("abc-123"));
-        t.apply_hook("claude", "Claude Code", "session-end", None, None);
+        t.apply_hook(Some(1), "claude", "Claude Code", "session-end", None, None);
         assert_eq!(t.session_id(), None);
     }
 
@@ -726,13 +824,14 @@ mod tests {
             Duration::from_secs(1),
         );
         t.apply_hook(
+            Some(1),
             "codex",
             "Codex",
             "prompt-submit",
             None,
             Some("add CSV export".into()),
         );
-        t.apply_hook("codex", "Codex", "stop", None, None);
+        t.apply_hook(Some(1), "codex", "Codex", "stop", None, None);
         t.refresh();
         assert_eq!(
             t.ai_wants(true, false, "", None),
@@ -744,13 +843,14 @@ mod tests {
         t.set_ai_topic(None);
         assert!(t.ai_wants(true, false, "", None).is_empty());
         t.apply_hook(
+            Some(1),
             "codex",
             "Codex",
             "prompt-submit",
             None,
             Some("and tests".into()),
         );
-        t.apply_hook("codex", "Codex", "stop", None, None);
+        t.apply_hook(Some(1), "codex", "Codex", "stop", None, None);
         t.refresh();
         // The first prompt still names the session.
         assert_eq!(
@@ -804,6 +904,7 @@ mod tests {
             Duration::from_secs(1),
         );
         t.apply_hook(
+            Some(1),
             "claude",
             "Claude Code",
             "notification",
@@ -816,13 +917,21 @@ mod tests {
         let s = t.refresh().unwrap().unwrap();
         assert_eq!(s.message.as_deref(), Some("Wants to run `rm -rf build`"));
 
-        t.apply_hook("claude", "Claude Code", "tool-complete", None, None);
+        t.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "tool-complete",
+            None,
+            None,
+        );
         let s = t.refresh().unwrap().unwrap();
         assert_eq!(s.status, AgentStatus::Working);
         assert_eq!(s.message, None);
         // A late answer for the old request.
         assert!(!t.set_ai_detail(episode, "stale".into()));
         t.apply_hook(
+            Some(1),
             "claude",
             "Claude Code",
             "notification",
@@ -850,8 +959,16 @@ mod tests {
             idle_after,
         );
         let ask = |t: &mut AgentTracker| {
-            t.apply_hook("claude", "Claude Code", "prompt-submit", None, None);
             t.apply_hook(
+                Some(1),
+                "claude",
+                "Claude Code",
+                "prompt-submit",
+                None,
+                None,
+            );
+            t.apply_hook(
+                Some(1),
                 "claude",
                 "Claude Code",
                 "notification",
@@ -882,7 +999,14 @@ mod tests {
             )
             .is_none()
         );
-        t.apply_hook("claude", "Claude Code", "tool-complete", None, None);
+        t.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "tool-complete",
+            None,
+            None,
+        );
         t.refresh();
         assert_eq!(t.state().unwrap().status, AgentStatus::Working);
 
@@ -912,9 +1036,17 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(1),
         );
-        t.apply_hook("claude", "Claude Code", "prompt-submit", None, None);
-        t.apply_hook("claude", "Claude Code", "stop", None, None);
         t.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "prompt-submit",
+            None,
+            None,
+        );
+        t.apply_hook(Some(1), "claude", "Claude Code", "stop", None, None);
+        t.apply_hook(
+            Some(1),
             "claude",
             "Claude Code",
             "notification",
@@ -925,6 +1057,7 @@ mod tests {
         assert_eq!((s.status, s.message), (AgentStatus::Done, None));
         t.user_input();
         t.apply_hook(
+            Some(1),
             "claude",
             "Claude Code",
             "notification",
