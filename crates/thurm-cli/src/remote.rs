@@ -296,7 +296,8 @@ fn run_in_terminal(ssh: &Ssh, script: &str) -> Result<bool, Box<dyn std::error::
     Ok(status.success())
 }
 
-/// Offers the fix for every problem of `report`, then checks again.
+/// Offers the fix for every problem of `report`, then checks again: a fix can bring up new
+/// checks (installing an agent adds its sign-in and hooks), offered in the next round.
 fn fix_flow(
     ssh: &Ssh,
     name: &str,
@@ -307,68 +308,91 @@ fn fix_flow(
     let tty = std::io::stdin().is_terminal();
     let bins = local_bins();
     let mut later: Vec<(String, String)> = Vec::new();
-    for c in &report.checks {
-        if matches!(c.state, State::Ok | State::Skip) {
-            continue;
+    let mut offered = std::collections::HashSet::new();
+    let mut report = report.clone();
+    for _ in 0..3 {
+        let pending: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|c| !matches!(c.state, State::Ok | State::Skip))
+            .filter(|c| offered.insert(c.id.clone()))
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            break;
         }
-        let mut done = false;
-        if let Some(f) = &c.fix {
-            let question = match &f.confirm {
-                Some(q) => format!("{} {q} {}?", c.title, f.label),
-                None => format!("{}: {}?", c.title, f.label),
-            };
-            // Answered for scripts by --yes/--no; with neither and no terminal, only listed.
-            let yes = match (assume, tty) {
-                (Some(a), _) => a,
-                (None, true) => ask(&question, true, None)?,
-                (None, false) => false,
-            };
-            if yes {
-                let restart = f.confirm.is_some();
-                match doctor::fix(ssh, socket, bins.as_deref(), &c.id, restart) {
-                    Ok(out) => {
-                        println!(
-                            "  {}: {}",
-                            c.title,
-                            if out.is_empty() { "done" } else { &out }
-                        );
-                        done = true;
-                    }
-                    Err(e) => eprintln!("thurm: {}: {e}", c.title),
-                }
+        for c in &pending {
+            if offer_fix(ssh, name, socket, c, assume, tty, bins.as_deref())? {
+                continue;
             }
-        }
-        if done {
-            continue;
-        }
-        if let Some(script) = &c.terminal {
-            // Only asked in person: --yes and --no both leave these listed for later.
-            if tty
-                && assume.is_none()
-                && ask(
-                    &format!("{}: run `{script}` on {name} here?", c.title),
-                    true,
-                    None,
-                )?
-            {
-                if !run_in_terminal(ssh, script)? {
-                    eprintln!("thurm: {}: the command failed", c.title);
-                }
-            } else {
+            if let Some(script) = &c.terminal {
                 later.push((c.title.clone(), script.clone()));
             }
         }
+        report = doctor::run(ssh, name, socket, bins.as_deref())?;
     }
-    let after = doctor::run(ssh, name, socket, bins.as_deref())?;
     println!();
-    print_report(name, &ssh.target, &after);
+    print_report(name, &ssh.target, &report);
     if !later.is_empty() {
         println!("\nThese need you at a terminal on {name}:");
         for (title, script) in later {
             println!("  {title}: ssh -t {} '{script}'", ssh.target);
         }
     }
-    Ok(after)
+    Ok(report)
+}
+
+/// Offers `c`'s fix, then its terminal script (in person only: --yes and --no leave that
+/// for later). Returns whether it was taken care of.
+fn offer_fix(
+    ssh: &Ssh,
+    name: &str,
+    socket: Option<&str>,
+    c: &doctor::Check,
+    assume: Option<bool>,
+    tty: bool,
+    bins: Option<&Path>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(f) = &c.fix {
+        let question = match &f.confirm {
+            Some(q) => format!("{} {q} {}?", c.title, f.label),
+            None => format!("{}: {}?", c.title, f.label),
+        };
+        // Answered for scripts by --yes/--no; with neither and no terminal, only listed.
+        let yes = match (assume, tty) {
+            (Some(a), _) => a,
+            (None, true) => ask(&question, true, None)?,
+            (None, false) => false,
+        };
+        if yes {
+            let restart = f.confirm.is_some();
+            match doctor::fix(ssh, socket, bins, &c.id, restart) {
+                Ok(out) => {
+                    let out = if out.is_empty() { "done" } else { &out };
+                    println!("  {}: {out}", c.title);
+                    return Ok(true);
+                }
+                Err(e) => eprintln!("thurm: {}: {e}", c.title),
+            }
+        }
+    }
+    let Some(script) = &c.terminal else {
+        return Ok(false);
+    };
+    if tty
+        && assume.is_none()
+        && ask(
+            &format!("{}: run `{script}` on {name} here?", c.title),
+            true,
+            None,
+        )?
+    {
+        if !run_in_terminal(ssh, script)? {
+            eprintln!("thurm: {}: the command failed", c.title);
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 pub fn doctor_cmd(name: Option<&str>, fix: bool, assume: Option<bool>, json: bool) -> R {
