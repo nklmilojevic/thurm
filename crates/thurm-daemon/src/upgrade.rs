@@ -26,8 +26,10 @@ use crate::pty;
 /// Bumped when [`Handoff`] changes incompatibly. A new daemon reads every version up to its own.
 pub const HANDOFF_VERSION: u32 = 1;
 
-/// How long the old image waits for its readers to stop and its parsers to catch up.
-const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long the old image waits for a reader to stop, or for a parser that makes no progress.
+const QUIESCE_STALL: std::time::Duration = std::time::Duration::from_secs(3);
+/// The most it waits for its parsers to catch up (a debug build parses slowly).
+const QUIESCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Handoff {
@@ -166,7 +168,7 @@ pub fn perform(
         }
     }
     let _resume = Resume(daemon);
-    if !daemon.quiesce_readers(QUIESCE_TIMEOUT) {
+    if !daemon.quiesce_readers(QUIESCE_STALL, QUIESCE_LIMIT) {
         // Going on would drop what they read; the next upgrade request can try again.
         log::warn!("upgrade aborted: pane readers did not stop in time");
         return;

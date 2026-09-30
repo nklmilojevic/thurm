@@ -1373,13 +1373,16 @@ impl Daemon {
     /// by the panes; they only become the new image's through exec.
     /// Stops every pane's reader and waits until each pane parsed everything already read, so
     /// the terminals can be serialized with nothing lost: the rest of the output waits in the
-    /// kernel for the next image. False when that didn't happen within `timeout`.
-    pub fn quiesce_readers(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        if !self.readers.pause(timeout) {
+    /// kernel for the next image. False when a reader didn't stop within `stall`, or a parser
+    /// made no progress for `stall` (or everything took longer than `limit`).
+    pub fn quiesce_readers(&self, stall: Duration, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        if !self.readers.pause(stall) {
             return false;
         }
         for pane in self.all_panes() {
+            let mut generation = pane.state.lock().term.generation();
+            let mut progress = Instant::now();
             loop {
                 {
                     let st = pane.pipe.state.lock();
@@ -1387,7 +1390,13 @@ impl Daemon {
                         break;
                     }
                 }
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                let g = pane.state.lock().term.generation();
+                if g != generation {
+                    generation = g;
+                    progress = now;
+                }
+                if now >= end || now - progress >= stall {
                     return false;
                 }
                 std::thread::sleep(Duration::from_millis(2));
