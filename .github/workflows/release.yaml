@@ -179,7 +179,8 @@ jobs:
           set -euo pipefail
           # The update feed compiled into the app: the variable, else this repository's GitHub
           # Pages appcast (github.event has no repository on scheduled runs).
-          FEED="${SPARKLE_FEED_URL:-https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/appcast.xml}"
+          OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          FEED="${SPARKLE_FEED_URL:-https://$OWNER.github.io/${GITHUB_REPOSITORY#*/}/appcast.xml}"
           echo "THURM_FEED_URL=$FEED" >> "$GITHUB_ENV"
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           if [[ "${{ github.event_name }}" == release ]]; then
@@ -190,7 +191,7 @@ jobs:
             fi
             # Only a commit that passed CI on main is released (like tip builds).
             SHA="$(git rev-parse HEAD)"
-            PASSED="$(gh run list --repo "$REPO" --workflow CI --commit "$SHA" --event push --status success \
+            PASSED="$(gh run list --repo "$REPO" --workflow CI --commit "$SHA" --branch main --event push --status success \
               --limit 1 --json headSha -q '.[0].headSha // empty')"
             if [[ "$PASSED" != "$SHA" ]]; then
               echo "::error::$TAG points at ${SHA:0:7}, which has not passed CI on main. Tag a green commit (gh release create $TAG --target <sha>)."
