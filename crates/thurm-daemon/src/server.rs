@@ -28,7 +28,7 @@ pub fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
 }
 
 fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
-    if !peer_is_same_user(&stream) {
+    if !thurm_config::peer_is_same_user(&stream) {
         log::warn!("rejecting connection from another user");
         return;
     }
@@ -113,41 +113,4 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
 fn write_msg<W: std::io::Write>(w: &mut W, msg: &ServerMessage) -> std::io::Result<()> {
     let buf = codec::encode(msg)?;
     w.write_all(&buf)
-}
-
-/// Only accept clients running as the daemon's user (the socket dir is 0700 too).
-fn peer_is_same_user(stream: &UnixStream) -> bool {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let me = unsafe { libc::getuid() };
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let mut cred: libc::ucred = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        if libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        ) == 0
-        {
-            return cred.uid == me;
-        }
-        false
-    }
-    #[cfg(target_os = "macos")]
-    unsafe {
-        let mut uid: libc::uid_t = 0;
-        let mut gid: libc::gid_t = 0;
-        if libc::getpeereid(fd, &mut uid, &mut gid) == 0 {
-            return uid == me;
-        }
-        false
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (fd, me);
-        true
-    }
 }
