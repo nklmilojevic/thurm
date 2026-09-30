@@ -104,11 +104,11 @@ impl Store {
     pub fn save(
         &self,
         snap: &SessionSnapshot,
-        scrollbacks: &[(PaneId, Vec<u8>)],
+        scrollbacks: &[(PaneId, impl AsRef<[u8]>)],
     ) -> std::io::Result<()> {
         std::fs::create_dir_all(self.scrollback_dir())?;
         for (id, data) in scrollbacks {
-            write_atomic(&self.scrollback_path(*id), data)?;
+            write_atomic(&self.scrollback_path(*id), data.as_ref())?;
         }
         let json = serde_json::to_vec_pretty(snap).map_err(std::io::Error::other)?;
         write_atomic(&self.session_path(), &json)?;

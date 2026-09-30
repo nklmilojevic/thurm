@@ -406,6 +406,17 @@ fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
     else {
         return Vec::new();
     };
+    // Read while the child runs: output beyond the pipe buffer (64 KiB) would otherwise block
+    // it until the deadline.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(s) = child.stdout.take() {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut out = String::new();
+            let _ = s.take(4 << 20).read_to_string(&mut out);
+            let _ = tx.send(out);
+        });
+    }
     let deadline = Instant::now() + Duration::from_millis(600);
     loop {
         match child.try_wait() {
@@ -418,11 +429,11 @@ fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
             }
         }
     }
-    let mut out = String::new();
-    if let Some(s) = child.stdout.take() {
-        use std::io::Read;
-        let _ = s.take(4 << 20).read_to_string(&mut out);
-    }
+    // A background process the generator left behind may hold the pipe open.
+    let rest = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(50));
+    let out = rx.recv_timeout(rest).unwrap_or_default();
     let lines: Vec<String> = out.lines().map(str::to_owned).collect();
     cache
         .lock()
@@ -471,6 +482,18 @@ fn load_spec(command: &str) -> Option<Spec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generator_output_beyond_pipe_buffer() {
+        let script = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "i=0; while [ $i -lt 2000 ]; do echo \"line $i ................................................................................\"; i=$((i+1)); done".to_owned(),
+        ];
+        let lines = run_generator(&script, Path::new("/"), "/bin:/usr/bin");
+        assert_eq!(lines.len(), 2000);
+        assert_eq!(lines[1999].split_whitespace().nth(1), Some("1999"));
+    }
 
     #[test]
     fn words_and_segments() {
