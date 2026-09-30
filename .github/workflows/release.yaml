@@ -304,12 +304,11 @@ jobs:
           if [[ "${{ steps.meta.outputs.channel }}" == release ]]; then
             gh release view "${{ steps.meta.outputs.tag }}" --repo "$REPO" --json body -q .body > "$NOTES"
           else
+            # Everything merged since the build the `tip` tag still points at (moved on publish).
             SHA="${{ steps.meta.outputs.sha }}"
-            {
-              echo "**Tip build** of [\`${SHA:0:7}\`](https://github.com/$REPO/commit/$SHA)"
-              echo
-              git log -1 --format='%s%n%n%b' "$SHA"
-            } > "$NOTES"
+            PREVIOUS="$(git rev-parse -q --verify 'refs/tags/tip^{commit}' || true)"
+            python3 macos/release/tip_notes.py --repo "$REPO" --sha "$SHA" --since "$PREVIOUS" > "$NOTES"
+            cat "$NOTES"
           fi
           echo "THURM_NOTES_FILE=$NOTES" >> "$GITHUB_ENV"
 
@@ -351,6 +350,9 @@ jobs:
             echo "Nightly build of \`main\` at [\`${SHA:0:7}\`](https://github.com/$REPO/commit/$SHA). Apple silicon, macOS 14 or later."
             echo
             echo "Download **Thurm-tip.dmg**, or choose *Thurm › Update Channel › Tip* in any Thurm to get these builds automatically."
+            echo
+            # The changes in this build (the appcast's notes, less their heading).
+            tail -n +3 "$THURM_NOTES_FILE"
           } > "$NOTES"
           if gh release view tip --repo "$REPO" >/dev/null 2>&1; then
             gh release edit tip --repo "$REPO" --title "Tip" --notes-file "$NOTES" --prerelease
