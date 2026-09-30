@@ -38,6 +38,28 @@
 	<true/>
 	<key>SUScheduledCheckInterval</key>
 	<integer>3600</integer>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>A program running in Thurm wants to control another app.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>A program running in Thurm wants to use the camera.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>A program running in Thurm wants to use the microphone.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>A program running in Thurm wants to use your location.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>A program running in Thurm wants to use your location.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>A program running in Thurm wants to access your contacts.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>A program running in Thurm wants to access your calendars.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>A program running in Thurm wants to access your calendars.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>A program running in Thurm wants to access your reminders.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>A program running in Thurm wants to access your reminders.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>A program running in Thurm wants to access your photos.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Nikola Milojević. Licensed under the Apache License 2.0.</string>
 </dict>

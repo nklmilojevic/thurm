@@ -37,6 +37,9 @@ final class TerminalView: NSView, NSTextInputClient {
     private var reportedSize: GridSize?
     private var reportedFocus: Bool?
     private var waitingForResizeFrame = false
+    /// The daemon didn't answer a resize in time: draw the frame we have at the new size.
+    private var resizeTimedOut = false
+    private var resizeFrameTimeout: DispatchWorkItem?
     private(set) var cols = 0
     private(set) var rows = 0
 
@@ -44,6 +47,8 @@ final class TerminalView: NSView, NSTextInputClient {
     private var markedText = NSMutableAttributedString()
     /// Non-nil while `interpretKeyEvents` runs inside keyDown; collects committed text.
     private var keyTextAccumulator: [String]?
+    /// Set when the input method passed the key on as a command (`doCommand`) during keyDown.
+    private var keyCommandIssued = false
 
     // Mouse state.
     private var scrollAccumulator: CGFloat = 0
@@ -307,7 +312,24 @@ final class TerminalView: NSView, NSTextInputClient {
             reportedSize = size
             waitingForResizeFrame = true
             Core.shared.resize(pane, cols: newCols, rows: newRows, cellWidth: s.cellWidth, cellHeight: s.cellHeight)
+            scheduleResizeFrameTimeout()
         }
+    }
+
+    /// A resize the daemon never answers (busy, or gone) must not leave the old frame on
+    /// screen for good.
+    private func scheduleResizeFrameTimeout() {
+        resizeFrameTimeout?.cancel()
+        resizeTimedOut = false
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.waitingForResizeFrame, !self.holdGridSize else { return }
+            self.resizeTimedOut = true
+            self.waitingForResizeFrame = false
+            self.updateDrawableSize()
+            self.needsRender = true
+        }
+        resizeFrameTimeout = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(250), execute: work)
     }
 
     private func updateSubscription() {
@@ -546,7 +568,9 @@ final class TerminalView: NSView, NSTextInputClient {
         let perfGrid = Perf.enabled ? CACurrentMediaTime() : 0
         _ = renderer.snapshot.update(pane: pane)
         // A previous resize can still be in flight when another layout change occurs.
-        guard renderer.snapshot.cols == cols, renderer.snapshot.rows == rows else {
+        let sized = renderer.snapshot.cols == cols && renderer.snapshot.rows == rows
+        if sized { resizeTimedOut = false }
+        guard sized || resizeTimedOut else {
             needsRender = true
             return
         }
@@ -813,7 +837,8 @@ final class TerminalView: NSView, NSTextInputClient {
         if escaped.hasPrefix(typed) {
             out = String(escaped.dropFirst(typed.count))
         } else {
-            out = String(repeating: "\u{7f}", count: word.count) + escaped
+            // Erase what is on the line: the word as typed, escapes included.
+            out = String(repeating: "\u{7f}", count: typed.count) + escaped
         }
         if final { out += " " }
         Core.shared.input(pane, text: out)
@@ -919,6 +944,7 @@ final class TerminalView: NSView, NSTextInputClient {
         }
 
         keyTextAccumulator = []
+        keyCommandIssued = false
         interpretKeyEvents([event])
         let committed = keyTextAccumulator ?? []
         keyTextAccumulator = nil
@@ -928,13 +954,22 @@ final class TerminalView: NSView, NSTextInputClient {
             if hadMarked {
                 // IME / dead key commit: plain text, not a key press.
                 Core.shared.input(pane, text: text)
+                // Some input methods (Korean) commit and pass the key on too: Return, arrows,
+                // Backspace still do what they do.
+                if keyCommandIssued {
+                    sendKey(event, action: action, text: nil, optionIsAlt: false)
+                }
             } else {
                 sendKey(event, action: action, text: KeyMapping.isPrintable(text) ? text : nil, optionIsAlt: false)
             }
             return
         }
         if hadMarked || hasMarkedText() {
-            // The input method consumed the key (preedit update / cancel).
+            // Composition ended and the input method passed the key on.
+            if keyCommandIssued && !hasMarkedText() {
+                sendKey(event, action: action, text: nil, optionIsAlt: false)
+            }
+            // Otherwise the input method consumed the key (preedit update / cancel).
             return
         }
         sendKey(event, action: action, text: nil, optionIsAlt: false)
@@ -1040,7 +1075,8 @@ final class TerminalView: NSView, NSTextInputClient {
 
     override func doCommand(by selector: Selector) {
         // Keys like Return, arrows and Ctrl combinations are sent as key events after
-        // interpretKeyEvents returns; nothing to do here (and never beep).
+        // interpretKeyEvents returns (never beep); note that the input method passed it on.
+        if keyTextAccumulator != nil { keyCommandIssued = true }
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
@@ -1107,21 +1143,25 @@ final class TerminalView: NSView, NSTextInputClient {
             if let path = imagePath(pb) { Core.shared.paste(pane, text: shellEscape(path) + " ") }
             return
         }
-        guard let text = pb.string(forType: .string), !text.isEmpty else { return }
+        guard let text = pb.string(forType: .string), !text.isEmpty, pasteConfirmed(text) else { return }
+        Core.shared.paste(pane, text: text)
+    }
+
+    /// `confirm_multiline_paste`: several lines into a program without bracketed paste would
+    /// run one by one as they arrive; ask first. For pastes and drops alike.
+    private func pasteConfirmed(_ text: String) -> Bool {
         let bracketed = (snapshotModes & TermMode.bracketedPaste) != 0
         let multiline = text.unicodeScalars.contains { $0 == "\n" || $0 == "\r" }
-        if config.confirmMultilinePaste && multiline && !bracketed {
-            let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }.count
-            let alert = NSAlert()
-            alert.messageText = "Paste \(lines) lines?"
-            alert.informativeText = "The program in this pane did not enable bracketed paste, so every line "
-                + "may run as a separate command as soon as it is pasted."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "Paste")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-        }
-        Core.shared.paste(pane, text: text)
+        guard config.confirmMultilinePaste && multiline && !bracketed else { return true }
+        let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }.count
+        let alert = NSAlert()
+        alert.messageText = "Paste \(lines) lines?"
+        alert.informativeText = "The program in this pane did not enable bracketed paste, so every line "
+            + "may run as a separate command as soon as it is pasted."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Paste")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     // MARK: Drag and drop
@@ -1139,6 +1179,7 @@ final class TerminalView: NSView, NSTextInputClient {
         guard let text = dropText(sender.draggingPasteboard, materialize: true) else { return false }
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
+        guard pasteConfirmed(text) else { return false }
         Core.shared.paste(pane, text: text)
         return true
     }

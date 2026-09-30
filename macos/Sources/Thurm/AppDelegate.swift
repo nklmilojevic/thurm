@@ -14,12 +14,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if offerMoveToApplications() { return }
+        if MetalContext.shared == nil {
+            // Every pane would stay blank.
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Thurm Can't Draw on This Mac"
+            alert.informativeText = "Thurm needs Metal to draw terminals, and Metal is not available. "
+                + "Your shells keep running in the session daemon."
+            alert.runModal()
+        }
         FontShaper.registerBundledFonts()
         Notifications.shared.setup()
         SecureInput.shared.restoreUserPreference()
         SessionManager.shared.start()
         Updater.shared.start()
         NSApp.activate()
+    }
+
+    /// Opened from the disk image (or translocated by Gatekeeper to a random read-only path): the
+    /// daemon, the command-line tool and the login item would point at a path that disappears,
+    /// and updates couldn't replace the app. Offers to copy it to Applications and relaunch
+    /// from there; true when that is happening.
+    private func offerMoveToApplications() -> Bool {
+        let fm = FileManager.default
+        let url = Bundle.main.bundleURL
+        let translocated = url.path.contains("/AppTranslocation/")
+        let readOnly = (try? url.resourceValues(forKeys: [.volumeIsReadOnlyKey]))?.volumeIsReadOnly == true
+        guard url.pathExtension == "app", translocated || readOnly else { return false }
+        let alert = NSAlert()
+        alert.messageText = "Move Thurm to Applications?"
+        alert.informativeText = "Thurm is running from a disk image. The session daemon, the command-line "
+            + "tool and updates need it installed in Applications."
+        alert.addButton(withTitle: "Move to Applications")
+        alert.addButton(withTitle: "Not Now")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        let targets = [URL(fileURLWithPath: "/Applications"),
+                       fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications")]
+        for dir in targets {
+            let dest = dir.appendingPathComponent(url.lastPathComponent)
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                if fm.fileExists(atPath: dest.path) { try fm.trashItem(at: dest, resultingItemURL: nil) }
+                try fm.copyItem(at: url, to: dest)
+            } catch {
+                continue
+            }
+            // Gatekeeper already checked this copy of the app; without the quarantine flag the
+            // copy isn't translocated again.
+            let xattr = Process()
+            xattr.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+            xattr.arguments = ["-dr", "com.apple.quarantine", dest.path]
+            try? xattr.run()
+            xattr.waitUntilExit()
+            NSWorkspace.shared.openApplication(at: dest, configuration: NSWorkspace.OpenConfiguration()) { _, _ in
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+            }
+            return true
+        }
+        let failed = NSAlert()
+        failed.messageText = "Thurm Could Not Be Moved"
+        failed.informativeText = "Drag Thurm from the disk image to Applications, then open it from there."
+        failed.runModal()
+        return false
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
