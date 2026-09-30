@@ -1409,7 +1409,9 @@ fn daemons_started_together_leave_one() {
 #[test]
 fn starts_on_a_fresh_default_socket() {
     let env = Env::new("fresh-default");
-    let runtime = env.dir.join("run");
+    // Short: a socket path must fit in 104 bytes, and CI's temporary directory is long.
+    let runtime = PathBuf::from(format!("/tmp/thurm-rt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&runtime);
     std::fs::create_dir_all(&runtime).unwrap();
     // No --socket: the default directory is created (private) under XDG_RUNTIME_DIR.
     let mut child = Command::new(env!("CARGO_BIN_EXE_thurmd"))
@@ -1436,5 +1438,6 @@ fn starts_on_a_fresh_default_socket() {
     let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     let _ = child.kill();
     let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&runtime);
     assert_eq!(mode, 0o700);
 }
