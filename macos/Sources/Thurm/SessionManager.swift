@@ -323,8 +323,14 @@ final class SessionManager: NSObject, CoreDelegate {
         return key
     }
 
+    /// The backing scale of the window new panes open in (not the main screen's: the window
+    /// may be on another display).
+    private var newPaneScale: CGFloat {
+        currentController?.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+    }
+
     private func paneSizeObject(cols: Int, rows: Int) -> [String: Any] {
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let scale = newPaneScale
         let shaper = FontShaper.shared(scale: scale)
         return [
             "cols": NSNumber(value: max(2, min(1000, cols))),
@@ -336,7 +342,7 @@ final class SessionManager: NSObject, CoreDelegate {
 
     /// Grid size that fits in `size` points.
     func gridSize(forPoints size: NSSize) -> (cols: Int, rows: Int) {
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let scale = newPaneScale
         guard let s = FontShaper.shared(scale: scale), size.width > 0, size.height > 0 else {
             return (config.columns, config.rows)
         }
@@ -957,7 +963,8 @@ final class SessionManager: NSObject, CoreDelegate {
         lastLayoutJSON = json
         let request: [String: Any] = ["SetLayout": ["json": json]]
         if blocking {
-            Core.shared.request(object: request)
+            // At quit: a daemon that stopped answering must not hold up Quit (or an update).
+            Core.shared.request(object: request, timeout: 3)
         } else {
             Core.shared.send(object: request)
         }
@@ -990,7 +997,7 @@ final class SessionManager: NSObject, CoreDelegate {
         periodicTimer?.invalidate()
         periodicTimer = nil
         if config.quitTerminates {
-            Core.shared.request(object: ["Shutdown": ["kill_panes": true]])
+            Core.shared.request(object: ["Shutdown": ["kill_panes": true]], timeout: 3)
         }
         for c in liveControllers {
             c.content.detachAll()

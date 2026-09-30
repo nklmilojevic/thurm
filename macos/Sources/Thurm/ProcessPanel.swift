@@ -74,19 +74,31 @@ final class ProcessPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate, 
         panel = p
     }
 
+    /// Each host's latest rows, and the hosts whose answer is still on its way.
+    private var hostRows: [HostId: [Row]] = [:]
+    private var asking: Set<HostId> = []
+
+    /// Asks every host without blocking (`ps`/`lsof` on a remote host over a tunnel can take a
+    /// while, or hang), and shows each host's rows as they arrive. A host still answering the
+    /// previous round isn't asked again.
     private func refresh() {
-        var out: [Row] = []
         // This Mac's panes, then each connected remote host's.
-        for host in [localHost] + Core.shared.connectedRemotes {
-            out += rows(host: host)
+        let hosts = [localHost] + Core.shared.connectedRemotes
+        hostRows = hostRows.filter { hosts.contains($0.key) }
+        for host in hosts where !asking.contains(host) {
+            asking.insert(host)
+            Core.shared.requestAsync(object: ["Processes": ["pane": NSNull()]], host: host, timeout: 5) { [weak self] resp in
+                guard let self else { return }
+                self.asking.remove(host)
+                self.hostRows[host] = self.rows(host: host, response: resp)
+                self.rows = ([localHost] + Core.shared.connectedRemotes).flatMap { self.hostRows[$0] ?? [] }
+                self.table.reloadData()
+            }
         }
-        rows = out
-        table.reloadData()
     }
 
-    private func rows(host: HostId) -> [Row] {
-        guard let resp = Core.shared.request(object: ["Processes": ["pane": NSNull()]], host: host),
-              let v = JSON.variant(resp), v.name == "Processes", let list = v.payload as? [[String: Any]]
+    private func rows(host: HostId, response resp: Any?) -> [Row] {
+        guard let v = JSON.variant(resp), v.name == "Processes", let list = v.payload as? [[String: Any]]
         else { return [] }
         var out: [Row] = []
         for pane in list {

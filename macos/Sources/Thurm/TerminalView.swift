@@ -37,6 +37,9 @@ final class TerminalView: NSView, NSTextInputClient {
     private var reportedSize: GridSize?
     private var reportedFocus: Bool?
     private var waitingForResizeFrame = false
+    /// The daemon didn't answer a resize in time: draw the frame we have at the new size.
+    private var resizeTimedOut = false
+    private var resizeFrameTimeout: DispatchWorkItem?
     private(set) var cols = 0
     private(set) var rows = 0
 
@@ -44,6 +47,8 @@ final class TerminalView: NSView, NSTextInputClient {
     private var markedText = NSMutableAttributedString()
     /// Non-nil while `interpretKeyEvents` runs inside keyDown; collects committed text.
     private var keyTextAccumulator: [String]?
+    /// Set when the input method passed the key on as a command (`doCommand`) during keyDown.
+    private var keyCommandIssued = false
 
     // Mouse state.
     private var scrollAccumulator: CGFloat = 0
@@ -307,7 +312,24 @@ final class TerminalView: NSView, NSTextInputClient {
             reportedSize = size
             waitingForResizeFrame = true
             Core.shared.resize(pane, cols: newCols, rows: newRows, cellWidth: s.cellWidth, cellHeight: s.cellHeight)
+            scheduleResizeFrameTimeout()
         }
+    }
+
+    /// A resize the daemon never answers (busy, or gone) must not leave the old frame on
+    /// screen for good.
+    private func scheduleResizeFrameTimeout() {
+        resizeFrameTimeout?.cancel()
+        resizeTimedOut = false
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.waitingForResizeFrame, !self.holdGridSize else { return }
+            self.resizeTimedOut = true
+            self.waitingForResizeFrame = false
+            self.updateDrawableSize()
+            self.needsRender = true
+        }
+        resizeFrameTimeout = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(250), execute: work)
     }
 
     private func updateSubscription() {
@@ -546,7 +568,9 @@ final class TerminalView: NSView, NSTextInputClient {
         let perfGrid = Perf.enabled ? CACurrentMediaTime() : 0
         _ = renderer.snapshot.update(pane: pane)
         // A previous resize can still be in flight when another layout change occurs.
-        guard renderer.snapshot.cols == cols, renderer.snapshot.rows == rows else {
+        let sized = renderer.snapshot.cols == cols && renderer.snapshot.rows == rows
+        if sized { resizeTimedOut = false }
+        guard sized || resizeTimedOut else {
             needsRender = true
             return
         }
@@ -714,6 +738,8 @@ final class TerminalView: NSView, NSTextInputClient {
         return p
     }()
     private var completionRefresh: DispatchWorkItem?
+    /// Numbers completion refreshes, so only the answer to the latest one is shown.
+    private var completionQuery = 0
 
     /// Tab and the menu's navigation keys. Returns true when the key was consumed.
     private func handleCompletionKey(_ event: NSEvent) -> Bool {
@@ -763,9 +789,18 @@ final class TerminalView: NSView, NSTextInputClient {
         return true
     }
 
+    /// Tab has to know right away whether it completes or goes to the shell: a short timeout,
+    /// and nothing while the host is offline.
     private func fetchCompletions() -> (String, [CompletionCandidate])? {
-        guard let resp = Core.shared.request(object: ["Complete": ["pane": pane.number]], host: pane.host),
-              let v = JSON.variant(resp), v.name == "Completions", let d = v.payload as? [String: Any]
+        guard !isOffline,
+              let resp = Core.shared.request(object: ["Complete": ["pane": pane.number]], host: pane.host,
+                                             timeout: 1)
+        else { return nil }
+        return parseCompletions(resp)
+    }
+
+    private func parseCompletions(_ resp: Any?) -> (String, [CompletionCandidate])? {
+        guard let v = JSON.variant(resp), v.name == "Completions", let d = v.payload as? [String: Any]
         else { return nil }
         let word = jsonString(d["word"]) ?? ""
         let items = (d["items"] as? [[String: Any]] ?? []).compactMap { i -> CompletionCandidate? in
@@ -784,15 +819,22 @@ final class TerminalView: NSView, NSTextInputClient {
     /// After a typed key reaches the shell (and it echoed), re-query; close when nothing is left.
     private func scheduleCompletionRefresh() {
         completionRefresh?.cancel()
+        // Every key makes answers to earlier queries stale, also the one still on its way.
+        completionQuery += 1
+        let query = completionQuery
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.completion.isVisible else { return }
-            guard let (word, items) = self.fetchCompletions(), !items.isEmpty,
-                  SessionManager.shared.panes[self.pane]?.atPrompt == true
-            else {
-                self.completion.close()
-                return
+            guard let self, self.completion.isVisible, !self.isOffline else { return }
+            Core.shared.requestAsync(object: ["Complete": ["pane": self.pane.number]], host: self.pane.host,
+                                     timeout: 2) { [weak self] resp in
+                guard let self, query == self.completionQuery, self.completion.isVisible else { return }
+                guard let (word, items) = self.parseCompletions(resp), !items.isEmpty,
+                      SessionManager.shared.panes[self.pane]?.atPrompt == true
+                else {
+                    self.completion.close()
+                    return
+                }
+                self.showCompletions(items, word: word)
             }
-            self.showCompletions(items, word: word)
         }
         completionRefresh = work
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60), execute: work)
@@ -813,7 +855,8 @@ final class TerminalView: NSView, NSTextInputClient {
         if escaped.hasPrefix(typed) {
             out = String(escaped.dropFirst(typed.count))
         } else {
-            out = String(repeating: "\u{7f}", count: word.count) + escaped
+            // Erase what is on the line: the word as typed, escapes included.
+            out = String(repeating: "\u{7f}", count: typed.count) + escaped
         }
         if final { out += " " }
         Core.shared.input(pane, text: out)
@@ -919,6 +962,7 @@ final class TerminalView: NSView, NSTextInputClient {
         }
 
         keyTextAccumulator = []
+        keyCommandIssued = false
         interpretKeyEvents([event])
         let committed = keyTextAccumulator ?? []
         keyTextAccumulator = nil
@@ -928,13 +972,22 @@ final class TerminalView: NSView, NSTextInputClient {
             if hadMarked {
                 // IME / dead key commit: plain text, not a key press.
                 Core.shared.input(pane, text: text)
+                // Some input methods (Korean) commit and pass the key on too: Return, arrows,
+                // Backspace still do what they do.
+                if keyCommandIssued {
+                    sendKey(event, action: action, text: nil, optionIsAlt: false)
+                }
             } else {
                 sendKey(event, action: action, text: KeyMapping.isPrintable(text) ? text : nil, optionIsAlt: false)
             }
             return
         }
         if hadMarked || hasMarkedText() {
-            // The input method consumed the key (preedit update / cancel).
+            // Composition ended and the input method passed the key on.
+            if keyCommandIssued && !hasMarkedText() {
+                sendKey(event, action: action, text: nil, optionIsAlt: false)
+            }
+            // Otherwise the input method consumed the key (preedit update / cancel).
             return
         }
         sendKey(event, action: action, text: nil, optionIsAlt: false)
@@ -1040,7 +1093,8 @@ final class TerminalView: NSView, NSTextInputClient {
 
     override func doCommand(by selector: Selector) {
         // Keys like Return, arrows and Ctrl combinations are sent as key events after
-        // interpretKeyEvents returns; nothing to do here (and never beep).
+        // interpretKeyEvents returns (never beep); note that the input method passed it on.
+        if keyTextAccumulator != nil { keyCommandIssued = true }
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
@@ -1090,7 +1144,9 @@ final class TerminalView: NSView, NSTextInputClient {
     // MARK: Edit actions
 
     @objc func copy(_ sender: Any?) {
-        guard let resp = Core.shared.request(object: ["CopySelection": ["pane": pane.number]], host: pane.host),
+        // Local panes answer from the app's own copy; a remote host gets a moment, not forever.
+        guard let resp = Core.shared.request(object: ["CopySelection": ["pane": pane.number]], host: pane.host,
+                                             timeout: 2),
               let v = JSON.variant(resp), v.name == "Text",
               let text = v.payload as? String, !text.isEmpty
         else { return }
@@ -1107,21 +1163,25 @@ final class TerminalView: NSView, NSTextInputClient {
             if let path = imagePath(pb) { Core.shared.paste(pane, text: shellEscape(path) + " ") }
             return
         }
-        guard let text = pb.string(forType: .string), !text.isEmpty else { return }
+        guard let text = pb.string(forType: .string), !text.isEmpty, pasteConfirmed(text) else { return }
+        Core.shared.paste(pane, text: text)
+    }
+
+    /// `confirm_multiline_paste`: several lines into a program without bracketed paste would
+    /// run one by one as they arrive; ask first. For pastes and drops alike.
+    private func pasteConfirmed(_ text: String) -> Bool {
         let bracketed = (snapshotModes & TermMode.bracketedPaste) != 0
         let multiline = text.unicodeScalars.contains { $0 == "\n" || $0 == "\r" }
-        if config.confirmMultilinePaste && multiline && !bracketed {
-            let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }.count
-            let alert = NSAlert()
-            alert.messageText = "Paste \(lines) lines?"
-            alert.informativeText = "The program in this pane did not enable bracketed paste, so every line "
-                + "may run as a separate command as soon as it is pasted."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "Paste")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-        }
-        Core.shared.paste(pane, text: text)
+        guard config.confirmMultilinePaste && multiline && !bracketed else { return true }
+        let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }.count
+        let alert = NSAlert()
+        alert.messageText = "Paste \(lines) lines?"
+        alert.informativeText = "The program in this pane did not enable bracketed paste, so every line "
+            + "may run as a separate command as soon as it is pasted."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Paste")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     // MARK: Drag and drop
@@ -1139,6 +1199,7 @@ final class TerminalView: NSView, NSTextInputClient {
         guard let text = dropText(sender.draggingPasteboard, materialize: true) else { return false }
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
+        guard pasteConfirmed(text) else { return false }
         Core.shared.paste(pane, text: text)
         return true
     }
@@ -1193,11 +1254,25 @@ final class TerminalView: NSView, NSTextInputClient {
         let file = dir.appendingPathComponent("image-\(UUID().uuidString.prefix(8)).png")
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            pruneOldFiles(in: dir)
             try png.write(to: file)
         } catch {
             return nil
         }
         return file.path
+    }
+
+    /// Dropped images are used by path for a moment, then never again: forget old ones.
+    private static func pruneOldFiles(in dir: URL, olderThan age: TimeInterval = 24 * 60 * 60) {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }
+        for file in files {
+            if let date = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+               Date().timeIntervalSince(date) > age {
+                try? fm.removeItem(at: file)
+            }
+        }
     }
 
     @objc override func selectAll(_ sender: Any?) {
@@ -1217,22 +1292,22 @@ final class TerminalView: NSView, NSTextInputClient {
 
     /// Asks the on-device model (`ai.explain`) what happened in the last command, and shows it.
     @objc func explainLastCommand(_ sender: Any?) {
-        let pane = self.pane
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let resp = Core.shared.request(object: ["Explain": ["pane": pane.number]], host: pane.host) as? [String: Any]
-            DispatchQueue.main.async {
-                guard let self, let window = self.window else { return }
-                let alert = NSAlert()
-                if let text = jsonString(resp?["Text"]) {
-                    alert.messageText = "Last Command"
-                    alert.informativeText = text
-                } else {
-                    alert.alertStyle = .warning
-                    alert.messageText = "Could Not Explain the Last Command"
-                    alert.informativeText = jsonString(resp?["error"]) ?? "The session daemon is not connected."
-                }
-                alert.beginSheetModal(for: window)
+        // Asynchronous, and the connection is resolved here on the main thread (the library
+        // keeps it alive for the request even if the host disconnects meanwhile).
+        Core.shared.requestAsync(object: ["Explain": ["pane": pane.number]], host: pane.host,
+                                 timeout: 120) { [weak self] response in
+            guard let self, let window = self.window else { return }
+            let resp = response as? [String: Any]
+            let alert = NSAlert()
+            if let text = jsonString(resp?["Text"]) {
+                alert.messageText = "Last Command"
+                alert.informativeText = text
+            } else {
+                alert.alertStyle = .warning
+                alert.messageText = "Could Not Explain the Last Command"
+                alert.informativeText = jsonString(resp?["error"]) ?? "The session daemon is not connected."
             }
+            alert.beginSheetModal(for: window)
         }
     }
 

@@ -334,22 +334,40 @@ impl Client {
         std::thread::Builder::new()
             .name("thurm-client-reader".into())
             .spawn(move || {
+                // However this thread ends (a panic in `on_event` too), requests still waiting
+                // get an error instead of waiting forever.
+                struct Finish(Arc<AtomicBool>, Pending);
+                impl Drop for Finish {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Relaxed);
+                        for (_, tx) in self.1.lock().drain() {
+                            let _ = tx.send(Err("disconnected".into()));
+                        }
+                    }
+                }
+                let finish = Finish(alive.clone(), pending.clone());
                 let mut reader = BufReader::with_capacity(256 * 1024, read_half);
-                loop {
-                    match codec::read_message::<_, ServerMessage>(&mut reader) {
-                        Ok(Some(ServerMessage::Response { id, result })) => {
+                while let Ok(Some(frame)) = codec::read_frame(&mut reader) {
+                    // A message of a newer daemon this client can't decode is skipped (the frames
+                    // after it are intact); a response still ends its request, with an error.
+                    let Ok(msg) = codec::decode::<ServerMessage>(&frame) else {
+                        if let Some(id) = codec::response_id(&frame)
+                            && let Some(tx) = pending.lock().remove(&id)
+                        {
+                            let _ = tx.send(Err("the daemon's answer could not be read".into()));
+                        }
+                        continue;
+                    };
+                    match msg {
+                        ServerMessage::Response { id, result } => {
                             if let Some(tx) = pending.lock().remove(&id) {
                                 let _ = tx.send(result);
                             }
                         }
-                        Ok(Some(ServerMessage::Event(ev))) => on_event(ev),
-                        Ok(None) | Err(_) => break,
+                        ServerMessage::Event(ev) => on_event(ev),
                     }
                 }
-                alive.store(false, Ordering::Relaxed);
-                for (_, tx) in pending.lock().drain() {
-                    let _ = tx.send(Err("disconnected".into()));
-                }
+                drop(finish);
                 on_disconnect();
             })?;
 
@@ -371,14 +389,72 @@ impl Client {
     }
 
     fn write(&self, env: &Envelope) -> Result<(), ClientError> {
+        self.write_by(env, None)
+    }
+
+    /// Writes `env`, giving up at `deadline` (waiting for the writer lock included). A write
+    /// cut off mid-message would leave the stream out of step, so a timeout closes the
+    /// connection.
+    fn write_by(&self, env: &Envelope, deadline: Option<Instant>) -> Result<(), ClientError> {
         if !self.is_alive() {
             return Err(ClientError::Disconnected);
         }
         let buf = codec::encode(env)?;
-        let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
-        Ok(())
+        let mut w = match deadline {
+            Some(d) => self.writer.try_lock_until(d).ok_or(ClientError::Timeout)?,
+            None => self.writer.lock(),
+        };
+        let written = match deadline {
+            None => w.write_all(&buf).and_then(|()| w.flush()),
+            // Write by hand, giving each call only the time left: a peer that reads a little
+            // at a time must not stretch the request past its deadline.
+            Some(d) => (|| {
+                // Every write flushes, so leftovers mean an earlier one failed partway: the
+                // stream is out of step already.
+                if !w.buffer().is_empty() {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let stream = w.get_mut();
+                let mut rest = &buf[..];
+                while !rest.is_empty() {
+                    let left = d.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    stream.set_write_timeout(Some(left))?;
+                    match stream.write(rest) {
+                        Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                        Ok(n) => rest = &rest[n..],
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            })(),
+        };
+        if deadline.is_some() {
+            let _ = w.get_ref().set_write_timeout(None);
+        }
+        match written {
+            Ok(()) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                self.alive.store(false, Ordering::Relaxed);
+                let _ = w.get_ref().shutdown(std::net::Shutdown::Both);
+                Err(ClientError::Timeout)
+            }
+            // Out of step (see above): nothing more can be sent on it.
+            Err(e) if deadline.is_some() && e.kind() == std::io::ErrorKind::BrokenPipe => {
+                self.alive.store(false, Ordering::Relaxed);
+                let _ = w.get_ref().shutdown(std::net::Shutdown::Both);
+                Err(ClientError::Disconnected)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Send and wait for the response (no timeout).
@@ -394,12 +470,21 @@ impl Client {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = bounded(1);
         self.pending.lock().insert(id, tx);
-        if let Err(e) = self.write(&Envelope { id, request }) {
+        // One deadline for sending and for the answer.
+        let deadline = timeout.map(|t| Instant::now() + t);
+        if let Err(e) = self.write_by(&Envelope { id, request }, deadline) {
             self.pending.lock().remove(&id);
             return Err(e);
         }
-        let result = match timeout {
-            Some(t) => rx.recv_timeout(t).map_err(|_| ClientError::Timeout)?,
+        let result = match deadline {
+            Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
+                Ok(r) => r,
+                Err(_) => {
+                    // Its late answer has nobody to go to.
+                    self.pending.lock().remove(&id);
+                    return Err(ClientError::Timeout);
+                }
+            },
             None => rx.recv().map_err(|_| ClientError::Disconnected)?,
         };
         if matches!(&result, Err(e) if e == "disconnected") {
@@ -437,6 +522,128 @@ mod tests {
             Some(12)
         );
         assert_eq!(mismatched_protocol("no such pane: 3"), None);
+    }
+
+    /// A daemon that answers Hello, never answers ListPanes, and hangs up on Capture.
+    #[test]
+    fn timeouts_and_hangups_end_waiting_requests() {
+        let dir = std::env::temp_dir().join(format!("thurm-client-to-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut w = s;
+            while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut r) {
+                match env.request {
+                    Request::Hello { .. } => codec::write_message(
+                        &mut w,
+                        &ServerMessage::Response {
+                            id: env.id,
+                            result: Ok(Response::Hello {
+                                version: 1,
+                                daemon_pid: 1,
+                                restored: false,
+                                build: String::new(),
+                                capabilities: Vec::new(),
+                            }),
+                        },
+                    )
+                    .unwrap(),
+                    Request::Capture { .. } => return,
+                    _ => {}
+                }
+            }
+        });
+        let client = Client::connect(
+            ConnectOptions {
+                socket: sock,
+                spawn_daemon: None,
+                client_name: "test",
+                ui: false,
+            },
+            |_| {},
+            || {},
+        )
+        .unwrap();
+        let r = client.request_timeout(Request::ListPanes, Some(Duration::from_millis(100)));
+        assert!(matches!(r, Err(ClientError::Timeout)), "{r:?}");
+        // The timed-out request is not kept around.
+        assert!(client.pending.lock().is_empty());
+        // A request waiting without a limit ends when the daemon goes away.
+        let waiting = {
+            let client = client.clone();
+            std::thread::spawn(move || client.request(Request::ListPanes))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = client.send(Request::Capture {
+            pane: 1,
+            opts: thurm_proto::CaptureOpts::default(),
+        });
+        let r = waiting.join().unwrap();
+        assert!(matches!(r, Err(ClientError::Disconnected)), "{r:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A daemon that answers Hello and then stops reading: a request that can't even be
+    /// written still ends at its deadline, and the connection is closed.
+    #[test]
+    fn timeouts_cover_writing() {
+        let dir = std::env::temp_dir().join(format!("thurm-client-wr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut w = s;
+            if let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut r) {
+                codec::write_message(
+                    &mut w,
+                    &ServerMessage::Response {
+                        id: env.id,
+                        result: Ok(Response::Hello {
+                            version: 1,
+                            daemon_pid: 1,
+                            restored: false,
+                            build: String::new(),
+                            capabilities: Vec::new(),
+                        }),
+                    },
+                )
+                .unwrap();
+            }
+            // Never read again (but keep the socket open).
+            let _ = stop_rx.recv();
+        });
+        let client = Client::connect(
+            ConnectOptions {
+                socket: sock,
+                spawn_daemon: None,
+                client_name: "test",
+                ui: false,
+            },
+            |_| {},
+            || {},
+        )
+        .unwrap();
+        let started = Instant::now();
+        let r = client.request_timeout(
+            Request::Input {
+                pane: 1,
+                data: vec![b'x'; 32 * 1024 * 1024],
+            },
+            Some(Duration::from_millis(300)),
+        );
+        assert!(matches!(r, Err(ClientError::Timeout)), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!client.is_alive());
+        let _ = stop_tx.send(());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Minimal fake daemon: answers Hello and echoes ListPanes, pushes one event.

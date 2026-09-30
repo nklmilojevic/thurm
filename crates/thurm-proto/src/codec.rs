@@ -23,6 +23,52 @@ pub fn write_message<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<(
     w.flush()
 }
 
+/// Read one message's bytes (without decoding). `Ok(None)` on a clean EOF at a boundary.
+pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
+    let mut len = [0u8; 4];
+    match r.read_exact(&mut len) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_le_bytes(len) as usize;
+    if len > MAX_MESSAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message too large",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(Some(buf))
+}
+
+/// Decodes a message read with [`read_frame`].
+pub fn decode<T: DeserializeOwned>(frame: &[u8]) -> io::Result<T> {
+    postcard::from_bytes(frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// The request id at the start of an `Envelope` frame whose request didn't decode (a request
+/// of a newer protocol), so it can be answered with an error.
+pub fn envelope_id(frame: &[u8]) -> Option<u64> {
+    postcard::take_from_bytes::<u64>(frame)
+        .ok()
+        .map(|(id, _)| id)
+}
+
+/// The request id of a `ServerMessage::Response` frame whose result didn't decode (a response
+/// of a newer protocol), so the request waiting for it can be failed.
+pub fn response_id(frame: &[u8]) -> Option<u64> {
+    // Variant 0 is `Response`, whose first field is the id.
+    let (variant, rest) = postcard::take_from_bytes::<u32>(frame).ok()?;
+    if variant != 0 {
+        return None;
+    }
+    postcard::take_from_bytes::<u64>(rest)
+        .ok()
+        .map(|(id, _)| id)
+}
+
 /// Read one message. Returns `Ok(None)` on a clean EOF at a message boundary.
 pub fn read_message<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<T>> {
     let mut len = [0u8; 4];
@@ -90,5 +136,32 @@ mod tests {
         let empty: &[u8] = &[];
         let r: Option<Envelope> = read_message(&mut &empty[..]).unwrap();
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn unknown_requests_keep_their_id() {
+        // An Envelope whose request variant this build doesn't have: id 7, variant 999.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&postcard::to_stdvec(&7u64).unwrap());
+        frame.extend_from_slice(&postcard::to_stdvec(&999u32).unwrap());
+        assert!(decode::<crate::Envelope>(&frame).is_err());
+        assert_eq!(envelope_id(&frame), Some(7));
+        let mut buf = (frame.len() as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(&frame);
+        assert_eq!(read_frame(&mut buf.as_slice()).unwrap(), Some(frame));
+    }
+
+    #[test]
+    fn unknown_responses_keep_their_id() {
+        let known = crate::ServerMessage::Response {
+            id: 42,
+            result: Ok(crate::Response::Ok),
+        };
+        let frame = postcard::to_stdvec(&known).unwrap();
+        assert_eq!(response_id(&frame), Some(42));
+        // Variant 0 (Response), id 9, then a result this build can't decode.
+        assert_eq!(response_id(&[0, 9, 0, 0xE7, 0x07]), Some(9));
+        let event = crate::ServerMessage::Event(crate::Event::Bell { pane: 1 });
+        assert_eq!(response_id(&postcard::to_stdvec(&event).unwrap()), None);
     }
 }
