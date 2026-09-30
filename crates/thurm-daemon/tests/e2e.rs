@@ -1184,9 +1184,14 @@ fn in_place_upgrade_loses_no_output() {
             .to_vec(),
     })
     .unwrap();
-    // Wait only sees the screen: the loop holds line 1000 there for a second. The upgrade
-    // then comes once the bursts have resumed.
-    wait_match(&c, pane, "line-1000");
+    // The loop holds at line 1000 for a second; the upgrade comes once the bursts have
+    // resumed. (Polled in the scrollback: Wait only sees the screen, and a debug build parses
+    // slowly enough to miss a moment there.)
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !capture(&c, pane).contains("line-1000\n") {
+        assert!(Instant::now() < deadline, "line 1000 never came");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     std::thread::sleep(Duration::from_millis(1100));
     let mut req = env.socket.as_os_str().to_owned();
     req.push(".upgrade");

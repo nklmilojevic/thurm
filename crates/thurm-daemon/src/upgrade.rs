@@ -167,7 +167,9 @@ pub fn perform(
     }
     let _resume = Resume(daemon);
     if !daemon.quiesce_readers(QUIESCE_TIMEOUT) {
-        log::warn!("upgrade: pane readers did not stop in time; output read meanwhile is lost");
+        // Going on would drop what they read; the next upgrade request can try again.
+        log::warn!("upgrade aborted: pane readers did not stop in time");
+        return;
     }
     // If the new image dies before adopting the panes, their shells are gone, but the session
     // (layout, scrollback, cwd) comes back from this snapshot on the next start.

@@ -273,6 +273,8 @@ struct InstallPane {
     hold: bool,
     osc_cwd: Option<String>,
     shell_integration_seen: bool,
+    /// Start of a sequence parsed by the image we replaced (see `PaneState::carry`).
+    carry: Vec<u8>,
 }
 
 pub struct Daemon {
@@ -532,6 +534,7 @@ impl Daemon {
                 hold: req.hold,
                 osc_cwd: None,
                 shell_integration_seen: false,
+                carry: Vec::new(),
             },
             true,
         )?;
@@ -564,7 +567,7 @@ impl Daemon {
                 last_history: None,
                 history_at: None,
                 saved_generation: 0,
-                carry: Vec::new(),
+                carry: p.carry,
                 pending_input: None,
                 shell_integration_seen: p.shell_integration_seen,
                 git_probe: None,
@@ -1474,6 +1477,8 @@ impl Daemon {
                     hold: p.hold,
                     osc_cwd: p.osc_cwd,
                     shell_integration_seen: p.shell_integration_seen,
+                    // Still the start of a sequence if the next upgrade comes before its end.
+                    carry: pending,
                 },
                 alive,
             );
