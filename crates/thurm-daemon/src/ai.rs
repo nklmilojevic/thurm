@@ -143,12 +143,13 @@ impl Model {
             .as_ref()
             .filter(|p| p.is_file())
             .ok_or("thurm-intelligence is not installed next to thurmd")?;
-        let mut child = Command::new(path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("cannot start {}: {e}", path.display()))?;
+        let mut child = crate::pty::spawn_locked(
+            Command::new(path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+        )
+        .map_err(|e| format!("cannot start {}: {e}", path.display()))?;
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let (tx, lines) = crossbeam_channel::unbounded();

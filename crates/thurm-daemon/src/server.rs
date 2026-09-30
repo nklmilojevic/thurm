@@ -41,19 +41,28 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
             return;
         }
     };
+    let counter = client.clone();
     let writer = std::thread::Builder::new()
         .name(format!("client-{}-writer", client.id))
         .spawn(move || {
             let mut w = BufWriter::with_capacity(256 * 1024, write_stream);
+            let written = |msg: &ServerMessage| {
+                counter.queued.fetch_sub(
+                    crate::daemon::message_weight(msg).min(counter.queued.load(Ordering::Relaxed)),
+                    Ordering::Relaxed,
+                );
+            };
             while let Ok(msg) = rx.recv() {
                 if write_msg(&mut w, &msg).is_err() {
                     break;
                 }
+                written(&msg);
                 // Drain whatever else is queued before flushing.
                 while let Ok(msg) = rx.try_recv() {
                     if write_msg(&mut w, &msg).is_err() {
                         return;
                     }
+                    written(&msg);
                 }
                 if std::io::Write::flush(&mut w).is_err() {
                     break;
@@ -63,8 +72,30 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
 
     let mut reader = std::io::BufReader::new(stream);
     loop {
-        match codec::read_message::<_, Envelope>(&mut reader) {
-            Ok(Some(env)) => daemon.handle(&client, env.id, env.request),
+        match codec::read_frame(&mut reader) {
+            Ok(Some(frame)) => match codec::decode::<Envelope>(&frame) {
+                Ok(env) => daemon.handle(&client, env.id, env.request),
+                // A request this daemon doesn't know (a newer client): answer it with an
+                // error, and keep the connection (the next frame is intact).
+                Err(e) => match codec::envelope_id(&frame) {
+                    Some(id) => {
+                        log::debug!("client {}: undecodable request {id}: {e}", client.id);
+                        if id != 0 {
+                            client.send(ServerMessage::Response {
+                                id,
+                                result: Err(format!(
+                                    "this daemon ({}) does not know the request",
+                                    thurm_proto::BUILD
+                                )),
+                            });
+                        }
+                    }
+                    None => {
+                        log::debug!("client {} sent garbage: {e}", client.id);
+                        break;
+                    }
+                },
+            },
             Ok(None) => break,
             Err(e) => {
                 log::debug!("client {} read error: {e}", client.id);

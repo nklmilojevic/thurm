@@ -395,16 +395,16 @@ fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
         .map(|d| d.join(program))
         .find(|p| p.is_file())
         .unwrap_or_else(|| PathBuf::from(program));
-    let Ok(mut child) = std::process::Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .env("PATH", path)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
+    let Ok(mut child) = crate::pty::spawn_locked(
+        std::process::Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .env("PATH", path)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+    ) else {
         return Vec::new();
     };
     // Read while the child runs (output beyond the 64 KiB pipe buffer would otherwise block
