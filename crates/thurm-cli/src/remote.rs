@@ -258,7 +258,15 @@ fn install_flow(
         } else {
             format!("Upgrade the daemon on {name} in place (its panes keep running)?")
         };
-        if ask(&question, !restart, assume)? {
+        // --yes doesn't stop programs: a restart is asked in person, or left for later.
+        let assume = if restart {
+            assume.filter(|a| !a)
+        } else {
+            assume
+        };
+        if restart && assume.is_none() && !std::io::stdin().is_terminal() {
+            println!("{question}\n(not done: a restart is only done when asked in a terminal)");
+        } else if ask(&question, !restart, assume)? {
             let out = install::upgrade_daemon(ssh, socket, Some(d), restart)?;
             println!("{out}");
         }
@@ -358,8 +366,16 @@ fn offer_fix(
             Some(q) => format!("{} {q} {}?", c.title, f.label),
             None => format!("{}: {}?", c.title, f.label),
         };
-        // Answered for scripts by --yes/--no; with neither and no terminal, only listed.
+        // Answered for scripts by --yes/--no; with neither and no terminal, only listed. A
+        // fix that restarts a daemon (stopping programs) or runs an installer script is not
+        // covered by --yes: it is asked in person, or left for later.
+        let destructive = f.confirm.is_some() || c.id.starts_with("agent.");
         let yes = match (assume, tty) {
+            (Some(true), true) if destructive => ask(&question, false, None)?,
+            (Some(true), false) if destructive => {
+                println!("  {}: not done with --yes; run it in a terminal", c.title);
+                false
+            }
             (Some(a), _) => a,
             (None, true) => ask(&question, true, None)?,
             (None, false) => false,

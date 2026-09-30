@@ -94,6 +94,9 @@ pub struct HostInfo {
     pub git: bool,
     /// systemd's `Linger` for the user ("yes"/"no"), when logind is there.
     pub linger: Option<String>,
+    /// logind's `KillUserProcesses`, when it could be read: with it, processes started from a
+    /// session (the daemon) end with it, lingering or not.
+    pub kill_user_processes: Option<bool>,
 }
 
 impl HostInfo {
@@ -129,6 +132,7 @@ const PROBE: &str = concat!(
     "command -v nix >/dev/null 2>&1 && echo nix=1; ",
     "command -v git >/dev/null 2>&1 && echo git=1; ",
     "command -v loginctl >/dev/null 2>&1 && echo \"linger=$(loginctl show-user \"$(id -un)\" -p Linger --value 2>/dev/null)\"; ",
+    "command -v busctl >/dev/null 2>&1 && echo \"killuser=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager KillUserProcesses 2>/dev/null)\"; ",
     "if command -v thurm >/dev/null 2>&1; then echo \"thurm=$(command -v thurm)\"; ",
     "echo \"info=$(thurm remote-info 2>/dev/null | head -n 1)\"; fi; true"
 );
@@ -153,6 +157,8 @@ fn parse_probe(out: &str) -> HostInfo {
             "nix" => h.nix = true,
             "git" => h.git = true,
             "linger" if !v.is_empty() => h.linger = Some(v.to_owned()),
+            // `b true` / `b false`
+            "killuser" if !v.is_empty() => h.kill_user_processes = Some(v.ends_with("true")),
             "thurm" if !v.is_empty() => h.thurm = Some(v.to_owned()),
             "info" => h.info = serde_json::from_str(v).ok(),
             _ => {}
@@ -184,7 +190,7 @@ mod tests {
     fn probe_output_parsed() {
         let info = ThurmInfo::current();
         let out = format!(
-            "os=Linux\narch=aarch64\nhome=/home/me\nnix=1\ngit=1\nlinger=no\nthurm=/home/me/.local/bin/thurm\ninfo={}\n",
+            "os=Linux\narch=aarch64\nhome=/home/me\nnix=1\ngit=1\nlinger=no\nkilluser=b true\nthurm=/home/me/.local/bin/thurm\ninfo={}\n",
             serde_json::to_string(&info).unwrap()
         );
         let h = parse_probe(&out);
@@ -192,6 +198,7 @@ mod tests {
         assert_eq!(h.artifact_target(), Some("aarch64-unknown-linux-musl"));
         assert!(h.nix && h.git);
         assert_eq!(h.linger.as_deref(), Some("no"));
+        assert_eq!(h.kill_user_processes, Some(true));
         assert!(h.runs_our_build() && h.speaks_our_protocol());
         // A thurm without `remote-info`: installed, build unknown.
         let old = parse_probe("os=Darwin\narch=arm64\nhome=/Users/me\nthurm=/x/thurm\ninfo=\n");

@@ -98,7 +98,7 @@ const PROBE: &str = concat!(
     "L=\"$TH/.local/bin/thurm\"; { [ -L \"$L\" ] || [ -x \"$L\" ]; } && echo link=1; ",
     "command -v curl >/dev/null 2>&1 && echo curl=1; ",
     "for a in claude codex; do p=\"$(command -v \"$a\" 2>/dev/null)\"; ",
-    "if [ -z \"$p\" ] && [ -z \"$THURM_BASE_PATH\" ]; then p=\"$(\"${SHELL:-sh}\" -lc \"command -v $a\" </dev/null 2>/dev/null | tail -n 1)\"; fi; ",
+    "if [ -z \"$p\" ] && [ -z \"$THURM_BASE_PATH\" ]; then p=\"$(\"${SHELL:-sh}\" -lc \"command -v $a\" </dev/null 2>/dev/null | grep ^/ | tail -n 1)\"; fi; ",
     "echo \"agent_$a=$p\"; done; ",
     "{ [ -f \"${CLAUDE_CONFIG_DIR:-$TH/.claude}/.credentials.json\" ] || [ -n \"$ANTHROPIC_API_KEY\" ]; } && echo claude_login=1; ",
     "command -v thurm >/dev/null 2>&1 && echo \"hooks=$(HOME=\"$TH\" thurm hooks status --json 2>/dev/null | head -n 1)\"; ",
@@ -398,6 +398,18 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
         }
     }
     out.push(c);
+    if host.kill_user_processes == Some(true) {
+        // Lingering keeps the user manager, not what a session started: the daemon still
+        // ends with the last ssh session.
+        let mut k = check("kill_user_processes", "Session cleanup", State::Fail, "");
+        k.detail = "logind kills your processes when your last session ends \
+                    (KillUserProcesses=yes): the daemon and its shells with them"
+            .into();
+        k.terminal = Some(format!(
+            "echo 'KillExcludeUsers={user}' | sudo tee -a /etc/systemd/logind.conf && sudo systemctl restart systemd-logind"
+        ));
+        out.push(k);
+    }
 
     // `thurm` on PATH in plain ssh sessions (`ssh host thurm …`).
     let own_install = host
