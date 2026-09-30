@@ -506,6 +506,10 @@ fn f26_to_f35_use_kitty_codes() {
     assert!(t.key(&ev).is_empty());
     t.advance(b"\x1b[=3u");
     assert_eq!(t.key(&ev), b"\x1b[57393;6:3u");
+    // Event types alone (no disambiguation) still use the kitty codes.
+    t.advance(b"\x1b[=2u");
+    assert_eq!(t.key(&press(NamedKey::F(26))), b"\x1b[57389u");
+    assert_eq!(t.key(&ev), b"\x1b[57393;6:3u");
 }
 
 // ---- kitty graphics ------------------------------------------------------------------------

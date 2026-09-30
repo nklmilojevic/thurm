@@ -338,7 +338,8 @@ unsafe fn encode(
 /// with the protocol on (legacy encodings have no sequence for them), presses and repeats,
 /// and releases when the program asked for event types.
 fn kitty_function_key(n: u8, ev: &KeyEvent, flags: u8) -> Vec<u8> {
-    if flags & 1 == 0 || (ev.action == KeyAction::Release && flags & 2 == 0) {
+    // No legacy form exists: any kitty flag makes them CSI-u.
+    if flags == 0 || (ev.action == KeyAction::Release && flags & 2 == 0) {
         return Vec::new();
     }
     let code = 57363 + u32::from(n);
