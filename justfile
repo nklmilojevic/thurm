@@ -124,7 +124,8 @@ _check-main notes:
     set -euo pipefail
     [[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || { echo "switch to main first" >&2; exit 1; }
     [[ -z "$(git status --porcelain)" ]] || { echo "the working tree is not clean" >&2; exit 1; }
-    git fetch -q origin main --tags
+    # Only main: `tip` is force-moved by every tip build, so fetching tags can be rejected.
+    git fetch -q origin main
     [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] \
         || { echo "main is not the same as origin/main; pull or push first" >&2; exit 1; }
     if [[ -n "{{ notes }}" && ! -f "{{ notes }}" ]]; then
@@ -136,6 +137,7 @@ _check-tag tag:
     #!/usr/bin/env bash
     set -euo pipefail
     if git rev-parse -q --verify "refs/tags/{{ tag }}" >/dev/null \
+        || git ls-remote --exit-code --tags origin "refs/tags/{{ tag }}" >/dev/null \
         || gh release view "{{ tag }}" --repo {{ repo }} >/dev/null 2>&1; then
         echo "{{ tag }} already exists" >&2; exit 1
     fi
