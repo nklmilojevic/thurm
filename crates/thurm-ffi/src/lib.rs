@@ -1426,8 +1426,16 @@ pub unsafe extern "C" fn thurm_preview_theme(
 #[unsafe(no_mangle)]
 pub extern "C" fn thurm_config_json(dark: bool) -> *mut c_char {
     let _ = thurm_config::ensure_default_config();
-    let json = match thurm_config::Config::load() {
-        Ok(cfg) => cfg.ui_json(dark),
+    let json = match thurm_config::Config::load_with_warnings() {
+        Ok((cfg, warnings)) if warnings.is_empty() => cfg.ui_json(dark),
+        Ok((cfg, warnings)) => {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&cfg.ui_json(dark)).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("warnings".into(), serde_json::json!(warnings));
+            }
+            v.to_string()
+        }
         Err(e) => {
             let mut v: serde_json::Value =
                 serde_json::from_str(&thurm_config::Config::default().ui_json(dark))

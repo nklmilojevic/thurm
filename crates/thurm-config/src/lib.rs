@@ -16,7 +16,7 @@ pub use agents::{AgentDef, builtin_agents};
 pub use themes::{Theme, builtin_theme, builtin_theme_names, is_own_theme};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     pub font: FontConfig,
     pub window: WindowConfig,
@@ -38,7 +38,6 @@ pub struct Config {
 
 /// A host whose `thurmd` the app attaches to over the system `ssh`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct RemoteConfig {
     /// Shown in the sidebar and used by `thurm --remote NAME`: letters, digits, `-`, `_`.
     pub name: String,
@@ -95,6 +94,64 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        // Numbers the app turns into sizes and pixel counts: a value out of these ranges would
+        // be saved and then break (or crash) every launch.
+        let f = &self.font;
+        let w = &self.window;
+        let q = &self.quick_terminal;
+        let t = &self.terminal;
+        for (key, value, lo, hi) in [
+            ("font.size", f.size, 4.0, 200.0),
+            ("font.line_height", f.line_height, 0.5, 4.0),
+            ("font.letter_spacing", f.letter_spacing, -20.0, 100.0),
+            ("window.padding_x", w.padding_x, 0.0, 200.0),
+            ("window.padding_y", w.padding_y, 0.0, 200.0),
+            ("window.opacity", w.opacity, 0.0, 1.0),
+            (
+                "window.unfocused_split_dim",
+                w.unfocused_split_dim,
+                0.0,
+                1.0,
+            ),
+            ("window.sidebar_width", w.sidebar_width, 0.0, 2000.0),
+            ("cursor.thickness", self.cursor.thickness, 0.0, 20.0),
+            (
+                "terminal.scroll_multiplier",
+                t.scroll_multiplier,
+                0.01,
+                100.0,
+            ),
+            ("quick_terminal.size", q.size, 0.0, 1.0),
+            (
+                "quick_terminal.animation_duration",
+                q.animation_duration,
+                0.0,
+                5.0,
+            ),
+            ("quick_terminal.opacity", q.opacity.unwrap_or(1.0), 0.0, 1.0),
+        ] {
+            check_range(key, value, lo, hi)?;
+        }
+        for (key, value, hi) in [
+            ("window.blur", u64::from(w.blur), 100),
+            ("window.columns", u64::from(w.columns), 1000),
+            ("window.rows", u64::from(w.rows), 1000),
+            ("terminal.scrollback", t.scrollback as u64, 10_000_000),
+            (
+                "terminal.image_memory_mib",
+                t.image_memory_mib as u64,
+                16_384,
+            ),
+            (
+                "session.scrollback_lines",
+                self.session.scrollback_lines as u64,
+                1_000_000,
+            ),
+        ] {
+            if value > hi {
+                return Err(format!("{key} = {value} is out of range (at most {hi})"));
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         for r in &self.remote {
             validate_remote_name(&r.name)?;
@@ -113,7 +170,7 @@ impl Config {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct FontConfig {
     pub family: String,
     pub size: f64,
@@ -183,7 +240,7 @@ pub enum OptionAsAlt {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct WindowConfig {
     pub padding_x: f64,
     pub padding_y: f64,
@@ -238,7 +295,7 @@ pub enum CursorStyle {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct CursorConfig {
     pub style: CursorStyle,
     pub blink: bool,
@@ -257,7 +314,7 @@ impl Default for CursorConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ColorConfig {
     /// Built-in theme name or path to a TOML theme file, or `light:NAME,dark:NAME` to follow
     /// the system appearance (see [`ThemeSpec`]).
@@ -285,7 +342,7 @@ pub enum Osc52Mode {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct TerminalConfig {
     /// Scrollback lines kept per pane.
     pub scrollback: usize,
@@ -349,7 +406,7 @@ pub enum QuitBehavior {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct SessionConfig {
     /// Save layout, cwd and scrollback to disk and restore them after a reboot.
     pub persist: bool,
@@ -377,7 +434,7 @@ impl Default for SessionConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct SecurityConfig {
     /// Turn on macOS Secure Keyboard Entry automatically while a password prompt is detected.
     pub auto_secure_input: bool,
@@ -398,7 +455,7 @@ impl Default for SecurityConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct NotificationConfig {
     pub enabled: bool,
     /// Notify when a detected agent needs input and the pane isn't focused.
@@ -426,7 +483,7 @@ impl Default for NotificationConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AgentsConfig {
     pub detect: bool,
     /// Milliseconds without output after which a working agent counts as idle.
@@ -459,7 +516,7 @@ impl Default for AgentsConfig {
 /// Apple Intelligence's on-device model (macOS 26+, Apple silicon, Apple Intelligence on).
 /// Nothing leaves the Mac, but it is opt-in: `enabled` turns the features below on.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AiConfig {
     pub enabled: bool,
     /// Name agent tabs after the task when the agent gives the session no title.
@@ -507,7 +564,7 @@ impl AiConfig {
 
 /// Automatic updates (Sparkle), read by the app.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct UpdatesConfig {
     pub channel: UpdateChannel,
     /// Look for updates in the background (hourly).
@@ -541,7 +598,7 @@ pub enum UpdateChannel {
 /// The quick terminal: a window that slides in from a screen edge on a global hotkey, read by
 /// the app.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct QuickTerminalConfig {
     /// Global shortcut that shows and hides it, like `"ctrl+grave"`; empty for none (Window >
     /// Quick Terminal still works).
@@ -648,15 +705,125 @@ pub fn state_dir() -> PathBuf {
 }
 
 /// Unix socket of the daemon. Short enough for `sun_path` (104 bytes on macOS).
+///
+/// In `$XDG_RUNTIME_DIR` when set; else on macOS in the per-user temporary directory, which no
+/// other user can create or enter, and elsewhere in `/tmp/thurm-<uid>` (checked by
+/// [`private_dir_ok`] before use). A daemon started by an earlier Thurm keeps answering on the
+/// old `/tmp` socket until it exits, and is used there meanwhile.
 pub fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("THURM_SOCKET") {
         return PathBuf::from(p);
     }
-    let uid = unsafe_uid();
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join(format!("thurm-{uid}")).join("thurmd.sock")
+    let preferred = default_socket_dir().join("thurmd.sock");
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        let legacy = PathBuf::from(format!("/tmp/thurm-{}", uid())).join("thurmd.sock");
+        if legacy != preferred
+            && !socket_answers(&preferred)
+            && legacy.parent().is_some_and(private_dir_ok)
+            && socket_answers(&legacy)
+        {
+            return legacy;
+        }
+    }
+    preferred
+}
+
+/// The directory of the default daemon socket (see [`socket_path`]).
+pub fn default_socket_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join(format!("thurm-{}", uid()));
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(tmp) = darwin_user_temp_dir() {
+        return tmp.join("thurm");
+    }
+    PathBuf::from(format!("/tmp/thurm-{}", uid()))
+}
+
+/// `confstr(_CS_DARWIN_USER_TEMP_DIR)`: `/var/folders/…/T/`, private to the user.
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buf = vec![0u8; 1024];
+    let n = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    buf.truncate(n - 1);
+    let dir = PathBuf::from(std::ffi::OsString::from_vec(buf));
+    dir.is_absolute().then_some(dir)
+}
+
+/// Whether a daemon of this user answers on `socket`.
+fn socket_answers(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok_and(|s| peer_is_same_user(&s))
+}
+
+/// Whether `dir` is a real directory (not a symlink) owned by this user that nobody else can
+/// enter: where the daemon socket may live.
+pub fn private_dir_ok(dir: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    std::fs::symlink_metadata(dir).is_ok_and(|m| {
+        m.file_type().is_dir() && m.uid() == uid() && m.permissions().mode() & 0o077 == 0
+    })
+}
+
+/// Creates `dir` (mode 0700) if missing, and checks it with [`private_dir_ok`]: a directory
+/// another user created first (in `/tmp`) must not hold our socket.
+pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    if private_dir_ok(dir) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a private directory owned by you (0700, not a symlink)",
+                dir.display()
+            ),
+        ))
+    }
+}
+
+/// Whether the process at the other end of `stream` runs as this user.
+pub fn peer_is_same_user(stream: &std::os::unix::net::UnixStream) -> bool {
+    peer_uid(stream).is_some_and(|u| u == uid())
+}
+
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        (libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        ) == 0)
+            .then_some(cred.uid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        (libc::getpeereid(fd, &mut uid, &mut gid) == 0).then_some(uid)
+    }
 }
 
 /// Where the app keeps its end of each remote tunnel (`<name>.sock`) and the tunnel's state
@@ -683,18 +850,8 @@ pub fn remote_state_path(name: &str) -> PathBuf {
     remote_dir().join(format!("{name}.state"))
 }
 
-fn unsafe_uid() -> u32 {
-    // Avoid a libc dependency for one call: the uid is only used to namespace the socket dir.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Some(home) = dirs::home_dir()
-            && let Ok(meta) = std::fs::metadata(home)
-        {
-            return meta.uid();
-        }
-    }
-    0
+fn uid() -> u32 {
+    unsafe { libc::getuid() }
 }
 
 impl Config {
@@ -718,9 +875,46 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Config, String> {
-        let cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+        Self::parse_with_warnings(text).map(|(cfg, _)| cfg)
+    }
+
+    /// Like [`Config::parse`], plus the keys it didn't know (a typo, or a setting of a newer
+    /// Thurm): they are ignored, with a warning, instead of failing the whole file.
+    pub fn parse_with_warnings(text: &str) -> Result<(Config, Vec<String>), String> {
+        let mut unknown = Vec::new();
+        let de = toml::Deserializer::parse(text).map_err(|e| e.to_string())?;
+        let cfg: Config = serde_ignored::deserialize(de, |path| {
+            unknown.push(format!("unknown setting `{path}` ignored"));
+        })
+        .map_err(|e| e.to_string())?;
         cfg.validate()?;
-        Ok(cfg)
+        Ok((cfg, unknown))
+    }
+
+    /// Like [`Config::parse`], but an unknown key is an error: for text Thurm writes (`thurm
+    /// set`, remotes), where a typo must not be saved.
+    pub fn parse_strict(text: &str) -> Result<Config, String> {
+        let (cfg, warnings) = Self::parse_with_warnings(text)?;
+        match warnings.first() {
+            Some(w) => Err(w.clone()),
+            None => Ok(cfg),
+        }
+    }
+
+    /// Like [`Config::load`], with the warnings of [`Config::parse_with_warnings`].
+    pub fn load_with_warnings() -> Result<(Config, Vec<String>), ConfigError> {
+        let path = config_path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self::parse_with_warnings(&text).map_err(|message| ConfigError {
+                path: path.clone(),
+                message,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Config::default(), vec![])),
+            Err(e) => Err(ConfigError {
+                path,
+                message: e.to_string(),
+            }),
+        }
     }
 
     pub fn theme_spec(&self) -> ThemeSpec {
@@ -998,7 +1192,7 @@ pub fn with_setting(text: &str, key: &str, value: &str) -> Result<String, String
         }
     }
     let out = doc.to_string();
-    Config::parse(&out)?;
+    check_edit(text, &out)?;
     Ok(out)
 }
 
@@ -1008,13 +1202,13 @@ pub fn value_literal(v: &str) -> String {
     if v.parse::<toml_edit::Value>().is_ok() {
         v.to_owned()
     } else {
-        format!("{v:?}")
+        toml_edit::Value::from(v).to_string()
     }
 }
 
 /// Persist `spec` as the theme in the config file (created from the default if missing).
 pub fn write_theme(spec: &ThemeSpec) -> Result<(), String> {
-    write_setting("colors.theme", &format!("{:?}", spec.to_string()))
+    write_setting("colors.theme", &value_literal(&spec.to_string()))
 }
 
 /// Persist one setting (see [`with_setting`]) in the config file.
@@ -1057,7 +1251,7 @@ pub fn with_remote_added(text: &str, remote: &RemoteConfig) -> Result<String, St
     }
     tables.push(t);
     let out = doc.to_string();
-    Config::parse(&out)?;
+    check_edit(text, &out)?;
     Ok(out)
 }
 
@@ -1077,7 +1271,7 @@ pub fn with_remote_removed(text: &str, name: &str) -> Result<String, String> {
         doc.remove("remote");
     }
     let out = doc.to_string();
-    Config::parse(&out)?;
+    check_edit(text, &out)?;
     Ok(out)
 }
 
@@ -1100,7 +1294,7 @@ pub fn with_remote_setting(
         .ok_or_else(|| format!("no remote named {name:?}"))?;
     table[key] = toml_edit::Item::Value(value);
     let out = doc.to_string();
-    Config::parse(&out)?;
+    check_edit(text, &out)?;
     Ok(out)
 }
 
@@ -1110,9 +1304,85 @@ pub fn edit_config(edit: impl FnOnce(&str) -> Result<String, String>) -> Result<
     let path = ensure_default_config().map_err(|e| e.to_string())?;
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let out = edit(&text)?;
-    let tmp = path.with_extension(format!("toml.tmp{}", std::process::id()));
-    std::fs::write(&tmp, out).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    replace_file(&path, out.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Replaces the contents of `path` atomically, keeping what the user set up around it: a
+/// symlink (a Home Manager or dotfiles link) stays a link and its target gets the new
+/// contents, and the file keeps its permissions (a new file is private).
+pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let target = match std::fs::canonicalize(path) {
+        Ok(t) => t,
+        // A link to a file that doesn't exist yet: create that file, keep the link.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Follow the chain of links to the missing file at its end.
+            let mut at = path.to_owned();
+            for _ in 0..40 {
+                match std::fs::symlink_metadata(&at) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        let link = std::fs::read_link(&at)?;
+                        at = match at.parent() {
+                            Some(dir) if link.is_relative() => dir.join(link),
+                            _ => link,
+                        };
+                    }
+                    _ => break,
+                }
+            }
+            at
+        }
+        Err(e) => return Err(e),
+    };
+    let mode = std::fs::metadata(&target)
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0o600);
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = target.with_file_name(format!(".{name}.tmp{}-{seq}", std::process::id()));
+    // Only a file this call created is removed on failure.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    let result = (|| {
+        f.write_all(contents)?;
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Validates `after`, an edit of the config text `before`: it must parse, and add no unknown
+/// key (a typo in `thurm set`). Unknown keys `before` already had (settings of a newer build)
+/// stay.
+fn check_edit(before: &str, after: &str) -> Result<(), String> {
+    let (_, new) = Config::parse_with_warnings(after)?;
+    let old = Config::parse_with_warnings(before)
+        .map(|(_, w)| w)
+        .unwrap_or_default();
+    match new.into_iter().find(|w| !old.contains(w)) {
+        Some(w) => Err(w),
+        None => Ok(()),
+    }
+}
+
+fn check_range(key: &str, value: f64, lo: f64, hi: f64) -> Result<(), String> {
+    if value.is_finite() && (lo..=hi).contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("{key} = {value} is out of range ({lo} to {hi})"))
+    }
 }
 
 /// Commented default config written on first launch.
@@ -1161,10 +1431,19 @@ clipboard_read = "always"
             "[[remote]]\nname = \"a/b\"\nhost = \"x\"",
             "[[remote]]\nname = \"a\"\nhost = \"-oProxyCommand=x\"",
             "[[remote]]\nname = \"a\"\nhost = \"x\"\n[[remote]]\nname = \"a\"\nhost = \"y\"",
-            "[[remote]]\nname = \"a\"\nhost = \"x\"\nport = 1",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
+        // An unknown key is ignored when loading, refused when Thurm writes the file.
+        let typo = "[[remote]]\nname = \"a\"\nhost = \"x\"\nport = 1";
+        assert_eq!(Config::parse_with_warnings(typo).unwrap().1.len(), 1);
+        assert!(Config::parse_strict(typo).is_err());
+        // Edits keep unknown keys the file already had, and refuse new ones.
+        let newer = "[window]\nfuture_setting = true\n";
+        let out = with_setting(newer, "font.size", "15.0").unwrap();
+        assert!(out.contains("future_setting"));
+        assert!(with_remote_setting(typo, "a", "enabled", "false").is_ok());
+        assert!(with_setting(newer, "window.nope", "1").is_err());
     }
 
     #[test]
@@ -1353,8 +1632,178 @@ clipboard_read = "always"
     }
 
     #[test]
-    fn unknown_keys_rejected() {
-        assert!(Config::parse("[font]\nfamliy = \"x\"").is_err());
+    fn unknown_keys_are_ignored_with_a_warning() {
+        let (c, warnings) = Config::parse_with_warnings(
+            "[font]\nfamliy = \"x\"\nsize = 15.0\n[window]\nfuture_setting = true\n\
+             [[remote]]\nname = \"box\"\nhost = \"box\"\ntypo = 1\n",
+        )
+        .unwrap();
+        // The rest of the file still applies, remotes included.
+        assert_eq!(c.font.size, 15.0);
+        assert_eq!(c.remote.len(), 1);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("font.famliy")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("window.future_setting")),
+            "{warnings:?}"
+        );
+        assert!(Config::parse_with_warnings("").unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn numbers_out_of_range_are_rejected() {
+        for bad in [
+            "[font]\nletter_spacing = 1e30",
+            "[font]\nsize = 5000.0",
+            "[font]\nsize = nan",
+            "[font]\nline_height = inf",
+            "[window]\nopacity = 2.0",
+            "[window]\npadding_x = -1.0",
+            "[window]\ncolumns = 60000",
+            "[cursor]\nthickness = 100.0",
+            "[terminal]\nscroll_multiplier = 0.0",
+            "[quick_terminal]\nsize = 3.0",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+        // `thurm set` refuses them rather than saving a config that breaks every launch.
+        assert!(with_setting("", "font.letter_spacing", "1e30").is_err());
+        assert!(Config::parse("[font]\nsize = 14.0\nletter_spacing = -1.0").is_ok());
+    }
+
+    #[test]
+    fn value_literals_are_valid_toml() {
+        for v in [
+            "plain",
+            "tab\there",
+            "esc\u{1b}[31m",
+            "quote\"and\\slash",
+            "snow ☃",
+        ] {
+            let lit = value_literal(v);
+            let parsed: toml_edit::Value = lit.parse().unwrap_or_else(|e| panic!("{lit}: {e}"));
+            assert_eq!(parsed.as_str(), Some(v), "{lit}");
+        }
+        assert_eq!(value_literal("true"), "true");
+        assert_eq!(value_literal("240.0"), "240.0");
+    }
+
+    #[test]
+    fn replacing_a_file_keeps_links_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("thurm-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        let real = dir.join("dotfiles/config.toml");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        replace_file(&link, b"new").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        // A link to a file not created yet stays a link.
+        let dangling = dir.join("dangling.toml");
+        std::os::unix::fs::symlink("dotfiles/later.toml", &dangling).unwrap();
+        replace_file(&dangling, b"x").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dotfiles/later.toml")).unwrap(),
+            "x"
+        );
+        // And a chain of links ending at a missing file.
+        std::os::unix::fs::symlink("hop.toml", dir.join("chain.toml")).unwrap();
+        std::os::unix::fs::symlink("dotfiles/end.toml", dir.join("hop.toml")).unwrap();
+        replace_file(&dir.join("chain.toml"), b"y").unwrap();
+        for l in ["chain.toml", "hop.toml"] {
+            assert!(
+                std::fs::symlink_metadata(dir.join(l))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dotfiles/end.toml")).unwrap(),
+            "y"
+        );
+        // Someone else's leftover temporary file is not deleted.
+        let leftover = dir.join(format!("dotfiles/.config.toml.tmp{}", std::process::id()));
+        std::fs::write(&leftover, "keep").unwrap();
+        replace_file(&link, b"newer").unwrap();
+        assert_eq!(std::fs::read_to_string(&leftover).unwrap(), "keep");
+        // A new file is private.
+        let fresh = dir.join("fresh.json");
+        replace_file(&fresh, b"{}").unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn example_config_matches_the_defaults() {
+        let text = include_str!("../../../config.example.toml");
+        let (c, warnings) = Config::parse_with_warnings(text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn socket_directories_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("thurm-sockdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let fresh = base.join("fresh");
+        ensure_private_dir(&fresh).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Someone else's (here: too open) directory is refused, not chmodded.
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_private_dir(&open).is_err());
+        assert_eq!(
+            std::fs::metadata(&open).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        // A symlink to a private directory is refused too.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        assert!(!private_dir_ok(&link));
+        assert!(ensure_private_dir(&link).is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn default_socket_is_private_and_short() {
+        let dir = default_socket_dir();
+        assert!(dir.is_absolute());
+        // sun_path is 104 bytes on macOS.
+        assert!(
+            dir.join("thurmd.sock").as_os_str().len() < 100,
+            "{}",
+            dir.display()
+        );
+        #[cfg(target_os = "macos")]
+        assert!(!dir.starts_with("/tmp"), "{}", dir.display());
     }
 
     #[test]

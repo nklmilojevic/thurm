@@ -78,7 +78,7 @@ impl Default for ConnectOptions<'_> {
 /// Pid of the process listening on `socket` (the daemon), from the peer credentials.
 pub fn daemon_pid(socket: &Path) -> Option<u32> {
     use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(socket).ok()?;
+    let stream = connect_daemon(socket).ok()?;
     let fd = stream.as_raw_fd();
     #[cfg(target_os = "macos")]
     {
@@ -271,8 +271,21 @@ pub fn find_daemon() -> Option<PathBuf> {
     thurm_config::which("thurmd")
 }
 
+/// Connects to the daemon socket at `path`, which must be served by this user: another user
+/// who got to a shared directory first must not receive our keystrokes.
+pub fn connect_daemon(path: &Path) -> std::io::Result<UnixStream> {
+    let stream = UnixStream::connect(path)?;
+    if !thurm_config::peer_is_same_user(&stream) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is served by another user", path.display()),
+        ));
+    }
+    Ok(stream)
+}
+
 fn connect_socket(opts: &ConnectOptions<'_>) -> Result<UnixStream, ClientError> {
-    match UnixStream::connect(&opts.socket) {
+    match connect_daemon(&opts.socket) {
         Ok(s) => return Ok(s),
         Err(e) if opts.spawn_daemon.is_none() => return Err(ClientError::Connect(e.to_string())),
         Err(_) => {}
@@ -290,7 +303,7 @@ fn connect_socket(opts: &ConnectOptions<'_>) -> Result<UnixStream, ClientError> 
     let _ = child.wait();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match UnixStream::connect(&opts.socket) {
+        match connect_daemon(&opts.socket) {
             Ok(s) => return Ok(s),
             Err(e) if Instant::now() > deadline => return Err(ClientError::Connect(e.to_string())),
             Err(_) => std::thread::sleep(Duration::from_millis(25)),
