@@ -145,7 +145,10 @@ pub fn perform(
     }
     // If the new image dies before adopting the panes, their shells are gone, but the session
     // (layout, scrollback, cwd) comes back from this snapshot on the next start.
-    daemon.save_session();
+    if let Err(e) = daemon.save_session() {
+        // The handoff carries the panes; the snapshot is only the fallback after a crash.
+        log::warn!("upgrade: session snapshot not saved: {e}");
+    }
     let handoff = daemon.handoff(listener_fd, log_to_file);
     let path = handoff_path(state_dir);
     let written = serde_json::to_vec(&handoff)

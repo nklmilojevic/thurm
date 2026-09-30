@@ -189,7 +189,7 @@ fn main() {
         std::thread::sleep(Duration::from_millis(100));
         if term.load(Ordering::Relaxed) {
             log::info!("signal received, saving session");
-            daemon.save_session();
+            let _ = daemon.save_session();
             break;
         }
         if daemon.shutdown.load(Ordering::Relaxed) {
@@ -202,7 +202,7 @@ fn main() {
         // Socket file deleted or replaced: another daemon took over or the user cleaned up.
         if !socket.exists() {
             log::warn!("socket removed, exiting");
-            daemon.save_session();
+            let _ = daemon.save_session();
             break;
         }
     }
