@@ -198,6 +198,7 @@ impl StreamFilter {
                                 b'c' => {
                                     // RIS resets everything.
                                     self.scroll_region = Some(None);
+                                    self.media_more = false;
                                 }
                                 _ => {}
                             }
@@ -503,13 +504,21 @@ impl StreamFilter {
         let Some(ctl) = self.buf.strip_prefix(b"G") else {
             return false;
         };
-        let (mut medium, mut more) = (b'd', false);
+        let (mut medium, mut more, mut command) = (b'd', false, false);
         for kv in ctl.split(|&b| b == b',') {
             match kv {
-                [b't', b'=', m, ..] => medium = *m,
+                [b't', b'=', m, ..] => {
+                    medium = *m;
+                    command = true;
+                }
+                [b'a', b'=', ..] => command = true,
                 [b'm', b'=', rest @ ..] => more = rest == b"1",
                 _ => {}
             }
+        }
+        // A new command ends an unfinished chunked transmission instead of continuing it.
+        if command {
+            self.media_more = false;
         }
         let media = self.media_more || matches!(medium, b'f' | b't' | b's');
         if media {
@@ -669,6 +678,18 @@ mod tests {
             assert!(pass.is_empty());
             assert_eq!(seqs.len(), 1);
         }
+    }
+
+    #[test]
+    fn unfinished_file_transmission_does_not_eat_the_next_command() {
+        // A chunked file transmission that never ends, then a direct image: it passes through.
+        let (pass, seqs) = run(b"\x1b_Ga=T,t=f,m=1;L3Rt\x1b\\\x1b_Ga=T,f=100;AAAA\x1b\\");
+        assert_eq!(pass, b"\x1b_Ga=T,f=100;AAAA\x1b\\");
+        assert_eq!(seqs, vec![Chunk::Apc(b"Ga=T,t=f,m=1;L3Rt".to_vec())]);
+        // RIS ends it too.
+        let (pass, seqs) = run(b"\x1b_Ga=T,t=f,m=1;L3Rt\x1b\\\x1bc\x1b_Gm=0;AAAA\x1b\\");
+        assert_eq!(pass, b"\x1bc\x1b_Gm=0;AAAA\x1b\\");
+        assert_eq!(seqs.len(), 1);
     }
 
     #[test]

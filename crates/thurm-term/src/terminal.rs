@@ -556,6 +556,14 @@ impl Terminal {
         self.vt
             .set_kitty_graphics(if on { self.cfg.image_memory as u64 } else { 0 });
         self.filter.all_apc = !on;
+        self.media.set_max_bytes(self.cfg.image_memory);
+    }
+
+    /// For a copy of a pane's terminal fed a stream the daemon already filtered (the app's):
+    /// file, temporary file and shared memory transmissions are dropped rather than read on
+    /// this machine.
+    pub fn set_reads_media(&mut self, reads: bool) {
+        self.media.set_enabled(reads);
     }
 
     fn apply_cursor(&mut self) {

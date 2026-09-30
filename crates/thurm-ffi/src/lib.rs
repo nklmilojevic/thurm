@@ -610,6 +610,9 @@ fn handle_event(
     match ev {
         Event::Attach { pane, size, state } => {
             let mut term = Terminal::new(size, shared.engine.lock().engine_config());
+            // The daemon has read (and replaced) the pane's own transmissions; any left in the
+            // stream (an older or hostile remote daemon) must not read this Mac's files.
+            term.set_reads_media(false);
             term.replay(&state);
             let _ = term.drain_events();
             shared.images.lock().retain(|(p, _), _| *p != pane);
