@@ -1200,7 +1200,8 @@ fn in_place_upgrade_loses_no_output() {
         unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR2) },
         0
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The old image first drains what it read, up to 30 s in a slow debug build.
+    let deadline = Instant::now() + Duration::from_secs(45);
     while c.is_alive() {
         assert!(Instant::now() < deadline, "old image kept the connection");
         std::thread::sleep(Duration::from_millis(20));
@@ -1299,4 +1300,100 @@ fn completion_uses_only_the_path_the_shell_reported() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Spawns another daemon on `env`'s socket and returns whether it exited by itself in time.
+fn second_daemon_exits(env: &Env) -> bool {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_thurmd"))
+        .args(["--foreground", "--socket"])
+        .arg(&env.socket)
+        .env("THURM_CONFIG_DIR", env.dir.join("config"))
+        .env("THURM_STATE_DIR", env.dir.join("state2"))
+        .spawn()
+        .expect("spawn daemon");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
+#[test]
+fn one_daemon_per_socket() {
+    let env = Env::new("single");
+    // A socket directory given with --socket keeps its permissions.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&env.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut daemon = env.start();
+    let (c, _events) = env.connect();
+    let pane = create(&c, &env.dir);
+    assert!(second_daemon_exits(&env), "a second daemon kept running");
+    // The first one still has the socket and its pane.
+    assert!(matches!(
+        c.request(Request::PaneInfo { pane }).unwrap(),
+        Response::PaneInfo(_)
+    ));
+    let (c2, _e2) = env.connect();
+    assert!(matches!(
+        c2.request(Request::PaneInfo { pane }).unwrap(),
+        Response::PaneInfo(_)
+    ));
+    let mode = std::fs::metadata(&env.dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+
+    // Through an in-place upgrade the lock stays held.
+    let mut req = env.socket.as_os_str().to_owned();
+    req.push(".upgrade");
+    std::fs::write(PathBuf::from(req), env!("CARGO_BIN_EXE_thurmd")).unwrap();
+    assert_eq!(
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR2) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.is_alive() {
+        assert!(Instant::now() < deadline, "old image kept the connection");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop((c, c2));
+    let (c, _events) = env.connect();
+    assert!(matches!(
+        c.request(Request::PaneInfo { pane }).unwrap(),
+        Response::PaneInfo(_)
+    ));
+    assert!(
+        second_daemon_exits(&env),
+        "a second daemon started after the upgrade"
+    );
+    assert!(daemon.child.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn daemons_started_together_leave_one() {
+    let env = Env::new("together");
+    let spawn = || {
+        Command::new(env!("CARGO_BIN_EXE_thurmd"))
+            .args(["--foreground", "--socket"])
+            .arg(&env.socket)
+            .env("THURM_CONFIG_DIR", env.dir.join("config"))
+            .env("THURM_STATE_DIR", env.dir.join("state"))
+            .spawn()
+            .expect("spawn daemon")
+    };
+    let mut children = [spawn(), spawn(), spawn()];
+    std::thread::sleep(Duration::from_secs(2));
+    let running = children
+        .iter_mut()
+        .map(|c| c.try_wait().unwrap().is_none())
+        .filter(|&alive| alive)
+        .count();
+    for c in &mut children {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    assert_eq!(running, 1);
 }

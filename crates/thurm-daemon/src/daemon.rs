@@ -1441,6 +1441,7 @@ impl Daemon {
         upgrade::Handoff {
             version: upgrade::HANDOFF_VERSION,
             listener_fd,
+            lock_fd: None,
             log_to_file,
             layout: self.layout.lock().clone(),
             next_pane_id: self.next_pane.load(Ordering::Relaxed),

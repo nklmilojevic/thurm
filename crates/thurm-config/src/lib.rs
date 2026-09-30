@@ -648,15 +648,125 @@ pub fn state_dir() -> PathBuf {
 }
 
 /// Unix socket of the daemon. Short enough for `sun_path` (104 bytes on macOS).
+///
+/// In `$XDG_RUNTIME_DIR` when set; else on macOS in the per-user temporary directory, which no
+/// other user can create or enter, and elsewhere in `/tmp/thurm-<uid>` (checked by
+/// [`private_dir_ok`] before use). A daemon started by an earlier Thurm keeps answering on the
+/// old `/tmp` socket until it exits, and is used there meanwhile.
 pub fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("THURM_SOCKET") {
         return PathBuf::from(p);
     }
-    let uid = unsafe_uid();
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join(format!("thurm-{uid}")).join("thurmd.sock")
+    let preferred = default_socket_dir().join("thurmd.sock");
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        let legacy = PathBuf::from(format!("/tmp/thurm-{}", uid())).join("thurmd.sock");
+        if legacy != preferred
+            && !socket_answers(&preferred)
+            && legacy.parent().is_some_and(private_dir_ok)
+            && socket_answers(&legacy)
+        {
+            return legacy;
+        }
+    }
+    preferred
+}
+
+/// The directory of the default daemon socket (see [`socket_path`]).
+pub fn default_socket_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join(format!("thurm-{}", uid()));
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(tmp) = darwin_user_temp_dir() {
+        return tmp.join("thurm");
+    }
+    PathBuf::from(format!("/tmp/thurm-{}", uid()))
+}
+
+/// `confstr(_CS_DARWIN_USER_TEMP_DIR)`: `/var/folders/…/T/`, private to the user.
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buf = vec![0u8; 1024];
+    let n = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    buf.truncate(n - 1);
+    let dir = PathBuf::from(std::ffi::OsString::from_vec(buf));
+    dir.is_absolute().then_some(dir)
+}
+
+/// Whether a daemon of this user answers on `socket`.
+fn socket_answers(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok_and(|s| peer_is_same_user(&s))
+}
+
+/// Whether `dir` is a real directory (not a symlink) owned by this user that nobody else can
+/// enter: where the daemon socket may live.
+pub fn private_dir_ok(dir: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    std::fs::symlink_metadata(dir).is_ok_and(|m| {
+        m.file_type().is_dir() && m.uid() == uid() && m.permissions().mode() & 0o077 == 0
+    })
+}
+
+/// Creates `dir` (mode 0700) if missing, and checks it with [`private_dir_ok`]: a directory
+/// another user created first (in `/tmp`) must not hold our socket.
+pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    if private_dir_ok(dir) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a private directory owned by you (0700, not a symlink)",
+                dir.display()
+            ),
+        ))
+    }
+}
+
+/// Whether the process at the other end of `stream` runs as this user.
+pub fn peer_is_same_user(stream: &std::os::unix::net::UnixStream) -> bool {
+    peer_uid(stream).is_some_and(|u| u == uid())
+}
+
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        (libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        ) == 0)
+            .then_some(cred.uid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        (libc::getpeereid(fd, &mut uid, &mut gid) == 0).then_some(uid)
+    }
 }
 
 /// Where the app keeps its end of each remote tunnel (`<name>.sock`) and the tunnel's state
@@ -683,18 +793,8 @@ pub fn remote_state_path(name: &str) -> PathBuf {
     remote_dir().join(format!("{name}.state"))
 }
 
-fn unsafe_uid() -> u32 {
-    // Avoid a libc dependency for one call: the uid is only used to namespace the socket dir.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Some(home) = dirs::home_dir()
-            && let Ok(meta) = std::fs::metadata(home)
-        {
-            return meta.uid();
-        }
-    }
-    0
+fn uid() -> u32 {
+    unsafe { libc::getuid() }
 }
 
 impl Config {
@@ -1355,6 +1455,49 @@ clipboard_read = "always"
     #[test]
     fn unknown_keys_rejected() {
         assert!(Config::parse("[font]\nfamliy = \"x\"").is_err());
+    }
+
+    #[test]
+    fn socket_directories_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("thurm-sockdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let fresh = base.join("fresh");
+        ensure_private_dir(&fresh).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Someone else's (here: too open) directory is refused, not chmodded.
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_private_dir(&open).is_err());
+        assert_eq!(
+            std::fs::metadata(&open).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        // A symlink to a private directory is refused too.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        assert!(!private_dir_ok(&link));
+        assert!(ensure_private_dir(&link).is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn default_socket_is_private_and_short() {
+        let dir = default_socket_dir();
+        assert!(dir.is_absolute());
+        // sun_path is 104 bytes on macOS.
+        assert!(
+            dir.join("thurmd.sock").as_os_str().len() < 100,
+            "{}",
+            dir.display()
+        );
+        #[cfg(target_os = "macos")]
+        assert!(!dir.starts_with("/tmp"), "{}", dir.display());
     }
 
     #[test]

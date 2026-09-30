@@ -35,6 +35,9 @@ const QUIESCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 pub struct Handoff {
     pub version: u32,
     pub listener_fd: RawFd,
+    /// The single-instance lock (`<socket>.lock`), held across the exec.
+    #[serde(default)]
+    pub lock_fd: Option<RawFd>,
     /// The old image logged to the state dir's log file (it was daemonized), not stderr.
     pub log_to_file: bool,
     pub layout: Option<String>,
@@ -155,6 +158,7 @@ fn check(exe: &Path) -> Result<(), String> {
 pub fn perform(
     daemon: &Arc<Daemon>,
     listener_fd: RawFd,
+    lock_fd: Option<RawFd>,
     socket: &Path,
     state_dir: &Path,
     log_to_file: bool,
@@ -185,7 +189,8 @@ pub fn perform(
         // The handoff carries the panes; the snapshot is only the fallback after a crash.
         log::warn!("upgrade: session snapshot not saved: {e}");
     }
-    let handoff = daemon.handoff(listener_fd, log_to_file);
+    let mut handoff = daemon.handoff(listener_fd, log_to_file);
+    handoff.lock_fd = lock_fd;
     let path = handoff_path(state_dir);
     let written = serde_json::to_vec(&handoff)
         .map_err(std::io::Error::other)
@@ -195,6 +200,7 @@ pub fn perform(
         return;
     }
     let fds: Vec<RawFd> = std::iter::once(listener_fd)
+        .chain(lock_fd)
         .chain(handoff.panes.iter().map(|p| p.fd))
         .collect();
     for &fd in &fds {
