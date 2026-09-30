@@ -113,6 +113,8 @@ final class Perf {
             }
         }
         stats[pane] = s
+        // The display link is paused while idle and output is drawn outside it.
+        flushIfDue()
     }
 
     private let path = ProcessInfo.processInfo.environment["THURM_PERF_LOG"] ?? "/tmp/thurm-perf.log"

@@ -1307,16 +1307,18 @@ impl Terminal {
                     focused_match.as_ref(),
                 ));
             }
-            let (cells, clusters, hash) = cached.encoded.clone().unwrap_or_default();
-            self.frame_rows[vrow] = Some(cached);
-            if full || view.row_hashes[vrow] != hash {
-                view.row_hashes[vrow] = hash;
+            // Only rows the client doesn't have yet are cloned out of the cache.
+            if let Some((cells, clusters, hash)) = &cached.encoded
+                && (full || view.row_hashes[vrow] != *hash)
+            {
+                view.row_hashes[vrow] = *hash;
                 lines.push(FrameRow {
                     row: vrow as u16,
-                    cells,
-                    clusters,
+                    cells: cells.clone(),
+                    clusters: clusters.clone(),
                 });
             }
+            self.frame_rows[vrow] = Some(cached);
         }
 
         // Borrowed from the cache for the cursor and images below (put back before returning).

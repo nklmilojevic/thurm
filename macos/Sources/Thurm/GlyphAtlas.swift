@@ -79,8 +79,8 @@ final class GlyphAtlas {
                 }
             }
         }
-        // Frames in flight may still read this region (a wiped atlas reuses space).
-        MetalContext.shared?.waitForGPU()
+        // No wait for the GPU: frames in flight only sample regions uploaded before them, and
+        // space is reused only after `wipe()`, which starts a new texture.
         bytes.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             texture.replace(region: MTLRegionMake2D(x, y, w, h), mipmapLevel: 0,
@@ -108,13 +108,19 @@ final class GlyphAtlas {
         return true
     }
 
-    /// Clears everything (atlas full at max size). Callers drop their caches via `epoch`.
+    /// Clears everything (atlas full at max size). Callers drop their caches via `epoch`. A
+    /// new texture keeps frames in flight sampling the old one intact.
     private func wipe() {
         pixels = [UInt8](repeating: 0, count: pixels.count)
         cursorX = 1
         cursorY = 1
         shelfHeight = 0
         epoch += 1
+        if let tex = GlyphAtlas.makeTexture(device: device, format: pixelFormat, width: width, height: height) {
+            texture = tex
+        } else {
+            MetalContext.shared?.waitForGPU()
+        }
     }
 }
 

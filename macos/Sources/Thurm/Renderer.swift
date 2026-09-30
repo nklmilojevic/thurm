@@ -168,7 +168,7 @@ final class MetalContext {
     var lastCommitted: MTLCommandBuffer?
 
     /// Blocks until the GPU finished every committed frame, before the CPU rewrites a texture
-    /// region those frames may still sample (glyph atlas uploads, which are rare).
+    /// region those frames may still sample (a wiped glyph atlas that got no new texture).
     func waitForGPU() {
         if let cb = lastCommitted, cb.status != .completed, cb.status != .error {
             cb.waitUntilCompleted()
@@ -257,8 +257,17 @@ final class GridSnapshot {
             cells = [thurm_cell](repeating: thurm_cell(), count: count)
         }
         if let src = ptr, count > 0 {
+            // Only rows that changed since the last lock; a scroll or resize moves everything.
+            let mask: UInt64 = sizeChanged || newInfo.shift != 0 ? UInt64.max : newInfo.dirty_rows
             cells.withUnsafeMutableBufferPointer { dst in
-                if let base = dst.baseAddress { base.update(from: src, count: count) }
+                guard let base = dst.baseAddress else { return }
+                if mask == UInt64.max {
+                    base.update(from: src, count: count)
+                    return
+                }
+                for r in 0..<rows where mask & (UInt64(1) << UInt64(min(r, 63))) != 0 {
+                    (base + r * cols).update(from: src + r * cols, count: cols)
+                }
             }
         }
 
@@ -411,7 +420,18 @@ final class TerminalRenderer {
     private var decorations: [QuadInstance] = []
     private var cursorOver: [QuadInstance] = []
     private var overlay: [QuadInstance] = []
-    private var imageTextures: [UInt32: MTLTexture] = [:]
+    /// Uploaded kitty images by id, with the serial of the pixels they hold and when they
+    /// were last drawn (textures of images scrolled off stay a moment in case they return).
+    private var imageTextures: [UInt32: (serial: UInt64, texture: MTLTexture, lastUsed: CFTimeInterval)] = [:]
+    private static let imageGrace: CFTimeInterval = 2
+    /// Quad buffers reused round robin; `inFlight` keeps the CPU from rewriting one the GPU
+    /// may still read.
+    private static let bufferCount = 3
+    private var quadBuffers: [MTLBuffer?] = Array(repeating: nil, count: bufferCount)
+    private var quadBufferIndex = 0
+    private let inFlight = DispatchSemaphore(value: bufferCount)
+    private var allQuads: [QuadInstance] = []
+    private var segments: [DrawSegment] = []
     /// Set when an image was referenced but its pixels were not available yet.
     private(set) var wantsAnotherFrame = false
 
@@ -423,7 +443,13 @@ final class TerminalRenderer {
         guard let ctx = MetalContext.shared else { return }
         guard p.viewportWidth > 0, p.viewportHeight > 0 else { return }
         wantsAnotherFrame = false
+        // Rasterizing a glyph can wipe a full atlas; quads built before that point to stale
+        // texels, so build again against the fresh atlas.
+        let epochs = (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color.epoch)
         buildQuads(p, device: ctx.device)
+        if epochs != (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color.epoch) {
+            buildQuads(p, device: ctx.device)
+        }
 
         guard let drawable = layer.nextDrawable() else { return }
         let bgColor = snapshot.valid ? snapshot.info.background : p.themeBackground
@@ -441,14 +467,12 @@ final class TerminalRenderer {
         else { return }
 
         // Assemble all quads into one buffer, in paint order.
-        var all: [QuadInstance] = []
-        all.reserveCapacity(backgrounds.count + cursorUnder.count + glyphQuads.count + decorations.count
-                            + cursorOver.count + overlay.count + snapshot.images.count)
-        var segments: [DrawSegment] = []
+        allQuads.removeAll(keepingCapacity: true)
+        segments.removeAll(keepingCapacity: true)
         func append(_ quads: [QuadInstance], texture: MTLTexture? = nil) {
             guard !quads.isEmpty else { return }
-            segments.append(DrawSegment(start: all.count, count: quads.count, texture: texture))
-            all.append(contentsOf: quads)
+            segments.append(DrawSegment(start: allQuads.count, count: quads.count, texture: texture))
+            allQuads.append(contentsOf: quads)
         }
         append(backgrounds)
         append(cursorUnder)
@@ -468,13 +492,14 @@ final class TerminalRenderer {
         encoder.setFragmentTexture(p.shaper.glyphs.color.texture, index: 1)
         encoder.setFragmentTexture(ctx.emptyTexture, index: 2)
 
-        if !all.isEmpty {
+        if !allQuads.isEmpty {
             let stride = MemoryLayout<QuadInstance>.stride
-            let buffer: MTLBuffer? = all.withUnsafeBytes { raw -> MTLBuffer? in
-                guard let base = raw.baseAddress else { return nil }
-                return ctx.device.makeBuffer(bytes: base, length: raw.count, options: [.storageModeShared])
-            }
-            if let buffer = buffer {
+            if let buffer = nextQuadBuffer(device: ctx.device, length: allQuads.count * stride) {
+                allQuads.withUnsafeBytes { raw in
+                    if let base = raw.baseAddress { buffer.contents().copyMemory(from: base, byteCount: raw.count) }
+                }
+                let inFlight = self.inFlight
+                commands.addCompletedHandler { _ in inFlight.signal() }
                 encoder.setVertexBuffer(buffer, offset: 0, index: 0)
                 // While smooth scrolling, clip the shifted grid to the padded text area.
                 let full = MTLScissorRect(x: 0, y: 0, width: p.viewportWidth, height: p.viewportHeight)
@@ -497,6 +522,22 @@ final class TerminalRenderer {
         commands.present(drawable)
         commands.commit()
         ctx.lastCommitted = commands
+    }
+
+    /// The next quad buffer, at least `length` bytes. Waits while the GPU still reads every
+    /// buffer; on success the caller signals `inFlight` when its command buffer completes.
+    private func nextQuadBuffer(device: MTLDevice, length: Int) -> MTLBuffer? {
+        inFlight.wait()
+        quadBufferIndex = (quadBufferIndex + 1) % Self.bufferCount
+        if let buffer = quadBuffers[quadBufferIndex], buffer.length >= length { return buffer }
+        // Room to grow, so a busier screen doesn't reallocate on every frame.
+        let size = max(64 * 1024, length + length / 2)
+        guard let buffer = device.makeBuffer(length: size, options: [.storageModeShared]) else {
+            inFlight.signal()
+            return nil
+        }
+        quadBuffers[quadBufferIndex] = buffer
+        return buffer
     }
 
     // MARK: Quad building
@@ -731,16 +772,16 @@ final class TerminalRenderer {
         -> ([(QuadInstance, MTLTexture)], [(QuadInstance, MTLTexture)]) {
         var below: [(QuadInstance, MTLTexture)] = []
         var above: [(QuadInstance, MTLTexture)] = []
-        guard snapshot.valid, !snapshot.images.isEmpty else {
-            imageTextures.removeAll()
-            return (below, above)
+        let now = CACurrentMediaTime()
+        defer {
+            // Evict textures of images not shown for a while.
+            imageTextures = imageTextures.filter { now - $0.value.lastUsed < Self.imageGrace }
         }
+        guard snapshot.valid, !snapshot.images.isEmpty else { return (below, above) }
         let cw = Float(p.shaper.cellWidth)
         let ch = Float(p.shaper.cellHeight)
-        var referenced = Set<UInt32>()
         for placement in snapshot.images {
-            referenced.insert(placement.image)
-            guard let tex = texture(for: placement.image, pane: p.pane, device: device) else {
+            guard let tex = texture(for: placement.image, pane: p.pane, device: device, now: now) else {
                 wantsAnotherFrame = true
                 continue
             }
@@ -763,17 +804,18 @@ final class TerminalRenderer {
                 above.append((quad, tex))
             }
         }
-        // Evict textures of images that are no longer shown.
-        for id in Array(imageTextures.keys) where !referenced.contains(id) {
-            imageTextures.removeValue(forKey: id)
-        }
         return (below, above)
     }
 
-    private func texture(for image: UInt32, pane key: PaneKey, device: MTLDevice) -> MTLTexture? {
-        if let tex = imageTextures[image] { return tex }
+    private func texture(for image: UInt32, pane key: PaneKey, device: MTLDevice, now: CFTimeInterval) -> MTLTexture? {
         guard let client = Core.shared.client(for: key.host) else { return nil }
         let pane = key.id
+        // The serial changes when the image is replaced under the same id.
+        let serial = thurm_image_serial(client, pane, image)
+        if let cached = imageTextures[image], cached.serial == serial {
+            imageTextures[image]?.lastUsed = now
+            return cached.texture
+        }
         var width: UInt32 = 0
         var height: UInt32 = 0
         var pixels: UnsafePointer<UInt8>? = nil
@@ -786,7 +828,7 @@ final class TerminalRenderer {
         guard let tex = device.makeTexture(descriptor: desc) else { return nil }
         tex.replace(region: MTLRegionMake2D(0, 0, Int(width), Int(height)), mipmapLevel: 0,
                     withBytes: src, bytesPerRow: Int(width) * 4)
-        imageTextures[image] = tex
+        imageTextures[image] = (serial, tex, now)
         return tex
     }
 

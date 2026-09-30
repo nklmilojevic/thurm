@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ::thurm_client::{Client, ConnectOptions};
@@ -116,6 +117,24 @@ struct Grid {
     peek_clusters: HashMap<u16, CString>,
 }
 
+/// Moves the rows of a `cols`×`rows` grid down by `shift` (up when negative), in place.
+/// Exposed rows are cleared.
+fn shift_rows(cells: &mut [thurm_cell], cols: usize, rows: usize, shift: i32) {
+    let n = shift.unsigned_abs() as usize;
+    if n >= rows {
+        cells.fill(thurm_cell::default());
+        return;
+    }
+    let keep = (rows - n) * cols;
+    if shift > 0 {
+        cells.copy_within(0..keep, n * cols);
+        cells[..n * cols].fill(thurm_cell::default());
+    } else {
+        cells.copy_within(n * cols.., 0);
+        cells[keep..].fill(thurm_cell::default());
+    }
+}
+
 /// Moves a dirty-row mask by `shift` rows. Bit 63 stands for "row 63 or below".
 fn shift_dirty(mask: u64, shift: i32, rows: usize) -> u64 {
     let mut out = 0u64;
@@ -147,15 +166,7 @@ impl Grid {
         if f.shift != 0 && !f.full {
             // Row r now shows what row r - shift showed; exposed rows follow in `lines`.
             let s = f.shift as i64;
-            let old = std::mem::take(&mut self.cells);
-            self.cells = vec![thurm_cell::default(); cols * rows];
-            for r in 0..rows as i64 {
-                let src = r - s;
-                if (0..rows as i64).contains(&src) {
-                    let (d, o) = (r as usize * cols, src as usize * cols);
-                    self.cells[d..d + cols].copy_from_slice(&old[o..o + cols]);
-                }
-            }
+            shift_rows(&mut self.cells, cols, rows, f.shift);
             self.clusters = std::mem::take(&mut self.clusters)
                 .into_iter()
                 .filter_map(|((row, col), v)| {
@@ -206,7 +217,8 @@ impl Grid {
                 .map(|l| CString::new(l).unwrap_or_default())
                 .collect();
         }
-        self.images = f.images.iter().map(placement).collect();
+        self.images.clear();
+        self.images.extend(f.images.iter().map(placement));
         let i = &mut self.info;
         i.cursor_col = f.cursor.col;
         i.cursor_row = f.cursor.row;
@@ -263,8 +275,13 @@ fn placement(p: &ImagePlacement) -> thurm_image_placement {
 struct ImageSlot {
     width: u32,
     height: u32,
-    rgba: Vec<u8>,
+    /// Shared with the terminal's copy of the image.
+    rgba: Arc<Vec<u8>>,
+    /// Unique per stored image, so a replaced image (same id) gets a new texture.
+    serial: u64,
 }
+
+static IMAGE_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 type ImageKey = (PaneId, u32);
 
@@ -1077,7 +1094,8 @@ pub unsafe extern "C" fn thurm_grid_lock(
                     Arc::new(ImageSlot {
                         width: img.width,
                         height: img.height,
-                        rgba: (*img.rgba).clone(),
+                        rgba: Arc::clone(&img.rgba),
+                        serial: IMAGE_SERIAL.fetch_add(1, Ordering::Relaxed),
                     }),
                 );
             }
@@ -1225,6 +1243,22 @@ pub unsafe extern "C" fn thurm_grid_unlock(client: *mut thurm_client, pane: u64)
     if let Some(slot) = c.shared.locked.lock().remove(&pane) {
         unsafe { slot.force_unlock() };
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_image_serial(
+    client: *mut thurm_client,
+    pane: u64,
+    image: u32,
+) -> u64 {
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return 0;
+    };
+    c.shared
+        .images
+        .lock()
+        .get(&(pane, image))
+        .map_or(0, |slot| slot.serial)
 }
 
 #[unsafe(no_mangle)]
@@ -1387,6 +1421,35 @@ mod tests {
             (1 << 61) | (1 << 62) | (1 << 63)
         );
         assert_eq!(shift_dirty(1 << 4, 10, 10), 0);
+    }
+
+    #[test]
+    fn rows_shift_in_place() {
+        let grid = |chars: &str| -> Vec<thurm_cell> {
+            chars
+                .chars()
+                .map(|ch| thurm_cell {
+                    ch: ch as u32,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let text = |cells: &[thurm_cell]| -> String {
+            cells
+                .iter()
+                .map(|c| char::from_u32(c.ch).filter(|&c| c != '\0').unwrap_or('.'))
+                .collect()
+        };
+        // 2 columns, 4 rows.
+        let mut cells = grid("aabbccdd");
+        shift_rows(&mut cells, 2, 4, 1);
+        assert_eq!(text(&cells), "..aabbcc");
+        let mut cells = grid("aabbccdd");
+        shift_rows(&mut cells, 2, 4, -3);
+        assert_eq!(text(&cells), "dd......");
+        let mut cells = grid("aabbccdd");
+        shift_rows(&mut cells, 2, 4, 4);
+        assert_eq!(text(&cells), "........");
     }
 
     #[test]
