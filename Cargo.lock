@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "libc",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "libc",
@@ -901,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "parking_lot",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "postcard",
  "serde",
@@ -947,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-remote"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "log",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-term"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "bitflags 2.13.2",
