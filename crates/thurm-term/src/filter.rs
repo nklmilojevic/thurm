@@ -604,6 +604,90 @@ fn is_intercepted(body: &[u8]) -> bool {
     osc_number(body).is_some_and(|n| INTERCEPTED_OSC.contains(&n))
 }
 
+/// Where the unterminated end of `bytes` starts: an escape sequence that has no final byte or
+/// terminator yet, or the start of an incomplete UTF-8 character. `bytes.len()` when the
+/// stream ends between sequences. Replaying that tail into a fresh parser before the rest of
+/// the stream (a daemon upgraded in place) completes the sequence instead of cutting it.
+pub fn unterminated_tail(bytes: &[u8]) -> usize {
+    let Some(esc) = memchr::memrchr(0x1b, bytes) else {
+        return utf8_tail(bytes, 0);
+    };
+    let seq = &bytes[esc..];
+    // ESC \ (ST) ends whatever string sequence came before.
+    if seq.get(1) == Some(&b'\\') {
+        return utf8_tail(bytes, esc + 2);
+    }
+    if sequence_complete(seq) {
+        return utf8_tail(bytes, esc + sequence_len(seq));
+    }
+    // A lone ESC at the end may be the start of the ST of a string sequence opened earlier:
+    // then the tail starts at that sequence.
+    if seq.len() == 1 {
+        return string_opener(&bytes[..esc]).unwrap_or(esc);
+    }
+    esc
+}
+
+/// The start of an unterminated string sequence (OSC, DCS, APC, PM, SOS) whose last byte is
+/// in `bytes`, when `bytes` ends inside one.
+fn string_opener(bytes: &[u8]) -> Option<usize> {
+    let esc = memchr::memrchr(0x1b, bytes)?;
+    let kind = *bytes.get(esc + 1)?;
+    let body = &bytes[esc + 2..];
+    let open =
+        matches!(kind, b']' | b'P' | b'_' | b'^' | b'X') && (kind != b']' || !body.contains(&0x07));
+    open.then_some(esc)
+}
+
+/// Whether `seq` (starting with ESC) is a complete escape sequence.
+fn sequence_complete(seq: &[u8]) -> bool {
+    sequence_len(seq) <= seq.len() && sequence_len(seq) > 0
+}
+
+/// Length of the escape sequence at the start of `seq`, or `usize::MAX` when it isn't complete.
+fn sequence_len(seq: &[u8]) -> usize {
+    let Some(&kind) = seq.get(1) else {
+        return usize::MAX;
+    };
+    match kind {
+        b'[' => seq[2..]
+            .iter()
+            .position(|b| (0x40..=0x7e).contains(b))
+            .map_or(usize::MAX, |i| i + 3),
+        // OSC ends with BEL or ST; the others with ST (ESC \, whose ESC we'd have found last).
+        b']' => seq[2..]
+            .iter()
+            .position(|&b| b == 0x07)
+            .map_or(usize::MAX, |i| i + 3),
+        b'P' | b'_' | b'^' | b'X' => usize::MAX,
+        // ESC, intermediates, final byte.
+        _ => seq[1..]
+            .iter()
+            .position(|b| (0x30..=0x7e).contains(b))
+            .map_or(usize::MAX, |i| i + 2),
+    }
+}
+
+/// `from`, or the start of an incomplete UTF-8 character at the end of `bytes[from..]`.
+fn utf8_tail(bytes: &[u8], from: usize) -> usize {
+    let end = bytes.len();
+    let start = end.saturating_sub(3).max(from);
+    for i in (start..end).rev() {
+        let b = bytes[i];
+        if b & 0xc0 == 0x80 {
+            continue; // continuation byte
+        }
+        let need = match b {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        return if end - i < need { i } else { end };
+    }
+    end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +719,32 @@ mod tests {
         let bytes: Vec<&[u8]> = input.chunks(1).collect();
         assert_eq!(collect(&bytes), whole, "byte by byte");
         whole
+    }
+
+    #[test]
+    fn unterminated_tails() {
+        fn tail(b: &[u8]) -> &[u8] {
+            &b[unterminated_tail(b)..]
+        }
+        assert_eq!(tail(b"plain text\r\n"), b"");
+        assert_eq!(tail(b"red \x1b[31mtext"), b"");
+        assert_eq!(tail(b"red \x1b[31"), b"\x1b[31");
+        assert_eq!(tail(b"red \x1b"), b"\x1b");
+        assert_eq!(tail(b"x \x1b]0;title"), b"\x1b]0;title");
+        assert_eq!(tail(b"x \x1b]0;title\x07"), b"");
+        assert_eq!(tail(b"x \x1b]0;title\x1b"), b"\x1b]0;title\x1b");
+        assert_eq!(tail(b"x \x1b]0;title\x1b\\"), b"");
+        assert_eq!(tail(b"x \x1b_Ga=T;AAAA"), b"\x1b_Ga=T;AAAA");
+        assert_eq!(tail(b"x \x1b_Ga=T;AAAA\x1b\\done"), b"");
+        assert_eq!(tail(b"x \x1b(B"), b"");
+        assert_eq!(tail(b"x \x1b("), b"\x1b(");
+        assert_eq!(tail("caf\u{e9}".as_bytes()), b"");
+        assert_eq!(tail(&"caf\u{e9}".as_bytes()[..4]), &[0xc3]);
+        assert_eq!(
+            tail(&"\u{1f600}".as_bytes()[..3]),
+            &"\u{1f600}".as_bytes()[..3]
+        );
+        assert_eq!(tail(&[b'\x1b', b'[', b'm', 0xe2, 0x94]), &[0xe2, 0x94]);
     }
 
     #[test]

@@ -26,6 +26,11 @@ use crate::pty;
 /// Bumped when [`Handoff`] changes incompatibly. A new daemon reads every version up to its own.
 pub const HANDOFF_VERSION: u32 = 1;
 
+/// How long the old image waits for a reader to stop, or for a parser that makes no progress.
+const QUIESCE_STALL: std::time::Duration = std::time::Duration::from_secs(3);
+/// The most it waits for its parsers to catch up (a debug build parses slowly).
+const QUIESCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Handoff {
     pub version: u32,
@@ -55,12 +60,22 @@ pub struct PaneHandoff {
     pub shell_integration_seen: bool,
     /// Base64 of the terminal's serialized state.
     pub state: String,
+    /// Base64 of the unterminated end of the output the old image parsed, fed to the new
+    /// terminal after `state` (empty from images that didn't write it).
+    #[serde(default)]
+    pub pending: String,
 }
 
 impl PaneHandoff {
     pub fn state_bytes(&self) -> Vec<u8> {
         base64::engine::general_purpose::STANDARD
             .decode(&self.state)
+            .unwrap_or_default()
+    }
+
+    pub fn pending_bytes(&self) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(&self.pending)
             .unwrap_or_default()
     }
 
@@ -141,6 +156,21 @@ pub fn perform(
     let exe = target(socket);
     if let Err(e) = check(&exe) {
         log::warn!("upgrade refused: {e}");
+        return;
+    }
+    // Stop reading the PTYs and parse what was read: the terminals are then serialized with
+    // nothing lost, and the output that follows stays in the kernel for the new image. Readers
+    // resume if we return (the upgrade didn't happen).
+    struct Resume<'a>(&'a Daemon);
+    impl Drop for Resume<'_> {
+        fn drop(&mut self) {
+            self.0.resume_readers();
+        }
+    }
+    let _resume = Resume(daemon);
+    if !daemon.quiesce_readers(QUIESCE_STALL, QUIESCE_LIMIT) {
+        // Going on would drop what they read; the next upgrade request can try again.
+        log::warn!("upgrade aborted: pane readers did not stop in time");
         return;
     }
     // If the new image dies before adopting the panes, their shells are gone, but the session

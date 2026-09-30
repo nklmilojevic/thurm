@@ -116,9 +116,11 @@ fn main() {
         adopt => {
             if let Some(Err(e)) = &adopt {
                 // The panes' fds are lost with the file; the snapshot saved before the
-                // upgrade brings the session back. The old listener still holds the socket,
-                // so skip the single-instance check and bind afresh.
+                // upgrade brings the session back. Close the inherited PTY masters (which
+                // hangs up the shells running invisibly behind them) and the old listener,
+                // then skip the single-instance check and bind afresh.
                 eprintln!("thurmd: cannot adopt the previous daemon's panes: {e}");
+                pty::close_inherited_fds();
             } else if UnixStream::connect(&socket).is_ok() {
                 // Single instance: if a daemon answers on the socket, we're done.
                 eprintln!("thurmd: already running on {}", socket.display());
