@@ -21,7 +21,7 @@ if status is-interactive; and not set -q __thurm_fish_loaded
     end
 
     function __thurm_prompt --on-event fish_prompt
-        printf '\e]7;file://%s%s\a' (hostname) (string escape --style=url -- $PWD)
+        printf '\e]7;file://%s%s\a' $hostname (string escape --style=url -- $PWD)
         # $PATH for Thurm's tab completion (only when it changed).
         set -l path (string join : -- $PATH)
         if test -n "$__thurm_token"; and test "$path" != "$__thurm_last_path"
