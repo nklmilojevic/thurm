@@ -15,14 +15,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if offerMoveToApplications() { return }
+        startUp()
+    }
+
+    /// Everything after the launch-location check.
+    func startUp() {
         if MetalContext.shared == nil {
             // Every pane would stay blank.
             let alert = NSAlert()
             alert.alertStyle = .critical
             alert.messageText = "Thurm Can't Draw on This Mac"
-            alert.informativeText = "Thurm needs Metal to draw terminals, and Metal is not available. "
-                + "Your shells keep running in the session daemon."
+            alert.informativeText = "Thurm needs Metal to draw terminals, and Metal is not available "
+                + "on this Mac."
             alert.runModal()
+            NSApp.terminate(nil)
+            return
         }
         FontShaper.registerBundledFonts()
         Notifications.shared.setup()
@@ -53,11 +60,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                        fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications")]
         for dir in targets {
             let dest = dir.appendingPathComponent(url.lastPathComponent)
+            // Copied next to it first: an installed Thurm is only replaced by a complete copy.
+            let staging = dir.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString)")
             do {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-                if fm.fileExists(atPath: dest.path) { try fm.trashItem(at: dest, resultingItemURL: nil) }
-                try fm.copyItem(at: url, to: dest)
+                try fm.copyItem(at: url, to: staging)
+                if fm.fileExists(atPath: dest.path) {
+                    _ = try fm.replaceItemAt(dest, withItemAt: staging)
+                } else {
+                    try fm.moveItem(at: staging, to: dest)
+                }
             } catch {
+                try? fm.removeItem(at: staging)
                 continue
             }
             // Gatekeeper already checked this copy of the app; without the quarantine flag the
@@ -67,8 +81,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             xattr.arguments = ["-dr", "com.apple.quarantine", dest.path]
             try? xattr.run()
             xattr.waitUntilExit()
-            NSWorkspace.shared.openApplication(at: dest, configuration: NSWorkspace.OpenConfiguration()) { _, _ in
-                DispatchQueue.main.async { NSApp.terminate(nil) }
+            // This copy quits only once the moved one runs; if it can't be opened, this one
+            // carries on.
+            NSWorkspace.shared.openApplication(at: dest, configuration: NSWorkspace.OpenConfiguration()) { app, error in
+                DispatchQueue.main.async {
+                    if app != nil && error == nil {
+                        NSApp.terminate(nil)
+                        return
+                    }
+                    let failed = NSAlert()
+                    failed.messageText = "Thurm Could Not Be Opened from Applications"
+                    failed.informativeText = "It was copied to \(dest.path). \(error?.localizedDescription ?? "")"
+                    failed.runModal()
+                    (NSApp.delegate as? AppDelegate)?.startUp()
+                }
             }
             return true
         }
