@@ -400,7 +400,11 @@ impl Client {
             // Write by hand, giving each call only the time left: a peer that reads a little
             // at a time must not stretch the request past its deadline.
             Some(d) => (|| {
-                w.flush()?;
+                // Every write flushes, so leftovers mean an earlier one failed partway: the
+                // stream is out of step already.
+                if !w.buffer().is_empty() {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
                 let stream = w.get_mut();
                 let mut rest = &buf[..];
                 while !rest.is_empty() {
@@ -433,6 +437,12 @@ impl Client {
                 self.alive.store(false, Ordering::Relaxed);
                 let _ = w.get_ref().shutdown(std::net::Shutdown::Both);
                 Err(ClientError::Timeout)
+            }
+            // Out of step (see above): nothing more can be sent on it.
+            Err(e) if deadline.is_some() && e.kind() == std::io::ErrorKind::BrokenPipe => {
+                self.alive.store(false, Ordering::Relaxed);
+                let _ = w.get_ref().shutdown(std::net::Shutdown::Both);
+                Err(ClientError::Disconnected)
             }
             Err(e) => Err(e.into()),
         }
