@@ -1548,6 +1548,22 @@ pub fn style(r: &GridRef) -> Style {
     s
 }
 
+/// Cells the first grapheme cluster of `cps` takes, as the terminal lays it out, and how many
+/// codepoints it is. `clustered`: grapheme clustering (mode 2027) is on; off, every codepoint
+/// is its own cluster.
+pub fn cluster_width(cps: &[u32], clustered: bool) -> (usize, usize) {
+    if cps.is_empty() {
+        return (0, 0);
+    }
+    if !clustered {
+        return (1, unsafe { ffi::ghostty_unicode_codepoint_width(cps[0]) }
+            as usize);
+    }
+    let mut width = 0u8;
+    let n = unsafe { ffi::ghostty_unicode_grapheme_width(cps.as_ptr(), cps.len(), &mut width) };
+    (n.max(1), width as usize)
+}
+
 /// The full grapheme cluster (base codepoint first) of the cell.
 pub fn graphemes(r: &GridRef) -> Vec<char> {
     let mut buf = [0u32; 16];

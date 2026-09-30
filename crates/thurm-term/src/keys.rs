@@ -63,8 +63,14 @@ impl Encoders {
         e
     }
 
-    /// Bytes for the PTY for a key, in the terminal's current modes.
-    pub fn key(&mut self, vt: &Vt, ev: &KeyEvent) -> Vec<u8> {
+    /// Bytes for the PTY for a key, in the terminal's current modes. `kitty`: the kitty
+    /// keyboard protocol is enabled in the config (off: keys stay legacy whatever the program
+    /// pushed).
+    pub fn key(&mut self, vt: &Vt, ev: &KeyEvent, kitty: bool) -> Vec<u8> {
+        // libghostty-vt's keys stop at F25; the kitty protocol numbers F26-F35 on.
+        if let Key::Named(NamedKey::F(n @ 26..=35)) = ev.key {
+            return kitty_function_key(n, ev, if kitty { vt.kitty_flags() } else { 0 });
+        }
         let (key, unshifted) = match ev.key {
             Key::Char(c) => (physical_key(ev.base_layout.unwrap_or(c)), c as u32),
             Key::Named(k) => (named_key(k), 0),
@@ -97,6 +103,14 @@ impl Encoders {
         };
         let mut out = unsafe {
             ffi::ghostty_key_encoder_setopt_from_terminal(self.key, vt.raw());
+            if !kitty {
+                let none: ffi::KittyKeyFlags = 0;
+                ffi::ghostty_key_encoder_setopt(
+                    self.key,
+                    ffi::KeyEncoderOption::KITTY_FLAGS,
+                    (&none as *const ffi::KittyKeyFlags).cast(),
+                );
+            }
             // Option-as-Alt is decided by the app: ALT only arrives when it applies.
             let alt = ffi::OptionAsAlt::TRUE;
             ffi::ghostty_key_encoder_setopt(
@@ -154,6 +168,7 @@ impl Encoders {
     /// Wheel movement (`lines` > 0: up) at a cell. For an application that grabbed the mouse
     /// this is buttons 4 / 5; on the alternate screen with alternate scroll mode (1007), arrow
     /// keys. `None` when neither applies.
+    #[allow(clippy::too_many_arguments)]
     pub fn wheel(
         &mut self,
         vt: &Vt,
@@ -162,6 +177,7 @@ impl Encoders {
         row: u16,
         m: u8,
         grid: Grid,
+        kitty: bool,
     ) -> Option<Vec<u8>> {
         if lines == 0 {
             return None;
@@ -210,7 +226,7 @@ impl Encoders {
             base_layout: None,
         };
         for _ in 0..lines.unsigned_abs() {
-            out.extend(self.key(vt, &arrow));
+            out.extend(self.key(vt, &arrow, kitty));
         }
         Some(out)
     }
@@ -316,6 +332,31 @@ unsafe fn encode(
     }
     buf.truncate(len);
     buf
+}
+
+/// F26-F35 in the kitty keyboard protocol (`CSI code ; mods u`, codes 57389-57398): only
+/// with the protocol on (legacy encodings have no sequence for them), presses and repeats,
+/// and releases when the program asked for event types.
+fn kitty_function_key(n: u8, ev: &KeyEvent, flags: u8) -> Vec<u8> {
+    // No legacy form exists: any kitty flag makes them CSI-u.
+    if flags == 0 || (ev.action == KeyAction::Release && flags & 2 == 0) {
+        return Vec::new();
+    }
+    let code = 57363 + u32::from(n);
+    // The protocol's modifier bits are Thurm's own (shift 1, alt 2, ctrl 4, super 8, hyper
+    // 16, meta 32, caps lock 64, num lock 128).
+    let mods = u32::from(ev.mods) + 1;
+    let event = match ev.action {
+        KeyAction::Press => "",
+        KeyAction::Repeat if flags & 2 != 0 => ":2",
+        KeyAction::Repeat => "",
+        KeyAction::Release => ":3",
+    };
+    if mods == 1 && event.is_empty() {
+        format!("\x1b[{code}u").into_bytes()
+    } else {
+        format!("\x1b[{code};{mods}{event}u").into_bytes()
+    }
 }
 
 fn ghostty_mods(m: u8) -> ffi::Mods {

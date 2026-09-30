@@ -330,6 +330,9 @@ impl<'a> Rows<'a> {
     }
 }
 
+/// Most hyperlinks the table holds before it starts over (far more than a screen shows).
+const MAX_LINKS: usize = 4096;
+
 /// Per-client state for incremental frames.
 #[derive(Default, Debug)]
 pub struct ClientView {
@@ -337,6 +340,8 @@ pub struct ClientView {
     cols: u16,
     rows: u16,
     links_sent: usize,
+    /// The `Terminal::links_gen` of the link table the client has.
+    links_gen: u64,
     /// Images the client has, with the generation it has of each.
     images_sent: HashMap<u32, u64>,
     last: Option<FrameMeta>,
@@ -490,6 +495,8 @@ pub struct Terminal {
     cfg: EngineConfig,
     links: HashMap<String, u16>,
     link_list: Vec<String>,
+    /// Bumped when the link table starts over (see `MAX_LINKS`).
+    links_gen: u64,
     search: Option<SearchState>,
     title: Option<String>,
     focused: bool,
@@ -539,6 +546,7 @@ impl Terminal {
             size,
             links: HashMap::new(),
             link_list: Vec::new(),
+            links_gen: 0,
             search: None,
             title: None,
             focused: true,
@@ -690,7 +698,10 @@ impl Terminal {
                 }
                 Chunk::Osc(body) => {
                     self.handle_osc(&body);
-                    if let Some(f) = &mut self.forward {
+                    // A shared OSC (52) follows as a Pass chunk too: forward it once.
+                    if let Some(f) = &mut self.forward
+                        && !crate::filter::osc_is_passed(&body)
+                    {
                         f.extend_from_slice(b"\x1b]");
                         f.extend_from_slice(&body);
                         f.push(0x07);
@@ -1250,6 +1261,18 @@ impl Terminal {
         if self.prompt_hold.is_some() {
             return None;
         }
+        // Hyperlink ids are handed out as rows are drawn, and every new one grew the table
+        // every client gets (`ls --hyperlink` on a big directory ran it out of ids). Past
+        // MAX_LINKS it starts over: rows are encoded again with new ids, and clients get the
+        // new table with them.
+        if self.link_list.len() > MAX_LINKS {
+            self.links.clear();
+            self.link_list.clear();
+            self.links_gen += 1;
+            for r in self.frame_rows.iter_mut().flatten() {
+                r.encoded = None;
+            }
+        }
         let cols = self.cols;
         let rows = self.rows;
         let full = view.cols as usize != cols || view.rows as usize != rows || view.last.is_none();
@@ -1472,12 +1495,14 @@ impl Terminal {
             images,
             title: self.title.clone().unwrap_or_default(),
         };
-        let links = if self.link_list.len() > view.links_sent || full {
-            view.links_sent = self.link_list.len();
-            self.link_list.clone()
-        } else {
-            Vec::new()
-        };
+        let links =
+            if self.link_list.len() > view.links_sent || full || view.links_gen != self.links_gen {
+                view.links_sent = self.link_list.len();
+                view.links_gen = self.links_gen;
+                self.link_list.clone()
+            } else {
+                Vec::new()
+            };
         if !full
             && lines.is_empty()
             && peek.is_none()
@@ -1732,7 +1757,7 @@ impl Terminal {
 
     /// Encode a key for the PTY. Scrolls back to the bottom when bytes are produced.
     pub fn key(&mut self, ev: &KeyEvent) -> Vec<u8> {
-        let bytes = self.enc.key(&self.vt, ev);
+        let bytes = self.enc.key(&self.vt, ev, self.cfg.kitty_keyboard);
         if !bytes.is_empty() {
             self.scroll_to_bottom();
         }
@@ -1834,7 +1859,15 @@ impl Terminal {
     pub fn wheel(&mut self, lines: i32, col: u16, row: u16, m: u8) -> Vec<u8> {
         let grabbed = self.mode().intersects(TermMode::MOUSE_MODE) && m & mods::SHIFT == 0;
         if (grabbed || self.is_alt_screen())
-            && let Some(b) = self.enc.wheel(&self.vt, lines, col, row, m, self.grid())
+            && let Some(b) = self.enc.wheel(
+                &self.vt,
+                lines,
+                col,
+                row,
+                m,
+                self.grid(),
+                self.cfg.kitty_keyboard,
+            )
         {
             return b;
         }
@@ -2491,6 +2524,7 @@ impl Terminal {
     fn export_lines_marked(&self, top: i32, bottom: i32) -> Vec<(String, bool)> {
         use vt::Semantic;
         let mut out = self.export_lines(top, bottom, true);
+        let clustered = self.vt.mode(vt::mode(2027, false));
         let mut current = Semantic::OUTPUT;
         for (i, line) in (top..=bottom).enumerate() {
             let Some(r0) = self.row_ref(line) else {
@@ -2517,7 +2551,7 @@ impl Terminal {
             }
             let (text, _) = &mut out[i];
             for (col, kind) in marks.into_iter().rev() {
-                let at = byte_offset_of_column(text, col);
+                let at = byte_offset_of_column(text, col, clustered);
                 text.insert_str(
                     at,
                     &format!("\x1b]133;{kind};{}\x07", crate::osc::REPLAY_MARK),
@@ -2685,28 +2719,44 @@ fn strip_sgr(text: &str) -> String {
     out
 }
 
-/// Byte offset in an exported line (text with SGR escapes) where display column `col` starts.
-fn byte_offset_of_column(text: &str, col: usize) -> usize {
+/// Byte offset in an exported line (text with SGR escapes) where display column `col` starts,
+/// with the terminal's own character widths (`clustered`: mode 2027).
+fn byte_offset_of_column(text: &str, col: usize, clustered: bool) -> usize {
     let mut column = 0;
     let mut chars = text.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if c == '\x1b' {
+    let mut run: Vec<(usize, u32)> = Vec::new();
+    loop {
+        // A run of text up to the next escape (or the end), measured cluster by cluster.
+        run.clear();
+        while let Some(&(i, c)) = chars.peek() {
+            if c == '\x1b' {
+                break;
+            }
+            run.push((i, c as u32));
+            chars.next();
+        }
+        let cps: Vec<u32> = run.iter().map(|&(_, c)| c).collect();
+        let mut k = 0;
+        while k < cps.len() {
+            let (n, width) = vt::cluster_width(&cps[k..], clustered);
+            if width > 0 && column >= col {
+                return run[k].0;
+            }
+            column += width;
+            k += n;
+        }
+        match chars.next() {
             // Skip a CSI sequence.
-            for (_, d) in chars.by_ref() {
-                if d.is_ascii_alphabetic() {
-                    break;
+            Some(_) => {
+                for (_, d) in chars.by_ref() {
+                    if d.is_ascii_alphabetic() {
+                        break;
+                    }
                 }
             }
-            continue;
-        }
-        if column >= col {
-            return i;
-        }
-        if unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) > 0 {
-            column += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            None => return text.len(),
         }
     }
-    text.len()
 }
 
 #[derive(Default)]

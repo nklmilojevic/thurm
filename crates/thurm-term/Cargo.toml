@@ -16,5 +16,4 @@ png.workspace = true
 base64.workspace = true
 regex.workspace = true
 log.workspace = true
-unicode-width.workspace = true
 libc.workspace = true

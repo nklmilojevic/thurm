@@ -20,6 +20,12 @@ const INTERCEPTED_OSC: &[u32] = &[
 /// Intercepted OSC numbers libghostty-vt gets too (it handles other parts of them).
 const SHARED_OSC: &[u32] = &[52];
 
+/// Whether the filter passes this intercepted OSC on as well (see `SHARED_OSC`): then the
+/// passed copy is the one to forward.
+pub fn osc_is_passed(body: &[u8]) -> bool {
+    osc_number(body).is_some_and(|n| SHARED_OSC.contains(&n))
+}
+
 /// Longest OSC we buffer before giving up and passing it through untouched.
 const MAX_OSC: usize = 8 * 1024 * 1024;
 /// Longest APC we accept (kitty chunks are ≤ 4 KiB, but be generous).
@@ -278,7 +284,20 @@ impl StreamFilter {
                     }
                 }
                 State::Osc => {
-                    match memchr::memchr2(0x07, 0x1b, &input[i..]) {
+                    match input[i..]
+                        .iter()
+                        .position(|&b| matches!(b, 0x07 | 0x1b | CAN | SUB))
+                    {
+                        Some(off) if matches!(input[i + off], CAN | SUB) => {
+                            // CAN/SUB cancel the sequence: hand it to the terminal as it came,
+                            // which drops it.
+                            self.buf.extend_from_slice(&input[i..i + off]);
+                            let mut raw = b"\x1b]".to_vec();
+                            raw.append(&mut self.buf);
+                            out.push(Chunk::Pass(Cow::Owned(raw)));
+                            self.state = State::Ground;
+                            i += off;
+                        }
                         Some(off) => {
                             self.buf.extend_from_slice(&input[i..i + off]);
                             i += off;
@@ -379,7 +398,16 @@ impl StreamFilter {
                     }
                 }
                 State::Apc => {
-                    match memchr::memchr3(0x1b, 0x07, 0x9c, &input[i..]) {
+                    match input[i..]
+                        .iter()
+                        .position(|&b| matches!(b, 0x1b | 0x07 | 0x9c | CAN | SUB))
+                    {
+                        Some(off) if matches!(input[i + off], CAN | SUB) => {
+                            // Cancelled: drop it; CAN/SUB go on to the terminal.
+                            self.buf.clear();
+                            self.state = State::Ground;
+                            i += off;
+                        }
                         Some(off) => {
                             self.buf.extend_from_slice(&input[i..i + off]);
                             i += off;
@@ -417,7 +445,14 @@ impl StreamFilter {
                     pass_start = i;
                 }
                 State::Discard => {
-                    match memchr::memchr2(0x1b, 0x07, &input[i..]) {
+                    match input[i..]
+                        .iter()
+                        .position(|&b| matches!(b, 0x1b | 0x07 | CAN | SUB))
+                    {
+                        Some(off) if matches!(input[i + off], CAN | SUB) => {
+                            self.state = State::Ground;
+                            i += off;
+                        }
                         Some(off) => {
                             i += off;
                             self.state = if input[i] == 0x07 {
@@ -604,6 +639,10 @@ fn is_intercepted(body: &[u8]) -> bool {
     osc_number(body).is_some_and(|n| INTERCEPTED_OSC.contains(&n))
 }
 
+/// CAN and SUB cancel an escape sequence in progress (ECMA-48).
+const CAN: u8 = 0x18;
+const SUB: u8 = 0x1a;
+
 /// Where the unterminated end of `bytes` starts: an escape sequence that has no final byte or
 /// terminator yet, or the start of an incomplete UTF-8 character. `bytes.len()` when the
 /// stream ends between sequences. Replaying that tail into a fresh parser before the rest of
@@ -745,6 +784,18 @@ mod tests {
             &"\u{1f600}".as_bytes()[..3]
         );
         assert_eq!(tail(&[b'\x1b', b'[', b'm', 0xe2, 0x94]), &[0xe2, 0x94]);
+    }
+
+    #[test]
+    fn can_and_sub_cancel_sequences() {
+        // A cancelled APC transmission is dropped; CAN goes on, and so does the text after.
+        let (pass, seqs) = run(b"\x1b_Ga=T,t=f;L3Rt\x18after");
+        assert_eq!(pass, b"\x18after");
+        assert!(seqs.is_empty());
+        // A cancelled OSC reaches the terminal as it came (which drops it), not as an OSC.
+        let (pass, seqs) = run(b"\x1b]0;title\x1aafter");
+        assert_eq!(pass, b"\x1b]0;title\x1aafter");
+        assert!(seqs.is_empty());
     }
 
     #[test]
