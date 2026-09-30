@@ -86,6 +86,9 @@ impl Ssh {
             "PermitLocalCommand=no",
             "ControlMaster=no",
             "ControlPath=none",
+            // A Host block's `RemoteCommand` (`tmux new -A`) can't be combined with the
+            // commands Thurm runs ("Cannot execute command-line and remote command").
+            "RemoteCommand=none",
             "ServerAliveInterval=15",
             "ServerAliveCountMax=3",
             "ConnectTimeout=15",
@@ -140,15 +143,16 @@ impl Ssh {
     /// The tunnel: forwards `local` (a Unix socket on this machine) to `remote` (the daemon's
     /// socket there) and nothing else. `ClearAllForwardings` is not used: it drops the `-L`
     /// given on the command line too (checked with OpenSSH 10.5), so [`check_forwards`]
-    /// refuses hosts whose config adds remote or dynamic forwards instead.
+    /// refuses hosts whose config adds remote or dynamic forwards instead. The host's own
+    /// `LocalForward`s still come along; without `ExitOnForwardFailure` a port one of them
+    /// can't bind is a warning, not a tunnel that fails forever (the tunnel is up once its
+    /// socket answers).
     pub fn tunnel_command(&self, local: &Path, remote: &str) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(self.base_args())
             .args([
                 "-N",
                 "-T",
-                "-o",
-                "ExitOnForwardFailure=yes",
                 "-o",
                 "StreamLocalBindUnlink=yes",
                 "-o",
@@ -264,7 +268,7 @@ pub fn generated_config() -> String {
     let home = dirs_home();
     format!(
         "# Written by Thurm for its ssh connections to remote workspaces.\n\
-         Include {}/.ssh/config\n\
+         Include \"{}/.ssh/config\"\n\
          Include /etc/ssh/ssh_config\n",
         home.display()
     )
@@ -373,6 +377,7 @@ pub fn classify(stderr: &str) -> SshError {
         "tailscale ssh requires an additional check",
         "no such identity",
         "check the ssh config",
+        "cannot execute command-line and remote command",
     ];
     let message = if text.is_empty() {
         "ssh failed without saying why".to_owned()
@@ -464,10 +469,12 @@ mod tests {
             "BatchMode=yes",
             "ForwardAgent=no",
             "ForwardX11=no",
-            "ExitOnForwardFailure=yes",
+            "RemoteCommand=none",
         ] {
             assert!(args.windows(2).any(|w| w[0] == "-o" && w[1] == o), "{o}");
         }
+        // A LocalForward of the user's that can't bind must not take the tunnel down.
+        assert!(!args.iter().any(|a| a.starts_with("ExitOnForwardFailure")));
         // First value wins in ssh: the hardening comes before the destination.
         assert!(args.iter().position(|a| a == "BatchMode=yes").unwrap() < args.len() - 1);
     }

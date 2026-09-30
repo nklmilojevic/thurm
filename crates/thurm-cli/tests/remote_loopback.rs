@@ -86,6 +86,11 @@ impl Drop for World {
 
 fn setup() -> Option<World> {
     let Some(sshd) = find_sshd() else {
+        // CI installs sshd and sets this: there, a missing sshd is a failure, not a skip.
+        assert!(
+            std::env::var_os("THURM_REQUIRE_SSHD").is_none(),
+            "no sshd found, and THURM_REQUIRE_SSHD is set"
+        );
         eprintln!("note: no sshd found; skipping the loopback ssh tests");
         return None;
     };

@@ -186,7 +186,7 @@ fn daemon_state(
         None,
         Duration::from_secs(30),
     )?;
-    Ok(parse_daemon_status(out.lines().next().unwrap_or("")))
+    Ok(out.lines().find_map(parse_daemon_status))
 }
 
 fn parse_daemon_status(line: &str) -> Option<DaemonState> {
@@ -288,7 +288,7 @@ pub fn install(
         "thurm remote-info"
     );
     let out = ssh.run(FINISH, &[], None, Duration::from_secs(30))?;
-    let info: ThurmInfo = serde_json::from_str(out.lines().next().unwrap_or(""))
+    let info: ThurmInfo = json_line(&out)
         .map_err(|e| InstallError::Failed(format!("the installed thurm does not run: {e}")))?;
     if info.protocol != thurm_proto::PROTOCOL_VERSION {
         return Err(InstallError::Failed(format!(
@@ -300,20 +300,51 @@ pub fn install(
     Ok(info)
 }
 
+/// The first line of `out` that parses as a `T`: the user's shell startup files may print
+/// lines of their own before a command's output.
+fn json_line<T: serde::de::DeserializeOwned>(out: &str) -> Result<T, String> {
+    let mut first_err = None;
+    for line in out.lines().filter(|l| l.trim_start().starts_with('{')) {
+        match serde_json::from_str(line) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                first_err.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| "no output".into()))
+}
+
 fn read(p: &Path) -> Result<Vec<u8>, InstallError> {
     std::fs::read(p).map_err(|e| InstallError::Failed(format!("{}: {e}", p.display())))
 }
 
 /// Writes `data` to `~/.local/share/thurm/bin/<name>` on the host, atomically (a running
-/// daemon keeps its old file).
+/// daemon keeps its old file). The copy is checked on the host (its length, and its SHA-256
+/// where `sha256sum` exists) before it replaces anything: an upload cut short must not install
+/// a truncated binary.
 fn upload(ssh: &Ssh, name: &str, data: &[u8]) -> Result<(), SshError> {
-    const UPLOAD: &str = concat!(
-        "TH=\"${THURM_HOME:-$HOME}\"; D=\"$TH/.local/share/thurm/bin\"; ",
-        "mkdir -p \"$D\" && cat > \"$D/.$1.new\" && chmod 755 \"$D/.$1.new\" && mv -f \"$D/.$1.new\" \"$D/$1\""
-    );
-    ssh.run(UPLOAD, &[name], Some(data), Duration::from_secs(600))
-        .map(|_| ())
+    let len = data.len().to_string();
+    let sum = hex(&Sha256::digest(data));
+    ssh.run(
+        UPLOAD,
+        &[name, &len, &sum],
+        Some(data),
+        Duration::from_secs(600),
+    )
+    .map(|_| ())
 }
+
+/// `$1` the file name, `$2` its length, `$3` its SHA-256 (hex).
+const UPLOAD: &str = concat!(
+    "TH=\"${THURM_HOME:-$HOME}\"; D=\"$TH/.local/share/thurm/bin\"; N=\"$D/.$1.new\"; ",
+    "mkdir -p \"$D\" && cat > \"$N\" || exit 1; ",
+    "n=$(wc -c < \"$N\"); ",
+    "if [ $n -ne \"$2\" ]; then rm -f \"$N\"; echo \"upload of $1 incomplete: $n of $2 bytes\" >&2; exit 1; fi; ",
+    "if command -v sha256sum >/dev/null 2>&1 && [ \"$(sha256sum < \"$N\" | cut -c1-64)\" != \"$3\" ]; then ",
+    "rm -f \"$N\"; echo \"upload of $1 is corrupt (checksum mismatch)\" >&2; exit 1; fi; ",
+    "chmod 755 \"$N\" && mv -f \"$N\" \"$D/$1\""
+);
 
 /// The Linux build's `thurm` and `thurmd`, downloaded and checked, or taken from
 /// `THURM_ARTIFACT_DIR` (a directory of archives, for development).
@@ -542,5 +573,21 @@ mod tests {
             hex(&Sha256::digest(b"abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn upload_script_is_safe_to_quote() {
+        crate::ssh::quote(UPLOAD).unwrap();
+    }
+
+    #[test]
+    fn json_after_startup_noise() {
+        #[derive(serde::Deserialize)]
+        struct T {
+            a: u32,
+        }
+        let out = "Welcome to devbox!\n{ \"motd\": broken\n{\"a\": 3}\n";
+        assert_eq!(json_line::<T>(out).unwrap().a, 3);
+        assert!(json_line::<T>("only text\n").is_err());
     }
 }
