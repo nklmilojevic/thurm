@@ -393,8 +393,9 @@ impl Client {
     }
 
     /// Writes `env`, giving up at `deadline` (waiting for the writer lock included). A write
-    /// cut off mid-message would leave the stream out of step, so a timeout closes the
-    /// connection.
+    /// cut off mid-message would leave the stream out of step, so a timeout once writing began
+    /// closes the connection; one before (the lock, an expired deadline) only fails the
+    /// request.
     fn write_by(&self, env: &Envelope, deadline: Option<Instant>) -> Result<(), ClientError> {
         if !self.is_alive() {
             return Err(ClientError::Disconnected);
@@ -404,6 +405,7 @@ impl Client {
             Some(d) => self.writer.try_lock_until(d).ok_or(ClientError::Timeout)?,
             None => self.writer.lock(),
         };
+        let mut started = false;
         let written = match deadline {
             None => w.write_all(&buf).and_then(|()| w.flush()),
             // Write by hand, giving each call only the time left: a peer that reads a little
@@ -422,6 +424,9 @@ impl Client {
                         return Err(std::io::ErrorKind::TimedOut.into());
                     }
                     stream.set_write_timeout(Some(left))?;
+                    // A write that times out may still have sent part of it (macOS reports
+                    // EAGAIN then): from here on the stream can be out of step.
+                    started = true;
                     match stream.write(rest) {
                         Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
                         Ok(n) => rest = &rest[n..],
@@ -443,8 +448,10 @@ impl Client {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                self.alive.store(false, Ordering::Relaxed);
-                let _ = w.get_ref().shutdown(std::net::Shutdown::Both);
+                if started {
+                    self.alive.store(false, Ordering::Relaxed);
+                    let _ = w.get_ref().shutdown(std::net::Shutdown::Both);
+                }
                 Err(ClientError::Timeout)
             }
             // Out of step (see above): nothing more can be sent on it.
@@ -635,9 +642,11 @@ mod tests {
         let r = client.request_timeout(
             Request::Input {
                 pane: 1,
-                data: vec![b'x'; 32 * 1024 * 1024],
+                // Far more than the socket holds, small enough to encode well within the
+                // deadline (in debug builds too): the write starts, then stalls.
+                data: vec![b'x'; 4 * 1024 * 1024],
             },
-            Some(Duration::from_millis(300)),
+            Some(Duration::from_millis(500)),
         );
         assert!(matches!(r, Err(ClientError::Timeout)), "{r:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -715,6 +724,16 @@ mod tests {
                 focused: true,
             })
             .unwrap();
+        // A deadline that passed before anything was written fails only that request.
+        for _ in 0..100 {
+            let r = client.request_timeout(Request::ListPanes, Some(Duration::ZERO));
+            assert!(matches!(r, Err(ClientError::Timeout) | Ok(_)), "{r:?}");
+        }
+        assert!(client.is_alive());
+        assert!(matches!(
+            client.request(Request::ListPanes).unwrap(),
+            Response::Panes(_)
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
