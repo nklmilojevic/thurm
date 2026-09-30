@@ -50,7 +50,7 @@ Use `--pane ID` to select another source pane. Without `--split`, the fork
 opens in a new tab. The installed agent must support its configured fork command.
 
 Saved sessions can use agent resume commands after a daemon restart.
-See [Sessions](/thurm/sessions/) for the limits of restoration.
+See [Sessions](/sessions/) for the limits of restoration.
 
 ## Custom presets and detection
 
@@ -65,7 +65,7 @@ An empty preset list uses installed built-in agents. To define another agent,
 add an `[[agents.define]]` block. `processes` matches executable names; `argv`
 matches parts of process arguments. `working` and `attention` match screen text.
 Optional launch, resume, and fork commands control how Thurm starts that agent.
-See the [configuration reference](/thurm/configuration-reference/) for a full example.
+See the [configuration reference](/configuration-reference/) for a full example.
 
 Agent notifications apply to panes without focus. Check macOS notification
 permissions and `[notifications]` if they do not appear. Optional AI summaries

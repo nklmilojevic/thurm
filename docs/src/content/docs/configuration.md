@@ -24,7 +24,7 @@ size = 14.0
 ligatures = true
 
 [window]
-tab_style = "sidebar"
+tab_style = "native"
 option_as_alt = "left"
 
 [colors]
@@ -34,7 +34,7 @@ theme = "light:catppuccin-latte,dark:catppuccin-mocha"
 quit = "detach"
 ```
 
-Use the [complete reference](/thurm/configuration-reference/) for defaults, value
+Use the [complete reference](/configuration-reference/) for defaults, value
 ranges, and optional settings. Copy only the sections you need. Do not repeat
 a TOML section header when you add more settings to that section.
 
@@ -43,7 +43,7 @@ a TOML section header when you add more settings to that section.
 ```sh
 thurm set font.size 14.0
 thurm set font.ligatures true
-thurm set window.tab_style sidebar
+thurm set window.tab_style native
 thurm theme
 thurm theme nord
 ```

@@ -82,6 +82,6 @@ to choose Release or Tip. By default, `updates.channel = "auto"` follows the
 installed build. Release receives tagged versions. Tip receives a nightly
 build of `main`, made from the newest commit that passed CI. Local builds do not have an
 update feed and public signing key unless you configure them during the build.
-See [update settings](/thurm/configuration/#updates) for background checks and downloads.
+See [update settings](/configuration/#updates) for background checks and downloads.
 
-Continue with [Use Thurm](/thurm/usage/) and [Configuration](/thurm/configuration/).
+Continue with [Use Thurm](/usage/) and [Configuration](/configuration/).

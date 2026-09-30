@@ -55,7 +55,7 @@ Open the local address printed by Astro. Before you commit, run
 
 Edit pages in `docs/src/content/docs/`. Each page needs a `title` in its
 frontmatter. Add new pages to `sidebar` in `docs/astro.config.mjs`. Link to other
-pages by their full path, such as `/thurm/usage/`. Edit `config.example.toml` to
+pages by their full path, such as `/usage/`. Edit `config.example.toml` to
 change the configuration reference; the page includes that file on each build.
 
 ## Publish to GitHub Pages
