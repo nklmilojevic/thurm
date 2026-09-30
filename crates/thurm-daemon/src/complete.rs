@@ -406,29 +406,101 @@ fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
     else {
         return Vec::new();
     };
+    // Read while the child runs (output beyond the 64 KiB pipe buffer would otherwise block
+    // it until the deadline), without blocking: a background process the generator leaves
+    // behind may hold the pipe open after it exits.
+    let mut stdout = child.stdout.take();
+    if let Some(s) = &stdout {
+        use std::os::fd::AsRawFd;
+        let fd = s.as_raw_fd();
+        unsafe {
+            libc::fcntl(
+                fd,
+                libc::F_SETFL,
+                libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+            )
+        };
+    }
+    let mut out = Vec::new();
     let deadline = Instant::now() + Duration::from_millis(600);
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Vec::new();
+        if let Some(s) = &mut stdout {
+            match drain(s, &mut out) {
+                Drained::Open => {}
+                Drained::Closed => stdout = None,
+                Drained::TooLarge => break,
             }
         }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                if let Some(s) = &mut stdout {
+                    drain(s, &mut out);
+                }
+                break;
+            }
+            Ok(None) if Instant::now() < deadline => wait_readable(stdout.as_ref(), 10),
+            _ => break,
+        }
     }
-    let mut out = String::new();
-    if let Some(s) = child.stdout.take() {
-        use std::io::Read;
-        let _ = s.take(4 << 20).read_to_string(&mut out);
+    if !matches!(child.try_wait(), Ok(Some(_))) || out.len() > GENERATOR_MAX_OUTPUT {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
     }
+    let out = String::from_utf8_lossy(&out);
     let lines: Vec<String> = out.lines().map(str::to_owned).collect();
     cache
         .lock()
         .unwrap()
         .insert(key, (Instant::now(), lines.clone()));
     lines
+}
+
+const GENERATOR_MAX_OUTPUT: usize = 4 << 20;
+
+enum Drained {
+    /// Everything available was read; the pipe is still open.
+    Open,
+    /// End of file (or an error).
+    Closed,
+    /// More than `GENERATOR_MAX_OUTPUT`.
+    TooLarge,
+}
+
+/// Reads what a nonblocking pipe has now.
+fn drain(s: &mut std::process::ChildStdout, out: &mut Vec<u8>) -> Drained {
+    use std::io::Read;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return Drained::Closed,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.len() > GENERATOR_MAX_OUTPUT {
+                    return Drained::TooLarge;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Drained::Open,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Drained::Closed,
+        }
+    }
+}
+
+/// Waits up to `ms` for `s` to have data (or just sleeps without a pipe).
+fn wait_readable(s: Option<&std::process::ChildStdout>, ms: i32) {
+    use std::os::fd::AsRawFd;
+    match s {
+        Some(s) => {
+            let mut pfd = libc::pollfd {
+                fd: s.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe { libc::poll(&mut pfd, 1, ms) };
+        }
+        None => std::thread::sleep(Duration::from_millis(ms as u64)),
+    }
 }
 
 /// Directories searched for `<command>.json`.
@@ -471,6 +543,32 @@ fn load_spec(command: &str) -> Option<Spec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generator_output_beyond_pipe_buffer() {
+        let script = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "i=0; while [ $i -lt 2000 ]; do echo \"line $i ................................................................................\"; i=$((i+1)); done".to_owned(),
+        ];
+        let lines = run_generator(&script, Path::new("/"), "/bin:/usr/bin");
+        assert_eq!(lines.len(), 2000);
+        assert_eq!(lines[1999].split_whitespace().nth(1), Some("1999"));
+    }
+
+    #[test]
+    fn generator_leaving_the_pipe_open_returns_promptly() {
+        // The generator exits, but a background process keeps its stdout open.
+        let script = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "echo one; echo two; sleep 5 &".to_owned(),
+        ];
+        let started = Instant::now();
+        let lines = run_generator(&script, Path::new("/"), "/bin:/usr/bin");
+        assert_eq!(lines, vec!["one", "two"]);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn words_and_segments() {

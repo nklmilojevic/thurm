@@ -49,6 +49,9 @@ const AI_SCREEN_LINES: usize = 60;
 /// the session. Quitting the app signals the daemon and the shells at once, and the reader can
 /// see the shell go before the signal handler has run.
 const TEARDOWN_GRACE: Duration = Duration::from_millis(200);
+/// Autosave serializes a busy pane's scrollback (under its lock) at most this often.
+/// Explicit saves (quit, upgrade, `thurm save`) always do.
+const HISTORY_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Work for the on-device model (`[ai]`), done one at a time by `ai_worker`.
 enum AiJob {
@@ -140,7 +143,9 @@ pub struct PaneState {
     osc_cwd: Option<String>,
     command_started: Option<Instant>,
     command_line: Option<String>,
-    last_history: Option<Vec<u8>>,
+    last_history: Option<Arc<[u8]>>,
+    /// When `last_history` was serialized.
+    history_at: Option<Instant>,
     saved_generation: u64,
     pending_input: Option<(Instant, Vec<u8>)>,
     shell_integration_seen: bool,
@@ -441,6 +446,7 @@ impl Daemon {
                 command_started: None,
                 command_line: None,
                 last_history: None,
+                history_at: None,
                 saved_generation: 0,
                 pending_input: None,
                 shell_integration_seen: p.shell_integration_seen,
@@ -769,17 +775,18 @@ impl Daemon {
             log::info!("pane {} ended with the daemon", pane.id);
             return;
         }
-        let (code, hold) = {
-            let mut st = pane.state.lock();
-            // Give the kernel a moment to deliver the exit status.
-            let mut code = None;
-            for _ in 0..50 {
-                if let Some(c) = st.pty.try_wait() {
-                    code = c;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+        // Give the kernel a moment to deliver the exit status, without holding the pane's
+        // lock while waiting.
+        let mut code = None;
+        for _ in 0..50 {
+            if let Some(c) = pane.state.lock().pty.try_wait() {
+                code = c;
+                break;
             }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let hold = {
+            let mut st = pane.state.lock();
             st.info.alive = false;
             st.info.exit_code = code;
             if st.hold {
@@ -789,7 +796,7 @@ impl Daemon {
                 };
                 st.term.print(&msg);
             }
-            (code, st.hold)
+            st.hold
         };
         if self.pane(pane.id).is_none() {
             // Closed explicitly; ClosePane already notified clients.
@@ -1123,7 +1130,7 @@ impl Daemon {
                     && last_save.elapsed() > Duration::from_secs(1)
                     || last_save.elapsed() > interval)
             {
-                self.save_session();
+                self.save_session_with(false);
                 last_save = Instant::now();
             }
             let idle_exit = self.config.read().session.daemon_idle_exit_secs;
@@ -1151,6 +1158,12 @@ impl Daemon {
     }
 
     pub fn save_session(&self) {
+        self.save_session_with(true);
+    }
+
+    /// `full`: serialize every changed scrollback now. Autosave leaves panes whose history
+    /// was serialized less than `HISTORY_AUTOSAVE_INTERVAL` ago for a later round.
+    fn save_session_with(&self, full: bool) {
         let Some(store) = &self.store else { return };
         let lines = self.config.read().session.scrollback_lines;
         let mut panes = Vec::new();
@@ -1161,12 +1174,17 @@ impl Daemon {
                 continue;
             }
             let generation = st.term.generation();
-            if generation != st.saved_generation || st.last_history.is_none() {
+            let recent = st
+                .history_at
+                .is_some_and(|at| at.elapsed() < HISTORY_AUTOSAVE_INTERVAL);
+            if (generation != st.saved_generation || st.last_history.is_none()) && (full || !recent)
+            {
                 if let Some(h) = st.term.serialize_history(lines) {
-                    st.last_history = Some(h);
+                    st.last_history = Some(Arc::from(h));
+                    st.history_at = Some(Instant::now());
                 }
                 if let Some(h) = &st.last_history {
-                    scrollbacks.push((pane.id, h.clone()));
+                    scrollbacks.push((pane.id, Arc::clone(h)));
                 }
                 st.saved_generation = generation;
             }
@@ -1353,7 +1371,7 @@ impl Daemon {
                 let daemon = self.clone();
                 let client = client.clone();
                 std::thread::spawn(move || {
-                    let outcome = daemon.wait(pane, until, timeout_ms);
+                    let outcome = daemon.wait(client.id, pane, until, timeout_ms);
                     if id != 0 {
                         client.send(ServerMessage::Response {
                             id,
@@ -1373,6 +1391,27 @@ impl Daemon {
                     }
                 });
                 return;
+            }
+            // Slow read-only requests (completion generators, `ps`/`lsof`) run on their own
+            // thread so they don't hold up the typing, resizes and scrolls that follow on the
+            // same connection. Responses carry their id. Requests that change or snapshot
+            // state stay in order on the reader.
+            slow @ (Request::Complete { .. } | Request::Processes { .. }) => {
+                let daemon = self.clone();
+                let client = client.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("request".into())
+                    .spawn(move || {
+                        let result = daemon.dispatch(&client, slow);
+                        if id != 0 {
+                            client.send(ServerMessage::Response { id, result });
+                        }
+                    });
+                if let Err(e) = spawned {
+                    Err(format!("could not start a request thread: {e}"))
+                } else {
+                    return;
+                }
             }
             other => self.dispatch(client, other),
         };
@@ -1854,6 +1893,7 @@ impl Daemon {
 
     fn wait(
         &self,
+        client: u64,
         pane: PaneId,
         until: WaitCondition,
         timeout_ms: Option<u64>,
@@ -1868,7 +1908,13 @@ impl Daemon {
         // Conditions about "becoming" free need the pane to have been busy first, otherwise
         // `wait --prompt` right after `send` would return before the command even started.
         let started = Instant::now();
+        // The screen is only searched again after new output.
+        let mut matched: Option<(u64, bool)> = None;
         loop {
+            // Nobody is left to tell (the client disconnected).
+            if !self.clients.lock().contains_key(&client) {
+                return Ok(WaitOutcome::Timeout);
+            }
             let Some(p) = self.pane(pane) else {
                 return Ok(WaitOutcome::Exited { code: None });
             };
@@ -1886,9 +1932,19 @@ impl Daemon {
                     }
                     WaitCondition::Prompt => settle && st.info.at_prompt,
                     WaitCondition::Exit => false,
-                    WaitCondition::Match { .. } => regex
-                        .as_ref()
-                        .is_some_and(|r| r.is_match(&st.term.screen_text())),
+                    WaitCondition::Match { .. } => {
+                        let generation = st.term.generation();
+                        match matched {
+                            Some((g, hit)) if g == generation => hit,
+                            _ => {
+                                let hit = regex
+                                    .as_ref()
+                                    .is_some_and(|r| r.is_match(&st.term.screen_text()));
+                                matched = Some((generation, hit));
+                                hit
+                            }
+                        }
+                    }
                     WaitCondition::AgentStatus(want) => {
                         st.agent.state().is_some_and(|a| a.status == *want)
                     }
