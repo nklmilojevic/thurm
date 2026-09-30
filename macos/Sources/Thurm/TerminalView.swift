@@ -27,8 +27,12 @@ final class TerminalView: NSView, NSTextInputClient {
     private let renderer = TerminalRenderer()
     private var shaper: FontShaper?
     private var frameLink: CADisplayLink?
+    /// Wakes the paused display link for the next cursor blink phase.
+    private var blinkTimer: Timer?
     /// Force a redraw on the next display refresh.
-    var needsRender = true
+    var needsRender = true {
+        didSet { if needsRender { wakeLink() } }
+    }
     private var subscribed = false
     private var reportedSize: GridSize?
     private var reportedFocus: Bool?
@@ -94,6 +98,7 @@ final class TerminalView: NSView, NSTextInputClient {
 
     deinit {
         frameLink?.invalidate()
+        blinkTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -107,6 +112,7 @@ final class TerminalView: NSView, NSTextInputClient {
         // Present as soon as a frame is drawn instead of on the next vsync (Alacritty's
         // `SwapInterval::DontWait`); pacing comes from `scheduleRender`.
         layer.displaySyncEnabled = !Perf.tickRendering
+        // Opaque (no WindowServer blending) whenever the window's opacity is 1; see `renderNow`.
         layer.isOpaque = false
         layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         layer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
@@ -122,7 +128,7 @@ final class TerminalView: NSView, NSTextInputClient {
     private var metalLayer: CAMetalLayer? { layer as? CAMetalLayer }
 
     override var isFlipped: Bool { true }
-    override var isOpaque: Bool { false }
+    override var isOpaque: Bool { metalLayer?.isOpaque ?? false }
     override var acceptsFirstResponder: Bool { true }
 
     private var container: TabContentView? { superview as? TabContentView }
@@ -158,6 +164,7 @@ final class TerminalView: NSView, NSTextInputClient {
             nc.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: old)
             nc.removeObserver(self, name: NSWindow.didResignKeyNotification, object: old)
             nc.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: old)
+            nc.removeObserver(self, name: NSWindow.didChangeScreenNotification, object: old)
         }
     }
 
@@ -176,14 +183,13 @@ final class TerminalView: NSView, NSTextInputClient {
                        name: NSWindow.didResignKeyNotification, object: window)
         nc.addObserver(self, selector: #selector(windowOcclusionChanged(_:)),
                        name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        nc.addObserver(self, selector: #selector(windowScreenChanged(_:)),
+                       name: NSWindow.didChangeScreenNotification, object: window)
 
         let link = displayLink(target: self, selector: #selector(displayTick(_:)))
-        // Ask for the panel's full rate (120 Hz on ProMotion) rather than letting it float.
-        let maxFPS = Float(window.screen?.maximumFramesPerSecond ?? 60)
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: min(80, maxFPS), maximum: maxFPS,
-                                                        preferred: maxFPS)
         link.add(to: .main, forMode: .common)
         frameLink = link
+        updateFrameRate()
 
         updateScale()
         updateSubscription()
@@ -222,12 +228,15 @@ final class TerminalView: NSView, NSTextInputClient {
         }
         frameLink?.invalidate()
         frameLink = nil
+        blinkTimer?.invalidate()
+        blinkTimer = nil
         NSObject.cancelPreviousPerformRequests(withTarget: self)
     }
 
     /// Called by the container after layout (zoom changes hide panes).
     func visibilityChanged() {
         updateSubscription()
+        wakeLink()
     }
 
     /// After reconnecting to the daemon: subscribe and report the size again.
@@ -326,6 +335,11 @@ final class TerminalView: NSView, NSTextInputClient {
 
     @objc private func windowOcclusionChanged(_ note: Notification) {
         updateSubscription()
+        wakeLink()
+    }
+
+    @objc private func windowScreenChanged(_ note: Notification) {
+        updateFrameRate()
     }
 
     // MARK: Focus
@@ -370,8 +384,65 @@ final class TerminalView: NSView, NSTextInputClient {
 
     // MARK: Rendering
 
+    /// Asks for the screen's full rate (120 Hz on ProMotion) while the link runs. The link is
+    /// paused whenever nothing animates (`updateLinkState`), so the floor only matters for
+    /// how far the system may throttle an active pane.
+    private func updateFrameRate() {
+        guard let link = frameLink else { return }
+        let maxFPS = Float(window?.screen?.maximumFramesPerSecond ?? 60)
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: min(10, maxFPS), maximum: maxFPS,
+                                                        preferred: maxFPS)
+    }
+
+    /// Resumes the display link for at least one tick.
+    private func wakeLink() {
+        guard let link = frameLink, link.isPaused else { return }
+        link.isPaused = false
+    }
+
+    /// True while the next refresh has work: a pending draw, scroll or animation.
+    private var wantsTick: Bool {
+        needsRender || pendingScroll != nil || smoothActive || flashStart > 0 || renderer.wantsAnotherFrame
+    }
+
+    /// Pauses the display link when nothing animates, so an idle pane costs no wakeups. New
+    /// output is drawn by `frameArrived`; input, focus and visibility changes wake the link;
+    /// a one-shot timer wakes it for the next cursor blink.
+    private func updateLinkState() {
+        guard let link = frameLink else { return }
+        if Perf.tickRendering || wantsTick {
+            link.isPaused = false
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+            return
+        }
+        link.isPaused = true
+        let blinking = config.cursorBlink || renderer.snapshot.info.cursor_blinking
+        guard blinking, isKeyFocused, window != nil, subscribed, !isHiddenOrHasHiddenAncestor else {
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+            return
+        }
+        // An early wake is harmless: the tick finds no phase change and schedules again.
+        if blinkTimer?.isValid == true { return }
+        let elapsed = CACurrentMediaTime() - blinkEpoch
+        let next = (floor(elapsed / 0.53) + 1) * 0.53 - elapsed
+        let timer = Timer(timeInterval: next + 0.001, repeats: false) { [weak self] _ in
+            self?.wakeLink()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        blinkTimer = timer
+    }
+
     @objc private func displayTick(_ link: CADisplayLink) {
-        guard window != nil, subscribed, !isHiddenOrHasHiddenAncestor else { return }
+        guard window != nil, subscribed, !isHiddenOrHasHiddenAncestor else {
+            // Nothing to draw until the pane is shown again, which wakes the link.
+            link.isPaused = true
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+            return
+        }
+        defer { updateLinkState() }
         if Perf.enabled { Perf.shared.tick(pane: pane, link: link) }
         if let s = pendingScroll {
             pendingScroll = nil
@@ -441,7 +512,10 @@ final class TerminalView: NSView, NSTextInputClient {
     /// refresh interval ago, else at the end of that interval (Alacritty's `FrameTimer`), so
     /// output shows up without waiting for the next display-link tick.
     func frameArrived() {
-        guard !Perf.tickRendering else { return }
+        guard !Perf.tickRendering else {
+            wakeLink()
+            return
+        }
         guard window != nil, subscribed, !isHiddenOrHasHiddenAncestor, !renderScheduled else { return }
         let fps = Double(window?.screen?.maximumFramesPerSecond ?? 60)
         let wait = lastRenderTime + 1 / max(30, fps) - CACurrentMediaTime()
@@ -464,6 +538,8 @@ final class TerminalView: NSView, NSTextInputClient {
         defer { if Perf.enabled { Perf.shared.rendered(pane: pane, start: perfStart, generation: renderer.snapshot.info.generation) } }
         needsRender = false
         guard let layer = metalLayer else { return }
+        // A blinking cursor or an animation may have started with this frame.
+        defer { updateLinkState() }
         if shaper == nil { updateScale() }
         guard let s = shaper else { return }
         let oldCursor = (renderer.snapshot.info.cursor_col, renderer.snapshot.info.cursor_row)
@@ -493,6 +569,8 @@ final class TerminalView: NSView, NSTextInputClient {
         if let c = container, c.hasMultipleVisiblePanes, c.focusedPane != pane {
             dim = Float(config.unfocusedSplitDim)
         }
+        let opacity = Float((window?.windowController as? TerminalWindowController)?.opacity ?? config.opacity)
+        if layer.isOpaque != (opacity >= 1) { layer.isOpaque = opacity >= 1 }
         let params = RenderParams(pane: pane,
                                   shaper: s,
                                   padX: padXPixels,
@@ -504,8 +582,7 @@ final class TerminalView: NSView, NSTextInputClient {
                                   cursorThickness: max(1, Int((config.cursorThickness * backingScale).rounded())),
                                   dim: dim,
                                   flash: flash,
-                                  opacity: Float((window?.windowController as? TerminalWindowController)?.opacity
-                                      ?? config.opacity),
+                                  opacity: opacity,
                                   themeBackground: config.theme.background,
                                   themeForeground: config.theme.foreground,
                                   hoverLink: hoverLink,
@@ -525,6 +602,7 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Visual bell.
     func flash() {
         flashStart = CACurrentMediaTime()
+        wakeLink()
     }
 
     // MARK: Overlays
@@ -1347,6 +1425,7 @@ final class TerminalView: NSView, NSTextInputClient {
             }
             pendingScroll = (lines, p.col, p.row, mods)
         }
+        wakeLink()
     }
 
     // MARK: Hyperlinks
