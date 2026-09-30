@@ -323,7 +323,8 @@ fn is_temp_graphics_file(path: &str) -> bool {
 
 /// Whether `path` (absolute, without `.` or `..`) is on or under a forbidden root.
 fn forbidden(path: &std::path::Path, allow_dev_shm: bool) -> bool {
-    if allow_dev_shm && path.starts_with(DEV_SHM) {
+    // /dev itself only as the step on the way to /dev/shm.
+    if allow_dev_shm && (path == std::path::Path::new("/dev") || path.starts_with(DEV_SHM)) {
         return false;
     }
     FORBIDDEN_ROOTS.iter().any(|root| path.starts_with(root))
@@ -637,6 +638,20 @@ mod tests {
         // Other files there are not readable as plain files.
         let body = format!("Ga=t,t=f,i=1;{}", b64(b"/dev/shm/x"));
         assert!(reply_text(r.handle(body.as_bytes())).contains("EPERM"));
+    }
+
+    #[test]
+    fn dev_is_only_a_step_towards_dev_shm() {
+        use std::path::Path;
+        assert!(!forbidden(Path::new("/dev"), true));
+        assert!(!forbidden(
+            Path::new("/dev/shm/tty-graphics-protocol-x"),
+            true
+        ));
+        assert!(forbidden(Path::new("/dev/zero"), true));
+        assert!(forbidden(Path::new("/dev/fd/0"), true));
+        assert!(forbidden(Path::new("/dev"), false));
+        assert!(forbidden(Path::new("/dev/shm/x"), false));
     }
 
     #[test]
