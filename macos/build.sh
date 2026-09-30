@@ -206,6 +206,8 @@ cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_LICENSES" "$APP/Contents/Resources/"
 # ---------------------------------------------------------------------------------------
 # 5. Sign helpers first, then the app.
 # ---------------------------------------------------------------------------------------
+# Resource access the hardened runtime otherwise denies to programs in the shells.
+ENTITLEMENTS="$HERE/Resources/Thurm.entitlements"
 if [[ -n "$IDENTITY" ]]; then
     log "codesign ($IDENTITY)"
     SIGN_FLAGS=(--timestamp=none --options runtime)
@@ -220,13 +222,20 @@ if [[ -n "$IDENTITY" ]]; then
     sign "$FW/Autoupdate"
     sign "$FW/Updater.app"
     sign "$APP/Contents/Frameworks/Sparkle.framework"
+    # thurmd too: started at login it is the process macOS holds responsible for the shells.
     for b in "${BINARIES[@]}" thurm-intelligence; do
-        sign "$APP/Contents/Helpers/$b"
+        if [[ "$b" == thurmd ]]; then
+            sign --entitlements "$ENTITLEMENTS" "$APP/Contents/Helpers/$b"
+        else
+            sign "$APP/Contents/Helpers/$b"
+        fi
     done
-    sign "$APP"
+    sign --entitlements "$ENTITLEMENTS" "$APP"
 else
     log "codesign (ad-hoc; set THURM_SIGN_IDENTITY for grants that survive rebuilds)"
     codesign --force --deep -s - "$APP"
+    codesign --force -s - --entitlements "$ENTITLEMENTS" "$APP/Contents/Helpers/thurmd"
+    codesign --force -s - --entitlements "$ENTITLEMENTS" "$APP"
 fi
 codesign --verify --deep --strict "$APP"
 

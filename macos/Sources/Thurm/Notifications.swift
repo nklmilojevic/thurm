@@ -18,6 +18,9 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
 
     private var authorizationRequested = false
     private(set) var authorized = false
+    /// Notifications posted while the first authorization prompt is still open: sent once it is
+    /// answered (posting before then loses them).
+    private var waitingForAuthorization: [UNNotificationRequest]? = []
 
     var isAvailable: Bool {
         Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app"
@@ -48,7 +51,11 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
                 tlog("notification authorization failed: \(error.localizedDescription)")
             }
             DispatchQueue.main.async {
-                Notifications.shared.authorized = granted
+                let n = Notifications.shared
+                n.authorized = granted
+                let waiting = n.waitingForAuthorization ?? []
+                n.waitingForAuthorization = nil
+                if granted { waiting.forEach(n.add) }
             }
         }
     }
@@ -70,6 +77,14 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
             identifier = Notifications.permissionIdentifier(pane: pane)
         }
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+        if waitingForAuthorization != nil {
+            waitingForAuthorization?.append(request)
+        } else {
+            add(request)
+        }
+    }
+
+    private func add(_ request: UNNotificationRequest) {
         UNUserNotificationCenter.current().add(request) { error in
             if let error = error {
                 tlog("could not post notification: \(error.localizedDescription)")
