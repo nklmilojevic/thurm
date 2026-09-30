@@ -65,19 +65,26 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
 
   if [[ -n "${bash_preexec_imported-}${__bp_imported-}" ]]; then
     # bash-preexec (atuin, starship...) owns the DEBUG trap: take part in it instead.
-    precmd_functions=(_thurm_prompt_start "${precmd_functions[@]}" _thurm_prompt_end)
+    # Its dispatcher has run by the time a precmd hook does: the command's status is the
+    # one it saved.
+    _thurm_bp_prompt_start() {
+      _thurm_ret=${__bp_last_ret_value-$?}
+      _thurm_in_prompt=1
+    }
+    precmd_functions=(_thurm_bp_prompt_start "${precmd_functions[@]}" _thurm_prompt_end)
     preexec_functions+=(_thurm_preexec)
   else
     PROMPT_COMMAND="_thurm_prompt_start${PROMPT_COMMAND:+;$PROMPT_COMMAND};_thurm_prompt_end"
-    # Keep a DEBUG trap the user's config set, running it after ours.
+    # Keep a DEBUG trap the user's config set, running it first so it still sees the
+    # previous command's $?.
     _thurm_prev_debug=$(builtin trap -p DEBUG)
     _thurm_prev_debug=${_thurm_prev_debug#"trap -- '"}
     _thurm_prev_debug=${_thurm_prev_debug%"' DEBUG"}
     _thurm_prev_debug=${_thurm_prev_debug//"'\\''"/"'"}
     if [[ -n "$_thurm_prev_debug" ]]; then
       _thurm_debug() {
-        _thurm_preexec
         builtin eval "$_thurm_prev_debug"
+        _thurm_preexec
       }
       builtin trap '_thurm_debug' DEBUG
     else
