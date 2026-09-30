@@ -147,6 +147,14 @@ final class TerminalView: NSView, NSTextInputClient {
     private var padYPixels: Int { Int((config.paddingY * backingScale).rounded()) }
 
     /// Cell size in points (for layout / IME).
+    /// VoiceOver's model of the screen (TerminalAccessibility.swift).
+    let accessibilityModel = TerminalAccessibility()
+    var accessibilitySnapshot: GridSnapshot { renderer.snapshot }
+    var accessibilityCellSize: CGSize { cellSizePoints }
+    var accessibilityPadding: CGPoint {
+        CGPoint(x: CGFloat(padXPixels) / backingScale, y: CGFloat(padYPixels) / backingScale)
+    }
+
     private var cellSizePoints: CGSize {
         guard let s = shaper else { return CGSize(width: 8, height: 16) }
         return CGSize(width: CGFloat(s.cellWidth) / backingScale, height: CGFloat(s.cellHeight) / backingScale)
@@ -566,7 +574,7 @@ final class TerminalView: NSView, NSTextInputClient {
         guard let s = shaper else { return }
         let oldCursor = (renderer.snapshot.info.cursor_col, renderer.snapshot.info.cursor_row)
         let perfGrid = Perf.enabled ? CACurrentMediaTime() : 0
-        _ = renderer.snapshot.update(pane: pane)
+        if renderer.snapshot.update(pane: pane) { accessibilityGridChanged() }
         // A previous resize can still be in flight when another layout change occurs.
         let sized = renderer.snapshot.cols == cols && renderer.snapshot.rows == rows
         if sized { resizeTimedOut = false }
@@ -931,6 +939,7 @@ final class TerminalView: NSView, NSTextInputClient {
     override func keyDown(with event: NSEvent) {
         if isOffline { return }
         if Perf.enabled { Perf.shared.key(pane: pane) }
+        accessibilityModel.lastKey = CACurrentMediaTime()
         NSCursor.setHiddenUntilMouseMoves(true)
         smoothActive = false
         resetBlink()
