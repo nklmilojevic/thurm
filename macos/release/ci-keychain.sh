@@ -29,7 +29,8 @@ printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$WORK/certificate.p12"
 security create-keychain -p "$(cat "$WORK/lock")" "$KEYCHAIN" >&2
 security set-keychain-settings -lut 21600 "$KEYCHAIN" >&2
 security unlock-keychain -p "$(cat "$WORK/lock")" "$KEYCHAIN" >&2
-security import "$WORK/certificate.p12" -P "${MACOS_CERTIFICATE_PASSWORD:-}" -A -t cert -f pkcs12 \
+# Only codesign may use the key (-A would let any program on the runner).
+security import "$WORK/certificate.p12" -P "${MACOS_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign -t cert -f pkcs12 \
     -k "$KEYCHAIN" >&2
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$(cat "$WORK/lock")" \
     "$KEYCHAIN" >/dev/null

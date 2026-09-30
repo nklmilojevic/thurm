@@ -37,7 +37,12 @@ if [[ "$PREVIEW" == 0 ]]; then
     [[ -n "$IDENTITY" && "$IDENTITY" != - ]] || die "Set THURM_SIGN_IDENTITY to a Developer ID Application certificate"
     security find-identity -v -p codesigning | grep -F "$IDENTITY" | grep -q '"Developer ID Application:' \
         || die "A valid Developer ID Application identity is required"
-    for binary in "$APP" "$APP/Contents/Helpers/thurm" "$APP/Contents/Helpers/thurmd"; do
+    SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+    for binary in "$APP" "$APP/Contents/Helpers/thurm" "$APP/Contents/Helpers/thurmd" \
+        "$APP/Contents/Helpers/thurm-intelligence" "$SPARKLE" "$SPARKLE/Versions/B/Autoupdate" \
+        "$SPARKLE/Versions/B/Updater.app" "$SPARKLE/Versions/B/XPCServices/Installer.xpc" \
+        "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"; do
+        codesign --verify --strict --verbose=2 "$binary" || die "Signature is invalid: $binary"
         details="$(codesign -dv --verbose=4 "$binary" 2>&1)"
         grep -q '^Authority=Developer ID Application:' <<<"$details" || die "Build with --distribution first"
         grep -q 'flags=.*runtime' <<<"$details" || die "Hardened runtime is missing: $binary"

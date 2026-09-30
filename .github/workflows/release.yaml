@@ -21,9 +21,9 @@ on:
   release:
     types: [published]
 
-permissions:
-  contents: write
-  actions: write # start pages.yml after publishing
+# Nothing by default: each job asks for what it needs (only `build`, which signs and
+# publishes, can write). Every action is pinned to a commit (its tag in the comment).
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,6 +33,9 @@ jobs:
     name: Plan tip
     if: github.event_name != 'release'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # the CI runs of main
     outputs:
       sha: ${{ steps.plan.outputs.sha }}
       build: ${{ steps.plan.outputs.build }}
@@ -41,7 +44,7 @@ jobs:
       REPO: ${{ github.repository }}
       FORCE: ${{ inputs.force || false }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: main
           fetch-depth: 0
@@ -69,7 +72,7 @@ jobs:
             elif git merge-base --is-ancestor "$TIP" "$SHA"; then
               # Files that never reach the app. This workflow itself still counts.
               APP="$(git diff --name-only "$TIP" "$SHA" \
-                | grep -vE '^(docs/|\.github/|README\.md$|LICENSE|renovate\.json$|flake\.(nix|lock)$|\.envrc$|\.gitignore$)' || true)"
+                | grep -vE '^(docs/|\.github/|README\.md$|LICENSE$|renovate\.json$|\.envrc$|\.gitignore$)' || true)"
               if [[ -z "$APP" ]] && ! git diff --quiet "$TIP" "$SHA" -- .github/workflows/release.yaml; then
                 APP=.github/workflows/release.yaml
               fi
@@ -99,8 +102,11 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # Builds only; the build job publishes (its checksums are compiled into the app).
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || needs.plan.outputs.sha }}
           fetch-depth: 0 # the build number is the commit count
@@ -119,13 +125,14 @@ jobs:
           BUILD="$SHORT+$NUMBER"
           echo "THURM_BUILD=$BUILD" >> "$GITHUB_ENV"
           echo "archive=thurm-${BUILD//+/-}-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-${{ matrix.target }}
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
       - name: musl
@@ -141,7 +148,7 @@ jobs:
             -C "$GITHUB_WORKSPACE" LICENSE THIRD_PARTY_LICENSES
           (cd "$OUT" && sha256sum "${{ steps.meta.outputs.archive }}" > "${{ steps.meta.outputs.archive }}.sha256")
           cat "$OUT"/*.sha256
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: linux-${{ matrix.target }}
           path: ${{ runner.temp }}/linux/*
@@ -161,12 +168,15 @@ jobs:
       # One build per channel at a time, never cancelled halfway through an upload.
       group: release-build-${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }}
       cancel-in-progress: false
+    permissions:
+      contents: write # the release, its assets and the `tip` tag
+      actions: write # start pages.yml after publishing
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       THURM_SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || needs.plan.outputs.sha }}
           fetch-depth: 0 # the build number is the commit count
@@ -226,13 +236,14 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
       - name: Toolchain versions

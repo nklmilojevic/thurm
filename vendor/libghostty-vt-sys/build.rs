@@ -95,7 +95,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HOST");
     println!("cargo:rerun-if-env-changed=DEBUG");
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
-    println!("cargo:rerun-if-changed=crates/libghostty-vt-sys/build.rs");
+    println!("cargo:rerun-if-changed=build.rs");
 
     // An explicit source override should stay authoritative even when the
     // pkg-config feature is enabled, so local Ghostty checkouts remain easy to
@@ -131,6 +131,22 @@ fn build_vendored(link_mode: LinkMode, target: &str) {
                 "GHOSTTY_SOURCE_DIR does not contain build.zig: {}",
                 p.display()
             );
+            // Thurm: a checkout at another commit builds, but say so (the Nix package's
+            // source has no .git; CI checks that it pins the same commit).
+            if let Some(head) = Command::new("git")
+                .arg("-C")
+                .arg(&p)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                && head != GHOSTTY_COMMIT
+            {
+                println!(
+                    "cargo:warning=GHOSTTY_SOURCE_DIR is at {head}, not the pinned {GHOSTTY_COMMIT}"
+                );
+            }
             p
         }
         Err(_) => fetch_ghostty(&out_dir),
