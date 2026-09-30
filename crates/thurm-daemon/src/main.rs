@@ -337,19 +337,22 @@ fn daemonize(log_path: &Path) {
             _ => libc::_exit(0),
         }
         let _ = libc::chdir(c"/".as_ptr());
-        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        // Only 0-2 stay open: every shell would inherit the originals.
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
         if devnull >= 0 {
             libc::dup2(devnull, 0);
+            if devnull > 2 {
+                libc::close(devnull);
+            }
         }
         if let Ok(f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(log_path)
         {
-            use std::os::fd::IntoRawFd;
-            let fd = f.into_raw_fd();
-            libc::dup2(fd, 1);
-            libc::dup2(fd, 2);
+            use std::os::fd::AsRawFd;
+            libc::dup2(f.as_raw_fd(), 1);
+            libc::dup2(f.as_raw_fd(), 2);
         }
     }
 }

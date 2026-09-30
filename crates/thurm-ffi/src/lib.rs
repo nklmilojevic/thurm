@@ -482,7 +482,15 @@ unsafe fn connect_to(
     let ctx = Ctx(ctx);
     let conn_ctx = ctx;
     let events_shared = shared.clone();
-    let on_ev = move |ev: Event| handle_event(&events_shared, ev, on_event, on_frame, ctx);
+    // A panic here would end the connection's reader thread (and with it the pane updates).
+    let on_ev = move |ev: Event| {
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_event(&events_shared, ev, on_event, on_frame, ctx)
+        }));
+        if handled.is_err() {
+            log::error!("an event from the daemon panicked the app's handler");
+        }
+    };
     let on_disc = move || emit_json(on_event, ctx, "\"Disconnected\"");
     match Client::connect(
         ConnectOptions {

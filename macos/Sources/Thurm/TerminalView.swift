@@ -1213,11 +1213,25 @@ final class TerminalView: NSView, NSTextInputClient {
         let file = dir.appendingPathComponent("image-\(UUID().uuidString.prefix(8)).png")
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            pruneOldFiles(in: dir)
             try png.write(to: file)
         } catch {
             return nil
         }
         return file.path
+    }
+
+    /// Dropped images are used by path for a moment, then never again: forget old ones.
+    private static func pruneOldFiles(in dir: URL, olderThan age: TimeInterval = 24 * 60 * 60) {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }
+        for file in files {
+            if let date = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+               Date().timeIntervalSince(date) > age {
+                try? fm.removeItem(at: file)
+            }
+        }
     }
 
     @objc override func selectAll(_ sender: Any?) {
