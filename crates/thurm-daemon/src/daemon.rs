@@ -1392,13 +1392,11 @@ impl Daemon {
                 });
                 return;
             }
-            // Slow requests (spawning processes, `ps`/`lsof`, completion generators, reading
-            // scrollback) run on their own thread so they don't hold up the typing, resizes
-            // and scrolls that follow on the same connection. Responses carry their id.
-            slow @ (Request::Complete { .. }
-            | Request::Processes { .. }
-            | Request::CreatePane(_)
-            | Request::Capture { .. }) => {
+            // Slow read-only requests (completion generators, `ps`/`lsof`) run on their own
+            // thread so they don't hold up the typing, resizes and scrolls that follow on the
+            // same connection. Responses carry their id. Requests that change or snapshot
+            // state stay in order on the reader.
+            slow @ (Request::Complete { .. } | Request::Processes { .. }) => {
                 let daemon = self.clone();
                 let client = client.clone();
                 let spawned = std::thread::Builder::new()
