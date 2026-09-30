@@ -213,6 +213,9 @@ pub fn snapshot(repo: &Path) -> Result<Snapshot, String> {
     };
     let result = (|| {
         with_index(&["read-tree", "HEAD"])?;
+        // Every change to tracked files (secrets included: an edit or a deletion must not
+        // travel as the old version), then the untracked files, without secret ones.
+        with_index(&["add", "-u", "--", "."])?;
         let mut add = vec!["add", "-A", "--", "."];
         add.extend(SECRET_PATHSPECS);
         with_index(&add)?;
@@ -907,8 +910,13 @@ mod tests {
         };
         git(&["init", "-q", "-b", "main"]);
         std::fs::write(dir.join("README"), "x").unwrap();
-        git(&["add", "."]);
+        // Tracked secrets: their edits and deletions still travel.
+        std::fs::write(dir.join(".env.tracked"), "old").unwrap();
+        std::fs::write(dir.join("old.key"), "old").unwrap();
+        git(&["add", "-f", "."]);
         git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join(".env.tracked"), "new").unwrap();
+        std::fs::remove_file(dir.join("old.key")).unwrap();
         for f in ["app.txt", ".env", "sub/.env.local", "cert.pem"] {
             std::fs::write(dir.join(f), "secret?").unwrap();
         }
@@ -923,6 +931,12 @@ mod tests {
                 "{secret} was handed off: {files:?}"
             );
         }
+        assert!(
+            !files.contains(&"old.key"),
+            "a deleted tracked file came back: {files:?}"
+        );
+        let tracked = git(&["show", &format!("{}:.env.tracked", snap.commit)]);
+        assert_eq!(tracked, "new");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

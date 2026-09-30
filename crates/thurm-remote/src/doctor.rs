@@ -402,12 +402,13 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
         // Lingering keeps the user manager, not what a session started: the daemon still
         // ends with the last ssh session.
         let mut k = check("kill_user_processes", "Session cleanup", State::Fail, "");
-        k.detail = "logind kills your processes when your last session ends \
-                    (KillUserProcesses=yes): the daemon and its shells with them"
-            .into();
-        k.terminal = Some(format!(
-            "echo 'KillExcludeUsers={user}' | sudo tee -a /etc/systemd/logind.conf && sudo systemctl restart systemd-logind"
-        ));
+        // No command offered: KillExcludeUsers is a list, and adding a line would replace the
+        // exclusions already there.
+        k.detail = format!(
+            "logind kills your processes when your last session ends (KillUserProcesses=yes): \
+             the daemon and its shells with them. Have {user} added to KillExcludeUsers in \
+             /etc/systemd/logind.conf, keeping the users listed there"
+        );
         out.push(k);
     }
 
