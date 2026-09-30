@@ -21,7 +21,10 @@ use thurm_proto::{
 #[command(
     name = "thurm",
     version,
-    about = "Control Thurm terminal panes (tabs, splits, agents, capture, wait)"
+    about = "Control Thurm terminal panes (tabs, splits, agents, capture, wait)",
+    after_help = "Exit status: 0 success, 1 error, 2 `wait`: the pane exited (without --exit), \
+                  3 `daemon status`: not running, 4 `daemon status`: running but incompatible, \
+                  124 `wait`: timed out."
 )]
 struct Cli {
     /// Machine readable JSON output.
@@ -70,8 +73,12 @@ enum RemoteCmd {
     /// Install this build of Thurm on a host, and upgrade its daemon in place.
     Install {
         name: String,
-        #[arg(long, short = 'y')]
+        /// Answer yes to every question (a daemon restart that stops programs still asks).
+        #[arg(long, short = 'y', conflicts_with = "no")]
         yes: bool,
+        /// Answer no to every question.
+        #[arg(long)]
+        no: bool,
     },
     /// Check what a host needs (Thurm, lingering, PATH, agents, sign-in, hooks), and fix it.
     Doctor {
@@ -80,8 +87,9 @@ enum RemoteCmd {
         /// Offer the fix for every problem found.
         #[arg(long)]
         fix: bool,
-        /// With --fix: run every fix without asking (fixes that need a terminal are listed).
-        #[arg(long, short = 'y')]
+        /// With --fix: run every fix without asking (fixes that need a terminal are listed;
+        /// a daemon restart or an installer script still asks).
+        #[arg(long, short = 'y', requires = "fix")]
         yes: bool,
     },
 }
@@ -323,7 +331,7 @@ enum Cmd {
         #[arg(long, value_name = "ID")]
         cleanup: Option<String>,
         /// With --cleanup: remove even with uncommitted or unfetched work.
-        #[arg(long)]
+        #[arg(long, requires = "cleanup")]
         force: bool,
     },
     /// Install, remove or check the agent hooks that report status to Thurm
@@ -540,7 +548,9 @@ fn run(cli: Cli) -> R {
             RemoteCmd::List => remote::list(json),
             RemoteCmd::Remove { name } => remote::remove(&name),
             RemoteCmd::Status { name } => remote::status(name.as_deref(), json),
-            RemoteCmd::Install { name, yes } => remote::install_cmd(&name, yes.then_some(true)),
+            RemoteCmd::Install { name, yes, no } => {
+                remote::install_cmd(&name, if yes { Some(true) } else { no.then_some(false) })
+            }
             RemoteCmd::Doctor { name, fix, yes } => {
                 remote::doctor_cmd(name.as_deref(), fix, yes.then_some(true), json)
             }
@@ -1544,5 +1554,19 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["thurm", "handoff", "--list", "--fetch", "x"]).is_err());
+    }
+
+    #[test]
+    fn flags_that_need_another_flag() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("thurm").chain(args.iter().copied()))
+        };
+        assert!(parse(&["remote", "doctor", "--yes"]).is_err());
+        assert!(parse(&["remote", "doctor", "--fix", "--yes"]).is_ok());
+        assert!(parse(&["handoff", "--force"]).is_err());
+        assert!(parse(&["handoff", "--cleanup", "x", "--force"]).is_ok());
+        assert!(parse(&["remote", "install", "box", "--no"]).is_ok());
+        assert!(parse(&["remote", "install", "box", "--yes", "--no"]).is_err());
     }
 }

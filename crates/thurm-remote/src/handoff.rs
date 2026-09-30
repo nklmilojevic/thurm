@@ -184,8 +184,17 @@ pub struct Snapshot {
     pub wip: bool,
 }
 
+/// Untracked files a snapshot leaves out: they usually hold secrets (`.env.local`), and a
+/// handoff pushes the snapshot to another machine.
+const SECRET_PATHSPECS: &[&str] = &[
+    ":(exclude,glob)**/.env",
+    ":(exclude,glob)**/.env.*",
+    ":(exclude,glob)**/*.pem",
+    ":(exclude,glob)**/*.key",
+];
+
 /// HEAD, or a WIP commit of HEAD plus every change (untracked files included, ignored ones
-/// not), made through a temporary index so nothing local changes.
+/// and [`SECRET_PATHSPECS`] not), made through a temporary index so nothing local changes.
 pub fn snapshot(repo: &Path) -> Result<Snapshot, String> {
     let head = git_out(repo, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])
         .map_err(|_| "the repository has no commits yet; commit something first".to_owned())?;
@@ -204,7 +213,12 @@ pub fn snapshot(repo: &Path) -> Result<Snapshot, String> {
     };
     let result = (|| {
         with_index(&["read-tree", "HEAD"])?;
-        with_index(&["add", "-A", "--", "."])?;
+        // Every change to tracked files (secrets included: an edit or a deletion must not
+        // travel as the old version), then the untracked files, without secret ones.
+        with_index(&["add", "-u", "--", "."])?;
+        let mut add = vec!["add", "-A", "--", "."];
+        add.extend(SECRET_PATHSPECS);
+        with_index(&add)?;
         let tree = with_index(&["write-tree"])?;
         let head_tree = git_out(repo, &["rev-parse", "HEAD^{tree}"])?;
         if tree == head_tree {
@@ -689,11 +703,24 @@ impl Default for Registry {
 
 impl Registry {
     pub fn list(&self) -> Vec<Handoff> {
-        std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<RegistryFile>(&t).ok())
-            .map(|f| f.handoffs)
-            .unwrap_or_default()
+        self.load().unwrap_or_default()
+    }
+
+    /// The stored handoffs; an error when the file exists but can't be read, so an edit
+    /// doesn't replace every other handoff with its own.
+    fn load(&self) -> Result<Vec<Handoff>, String> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(t) => serde_json::from_str::<RegistryFile>(&t)
+                .map(|f| f.handoffs)
+                .map_err(|e| {
+                    format!(
+                        "{} is unreadable ({e}); fix or remove it",
+                        self.path.display()
+                    )
+                }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("{}: {e}", self.path.display())),
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Handoff> {
@@ -746,7 +773,7 @@ impl Registry {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let _lock = FileLock::acquire(&self.path.with_extension("json.lock"))?;
-        let mut all = self.list();
+        let mut all = self.load()?;
         f(&mut all);
         let json = serde_json::to_string_pretty(&RegistryFile { handoffs: all })
             .map_err(|e| e.to_string())?;
@@ -848,5 +875,68 @@ mod tests {
         for s in [PREPARE, WORKTREE, CHECK, REMOVE] {
             crate::ssh::quote(s).unwrap();
         }
+    }
+
+    #[test]
+    fn an_unreadable_registry_is_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("thurm-registry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("handoffs.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let r = Registry { path: path.clone() };
+        assert!(r.remove("x").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn snapshots_leave_out_secret_files() {
+        let dir = std::env::temp_dir().join(format!("thurm-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README"), "x").unwrap();
+        // Tracked secrets: their edits and deletions still travel.
+        std::fs::write(dir.join(".env.tracked"), "old").unwrap();
+        std::fs::write(dir.join("old.key"), "old").unwrap();
+        git(&["add", "-f", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join(".env.tracked"), "new").unwrap();
+        std::fs::remove_file(dir.join("old.key")).unwrap();
+        for f in ["app.txt", ".env", "sub/.env.local", "cert.pem"] {
+            std::fs::write(dir.join(f), "secret?").unwrap();
+        }
+        let snap = snapshot(&dir).unwrap();
+        assert!(snap.wip);
+        let files = git(&["ls-tree", "-r", "--name-only", &snap.commit]);
+        let files: Vec<&str> = files.lines().collect();
+        assert!(files.contains(&"app.txt"), "{files:?}");
+        for secret in [".env", "sub/.env.local", "cert.pem"] {
+            assert!(
+                !files.contains(&secret),
+                "{secret} was handed off: {files:?}"
+            );
+        }
+        assert!(
+            !files.contains(&"old.key"),
+            "a deleted tracked file came back: {files:?}"
+        );
+        let tracked = git(&["show", &format!("{}:.env.tracked", snap.commit)]);
+        assert_eq!(tracked, "new");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
