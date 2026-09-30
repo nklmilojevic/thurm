@@ -1092,7 +1092,7 @@ pub fn with_setting(text: &str, key: &str, value: &str) -> Result<String, String
         }
     }
     let out = doc.to_string();
-    Config::parse_strict(&out)?;
+    check_edit(text, &out)?;
     Ok(out)
 }
 
@@ -1151,7 +1151,7 @@ pub fn with_remote_added(text: &str, remote: &RemoteConfig) -> Result<String, St
     }
     tables.push(t);
     let out = doc.to_string();
-    Config::parse_strict(&out)?;
+    check_edit(text, &out)?;
     Ok(out)
 }
 
@@ -1171,7 +1171,7 @@ pub fn with_remote_removed(text: &str, name: &str) -> Result<String, String> {
         doc.remove("remote");
     }
     let out = doc.to_string();
-    Config::parse_strict(&out)?;
+    check_edit(text, &out)?;
     Ok(out)
 }
 
@@ -1194,7 +1194,7 @@ pub fn with_remote_setting(
         .ok_or_else(|| format!("no remote named {name:?}"))?;
     table[key] = toml_edit::Item::Value(value);
     let out = doc.to_string();
-    Config::parse_strict(&out)?;
+    check_edit(text, &out)?;
     Ok(out)
 }
 
@@ -1215,7 +1215,19 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let target = match std::fs::canonicalize(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_owned(),
+        // A link to a file that doesn't exist yet: create that file, keep the link.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    let link = std::fs::read_link(path)?;
+                    match path.parent() {
+                        Some(dir) if link.is_relative() => dir.join(link),
+                        _ => link,
+                    }
+                }
+                _ => path.to_owned(),
+            }
+        }
         Err(e) => return Err(e),
     };
     let mode = std::fs::metadata(&target)
@@ -1225,13 +1237,16 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = target.with_file_name(format!(".{name}.tmp{}", std::process::id()));
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = target.with_file_name(format!(".{name}.tmp{}-{seq}", std::process::id()));
+    // Only a file this call created is removed on failure.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
     let result = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
         f.write_all(contents)?;
         f.set_permissions(std::fs::Permissions::from_mode(mode))?;
         f.sync_all()?;
@@ -1241,6 +1256,20 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Validates `after`, an edit of the config text `before`: it must parse, and add no unknown
+/// key (a typo in `thurm set`). Unknown keys `before` already had (settings of a newer build)
+/// stay.
+fn check_edit(before: &str, after: &str) -> Result<(), String> {
+    let (_, new) = Config::parse_with_warnings(after)?;
+    let old = Config::parse_with_warnings(before)
+        .map(|(_, w)| w)
+        .unwrap_or_default();
+    match new.into_iter().find(|w| !old.contains(w)) {
+        Some(w) => Err(w),
+        None => Ok(()),
+    }
 }
 
 fn check_range(key: &str, value: f64, lo: f64, hi: f64) -> Result<(), String> {
@@ -1304,6 +1333,12 @@ clipboard_read = "always"
         let typo = "[[remote]]\nname = \"a\"\nhost = \"x\"\nport = 1";
         assert_eq!(Config::parse_with_warnings(typo).unwrap().1.len(), 1);
         assert!(Config::parse_strict(typo).is_err());
+        // Edits keep unknown keys the file already had, and refuse new ones.
+        let newer = "[window]\nfuture_setting = true\n";
+        let out = with_setting(newer, "font.size", "15.0").unwrap();
+        assert!(out.contains("future_setting"));
+        assert!(with_remote_setting(typo, "a", "enabled", "false").is_ok());
+        assert!(with_setting(newer, "window.nope", "1").is_err());
     }
 
     #[test]
@@ -1572,6 +1607,25 @@ clipboard_read = "always"
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
         let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
+        // A link to a file not created yet stays a link.
+        let dangling = dir.join("dangling.toml");
+        std::os::unix::fs::symlink("dotfiles/later.toml", &dangling).unwrap();
+        replace_file(&dangling, b"x").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dotfiles/later.toml")).unwrap(),
+            "x"
+        );
+        // Someone else's leftover temporary file is not deleted.
+        let leftover = dir.join(format!("dotfiles/.config.toml.tmp{}", std::process::id()));
+        std::fs::write(&leftover, "keep").unwrap();
+        replace_file(&link, b"newer").unwrap();
+        assert_eq!(std::fs::read_to_string(&leftover).unwrap(), "keep");
         // A new file is private.
         let fresh = dir.join("fresh.json");
         replace_file(&fresh, b"{}").unwrap();
