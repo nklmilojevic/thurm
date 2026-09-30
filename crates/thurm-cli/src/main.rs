@@ -1269,11 +1269,17 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
         }
         Cmd::Set { key, value } => {
             let literal = thurm_config::value_literal(&value);
-            c.request(Request::SetSetting {
+            let resp = c.request(Request::SetSetting {
                 key: key.clone(),
                 value: literal,
             })?;
             println!("{key} = {value}");
+            // The daemon writes its own config file; say so when it isn't ours.
+            if let Response::Text(path) = resp
+                && std::path::Path::new(&path) != thurm_config::config_path()
+            {
+                println!("(in {path}, the running daemon's config file)");
+            }
         }
         Cmd::Theme { spec: Some(spec) } => {
             c.request(Request::SetTheme { spec: spec.clone() })?;

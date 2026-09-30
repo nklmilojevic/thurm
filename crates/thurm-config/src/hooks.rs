@@ -203,12 +203,20 @@ pub fn write_at(agent: &HookAgent, path: &Path, install: bool) -> Result<Written
     if !current.is_empty() {
         let backup = path.with_extension("json.thurm-backup");
         if !backup.exists() {
-            std::fs::write(&backup, &current).map_err(io)?;
+            // The settings may hold tokens: the backup is private.
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&backup)
+                .and_then(|mut f| f.write_all(current.as_bytes()))
+                .map_err(io)?;
         }
     }
-    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
-    std::fs::write(&tmp, updated).map_err(io)?;
-    std::fs::rename(&tmp, path).map_err(io)?;
+    // A symlinked settings file stays a link, and the file keeps its permissions.
+    crate::replace_file(path, updated.as_bytes()).map_err(io)?;
     Ok(Written::Changed)
 }
 
@@ -308,6 +316,35 @@ mod tests {
             Written::Unchanged
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrites_keep_links_and_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("thurm-hooks-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        // A private settings file, linked from where the agent reads it.
+        let real = dir.join("dotfiles/settings.json");
+        std::fs::write(&real, r#"{"apiKeyHelper": "secret"}"#).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(write_at(&AGENTS[0], &link, true).unwrap(), Written::Changed);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            installed(&AGENTS[0], &std::fs::read_to_string(&real).unwrap()),
+            CLAUDE_EVENTS.len()
+        );
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&real), 0o600);
+        assert_eq!(mode(&link.with_extension("json.thurm-backup")), 0o600);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1973,7 +1973,10 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::ReloadConfig => {
-                let cfg = Config::load().map_err(|e| e.to_string())?;
+                let (cfg, warnings) = Config::load_with_warnings().map_err(|e| e.to_string())?;
+                for w in warnings {
+                    log::warn!("config: {w}");
+                }
                 self.apply_config(cfg);
                 Ok(Response::Ok)
             }
@@ -2043,7 +2046,11 @@ impl Daemon {
                 thurm_config::write_setting(&key, &value)?;
                 let cfg = Config::load().map_err(|e| e.to_string())?;
                 self.apply_config(cfg);
-                Ok(Response::Ok)
+                // Where it went: the daemon's config file, which a CLI with another
+                // environment may not know about.
+                Ok(Response::Text(
+                    thurm_config::config_path().display().to_string(),
+                ))
             }
             Request::AnswerPermission {
                 pane,
