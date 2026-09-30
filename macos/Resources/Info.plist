@@ -39,6 +39,6 @@
 	<key>SUScheduledCheckInterval</key>
 	<integer>3600</integer>
 	<key>NSHumanReadableCopyright</key>
-	<string>Apache-2.0</string>
+	<string>Copyright © 2026 Nikola Milojević. Licensed under the Apache License 2.0.</string>
 </dict>
 </plist>

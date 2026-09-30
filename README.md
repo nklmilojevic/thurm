@@ -2,6 +2,10 @@
 
 [Documentation](https://nklmilojevic.github.io/thurm/) includes installation, user guides, configuration, and CLI commands.
 
+**Download:** [Thurm.dmg](https://github.com/nklmilojevic/thurm/releases/latest/download/Thurm.dmg)
+for Apple silicon, macOS 14 or later. Drag Thurm to Applications and open it from there,
+not from the disk image. Nightly builds: [Thurm-tip.dmg](https://github.com/nklmilojevic/thurm/releases/download/tip/Thurm-tip.dmg).
+
 Thurm is a macOS terminal with tabs, split panes, and support for coding agents.
 It uses libghostty-vt for terminal state, AppKit for the interface, and Metal and
 CoreText to draw text and images.
@@ -170,3 +174,10 @@ on `PATH`. The macOS app is built separately with `./macos/build.sh`.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## License
+
+Thurm is licensed under the [Apache License 2.0](LICENSE). It includes Ghostty's
+libghostty-vt, Sparkle, color themes, fonts and Rust crates under their own licenses,
+listed in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)
+(regenerate it with `scripts/third-party-licenses.py`).

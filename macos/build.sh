@@ -167,6 +167,12 @@ plist "Set :CFBundleShortVersionString $VERSION"
 plist "Set :CFBundleVersion $BUILD_NUMBER"
 plist "Add :ThurmBuild string $THURM_BUILD"
 plist "Add :ThurmChannel string $CHANNEL"
+# A malformed feed (e.g. `https://owner.github.io//appcast.xml`) would strand every copy of
+# this build on it: no update could ever fix it.
+if [[ -n "${THURM_FEED_URL:-}" ]] \
+    && ! [[ "$THURM_FEED_URL" =~ ^https://[^/]+/[^/] && "${THURM_FEED_URL#https://}" != *//* ]]; then
+    die "THURM_FEED_URL is not a valid https URL: $THURM_FEED_URL"
+fi
 if [[ -n "${THURM_FEED_URL:-}" && -n "${THURM_SPARKLE_PUBLIC_KEY:-}" ]]; then
     plist "Add :SUFeedURL string $THURM_FEED_URL"
     plist "Add :SUPublicEDKey string $THURM_SPARKLE_PUBLIC_KEY"
@@ -194,6 +200,8 @@ fi
 if [[ -f "$HERE/Resources/AppIcon.icns" ]]; then
     cp "$HERE/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 fi
+# Thurm's license and the notices of everything it includes.
+cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_LICENSES" "$APP/Contents/Resources/"
 
 # ---------------------------------------------------------------------------------------
 # 5. Sign helpers first, then the app.

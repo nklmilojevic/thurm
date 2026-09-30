@@ -40,6 +40,16 @@ class RenderTest(unittest.TestCase):
         # Releases are in the default channel, which every app accepts.
         self.assertEqual(channels, ["tip", None, None])
 
+    def test_tip_goes_first_when_a_release_has_the_same_version(self):
+        items = self.parse([
+            meta("release", 78, "0.1.0"),
+            meta("tip", 78, "0.1.0-tip.2749235"),
+            meta("tip", 77, "0.1.0-tip.bb1eb59"),
+        ])
+        order = [(i.find("sparkle:version", NS).text,
+                  getattr(i.find("sparkle:channel", NS), "text", None)) for i in items]
+        self.assertEqual(order, [("78", "tip"), ("78", None), ("77", "tip")])
+
     def test_enclosure_and_requirements(self):
         (item,) = self.parse([meta("release", 40, "0.2.0")])
         enc = item.find("enclosure")
