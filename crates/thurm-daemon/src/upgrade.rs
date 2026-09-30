@@ -133,16 +133,36 @@ fn check(exe: &Path) -> Result<(), String> {
             .stderr(std::process::Stdio::null()),
     )
     .map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
+    // Its output is read on a thread: a process it left behind could keep the pipe open.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut out = Vec::new();
+            let _ = (&mut stdout).take(64 * 1024).read_to_end(&mut out);
+            let _ = tx.send(out);
+        });
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while child.try_wait().map_err(|e| e.to_string())?.is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!("{} --handoff-check did not answer", exe.display()));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    };
+    let stdout = rx
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .map_err(|_| format!("{} --handoff-check did not answer", exe.display()))?;
+    let out = std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    };
     let text = String::from_utf8_lossy(&out.stdout);
     let theirs = text
         .split_whitespace()

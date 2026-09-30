@@ -1693,7 +1693,10 @@ impl Daemon {
                 let spawned = std::thread::Builder::new()
                     .name("request".into())
                     .spawn(move || {
-                        let result = daemon.dispatch(&client, slow);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            daemon.dispatch(&client, slow)
+                        }))
+                        .unwrap_or_else(|_| Err("the daemon hit an internal error".into()));
                         if id != 0 {
                             client.send(ServerMessage::Response { id, result });
                         }

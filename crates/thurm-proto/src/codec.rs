@@ -56,6 +56,19 @@ pub fn envelope_id(frame: &[u8]) -> Option<u64> {
         .map(|(id, _)| id)
 }
 
+/// The request id of a `ServerMessage::Response` frame whose result didn't decode (a response
+/// of a newer protocol), so the request waiting for it can be failed.
+pub fn response_id(frame: &[u8]) -> Option<u64> {
+    // Variant 0 is `Response`, whose first field is the id.
+    let (variant, rest) = postcard::take_from_bytes::<u32>(frame).ok()?;
+    if variant != 0 {
+        return None;
+    }
+    postcard::take_from_bytes::<u64>(rest)
+        .ok()
+        .map(|(id, _)| id)
+}
+
 /// Read one message. Returns `Ok(None)` on a clean EOF at a message boundary.
 pub fn read_message<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<T>> {
     let mut len = [0u8; 4];
@@ -136,5 +149,19 @@ mod tests {
         let mut buf = (frame.len() as u32).to_le_bytes().to_vec();
         buf.extend_from_slice(&frame);
         assert_eq!(read_frame(&mut buf.as_slice()).unwrap(), Some(frame));
+    }
+
+    #[test]
+    fn unknown_responses_keep_their_id() {
+        let known = crate::ServerMessage::Response {
+            id: 42,
+            result: Ok(crate::Response::Ok),
+        };
+        let frame = postcard::to_stdvec(&known).unwrap();
+        assert_eq!(response_id(&frame), Some(42));
+        // Variant 0 (Response), id 9, then a result this build can't decode.
+        assert_eq!(response_id(&[0, 9, 0, 0xE7, 0x07]), Some(9));
+        let event = crate::ServerMessage::Event(crate::Event::Bell { pane: 1 });
+        assert_eq!(response_id(&postcard::to_stdvec(&event).unwrap()), None);
     }
 }
