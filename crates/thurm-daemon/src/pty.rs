@@ -317,23 +317,74 @@ fn wait_for(f: &File, events: libc::c_short) -> io::Result<()> {
 }
 
 /// Read from the PTY master, blocking until data (or EOF) arrives. Retries on EINTR and maps
-/// EIO (slave closed) to EOF. On a non-blocking handle, spins briefly before sleeping.
-pub fn read_pty(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+/// EIO (slave closed) to EOF. On a non-blocking handle, spins briefly before sleeping. Returns
+/// `None`, without reading, once `wake` is readable (see [`ReaderGate`](crate::daemon)).
+pub fn read_pty(f: &mut File, buf: &mut [u8], wake: RawFd) -> io::Result<Option<usize>> {
     let mut empty = 0;
     loop {
         match f.read(buf) {
-            Ok(n) => return Ok(n),
+            Ok(n) => return Ok(Some(n)),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if e.raw_os_error() == Some(libc::EIO) => return Ok(0),
+            Err(e) if e.raw_os_error() == Some(libc::EIO) => return Ok(Some(0)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 empty += 1;
                 if empty >= READ_SPINS {
                     empty = 0;
-                    wait_for(f, libc::POLLIN)?;
+                    if wait_readable_or_wake(f, wake)? {
+                        return Ok(None);
+                    }
                 }
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// Waits until `f` is readable or `wake` is; true for `wake`.
+fn wait_readable_or_wake(f: &File, wake: RawFd) -> io::Result<bool> {
+    let mut p = [
+        libc::pollfd {
+            fd: f.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    if unsafe { libc::poll(p.as_mut_ptr(), 2, -1) } < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+        return Ok(false);
+    }
+    Ok(p[1].revents & libc::POLLIN != 0)
+}
+
+/// Closes every file descriptor above stderr. For a daemon that could not adopt its
+/// predecessor's panes: their PTY masters (and the old listener) were inherited without a
+/// record of which they are; closing them hangs up the orphaned shells, and keeps new shells
+/// from inheriting them.
+pub fn close_inherited_fds() {
+    let dir = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let fds: Vec<RawFd> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse().ok())
+            .filter(|&fd| fd > 2)
+            .collect(),
+        Err(_) => return,
+    };
+    // The directory's own descriptor is closed by now; closing it again is harmless.
+    for fd in fds {
+        unsafe { libc::close(fd) };
     }
 }
 
