@@ -1052,7 +1052,10 @@ fn device_queries_are_answered() {
     t.advance(b"\x1b[14t");
     assert_eq!(responses(&mut t), "\x1b[4;100;200t");
     t.advance(b"\x1b[>q");
-    assert_eq!(responses(&mut t), "\x1bP>|Thurm 0.1.0\x1b\\");
+    assert_eq!(
+        responses(&mut t),
+        concat!("\x1bP>|Thurm ", env!("CARGO_PKG_VERSION"), "\x1b\\")
+    );
 }
 
 #[test]
