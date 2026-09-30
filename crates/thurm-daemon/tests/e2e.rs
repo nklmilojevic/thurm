@@ -1172,6 +1172,61 @@ fn in_place_upgrade_keeps_panes_running() {
 }
 
 #[test]
+fn in_place_upgrade_loses_no_output() {
+    let env = Env::new("upgrade-output");
+    let daemon = env.start();
+    let (c, _events) = env.connect();
+    let pane = create(&c, &env.dir);
+    // 6000 numbered lines in bursts, with the upgrade in the middle of them.
+    c.request(Request::Input {
+        pane,
+        data: b"for i in $(seq 1 6000); do echo line-$i; [ $((i % 200)) -eq 0 ] && sleep 0.05; [ $i -eq 1000 ] && sleep 1; done; echo ALL-DONE\r"
+            .to_vec(),
+    })
+    .unwrap();
+    // The loop holds at line 1000 for a second; the upgrade comes once the bursts have
+    // resumed. (Polled in the scrollback: Wait only sees the screen, and a debug build parses
+    // slowly enough to miss a moment there.)
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !capture(&c, pane).contains("line-1000\n") {
+        assert!(Instant::now() < deadline, "line 1000 never came");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut req = env.socket.as_os_str().to_owned();
+    req.push(".upgrade");
+    std::fs::write(PathBuf::from(req), env!("CARGO_BIN_EXE_thurmd")).unwrap();
+    assert_eq!(
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR2) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.is_alive() {
+        assert!(Instant::now() < deadline, "old image kept the connection");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(c);
+    let (c, _events) = env.connect();
+    wait_match(&c, pane, "(?m)^ALL-DONE");
+    let text = capture(&c, pane);
+    let numbers: Vec<u32> = text
+        .lines()
+        .filter_map(|l| l.trim_end().strip_prefix("line-")?.parse().ok())
+        .collect();
+    let missing: Vec<u32> = (1..=6000).filter(|n| !numbers.contains(n)).collect();
+    assert!(
+        missing.is_empty(),
+        "lost {} lines: {:?}",
+        missing.len(),
+        &missing[..missing.len().min(20)]
+    );
+    assert!(
+        numbers.windows(2).all(|w| w[0] < w[1]),
+        "lines out of order"
+    );
+}
+
+#[test]
 fn upgrade_to_a_broken_binary_is_refused() {
     let env = Env::new("upgrade-refused");
     let daemon = env.start();
@@ -1190,4 +1245,58 @@ fn upgrade_to_a_broken_binary_is_refused() {
     })
     .unwrap();
     wait_match(&c, pane, "still-here");
+}
+
+#[test]
+fn completion_uses_only_the_path_the_shell_reported() {
+    let env = Env::with_shell("shellpath", &["/bin/bash"]);
+    let home = env.dir.join("home");
+    let bin = env.dir.join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let tool = bin.join("thurmzzcmd");
+    std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _daemon = env.start_with(&[("HOME", &home)]);
+    let (c, _events) = env.connect();
+    let pane = create(&c, &env.dir);
+    // The token is not in the environment of programs the shell runs.
+    let line = format!(
+        "echo token=[$THURM_SHELL_TOKEN]; export PATH={}:$PATH\r",
+        bin.display()
+    );
+    c.request(Request::Input {
+        pane,
+        data: line.into_bytes(),
+    })
+    .unwrap();
+    wait_match(&c, pane, r"token=\[\]");
+    // Program output claiming another PATH is ignored.
+    c.request(Request::Input {
+        pane,
+        data: b"printf '\\033]633;P;ThurmPath=/nonexistent\\007'; echo printed\r".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, "(?m)^printed");
+    c.request(Request::Input {
+        pane,
+        data: b"thurmzz".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, "(?m)thurmzz$");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match c.request(Request::Complete { pane }).unwrap() {
+            Response::Completions(comp) if comp.items.iter().any(|i| i.text == "thurmzzcmd") => {
+                break;
+            }
+            other => assert!(
+                Instant::now() < deadline,
+                "no completion: {other:?}\n{}",
+                capture(&c, pane)
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

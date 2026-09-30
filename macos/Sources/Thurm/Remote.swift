@@ -442,20 +442,22 @@ extension SessionManager {
 
     // MARK: Links
 
-    /// Cmd-click on a link: this Mac's panes open it; a remote pane's http(s) links open, other
-    /// schemes ask, and file:// paths (the host's) are offered for copying, never opened here.
+    /// Cmd-click on a link (`policy::link`): web and mail links open; other schemes ask; file://
+    /// paths are revealed in Finder for this Mac's panes, and offered for copying for a remote
+    /// pane (they are the host's), never opened.
     func openLink(_ url: URL, from pane: PaneKey, in window: NSWindow?) {
-        guard pane.isRemote else {
-            NSWorkspace.shared.open(url)
-            return
-        }
-        let v = Core.shared.remoteCall(["op": "link", "host": pane.host, "url": url.absoluteString]) as? [String: Any]
+        var call: [String: Any] = ["op": "link", "url": url.absoluteString]
+        if pane.isRemote { call["host"] = pane.host }
+        let v = Core.shared.remoteCall(call) as? [String: Any]
         switch jsonString(v?["action"]) {
         case "open":
             NSWorkspace.shared.open(url)
+        case "reveal":
+            let path = jsonString(v?["path"]) ?? url.path
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
         case "ask":
             let alert = NSAlert()
-            alert.messageText = "Open this link from \(pane.host)?"
+            alert.messageText = pane.isRemote ? "Open this link from \(pane.host)?" : "Open this link?"
             alert.informativeText = url.absoluteString
             alert.addButton(withTitle: "Open")
             alert.addButton(withTitle: "Cancel")

@@ -464,6 +464,8 @@ pub struct Terminal {
     scroll_region: Option<(u16, u16)>,
     /// `$PATH` as the shell last reported it (shell integration).
     shell_path: Option<String>,
+    /// The token the pane's shell integration puts in front of its `$PATH` report.
+    shell_token: Option<String>,
     /// Where the current prompt's input starts (OSC 133;B).
     input_start: Option<vt::Tracked>,
     /// Where the current prompt began (OSC 133;A), and whether the shell is still at it (no
@@ -523,6 +525,7 @@ impl Terminal {
             forward: None,
             scroll_region: None,
             shell_path: None,
+            shell_token: None,
             input_start: None,
             prompt_start: None,
             at_prompt: false,
@@ -1016,7 +1019,17 @@ impl Terminal {
                 self.mark_prompt();
                 self.prompt_redraw_ready = true;
             }
-            OscEvent::ShellPath(p) => self.shell_path = Some(p),
+            OscEvent::ShellPath(p) => {
+                // Only the pane's own shell knows the token: program output (`cat`, a remote
+                // host) must not choose which programs tab completion runs.
+                if let Some(path) = self
+                    .shell_token
+                    .as_deref()
+                    .and_then(|t| p.strip_prefix(t)?.strip_prefix(':'))
+                {
+                    self.shell_path = Some(absolute_path_entries(path));
+                }
+            }
             OscEvent::CommandStart => {
                 self.at_prompt = false;
                 self.events.push(TermEvent::CommandStart);
@@ -1046,6 +1059,20 @@ impl Terminal {
     /// The shell's `$PATH`, when its integration reported it.
     pub fn shell_path(&self) -> Option<&str> {
         self.shell_path.as_deref()
+    }
+
+    /// Accept `$PATH` reports carrying `token` (see `OscEvent::ShellPath`).
+    pub fn set_shell_token(&mut self, token: Option<String>) {
+        self.shell_token = token;
+    }
+
+    pub fn shell_token(&self) -> Option<&str> {
+        self.shell_token.as_deref()
+    }
+
+    /// Restores a `$PATH` reported before (an in-place upgrade).
+    pub fn set_shell_path(&mut self, path: Option<String>) {
+        self.shell_path = path.map(|p| absolute_path_entries(&p));
     }
 
     /// The command line being typed: text from the prompt's input start (OSC 133;B) to the
@@ -2772,6 +2799,15 @@ fn regex_escape_if_invalid(q: &str) -> String {
     } else {
         regex::escape(q)
     }
+}
+
+/// `path` without relative entries (`.`, `bin`, empty): a program found through one depends
+/// on the directory the shell happens to be in.
+fn absolute_path_entries(path: &str) -> String {
+    path.split(':')
+        .filter(|e| e.starts_with('/'))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 #[cfg(test)]

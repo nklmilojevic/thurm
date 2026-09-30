@@ -80,6 +80,110 @@ enum AiJob {
     },
 }
 
+/// Most of an unterminated escape sequence (or UTF-8 character) kept to replay after an
+/// in-place upgrade (see `PaneState::carry`).
+const MAX_CARRY: usize = 256 * 1024;
+
+/// Stops every pane's reader between two reads, for an in-place upgrade: what the old image
+/// read is then parsed (and serialized) completely, and the rest stays in the kernel for the
+/// new image.
+pub struct ReaderGate {
+    paused: AtomicBool,
+    /// Readable while paused, so readers blocked in `poll` wake up.
+    wake_r: std::os::fd::OwnedFd,
+    wake_w: std::os::fd::OwnedFd,
+    state: Mutex<GateState>,
+    changed: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    readers: usize,
+    parked: usize,
+}
+
+impl ReaderGate {
+    fn new() -> std::io::Result<ReaderGate> {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for fd in fds {
+            pty::set_cloexec(fd, true)?;
+            unsafe {
+                libc::fcntl(
+                    fd,
+                    libc::F_SETFL,
+                    libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+                )
+            };
+        }
+        Ok(ReaderGate {
+            paused: AtomicBool::new(false),
+            wake_r: unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) },
+            wake_w: unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) },
+            state: Mutex::new(GateState::default()),
+            changed: parking_lot::Condvar::new(),
+        })
+    }
+
+    fn wake_fd(&self) -> RawFd {
+        use std::os::fd::AsRawFd;
+        self.wake_r.as_raw_fd()
+    }
+
+    /// A reader starts (`leave` when it ends).
+    fn enter(&self) {
+        self.state.lock().readers += 1;
+    }
+
+    fn leave(&self) {
+        self.state.lock().readers -= 1;
+        self.changed.notify_all();
+    }
+
+    /// Called by a reader before each read: waits while the gate is closed.
+    fn park_if_paused(&self) {
+        if !self.paused.load(Ordering::Acquire) {
+            return;
+        }
+        let mut st = self.state.lock();
+        st.parked += 1;
+        self.changed.notify_all();
+        while self.paused.load(Ordering::Acquire) {
+            self.changed.wait(&mut st);
+        }
+        st.parked -= 1;
+    }
+
+    /// Closes the gate; true once every reader is parked, false after `timeout`.
+    fn pause(&self, timeout: Duration) -> bool {
+        use std::os::fd::AsRawFd;
+        self.paused.store(true, Ordering::Release);
+        unsafe { libc::write(self.wake_w.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+        let deadline = Instant::now() + timeout;
+        let mut st = self.state.lock();
+        while st.parked < st.readers {
+            if self.changed.wait_until(&mut st, deadline).timed_out() {
+                return st.parked >= st.readers;
+            }
+        }
+        true
+    }
+
+    fn resume(&self) {
+        use std::os::fd::AsRawFd;
+        let _st = self.state.lock();
+        self.paused.store(false, Ordering::Release);
+        let mut buf = [0u8; 64];
+        while unsafe { libc::read(self.wake_r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0
+        {
+        }
+        self.changed.notify_all();
+    }
+}
+
 /// Bytes read from a pane's PTY that its parser hasn't taken yet.
 #[derive(Default)]
 struct ReadAhead {
@@ -122,6 +226,8 @@ pub struct Pane {
     pub id: PaneId,
     pub state: Mutex<PaneState>,
     input: Sender<Vec<u8>>,
+    /// Read from the PTY, not parsed yet.
+    pipe: Arc<ReadAhead>,
 }
 
 impl Pane {
@@ -147,6 +253,10 @@ pub struct PaneState {
     /// When `last_history` was serialized.
     history_at: Option<Instant>,
     saved_generation: u64,
+    /// The unterminated end of what was parsed (an escape sequence cut by a read, or part of a
+    /// UTF-8 character): an in-place upgrade replays it into the new terminal ahead of the
+    /// rest, which is still in the kernel.
+    carry: Vec<u8>,
     pending_input: Option<(Instant, Vec<u8>)>,
     shell_integration_seen: bool,
     /// Last git probe: when, for which directory, and whether one is in flight.
@@ -163,6 +273,8 @@ struct InstallPane {
     hold: bool,
     osc_cwd: Option<String>,
     shell_integration_seen: bool,
+    /// Start of a sequence parsed by the image we replaced (see `PaneState::carry`).
+    carry: Vec<u8>,
 }
 
 pub struct Daemon {
@@ -184,6 +296,7 @@ pub struct Daemon {
     store: Option<Store>,
     /// One session save at a time: the monitor's autosave, SIGTERM, upgrades and requests.
     save_lock: Mutex<()>,
+    readers: ReaderGate,
     pub socket: PathBuf,
     integration_dir: Option<PathBuf>,
     session_dirty: AtomicBool,
@@ -228,6 +341,7 @@ impl Daemon {
             ai_rx: ai_channel.1,
             store,
             save_lock: Mutex::new(()),
+            readers: ReaderGate::new().expect("reader gate pipe"),
             socket,
             integration_dir,
             session_dirty: AtomicBool::new(false),
@@ -377,6 +491,7 @@ impl Daemon {
         if restore.is_none() && cfg.agents.install_hooks {
             ensure_hooks(command.as_deref());
         }
+        let token = shell_token()?;
         let opts = shell::spawn_options(shell::PaneLaunch {
             id,
             command: command.clone(),
@@ -386,8 +501,10 @@ impl Daemon {
             config: &cfg,
             socket: &self.socket,
             integration_dir: self.integration_dir.as_deref(),
+            token: &token,
         });
         let mut term = Terminal::new(size, self.engine.read().clone());
+        term.set_shell_token(Some(token));
         let restored = restore.is_some();
         if let Some((_, Some(history))) = &restore {
             term.replay(history);
@@ -420,6 +537,7 @@ impl Daemon {
                 hold: req.hold,
                 osc_cwd: None,
                 shell_integration_seen: false,
+                carry: Vec::new(),
             },
             true,
         )?;
@@ -437,6 +555,7 @@ impl Daemon {
         let pane = Arc::new(Pane {
             id,
             input: input_tx,
+            pipe: Arc::new(ReadAhead::default()),
             state: Mutex::new(PaneState {
                 term: p.term,
                 pty: p.pty,
@@ -451,6 +570,7 @@ impl Daemon {
                 last_history: None,
                 history_at: None,
                 saved_generation: 0,
+                carry: p.carry,
                 pending_input: None,
                 shell_integration_seen: p.shell_integration_seen,
                 git_probe: None,
@@ -474,7 +594,15 @@ impl Daemon {
     /// second thread, so the program never waits for the parser.
     fn reader_loop(self: Arc<Self>, pane: Arc<Pane>, mut reader: File) {
         interactive_qos();
-        let pipe = Arc::new(ReadAhead::default());
+        self.readers.enter();
+        struct Leave<'a>(&'a ReaderGate);
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                self.0.leave();
+            }
+        }
+        let _leave = Leave(&self.readers);
+        let pipe = pane.pipe.clone();
         let parser = {
             let (daemon, pane, pipe) = (self.clone(), pane.clone(), pipe.clone());
             std::thread::Builder::new()
@@ -491,9 +619,12 @@ impl Daemon {
         let mut buf = vec![0u8; 64 * 1024];
         let mut last_read = Instant::now();
         loop {
-            let n = match pty::read_pty(&mut reader, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
+            self.readers.park_if_paused();
+            let n = match pty::read_pty(&mut reader, &mut buf, self.readers.wake_fd()) {
+                // Woken by the gate: park.
+                Ok(None) => continue,
+                Ok(Some(0)) => break,
+                Ok(Some(n)) => n,
                 Err(e) => {
                     log::warn!("pane {} read error: {e}", pane.id);
                     break;
@@ -569,6 +700,7 @@ impl Daemon {
                     let data = st.term.advance_forward(slice);
                     self.forward_output(pane.id, &mut st, data);
                 }
+                update_carry(&mut st.carry, slice);
                 st.term.drain_events()
             };
             self.handle_term_events(pane, events);
@@ -1242,6 +1374,45 @@ impl Daemon {
 
     /// Everything the next image needs to carry on (see `upgrade.rs`). The PTY fds stay owned
     /// by the panes; they only become the new image's through exec.
+    /// Stops every pane's reader and waits until each pane parsed everything already read, so
+    /// the terminals can be serialized with nothing lost: the rest of the output waits in the
+    /// kernel for the next image. False when a reader didn't stop within `stall`, or a parser
+    /// made no progress for `stall` (or everything took longer than `limit`).
+    pub fn quiesce_readers(&self, stall: Duration, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        if !self.readers.pause(stall) {
+            return false;
+        }
+        for pane in self.all_panes() {
+            let mut generation = pane.state.lock().term.generation();
+            let mut progress = Instant::now();
+            loop {
+                {
+                    let st = pane.pipe.state.lock();
+                    if st.data.is_empty() && !st.parsing {
+                        break;
+                    }
+                }
+                let now = Instant::now();
+                let g = pane.state.lock().term.generation();
+                if g != generation {
+                    generation = g;
+                    progress = now;
+                }
+                if now >= end || now - progress >= stall {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        true
+    }
+
+    /// Lets the readers go on (the upgrade did not happen).
+    pub fn resume_readers(&self) {
+        self.readers.resume();
+    }
+
     pub fn handoff(&self, listener_fd: RawFd, log_to_file: bool) -> upgrade::Handoff {
         let mut panes = Vec::new();
         for pane in self.all_panes() {
@@ -1262,6 +1433,9 @@ impl Daemon {
                 osc_cwd: st.osc_cwd.clone(),
                 shell_integration_seen: st.shell_integration_seen,
                 state: upgrade::PaneHandoff::encode_state(&state),
+                pending: upgrade::PaneHandoff::encode_state(&st.carry),
+                shell_token: st.term.shell_token().map(str::to_owned),
+                shell_path: st.term.shell_path().map(str::to_owned),
             });
         }
         upgrade::Handoff {
@@ -1289,6 +1463,14 @@ impl Daemon {
             };
             let mut term = Terminal::new(size, self.engine.read().clone());
             term.replay(&p.state_bytes());
+            // The start of a sequence the old image had parsed; the rest follows from the PTY.
+            let pending = p.pending_bytes();
+            if !pending.is_empty() {
+                term.advance(&pending);
+                let _ = term.drain_events();
+            }
+            term.set_shell_token(p.shell_token.clone());
+            term.set_shell_path(p.shell_path.clone());
             let alive = p.exited.is_none();
             let info = PaneInfo {
                 id: p.id,
@@ -1311,6 +1493,8 @@ impl Daemon {
                     hold: p.hold,
                     osc_cwd: p.osc_cwd,
                     shell_integration_seen: p.shell_integration_seen,
+                    // Still the start of a sequence if the next upgrade comes before its end.
+                    carry: pending,
                 },
                 alive,
             );
@@ -1559,14 +1743,18 @@ impl Daemon {
                 }
             }
             Request::Complete { pane } => {
-                let (line, cwd, at_prompt, path) = self.with_pane(pane, |_, st| {
+                let (line, cwd, at_prompt, path, pid) = self.with_pane(pane, |_, st| {
                     (
                         st.term.input_line(),
                         st.info.cwd.clone(),
                         st.info.at_prompt,
                         st.term.shell_path().map(str::to_owned),
+                        st.info.pid,
                     )
                 })?;
+                // Until the shell reports its PATH (or for a shell handed over by a daemon
+                // that gave it no token): the PATH it was started with.
+                let path = path.or_else(|| procinfo::env_var(pid?, "PATH"));
                 let Some(line) = line.filter(|_| at_prompt) else {
                     return Ok(Response::Completions(thurm_proto::Completions::default()));
                 };
@@ -1998,6 +2186,36 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// Keeps the unterminated end of the output parsed so far in `carry`, given the next `slice`.
+fn update_carry(carry: &mut Vec<u8>, slice: &[u8]) {
+    if carry.is_empty() {
+        let start = thurm_term::filter::unterminated_tail(slice);
+        if slice.len() - start <= MAX_CARRY {
+            carry.extend_from_slice(&slice[start..]);
+        }
+        return;
+    }
+    // The sequence may go on (or end) in this slice.
+    carry.extend_from_slice(slice);
+    let start = thurm_term::filter::unterminated_tail(carry);
+    if carry.len() - start > MAX_CARRY {
+        carry.clear();
+    } else {
+        carry.drain(..start);
+    }
+}
+
+/// A random token for a pane's shell integration (see `Terminal::set_shell_token`). No pane
+/// is created without one: a guessable token would let program output set the PATH again.
+fn shell_token() -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(|e| anyhow::anyhow!("no random source for the shell token: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// PTY threads run at interactive priority: on macOS a daemon's threads otherwise may land on
