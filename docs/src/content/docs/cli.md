@@ -2,7 +2,7 @@
 title: Command line
 ---
 
-Install the CLI as described in [Install](/thurm/install/). Keep the app open for
+Install the CLI as described in [Install](/install/). Keep the app open for
 commands that create or focus tabs and splits.
 
 ```sh
@@ -70,9 +70,9 @@ Use `thurm COMMAND --help` for the full argument list.
 | `theme [SPEC]` | List themes, or select a theme |
 | `save` | Write a session snapshot |
 | `layout` | Print layout JSON |
-| `daemon ACTION` | Control the daemon; see [Sessions](/thurm/sessions/) |
+| `daemon ACTION` | Control the daemon; see [Sessions](/sessions/) |
 | `socket-path` | Print the daemon socket path |
-| `remote add\|list\|remove\|status\|install` | Manage remote hosts; see [Remote workspaces](/thurm/remote/) |
+| `remote add\|list\|remove\|status\|install` | Manage remote hosts; see [Remote workspaces](/remote/) |
 | `remote doctor [NAME]` | Check what a host needs and offer fixes; `--fix`, `--yes` |
 | `handoff` | Hand the repository to a remote agent; `--remote NAME`, `--preset`, `--branch agent/NAME`, `--list`, `--fetch ID`, `--cleanup ID` |
 
@@ -110,7 +110,7 @@ not all saved scrollback.
 
 `--remote NAME` is global: it sends the command to that host's daemon through
 the tunnel the app keeps open, and fails when the app is not connected to it.
-Pass `--pane` with it. See [Remote workspaces](/thurm/remote/#the-cli).
+Pass `--pane` with it. See [Remote workspaces](/remote/#the-cli).
 
 `--json` is global. Use it for structured results where the command returns
 data. A command that only performs an action can return no output.

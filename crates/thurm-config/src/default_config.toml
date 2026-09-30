@@ -8,7 +8,7 @@ family = "JetBrains Mono"
 # family_bold = "JetBrains Mono ExtraBold"
 # family_italic = "..."
 # family_bold_italic = "..."
-size = 13.0
+size = 16.0
 # Programming ligatures (=>, !=, ->, ...). Needs a font that ships them.
 ligatures = true
 # Extra OpenType features, e.g. ["ss01", "zero", "cv02"]. Prefix with "-" to disable.
@@ -38,7 +38,7 @@ quit_after_last_window = false
 unfocused_split_dim = 0.25
 pane_headers = false
 # Tabs: "native" (in the titlebar) or "sidebar" (vertical, grouped by repository). View > Tabs.
-tab_style = "native"
+tab_style = "sidebar"
 sidebar_width = 240.0
 
 [cursor]

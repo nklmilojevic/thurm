@@ -8,11 +8,13 @@ Keep work running after you quit the app, or run it on a remote host and return
 from your Mac.
 
 [Download for Apple silicon](https://github.com/nklmilojevic/thurm/releases/latest/download/Thurm.dmg)
-· [Documentation](https://nklmilojevic.github.io/thurm/)
+· [Documentation](https://docs.thurm.rs/)
 · [Releases](https://github.com/nklmilojevic/thurm/releases)
 
 The app requires **Apple silicon and macOS 14 or later**. Remote sessions can run
 on Linux x86_64, Linux aarch64, or another Apple silicon Mac.
+
+![Thurm with tabs grouped by repository in the sidebar, Claude Code working in the left pane, and lazygit and cargo test output on the right](docs/public/screenshots/hero.webp)
 
 ## Why Thurm?
 
@@ -50,7 +52,7 @@ can use configured resume commands to continue a saved conversation.
 
 By default, Thurm saves a snapshot every 15 seconds and keeps up to 4,000
 scrollback lines per pane on disk. Use `thurm save` to save one now.
-See the [session guide](https://nklmilojevic.github.io/thurm/sessions/) for storage
+See the [session guide](https://docs.thurm.rs/sessions/) for storage
 paths, daemon controls, and restoration settings.
 
 ### Tabs, splits, and workspaces
@@ -66,6 +68,8 @@ For a shell you can reach from another app, use **Window > Quick Terminal**.
 You can assign a global shortcut and choose its screen, position, and size.
 Its shell keeps running while the quick terminal is hidden.
 
+![The workspace switcher listing three workspaces with their tab counts](docs/public/screenshots/workspaces-crop.webp)
+
 ### Coding agent controls
 
 Thurm detects supported agents and shows whether they are working or need input.
@@ -78,13 +82,15 @@ completion notifications, session titles, and commands that wait for a turn to
 finish. With a known session ID and a supported agent, you can fork a conversation
 into another tab or split.
 
+![The agent switcher listing a Codex session and a Claude Code session, with presets to launch either](docs/public/screenshots/agents-crop.webp)
+
 Agent notifications apply to panes without focus. Claude Code permission
 notifications also have **Approve** and **Deny** buttons for the active request.
 
 Thurm uses agent tools installed on your machine. When it launches Claude Code
 or Codex without Thurm hooks, it adds the hooks to that agent's configuration
 by default. Set `agents.install_hooks = false` to disable this behavior.
-See the [agent guide](https://nklmilojevic.github.io/thurm/agents/) for setup and limits.
+See the [agent guide](https://docs.thurm.rs/agents/) for setup and limits.
 
 ### Remote workspaces and repository handoff
 
@@ -104,7 +110,7 @@ The agent works in that remote worktree. Thurm fetches its committed results for
 you to review and merge. It does not merge them into your local branch. This lets
 you continue local work while a remote agent handles another task.
 
-See the [remote guide](https://nklmilojevic.github.io/thurm/remote/) for host setup,
+See the [remote guide](https://docs.thurm.rs/remote/) for host setup,
 SSH requirements, file transfers, and handoff cleanup.
 
 ### Terminal tools for daily work
@@ -123,6 +129,10 @@ libghostty-vt maintains terminal state.
   prompt is detected, and confirmation for multiline pastes outside bracketed paste mode.
 - **Notifications:** alerts for agents and for commands that finish in a pane without
   focus after at least 15 seconds, by default.
+
+![Pressing Tab after kubectl shows a completion menu of subcommands with descriptions](docs/public/screenshots/complete-kubectl.webp)
+
+![fastfetch drawing the Thurm icon inline with the kitty graphics protocol](docs/public/screenshots/graphics.webp)
 
 ### Optional on-device AI
 
@@ -162,7 +172,7 @@ Start with these shortcuts:
 
 For CLI access, select **Thurm > Integrations > Install Command-Line Tool**.
 Make sure its install directory is on your `PATH`, then run `thurm --help`.
-See the [installation guide](https://nklmilojevic.github.io/thurm/install/) for details.
+See the [installation guide](https://docs.thurm.rs/install/) for details.
 
 ## Use Thurm from the command line
 
@@ -186,6 +196,8 @@ thurm capture --pane "$pane" -n 20
 other pane IDs and `thurm --json list` for structured output. A wait timeout returns
 exit code 124. Waiting for a shell prompt requires shell integration.
 
+![A split tab where the left pane runs thurm split, send, wait, and capture to drive a build in the right pane](docs/public/screenshots/cli.webp)
+
 ### Launch and inspect an agent
 
 With Codex installed, run:
@@ -198,7 +210,7 @@ thurm hooks status
 ```
 
 Use a preset name from `thurm presets` to launch another installed agent.
-The [CLI guide](https://nklmilojevic.github.io/thurm/cli/) covers agent waits, session
+The [CLI guide](https://docs.thurm.rs/cli/) covers agent waits, session
 forks, process inspection, and other commands. The repository also includes a
 [Thurm skill for coding agents](skills/thurm/SKILL.md).
 
@@ -238,7 +250,7 @@ size = 14.0
 ligatures = true
 
 [window]
-tab_style = "sidebar"
+tab_style = "native"
 
 [colors]
 theme = "light:catppuccin-latte,dark:catppuccin-mocha"
@@ -262,7 +274,7 @@ thurm theme nord
 
 To enable the optional Apple Intelligence features, add `[ai]` with `enabled = true`.
 The [example configuration](config.example.toml) lists all settings and defaults.
-See the [configuration guide](https://nklmilojevic.github.io/thurm/configuration/)
+See the [configuration guide](https://docs.thurm.rs/configuration/)
 for more examples.
 
 ## Build and contribute
@@ -314,9 +326,9 @@ uv run --no-project python -m unittest discover -s macos/release -v
 
 For documentation site changes, run `bun install --frozen-lockfile` and
 `bun run build` from `docs/`. The site build checks internal links and anchors.
-See the [development guide](https://nklmilojevic.github.io/thurm/development/) for
+See the [development guide](https://docs.thurm.rs/development/) for
 more detail and the [macOS guide](macos/README.md) for builds, signing, and releases.
-For usage problems, see [troubleshooting](https://nklmilojevic.github.io/thurm/troubleshooting/).
+For usage problems, see [troubleshooting](https://docs.thurm.rs/troubleshooting/).
 
 ## License
 

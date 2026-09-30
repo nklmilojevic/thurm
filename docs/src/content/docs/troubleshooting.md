@@ -21,13 +21,13 @@ Outside a Thurm pane, specify `--pane ID` for commands that need a target.
 Use `thurm close ID` and `thurm focus ID` with a positional ID.
 Check that the app and CLI use the same `THURM_SOCKET` and `XDG_RUNTIME_DIR`.
 If the installed app and daemon have different versions, try
-`thurm daemon upgrade`. See [Sessions](/thurm/sessions/) before stopping a daemon.
+`thurm daemon upgrade`. See [Sessions](/sessions/) before stopping a daemon.
 
 ## A configuration change has no effect
 
 Run `thurm config-path` and check that you edited that file. Run `thurm reload`
 and read any error. Check TOML syntax, section names, and values against the
-[reference](/thurm/configuration-reference/). A shell or environment change needs
+[reference](/configuration-reference/). A shell or environment change needs
 a new process. `THURM_CONFIG_DIR` takes priority over `XDG_CONFIG_HOME`.
 
 ## Agent status or notifications are missing
@@ -52,7 +52,7 @@ Replace `1` with the target ID from `thurm list`.
 ## Build fails
 
 Check `xcodebuild -version`, `rustc --version`, and `zig version` against the
-[requirements](/thurm/install/). Use `nix develop` for the repository toolchain.
+[requirements](/install/). Use `nix develop` for the repository toolchain.
 The initial build needs network access. Run `./macos/build.sh` from the repository
 root to build the Rust libraries, Swift app, and full app bundle together.
 

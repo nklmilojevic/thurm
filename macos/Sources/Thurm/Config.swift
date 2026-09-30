@@ -94,7 +94,7 @@ func colorFromRGB(_ rgb: UInt32, alpha: CGFloat = 1) -> NSColor {
 final class AppConfig {
     // [font]
     var fontFamily = "JetBrains Mono"
-    var fontSize: CGFloat = 13
+    var fontSize: CGFloat = 16
     var lineHeight: CGFloat = 1
     var letterSpacing: CGFloat = 0
     var fontFallback: [String] = ["SF Mono", "Menlo"]
@@ -118,7 +118,7 @@ final class AppConfig {
     var confirmClose = true
     var unfocusedSplitDim: CGFloat = 0.25
     /// `window.tab_style == "sidebar"`: vertical tabs instead of the native tab bar.
-    var sidebarTabs = false
+    var sidebarTabs = true
     var quitAfterLastWindow = false
     /// `window.blur` > 0: blur what is behind a translucent window.
     var blur = 0
@@ -260,7 +260,7 @@ final class AppConfig {
             confirmClose = jsonBool(w["confirm_close"]) ?? confirmClose
             unfocusedSplitDim = CGFloat(min(1, max(0, jsonDouble(w["unfocused_split_dim"])
                 ?? Double(unfocusedSplitDim))))
-            sidebarTabs = jsonString(w["tab_style"]) == "sidebar"
+            if let style = jsonString(w["tab_style"]) { sidebarTabs = style == "sidebar" }
             blur = min(100, max(0, jsonInt(w["blur"]) ?? blur))
             quitAfterLastWindow = jsonBool(w["quit_after_last_window"]) ?? quitAfterLastWindow
             sidebarWidth = CGFloat(min(480, max(180, jsonDouble(w["sidebar_width"]) ?? Double(sidebarWidth))))

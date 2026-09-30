@@ -96,8 +96,8 @@ needs the old restart, which restores layout and scrollback but not processes.
    keychain (back it up: `generate_keys --account thurm -x FILE`; losing it strands every
    installed copy). It also switches GitHub Pages to deploy from Actions.
 3. Optional variables: `SPARKLE_FEED_URL` (defaults to
-   `https://<owner>.github.io/<repo>/appcast.xml`; pin it before renaming the repository) and
-   `MACOS_SIGN_IDENTITY`.
+   `https://<owner>.github.io/<repo>/appcast.xml`; pin it before renaming the repository.
+   This repository sets it to `https://docs.thurm.rs/appcast.xml`) and `MACOS_SIGN_IDENTITY`.
 
 **A local release build** (same as CI, with your login keychain and a notarytool profile):
 
@@ -105,7 +105,7 @@ needs the old restart, which restores layout and scrollback but not processes.
 export THURM_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 export NOTARY_PROFILE=thurm-notary   # xcrun notarytool store-credentials thurm-notary
 export THURM_VERSION=0.2.0 THURM_BUILD_NUMBER="$(git rev-list --count HEAD)"
-export THURM_FEED_URL=https://<owner>.github.io/<repo>/appcast.xml
+export THURM_FEED_URL=https://docs.thurm.rs/appcast.xml
 export THURM_SPARKLE_PUBLIC_KEY=… SPARKLE_KEY_FILE=… THURM_DOWNLOAD_BASE=…
 macos/release/build-release.sh release
 ```

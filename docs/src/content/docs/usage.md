@@ -24,7 +24,7 @@ of tabs.
 | Agent switcher | Cmd+Shift+A |
 
 Closing a pane stops its process. Quitting the app keeps processes running by
-default. See [Sessions](/thurm/sessions/).
+default. See [Sessions](/sessions/).
 
 ## Workspaces and sidebar
 
@@ -35,13 +35,14 @@ host while the window shows a local workspace, goes to that workspace in the
 background, and the window says where. **Move Tab to New Workspace** (or
 dragging a tab out of the tab bar) moves a tab into a new workspace.
 
-To show tabs in a sidebar grouped by repository:
+By default, tabs show in a sidebar grouped by repository. To use native tabs in the
+titlebar:
 
 ```sh
-thurm set window.tab_style sidebar
+thurm set window.tab_style native
 ```
 
-Use `thurm set window.tab_style native` to return to native tabs.
+Use `thurm set window.tab_style sidebar` to return to the sidebar.
 
 ## Text, search, and navigation
 

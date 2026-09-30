@@ -1,12 +1,161 @@
-:root {
-  --sl-font: 'Inter Variable';
-  --sl-font-mono: 'JetBrains Mono Variable';
+/* Match thurm.rs: Catppuccin Mocha on crust, Geist for text, TX-02 for code. */
+
+/* TX-02 is licensed for thurm.rs and served from there (CORS allows docs.thurm.rs).
+   Without it, code falls back to the bundled JetBrains Mono. */
+@font-face {
+  font-family: 'TX-02';
+  src: url('https://thurm.rs/fonts/TX-02-Variable.woff2') format('woff2-variations');
+  font-weight: 100 900;
+  font-stretch: 60% 100%;
+  font-display: swap;
 }
 
-.sl-markdown-content :is(h1, h2, h3, h4) {
-  letter-spacing: -0.015em;
+:root,
+:root[data-theme='dark'] {
+  --sl-font: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: 'TX-02', 'JetBrains Mono Variable', ui-monospace, monospace;
+
+  --sl-color-bg: #11111b;
+  --sl-color-bg-nav: rgb(17 17 27 / 0.85);
+  --sl-color-bg-sidebar: #11111b;
+  --sl-color-bg-inline-code: #313244;
+  --sl-color-hairline: #313244;
+  --sl-color-hairline-light: #313244;
+  --sl-color-hairline-shade: #181825;
+
+  --sl-color-accent-low: #313244;
+  --sl-color-accent: #89b4fa;
+  --sl-color-accent-high: #cba6f7;
+  --sl-color-text-accent: #cba6f7;
+  --sl-color-text-invert: #11111b;
+
+  --sl-content-width: 46rem;
+  --sl-line-height: 1.7;
+}
+
+/* The monospace face in the screenshots: TX-02 Retina ExtraCondensed. */
+code,
+kbd,
+pre,
+.expressive-code {
+  font-stretch: 70%;
+}
+
+header.header {
+  backdrop-filter: blur(16px);
+}
+
+.site-title {
+  color: var(--sl-color-white);
+  font-family: var(--sl-font-mono);
+  font-stretch: 70%;
+  font-size: 1.25rem;
+  font-weight: 600;
+  gap: 0.6rem;
+}
+
+.site-title img {
+  height: 1.75rem;
+}
+
+/* Headings like the site: Geist, heavy, tight. */
+h1,
+.sl-markdown-content :is(h2, h3, h4),
+.hero h1 {
+  font-weight: 650;
+  letter-spacing: -0.035em;
+  color: var(--sl-color-white);
+}
+
+.content-panel h1#_top {
+  font-size: clamp(2.25rem, 4vw, 3rem);
+  line-height: 1;
+}
+
+.sl-markdown-content :is(h2) {
+  font-size: 1.75rem;
+  margin-top: 2.5rem;
+}
+
+.sl-markdown-content a:not(.sl-link-card, .sl-link-button) {
+  text-decoration-color: color-mix(in srgb, var(--sl-color-text-accent) 40%, transparent);
+  text-underline-offset: 3px;
+}
+.sl-markdown-content a:not(.sl-link-card, .sl-link-button):hover {
+  text-decoration-color: var(--sl-color-text-accent);
 }
 
 .sl-markdown-content :not(pre) > code {
-  font-size: 0.875em;
+  font-size: 0.95em;
+  padding: 0.08em 0.35em;
+  border-radius: 5px;
+  color: #bac2de;
+}
+
+/* Tables and link cards: bordered panels on base, like the site's cards. */
+.sl-markdown-content table {
+  display: table;
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid #313244;
+  border-radius: 0.75rem;
+  overflow: hidden;
+}
+.sl-markdown-content :is(th, td) {
+  border-color: #313244;
+  padding: 0.6rem 1rem;
+}
+.sl-markdown-content th {
+  background: #181825;
+  color: #7f849c;
+  font-weight: 500;
+}
+.sl-markdown-content tr:last-child td {
+  border-bottom: 0;
+}
+
+.sl-link-card {
+  background: #1e1e2e;
+  border-color: #313244;
+  border-radius: 0.75rem;
+}
+.sl-link-card:hover {
+  background: #313244;
+  border-color: #45475a;
+}
+
+/* Sidebar: current page highlighted like a Thurm sidebar tab. */
+.sidebar-content a[aria-current='page'] {
+  background: #313244;
+  color: var(--sl-color-white);
+  font-weight: 600;
+}
+
+/* Buttons match the site's download button. */
+.sl-link-button.primary {
+  background: #89b4fa;
+  border-color: #89b4fa;
+  color: #11111b;
+  border-radius: 0.5rem;
+}
+.sl-link-button.primary:hover {
+  background: #b4befe;
+  border-color: #b4befe;
+}
+.sl-link-button.minimal,
+.sl-link-button.secondary {
+  border-radius: 0.5rem;
+}
+
+.hero h1 {
+  font-size: clamp(2.75rem, 6vw, 4.5rem);
+  line-height: 0.95;
+}
+.hero .tagline {
+  color: #bac2de;
+}
+
+.site-title span {
+  text-transform: lowercase;
 }
