@@ -1,5 +1,7 @@
 """Tests for tip_notes.py: python3 -m unittest discover -s macos/release"""
 
+import contextlib
+import io
 import os
 import subprocess
 import tempfile
@@ -67,6 +69,22 @@ class NotesTest(unittest.TestCase):
     def test_nothing_new(self):
         out = tip_notes.render(REPO, self.head, self.head, [])
         self.assertIn("No changes to the app", out)
+
+    def test_rebuilding_the_tip_lists_nothing(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            tip_notes.main(["--repo", REPO, "--sha", self.head, "--since", self.head])
+        self.assertIn("Changes since the previous tip", out.getvalue())
+        self.assertIn("No changes to the app", out.getvalue())
+        self.assertNotIn("PR title", out.getvalue())
+
+    def test_branches_merged_into_main_are_listed(self):
+        git(self.dir, "switch", "-q", "-c", "local")
+        git(self.dir, "commit", "-q", "--allow-empty", "-m", "local work")
+        git(self.dir, "switch", "-q", "main")
+        git(self.dir, "merge", "-q", "--no-ff", "local", "-m", "Merge branch 'local'")
+        self.head = git(self.dir, "rev-parse", "HEAD")
+        self.assertIn("- Merge branch 'local' ([`", self.notes(self.previous))
 
     def test_long_lists_are_cut(self):
         items = [(f"{i:040x}", f"change {i}", "") for i in range(tip_notes.MAX_ENTRIES + 7)]

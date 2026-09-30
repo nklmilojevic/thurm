@@ -4,7 +4,8 @@
 usage: tip_notes.py --repo OWNER/NAME --sha SHA [--since PREVIOUS_TIP_SHA]
 
 Merged pull requests are listed by their title. Without --since (the first tip, or a tip that
-isn't an ancestor of SHA), the newest changes are listed.
+isn't an ancestor of SHA), the newest changes are listed; a rebuild of the same commit lists
+none.
 """
 
 import argparse
@@ -14,8 +15,6 @@ import sys
 
 MAX_ENTRIES = 50
 MERGE_PR = re.compile(r"^Merge pull request #(\d+) from ")
-# Merges that aren't changes of their own (a branch brought up to date).
-MERGE_OTHER = re.compile(r"^Merge (branch|remote-tracking branch) ")
 
 
 def commits(sha, since=None, limit=None):
@@ -36,19 +35,18 @@ def commits(sha, since=None, limit=None):
 
 
 def entry(repo, h, subject, body):
-    """One list line, or None for a merge that brings nothing of its own."""
+    """One list line (main's first parents only, so a branch's catch-up merges never get
+    here)."""
     m = MERGE_PR.match(subject)
     if m:
         title = next((line.strip() for line in body.splitlines() if line.strip()), subject)
         return f"- {title} ([#{m.group(1)}](https://github.com/{repo}/pull/{m.group(1)}))"
-    if MERGE_OTHER.match(subject):
-        return None
     return f"- {subject} ([`{h[:7]}`](https://github.com/{repo}/commit/{h}))"
 
 
 def render(repo, sha, since, items):
     lines = [f"**Tip build** of [`{sha[:7]}`](https://github.com/{repo}/commit/{sha})", ""]
-    entries = [e for e in (entry(repo, *c) for c in items) if e]
+    entries = [entry(repo, *c) for c in items]
     if since:
         compare = f"https://github.com/{repo}/compare/{since[:7]}...{sha[:7]}"
         lines.append(f"Changes since the previous tip ([`{since[:7]}`]({compare})):")
@@ -74,7 +72,7 @@ def main(argv=None):
     ap.add_argument("--sha", required=True)
     ap.add_argument("--since", default="")
     a = ap.parse_args(argv)
-    since = a.since if a.since and a.since != a.sha and is_ancestor(a.since, a.sha) else None
+    since = a.since if a.since and is_ancestor(a.since, a.sha) else None
     items = commits(a.sha, since, None if since else 20)
     sys.stdout.write(render(a.repo, a.sha, since, items))
 
