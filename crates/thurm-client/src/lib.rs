@@ -382,13 +382,30 @@ impl Client {
             Some(d) => self.writer.try_lock_until(d).ok_or(ClientError::Timeout)?,
             None => self.writer.lock(),
         };
-        if let Some(d) = deadline {
-            let rest = d
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1));
-            w.get_ref().set_write_timeout(Some(rest))?;
-        }
-        let written = w.write_all(&buf).and_then(|()| w.flush());
+        let written = match deadline {
+            None => w.write_all(&buf).and_then(|()| w.flush()),
+            // Write by hand, giving each call only the time left: a peer that reads a little
+            // at a time must not stretch the request past its deadline.
+            Some(d) => (|| {
+                w.flush()?;
+                let stream = w.get_mut();
+                let mut rest = &buf[..];
+                while !rest.is_empty() {
+                    let left = d.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    stream.set_write_timeout(Some(left))?;
+                    match stream.write(rest) {
+                        Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                        Ok(n) => rest = &rest[n..],
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            })(),
+        };
         if deadline.is_some() {
             let _ = w.get_ref().set_write_timeout(None);
         }
