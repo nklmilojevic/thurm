@@ -124,6 +124,56 @@ fn hyperlinks_get_stable_ids() {
 }
 
 #[test]
+fn link_table_starts_over_when_full() {
+    // Screens of distinct links, one after another: past MAX_LINKS the table holds only
+    // what is on screen, and the client gets it again with the rows that use it.
+    let (cols, rows) = (40u16, 25u16);
+    let mut t = term(cols, rows);
+    let screen = |t: &mut Terminal, tag: usize| {
+        let mut out = String::from("\x1b[H\x1b[2J");
+        for r in 0..rows {
+            for c in 0..cols / 2 {
+                out.push_str(&format!(
+                    "\x1b]8;;https://{tag}/{r}/{c}\x1b\\x\x1b]8;;\x1b\\ "
+                ));
+            }
+            if r + 1 < rows {
+                out.push_str("\r\n");
+            }
+        }
+        t.advance(out.as_bytes());
+    };
+    let per_screen = (cols / 2) as usize * rows as usize;
+    let screens = MAX_LINKS / per_screen + 1;
+    let mut view = ClientView::new();
+    for tag in 0..screens {
+        screen(&mut t, tag);
+        let s = t.snapshot(1, &mut view).unwrap();
+        assert_eq!(s.frame.links.len(), (tag + 1) * per_screen);
+    }
+    t.advance(b"\x1b[H");
+    let s = t.snapshot(1, &mut view).unwrap();
+    let last = screens - 1;
+    assert_eq!(s.frame.links.len(), per_screen);
+    assert!(
+        s.frame
+            .links
+            .iter()
+            .all(|l| l.starts_with(&format!("https://{last}/")))
+    );
+    assert_eq!(
+        s.frame.lines.len(),
+        rows as usize,
+        "every row is sent with the new ids"
+    );
+    let first = s.frame.lines.iter().find(|l| l.row == 0).unwrap().cells[0].link;
+    assert_eq!(
+        s.frame.links[first as usize - 1],
+        format!("https://{last}/0/0")
+    );
+}
+
+#[test]
 fn intercepted_osc_events() {
     let mut t = term(20, 2);
     t.advance(
@@ -414,6 +464,48 @@ fn kitty_keyboard_mode_is_tracked() {
             .iter()
             .any(|e| matches!(e, TermEvent::PtyWrite(b) if b == b"\x1b[?1u"))
     );
+}
+
+fn press(key: NamedKey) -> KeyEvent {
+    KeyEvent {
+        key: Key::Named(key),
+        mods: 0,
+        action: KeyAction::Press,
+        text: String::new(),
+        shifted: None,
+        base_layout: None,
+    }
+}
+
+#[test]
+fn kitty_keyboard_off_keeps_keys_legacy() {
+    let mut t = term(10, 3);
+    t.set_config(EngineConfig {
+        kitty_keyboard: false,
+        ..EngineConfig::default()
+    });
+    t.advance(b"\x1b[>1u");
+    assert!(!t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+    assert_eq!(t.key(&press(NamedKey::Escape)), b"\x1b");
+    assert!(t.key(&press(NamedKey::F(30))).is_empty());
+}
+
+#[test]
+fn f26_to_f35_use_kitty_codes() {
+    let mut t = term(10, 3);
+    // No legacy sequence exists for them.
+    assert!(t.key(&press(NamedKey::F(26))).is_empty());
+    t.advance(b"\x1b[>1u");
+    assert_eq!(t.key(&press(NamedKey::F(26))), b"\x1b[57389u");
+    assert_eq!(t.key(&press(NamedKey::F(35))), b"\x1b[57398u");
+    let mut ev = press(NamedKey::F(30));
+    ev.mods = mods::CTRL | mods::SHIFT;
+    assert_eq!(t.key(&ev), b"\x1b[57393;6u");
+    // Releases only when event types are reported.
+    ev.action = KeyAction::Release;
+    assert!(t.key(&ev).is_empty());
+    t.advance(b"\x1b[=3u");
+    assert_eq!(t.key(&ev), b"\x1b[57393;6:3u");
 }
 
 // ---- kitty graphics ------------------------------------------------------------------------
@@ -1112,6 +1204,25 @@ fn cwd_and_clipboard_come_from_libghostty() {
 }
 
 #[test]
+fn prompt_mark_columns_use_the_terminals_widths() {
+    assert_eq!(byte_offset_of_column("日x", 2, true), "日".len());
+    assert_eq!(
+        byte_offset_of_column("\x1b[1m日\x1b[0mx", 2, true),
+        "\x1b[1m日\x1b[0m".len()
+    );
+    assert_eq!(
+        byte_offset_of_column("e\u{301}x", 1, true),
+        "e\u{301}".len()
+    );
+    // An emoji presentation selector makes a wide cluster with grapheme clustering (2027),
+    // and changes nothing without it.
+    let heart = "\u{2764}\u{fe0f}x";
+    assert_eq!(byte_offset_of_column(heart, 2, true), heart.len() - 1);
+    assert_eq!(byte_offset_of_column(heart, 1, false), heart.len() - 1);
+    assert_eq!(byte_offset_of_column("ab", 5, true), 2);
+}
+
+#[test]
 fn prompt_marks_are_libghosttys() {
     // VS Code's marks work like OSC 133 ones.
     let mut t = term(20, 5);
@@ -1640,4 +1751,23 @@ fn shell_path_needs_the_pane_token() {
     // The shell's report; relative entries are dropped.
     t.advance(b"\x1b]633;P;ThurmPath=secret:.:/opt/bin::bin:/usr/bin\x07");
     assert_eq!(t.shell_path(), Some("/opt/bin:/usr/bin"));
+}
+
+#[test]
+fn osc52_is_forwarded_once() {
+    let mut t = term(40, 5);
+    t.set_config(EngineConfig {
+        osc52: thurm_config::Osc52Mode::CopyPaste,
+        ..EngineConfig::default()
+    });
+    let _ = t.drain_events();
+    let data = t.advance_forward(b"\x1b]52;c;aGVsbG8=\x07");
+    let text = String::from_utf8_lossy(&data);
+    assert_eq!(text.matches("]52;").count(), 1, "{text:?}");
+    let stores = t
+        .drain_events()
+        .iter()
+        .filter(|e| matches!(e, TermEvent::ClipboardStore(_)))
+        .count();
+    assert_eq!(stores, 1);
 }
