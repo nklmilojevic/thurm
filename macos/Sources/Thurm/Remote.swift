@@ -140,14 +140,12 @@ final class Remotes {
         }
         monitor.start(queue: DispatchQueue.global(qos: .utility))
         pathMonitor = monitor
-        countdown = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
-            Remotes.shared.tick()
-        }
     }
 
     func stop() {
         pathMonitor?.cancel()
         countdown?.invalidate()
+        countdown = nil
         thurm_remotes_stop()
     }
 
@@ -159,6 +157,7 @@ final class Remotes {
             statuses.removeValue(forKey: host)
             Core.shared.disconnect(host)
         }
+        syncCountdown()
         RemotesWindow.shared.reload()
     }
 
@@ -190,6 +189,7 @@ final class Remotes {
             tlog("\(host): \(s.label): \(s.message ?? "")")
         }
         updateOverlays(host)
+        syncCountdown()
         RemotesWindow.shared.reload()
         SessionManager.shared.refreshSidebars()
     }
@@ -198,6 +198,7 @@ final class Remotes {
     func connectionLost(_ host: HostId) {
         Core.shared.disconnect(host)
         updateOverlays(host)
+        syncCountdown()
         SessionManager.shared.refreshSidebars()
         // The tunnel may still look alive; have it checked and replaced now.
         thurm_remote_kick(host, true)
@@ -206,6 +207,20 @@ final class Remotes {
     private func tick() {
         for host in statuses.keys where !Core.shared.isConnected(host) {
             updateOverlays(host)
+        }
+        syncCountdown()
+    }
+
+    /// The 1 s timer only runs while a disconnected host shows a reconnect countdown.
+    private func syncCountdown() {
+        let needed = started && statuses.contains { !Core.shared.isConnected($0.key) && $0.value.retryAt != nil }
+        if needed, countdown == nil {
+            countdown = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+                Remotes.shared.tick()
+            }
+        } else if !needed, let timer = countdown {
+            timer.invalidate()
+            countdown = nil
         }
     }
 

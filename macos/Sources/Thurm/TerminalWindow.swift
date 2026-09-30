@@ -178,11 +178,42 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
     override func update() {
         super.update()
         // Adding a tab rebuilds the bar lazily, after the KVO callbacks ran. This runs once per
-        // event loop pass before display: the earliest point to fix a new bar up. The walk is
-        // one tab bar and a no-op when nothing changed.
+        // event loop pass before display: the earliest point to fix a new bar up. It runs for
+        // every key and mouse event, so walk the bar only for a few passes after the tabs,
+        // selection, size or tint changed, and otherwise at most twice a second.
+        let key = TabBarSyncKey(tabs: tabGroup?.windows.count ?? 1,
+                                selected: tabGroup?.selectedWindow.map(ObjectIdentifier.init),
+                                fullScreen: styleMask.contains(.fullScreen),
+                                width: frame.width,
+                                color: titlebarColor,
+                                appearance: effectiveAppearance.name,
+                                suppressed: suppressTabBar)
+        if key != tabBarSyncKey {
+            tabBarSyncKey = key
+            tabBarSyncPasses = 3
+        }
+        let now = CACurrentMediaTime()
+        guard tabBarSyncPasses > 0 || now - lastTabBarSync > 0.5 else { return }
+        tabBarSyncPasses = max(0, tabBarSyncPasses - 1)
+        lastTabBarSync = now
         syncTabBarBackground()
         if suppressTabBar { applyTabBarVisibility() }
     }
+
+    /// What decides whether `update()` walks the tab bar.
+    private struct TabBarSyncKey: Equatable {
+        var tabs: Int
+        var selected: ObjectIdentifier?
+        var fullScreen: Bool
+        var width: CGFloat
+        var color: NSColor?
+        var appearance: NSAppearance.Name
+        var suppressed: Bool
+    }
+
+    private var tabBarSyncKey: TabBarSyncKey?
+    private var tabBarSyncPasses = 0
+    private var lastTabBarSync: CFTimeInterval = 0
 
     // MARK: Tab bar
 
