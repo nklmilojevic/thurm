@@ -8,7 +8,7 @@
 [font]
 # Use a font family or face name. Sizes and spacing are in points.
 family = "JetBrains Mono"
-size = 13.0
+size = 16.0
 # These faces are selected from the font family when not set.
 # family_bold = "JetBrains Mono Bold"
 # family_italic = "JetBrains Mono Italic"
@@ -46,7 +46,7 @@ quit_after_last_window = false
 unfocused_split_dim = 0.25
 pane_headers = false
 # Tab location: "native" or "sidebar".
-tab_style = "native"
+tab_style = "sidebar"
 sidebar_width = 240.0
 
 [cursor]

@@ -202,7 +202,7 @@ impl Default for FontConfig {
     fn default() -> Self {
         Self {
             family: "JetBrains Mono".into(),
-            size: 13.0,
+            size: 16.0,
             ligatures: true,
             features: Vec::new(),
             line_height: 1.0,
@@ -223,9 +223,9 @@ impl Default for FontConfig {
 #[serde(rename_all = "lowercase")]
 pub enum TabStyle {
     /// Native macOS tabs in the titlebar.
-    #[default]
     Native,
     /// A vertical sidebar (grouped by repository, with agent status and git info), like tty7.
+    #[default]
     Sidebar,
 }
 
@@ -279,7 +279,7 @@ impl Default for WindowConfig {
             quit_after_last_window: false,
             unfocused_split_dim: 0.25,
             pane_headers: false,
-            tab_style: TabStyle::Native,
+            tab_style: TabStyle::Sidebar,
             sidebar_width: 240.0,
         }
     }
@@ -1500,6 +1500,18 @@ clipboard_read = "always"
     }
 
     #[test]
+    fn unconfigured_font_is_bundled_jetbrains_mono_at_16pt() {
+        let c = Config::parse("").unwrap();
+        assert_eq!(c.font.family, "JetBrains Mono");
+        assert_eq!(c.font.size, 16.0);
+        let bundled = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../macos/Resources/fonts/JetBrainsMono-Regular.ttf"
+        );
+        assert!(std::path::Path::new(bundled).exists(), "missing {bundled}");
+    }
+
+    #[test]
     fn overrides_and_features() {
         let c = Config::parse(
             r##"
@@ -1556,10 +1568,10 @@ clipboard_read = "always"
 
     #[test]
     fn settings_written_and_validated() {
-        let out = with_setting(DEFAULT_CONFIG_TOML, "window.tab_style", "\"sidebar\"").unwrap();
+        let out = with_setting(DEFAULT_CONFIG_TOML, "window.tab_style", "\"native\"").unwrap();
         assert_eq!(
             Config::parse(&out).unwrap().window.tab_style,
-            TabStyle::Sidebar
+            TabStyle::Native
         );
         assert!(out.contains("# Tabs:"), "comments kept");
         let out = with_setting(&out, "window.sidebar_width", "300.0").unwrap();
