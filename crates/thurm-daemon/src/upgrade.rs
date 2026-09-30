@@ -64,6 +64,12 @@ pub struct PaneHandoff {
     /// terminal after `state` (empty from images that didn't write it).
     #[serde(default)]
     pub pending: String,
+    /// The token the shell integration sends with `$PATH` (from images that wrote it).
+    #[serde(default)]
+    pub shell_token: Option<String>,
+    /// The `$PATH` the shell reported (it only reports it again when it changes).
+    #[serde(default)]
+    pub shell_path: Option<String>,
 }
 
 impl PaneHandoff {

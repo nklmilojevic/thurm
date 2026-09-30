@@ -1625,3 +1625,19 @@ fn color_scheme_reports() {
     t.set_config(cfg);
     assert_eq!(responses(&mut t), "\x1b[?997;2n");
 }
+
+#[test]
+fn shell_path_needs_the_pane_token() {
+    let mut t = term(40, 5);
+    // Without a token (program output, or a copy of the terminal) nothing is accepted.
+    t.advance(b"\x1b]633;P;ThurmPath=/usr/bin\x07");
+    assert_eq!(t.shell_path(), None);
+    t.set_shell_token(Some("secret".into()));
+    // `cat README` printing a PATH of its own.
+    t.advance(b"\x1b]633;P;ThurmPath=.\x07");
+    t.advance(b"\x1b]633;P;ThurmPath=wrong:/tmp/evil\x07");
+    assert_eq!(t.shell_path(), None);
+    // The shell's report; relative entries are dropped.
+    t.advance(b"\x1b]633;P;ThurmPath=secret:.:/opt/bin::bin:/usr/bin\x07");
+    assert_eq!(t.shell_path(), Some("/opt/bin:/usr/bin"));
+}

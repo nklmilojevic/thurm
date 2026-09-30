@@ -491,6 +491,7 @@ impl Daemon {
         if restore.is_none() && cfg.agents.install_hooks {
             ensure_hooks(command.as_deref());
         }
+        let token = shell_token()?;
         let opts = shell::spawn_options(shell::PaneLaunch {
             id,
             command: command.clone(),
@@ -500,8 +501,10 @@ impl Daemon {
             config: &cfg,
             socket: &self.socket,
             integration_dir: self.integration_dir.as_deref(),
+            token: &token,
         });
         let mut term = Terminal::new(size, self.engine.read().clone());
+        term.set_shell_token(Some(token));
         let restored = restore.is_some();
         if let Some((_, Some(history))) = &restore {
             term.replay(history);
@@ -1431,6 +1434,8 @@ impl Daemon {
                 shell_integration_seen: st.shell_integration_seen,
                 state: upgrade::PaneHandoff::encode_state(&state),
                 pending: upgrade::PaneHandoff::encode_state(&st.carry),
+                shell_token: st.term.shell_token().map(str::to_owned),
+                shell_path: st.term.shell_path().map(str::to_owned),
             });
         }
         upgrade::Handoff {
@@ -1464,6 +1469,8 @@ impl Daemon {
                 term.advance(&pending);
                 let _ = term.drain_events();
             }
+            term.set_shell_token(p.shell_token.clone());
+            term.set_shell_path(p.shell_path.clone());
             let alive = p.exited.is_none();
             let info = PaneInfo {
                 id: p.id,
@@ -1736,14 +1743,18 @@ impl Daemon {
                 }
             }
             Request::Complete { pane } => {
-                let (line, cwd, at_prompt, path) = self.with_pane(pane, |_, st| {
+                let (line, cwd, at_prompt, path, pid) = self.with_pane(pane, |_, st| {
                     (
                         st.term.input_line(),
                         st.info.cwd.clone(),
                         st.info.at_prompt,
                         st.term.shell_path().map(str::to_owned),
+                        st.info.pid,
                     )
                 })?;
+                // Until the shell reports its PATH (or for a shell handed over by a daemon
+                // that gave it no token): the PATH it was started with.
+                let path = path.or_else(|| procinfo::env_var(pid?, "PATH"));
                 let Some(line) = line.filter(|_| at_prompt) else {
                     return Ok(Response::Completions(thurm_proto::Completions::default()));
                 };
@@ -2187,6 +2198,17 @@ fn update_carry(carry: &mut Vec<u8>, slice: &[u8]) {
     } else {
         carry.drain(..start);
     }
+}
+
+/// A random token for a pane's shell integration (see `Terminal::set_shell_token`). No pane
+/// is created without one: a guessable token would let program output set the PATH again.
+fn shell_token() -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(|e| anyhow::anyhow!("no random source for the shell token: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// PTY threads run at interactive priority: on macOS a daemon's threads otherwise may land on

@@ -54,11 +54,17 @@ pub enum LinkAction {
     CopyPath {
         path: String,
     },
+    /// A file on this Mac: shown in Finder, never opened (it could be an app or a script).
+    Reveal {
+        path: String,
+    },
     /// Not a URL at all.
     Ignore,
 }
 
-/// Cmd-click on `url` in a pane of `host`.
+/// Cmd-click on `url` in a pane of `host`. The URL comes from program output (OSC 8 or text),
+/// so only web and mail links open directly, even in this Mac's panes: other schemes can start
+/// apps (`smb:`, custom handlers) and a `file:` URL can name an app or a `.command` script.
 pub fn link(host: Option<&str>, url: &str) -> LinkAction {
     let Some((scheme, rest)) = url.split_once(':') else {
         return LinkAction::Ignore;
@@ -71,11 +77,9 @@ pub fn link(host: Option<&str>, url: &str) -> LinkAction {
     {
         return LinkAction::Ignore;
     }
-    if host.is_none() {
-        return LinkAction::Open;
-    }
     match scheme.as_str() {
         "http" | "https" => LinkAction::Open,
+        "mailto" if host.is_none() => LinkAction::Open,
         "file" => {
             // file://host/path or file:///path: the path part, percent-decoded.
             let rest = rest.strip_prefix("//").unwrap_or(rest);
@@ -83,8 +87,11 @@ pub fn link(host: Option<&str>, url: &str) -> LinkAction {
                 Some(i) => &rest[i..],
                 None => "/",
             };
-            LinkAction::CopyPath {
-                path: percent_decode(path),
+            let path = percent_decode(path);
+            if host.is_none() {
+                LinkAction::Reveal { path }
+            } else {
+                LinkAction::CopyPath { path }
             }
         }
         _ => LinkAction::Ask,
@@ -188,8 +195,16 @@ clipboard_read = "never"
             }
         );
         assert_eq!(link(r, "not a url"), LinkAction::Ignore);
-        // Local panes: unchanged.
-        assert_eq!(link(None, "file:///etc/hosts"), LinkAction::Open);
-        assert_eq!(link(None, "vscode://x"), LinkAction::Open);
+        // This Mac's panes: files are revealed, other schemes ask.
+        assert_eq!(
+            link(None, "file:///Users/me/x%20y.command"),
+            LinkAction::Reveal {
+                path: "/Users/me/x y.command".into()
+            }
+        );
+        assert_eq!(link(None, "https://example.com"), LinkAction::Open);
+        assert_eq!(link(None, "mailto:me@x.org"), LinkAction::Open);
+        assert_eq!(link(None, "vscode://x"), LinkAction::Ask);
+        assert_eq!(link(None, "smb://attacker/share"), LinkAction::Ask);
     }
 }
