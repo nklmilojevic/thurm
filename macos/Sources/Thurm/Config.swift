@@ -178,6 +178,15 @@ final class AppConfig {
     var remoteNames: [String] = []
     var configPath = ""
     var loadError: String?
+    /// Settings the config file has that this build doesn't know (ignored).
+    var loadWarnings: [String] = []
+
+    /// One line for a toast about `loadWarnings`.
+    var warningSummary: String? {
+        guard let first = loadWarnings.first else { return nil }
+        let more = loadWarnings.count > 1 ? " (+\(loadWarnings.count - 1) more)" : ""
+        return "Config: \(first)\(more)"
+    }
 
     /// Loads (and on first run creates) the config through the Rust core, resolving the
     /// theme for the current system appearance.
@@ -201,6 +210,7 @@ final class AppConfig {
 
     private func apply(_ root: [String: Any]) {
         loadError = jsonString(root["error"])
+        loadWarnings = root["warnings"] as? [String] ?? []
         configPath = jsonString(root["config_path"]) ?? ""
         if let features = root["font_features"] as? [String] {
             fontFeatures = features
@@ -228,9 +238,10 @@ final class AppConfig {
 
         if let font = c["font"] as? [String: Any] {
             fontFamily = jsonString(font["family"]) ?? fontFamily
-            fontSize = CGFloat(jsonDouble(font["size"]) ?? Double(fontSize))
-            lineHeight = CGFloat(jsonDouble(font["line_height"]) ?? Double(lineHeight))
-            letterSpacing = CGFloat(jsonDouble(font["letter_spacing"]) ?? Double(letterSpacing))
+            // Clamped as the daemon validates them: sizes become pixel counts (`Int(...)`).
+            fontSize = CGFloat(clamped(font["size"], 4, 200) ?? Double(fontSize))
+            lineHeight = CGFloat(clamped(font["line_height"], 0.5, 4) ?? Double(lineHeight))
+            letterSpacing = CGFloat(clamped(font["letter_spacing"], -20, 100) ?? Double(letterSpacing))
             if let fb = font["fallback"] as? [String] { fontFallback = fb }
             fontFamilyBold = jsonString(font["family_bold"]).flatMap { $0.isEmpty ? nil : $0 }
             fontFamilyItalic = jsonString(font["family_italic"]).flatMap { $0.isEmpty ? nil : $0 }
@@ -240,29 +251,29 @@ final class AppConfig {
             nerdFontSymbols = jsonBool(font["nerd_font_symbols"]) ?? nerdFontSymbols
         }
         if let w = c["window"] as? [String: Any] {
-            paddingX = CGFloat(jsonDouble(w["padding_x"]) ?? Double(paddingX))
-            paddingY = CGFloat(jsonDouble(w["padding_y"]) ?? Double(paddingY))
+            paddingX = CGFloat(clamped(w["padding_x"], 0, 200) ?? Double(paddingX))
+            paddingY = CGFloat(clamped(w["padding_y"], 0, 200) ?? Double(paddingY))
             opacity = CGFloat(min(1, max(0.05, jsonDouble(w["opacity"]) ?? Double(opacity))))
             if let o = jsonString(w["option_as_alt"]), let v = OptionAsAlt(rawValue: o) { optionAsAlt = v }
-            columns = max(10, jsonInt(w["columns"]) ?? columns)
-            rows = max(3, jsonInt(w["rows"]) ?? rows)
+            columns = min(1000, max(10, jsonInt(w["columns"]) ?? columns))
+            rows = min(1000, max(3, jsonInt(w["rows"]) ?? rows))
             confirmClose = jsonBool(w["confirm_close"]) ?? confirmClose
             unfocusedSplitDim = CGFloat(min(1, max(0, jsonDouble(w["unfocused_split_dim"])
                 ?? Double(unfocusedSplitDim))))
             sidebarTabs = jsonString(w["tab_style"]) == "sidebar"
-            blur = max(0, jsonInt(w["blur"]) ?? blur)
+            blur = min(100, max(0, jsonInt(w["blur"]) ?? blur))
             quitAfterLastWindow = jsonBool(w["quit_after_last_window"]) ?? quitAfterLastWindow
             sidebarWidth = CGFloat(min(480, max(180, jsonDouble(w["sidebar_width"]) ?? Double(sidebarWidth))))
         }
         if let cur = c["cursor"] as? [String: Any] {
             cursorBlink = jsonBool(cur["blink"]) ?? cursorBlink
-            cursorThickness = CGFloat(jsonDouble(cur["thickness"]) ?? Double(cursorThickness))
+            cursorThickness = CGFloat(clamped(cur["thickness"], 0, 20) ?? Double(cursorThickness))
         }
         if let term = c["terminal"] as? [String: Any] {
             copyOnSelect = jsonBool(term["copy_on_select"]) ?? copyOnSelect
             smoothScroll = jsonBool(term["smooth_scroll"]) ?? smoothScroll
             tabCompletion = jsonBool(term["tab_completion"]) ?? tabCompletion
-            scrollMultiplier = CGFloat(max(0.1, jsonDouble(term["scroll_multiplier"]) ?? Double(scrollMultiplier)))
+            scrollMultiplier = CGFloat(clamped(term["scroll_multiplier"], 0.1, 100) ?? Double(scrollMultiplier))
         }
         if let session = c["session"] as? [String: Any] {
             quitTerminates = (jsonString(session["quit"]) ?? "detach") == "terminate"
@@ -292,7 +303,7 @@ final class AppConfig {
             quickSize = CGFloat(min(1, max(0.1, jsonDouble(q["size"]) ?? Double(quickSize))))
             quickAutohide = jsonBool(q["autohide"]) ?? quickAutohide
             quickOnMainScreen = jsonString(q["screen"]) == "main"
-            quickAnimationDuration = max(0, jsonDouble(q["animation_duration"]) ?? quickAnimationDuration)
+            quickAnimationDuration = clamped(q["animation_duration"], 0, 5) ?? quickAnimationDuration
             quickOpacity = jsonDouble(q["opacity"]).map { CGFloat(min(1, max(0.05, $0))) }
         }
         if let remotes = c["remote"] as? [[String: Any]] {

@@ -61,6 +61,8 @@ final class SessionManager: NSObject, CoreDelegate {
             currentController?.content.focusedView?.showToast("Config error: \(err)", duration: 8)
         } else if let err = QuickTerminal.shared.configChanged() {
             currentController?.content.focusedView?.showToast(err, duration: 8)
+        } else if let warning = config.warningSummary {
+            currentController?.content.focusedView?.showToast(warning, duration: 8)
         }
     }
 
@@ -822,6 +824,8 @@ final class SessionManager: NSObject, CoreDelegate {
             view?.showToast("Config error: \(err)", duration: 8)
         } else if let err = quickError {
             view?.showToast(err, duration: 8)
+        } else if let warning = config.warningSummary {
+            view?.showToast(warning, duration: 8)
         } else if notifyDaemon {
             view?.showToast("Configuration reloaded")
         }
