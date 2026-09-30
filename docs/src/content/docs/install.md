@@ -5,10 +5,30 @@ title: Install Thurm
 ## Requirements
 
 Thurm runs on Apple silicon with macOS 14 or later. Intel Macs are not supported.
-To build from source, install Xcode 26 or later, Rust stable with the
-`aarch64-apple-darwin` target, and Zig 0.16.0.
+
+## Download
+
+1. Download [Thurm.dmg](https://github.com/nklmilojevic/thurm/releases/latest/download/Thurm.dmg).
+2. Open it and drag **Thurm** to **Applications**.
+3. Eject the disk image, then open Thurm from Applications.
+
+Release builds are signed with a Developer ID and notarized by Apple. On the first
+launch, macOS asks you to confirm that you want to open an app downloaded from
+the internet. Select **Open**.
+
+Don't run Thurm from the disk image. macOS runs apps opened there from a
+temporary, read-only location. The daemon, the command-line tool and the login
+item would point at a path that disappears when the image is ejected, and
+updates can't replace the app.
+
+To get nightly builds of `main` instead, download
+[Thurm-tip.dmg](https://github.com/nklmilojevic/thurm/releases/download/tip/Thurm-tip.dmg),
+or select **Thurm > Update Channel > Tip** in an installed Thurm.
 
 ## Build from source
+
+To build from source, install Xcode 26 or later, Rust stable with the
+`aarch64-apple-darwin` target, and Zig 0.16.0.
 
 Clone the repository and enter its directory:
 
@@ -54,12 +74,9 @@ thurm --help
 Add the `export` line to your shell configuration to keep it for new shells.
 Open Thurm, then run `thurm list` to see your panes.
 
-## Release builds and updates
+## Updates
 
-Check [GitHub Releases](https://github.com/nklmilojevic/thurm/releases) for
-published builds. If no build is listed, use the source instructions above.
-For a published DMG, open it and copy Thurm to Applications.
-
+All builds are listed on [GitHub Releases](https://github.com/nklmilojevic/thurm/releases).
 Signed release builds use Sparkle for updates. Select **Thurm > Update Channel**
 to choose Release or Tip. By default, `updates.channel = "auto"` follows the
 installed build. Release receives tagged versions. Tip receives a nightly

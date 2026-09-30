@@ -137,7 +137,8 @@ jobs:
           set -euo pipefail
           OUT="$RUNNER_TEMP/linux"
           mkdir -p "$OUT"
-          tar -czf "$OUT/${{ steps.meta.outputs.archive }}" -C "target/${{ matrix.target }}/release" thurm thurmd
+          tar -czf "$OUT/${{ steps.meta.outputs.archive }}" -C "target/${{ matrix.target }}/release" thurm thurmd \
+            -C "$GITHUB_WORKSPACE" LICENSE THIRD_PARTY_LICENSES
           (cd "$OUT" && sha256sum "${{ steps.meta.outputs.archive }}" > "${{ steps.meta.outputs.archive }}.sha256")
           cat "$OUT"/*.sha256
       - uses: actions/upload-artifact@v7
@@ -163,7 +164,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      THURM_FEED_URL: ${{ vars.SPARKLE_FEED_URL || format('https://{0}.github.io/{1}/appcast.xml', github.repository_owner, github.event.repository.name) }}
       THURM_SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@v7
@@ -173,13 +173,28 @@ jobs:
 
       - name: Channel and version
         id: meta
+        env:
+          SPARKLE_FEED_URL: ${{ vars.SPARKLE_FEED_URL }}
         run: |
           set -euo pipefail
+          # The update feed compiled into the app: the variable, else this repository's GitHub
+          # Pages appcast (github.event has no repository on scheduled runs).
+          OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          FEED="${SPARKLE_FEED_URL:-https://$OWNER.github.io/${GITHUB_REPOSITORY#*/}/appcast.xml}"
+          echo "THURM_FEED_URL=$FEED" >> "$GITHUB_ENV"
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           if [[ "${{ github.event_name }}" == release ]]; then
             TAG="${{ github.event.release.tag_name }}"
             if [[ "$TAG" != "v$VERSION" ]]; then
               echo "::error::Tag $TAG does not match the workspace version $VERSION in Cargo.toml. Bump it, merge, then tag v$VERSION."
+              exit 1
+            fi
+            # Only a commit that passed CI on main is released (like tip builds).
+            SHA="$(git rev-parse HEAD)"
+            PASSED="$(gh run list --repo "$REPO" --workflow CI --commit "$SHA" --branch main --event push --status success \
+              --limit 1 --json headSha -q '.[0].headSha // empty')"
+            if [[ "$PASSED" != "$SHA" ]]; then
+              echo "::error::$TAG points at ${SHA:0:7}, which has not passed CI on main. Tag a green commit (gh release create $TAG --target <sha>)."
               exit 1
             fi
             CHANNEL=release
@@ -303,8 +318,10 @@ jobs:
           TAG="${{ steps.meta.outputs.tag }}"
           cd macos/build/dist
           gh release upload "$TAG" --repo "$REPO" --clobber "$RUNNER_TEMP"/linux/thurm-*
+          # Also as Thurm.dmg: releases/latest/download/Thurm.dmg is the stable download link.
+          cp Thurm-*.dmg "$RUNNER_TEMP/Thurm.dmg"
           # sparkle.json last: the appcast only lists a release once it carries one.
-          gh release upload "$TAG" --repo "$REPO" --clobber Thurm-*.dmg Thurm-*.zip
+          gh release upload "$TAG" --repo "$REPO" --clobber Thurm-*.dmg Thurm-*.zip "$RUNNER_TEMP/Thurm.dmg"
           gh release upload "$TAG" --repo "$REPO" --clobber sparkle.json
 
       - name: Publish the tip build
@@ -339,11 +356,12 @@ jobs:
             | { grep -E '^Thurm-tip-[0-9]+\.zip$' || true; } \
             | sort -t- -k3 -n -r | tail -n +4 \
             | while read -r old; do gh release delete-asset tip "$old" --repo "$REPO" --yes; done
-          # And the three newest Linux builds per target (a remote may be installing an older one).
+          # And the 30 newest Linux builds per target: each tip app installs its own exact build on
+          # remote hosts, so an app that hasn't updated for a while still finds it.
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             gh release view tip --repo "$REPO" --json assets -q '.assets[].name' \
               | { grep -E "^thurm-.*-[0-9]+-$t\.tar\.gz$" || true; } \
-              | sed -E "s/^(.*-([0-9]+)-$t\.tar\.gz)$/\2 \1/" | sort -n -r | tail -n +4 | cut -d' ' -f2 \
+              | sed -E "s/^(.*-([0-9]+)-$t\.tar\.gz)$/\2 \1/" | sort -n -r | tail -n +31 | cut -d' ' -f2 \
               | while read -r old; do
                   gh release delete-asset tip "$old" --repo "$REPO" --yes
                   gh release delete-asset tip "$old.sha256" --repo "$REPO" --yes || true

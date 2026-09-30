@@ -5,7 +5,7 @@ Every published release (and the rolling `tip` prerelease) carries a `sparkle.js
 written by build-release.sh. The appcast is generated from those alone, so it never drifts
 from what is actually published and needs no state of its own:
 
-    macos/release/appcast.py --repo OWNER/REPO --output site/appcast.xml
+    macos/release/appcast.py --repo OWNER/REPO --output docs/dist/appcast.xml
 
 Release items have no channel (everyone gets them); tip items are in the `tip` channel, which
 only apps set to the tip channel accept (Updater.swift). Uses the `gh` CLI (GH_TOKEN in CI).
@@ -86,8 +86,13 @@ def render_item(m):
 
 
 def render(items, title="Thurm"):
-    """The appcast XML for `items` (sparkle.json dicts), newest version first."""
-    items = sorted(items, key=lambda m: int(m["version"]), reverse=True)
+    """The appcast XML for `items` (sparkle.json dicts), newest version first.
+
+    A release and a tip build of the same commit share a version (the commit count). Sparkle
+    takes the first of equal versions, so the tip item goes first: a tip-channel app then
+    stays on tip builds instead of switching to the release build (and its release channel).
+    """
+    items = sorted(items, key=lambda m: (int(m["version"]), m["channel"] == "tip"), reverse=True)
     body = "\n".join(render_item(m) for m in items)
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'

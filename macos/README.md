@@ -55,8 +55,9 @@ or `tip` pin one. *Thurm › Update Channel* and `thurm set updates.channel tip`
 setting. `updates.check_automatically` and `updates.download_automatically` control
 background checks and downloads. Tip items carry `<sparkle:channel>tip`, so a
 release-channel app never sees them. `CFBundleVersion` is the commit count, so it grows across
-both channels. A tip build and a release of the same commit have the same number, so neither
-replaces the other.
+both channels. A tip build and a release of the same commit have the same number; the appcast
+lists the tip item first, so a tip-channel app stays on tip builds, and a release-channel app
+never sees tip items.
 
 The Pages workflow publishes the documentation and update feed together.
 After every build it publishes, `release.yaml` starts `.github/workflows/pages.yml`, which
@@ -118,9 +119,12 @@ To check the DMG layout without a certificate: `THURM_SIGN_IDENTITY=- ./macos/bu
 macos/
 ├── Package.swift            SwiftPM manifest (macOS 14, Swift tools 5.10)
 ├── build.sh                 Rust + Swift build, bundle assembly, signing
-├── Resources/Info.plist     bundle id com.thurm.terminal
+├── package-dmg.sh           the DMG
+├── release/                 release builds, notarization, appcast (see above)
+├── Resources/               Info.plist (bundle id com.thurm.terminal), icon, bundled fonts
 └── Sources/
     ├── CThurm/              C module: module.modulemap (+ include/thurm.h copied by build.sh)
+    ├── ThurmIntelligence/   thurm-intelligence: prompts on Apple's on-device model for thurmd
     └── Thurm/
         ├── main.swift            NSApplication bootstrap
         ├── AppDelegate.swift     app lifecycle, app-level actions
@@ -131,6 +135,9 @@ macos/
         ├── SessionManager.swift  windows/tabs, pane lifecycle, layout save/restore,
         │                         daemon events, reconnect, command palette entries
         ├── WindowController.swift one native tab = one NSWindow; agent status dot
+        ├── TerminalWindow.swift  tabs in the titlebar, titlebar tint
+        ├── TabSidebar.swift      vertical tabs grouped by repository
+        ├── Workspaces.swift      named sets of tabs, one shown per window
         ├── SplitView.swift       split tree (mirrors LayoutNode) and TabContentView
         ├── TerminalView.swift    CAMetalLayer view, NSTextInputClient, mouse, scroll
         ├── KeyMapping.swift      virtual key codes → Thurm keys, Option-as-Alt
@@ -138,6 +145,14 @@ macos/
         ├── FontShaper.swift      CoreText fonts, metrics, ligature-aware shaping
         ├── GlyphAtlas.swift      R8 / BGRA glyph atlases, CoreGraphics rasterization
         ├── BoxDrawing.swift      procedural box drawing and block elements
+        ├── CompletionPopup.swift tab completion popup
+        ├── AgentPicker.swift     coding agents across windows and workspaces
+        ├── ProcessPanel.swift    processes and listening ports of every pane
+        ├── QuickTerminal.swift   hotkey terminal sliding in from a screen edge
+        ├── Remote.swift          remote workspaces: tunnels, status, offline overlays
+        ├── Integrations.swift    CLI tool, login item, agent hooks, skill
+        ├── Updater.swift         Sparkle updates, release and tip channels
+        ├── Perf.swift            frame timing log (THURM_PERF=1)
         ├── SecureInput.swift     balanced Enable/DisableSecureEventInput
         ├── CommandPalette.swift  Cmd+Shift+P palette
         ├── FindBar.swift         Cmd+F scrollback search
@@ -171,7 +186,7 @@ macos/
 
 | Action | Shortcut |
 | --- | --- |
-| New tab (inherits cwd) / new window | ⌘T / ⌘N |
+| New tab (inherits cwd) / new workspace | ⌘T / ⌘N |
 | Close pane / close tab | ⌘W / ⇧⌘W |
 | Select tab 1–9, previous / next tab | ⌘1…⌘9, ⇧⌘[ / ⇧⌘] |
 | Split right / down | ⌘D / ⇧⌘D |

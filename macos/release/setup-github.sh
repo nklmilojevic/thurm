@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time setup of the release pipeline (.github/workflows/release.yml) for this repository.
+# One-time setup of the release pipeline (.github/workflows/release.yaml) for this repository.
 # Stores the signing material as GitHub Actions secrets and turns on GitHub Pages for the
 # appcast. Nothing is written to the repository or printed.
 #
