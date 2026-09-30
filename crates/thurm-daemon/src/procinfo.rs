@@ -216,10 +216,9 @@ pub type ProcRow = (u32, u32, String);
 
 /// Every process, from `ps`.
 pub fn process_table() -> Vec<ProcRow> {
-    let Ok(out) = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,args="])
-        .output()
-    else {
+    let Ok(out) = crate::pty::output_locked(
+        std::process::Command::new("/bin/ps").args(["-axo", "pid=,ppid=,args="]),
+    ) else {
         return Vec::new();
     };
     String::from_utf8_lossy(&out.stdout)
@@ -341,10 +340,15 @@ pub fn listening_ports(pids: &[u32]) -> std::collections::HashMap<u32, Vec<u16>>
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let Ok(out) = std::process::Command::new("/usr/sbin/lsof")
-        .args(["-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-Fpn", "-p", &list])
-        .output()
-    else {
+    let Ok(out) = crate::pty::output_locked(std::process::Command::new("/usr/sbin/lsof").args([
+        "-nP",
+        "-a",
+        "-iTCP",
+        "-sTCP:LISTEN",
+        "-Fpn",
+        "-p",
+        &list,
+    ])) else {
         return map;
     };
     let mut current = 0u32;

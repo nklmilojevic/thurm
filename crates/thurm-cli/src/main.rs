@@ -737,10 +737,10 @@ fn daemon_cmd(action: &str, json: bool) -> R {
                 std::fs::create_dir_all(dir)?;
             }
             let log = thurm_config::state_dir().join("thurmd.log");
-            std::fs::write(
-                &path,
-                launchd_plist(&daemon, &thurm_config::socket_path(), &log),
-            )?;
+            // The default socket is left to the daemon to work out at each login (it moved
+            // once already); an explicit THURM_SOCKET is passed on.
+            let socket = std::env::var_os("THURM_SOCKET").map(std::path::PathBuf::from);
+            std::fs::write(&path, launchd_plist(&daemon, socket.as_deref(), &log))?;
             let domain = format!("gui/{}", unsafe { libc_getuid() });
             // Replace a previous registration, then load (starts it now and at every login).
             let _ = std::process::Command::new("launchctl")
@@ -803,7 +803,7 @@ fn launchd_plist_path() -> std::path::PathBuf {
 /// pid) and is not kept alive, so `thurm daemon stop` stops it until the next login.
 fn launchd_plist(
     daemon: &std::path::Path,
-    socket: &std::path::Path,
+    socket: Option<&std::path::Path>,
     log: &std::path::Path,
 ) -> String {
     let esc = |p: &std::path::Path| {
@@ -823,9 +823,7 @@ fn launchd_plist(
     <key>ProgramArguments</key>
     <array>
         <string>{}</string>
-        <string>--foreground</string>
-        <string>--socket</string>
-        <string>{}</string>
+        <string>--foreground</string>{}
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -839,7 +837,10 @@ fn launchd_plist(
 </plist>
 "#,
         esc(daemon),
-        esc(socket),
+        socket.map_or_else(String::new, |s| format!(
+            "\n        <string>--socket</string>\n        <string>{}</string>",
+            esc(s)
+        )),
         esc(log)
     )
 }
@@ -1469,27 +1470,31 @@ mod tests {
 
     #[test]
     fn launchd_plist_is_valid() {
-        let s = launchd_plist(
-            std::path::Path::new("/Applications/Thurm & Co.app/Contents/Helpers/thurmd"),
-            std::path::Path::new("/tmp/thurm-501/thurmd.sock"),
-            std::path::Path::new("/tmp/log"),
-        );
-        assert!(s.contains("Thurm &amp; Co.app"));
-        assert!(s.contains("<string>--foreground</string>"));
+        let daemon = std::path::Path::new("/Applications/Thurm & Co.app/Contents/Helpers/thurmd");
+        let log = std::path::Path::new("/tmp/log");
+        let explicit = launchd_plist(daemon, Some(std::path::Path::new("/x/thurmd.sock")), log);
+        assert!(explicit.contains("<string>--socket</string>"));
+        // The default socket is left to the daemon.
+        let default = launchd_plist(daemon, None, log);
+        assert!(!default.contains("--socket"));
         let dir = std::env::temp_dir().join(format!("thurm-plist-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("x.plist");
-        std::fs::write(&f, &s).unwrap();
-        let ok = std::process::Command::new("plutil")
-            .arg("-lint")
-            .arg(&f)
-            .output();
-        if let Ok(out) = ok {
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stdout)
-            );
+        for s in [explicit, default] {
+            assert!(s.contains("Thurm &amp; Co.app"));
+            assert!(s.contains("<string>--foreground</string>"));
+            let f = dir.join("x.plist");
+            std::fs::write(&f, &s).unwrap();
+            let ok = std::process::Command::new("plutil")
+                .arg("-lint")
+                .arg(&f)
+                .output();
+            if let Ok(out) = ok {
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stdout)
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(dir);
     }

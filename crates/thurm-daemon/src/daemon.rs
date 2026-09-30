@@ -29,6 +29,9 @@ use crate::upgrade;
 /// Messages queued for a client before its subscriptions switch to re-sync (it stops getting
 /// output and gets a fresh `Attach` once it caught up).
 const OUTPUT_BACKLOG: usize = 4096;
+/// Bytes of output queued for a client before its subscriptions switch to re-sync (an
+/// `Output` can be 256 KiB: counting messages alone let a stalled client pin a gigabyte).
+const OUTPUT_BACKLOG_BYTES: usize = 16 * 1024 * 1024;
 
 /// PTY output read ahead of the parser. A macOS PTY buffers only a few KiB, so a program that
 /// writes faster than we parse would stall on every chunk; with the read-ahead it keeps
@@ -214,11 +217,39 @@ pub struct Client {
     pub tx: Sender<ServerMessage>,
     pub ui: AtomicBool,
     pub name: Mutex<String>,
+    /// Approximate bytes queued in `tx` (see [`message_weight`]); the writer subtracts what it
+    /// wrote.
+    pub queued: std::sync::atomic::AtomicUsize,
 }
 
 impl Client {
     pub fn send(&self, msg: ServerMessage) {
-        let _ = self.tx.send(msg);
+        self.queued
+            .fetch_add(message_weight(&msg), Ordering::Relaxed);
+        if self.tx.send(msg).is_err() {
+            self.queued.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The client is far enough behind that it should get fresh state instead of output.
+    fn backlogged(&self) -> bool {
+        self.tx.len() > OUTPUT_BACKLOG || self.queued.load(Ordering::Relaxed) > OUTPUT_BACKLOG_BYTES
+    }
+
+    /// Caught up enough to be re-attached.
+    fn caught_up(&self) -> bool {
+        self.tx.len() < OUTPUT_BACKLOG / 2
+            && self.queued.load(Ordering::Relaxed) < OUTPUT_BACKLOG_BYTES / 2
+    }
+}
+
+/// What a queued message costs, for [`Client::queued`]: its output or state bytes, else a
+/// little.
+pub fn message_weight(msg: &ServerMessage) -> usize {
+    match msg {
+        ServerMessage::Event(Event::Output { data, .. }) => data.len(),
+        ServerMessage::Event(Event::Attach { state, .. }) => state.len(),
+        _ => 256,
     }
 }
 
@@ -393,6 +424,7 @@ impl Daemon {
             tx,
             ui: AtomicBool::new(false),
             name: Mutex::new(String::new()),
+            queued: std::sync::atomic::AtomicUsize::new(0),
         });
         self.clients.lock().insert(id, client.clone());
         *self.last_activity.lock() = Instant::now();
@@ -638,7 +670,7 @@ impl Daemon {
                 // waking the parser, which is idle and has nothing queued. Nothing else can be
                 // appended meanwhile, so the order holds.
                 drop(st);
-                self.parse_output(&pane, &buf[..n]);
+                self.parse_guarded(&pane, &buf[..n]);
                 continue;
             }
             while st.data.len() >= READ_AHEAD {
@@ -677,7 +709,7 @@ impl Daemon {
                 st.parsing = true;
                 pipe.room.notify_one();
             }
-            self.parse_output(&pane, &batch);
+            self.parse_guarded(&pane, &batch);
             batch.clear();
             // After a burst, give the memory back rather than keep megabytes per pane (the
             // reader's buffer is this one after the next swap).
@@ -686,6 +718,21 @@ impl Daemon {
             }
         }
         self.pane_exited(&pane);
+    }
+
+    /// [`Daemon::parse_output`], surviving a panic in the terminal code: the pane goes on with
+    /// the next output instead of freezing with a dead parser thread.
+    fn parse_guarded(&self, pane: &Arc<Pane>, bytes: &[u8]) {
+        let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parse_output(pane, bytes)
+        }));
+        if parsed.is_err() {
+            log::error!(
+                "pane {}: the terminal panicked on {} bytes of output",
+                pane.id,
+                bytes.len()
+            );
+        }
     }
 
     /// Feeds PTY output to the pane's terminal and forwards it to subscribers, a slice per
@@ -716,14 +763,13 @@ impl Daemon {
         let mut need_state = false;
         for (cid, sub) in st.subscribers.iter_mut() {
             let Some(c) = clients.get(cid) else { continue };
-            let backlog = c.tx.len();
             if sub.resync {
-                if backlog < OUTPUT_BACKLOG / 2 {
+                if c.caught_up() {
                     sub.resync = false;
                     need_state = true;
                     plan.push((c.clone(), true));
                 }
-            } else if backlog > OUTPUT_BACKLOG {
+            } else if c.backlogged() {
                 log::warn!("client {cid} fell behind on pane {pane}; re-syncing");
                 sub.resync = true;
             } else {
@@ -754,6 +800,36 @@ impl Daemon {
                 Event::Output { pane, data }
             };
             c.send(ServerMessage::Event(ev));
+        }
+    }
+
+    /// Re-attaches `pane`'s subscribers that were switched to re-sync and have caught up.
+    fn recover_subscribers(&self, pane: PaneId, st: &mut PaneState) {
+        if !st.subscribers.values().any(|s| s.resync) {
+            return;
+        }
+        let clients = self.clients.lock().clone();
+        let mut ready = Vec::new();
+        for (cid, sub) in st.subscribers.iter_mut() {
+            if let Some(c) = clients.get(cid)
+                && sub.resync
+                && c.caught_up()
+            {
+                sub.resync = false;
+                ready.push(c.clone());
+            }
+        }
+        if ready.is_empty() {
+            return;
+        }
+        let state = st.term.serialize_state();
+        let size = st.term.size();
+        for c in ready {
+            c.send(ServerMessage::Event(Event::Attach {
+                pane,
+                size,
+                state: state.clone(),
+            }));
         }
     }
 
@@ -1175,6 +1251,12 @@ impl Daemon {
                     if !st.info.alive {
                         continue;
                     }
+                    // A shell that exited while a background job still holds the terminal is
+                    // collected now (no zombie); its status is kept for when the pane ends.
+                    let _ = st.pty.try_wait();
+                    // Subscribers that fell behind get fresh state once they caught up, even if
+                    // the pane has no new output to carry it.
+                    self.recover_subscribers(pane.id, &mut st);
                     if st.term.sync_deadline().is_some_and(|d| d <= Instant::now()) {
                         st.term.flush_sync();
                     }
@@ -1441,6 +1523,7 @@ impl Daemon {
         upgrade::Handoff {
             version: upgrade::HANDOFF_VERSION,
             listener_fd,
+            lock_fd: None,
             log_to_file,
             layout: self.layout.lock().clone(),
             next_pane_id: self.next_pane.load(Ordering::Relaxed),
@@ -1611,7 +1694,10 @@ impl Daemon {
                 let spawned = std::thread::Builder::new()
                     .name("request".into())
                     .spawn(move || {
-                        let result = daemon.dispatch(&client, slow);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            daemon.dispatch(&client, slow)
+                        }))
+                        .unwrap_or_else(|_| Err("the daemon hit an internal error".into()));
                         if id != 0 {
                             client.send(ServerMessage::Response { id, result });
                         }
@@ -1622,7 +1708,14 @@ impl Daemon {
                     return;
                 }
             }
-            other => self.dispatch(client, other),
+            other => {
+                // A panic answers the request with an error instead of leaving the client
+                // waiting forever.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.dispatch(client, other)
+                }))
+                .unwrap_or_else(|_| Err("the daemon hit an internal error".into()))
+            }
         };
         if id != 0 {
             client.send(ServerMessage::Response { id, result });
@@ -2287,11 +2380,32 @@ fn spawn_writer(id: PaneId, mut writer: File, rx: Receiver<Vec<u8>>) {
 
 /// Writes `data` to a new file in `dir` (0700, created if needed) named after `name`'s
 /// extension, readable by the owner only.
+/// Deletes the files in `dir` older than `age` (pasted and dropped files are referred to by
+/// path for a moment, then never again).
+fn prune_old_files(dir: &Path, age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let old = e
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|elapsed| elapsed > age);
+        if old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn write_temp_file(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    prune_old_files(dir, Duration::from_secs(24 * 60 * 60));
     let ext: String = Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
@@ -2336,5 +2450,53 @@ fn ensure_hooks(command: Option<&[String]>) {
         Ok(true) => log::info!("installed {} hooks in {}", agent.name, path.display()),
         Ok(false) => {}
         Err(e) => log::warn!("{} hooks: {e}", agent.name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_backlog_counts_bytes() {
+        let (tx, _rx) = unbounded();
+        let c = Client {
+            id: 1,
+            tx,
+            ui: AtomicBool::new(false),
+            name: Mutex::new(String::new()),
+            queued: std::sync::atomic::AtomicUsize::new(0),
+        };
+        // A few big outputs are a backlog, not only thousands of messages.
+        for _ in 0..70 {
+            c.send(ServerMessage::Event(Event::Output {
+                pane: 1,
+                data: vec![0; 256 * 1024],
+            }));
+        }
+        assert!(c.backlogged() && !c.caught_up());
+        c.queued.store(0, Ordering::Relaxed);
+        assert!(!c.backlogged());
+    }
+
+    #[test]
+    fn old_temporary_files_are_pruned() {
+        let dir = std::env::temp_dir().join(format!("thurm-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.png");
+        let new = dir.join("new.png");
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(&new, "x").unwrap();
+        let two_days_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+        prune_old_files(&dir, Duration::from_secs(24 * 60 * 60));
+        assert!(!old.exists() && new.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

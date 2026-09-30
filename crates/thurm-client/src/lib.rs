@@ -78,7 +78,7 @@ impl Default for ConnectOptions<'_> {
 /// Pid of the process listening on `socket` (the daemon), from the peer credentials.
 pub fn daemon_pid(socket: &Path) -> Option<u32> {
     use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(socket).ok()?;
+    let stream = connect_daemon(socket).ok()?;
     let fd = stream.as_raw_fd();
     #[cfg(target_os = "macos")]
     {
@@ -271,8 +271,21 @@ pub fn find_daemon() -> Option<PathBuf> {
     thurm_config::which("thurmd")
 }
 
+/// Connects to the daemon socket at `path`, which must be served by this user: another user
+/// who got to a shared directory first must not receive our keystrokes.
+pub fn connect_daemon(path: &Path) -> std::io::Result<UnixStream> {
+    let stream = UnixStream::connect(path)?;
+    if !thurm_config::peer_is_same_user(&stream) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is served by another user", path.display()),
+        ));
+    }
+    Ok(stream)
+}
+
 fn connect_socket(opts: &ConnectOptions<'_>) -> Result<UnixStream, ClientError> {
-    match UnixStream::connect(&opts.socket) {
+    match connect_daemon(&opts.socket) {
         Ok(s) => return Ok(s),
         Err(e) if opts.spawn_daemon.is_none() => return Err(ClientError::Connect(e.to_string())),
         Err(_) => {}
@@ -290,7 +303,7 @@ fn connect_socket(opts: &ConnectOptions<'_>) -> Result<UnixStream, ClientError> 
     let _ = child.wait();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match UnixStream::connect(&opts.socket) {
+        match connect_daemon(&opts.socket) {
             Ok(s) => return Ok(s),
             Err(e) if Instant::now() > deadline => return Err(ClientError::Connect(e.to_string())),
             Err(_) => std::thread::sleep(Duration::from_millis(25)),
@@ -322,15 +335,24 @@ impl Client {
             .name("thurm-client-reader".into())
             .spawn(move || {
                 let mut reader = BufReader::with_capacity(256 * 1024, read_half);
-                loop {
-                    match codec::read_message::<_, ServerMessage>(&mut reader) {
-                        Ok(Some(ServerMessage::Response { id, result })) => {
+                while let Ok(Some(frame)) = codec::read_frame(&mut reader) {
+                    // A message of a newer daemon this client can't decode is skipped (the frames
+                    // after it are intact); a response still ends its request, with an error.
+                    let Ok(msg) = codec::decode::<ServerMessage>(&frame) else {
+                        if let Some(id) = codec::response_id(&frame)
+                            && let Some(tx) = pending.lock().remove(&id)
+                        {
+                            let _ = tx.send(Err("the daemon's answer could not be read".into()));
+                        }
+                        continue;
+                    };
+                    match msg {
+                        ServerMessage::Response { id, result } => {
                             if let Some(tx) = pending.lock().remove(&id) {
                                 let _ = tx.send(result);
                             }
                         }
-                        Ok(Some(ServerMessage::Event(ev))) => on_event(ev),
-                        Ok(None) | Err(_) => break,
+                        ServerMessage::Event(ev) => on_event(ev),
                     }
                 }
                 alive.store(false, Ordering::Relaxed);

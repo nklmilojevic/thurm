@@ -35,11 +35,30 @@ fn winsize(size: PaneSize) -> libc::winsize {
     }
 }
 
+/// Held while a PTY's descriptors are not close-on-exec yet (between `openpty` and `fcntl`),
+/// and by every other place that starts a process: a process started in that window would
+/// inherit another pane's slave, and that pane would never see EOF.
+pub static SPAWN_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Starts `cmd` under [`SPAWN_LOCK`] (held only for the start, not while it runs).
+pub fn spawn_locked(cmd: &mut Command) -> io::Result<std::process::Child> {
+    let _guard = SPAWN_LOCK.lock();
+    cmd.spawn()
+}
+
+/// Like `Command::output`, starting the process under [`SPAWN_LOCK`].
+pub fn output_locked(cmd: &mut Command) -> io::Result<std::process::Output> {
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    spawn_locked(cmd)?.wait_with_output()
+}
+
 impl Pty {
     pub fn spawn(opts: SpawnOptions) -> io::Result<Pty> {
         let mut master: RawFd = -1;
         let mut slave: RawFd = -1;
         let mut ws = winsize(opts.size);
+        let guard = SPAWN_LOCK.lock();
         let rc = unsafe {
             libc::openpty(
                 &mut master,
@@ -57,7 +76,9 @@ impl Pty {
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         unsafe {
             libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(slave.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
         }
+        drop(guard);
 
         // UTF-8 input processing.
         unsafe {

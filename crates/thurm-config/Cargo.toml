@@ -12,4 +12,5 @@ toml.workspace = true
 serde_ignored.workspace = true
 toml_edit.workspace = true
 dirs.workspace = true
+libc.workspace = true
 thurm-proto.workspace = true

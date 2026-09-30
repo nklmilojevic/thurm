@@ -35,6 +35,9 @@ const QUIESCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 pub struct Handoff {
     pub version: u32,
     pub listener_fd: RawFd,
+    /// The single-instance lock (`<socket>.lock`), held across the exec.
+    #[serde(default)]
+    pub lock_fd: Option<RawFd>,
     /// The old image logged to the state dir's log file (it was daemonized), not stderr.
     pub log_to_file: bool,
     pub layout: Option<String>,
@@ -124,12 +127,45 @@ fn target(socket: &Path) -> PathBuf {
 
 /// Asks `exe` which hand-off versions it reads; an error when it can't take ours.
 fn check(exe: &Path) -> Result<(), String> {
-    let out = std::process::Command::new(exe)
-        .arg("--handoff-check")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
+    // A binary that hangs must not hold up the daemon (the upgrade runs on its main thread).
+    let mut child = crate::pty::spawn_locked(
+        std::process::Command::new(exe)
+            .arg("--handoff-check")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+    )
+    .map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
+    // Its output is read on a thread: a process it left behind could keep the pipe open.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut out = Vec::new();
+            let _ = (&mut stdout).take(64 * 1024).read_to_end(&mut out);
+            let _ = tx.send(out);
+        });
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{} --handoff-check did not answer", exe.display()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let stdout = rx
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .map_err(|_| format!("{} --handoff-check did not answer", exe.display()))?;
+    let out = std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    };
     let text = String::from_utf8_lossy(&out.stdout);
     let theirs = text
         .split_whitespace()
@@ -155,6 +191,7 @@ fn check(exe: &Path) -> Result<(), String> {
 pub fn perform(
     daemon: &Arc<Daemon>,
     listener_fd: RawFd,
+    lock_fd: Option<RawFd>,
     socket: &Path,
     state_dir: &Path,
     log_to_file: bool,
@@ -185,7 +222,8 @@ pub fn perform(
         // The handoff carries the panes; the snapshot is only the fallback after a crash.
         log::warn!("upgrade: session snapshot not saved: {e}");
     }
-    let handoff = daemon.handoff(listener_fd, log_to_file);
+    let mut handoff = daemon.handoff(listener_fd, log_to_file);
+    handoff.lock_fd = lock_fd;
     let path = handoff_path(state_dir);
     let written = serde_json::to_vec(&handoff)
         .map_err(std::io::Error::other)
@@ -195,6 +233,7 @@ pub fn perform(
         return;
     }
     let fds: Vec<RawFd> = std::iter::once(listener_fd)
+        .chain(lock_fd)
         .chain(handoff.panes.iter().map(|p| p.fd))
         .collect();
     for &fd in &fds {
@@ -270,4 +309,23 @@ pub fn load(path: &Path) -> Result<Handoff, String> {
         ));
     }
     Ok(h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hanging_binary_is_refused_in_time() {
+        let dir = std::env::temp_dir().join(format!("thurm-upgrade-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("thurmd");
+        std::fs::write(&exe, "#!/bin/sh\nsleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        assert!(check(&exe).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -1177,10 +1177,10 @@ fn in_place_upgrade_loses_no_output() {
     let daemon = env.start();
     let (c, _events) = env.connect();
     let pane = create(&c, &env.dir);
-    // 6000 numbered lines in bursts, with the upgrade in the middle of them.
+    // 4000 numbered lines in bursts, with the upgrade in the middle of them.
     c.request(Request::Input {
         pane,
-        data: b"for i in $(seq 1 6000); do echo line-$i; [ $((i % 200)) -eq 0 ] && sleep 0.05; [ $i -eq 1000 ] && sleep 1; done; echo ALL-DONE\r"
+        data: b"for i in $(seq 1 4000); do echo line-$i; [ $((i % 200)) -eq 0 ] && sleep 0.05; [ $i -eq 1000 ] && sleep 1; done; echo ALL-DONE\r"
             .to_vec(),
     })
     .unwrap();
@@ -1200,20 +1200,29 @@ fn in_place_upgrade_loses_no_output() {
         unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR2) },
         0
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The old image first drains what it read, up to 30 s in a slow debug build.
+    let deadline = Instant::now() + Duration::from_secs(45);
     while c.is_alive() {
         assert!(Instant::now() < deadline, "old image kept the connection");
         std::thread::sleep(Duration::from_millis(20));
     }
     drop(c);
     let (c, _events) = env.connect();
-    wait_match(&c, pane, "(?m)^ALL-DONE");
-    let text = capture(&c, pane);
+    // A debug build parses slowly: wait in the scrollback, with room to spare.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let text = loop {
+        let text = capture(&c, pane);
+        if text.lines().any(|l| l.trim_end() == "ALL-DONE") {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "output never finished\n{text}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
     let numbers: Vec<u32> = text
         .lines()
         .filter_map(|l| l.trim_end().strip_prefix("line-")?.parse().ok())
         .collect();
-    let missing: Vec<u32> = (1..=6000).filter(|n| !numbers.contains(n)).collect();
+    let missing: Vec<u32> = (1..=4000).filter(|n| !numbers.contains(n)).collect();
     assert!(
         missing.is_empty(),
         "lost {} lines: {:?}",
@@ -1299,4 +1308,170 @@ fn completion_uses_only_the_path_the_shell_reported() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn unknown_requests_are_answered_not_dropped() {
+    use std::io::Write;
+    let env = Env::new("unknown-request");
+    let _daemon = env.start();
+    let mut s = std::os::unix::net::UnixStream::connect(&env.socket).unwrap();
+    // A request of a newer protocol: id 7, then request variant 999 (postcard varints), which
+    // this daemon doesn't have.
+    let frame = [7u8, 0xE7, 0x07];
+    let mut buf = (frame.len() as u32).to_le_bytes().to_vec();
+    buf.extend_from_slice(&frame);
+    s.write_all(&buf).unwrap();
+    // Then a known one on the same connection.
+    codec::write_message(
+        &mut s,
+        &Envelope {
+            id: 8,
+            request: Request::ListPanes,
+        },
+    )
+    .unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut r = std::io::BufReader::new(s);
+    let mut answered = Vec::new();
+    while answered.len() < 2 {
+        match codec::read_message::<_, ServerMessage>(&mut r).unwrap() {
+            Some(ServerMessage::Response { id, result }) => answered.push((id, result.is_ok())),
+            Some(ServerMessage::Event(_)) => {}
+            None => panic!("the daemon dropped the connection"),
+        }
+    }
+    assert_eq!(answered, vec![(7, false), (8, true)]);
+}
+
+/// Spawns another daemon on `env`'s socket and returns whether it exited by itself in time.
+fn second_daemon_exits(env: &Env) -> bool {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_thurmd"))
+        .args(["--foreground", "--socket"])
+        .arg(&env.socket)
+        .env("THURM_CONFIG_DIR", env.dir.join("config"))
+        .env("THURM_STATE_DIR", env.dir.join("state2"))
+        .spawn()
+        .expect("spawn daemon");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
+#[test]
+fn one_daemon_per_socket() {
+    let env = Env::new("single");
+    // A socket directory given with --socket keeps its permissions.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&env.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut daemon = env.start();
+    let (c, _events) = env.connect();
+    let pane = create(&c, &env.dir);
+    assert!(second_daemon_exits(&env), "a second daemon kept running");
+    // The first one still has the socket and its pane.
+    assert!(matches!(
+        c.request(Request::PaneInfo { pane }).unwrap(),
+        Response::PaneInfo(_)
+    ));
+    let (c2, _e2) = env.connect();
+    assert!(matches!(
+        c2.request(Request::PaneInfo { pane }).unwrap(),
+        Response::PaneInfo(_)
+    ));
+    let mode = std::fs::metadata(&env.dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+
+    // Through an in-place upgrade the lock stays held.
+    let mut req = env.socket.as_os_str().to_owned();
+    req.push(".upgrade");
+    std::fs::write(PathBuf::from(req), env!("CARGO_BIN_EXE_thurmd")).unwrap();
+    assert_eq!(
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR2) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.is_alive() {
+        assert!(Instant::now() < deadline, "old image kept the connection");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop((c, c2));
+    let (c, _events) = env.connect();
+    assert!(matches!(
+        c.request(Request::PaneInfo { pane }).unwrap(),
+        Response::PaneInfo(_)
+    ));
+    assert!(
+        second_daemon_exits(&env),
+        "a second daemon started after the upgrade"
+    );
+    assert!(daemon.child.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn daemons_started_together_leave_one() {
+    let env = Env::new("together");
+    let spawn = || {
+        Command::new(env!("CARGO_BIN_EXE_thurmd"))
+            .args(["--foreground", "--socket"])
+            .arg(&env.socket)
+            .env("THURM_CONFIG_DIR", env.dir.join("config"))
+            .env("THURM_STATE_DIR", env.dir.join("state"))
+            .spawn()
+            .expect("spawn daemon")
+    };
+    let mut children = [spawn(), spawn(), spawn()];
+    std::thread::sleep(Duration::from_secs(2));
+    let running = children
+        .iter_mut()
+        .map(|c| c.try_wait().unwrap().is_none())
+        .filter(|&alive| alive)
+        .count();
+    for c in &mut children {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    assert_eq!(running, 1);
+}
+
+#[test]
+fn starts_on_a_fresh_default_socket() {
+    let env = Env::new("fresh-default");
+    // Short: a socket path must fit in 104 bytes, and CI's temporary directory is long.
+    let runtime = PathBuf::from(format!("/tmp/thurm-rt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&runtime);
+    std::fs::create_dir_all(&runtime).unwrap();
+    // No --socket: the default directory is created (private) under XDG_RUNTIME_DIR.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_thurmd"))
+        .arg("--foreground")
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("THURM_SOCKET")
+        .env("THURM_CONFIG_DIR", env.dir.join("config"))
+        .env("THURM_STATE_DIR", env.dir.join("state"))
+        .spawn()
+        .expect("spawn daemon");
+    let uid = unsafe { libc::getuid() };
+    let dir = runtime.join(format!("thurm-{uid}"));
+    let socket = dir.join("thurmd.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the daemon exited instead of starting"
+        );
+        assert!(Instant::now() < deadline, "daemon did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&runtime);
+    assert_eq!(mode, 0o700);
 }

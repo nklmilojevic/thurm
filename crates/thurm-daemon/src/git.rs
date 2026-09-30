@@ -90,24 +90,25 @@ fn git(dir: &str, args: &[&str]) -> Option<String> {
 
 /// Exit status and output of a git command; `None` when it didn't start or timed out.
 fn run_git(dir: &str, args: &[&str]) -> Option<(Option<i32>, String)> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        // A repository's config must not make the probe run programs.
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-        ])
-        .args(args)
-        // Never take the index lock (a probe must not get in the way of the user's git).
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut child = crate::pty::spawn_locked(
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            // A repository's config must not make the probe run programs.
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+            ])
+            .args(args)
+            // Never take the index lock (a probe must not get in the way of the user's git).
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .ok()?;
     // Read while it runs (a large diff fills the pipe), and give up after TIMEOUT.
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
