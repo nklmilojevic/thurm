@@ -128,6 +128,12 @@ enum JSON {
 func jsonUInt64(_ value: Any?) -> UInt64? { (value as? NSNumber)?.uint64Value }
 func jsonInt(_ value: Any?) -> Int? { (value as? NSNumber)?.intValue }
 func jsonDouble(_ value: Any?) -> Double? { (value as? NSNumber)?.doubleValue }
+
+/// A finite number from JSON, clamped to `lo...hi`; nil when missing or not finite.
+func clamped(_ value: Any?, _ lo: Double, _ hi: Double) -> Double? {
+    guard let v = jsonDouble(value), v.isFinite else { return nil }
+    return min(hi, max(lo, v))
+}
 func jsonBool(_ value: Any?) -> Bool? { (value as? NSNumber)?.boolValue }
 func jsonString(_ value: Any?) -> String? { value as? String }
 

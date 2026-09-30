@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AgentDef {
     /// Stable identifier ("claude").
     pub kind: String,

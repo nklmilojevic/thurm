@@ -84,9 +84,9 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
-    let config = Config::load().unwrap_or_else(|e| {
+    let (config, config_warnings) = Config::load_with_warnings().unwrap_or_else(|e| {
         eprintln!("thurmd: config error, using defaults: {e}");
-        Config::default()
+        (Config::default(), Vec::new())
     });
     let socket = args.socket.unwrap_or_else(thurm_config::socket_path);
     let state_dir = thurm_config::state_dir();
@@ -149,6 +149,9 @@ fn main() {
         thurm_proto::BUILD,
         socket.display()
     );
+    for w in config_warnings {
+        log::warn!("config: {w}");
+    }
 
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
