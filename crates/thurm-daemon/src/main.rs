@@ -149,7 +149,10 @@ fn main() {
             }
             // Only the default location is ours to create and check; a directory given with
             // --socket is left as it is.
-            let managed = args_socket_default;
+            // The client passes the default path with --socket when it starts us.
+            let managed = args_socket_default
+                || (std::env::var_os("THURM_SOCKET").is_none()
+                    && socket == thurm_config::default_socket_dir().join("thurmd.sock"));
             let listener = match bind(&socket, managed) {
                 Ok(l) => l,
                 Err(e) => {
@@ -291,7 +294,12 @@ fn lock_instance(socket: &Path) -> std::io::Result<std::os::fd::RawFd> {
     use std::os::fd::IntoRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = socket.parent() {
-        std::fs::create_dir_all(dir)?;
+        // Missing directories are created private (the default one is checked by `bind`).
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
     }
     let file = std::fs::OpenOptions::new()
         .read(true)

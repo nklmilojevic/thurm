@@ -1397,3 +1397,36 @@ fn daemons_started_together_leave_one() {
     }
     assert_eq!(running, 1);
 }
+
+#[test]
+fn starts_on_a_fresh_default_socket() {
+    let env = Env::new("fresh-default");
+    let runtime = env.dir.join("run");
+    std::fs::create_dir_all(&runtime).unwrap();
+    // No --socket: the default directory is created (private) under XDG_RUNTIME_DIR.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_thurmd"))
+        .arg("--foreground")
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("THURM_SOCKET")
+        .env("THURM_CONFIG_DIR", env.dir.join("config"))
+        .env("THURM_STATE_DIR", env.dir.join("state"))
+        .spawn()
+        .expect("spawn daemon");
+    let uid = unsafe { libc::getuid() };
+    let dir = runtime.join(format!("thurm-{uid}"));
+    let socket = dir.join("thurmd.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the daemon exited instead of starting"
+        );
+        assert!(Instant::now() < deadline, "daemon did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(mode, 0o700);
+}
