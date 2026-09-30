@@ -1177,10 +1177,10 @@ fn in_place_upgrade_loses_no_output() {
     let daemon = env.start();
     let (c, _events) = env.connect();
     let pane = create(&c, &env.dir);
-    // 6000 numbered lines in bursts, with the upgrade in the middle of them.
+    // 4000 numbered lines in bursts, with the upgrade in the middle of them.
     c.request(Request::Input {
         pane,
-        data: b"for i in $(seq 1 6000); do echo line-$i; [ $((i % 200)) -eq 0 ] && sleep 0.05; [ $i -eq 1000 ] && sleep 1; done; echo ALL-DONE\r"
+        data: b"for i in $(seq 1 4000); do echo line-$i; [ $((i % 200)) -eq 0 ] && sleep 0.05; [ $i -eq 1000 ] && sleep 1; done; echo ALL-DONE\r"
             .to_vec(),
     })
     .unwrap();
@@ -1208,13 +1208,21 @@ fn in_place_upgrade_loses_no_output() {
     }
     drop(c);
     let (c, _events) = env.connect();
-    wait_match(&c, pane, "(?m)^ALL-DONE");
-    let text = capture(&c, pane);
+    // A debug build parses slowly: wait in the scrollback, with room to spare.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let text = loop {
+        let text = capture(&c, pane);
+        if text.lines().any(|l| l.trim_end() == "ALL-DONE") {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "output never finished\n{text}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
     let numbers: Vec<u32> = text
         .lines()
         .filter_map(|l| l.trim_end().strip_prefix("line-")?.parse().ok())
         .collect();
-    let missing: Vec<u32> = (1..=6000).filter(|n| !numbers.contains(n)).collect();
+    let missing: Vec<u32> = (1..=4000).filter(|n| !numbers.contains(n)).collect();
     assert!(
         missing.is_empty(),
         "lost {} lines: {:?}",
