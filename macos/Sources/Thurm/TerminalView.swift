@@ -273,8 +273,8 @@ final class TerminalView: NSView, NSTextInputClient {
         didSet {
             if holdGridSize {
                 waitingForResizeFrame = true
-                // Keep the right prompt in place while the sidebar changes the left edge.
-                metalLayer?.contentsGravity = .topRight
+                // Pin the held frame to the left edge so the text slides with the sidebar.
+                metalLayer?.contentsGravity = .topLeft
             }
             guard oldValue, !holdGridSize else { return }
             updateGridSize()
