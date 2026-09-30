@@ -371,6 +371,9 @@ void thurm_grid_unlock(thurm_client *client, thurm_pane_id pane);
 bool thurm_image_lock(thurm_client *client, thurm_pane_id pane, uint32_t image,
                       uint32_t *width, uint32_t *height, const uint8_t **rgba);
 void thurm_image_unlock(thurm_client *client, thurm_pane_id pane, uint32_t image);
+/* Identifies the pixels currently stored for `image`: it changes when the image is
+ * replaced under the same id. 0 if the image is not (yet) known. */
+uint64_t thurm_image_serial(thurm_client *client, thurm_pane_id pane, uint32_t image);
 
 /* ---------------------------------------------------------------------------------------
  * Configuration.

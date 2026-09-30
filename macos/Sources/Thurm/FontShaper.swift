@@ -84,11 +84,14 @@ final class FontShaper {
     private var fontIndex: [String: Int] = [:]
     /// Font ids of the Nerd Font symbols fallback (their glyphs are fitted to the cell).
     private var symbolFonts: Set<Int> = []
-    /// Shaped rows, two generations: when the current one fills up it becomes the old one, and
-    /// rows still in use move back on their next hit (an LRU without the bookkeeping).
+    /// Shaped rows, two generations: when the current one fills up (by rows or by bytes) it
+    /// becomes the old one, and rows still in use move back on their next hit (an LRU without
+    /// the bookkeeping).
     private var rowCache: [ShapeKey: [ShapedGlyph]] = [:]
     private var oldRowCache: [ShapeKey: [ShapedGlyph]] = [:]
+    private var rowCacheBytes = 0
     private static let rowCacheGeneration = 4096
+    private static let rowCacheGenerationBytes = 6 << 20
     private var boxCache: [UInt32: [BoxRect]] = [:]
     private let fontAttributeKey = NSAttributedString.Key(rawValue: kCTFontAttributeName as String)
 
@@ -352,12 +355,17 @@ final class FontShaper {
     }
 
     private func storeRow(_ key: ShapeKey, _ glyphs: [ShapedGlyph]) {
-        if rowCache.count >= FontShaper.rowCacheGeneration {
+        // Rough size: key cells, cluster strings, shaped glyphs and per-entry overhead.
+        let bytes = key.cells.count * 4 + key.clusters.count * 32
+            + glyphs.count * MemoryLayout<ShapedGlyph>.stride + 96
+        if rowCache.count >= FontShaper.rowCacheGeneration
+            || rowCacheBytes + bytes > FontShaper.rowCacheGenerationBytes {
             oldRowCache = rowCache
             rowCache = [:]
-            rowCache.reserveCapacity(FontShaper.rowCacheGeneration)
+            rowCacheBytes = 0
         }
         rowCache[key] = glyphs
+        rowCacheBytes += bytes
     }
 
     /// Shapes one run of identically styled text. `map[i]` is the column of UTF-16 unit `i`.
