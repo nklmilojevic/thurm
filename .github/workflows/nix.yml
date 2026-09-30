@@ -4,9 +4,9 @@ name: Nix
 on:
   push:
     branches: [main]
-    paths: [flake.nix, flake.lock, 'nix/**', Cargo.lock, 'vendor/**', .github/workflows/nix.yml]
+    paths: [flake.nix, flake.lock, 'nix/**', Cargo.toml, Cargo.lock, 'crates/**', 'vendor/**', 'shell-integration/**', 'completions/**', .github/workflows/nix.yml]
   pull_request:
-    paths: [flake.nix, flake.lock, 'nix/**', Cargo.lock, 'vendor/**', .github/workflows/nix.yml]
+    paths: [flake.nix, flake.lock, 'nix/**', Cargo.toml, Cargo.lock, 'crates/**', 'vendor/**', 'shell-integration/**', 'completions/**', .github/workflows/nix.yml]
 
 permissions:
   contents: read

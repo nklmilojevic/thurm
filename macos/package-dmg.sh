@@ -42,6 +42,7 @@ if [[ "$PREVIEW" == 0 ]]; then
         "$APP/Contents/Helpers/thurm-intelligence" "$SPARKLE" "$SPARKLE/Versions/B/Autoupdate" \
         "$SPARKLE/Versions/B/Updater.app" "$SPARKLE/Versions/B/XPCServices/Installer.xpc" \
         "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"; do
+        codesign --verify --strict --verbose=2 "$binary" || die "Signature is invalid: $binary"
         details="$(codesign -dv --verbose=4 "$binary" 2>&1)"
         grep -q '^Authority=Developer ID Application:' <<<"$details" || die "Build with --distribution first"
         grep -q 'flags=.*runtime' <<<"$details" || die "Hardened runtime is missing: $binary"
