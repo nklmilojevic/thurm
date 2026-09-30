@@ -88,6 +88,7 @@ fn main() {
         eprintln!("thurmd: config error, using defaults: {e}");
         (Config::default(), Vec::new())
     });
+    let args_socket_default = args.socket.is_none() && std::env::var_os("THURM_SOCKET").is_none();
     let socket = args.socket.unwrap_or_else(thurm_config::socket_path);
     let state_dir = thurm_config::state_dir();
     let _ = std::fs::create_dir_all(&state_dir);
@@ -104,6 +105,7 @@ fn main() {
 
     let log_path = state_dir.join("thurmd.log");
     let handoff = args.adopt.as_deref().map(upgrade::load);
+    let lock_fd: Option<std::os::fd::RawFd>;
     let (listener, handoff, log_to_file) = match handoff {
         // Replacing ourselves: already daemonized, and the socket never stopped listening.
         Some(Ok(h)) => {
@@ -111,6 +113,11 @@ fn main() {
             let _ = pty::set_cloexec(listener.as_raw_fd(), true);
             let log_to_file = h.log_to_file;
             init_logging(&log_path, log_to_file);
+            // The instance lock came along (an image that held none: take it now).
+            match h.lock_fd.filter(|&fd| pty::set_cloexec(fd, true).is_ok()) {
+                Some(fd) => lock_fd = Some(fd),
+                None => lock_fd = lock_instance(&socket).ok(),
+            }
             (listener, Some(h), log_to_file)
         }
         adopt => {
@@ -121,12 +128,32 @@ fn main() {
                 // then skip the single-instance check and bind afresh.
                 eprintln!("thurmd: cannot adopt the previous daemon's panes: {e}");
                 pty::close_inherited_fds();
-            } else if UnixStream::connect(&socket).is_ok() {
-                // Single instance: if a daemon answers on the socket, we're done.
+            }
+            // Single instance: one daemon holds the lock for as long as it runs (through
+            // in-place upgrades too), taken before anything touches the socket.
+            match lock_instance(&socket) {
+                Ok(fd) => lock_fd = Some(fd),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    eprintln!("thurmd: already running on {}", socket.display());
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("thurmd: cannot lock {}: {e}", lock_path(&socket).display());
+                    std::process::exit(1);
+                }
+            }
+            // A daemon of an earlier version (without the lock) answering on the socket.
+            if adopt.is_none() && UnixStream::connect(&socket).is_ok() {
                 eprintln!("thurmd: already running on {}", socket.display());
                 return;
             }
-            let listener = match bind(&socket) {
+            // Only the default location is ours to create and check; a directory given with
+            // --socket is left as it is.
+            // The client passes the default path with --socket when it starts us.
+            let managed = args_socket_default
+                || (std::env::var_os("THURM_SOCKET").is_none()
+                    && socket == thurm_config::default_socket_dir().join("thurmd.sock"));
+            let listener = match bind(&socket, managed) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("thurmd: cannot bind {}: {e}", socket.display());
@@ -205,7 +232,14 @@ fn main() {
         }
         if upgrade_requested.swap(false, Ordering::Relaxed) {
             // Returns only when the upgrade could not happen; we carry on as before.
-            upgrade::perform(&daemon, listener_fd, &socket, &state_dir, log_to_file);
+            upgrade::perform(
+                &daemon,
+                listener_fd,
+                lock_fd,
+                &socket,
+                &state_dir,
+                log_to_file,
+            );
         }
         // Socket file deleted or replaced: another daemon took over or the user cleaned up.
         if !socket.exists() {
@@ -229,15 +263,60 @@ fn thurm_client_pid_path(socket: &Path) -> std::path::PathBuf {
     p.into()
 }
 
-fn bind(socket: &Path) -> std::io::Result<UnixListener> {
+/// `managed`: the default socket directory, created private and checked (see
+/// `thurm_config::ensure_private_dir`); any other directory is only created if missing.
+fn bind(socket: &Path, managed: bool) -> std::io::Result<UnixListener> {
     if let Some(dir) = socket.parent() {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        if managed {
+            thurm_config::ensure_private_dir(dir)?;
+        } else {
+            // Directories it has to create are private; existing ones are left alone.
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+        }
     }
     let _ = std::fs::remove_file(socket);
     let l = UnixListener::bind(socket)?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
     Ok(l)
+}
+
+fn lock_path(socket: &Path) -> std::path::PathBuf {
+    let mut p = socket.as_os_str().to_owned();
+    p.push(".lock");
+    p.into()
+}
+
+/// Takes the single-instance lock next to `socket` (`flock`, held until the process ends; the
+/// fd is close-on-exec, and an in-place upgrade hands it over like the listener).
+/// `WouldBlock` when another daemon holds it.
+fn lock_instance(socket: &Path) -> std::io::Result<std::os::fd::RawFd> {
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = socket.parent() {
+        // Missing directories are created private (the default one is checked by `bind`).
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(lock_path(socket))?;
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file.into_raw_fd())
 }
 
 /// Classic double fork so the daemon outlives whoever launched it.
