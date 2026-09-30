@@ -716,6 +716,85 @@ pub unsafe extern "C" fn thurm_request(
     into_c(out)
 }
 
+/// Like [`thurm_request`], but gives up after `timeout_ms` (0: no limit) with an error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_request_timeout(
+    client: *mut thurm_client,
+    json: *const c_char,
+    timeout_ms: u64,
+) -> *mut c_char {
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return into_c(error_json("null client"));
+    };
+    let req = match unsafe { parse_request(json) } {
+        Ok(r) => r,
+        Err(e) => return into_c(e),
+    };
+    let req = match c.local_request(req) {
+        Ok(resp) => return into_c(serde_json::to_string(&resp).unwrap_or_else(error_json)),
+        Err(req) => req,
+    };
+    into_c(daemon_request(&c.client, req, timeout_ms))
+}
+
+/// Callback of [`thurm_request_async`]: the response JSON (freed with `thurm_string_free` by
+/// the callee), on an arbitrary thread.
+pub type thurm_response_cb = Option<unsafe extern "C" fn(ctx: *mut c_void, json: *mut c_char)>;
+
+/// Sends a request without waiting: `cb` gets the response (or an error after `timeout_ms`,
+/// 0: no limit) on another thread. The connection is held until then, so the caller may
+/// disconnect `client` meanwhile.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_request_async(
+    client: *mut thurm_client,
+    json: *const c_char,
+    timeout_ms: u64,
+    cb: thurm_response_cb,
+    ctx: *mut c_void,
+) {
+    let reply = move |ctx: Ctx, out: String| {
+        if let Some(cb) = cb {
+            unsafe { cb(ctx.0, into_c(out)) };
+        }
+    };
+    let ctx = Ctx(ctx);
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return reply(ctx, error_json("null client"));
+    };
+    let req = match unsafe { parse_request(json) } {
+        Ok(r) => r,
+        Err(e) => return reply(ctx, e),
+    };
+    let req = match c.local_request(req) {
+        Ok(resp) => return reply(ctx, serde_json::to_string(&resp).unwrap_or_else(error_json)),
+        Err(req) => req,
+    };
+    // The Arc keeps the connection alive for the request, whatever the caller does.
+    let conn = c.client.clone();
+    let spawned = std::thread::Builder::new()
+        .name("thurm-request".into())
+        .spawn(move || reply(ctx, daemon_request(&conn, req, timeout_ms)));
+    if let Err(e) = spawned {
+        reply(
+            ctx,
+            error_json(format!("cannot start a request thread: {e}")),
+        );
+    }
+}
+
+unsafe fn parse_request(json: *const c_char) -> Result<Request, String> {
+    let json = unsafe { opt_str(json) }.ok_or_else(|| error_json("invalid string"))?;
+    serde_json::from_str(json).map_err(|e| error_json(format!("bad request: {e}")))
+}
+
+fn daemon_request(client: &Client, req: Request, timeout_ms: u64) -> String {
+    let timeout = (timeout_ms > 0).then(|| std::time::Duration::from_millis(timeout_ms));
+    match client.request_timeout(req, timeout) {
+        Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(error_json),
+        Err(e) => error_json(e),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_send(client: *mut thurm_client, json: *const c_char) {
     let Some(c) = (unsafe { client_ref(client) }) else {
@@ -1413,6 +1492,26 @@ pub extern "C" fn thurm_config_path() -> *mut c_char {
 mod tests {
     use super::*;
     use thurm_proto::{Cell, FrameRow};
+
+    #[test]
+    fn async_requests_always_answer() {
+        unsafe extern "C" fn cb(ctx: *mut c_void, json: *mut c_char) {
+            let tx = unsafe { Box::from_raw(ctx as *mut std::sync::mpsc::Sender<String>) };
+            let text = unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned();
+            unsafe { thurm_string_free(json) };
+            let _ = tx.send(text);
+        }
+        for (client, json) in [
+            (std::ptr::null_mut(), c"\"ListPanes\""),
+            (std::ptr::null_mut(), c"not json"),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+            unsafe { thurm_request_async(client, json.as_ptr(), 100, Some(cb), ctx) };
+            let text = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            assert!(text.contains("error"), "{text}");
+        }
+    }
 
     #[test]
     fn dirty_mask_shifts() {

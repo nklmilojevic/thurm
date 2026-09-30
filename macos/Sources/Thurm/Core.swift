@@ -233,12 +233,19 @@ final class Core {
 
     // MARK: Requests
 
-    /// Blocking request to `host`'s daemon. Returns the decoded JSON response, or nil when
-    /// disconnected.
+    /// On the main thread a request never waits longer than this: a daemon that stopped
+    /// answering (a hung tunnel after sleep) must not freeze the app.
+    static let mainThreadTimeout: TimeInterval = 10
+
+    /// Blocking request to `host`'s daemon. Returns the decoded JSON response ({"error": …}
+    /// after `timeout`), or nil when disconnected. `timeout` defaults to `mainThreadTimeout`
+    /// on the main thread and to none elsewhere.
     @discardableResult
-    func request(_ json: String, host: HostId = localHost) -> Any? {
+    func request(_ json: String, host: HostId = localHost, timeout: TimeInterval? = nil) -> Any? {
+        assert(Thread.isMainThread, "Core requests resolve connections on the main thread")
         guard let c = clients[host] else { return nil }
-        guard let raw = thurm_request(c, json) else { return nil }
+        let limit = timeout ?? Core.mainThreadTimeout
+        guard let raw = thurm_request_timeout(c, json, UInt64(max(0, limit) * 1000)) else { return nil }
         let text = String(cString: raw)
         thurm_string_free(raw)
         let value = JSON.decode(text)
@@ -249,8 +256,33 @@ final class Core {
     }
 
     @discardableResult
-    func request(object: Any, host: HostId = localHost) -> Any? {
-        request(JSON.encode(object), host: host)
+    func request(object: Any, host: HostId = localHost, timeout: TimeInterval? = nil) -> Any? {
+        request(JSON.encode(object), host: host, timeout: timeout)
+    }
+
+    /// Sends a request without blocking; `completion` runs on the main thread with the decoded
+    /// response (nil when not connected). Resolves the connection here, on the main thread:
+    /// the library keeps it open for the request even if it is disconnected meanwhile.
+    func requestAsync(object: Any, host: HostId = localHost, timeout: TimeInterval,
+                      completion: @escaping (Any?) -> Void) {
+        assert(Thread.isMainThread, "Core requests resolve connections on the main thread")
+        guard let c = clients[host] else {
+            completion(nil)
+            return
+        }
+        let box = Unmanaged.passRetained(ResponseBox(completion)).toOpaque()
+        JSON.encode(object).withCString { json in
+            thurm_request_async(c, json, UInt64(max(0, timeout) * 1000), { ctx, raw in
+                guard let ctx else { return }
+                let box = Unmanaged<ResponseBox>.fromOpaque(ctx).takeRetainedValue()
+                var value: Any?
+                if let raw {
+                    value = JSON.decode(String(cString: raw))
+                    thurm_string_free(raw)
+                }
+                DispatchQueue.main.async { box.completion(value) }
+            }, box)
+        }
     }
 
     /// Fire-and-forget request.
@@ -395,4 +427,10 @@ final class Core {
         defer { thurm_string_free(raw) }
         return JSON.decode(String(cString: raw))
     }
+}
+
+/// Carries a `requestAsync` completion through the C callback.
+private final class ResponseBox {
+    let completion: (Any?) -> Void
+    init(_ completion: @escaping (Any?) -> Void) { self.completion = completion }
 }

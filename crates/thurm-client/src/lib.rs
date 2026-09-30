@@ -321,6 +321,18 @@ impl Client {
         std::thread::Builder::new()
             .name("thurm-client-reader".into())
             .spawn(move || {
+                // However this thread ends (a panic in `on_event` too), requests still waiting
+                // get an error instead of waiting forever.
+                struct Finish(Arc<AtomicBool>, Pending);
+                impl Drop for Finish {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Relaxed);
+                        for (_, tx) in self.1.lock().drain() {
+                            let _ = tx.send(Err("disconnected".into()));
+                        }
+                    }
+                }
+                let finish = Finish(alive.clone(), pending.clone());
                 let mut reader = BufReader::with_capacity(256 * 1024, read_half);
                 loop {
                     match codec::read_message::<_, ServerMessage>(&mut reader) {
@@ -333,10 +345,7 @@ impl Client {
                         Ok(None) | Err(_) => break,
                     }
                 }
-                alive.store(false, Ordering::Relaxed);
-                for (_, tx) in pending.lock().drain() {
-                    let _ = tx.send(Err("disconnected".into()));
-                }
+                drop(finish);
                 on_disconnect();
             })?;
 
@@ -386,7 +395,14 @@ impl Client {
             return Err(e);
         }
         let result = match timeout {
-            Some(t) => rx.recv_timeout(t).map_err(|_| ClientError::Timeout)?,
+            Some(t) => match rx.recv_timeout(t) {
+                Ok(r) => r,
+                Err(_) => {
+                    // Its late answer has nobody to go to.
+                    self.pending.lock().remove(&id);
+                    return Err(ClientError::Timeout);
+                }
+            },
             None => rx.recv().map_err(|_| ClientError::Disconnected)?,
         };
         if matches!(&result, Err(e) if e == "disconnected") {
@@ -424,6 +440,69 @@ mod tests {
             Some(12)
         );
         assert_eq!(mismatched_protocol("no such pane: 3"), None);
+    }
+
+    /// A daemon that answers Hello, never answers ListPanes, and hangs up on Capture.
+    #[test]
+    fn timeouts_and_hangups_end_waiting_requests() {
+        let dir = std::env::temp_dir().join(format!("thurm-client-to-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut w = s;
+            while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut r) {
+                match env.request {
+                    Request::Hello { .. } => codec::write_message(
+                        &mut w,
+                        &ServerMessage::Response {
+                            id: env.id,
+                            result: Ok(Response::Hello {
+                                version: 1,
+                                daemon_pid: 1,
+                                restored: false,
+                                build: String::new(),
+                                capabilities: Vec::new(),
+                            }),
+                        },
+                    )
+                    .unwrap(),
+                    Request::Capture { .. } => return,
+                    _ => {}
+                }
+            }
+        });
+        let client = Client::connect(
+            ConnectOptions {
+                socket: sock,
+                spawn_daemon: None,
+                client_name: "test",
+                ui: false,
+            },
+            |_| {},
+            || {},
+        )
+        .unwrap();
+        let r = client.request_timeout(Request::ListPanes, Some(Duration::from_millis(100)));
+        assert!(matches!(r, Err(ClientError::Timeout)), "{r:?}");
+        // The timed-out request is not kept around.
+        assert!(client.pending.lock().is_empty());
+        // A request waiting without a limit ends when the daemon goes away.
+        let waiting = {
+            let client = client.clone();
+            std::thread::spawn(move || client.request(Request::ListPanes))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = client.send(Request::Capture {
+            pane: 1,
+            opts: thurm_proto::CaptureOpts::default(),
+        });
+        let r = waiting.join().unwrap();
+        assert!(matches!(r, Err(ClientError::Disconnected)), "{r:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Minimal fake daemon: answers Hello and echoes ListPanes, pushes one event.
