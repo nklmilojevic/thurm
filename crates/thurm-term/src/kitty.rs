@@ -60,8 +60,20 @@ impl Default for MediaReader {
 const CHUNK: usize = 4096;
 /// Most base64 bytes of a file or shared memory name (chunks included).
 const MAX_NAME_PAYLOAD: usize = 4096;
-/// Where reading a file can block or reach other machines (automounts, devices).
-const FORBIDDEN_PREFIXES: &[&str] = &["/dev/", "/net/", "/Volumes/", "/System/Volumes/", "/proc/"];
+/// Where reading a file can block or reach other machines (automounts, devices, mounted
+/// volumes, kernel files). Checked on every step of resolving a path, before touching it.
+const FORBIDDEN_ROOTS: &[&str] = &[
+    "/dev",
+    "/net",
+    "/Volumes",
+    "/System/Volumes",
+    "/proc",
+    "/sys",
+];
+/// Allowed under /dev for temporary files (Linux shared memory).
+const DEV_SHM: &str = "/dev/shm";
+/// Most symlinks followed while resolving one path.
+const MAX_LINKS: usize = 40;
 
 impl MediaReader {
     pub fn set_max_bytes(&mut self, max: usize) {
@@ -87,6 +99,16 @@ impl MediaReader {
         if key(ctl, b't').is_some() || key(ctl, b'a').is_some() {
             self.pending = None;
         }
+        // Checked before copying anything: a name is short.
+        let so_far = self.pending.as_ref().map_or(0, |(_, data)| data.len());
+        if so_far.saturating_add(payload.len()) > MAX_NAME_PAYLOAD {
+            let first = self
+                .pending
+                .take()
+                .map_or_else(|| ctl.to_vec(), |(first, _)| first);
+            return reply(&first, err("EINVAL", "file name too long"))
+                .map_or(Media::Drop, Media::Reply);
+        }
         let (ctl, payload) = match self.pending.take() {
             Some((first, mut data)) => {
                 data.extend_from_slice(payload);
@@ -94,10 +116,6 @@ impl MediaReader {
             }
             None => (ctl.to_vec(), payload.to_vec()),
         };
-        if payload.len() > MAX_NAME_PAYLOAD {
-            return reply(&ctl, err("EINVAL", "file name too long"))
-                .map_or(Media::Drop, Media::Reply);
-        }
         if more {
             self.pending = Some((ctl, payload));
             return Media::Wait;
@@ -147,12 +165,12 @@ fn read(ctl: &[u8], payload: &[u8], max: usize) -> Result<Vec<u8>, Err> {
         .ok_or_else(|| err("EINVAL", "bad file name"))?;
     let (offset, size) = (num(ctl, b'O').unwrap_or(0), num(ctl, b'S'));
     match key(ctl, b't').and_then(|m| m.first()) {
-        Some(b'f') => read_file(&name, offset, size, max),
+        Some(b'f') => read_file(&name, offset, size, max, false),
         Some(b't') => {
             if !is_temp_graphics_file(&name) {
                 return Err(err("EPERM", "not a temporary graphics file"));
             }
-            let bytes = read_file(&name, offset, size, max);
+            let bytes = read_file(&name, offset, size, max, true);
             // Only a regular file (not a link to one) is deleted.
             if std::fs::symlink_metadata(&name).is_ok_and(|m| m.file_type().is_file()) {
                 let _ = std::fs::remove_file(&name);
@@ -303,16 +321,90 @@ fn is_temp_graphics_file(path: &str) -> bool {
     !path.contains("..") && dirs.iter().any(|d| path.starts_with(d.as_str()))
 }
 
-fn read_file(path: &str, offset: usize, size: Option<usize>, max: usize) -> Result<Vec<u8>, Err> {
-    if !path.starts_with('/') || FORBIDDEN_PREFIXES.iter().any(|p| path.starts_with(p)) {
-        return Err(err("EPERM", "file not allowed"));
+/// Whether `path` (absolute, without `.` or `..`) is on or under a forbidden root.
+fn forbidden(path: &std::path::Path, allow_dev_shm: bool) -> bool {
+    if allow_dev_shm && path.starts_with(DEV_SHM) {
+        return false;
     }
+    FORBIDDEN_ROOTS.iter().any(|root| path.starts_with(root))
+}
+
+/// `path` with `.`, `..` and every symlink but the last component resolved, like realpath(3),
+/// except that each step is checked against the forbidden roots before it is looked at (so
+/// `/tmp/../net/host/x`, or a directory symlink into `/net`, never triggers an automount).
+fn resolve(path: &str, allow_dev_shm: bool) -> Result<std::path::PathBuf, Err> {
+    use std::path::{Component, Path, PathBuf};
+    let denied = || err("EPERM", "file not allowed");
+    if !path.starts_with('/') {
+        return Err(denied());
+    }
+    let mut todo: std::collections::VecDeque<std::ffi::OsString> = Path::new(path)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_owned()),
+            Component::ParentDir => Some("..".into()),
+            _ => None,
+        })
+        .collect();
+    let mut resolved = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(part) = todo.pop_front() {
+        if part == ".." {
+            resolved.pop();
+            continue;
+        }
+        let next = resolved.join(&part);
+        if forbidden(&next, allow_dev_shm) {
+            return Err(denied());
+        }
+        // The last component is opened with O_NOFOLLOW instead.
+        if todo.is_empty() {
+            resolved = next;
+            break;
+        }
+        let meta =
+            std::fs::symlink_metadata(&next).map_err(|_| err("EBADF", "cannot open the file"))?;
+        if !meta.file_type().is_symlink() {
+            resolved = next;
+            continue;
+        }
+        links += 1;
+        if links > MAX_LINKS {
+            return Err(err("ELOOP", "too many symbolic links"));
+        }
+        let target = std::fs::read_link(&next).map_err(|_| err("EBADF", "cannot open the file"))?;
+        if target.is_absolute() {
+            resolved = PathBuf::from("/");
+        }
+        for c in target.components().rev() {
+            match c {
+                Component::Normal(s) => todo.push_front(s.to_owned()),
+                Component::ParentDir => todo.push_front("..".into()),
+                _ => {}
+            }
+        }
+    }
+    if forbidden(&resolved, allow_dev_shm) {
+        return Err(denied());
+    }
+    Ok(resolved)
+}
+
+/// `allow_dev_shm`: temporary graphics files may be in /dev/shm.
+fn read_file(
+    path: &str,
+    offset: usize,
+    size: Option<usize>,
+    max: usize,
+    allow_dev_shm: bool,
+) -> Result<Vec<u8>, Err> {
+    let path = resolve(path, allow_dev_shm)?;
     // Never blocks on open (a FIFO without a writer) and never follows a final symlink; only
     // regular files are read.
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+        .open(&path)
         .map_err(|_| err("EBADF", "cannot open the file"))?;
     let meta = f
         .metadata()
@@ -492,6 +584,67 @@ mod tests {
             assert!(text.contains("EPERM"), "{bad}: {text}");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn path_aliases_cannot_reach_forbidden_roots() {
+        let dir = std::env::temp_dir().join(format!("thurm-kitty-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory symlink into /dev, and one into /net (not followed, never looked up).
+        std::os::unix::fs::symlink("/dev", dir.join("devlink")).unwrap();
+        std::os::unix::fs::symlink("/net/host", dir.join("netlink")).unwrap();
+        std::os::unix::fs::symlink("../../../../../../../../dev", dir.join("rel")).unwrap();
+        let d = dir.to_str().unwrap();
+        let mut r = MediaReader::default();
+        for bad in [
+            "/usr/../net/host/x".to_owned(),
+            "/tmp/../../dev/zero".to_owned(),
+            format!("{d}/devlink/zero"),
+            format!("{d}/netlink/x"),
+            format!("{d}/rel/zero"),
+        ] {
+            let text =
+                reply_text(r.handle(format!("Ga=t,t=f,i=1;{}", b64(bad.as_bytes())).as_bytes()));
+            assert!(text.contains("EPERM"), "{bad}: {text}");
+        }
+        // Symlinks elsewhere still resolve.
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/img"), [9u8; 8]).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("ok")).unwrap();
+        let body = format!(
+            "Ga=t,t=f,i=1;{}",
+            b64(format!("{d}/ok/../ok/img").as_bytes())
+        );
+        assert!(matches!(r.handle(body.as_bytes()), Media::Direct(_)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn temporary_files_in_dev_shm() {
+        let path = format!(
+            "/dev/shm/tty-graphics-protocol-thurm-{}",
+            std::process::id()
+        );
+        std::fs::write(&path, [5u8; 12]).unwrap();
+        let mut r = MediaReader::default();
+        let body = format!("Ga=t,t=t,i=1;{}", b64(path.as_bytes()));
+        assert!(matches!(r.handle(body.as_bytes()), Media::Direct(_)));
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "temporary files are deleted"
+        );
+        // Other files there are not readable as plain files.
+        let body = format!("Ga=t,t=f,i=1;{}", b64(b"/dev/shm/x"));
+        assert!(reply_text(r.handle(body.as_bytes())).contains("EPERM"));
+    }
+
+    #[test]
+    fn oversized_first_chunk_is_refused() {
+        let mut r = MediaReader::default();
+        let long = "A".repeat(MAX_NAME_PAYLOAD + 1);
+        let text = reply_text(r.handle(format!("Ga=t,t=f,i=1;{long}").as_bytes()));
+        assert!(text.contains("EINVAL"), "{text}");
     }
 
     #[test]
