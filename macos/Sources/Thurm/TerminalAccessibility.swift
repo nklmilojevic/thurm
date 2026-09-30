@@ -7,8 +7,10 @@ final class TerminalAccessibility {
     private(set) var text = ""
     /// UTF-16 offset where each row starts in `text`.
     private(set) var lineStarts: [Int] = []
-    /// Column of every UTF-16 unit of each row.
+    /// Column of every UTF-16 unit of each row, and the column after its glyph (a wide one
+    /// takes two).
     private var columns: [[Int]] = []
+    private var ends: [[Int]] = []
     private var lines: [String] = []
     private var generation: UInt64 = .max
     /// When a key was last typed: its echo is not announced (VoiceOver speaks typed keys).
@@ -27,16 +29,26 @@ final class TerminalAccessibility {
         generation = snapshot.info.generation
         var newLines: [String] = []
         var newColumns: [[Int]] = []
+        var newEnds: [[Int]] = []
         for r in 0..<snapshot.rows {
             let (row, map) = snapshot.rowText(r)
             let trimmed = row.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
             let units = (trimmed as NSString).length
             newLines.append(trimmed)
             newColumns.append(Array(map.prefix(units)))
+            // The next glyph's column (spacers aren't in the map), or the row's end.
+            var end = Array(repeating: snapshot.cols, count: units)
+            var next = snapshot.cols
+            for k in stride(from: map.count - 1, through: 0, by: -1) {
+                if k + 1 < map.count, map[k + 1] != map[k] { next = map[k + 1] }
+                if k < units { end[k] = next }
+            }
+            newEnds.append(end)
         }
         let added = TerminalAccessibility.newRows(old: lines, new: newLines)
         lines = newLines
         columns = newColumns
+        ends = newEnds
         var starts: [Int] = []
         var offset = 0
         for l in lines {
@@ -52,12 +64,14 @@ final class TerminalAccessibility {
     static func newRows(old: [String], new: [String]) -> [String] {
         guard !old.isEmpty, old.count == new.count else { return new.filter { !$0.isEmpty } }
         let n = new.count
-        // The scroll that keeps the most rows in place (0: none).
+        // The scroll that keeps the most rows in place, either way (row i of the new screen
+        // was row i + shift), the smallest on a tie.
         var best = 0
         var bestSame = -1
-        for shift in 0..<n {
+        for step in 0..<(2 * n - 1) {
+            let shift = step % 2 == 0 ? step / 2 : -(step + 1) / 2
             var same = 0
-            for i in 0..<(n - shift) where new[i] == old[i + shift] { same += 1 }
+            for i in max(0, -shift)..<min(n, n - shift) where new[i] == old[i + shift] { same += 1 }
             if same > bestSame {
                 bestSame = same
                 best = shift
@@ -66,7 +80,7 @@ final class TerminalAccessibility {
         var out: [String] = []
         for i in 0..<n {
             let j = i + best
-            if (j >= n || new[i] != old[j]) && !new[i].isEmpty { out.append(new[i]) }
+            if (j < 0 || j >= n || new[i] != old[j]) && !new[i].isEmpty { out.append(new[i]) }
         }
         return out
     }
@@ -95,14 +109,16 @@ final class TerminalAccessibility {
         return lineStarts[row] + within
     }
 
-    /// Cell of an offset, for the frame of a range.
-    func cell(at index: Int) -> (col: Int, row: Int) {
+    /// Cells of an offset's glyph (`end` exclusive), for the frame of a range.
+    func cell(at index: Int) -> (col: Int, end: Int, row: Int) {
         let row = line(for: index)
-        guard row < columns.count else { return (0, 0) }
+        guard row < columns.count else { return (0, 1, 0) }
         let i = index - lineStarts[row]
         let cols = columns[row]
-        if i < cols.count { return (cols[i], row) }
-        return ((cols.last ?? -1) + 1, row)
+        if i >= 0, i < cols.count { return (cols[i], ends[row][i], row) }
+        // The newline, or past the text: the cell after it.
+        let col = ends[row].last ?? 0
+        return (col, col + 1, row)
     }
 
     /// Speaks new output a moment after it stops arriving, so a burst is one announcement.
@@ -210,7 +226,7 @@ extension TerminalView {
         let rect: NSRect
         if start.row == end.row {
             rect = NSRect(x: pad.x + CGFloat(start.col) * cell.width, y: pad.y + CGFloat(start.row) * cell.height,
-                          width: CGFloat(max(1, end.col - start.col + 1)) * cell.width, height: cell.height)
+                          width: CGFloat(max(1, end.end - start.col)) * cell.width, height: cell.height)
         } else {
             // Across rows: the full width of every row in it.
             rect = NSRect(x: pad.x, y: pad.y + CGFloat(start.row) * cell.height,
