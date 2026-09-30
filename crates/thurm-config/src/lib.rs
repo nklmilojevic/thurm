@@ -1217,16 +1217,21 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         Ok(t) => t,
         // A link to a file that doesn't exist yet: create that file, keep the link.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::symlink_metadata(path) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    let link = std::fs::read_link(path)?;
-                    match path.parent() {
-                        Some(dir) if link.is_relative() => dir.join(link),
-                        _ => link,
+            // Follow the chain of links to the missing file at its end.
+            let mut at = path.to_owned();
+            for _ in 0..40 {
+                match std::fs::symlink_metadata(&at) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        let link = std::fs::read_link(&at)?;
+                        at = match at.parent() {
+                            Some(dir) if link.is_relative() => dir.join(link),
+                            _ => link,
+                        };
                     }
+                    _ => break,
                 }
-                _ => path.to_owned(),
             }
+            at
         }
         Err(e) => return Err(e),
     };
@@ -1620,6 +1625,22 @@ clipboard_read = "always"
         assert_eq!(
             std::fs::read_to_string(dir.join("dotfiles/later.toml")).unwrap(),
             "x"
+        );
+        // And a chain of links ending at a missing file.
+        std::os::unix::fs::symlink("hop.toml", dir.join("chain.toml")).unwrap();
+        std::os::unix::fs::symlink("dotfiles/end.toml", dir.join("hop.toml")).unwrap();
+        replace_file(&dir.join("chain.toml"), b"y").unwrap();
+        for l in ["chain.toml", "hop.toml"] {
+            assert!(
+                std::fs::symlink_metadata(dir.join(l))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dotfiles/end.toml")).unwrap(),
+            "y"
         );
         // Someone else's leftover temporary file is not deleted.
         let leftover = dir.join(format!("dotfiles/.config.toml.tmp{}", std::process::id()));
