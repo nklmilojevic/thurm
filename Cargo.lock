@@ -880,6 +880,7 @@ name = "thurm-config"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "thurm-proto",
