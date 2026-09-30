@@ -36,16 +36,19 @@ pub fn probe(cwd: &str) -> Option<GitInfo> {
     // Diffing the work tree runs the clean filter of files whose attributes name one; a
     // repository that defines its own filter drivers gets no counts. Reading config runs
     // nothing.
-    let own_filters = git(
-        &root,
-        &[
-            "config",
-            "--local",
-            "--get-regexp",
-            r"^filter\..*\.(clean|smudge|process)$",
-        ],
-    )
-    .is_some_and(|out| !out.trim().is_empty());
+    // Anything but a clear "none" (exit status 1) counts as having them.
+    let own_filters = !matches!(
+        run_git(
+            &root,
+            &[
+                "config",
+                "--local",
+                "--get-regexp",
+                r"^filter\..*\.(clean|smudge|process)$",
+            ],
+        ),
+        Some((Some(1), _))
+    );
     // `HEAD` fails in a repository without commits; then everything is untracked anyway.
     let numstat = (!own_filters)
         .then(|| {
@@ -77,7 +80,16 @@ pub fn probe(cwd: &str) -> Option<GitInfo> {
     })
 }
 
+/// Output of a successful git command.
 fn git(dir: &str, args: &[&str]) -> Option<String> {
+    match run_git(dir, args)? {
+        (Some(0), out) => Some(out),
+        _ => None,
+    }
+}
+
+/// Exit status and output of a git command; `None` when it didn't start or timed out.
+fn run_git(dir: &str, args: &[&str]) -> Option<(Option<i32>, String)> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -117,9 +129,7 @@ fn git(dir: &str, args: &[&str]) -> Option<String> {
         }
     };
     let out = reader.join().ok()?;
-    status
-        .success()
-        .then(|| String::from_utf8_lossy(&out).into_owned())
+    Some((status.code(), String::from_utf8_lossy(&out).into_owned()))
 }
 
 #[cfg(test)]

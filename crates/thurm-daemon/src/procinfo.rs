@@ -29,6 +29,20 @@ fn argv(pid: u32) -> Option<Vec<String>> {
     )
 }
 
+/// `name` in the environment `pid` was started with (not what it changed since).
+#[cfg(target_os = "linux")]
+pub fn env_var(pid: u32, name: &str) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    find_var(raw.split(|&b| b == 0), name)
+}
+
+fn find_var<'a>(entries: impl Iterator<Item = &'a [u8]>, name: &str) -> Option<String> {
+    entries.into_iter().find_map(|e| {
+        let rest = e.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+        Some(String::from_utf8_lossy(rest).into_owned())
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn cwd(pid: u32) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/cwd"))
@@ -50,6 +64,26 @@ fn name(pid: u32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn argv(pid: u32) -> Option<Vec<String>> {
+    let (argc, strings) = procargs(pid)?;
+    Some(
+        strings
+            .split(|&b| b == 0)
+            .take(argc)
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect(),
+    )
+}
+
+/// `name` in the environment `pid` was started with (not what it changed since).
+#[cfg(target_os = "macos")]
+pub fn env_var(pid: u32, name: &str) -> Option<String> {
+    let (argc, strings) = procargs(pid)?;
+    find_var(strings.split(|&b| b == 0).skip(argc), name)
+}
+
+/// argc, and the NUL-separated argv then environment of `pid`.
+#[cfg(target_os = "macos")]
+fn procargs(pid: u32) -> Option<(usize, Vec<u8>)> {
     // KERN_PROCARGS2: argc (i32), exec path, NUL padding, argv..., env...
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let mut size: libc::size_t = 0;
@@ -92,12 +126,7 @@ fn argv(pid: u32) -> Option<Vec<String>> {
     // Skip NUL padding.
     let start = rest.iter().position(|&b| b != 0)?;
     rest = &rest[start..];
-    let args = rest
-        .split(|&b| b == 0)
-        .take(argc)
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect();
-    Some(args)
+    Some((argc, rest.to_vec()))
 }
 
 #[cfg(target_os = "macos")]
@@ -139,6 +168,12 @@ fn argv(_pid: u32) -> Option<Vec<String>> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn cwd(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn env_var(_pid: u32, _name: &str) -> Option<String> {
+    let _ = find_var;
     None
 }
 
@@ -405,5 +440,26 @@ mod proc_tests {
    2: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 100 0 0 10 0
 ";
         assert_eq!(listening_sockets(table), vec![(41234, 8080)]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn environment_a_process_started_with() {
+        // Our own process: other processes' environments may be hidden by the system.
+        let pid = std::process::id();
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(env_var(pid, "HOME"), Some(home));
+        assert_eq!(env_var(pid, "THURM_SURELY_UNSET_VARIABLE"), None);
+    }
+
+    #[test]
+    fn finds_variables_by_whole_name() {
+        let env: [&[u8]; 3] = [b"PATHS=x", b"PATH=/usr/bin:/bin", b"EMPTY="];
+        assert_eq!(
+            find_var(env.into_iter(), "PATH").as_deref(),
+            Some("/usr/bin:/bin")
+        );
+        assert_eq!(find_var(env.into_iter(), "EMPTY").as_deref(), Some(""));
+        assert_eq!(find_var(env.into_iter(), "PAT"), None);
     }
 }
