@@ -714,6 +714,8 @@ final class TerminalView: NSView, NSTextInputClient {
         return p
     }()
     private var completionRefresh: DispatchWorkItem?
+    /// Numbers completion refreshes, so only the answer to the latest one is shown.
+    private var completionQuery = 0
 
     /// Tab and the menu's navigation keys. Returns true when the key was consumed.
     private func handleCompletionKey(_ event: NSEvent) -> Bool {
@@ -763,9 +765,18 @@ final class TerminalView: NSView, NSTextInputClient {
         return true
     }
 
+    /// Tab has to know right away whether it completes or goes to the shell: a short timeout,
+    /// and nothing while the host is offline.
     private func fetchCompletions() -> (String, [CompletionCandidate])? {
-        guard let resp = Core.shared.request(object: ["Complete": ["pane": pane.number]], host: pane.host),
-              let v = JSON.variant(resp), v.name == "Completions", let d = v.payload as? [String: Any]
+        guard !isOffline,
+              let resp = Core.shared.request(object: ["Complete": ["pane": pane.number]], host: pane.host,
+                                             timeout: 1)
+        else { return nil }
+        return parseCompletions(resp)
+    }
+
+    private func parseCompletions(_ resp: Any?) -> (String, [CompletionCandidate])? {
+        guard let v = JSON.variant(resp), v.name == "Completions", let d = v.payload as? [String: Any]
         else { return nil }
         let word = jsonString(d["word"]) ?? ""
         let items = (d["items"] as? [[String: Any]] ?? []).compactMap { i -> CompletionCandidate? in
@@ -784,15 +795,22 @@ final class TerminalView: NSView, NSTextInputClient {
     /// After a typed key reaches the shell (and it echoed), re-query; close when nothing is left.
     private func scheduleCompletionRefresh() {
         completionRefresh?.cancel()
+        // Every key makes answers to earlier queries stale, also the one still on its way.
+        completionQuery += 1
+        let query = completionQuery
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.completion.isVisible else { return }
-            guard let (word, items) = self.fetchCompletions(), !items.isEmpty,
-                  SessionManager.shared.panes[self.pane]?.atPrompt == true
-            else {
-                self.completion.close()
-                return
+            guard let self, self.completion.isVisible, !self.isOffline else { return }
+            Core.shared.requestAsync(object: ["Complete": ["pane": self.pane.number]], host: self.pane.host,
+                                     timeout: 2) { [weak self] resp in
+                guard let self, query == self.completionQuery, self.completion.isVisible else { return }
+                guard let (word, items) = self.parseCompletions(resp), !items.isEmpty,
+                      SessionManager.shared.panes[self.pane]?.atPrompt == true
+                else {
+                    self.completion.close()
+                    return
+                }
+                self.showCompletions(items, word: word)
             }
-            self.showCompletions(items, word: word)
         }
         completionRefresh = work
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60), execute: work)
@@ -1090,7 +1108,9 @@ final class TerminalView: NSView, NSTextInputClient {
     // MARK: Edit actions
 
     @objc func copy(_ sender: Any?) {
-        guard let resp = Core.shared.request(object: ["CopySelection": ["pane": pane.number]], host: pane.host),
+        // Local panes answer from the app's own copy; a remote host gets a moment, not forever.
+        guard let resp = Core.shared.request(object: ["CopySelection": ["pane": pane.number]], host: pane.host,
+                                             timeout: 2),
               let v = JSON.variant(resp), v.name == "Text",
               let text = v.payload as? String, !text.isEmpty
         else { return }
@@ -1231,22 +1251,22 @@ final class TerminalView: NSView, NSTextInputClient {
 
     /// Asks the on-device model (`ai.explain`) what happened in the last command, and shows it.
     @objc func explainLastCommand(_ sender: Any?) {
-        let pane = self.pane
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let resp = Core.shared.request(object: ["Explain": ["pane": pane.number]], host: pane.host) as? [String: Any]
-            DispatchQueue.main.async {
-                guard let self, let window = self.window else { return }
-                let alert = NSAlert()
-                if let text = jsonString(resp?["Text"]) {
-                    alert.messageText = "Last Command"
-                    alert.informativeText = text
-                } else {
-                    alert.alertStyle = .warning
-                    alert.messageText = "Could Not Explain the Last Command"
-                    alert.informativeText = jsonString(resp?["error"]) ?? "The session daemon is not connected."
-                }
-                alert.beginSheetModal(for: window)
+        // Asynchronous, and the connection is resolved here on the main thread (the library
+        // keeps it alive for the request even if the host disconnects meanwhile).
+        Core.shared.requestAsync(object: ["Explain": ["pane": pane.number]], host: pane.host,
+                                 timeout: 120) { [weak self] response in
+            guard let self, let window = self.window else { return }
+            let resp = response as? [String: Any]
+            let alert = NSAlert()
+            if let text = jsonString(resp?["Text"]) {
+                alert.messageText = "Last Command"
+                alert.informativeText = text
+            } else {
+                alert.alertStyle = .warning
+                alert.messageText = "Could Not Explain the Last Command"
+                alert.informativeText = jsonString(resp?["error"]) ?? "The session daemon is not connected."
             }
+            alert.beginSheetModal(for: window)
         }
     }
 

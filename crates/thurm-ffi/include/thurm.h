@@ -87,6 +87,14 @@ void thurm_string_free(char *s);
  * "Ok", {"Text":"..."}, {"Layout":"..."|null}, or {"error":"message"}. Free the result.
  * ------------------------------------------------------------------------------------- */
 char *thurm_request(thurm_client *client, const char *json);
+/* Same as thurm_request, but gives up after timeout_ms (0: no limit) with an error. */
+char *thurm_request_timeout(thurm_client *client, const char *json, uint64_t timeout_ms);
+/* Sends a request without waiting: cb gets the response JSON (free it with
+ * thurm_string_free) on another thread, or an error after timeout_ms (0: no limit). The
+ * connection stays open until then, so client may be disconnected meanwhile. */
+typedef void (*thurm_response_cb)(void *ctx, char *json);
+void thurm_request_async(thurm_client *client, const char *json, uint64_t timeout_ms,
+                         thurm_response_cb cb, void *ctx);
 
 /* Same as thurm_request but does not wait for the answer. */
 void thurm_send(thurm_client *client, const char *json);

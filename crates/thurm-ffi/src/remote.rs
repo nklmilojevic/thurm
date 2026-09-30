@@ -43,7 +43,17 @@ fn sync(m: &mut Manager) {
         .iter()
         .map(|r| (r.name.clone(), r.clone()))
         .collect();
-    m.supervisors.retain(|name, _| wanted.contains_key(name));
+    let gone: Vec<String> = m
+        .supervisors
+        .keys()
+        .filter(|name| !wanted.contains_key(*name))
+        .cloned()
+        .collect();
+    stop_later(
+        gone.iter()
+            .filter_map(|n| m.supervisors.remove(n))
+            .collect(),
+    );
     for (name, r) in wanted {
         match m.supervisors.get(&name) {
             Some(s) => {
@@ -71,6 +81,25 @@ fn sync(m: &mut Manager) {
     }
 }
 
+/// Stops `supervisors` on another thread: stopping joins the tunnel thread, which must not
+/// hold up the caller (the app's main thread, holding the manager's lock).
+fn stop_later(supervisors: Vec<Supervisor>) {
+    if supervisors.is_empty() {
+        return;
+    }
+    // The closure owns them only through this slot: if the thread can't start, they are
+    // left running (until the app exits) rather than stopped here.
+    let slot = std::sync::Arc::new(Mutex::new(Some(supervisors)));
+    let theirs = slot.clone();
+    let spawned = std::thread::Builder::new()
+        .name("remote-stop".into())
+        .spawn(move || drop(theirs.lock().take()));
+    if let Err(e) = spawned {
+        log::warn!("cannot stop remote tunnels in the background: {e}");
+        std::mem::forget(slot.lock().take());
+    }
+}
+
 /// Starts supervising every enabled `[[remote]]`. `on_status` gets each host's status JSON
 /// on every change (on a background thread). Calling it again replaces the callback.
 #[unsafe(no_mangle)]
@@ -80,7 +109,7 @@ pub unsafe extern "C" fn thurm_remotes_start(on_status: thurm_remote_status_cb, 
         m.cb = on_status;
         m.ctx = Ctx(ctx);
         // Supervisors keep their old callback; restart them with the new one.
-        m.supervisors.clear();
+        stop_later(m.supervisors.drain().map(|(_, s)| s).collect());
         sync(m);
         return;
     }

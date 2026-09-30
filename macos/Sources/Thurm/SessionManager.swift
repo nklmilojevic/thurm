@@ -957,7 +957,8 @@ final class SessionManager: NSObject, CoreDelegate {
         lastLayoutJSON = json
         let request: [String: Any] = ["SetLayout": ["json": json]]
         if blocking {
-            Core.shared.request(object: request)
+            // At quit: a daemon that stopped answering must not hold up Quit (or an update).
+            Core.shared.request(object: request, timeout: 3)
         } else {
             Core.shared.send(object: request)
         }
@@ -990,7 +991,7 @@ final class SessionManager: NSObject, CoreDelegate {
         periodicTimer?.invalidate()
         periodicTimer = nil
         if config.quitTerminates {
-            Core.shared.request(object: ["Shutdown": ["kill_panes": true]])
+            Core.shared.request(object: ["Shutdown": ["kill_panes": true]], timeout: 3)
         }
         for c in liveControllers {
             c.content.detachAll()
