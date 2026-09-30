@@ -795,11 +795,11 @@ final class TerminalView: NSView, NSTextInputClient {
     /// After a typed key reaches the shell (and it echoed), re-query; close when nothing is left.
     private func scheduleCompletionRefresh() {
         completionRefresh?.cancel()
+        // Every key makes answers to earlier queries stale, also the one still on its way.
+        completionQuery += 1
+        let query = completionQuery
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.completion.isVisible, !self.isOffline else { return }
-            // Typing goes on meanwhile: the answer is used only if no newer query was made.
-            self.completionQuery += 1
-            let query = self.completionQuery
             Core.shared.requestAsync(object: ["Complete": ["pane": self.pane.number]], host: self.pane.host,
                                      timeout: 2) { [weak self] resp in
                 guard let self, query == self.completionQuery, self.completion.isVisible else { return }

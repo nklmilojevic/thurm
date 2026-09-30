@@ -367,14 +367,45 @@ impl Client {
     }
 
     fn write(&self, env: &Envelope) -> Result<(), ClientError> {
+        self.write_by(env, None)
+    }
+
+    /// Writes `env`, giving up at `deadline` (waiting for the writer lock included). A write
+    /// cut off mid-message would leave the stream out of step, so a timeout closes the
+    /// connection.
+    fn write_by(&self, env: &Envelope, deadline: Option<Instant>) -> Result<(), ClientError> {
         if !self.is_alive() {
             return Err(ClientError::Disconnected);
         }
         let buf = codec::encode(env)?;
-        let mut w = self.writer.lock();
-        w.write_all(&buf)?;
-        w.flush()?;
-        Ok(())
+        let mut w = match deadline {
+            Some(d) => self.writer.try_lock_until(d).ok_or(ClientError::Timeout)?,
+            None => self.writer.lock(),
+        };
+        if let Some(d) = deadline {
+            let rest = d
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            w.get_ref().set_write_timeout(Some(rest))?;
+        }
+        let written = w.write_all(&buf).and_then(|()| w.flush());
+        if deadline.is_some() {
+            let _ = w.get_ref().set_write_timeout(None);
+        }
+        match written {
+            Ok(()) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                self.alive.store(false, Ordering::Relaxed);
+                let _ = w.get_ref().shutdown(std::net::Shutdown::Both);
+                Err(ClientError::Timeout)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Send and wait for the response (no timeout).
@@ -390,12 +421,14 @@ impl Client {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = bounded(1);
         self.pending.lock().insert(id, tx);
-        if let Err(e) = self.write(&Envelope { id, request }) {
+        // One deadline for sending and for the answer.
+        let deadline = timeout.map(|t| Instant::now() + t);
+        if let Err(e) = self.write_by(&Envelope { id, request }, deadline) {
             self.pending.lock().remove(&id);
             return Err(e);
         }
-        let result = match timeout {
-            Some(t) => match rx.recv_timeout(t) {
+        let result = match deadline {
+            Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
                 Ok(r) => r,
                 Err(_) => {
                     // Its late answer has nobody to go to.
@@ -502,6 +535,65 @@ mod tests {
         });
         let r = waiting.join().unwrap();
         assert!(matches!(r, Err(ClientError::Disconnected)), "{r:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A daemon that answers Hello and then stops reading: a request that can't even be
+    /// written still ends at its deadline, and the connection is closed.
+    #[test]
+    fn timeouts_cover_writing() {
+        let dir = std::env::temp_dir().join(format!("thurm-client-wr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut w = s;
+            if let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut r) {
+                codec::write_message(
+                    &mut w,
+                    &ServerMessage::Response {
+                        id: env.id,
+                        result: Ok(Response::Hello {
+                            version: 1,
+                            daemon_pid: 1,
+                            restored: false,
+                            build: String::new(),
+                            capabilities: Vec::new(),
+                        }),
+                    },
+                )
+                .unwrap();
+            }
+            // Never read again (but keep the socket open).
+            let _ = stop_rx.recv();
+        });
+        let client = Client::connect(
+            ConnectOptions {
+                socket: sock,
+                spawn_daemon: None,
+                client_name: "test",
+                ui: false,
+            },
+            |_| {},
+            || {},
+        )
+        .unwrap();
+        let started = Instant::now();
+        let r = client.request_timeout(
+            Request::Input {
+                pane: 1,
+                data: vec![b'x'; 32 * 1024 * 1024],
+            },
+            Some(Duration::from_millis(300)),
+        );
+        assert!(matches!(r, Err(ClientError::Timeout)), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!client.is_alive());
+        let _ = stop_tx.send(());
         let _ = std::fs::remove_dir_all(dir);
     }
 

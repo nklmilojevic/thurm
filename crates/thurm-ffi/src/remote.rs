@@ -87,9 +87,17 @@ fn stop_later(supervisors: Vec<Supervisor>) {
     if supervisors.is_empty() {
         return;
     }
-    let _ = std::thread::Builder::new()
+    // The closure owns them only through this slot: if the thread can't start, they are
+    // left running (until the app exits) rather than stopped here.
+    let slot = std::sync::Arc::new(Mutex::new(Some(supervisors)));
+    let theirs = slot.clone();
+    let spawned = std::thread::Builder::new()
         .name("remote-stop".into())
-        .spawn(move || drop(supervisors));
+        .spawn(move || drop(theirs.lock().take()));
+    if let Err(e) = spawned {
+        log::warn!("cannot stop remote tunnels in the background: {e}");
+        std::mem::forget(slot.lock().take());
+    }
 }
 
 /// Starts supervising every enabled `[[remote]]`. `on_status` gets each host's status JSON

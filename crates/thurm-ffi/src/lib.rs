@@ -1497,7 +1497,9 @@ mod tests {
     fn async_requests_always_answer() {
         unsafe extern "C" fn cb(ctx: *mut c_void, json: *mut c_char) {
             let tx = unsafe { Box::from_raw(ctx as *mut std::sync::mpsc::Sender<String>) };
-            let text = unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned();
+            let text = unsafe { CStr::from_ptr(json) }
+                .to_string_lossy()
+                .into_owned();
             unsafe { thurm_string_free(json) };
             let _ = tx.send(text);
         }

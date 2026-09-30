@@ -74,25 +74,24 @@ final class ProcessPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate, 
         panel = p
     }
 
-    /// Numbers refreshes: a slow host's answer to an older one is dropped.
-    private var generation = 0
+    /// Each host's latest rows, and the hosts whose answer is still on its way.
+    private var hostRows: [HostId: [Row]] = [:]
+    private var asking: Set<HostId> = []
 
-    /// Asks every host at once without blocking (`ps`/`lsof` on a remote host over a tunnel
-    /// can take a while, or hang), and shows the rows once all have answered.
+    /// Asks every host without blocking (`ps`/`lsof` on a remote host over a tunnel can take a
+    /// while, or hang), and shows each host's rows as they arrive. A host still answering the
+    /// previous round isn't asked again.
     private func refresh() {
-        generation += 1
-        let current = generation
         // This Mac's panes, then each connected remote host's.
         let hosts = [localHost] + Core.shared.connectedRemotes
-        var answers = [[Row]?](repeating: nil, count: hosts.count)
-        var left = hosts.count
-        for (i, host) in hosts.enumerated() {
+        hostRows = hostRows.filter { hosts.contains($0.key) }
+        for host in hosts where !asking.contains(host) {
+            asking.insert(host)
             Core.shared.requestAsync(object: ["Processes": ["pane": NSNull()]], host: host, timeout: 5) { [weak self] resp in
-                guard let self, current == self.generation else { return }
-                answers[i] = self.rows(host: host, response: resp)
-                left -= 1
-                guard left == 0 else { return }
-                self.rows = answers.compactMap { $0 }.flatMap { $0 }
+                guard let self else { return }
+                self.asking.remove(host)
+                self.hostRows[host] = self.rows(host: host, response: resp)
+                self.rows = ([localHost] + Core.shared.connectedRemotes).flatMap { self.hostRows[$0] ?? [] }
                 self.table.reloadData()
             }
         }
