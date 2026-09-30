@@ -182,6 +182,8 @@ pub struct Daemon {
     ai_tx: Sender<AiJob>,
     ai_rx: Receiver<AiJob>,
     store: Option<Store>,
+    /// One session save at a time: the monitor's autosave, SIGTERM, upgrades and requests.
+    save_lock: Mutex<()>,
     pub socket: PathBuf,
     integration_dir: Option<PathBuf>,
     session_dirty: AtomicBool,
@@ -225,6 +227,7 @@ impl Daemon {
             ai_tx: ai_channel.0,
             ai_rx: ai_channel.1,
             store,
+            save_lock: Mutex::new(()),
             socket,
             integration_dir,
             session_dirty: AtomicBool::new(false),
@@ -1130,7 +1133,7 @@ impl Daemon {
                     && last_save.elapsed() > Duration::from_secs(1)
                     || last_save.elapsed() > interval)
             {
-                self.save_session_with(false);
+                let _ = self.save_session_with(false);
                 last_save = Instant::now();
             }
             let idle_exit = self.config.read().session.daemon_idle_exit_secs;
@@ -1157,17 +1160,24 @@ impl Daemon {
         serde_json::to_string(&layout).ok()
     }
 
-    pub fn save_session(&self) {
-        self.save_session_with(true);
+    pub fn save_session(&self) -> std::io::Result<()> {
+        self.save_session_with(true)
     }
 
     /// `full`: serialize every changed scrollback now. Autosave leaves panes whose history
     /// was serialized less than `HISTORY_AUTOSAVE_INTERVAL` ago for a later round.
-    fn save_session_with(&self, full: bool) {
-        let Some(store) = &self.store else { return };
+    fn save_session_with(&self, full: bool) -> std::io::Result<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let _saving = self.save_lock.lock();
+        // Changes from here on (a hook during the save) make the session dirty again.
+        let was_dirty = self.session_dirty.swap(false, Ordering::Relaxed);
         let lines = self.config.read().session.scrollback_lines;
         let mut panes = Vec::new();
         let mut scrollbacks = Vec::new();
+        // Scrollbacks written by this save: marked saved only once it succeeded.
+        let mut written = Vec::new();
         for pane in self.all_panes() {
             let mut st = pane.state.lock();
             if !st.info.alive {
@@ -1186,7 +1196,7 @@ impl Daemon {
                 if let Some(h) = &st.last_history {
                     scrollbacks.push((pane.id, Arc::clone(h)));
                 }
-                st.saved_generation = generation;
+                written.push((Arc::clone(&pane), generation));
             }
             panes.push(PaneSnapshot {
                 id: pane.id,
@@ -1210,8 +1220,23 @@ impl Daemon {
             next_pane_id: self.next_pane.load(Ordering::Relaxed),
         };
         match store.save(&snap, &scrollbacks) {
-            Ok(()) => self.session_dirty.store(false, Ordering::Relaxed),
-            Err(e) => log::warn!("failed to save session: {e}"),
+            Ok(()) => {
+                for (pane, generation) in written {
+                    pane.state.lock().saved_generation = generation;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!("failed to save session: {e}");
+                if was_dirty {
+                    self.session_dirty.store(true, Ordering::Relaxed);
+                }
+                // Retry these scrollbacks on the next save, not after the autosave interval.
+                for (pane, _) in written {
+                    pane.state.lock().history_at = None;
+                }
+                Err(e)
+            }
         }
     }
 
@@ -1764,13 +1789,13 @@ impl Daemon {
                 self.apply_config(cfg);
                 Ok(Response::Ok)
             }
-            Request::SaveSnapshot => {
-                self.save_session();
-                Ok(Response::Ok)
-            }
+            Request::SaveSnapshot => self
+                .save_session()
+                .map(|()| Response::Ok)
+                .map_err(|e| format!("could not save the session: {e}")),
             Request::Shutdown { kill_panes } => {
                 log::info!("shutdown requested (kill panes: {kill_panes})");
-                self.save_session();
+                let _ = self.save_session();
                 self.shutdown.store(true, Ordering::Relaxed);
                 Ok(Response::Ok)
             }
