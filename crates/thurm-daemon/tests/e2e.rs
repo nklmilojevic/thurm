@@ -1191,3 +1191,57 @@ fn upgrade_to_a_broken_binary_is_refused() {
     .unwrap();
     wait_match(&c, pane, "still-here");
 }
+
+#[test]
+fn completion_uses_only_the_path_the_shell_reported() {
+    let env = Env::with_shell("shellpath", &["/bin/bash"]);
+    let home = env.dir.join("home");
+    let bin = env.dir.join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let tool = bin.join("thurmzzcmd");
+    std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _daemon = env.start_with(&[("HOME", &home)]);
+    let (c, _events) = env.connect();
+    let pane = create(&c, &env.dir);
+    // The token is not in the environment of programs the shell runs.
+    let line = format!(
+        "echo token=[$THURM_SHELL_TOKEN]; export PATH={}:$PATH\r",
+        bin.display()
+    );
+    c.request(Request::Input {
+        pane,
+        data: line.into_bytes(),
+    })
+    .unwrap();
+    wait_match(&c, pane, r"token=\[\]");
+    // Program output claiming another PATH is ignored.
+    c.request(Request::Input {
+        pane,
+        data: b"printf '\\033]633;P;ThurmPath=/nonexistent\\007'; echo printed\r".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, "(?m)^printed");
+    c.request(Request::Input {
+        pane,
+        data: b"thurmzz".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, "(?m)thurmzz$");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match c.request(Request::Complete { pane }).unwrap() {
+            Response::Completions(comp) if comp.items.iter().any(|i| i.text == "thurmzzcmd") => {
+                break;
+            }
+            other => assert!(
+                Instant::now() < deadline,
+                "no completion: {other:?}\n{}",
+                capture(&c, pane)
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

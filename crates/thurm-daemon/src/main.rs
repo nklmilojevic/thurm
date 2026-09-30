@@ -162,11 +162,14 @@ fn main() {
     }
 
     {
-        let d = daemon.clone();
-        std::thread::Builder::new()
-            .name("git".into())
-            .spawn(move || d.git_worker())
-            .expect("thread");
+        // A few, so one slow repository doesn't hold up every pane's status.
+        for i in 0..3 {
+            let d = daemon.clone();
+            std::thread::Builder::new()
+                .name(format!("git-{i}"))
+                .spawn(move || d.git_worker())
+                .expect("thread");
+        }
         let d = daemon.clone();
         std::thread::Builder::new()
             .name("ai".into())

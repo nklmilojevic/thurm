@@ -377,6 +377,7 @@ impl Daemon {
         if restore.is_none() && cfg.agents.install_hooks {
             ensure_hooks(command.as_deref());
         }
+        let token = shell_token();
         let opts = shell::spawn_options(shell::PaneLaunch {
             id,
             command: command.clone(),
@@ -386,8 +387,10 @@ impl Daemon {
             config: &cfg,
             socket: &self.socket,
             integration_dir: self.integration_dir.as_deref(),
+            token: &token,
         });
         let mut term = Terminal::new(size, self.engine.read().clone());
+        term.set_shell_token(Some(token));
         let restored = restore.is_some();
         if let Some((_, Some(history))) = &restore {
             term.replay(history);
@@ -1262,6 +1265,8 @@ impl Daemon {
                 osc_cwd: st.osc_cwd.clone(),
                 shell_integration_seen: st.shell_integration_seen,
                 state: upgrade::PaneHandoff::encode_state(&state),
+                shell_token: st.term.shell_token().map(str::to_owned),
+                shell_path: st.term.shell_path().map(str::to_owned),
             });
         }
         upgrade::Handoff {
@@ -1289,6 +1294,8 @@ impl Daemon {
             };
             let mut term = Terminal::new(size, self.engine.read().clone());
             term.replay(&p.state_bytes());
+            term.set_shell_token(p.shell_token.clone());
+            term.set_shell_path(p.shell_path.clone());
             let alive = p.exited.is_none();
             let info = PaneInfo {
                 id: p.id,
@@ -1991,6 +1998,24 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// A random token for a pane's shell integration (see `Terminal::set_shell_token`).
+fn shell_token() -> String {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_err()
+    {
+        // Never reached in practice; still unpredictable enough for program output.
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        bytes = (t ^ (std::process::id() as u128) << 64).to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// PTY threads run at interactive priority: on macOS a daemon's threads otherwise may land on

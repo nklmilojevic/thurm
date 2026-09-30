@@ -1,8 +1,16 @@
 //! Per-pane git status (repository, branch, diff size) for tab sidebars, probed with the
 //! `git` CLI off the monitor thread.
+//!
+//! The probe runs in whatever directory a pane is in (which program output can also set, with
+//! OSC 7), so it must not run code a repository's own config names: fsmonitor hooks, external
+//! diff and textconv commands, and filter drivers are all kept out.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// A git command that takes longer (a huge or hung repository) is killed.
+const TIMEOUT: Duration = Duration::from_secs(3);
 
 use thurm_proto::GitInfo;
 
@@ -25,8 +33,35 @@ pub fn probe(cwd: &str) -> Option<GitInfo> {
             .unwrap_or_default();
     }
     let (mut added, mut removed) = (0u32, 0u32);
+    // Diffing the work tree runs the clean filter of files whose attributes name one; a
+    // repository that defines its own filter drivers gets no counts. Reading config runs
+    // nothing.
+    let own_filters = git(
+        &root,
+        &[
+            "config",
+            "--local",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process)$",
+        ],
+    )
+    .is_some_and(|out| !out.trim().is_empty());
     // `HEAD` fails in a repository without commits; then everything is untracked anyway.
-    if let Some(numstat) = git(&root, &["diff", "--numstat", "HEAD"]) {
+    let numstat = (!own_filters)
+        .then(|| {
+            git(
+                &root,
+                &[
+                    "diff",
+                    "--numstat",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "HEAD",
+                ],
+            )
+        })
+        .flatten();
+    if let Some(numstat) = numstat {
         for line in numstat.lines() {
             let mut f = line.split('\t');
             // Binary files show "-".
@@ -43,19 +78,48 @@ pub fn probe(cwd: &str) -> Option<GitInfo> {
 }
 
 fn git(dir: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(dir)
+        // A repository's config must not make the probe run programs.
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+        ])
         .args(args)
         // Never take the index lock (a probe must not get in the way of the user's git).
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    out.status
+    // Read while it runs (a large diff fills the pipe), and give up after TIMEOUT.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        out
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let out = reader.join().ok()?;
+    status
         .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        .then(|| String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]
@@ -99,6 +163,36 @@ mod tests {
         assert_eq!(g.branch, "main");
         assert_eq!((g.added, g.removed), (3, 1));
         assert!(probe("/").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repository_config_runs_no_programs() {
+        let dir = std::env::temp_dir().join(format!("thurm-git-evil-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "1\n").unwrap();
+        run(&dir, &["add", "."]);
+        run(&dir, &["commit", "-q", "-m", "init"]);
+        // What an extracted archive's .git/config could hold.
+        let marker = dir.join("ran");
+        let hook = format!("touch {}", marker.display());
+        run(&dir, &["config", "core.fsmonitor", &hook]);
+        run(&dir, &["config", "diff.external", &hook]);
+        run(&dir, &["config", "filter.evil.clean", &hook]);
+        std::fs::write(dir.join(".gitattributes"), "* filter=evil diff=evil\n").unwrap();
+        run(&dir, &["config", "diff.evil.textconv", &hook]);
+        std::fs::write(dir.join("a.txt"), "1\n2\n").unwrap();
+
+        let g = probe(dir.to_str().unwrap()).expect("inside a repo");
+        assert_eq!(g.branch, "main");
+        // The repository's own filter driver means no counts, rather than running it.
+        assert_eq!((g.added, g.removed), (0, 0));
+        assert!(
+            !marker.exists(),
+            "the probe ran a program from the repository's config"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

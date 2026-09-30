@@ -55,6 +55,12 @@ pub struct PaneHandoff {
     pub shell_integration_seen: bool,
     /// Base64 of the terminal's serialized state.
     pub state: String,
+    /// The token the shell integration sends with `$PATH` (from images that wrote it).
+    #[serde(default)]
+    pub shell_token: Option<String>,
+    /// The `$PATH` the shell reported (it only reports it again when it changes).
+    #[serde(default)]
+    pub shell_path: Option<String>,
 }
 
 impl PaneHandoff {

@@ -391,6 +391,7 @@ fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
     }
     // Command::new looks the program up in *our* PATH; use the shell's.
     let program = std::env::split_paths(path)
+        .filter(|d| d.is_absolute())
         .map(|d| d.join(program))
         .find(|p| p.is_file())
         .unwrap_or_else(|| PathBuf::from(program));

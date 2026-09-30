@@ -80,6 +80,8 @@ pub struct PaneLaunch<'a> {
     pub config: &'a Config,
     pub socket: &'a Path,
     pub integration_dir: Option<&'a Path>,
+    /// Passed to the shell integration, which puts it in front of its `$PATH` reports.
+    pub token: &'a str,
 }
 
 /// Ghostty release matching the pinned libghostty-vt (1.3.2-dev).
@@ -145,6 +147,7 @@ pub fn spawn_options(l: PaneLaunch<'_>) -> SpawnOptions {
         && let Some(dir) = l.integration_dir
     {
         env.push(("THURM_SHELL_INTEGRATION".into(), dir.display().to_string()));
+        env.push(("THURM_SHELL_TOKEN".into(), l.token.to_owned()));
         match name.as_str() {
             "zsh" => {
                 if let Ok(orig) = std::env::var("ZDOTDIR") {
@@ -265,8 +268,14 @@ mod tests {
             config: &cfg,
             socket: &sock,
             integration_dir: Some(&integ),
+            token: "abc",
         });
         assert_eq!(opts.program, "/bin/bash");
+        assert!(
+            opts.env
+                .iter()
+                .any(|(k, v)| k == "THURM_SHELL_TOKEN" && v == "abc")
+        );
         assert_eq!(opts.args[0], "--rcfile");
         assert!(
             opts.env

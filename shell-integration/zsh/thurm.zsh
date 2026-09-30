@@ -2,6 +2,10 @@
 [[ -n "${_THURM_ZSH_LOADED-}" ]] && return
 typeset -g _THURM_ZSH_LOADED=1
 typeset -g _thurm_executing=""
+# Proves to Thurm that the $PATH report comes from this shell, not from program output.
+# Kept out of the environment of the programs the shell runs.
+typeset -g _thurm_token="${THURM_SHELL_TOKEN-}"
+builtin unset THURM_SHELL_TOKEN
 
 # Make the bundled `thurm` CLI reachable (appended, so an installed one wins).
 if [[ -n "${THURM_BIN_DIR-}" && ":$PATH:" != *":$THURM_BIN_DIR:"* ]]; then
@@ -28,8 +32,8 @@ _thurm_precmd() {
   _thurm_executing=""
   builtin printf '\e]7;file://%s%s\a' "${HOST}" "$(_thurm_urlencode "$PWD")"
   # $PATH for Thurm's tab completion (only when it changed).
-  if [[ "$PATH" != "${_thurm_last_path-}" ]]; then
-    builtin printf '\e]633;P;ThurmPath=%s\a' "${PATH//;/\\x3b}"
+  if [[ -n "$_thurm_token" && "$PATH" != "${_thurm_last_path-}" ]]; then
+    builtin printf '\e]633;P;ThurmPath=%s:%s\a' "$_thurm_token" "${PATH//;/\\x3b}"
     _thurm_last_path=$PATH
   fi
   builtin printf '\e]133;A\a'
