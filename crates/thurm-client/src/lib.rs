@@ -322,15 +322,19 @@ impl Client {
             .name("thurm-client-reader".into())
             .spawn(move || {
                 let mut reader = BufReader::with_capacity(256 * 1024, read_half);
-                loop {
-                    match codec::read_message::<_, ServerMessage>(&mut reader) {
-                        Ok(Some(ServerMessage::Response { id, result })) => {
+                while let Ok(Some(frame)) = codec::read_frame(&mut reader) {
+                    // A message of a newer daemon this client can't decode is skipped; the
+                    // frames after it are intact.
+                    let Ok(msg) = codec::decode::<ServerMessage>(&frame) else {
+                        continue;
+                    };
+                    match msg {
+                        ServerMessage::Response { id, result } => {
                             if let Some(tx) = pending.lock().remove(&id) {
                                 let _ = tx.send(result);
                             }
                         }
-                        Ok(Some(ServerMessage::Event(ev))) => on_event(ev),
-                        Ok(None) | Err(_) => break,
+                        ServerMessage::Event(ev) => on_event(ev),
                     }
                 }
                 alive.store(false, Ordering::Relaxed);

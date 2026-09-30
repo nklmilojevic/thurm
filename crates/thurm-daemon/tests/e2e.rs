@@ -1300,3 +1300,37 @@ fn completion_uses_only_the_path_the_shell_reported() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn unknown_requests_are_answered_not_dropped() {
+    use std::io::Write;
+    let env = Env::new("unknown-request");
+    let _daemon = env.start();
+    let mut s = std::os::unix::net::UnixStream::connect(&env.socket).unwrap();
+    // A request of a newer protocol: id 7, then request variant 999 (postcard varints), which
+    // this daemon doesn't have.
+    let frame = [7u8, 0xE7, 0x07];
+    let mut buf = (frame.len() as u32).to_le_bytes().to_vec();
+    buf.extend_from_slice(&frame);
+    s.write_all(&buf).unwrap();
+    // Then a known one on the same connection.
+    codec::write_message(
+        &mut s,
+        &Envelope {
+            id: 8,
+            request: Request::ListPanes,
+        },
+    )
+    .unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut r = std::io::BufReader::new(s);
+    let mut answered = Vec::new();
+    while answered.len() < 2 {
+        match codec::read_message::<_, ServerMessage>(&mut r).unwrap() {
+            Some(ServerMessage::Response { id, result }) => answered.push((id, result.is_ok())),
+            Some(ServerMessage::Event(_)) => {}
+            None => panic!("the daemon dropped the connection"),
+        }
+    }
+    assert_eq!(answered, vec![(7, false), (8, true)]);
+}

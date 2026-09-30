@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
 
 /// Bumped whenever the wire format changes incompatibly.
+///
+/// Compatibility within a version: new `Request`, `Response` and `Event` variants go at the end
+/// of their enums (postcard encodes the variant index), and new fields only at the end of a
+/// struct, with `#[serde(default)]`. A daemon answers a request it doesn't know with an error
+/// and keeps the connection; a client skips a message it can't decode. Anything else (removing
+/// or reordering variants or fields) bumps this.
 pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Daemons speaking this protocol or later replace themselves in place on SIGUSR2 (see
