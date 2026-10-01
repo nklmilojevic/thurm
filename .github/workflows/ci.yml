@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # libghostty-vt (the terminal engine) is built from source with Zig.
@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -103,9 +103,21 @@ jobs:
             echo "::error::vendor/libghostty-vt-sys/build.rs and flake.nix pin different Ghostty commits"
             exit 1
           }
+      # The Rust version is pinned in rust-toolchain.toml and repeated in every workflow.
+      - name: One Rust toolchain
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          echo "rust-toolchain.toml: $pin"
+          stray="$(grep -rn '^ *toolchain:' .github/workflows | grep -v "toolchain: $pin\$" || true)"
+          [[ -n "$pin" && -z "$stray" ]] || {
+            echo "$stray"
+            echo "::error::workflows and rust-toolchain.toml pin different Rust versions"
+            exit 1
+          }
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: 1.98.1
       - name: Dependency advisories
         run: |
           cargo install --locked cargo-audit
