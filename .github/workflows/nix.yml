@@ -18,17 +18,5 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-      # Nix builds and the dev shell take rustc from the locked nixpkgs, not rust-toolchain.toml.
-      - name: Same Rust as rust-toolchain.toml
-        run: |
-          set -euo pipefail
-          pin="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
-          nix_rustc="$(nix eval --raw --impure --expr '(builtins.getFlake (toString ./.)).inputs.nixpkgs.legacyPackages.x86_64-linux.rustc.version')"
-          echo "rust-toolchain.toml: $pin"
-          echo "nixpkgs: $nix_rustc"
-          [[ -n "$pin" && "$pin" == "$nix_rustc" ]] || {
-            echo "::error::flake.lock's nixpkgs has rustc $nix_rustc, rust-toolchain.toml pins $pin"
-            exit 1
-          }
       - name: Build
         run: nix build .#thurm -L --no-link

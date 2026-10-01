@@ -2,12 +2,29 @@
   description = "Thurm: a macOS terminal (Apple silicon), and thurm/thurmd for remote hosts";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  # Rust from rust-toolchain.toml, the version CI uses, rather than nixpkgs' rustc.
+  inputs.rust-overlay = {
+    url = "github:oxalica/rust-overlay";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { self, nixpkgs, ... }:
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      ...
+    }:
     let
       system = "aarch64-darwin";
-      pkgs = nixpkgs.legacyPackages.${system};
+      pkgsFor =
+        s:
+        import nixpkgs {
+          system = s;
+          overlays = [ rust-overlay.overlays.default ];
+        };
+      pkgs = pkgsFor system;
+      rustVersion = (nixpkgs.lib.importTOML ./rust-toolchain.toml).toolchain.channel;
       # `thurm` and `thurmd` (the CLI and the session daemon) build everywhere a remote
       # workspace can live; the app itself is macOS only (macos/build.sh).
       packageSystems = [
@@ -15,7 +32,7 @@
         "x86_64-linux"
         "aarch64-linux"
       ];
-      forPackageSystems = f: nixpkgs.lib.genAttrs packageSystems (s: f nixpkgs.legacyPackages.${s});
+      forPackageSystems = f: nixpkgs.lib.genAttrs packageSystems (s: f (pkgsFor s));
 
       thurmFor =
         pkgs:
@@ -31,8 +48,13 @@
           };
           # Its Zig packages, fetched ahead (the build has no network): Ghostty's own list.
           ghosttyZigDeps = pkgs.callPackage ./nix/ghostty-zig-deps.nix { };
+          rust = pkgs.rust-bin.stable.${rustVersion}.minimal;
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rust;
+            rustc = rust;
+          };
         in
-        pkgs.rustPlatform.buildRustPackage {
+        rustPlatform.buildRustPackage {
           pname = "thurm";
           inherit version;
           src = lib.fileset.toSource {
@@ -82,6 +104,12 @@
             platforms = packageSystems;
           };
         };
+      rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
+        extensions = [
+          "rust-src"
+          "rust-analyzer"
+        ];
+      };
     in
     {
       packages = forPackageSystems (pkgs: rec {
@@ -93,11 +121,7 @@
       # system: `nix develop`, or `direnv allow` with the .envrc.
       devShells.${system}.default = pkgs.mkShellNoCC {
         packages = with pkgs; [
-          cargo
-          rustc
-          clippy
-          rustfmt
-          rust-analyzer
+          rustToolchain
           # libghostty-vt is built from source with Zig 0.16.
           zig_0_16
           python3
@@ -107,7 +131,7 @@
           gh
         ];
 
-        RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+        RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
         # No Nix compiler or SDK: cargo links with Xcode's clang, and swift/xcrun must see
         # Xcode's developer dir and SDK.
