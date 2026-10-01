@@ -103,16 +103,32 @@ jobs:
             echo "::error::vendor/libghostty-vt-sys/build.rs and flake.nix pin different Ghostty commits"
             exit 1
           }
-      # The Rust version is pinned in rust-toolchain.toml and repeated in every workflow.
+      # The Rust version is pinned in rust-toolchain.toml and repeated in every workflow. A
+      # dtolnay/rust-toolchain step without a toolchain input gets its ref's default, stable.
       - name: One Rust toolchain
         run: |
           set -euo pipefail
           pin="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
           echo "rust-toolchain.toml: $pin"
-          stray="$(grep -rn '^ *toolchain:' .github/workflows | grep -v "toolchain: $pin\$" || true)"
-          [[ -n "$pin" && -z "$stray" ]] || {
-            echo "$stray"
-            echo "::error::workflows and rust-toolchain.toml pin different Rust versions"
+          [[ -n "$pin" ]]
+          awk -v pin="$pin" '
+            function end_step() {
+              if (open && !pinned) { print step ": no toolchain input"; bad = 1 }
+              open = 0
+            }
+            FNR == 1 { end_step() }
+            /^ *- / { match($0, /^ */); if (open && RLENGTH <= indent) end_step() }
+            /uses: dtolnay\/rust-toolchain@/ {
+              end_step(); open = 1; pinned = 0; step = FILENAME ":" FNR
+              match($0, /^ */); indent = RLENGTH
+            }
+            /^ *toolchain:/ {
+              v = $0; sub(/^ *toolchain: */, "", v)
+              if (v == pin) pinned = 1; else { print FILENAME ":" FNR ": toolchain " v; bad = 1 }
+            }
+            END { end_step(); exit bad }
+          ' .github/workflows/*.yml .github/workflows/*.yaml || {
+            echo "::error::every dtolnay/rust-toolchain step must pin rust-toolchain.toml's version"
             exit 1
           }
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
