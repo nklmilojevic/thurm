@@ -798,7 +798,7 @@ fn panes_killed_with_the_daemon_are_restored() {
     // shells dying during that teardown must not drop out of the saved session.
     let env = Env::new("teardown");
     let mut daemon = env.start();
-    let (c, _events) = env.connect();
+    let (c, events) = env.connect();
     let pane = create(&c, &env.dir);
     c.request(Request::Input {
         pane,
@@ -806,16 +806,42 @@ fn panes_killed_with_the_daemon_are_restored() {
     })
     .unwrap();
     wait_match(&c, pane, "before-teardown");
-    let shell = match c.request(Request::PaneInfo { pane }).unwrap() {
-        Response::PaneInfo(i) => i.pid.expect("shell pid"),
+    // A shell that traps the signal and exits by itself, with an ordinary status. Not the
+    // interactive shell: dash runs traps only once its prompt's read returns. `exec` keeps the
+    // pane's pid; the quotes keep the echoed input from matching before the trap is set.
+    let trapped = create(&c, &env.dir);
+    c.request(Request::Input {
+        pane: trapped,
+        data:
+            b"exec sh -c 'trap \"exit 0\" TERM; echo trap-\"set\"; while :; do sleep 0.05; done'\r"
+                .to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, trapped, "trap-set");
+    let pid = |pane| match c.request(Request::PaneInfo { pane }).unwrap() {
+        Response::PaneInfo(i) => i.pid.expect("shell pid") as libc::pid_t,
         other => panic!("{other:?}"),
     };
-    // The shell goes first, the worst order: the daemon sees it die before the signal lands.
+    let (shell, trapped_shell) = (pid(pane), pid(trapped));
+    // The shells go first, the worst order: the daemon sees them die before the signal lands.
     unsafe {
-        libc::kill(-(shell as libc::pid_t), libc::SIGKILL);
-        libc::kill(shell as libc::pid_t, libc::SIGKILL);
+        libc::kill(-shell, libc::SIGKILL);
+        libc::kill(shell, libc::SIGKILL);
+        libc::kill(trapped_shell, libc::SIGTERM);
     }
-    std::thread::sleep(Duration::from_millis(20));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut closed = Vec::new();
+    while closed.len() < 2 && Instant::now() < deadline {
+        if let Ok(Event::PaneClosed { pane: p }) = events.recv_timeout(Duration::from_millis(100)) {
+            closed.push(p);
+        }
+    }
+    closed.sort();
+    assert_eq!(
+        closed,
+        vec![pane, trapped],
+        "both panes close for the clients at once"
+    );
     unsafe {
         libc::kill(daemon.child.id() as libc::pid_t, libc::SIGTERM);
     }
@@ -828,7 +854,10 @@ fn panes_killed_with_the_daemon_are_restored() {
         Response::Panes(p) => p,
         other => panic!("{other:?}"),
     };
-    assert_eq!(panes.iter().map(|p| p.id).collect::<Vec<_>>(), vec![pane]);
+    assert_eq!(
+        panes.iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![pane, trapped]
+    );
     assert!(capture(&c, pane).contains("before-teardown"));
 }
 
