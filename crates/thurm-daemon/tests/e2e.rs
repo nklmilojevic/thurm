@@ -759,12 +759,15 @@ fn panes_killed_with_the_daemon_are_restored() {
     })
     .unwrap();
     wait_match(&c, pane, "before-teardown");
-    // A shell that traps the signal and exits by itself, with an ordinary status.
+    // A shell that traps the signal and exits by itself, with an ordinary status. Not the
+    // interactive shell: dash runs traps only once its prompt's read returns. `exec` keeps the
+    // pane's pid; the quotes keep the echoed input from matching before the trap is set.
     let trapped = create(&c, &env.dir);
     c.request(Request::Input {
         pane: trapped,
-        // Quoted so the echoed input does not match before the trap is set.
-        data: b"trap 'exit 0' TERM; echo trap-\"set\"\r".to_vec(),
+        data:
+            b"exec sh -c 'trap \"exit 0\" TERM; echo trap-\"set\"; while :; do sleep 0.05; done'\r"
+                .to_vec(),
     })
     .unwrap();
     wait_match(&c, trapped, "trap-set");

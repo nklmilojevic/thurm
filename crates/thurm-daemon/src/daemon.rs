@@ -48,10 +48,11 @@ const QUIET: Duration = Duration::from_millis(2);
 /// Screen lines the model reads for titles, requests and turn summaries.
 const AI_SCREEN_LINES: usize = 60;
 
-/// How long a pane whose shell died still counts for a session save on SIGTERM. Quitting the
-/// app signals the daemon and the shells at once, and the reader can see the shell go before
-/// the signal handler has run.
-const TEARDOWN_GRACE: Duration = Duration::from_millis(200);
+/// How long before the daemon notices a SIGTERM a pane whose shell died still counts for the
+/// session save. Quitting the app signals the daemon and the shells at once, and the reader
+/// can see the shell go before the signal handler has run (and the main thread notices the
+/// signal up to 100ms after that).
+const TEARDOWN_GRACE: Duration = Duration::from_millis(500);
 /// Autosave serializes a busy pane's scrollback (under its lock) at most this often.
 /// Explicit saves (quit, upgrade, `thurm save`) always do.
 const HISTORY_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -339,6 +340,8 @@ pub struct Daemon {
     /// Panes whose shell died less than `TEARDOWN_GRACE` ago, for a teardown save that
     /// lands just after (they close for the clients at once).
     just_exited: Mutex<Vec<(Arc<Pane>, Instant)>>,
+    /// When a save first saw `stopping`: the end of the teardown window.
+    stopped_at: std::sync::OnceLock<Instant>,
     last_activity: Mutex<Instant>,
 }
 
@@ -383,6 +386,7 @@ impl Daemon {
             shutdown: AtomicBool::new(false),
             stopping,
             just_exited: Mutex::new(Vec::new()),
+            stopped_at: std::sync::OnceLock::new(),
             last_activity: Mutex::new(Instant::now()),
         })
     }
@@ -1044,10 +1048,11 @@ impl Daemon {
         if !self.stopping.load(Ordering::Relaxed) {
             return Vec::new();
         }
+        let stopped = *self.stopped_at.get_or_init(Instant::now);
         self.just_exited
             .lock()
             .iter()
-            .filter(|(_, at)| at.elapsed() < TEARDOWN_GRACE)
+            .filter(|(_, at)| stopped.saturating_duration_since(*at) < TEARDOWN_GRACE)
             .map(|(p, _)| p.clone())
             .collect()
     }
@@ -1244,9 +1249,11 @@ impl Daemon {
         while !self.shutdown.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(500));
             tick += 1;
-            self.just_exited
-                .lock()
-                .retain(|(_, at)| at.elapsed() < TEARDOWN_GRACE);
+            if !self.stopping.load(Ordering::Relaxed) {
+                self.just_exited
+                    .lock()
+                    .retain(|(_, at)| at.elapsed() < TEARDOWN_GRACE);
+            }
             let (idle_after, interval, detect, ai_cfg) = {
                 let c = self.config.read();
                 (
