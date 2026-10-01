@@ -24,8 +24,6 @@ pub struct Pty {
     master: File,
     pid: libc::pid_t,
     exited: Option<Option<i32>>,
-    /// The child was killed by a signal rather than exiting by itself.
-    signaled: bool,
 }
 
 fn winsize(size: PaneSize) -> libc::winsize {
@@ -148,7 +146,6 @@ impl Pty {
             master: File::from(master),
             pid: child.id() as libc::pid_t,
             exited: None,
-            signaled: false,
         })
     }
 
@@ -163,7 +160,6 @@ impl Pty {
             master: unsafe { File::from_raw_fd(fd) },
             pid: pid as libc::pid_t,
             exited,
-            signaled: false,
         })
     }
 
@@ -178,11 +174,6 @@ impl Pty {
     /// The exit status collected so far (`Some` once the child is gone).
     pub fn exit_status(&self) -> Option<Option<i32>> {
         self.exited
-    }
-
-    /// Whether the collected exit was a kill by a signal.
-    pub fn signaled(&self) -> bool {
-        self.signaled
     }
 
     /// A handle for the reader thread.
@@ -233,7 +224,6 @@ impl Pty {
             let code = if libc::WIFEXITED(status) {
                 Some(libc::WEXITSTATUS(status))
             } else if libc::WIFSIGNALED(status) {
-                self.signaled = true;
                 Some(128 + libc::WTERMSIG(status))
             } else {
                 None
@@ -430,39 +420,4 @@ pub fn write_all(f: &mut File, mut data: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn exit_of(script: &str) -> (Option<i32>, bool) {
-        let mut pty = Pty::spawn(SpawnOptions {
-            program: "/bin/sh".into(),
-            args: vec!["-c".into(), script.into()],
-            argv0: None,
-            cwd: None,
-            env: Vec::new(),
-            size: PaneSize::default(),
-        })
-        .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if let Some(code) = pty.try_wait() {
-                return (code, pty.signaled());
-            }
-            assert!(std::time::Instant::now() < deadline, "child never exited");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn an_exit_by_itself_is_not_a_signal() {
-        assert_eq!(exit_of("exit 130"), (Some(130), false));
-    }
-
-    #[test]
-    fn a_kill_is_a_signal() {
-        assert_eq!(exit_of("kill -KILL $$"), (Some(128 + libc::SIGKILL), true));
-    }
 }

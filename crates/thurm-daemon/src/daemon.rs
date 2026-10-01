@@ -48,9 +48,9 @@ const QUIET: Duration = Duration::from_millis(2);
 /// Screen lines the model reads for titles, requests and turn summaries.
 const AI_SCREEN_LINES: usize = 60;
 
-/// How long a pane whose shell was killed by a signal waits for a SIGTERM to the daemon before
-/// dropping out of the session. Quitting the app signals the daemon and the shells at once, and the reader can
-/// see the shell go before the signal handler has run.
+/// How long a pane whose shell died still counts for a session save on SIGTERM. Quitting the
+/// app signals the daemon and the shells at once, and the reader can see the shell go before
+/// the signal handler has run.
 const TEARDOWN_GRACE: Duration = Duration::from_millis(200);
 /// Autosave serializes a busy pane's scrollback (under its lock) at most this often.
 /// Explicit saves (quit, upgrade, `thurm save`) always do.
@@ -336,6 +336,9 @@ pub struct Daemon {
     /// SIGTERM/SIGINT arrived. Shells dying from here on are part of the teardown (quitting
     /// the app that spawned us signals its whole tree at once) and stay in the saved session.
     pub stopping: Arc<AtomicBool>,
+    /// Panes whose shell died less than `TEARDOWN_GRACE` ago, for a teardown save that
+    /// lands just after (they close for the clients at once).
+    just_exited: Mutex<Vec<(Arc<Pane>, Instant)>>,
     last_activity: Mutex<Instant>,
 }
 
@@ -379,6 +382,7 @@ impl Daemon {
             restored: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             stopping,
+            just_exited: Mutex::new(Vec::new()),
             last_activity: Mutex::new(Instant::now()),
         })
     }
@@ -985,25 +989,14 @@ impl Daemon {
         // Give the kernel a moment to deliver the exit status, without holding the pane's
         // lock while waiting.
         let mut code = None;
-        let mut signaled = true;
         for _ in 0..50 {
-            let mut st = pane.state.lock();
-            if let Some(c) = st.pty.try_wait() {
+            if let Some(c) = pane.state.lock().pty.try_wait() {
                 code = c;
-                signaled = st.pty.signaled();
                 break;
             }
-            drop(st);
             std::thread::sleep(Duration::from_millis(10));
         }
-        // Only a shell killed by a signal can be the daemon's teardown racing us; one that
-        // exited by itself (ctrl+d, `exit`) closes at once.
-        let grace = if signaled {
-            TEARDOWN_GRACE
-        } else {
-            Duration::ZERO
-        };
-        if self.stopping_within(grace) {
+        if self.stopping.load(Ordering::Relaxed) {
             log::info!("pane {} ended with the daemon", pane.id);
             return;
         }
@@ -1025,6 +1018,11 @@ impl Daemon {
             return;
         }
         log::info!("pane {} exited ({code:?})", pane.id);
+        {
+            let mut recent = self.just_exited.lock();
+            recent.retain(|(_, at)| at.elapsed() < TEARDOWN_GRACE);
+            recent.push((pane.clone(), Instant::now()));
+        }
         self.broadcast(
             Event::PaneExited {
                 pane: pane.id,
@@ -1040,24 +1038,25 @@ impl Daemon {
         }
     }
 
-    /// Whether a SIGTERM/SIGINT arrives within `grace`.
-    fn stopping_within(&self, grace: Duration) -> bool {
-        let deadline = Instant::now() + grace;
-        loop {
-            if self.stopping.load(Ordering::Relaxed) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+    /// Panes whose shell died within `TEARDOWN_GRACE` of a SIGTERM/SIGINT: part of the
+    /// teardown, so they stay in the saved session. Empty unless the daemon is stopping.
+    fn teardown_exits(&self) -> Vec<Arc<Pane>> {
+        if !self.stopping.load(Ordering::Relaxed) {
+            return Vec::new();
         }
+        self.just_exited
+            .lock()
+            .iter()
+            .filter(|(_, at)| at.elapsed() < TEARDOWN_GRACE)
+            .map(|(p, _)| p.clone())
+            .collect()
     }
 
     pub fn close_pane(&self, id: PaneId) -> bool {
         let Some(pane) = self.panes.lock().remove(&id) else {
             return false;
         };
+        self.just_exited.lock().retain(|(p, _)| p.id != id);
         pane.state.lock().pty.hangup();
         self.session_dirty.store(true, Ordering::Relaxed);
         self.broadcast(Event::PaneClosed { pane: id }, false);
@@ -1380,8 +1379,9 @@ impl Daemon {
     fn sanitized_layout(&self) -> Option<String> {
         let raw = self.layout.lock().clone()?;
         let mut layout: Layout = serde_json::from_str(&raw).ok()?;
+        let teardown: Vec<_> = self.teardown_exits().iter().map(|p| p.id).collect();
         let panes = self.panes.lock();
-        layout.retain_panes(&|id| panes.contains_key(&id));
+        layout.retain_panes(&|id| panes.contains_key(&id) || teardown.contains(&id));
         serde_json::to_string(&layout).ok()
     }
 
@@ -1403,9 +1403,17 @@ impl Daemon {
         let mut scrollbacks = Vec::new();
         // Scrollbacks written by this save: marked saved only once it succeeded.
         let mut written = Vec::new();
-        for pane in self.all_panes() {
+        let teardown = self.teardown_exits();
+        let mut saving = self.all_panes();
+        for p in &teardown {
+            if !saving.iter().any(|s| s.id == p.id) {
+                saving.push(p.clone());
+            }
+        }
+        saving.sort_by_key(|p| p.id);
+        for pane in saving {
             let mut st = pane.state.lock();
-            if !st.info.alive {
+            if !st.info.alive && !teardown.iter().any(|p| p.id == pane.id) {
                 continue;
             }
             let generation = st.term.generation();
