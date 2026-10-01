@@ -48,8 +48,8 @@ const QUIET: Duration = Duration::from_millis(2);
 /// Screen lines the model reads for titles, requests and turn summaries.
 const AI_SCREEN_LINES: usize = 60;
 
-/// How long a pane whose shell died waits for a SIGTERM to the daemon before dropping out of
-/// the session. Quitting the app signals the daemon and the shells at once, and the reader can
+/// How long a pane whose shell was killed by a signal waits for a SIGTERM to the daemon before
+/// dropping out of the session. Quitting the app signals the daemon and the shells at once, and the reader can
 /// see the shell go before the signal handler has run.
 const TEARDOWN_GRACE: Duration = Duration::from_millis(200);
 /// Autosave serializes a busy pane's scrollback (under its lock) at most this often.
@@ -982,19 +982,30 @@ impl Daemon {
     }
 
     fn pane_exited(&self, pane: &Arc<Pane>) {
-        if self.stopping_within(TEARDOWN_GRACE) {
-            log::info!("pane {} ended with the daemon", pane.id);
-            return;
-        }
         // Give the kernel a moment to deliver the exit status, without holding the pane's
         // lock while waiting.
         let mut code = None;
+        let mut signaled = true;
         for _ in 0..50 {
-            if let Some(c) = pane.state.lock().pty.try_wait() {
+            let mut st = pane.state.lock();
+            if let Some(c) = st.pty.try_wait() {
                 code = c;
+                signaled = st.pty.signaled();
                 break;
             }
+            drop(st);
             std::thread::sleep(Duration::from_millis(10));
+        }
+        // Only a shell killed by a signal can be the daemon's teardown racing us; one that
+        // exited by itself (ctrl+d, `exit`) closes at once.
+        let grace = if signaled {
+            TEARDOWN_GRACE
+        } else {
+            Duration::ZERO
+        };
+        if self.stopping_within(grace) {
+            log::info!("pane {} ended with the daemon", pane.id);
+            return;
         }
         let hold = {
             let mut st = pane.state.lock();
