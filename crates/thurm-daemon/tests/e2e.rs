@@ -657,6 +657,53 @@ fn terminate_daemon_by_socket_peer() {
     assert!(env.dir.join("state/session.json").exists());
 }
 
+/// Open descriptors of process `pid`.
+fn open_fds(pid: u32) -> usize {
+    if let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        return dir.count();
+    }
+    let out = Command::new("lsof")
+        .args(["-n", "-P", "-p", &pid.to_string()])
+        .output()
+        .expect("lsof");
+    // Minus the header line.
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .count()
+        .saturating_sub(1)
+}
+
+#[test]
+fn disconnected_clients_release_their_sockets() {
+    let env = Env::new("client-leak");
+    let d = env.start();
+    let cycle = || {
+        for _ in 0..20 {
+            let (c, _rx) = env.connect();
+            c.request(Request::ListPanes).unwrap();
+            drop(c);
+            drop(std::os::unix::net::UnixStream::connect(&env.socket).unwrap());
+        }
+    };
+    cycle();
+    std::thread::sleep(Duration::from_millis(300));
+    let before = open_fds(d.child.id());
+    cycle();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let now = open_fds(d.child.id());
+        if now <= before + 4 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "40 closed connections left {} descriptors open",
+            now - before
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn launching_an_agent_installs_its_hooks() {
     let env = Env::new("launch-hooks");
