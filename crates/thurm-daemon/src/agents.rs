@@ -561,7 +561,7 @@ fn next_prompt_id() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_micros() as u64);
     let prev = LAST
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |l| {
             Some(now.max(l + 1))
         })
         .unwrap_or_default();
