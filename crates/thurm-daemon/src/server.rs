@@ -41,12 +41,16 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
             return;
         }
     };
-    let counter = client.clone();
+    // Weak: the client owns `rx`'s sender, and the writer only stops once every sender is gone.
+    let counter = Arc::downgrade(&client);
     let writer = std::thread::Builder::new()
         .name(format!("client-{}-writer", client.id))
         .spawn(move || {
             let mut w = BufWriter::with_capacity(256 * 1024, write_stream);
             let written = |msg: &ServerMessage| {
+                let Some(counter) = counter.upgrade() else {
+                    return;
+                };
                 counter.queued.fetch_sub(
                     crate::daemon::message_weight(msg).min(counter.queued.load(Ordering::Relaxed)),
                     Ordering::Relaxed,
