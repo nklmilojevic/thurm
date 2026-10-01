@@ -1244,6 +1244,9 @@ impl Daemon {
         while !self.shutdown.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(500));
             tick += 1;
+            self.just_exited
+                .lock()
+                .retain(|(_, at)| at.elapsed() < TEARDOWN_GRACE);
             let (idle_after, interval, detect, ai_cfg) = {
                 let c = self.config.read();
                 (
@@ -1376,12 +1379,12 @@ impl Daemon {
     // Persistence
     // -----------------------------------------------------------------------------------------
 
-    fn sanitized_layout(&self) -> Option<String> {
+    /// The layout without the panes that are gone, except those in `keep`.
+    fn sanitized_layout(&self, keep: &[Arc<Pane>]) -> Option<String> {
         let raw = self.layout.lock().clone()?;
         let mut layout: Layout = serde_json::from_str(&raw).ok()?;
-        let teardown: Vec<_> = self.teardown_exits().iter().map(|p| p.id).collect();
         let panes = self.panes.lock();
-        layout.retain_panes(&|id| panes.contains_key(&id) || teardown.contains(&id));
+        layout.retain_panes(&|id| panes.contains_key(&id) || keep.iter().any(|p| p.id == id));
         serde_json::to_string(&layout).ok()
     }
 
@@ -1448,7 +1451,7 @@ impl Daemon {
         let snap = SessionSnapshot {
             version: persist::SNAPSHOT_VERSION,
             saved_at: persist::now_secs(),
-            layout: self.sanitized_layout(),
+            layout: self.sanitized_layout(&teardown),
             panes,
             next_pane_id: self.next_pane.load(Ordering::Relaxed),
         };
@@ -2052,7 +2055,7 @@ impl Daemon {
                 self.session_dirty.store(true, Ordering::Relaxed);
                 Ok(Response::Ok)
             }
-            Request::GetLayout => Ok(Response::Layout(self.sanitized_layout())),
+            Request::GetLayout => Ok(Response::Layout(self.sanitized_layout(&[]))),
             Request::Ui(cmd) => {
                 if !self.has_ui_clients() {
                     return Err("no Thurm window is open".into());
