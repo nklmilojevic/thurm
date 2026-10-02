@@ -277,6 +277,50 @@ The [example configuration](config.example.toml) lists all settings and defaults
 See the [configuration guide](https://docs.thurm.rs/configuration/)
 for more examples.
 
+### Manage the configuration with Home Manager
+
+The flake includes a Home Manager module. Add the flake as an input, then import
+the module:
+
+```nix
+# flake.nix
+inputs.thurm.url = "github:nklmilojevic/thurm";
+
+# Home Manager configuration
+imports = [ inputs.thurm.homeManagerModules.default ];
+
+programs.thurm = {
+  enable = true;
+  settings = {
+    font.size = 14.0;
+    colors.theme = "light:catppuccin-latte,dark:catppuccin-mocha";
+    keybindings."cmd+shift+d" = "split_down";
+    remote = [ { name = "devbox"; host = "devbox"; } ];
+  };
+  themes.mine = {
+    foreground = "#cdd6f4";
+    background = "#1e1e2e";
+    palette = [ /* 16 colors */ ];
+  };
+};
+```
+
+| Option | Effect |
+| --- | --- |
+| `settings` | Written as `~/.config/thurm/config.toml` |
+| `extraConfig` | TOML text added after `settings` |
+| `themes.<name>` | Written as `~/.config/thurm/themes/<name>.toml`. Use an attribute set, a file, or text. Select it with `colors.theme = "~/.config/thurm/themes/<name>.toml"` |
+| `package` | The `thurm` and `thurmd` package. On macOS the default is `null` because the app includes its own CLI. On Linux the default is the flake's `thurm` |
+| `reloadOnChange` | Runs `thurm reload` after a config change when the daemon runs. The default is `true` |
+
+On macOS, use **Install Command-Line Tool** to get the CLI. A CLI from another
+build might not connect to the app's daemon. On a remote host, pin the flake
+input to the version of your app.
+
+Home Manager makes the file read-only. Because of this, changes from the
+settings window, `thurm set`, `thurm theme NAME`, and `thurm remote add` fail.
+Make these changes in your Home Manager configuration.
+
 ## Build and contribute
 
 To build the app, use an Apple silicon Mac with macOS 14 or later and Xcode 26 or

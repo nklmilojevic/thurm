@@ -117,6 +117,12 @@
         default = thurm;
       });
 
+      # programs.thurm: config.toml, themes, and (off macOS, where the app ships it) the CLI.
+      homeManagerModules = rec {
+        thurm = import ./nix/hm-module.nix self;
+        default = thurm;
+      };
+
       # Everything but Xcode (Swift, the macOS SDK, codesign, notarytool), which comes from the
       # system: `nix develop`, or `direnv allow` with the .envrc.
       devShells.${system}.default = pkgs.mkShellNoCC {
