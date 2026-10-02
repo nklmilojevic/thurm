@@ -759,7 +759,10 @@ final class TerminalView: NSView, NSTextInputClient {
                 return true
             case 125: completion.move(1); return true   // down
             case 126: completion.move(-1); return true  // up
-            case 36, 76, 124: // return, enter, right: accept
+            case 36, 76: // return, enter: accept
+                if let item = completion.selected { acceptCompletion(item) }
+                return true
+            case 124 where mods.isEmpty: // right: accept (Cmd+Right goes to the end of the line)
                 if let item = completion.selected { acceptCompletion(item) }
                 return true
             case 53: // escape
@@ -1063,7 +1066,7 @@ final class TerminalView: NSView, NSTextInputClient {
     private func handleCommandFallback(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags
         if flags.isDisjoint(with: [.shift, .control, .option]) {
-            // Line editing as in other macOS terminals: Cmd+Backspace deletes the line (Ctrl+U),
+            // Line editing as in other macOS terminals: Cmd+Backspace deletes to its start (Ctrl+U),
             // Cmd+Left/Right go to its start/end (Ctrl+A/Ctrl+E).
             let text: String?
             switch event.keyCode {
