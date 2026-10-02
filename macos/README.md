@@ -55,9 +55,10 @@ or `tip` pin one. *Thurm › Update Channel* and `thurm set updates.channel tip`
 setting. `updates.check_automatically` and `updates.download_automatically` control
 background checks and downloads. Tip items carry `<sparkle:channel>tip`, so a
 release-channel app never sees them. `CFBundleVersion` is the commit count, so it grows across
-both channels. A tip build and a release of the same commit have the same number; the appcast
-lists the tip item first, so a tip-channel app stays on tip builds, and a release-channel app
-never sees tip items.
+both channels. A tip-channel app only picks tip items (`bestValidUpdate` in Updater.swift), so
+a release published ahead of the next nightly tip doesn't move it onto the release build. A tip
+build and a release of the same commit have the same number; the appcast lists the tip item
+first.
 
 The Pages workflow publishes the documentation and update feed together.
 After every build it publishes, `release.yaml` starts `.github/workflows/pages.yml`, which

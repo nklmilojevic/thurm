@@ -127,6 +127,17 @@ final class Updater: NSObject, SPUUpdaterDelegate, SPUStandardUserDriverDelegate
         channel == .tip ? ["tip"] : []
     }
 
+    /// Sparkle always adds default-channel (release) items to the allowed channels. A release
+    /// is published before the nightly tip build of its commit, so it would briefly be the
+    /// newest item and move a tip app onto the release build. On tip, pick only tip items;
+    /// Sparkle has already dropped the ones this system can't run.
+    func bestValidUpdate(in appcast: SUAppcast, for updater: SPUUpdater) -> SUAppcastItem? {
+        guard channel == .tip else { return nil }
+        let comparator = SUStandardVersionComparator.default
+        let tips = appcast.items.filter { $0.channel == Channel.tip.rawValue }
+        return tips.max { comparator.compareVersion($0.versionString, toVersion: $1.versionString) == .orderedAscending }
+    }
+
     // MARK: SPUStandardUserDriverDelegate
 
     var supportsGentleScheduledUpdateReminders: Bool { true }
