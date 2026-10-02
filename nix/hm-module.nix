@@ -20,11 +20,21 @@ let
       [ (lib.getExe cfg.package) ]
     else
       [
-        "thurm"
         "${config.home.homeDirectory}/.local/bin/thurm"
         "/Applications/Thurm.app/Contents/Helpers/thurm"
         "${config.home.homeDirectory}/Applications/Thurm.app/Contents/Helpers/thurm"
+        "thurm"
       ];
+  # `daemon status` never starts a daemon (as `reload` would on a stale socket) and exits 0
+  # only when one answers that this CLI can talk to: reload with the first such CLI.
+  reloadScript = lib.optionalString cfg.reloadOnChange ''
+    for thurm in ${lib.escapeShellArgs thurmCandidates}; do
+      if command -v "$thurm" >/dev/null 2>&1 && "$thurm" daemon status >/dev/null 2>&1; then
+        run "$thurm" reload >/dev/null 2>&1 || true
+        break
+      fi
+    done
+  '';
 
   configFile = pkgs.concatText "thurm-config.toml" (
     lib.optional (cfg.settings != { }) (toml.generate "thurm-settings.toml" cfg.settings)
@@ -122,7 +132,7 @@ in
     reloadOnChange = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Run `thurm reload` on activation when the config changes and the daemon is running.";
+      description = "Run `thurm reload` on activation when the config or a theme changes and the daemon is running.";
     };
   };
 
@@ -132,21 +142,15 @@ in
     xdg.configFile = {
       "thurm/config.toml" = lib.mkIf (cfg.settings != { } || cfg.extraConfig != "") {
         source = configFile;
-        onChange = lib.mkIf cfg.reloadOnChange ''
-          for thurm in ${lib.escapeShellArgs thurmCandidates}; do
-            if command -v "$thurm" >/dev/null 2>&1; then
-              sock="$("$thurm" socket-path 2>/dev/null || true)"
-              if [ -n "$sock" ] && [ -S "$sock" ]; then
-                run "$thurm" reload >/dev/null 2>&1 || true
-              fi
-              break
-            fi
-          done
-        '';
+        onChange = reloadScript;
       };
     }
     // lib.mapAttrs' (
-      name: theme: lib.nameValuePair "thurm/themes/${name}.toml" { source = themeFile name theme; }
+      name: theme:
+      lib.nameValuePair "thurm/themes/${name}.toml" {
+        source = themeFile name theme;
+        onChange = reloadScript;
+      }
     ) cfg.themes;
   };
 }

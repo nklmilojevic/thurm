@@ -311,7 +311,7 @@ programs.thurm = {
 | `extraConfig` | TOML text added after `settings` |
 | `themes.<name>` | Written as `~/.config/thurm/themes/<name>.toml`. Use an attribute set, a file, or text. Select it with `colors.theme = "~/.config/thurm/themes/<name>.toml"` |
 | `package` | The `thurm` and `thurmd` package. On macOS the default is `null` because the app includes its own CLI. On Linux the default is the flake's `thurm` |
-| `reloadOnChange` | Runs `thurm reload` after a config change when the daemon runs. The default is `true` |
+| `reloadOnChange` | Runs `thurm reload` after a config or theme change when the daemon runs. It never starts the daemon. The default is `true` |
 
 On macOS, use **Install Command-Line Tool** to get the CLI. A CLI from another
 build might not connect to the app's daemon. On a remote host, pin the flake
