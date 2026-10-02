@@ -105,7 +105,8 @@ download_automatically = false
 
 `auto` follows the installed build: a Tip build receives Tip updates, and a
 Release build receives tagged releases. Set `channel` to `release` or `tip`
-to keep a fixed channel. Tip also accepts tagged releases.
+to keep a fixed channel. Tip receives only Tip builds; each release reaches it
+as the next Tip build.
 
 **Thurm > Update Channel** writes the same setting as the CLI:
 
