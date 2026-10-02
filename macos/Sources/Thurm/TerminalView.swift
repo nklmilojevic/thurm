@@ -1062,6 +1062,21 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Command shortcuts that the menu may not match on every layout.
     private func handleCommandFallback(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags
+        if flags.isDisjoint(with: [.shift, .control, .option]) {
+            // Line editing as in other macOS terminals: Cmd+Backspace deletes the line (Ctrl+U),
+            // Cmd+Left/Right go to its start/end (Ctrl+A/Ctrl+E).
+            let text: String?
+            switch event.keyCode {
+            case 0x33: text = "\u{15}"
+            case 0x7B: text = "\u{01}"
+            case 0x7C: text = "\u{05}"
+            default: text = nil
+            }
+            if let text {
+                Core.shared.input(pane, text: text)
+                return true
+            }
+        }
         guard flags.contains(.shift) else { return false }
         switch event.keyCode {
         case 0x21: // [
