@@ -52,7 +52,7 @@ Use `thurm set window.tab_style sidebar` to return to the sidebar.
 | Find text in scrollback | Cmd+F |
 | Find next / previous | Cmd+G / Cmd+Shift+G |
 | Clear screen / scrollback | Cmd+K / Cmd+Option+K |
-| Delete the line / go to its start / end | Cmd+Backspace / Cmd+Left / Cmd+Right |
+| Delete to line start / go to line start / end | Cmd+Backspace / Cmd+Left / Cmd+Right |
 | Increase / decrease / reset font size | Cmd++ / Cmd+- / Cmd+0 |
 | Open a URL | Cmd+click |
 | Open / reload configuration | Cmd+, / Cmd+Shift+, |
