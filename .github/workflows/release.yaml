@@ -144,6 +144,7 @@ jobs:
           set -euo pipefail
           OUT="$RUNNER_TEMP/linux"
           mkdir -p "$OUT"
+          python3 scripts/third-party-licenses.py
           tar -czf "$OUT/${{ steps.meta.outputs.archive }}" -C "target/${{ matrix.target }}/release" thurm thurmd \
             -C "$GITHUB_WORKSPACE" LICENSE THIRD_PARTY_LICENSES
           (cd "$OUT" && sha256sum "${{ steps.meta.outputs.archive }}" > "${{ steps.meta.outputs.archive }}.sha256")
