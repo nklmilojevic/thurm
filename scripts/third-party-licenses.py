@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Writes THIRD_PARTY_LICENSES: the license texts of everything compiled into or shipped with
-Thurm (the app, thurmd and thurm, and the Linux tarballs).
-
-  scripts/third-party-licenses.py          regenerate THIRD_PARTY_LICENSES
-  scripts/third-party-licenses.py --check  fail if it is out of date (CI)
+Thurm (the app, thurmd and thurm, and the Linux tarballs). Not committed: macos/build.sh and
+the release workflow generate it at build time, so dependency updates never leave it stale.
 
 Crates come from `cargo metadata` (the normal dependencies of thurm-ffi, thurm-daemon and
 thurm-cli on the shipped targets) and their own license files. Identical texts are printed
@@ -112,13 +110,7 @@ def render():
 
 
 def main():
-    text = render()
-    if "--check" in sys.argv[1:]:
-        if not OUT.exists() or OUT.read_text() != text:
-            print("THIRD_PARTY_LICENSES is out of date: run scripts/third-party-licenses.py", file=sys.stderr)
-            return 1
-        return 0
-    OUT.write_text(text)
+    OUT.write_text(render())
     return 0
 
 

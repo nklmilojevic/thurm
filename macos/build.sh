@@ -201,6 +201,7 @@ if [[ -f "$HERE/Resources/AppIcon.icns" ]]; then
     cp "$HERE/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 fi
 # Thurm's license and the notices of everything it includes.
+python3 "$ROOT/scripts/third-party-licenses.py"
 cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_LICENSES" "$APP/Contents/Resources/"
 
 # ---------------------------------------------------------------------------------------

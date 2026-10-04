@@ -5,6 +5,7 @@
 .DS_Store
 /macos/.sign-identity
 /.direnv
+/THIRD_PARTY_LICENSES
 
 /site/
 /docs/node_modules/
