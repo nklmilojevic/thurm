@@ -33,6 +33,9 @@ jobs:
       # --locked: a dependency change must come with its Cargo.lock.
       - name: Test
         run: cargo test --workspace --locked
+      # Not committed (the builds generate it), but a broken generator should fail here, not at release.
+      - name: Third-party licenses
+        run: python3 scripts/third-party-licenses.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
