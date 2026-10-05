@@ -157,6 +157,36 @@ fn prompt_wait_rejects_other_keyboard_input() {
 }
 
 #[test]
+fn permission_answer_cannot_complete_the_original_prompt_wait() {
+    let (_env, _daemon, client, pane) = setup("prompt-permission-answer");
+    let worker = {
+        let client = client.clone();
+        std::thread::spawn(move || submit(&client, pane, "permission-turn-marker", true, 3000))
+    };
+    wait_match(&client, pane, "permission-turn-marker");
+    hook(&client, pane, "prompt-submit", None);
+    hook(&client, pane, "permission-prompt", None);
+    let prompt = agent(&client, pane).unwrap().permission.unwrap();
+    client
+        .request(Request::AnswerPermission {
+            pane,
+            prompt,
+            allow: true,
+        })
+        .unwrap();
+    hook(&client, pane, "stop", None);
+    // The wait can observe NeedsInput before the answer. Once answered, it must fail.
+    let result = worker.join().unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(_) | Ok(Response::AgentPrompt(AgentPromptOutcome::NeedsInput))
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn prompt_respects_disabled_automatic_detection() {
     let env = Env::new("prompt-detect-disabled");
     std::fs::write(

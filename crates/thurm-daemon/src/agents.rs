@@ -150,6 +150,7 @@ impl AgentTracker {
             return None;
         }
         let keys: &'static [u8] = if allow { b"\r" } else { b"\x1b" };
+        self.prompt.interrupted();
         self.user_answer(keys);
         Some(keys)
     }
@@ -1321,6 +1322,34 @@ mod tests {
         );
         t.refresh();
         assert_eq!(t.answer_permission(fourth, true), None);
+    }
+
+    #[test]
+    fn permission_answer_invalidates_the_submitted_turn() {
+        let defs = thurm_config::builtin_agents();
+        let mut tracker = AgentTracker::default();
+        tracker.update(
+            &defs, Some(&proc("claude")), "> ",
+            Duration::from_secs(5), Duration::from_millis(1500),
+        );
+        tracker.apply_hook(Some(1), "claude", "Claude Code", "session-start", None, None);
+        tracker.refresh();
+        let token = tracker.prompt.reserve(tracker.state().unwrap().status)
+            .unwrap();
+        tracker.apply_hook(Some(1), "claude", "Claude Code", "prompt-submit", None, None);
+        tracker.refresh();
+        tracker.apply_hook(
+            Some(1), "claude", "Claude Code", "permission-prompt", None, None,
+        );
+        tracker.refresh();
+        let prompt = tracker.permission_prompt().unwrap();
+        assert!(tracker.answer_permission(prompt.wrapping_add(1), true).is_none());
+        assert!(tracker.prompt.outcome(token, AgentStatus::NeedsInput).is_ok());
+        assert_eq!(tracker.answer_permission(prompt, true), Some(&b"\r"[..]));
+        tracker.apply_hook(Some(1), "claude", "Claude Code", "stop", None, None);
+        tracker.refresh();
+        assert!(tracker.prompt.outcome(token, tracker.state().unwrap().status)
+            .is_err());
     }
 
     #[test]

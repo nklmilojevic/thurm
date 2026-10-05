@@ -2797,7 +2797,8 @@ impl App {
                         self.tab_of(&PaneKey::new(host, pane))
                             .is_some_and(|tab| tab.workspace.get() == id)
                     }) {
-                        self.workspaces.borrow_mut().retain(|ws| ws.id != id);
+                        // Ownership is committed. Keep the panes' placement for recovery.
+                        self.schedule_save();
                         return Err("the desktop could not install the layout".into());
                     }
                     self.schedule_save();
