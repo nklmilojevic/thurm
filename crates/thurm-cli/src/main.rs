@@ -4,6 +4,8 @@
 //! (`$THURM_PANE_ID`), prints plain text, supports `--json`, and uses exit codes
 //! (0 ok, 1 error, 124 wait timeout).
 
+mod events;
+mod layouts;
 mod remote;
 
 use std::io::{IsTerminal, Read, Write};
@@ -295,7 +297,15 @@ enum Cmd {
     /// Show a desktop notification from this pane (OSC 777).
     Notify { title: String, body: Vec<String> },
     /// Print the saved window/tab/split layout as JSON.
-    Layout,
+    Layout {
+        #[command(subcommand)]
+        action: Option<layouts::LayoutCmd>,
+    },
+    /// Stream state changes as JSON Lines.
+    Events {
+        #[arg(long)]
+        pane: Option<PaneId>,
+    },
     /// Reload ~/.config/thurm/config.toml.
     Reload,
     /// Change a setting in config.toml and reload: `thurm set window.tab_style sidebar`.
@@ -539,6 +549,7 @@ fn run(cli: Cli) -> R {
         }
     }
     match cli.cmd {
+        Cmd::Events { pane } => events::run(remote.as_deref(), pane),
         Cmd::SocketPath => {
             println!("{}", thurm_config::socket_path().display());
             Ok(ExitCode::SUCCESS)
@@ -1401,17 +1412,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             let pane = current_pane(pane)?;
             c.request(Request::ClearScrollback { pane })?;
         }
-        Cmd::Layout => {
-            if let Response::Layout(l) = c.request(Request::GetLayout)? {
-                match l {
-                    Some(l) => {
-                        let v: serde_json::Value = serde_json::from_str(&l)?;
-                        println!("{}", serde_json::to_string_pretty(&v)?);
-                    }
-                    None => println!("null"),
-                }
-            }
-        }
+        Cmd::Layout { action } => return layouts::run(c, action),
         Cmd::Reload => {
             c.request(Request::ReloadConfig)?;
             println!("configuration reloaded");
@@ -1446,6 +1447,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
         | Cmd::Handoff { .. }
         | Cmd::Notify { .. }
         | Cmd::Daemon { .. }
+        | Cmd::Events { .. }
         | Cmd::AgentHook { .. }
         | Cmd::Hooks { .. }
         | Cmd::Theme { spec: None } => unreachable!(),

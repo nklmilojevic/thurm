@@ -66,7 +66,7 @@ export default defineConfig({
         },
         {
           label: 'Guides',
-          items: ['cli', 'agents', 'sessions', 'remote'],
+          items: ['cli', 'agents', 'sessions', 'remote', 'workflows'],
         },
         {
           label: 'Help',

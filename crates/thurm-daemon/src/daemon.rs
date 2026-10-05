@@ -2059,13 +2059,28 @@ impl Daemon {
                 serde_json::from_str::<Layout>(&json)
                     .map_err(|e| format!("invalid layout: {e}"))?;
                 *self.layout.lock() = Some(json);
+                self.broadcast(Event::LayoutChanged, false);
                 self.session_dirty.store(true, Ordering::Relaxed);
                 Ok(Response::Ok)
             }
             Request::GetLayout => Ok(Response::Layout(self.sanitized_layout(&[]))),
+            Request::CheckUi => {
+                if !self.has_ui_clients() {
+                    return Err("no Thurm window is open".into());
+                }
+                Ok(Response::Ok)
+            }
             Request::Ui(cmd) => {
                 if !self.has_ui_clients() {
                     return Err("no Thurm window is open".into());
+                }
+                if let thurm_proto::UiCommand::OpenLayout { json } = &cmd {
+                    let tab: thurm_proto::TabLayout = serde_json::from_str(json)
+                        .map_err(|e| format!("invalid tab layout: {e}"))?;
+                    let ids = thurm_proto::template::validate_tab(&tab)?;
+                    if ids.iter().any(|id| self.pane(*id).is_none()) {
+                        return Err("a layout pane no longer exists".into());
+                    }
                 }
                 self.broadcast(Event::Ui(cmd), true);
                 Ok(Response::Ok)

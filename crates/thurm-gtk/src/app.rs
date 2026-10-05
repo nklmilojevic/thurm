@@ -1721,6 +1721,10 @@ impl App {
 
     /// Takes a pane out of its tab (closing the tab when it was the last pane).
     pub fn remove_pane_from_ui(self: &Rc<Self>, key: &PaneKey) {
+        self.remove_pane_from_ui_inner(key, true);
+    }
+
+    fn remove_pane_from_ui_inner(self: &Rc<Self>, key: &PaneKey, refill_window: bool) {
         let removed = self.views.borrow_mut().remove(key);
         if let Some(v) = removed {
             v.detach();
@@ -1774,7 +1778,7 @@ impl App {
                     _ => {
                         if let Some(w) = self.win() {
                             w.remove_tab(&tab);
-                            if w.ordered_tabs().is_empty() {
+                            if refill_window && w.ordered_tabs().is_empty() {
                                 self.window_emptied();
                             }
                         }
@@ -2752,6 +2756,30 @@ impl App {
             .and_then(Value::as_u64)
             .map(|id| PaneKey::new(host, id));
         match name.as_str() {
+            "OpenLayout" => {
+                let Some(json) = p.get("json").and_then(Value::as_str) else {
+                    return;
+                };
+                let Ok(tab) = serde_json::from_str::<TabLayout>(json) else {
+                    return;
+                };
+                let mut ids = Vec::new();
+                tab.root.panes(&mut ids);
+                for id in ids {
+                    let key = PaneKey::new(host, id);
+                    self.remove_pane_from_ui_inner(&key, false);
+                    self.fetch_info(&key);
+                }
+                let mut ws = self.make_workspace(host);
+                if let Some(title) = &tab.title {
+                    ws.name = title.clone();
+                }
+                ws.hidden_tabs.push(tab);
+                let id = ws.id;
+                self.workspaces.borrow_mut().push(ws);
+                self.show_workspace(id);
+                self.schedule_save();
+            }
             "NewTab" => {
                 let Some(k) = key else { return };
                 let new_window = p.get("new_window").and_then(Value::as_bool) == Some(true);

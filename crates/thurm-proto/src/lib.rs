@@ -9,6 +9,7 @@
 pub mod bytes;
 pub mod codec;
 pub mod layout;
+pub mod template;
 
 use serde::{Deserialize, Serialize};
 
@@ -233,6 +234,8 @@ pub enum Request {
         #[serde(with = "bytes")]
         data: Vec<u8>,
     },
+    /// Check that a desktop client can open a layout.
+    CheckUi,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -367,6 +370,8 @@ pub enum Event {
     },
     Ui(UiCommand),
     ConfigReloaded,
+    /// The saved layout changed. Read GetLayout for current state.
+    LayoutChanged,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -934,6 +939,10 @@ pub enum UiCommand {
     Scroll {
         pane: PaneId,
         scroll: ScrollCmd,
+    },
+    /// Open this tab layout in a new workspace.
+    OpenLayout {
+        json: String,
     },
 }
 
