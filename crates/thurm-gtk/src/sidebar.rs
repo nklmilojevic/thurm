@@ -306,19 +306,7 @@ impl Sidebar {
             *self.shown.borrow_mut() = (groups, agents, collapsed.to_vec());
         }
         // The selection mirrors the current tab and pane.
-        let selected = self
-            .shown
-            .borrow()
-            .0
-            .iter()
-            .filter(|g| !g.name.as_ref().is_some_and(|n| collapsed.contains(n)))
-            .flat_map(|g| {
-                let header = g.name.is_some();
-                std::iter::once(false)
-                    .filter(move |_| header)
-                    .chain(g.rows.iter().map(|r| r.selected))
-            })
-            .position(|s| s);
+        let selected = selected_tab_row(&self.shown.borrow().0, collapsed);
         match selected.and_then(|i| self.list.row_at_index(i as i32)) {
             Some(row) => self.list.select_row(Some(&row)),
             None => self.list.unselect_all(),
@@ -377,6 +365,20 @@ impl Sidebar {
         });
         row.add_controller(drop);
     }
+}
+
+fn selected_tab_row(groups: &[Group], collapsed: &[String]) -> Option<usize> {
+    groups
+        .iter()
+        .flat_map(|g| {
+            let header = g.name.is_some();
+            let is_collapsed = g.name.as_ref().is_some_and(|n| collapsed.contains(n));
+            // A collapsed group still has a visible header row.
+            std::iter::once(false)
+                .filter(move |_| header)
+                .chain(g.rows.iter().filter(move |_| !is_collapsed).map(|r| r.selected))
+        })
+        .position(|s| s)
 }
 
 fn dot(status: Option<AgentStatus>) -> gtk::Box {
@@ -443,4 +445,59 @@ fn agent_row(a: &AgentRow) -> gtk::ListBoxRow {
         sub.set_ellipsize(gtk::pango::EllipsizeMode::End);
     }
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(name: Option<&str>, selected: &[bool]) -> Group {
+        Group {
+            name: name.map(str::to_owned),
+            rows: selected
+                .iter()
+                .map(|&selected| TabRow {
+                    title: String::new(),
+                    subtitle: String::new(),
+                    status: None,
+                    shortcut: String::new(),
+                    selected,
+                    tooltip: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn selection_counts_collapsed_headers() {
+        let groups = [
+            group(Some("registry"), &[false, false]),
+            group(Some("hosting"), &[false]),
+            group(Some("home-ops"), &[false, false, true]),
+        ];
+        // Both headers remain visible above the selected tab.
+        assert_eq!(selected_tab_row(&groups, &["registry".into(), "hosting".into()]), Some(5));
+        assert_eq!(selected_tab_row(&groups, &["registry".into()]), Some(6));
+        assert_eq!(selected_tab_row(&groups, &[]), Some(8));
+    }
+
+    #[test]
+    fn selection_before_collapsed_group_does_not_move() {
+        let groups = [group(Some("first"), &[false, true]), group(Some("last"), &[false])];
+        assert_eq!(selected_tab_row(&groups, &["last".into()]), Some(2));
+    }
+
+    #[test]
+    fn hidden_selection_has_no_visible_row() {
+        let groups = [group(Some("hidden"), &[true]), group(Some("visible"), &[false])];
+        assert_eq!(selected_tab_row(&groups, &["hidden".into()]), None);
+    }
+
+    #[test]
+    fn selection_without_headers() {
+        let groups = [group(None, &[false, true])];
+        assert_eq!(selected_tab_row(&groups, &[]), Some(1));
+        assert_eq!(selected_tab_row(&[], &[]), None);
+        assert_eq!(selected_tab_row(&[group(None, &[false])], &[]), None);
+    }
 }
