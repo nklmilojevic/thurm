@@ -825,7 +825,13 @@ fn daemon_cmd(action: &str, json: bool) -> R {
                     .status()
                     .is_ok_and(|s| s.success())
             };
-            systemctl(&["daemon-reload"]);
+            if !systemctl(&["daemon-reload"]) {
+                return Err(format!(
+                    "wrote {}, but systemctl --user daemon-reload failed",
+                    path.display()
+                )
+                .into());
+            }
             // Enabled for the next login; a daemon running now keeps serving its sessions.
             let ok = systemctl(&["enable", SYSTEMD_UNIT]);
             println!(
@@ -876,13 +882,30 @@ fn systemd_unit_path() -> std::path::PathBuf {
 /// A user unit that starts `thurmd` at login, in the foreground. Not restarted, so
 /// `thurm daemon stop` stops it until the next login (like the macOS LaunchAgent).
 fn systemd_unit(daemon: &std::path::Path, socket: Option<&std::path::Path>) -> String {
-    let mut exec = format!("{} --foreground", daemon.display());
+    let mut exec = format!("{} --foreground", systemd_quote(&daemon.to_string_lossy()));
     if let Some(s) = socket {
-        exec.push_str(&format!(" --socket {}", s.display()));
+        exec.push_str(&format!(" --socket {}", systemd_quote(&s.to_string_lossy())));
     }
     format!(
         "[Unit]\nDescription=Thurm session daemon\n\n[Service]\nType=simple\nExecStart={exec}\nRestart=no\n\n[Install]\nWantedBy=default.target\n"
     )
+}
+
+/// One `ExecStart=` item: double-quoted, with systemd's escapes, `%` specifiers and `$`
+/// variable expansion turned off.
+fn systemd_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 const LAUNCHD_LABEL: &str = "com.thurm.daemon";
@@ -1593,6 +1616,19 @@ fn key_bytes(k: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_unit_quotes_paths() {
+        let daemon = std::path::Path::new("/opt/My Apps/thurm \"x\"/thurmd");
+        let socket = std::path::Path::new("/run/a b/100%$HOME\\.sock");
+        let unit = systemd_unit(daemon, Some(socket));
+        assert!(unit.contains(
+            "ExecStart=\"/opt/My Apps/thurm \\\"x\\\"/thurmd\" --foreground \
+             --socket \"/run/a b/100%%$$HOME\\\\.sock\"\n"
+        ));
+        assert!(systemd_unit(std::path::Path::new("/usr/bin/thurmd"), None)
+            .contains("ExecStart=\"/usr/bin/thurmd\" --foreground\n"));
+    }
 
     #[test]
     fn launchd_plist_is_valid() {

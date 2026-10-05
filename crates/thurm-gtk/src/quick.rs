@@ -226,18 +226,26 @@ fn quick_tab(app: &Rc<App>) -> Option<Rc<Tab>> {
 
 thread_local! {
     static BOUND: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The GlobalShortcuts session holding the hotkey.
+    static SESSION: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Counts bindings: a session created for an older hotkey is closed when it arrives.
+    static SERIAL: Cell<u32> = const { Cell::new(0) };
+    static ACTIVATED: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn configure(app: &App) {
     let spec = app.ui().cfg.quick_terminal.hotkey.trim().to_string();
+    // The previous hotkey stops working, whether the new one is empty, changed or invalid.
+    SERIAL.with(|n| n.set(n.get() + 1));
+    if let Some(old) = SESSION.with(|s| s.borrow_mut().take()) {
+        close_session(&old);
+    }
+    BOUND.with(|b| *b.borrow_mut() = spec.clone());
     if spec.is_empty() {
         return;
     }
     match portal_trigger(&spec) {
-        Some(trigger) => {
-            BOUND.with(|b| *b.borrow_mut() = spec.clone());
-            bind_portal(trigger, spec);
-        }
+        Some(trigger) => bind_portal(trigger, spec),
         None => app.toast(&format!("Quick terminal: unknown hotkey \"{spec}\""), 8.0),
     }
 }
@@ -303,7 +311,8 @@ fn bind_portal(trigger: String, spec: String) {
     let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) else {
         return;
     };
-    let token = format!("thurm{}", std::process::id());
+    let serial = SERIAL.with(Cell::get);
+    let token = format!("thurm{}_{serial}", std::process::id());
     let opts = glib::VariantDict::new(None);
     opts.insert_value("handle_token", &token.to_variant());
     opts.insert_value("session_handle_token", &token.to_variant());
@@ -345,11 +354,20 @@ fn bind_portal(trigger: String, spec: String) {
             else {
                 return;
             };
+            if SERIAL.with(Cell::get) != serial {
+                // The hotkey changed while the portal was answering.
+                close_session(&session);
+                return;
+            }
             bind_shortcut(&bus2, &session, &trigger);
+            SESSION.with(|s| *s.borrow_mut() = Some(session));
         },
     );
     *sub.borrow_mut() = Some(id);
-    // Toggle on activation.
+    // Toggle on activation, once for every binding to come: only the current session counts.
+    if ACTIVATED.with(|a| a.replace(true)) {
+        return;
+    }
     bus.signal_subscribe(
         Some("org.freedesktop.portal.Desktop"),
         Some("org.freedesktop.portal.GlobalShortcuts"),
@@ -358,10 +376,29 @@ fn bind_portal(trigger: String, spec: String) {
         None,
         gio::DBusSignalFlags::NONE,
         |_, _, _, _, _, params| {
-            if params.child_value(1).str() == Some("quick-terminal") {
+            let session = params.child_value(0);
+            let current = SESSION.with(|s| s.borrow().as_deref() == session.str());
+            if current && params.child_value(1).str() == Some("quick-terminal") {
                 app::with_app(|a| a.toggle_quick());
             }
         },
+    );
+}
+
+fn close_session(session: &str) {
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) else {
+        return;
+    };
+    let _ = bus.call_sync(
+        Some("org.freedesktop.portal.Desktop"),
+        session,
+        "org.freedesktop.portal.Session",
+        "Close",
+        None,
+        None,
+        gio::DBusCallFlags::NONE,
+        3000,
+        None::<&gio::Cancellable>,
     );
 }
 

@@ -282,18 +282,26 @@ pub fn bindings(
             warnings.push(format!("keybindings: cannot read \"{spec}\""));
             continue;
         };
+        let action = action.trim();
+        let target = if action.is_empty() || action == "none" {
+            None
+        } else {
+            match find(action) {
+                Some(def) => Some(def.name),
+                None => {
+                    // A typo leaves the combination's default alone.
+                    warnings.push(format!("keybindings: unknown action \"{action}\""));
+                    continue;
+                }
+            }
+        };
         let parsed = parse_accel(&accel);
-        // The combination now means only this action.
+        // The combination now means only this action (or nothing).
         for list in out.values_mut() {
             list.retain(|a| parse_accel(a) != parsed);
         }
-        let action = action.trim();
-        if action.is_empty() || action == "none" {
-            continue;
-        }
-        match find(action) {
-            Some(def) => out.entry(def.name).or_default().insert(0, accel),
-            None => warnings.push(format!("keybindings: unknown action \"{action}\"")),
+        if let Some(name) = target {
+            out.entry(name).or_default().insert(0, accel);
         }
     }
     out
@@ -343,12 +351,15 @@ mod tests {
         user.insert("ctrl+shift+d".to_string(), "split_down".to_string());
         user.insert("ctrl+shift+t".to_string(), "none".to_string());
         user.insert("ctrl+x".to_string(), "bogus".to_string());
+        // A typo keeps the default: ctrl+shift+w still closes the pane.
+        user.insert("ctrl+shift+w".to_string(), "close_pnae".to_string());
         let mut warnings = Vec::new();
         let b = bindings(&user, &mut warnings);
         assert_eq!(b["split_down"][0], "<Control><Shift>d");
         assert!(!b["split_right"].contains(&"<Control><Shift>d".to_string()));
         assert!(b["new_tab"].is_empty());
-        assert_eq!(warnings.len(), 1);
+        assert!(b.values().flatten().any(|a| a == "<Control><Shift>w"));
+        assert_eq!(warnings.len(), 2);
     }
 
     #[test]
