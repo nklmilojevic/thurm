@@ -2754,8 +2754,16 @@ impl App {
         match name.as_str() {
             "NewTab" => {
                 let Some(k) = key else { return };
-                if self.tab_of(&k).is_some() {
-                    self.focus_pane(&k);
+                let new_window = p.get("new_window").and_then(Value::as_bool) == Some(true);
+                if let Some(tab) = self.tab_of(&k) {
+                    // Adopted while the app started (this command launched it): `--window` still
+                    // gets its own workspace, unless that would leave the window without a tab.
+                    let tabs = self.win().map_or(0, |w| w.ordered_tabs().len());
+                    if new_window && tab.panes().len() == 1 && tabs > 1 {
+                        self.move_tab_to_new_workspace(&tab);
+                    } else {
+                        self.focus_pane(&k);
+                    }
                     return;
                 }
                 self.fetch_info(&k);
@@ -2763,7 +2771,7 @@ impl App {
                 // Launched by this command, the app may have adopted the pane as an orphan
                 // already: it moves to where the command says.
                 self.take_hidden_tab(&k);
-                if p.get("new_window").and_then(Value::as_bool) == Some(true) {
+                if new_window {
                     // Its own new workspace, in the background.
                     let mut ws = self.make_workspace(&k.host);
                     ws.hidden_tabs.push(TabLayout {

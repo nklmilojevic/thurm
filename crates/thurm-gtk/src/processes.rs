@@ -41,6 +41,8 @@ pub fn show(app: &Rc<App>) {
     }
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
+    // A click focuses the pane; opening a port takes a double click (or Enter), as on macOS.
+    list.set_activate_on_single_click(false);
     list.add_css_class("rich-list");
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);

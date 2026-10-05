@@ -1186,15 +1186,22 @@ final class SessionManager: NSObject, CoreDelegate {
         switch v.name {
         case "NewTab":
             guard let pane = key("pane") else { return }
-            if controller(for: pane) != nil {
-                focusPane(pane, activate: true)
+            let ownWorkspace = jsonBool(d["new_window"]) ?? false
+            if let c = controller(for: pane) {
+                // Adopted while the app started (this command launched it): `--window` still
+                // gets its own workspace, unless that would leave the window without a tab.
+                if ownWorkspace, c.content.paneIds.count == 1, group(of: c).count > 1 {
+                    moveTabToNewWorkspace(c)
+                } else {
+                    focusPane(pane, activate: true)
+                }
                 return
             }
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
             // Launched by this command, the app may have adopted the pane as an orphan already:
             // it moves to where the command says.
             takeHiddenTab(pane)
-            if jsonBool(d["new_window"]) ?? false {
+            if ownWorkspace {
                 // `thurm new-tab --window`: its own workspace, in the background (Thurm stays
                 // where it is too).
                 newWindow(pane: pane, background: true)
