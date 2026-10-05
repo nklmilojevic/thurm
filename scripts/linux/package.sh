@@ -2,8 +2,9 @@
 # Builds the .deb and .rpm of the Linux app (linux/nfpm.yaml) from built binaries, for this
 # machine's architecture. Needs nfpm on PATH.
 #   scripts/linux/package.sh VERSION THURM_GTK MUSL_DIR OUT_DIR
-# VERSION is the workspace version (0.3.0), or 0.3.0~tip.<sha> for a tip build: `~` sorts
-# before the release in dpkg and rpm. THURM_GTK is the thurm-gtk binary, MUSL_DIR the
+# VERSION is the workspace version (0.3.0), or 0.3.0+tip.<commit count>.<sha> for a tip
+# build: it sorts after that release, before the next, and by commit among tips (dpkg, rpm
+# and pacman alike). THURM_GTK is the thurm-gtk binary, MUSL_DIR the
 # directory with the static thurm and thurmd; all three built with the same THURM_BUILD.
 # OUT_DIR gets the versioned packages, copies with fixed names (thurm-amd64.deb,
 # thurm-x86_64.rpm, ...) for releases/latest/download links, and a .sha256 for each.
@@ -32,10 +33,10 @@ for packager in deb rpm; do
 done
 
 cd "$work"
-# `~` stays in the package version but not in file names (release asset names).
+# `+` stays in the package version but not in file names (release asset names).
 shopt -s nullglob
-for f in *~*; do
-    mv -- "$f" "${f//\~/-}"
+for f in *+*; do
+    mv -- "$f" "${f//+/-}"
 done
 deb=(*.deb) rpm=(*.rpm)
 cp "${deb[0]}" "thurm-$deb_arch.deb"

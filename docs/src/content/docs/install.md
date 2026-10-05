@@ -49,15 +49,15 @@ and install it:
 sudo dnf install ./thurm-x86_64.rpm
 ```
 
-On Arch Linux and CachyOS, install the `thurm` package from the AUR with an AUR helper:
+On Arch Linux and CachyOS (x86_64), install the package from the latest release:
 
 ```sh
-paru -S thurm
+sudo pacman -U https://github.com/nklmilojevic/thurm/releases/latest/download/thurm-x86_64.pkg.tar.zst
 ```
 
 Each package installs the app (`thurm-gtk`, listed as **Thurm** in the desktop's app list),
 the daemon `thurmd`, and the `thurm` command-line tool. Updates come with new packages:
-download the new `.deb` or `.rpm`, or update with your AUR helper. Nightly builds of `main`
+install the new `.deb`, `.rpm` or `.pkg.tar.zst` the same way. Nightly builds of `main`
 are on the [tip release](https://github.com/nklmilojevic/thurm/releases/tag/tip), with the
 same file names.
 

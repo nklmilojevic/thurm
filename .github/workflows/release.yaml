@@ -120,11 +120,11 @@ jobs:
           # Same as macos/release/build-release.sh.
           if [[ "${{ github.event_name }}" == release ]]; then
             SHORT="$VERSION"
-            # Package version: `~` sorts a tip before its release in dpkg and rpm.
             PACKAGE="$VERSION"
           else
             SHORT="$VERSION-tip.$(git rev-parse --short=7 HEAD)"
-            PACKAGE="$VERSION~tip.$(git rev-parse --short=7 HEAD)"
+            # Package version: after the release it follows, before the next (dpkg, rpm, pacman).
+            PACKAGE="$VERSION+tip.$NUMBER.$(git rev-parse --short=7 HEAD)"
           fi
           BUILD="$SHORT+$NUMBER"
           echo "THURM_BUILD=$BUILD" >> "$GITHUB_ENV"
@@ -186,12 +186,78 @@ jobs:
           path: ${{ runner.temp }}/linux/*
           retention-days: 3
 
+  arch:
+    # The Arch Linux package (linux/arch/PKGBUILD, as on the AUR), built from this commit in an
+    # Arch container and checked by installing it. Published by the build job.
+    name: Arch package
+    needs: plan
+    if: >-
+      always()
+      && ((github.event_name == 'release' && !github.event.release.prerelease)
+        || (needs.plan.result == 'success' && needs.plan.outputs.build == 'true'))
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    permissions:
+      contents: read
+    steps:
+      # git first: the checkout must be a repository (arch-package.sh packs it with git ls-files).
+      - name: Build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git rustup zig musl pkgconf curl python \
+            gtk4 libadwaita fontconfig hicolor-icon-theme
+          useradd -m builder
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || needs.plan.outputs.sha }}
+          fetch-depth: 0 # the tip version has the commit count
+      - name: makepkg
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [[ "${{ github.event_name }}" == release ]]; then
+            PKGVER="$VERSION"
+          else
+            PKGVER="$VERSION+tip.$(git rev-list --count HEAD).$(git rev-parse --short=7 HEAD)"
+          fi
+          chown -R builder "$GITHUB_WORKSPACE"
+          # makepkg refuses to run as root.
+          sudo -u builder git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo -u builder env PKGVER="$PKGVER" scripts/linux/arch-package.sh /tmp/arch
+      - name: Install
+        run: |
+          set -euo pipefail
+          pacman -U --noconfirm /tmp/arch/thurm-*.pkg.tar.zst
+          if ldd /usr/bin/thurm-gtk | grep "not found"; then exit 1; fi
+          thurm --version
+          test -f /usr/share/thurm/icons/hicolor/scalable/actions/tab-new-symbolic.svg
+      - name: Package
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/linux"
+          mkdir -p "$OUT"
+          cd /tmp/arch
+          for f in thurm-*.pkg.tar.zst; do
+            # `+` stays in the package version but not in file names (release asset names).
+            cp "$f" "$OUT/${f//+/-}"
+          done
+          cp thurm-*.pkg.tar.zst "$OUT/thurm-x86_64.pkg.tar.zst"
+          cd "$OUT"
+          for f in *.pkg.tar.zst; do sha256sum "$f" > "$f.sha256"; done
+          cat ./*.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-arch-x86_64
+          path: ${{ runner.temp }}/linux/*
+          retention-days: 3
+
   build:
     name: Build (${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }})
-    needs: [plan, linux]
+    needs: [plan, linux, arch]
     if: >-
       always()
       && needs.linux.result == 'success'
+      && needs.arch.result == 'success'
       && ((github.event_name == 'release' && !github.event.release.prerelease)
         || (needs.plan.result == 'success' && needs.plan.outputs.build == 'true'))
     runs-on: macos-26
@@ -383,7 +449,7 @@ jobs:
             echo
             echo "Download **Thurm-tip.dmg**, or choose *Thurm › Update Channel › Tip* in any Thurm to get these builds automatically."
             echo
-            echo "Linux (Ubuntu 24.04+, Debian 13+, Fedora 40+): **thurm-amd64.deb** / **thurm-arm64.deb** or **thurm-x86_64.rpm** / **thurm-aarch64.rpm**."
+            echo "Linux (Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch): **thurm-amd64.deb** / **thurm-arm64.deb**, **thurm-x86_64.rpm** / **thurm-aarch64.rpm**, or **thurm-x86_64.pkg.tar.zst** (\`sudo pacman -U\` its link)."
             echo
             # The changes in this build (the appcast's notes, less their heading).
             tail -n +3 "$THURM_NOTES_FILE"
@@ -397,8 +463,8 @@ jobs:
           gh release upload tip --repo "$REPO" --clobber "$RUNNER_TEMP"/linux/thurm[-_]*
           # Only this build's versioned Linux packages (the fixed names are replaced above).
           gh release view tip --repo "$REPO" --json assets -q '.assets[].name' \
-            | { grep -E '^(thurm_.*\.deb|thurm-[0-9].*\.rpm)(\.sha256)?$' || true; } \
-            | { grep -vF -- "-tip.${SHA:0:7}" || true; } \
+            | { grep -E '^(thurm_.*\.deb|thurm-[0-9].*\.(rpm|pkg\.tar\.zst))(\.sha256)?$' || true; } \
+            | { grep -vF -- ".${SHA:0:7}" || true; } \
             | while read -r old; do gh release delete-asset tip "$old" --repo "$REPO" --yes; done
           cd macos/build/dist
           gh release upload tip --repo "$REPO" --clobber Thurm-tip-*.zip Thurm-tip.dmg

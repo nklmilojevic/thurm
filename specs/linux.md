@@ -64,12 +64,15 @@ tunnel), panes keyed by (host, id).
   `linux/nfpm.yaml`): `thurm_<ver>-1_<arch>.deb`, `thurm-<ver>-1.<arch>.rpm`, and copies with
   fixed names (`thurm-amd64.deb`, `thurm-x86_64.rpm`, …) for `releases/latest/download`
   links. Each is installed in an `ubuntu:24.04` / `fedora:43` container before publishing.
-  Tip packages are versioned `<ver>~tip.<sha>`, which sorts before the release.
+  Tip packages are versioned `<ver>+tip.<commit count>.<sha>`: after the release they follow,
+  before the next, in dpkg, rpm and pacman alike.
 - Arch / CachyOS: `linux/arch/PKGBUILD` is the AUR package `thurm` (built from the release's
   tag tarball, with Arch's `zig`). `scripts/linux/aur-update.sh VERSION AUR_DIR` updates a
   clone of the AUR repository for a release (version, checksum, `.SRCINFO`) and commits;
   pushing is manual. `scripts/linux/arch-package.sh` builds the same PKGBUILD from the
-  working tree into `target/arch/`; the `Arch package` workflow runs it in an Arch container.
+  working tree into `target/arch/`; the `Arch package` workflow runs it in an Arch container,
+  and the release workflow's `arch` job publishes its result as `thurm-x86_64.pkg.tar.zst`
+  (until the package is on the AUR, whose registration was closed in October 2026).
 - From source on Ubuntu 24.04+ / Debian: `scripts/linux/provision.sh`, then
   `scripts/linux/install.sh` (installs to `~/.local`).
 - Installed layout: `/usr/bin/{thurm-gtk,thurm,thurmd}`, the desktop entry (with New Tab, New
