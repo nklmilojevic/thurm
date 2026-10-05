@@ -133,21 +133,30 @@ fn copyable(target: &str, local_bins: Option<&Path>) -> bool {
 
 /// A 64-bit little-endian ELF executable without a program interpreter (statically linked).
 fn is_static_elf(path: &Path) -> bool {
-    let Ok(data) = std::fs::read(path) else {
+    use std::io::{Read, Seek, SeekFrom};
+    // Only the ELF header and the program headers: not the whole binary.
+    let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    if data.len() < 64 || &data[..4] != b"\x7fELF" || data[4] != 2 || data[5] != 1 {
+    let mut head = [0u8; 64];
+    if file.read_exact(&mut head).is_err() || &head[..4] != b"\x7fELF" || head[4] != 2 || head[5] != 1 {
         return false;
     }
-    let u16_at = |o: usize| u16::from_le_bytes([data[o], data[o + 1]]) as usize;
-    let phoff = u64::from_le_bytes(data[0x20..0x28].try_into().unwrap_or_default()) as usize;
-    let (size, count) = (u16_at(0x36), u16_at(0x38));
-    (0..count).all(|i| {
-        let o = phoff + i * size;
-        // PT_INTERP: dynamically linked.
-        data.get(o..o + 4)
-            .is_some_and(|t| u32::from_le_bytes(t.try_into().unwrap_or_default()) != 3)
-    })
+    let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as usize;
+    let phoff = u64::from_le_bytes(head[0x20..0x28].try_into().unwrap_or_default());
+    let (size, count) = (u16_at(&head, 0x36), u16_at(&head, 0x38));
+    // A sane, bounded table (entries are 56 bytes); anything else is no executable of ours.
+    if size < 4 || size * count > 64 * 1024 * 1024 || file.seek(SeekFrom::Start(phoff)).is_err() {
+        return false;
+    }
+    let mut table = vec![0u8; size * count];
+    if file.read_exact(&mut table).is_err() {
+        return false;
+    }
+    // PT_INTERP: dynamically linked.
+    table
+        .chunks_exact(size)
+        .all(|h| u32::from_le_bytes(h[..4].try_into().unwrap_or_default()) != 3)
 }
 
 /// Probes the host and its daemon and lists the ways to put our build there.
@@ -560,6 +569,12 @@ mod tests {
         assert!(is_static_elf(&st));
         assert!(!is_static_elf(&dy));
         assert!(!is_static_elf(&txt));
+        // A truncated program-header table.
+        std::fs::write(&txt, &elf(1)[..80]).unwrap();
+        assert!(!is_static_elf(&txt));
+        if cfg!(target_os = "linux") {
+            assert!(!is_static_elf(Path::new("/bin/sh")));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
