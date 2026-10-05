@@ -42,7 +42,8 @@ tunnel), panes keyed by (host, id).
   Wayland does not let apps place windows, so it fades in where the compositor puts it instead
   of sliding from a screen edge. Its size follows `quick_terminal.screen`: `mouse` uses the
   monitor showing the main window (GTK cannot see the pointer outside its windows), `main` the
-  first monitor.
+  first monitor. The hotkey hides it whenever it is shown (macOS: only when it has focus, else
+  focuses it), because a Wayland compositor may not focus the window it shows.
 - **Updates**: no Sparkle; packages are updated by the package manager.
 - **Secure keyboard entry**: macOS-only. Linux shows the lock badge on password prompts (input
   is not observable by other Wayland clients anyway).

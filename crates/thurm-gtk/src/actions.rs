@@ -368,6 +368,26 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_user_bindings_have_one_owner() {
+        // Two spellings of one combination: the later entry (BTreeMap order) owns it, in the
+        // bindings GTK registers and in the terminal's keymap alike.
+        let mut user = std::collections::BTreeMap::new();
+        user.insert("ctrl+shift+t".to_string(), "split_down".to_string());
+        user.insert("shift+ctrl+t".to_string(), "zoom_split".to_string());
+        let mut warnings = Vec::new();
+        let b = bindings(&user, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let c = normalized("<Control><Shift>t");
+        let owners: Vec<&str> = b
+            .iter()
+            .filter(|(_, accels)| accels.iter().any(|a| normalized(a) == c))
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(owners.len(), 1, "{owners:?}");
+        assert_eq!(keymap(&b).get(&c.unwrap()), Some(&owners[0]));
+    }
+
+    #[test]
     fn defaults_share_no_combination() {
         let mut owner: HashMap<Combo, &str> = HashMap::new();
         for a in ACTIONS {
