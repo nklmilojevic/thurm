@@ -208,6 +208,9 @@ mod tests {
         assert!(!info.name.is_empty());
         assert!(!info.argv.is_empty());
         assert!(cwd(me).is_some());
+        let birth = process_birth(me).expect("self process birth");
+        assert_eq!(process_birth(me), Some(birth));
+        assert!(process_birth(u32::MAX).is_none());
     }
 }
 
@@ -466,4 +469,53 @@ mod proc_tests {
         assert_eq!(find_var(env.into_iter(), "EMPTY").as_deref(), Some(""));
         assert_eq!(find_var(env.into_iter(), "PAT"), None);
     }
+}
+
+/// Process birth, used to distinguish a reused PID from its previous process.
+#[cfg(target_os = "linux")]
+pub fn process_birth(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The first field after the name is field 3; starttime is field 22.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_birth(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (n == size).then(|| {
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec)
+    })
+}
+
+/// Read the agent's identity and confirm that it belongs to the pane's foreground.
+pub fn report_owner(pid: u32, foreground: Option<u32>) -> Result<(u64, u32), String> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err("invalid owner PID".into());
+    }
+    let birth = process_birth(pid).ok_or("cannot read the report owner's process")?;
+    let pgrp = unsafe { libc::getpgid(pid as i32) };
+    if pgrp <= 0 || Some(pgrp as u32) != foreground {
+        return Err("report owner is not in the pane's foreground process group".into());
+    }
+    if process_info(pid).is_none_or(|p| is_shell(&p.name)) {
+        return Err("report owner must be an agent process, not a shell".into());
+    }
+    Ok((birth, pgrp as u32))
 }

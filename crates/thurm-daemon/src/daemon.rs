@@ -1288,6 +1288,9 @@ impl Daemon {
                         st.term.flush_sync();
                     }
                     let before = st.info.clone();
+                    if st.agent.invalidate_dead_report_owner() {
+                        st.info.agent = st.agent.state().cloned();
+                    }
                     let fg = st.pty.foreground_pgrp().and_then(procinfo::process_info);
                     st.info.password_input = st.pty.password_mode();
                     if (st.osc_cwd.is_none() || !st.shell_integration_seen)
@@ -1459,6 +1462,7 @@ impl Daemon {
                     .state()
                     .and(st.agent.session_id())
                     .map(str::to_owned),
+                agent_resume: st.agent.resume_argv().map(<[String]>::to_vec),
                 size: st.info.size.into(),
             });
         }
@@ -1554,6 +1558,7 @@ impl Daemon {
                 pending: upgrade::PaneHandoff::encode_state(&st.carry),
                 shell_token: st.term.shell_token().map(str::to_owned),
                 shell_path: st.term.shell_path().map(str::to_owned),
+                agent_report: st.agent.report_handoff(),
             });
         }
         upgrade::Handoff {
@@ -1618,7 +1623,18 @@ impl Daemon {
                 alive,
             );
             match installed {
-                Ok(()) => adopted += 1,
+                Ok(()) => {
+                    adopted += 1;
+                    if let Some(report) = p.agent_report
+                        && let Some(pane) = self.pane(p.id)
+                    {
+                        let mut st = pane.state.lock();
+                        let fg = st.pty.foreground_pgrp();
+                        st.agent.saw_foreground(fg);
+                        st.agent.restore_report_handoff(report);
+                        st.info.agent = st.agent.state().cloned();
+                    }
+                }
                 Err(e) => log::warn!("pane {}: {e}", p.id),
             }
         }
@@ -1637,8 +1653,13 @@ impl Daemon {
         let mut restored = 0;
         for p in &snap.panes {
             let history = store.load_scrollback(p.id);
+            let reported_resume = p.agent_resume.as_ref().filter(|argv| {
+                cfg.session.resume_agents
+                    && p.agent_session.is_some()
+                    && agents::reporting::validate_resume(argv).is_ok()
+            });
             let req = CreatePane {
-                command: p.command.clone(),
+                command: reported_resume.cloned().or_else(|| p.command.clone()),
                 cwd: p.cwd.clone(),
                 size: p.size.into(),
                 ..Default::default()
@@ -1646,7 +1667,11 @@ impl Daemon {
             match self.create_pane(req, Some((p.id, history))) {
                 Ok(id) => {
                     restored += 1;
-                    if cfg.session.resume_agents && p.command.is_none() {
+                    if reported_resume.is_some() {
+                        if let Some(pane) = self.pane(id) {
+                            pane.state.lock().command = p.command.clone();
+                        }
+                    } else if cfg.session.resume_agents && p.command.is_none() {
                         let def = p
                             .agent
                             .as_ref()
@@ -2159,7 +2184,13 @@ impl Daemon {
                     .map_or_else(|| agent.clone(), |d| d.name.clone());
                 self.with_pane(pane, |_, st| {
                     let before = st.info.agent.clone();
+                    if st.agent.invalidate_dead_report_owner() {
+                        st.info.agent = st.agent.state().cloned();
+                    }
                     st.agent.saw_foreground(st.pty.foreground_pgrp());
+                    if st.agent.public_report_active() {
+                        return;
+                    }
                     st.agent
                         .apply_hook(pgrp, &agent, &name, &event, session_id, message);
                     st.agent.titles = titles;
@@ -2179,6 +2210,96 @@ impl Daemon {
                         }
                     }
                 })?;
+                self.session_dirty.store(true, Ordering::Relaxed);
+                Ok(Response::Ok)
+            }
+            Request::AgentExplain { pane } => {
+                let defs = self.agent_defs.read().clone();
+                let cfg = self.config.read();
+                let idle_after = Duration::from_millis(cfg.agents.idle_after_ms);
+                let detect = cfg.agents.detect;
+                drop(cfg);
+                let explanation = self.with_pane(pane, |_, st| {
+                    if st.agent.invalidate_dead_report_owner() {
+                        st.info.agent = st.agent.state().cloned();
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    }
+                    let fg = st.pty.foreground_pgrp().and_then(procinfo::process_info);
+                    let screen = agents::tail(&st.term.screen_text(), 20);
+                    let idle = st.term.last_output.elapsed();
+                    if detect
+                        && let Some(new) =
+                            st.agent
+                                .update(&defs, fg.as_ref(), &screen, idle, idle_after)
+                    {
+                        st.info.agent = new;
+                        st.info.title = pane_title(st, fg.as_ref());
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    }
+                    let mut result = st.agent.explain(pane, &defs, fg, &screen, idle, idle_after);
+                    if !detect {
+                        result.rules.push("automatic detection is disabled".into());
+                    }
+                    result
+                })?;
+                Ok(Response::AgentExplanation(explanation))
+            }
+            Request::AgentReport { pane, report } => {
+                let name = self
+                    .agent_defs
+                    .read()
+                    .iter()
+                    .find(|d| d.kind == report.agent)
+                    .map_or_else(|| report.agent.clone(), |d| d.name.clone());
+                self.with_pane(pane, |_, st| -> Result<(), String> {
+                    if !st.info.alive {
+                        return Err("pane process has exited".into());
+                    }
+                    if st.agent.invalidate_dead_report_owner() {
+                        st.info.agent = st.agent.state().cloned();
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    }
+                    let fg = st.pty.foreground_pgrp();
+                    let (birth, pgrp) = procinfo::report_owner(report.owner_pid, fg)?;
+                    let before = st.info.agent.clone();
+                    st.agent.saw_foreground(fg);
+                    st.agent.apply_report(&report, birth, pgrp, &name)?;
+                    if let Some(new) = st.agent.refresh() {
+                        let events =
+                            self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
+                        st.info.agent = new;
+                        st.info.title = pane_title(st, st.info.foreground.as_ref());
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                        for ev in events {
+                            self.broadcast(ev, true);
+                        }
+                    }
+                    Ok(())
+                })??;
+                self.session_dirty.store(true, Ordering::Relaxed);
+                Ok(Response::Ok)
+            }
+            Request::AgentRelease {
+                pane,
+                owner_pid,
+                instance,
+                sequence,
+            } => {
+                self.with_pane(pane, |_, st| -> Result<(), String> {
+                    if st.agent.invalidate_dead_report_owner() {
+                        st.info.agent = st.agent.state().cloned();
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    }
+                    let fg = st.pty.foreground_pgrp();
+                    let (birth, _) = procinfo::report_owner(owner_pid, fg)?;
+                    st.agent.saw_foreground(fg);
+                    st.agent
+                        .release_report(owner_pid, birth, &instance, sequence)?;
+                    st.info.agent = st.agent.state().cloned();
+                    st.info.title = pane_title(st, st.info.foreground.as_ref());
+                    self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    Ok(())
+                })??;
                 self.session_dirty.store(true, Ordering::Relaxed);
                 Ok(Response::Ok)
             }

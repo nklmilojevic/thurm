@@ -245,6 +245,22 @@ pub enum Request {
     DetachTerminal {
         pane: PaneId,
     },
+    /// Explain the process and rules used to detect an agent.
+    AgentExplain {
+        pane: PaneId,
+    },
+    /// Report an agent state from its current process instance.
+    AgentReport {
+        pane: PaneId,
+        report: AgentReport,
+    },
+    /// End reporting for this process instance. The sequence must increase.
+    AgentRelease {
+        pane: PaneId,
+        owner_pid: u32,
+        instance: String,
+        sequence: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -323,6 +339,36 @@ pub enum Response {
     AgentPresets(Vec<AgentPreset>),
     Processes(Vec<PaneProcesses>),
     Completions(Completions),
+    AgentExplanation(AgentExplanation),
+}
+
+/// A report is scoped to one process instance in one pane.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AgentReport {
+    pub agent: String,
+    pub owner_pid: u32,
+    pub instance: String,
+    pub sequence: u64,
+    pub status: AgentStatus,
+    pub session_id: Option<String>,
+    pub message: Option<String>,
+    /// Complete arguments for this session. No placeholder expansion is done.
+    pub resume_argv: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AgentExplanation {
+    pub pane: PaneId,
+    pub state: Option<AgentState>,
+    pub foreground: Option<ProcessInfo>,
+    pub source: String,
+    pub rules: Vec<String>,
+    pub screen_tail: String,
+    pub idle_ms: u64,
+    pub idle_after_ms: u64,
+    pub report_instance: Option<String>,
+    pub report_sequence: Option<u64>,
+    pub report_owner_pid: Option<u32>,
 }
 
 #[allow(clippy::large_enum_variant)]

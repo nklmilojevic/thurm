@@ -16,6 +16,8 @@ use thurm_proto::{AgentState, AgentStatus, ProcessInfo};
 
 use crate::transcript::TitleReader;
 
+pub mod reporting;
+
 #[derive(Default, Debug)]
 pub struct AgentTracker {
     current: Option<AgentState>,
@@ -33,6 +35,9 @@ pub struct AgentTracker {
     /// status (a request, a finished turn) must not stick to the next.
     episode: u64,
     ai: AiNotes,
+    report_owner: Option<reporting::ReportOwner>,
+    report_resume: Option<Vec<String>>,
+    retired_report_instances: std::collections::HashSet<String>,
 }
 
 /// What the on-device model said about the current agent session (`[ai]`).
@@ -398,7 +403,11 @@ impl AgentTracker {
     }
 
     fn with_hook(&self, mut state: AgentState) -> AgentState {
-        if let Some(h) = self.hook.as_ref().filter(|h| h.kind == state.kind) {
+        if let Some(h) = self
+            .hook
+            .as_ref()
+            .filter(|h| h.kind == state.kind && h.pgrp == self.fg_pgrp)
+        {
             state.status = h.status;
             state.session_id = h.session_id.clone();
             state.message = h.message.clone();

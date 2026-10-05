@@ -7,6 +7,7 @@
 mod events;
 mod layouts;
 mod attach;
+mod agent;
 mod remote;
 
 use std::io::{IsTerminal, Read, Write};
@@ -134,6 +135,11 @@ enum Cmd {
     Attach {
         #[arg(short, long)]
         pane: PaneId,
+    },
+    /// Inspect or report agent state.
+    Agent {
+        #[command(subcommand)]
+        action: agent::AgentCmd,
     },
     /// List panes.
     #[command(alias = "ls")]
@@ -1012,6 +1018,7 @@ fn pane_size_default() -> PaneSize {
 
 fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
     match cmd {
+        Cmd::Agent { action } => return agent::run(c, action, json),
         Cmd::List => {
             let panes = list(c)?;
             if json {

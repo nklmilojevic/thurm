@@ -73,6 +73,9 @@ pub struct PaneHandoff {
     /// The `$PATH` the shell reported (it only reports it again when it changes).
     #[serde(default)]
     pub shell_path: Option<String>,
+    /// Ordered public reporting state for agent processes that remain alive.
+    #[serde(default)]
+    pub agent_report: Option<crate::agents::reporting::ReportHandoff>,
 }
 
 impl PaneHandoff {
