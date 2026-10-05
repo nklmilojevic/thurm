@@ -1605,3 +1605,106 @@ fn bash_prompt_command_array_keeps_output_on_resize() {
     let after = capture(&c, pane);
     assert!(after.contains("out2"), "{after}");
 }
+
+#[test]
+fn terminal_attachment_owns_input_and_restores_size() {
+    let env = Env::new("terminal-attachment");
+    let _daemon = env.start();
+    let (ui, _) = env.connect();
+    let pane = create(&ui, &env.dir);
+    let original = match ui.request(Request::PaneInfo { pane }).unwrap() {
+        Response::PaneInfo(info) => info.size,
+        other => panic!("{other:?}"),
+    };
+    let (owner, events) = env.connect();
+    let attached_size = PaneSize {
+        cols: 93,
+        rows: 31,
+        ..original
+    };
+    owner
+        .request(Request::AttachTerminal {
+            pane,
+            size: attached_size,
+        })
+        .unwrap();
+    let state = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Attach { size, state, .. } => {
+                assert_eq!(size, attached_size);
+                Some(state)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(!state.is_empty());
+    for request in [
+        Request::AttachTerminal {
+            pane,
+            size: original,
+        },
+        Request::Input {
+            pane,
+            data: b"echo forbidden\r".to_vec(),
+        },
+        Request::Paste {
+            pane,
+            text: "forbidden".into(),
+        },
+        Request::Resize {
+            pane,
+            size: original,
+        },
+        Request::DetachTerminal { pane },
+        Request::AnswerPermission {
+            pane,
+            prompt: 1,
+            allow: true,
+        },
+    ] {
+        assert!(ui.request(request).is_err());
+    }
+    owner
+        .request(Request::Input {
+            pane,
+            data: b"echo attached-$((42+1))\r".to_vec(),
+        })
+        .unwrap();
+    wait_match(&owner, pane, "attached-43");
+    owner.request(Request::DetachTerminal { pane }).unwrap();
+    assert!(
+        matches!(ui.request(Request::PaneInfo { pane }).unwrap(), Response::PaneInfo(info) if info.size == original)
+    );
+    ui.request(Request::Input {
+        pane,
+        data: b"echo released-$((42+2))\r".to_vec(),
+    })
+    .unwrap();
+    wait_match(&ui, pane, "released-44");
+    owner
+        .request(Request::AttachTerminal {
+            pane,
+            size: attached_size,
+        })
+        .unwrap();
+    drop(owner);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(ui.request(Request::PaneInfo { pane }).unwrap(), Response::PaneInfo(info) if info.size == original)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attachment was not released after disconnect"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    ui.request(Request::AttachTerminal {
+        pane,
+        size: attached_size,
+    })
+    .unwrap();
+    ui.request(Request::DetachTerminal { pane }).unwrap();
+}

@@ -1369,10 +1369,12 @@ dependencies = [
  "libc",
  "parking_lot",
  "serde_json",
+ "signal-hook",
  "thurm-client",
  "thurm-config",
  "thurm-proto",
  "thurm-remote",
+ "thurm-term",
 ]
 
 [[package]]

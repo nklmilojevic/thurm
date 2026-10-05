@@ -6,6 +6,7 @@
 
 mod events;
 mod layouts;
+mod attach;
 mod remote;
 
 use std::io::{IsTerminal, Read, Write};
@@ -129,6 +130,11 @@ impl From<Dir> for SplitDir {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Attach to a pane. Press Ctrl-] then d to detach.
+    Attach {
+        #[arg(short, long)]
+        pane: PaneId,
+    },
     /// List panes.
     #[command(alias = "ls")]
     List,
@@ -550,6 +556,7 @@ fn run(cli: Cli) -> R {
     }
     match cli.cmd {
         Cmd::Events { pane } => events::run(remote.as_deref(), pane),
+        Cmd::Attach { pane } => attach::run(pane, remote.as_deref(), json),
         Cmd::SocketPath => {
             println!("{}", thurm_config::socket_path().display());
             Ok(ExitCode::SUCCESS)
@@ -1439,7 +1446,8 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             c.request(Request::SaveSnapshot)?;
             println!("session saved");
         }
-        Cmd::PaneId
+        Cmd::Attach { .. }
+        | Cmd::PaneId
         | Cmd::ConfigPath
         | Cmd::SocketPath
         | Cmd::RemoteInfo

@@ -1,5 +1,8 @@
 //! Daemon state: panes, clients, frame pump, monitor loop and request handling.
 
+#[path = "terminal_attach.rs"]
+mod terminal_attach;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::RawFd;
@@ -277,6 +280,7 @@ pub struct PaneState {
     pub command: Option<Vec<String>>,
     pub hold: bool,
     pub subscribers: HashMap<u64, Subscriber>,
+    pub terminal_attachment: Option<(u64, PaneSize)>,
     pub agent: AgentTracker,
     osc_cwd: Option<String>,
     command_started: Option<Instant>,
@@ -442,7 +446,9 @@ impl Daemon {
     pub fn remove_client(&self, id: u64) {
         self.clients.lock().remove(&id);
         for p in self.all_panes() {
-            p.state.lock().subscribers.remove(&id);
+            let mut st = p.state.lock();
+            st.subscribers.remove(&id);
+            self.release_terminal(&mut st, id);
         }
         *self.last_activity.lock() = Instant::now();
     }
@@ -603,6 +609,7 @@ impl Daemon {
                 command: p.command,
                 hold: p.hold,
                 subscribers: HashMap::new(),
+                terminal_attachment: None,
                 agent: AgentTracker::default(),
                 osc_cwd: p.osc_cwd,
                 command_started: None,
@@ -1829,6 +1836,8 @@ impl Daemon {
 
     fn dispatch(self: &Arc<Self>, client: &Arc<Client>, req: Request) -> Result<Response, String> {
         match req {
+            Request::AttachTerminal { pane, size } => self.attach_terminal(client, pane, size),
+            Request::DetachTerminal { pane } => self.detach_terminal(client.id, pane),
             Request::Hello {
                 client: name,
                 version,
@@ -1935,7 +1944,7 @@ impl Daemon {
             }
             Request::Resize { pane, size } => {
                 let size = sanitize_size(size);
-                self.with_pane(pane, |_, st| {
+                self.with_input_pane(client.id, pane, |_, st| {
                     if st.info.size != size {
                         if let Err(e) = st.pty.resize(size) {
                             log::warn!("pane {pane}: resize to {}x{}: {e}", size.cols, size.rows);
@@ -1948,21 +1957,21 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::Input { pane, data } => {
-                self.with_pane(pane, |p, st| {
+                self.with_input_pane(client.id, pane, |p, st| {
                     st.agent.user_answer(&data);
                     p.write(data);
                 })?;
                 Ok(Response::Ok)
             }
             Request::Paste { pane, text } => {
-                self.with_pane(pane, |p, st| {
+                self.with_input_pane(client.id, pane, |p, st| {
                     st.agent.user_input();
                     p.write(st.term.paste(&text));
                 })?;
                 Ok(Response::Ok)
             }
             Request::Key { pane, key } => {
-                self.with_pane(pane, |p, st| {
+                self.with_input_pane(client.id, pane, |p, st| {
                     let bytes = st.term.key(&key);
                     if !bytes.is_empty() {
                         st.agent.user_answer(&bytes);
@@ -1973,7 +1982,7 @@ impl Daemon {
             }
             Request::Mouse { pane, event } => {
                 let copy_on_select = self.config.read().terminal.copy_on_select;
-                let text = self.with_pane(pane, |p, st| {
+                let text = self.with_input_pane(client.id, pane, |p, st| {
                     let (outcome, bytes) = st.term.mouse(&event);
                     p.write(bytes);
                     (outcome == MouseOutcome::SelectionDone && copy_on_select)
@@ -1991,7 +2000,9 @@ impl Daemon {
                 row,
                 mods,
             } => {
-                self.with_pane(pane, |p, st| p.write(st.term.wheel(lines, col, row, mods)))?;
+                self.with_input_pane(client.id, pane, |p, st| {
+                    p.write(st.term.wheel(lines, col, row, mods))
+                })?;
                 Ok(Response::Ok)
             }
             Request::Scroll { pane, scroll } => {
@@ -2004,7 +2015,7 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::Focus { pane, focused } => {
-                self.with_pane(pane, |p, st| {
+                self.with_input_pane(client.id, pane, |p, st| {
                     if let Some(b) = st.term.focus(focused) {
                         p.write(b);
                     }
@@ -2086,7 +2097,7 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::ClipboardReply { pane, text } => {
-                let events = self.with_pane(pane, |_, st| {
+                let events = self.with_input_pane(client.id, pane, |_, st| {
                     st.term.clipboard_reply(&text);
                     st.term.drain_events()
                 })?;
@@ -2195,16 +2206,27 @@ impl Daemon {
                 allow,
             } => {
                 let mut answered = false;
+                let mut attached = false;
                 let p = self
                     .pane(pane)
                     .ok_or_else(|| format!("no such pane: {pane}"))?;
                 self.update_agent(pane, |st| {
+                    if st
+                        .terminal_attachment
+                        .is_some_and(|(owner, _)| owner != client.id)
+                    {
+                        attached = true;
+                        return Vec::new();
+                    }
                     if let Some(keys) = st.agent.answer_permission(prompt, allow) {
                         p.write(keys.to_vec());
                         answered = true;
                     }
                     Vec::new()
                 });
+                if attached {
+                    return Err("pane input belongs to an attached terminal".into());
+                }
                 if !answered {
                     return Err("that permission prompt is no longer showing".into());
                 }

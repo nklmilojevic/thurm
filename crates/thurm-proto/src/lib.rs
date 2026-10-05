@@ -236,6 +236,15 @@ pub enum Request {
     },
     /// Check that a desktop client can open a layout.
     CheckUi,
+    /// Acquire exclusive input and resize control, then subscribe to the pane.
+    AttachTerminal {
+        pane: PaneId,
+        size: PaneSize,
+    },
+    /// Release terminal control and restore the previous pane size.
+    DetachTerminal {
+        pane: PaneId,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
