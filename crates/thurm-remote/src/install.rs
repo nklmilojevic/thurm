@@ -116,16 +116,15 @@ pub fn same_build(ours: &str, theirs: &str) -> bool {
     }
 }
 
-/// Our own binaries run there: the same target, or (a Linux app's helpers) static Linux
-/// binaries of the same architecture.
+/// Our own binaries run there: the same target (macOS), or static Linux binaries of the same
+/// architecture (a Linux host has none of our libraries, whatever the target string says).
 fn copyable(target: &str, local_bins: Option<&Path>) -> bool {
     let ours = crate::current_target();
-    if target == ours {
-        return true;
+    if !target.contains("-linux-") {
+        return target == ours;
     }
     let arch = |t: &str| t.split('-').next().unwrap_or("").to_string();
-    target.contains("-linux-")
-        && ours.contains("-linux-")
+    ours.contains("-linux-")
         && arch(target) == arch(ours)
         && local_bins
             .and_then(local_binaries)
@@ -561,6 +560,28 @@ mod tests {
         assert!(is_static_elf(&st));
         assert!(!is_static_elf(&dy));
         assert!(!is_static_elf(&txt));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn linux_copies_need_static_helpers() {
+        let dir = std::env::temp_dir().join(format!("thurm-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = crate::current_target();
+        // Dynamically linked helpers: not even to the very same Linux target.
+        std::fs::write(dir.join("thurm"), elf(3)).unwrap();
+        std::fs::write(dir.join("thurmd"), elf(3)).unwrap();
+        assert!(!copyable("x86_64-unknown-linux-musl", Some(&dir)));
+        assert!(!copyable("aarch64-unknown-linux-musl", Some(&dir)));
+        if ours.contains("-linux-") {
+            assert!(!copyable(ours, Some(&dir)));
+            std::fs::write(dir.join("thurm"), elf(1)).unwrap();
+            std::fs::write(dir.join("thurmd"), elf(1)).unwrap();
+            assert!(copyable(ours, Some(&dir)));
+        } else {
+            // macOS: the same target is enough.
+            assert!(copyable(ours, None));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

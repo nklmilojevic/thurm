@@ -703,8 +703,13 @@ fn shorten_message(message: &str, agent_name: &str) -> String {
 
 // MARK: - Shell escaping
 
-/// Backslash-escapes characters the shell treats specially (a leading `~` stays).
-pub fn shell_escape(s: &str) -> String {
+/// Backslash-escapes characters the shell treats specially (a leading `~` stays). `None` for
+/// text with control characters: no escape is safe in every shell (a backslash before a line
+/// break continues the line), so such a path is not typed at all.
+pub fn shell_escape(s: &str) -> Option<String> {
+    if s.chars().any(char::is_control) {
+        return None;
+    }
     let mut out = String::with_capacity(s.len());
     for (i, c) in s.chars().enumerate() {
         if i == 0 && c == '~' {
@@ -716,7 +721,7 @@ pub fn shell_escape(s: &str) -> String {
         }
         out.push(c);
     }
-    out
+    Some(out)
 }
 
 // MARK: - Palette matching
@@ -908,7 +913,9 @@ mod tests {
 
     #[test]
     fn escaping() {
-        assert_eq!(shell_escape("~/a b/(x).png"), "~/a\\ b/\\(x\\).png");
+        assert_eq!(shell_escape("~/a b/(x).png").as_deref(), Some("~/a\\ b/\\(x\\).png"));
+        assert_eq!(shell_escape("/tmp/x\nrm -rf ~"), None);
+        assert_eq!(shell_escape("/tmp/x\ry"), None);
     }
 
     #[test]

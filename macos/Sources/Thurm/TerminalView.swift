@@ -860,8 +860,7 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Types the completion into the shell: only the missing part when `text` extends `word`,
     /// else backspaces over the word first. Special characters are escaped.
     private func insertCompletion(_ text: String, replacing word: String, final: Bool) {
-        let escaped = shellEscape(text)
-        let typed = shellEscape(word)
+        guard let escaped = shellEscape(text), let typed = shellEscape(word) else { return }
         var out = ""
         if escaped.hasPrefix(typed) {
             out = String(escaped.dropFirst(typed.count))
@@ -873,7 +872,10 @@ final class TerminalView: NSView, NSTextInputClient {
         Core.shared.input(pane, text: out)
     }
 
-    private func shellEscape(_ s: String) -> String {
+    /// nil for text with control characters: no escape is safe in every shell (a backslash
+    /// before a line break continues the line), so such a path is not typed at all.
+    private func shellEscape(_ s: String) -> String? {
+        if s.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) { return nil }
         var out = ""
         for c in s {
             if " \t'\"\\$`!&;|()<>*?[]{}#~".contains(c) && !(c == "~" && out.isEmpty) { out.append("\\") }
@@ -1187,7 +1189,9 @@ final class TerminalView: NSView, NSTextInputClient {
         let pb = NSPasteboard.general
         if pb.string(forType: .string) == nil, pb.availableType(from: [.png, .tiff]) != nil {
             // An image: its file's path (on the pane's host).
-            if let path = imagePath(pb) { Core.shared.paste(pane, text: shellEscape(path) + " ") }
+            if let path = imagePath(pb), let escaped = shellEscape(path) {
+                Core.shared.paste(pane, text: escaped + " ")
+            }
             return
         }
         guard let text = pb.string(forType: .string), !text.isEmpty, pasteConfirmed(text) else { return }
@@ -1240,11 +1244,12 @@ final class TerminalView: NSView, NSTextInputClient {
         // when they are images (copied over), else as their paths as text.
         if let urls = pb.readObjects(forClasses: [NSURL.self], options: fileOpts) as? [URL], !urls.isEmpty,
            !pane.isRemote || pb.availableType(from: [.png, .tiff]) == nil {
-            return urls.map { shellEscape($0.path) }.joined(separator: " ") + " "
+            let paths = urls.compactMap { shellEscape($0.path) }
+            return paths.isEmpty ? "" : paths.joined(separator: " ") + " "
         }
         if pb.availableType(from: [.png, .tiff]) != nil {
             guard materialize else { return "" }
-            if let path = imagePath(pb) { return shellEscape(path) + " " }
+            if let path = imagePath(pb), let escaped = shellEscape(path) { return escaped + " " }
         }
         if let url = pb.readObjects(forClasses: [NSURL.self], options: nil)?.first as? URL {
             return url.absoluteString
