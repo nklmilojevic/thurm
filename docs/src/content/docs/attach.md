@@ -36,6 +36,11 @@ must already be running. Local terminal settings are restored on normal detach,
 connection errors, and handled termination signals. A forced kill cannot run this
 cleanup.
 
+`SIGTSTP` restores the local terminal and releases control of the pane before it
+suspends the attachment process. After `SIGCONT`, the command connects again and
+loads the current pane screen and terminal size. If another terminal controls the
+pane, the connection fails and the local terminal stays restored.
+
 This view shows text, colors, and cursor position. Images, hyperlinks, mouse
 reporting, and extended keyboard protocols are not supported. Clipboard requests
 are not sent to the local terminal. Use the desktop app for these functions.

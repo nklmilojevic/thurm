@@ -156,6 +156,23 @@ pub fn run(pane: PaneId, remote: Option<&str>, json: bool) -> super::R {
     } else {
         thurm_config::socket_path()
     };
+    loop {
+        match attach(pane, socket.clone())? {
+            Outcome::Exit(code) => return Ok(code),
+            Outcome::Suspend => {
+                // The terminal and pane lease are restored before the process stops.
+                signal_hook::low_level::emulate_default_handler(libc::SIGTSTP)?;
+            }
+        }
+    }
+}
+
+enum Outcome {
+    Exit(ExitCode),
+    Suspend,
+}
+
+fn attach(pane: PaneId, socket: std::path::PathBuf) -> Result<Outcome, Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::sync_channel(256);
     let overflow = Arc::new(AtomicBool::new(false));
     let full = overflow.clone();
@@ -207,7 +224,7 @@ fn interact(
     overflow: &AtomicBool,
     stop: &AtomicUsize,
     current_size: &mut PaneSize,
-) -> super::R {
+) -> Result<Outcome, Box<dyn std::error::Error>> {
     let mut model: Option<Terminal> = None;
     let mut view = ClientView::new();
     let mut escape = Escape::default();
@@ -215,8 +232,11 @@ fn interact(
     let mut stdout = io::stdout();
     loop {
         let signal = stop.load(Ordering::Relaxed);
+        if signal == libc::SIGTSTP as usize {
+            return Ok(Outcome::Suspend);
+        }
         if signal != 0 {
-            return Ok(ExitCode::from((128 + signal) as u8));
+            return Ok(Outcome::Exit(ExitCode::from((128 + signal) as u8)));
         }
         if overflow.load(Ordering::Relaxed) {
             return Err("terminal output exceeded the input queue; attach again".into());
@@ -262,7 +282,7 @@ fn interact(
             }
         }
         if done {
-            return Ok(ExitCode::SUCCESS);
+            return Ok(Outcome::Exit(ExitCode::SUCCESS));
         }
         let latest = size()?;
         if latest != *current_size {
@@ -287,12 +307,12 @@ fn interact(
         }
         if ready > 0 {
             if fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                return Ok(ExitCode::SUCCESS);
+                return Ok(Outcome::Exit(ExitCode::SUCCESS));
             }
             let mut input = [0u8; 8192];
             let count = stdin.read(&mut input)?;
             if count == 0 {
-                return Ok(ExitCode::SUCCESS);
+                return Ok(Outcome::Exit(ExitCode::SUCCESS));
             }
             let (data, detach) = escape.input(&input[..count]);
             if !data.is_empty() {
@@ -300,7 +320,7 @@ fn interact(
                     .request_timeout(Request::Input { pane, data }, Some(Duration::from_secs(2)))?;
             }
             if detach {
-                return Ok(ExitCode::SUCCESS);
+                return Ok(Outcome::Exit(ExitCode::SUCCESS));
             }
         }
     }
