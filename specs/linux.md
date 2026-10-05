@@ -40,7 +40,9 @@ tunnel), panes keyed by (host, id).
 - **Quick terminal**: the hotkey goes through the XDG GlobalShortcuts portal where the desktop
   has one (KDE, GNOME 48+); `thurm-gtk --quick-terminal` toggles it from a desktop shortcut.
   Wayland does not let apps place windows, so it fades in where the compositor puts it instead
-  of sliding from a screen edge.
+  of sliding from a screen edge. Its size follows `quick_terminal.screen`: `mouse` uses the
+  monitor showing the main window (GTK cannot see the pointer outside its windows), `main` the
+  first monitor.
 - **Updates**: no Sparkle; packages are updated by the package manager.
 - **Secure keyboard entry**: macOS-only. Linux shows the lock badge on password prompts (input
   is not observable by other Wayland clients anyway).

@@ -817,7 +817,7 @@ fn daemon_cmd(action: &str, json: bool) -> R {
                 std::fs::create_dir_all(dir)?;
             }
             let socket = std::env::var_os("THURM_SOCKET").map(std::path::PathBuf::from);
-            std::fs::write(&path, systemd_unit(&daemon, socket.as_deref()))?;
+            std::fs::write(&path, systemd_unit(&daemon, socket.as_deref())?)?;
             let systemctl = |args: &[&str]| {
                 std::process::Command::new("systemctl")
                     .arg("--user")
@@ -881,19 +881,24 @@ fn systemd_unit_path() -> std::path::PathBuf {
 
 /// A user unit that starts `thurmd` at login, in the foreground. Not restarted, so
 /// `thurm daemon stop` stops it until the next login (like the macOS LaunchAgent).
-fn systemd_unit(daemon: &std::path::Path, socket: Option<&std::path::Path>) -> String {
-    let mut exec = format!("{} --foreground", systemd_quote(&daemon.to_string_lossy()));
+fn systemd_unit(daemon: &std::path::Path, socket: Option<&std::path::Path>) -> Result<String, String> {
+    let mut exec = format!("{} --foreground", systemd_quote(daemon)?);
     if let Some(s) = socket {
-        exec.push_str(&format!(" --socket {}", systemd_quote(&s.to_string_lossy())));
+        exec.push_str(&format!(" --socket {}", systemd_quote(s)?));
     }
-    format!(
+    Ok(format!(
         "[Unit]\nDescription=Thurm session daemon\n\n[Service]\nType=simple\nExecStart={exec}\nRestart=no\n\n[Install]\nWantedBy=default.target\n"
-    )
+    ))
 }
 
 /// One `ExecStart=` item: double-quoted, with systemd's escapes, `%` specifiers and `$`
-/// variable expansion turned off.
-fn systemd_quote(s: &str) -> String {
+/// variable expansion turned off. Control characters are refused: a line break would end the
+/// directive and start another.
+fn systemd_quote(path: &std::path::Path) -> Result<String, String> {
+    let s = path.to_string_lossy();
+    if s.chars().any(char::is_control) {
+        return Err(format!("{path:?}: control characters cannot go in a systemd unit"));
+    }
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {
@@ -905,7 +910,7 @@ fn systemd_quote(s: &str) -> String {
         }
     }
     out.push('"');
-    out
+    Ok(out)
 }
 
 const LAUNCHD_LABEL: &str = "com.thurm.daemon";
@@ -1621,13 +1626,16 @@ mod tests {
     fn systemd_unit_quotes_paths() {
         let daemon = std::path::Path::new("/opt/My Apps/thurm \"x\"/thurmd");
         let socket = std::path::Path::new("/run/a b/100%$HOME\\.sock");
-        let unit = systemd_unit(daemon, Some(socket));
+        let unit = systemd_unit(daemon, Some(socket)).unwrap();
         assert!(unit.contains(
             "ExecStart=\"/opt/My Apps/thurm \\\"x\\\"/thurmd\" --foreground \
              --socket \"/run/a b/100%%$$HOME\\\\.sock\"\n"
         ));
         assert!(systemd_unit(std::path::Path::new("/usr/bin/thurmd"), None)
+            .unwrap()
             .contains("ExecStart=\"/usr/bin/thurmd\" --foreground\n"));
+        let injected = std::path::Path::new("/tmp/x\nExecStartPre=/bin/evil");
+        assert!(systemd_unit(daemon, Some(injected)).is_err());
     }
 
     #[test]

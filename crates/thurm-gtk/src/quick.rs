@@ -73,13 +73,18 @@ impl QuickTerminal {
         let qt = &ui.cfg.quick_terminal;
         let size = qt.size.clamp(0.1, 1.0);
         let display = gtk::gdk::Display::default();
+        // GTK can't read the pointer's position outside its own windows (Wayland), nor which
+        // monitor is primary: `mouse` is the monitor showing the main window, `main` the first.
         let monitor = display.and_then(|d| {
-            let monitors = d.monitors();
-            let index = match qt.screen {
-                QuickTerminalScreen::Main => 0,
-                _ => 0,
-            };
-            monitors.item(index).and_downcast::<gtk::gdk::Monitor>()
+            let first = || d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>();
+            match qt.screen {
+                QuickTerminalScreen::Main => first(),
+                QuickTerminalScreen::Mouse => app::with_app(|a| a.win())
+                    .flatten()
+                    .and_then(|w| w.window.surface())
+                    .and_then(|s| d.monitor_at_surface(&s))
+                    .or_else(first),
+            }
         });
         let (mw, mh) = monitor
             .map(|m| {
