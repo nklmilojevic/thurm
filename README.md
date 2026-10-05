@@ -1,18 +1,23 @@
 # Thurm
 
-**A native macOS terminal for persistent sessions, coding agents, and remote work.**
+**A native terminal for macOS and Linux, for persistent sessions, coding agents, and remote work.**
 
 Thurm brings your shells, development tools, and coding agents into one window.
 Organize them with tabs, split panes, and workspaces. See which agents need input.
-Keep work running after you quit the app, or run it on a remote host and return
-from your Mac.
+Keep work running after you quit the app, or run it on a remote host and come back
+to it from your computer.
 
 [Download for Apple silicon](https://github.com/nklmilojevic/thurm/releases/latest/download/Thurm.dmg)
+· Linux: [.deb](https://github.com/nklmilojevic/thurm/releases/latest/download/thurm-amd64.deb),
+[.rpm](https://github.com/nklmilojevic/thurm/releases/latest/download/thurm-x86_64.rpm),
+[Arch](https://github.com/nklmilojevic/thurm/releases/latest/download/thurm-x86_64.pkg.tar.zst)
 · [Documentation](https://docs.thurm.rs/)
 · [Releases](https://github.com/nklmilojevic/thurm/releases)
 
-The app requires **Apple silicon and macOS 14 or later**. Remote sessions can run
-on Linux x86_64, Linux aarch64, or another Apple silicon Mac.
+The macOS app requires **Apple silicon and macOS 14 or later**. The Linux app (GTK 4)
+runs on x86_64 and aarch64 with **GTK 4.14 and libadwaita 1.5 or later**: Ubuntu 24.04,
+Debian 13, Fedora 40, Arch Linux, or newer; see [Install](https://docs.thurm.rs/install/#linux).
+Remote sessions can run on Linux x86_64, Linux aarch64, or another Apple silicon Mac.
 
 ![Thurm with tabs grouped by repository in the sidebar, Claude Code working in the left pane, and lazygit and cargo test output on the right](docs/public/screenshots/hero.webp)
 
@@ -323,7 +328,7 @@ Make these changes in your Home Manager configuration.
 
 ## Build and contribute
 
-To build the app, use an Apple silicon Mac with macOS 14 or later and Xcode 26 or
+To build the macOS app, use an Apple silicon Mac with macOS 14 or later and Xcode 26 or
 later. The [Nix development shell](flake.nix) provides Rust, Zig, and the other
 command-line build tools.
 
@@ -345,11 +350,19 @@ Thurm in `/Applications`, or in `~/Applications` if `/Applications` is not writa
 It also links `thurm` into `~/.local/bin` when that directory exists and the
 destination is not a regular file.
 
-The Swift app connects through a Rust FFI to the daemon. The main source areas are:
+To build the Linux app on Ubuntu 24.04 or newer, install the build dependencies
+(GTK 4, libadwaita, Rust, Zig 0.16.0) with `scripts/linux/provision.sh`, then
+`scripts/linux/install.sh` builds it and installs it in `~/.local`. On Arch,
+`scripts/linux/arch-package.sh` builds a package from the working tree. See
+[specs/linux.md](specs/linux.md) for the Linux app's design, packaging, and tests.
+
+The macOS app (Swift) and the Linux app (Rust, GTK) connect to the daemon through the
+same Rust FFI. The main source areas are:
 
 | Path | Purpose |
 | --- | --- |
 | `macos/` | AppKit interface, Metal rendering, and app packaging |
+| `crates/thurm-gtk/`, `linux/` | The Linux app (GTK 4, libadwaita) and its packaging |
 | `crates/thurm-daemon/` | Processes, panes, agent tracking, and saved sessions |
 | `crates/thurm-term/` | Terminal state, graphics, input, and scrollback |
 | `crates/thurm-remote/` | Remote hosts, SSH connections, and repository handoff |
