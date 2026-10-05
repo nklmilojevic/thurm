@@ -38,6 +38,11 @@ for _ in $(seq 1 50); do
     xdotool search --onlyvisible --class rs.thurm.Thurm >/dev/null 2>&1 && break
     sleep 0.2
 done
+if ! xdotool search --onlyvisible --class rs.thurm.Thurm >/dev/null 2>&1; then
+    echo "thurm-gtk showed no window:" >&2
+    tail -n 40 "$out/thurm-gtk.log" >&2 || true
+    exit 1
+fi
 sleep 4
 n=0
 shot() {
