@@ -48,8 +48,9 @@ the commands before you apply a template from another source. Commands use
 literal arguments. Shell operators and variable expansion need an explicit
 shell command, such as `["sh", "-c", "your command"]`.
 
-The CLI checks the full template before it creates panes. If creation or the
-request to open the layout fails, it closes the panes that it created. A command
+The CLI checks the full template before it creates panes. It waits up to 10 seconds
+for the selected desktop app to confirm that it installed the tab. If creation,
+installation, or confirmation fails, it closes the panes that it created. A command
 that already started can have effects that closing its pane does not undo.
 
 Templates support up to 64 panes and 16 split levels. Split ratios must be from

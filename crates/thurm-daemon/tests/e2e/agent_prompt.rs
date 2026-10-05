@@ -1,6 +1,10 @@
 use super::*;
 
 fn setup(name: &str) -> (Env, Daemon, Arc<Client>, PaneId) {
+    setup_command(name, "/bin/cat\r")
+}
+
+fn setup_command(name: &str, command: &str) -> (Env, Daemon, Arc<Client>, PaneId) {
     let env = Env::new(name);
     let daemon = env.start();
     let (client, _) = env.connect();
@@ -8,7 +12,7 @@ fn setup(name: &str) -> (Env, Daemon, Arc<Client>, PaneId) {
     client
         .request(Request::Input {
             pane,
-            data: b"/bin/cat\r".to_vec(),
+            data: command.as_bytes().to_vec(),
         })
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -192,4 +196,66 @@ fn prompt_respects_disabled_automatic_detection() {
     let result = submit(&client, pane, "must-not-arrive", false, 1000);
     assert!(result.is_err(), "{result:?}");
     assert!(!capture(&client, pane).contains("must-not-arrive"));
+}
+
+#[test]
+fn terminal_reports_interrupt_prompt_waits_only_when_they_write_input() {
+    for enabled in [false, true] {
+        for kind in ["mouse", "wheel", "focus"] {
+            let name = format!("prompt-{kind}-{enabled}");
+            let command = if enabled {
+                "printf '\\033[?1000h\\033[?1006h\\033[?1004h'; /bin/cat\r"
+            } else {
+                "/bin/cat\r"
+            };
+            let (_env, _daemon, client, pane) = setup_command(&name, command);
+            let worker = {
+                let client = client.clone();
+                std::thread::spawn(move || submit(&client, pane, "report-turn-marker", true, 3000))
+            };
+            wait_match(&client, pane, "report-turn-marker");
+            let request = match kind {
+                "mouse" => Request::Mouse {
+                    pane,
+                    event: MouseEvent {
+                        kind: MouseKind::Press,
+                        button: MouseButton::Left,
+                        col: 1,
+                        row: 1,
+                        right_half: false,
+                        mods: 0,
+                        clicks: 1,
+                        x: 8,
+                        y: 16,
+                    },
+                },
+                "wheel" => Request::Wheel {
+                    pane,
+                    lines: 1,
+                    col: 1,
+                    row: 1,
+                    mods: 0,
+                },
+                _ => Request::Focus {
+                    pane,
+                    focused: false,
+                },
+            };
+            client.request(request).unwrap();
+            hook(&client, pane, "prompt-submit", None);
+            hook(&client, pane, "stop", None);
+            let result = worker.join().unwrap();
+            if enabled {
+                assert!(result.is_err(), "{kind}: {result:?}");
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Ok(Response::AgentPrompt(AgentPromptOutcome::Completed))
+                    ),
+                    "{kind}: {result:?}"
+                );
+            }
+        }
+    }
 }

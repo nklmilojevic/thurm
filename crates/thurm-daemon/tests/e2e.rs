@@ -6,6 +6,9 @@ mod workflows_upgrade;
 #[path = "e2e/agent_prompt.rs"]
 mod agent_prompt;
 
+#[path = "e2e/layouts.rs"]
+mod layouts;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;

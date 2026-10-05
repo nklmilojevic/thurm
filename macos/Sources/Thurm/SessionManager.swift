@@ -1185,6 +1185,14 @@ final class SessionManager: NSObject, CoreDelegate {
         let key = { (field: String) in jsonUInt64(d[field]).map { PaneKey(daemon, $0) } }
         switch v.name {
         case "OpenLayout":
+            guard let requestID = jsonUInt64(d["request_id"]) else { return }
+            var failure: String? = "the desktop could not install the layout"
+            defer {
+                Core.shared.send(object: ["LayoutApplied": [
+                    "request_id": requestID,
+                    "error": failure.map { $0 as Any } ?? NSNull()
+                ]], host: daemon)
+            }
             guard let json = jsonString(d["json"]), let data = json.data(using: .utf8),
                   var tab = try? JSONDecoder().decode(TabLayout.self, from: data) else { return }
             func onHost(_ node: LayoutNode) -> LayoutNode {
@@ -1196,9 +1204,15 @@ final class SessionManager: NSObject, CoreDelegate {
             }
             tab.root = onHost(tab.root)
             let moved = Set(tab.root.panes)
+            for pane in tab.root.panes {
+                guard let info = fetchPaneInfo(pane) else {
+                    failure = "a layout pane no longer exists"
+                    return
+                }
+                panes[pane] = info
+            }
             var emptied: [TerminalWindowController] = []
             for pane in tab.root.panes {
-                if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
                 if let c = controller(for: pane) {
                     if c.content.remove(pane: pane) { emptied.append(c) } else { c.updateTitle() }
                 }
@@ -1216,6 +1230,9 @@ final class SessionManager: NSObject, CoreDelegate {
                 c.window?.close()
             }
             scheduleLayoutSave()
+            if tab.root.panes.allSatisfy({ controller(for: $0)?.workspaceID == ws.id }) {
+                failure = nil
+            }
         case "NewTab":
             guard let pane = key("pane") else { return }
             let ownWorkspace = jsonBool(d["new_window"]) ?? false

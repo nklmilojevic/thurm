@@ -2757,28 +2757,51 @@ impl App {
             .map(|id| PaneKey::new(host, id));
         match name.as_str() {
             "OpenLayout" => {
-                let Some(json) = p.get("json").and_then(Value::as_str) else {
+                let Some(request_id) = p.get("request_id").and_then(Value::as_u64) else {
                     return;
                 };
-                let Ok(tab) = serde_json::from_str::<TabLayout>(json) else {
-                    return;
-                };
-                let mut ids = Vec::new();
-                tab.root.panes(&mut ids);
-                for id in ids {
-                    let key = PaneKey::new(host, id);
-                    self.remove_pane_from_ui_inner(&key, false);
-                    self.fetch_info(&key);
-                }
-                let mut ws = self.make_workspace(host);
-                if let Some(title) = &tab.title {
-                    ws.name = title.clone();
-                }
-                ws.hidden_tabs.push(tab);
-                let id = ws.id;
-                self.workspaces.borrow_mut().push(ws);
-                self.show_workspace(id);
-                self.schedule_save();
+                let Some(core) = self.core(host) else { return };
+                let result = (|| -> Result<(), String> {
+                    if self.win().is_none() {
+                        return Err("no Thurm window is open".into());
+                    }
+                    let json = p.get("json").and_then(Value::as_str)
+                        .ok_or("missing tab layout")?;
+                    let tab: TabLayout = serde_json::from_str(json).map_err(|e| e.to_string())?;
+                    let ids = thurm_proto::template::validate_tab(&tab)?;
+                    for &id in &ids {
+                        let key = PaneKey::new(host, id);
+                        let info = core.request(&json!({"PaneInfo": {"pane": id}}));
+                        let info = info.get("PaneInfo")
+                            .ok_or("a layout pane no longer exists")?;
+                        let info = serde_json::from_value::<PaneInfo>(info.clone())
+                            .map_err(|e| e.to_string())?;
+                        self.infos.borrow_mut().insert(key, info);
+                    }
+                    for &id in &ids {
+                        self.remove_pane_from_ui_inner(&PaneKey::new(host, id), false);
+                    }
+                    let mut ws = self.make_workspace(host);
+                    if let Some(title) = &tab.title {
+                        ws.name = title.clone();
+                    }
+                    ws.hidden_tabs.push(tab);
+                    let id = ws.id;
+                    self.workspaces.borrow_mut().push(ws);
+                    self.show_workspace(id);
+                    if !ids.iter().all(|&pane| {
+                        self.tab_of(&PaneKey::new(host, pane))
+                            .is_some_and(|tab| tab.workspace.get() == id)
+                    }) {
+                        self.workspaces.borrow_mut().retain(|ws| ws.id != id);
+                        return Err("the desktop could not install the layout".into());
+                    }
+                    self.schedule_save();
+                    Ok(())
+                })();
+                core.send(&json!({"LayoutApplied": {
+                    "request_id": request_id, "error": result.err()
+                }}));
             }
             "NewTab" => {
                 let Some(k) = key else { return };

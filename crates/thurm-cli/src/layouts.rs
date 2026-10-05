@@ -5,9 +5,7 @@ use std::path::PathBuf;
 use clap::Subcommand;
 use thurm_client::Client;
 use thurm_proto::template::{LayoutTemplate, TemplateNode};
-use thurm_proto::{
-    CreatePane, Layout, LayoutNode, PaneId, PaneInfo, Request, Response, TabLayout, UiCommand,
-};
+use thurm_proto::{CreatePane, Layout, LayoutNode, PaneId, PaneInfo, Request, Response, TabLayout};
 
 #[derive(Subcommand)]
 pub enum LayoutCmd {
@@ -87,9 +85,10 @@ pub fn run(c: &Client, action: Option<LayoutCmd>) -> super::R {
                     zoomed: None,
                     handoff: None,
                 };
-                c.request(Request::Ui(UiCommand::OpenLayout {
+                c.request(Request::ApplyLayout {
                     json: serde_json::to_string(&tab)?,
-                }))?;
+                    timeout_ms: 10_000,
+                })?;
                 println!("{}", serde_json::json!({"panes": created}));
                 Ok(())
             })();

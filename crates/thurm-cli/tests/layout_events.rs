@@ -86,7 +86,7 @@ fn apply_preserves_split_and_rolls_back_after_ui_failure() {
             answer(&mut s, req.id, Ok(Response::PaneCreated { pane }));
         }
         let req = request(&mut s);
-        let Request::Ui(thurm_proto::UiCommand::OpenLayout { json }) = req.request else {
+        let Request::ApplyLayout { json, .. } = req.request else {
             panic!("expected layout")
         };
         let tab: serde_json::Value = serde_json::from_str(&json).unwrap();

@@ -3,6 +3,7 @@
 #[path = "terminal_attach.rs"]
 mod terminal_attach;
 mod agent_prompt;
+mod layouts;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -325,6 +326,8 @@ pub struct Daemon {
     layout: Mutex<Option<String>>,
     next_pane: AtomicU64,
     next_client: AtomicU64,
+    next_layout: AtomicU64,
+    pending_layouts: Mutex<HashMap<u64, layouts::PendingLayout>>,
     git_tx: crossbeam_channel::Sender<(PaneId, String)>,
     git_rx: crossbeam_channel::Receiver<(PaneId, String)>,
     ai: ai::Model,
@@ -376,6 +379,8 @@ impl Daemon {
             layout: Mutex::new(None),
             next_pane: AtomicU64::new(1),
             next_client: AtomicU64::new(1),
+            next_layout: AtomicU64::new(1),
+            pending_layouts: Mutex::new(HashMap::new()),
             git_tx: git_channel.0,
             git_rx: git_channel.1,
             ai: ai::Model::new(),
@@ -1810,11 +1815,11 @@ impl Daemon {
                 });
                 return;
             }
-            // Slow read-only requests (completion generators, `ps`/`lsof`) run on their own
-            // thread so they don't hold up the typing, resizes and scrolls that follow on the
-            // same connection. Responses carry their id. Requests that change or snapshot
-            // state stay in order on the reader.
-            slow @ (Request::Complete { .. } | Request::Processes { .. }) => {
+            // Slow queries and layout confirmation must not block later requests,
+            // including the desktop client's reply. Responses carry their request ID.
+            slow @ (Request::Complete { .. }
+            | Request::Processes { .. }
+            | Request::ApplyLayout { .. }) => {
                 let daemon = self.clone();
                 let client = client.clone();
                 let spawned = std::thread::Builder::new()
@@ -2081,6 +2086,9 @@ impl Daemon {
                 let copy_on_select = self.config.read().terminal.copy_on_select;
                 let text = self.with_input_pane(client.id, pane, |p, st| {
                     let (outcome, bytes) = st.term.mouse(&event);
+                    if !bytes.is_empty() {
+                        st.agent.prompt.interrupted();
+                    }
                     p.write(bytes);
                     (outcome == MouseOutcome::SelectionDone && copy_on_select)
                         .then(|| st.term.selection_text())
@@ -2098,7 +2106,11 @@ impl Daemon {
                 mods,
             } => {
                 self.with_input_pane(client.id, pane, |p, st| {
-                    p.write(st.term.wheel(lines, col, row, mods))
+                    let bytes = st.term.wheel(lines, col, row, mods);
+                    if !bytes.is_empty() {
+                        st.agent.prompt.interrupted();
+                    }
+                    p.write(bytes);
                 })?;
                 Ok(Response::Ok)
             }
@@ -2114,6 +2126,9 @@ impl Daemon {
             Request::Focus { pane, focused } => {
                 self.with_input_pane(client.id, pane, |p, st| {
                     if let Some(b) = st.term.focus(focused) {
+                        if !b.is_empty() {
+                            st.agent.prompt.interrupted();
+                        }
                         p.write(b);
                     }
                     // Looking at a finished agent acknowledges it (Done → Idle).
@@ -2174,6 +2189,14 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::GetLayout => Ok(Response::Layout(self.sanitized_layout(&[]))),
+            Request::ApplyLayout { json, timeout_ms } => {
+                self.apply_layout(client.id, json, timeout_ms)?;
+                Ok(Response::Ok)
+            }
+            Request::LayoutApplied { request_id, error } => {
+                self.layout_applied(client.id, request_id, error)?;
+                Ok(Response::Ok)
+            }
             Request::CheckUi => {
                 if !self.has_ui_clients() {
                     return Err("no Thurm window is open".into());
@@ -2184,13 +2207,8 @@ impl Daemon {
                 if !self.has_ui_clients() {
                     return Err("no Thurm window is open".into());
                 }
-                if let thurm_proto::UiCommand::OpenLayout { json } = &cmd {
-                    let tab: thurm_proto::TabLayout = serde_json::from_str(json)
-                        .map_err(|e| format!("invalid tab layout: {e}"))?;
-                    let ids = thurm_proto::template::validate_tab(&tab)?;
-                    if ids.iter().any(|id| self.pane(*id).is_none()) {
-                        return Err("a layout pane no longer exists".into());
-                    }
+                if matches!(cmd, thurm_proto::UiCommand::OpenLayout { .. }) {
+                    return Err("use ApplyLayout to wait for desktop confirmation".into());
                 }
                 self.broadcast(Event::Ui(cmd), true);
                 Ok(Response::Ok)

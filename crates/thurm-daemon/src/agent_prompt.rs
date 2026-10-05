@@ -84,7 +84,7 @@ impl PromptTracker {
         if turns > 1 {
             return Err("another agent turn started before the wait completed".into());
         }
-        if status == AgentStatus::NeedsInput {
+        if turns == 1 && status == AgentStatus::NeedsInput {
             return Ok(Some(AgentPromptOutcome::NeedsInput));
         }
         if turns == 1 && matches!(status, AgentStatus::Idle | AgentStatus::Done) {
@@ -164,5 +164,19 @@ mod tests {
         tracker.started();
         tracker.started();
         assert!(tracker.outcome(token, AgentStatus::Done).is_err());
+    }
+
+    #[test]
+    fn needs_input_requires_exactly_one_new_turn() {
+        let mut tracker = PromptTracker::default();
+        let token = tracker.reserve(AgentStatus::Idle).unwrap();
+        assert_eq!(tracker.outcome(token, AgentStatus::NeedsInput), Ok(None));
+        tracker.started();
+        assert_eq!(
+            tracker.outcome(token, AgentStatus::NeedsInput),
+            Ok(Some(AgentPromptOutcome::NeedsInput))
+        );
+        tracker.started();
+        assert!(tracker.outcome(token, AgentStatus::NeedsInput).is_err());
     }
 }

@@ -22,7 +22,7 @@ pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
 /// struct, with `#[serde(default)]`. A daemon answers a request it doesn't know with an error
 /// and keeps the connection; a client skips a message it can't decode. Anything else (removing
 /// or reordering variants or fields) bumps this.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Daemons speaking this protocol or later replace themselves in place on SIGUSR2 (see
 /// `thurm_client::upgrade_daemon`), keeping every pane's process running.
@@ -267,6 +267,16 @@ pub enum Request {
         text: String,
         wait: bool,
         timeout_ms: u64,
+    },
+    /// Open a tab and wait for the selected desktop client to confirm installation.
+    ApplyLayout {
+        json: String,
+        timeout_ms: u64,
+    },
+    /// Complete a layout request. Only the selected desktop client can reply.
+    LayoutApplied {
+        request_id: u64,
+        error: Option<String>,
     },
 }
 
@@ -1006,6 +1016,7 @@ pub enum UiCommand {
     /// Open this tab layout in a new workspace.
     OpenLayout {
         json: String,
+        request_id: u64,
     },
 }
 
