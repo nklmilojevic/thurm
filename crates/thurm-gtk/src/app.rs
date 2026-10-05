@@ -134,7 +134,7 @@ fn ask_restart_daemon(gtk_app: &adw::Application, detail: &str) {
     log::warn!("{detail}");
     let window = adw::ApplicationWindow::new(gtk_app);
     window.set_title(Some("Thurm"));
-    window.set_default_size(560, 200);
+    window.set_default_size(640, 420);
     window.present();
     let dialog = adw::AlertDialog::new(
         Some("Restart the session daemon?"),
@@ -175,7 +175,7 @@ fn fatal(gtk_app: &adw::Application, message: &str) {
     log::error!("{message}");
     let window = adw::ApplicationWindow::new(gtk_app);
     window.set_title(Some("Thurm"));
-    window.set_default_size(560, 200);
+    window.set_default_size(640, 420);
     window.present();
     let dialog = adw::AlertDialog::new(
         Some("Cannot connect to the Thurm session daemon"),
