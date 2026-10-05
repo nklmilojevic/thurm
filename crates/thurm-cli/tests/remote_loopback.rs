@@ -509,9 +509,16 @@ fn remote_workspace_over_loopback_ssh() {
     //     because the old one still answers.
     let moved = w.base.join("rrun/moved.sock");
     let _moved = fake_old_daemon(&moved);
+    let before = watch.seen.lock().len();
     sup.update(remote("loop", Some(moved.display().to_string())))
         .unwrap();
     let s = watch.wait(&sup, Phase::UpgradeNeeded, 30);
+    assert!(
+        !watch.seen.lock()[before..].iter().any(|s| {
+            s.message.as_deref() == Some("the host's settings changed") && s.retry_at.is_some()
+        }),
+        "a settings change must not use the previous destination's retry delay"
+    );
     assert!(
         s.message.as_deref().unwrap_or("").contains("protocol 12"),
         "{s:?}"
