@@ -48,7 +48,7 @@ pub struct Sidebar {
     agents_list: gtk::ListBox,
     agents_summary: gtk::Label,
     agents_scroll: gtk::ScrolledWindow,
-    shown: RefCell<(Vec<Group>, Vec<AgentRow>)>,
+    shown: RefCell<(Vec<Group>, Vec<AgentRow>, Vec<String>)>,
     /// Row index → tab, for clicks, drags and menus.
     row_tabs: RefCell<Vec<Option<Weak<Tab>>>>,
     agent_keys: RefCell<Vec<PaneKey>>,
@@ -137,7 +137,7 @@ impl Sidebar {
             agents_list,
             agents_summary,
             agents_scroll,
-            shown: RefCell::new((Vec::new(), Vec::new())),
+            shown: RefCell::new((Vec::new(), Vec::new(), Vec::new())),
             row_tabs: RefCell::new(Vec::new()),
             agent_keys: RefCell::new(Vec::new()),
             agent_rows: Cell::new(0),
@@ -236,7 +236,7 @@ impl Sidebar {
     ) {
         let unchanged = {
             let shown = self.shown.borrow();
-            shown.0 == groups && shown.1 == agents
+            shown.0 == groups && shown.1 == agents && shown.2 == collapsed
         };
         if !unchanged {
             while let Some(r) = self.list.first_child() {
@@ -303,7 +303,7 @@ impl Sidebar {
             }
             self.agents_summary.set_text(&parts.join(" · "));
             self.agents_box.set_visible(!agents.is_empty());
-            *self.shown.borrow_mut() = (groups, agents);
+            *self.shown.borrow_mut() = (groups, agents, collapsed.to_vec());
         }
         // The selection mirrors the current tab and pane.
         let selected = self

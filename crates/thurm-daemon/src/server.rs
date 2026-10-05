@@ -28,7 +28,7 @@ pub fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
 }
 
 fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
-    if !thurm_config::peer_is_same_user(&stream) {
+    if !thurm_config::peer_may_use_daemon(&stream) {
         log::warn!("rejecting connection from another user");
         return;
     }
