@@ -199,7 +199,9 @@ fn fade(window: &adw::Window, to: f64, secs: f64, done: Option<Box<dyn FnOnce()>
 pub fn toggle(app: &Rc<App>) {
     let existing = app.quick.borrow().clone();
     match existing {
-        Some(q) if q.is_active() => q.hide(),
+        // Shown is enough (macOS also asks for focus): a Wayland compositor may not focus the
+        // window it shows, and the hotkey must still hide it.
+        Some(q) if q.shown.get() => q.hide(),
         Some(q) => q.show(),
         None => {
             let Some(tab) = quick_tab(app) else { return };

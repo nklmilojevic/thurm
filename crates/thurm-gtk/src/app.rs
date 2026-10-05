@@ -2874,6 +2874,15 @@ impl App {
         // Without an answer, keep every view: an empty list would drop them all.
         let Some(list) = panes.get("Panes").and_then(Value::as_array) else {
             log::warn!("resync: ListPanes failed: {panes}");
+            // Try again on this connection (a newer one resyncs itself).
+            let epoch = self.epochs.borrow().get(LOCAL).copied();
+            glib::timeout_add_local_once(Duration::from_secs(1), move || {
+                with_app(|a| {
+                    if a.epochs.borrow().get(LOCAL).copied() == epoch && a.core(LOCAL).is_some() {
+                        a.resync();
+                    }
+                });
+            });
             return;
         };
         let mut listed = HashSet::new();

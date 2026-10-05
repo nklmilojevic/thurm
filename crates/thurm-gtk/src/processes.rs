@@ -76,15 +76,20 @@ pub fn show(app: &Rc<App>) {
             p.render();
         }
     });
+    // A click on a row brings its pane forward (like the macOS panel); moving the selection
+    // with the keyboard or a refresh does not.
     let weak = Rc::downgrade(&panel);
-    panel.list.connect_row_selected(move |_, row| {
-        let (Some(p), Some(row)) = (weak.upgrade(), row) else { return };
+    let click = gtk::GestureClick::new();
+    click.connect_released(move |_, n, _, y| {
+        let Some(p) = weak.upgrade() else { return };
+        let Some(row) = p.list.row_at_y(y as i32).filter(|_| n == 1) else { return };
         let key = p.keys.borrow().get(row.index() as usize).map(|(k, _)| k.clone());
         if let Some(k) = key {
             app::with_app(|a| a.focus_agent(&k));
             p.window.present();
         }
     });
+    panel.list.add_controller(click);
     let weak = Rc::downgrade(&panel);
     panel.list.connect_row_activated(move |_, row| {
         let Some(p) = weak.upgrade() else { return };
