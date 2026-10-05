@@ -22,7 +22,7 @@ pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
 /// struct, with `#[serde(default)]`. A daemon answers a request it doesn't know with an error
 /// and keeps the connection; a client skips a message it can't decode. Anything else (removing
 /// or reordering variants or fields) bumps this.
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// A desktop can reject a layout before making changes when it has no window.
 /// The daemon can then try another desktop client.
@@ -282,6 +282,10 @@ pub enum Request {
         request_id: u64,
         error: Option<String>,
     },
+    /// Transfer pane ownership to the selected desktop before it installs the tab.
+    CommitLayout {
+        request_id: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -362,6 +366,14 @@ pub enum Response {
     Completions(Completions),
     AgentExplanation(AgentExplanation),
     AgentPrompt(AgentPromptOutcome),
+    LayoutResult(LayoutResult),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LayoutResult {
+    /// Once committed, a timeout must not close panes that the desktop may use.
+    pub committed: bool,
+    pub error: Option<String>,
 }
 
 /// A report is scoped to one process instance in one pane.

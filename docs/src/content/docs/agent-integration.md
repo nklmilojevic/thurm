@@ -36,6 +36,11 @@ The daemon binds the instance ID to the owner PID and its operating system start
 
 Supported states are `idle`, `working`, `needs-input`, and `done`. Report `working` when a new turn starts, and `done` when it finishes. Report `needs-input` when the agent needs a response. Public reports do not create one-click permission choices. Existing built-in `agent-hook` integrations still work. A public report has priority over legacy hooks in its process group.
 
+Each new turn must start from `idle` or `done`. Repeated `working` reports update the
+same turn. A transition from `needs-input` to `working` continues that turn.
+`agent prompt` rejects a submission while the reported state is `working` or
+`needs-input`. Sequence numbers order reports; they do not identify turns.
+
 An omitted session ID keeps the existing ID. An omitted message clears the previous message. Resume arguments remain until the session ID changes, the reporting process is replaced, or it releases ownership. Report the full resume arguments again after a session ID change. A release ends reporting and returns the pane to automatic detection.
 
 ## Exact session restore

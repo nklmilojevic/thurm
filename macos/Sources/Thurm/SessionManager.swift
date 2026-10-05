@@ -1211,6 +1211,12 @@ final class SessionManager: NSObject, CoreDelegate {
                 }
                 panes[pane] = info
             }
+            guard JSON.variant(Core.shared.request(object: ["CommitLayout": [
+                "request_id": requestID
+            ]], host: daemon))?.name == "Ok" else {
+                failure = "layout was cancelled before installation"
+                return
+            }
             var emptied: [TerminalWindowController] = []
             for pane in tab.root.panes {
                 if let c = controller(for: pane) {

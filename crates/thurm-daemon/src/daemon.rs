@@ -2190,7 +2190,14 @@ impl Daemon {
             }
             Request::GetLayout => Ok(Response::Layout(self.sanitized_layout(&[]))),
             Request::ApplyLayout { json, timeout_ms } => {
-                self.apply_layout(client.id, json, timeout_ms)?;
+                let result = self.apply_layout(client.id, json, timeout_ms)
+                    .unwrap_or_else(|error| thurm_proto::LayoutResult {
+                        committed: false, error: Some(error),
+                    });
+                Ok(Response::LayoutResult(result))
+            }
+            Request::CommitLayout { request_id } => {
+                self.commit_layout(client.id, request_id)?;
                 Ok(Response::Ok)
             }
             Request::LayoutApplied { request_id, error } => {

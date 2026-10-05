@@ -14,7 +14,10 @@ use thurm_proto::{CursorShape, Event, Frame, PaneId, PaneSize, Request, cell_fla
 use thurm_term::{ClientView, EngineConfig, TermMode, Terminal};
 
 const PREFIX: u8 = 0x1d;
-const CLEANUP: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?7h\x1b[?1l\x1b>\x1b[?2004l\x1b[0 q\x1b[?1049l";
+const RENDER_RESET: &[u8] = b"\x1b[?6l\x1b[4l\x1b[?69l\x1b[r\x1b(B\x0f";
+const INPUT_RESET: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l";
+const CLEANUP: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?7h\x1b[?1l\x1b>\x1b[?2004l\x1b[0 q\x1b[?1049l\x1b[?6l\x1b[4l\x1b[?69l\x1b[r\x1b(B\x0f";
 
 /// Ctrl-] d detaches. Ctrl-] Ctrl-] sends one literal Ctrl-].
 #[derive(Default)]
@@ -78,7 +81,10 @@ impl LocalTerminal {
         if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        io::stdout().write_all(b"\x1b[?1049h\x1b[?7l\x1b[2J")?;
+        io::stdout().write_all(b"\x1b[?1049h")?;
+        io::stdout().write_all(RENDER_RESET)?;
+        io::stdout().write_all(INPUT_RESET)?;
+        io::stdout().write_all(b"\x1b[?7l\x1b[0m\x1b[2J")?;
         io::stdout().flush()?;
         Ok(guard)
     }
@@ -301,6 +307,8 @@ fn interact(
 }
 
 fn render(frame: &Frame, out: &mut impl Write) -> io::Result<()> {
+    // Scroll margins must also cover the new size after a terminal resize.
+    out.write_all(RENDER_RESET)?;
     write!(out, "\x1b[?25l")?;
     if frame.full {
         write!(out, "\x1b[0m\x1b[2J")?;
@@ -413,6 +421,7 @@ mod tests {
         let mut local = Terminal::new(size, EngineConfig::default());
         local.replay(&daemon.serialize_state());
         let mut host = Terminal::new(size, EngineConfig::default());
+        host.advance(b"\x1b[2;5r\x1b[?6h\x1b[4h\x1b(0");
         let mut view = ClientView::new();
         for update in [b"".as_slice(), b"\x1b[4;1Hnext\x1b[?25l", b"\x1b[?1049l"] {
             daemon.advance(update);

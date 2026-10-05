@@ -2778,6 +2778,10 @@ impl App {
                             .map_err(|e| e.to_string())?;
                         self.infos.borrow_mut().insert(key, info);
                     }
+                    if core.request(&json!({"CommitLayout": {"request_id": request_id}}))
+                        .as_str() != Some("Ok") {
+                        return Err("layout was cancelled before installation".into());
+                    }
                     for &id in &ids {
                         self.remove_pane_from_ui_inner(&PaneKey::new(host, id), false);
                     }

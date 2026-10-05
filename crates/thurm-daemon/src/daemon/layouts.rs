@@ -2,6 +2,10 @@ use super::*;
 
 pub(super) struct PendingLayout {
     ui: u64,
+    caller: u64,
+    deadline: Instant,
+    committed: bool,
+    replied: bool,
     reply: Sender<Result<(), String>>,
 }
 
@@ -11,7 +15,7 @@ impl Daemon {
         caller: u64,
         json: String,
         timeout_ms: u64,
-    ) -> Result<(), String> {
+    ) -> Result<thurm_proto::LayoutResult, String> {
         if !(1..=30_000).contains(&timeout_ms) {
             return Err("layout timeout must be between 1 and 30000 ms".into());
         }
@@ -36,12 +40,8 @@ impl Daemon {
             let result = self.confirm_layout(caller, &ui, json.clone(), deadline);
             // This reply guarantees that the desktop made no layout changes.
             // Other rejections must reach the caller so it can close the new panes.
-            if result
-                .as_ref()
-                .err()
-                .is_none_or(|error| error != thurm_proto::LAYOUT_NO_WINDOW)
-            {
-                return result;
+            if result.committed || result.error.as_deref() != Some(thurm_proto::LAYOUT_NO_WINDOW) {
+                return Ok(result);
             }
         }
     }
@@ -52,18 +52,34 @@ impl Daemon {
         ui: &Client,
         json: String,
         deadline: Instant,
-    ) -> Result<(), String> {
+    ) -> thurm_proto::LayoutResult {
         if Instant::now() >= deadline {
-            return Err("desktop layout confirmation timed out".into());
+            return thurm_proto::LayoutResult {
+                committed: false,
+                error: Some("desktop layout confirmation timed out".into()),
+            };
         }
         let request_id = self.next_layout.fetch_add(1, Ordering::Relaxed);
         let (reply, receive) = crossbeam_channel::bounded(1);
         {
             let mut pending = self.pending_layouts.lock();
             if pending.len() >= 64 {
-                return Err("too many layout requests are pending".into());
+                return thurm_proto::LayoutResult {
+                    committed: false,
+                    error: Some("too many layout requests are pending".into()),
+                };
             }
-            pending.insert(request_id, PendingLayout { ui: ui.id, reply });
+            pending.insert(
+                request_id,
+                PendingLayout {
+                    ui: ui.id,
+                    caller,
+                    deadline,
+                    committed: false,
+                    replied: false,
+                    reply,
+                },
+            );
         }
         ui.send(ServerMessage::Event(Event::Ui(
             thurm_proto::UiCommand::OpenLayout { json, request_id },
@@ -87,8 +103,31 @@ impl Daemon {
                 }
             }
         };
-        self.pending_layouts.lock().remove(&request_id);
-        result
+        // Removing the request and reading its commit decision under one lock makes
+        // cancellation atomic with CommitLayout. A late desktop cannot install it.
+        let pending = self.pending_layouts.lock().remove(&request_id).unwrap();
+        thurm_proto::LayoutResult {
+            committed: pending.committed,
+            error: result.err(),
+        }
+    }
+
+    pub(super) fn commit_layout(&self, client: u64, request_id: u64) -> Result<(), String> {
+        let mut pending = self.pending_layouts.lock();
+        let request = pending
+            .get_mut(&request_id)
+            .ok_or("layout request is no longer pending")?;
+        if request.ui != client {
+            return Err("only the selected desktop client can commit this layout".into());
+        }
+        if request.replied
+            || Instant::now() >= request.deadline
+            || !self.clients.lock().contains_key(&request.caller)
+        {
+            return Err("layout request was cancelled before installation".into());
+        }
+        request.committed = true;
+        Ok(())
     }
 
     pub(super) fn layout_applied(
@@ -97,16 +136,21 @@ impl Daemon {
         request_id: u64,
         error: Option<String>,
     ) -> Result<(), String> {
-        let pending = self.pending_layouts.lock();
+        let mut pending = self.pending_layouts.lock();
         let request = pending
-            .get(&request_id)
+            .get_mut(&request_id)
             .ok_or("layout request is no longer pending")?;
         if request.ui != client {
             return Err("only the selected desktop client can confirm this layout".into());
         }
+        if request.replied || (error.is_none() && !request.committed) {
+            return Err("layout must be committed before installation is confirmed".into());
+        }
         request
             .reply
             .try_send(error.map_or(Ok(()), Err))
-            .map_err(|_| "layout request already has a reply".into())
+            .map_err(|_| "layout request already has a reply".to_string())?;
+        request.replied = true;
+        Ok(())
     }
 }

@@ -1945,7 +1945,9 @@ fn agent_reporting_child_fixture() {
         return;
     };
     let mut owner = Command::new("/bin/sleep").arg("60").spawn().unwrap();
-    std::fs::write(path, owner.id().to_string()).unwrap();
+    let pending_path = format!("{path}.pending");
+    std::fs::write(&pending_path, owner.id().to_string()).unwrap();
+    std::fs::rename(pending_path, path).unwrap();
     std::thread::spawn(move || {
         let _ = owner.wait();
     });

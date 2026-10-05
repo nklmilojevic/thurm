@@ -52,6 +52,19 @@ fn next_layout(events: &Receiver<Event>) -> u64 {
     }
 }
 
+fn outcome(
+    result: std::sync::mpsc::Receiver<Result<Response, thurm_client::ClientError>>,
+) -> LayoutResult {
+    let Response::LayoutResult(result) = result
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected a layout result");
+    };
+    result
+}
+
 #[test]
 fn layout_waits_for_the_selected_ui_and_propagates_rejection() {
     let env = Env::new("layout-confirm");
@@ -77,15 +90,30 @@ fn layout_waits_for_the_selected_ui_and_propagates_rejection() {
                 })
                 .is_err()
         );
+        assert!(
+            other_ui
+                .request(Request::CommitLayout { request_id })
+                .is_err()
+        );
+        if error.is_none() {
+            assert!(
+                ui.request(Request::LayoutApplied {
+                    request_id,
+                    error: None
+                })
+                .is_err()
+            );
+            ui.request(Request::CommitLayout { request_id }).unwrap();
+        }
         ui.request(Request::LayoutApplied {
             request_id,
             error: error.clone(),
         })
         .unwrap();
-        let result = result.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = outcome(result);
         match error {
-            None => assert!(matches!(result, Ok(Response::Ok))),
-            Some(error) => assert!(result.unwrap_err().to_string().contains(&error)),
+            None => assert!(result.committed && result.error.is_none()),
+            Some(error) => assert!(!result.committed && result.error == Some(error)),
         }
         assert!(
             ui.request(Request::LayoutApplied {
@@ -106,11 +134,10 @@ fn layout_timeout_rejects_late_confirmation() {
     let pane = create(&client, &env.dir);
     let result = apply(client, pane, 100);
     let request_id = next_layout(&events);
-    let error = result
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap_err();
-    assert!(error.to_string().contains("timed out"), "{error}");
+    let result = outcome(result);
+    assert!(!result.committed);
+    assert!(result.error.unwrap().contains("timed out"));
+    assert!(ui.request(Request::CommitLayout { request_id }).is_err());
     assert!(
         ui.request(Request::LayoutApplied {
             request_id,
@@ -130,11 +157,9 @@ fn layout_fails_when_the_selected_ui_disconnects() {
     let result = apply(client, pane, 30_000);
     next_layout(&events);
     drop(ui);
-    let error = result
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap_err();
-    assert!(error.to_string().contains("disconnected"), "{error}");
+    let result = outcome(result);
+    assert!(!result.committed);
+    assert!(result.error.unwrap().contains("disconnected"));
 }
 
 #[test]
@@ -173,17 +198,63 @@ fn layout_tries_another_desktop_when_the_first_has_no_window() {
                 })
                 .is_err()
         );
+        assert!(
+            first
+                .request(Request::CommitLayout {
+                    request_id: second_id
+                })
+                .is_err()
+        );
+        if error.is_none() {
+            second
+                .request(Request::CommitLayout {
+                    request_id: second_id,
+                })
+                .unwrap();
+        }
         second
             .request(Request::LayoutApplied {
                 request_id: second_id,
                 error: error.clone(),
             })
             .unwrap();
-        let result = result.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = outcome(result);
         if error.is_none() {
-            assert!(matches!(result, Ok(Response::Ok)));
+            assert!(result.committed && result.error.is_none());
         } else {
-            assert!(result.unwrap_err().to_string().contains(LAYOUT_NO_WINDOW));
+            assert!(!result.committed && result.error.as_deref() == Some(LAYOUT_NO_WINDOW));
         }
+    }
+}
+
+#[test]
+fn committed_layout_is_preserved_when_confirmation_is_late_or_ui_disconnects() {
+    for disconnect in [false, true] {
+        let env = Env::new(if disconnect {
+            "layout-committed-disconnect"
+        } else {
+            "layout-committed-timeout"
+        });
+        let _daemon = env.start();
+        let (ui, events) = env.connect();
+        let client = caller(&env);
+        let pane = create(&client, &env.dir);
+        let result = apply(client.clone(), pane, if disconnect { 30_000 } else { 1000 });
+        let request_id = next_layout(&events);
+        ui.request(Request::CommitLayout { request_id }).unwrap();
+        if disconnect {
+            drop(ui);
+        }
+        let result = outcome(result);
+        assert!(result.committed);
+        assert!(result.error.unwrap().contains(if disconnect {
+            "disconnected"
+        } else {
+            "timed out"
+        }));
+        assert!(matches!(
+            client.request(Request::PaneInfo { pane }),
+            Ok(Response::PaneInfo(_))
+        ));
     }
 }

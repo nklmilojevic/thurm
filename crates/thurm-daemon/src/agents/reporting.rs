@@ -626,6 +626,38 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_working_reports_belong_to_one_reserved_turn() {
+        let mut tracker = tracker();
+        let mut report = report();
+        report.status = AgentStatus::Idle;
+        tracker.apply_report(&report, 100, 42, "Example").unwrap();
+        tracker.refresh();
+        let token = tracker
+            .prompt
+            .reserve(tracker.state().unwrap().status)
+            .unwrap();
+        for sequence in [2, 3] {
+            report.sequence = sequence;
+            report.status = AgentStatus::Working;
+            tracker.apply_report(&report, 100, 42, "Example").unwrap();
+            tracker.refresh();
+            let status = tracker.state().unwrap().status;
+            assert!(tracker.prompt.reserve(status).is_err());
+            assert_eq!(tracker.prompt.outcome(token, status), Ok(None));
+        }
+        report.sequence = 4;
+        report.status = AgentStatus::Done;
+        tracker.apply_report(&report, 100, 42, "Example").unwrap();
+        tracker.refresh();
+        assert_eq!(
+            tracker
+                .prompt
+                .outcome(token, tracker.state().unwrap().status),
+            Ok(Some(thurm_proto::AgentPromptOutcome::Completed))
+        );
+    }
+
+    #[test]
     fn approval_continuation_keeps_the_same_turn() {
         let mut tracker = tracker();
         let mut report = report();

@@ -65,49 +65,68 @@ fn accept(listener: UnixListener) -> UnixStream {
 }
 
 #[test]
-fn apply_preserves_split_and_rolls_back_after_ui_failure() {
-    let env = TestSocket::new("rollback");
-    let file = env.dir.join("layout.json");
-    std::fs::write(&file, r#"{"version":1,"title":"tests","root":{"type":"split","dir":"down","ratio":0.3,"first":{"type":"pane","command":["printf","%s","$(literal)"]},"second":{"type":"pane"}}}"#).unwrap();
-    let listener = env.listen();
-    let server = std::thread::spawn(move || {
-        let mut s = accept(listener);
-        let check = request(&mut s);
-        assert!(matches!(check.request, Request::CheckUi));
-        answer(&mut s, check.id, Ok(Response::Ok));
-        for pane in [31, 32] {
-            let req = request(&mut s);
-            let Request::CreatePane(p) = req.request else {
-                panic!("expected creation")
-            };
-            if pane == 31 {
-                assert_eq!(p.command.unwrap(), ["printf", "%s", "$(literal)"]);
+fn apply_preserves_split_and_rolls_back_only_before_desktop_commit() {
+    for committed in [false, true] {
+        let env = TestSocket::new(if committed { "committed" } else { "rollback" });
+        let file = env.dir.join("layout.json");
+        std::fs::write(&file, r#"{"version":1,"title":"tests","root":{"type":"split","dir":"down","ratio":0.3,"first":{"type":"pane","command":["printf","%s","$(literal)"]},"second":{"type":"pane"}}}"#).unwrap();
+        let listener = env.listen();
+        let server = std::thread::spawn(move || {
+            let mut s = accept(listener);
+            let check = request(&mut s);
+            assert!(matches!(check.request, Request::CheckUi));
+            answer(&mut s, check.id, Ok(Response::Ok));
+            for pane in [31, 32] {
+                let req = request(&mut s);
+                let Request::CreatePane(p) = req.request else {
+                    panic!("expected creation")
+                };
+                if pane == 31 {
+                    assert_eq!(p.command.unwrap(), ["printf", "%s", "$(literal)"]);
+                }
+                answer(&mut s, req.id, Ok(Response::PaneCreated { pane }));
             }
-            answer(&mut s, req.id, Ok(Response::PaneCreated { pane }));
-        }
-        let req = request(&mut s);
-        let Request::ApplyLayout { json, .. } = req.request else {
-            panic!("expected layout")
-        };
-        let tab: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(tab["root"]["ratio"], 0.3);
-        assert_eq!(tab["root"]["second"]["id"], 32);
-        answer(&mut s, req.id, Err("window closed".into()));
-        for pane in [31, 32] {
             let req = request(&mut s);
-            assert!(matches!(req.request, Request::ClosePane { pane: id } if id == pane));
-            answer(&mut s, req.id, Ok(Response::Ok));
-        }
-    });
-    let output = env
-        .command()
-        .args(["layout", "apply"])
-        .arg(file)
-        .output()
-        .unwrap();
-    server.join().unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("window closed"));
+            let Request::ApplyLayout { json, .. } = req.request else {
+                panic!("expected layout")
+            };
+            let tab: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(tab["root"]["ratio"], 0.3);
+            assert_eq!(tab["root"]["second"]["id"], 32);
+            answer(
+                &mut s,
+                req.id,
+                Ok(Response::LayoutResult(thurm_proto::LayoutResult {
+                    committed,
+                    error: Some("confirmation timed out".into()),
+                })),
+            );
+            if committed {
+                assert!(
+                    codec::read_message::<_, Envelope>(&mut s)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                for pane in [31, 32] {
+                    let req = request(&mut s);
+                    assert!(matches!(req.request, Request::ClosePane { pane: id } if id == pane));
+                    answer(&mut s, req.id, Ok(Response::Ok));
+                }
+            }
+        });
+        let output = env
+            .command()
+            .args(["layout", "apply"])
+            .arg(file)
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("confirmation timed out"));
+        assert_eq!(error.contains("panes kept: [31,32]"), committed);
+    }
 }
 
 #[test]

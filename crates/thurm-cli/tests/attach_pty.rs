@@ -124,6 +124,22 @@ fn exercise(stop: u8) {
             }
         }
     }
+    let mut host = thurm_term::Terminal::new(
+        thurm_proto::PaneSize {
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        },
+        thurm_term::EngineConfig::default(),
+    );
+    host.advance(b"\x1b[3;12r\x1b[?6h\x1b[4h\x1b(0");
+    host.advance(&output);
+    assert!(host.screen_text().starts_with("previous screen"));
+    let frame = host
+        .snapshot(7, &mut thurm_term::ClientView::new())
+        .unwrap()
+        .frame;
+    assert_eq!((frame.cursor.row, frame.cursor.col), (1, 0));
     assert_eq!(terminal_flags(&slave) & (libc::ICANON | libc::ECHO), 0);
     size.ws_col = 96;
     size.ws_row = 28;

@@ -76,6 +76,7 @@ pub fn run(c: &Client, action: Option<LayoutCmd>) -> super::R {
             template.validate()?;
             c.request(Request::CheckUi)?;
             let mut created = Vec::new();
+            let mut rollback = true;
             let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                 let root = create_node(c, &template.root, &mut created)?;
                 let tab = TabLayout {
@@ -85,16 +86,35 @@ pub fn run(c: &Client, action: Option<LayoutCmd>) -> super::R {
                     zoomed: None,
                     handoff: None,
                 };
-                c.request(Request::ApplyLayout {
+                // Once sent, only a confirmed pre-commit failure permits cleanup.
+                rollback = false;
+                let Response::LayoutResult(result) = c.request(Request::ApplyLayout {
                     json: serde_json::to_string(&tab)?,
                     timeout_ms: 10_000,
-                })?;
+                })?
+                else {
+                    return Err("unexpected layout result".into());
+                };
+                rollback = !result.committed;
+                if let Some(error) = result.error {
+                    return Err(error.into());
+                }
+                if !result.committed {
+                    return Err("the desktop did not commit the layout".into());
+                }
                 println!("{}", serde_json::json!({"panes": created}));
                 Ok(())
             })();
             if let Err(error) = result {
-                for pane in created {
-                    let _ = c.request(Request::ClosePane { pane });
+                if rollback {
+                    for pane in created {
+                        let _ = c.request(Request::ClosePane { pane });
+                    }
+                } else {
+                    eprintln!(
+                        "layout state is uncertain; panes kept: {}",
+                        serde_json::json!(created)
+                    );
                 }
                 return Err(error);
             }

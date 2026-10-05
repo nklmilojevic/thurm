@@ -49,9 +49,15 @@ literal arguments. Shell operators and variable expansion need an explicit
 shell command, such as `["sh", "-c", "your command"]`.
 
 The CLI checks the full template before it creates panes. It waits up to 10 seconds
-for the selected desktop app to confirm that it installed the tab. If creation,
-installation, or confirmation fails, it closes the panes that it created. A command
-that already started can have effects that closing its pane does not undo.
+for a desktop app to confirm that it installed the tab. The app must commit the
+request before it changes the layout. A timeout before this commit cancels the
+request and closes the new panes. Creation failures and confirmed rejections
+before commit also close the new panes.
+
+After commit, the app owns the panes. If its confirmation is late or the connection
+is lost, the CLI reports an error and lists the pane IDs that it kept. This prevents
+cleanup from closing panes that the app may already use. A command that already
+started can have effects that closing its pane does not undo.
 
 Templates support up to 64 panes and 16 split levels. Split ratios must be from
 0.05 to 0.95. `hold` keeps a pane open after its command ends.
