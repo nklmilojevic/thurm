@@ -166,9 +166,9 @@ pub fn run(
 }
 
 /// Opens the forward the app's tunnel uses and pings the daemon through it. Some ssh servers
-/// accept a Unix-socket forward and close it at once (OrbStack's built-in one, Tailscale SSH
-/// before 1.98): everything else checks out, and the app still never connects. Starts the
-/// daemon when it is not running, as connecting would.
+/// accept a Unix-socket forward and close it at once (OrbStack's built-in one), or connect as
+/// root (Tailscale SSH), which older daemons refuse: everything else checks out, and the app
+/// still never connects. Starts the daemon when it is not running, as connecting would.
 fn tunnel_check(ssh: &Ssh, plan: &Plan, socket: Option<&str>) -> Check {
     let mut c = check(
         "tunnel",
@@ -203,8 +203,9 @@ fn tunnel_check(ssh: &Ssh, plan: &Plan, socket: Option<&str>) -> Check {
             c.detail = if daemon_answers(ssh, &remote) {
                 format!(
                     "the daemon answers on the host but not through the forward ({e}): the host's \
-                     ssh server likely cannot forward Unix sockets (OrbStack's built-in one and \
-                     Tailscale SSH before 1.98 cannot); connect to the host's OpenSSH instead"
+                     ssh server cannot forward Unix sockets (OrbStack's built-in one cannot; \
+                     connect to the host's OpenSSH instead), or opens them as root (Tailscale \
+                     SSH), which a daemon before 0.2.3 refuses (upgrade it)"
                 )
             } else {
                 format!("the daemon does not answer on {remote} ({e})")
