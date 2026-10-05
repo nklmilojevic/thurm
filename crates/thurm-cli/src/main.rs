@@ -833,35 +833,43 @@ fn daemon_cmd(action: &str, json: bool) -> R {
                 .into());
             }
             // Enabled for the next login; a daemon running now keeps serving its sessions.
-            let ok = systemctl(&["enable", SYSTEMD_UNIT]);
-            println!(
-                "{SYSTEMD_UNIT} {} ({})",
-                if ok {
-                    "installed and enabled"
-                } else {
-                    "installed; enable it with systemctl --user"
-                },
-                path.display()
-            );
+            if !systemctl(&["enable", SYSTEMD_UNIT]) {
+                eprintln!(
+                    "thurm: wrote {}, but systemctl --user enable {SYSTEMD_UNIT} failed; \
+                     enable it yourself to start thurmd at login",
+                    path.display()
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+            println!("{SYSTEMD_UNIT} installed and enabled ({})", path.display());
             Ok(ExitCode::SUCCESS)
         }
         "uninstall-systemd" => {
             let path = systemd_unit_path();
-            let _ = std::process::Command::new("systemctl")
-                .args(["--user", "disable", SYSTEMD_UNIT])
-                .status();
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    let _ = std::process::Command::new("systemctl")
-                        .args(["--user", "daemon-reload"])
-                        .status();
-                    println!("{SYSTEMD_UNIT} removed; the running daemon keeps its sessions")
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    println!("{SYSTEMD_UNIT} is not installed")
-                }
-                Err(e) => return Err(e.into()),
+            let systemctl = |args: &[&str]| {
+                std::process::Command::new("systemctl")
+                    .arg("--user")
+                    .args(args)
+                    .status()
+                    .is_ok_and(|s| s.success())
+            };
+            if !path.exists() {
+                println!("{SYSTEMD_UNIT} is not installed");
+                return Ok(ExitCode::SUCCESS);
             }
+            // Disabled first: removing the file would leave the login symlink behind.
+            if !systemctl(&["disable", SYSTEMD_UNIT]) {
+                return Err(format!(
+                    "systemctl --user disable {SYSTEMD_UNIT} failed; {} is still installed",
+                    path.display()
+                )
+                .into());
+            }
+            std::fs::remove_file(&path)?;
+            if !systemctl(&["daemon-reload"]) {
+                return Err("removed the unit, but systemctl --user daemon-reload failed".into());
+            }
+            println!("{SYSTEMD_UNIT} removed; the running daemon keeps its sessions");
             Ok(ExitCode::SUCCESS)
         }
         _ => unreachable!(),

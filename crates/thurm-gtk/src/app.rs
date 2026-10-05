@@ -91,11 +91,18 @@ pub fn run() -> std::process::ExitCode {
         let quick = opts.contains("quick-terminal");
         let new_tab = opts.contains("new-tab");
         let new_workspace = opts.contains("new-workspace");
-        if with_app(|_| ()).is_none()
-            && let Err(e) = App::start(gtk_app)
-        {
-            fatal(gtk_app, &e);
-            return 0.into();
+        if with_app(|_| ()).is_none() {
+            match App::start(gtk_app) {
+                Ok(()) => {}
+                Err(ConnectError::Failed(e)) => {
+                    fatal(gtk_app, &e);
+                    return 0.into();
+                }
+                Err(ConnectError::OldDaemon(e)) => {
+                    ask_restart_daemon(gtk_app, &e);
+                    return 0.into();
+                }
+            }
         }
         with_app(|a| {
             if quick {
@@ -119,6 +126,49 @@ pub fn run() -> std::process::ExitCode {
     });
     let code = gtk_app.run();
     std::process::ExitCode::from(code.get())
+}
+
+/// The running daemon is too old to replace in place: restarting it ends the programs in its
+/// panes, so the user decides (like the macOS app).
+fn ask_restart_daemon(gtk_app: &adw::Application, detail: &str) {
+    log::warn!("{detail}");
+    let window = adw::ApplicationWindow::new(gtk_app);
+    window.set_title(Some("Thurm"));
+    window.set_default_size(560, 200);
+    window.present();
+    let dialog = adw::AlertDialog::new(
+        Some("Restart the session daemon?"),
+        Some(
+            "Thurm was updated, but the session daemon still runs the previous version. \
+             Restarting it closes the programs running in your tabs; tabs, splits, scrollback \
+             and working directories come back.",
+        ),
+    );
+    dialog.add_response("quit", "Quit");
+    dialog.add_response("restart", "Restart Daemon");
+    dialog.set_response_appearance("restart", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("quit"));
+    dialog.set_close_response("quit");
+    let app = gtk_app.clone();
+    let w = window.clone();
+    dialog.connect_response(None, move |_, response| {
+        w.close();
+        if response != "restart" {
+            return;
+        }
+        if !core::terminate_daemon() {
+            log::warn!("could not stop the old daemon");
+        }
+        match App::start(&app) {
+            Ok(()) => {
+                if let Some(win) = with_app(|a| a.win()).flatten() {
+                    win.window.present();
+                }
+            }
+            Err(ConnectError::Failed(e) | ConnectError::OldDaemon(e)) => fatal(&app, &e),
+        }
+    });
+    dialog.present(Some(&window));
 }
 
 fn fatal(gtk_app: &adw::Application, message: &str) {
@@ -152,32 +202,42 @@ pub fn system_is_dark() -> bool {
     })
 }
 
-/// Connects and says Hello; replaces an older daemon in place (once per launch).
-fn connect_local(epoch: u64, upgraded: &Cell<bool>) -> Result<Core, String> {
+pub enum ConnectError {
+    Failed(String),
+    /// A daemon on another protocol that can't be replaced in place: only restarting it (which
+    /// ends its programs) helps.
+    OldDaemon(String),
+}
+
+/// Connects and says Hello; replaces an older daemon in place (once per launch). Never stops
+/// the daemon.
+fn connect_local(epoch: u64, upgraded: &Cell<bool>) -> Result<Core, ConnectError> {
     let daemon = core::daemon_path();
     let hello =
         json!({"Hello": {"client": "thurm-gtk", "version": core::protocol_version(), "ui": true}});
     loop {
         let core = match Core::connect(daemon.as_deref(), epoch) {
             Ok(c) => c,
-            Err(e) if e.contains("protocol mismatch") && !upgraded.get() && daemon.is_some() => {
-                upgraded.set(true);
-                if core::upgrade_daemon(daemon.as_deref().unwrap()) != 0
-                    && !core::terminate_daemon()
-                {
-                    return Err(format!(
-                        "The running thurmd speaks another protocol: {e}. Run `thurm daemon stop` (layout and scrollback are restored), then open Thurm again."
-                    ));
+            Err(e) if e.contains("protocol mismatch") => {
+                if !upgraded.get() && let Some(path) = daemon.as_deref() {
+                    upgraded.set(true);
+                    let rc = core::upgrade_daemon(path);
+                    log::info!("in-place daemon upgrade: {rc}");
+                    if rc == 0 {
+                        continue;
+                    }
                 }
-                continue;
+                return Err(ConnectError::OldDaemon(format!(
+                    "The running thurmd speaks another protocol: {e}. Run `thurm daemon stop` (layout and scrollback are restored), then open Thurm again."
+                )));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(ConnectError::Failed(e)),
         };
         let resp = core.request(&hello);
         if let Some(e) = resp.get("error").and_then(Value::as_str) {
-            return Err(format!(
+            return Err(ConnectError::Failed(format!(
                 "The running thurmd refused the connection: {e}. Quit Thurm and run `thurm daemon stop` (layout and scrollback are restored), then open Thurm again."
-            ));
+            )));
         }
         let build = resp.pointer("/Hello/build").and_then(Value::as_str).unwrap_or("");
         if !upgraded.get()
@@ -198,7 +258,7 @@ fn connect_local(epoch: u64, upgraded: &Cell<bool>) -> Result<Core, String> {
 }
 
 impl App {
-    fn start(gtk_app: &adw::Application) -> Result<(), String> {
+    fn start(gtk_app: &adw::Application) -> Result<(), ConnectError> {
         integrations::register_icons();
         let dark = system_is_dark();
         let ui = UiConfig::load(dark);
@@ -2769,7 +2829,7 @@ impl App {
                 self.reconnecting.set(false);
                 self.resync();
             }
-            Err(e) => {
+            Err(ConnectError::Failed(e) | ConnectError::OldDaemon(e)) => {
                 log::debug!("reconnect: {e}");
                 let n = self.reconnect_attempt.get();
                 self.reconnect_attempt.set(n + 1);
