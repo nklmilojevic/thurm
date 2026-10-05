@@ -288,7 +288,7 @@ final class QuickTerminal {
         hotKeySpec = spec
         guard !spec.isEmpty else { return nil }
         guard let key = Self.parseHotkey(spec) else {
-            return "Quick terminal: unknown hotkey \"\(spec)\""
+            return "Quick terminal: cannot use \"\(spec)\" as the hotkey (use a modifier, like ctrl+grave, or F1–F20)"
         }
         installHandler()
         var ref: EventHotKeyRef?
@@ -317,6 +317,8 @@ final class QuickTerminal {
 
     /// `"ctrl+grave"`, `"cmd+shift+space"`, `"f12"`: Carbon key code and modifiers. Keys are
     /// physical positions on an ANSI keyboard (so "grave" is the key left of 1 everywhere).
+    /// A key other than F1–F20 needs a modifier besides Shift: a global hotkey takes the
+    /// combination from every app.
     static func parseHotkey(_ spec: String) -> (code: UInt32, modifiers: UInt32)? {
         let parts = spec.lowercased().split(separator: "+", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -332,6 +334,8 @@ final class QuickTerminal {
             }
         }
         guard let code = keyCodes[keyName] else { return nil }
+        let functionKey = keyName.hasPrefix("f") && Int(keyName.dropFirst()).map { (1...20).contains($0) } == true
+        if modifiers & ~UInt32(shiftKey) == 0 && !functionKey { return nil }
         return (UInt32(code), modifiers)
     }
 

@@ -280,6 +280,9 @@ fn remote_connected(app: &Rc<App>, host: &str) {
     // Closes queued while the host was away.
     let mut all = pending_closes();
     if let Some(pending) = all.get_mut(host) {
+        // Panes a queued close was for: closed now, or still to close. Neither is shown or
+        // adopted (a just-closed one is still listed until its exit arrives).
+        let mut closing = HashSet::new();
         pending.retain(|id, pid| {
             let Some(info) = infos.iter().find(|i| i.id == *id && i.alive) else {
                 return false;
@@ -288,10 +291,10 @@ fn remote_connected(app: &Rc<App>, host: &str) {
             if !same {
                 return false;
             }
+            closing.insert(*id);
             core.request(&json!({"ClosePane": {"pane": id}})) != Value::String("Ok".into())
         });
-        let still: HashSet<u64> = pending.keys().copied().collect();
-        infos.retain(|i| !still.contains(&i.id));
+        infos.retain(|i| !closing.contains(&i.id));
     }
     if let Err(e) = save_pending_closes(&all) {
         log::warn!("saving the queued closes: {e}");

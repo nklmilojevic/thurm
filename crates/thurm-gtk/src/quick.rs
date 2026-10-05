@@ -253,7 +253,10 @@ pub fn configure(app: &App) {
     }
     match portal_trigger(&spec) {
         Some(trigger) => bind_portal(trigger, spec),
-        None => app.toast(&format!("Quick terminal: unknown hotkey \"{spec}\""), 8.0),
+        None => app.toast(
+            &format!("Quick terminal: cannot use \"{spec}\" as the hotkey (use a modifier, like ctrl+grave, or F1–F20)"),
+            8.0,
+        ),
     }
 }
 
@@ -267,7 +270,8 @@ pub fn configure_changed(app: &App) {
     }
 }
 
-/// `ctrl+grave` → `CTRL+grave` (the shortcuts portal's trigger format).
+/// `ctrl+grave` → `CTRL+grave` (the shortcuts portal's trigger format). A key other than F1–F20
+/// needs a modifier besides Shift: a global shortcut takes the combination from every app.
 pub fn portal_trigger(spec: &str) -> Option<String> {
     let parts: Vec<String> = spec.split('+').map(|p| p.trim().to_lowercase()).collect();
     let (key, mods) = parts.split_last()?;
@@ -304,6 +308,10 @@ pub fn portal_trigger(spec: &str) -> Option<String> {
         k if k.len() == 1 && k.chars().all(|c| c.is_ascii_alphanumeric()) => k.to_string(),
         _ => return None,
     };
+    let function_key = key.starts_with('F') && key[1..].parse::<u8>().is_ok();
+    if out.iter().all(|m| *m == "SHIFT") && !function_key {
+        return None;
+    }
     let mut s = out.join("+");
     if !s.is_empty() {
         s.push('+');
@@ -495,5 +503,10 @@ mod tests {
         assert_eq!(portal_trigger("cmd+shift+space").as_deref(), Some("LOGO+SHIFT+space"));
         assert_eq!(portal_trigger("f12").as_deref(), Some("F12"));
         assert_eq!(portal_trigger("hyper+x"), None);
+        // Bare or Shift-only keys would be taken from every app.
+        assert_eq!(portal_trigger("a"), None);
+        assert_eq!(portal_trigger("shift+grave"), None);
+        assert_eq!(portal_trigger("space"), None);
+        assert_eq!(portal_trigger("shift+f1").as_deref(), Some("SHIFT+F1"));
     }
 }

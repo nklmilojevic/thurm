@@ -906,7 +906,11 @@ impl TermView {
         keycode: u32,
         state: gdk::ModifierType,
     ) -> glib::Propagation {
+        // An offline pane takes no input, but the app's shortcuts still work (to switch away).
         if self.is_offline() {
+            if let Some(action) = app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten() {
+                app::with_app(|a| a.activate(action));
+            }
             return glib::Propagation::Stop;
         }
         self.area.set_cursor_from_name(Some("none"));
