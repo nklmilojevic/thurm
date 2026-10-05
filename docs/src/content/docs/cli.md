@@ -49,6 +49,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `focus ID` | Focus a pane in the app |
 | `close [ID]` | Stop and close a pane; ID is positional |
 | `title [TEXT...]` | Set the tab title; `--pane ID`; empty text resets it |
+| `workspace rename NAME...` | Rename the workspace a pane is in; `--pane ID` (`new-tab --window` prints the new pane's ID) |
 | `send [TEXT...]` | Send text; `--pane ID`, `--paste`, `--no-enter`; `-` reads stdin |
 | `send-keys [KEYS...]` | Send keys such as `Enter`, `Escape`, `C-c`; `--pane ID` |
 | `capture` | Read visible text; `--pane ID`, `-n N`, `--scrollback`, `--ansi` |

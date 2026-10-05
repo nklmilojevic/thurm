@@ -109,13 +109,27 @@ fn unit_at(chars: &[char], offset: usize, granularity: gtk::AccessibleTextGranul
     match granularity {
         gtk::AccessibleTextGranularity::Character => (offset, (offset + 1).min(n)),
         gtk::AccessibleTextGranularity::Word => {
-            let is_word = |c: char| c.is_alphanumeric() || c == '_';
-            let mut s = offset;
-            while s > 0 && is_word(chars[s - 1]) {
+            // The run of word characters, or of separators, the offset is in (at the end: the
+            // last one); a line break is a unit of its own.
+            if n == 0 {
+                return (0, 0);
+            }
+            let class = |c: char| match c {
+                '\n' => 2,
+                c if c.is_alphanumeric() || c == '_' => 0,
+                _ => 1,
+            };
+            let at = offset.min(n - 1);
+            let k = class(chars[at]);
+            if k == 2 {
+                return (at, at + 1);
+            }
+            let mut s = at;
+            while s > 0 && class(chars[s - 1]) == k {
                 s -= 1;
             }
-            let mut e = offset;
-            while e < n && is_word(chars[e]) {
+            let mut e = at + 1;
+            while e < n && class(chars[e]) == k {
                 e += 1;
             }
             (s, e)
@@ -143,6 +157,11 @@ mod tests {
         let chars: Vec<char> = "ls -la\nhello world".chars().collect();
         assert_eq!(unit_at(&chars, 8, gtk::AccessibleTextGranularity::Line), (7, 18));
         assert_eq!(unit_at(&chars, 14, gtk::AccessibleTextGranularity::Word), (13, 18));
+        // Separators are units too, so word navigation can step over them.
+        assert_eq!(unit_at(&chars, 2, gtk::AccessibleTextGranularity::Word), (2, 4));
+        assert_eq!(unit_at(&chars, 12, gtk::AccessibleTextGranularity::Word), (12, 13));
+        assert_eq!(unit_at(&chars, 6, gtk::AccessibleTextGranularity::Word), (6, 7));
+        assert_eq!(unit_at(&chars, 18, gtk::AccessibleTextGranularity::Word), (13, 18));
         assert_eq!(unit_at(&chars, 0, gtk::AccessibleTextGranularity::Character), (0, 1));
     }
 }

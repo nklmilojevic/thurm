@@ -1,9 +1,9 @@
 ---
 title: Thurm
-description: A native macOS terminal with persistent sessions and coding agent controls.
+description: A native terminal for macOS and Linux with persistent sessions and coding agent controls.
 template: splash
 hero:
-  tagline: A terminal for Apple silicon Macs with native tabs, split panes, workspaces, and controls for coding agents. Your shells keep running after you quit.
+  tagline: A terminal for Apple silicon Macs and Linux with native tabs, split panes, workspaces, and controls for coding agents. Your shells keep running after you quit.
   actions:
     - text: Install Thurm
       link: /install/
@@ -16,8 +16,9 @@ hero:
 
 import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-AppKit provides the interface. Metal and CoreText draw text and images. The
-libghostty-vt library maintains terminal state. The `thurmd` daemon runs your
+On macOS, AppKit provides the interface, and Metal and CoreText draw text and
+images. On Linux, the app uses GTK 4 and libadwaita. The libghostty-vt library
+maintains terminal state. The `thurmd` daemon runs your
 shells. By default, they continue to run when you quit the app. Open Thurm again
 to return to them.
 
@@ -30,8 +31,10 @@ to return to them.
   <LinkCard title="Sessions" href="/sessions/" description="Understand saved sessions before you stop the daemon." />
 </CardGrid>
 
-Thurm requires macOS 14 or later and Apple silicon. Optional on-device AI
+On macOS, Thurm requires macOS 14 or later and Apple silicon. Optional on-device AI
 features require macOS 26 or later and Apple Intelligence. They are off by default.
+On Linux, it needs GTK 4.14 and libadwaita 1.5 or later (Ubuntu 24.04, Debian 13,
+Fedora 40, Arch Linux, or newer), on x86_64 or aarch64.
 
 These pages describe the `main` branch. An older installed build can have fewer
 commands or settings. Use `thurm --version` to check your CLI version.

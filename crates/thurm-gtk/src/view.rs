@@ -756,8 +756,9 @@ impl TermView {
         let Some((opacity, cursor_blink, thickness, dim_amount, theme_fg, theme_bg)) =
             app::with_app(|a| {
                 let ui = a.ui();
+                let quick = a.quick.borrow().as_ref().is_some_and(|q| q.tab.panes().contains(&self.key));
                 (
-                    ui.opacity(),
+                    if quick { ui.quick_opacity() } else { ui.opacity() },
                     ui.cfg.cursor.blink,
                     ui.cursor_thickness(),
                     ui.unfocused_dim(),

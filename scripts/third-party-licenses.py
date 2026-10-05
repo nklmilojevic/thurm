@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Writes THIRD_PARTY_LICENSES: the license texts of everything compiled into or shipped with
-Thurm (the app, thurmd and thurm, and the Linux tarballs). Not committed: macos/build.sh and
+Thurm (the macOS and Linux apps, thurmd and thurm, and the Linux tarballs and packages). Not committed: macos/build.sh and
 the release workflow generate it at build time, so dependency updates never leave it stale.
 
 Crates come from `cargo metadata` (the normal dependencies of thurm-ffi, thurm-daemon and
@@ -16,8 +16,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "THIRD_PARTY_LICENSES"
-TARGETS = ["aarch64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
-ROOTS = {"thurm-ffi", "thurm-daemon", "thurm-cli"}
+TARGETS = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+ROOTS = {"thurm-ffi", "thurm-daemon", "thurm-cli", "thurm-gtk"}
 LICENSE_FILE = re.compile(r"^(licen[cs]e|copying|notice|unlicense)([-_.].*)?$", re.IGNORECASE)
 
 # Not crates: (component, where it is used, license files relative to the repo).
@@ -28,8 +34,10 @@ EXTRA = [
     ("iTerm2-Color-Schemes", "built-in color themes", ["crates/thurm-config/themes/LICENSE"]),
     ("tty7 and Fig autocomplete specs", "tab completion specs",
      ["completions/NOTICE", "completions/LICENSE-tty7-Apache-2.0"]),
-    ("JetBrains Mono", "bundled font, macOS app", ["macos/Resources/fonts/JetBrainsMono-OFL.txt"]),
-    ("Symbols Nerd Font", "bundled font, macOS app", ["macos/Resources/fonts/SymbolsNerdFont-LICENSE"]),
+    ("JetBrains Mono", "bundled font, macOS and Linux apps", ["macos/Resources/fonts/JetBrainsMono-OFL.txt"]),
+    ("Symbols Nerd Font", "bundled font, macOS and Linux apps",
+     ["macos/Resources/fonts/SymbolsNerdFont-LICENSE"]),
+    ("Adwaita icon theme", "symbolic icons, Linux app", ["linux/icons/COPYING"]),
 ]
 
 

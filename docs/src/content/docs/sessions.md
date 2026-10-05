@@ -45,11 +45,14 @@ previous process memory. Hooks can provide session IDs for a specific resume.
 ```sh
 thurm daemon start
 thurm daemon upgrade
-thurm daemon install-launchd
+thurm daemon install-launchd     # macOS
+thurm daemon install-systemd     # Linux
 ```
 
 `install-launchd` installs a per-user LaunchAgent to start the daemon at login.
-Use `thurm daemon uninstall-launchd` to remove it.
+Use `thurm daemon uninstall-launchd` to remove it. On Linux, `install-systemd`
+writes and enables a systemd user unit (`~/.config/systemd/user/thurmd.service`)
+instead; `thurm daemon uninstall-systemd` removes it.
 
 `upgrade` replaces an older daemon with the installed binary. Compatible
 versions transfer terminal state and open process handles so that programs

@@ -8,7 +8,11 @@ sidebar:
 Thurm can attach to `thurmd` running on other machines. A remote host's panes
 show as a workspace next to your local ones, with the same tabs, splits, agent
 sidebar, agent switcher (⌘⇧A) and notifications. Agents keep running there when
-the Mac sleeps, changes networks, or quits.
+your computer sleeps, changes networks, or quits.
+
+Shortcuts on this page are the macOS ones. On Linux, ⌘⇧P is Ctrl+Shift+P, ⌘⇧A is
+Ctrl+Alt+A, ⌘⇧O is Ctrl+Alt+O, and ⌘-click is Ctrl+click; **Thurm › Remotes…** is in
+the main menu (☰). See [Use Thurm](/usage/) for the full list.
 
 The connection is the system `ssh`, one tunnel per host. Thurm has no network
 layer, relay, or account of its own; Tailscale or any other network works

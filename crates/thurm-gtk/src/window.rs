@@ -166,9 +166,18 @@ impl MainWindow {
             });
             *w.width_save.borrow_mut() = Some(id);
         });
-        self.window.connect_close_request(|_| {
-            // Closing the window quits the app; the shells keep running in thurmd.
-            app::with_app(|a| a.quit());
+        self.window.connect_close_request(|w| {
+            // The shells keep running in thurmd either way. With `quit_after_last_window` off
+            // (the default) Thurm stays running without a window, like on macOS: the
+            // quick-terminal hotkey works, and opening Thurm again shows the window at once.
+            app::with_app(|a| {
+                if a.ui().cfg.window.quit_after_last_window {
+                    a.quit();
+                } else {
+                    a.save_now(true);
+                    w.set_visible(false);
+                }
+            });
             glib::Propagation::Stop
         });
         self.window.connect_is_active_notify(|_| {
@@ -209,6 +218,7 @@ impl MainWindow {
             r#"
             window.thurm, window.thurm .thurm-content {{ background-color: {bg_a}; }}
             window.thurm headerbar {{ background-color: {bg_a}; color: {fg}; box-shadow: none; }}
+            window.thurm.thurm-quick, window.thurm.thurm-quick .thurm-content {{ background-color: {quick_a}; }}
             .thurm-sidebar {{ background-color: {side}; color: {fg}; }}
             .thurm-sidebar list {{ background: transparent; }}
             .thurm-sidebar row {{ border-radius: 6px; margin: 1px 6px; }}
@@ -240,6 +250,7 @@ impl MainWindow {
             .thurm-dot {{ min-width: 8px; min-height: 8px; border-radius: 4px; }}
             "#,
             bg_a = css_rgba(bg, opacity),
+            quick_a = css_rgba(bg, ui.quick_opacity()),
             bg = css_rgb(bg),
             fg = css_rgb(fg),
             side = css_rgba(sidebar_bg, 1.0),

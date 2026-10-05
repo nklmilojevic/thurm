@@ -44,6 +44,9 @@ tunnel), panes keyed by (host, id).
   monitor showing the main window (GTK cannot see the pointer outside its windows), `main` the
   first monitor. The hotkey hides it whenever it is shown (macOS: only when it has focus, else
   focuses it), because a Wayland compositor may not focus the window it shows.
+- **Closing the window**: with `window.quit_after_last_window` off (the default) Thurm keeps
+  running without a window, as it stays in the Dock on macOS: the quick-terminal hotkey still
+  works, and opening Thurm again shows the window. Quit from the menu to end it.
 - **Updates**: no Sparkle; packages are updated by the package manager.
 - **Secure keyboard entry**: macOS-only. Linux shows the lock badge on password prompts (input
   is not observable by other Wayland clients anyway).
@@ -59,11 +62,23 @@ tunnel), panes keyed by (host, id).
 
 ## Building and packaging
 
-- Ubuntu 24.04+ / Debian: `scripts/linux/provision.sh`, then `scripts/linux/install.sh`
-  (installs to `~/.local`).
-- Arch / CachyOS: `scripts/linux/arch-package.sh` on an Arch machine builds
-  `target/arch/thurm-<version>-<arch>.pkg.tar.zst` from `linux/arch/PKGBUILD`;
-  `sudo pacman -U` it.
+- Releases: the `linux` job of `.github/workflows/release.yaml` builds `thurm-gtk` (glibc, on
+  Ubuntu 24.04) with the static `thurm`/`thurmd` it already builds for remote hosts, all with
+  one `THURM_BUILD`, and packages them with `scripts/linux/package.sh` (nfpm,
+  `linux/nfpm.yaml`): `thurm_<ver>-1_<arch>.deb`, `thurm-<ver>-1.<arch>.rpm`, and copies with
+  fixed names (`thurm-amd64.deb`, `thurm-x86_64.rpm`, …) for `releases/latest/download`
+  links. Each is installed in an `ubuntu:24.04` / `fedora:43` container before publishing.
+  Tip packages are versioned `<ver>+tip.<commit count>.<sha>`: after the release they follow,
+  before the next, in dpkg, rpm and pacman alike.
+- Arch / CachyOS: `linux/arch/PKGBUILD` is the AUR package `thurm` (built from the release's
+  tag tarball, with Arch's `zig`). `scripts/linux/aur-update.sh VERSION AUR_DIR` updates a
+  clone of the AUR repository for a release (version, checksum, `.SRCINFO`) and commits;
+  pushing is manual. `scripts/linux/arch-package.sh` builds the same PKGBUILD from the
+  working tree into `target/arch/`; the `Arch package` workflow runs it in an Arch container,
+  and the release workflow's `arch` job publishes its result as `thurm-x86_64.pkg.tar.zst`
+  (until the package is on the AUR, whose registration was closed in October 2026).
+- From source on Ubuntu 24.04+ / Debian: `scripts/linux/provision.sh`, then
+  `scripts/linux/install.sh` (installs to `~/.local`).
 - Installed layout: `/usr/bin/{thurm-gtk,thurm,thurmd}`, the desktop entry (with New Tab, New
   Workspace and Quick Terminal actions), `/usr/share/thurm/fonts` (bundled JetBrains Mono and
   Symbols Nerd Font, registered with fontconfig at startup), `/usr/share/thurm/icons` (the
