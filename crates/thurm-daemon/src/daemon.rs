@@ -2,6 +2,7 @@
 
 #[path = "terminal_attach.rs"]
 mod terminal_attach;
+mod agent_prompt;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -1716,6 +1717,33 @@ impl Daemon {
     pub fn handle(self: &Arc<Self>, client: &Arc<Client>, id: u64, req: Request) {
         *self.last_activity.lock() = Instant::now();
         let result = match req {
+            Request::AgentPrompt {
+                pane,
+                text,
+                wait,
+                timeout_ms,
+            } => match self.submit_agent_prompt(pane, &text, timeout_ms) {
+                Err(error) => Err(error),
+                Ok(ticket) if !wait => {
+                    let _ = ticket;
+                    Ok(Response::AgentPrompt(
+                        thurm_proto::AgentPromptOutcome::Submitted,
+                    ))
+                }
+                Ok(ticket) => {
+                    let daemon = self.clone();
+                    let client = client.clone();
+                    std::thread::spawn(move || {
+                        let result = daemon
+                            .wait_agent_prompt(client.id, pane, ticket)
+                            .map(Response::AgentPrompt);
+                        if id != 0 {
+                            client.send(ServerMessage::Response { id, result });
+                        }
+                    });
+                    return;
+                }
+            },
             Request::Wait {
                 pane,
                 until,
@@ -1983,6 +2011,9 @@ impl Daemon {
             }
             Request::Input { pane, data } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    if !data.is_empty() {
+                        st.agent.prompt.interrupted();
+                    }
                     st.agent.user_answer(&data);
                     p.write(data);
                 })?;
@@ -1990,6 +2021,9 @@ impl Daemon {
             }
             Request::Paste { pane, text } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    if !text.is_empty() {
+                        st.agent.prompt.interrupted();
+                    }
                     st.agent.user_input();
                     p.write(st.term.paste(&text));
                 })?;
@@ -1999,6 +2033,7 @@ impl Daemon {
                 self.with_input_pane(client.id, pane, |p, st| {
                     let bytes = st.term.key(&key);
                     if !bytes.is_empty() {
+                        st.agent.prompt.interrupted();
                         st.agent.user_answer(&bytes);
                         p.write(bytes);
                     }
@@ -2090,7 +2125,9 @@ impl Daemon {
             Request::Capture { pane, opts } => {
                 self.with_pane(pane, |_, st| Response::Text(st.term.capture(&opts)))
             }
-            Request::Wait { .. } | Request::Explain { .. } => unreachable!("handled in handle()"),
+            Request::Wait { .. } | Request::Explain { .. } | Request::AgentPrompt { .. } => {
+                unreachable!("handled in handle()")
+            }
             Request::SetLayout { json } => {
                 serde_json::from_str::<Layout>(&json)
                     .map_err(|e| format!("invalid layout: {e}"))?;

@@ -21,6 +21,7 @@ pub mod reporting;
 #[derive(Default, Debug)]
 pub struct AgentTracker {
     current: Option<AgentState>,
+    pub prompt: crate::agent_prompt::PromptTracker,
     /// Kind of the last agent seen (kept after it exits, used for resume on restore).
     pub last_kind: Option<String>,
     /// Set by a program notification; cleared when the user types.
@@ -251,6 +252,9 @@ impl AgentTracker {
         session_id: Option<String>,
         message: Option<String>,
     ) {
+        if matches!(event, "session-start" | "session-end") {
+            self.prompt.reset();
+        }
         if event == "session-end" {
             self.hook = None;
             return;
@@ -288,6 +292,7 @@ impl AgentTracker {
                 self.ai = AiNotes::default();
             }
             "prompt-submit" => {
+                self.prompt.started();
                 h.status = AgentStatus::Working;
                 h.message = None;
                 h.turn_started = Some(Instant::now());
@@ -441,6 +446,7 @@ impl AgentTracker {
     }
 
     fn set(&mut self, next: Option<AgentState>) -> Option<Option<AgentState>> {
+        self.prompt.observe(self.fg_pgrp, next.as_ref());
         if let Some(n) = &next {
             self.last_kind = Some(n.kind.clone());
         }

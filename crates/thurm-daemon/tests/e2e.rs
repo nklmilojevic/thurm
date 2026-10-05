@@ -1,5 +1,8 @@
 //! End-to-end: run the real daemon with real PTYs and drive it through the client library.
 
+#[path = "e2e/agent_prompt.rs"]
+mod agent_prompt;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;

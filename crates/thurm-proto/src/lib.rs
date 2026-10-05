@@ -261,6 +261,13 @@ pub enum Request {
         instance: String,
         sequence: u64,
     },
+    /// Submit one prompt to the current agent. Returns `Response::AgentPrompt`.
+    AgentPrompt {
+        pane: PaneId,
+        text: String,
+        wait: bool,
+        timeout_ms: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -340,6 +347,7 @@ pub enum Response {
     Processes(Vec<PaneProcesses>),
     Completions(Completions),
     AgentExplanation(AgentExplanation),
+    AgentPrompt(AgentPromptOutcome),
 }
 
 /// A report is scoped to one process instance in one pane.
@@ -1013,4 +1021,14 @@ impl Frame {
 /// Encode a request envelope as JSON (used by the CLI's `--json` mode and in tests).
 pub fn to_json<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).expect("serializable")
+}
+
+/// Result of an agent prompt operation.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentPromptOutcome {
+    Submitted,
+    Completed,
+    NeedsInput,
+    Timeout,
+    Exited,
 }
