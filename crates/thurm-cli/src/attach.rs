@@ -323,6 +323,12 @@ fn render(frame: &Frame, out: &mut impl Write) -> io::Result<()> {
     }
     for row in &frame.lines {
         write!(out, "\x1b[{};1H", row.row + 1)?;
+        let mut clusters = vec![None; row.cells.len()];
+        for (col, cluster) in &row.clusters {
+            if let Some(slot) = clusters.get_mut(*col as usize) {
+                *slot = Some(cluster.as_str());
+            }
+        }
         for (col, cell) in row.cells.iter().enumerate() {
             if cell.flags & flags::WIDE_SPACER != 0 {
                 continue;
@@ -349,7 +355,7 @@ fn render(frame: &Frame, out: &mut impl Write) -> io::Result<()> {
                     write!(out, "\x1b[{code}m")?;
                 }
             }
-            if let Some((_, cluster)) = row.clusters.iter().find(|(c, _)| *c as usize == col) {
+            if let Some(cluster) = clusters[col] {
                 for c in cluster.chars() {
                     write!(out, "{}", if c.is_control() { ' ' } else { c })?;
                 }
@@ -423,7 +429,13 @@ mod tests {
         let mut host = Terminal::new(size, EngineConfig::default());
         host.advance(b"\x1b[2;5r\x1b[?6h\x1b[4h\x1b(0");
         let mut view = ClientView::new();
-        for update in [b"".as_slice(), b"\x1b[4;1Hnext\x1b[?25l", b"\x1b[?1049l"] {
+        let combining = format!("\x1b[1;1H{}", "e\u{301}".repeat(28));
+        for update in [
+            b"".as_slice(),
+            b"\x1b[4;1Hnext\x1b[?25l",
+            combining.as_bytes(),
+            b"\x1b[?1049l",
+        ] {
             daemon.advance(update);
             local.advance(update);
             let frame = local.snapshot(1, &mut view).unwrap().frame;
