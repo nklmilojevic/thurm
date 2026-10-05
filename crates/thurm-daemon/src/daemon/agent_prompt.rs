@@ -30,7 +30,13 @@ impl Daemon {
             );
         }
         let defs = self.agent_defs.read().clone();
-        let idle_after = Duration::from_millis(self.config.read().agents.idle_after_ms);
+        let (detect, idle_after) = {
+            let cfg = self.config.read();
+            (
+                cfg.agents.detect,
+                Duration::from_millis(cfg.agents.idle_after_ms),
+            )
+        };
         self.with_pane(pane, |p, st| {
             if !st.info.alive || st.pending_input.is_some() || st.terminal_attachment.is_some() {
                 return Err("pane is not ready for an agent prompt".into());
@@ -48,10 +54,13 @@ impl Daemon {
             let tail = agents::tail(&st.term.screen_text(), 20);
             let idle = st.term.last_output.elapsed();
             let invalidated = st.agent.invalidate_dead_report_owner();
-            let changed = st
-                .agent
-                .update(&defs, Some(&process), &tail, idle, idle_after)
-                .is_some();
+            let changed = if detect {
+                st.agent
+                    .update(&defs, Some(&process), &tail, idle, idle_after)
+            } else {
+                st.agent.update_report_foreground(Some(&process))
+            }
+            .is_some();
             if invalidated || changed {
                 st.info.agent = st.agent.state().cloned();
                 st.info.title = pane_title(st, Some(&process));

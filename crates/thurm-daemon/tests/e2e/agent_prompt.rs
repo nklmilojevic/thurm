@@ -151,3 +151,45 @@ fn prompt_wait_rejects_other_keyboard_input() {
     hook(&client, pane, "stop", None);
     assert!(worker.join().unwrap().is_err());
 }
+
+#[test]
+fn prompt_respects_disabled_automatic_detection() {
+    let env = Env::new("prompt-detect-disabled");
+    std::fs::write(
+        env.dir.join("config/config.toml"),
+        r#"
+        [terminal]
+        shell = ["/bin/sh"]
+        [agents]
+        detect = false
+        idle_after_ms = 1
+        [[agents.define]]
+        kind = "test-cat"
+        name = "Test Cat"
+        processes = ["cat"]
+        "#,
+    )
+    .unwrap();
+    let _daemon = env.start();
+    let (client, _) = env.connect();
+    let pane = create(&client, &env.dir);
+    client
+        .request(Request::Input {
+            pane,
+            data: b"/bin/cat\r".to_vec(),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Response::PaneInfo(info) = client.request(Request::PaneInfo { pane }).unwrap()
+            && info.foreground.is_some_and(|p| p.name == "cat")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "cat did not start");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let result = submit(&client, pane, "must-not-arrive", false, 1000);
+    assert!(result.is_err(), "{result:?}");
+    assert!(!capture(&client, pane).contains("must-not-arrive"));
+}
