@@ -711,15 +711,16 @@ pub fn state_dir() -> PathBuf {
 /// Unix socket of the daemon. Short enough for `sun_path` (104 bytes on macOS).
 ///
 /// In `$XDG_RUNTIME_DIR` when set; else on macOS in the per-user temporary directory, which no
-/// other user can create or enter, and elsewhere in `/tmp/thurm-<uid>` (checked by
-/// [`private_dir_ok`] before use). A daemon started by an earlier Thurm keeps answering on the
-/// old `/tmp` socket until it exits, and is used there meanwhile.
+/// other user can create or enter, on Linux in `/run/user/<uid>` when it exists (sessions
+/// without logind, such as Tailscale SSH's, do not set the variable but must find the same
+/// daemon), and elsewhere in `/tmp/thurm-<uid>` (checked by [`private_dir_ok`] before use). A
+/// daemon started by an earlier Thurm keeps answering on the old `/tmp` socket until it exits,
+/// and is used there meanwhile.
 pub fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("THURM_SOCKET") {
         return PathBuf::from(p);
     }
     let preferred = default_socket_dir().join("thurmd.sock");
-    #[cfg(target_os = "macos")]
     if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
         let legacy = PathBuf::from(format!("/tmp/thurm-{}", uid())).join("thurmd.sock");
         if legacy != preferred
@@ -741,6 +742,13 @@ pub fn default_socket_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     if let Some(tmp) = darwin_user_temp_dir() {
         return tmp.join("thurm");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let run = PathBuf::from(format!("/run/user/{}", uid()));
+        if private_dir_ok(&run) {
+            return run.join(format!("thurm-{}", uid()));
+        }
     }
     PathBuf::from(format!("/tmp/thurm-{}", uid()))
 }
@@ -766,7 +774,6 @@ fn darwin_user_temp_dir() -> Option<PathBuf> {
 }
 
 /// Whether a daemon of this user answers on `socket`.
-#[cfg(target_os = "macos")]
 fn socket_answers(socket: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(socket).is_ok_and(|s| peer_is_same_user(&s))
 }
@@ -805,6 +812,13 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
 /// Whether the process at the other end of `stream` runs as this user.
 pub fn peer_is_same_user(stream: &std::os::unix::net::UnixStream) -> bool {
     peer_uid(stream).is_some_and(|u| u == uid())
+}
+
+/// Whether the process at the other end of `stream` may use this user's daemon: this user, or
+/// root, which can act as this user anyway. Tailscale SSH dials a forwarded socket from
+/// `tailscaled`, which runs as root.
+pub fn peer_may_use_daemon(stream: &std::os::unix::net::UnixStream) -> bool {
+    peer_uid(stream).is_some_and(|u| u == uid() || u == 0)
 }
 
 fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
