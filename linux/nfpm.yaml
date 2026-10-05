@@ -1,0 +1,80 @@
+# .deb and .rpm packages of the Linux app (nfpm), built by scripts/linux/package.sh from the
+# repository root. The same files as linux/arch/PKGBUILD's package().
+name: thurm
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${THURM_PKG_VERSION}
+version_schema: none
+release: 1
+maintainer: Nikola Milojević <nikola@milojevic.me>
+description: |-
+  Terminal for persistent sessions, coding agents and remote work.
+  Shells run in a daemon (thurmd) and survive closing the app; a CLI (thurm) drives panes
+  from scripts and agents.
+homepage: https://thurm.rs
+license: Apache-2.0
+section: utils
+priority: optional
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.39)
+      - libgtk-4-1 (>= 4.14)
+      - libadwaita-1-0 (>= 1.5)
+      - libfontconfig1
+    recommends:
+      - openssh-client
+      - git
+    suggests:
+      - fonts-noto-cjk
+      - fonts-noto-color-emoji
+  rpm:
+    depends:
+      - gtk4 >= 4.14
+      - libadwaita >= 1.5
+      - fontconfig
+    recommends:
+      - openssh-clients
+      - git
+    suggests:
+      - google-noto-sans-cjk-fonts
+      - google-noto-color-emoji-fonts
+
+contents:
+  - src: ${THURM_GTK_BIN}
+    dst: /usr/bin/thurm-gtk
+    expand: true
+    file_info: { mode: 0755 }
+  - src: ${THURM_MUSL_DIR}/thurm
+    dst: /usr/bin/thurm
+    expand: true
+    file_info: { mode: 0755 }
+  - src: ${THURM_MUSL_DIR}/thurmd
+    dst: /usr/bin/thurmd
+    expand: true
+    file_info: { mode: 0755 }
+  - src: linux/rs.thurm.Thurm.desktop
+    dst: /usr/share/applications/rs.thurm.Thurm.desktop
+  - src: linux/rs.thurm.Thurm.png
+    dst: /usr/share/icons/hicolor/256x256/apps/rs.thurm.Thurm.png
+  - src: macos/Resources/fonts/*.ttf
+    dst: /usr/share/thurm/fonts/
+  - src: linux/icons/hicolor
+    dst: /usr/share/thurm/icons/hicolor
+    type: tree
+  - src: skills/thurm
+    dst: /usr/share/thurm/skills/thurm
+    type: tree
+  - src: LICENSE
+    dst: /usr/share/doc/thurm/LICENSE
+  - src: THIRD_PARTY_LICENSES
+    dst: /usr/share/doc/thurm/THIRD_PARTY_LICENSES
+  - src: macos/Resources/fonts/JetBrainsMono-OFL.txt
+    dst: /usr/share/doc/thurm/JetBrainsMono-OFL.txt
+  - src: macos/Resources/fonts/SymbolsNerdFont-LICENSE
+    dst: /usr/share/doc/thurm/SymbolsNerdFont-LICENSE
+  - src: licenses/ghostty-MIT.txt
+    dst: /usr/share/doc/thurm/ghostty-MIT.txt
+  - src: linux/icons/COPYING
+    dst: /usr/share/doc/thurm/adwaita-icons-COPYING

@@ -4,7 +4,8 @@ title: Install Thurm
 
 ## Requirements
 
-Thurm runs on Apple silicon with macOS 14 or later. Intel Macs are not supported.
+On macOS, Thurm runs on Apple silicon with macOS 14 or later. Intel Macs are not
+supported. For Linux, see [Linux](#linux).
 
 ## Download
 
@@ -24,6 +25,45 @@ updates can't replace the app.
 To get nightly builds of `main` instead, download
 [Thurm-tip.dmg](https://github.com/nklmilojevic/thurm/releases/download/tip/Thurm-tip.dmg),
 or select **Thurm > Update Channel > Tip** in an installed Thurm.
+
+## Linux
+
+The Linux app needs GTK 4.14 and libadwaita 1.5 or later: Ubuntu 24.04, Debian 13,
+Fedora 40, Arch Linux, or newer. Packages are built for x86_64 and arm64.
+
+On Ubuntu and Debian, download
+[thurm-amd64.deb](https://github.com/nklmilojevic/thurm/releases/latest/download/thurm-amd64.deb)
+(or [thurm-arm64.deb](https://github.com/nklmilojevic/thurm/releases/latest/download/thurm-arm64.deb))
+and install it:
+
+```sh
+sudo apt install ./thurm-amd64.deb
+```
+
+On Fedora, download
+[thurm-x86_64.rpm](https://github.com/nklmilojevic/thurm/releases/latest/download/thurm-x86_64.rpm)
+(or [thurm-aarch64.rpm](https://github.com/nklmilojevic/thurm/releases/latest/download/thurm-aarch64.rpm))
+and install it:
+
+```sh
+sudo dnf install ./thurm-x86_64.rpm
+```
+
+On Arch Linux and CachyOS, install the `thurm` package from the AUR with an AUR helper:
+
+```sh
+paru -S thurm
+```
+
+Each package installs the app (`thurm-gtk`, listed as **Thurm** in the desktop's app list),
+the daemon `thurmd`, and the `thurm` command-line tool. Updates come with new packages:
+download the new `.deb` or `.rpm`, or update with your AUR helper. Nightly builds of `main`
+are on the [tip release](https://github.com/nklmilojevic/thurm/releases/tag/tip), with the
+same file names.
+
+Shortcuts that use Cmd on macOS use Ctrl+Shift on Linux. For example, Ctrl+Shift+T opens a
+tab and Ctrl+Shift+D splits the pane. To start the daemon at login, before the app is
+opened, run `thurm daemon install-systemd`.
 
 ## Build from source
 

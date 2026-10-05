@@ -1,0 +1,63 @@
+name: Arch package
+
+# Builds linux/arch/PKGBUILD (the AUR package) from the checkout in an Arch container and
+# installs it, when something it builds or packages changes. A full release build, so not on
+# every pull request.
+on:
+  push:
+    branches: [main]
+    paths:
+      - linux/**
+      - scripts/linux/**
+      - scripts/third-party-licenses.py
+      - crates/**
+      - vendor/**
+      - shell-integration/**
+      - skills/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/arch.yml
+  pull_request:
+    paths:
+      - linux/**
+      - scripts/linux/**
+      - scripts/third-party-licenses.py
+      - crates/**
+      - vendor/**
+      - shell-integration/**
+      - skills/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/arch.yml
+
+permissions:
+  contents: read
+
+jobs:
+  makepkg:
+    name: makepkg (x86_64)
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    timeout-minutes: 60
+    steps:
+      # git first: arch-package.sh packs the checkout's files with git ls-files.
+      - name: Build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git rustup zig musl pkgconf curl python \
+            gtk4 libadwaita fontconfig hicolor-icon-theme
+          useradd -m builder
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: makepkg
+        run: |
+          chown -R builder "$GITHUB_WORKSPACE"
+          # makepkg refuses to run as root.
+          sudo -u builder git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo -u builder scripts/linux/arch-package.sh /tmp/arch
+      - name: Install
+        run: |
+          pacman -U --noconfirm /tmp/arch/thurm-*.pkg.tar.zst
+          if ldd /usr/bin/thurm-gtk | grep "not found"; then exit 1; fi
+          thurm --version
+          test -f /usr/share/thurm/icons/hicolor/scalable/actions/tab-new-symbolic.svg

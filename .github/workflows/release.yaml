@@ -87,7 +87,8 @@ jobs:
   linux:
     # thurm and thurmd for Linux remote hosts, with the build id the app gets, so the app can
     # install exactly its own build there (remote workspaces). Published by the build job,
-    # which also compiles their SHA-256 into the app.
+    # which also compiles their SHA-256 into the app. Also the Linux app's .deb and .rpm
+    # (thurm-gtk with the same thurm and thurmd, one build id), checked by installing them.
     name: Linux (${{ matrix.target }})
     needs: plan
     if: >-
@@ -119,12 +120,16 @@ jobs:
           # Same as macos/release/build-release.sh.
           if [[ "${{ github.event_name }}" == release ]]; then
             SHORT="$VERSION"
+            # Package version: `~` sorts a tip before its release in dpkg and rpm.
+            PACKAGE="$VERSION"
           else
             SHORT="$VERSION-tip.$(git rev-parse --short=7 HEAD)"
+            PACKAGE="$VERSION~tip.$(git rev-parse --short=7 HEAD)"
           fi
           BUILD="$SHORT+$NUMBER"
           echo "THURM_BUILD=$BUILD" >> "$GITHUB_ENV"
           echo "archive=thurm-${BUILD//+/-}-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.99.0
@@ -135,10 +140,23 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
-      - name: musl
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: musl, GTK and nfpm
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y musl-tools libgtk-4-dev libadwaita-1-dev
+          case "$(uname -m)" in
+            x86_64) ASSET=nfpm_2.47.0_Linux_x86_64.tar.gz SUM=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783 ;;
+            aarch64) ASSET=nfpm_2.47.0_Linux_arm64.tar.gz SUM=1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c ;;
+          esac
+          curl -fsSL -o "$RUNNER_TEMP/$ASSET" "https://github.com/goreleaser/nfpm/releases/download/v2.47.0/$ASSET"
+          echo "$SUM  $RUNNER_TEMP/$ASSET" | sha256sum -c
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$ASSET" -C "$RUNNER_TEMP/bin" nfpm
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p thurm-cli -p thurm-daemon
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p thurm-cli -p thurm-daemon
+          cargo build --release -p thurm-gtk
       - name: Package
         run: |
           set -euo pipefail
@@ -148,7 +166,20 @@ jobs:
           tar -czf "$OUT/${{ steps.meta.outputs.archive }}" -C "target/${{ matrix.target }}/release" thurm thurmd \
             -C "$GITHUB_WORKSPACE" LICENSE THIRD_PARTY_LICENSES
           (cd "$OUT" && sha256sum "${{ steps.meta.outputs.archive }}" > "${{ steps.meta.outputs.archive }}.sha256")
+          scripts/linux/package.sh "${{ steps.meta.outputs.package }}" target/release/thurm-gtk \
+            "target/${{ matrix.target }}/release" "$OUT"
           cat "$OUT"/*.sha256
+      - name: Install the packages
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/linux"
+          DEB="thurm-$(dpkg --print-architecture).deb"
+          RPM="thurm-$(uname -m).rpm"
+          CHECK='! ldd /usr/bin/thurm-gtk | grep "not found" && thurm --version && test -f /usr/share/thurm/icons/hicolor/scalable/actions/tab-new-symbolic.svg'
+          docker run --rm -v "$OUT:/pkgs:ro" ubuntu:24.04 bash -c \
+            "apt-get update -qq && apt-get install -y -qq /pkgs/$DEB >/dev/null && $CHECK"
+          docker run --rm -v "$OUT:/pkgs:ro" fedora:43 bash -c \
+            "dnf install -y -q /pkgs/$RPM >/dev/null && $CHECK"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: linux-${{ matrix.target }}
@@ -328,7 +359,7 @@ jobs:
           set -euo pipefail
           TAG="${{ steps.meta.outputs.tag }}"
           cd macos/build/dist
-          gh release upload "$TAG" --repo "$REPO" --clobber "$RUNNER_TEMP"/linux/thurm-*
+          gh release upload "$TAG" --repo "$REPO" --clobber "$RUNNER_TEMP"/linux/thurm[-_]*
           # Also as Thurm.dmg: releases/latest/download/Thurm.dmg is the stable download link.
           cp Thurm-*.dmg "$RUNNER_TEMP/Thurm.dmg"
           # sparkle.json last: the appcast only lists a release once it carries one.
@@ -352,6 +383,8 @@ jobs:
             echo
             echo "Download **Thurm-tip.dmg**, or choose *Thurm › Update Channel › Tip* in any Thurm to get these builds automatically."
             echo
+            echo "Linux (Ubuntu 24.04+, Debian 13+, Fedora 40+): **thurm-amd64.deb** / **thurm-arm64.deb** or **thurm-x86_64.rpm** / **thurm-aarch64.rpm**."
+            echo
             # The changes in this build (the appcast's notes, less their heading).
             tail -n +3 "$THURM_NOTES_FILE"
           } > "$NOTES"
@@ -361,7 +394,12 @@ jobs:
             gh release create tip --repo "$REPO" --verify-tag --prerelease --latest=false \
               --title "Tip" --notes-file "$NOTES"
           fi
-          gh release upload tip --repo "$REPO" --clobber "$RUNNER_TEMP"/linux/thurm-*
+          gh release upload tip --repo "$REPO" --clobber "$RUNNER_TEMP"/linux/thurm[-_]*
+          # Only this build's versioned Linux packages (the fixed names are replaced above).
+          gh release view tip --repo "$REPO" --json assets -q '.assets[].name' \
+            | { grep -E '^(thurm_.*\.deb|thurm-[0-9].*\.rpm)(\.sha256)?$' || true; } \
+            | { grep -vF -- "-tip.${SHA:0:7}" || true; } \
+            | while read -r old; do gh release delete-asset tip "$old" --repo "$REPO" --yes; done
           cd macos/build/dist
           gh release upload tip --repo "$REPO" --clobber Thurm-tip-*.zip Thurm-tip.dmg
           gh release upload tip --repo "$REPO" --clobber sparkle.json

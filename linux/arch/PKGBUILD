@@ -1,5 +1,8 @@
+# Maintainer: Nikola Milojević <nikola at milojevic dot me>
+#
 # Thurm for Arch Linux (and CachyOS, EndeavourOS, Manjaro): the GTK app, thurmd and thurm.
-# Built from a source tarball of the repository (scripts/linux/arch-package.sh makes it).
+# Published to the AUR by scripts/linux/aur-update.sh; scripts/linux/arch-package.sh builds it
+# from a working tree instead of the release tarball.
 pkgname=thurm
 pkgver=0.2.2
 pkgrel=1
@@ -8,28 +11,29 @@ arch=(x86_64 aarch64)
 url="https://thurm.rs"
 license=(Apache-2.0)
 depends=(gtk4 libadwaita fontconfig hicolor-icon-theme)
-makedepends=(rustup git musl pkgconf curl)
+makedepends=(rustup zig git musl pkgconf curl python)
 optdepends=('openssh: remote workspaces'
             'git: handing work off to remote agents'
             'noto-fonts-cjk: Chinese, Japanese and Korean text'
             'noto-fonts-emoji: colour emoji')
 options=(!lto !debug)
-source=("thurm-src.tar.gz")
-source_x86_64=("https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz")
-source_aarch64=("https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz")
+source=("thurm-$pkgver.tar.gz::https://github.com/nklmilojevic/thurm/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
-sha256sums_x86_64=('70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00')
-sha256sums_aarch64=('ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17')
 
 _env() {
-    export PATH="$srcdir/zig-$CARCH-linux-0.16.0:$PATH"
     export CARGO_TARGET_DIR="$srcdir/target"
     export ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-cache"
+    # The app and daemon must carry the same build id (an app that finds another build
+    # replaces the running daemon in place).
+    export THURM_BUILD="$pkgver+arch.$pkgrel"
 }
 
 prepare() {
     _env
-    cd "$srcdir/thurm"
+    cd "thurm-$pkgver"
+    # The toolchain rust-toolchain.toml pins, with the target of the static thurm and thurmd.
+    rustup toolchain install
+    rustup target add "$CARCH-unknown-linux-musl"
     # Ghostty's Zig packages, fetched with curl (Zig's own client stalls on some networks).
     scripts/linux/zig-prefetch.sh
     cargo fetch --locked
@@ -37,33 +41,34 @@ prepare() {
 
 build() {
     _env
-    cd "$srcdir/thurm"
-    cargo build --release --locked -p thurm-gtk
+    cd "thurm-$pkgver"
+    cargo build --release --frozen -p thurm-gtk
     # thurm and thurmd static, like the release's Linux builds: the app copies them onto
     # remote hosts.
-    cargo build --release --locked --target "$CARCH-unknown-linux-musl" -p thurm-daemon -p thurm-cli
+    cargo build --release --frozen --target "$CARCH-unknown-linux-musl" -p thurm-daemon -p thurm-cli
+    python3 scripts/third-party-licenses.py
 }
 
 check() {
     _env
-    cd "$srcdir/thurm"
-    cargo test --release --locked -p thurm-gtk
+    cd "thurm-$pkgver"
+    cargo test --release --frozen -p thurm-gtk
 }
 
 package() {
-    cd "$srcdir/thurm"
+    cd "thurm-$pkgver"
     install -Dm755 "$srcdir/target/release/thurm-gtk" "$pkgdir/usr/bin/thurm-gtk"
     install -Dm755 "$srcdir/target/$CARCH-unknown-linux-musl/release/thurmd" "$pkgdir/usr/bin/thurmd"
     install -Dm755 "$srcdir/target/$CARCH-unknown-linux-musl/release/thurm" "$pkgdir/usr/bin/thurm"
     install -Dm644 linux/rs.thurm.Thurm.desktop "$pkgdir/usr/share/applications/rs.thurm.Thurm.desktop"
     install -Dm644 linux/rs.thurm.Thurm.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/rs.thurm.Thurm.png"
     install -Dm644 -t "$pkgdir/usr/share/thurm/fonts" macos/Resources/fonts/*.ttf
-    install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE \
+    install -Dm644 -t "$pkgdir/usr/share/thurm/icons/hicolor/scalable/actions" \
+        linux/icons/hicolor/scalable/actions/*.svg
+    install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE THIRD_PARTY_LICENSES \
         macos/Resources/fonts/JetBrainsMono-OFL.txt macos/Resources/fonts/SymbolsNerdFont-LICENSE \
         licenses/ghostty-MIT.txt
     install -Dm644 linux/icons/COPYING "$pkgdir/usr/share/licenses/$pkgname/adwaita-icons-COPYING"
-    install -Dm644 -t "$pkgdir/usr/share/thurm/icons/hicolor/scalable/actions" \
-        linux/icons/hicolor/scalable/actions/*.svg
     mkdir -p "$pkgdir/usr/share/thurm/skills"
     cp -R skills/thurm "$pkgdir/usr/share/thurm/skills/"
     chmod -R u=rwX,go=rX "$pkgdir/usr/share/thurm/skills"

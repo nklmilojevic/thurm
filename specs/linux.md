@@ -58,11 +58,20 @@ tunnel), panes keyed by (host, id).
 
 ## Building and packaging
 
-- Ubuntu 24.04+ / Debian: `scripts/linux/provision.sh`, then `scripts/linux/install.sh`
-  (installs to `~/.local`).
-- Arch / CachyOS: `scripts/linux/arch-package.sh` on an Arch machine builds
-  `target/arch/thurm-<version>-<arch>.pkg.tar.zst` from `linux/arch/PKGBUILD`;
-  `sudo pacman -U` it.
+- Releases: the `linux` job of `.github/workflows/release.yaml` builds `thurm-gtk` (glibc, on
+  Ubuntu 24.04) with the static `thurm`/`thurmd` it already builds for remote hosts, all with
+  one `THURM_BUILD`, and packages them with `scripts/linux/package.sh` (nfpm,
+  `linux/nfpm.yaml`): `thurm_<ver>-1_<arch>.deb`, `thurm-<ver>-1.<arch>.rpm`, and copies with
+  fixed names (`thurm-amd64.deb`, `thurm-x86_64.rpm`, …) for `releases/latest/download`
+  links. Each is installed in an `ubuntu:24.04` / `fedora:43` container before publishing.
+  Tip packages are versioned `<ver>~tip.<sha>`, which sorts before the release.
+- Arch / CachyOS: `linux/arch/PKGBUILD` is the AUR package `thurm` (built from the release's
+  tag tarball, with Arch's `zig`). `scripts/linux/aur-update.sh VERSION AUR_DIR` updates a
+  clone of the AUR repository for a release (version, checksum, `.SRCINFO`) and commits;
+  pushing is manual. `scripts/linux/arch-package.sh` builds the same PKGBUILD from the
+  working tree into `target/arch/`; the `Arch package` workflow runs it in an Arch container.
+- From source on Ubuntu 24.04+ / Debian: `scripts/linux/provision.sh`, then
+  `scripts/linux/install.sh` (installs to `~/.local`).
 - Installed layout: `/usr/bin/{thurm-gtk,thurm,thurmd}`, the desktop entry (with New Tab, New
   Workspace and Quick Terminal actions), `/usr/share/thurm/fonts` (bundled JetBrains Mono and
   Symbols Nerd Font, registered with fontconfig at startup), `/usr/share/thurm/icons` (the
