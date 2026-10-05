@@ -48,6 +48,8 @@ struct State {
     pressed: Option<u8>,
     clicks: u8,
     down: std::collections::HashSet<u32>,
+    /// Keys whose press reached the terminal: their release does too.
+    delivered: std::collections::HashSet<u32>,
     blink_epoch: Option<Instant>,
     flash_start: Option<Instant>,
     // Smooth scrolling.
@@ -969,17 +971,19 @@ impl TermView {
         keycode: u32,
         state: gdk::ModifierType,
     ) {
-        // Released to the terminal exactly when it got the press: not for a shortcut's key, and
-        // whatever the modifiers are now.
-        let pressed = self.state.borrow_mut().down.remove(&keycode);
-        if self.is_offline() || !pressed {
+        self.state.borrow_mut().down.remove(&keycode);
+        // Released to the terminal exactly when it got the press: not for a shortcut's or the
+        // input method's key, and whatever the modifiers and the input method do now.
+        let delivered = self.state.borrow_mut().delivered.remove(&keycode);
+        if self.is_offline() {
             return;
         }
         let Some(event) = ctl.current_event() else { return };
-        if self.im.filter_keypress(&event) || self.state.borrow().composing {
-            return;
+        // The input method sees every release (it may track the key).
+        self.im.filter_keypress(&event);
+        if delivered {
+            self.send_key(&event, keyval, keycode, state, keys::RELEASE, None);
         }
-        self.send_key(&event, keyval, keycode, state, keys::RELEASE, None);
     }
 
     fn modifiers_changed(&self, state: gdk::ModifierType) {
@@ -999,6 +1003,9 @@ impl TermView {
         action: u8,
         text: Option<&str>,
     ) {
+        if action != keys::RELEASE {
+            self.state.borrow_mut().delivered.insert(keycode);
+        }
         let mods = keys::mods(state);
         let id = self.key.id;
         if let Some((named, keypad)) = keys::named(keyval) {
