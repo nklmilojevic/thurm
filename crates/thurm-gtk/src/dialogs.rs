@@ -40,8 +40,8 @@ pub fn ask(
             Style::Default => {}
         }
     }
-    if let Some(first) = buttons.first() {
-        dialog.set_default_response(Some(first.id));
+    if let Some(id) = default_response(buttons) {
+        dialog.set_default_response(Some(id));
     }
     if buttons.iter().any(|b| b.id == "cancel") {
         dialog.set_close_response("cancel");
@@ -53,6 +53,16 @@ pub fn ask(
         }
     });
     dialog.present(Some(parent));
+}
+
+/// What Enter picks: the first button, or Cancel when a button destroys something.
+fn default_response<'a>(buttons: &[Button<'a>]) -> Option<&'a str> {
+    let destructive = buttons.iter().any(|b| b.style == Style::Destructive);
+    buttons
+        .iter()
+        .find(|b| destructive && b.id == "cancel")
+        .or(buttons.first())
+        .map(|b| b.id)
 }
 
 /// `ok_label` / Cancel; `done` runs only when confirmed.
@@ -131,5 +141,18 @@ pub fn prompt(
         glib::idle_add_local_once(move || {
             first.grab_focus();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enter_cancels_destructive_dialogs() {
+        let close = [button("ok", "Close", Style::Destructive), button("cancel", "Cancel", Style::Default)];
+        assert_eq!(default_response(&close), Some("cancel"));
+        let save = [button("ok", "Save", Style::Suggested), button("cancel", "Cancel", Style::Default)];
+        assert_eq!(default_response(&save), Some("ok"));
     }
 }

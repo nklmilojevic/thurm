@@ -101,10 +101,22 @@ pub fn save_state_list(key: &str, list: &[String]) {
 
 // MARK: files
 
-/// Writes a pasted or dropped image to `$TMPDIR/thurm-drops`, removing ones older than a day.
+/// Writes a pasted or dropped image to a directory only this user can read
+/// (`$XDG_RUNTIME_DIR/thurm-drops`, else in Thurm's state directory), removing ones older than
+/// a day.
 pub fn save_drop_image(png: &[u8]) -> Option<String> {
-    let dir = std::env::temp_dir().join("thurm-drops");
-    std::fs::create_dir_all(&dir).ok()?;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute() && d.is_dir())
+        .unwrap_or_else(thurm_config::state_dir);
+    let dir = base.join("thurm-drops");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).ok()?;
+    // Not a symlink to somewhere else, and private even if it existed before.
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let old = e
@@ -122,7 +134,13 @@ pub fn save_drop_image(png: &[u8]) -> Option<String> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let path = dir.join(format!("image-{:08x}.png", (nanos as u64) ^ std::process::id() as u64));
-    std::fs::write(&path, png).ok()?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .ok()?;
+    std::io::Write::write_all(&mut file, png).ok()?;
     Some(path.to_string_lossy().into_owned())
 }
 
@@ -390,12 +408,28 @@ fn run_cli(args: Vec<String>, title: &'static str) {
             .collect::<Vec<_>>(),
         gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_MERGE,
     );
-    let Ok(proc) = proc else { return };
+    let proc = match proc {
+        Ok(p) => p,
+        Err(e) => {
+            app::with_app(|a| report(a, title, Err(format!("could not run thurm: {e}"))));
+            return;
+        }
+    };
+    let waited = proc.clone();
     proc.communicate_utf8_async(None, None::<&gio::Cancellable>, move |res| {
-        let text = res
-            .ok()
-            .and_then(|(out, _)| out.map(|s| s.trim().to_string()))
-            .unwrap_or_default();
-        app::with_app(|a| report(a, title, Ok(text)));
+        let result = match res {
+            Err(e) => Err(format!("thurm failed: {e}")),
+            Ok((out, _)) => {
+                let text = out.map(|s| s.trim().to_string()).unwrap_or_default();
+                if waited.is_successful() {
+                    Ok(text)
+                } else if text.is_empty() {
+                    Err(format!("thurm exited with status {}", waited.exit_status()))
+                } else {
+                    Err(text)
+                }
+            }
+        };
+        app::with_app(|a| report(a, title, result));
     });
 }
