@@ -118,8 +118,9 @@ Tailscale is only the network. Either works:
 
 - **Tailscale SSH**, version 1.98 or later. Earlier versions cannot forward a
   Unix socket, and the host shows **needs attention** with "unsupported channel
-  type". Tailscale SSH opens the forward as root, which a daemon before Thurm
-  0.2.3 refuses: the host stays **reconnecting**; upgrade it. Tailscale SSH's `check` action signs you in through a browser, which a
+  type". Tailscale SSH opens the forward as root; an older Thurm daemon accepts
+  only your own user and closes it, so the host stays **reconnecting** until you
+  upgrade the daemon. Tailscale SSH's `check` action signs you in through a browser, which a
   background connection cannot do: use an `accept` rule for your own devices.
 - **A regular `sshd`** reached over the tailnet.
 

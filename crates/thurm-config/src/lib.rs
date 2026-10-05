@@ -720,36 +720,56 @@ pub fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("THURM_SOCKET") {
         return PathBuf::from(p);
     }
-    let preferred = default_socket_dir().join("thurmd.sock");
-    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-        let legacy = PathBuf::from(format!("/tmp/thurm-{}", uid())).join("thurmd.sock");
-        if legacy != preferred
-            && !socket_answers(&preferred)
-            && legacy.parent().is_some_and(private_dir_ok)
-            && socket_answers(&legacy)
-        {
-            return legacy;
-        }
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let preferred = socket_dir_for(xdg.as_deref(), &run_user_dir()).join("thurmd.sock");
+    match xdg {
+        Some(_) => preferred,
+        None => live_socket(preferred, legacy_socket_dir().join("thurmd.sock")),
     }
-    preferred
+}
+
+/// `preferred`, unless only `legacy` (in a private directory) has a daemon of ours answering.
+fn live_socket(preferred: PathBuf, legacy: PathBuf) -> PathBuf {
+    if legacy != preferred
+        && !socket_answers(&preferred)
+        && legacy.parent().is_some_and(private_dir_ok)
+        && socket_answers(&legacy)
+    {
+        legacy
+    } else {
+        preferred
+    }
 }
 
 /// The directory of the default daemon socket (see [`socket_path`]).
 pub fn default_socket_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join(format!("thurm-{}", uid()));
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    socket_dir_for(xdg.as_deref(), &run_user_dir())
+}
+
+/// [`default_socket_dir`] for a session's `$XDG_RUNTIME_DIR` and the user's `/run/user/<uid>`.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn socket_dir_for(xdg_runtime_dir: Option<&Path>, run_user: &Path) -> PathBuf {
+    if let Some(dir) = xdg_runtime_dir {
+        return dir.join(format!("thurm-{}", uid()));
     }
     #[cfg(target_os = "macos")]
     if let Some(tmp) = darwin_user_temp_dir() {
         return tmp.join("thurm");
     }
     #[cfg(target_os = "linux")]
-    {
-        let run = PathBuf::from(format!("/run/user/{}", uid()));
-        if private_dir_ok(&run) {
-            return run.join(format!("thurm-{}", uid()));
-        }
+    if private_dir_ok(run_user) {
+        return run_user.join(format!("thurm-{}", uid()));
     }
+    legacy_socket_dir()
+}
+
+/// Where systemd-logind keeps the user's runtime directory (`$XDG_RUNTIME_DIR` in its sessions).
+fn run_user_dir() -> PathBuf {
+    PathBuf::from(format!("/run/user/{}", uid()))
+}
+
+fn legacy_socket_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/thurm-{}", uid()))
 }
 
@@ -1820,6 +1840,50 @@ clipboard_read = "always"
         std::os::unix::fs::symlink(&fresh, &link).unwrap();
         assert!(!private_dir_ok(&link));
         assert!(ensure_private_dir(&link).is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sessions_without_xdg_runtime_dir_find_the_same_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("thurm-rundir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let run = base.join("run");
+        ensure_private_dir(&run).unwrap();
+        // A logind session sets XDG_RUNTIME_DIR to /run/user/<uid>; Tailscale SSH may not.
+        assert_eq!(socket_dir_for(None, &run), socket_dir_for(Some(&run), &run));
+        // No usable runtime directory: the private one in /tmp.
+        assert_eq!(socket_dir_for(None, &base.join("missing")), legacy_socket_dir());
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(socket_dir_for(None, &run), legacy_socket_dir());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_daemon_on_the_legacy_socket_is_used_until_it_exits() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        let base = std::env::temp_dir().join(format!("thurm-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let (new_dir, old_dir) = (base.join("n"), base.join("o"));
+        ensure_private_dir(&new_dir).unwrap();
+        ensure_private_dir(&old_dir).unwrap();
+        let (preferred, legacy) = (new_dir.join("d.sock"), old_dir.join("d.sock"));
+        // Nothing answers anywhere: the preferred socket, where a daemon will start.
+        assert_eq!(live_socket(preferred.clone(), legacy.clone()), preferred);
+        let old = UnixListener::bind(&legacy).unwrap();
+        assert_eq!(live_socket(preferred.clone(), legacy.clone()), legacy);
+        // Not in a private directory: someone else's socket, never used.
+        std::fs::set_permissions(&old_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(live_socket(preferred.clone(), legacy.clone()), preferred);
+        std::fs::set_permissions(&old_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Once a daemon answers on the preferred socket, it wins.
+        let _new = UnixListener::bind(&preferred).unwrap();
+        assert_eq!(live_socket(preferred.clone(), legacy.clone()), preferred);
+        drop(old);
         let _ = std::fs::remove_dir_all(base);
     }
 

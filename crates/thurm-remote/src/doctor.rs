@@ -205,7 +205,7 @@ fn tunnel_check(ssh: &Ssh, plan: &Plan, socket: Option<&str>) -> Check {
                     "the daemon answers on the host but not through the forward ({e}): the host's \
                      ssh server cannot forward Unix sockets (OrbStack's built-in one cannot; \
                      connect to the host's OpenSSH instead), or opens them as root (Tailscale \
-                     SSH), which a daemon before 0.2.3 refuses (upgrade it)"
+                     SSH), which a daemon that only accepts your own user refuses (upgrade it)"
                 )
             } else {
                 format!("the daemon does not answer on {remote} ({e})")
