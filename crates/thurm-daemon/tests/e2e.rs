@@ -1850,6 +1850,28 @@ fn agent_reporting_restores_exact_arguments_without_shell_expansion() {
         !marker.exists(),
         "resume arguments were evaluated by a shell"
     );
+    c.request(Request::Input {
+        pane,
+        data: vec![0x04],
+    })
+    .unwrap();
+    wait_for_reporting_shell(&c, pane);
+    c.request(Request::Input {
+        pane,
+        data: b"printf 'SHELL-STILL-OPEN\\n'\r".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, "SHELL-STILL-OPEN");
+    c.request(Request::SaveSnapshot).unwrap();
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.dir.join("state/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(snapshot["panes"][0]["id"], pane);
+    assert!(
+        env.dir
+            .join(format!("state/scrollback/{pane}.ansi"))
+            .exists()
+    );
 }
 
 #[test]
@@ -1995,4 +2017,67 @@ fn agent_reporting_owner_exit_releases_a_live_group() {
     report.instance = "leader-b".into();
     c.request(Request::AgentReport { pane, report }).unwrap();
     assert_eq!(agent(&c, pane).unwrap().kind, "example");
+}
+
+fn wait_for_reporting_shell(c: &Client, pane: PaneId) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Response::PaneInfo(info) = c.request(Request::PaneInfo { pane }).unwrap() {
+            assert!(info.alive, "resume closed the pane");
+            if info.foreground.as_ref().is_some_and(|p| {
+                Some(p.pid) == info.pid && matches!(p.name.as_str(), "sh" | "bash")
+            }) {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resume did not return to the shell"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[test]
+fn agent_reporting_missing_resume_keeps_pane_and_history() {
+    let env = Env::new("report-missing");
+    let mut daemon = env.start();
+    let (c, _) = env.connect();
+    let (pane, owner_pid) = reporting_pane(&c, &env.dir);
+    c.request(Request::Input {
+        pane,
+        data: b"PRESERVE-THIS-HISTORY\r".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, "PRESERVE-THIS-HISTORY");
+    c.request(Request::AgentReport {
+        pane,
+        report: AgentReport {
+            agent: "example".into(),
+            owner_pid,
+            instance: "process-a".into(),
+            sequence: 1,
+            status: AgentStatus::Idle,
+            session_id: Some("session-42".into()),
+            message: None,
+            resume_argv: Some(vec![env.dir.join("missing-agent").display().to_string()]),
+        },
+    })
+    .unwrap();
+    c.request(Request::Shutdown { kill_panes: true }).unwrap();
+    daemon.wait_exit();
+    drop(c);
+    let _restored = env.start();
+    let (c, _) = env.connect();
+    wait_match(&c, pane, "not found|No such file|no such file");
+    wait_for_reporting_shell(&c, pane);
+    assert!(capture(&c, pane).contains("PRESERVE-THIS-HISTORY"));
+    c.request(Request::SaveSnapshot).unwrap();
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.dir.join("state/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(snapshot["panes"][0]["id"], pane);
+    let history =
+        std::fs::read_to_string(env.dir.join(format!("state/scrollback/{pane}.ansi"))).unwrap();
+    assert!(history.contains("PRESERVE-THIS-HISTORY"));
 }

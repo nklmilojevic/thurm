@@ -44,25 +44,48 @@ pub fn validate_resume(argv: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Run the resume command below a shell so a failure or exit keeps the pane open.
+pub fn resume_input(shell: &str, argv: &[String]) -> Result<Vec<u8>, String> {
+    validate_resume(argv)?;
+    let name = shell.rsplit('/').next().unwrap_or(shell);
+    if !matches!(name, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish") {
+        return Err(format!(
+            "automatic agent resume is not supported for shell {name}"
+        ));
+    }
+    let command = argv
+        .iter()
+        .map(|a| crate::shell::shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // A separate shell prevents reported names such as `exit` from closing the pane shell.
+    let script = format!("exec {command}");
+    Ok(format!("/bin/sh -c {}\r", crate::shell::shell_quote(&script)).into_bytes())
+}
+
 fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
 impl AgentTracker {
-    /// Remove a report when its owner exits, even if its process group stays alive.
+    /// Remove a report when its owner exits or leaves the registered process group.
     pub fn invalidate_dead_report_owner(&mut self) -> bool {
-        let birth = self
-            .report_owner
-            .as_ref()
-            .and_then(|o| crate::procinfo::process_birth(o.pid));
-        self.check_report_birth(birth)
+        let identity = self.report_owner.as_ref().map(|o| {
+            let group = unsafe { libc::getpgid(o.pid as i32) };
+            (
+                crate::procinfo::process_birth(o.pid),
+                (group > 0).then_some(group as u32),
+            )
+        });
+        let (birth, group) = identity.unwrap_or_default();
+        self.check_report_identity(birth, group)
     }
 
-    fn check_report_birth(&mut self, birth: Option<u64>) -> bool {
+    fn check_report_identity(&mut self, birth: Option<u64>, group: Option<u32>) -> bool {
         let Some(owner) = self.report_owner.as_mut() else {
             return false;
         };
-        if owner.released || birth == Some(owner.birth) {
+        if owner.released || (birth == Some(owner.birth) && group == Some(owner.pgrp)) {
             return false;
         }
         owner.released = true;
@@ -76,6 +99,30 @@ impl AgentTracker {
             self.set(None);
         }
         true
+    }
+
+    /// Track public report ownership when automatic detection is disabled.
+    pub fn update_report_foreground(
+        &mut self,
+        foreground: Option<&ProcessInfo>,
+    ) -> Option<Option<thurm_proto::AgentState>> {
+        self.fg_pgrp = foreground.map(|p| p.pid);
+        let owner = self.report_owner.as_ref()?;
+        let owns_hook = self
+            .hook
+            .as_ref()
+            .is_some_and(|h| h.kind == owner.agent && h.pgrp == Some(owner.pgrp));
+        if !owns_hook {
+            return None;
+        }
+        let next = if self.public_report_active()
+            && foreground.is_some_and(|p| !crate::procinfo::is_shell(&p.name))
+        {
+            self.hook_state().map(|state| self.with_hook(state))
+        } else {
+            None
+        };
+        self.set(next)
     }
 
     pub fn report_handoff(&self) -> Option<ReportHandoff> {
@@ -626,7 +673,7 @@ mod tests {
             let report = report();
             tracker.apply_report(&report, 100, 42, "Example").unwrap();
             tracker.refresh();
-            assert!(tracker.check_report_birth(birth));
+            assert!(tracker.check_report_identity(birth, Some(42)));
             assert!(tracker.state().is_none());
             assert!(tracker.resume_argv().is_none());
             assert!(!tracker.public_report_active());
@@ -636,6 +683,58 @@ mod tests {
             tracker.apply_report(&next, 102, 42, "Example").unwrap();
             assert!(tracker.apply_report(&report, 100, 42, "Example").is_err());
         }
+    }
+
+    #[test]
+    fn moved_owner_releases_its_old_process_group() {
+        let mut tracker = tracker();
+        let report = report();
+        tracker.apply_report(&report, 100, 42, "Example").unwrap();
+        tracker.refresh();
+        assert!(tracker.check_report_identity(Some(100), Some(99)));
+        assert!(tracker.state().is_none());
+        assert!(!tracker.public_report_active());
+        assert!(tracker.resume_argv().is_none());
+    }
+
+    #[test]
+    fn report_foreground_tracking_does_not_enable_detection() {
+        let mut tracker = tracker();
+        let mut report = report();
+        report.status = AgentStatus::Working;
+        tracker.apply_report(&report, 100, 42, "Example").unwrap();
+        let owner_group = ProcessInfo {
+            pid: 42,
+            name: "cat".into(),
+            argv: vec!["cat".into()],
+        };
+        tracker.update_report_foreground(Some(&owner_group));
+        assert_eq!(tracker.state().unwrap().status, AgentStatus::Working);
+        let other = ProcessInfo {
+            pid: 99,
+            name: "claude".into(),
+            argv: vec!["claude".into()],
+        };
+        tracker.update_report_foreground(Some(&other));
+        assert!(tracker.state().is_none());
+        tracker.update_report_foreground(Some(&owner_group));
+        assert_eq!(tracker.state().unwrap().status, AgentStatus::Working);
+    }
+
+    #[test]
+    fn unsupported_shell_does_not_receive_resume_input() {
+        let argv = vec!["example".into(), "session".into()];
+        assert!(resume_input("/bin/nu", &argv).is_err());
+        assert!(
+            resume_input("/bin/sh", &argv)
+                .unwrap()
+                .starts_with(b"/bin/sh -c ")
+        );
+        assert!(
+            resume_input("/bin/sh", &["exit".into()])
+                .unwrap()
+                .starts_with(b"/bin/sh -c ")
+        );
     }
 
     #[test]

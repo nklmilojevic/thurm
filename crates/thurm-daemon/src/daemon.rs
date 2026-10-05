@@ -1328,6 +1328,8 @@ impl Daemon {
                         if ai_cfg.enabled {
                             self.queue_ai(pane.id, &mut st, &ai_cfg, &screen);
                         }
+                    } else if let Some(new) = st.agent.update_report_foreground(fg.as_ref()) {
+                        st.info.agent = new;
                     }
                     if let Some(p) = &fg {
                         if !procinfo::is_shell(&p.name) {
@@ -1672,7 +1674,12 @@ impl Daemon {
                     && agents::reporting::validate_resume(argv).is_ok()
             });
             let req = CreatePane {
-                command: reported_resume.cloned().or_else(|| p.command.clone()),
+                // A reported resume runs inside a shell. Keep the pane if it fails or exits.
+                command: if reported_resume.is_some() {
+                    None
+                } else {
+                    p.command.clone()
+                },
                 cwd: p.cwd.clone(),
                 size: p.size.into(),
                 ..Default::default()
@@ -1680,9 +1687,27 @@ impl Daemon {
             match self.create_pane(req, Some((p.id, history))) {
                 Ok(id) => {
                     restored += 1;
-                    if reported_resume.is_some() {
+                    if let Some(argv) = reported_resume {
                         if let Some(pane) = self.pane(id) {
-                            pane.state.lock().command = p.command.clone();
+                            let shell = cfg
+                                .terminal
+                                .shell
+                                .as_ref()
+                                .and_then(|s| s.first())
+                                .cloned()
+                                .unwrap_or_else(shell::user_shell);
+                            let mut st = pane.state.lock();
+                            match agents::reporting::resume_input(&shell, argv) {
+                                Ok(input) => {
+                                    st.pending_input =
+                                        Some((Instant::now() + Duration::from_millis(2500), input))
+                                }
+                                Err(error) => {
+                                    log::warn!("pane {id}: {error}");
+                                    st.term
+                                        .print(&format!("\r\n[agent resume skipped: {error}]\r\n"));
+                                }
+                            }
                         }
                     } else if cfg.session.resume_agents && p.command.is_none() {
                         let def = p
@@ -2281,6 +2306,11 @@ impl Daemon {
                             st.agent
                                 .update(&defs, fg.as_ref(), &screen, idle, idle_after)
                     {
+                        st.info.agent = new;
+                        st.info.title = pane_title(st, fg.as_ref());
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    }
+                    if !detect && let Some(new) = st.agent.update_report_foreground(fg.as_ref()) {
                         st.info.agent = new;
                         st.info.title = pane_title(st, fg.as_ref());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
