@@ -1191,6 +1191,9 @@ final class SessionManager: NSObject, CoreDelegate {
                 return
             }
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
+            // Launched by this command, the app may have adopted the pane as an orphan already:
+            // it moves to where the command says.
+            takeHiddenTab(pane)
             if jsonBool(d["new_window"]) ?? false {
                 // `thurm new-tab --window`: its own workspace, in the background (Thurm stays
                 // where it is too).

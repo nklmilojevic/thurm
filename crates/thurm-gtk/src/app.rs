@@ -1143,6 +1143,26 @@ impl App {
         v
     }
 
+    /// Takes `key`'s own tab out of the background workspaces; one left empty goes too.
+    fn take_hidden_tab(&self, key: &PaneKey) {
+        let shown = self.current_workspace();
+        let mut wss = self.workspaces.borrow_mut();
+        let mut emptied = Vec::new();
+        for ws in wss.iter_mut().filter(|w| Some(w.id) != shown) {
+            let before = ws.hidden_tabs.len();
+            let host = ws.host.clone();
+            ws.hidden_tabs.retain(|t| {
+                let panes = leaves(&t.root);
+                !(panes.len() == 1 && PaneKey::new(panes[0].0.unwrap_or(&host), panes[0].1) == *key)
+            });
+            if before > 0 && ws.hidden_tabs.is_empty() {
+                emptied.push(ws.id);
+            }
+            ws.hidden_selected = ws.hidden_selected.min(ws.hidden_tabs.len().saturating_sub(1));
+        }
+        wss.retain(|w| !emptied.contains(&w.id));
+    }
+
     fn is_shown(&self, id: u64) -> bool {
         self.current_workspace() == Some(id)
     }
@@ -2740,6 +2760,9 @@ impl App {
                 }
                 self.fetch_info(&k);
                 let handoff = self.remotes.handoff_for_pane(&k);
+                // Launched by this command, the app may have adopted the pane as an orphan
+                // already: it moves to where the command says.
+                self.take_hidden_tab(&k);
                 if p.get("new_window").and_then(Value::as_bool) == Some(true) {
                     // Its own new workspace, in the background.
                     let mut ws = self.make_workspace(&k.host);

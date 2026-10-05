@@ -903,7 +903,10 @@ fn systemd_unit(daemon: &std::path::Path, socket: Option<&std::path::Path>) -> R
 /// variable expansion turned off. Control characters are refused: a line break would end the
 /// directive and start another.
 fn systemd_quote(path: &std::path::Path) -> Result<String, String> {
-    let s = path.to_string_lossy();
+    // Not lossy: a replaced byte would name another file.
+    let s = path
+        .to_str()
+        .ok_or_else(|| format!("{path:?}: a systemd unit needs a UTF-8 path"))?;
     if s.chars().any(char::is_control) {
         return Err(format!("{path:?}: control characters cannot go in a systemd unit"));
     }
@@ -1451,33 +1454,44 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
 }
 
 fn ui(c: &Client, cmd: UiCommand) {
-    if let Err(e) = c.request(Request::Ui(cmd)) {
-        eprintln!("thurm: pane created but not shown: {e}");
-        #[cfg(target_os = "macos")]
-        {
-            // Launch the app; it picks up panes that aren't in its layout.
-            let _ = std::process::Command::new("open")
-                .args(["-b", "com.thurm.terminal"])
-                .status();
-        }
-        #[cfg(target_os = "linux")]
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some() {
-            // The Linux app, next to this binary or on PATH; it picks up panes that aren't in
-            // its layout.
-            let app = std::env::current_exe()
-                .ok()
-                .and_then(|e| e.parent().map(|d| d.join("thurm-gtk")))
-                .filter(|p| p.is_file())
-                .or_else(|| thurm_config::which("thurm-gtk"));
-            if let Some(app) = app {
-                let _ = std::process::Command::new(app)
+    let Err(e) = c.request(Request::Ui(cmd.clone())) else {
+        return;
+    };
+    // No window is open: start the app.
+    #[cfg(target_os = "macos")]
+    let launched = std::process::Command::new("open")
+        .args(["-b", "com.thurm.terminal"])
+        .status()
+        .is_ok_and(|s| s.success());
+    #[cfg(target_os = "linux")]
+    let launched = (std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some())
+        && std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("thurm-gtk")))
+            .filter(|p| p.is_file())
+            .or_else(|| thurm_config::which("thurm-gtk"))
+            .is_some_and(|app| {
+                std::process::Command::new(app)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
-                    .spawn();
+                    .spawn()
+                    .is_ok()
+            });
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let launched = false;
+    // The app adopts panes it doesn't know as a background workspace: send the command again
+    // once it is up, so the pane goes where it says (its own workspace, a tab).
+    if launched {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if c.request(Request::Ui(cmd.clone())).is_ok() {
+                return;
             }
         }
     }
+    eprintln!("thurm: pane created but not shown: {e}");
 }
 
 fn pane_info(c: &Client, pane: PaneId) -> Option<PaneInfo> {
@@ -1644,6 +1658,12 @@ mod tests {
             .contains("ExecStart=\"/usr/bin/thurmd\" --foreground\n"));
         let injected = std::path::Path::new("/tmp/x\nExecStartPre=/bin/evil");
         assert!(systemd_unit(daemon, Some(injected)).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let latin1 = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9/thurmd"));
+            assert!(systemd_unit(latin1, None).is_err());
+        }
     }
 
     #[test]
