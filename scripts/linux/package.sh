@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the .deb and .rpm of the Linux app (linux/nfpm.yaml) from built binaries, for this
-# machine's architecture. Needs nfpm on PATH.
+# machine's architecture. Needs nfpm, cargo and python3 on PATH.
 #   scripts/linux/package.sh VERSION THURM_GTK MUSL_DIR OUT_DIR
 # VERSION is the workspace version (0.3.0), or 0.3.0+tip.<commit count>.<sha> for a tip
 # build: it sorts after that release, before the next, and by commit among tips (dpkg, rpm
@@ -23,7 +23,8 @@ case "$(uname -m)" in
 esac
 
 cd "$repo"
-[ -f THIRD_PARTY_LICENSES ] || python3 scripts/third-party-licenses.py
+# Generated, never reused: it follows the dependencies being packaged.
+python3 scripts/third-party-licenses.py
 export NFPM_ARCH="$deb_arch" THURM_PKG_VERSION="$version" THURM_GTK_BIN="$gtk" THURM_MUSL_DIR="$musl"
 
 work="$(mktemp -d)"
