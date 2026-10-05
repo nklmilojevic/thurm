@@ -1192,14 +1192,15 @@ final class SessionManager: NSObject, CoreDelegate {
             }
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
             if jsonBool(d["new_window"]) ?? false {
-                // `thurm new-tab --window`: its own workspace, in the background.
+                // `thurm new-tab --window`: its own workspace, in the background (Thurm stays
+                // where it is too).
                 newWindow(pane: pane, background: true)
             } else {
                 // `thurm handoff` opened it: tag and group it.
                 newTab(from: currentController, pane: pane,
                        handoff: Remotes.shared.handoff(host: daemon, pane: pane.id)?.id)
+                NSApp.activate()
             }
-            NSApp.activate()
         case "Split":
             guard let pane = key("pane") else { return }
             if controller(for: pane) != nil {

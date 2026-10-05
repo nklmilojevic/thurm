@@ -2763,9 +2763,10 @@ impl App {
                     self.schedule_save();
                 } else {
                     self.place_new_tab(k, handoff, true);
-                }
-                if let Some(w) = self.win() {
-                    w.window.present();
+                    // Only a tab in front raises the window; a background workspace stays back.
+                    if let Some(w) = self.win() {
+                        w.window.present();
+                    }
                 }
             }
             "Split" => {
