@@ -24,6 +24,10 @@ pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
 /// or reordering variants or fields) bumps this.
 pub const PROTOCOL_VERSION: u32 = 17;
 
+/// A desktop can reject a layout before making changes when it has no window.
+/// The daemon can then try another desktop client.
+pub const LAYOUT_NO_WINDOW: &str = "no Thurm window is open";
+
 /// Daemons speaking this protocol or later replace themselves in place on SIGUSR2 (see
 /// `thurm_client::upgrade_daemon`), keeping every pane's process running.
 pub const HOT_UPGRADE_PROTOCOL: u32 = 13;

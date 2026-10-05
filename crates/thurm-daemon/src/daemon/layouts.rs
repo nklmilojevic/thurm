@@ -21,14 +21,41 @@ impl Daemon {
         if ids.iter().any(|id| self.pane(*id).is_none()) {
             return Err("a layout pane no longer exists".into());
         }
-        let ui = self
-            .clients
-            .lock()
-            .values()
-            .filter(|c| c.ui.load(Ordering::Relaxed))
-            .min_by_key(|c| c.id)
-            .cloned()
-            .ok_or("no Thurm window is open")?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut tried = Vec::new();
+        loop {
+            let ui = self
+                .clients
+                .lock()
+                .values()
+                .filter(|c| c.ui.load(Ordering::Relaxed) && !tried.contains(&c.id))
+                .min_by_key(|c| c.id)
+                .cloned()
+                .ok_or(thurm_proto::LAYOUT_NO_WINDOW)?;
+            tried.push(ui.id);
+            let result = self.confirm_layout(caller, &ui, json.clone(), deadline);
+            // This reply guarantees that the desktop made no layout changes.
+            // Other rejections must reach the caller so it can close the new panes.
+            if result
+                .as_ref()
+                .err()
+                .is_none_or(|error| error != thurm_proto::LAYOUT_NO_WINDOW)
+            {
+                return result;
+            }
+        }
+    }
+
+    fn confirm_layout(
+        &self,
+        caller: u64,
+        ui: &Client,
+        json: String,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if Instant::now() >= deadline {
+            return Err("desktop layout confirmation timed out".into());
+        }
         let request_id = self.next_layout.fetch_add(1, Ordering::Relaxed);
         let (reply, receive) = crossbeam_channel::bounded(1);
         {
@@ -41,7 +68,6 @@ impl Daemon {
         ui.send(ServerMessage::Event(Event::Ui(
             thurm_proto::UiCommand::OpenLayout { json, request_id },
         )));
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let result = loop {
             let now = Instant::now();
             if now >= deadline {

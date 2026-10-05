@@ -10,6 +10,9 @@ use thurm_client::{Client, ConnectOptions};
 use thurm_proto::{Event, PaneId};
 
 pub fn run(remote: Option<&str>, pane: Option<PaneId>) -> super::R {
+    if let Some(name) = remote {
+        drop(super::remote::connect_remote(name)?);
+    }
     let (tx, rx) = sync_channel(256);
     let lost = Arc::new(AtomicBool::new(false));
     let disconnected = Arc::new(AtomicBool::new(false));

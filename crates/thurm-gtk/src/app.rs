@@ -2763,7 +2763,7 @@ impl App {
                 let Some(core) = self.core(host) else { return };
                 let result = (|| -> Result<(), String> {
                     if self.win().is_none() {
-                        return Err("no Thurm window is open".into());
+                        return Err(thurm_proto::LAYOUT_NO_WINDOW.into());
                     }
                     let json = p.get("json").and_then(Value::as_str)
                         .ok_or("missing tab layout")?;

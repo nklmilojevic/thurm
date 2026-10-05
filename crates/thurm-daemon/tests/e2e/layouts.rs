@@ -136,3 +136,54 @@ fn layout_fails_when_the_selected_ui_disconnects() {
         .unwrap_err();
     assert!(error.to_string().contains("disconnected"), "{error}");
 }
+
+#[test]
+fn layout_tries_another_desktop_when_the_first_has_no_window() {
+    let env = Env::new("layout-no-window");
+    let _daemon = env.start();
+    let (first, first_events) = env.connect();
+    let (second, second_events) = env.connect();
+    let client = caller(&env);
+    let pane = create(&client, &env.dir);
+    for error in [None, Some(LAYOUT_NO_WINDOW.to_owned())] {
+        let result = apply(client.clone(), pane, 5000);
+        let first_id = next_layout(&first_events);
+        first
+            .request(Request::LayoutApplied {
+                request_id: first_id,
+                error: Some(LAYOUT_NO_WINDOW.into()),
+            })
+            .unwrap();
+        let second_id = next_layout(&second_events);
+        assert_ne!(first_id, second_id);
+        assert!(result.try_recv().is_err());
+        assert!(
+            first
+                .request(Request::LayoutApplied {
+                    request_id: second_id,
+                    error: None
+                })
+                .is_err()
+        );
+        assert!(
+            first
+                .request(Request::LayoutApplied {
+                    request_id: first_id,
+                    error: None
+                })
+                .is_err()
+        );
+        second
+            .request(Request::LayoutApplied {
+                request_id: second_id,
+                error: error.clone(),
+            })
+            .unwrap();
+        let result = result.recv_timeout(Duration::from_secs(5)).unwrap();
+        if error.is_none() {
+            assert!(matches!(result, Ok(Response::Ok)));
+        } else {
+            assert!(result.unwrap_err().to_string().contains(LAYOUT_NO_WINDOW));
+        }
+    }
+}

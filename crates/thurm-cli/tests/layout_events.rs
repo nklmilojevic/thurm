@@ -167,3 +167,88 @@ fn events_filter_metadata_and_fail_on_disconnect() {
         r#"{"PaneClosed":{"pane":4}}"#
     );
 }
+
+#[test]
+fn remote_events_reject_unknown_and_disconnected_hosts_before_socket_access() {
+    for configured in [false, true] {
+        let env = TestSocket::new(if configured {
+            "remote-disabled"
+        } else {
+            "remote-unknown"
+        });
+        let config = env.dir.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            if configured {
+                "[[remote]]\nname = \"testbox\"\nhost = \"example.invalid\"\nenabled = false\n"
+            } else {
+                ""
+            },
+        )
+        .unwrap();
+        let socket = env.dir.join("testbox.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        if configured {
+            let status = thurm_remote::tunnel::Status {
+                name: "testbox".into(),
+                host: "example.invalid".into(),
+                phase: thurm_remote::tunnel::Phase::Disabled,
+                message: None,
+                socket: socket.display().to_string(),
+                since: 0,
+                retry_at: None,
+                remote_build: None,
+                remote_protocol: None,
+                upgrade_available: false,
+                os: None,
+                arch: None,
+                linger: None,
+                owner_pid: std::process::id(),
+                tunnel_pid: None,
+            };
+            std::fs::write(
+                env.dir.join("testbox.state"),
+                serde_json::to_string(&status).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut child = env
+            .command()
+            .args(["--remote", "testbox", "events", "--json"])
+            .env("THURM_CONFIG_DIR", &config)
+            .env("THURM_REMOTE_DIR", &env.dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut connected = false;
+        while child.try_wait().unwrap().is_none() {
+            if let Ok((stream, _)) = listener.accept() {
+                connected = true;
+                drop(stream);
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("remote event command did not stop");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        assert!(!connected, "read an unvalidated remote socket");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains(if configured {
+                "state: disabled"
+            } else {
+                "no remote named"
+            }),
+            "{error}"
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
