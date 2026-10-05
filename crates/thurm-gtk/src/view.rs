@@ -916,8 +916,10 @@ impl TermView {
         if !composing && self.completion_key(keyval, state) {
             return glib::Propagation::Stop;
         }
-        // The app's shortcuts.
-        if let Some(action) = app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten() {
+        // The app's shortcuts, except while the input method composes (its keys pick candidates).
+        if !composing
+            && let Some(action) = app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten()
+        {
             app::with_app(|a| a.activate(action));
             return glib::Propagation::Stop;
         }

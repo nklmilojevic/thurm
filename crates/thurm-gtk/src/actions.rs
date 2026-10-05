@@ -295,10 +295,10 @@ pub fn bindings(
                 }
             }
         };
-        let parsed = parse_accel(&accel);
-        // The combination now means only this action (or nothing).
+        let parsed = normalized(&accel);
+        // The combination now means only this action (or nothing), however it is spelled.
         for list in out.values_mut() {
-            list.retain(|a| parse_accel(a) != parsed);
+            list.retain(|a| normalized(a) != parsed);
         }
         if let Some(name) = target {
             out.entry(name).or_default().insert(0, accel);
@@ -307,13 +307,18 @@ pub fn bindings(
     out
 }
 
-/// Combination → action, for the terminal's own key handling.
+fn normalized(accel: &str) -> Option<Combo> {
+    parse_accel(accel).map(|(key, mods)| combo(key, mods))
+}
+
+/// Combination → action, for the terminal's own key handling. In table order, the first
+/// action wins a combination two defaults share (user bindings already own theirs).
 pub fn keymap(bindings: &HashMap<&'static str, Vec<String>>) -> HashMap<Combo, &'static str> {
     let mut map = HashMap::new();
-    for (name, accels) in bindings {
-        for accel in accels {
-            if let Some((key, mods)) = parse_accel(accel) {
-                map.insert(combo(key, mods), *name);
+    for def in ACTIONS {
+        for accel in bindings.get(def.name).into_iter().flatten() {
+            if let Some(c) = normalized(accel) {
+                map.entry(c).or_insert(def.name);
             }
         }
     }
@@ -360,6 +365,22 @@ mod tests {
         assert!(b["new_tab"].is_empty());
         assert!(b.values().flatten().any(|a| a == "<Control><Shift>w"));
         assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn defaults_share_no_combination() {
+        let mut owner: HashMap<Combo, &str> = HashMap::new();
+        for a in ACTIONS {
+            for accel in a.accels {
+                let c = normalized(accel).unwrap();
+                if let Some(other) = owner.insert(c, a.name) {
+                    assert_eq!(other, a.name, "{accel} is {other}'s and {}'s", a.name);
+                }
+            }
+        }
+        let mut warnings = Vec::new();
+        let map = keymap(&bindings(&Default::default(), &mut warnings));
+        assert_eq!(map.len(), owner.len());
     }
 
     #[test]

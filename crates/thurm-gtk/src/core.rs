@@ -74,8 +74,8 @@ struct Token {
 
 /// Panes with a frame not drawn yet: one main-loop hop per batch, like Core.swift's
 /// `markDirty`.
-fn dirty() -> &'static Mutex<HashSet<(HostId, PaneId)>> {
-    static DIRTY: OnceLock<Mutex<HashSet<(HostId, PaneId)>>> = OnceLock::new();
+fn dirty() -> &'static Mutex<HashSet<(HostId, u64, PaneId)>> {
+    static DIRTY: OnceLock<Mutex<HashSet<(HostId, u64, PaneId)>>> = OnceLock::new();
     DIRTY.get_or_init(Default::default)
 }
 
@@ -106,11 +106,13 @@ unsafe extern "C" fn on_frame(ctx: *mut c_void, pane: u64) {
         return;
     }
     let token = unsafe { &*(ctx as *const Token) };
-    let key = (token.host.clone(), pane);
+    // With the connection's epoch: a frame from a replaced connection is dropped, not drawn
+    // from the new one's pane of the same id.
+    let key = (token.host.clone(), token.epoch, pane);
     if dirty().lock().insert(key.clone()) {
         glib::idle_add_once(move || {
             dirty().lock().remove(&key);
-            crate::app::with_app(|app| app.frame_arrived(&PaneKey::new(&key.0, key.1)));
+            crate::app::with_app(|app| app.frame_arrived(&PaneKey::new(&key.0, key.2), key.1));
         });
     }
 }

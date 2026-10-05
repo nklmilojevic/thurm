@@ -2451,7 +2451,10 @@ impl App {
 
     // MARK: daemon events
 
-    pub fn frame_arrived(&self, key: &PaneKey) {
+    pub fn frame_arrived(&self, key: &PaneKey, epoch: u64) {
+        if self.epochs.borrow().get(&key.host) != Some(&epoch) {
+            return;
+        }
         if let Some(v) = self.view(key) {
             v.frame_arrived();
         }
