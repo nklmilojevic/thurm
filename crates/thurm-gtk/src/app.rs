@@ -3021,7 +3021,9 @@ impl App {
                 None => return,
             }
         };
-        self.paste_text(key, model::shell_escape(&path) + " ");
+        if let Some(escaped) = model::shell_escape(&path) {
+            self.paste_text(key, escaped + " ");
+        }
     }
 
     pub fn open_link(self: &Rc<Self>, url: &str, key: &PaneKey) {

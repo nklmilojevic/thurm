@@ -1083,8 +1083,10 @@ impl TermView {
     }
 
     fn insert_completion(&self, text: &str, word: &str, last: bool) {
-        let escaped = model::shell_escape(text);
-        let typed = model::shell_escape(word);
+        let (Some(escaped), Some(typed)) = (model::shell_escape(text), model::shell_escape(word))
+        else {
+            return;
+        };
         let mut out = match escaped.strip_prefix(&typed) {
             Some(rest) => rest.to_string(),
             None => "\u{7f}".repeat(typed.chars().count()) + &escaped,
@@ -1480,7 +1482,7 @@ impl TermView {
                 .files()
                 .iter()
                 .filter_map(|f| f.path())
-                .map(|p| model::shell_escape(&p.to_string_lossy()))
+                .filter_map(|p| model::shell_escape(&p.to_string_lossy()))
                 .collect();
             if text.is_empty() {
                 return false;

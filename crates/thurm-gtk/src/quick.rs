@@ -321,54 +321,28 @@ fn bind_portal(trigger: String, spec: String) {
     let opts = glib::VariantDict::new(None);
     opts.insert_value("handle_token", &token.to_variant());
     opts.insert_value("session_handle_token", &token.to_variant());
-    let reply = bus.call_sync(
-        Some("org.freedesktop.portal.Desktop"),
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.GlobalShortcuts",
-        "CreateSession",
-        Some(&(opts.end(),).to_variant()),
-        None,
-        gio::DBusCallFlags::NONE,
-        3000,
-        None::<&gio::Cancellable>,
-    );
-    let Ok(reply) = reply else {
+    let bus2 = bus.clone();
+    let spec2 = spec.clone();
+    let sent = portal_request(&bus, &token, "CreateSession", (opts.end(),).to_variant(), move |code, results| {
+        let dict = glib::VariantDict::new(Some(&results));
+        let session = dict
+            .lookup_value("session_handle", None)
+            .and_then(|v| v.str().map(str::to_string));
+        let Some(session) = session.filter(|_| code == 0) else {
+            not_bound(&spec2);
+            return;
+        };
+        if SERIAL.with(Cell::get) != serial {
+            // The hotkey changed while the portal was answering.
+            close_session(&session);
+            return;
+        }
+        bind_shortcut(&bus2, session, &trigger, &spec2, serial);
+    });
+    if !sent {
         log::info!("no GlobalShortcuts portal; bind `thurm-gtk --quick-terminal` in the desktop's keyboard settings for {spec}");
         return;
-    };
-    let request: String = reply.child_value(0).get::<String>().unwrap_or_default();
-    let bus2 = bus.clone();
-    let sub = Rc::new(RefCell::new(None));
-    let sub2 = sub.clone();
-    let id = bus.signal_subscribe(
-        Some("org.freedesktop.portal.Desktop"),
-        Some("org.freedesktop.portal.Request"),
-        Some("Response"),
-        Some(&request),
-        None,
-        gio::DBusSignalFlags::NONE,
-        move |_, _, _, _, _, params| {
-            if let Some(id) = sub2.borrow_mut().take() {
-                bus2.signal_unsubscribe(id);
-            }
-            let results = params.child_value(1);
-            let dict = glib::VariantDict::new(Some(&results));
-            let Some(session) = dict
-                .lookup_value("session_handle", None)
-                .and_then(|v| v.str().map(str::to_string))
-            else {
-                return;
-            };
-            if SERIAL.with(Cell::get) != serial {
-                // The hotkey changed while the portal was answering.
-                close_session(&session);
-                return;
-            }
-            bind_shortcut(&bus2, &session, &trigger);
-            SESSION.with(|s| *s.borrow_mut() = Some(session));
-        },
-    );
-    *sub.borrow_mut() = Some(id);
+    }
     // Toggle on activation, once for every binding to come: only the current session counts.
     if ACTIVATED.with(|a| a.replace(true)) {
         return;
@@ -390,6 +364,104 @@ fn bind_portal(trigger: String, spec: String) {
     );
 }
 
+/// The session holds the hotkey only once the portal says the binding succeeded (the user can
+/// refuse it).
+fn bind_shortcut(bus: &gio::DBusConnection, session: String, trigger: &str, spec: &str, serial: u32) {
+    let props = glib::VariantDict::new(None);
+    props.insert_value("description", &"Show or hide the quick terminal".to_variant());
+    props.insert_value("preferred_trigger", &trigger.to_variant());
+    let shortcuts = vec![("quick-terminal".to_string(), props.end())];
+    let token = format!("thurm{}_{serial}_bind", std::process::id());
+    let opts = glib::VariantDict::new(None);
+    opts.insert_value("handle_token", &token.to_variant());
+    let Ok(path) = glib::variant::ObjectPath::try_from(session.clone()) else { return };
+    let params = (path, shortcuts, String::new(), opts.end()).to_variant();
+    let spec2 = spec.to_string();
+    let session2 = session.clone();
+    let sent = portal_request(bus, &token, "BindShortcuts", params, move |code, _| {
+        if code == 0 && SERIAL.with(Cell::get) == serial {
+            SESSION.with(|s| *s.borrow_mut() = Some(session2));
+        } else {
+            close_session(&session2);
+            if code != 0 {
+                not_bound(&spec2);
+            }
+        }
+    });
+    if !sent {
+        close_session(&session);
+        not_bound(spec);
+    }
+}
+
+fn not_bound(spec: &str) {
+    log::info!("the desktop did not bind the quick terminal hotkey {spec}");
+    app::with_app(|a| {
+        a.toast(
+            &format!(
+                "Quick terminal: the desktop did not bind {spec}. Bind `thurm-gtk --quick-terminal` in its keyboard settings."
+            ),
+            8.0,
+        )
+    });
+}
+
+/// Calls a portal method that answers through a Request object: subscribes to its Response
+/// at the path the handle token gives (before calling, so a quick answer is not missed), then
+/// calls. `done` gets the response code (0: success) and results. False when the call failed.
+#[allow(deprecated)]
+fn portal_request(
+    bus: &gio::DBusConnection,
+    token: &str,
+    method: &str,
+    params: glib::Variant,
+    done: impl FnOnce(u32, glib::Variant) + 'static,
+) -> bool {
+    let sender = bus
+        .unique_name()
+        .map(|n| n.trim_start_matches(':').replace('.', "_"))
+        .unwrap_or_default();
+    let path = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
+    let sub = Rc::new(RefCell::new(None));
+    let done = RefCell::new(Some(done));
+    let bus2 = bus.clone();
+    let sub2 = sub.clone();
+    let id = bus.signal_subscribe(
+        Some("org.freedesktop.portal.Desktop"),
+        Some("org.freedesktop.portal.Request"),
+        Some("Response"),
+        Some(&path),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |_, _, _, _, _, params| {
+            if let Some(id) = sub2.borrow_mut().take() {
+                bus2.signal_unsubscribe(id);
+            }
+            if let Some(f) = done.borrow_mut().take() {
+                f(params.child_value(0).get::<u32>().unwrap_or(2), params.child_value(1));
+            }
+        },
+    );
+    *sub.borrow_mut() = Some(id);
+    let sent = bus
+        .call_sync(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.GlobalShortcuts",
+            method,
+            Some(&params),
+            None,
+            gio::DBusCallFlags::NONE,
+            3000,
+            None::<&gio::Cancellable>,
+        )
+        .is_ok();
+    if !sent && let Some(id) = sub.borrow_mut().take() {
+        bus.signal_unsubscribe(id);
+    }
+    sent
+}
+
 fn close_session(session: &str) {
     let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) else {
         return;
@@ -400,27 +472,6 @@ fn close_session(session: &str) {
         "org.freedesktop.portal.Session",
         "Close",
         None,
-        None,
-        gio::DBusCallFlags::NONE,
-        3000,
-        None::<&gio::Cancellable>,
-    );
-}
-
-fn bind_shortcut(bus: &gio::DBusConnection, session: &str, trigger: &str) {
-    let props = glib::VariantDict::new(None);
-    props.insert_value("description", &"Show or hide the quick terminal".to_variant());
-    props.insert_value("preferred_trigger", &trigger.to_variant());
-    let shortcuts = vec![("quick-terminal".to_string(), props.end())];
-    let opts = glib::VariantDict::new(None);
-    let Ok(path) = glib::variant::ObjectPath::try_from(session.to_string()) else { return };
-    let params = (path, shortcuts, String::new(), opts.end()).to_variant();
-    let _ = bus.call_sync(
-        Some("org.freedesktop.portal.Desktop"),
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.GlobalShortcuts",
-        "BindShortcuts",
-        Some(&params),
         None,
         gio::DBusCallFlags::NONE,
         3000,
