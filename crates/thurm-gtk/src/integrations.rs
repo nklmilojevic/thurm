@@ -89,14 +89,22 @@ pub fn load_state_list(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn save_state_list(key: &str, list: &[String]) {
+/// Written to a temporary file and renamed into place, so a crash never leaves half a file
+/// (which would read as empty).
+pub fn save_state_list(key: &str, list: &[String]) -> std::io::Result<()> {
     let mut state = load_state();
     state.insert(key.into(), Value::from(list.to_vec()));
     let path = state_file();
     if let Some(d) = path.parent() {
-        let _ = std::fs::create_dir_all(d);
+        std::fs::create_dir_all(d)?;
     }
-    let _ = std::fs::write(path, Value::Object(state).to_string());
+    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let written = std::fs::write(&tmp, Value::Object(state).to_string())
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 // MARK: files

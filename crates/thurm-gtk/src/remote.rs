@@ -142,10 +142,10 @@ impl Remotes {
     }
 
     /// A close for a pane of an offline host, applied when it is back (persisted).
-    pub fn queue_close(&self, key: &PaneKey, pid: u32) {
+    pub fn queue_close(&self, key: &PaneKey, pid: u32) -> std::io::Result<()> {
         let mut all = pending_closes();
         all.entry(key.host.clone()).or_default().insert(key.id, pid);
-        save_pending_closes(&all);
+        save_pending_closes(&all)
     }
 }
 
@@ -164,12 +164,12 @@ fn pending_closes() -> HashMap<String, HashMap<u64, u32>> {
     out
 }
 
-fn save_pending_closes(all: &HashMap<String, HashMap<u64, u32>>) {
+fn save_pending_closes(all: &HashMap<String, HashMap<u64, u32>>) -> std::io::Result<()> {
     let list: Vec<String> = all
         .iter()
         .flat_map(|(h, m)| m.iter().map(move |(id, pid)| format!("{h}:{id}:{pid}")))
         .collect();
-    crate::integrations::save_state_list("pending_remote_closes", &list);
+    crate::integrations::save_state_list("pending_remote_closes", &list)
 }
 
 pub fn start(app: &Rc<App>) {
@@ -293,7 +293,9 @@ fn remote_connected(app: &Rc<App>, host: &str) {
         let still: HashSet<u64> = pending.keys().copied().collect();
         infos.retain(|i| !still.contains(&i.id));
     }
-    save_pending_closes(&all);
+    if let Err(e) = save_pending_closes(&all) {
+        log::warn!("saving the queued closes: {e}");
+    }
 
     let alive: HashSet<u64> = infos.iter().filter(|i| i.alive).map(|i| i.id).collect();
     // Panes that ended while it was away.

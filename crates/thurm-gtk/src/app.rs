@@ -1066,8 +1066,19 @@ impl App {
             return;
         }
         if let Some(c) = self.core(LOCAL) {
-            c.send(&json!({"SetLayout": {"json": json}}));
-            *self.last_layout.borrow_mut() = json;
+            // Saved once the daemon says so: a failed save is tried again by the next one (or the
+            // 15 s safety net), which would skip a layout already recorded as saved.
+            let sent = json.clone();
+            c.request_async(&json!({"SetLayout": {"json": json}}), 5000, move |resp| {
+                with_app(|a| {
+                    if resp == Value::String("Ok".into()) {
+                        *a.last_layout.borrow_mut() = sent;
+                    } else {
+                        log::warn!("saving the layout failed: {resp}");
+                        a.last_layout.borrow_mut().clear();
+                    }
+                });
+            });
         }
     }
 
@@ -1675,7 +1686,13 @@ impl App {
             Some(c) => c.send(&json!({"ClosePane": {"pane": key.id}})),
             None if key.is_remote() => {
                 let pid = self.pane_info(key).and_then(|i| i.pid).unwrap_or(0);
-                self.remotes.queue_close(key, pid);
+                if let Err(e) = self.remotes.queue_close(key, pid) {
+                    log::warn!("queueing the close of {key}: {e}");
+                    self.toast(
+                        &format!("Could not save the close of {key}: it may come back when {} reconnects ({e})", key.host),
+                        8.0,
+                    );
+                }
             }
             None => {}
         }
@@ -2039,7 +2056,9 @@ impl App {
                 }
                 None => c.push(name.to_string()),
             }
-            integrations::save_state_list("collapsed_groups", &c);
+            if let Err(e) = integrations::save_state_list("collapsed_groups", &c) {
+                log::warn!("saving the collapsed groups: {e}");
+            }
         }
         self.refresh_sidebar();
     }
