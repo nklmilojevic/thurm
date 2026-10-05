@@ -528,6 +528,10 @@ impl Core {
     }
 
     /// The image as cairo wants it: premultiplied ARGB32 in native byte order, with its size.
+    /// Images larger than this on a side are not drawn (cairo's limit is 32767).
+    pub const MAX_IMAGE_SIDE: u32 = 16384;
+
+    /// `None` for one larger than [`Self::MAX_IMAGE_SIDE`], before anything is copied.
     pub fn image_argb(&self, pane: PaneId, image: u32) -> Option<(i32, i32, Vec<u8>)> {
         let (mut w, mut h) = (0u32, 0u32);
         let mut rgba: *const u8 = ptr::null();
@@ -536,8 +540,9 @@ impl Core {
         } {
             return None;
         }
+        let fits = (1..=Self::MAX_IMAGE_SIDE).contains(&w) && (1..=Self::MAX_IMAGE_SIDE).contains(&h);
         let n = w as usize * h as usize * 4;
-        let out = (!rgba.is_null() && n > 0).then(|| {
+        let out = (fits && !rgba.is_null()).then(|| {
             let src = unsafe { std::slice::from_raw_parts(rgba, n) };
             let mut out = vec![0u8; n];
             for (d, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {

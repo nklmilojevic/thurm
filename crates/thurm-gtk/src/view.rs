@@ -729,10 +729,6 @@ impl TermView {
                 continue;
             }
             if let Some((w, h, data)) = core.image_argb(id, pl.image)
-                && w > 0
-                && h > 0
-                && w <= 16384
-                && h <= 16384
                 && let Some(surface) = render::image_surface(w, h, data)
             {
                 st.images.insert(
