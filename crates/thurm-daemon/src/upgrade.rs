@@ -76,6 +76,12 @@ pub struct PaneHandoff {
     /// Ordered public reporting state for agent processes that remain alive.
     #[serde(default)]
     pub agent_report: Option<crate::agents::reporting::ReportHandoff>,
+    /// A submitted prompt that has not started a turn.
+    #[serde(default)]
+    pub agent_prompt: Option<crate::agents::prompt_handoff::PendingPromptHandoff>,
+    /// Restore this size because exec closes the attached terminal connection.
+    #[serde(default)]
+    pub terminal_size_after_detach: Option<PaneSizeSnap>,
 }
 
 impl PaneHandoff {

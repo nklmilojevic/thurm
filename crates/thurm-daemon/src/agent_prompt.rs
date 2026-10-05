@@ -46,6 +46,10 @@ impl PromptTracker {
         self.pending = false;
     }
 
+    pub fn restore_pending(&mut self) {
+        self.pending = true;
+    }
+
     pub fn is_pending(&self) -> bool {
         self.pending
     }

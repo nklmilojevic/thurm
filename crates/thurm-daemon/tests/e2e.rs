@@ -1,5 +1,8 @@
 //! End-to-end: run the real daemon with real PTYs and drive it through the client library.
 
+#[path = "e2e/workflows_upgrade.rs"]
+mod workflows_upgrade;
+
 #[path = "e2e/agent_prompt.rs"]
 mod agent_prompt;
 

@@ -16,6 +16,7 @@ use thurm_proto::{AgentState, AgentStatus, ProcessInfo};
 
 use crate::transcript::TitleReader;
 
+pub mod prompt_handoff;
 pub mod reporting;
 
 #[derive(Default, Debug)]

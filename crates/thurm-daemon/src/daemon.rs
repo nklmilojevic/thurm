@@ -1560,6 +1560,8 @@ impl Daemon {
                 shell_token: st.term.shell_token().map(str::to_owned),
                 shell_path: st.term.shell_path().map(str::to_owned),
                 agent_report: st.agent.report_handoff(),
+                agent_prompt: st.agent.pending_prompt_handoff(),
+                terminal_size_after_detach: st.terminal_attachment.map(|(_, size)| size.into()),
             });
         }
         upgrade::Handoff {
@@ -1578,7 +1580,7 @@ impl Daemon {
     pub fn adopt(self: &Arc<Self>, h: upgrade::Handoff) {
         let mut adopted = 0;
         for p in h.panes {
-            let size = sanitize_size(p.size.into());
+            let mut size = sanitize_size(p.size.into());
             let pty = match Pty::adopt(p.fd, p.pid, p.exited) {
                 Ok(pty) => pty,
                 Err(e) => {
@@ -1593,6 +1595,13 @@ impl Daemon {
             if !pending.is_empty() {
                 term.advance(&pending);
                 let _ = term.drain_events();
+            }
+            if let Some(original) = p.terminal_size_after_detach {
+                size = sanitize_size(original.into());
+                if let Err(error) = pty.resize(size) {
+                    log::warn!("pane {}: cannot restore size after upgrade: {error}", p.id);
+                }
+                term.resize(size);
             }
             term.set_shell_token(p.shell_token.clone());
             term.set_shell_path(p.shell_path.clone());
@@ -1626,13 +1635,16 @@ impl Daemon {
             match installed {
                 Ok(()) => {
                     adopted += 1;
-                    if let Some(report) = p.agent_report
-                        && let Some(pane) = self.pane(p.id)
-                    {
+                    if let Some(pane) = self.pane(p.id) {
                         let mut st = pane.state.lock();
                         let fg = st.pty.foreground_pgrp();
                         st.agent.saw_foreground(fg);
-                        st.agent.restore_report_handoff(report);
+                        if let Some(report) = p.agent_report {
+                            st.agent.restore_report_handoff(report);
+                        }
+                        if let Some(prompt) = p.agent_prompt {
+                            st.agent.restore_pending_prompt(prompt);
+                        }
                         st.info.agent = st.agent.state().cloned();
                     }
                 }
