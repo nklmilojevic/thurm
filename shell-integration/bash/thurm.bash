@@ -32,6 +32,8 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
   _thurm_prompt_start() {
     _thurm_ret=$?
     _thurm_in_prompt=1
+    # The prompt commands after this one still see the command's status.
+    return "$_thurm_ret"
   }
 
   _thurm_prompt_end() {
@@ -74,7 +76,15 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
     precmd_functions=(_thurm_bp_prompt_start "${precmd_functions[@]}" _thurm_prompt_end)
     preexec_functions+=(_thurm_preexec)
   else
-    PROMPT_COMMAND="_thurm_prompt_start${PROMPT_COMMAND:+;$PROMPT_COMMAND};_thurm_prompt_end"
+    if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+      # bash 5.1+ runs every element of a PROMPT_COMMAND array (systemd's OSC 3008 profile
+      # script appends one): the prompt ends after the last, or the DEBUG trap takes the
+      # later ones for the user's command.
+      PROMPT_COMMAND[0]="_thurm_prompt_start${PROMPT_COMMAND[0]:+;${PROMPT_COMMAND[0]}}"
+      PROMPT_COMMAND+=(_thurm_prompt_end)
+    else
+      PROMPT_COMMAND="_thurm_prompt_start${PROMPT_COMMAND:+;$PROMPT_COMMAND};_thurm_prompt_end"
+    fi
     # Keep a DEBUG trap the user's config set, running it first so it still sees the
     # previous command's $?.
     _thurm_prev_debug=$(builtin trap -p DEBUG)

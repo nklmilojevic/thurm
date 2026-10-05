@@ -42,7 +42,8 @@ pub enum Method {
 impl Method {
     pub fn label(self) -> &'static str {
         match self {
-            Method::Copy => "Copy this Mac's Thurm",
+            Method::Copy if cfg!(target_os = "macos") => "Copy this Mac's Thurm",
+            Method::Copy => "Copy this computer's Thurm",
             Method::Download => "Download the Linux build",
             Method::Nix => "Install with Nix",
         }
@@ -115,6 +116,49 @@ pub fn same_build(ours: &str, theirs: &str) -> bool {
     }
 }
 
+/// Our own binaries run there: the same target (macOS), or static Linux binaries of the same
+/// architecture (a Linux host has none of our libraries, whatever the target string says).
+fn copyable(target: &str, local_bins: Option<&Path>) -> bool {
+    let ours = crate::current_target();
+    if !target.contains("-linux-") {
+        return target == ours;
+    }
+    let arch = |t: &str| t.split('-').next().unwrap_or("").to_string();
+    ours.contains("-linux-")
+        && arch(target) == arch(ours)
+        && local_bins
+            .and_then(local_binaries)
+            .is_some_and(|(thurm, thurmd)| is_static_elf(&thurm) && is_static_elf(&thurmd))
+}
+
+/// A 64-bit little-endian ELF executable without a program interpreter (statically linked).
+fn is_static_elf(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    // Only the ELF header and the program headers: not the whole binary.
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 64];
+    if file.read_exact(&mut head).is_err() || &head[..4] != b"\x7fELF" || head[4] != 2 || head[5] != 1 {
+        return false;
+    }
+    let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as usize;
+    let phoff = u64::from_le_bytes(head[0x20..0x28].try_into().unwrap_or_default());
+    let (size, count) = (u16_at(&head, 0x36), u16_at(&head, 0x38));
+    // A sane, bounded table (entries are 56 bytes); anything else is no executable of ours.
+    if size < 4 || size * count > 64 * 1024 * 1024 || file.seek(SeekFrom::Start(phoff)).is_err() {
+        return false;
+    }
+    let mut table = vec![0u8; size * count];
+    if file.read_exact(&mut table).is_err() {
+        return false;
+    }
+    // PT_INTERP: dynamically linked.
+    table
+        .chunks_exact(size)
+        .all(|h| u32::from_le_bytes(h[..4].try_into().unwrap_or_default()) != 3)
+}
+
 /// Probes the host and its daemon and lists the ways to put our build there.
 pub fn plan(ssh: &Ssh, socket: Option<&str>, local_bins: Option<&Path>) -> Result<Plan, SshError> {
     let host = crate::probe(ssh)?;
@@ -126,7 +170,7 @@ pub fn plan(ssh: &Ssh, socket: Option<&str>, local_bins: Option<&Path>) -> Resul
     let mut methods = Vec::new();
     let mut problem = None;
     match host.artifact_target() {
-        Some(t) if t == crate::current_target() => {
+        Some(t) if copyable(t, local_bins) => {
             if local_bins.and_then(local_binaries).is_some() {
                 methods.push(Method::Copy);
             } else {
@@ -501,6 +545,61 @@ pub fn upgrade_daemon(
 
 #[cfg(test)]
 mod tests {
+    /// A minimal 64-bit ELF with one program header of type `ptype`.
+    fn elf(ptype: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 64 + 56];
+        d[..4].copy_from_slice(b"\x7fELF");
+        d[4] = 2;
+        d[5] = 1;
+        d[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        d[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        d[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+        d[64..68].copy_from_slice(&ptype.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn static_elf_detection() {
+        let dir = std::env::temp_dir().join(format!("thurm-elf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (st, dy, txt) = (dir.join("static"), dir.join("dynamic"), dir.join("text"));
+        std::fs::write(&st, elf(1)).unwrap();
+        std::fs::write(&dy, elf(3)).unwrap();
+        std::fs::write(&txt, b"#!/bin/sh\n").unwrap();
+        assert!(is_static_elf(&st));
+        assert!(!is_static_elf(&dy));
+        assert!(!is_static_elf(&txt));
+        // A truncated program-header table.
+        std::fs::write(&txt, &elf(1)[..80]).unwrap();
+        assert!(!is_static_elf(&txt));
+        if cfg!(target_os = "linux") {
+            assert!(!is_static_elf(Path::new("/bin/sh")));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn linux_copies_need_static_helpers() {
+        let dir = std::env::temp_dir().join(format!("thurm-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = crate::current_target();
+        // Dynamically linked helpers: not even to the very same Linux target.
+        std::fs::write(dir.join("thurm"), elf(3)).unwrap();
+        std::fs::write(dir.join("thurmd"), elf(3)).unwrap();
+        assert!(!copyable("x86_64-unknown-linux-musl", Some(&dir)));
+        assert!(!copyable("aarch64-unknown-linux-musl", Some(&dir)));
+        if ours.contains("-linux-") {
+            assert!(!copyable(ours, Some(&dir)));
+            std::fs::write(dir.join("thurm"), elf(1)).unwrap();
+            std::fs::write(dir.join("thurmd"), elf(1)).unwrap();
+            assert!(copyable(ours, Some(&dir)));
+        } else {
+            // macOS: the same target is enough.
+            assert!(copyable(ours, None));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

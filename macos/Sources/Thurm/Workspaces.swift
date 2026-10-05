@@ -79,6 +79,22 @@ extension SessionManager {
         workspaces.first { $0.id == id }
     }
 
+    /// Takes `pane`'s own tab out of the background workspaces; one left empty goes too.
+    func takeHiddenTab(_ pane: PaneKey) {
+        for ws in workspaces where !isShown(ws) {
+            let before = ws.hiddenTabs.count
+            ws.hiddenTabs.removeAll { $0.root.panes == [pane] }
+            ws.hiddenSelectedTab = min(ws.hiddenSelectedTab, max(0, ws.hiddenTabs.count - 1))
+            if before > 0 && ws.hiddenTabs.isEmpty { workspaces.removeAll { $0 === ws } }
+        }
+    }
+
+    /// The workspace showing `pane`, or holding it in a hidden tab.
+    func workspace(containing pane: PaneKey) -> Workspace? {
+        if let c = controller(for: pane) { return workspace(c.workspaceID) }
+        return workspaces.first { $0.hiddenTabs.contains { $0.root.panes.contains(pane) } }
+    }
+
     var currentWorkspace: Workspace? {
         currentController.flatMap { workspace($0.workspaceID) }
     }

@@ -23,7 +23,8 @@ thurm capture --pane "$id" -n 50
 ```
 
 Other ways to open panes: `thurm new-tab [--cwd DIR] -- CMD...`, `thurm split --dir down`,
-`--hold` keeps the pane open after the command exits.
+`--hold` keeps the pane open after the command exits. `thurm new-tab --window` opens it in a new
+workspace instead; name that with `thurm workspace rename --pane "$id" NAME`.
 
 ## Type into a pane
 
@@ -91,6 +92,7 @@ thurm --remote devbox capture --pane 3 -n 80
 thurm list                       # all panes (id, pid, size, title, agent, cwd)
 thurm info                       # details for the current pane
 thurm title "backend"            # tab title
+thurm workspace rename "api"     # name the current pane's workspace (--pane ID for another)
 thurm focus ID                   # bring a pane to the front
 thurm notify "Done" "tests pass" # desktop notification
 thurm close ID                   # kill a pane

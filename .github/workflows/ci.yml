@@ -86,6 +86,45 @@ jobs:
           THURM_REQUIRE_SSHD: "1"
         run: cargo test --locked --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
 
+  linux-app:
+    # The Linux app (crates/thurm-gtk, GTK 4 + libadwaita), and a headless run of it.
+    name: Linux app (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: linux-app
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+      - name: GTK and the headless display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev fonts-dejavu-core \
+            xvfb xdotool imagemagick dbus-x11
+      - name: Test
+        run: cargo test --locked -p thurm-gtk
+      - name: Clippy
+        run: cargo clippy --locked -p thurm-gtk --all-targets -- -D warnings
+      - name: Smoke test
+        run: |
+          cargo build --locked -p thurm-gtk -p thurm-daemon -p thurm-cli
+          scripts/linux/smoke.sh target/debug smoke
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: linux-app-smoke-${{ matrix.runner }}
+          path: smoke
+
   checks:
     name: Consistency and advisories
     runs-on: ubuntu-latest

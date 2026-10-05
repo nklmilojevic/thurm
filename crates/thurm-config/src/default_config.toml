@@ -40,6 +40,8 @@ pane_headers = false
 # Tabs: "native" (in the titlebar) or "sidebar" (vertical, grouped by repository). View > Tabs.
 tab_style = "sidebar"
 sidebar_width = 240.0
+# Agents listed in the sidebar before its agents panel scrolls; drag the panel's header to change.
+sidebar_agent_rows = 5
 
 [cursor]
 style = "block"   # block | beam | underline

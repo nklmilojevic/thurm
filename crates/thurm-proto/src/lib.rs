@@ -925,6 +925,11 @@ pub enum UiCommand {
         pane: PaneId,
         title: Option<String>,
     },
+    /// Rename the workspace `pane` is in.
+    RenameWorkspace {
+        pane: PaneId,
+        name: String,
+    },
     /// Scroll the pane's viewport (`thurm scroll`); the viewport lives in the app.
     Scroll {
         pane: PaneId,

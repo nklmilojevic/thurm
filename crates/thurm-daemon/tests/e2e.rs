@@ -56,7 +56,6 @@ impl Env {
     /// Like `start`, with extra environment variables for the daemon.
     fn start_with(&self, vars: &[(&str, &Path)]) -> Daemon {
         let child = Command::new(env!("CARGO_BIN_EXE_thurmd"))
-            .envs(vars.iter().copied())
             .args(["--foreground", "--socket"])
             .arg(&self.socket)
             .env("THURM_CONFIG_DIR", self.dir.join("config"))
@@ -66,6 +65,7 @@ impl Env {
             // Agents' settings (hooks installed on launch) stay in the test directory.
             .env("CLAUDE_CONFIG_DIR", self.dir.join("claude"))
             .env("CODEX_HOME", self.dir.join("codex"))
+            .envs(vars.iter().copied())
             .spawn()
             .expect("spawn daemon");
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1550,4 +1550,58 @@ fn starts_on_a_fresh_default_socket() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&runtime);
     assert_eq!(mode, 0o700);
+}
+
+// macOS starts the account's login shell through login(1), not $SHELL.
+#[cfg(target_os = "linux")]
+#[test]
+fn bash_prompt_command_array_keeps_output_on_resize() {
+    // systemd's profile script (OSC 3008) appends to a PROMPT_COMMAND array; bash 5.1+ runs
+    // every element. Output must stay output: libghostty-vt clears a prompt on resize.
+    if !Path::new("/bin/bash").exists() {
+        return;
+    }
+    let env = Env::new("bash-prompt-array");
+    std::fs::write(
+        env.dir.join("config/config.toml"),
+        "[session]\nsnapshot_interval_secs = 1\n",
+    )
+    .unwrap();
+    let home = env.dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join(".bash_profile"),
+        "PS1='[test]$ '\n\
+         _ctx() { printf '\\e]3008;start=x;type=shell\\e\\\\'; }\n\
+         [ -n \"$(declare -p PROMPT_COMMAND 2>/dev/null)\" ] || PROMPT_COMMAND+=('')\n\
+         PROMPT_COMMAND+=(_ctx)\n",
+    )
+    .unwrap();
+    let _daemon = env.start_with(&[("SHELL", Path::new("/bin/bash")), ("HOME", &home)]);
+    let (c, _events) = env.connect();
+    let pane = create(&c, &env.dir);
+    let resize = |rows| {
+        c.request(Request::Resize {
+            pane,
+            size: PaneSize {
+                cols: 53,
+                rows,
+                cell_width: 10,
+                cell_height: 22,
+            },
+        })
+        .unwrap();
+    };
+    resize(31);
+    wait_match(&c, pane, r"\[test\]\$");
+    c.request(Request::Input {
+        pane,
+        data: b"printf 'out%s\\n' 1 2 3\r".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, r"out3\n\[test\]\$");
+    resize(15);
+    std::thread::sleep(Duration::from_millis(500));
+    let after = capture(&c, pane);
+    assert!(after.contains("out2"), "{after}");
 }

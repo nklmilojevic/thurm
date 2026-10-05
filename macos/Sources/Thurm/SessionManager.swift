@@ -26,6 +26,8 @@ final class SessionManager: NSObject, CoreDelegate {
     /// Layout saving starts only after the initial restore, so a failed start never
     /// overwrites the stored layout with an empty one.
     private var sessionReady = false
+    /// Restores in a row whose ListPanes or GetLayout failed.
+    private var restoreFailures = 0
     private var lastLayoutJSON: String?
     private var periodicTimer: Timer?
     private var reconnectAttempt = 0
@@ -279,10 +281,11 @@ final class SessionManager: NSObject, CoreDelegate {
         return PaneInfo(json: v.payload, host: key.host)
     }
 
+    /// nil when the daemon did not answer (or its layout does not parse); an empty layout when
+    /// it has none saved.
     func fetchLayout() -> Layout? {
-        guard let v = JSON.variant(Core.shared.request("\"GetLayout\"")), v.name == "Layout",
-              let json = v.payload as? String
-        else { return nil }
+        guard let v = JSON.variant(Core.shared.request("\"GetLayout\"")), v.name == "Layout" else { return nil }
+        guard let json = v.payload as? String else { return v.payload is NSNull ? Layout(windows: []) : nil }
         return Layout.from(json: json)
     }
 
@@ -363,7 +366,26 @@ final class SessionManager: NSObject, CoreDelegate {
     // MARK: - Restore
 
     private func restoreSession() {
-        let infos = fetchPanes() ?? []
+        // Nothing is changed (or saved over the daemon's layout) unless both answered: a failed
+        // request is not an empty session.
+        guard let infos = fetchPanes(), let saved = fetchLayout() else {
+            restoreFailures += 1
+            tlog("restoring the session failed (\(restoreFailures))")
+            if restoreFailures < 5 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25 * Double(1 << restoreFailures)) { [weak self] in
+                    guard let self, !self.sessionReady else { return }
+                    self.restoreSession()
+                }
+            } else {
+                let alert = NSAlert()
+                alert.messageText = "Could not read the saved session"
+                alert.informativeText = "thurmd did not answer. Your tabs are left as they were: quit and reopen Thurm to try again."
+                alert.alertStyle = .warning
+                alert.runModal()
+            }
+            return
+        }
+        restoreFailures = 0
         panes = panes.filter { $0.key.isRemote }
         for info in infos { panes[info.key] = info }
         let alive = Set(infos.filter { $0.alive }.map { $0.key })
@@ -375,7 +397,7 @@ final class SessionManager: NSObject, CoreDelegate {
         // earlier window of the layout claimed (a layout saved after a double restore lists
         // them twice).
         var placed = Set(liveControllers.flatMap { $0.content.paneIds })
-        var layout = fetchLayout() ?? Layout(windows: [])
+        var layout = saved
         layout.retainPanes { key in
             !placed.contains(key) && (key.isRemote ? remotes.contains(key.host) : alive.contains(key))
         }
@@ -846,6 +868,7 @@ final class SessionManager: NSObject, CoreDelegate {
             }
             c.content.needsDisplay = true
         }
+        refreshSidebars()
         updateSecureInput()
     }
 
@@ -1036,7 +1059,11 @@ final class SessionManager: NSObject, CoreDelegate {
 
     /// After reconnecting: drop views of vanished panes, resubscribe the rest.
     private func resync() {
-        let infos = fetchPanes() ?? []
+        // Without an answer, keep every view: an empty list would drop them all.
+        guard let infos = fetchPanes() else {
+            tlog("resync: ListPanes failed")
+            return
+        }
         panes = panes.filter { $0.key.isRemote }
         for info in infos { panes[info.key] = info }
         for c in liveControllers {
@@ -1159,20 +1186,31 @@ final class SessionManager: NSObject, CoreDelegate {
         switch v.name {
         case "NewTab":
             guard let pane = key("pane") else { return }
-            if controller(for: pane) != nil {
-                focusPane(pane, activate: true)
+            let ownWorkspace = jsonBool(d["new_window"]) ?? false
+            if let c = controller(for: pane) {
+                // Adopted while the app started (this command launched it): `--window` still
+                // gets its own workspace, unless that would leave the window without a tab.
+                if ownWorkspace, c.content.paneIds.count == 1, group(of: c).count > 1 {
+                    moveTabToNewWorkspace(c)
+                } else {
+                    focusPane(pane, activate: true)
+                }
                 return
             }
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
-            if jsonBool(d["new_window"]) ?? false {
-                // `thurm new-tab --window`: its own workspace, in the background.
+            // Launched by this command, the app may have adopted the pane as an orphan already:
+            // it moves to where the command says.
+            takeHiddenTab(pane)
+            if ownWorkspace {
+                // `thurm new-tab --window`: its own workspace, in the background (Thurm stays
+                // where it is too).
                 newWindow(pane: pane, background: true)
             } else {
                 // `thurm handoff` opened it: tag and group it.
                 newTab(from: currentController, pane: pane,
                        handoff: Remotes.shared.handoff(host: daemon, pane: pane.id)?.id)
+                NSApp.activate()
             }
-            NSApp.activate()
         case "Split":
             guard let pane = key("pane") else { return }
             if controller(for: pane) != nil {
@@ -1201,6 +1239,13 @@ final class SessionManager: NSObject, CoreDelegate {
             if let pane = key("pane"), let c = controller(for: pane) {
                 let title = jsonString(d["title"])
                 c.titleOverride = (title?.isEmpty ?? true) ? nil : title
+                scheduleLayoutSave()
+            }
+        case "RenameWorkspace":
+            let name = (jsonString(d["name"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if let pane = key("pane"), !name.isEmpty, let ws = workspace(containing: pane) {
+                ws.name = name
+                refreshSidebars()
                 scheduleLayoutSave()
             }
         default:

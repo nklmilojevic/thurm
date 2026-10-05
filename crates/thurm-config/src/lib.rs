@@ -136,6 +136,7 @@ impl Config {
             ("window.blur", u64::from(w.blur), 100),
             ("window.columns", u64::from(w.columns), 1000),
             ("window.rows", u64::from(w.rows), 1000),
+            ("window.sidebar_agent_rows", u64::from(w.sidebar_agent_rows), 100),
             ("terminal.scrollback", t.scrollback as u64, 10_000_000),
             (
                 "terminal.image_memory_mib",
@@ -263,6 +264,8 @@ pub struct WindowConfig {
     pub tab_style: TabStyle,
     /// Width of the tab sidebar in points.
     pub sidebar_width: f64,
+    /// Rows the sidebar's agents panel shows before it scrolls (dragging its header sets it).
+    pub sidebar_agent_rows: u32,
 }
 
 impl Default for WindowConfig {
@@ -281,6 +284,7 @@ impl Default for WindowConfig {
             pane_headers: false,
             tab_style: TabStyle::Sidebar,
             sidebar_width: 240.0,
+            sidebar_agent_rows: 5,
         }
     }
 }
@@ -762,6 +766,7 @@ fn darwin_user_temp_dir() -> Option<PathBuf> {
 }
 
 /// Whether a daemon of this user answers on `socket`.
+#[cfg(target_os = "macos")]
 fn socket_answers(socket: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(socket).is_ok_and(|s| peer_is_same_user(&s))
 }
