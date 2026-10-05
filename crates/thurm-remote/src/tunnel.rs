@@ -415,6 +415,12 @@ impl Inner {
                         s.message = Some(reason);
                         s.tunnel_pid = None;
                     });
+                    // A settings edit requests a new destination now. Do not apply the
+                    // retry delay left over from failures at the previous destination.
+                    if self.reconfigured.swap(false, Ordering::SeqCst) {
+                        attempt = 0;
+                        continue;
+                    }
                 }
                 Err(f) => {
                     let (phase, message) = match f {
@@ -602,7 +608,7 @@ impl Inner {
             if !self.remote.lock().enabled {
                 return "disabled".into();
             }
-            if self.reconfigured.swap(false, Ordering::SeqCst) {
+            if self.reconfigured.load(Ordering::SeqCst) {
                 return "the host's settings changed".into();
             }
             if restart {

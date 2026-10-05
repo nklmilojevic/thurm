@@ -1184,6 +1184,61 @@ final class SessionManager: NSObject, CoreDelegate {
         guard let v = JSON.variant(payload), let d = v.payload as? [String: Any] else { return }
         let key = { (field: String) in jsonUInt64(d[field]).map { PaneKey(daemon, $0) } }
         switch v.name {
+        case "OpenLayout":
+            guard let requestID = jsonUInt64(d["request_id"]) else { return }
+            var failure: String? = "the desktop could not install the layout"
+            defer {
+                Core.shared.send(object: ["LayoutApplied": [
+                    "request_id": requestID,
+                    "error": failure.map { $0 as Any } ?? NSNull()
+                ]], host: daemon)
+            }
+            guard let json = jsonString(d["json"]), let data = json.data(using: .utf8),
+                  var tab = try? JSONDecoder().decode(TabLayout.self, from: data) else { return }
+            func onHost(_ node: LayoutNode) -> LayoutNode {
+                switch node {
+                case .pane(let pane): return .pane(PaneKey(daemon, pane.id))
+                case .split(let dir, let ratio, let first, let second):
+                    return .split(dir: dir, ratio: ratio, first: onHost(first), second: onHost(second))
+                }
+            }
+            tab.root = onHost(tab.root)
+            let moved = Set(tab.root.panes)
+            for pane in tab.root.panes {
+                guard let info = fetchPaneInfo(pane) else {
+                    failure = "a layout pane no longer exists"
+                    return
+                }
+                panes[pane] = info
+            }
+            guard JSON.variant(Core.shared.request(object: ["CommitLayout": [
+                "request_id": requestID
+            ]], host: daemon))?.name == "Ok" else {
+                failure = "layout was cancelled before installation"
+                return
+            }
+            var emptied: [TerminalWindowController] = []
+            for pane in tab.root.panes {
+                if let c = controller(for: pane) {
+                    if c.content.remove(pane: pane) { emptied.append(c) } else { c.updateTitle() }
+                }
+            }
+            for ws in workspaces {
+                ws.hiddenTabs = retainTabs(ws.hiddenTabs) { !moved.contains($0) }
+                ws.hiddenSelectedTab = min(ws.hiddenSelectedTab, max(0, ws.hiddenTabs.count - 1))
+            }
+            let ws = makeWorkspace(name: tab.title, host: daemon)
+            ws.hiddenTabs = [tab]
+            openWorkspaceInNewWindow(ws)
+            // Open the new window before closing an empty last window.
+            for c in emptied {
+                c.closingWithoutConfirmation = true
+                c.window?.close()
+            }
+            scheduleLayoutSave()
+            if tab.root.panes.allSatisfy({ controller(for: $0)?.workspaceID == ws.id }) {
+                failure = nil
+            }
         case "NewTab":
             guard let pane = key("pane") else { return }
             let ownWorkspace = jsonBool(d["new_window"]) ?? false

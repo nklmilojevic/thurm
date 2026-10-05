@@ -16,9 +16,13 @@ use thurm_proto::{AgentState, AgentStatus, ProcessInfo};
 
 use crate::transcript::TitleReader;
 
+pub mod prompt_handoff;
+pub mod reporting;
+
 #[derive(Default, Debug)]
 pub struct AgentTracker {
     current: Option<AgentState>,
+    pub prompt: crate::agent_prompt::PromptTracker,
     /// Kind of the last agent seen (kept after it exits, used for resume on restore).
     pub last_kind: Option<String>,
     /// Set by a program notification; cleared when the user types.
@@ -33,6 +37,9 @@ pub struct AgentTracker {
     /// status (a request, a finished turn) must not stick to the next.
     episode: u64,
     ai: AiNotes,
+    report_owner: Option<reporting::ReportOwner>,
+    report_resume: Option<Vec<String>>,
+    retired_report_instances: std::collections::HashSet<String>,
 }
 
 /// What the on-device model said about the current agent session (`[ai]`).
@@ -143,6 +150,7 @@ impl AgentTracker {
             return None;
         }
         let keys: &'static [u8] = if allow { b"\r" } else { b"\x1b" };
+        self.prompt.interrupted();
         self.user_answer(keys);
         Some(keys)
     }
@@ -246,6 +254,9 @@ impl AgentTracker {
         session_id: Option<String>,
         message: Option<String>,
     ) {
+        if matches!(event, "session-start" | "session-end") {
+            self.prompt.reset();
+        }
         if event == "session-end" {
             self.hook = None;
             return;
@@ -283,6 +294,7 @@ impl AgentTracker {
                 self.ai = AiNotes::default();
             }
             "prompt-submit" => {
+                self.prompt.started();
                 h.status = AgentStatus::Working;
                 h.message = None;
                 h.turn_started = Some(Instant::now());
@@ -398,7 +410,11 @@ impl AgentTracker {
     }
 
     fn with_hook(&self, mut state: AgentState) -> AgentState {
-        if let Some(h) = self.hook.as_ref().filter(|h| h.kind == state.kind) {
+        if let Some(h) = self
+            .hook
+            .as_ref()
+            .filter(|h| h.kind == state.kind && h.pgrp == self.fg_pgrp)
+        {
             state.status = h.status;
             state.session_id = h.session_id.clone();
             state.message = h.message.clone();
@@ -432,6 +448,7 @@ impl AgentTracker {
     }
 
     fn set(&mut self, next: Option<AgentState>) -> Option<Option<AgentState>> {
+        self.prompt.observe(self.fg_pgrp, next.as_ref());
         if let Some(n) = &next {
             self.last_kind = Some(n.kind.clone());
         }
@@ -1305,6 +1322,34 @@ mod tests {
         );
         t.refresh();
         assert_eq!(t.answer_permission(fourth, true), None);
+    }
+
+    #[test]
+    fn permission_answer_invalidates_the_submitted_turn() {
+        let defs = thurm_config::builtin_agents();
+        let mut tracker = AgentTracker::default();
+        tracker.update(
+            &defs, Some(&proc("claude")), "> ",
+            Duration::from_secs(5), Duration::from_millis(1500),
+        );
+        tracker.apply_hook(Some(1), "claude", "Claude Code", "session-start", None, None);
+        tracker.refresh();
+        let token = tracker.prompt.reserve(tracker.state().unwrap().status)
+            .unwrap();
+        tracker.apply_hook(Some(1), "claude", "Claude Code", "prompt-submit", None, None);
+        tracker.refresh();
+        tracker.apply_hook(
+            Some(1), "claude", "Claude Code", "permission-prompt", None, None,
+        );
+        tracker.refresh();
+        let prompt = tracker.permission_prompt().unwrap();
+        assert!(tracker.answer_permission(prompt.wrapping_add(1), true).is_none());
+        assert!(tracker.prompt.outcome(token, AgentStatus::NeedsInput).is_ok());
+        assert_eq!(tracker.answer_permission(prompt, true), Some(&b"\r"[..]));
+        tracker.apply_hook(Some(1), "claude", "Claude Code", "stop", None, None);
+        tracker.refresh();
+        assert!(tracker.prompt.outcome(token, tracker.state().unwrap().status)
+            .is_err());
     }
 
     #[test]

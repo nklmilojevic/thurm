@@ -16,6 +16,10 @@ Use the preset name shown by `thurm presets`. Add `--split right` to launch in
 a split or `--cwd PATH` to select a working directory. Cmd+Shift+A (Linux: Ctrl+Alt+A) opens the
 agent switcher.
 
+Use [Agent prompts](/agent-prompts/) to submit text and wait for the same turn.
+Use [Agent reporting and diagnostics](/agent-integration/) to inspect detection
+or add support for another agent.
+
 ## Install hooks
 
 Claude Code and Codex hooks provide turn completion events and session IDs.

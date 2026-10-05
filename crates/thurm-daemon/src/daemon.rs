@@ -1,5 +1,10 @@
 //! Daemon state: panes, clients, frame pump, monitor loop and request handling.
 
+#[path = "terminal_attach.rs"]
+mod terminal_attach;
+mod agent_prompt;
+mod layouts;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::RawFd;
@@ -277,6 +282,7 @@ pub struct PaneState {
     pub command: Option<Vec<String>>,
     pub hold: bool,
     pub subscribers: HashMap<u64, Subscriber>,
+    pub terminal_attachment: Option<(u64, PaneSize)>,
     pub agent: AgentTracker,
     osc_cwd: Option<String>,
     command_started: Option<Instant>,
@@ -320,6 +326,8 @@ pub struct Daemon {
     layout: Mutex<Option<String>>,
     next_pane: AtomicU64,
     next_client: AtomicU64,
+    next_layout: AtomicU64,
+    pending_layouts: Mutex<HashMap<u64, layouts::PendingLayout>>,
     git_tx: crossbeam_channel::Sender<(PaneId, String)>,
     git_rx: crossbeam_channel::Receiver<(PaneId, String)>,
     ai: ai::Model,
@@ -371,6 +379,8 @@ impl Daemon {
             layout: Mutex::new(None),
             next_pane: AtomicU64::new(1),
             next_client: AtomicU64::new(1),
+            next_layout: AtomicU64::new(1),
+            pending_layouts: Mutex::new(HashMap::new()),
             git_tx: git_channel.0,
             git_rx: git_channel.1,
             ai: ai::Model::new(),
@@ -442,7 +452,9 @@ impl Daemon {
     pub fn remove_client(&self, id: u64) {
         self.clients.lock().remove(&id);
         for p in self.all_panes() {
-            p.state.lock().subscribers.remove(&id);
+            let mut st = p.state.lock();
+            st.subscribers.remove(&id);
+            self.release_terminal(&mut st, id);
         }
         *self.last_activity.lock() = Instant::now();
     }
@@ -603,6 +615,7 @@ impl Daemon {
                 command: p.command,
                 hold: p.hold,
                 subscribers: HashMap::new(),
+                terminal_attachment: None,
                 agent: AgentTracker::default(),
                 osc_cwd: p.osc_cwd,
                 command_started: None,
@@ -1281,6 +1294,9 @@ impl Daemon {
                         st.term.flush_sync();
                     }
                     let before = st.info.clone();
+                    if st.agent.invalidate_dead_report_owner() {
+                        st.info.agent = st.agent.state().cloned();
+                    }
                     let fg = st.pty.foreground_pgrp().and_then(procinfo::process_info);
                     st.info.password_input = st.pty.password_mode();
                     if (st.osc_cwd.is_none() || !st.shell_integration_seen)
@@ -1317,6 +1333,8 @@ impl Daemon {
                         if ai_cfg.enabled {
                             self.queue_ai(pane.id, &mut st, &ai_cfg, &screen);
                         }
+                    } else if let Some(new) = st.agent.update_report_foreground(fg.as_ref()) {
+                        st.info.agent = new;
                     }
                     if let Some(p) = &fg {
                         if !procinfo::is_shell(&p.name) {
@@ -1452,6 +1470,7 @@ impl Daemon {
                     .state()
                     .and(st.agent.session_id())
                     .map(str::to_owned),
+                agent_resume: st.agent.resume_argv().map(<[String]>::to_vec),
                 size: st.info.size.into(),
             });
         }
@@ -1547,6 +1566,9 @@ impl Daemon {
                 pending: upgrade::PaneHandoff::encode_state(&st.carry),
                 shell_token: st.term.shell_token().map(str::to_owned),
                 shell_path: st.term.shell_path().map(str::to_owned),
+                agent_report: st.agent.report_handoff(),
+                agent_prompt: st.agent.pending_prompt_handoff(),
+                terminal_size_after_detach: st.terminal_attachment.map(|(_, size)| size.into()),
             });
         }
         upgrade::Handoff {
@@ -1565,7 +1587,7 @@ impl Daemon {
     pub fn adopt(self: &Arc<Self>, h: upgrade::Handoff) {
         let mut adopted = 0;
         for p in h.panes {
-            let size = sanitize_size(p.size.into());
+            let mut size = sanitize_size(p.size.into());
             let pty = match Pty::adopt(p.fd, p.pid, p.exited) {
                 Ok(pty) => pty,
                 Err(e) => {
@@ -1580,6 +1602,13 @@ impl Daemon {
             if !pending.is_empty() {
                 term.advance(&pending);
                 let _ = term.drain_events();
+            }
+            if let Some(original) = p.terminal_size_after_detach {
+                size = sanitize_size(original.into());
+                if let Err(error) = pty.resize(size) {
+                    log::warn!("pane {}: cannot restore size after upgrade: {error}", p.id);
+                }
+                term.resize(size);
             }
             term.set_shell_token(p.shell_token.clone());
             term.set_shell_path(p.shell_path.clone());
@@ -1611,7 +1640,21 @@ impl Daemon {
                 alive,
             );
             match installed {
-                Ok(()) => adopted += 1,
+                Ok(()) => {
+                    adopted += 1;
+                    if let Some(pane) = self.pane(p.id) {
+                        let mut st = pane.state.lock();
+                        let fg = st.pty.foreground_pgrp();
+                        st.agent.saw_foreground(fg);
+                        if let Some(report) = p.agent_report {
+                            st.agent.restore_report_handoff(report);
+                        }
+                        if let Some(prompt) = p.agent_prompt {
+                            st.agent.restore_pending_prompt(prompt);
+                        }
+                        st.info.agent = st.agent.state().cloned();
+                    }
+                }
                 Err(e) => log::warn!("pane {}: {e}", p.id),
             }
         }
@@ -1630,8 +1673,18 @@ impl Daemon {
         let mut restored = 0;
         for p in &snap.panes {
             let history = store.load_scrollback(p.id);
+            let reported_resume = p.agent_resume.as_ref().filter(|argv| {
+                cfg.session.resume_agents
+                    && p.agent_session.is_some()
+                    && agents::reporting::validate_resume(argv).is_ok()
+            });
             let req = CreatePane {
-                command: p.command.clone(),
+                // A reported resume runs inside a shell. Keep the pane if it fails or exits.
+                command: if reported_resume.is_some() {
+                    None
+                } else {
+                    p.command.clone()
+                },
                 cwd: p.cwd.clone(),
                 size: p.size.into(),
                 ..Default::default()
@@ -1639,7 +1692,29 @@ impl Daemon {
             match self.create_pane(req, Some((p.id, history))) {
                 Ok(id) => {
                     restored += 1;
-                    if cfg.session.resume_agents && p.command.is_none() {
+                    if let Some(argv) = reported_resume {
+                        if let Some(pane) = self.pane(id) {
+                            let shell = cfg
+                                .terminal
+                                .shell
+                                .as_ref()
+                                .and_then(|s| s.first())
+                                .cloned()
+                                .unwrap_or_else(shell::user_shell);
+                            let mut st = pane.state.lock();
+                            match agents::reporting::resume_input(&shell, argv) {
+                                Ok(input) => {
+                                    st.pending_input =
+                                        Some((Instant::now() + Duration::from_millis(2500), input))
+                                }
+                                Err(error) => {
+                                    log::warn!("pane {id}: {error}");
+                                    st.term
+                                        .print(&format!("\r\n[agent resume skipped: {error}]\r\n"));
+                                }
+                            }
+                        }
+                    } else if cfg.session.resume_agents && p.command.is_none() {
                         let def = p
                             .agent
                             .as_ref()
@@ -1684,6 +1759,33 @@ impl Daemon {
     pub fn handle(self: &Arc<Self>, client: &Arc<Client>, id: u64, req: Request) {
         *self.last_activity.lock() = Instant::now();
         let result = match req {
+            Request::AgentPrompt {
+                pane,
+                text,
+                wait,
+                timeout_ms,
+            } => match self.submit_agent_prompt(pane, &text, timeout_ms) {
+                Err(error) => Err(error),
+                Ok(ticket) if !wait => {
+                    let _ = ticket;
+                    Ok(Response::AgentPrompt(
+                        thurm_proto::AgentPromptOutcome::Submitted,
+                    ))
+                }
+                Ok(ticket) => {
+                    let daemon = self.clone();
+                    let client = client.clone();
+                    std::thread::spawn(move || {
+                        let result = daemon
+                            .wait_agent_prompt(client.id, pane, ticket)
+                            .map(Response::AgentPrompt);
+                        if id != 0 {
+                            client.send(ServerMessage::Response { id, result });
+                        }
+                    });
+                    return;
+                }
+            },
             Request::Wait {
                 pane,
                 until,
@@ -1713,11 +1815,11 @@ impl Daemon {
                 });
                 return;
             }
-            // Slow read-only requests (completion generators, `ps`/`lsof`) run on their own
-            // thread so they don't hold up the typing, resizes and scrolls that follow on the
-            // same connection. Responses carry their id. Requests that change or snapshot
-            // state stay in order on the reader.
-            slow @ (Request::Complete { .. } | Request::Processes { .. }) => {
+            // Slow queries and layout confirmation must not block later requests,
+            // including the desktop client's reply. Responses carry their request ID.
+            slow @ (Request::Complete { .. }
+            | Request::Processes { .. }
+            | Request::ApplyLayout { .. }) => {
                 let daemon = self.clone();
                 let client = client.clone();
                 let spawned = std::thread::Builder::new()
@@ -1829,6 +1931,8 @@ impl Daemon {
 
     fn dispatch(self: &Arc<Self>, client: &Arc<Client>, req: Request) -> Result<Response, String> {
         match req {
+            Request::AttachTerminal { pane, size } => self.attach_terminal(client, pane, size),
+            Request::DetachTerminal { pane } => self.detach_terminal(client.id, pane),
             Request::Hello {
                 client: name,
                 version,
@@ -1935,7 +2039,7 @@ impl Daemon {
             }
             Request::Resize { pane, size } => {
                 let size = sanitize_size(size);
-                self.with_pane(pane, |_, st| {
+                self.with_input_pane(client.id, pane, |_, st| {
                     if st.info.size != size {
                         if let Err(e) = st.pty.resize(size) {
                             log::warn!("pane {pane}: resize to {}x{}: {e}", size.cols, size.rows);
@@ -1948,23 +2052,30 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::Input { pane, data } => {
-                self.with_pane(pane, |p, st| {
+                self.with_input_pane(client.id, pane, |p, st| {
+                    if !data.is_empty() {
+                        st.agent.prompt.interrupted();
+                    }
                     st.agent.user_answer(&data);
                     p.write(data);
                 })?;
                 Ok(Response::Ok)
             }
             Request::Paste { pane, text } => {
-                self.with_pane(pane, |p, st| {
+                self.with_input_pane(client.id, pane, |p, st| {
+                    if !text.is_empty() {
+                        st.agent.prompt.interrupted();
+                    }
                     st.agent.user_input();
                     p.write(st.term.paste(&text));
                 })?;
                 Ok(Response::Ok)
             }
             Request::Key { pane, key } => {
-                self.with_pane(pane, |p, st| {
+                self.with_input_pane(client.id, pane, |p, st| {
                     let bytes = st.term.key(&key);
                     if !bytes.is_empty() {
+                        st.agent.prompt.interrupted();
                         st.agent.user_answer(&bytes);
                         p.write(bytes);
                     }
@@ -1973,8 +2084,11 @@ impl Daemon {
             }
             Request::Mouse { pane, event } => {
                 let copy_on_select = self.config.read().terminal.copy_on_select;
-                let text = self.with_pane(pane, |p, st| {
+                let text = self.with_input_pane(client.id, pane, |p, st| {
                     let (outcome, bytes) = st.term.mouse(&event);
+                    if !bytes.is_empty() {
+                        st.agent.prompt.interrupted();
+                    }
                     p.write(bytes);
                     (outcome == MouseOutcome::SelectionDone && copy_on_select)
                         .then(|| st.term.selection_text())
@@ -1991,7 +2105,13 @@ impl Daemon {
                 row,
                 mods,
             } => {
-                self.with_pane(pane, |p, st| p.write(st.term.wheel(lines, col, row, mods)))?;
+                self.with_input_pane(client.id, pane, |p, st| {
+                    let bytes = st.term.wheel(lines, col, row, mods);
+                    if !bytes.is_empty() {
+                        st.agent.prompt.interrupted();
+                    }
+                    p.write(bytes);
+                })?;
                 Ok(Response::Ok)
             }
             Request::Scroll { pane, scroll } => {
@@ -2004,8 +2124,11 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::Focus { pane, focused } => {
-                self.with_pane(pane, |p, st| {
+                self.with_input_pane(client.id, pane, |p, st| {
                     if let Some(b) = st.term.focus(focused) {
+                        if !b.is_empty() {
+                            st.agent.prompt.interrupted();
+                        }
                         p.write(b);
                     }
                     // Looking at a finished agent acknowledges it (Done → Idle).
@@ -2054,24 +2177,51 @@ impl Daemon {
             Request::Capture { pane, opts } => {
                 self.with_pane(pane, |_, st| Response::Text(st.term.capture(&opts)))
             }
-            Request::Wait { .. } | Request::Explain { .. } => unreachable!("handled in handle()"),
+            Request::Wait { .. } | Request::Explain { .. } | Request::AgentPrompt { .. } => {
+                unreachable!("handled in handle()")
+            }
             Request::SetLayout { json } => {
                 serde_json::from_str::<Layout>(&json)
                     .map_err(|e| format!("invalid layout: {e}"))?;
                 *self.layout.lock() = Some(json);
+                self.broadcast(Event::LayoutChanged, false);
                 self.session_dirty.store(true, Ordering::Relaxed);
                 Ok(Response::Ok)
             }
             Request::GetLayout => Ok(Response::Layout(self.sanitized_layout(&[]))),
+            Request::ApplyLayout { json, timeout_ms } => {
+                let result = self.apply_layout(client.id, json, timeout_ms)
+                    .unwrap_or_else(|error| thurm_proto::LayoutResult {
+                        committed: false, error: Some(error),
+                    });
+                Ok(Response::LayoutResult(result))
+            }
+            Request::CommitLayout { request_id } => {
+                self.commit_layout(client.id, request_id)?;
+                Ok(Response::Ok)
+            }
+            Request::LayoutApplied { request_id, error } => {
+                self.layout_applied(client.id, request_id, error)?;
+                Ok(Response::Ok)
+            }
+            Request::CheckUi => {
+                if !self.has_ui_clients() {
+                    return Err("no Thurm window is open".into());
+                }
+                Ok(Response::Ok)
+            }
             Request::Ui(cmd) => {
                 if !self.has_ui_clients() {
                     return Err("no Thurm window is open".into());
+                }
+                if matches!(cmd, thurm_proto::UiCommand::OpenLayout { .. }) {
+                    return Err("use ApplyLayout to wait for desktop confirmation".into());
                 }
                 self.broadcast(Event::Ui(cmd), true);
                 Ok(Response::Ok)
             }
             Request::ClipboardReply { pane, text } => {
-                let events = self.with_pane(pane, |_, st| {
+                let events = self.with_input_pane(client.id, pane, |_, st| {
                     st.term.clipboard_reply(&text);
                     st.term.drain_events()
                 })?;
@@ -2133,7 +2283,13 @@ impl Daemon {
                     .map_or_else(|| agent.clone(), |d| d.name.clone());
                 self.with_pane(pane, |_, st| {
                     let before = st.info.agent.clone();
+                    if st.agent.invalidate_dead_report_owner() {
+                        st.info.agent = st.agent.state().cloned();
+                    }
                     st.agent.saw_foreground(st.pty.foreground_pgrp());
+                    if st.agent.public_report_active() {
+                        return;
+                    }
                     st.agent
                         .apply_hook(pgrp, &agent, &name, &event, session_id, message);
                     st.agent.titles = titles;
@@ -2153,6 +2309,101 @@ impl Daemon {
                         }
                     }
                 })?;
+                self.session_dirty.store(true, Ordering::Relaxed);
+                Ok(Response::Ok)
+            }
+            Request::AgentExplain { pane } => {
+                let defs = self.agent_defs.read().clone();
+                let cfg = self.config.read();
+                let idle_after = Duration::from_millis(cfg.agents.idle_after_ms);
+                let detect = cfg.agents.detect;
+                drop(cfg);
+                let explanation = self.with_pane(pane, |_, st| {
+                    if st.agent.invalidate_dead_report_owner() {
+                        st.info.agent = st.agent.state().cloned();
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    }
+                    let fg = st.pty.foreground_pgrp().and_then(procinfo::process_info);
+                    let screen = agents::tail(&st.term.screen_text(), 20);
+                    let idle = st.term.last_output.elapsed();
+                    if detect
+                        && let Some(new) =
+                            st.agent
+                                .update(&defs, fg.as_ref(), &screen, idle, idle_after)
+                    {
+                        st.info.agent = new;
+                        st.info.title = pane_title(st, fg.as_ref());
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    }
+                    if !detect && let Some(new) = st.agent.update_report_foreground(fg.as_ref()) {
+                        st.info.agent = new;
+                        st.info.title = pane_title(st, fg.as_ref());
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    }
+                    let mut result = st.agent.explain(pane, &defs, fg, &screen, idle, idle_after);
+                    if !detect {
+                        result.rules.push("automatic detection is disabled".into());
+                    }
+                    result
+                })?;
+                Ok(Response::AgentExplanation(explanation))
+            }
+            Request::AgentReport { pane, report } => {
+                let name = self
+                    .agent_defs
+                    .read()
+                    .iter()
+                    .find(|d| d.kind == report.agent)
+                    .map_or_else(|| report.agent.clone(), |d| d.name.clone());
+                self.with_pane(pane, |_, st| -> Result<(), String> {
+                    if !st.info.alive {
+                        return Err("pane process has exited".into());
+                    }
+                    if st.agent.invalidate_dead_report_owner() {
+                        st.info.agent = st.agent.state().cloned();
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    }
+                    let fg = st.pty.foreground_pgrp();
+                    let (birth, pgrp) = procinfo::report_owner(report.owner_pid, fg)?;
+                    let before = st.info.agent.clone();
+                    st.agent.saw_foreground(fg);
+                    st.agent.apply_report(&report, birth, pgrp, &name)?;
+                    if let Some(new) = st.agent.refresh() {
+                        let events =
+                            self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
+                        st.info.agent = new;
+                        st.info.title = pane_title(st, st.info.foreground.as_ref());
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                        for ev in events {
+                            self.broadcast(ev, true);
+                        }
+                    }
+                    Ok(())
+                })??;
+                self.session_dirty.store(true, Ordering::Relaxed);
+                Ok(Response::Ok)
+            }
+            Request::AgentRelease {
+                pane,
+                owner_pid,
+                instance,
+                sequence,
+            } => {
+                self.with_pane(pane, |_, st| -> Result<(), String> {
+                    if st.agent.invalidate_dead_report_owner() {
+                        st.info.agent = st.agent.state().cloned();
+                        self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    }
+                    let fg = st.pty.foreground_pgrp();
+                    let (birth, _) = procinfo::report_owner(owner_pid, fg)?;
+                    st.agent.saw_foreground(fg);
+                    st.agent
+                        .release_report(owner_pid, birth, &instance, sequence)?;
+                    st.info.agent = st.agent.state().cloned();
+                    st.info.title = pane_title(st, st.info.foreground.as_ref());
+                    self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                    Ok(())
+                })??;
                 self.session_dirty.store(true, Ordering::Relaxed);
                 Ok(Response::Ok)
             }
@@ -2180,16 +2431,27 @@ impl Daemon {
                 allow,
             } => {
                 let mut answered = false;
+                let mut attached = false;
                 let p = self
                     .pane(pane)
                     .ok_or_else(|| format!("no such pane: {pane}"))?;
                 self.update_agent(pane, |st| {
+                    if st
+                        .terminal_attachment
+                        .is_some_and(|(owner, _)| owner != client.id)
+                    {
+                        attached = true;
+                        return Vec::new();
+                    }
                     if let Some(keys) = st.agent.answer_permission(prompt, allow) {
                         p.write(keys.to_vec());
                         answered = true;
                     }
                     Vec::new()
                 });
+                if attached {
+                    return Err("pane input belongs to an attached terminal".into());
+                }
                 if !answered {
                     return Err("that permission prompt is no longer showing".into());
                 }

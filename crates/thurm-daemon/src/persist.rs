@@ -34,6 +34,9 @@ pub struct PaneSnapshot {
     /// Its session id (from hooks), for an exact resume.
     #[serde(default)]
     pub agent_session: Option<String>,
+    /// Exact executable and arguments supplied by the session owner.
+    #[serde(default)]
+    pub agent_resume: Option<Vec<String>>,
     pub size: PaneSizeSnap,
 }
 
@@ -198,6 +201,7 @@ mod tests {
                                 command: None,
                                 agent: None,
                                 agent_session: None,
+                                agent_resume: None,
                                 size: PaneSize::default().into(),
                             }],
                             ..Default::default()
@@ -262,6 +266,7 @@ mod tests {
                 command: None,
                 agent: Some("claude".into()),
                 agent_session: Some("abc-123".into()),
+                agent_resume: Some(vec!["claude".into(), "--resume".into(), "abc-123".into()]),
                 size: PaneSize::default().into(),
             }],
             next_pane_id: 4,

@@ -9,6 +9,7 @@
 pub mod bytes;
 pub mod codec;
 pub mod layout;
+pub mod template;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +22,11 @@ pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
 /// struct, with `#[serde(default)]`. A daemon answers a request it doesn't know with an error
 /// and keeps the connection; a client skips a message it can't decode. Anything else (removing
 /// or reordering variants or fields) bumps this.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 18;
+
+/// A desktop can reject a layout before making changes when it has no window.
+/// The daemon can then try another desktop client.
+pub const LAYOUT_NO_WINDOW: &str = "no Thurm window is open";
 
 /// Daemons speaking this protocol or later replace themselves in place on SIGUSR2 (see
 /// `thurm_client::upgrade_daemon`), keeping every pane's process running.
@@ -233,6 +238,54 @@ pub enum Request {
         #[serde(with = "bytes")]
         data: Vec<u8>,
     },
+    /// Check that a desktop client can open a layout.
+    CheckUi,
+    /// Acquire exclusive input and resize control, then subscribe to the pane.
+    AttachTerminal {
+        pane: PaneId,
+        size: PaneSize,
+    },
+    /// Release terminal control and restore the previous pane size.
+    DetachTerminal {
+        pane: PaneId,
+    },
+    /// Explain the process and rules used to detect an agent.
+    AgentExplain {
+        pane: PaneId,
+    },
+    /// Report an agent state from its current process instance.
+    AgentReport {
+        pane: PaneId,
+        report: AgentReport,
+    },
+    /// End reporting for this process instance. The sequence must increase.
+    AgentRelease {
+        pane: PaneId,
+        owner_pid: u32,
+        instance: String,
+        sequence: u64,
+    },
+    /// Submit one prompt to the current agent. Returns `Response::AgentPrompt`.
+    AgentPrompt {
+        pane: PaneId,
+        text: String,
+        wait: bool,
+        timeout_ms: u64,
+    },
+    /// Open a tab and wait for the selected desktop client to confirm installation.
+    ApplyLayout {
+        json: String,
+        timeout_ms: u64,
+    },
+    /// Complete a layout request. Only the selected desktop client can reply.
+    LayoutApplied {
+        request_id: u64,
+        error: Option<String>,
+    },
+    /// Transfer pane ownership to the selected desktop before it installs the tab.
+    CommitLayout {
+        request_id: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -311,6 +364,45 @@ pub enum Response {
     AgentPresets(Vec<AgentPreset>),
     Processes(Vec<PaneProcesses>),
     Completions(Completions),
+    AgentExplanation(AgentExplanation),
+    AgentPrompt(AgentPromptOutcome),
+    LayoutResult(LayoutResult),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LayoutResult {
+    /// Once committed, a timeout must not close panes that the desktop may use.
+    pub committed: bool,
+    pub error: Option<String>,
+}
+
+/// A report is scoped to one process instance in one pane.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AgentReport {
+    pub agent: String,
+    pub owner_pid: u32,
+    pub instance: String,
+    pub sequence: u64,
+    pub status: AgentStatus,
+    pub session_id: Option<String>,
+    pub message: Option<String>,
+    /// Complete arguments for this session. No placeholder expansion is done.
+    pub resume_argv: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AgentExplanation {
+    pub pane: PaneId,
+    pub state: Option<AgentState>,
+    pub foreground: Option<ProcessInfo>,
+    pub source: String,
+    pub rules: Vec<String>,
+    pub screen_tail: String,
+    pub idle_ms: u64,
+    pub idle_after_ms: u64,
+    pub report_instance: Option<String>,
+    pub report_sequence: Option<u64>,
+    pub report_owner_pid: Option<u32>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -367,6 +459,8 @@ pub enum Event {
     },
     Ui(UiCommand),
     ConfigReloaded,
+    /// The saved layout changed. Read GetLayout for current state.
+    LayoutChanged,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -935,6 +1029,11 @@ pub enum UiCommand {
         pane: PaneId,
         scroll: ScrollCmd,
     },
+    /// Open this tab layout in a new workspace.
+    OpenLayout {
+        json: String,
+        request_id: u64,
+    },
 }
 
 impl Frame {
@@ -949,4 +1048,14 @@ impl Frame {
 /// Encode a request envelope as JSON (used by the CLI's `--json` mode and in tests).
 pub fn to_json<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).expect("serializable")
+}
+
+/// Result of an agent prompt operation.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentPromptOutcome {
+    Submitted,
+    Completed,
+    NeedsInput,
+    Timeout,
+    Exited,
 }

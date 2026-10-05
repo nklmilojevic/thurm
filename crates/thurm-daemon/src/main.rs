@@ -3,6 +3,7 @@
 //! Owns every PTY and terminal state so shells survive the GUI quitting or crashing, and
 //! snapshots layout + scrollback to disk so sessions come back after a reboot.
 
+mod agent_prompt;
 mod agents;
 mod ai;
 mod complete;

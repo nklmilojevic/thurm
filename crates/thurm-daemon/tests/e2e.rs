@@ -1,5 +1,14 @@
 //! End-to-end: run the real daemon with real PTYs and drive it through the client library.
 
+#[path = "e2e/workflows_upgrade.rs"]
+mod workflows_upgrade;
+
+#[path = "e2e/agent_prompt.rs"]
+mod agent_prompt;
+
+#[path = "e2e/layouts.rs"]
+mod layouts;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -1604,4 +1613,476 @@ fn bash_prompt_command_array_keeps_output_on_resize() {
     std::thread::sleep(Duration::from_millis(500));
     let after = capture(&c, pane);
     assert!(after.contains("out2"), "{after}");
+}
+
+#[test]
+fn terminal_attachment_owns_input_and_restores_size() {
+    let env = Env::new("terminal-attachment");
+    let _daemon = env.start();
+    let (ui, _) = env.connect();
+    let pane = create(&ui, &env.dir);
+    let original = match ui.request(Request::PaneInfo { pane }).unwrap() {
+        Response::PaneInfo(info) => info.size,
+        other => panic!("{other:?}"),
+    };
+    let (owner, events) = env.connect();
+    let attached_size = PaneSize {
+        cols: 93,
+        rows: 31,
+        ..original
+    };
+    owner
+        .request(Request::AttachTerminal {
+            pane,
+            size: attached_size,
+        })
+        .unwrap();
+    let state = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Attach { size, state, .. } => {
+                assert_eq!(size, attached_size);
+                Some(state)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(!state.is_empty());
+    for request in [
+        Request::AttachTerminal {
+            pane,
+            size: original,
+        },
+        Request::Input {
+            pane,
+            data: b"echo forbidden\r".to_vec(),
+        },
+        Request::Paste {
+            pane,
+            text: "forbidden".into(),
+        },
+        Request::Resize {
+            pane,
+            size: original,
+        },
+        Request::DetachTerminal { pane },
+        Request::AnswerPermission {
+            pane,
+            prompt: 1,
+            allow: true,
+        },
+    ] {
+        assert!(ui.request(request).is_err());
+    }
+    owner
+        .request(Request::Input {
+            pane,
+            data: b"echo attached-$((42+1))\r".to_vec(),
+        })
+        .unwrap();
+    wait_match(&owner, pane, "attached-43");
+    owner.request(Request::DetachTerminal { pane }).unwrap();
+    assert!(
+        matches!(ui.request(Request::PaneInfo { pane }).unwrap(), Response::PaneInfo(info) if info.size == original)
+    );
+    ui.request(Request::Input {
+        pane,
+        data: b"echo released-$((42+2))\r".to_vec(),
+    })
+    .unwrap();
+    wait_match(&ui, pane, "released-44");
+    owner
+        .request(Request::AttachTerminal {
+            pane,
+            size: attached_size,
+        })
+        .unwrap();
+    drop(owner);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(ui.request(Request::PaneInfo { pane }).unwrap(), Response::PaneInfo(info) if info.size == original)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attachment was not released after disconnect"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    ui.request(Request::AttachTerminal {
+        pane,
+        size: attached_size,
+    })
+    .unwrap();
+    ui.request(Request::DetachTerminal { pane }).unwrap();
+}
+
+fn reporting_pane(c: &Client, cwd: &Path) -> (PaneId, u32) {
+    let pane = match c
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec!["/bin/cat".into()]),
+            cwd: Some(cwd.display().to_string()),
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Response::PaneInfo(info) = c.request(Request::PaneInfo { pane }).unwrap()
+            && let Some(process) = info.foreground
+            && process.name == "cat"
+        {
+            return (pane, process.pid);
+        }
+        assert!(Instant::now() < deadline, "reporting process did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn agent_reporting_checks_ownership_order_and_release() {
+    let env = Env::new("report-order");
+    let _daemon = env.start();
+    let (c, _) = env.connect();
+    let (pane, owner_pid) = reporting_pane(&c, &env.dir);
+    let mut report = AgentReport {
+        agent: "example".into(),
+        owner_pid,
+        instance: "process-a".into(),
+        sequence: 1,
+        status: AgentStatus::Idle,
+        session_id: Some("session-42".into()),
+        message: None,
+        resume_argv: None,
+    };
+    let send = |report: &AgentReport| {
+        c.request(Request::AgentReport {
+            pane,
+            report: report.clone(),
+        })
+    };
+    report.owner_pid = std::process::id();
+    assert!(
+        send(&report).is_err(),
+        "a process outside the pane cannot report"
+    );
+    report.owner_pid = owner_pid;
+    send(&report).unwrap();
+    report.sequence = 3;
+    report.status = AgentStatus::Working;
+    send(&report).unwrap();
+    report.sequence = 2;
+    report.status = AgentStatus::Done;
+    assert!(send(&report).is_err());
+    assert_eq!(agent(&c, pane).unwrap().status, AgentStatus::Working);
+    let explanation = match c.request(Request::AgentExplain { pane }).unwrap() {
+        Response::AgentExplanation(value) => value,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(explanation.source, "report");
+    assert_eq!(explanation.foreground.unwrap().pid, owner_pid);
+    assert_eq!(explanation.report_sequence, Some(3));
+    // A legacy hook cannot replace state owned by the public interface.
+    hook(&c, pane, "stop", Some("wrong-session"));
+    assert_eq!(agent(&c, pane).unwrap().kind, "example");
+    c.request(Request::AgentRelease {
+        pane,
+        owner_pid,
+        instance: report.instance.clone(),
+        sequence: 4,
+    })
+    .unwrap();
+    assert!(agent(&c, pane).is_none());
+    report.sequence = 5;
+    assert!(send(&report).is_err());
+}
+
+#[test]
+fn agent_reporting_restores_exact_arguments_without_shell_expansion() {
+    let env = Env::new("report-resume");
+    let mut daemon = env.start();
+    let (c, _) = env.connect();
+    let (pane, owner_pid) = reporting_pane(&c, &env.dir);
+    let marker = env.dir.join("must-not-exist");
+    let literal = format!("session 'quoted' $(touch {}) ; *", marker.display());
+    let script = env.dir.join("resume.sh");
+    std::fs::write(&script, "printf 'RESUMED:%s\\n' \"$1\"\nexec /bin/cat\n").unwrap();
+    let argv = vec![
+        "/bin/sh".into(),
+        script.display().to_string(),
+        literal.clone(),
+    ];
+    c.request(Request::AgentReport {
+        pane,
+        report: AgentReport {
+            agent: "example".into(),
+            owner_pid,
+            instance: "process-a".into(),
+            sequence: 1,
+            status: AgentStatus::Idle,
+            session_id: Some("session-42".into()),
+            message: None,
+            resume_argv: Some(argv.clone()),
+        },
+    })
+    .unwrap();
+    c.request(Request::SaveSnapshot).unwrap();
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.dir.join("state/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(snapshot["panes"][0]["agent_session"], "session-42");
+    assert_eq!(
+        snapshot["panes"][0]["agent_resume"],
+        serde_json::json!(argv)
+    );
+    c.request(Request::Shutdown { kill_panes: true }).unwrap();
+    daemon.wait_exit();
+    drop(c);
+    let _restored = env.start();
+    let (c, _) = env.connect();
+    wait_match(&c, pane, "RESUMED:");
+    let text = capture(&c, pane);
+    // Long terminal lines can wrap, but the literal shell operators must remain.
+    assert!(text.contains("session 'quoted' $(touch"), "{text}");
+    assert!(text.contains("; *"), "{text}");
+    assert!(
+        !marker.exists(),
+        "resume arguments were evaluated by a shell"
+    );
+    c.request(Request::Input {
+        pane,
+        data: vec![0x04],
+    })
+    .unwrap();
+    wait_for_reporting_shell(&c, pane);
+    c.request(Request::Input {
+        pane,
+        data: b"printf 'SHELL-STILL-OPEN\\n'\r".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, "SHELL-STILL-OPEN");
+    c.request(Request::SaveSnapshot).unwrap();
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.dir.join("state/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(snapshot["panes"][0]["id"], pane);
+    assert!(
+        env.dir
+            .join(format!("state/scrollback/{pane}.ansi"))
+            .exists()
+    );
+}
+
+#[test]
+fn agent_reporting_survives_in_place_upgrade() {
+    let env = Env::new("report-upgrade");
+    let daemon = env.start();
+    let (c, _) = env.connect();
+    let (pane, owner_pid) = reporting_pane(&c, &env.dir);
+    let mut report = AgentReport {
+        agent: "example".into(),
+        owner_pid,
+        instance: "process-a".into(),
+        sequence: 9,
+        status: AgentStatus::Working,
+        session_id: Some("session-42".into()),
+        message: None,
+        resume_argv: Some(vec!["/bin/cat".into()]),
+    };
+    c.request(Request::AgentReport {
+        pane,
+        report: report.clone(),
+    })
+    .unwrap();
+    let mut request_path = env.socket.as_os_str().to_owned();
+    request_path.push(".upgrade");
+    std::fs::write(PathBuf::from(request_path), env!("CARGO_BIN_EXE_thurmd")).unwrap();
+    assert_eq!(
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR2) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.is_alive() {
+        assert!(
+            Instant::now() < deadline,
+            "upgrade did not close the connection"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(c);
+    let (c, _) = env.connect();
+    assert_eq!(agent(&c, pane).unwrap().status, AgentStatus::Working);
+    report.sequence = 8;
+    report.status = AgentStatus::Done;
+    assert!(
+        c.request(Request::AgentReport {
+            pane,
+            report: report.clone()
+        })
+        .is_err()
+    );
+    c.request(Request::SaveSnapshot).unwrap();
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.dir.join("state/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        snapshot["panes"][0]["agent_resume"],
+        serde_json::json!(["/bin/cat"])
+    );
+    report.sequence = 10;
+    c.request(Request::AgentReport { pane, report }).unwrap();
+    assert_eq!(agent(&c, pane).unwrap().status, AgentStatus::Done);
+}
+
+/// Run only inside the pane created by the owner-exit test.
+#[test]
+fn agent_reporting_child_fixture() {
+    let Ok(path) = std::env::var("THURM_REPORT_TEST_OWNER") else {
+        return;
+    };
+    let mut owner = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let pending_path = format!("{path}.pending");
+    std::fs::write(&pending_path, owner.id().to_string()).unwrap();
+    std::fs::rename(pending_path, path).unwrap();
+    std::thread::spawn(move || {
+        let _ = owner.wait();
+    });
+    let mut input = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+}
+
+#[test]
+fn agent_reporting_owner_exit_releases_a_live_group() {
+    let env = Env::new("report-owner-exit");
+    let _daemon = env.start();
+    let (c, _) = env.connect();
+    let owner_path = env.dir.join("owner.pid");
+    let pane = match c
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec![
+                std::env::current_exe().unwrap().display().to_string(),
+                "--exact".into(),
+                "agent_reporting_child_fixture".into(),
+                "--nocapture".into(),
+            ]),
+            env: vec![(
+                "THURM_REPORT_TEST_OWNER".into(),
+                owner_path.display().to_string(),
+            )],
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !owner_path.exists() {
+        assert!(Instant::now() < deadline, "owner process did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let owner_pid: u32 = std::fs::read_to_string(&owner_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut report = AgentReport {
+        agent: "example".into(),
+        owner_pid,
+        instance: "child-a".into(),
+        sequence: 1,
+        status: AgentStatus::Idle,
+        session_id: None,
+        message: None,
+        resume_argv: None,
+    };
+    c.request(Request::AgentReport {
+        pane,
+        report: report.clone(),
+    })
+    .unwrap();
+    assert_eq!(unsafe { libc::kill(owner_pid as i32, libc::SIGTERM) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while agent(&c, pane).is_some() {
+        assert!(Instant::now() < deadline, "dead owner kept agent state");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let leader = match c.request(Request::PaneInfo { pane }).unwrap() {
+        Response::PaneInfo(info) => {
+            assert!(info.alive);
+            info.pid.unwrap()
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_ne!(owner_pid, leader);
+    report.owner_pid = leader;
+    report.instance = "leader-b".into();
+    c.request(Request::AgentReport { pane, report }).unwrap();
+    assert_eq!(agent(&c, pane).unwrap().kind, "example");
+}
+
+fn wait_for_reporting_shell(c: &Client, pane: PaneId) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Response::PaneInfo(info) = c.request(Request::PaneInfo { pane }).unwrap() {
+            assert!(info.alive, "resume closed the pane");
+            if info.foreground.as_ref().is_some_and(|p| {
+                Some(p.pid) == info.pid && matches!(p.name.as_str(), "sh" | "bash")
+            }) {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resume did not return to the shell"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[test]
+fn agent_reporting_missing_resume_keeps_pane_and_history() {
+    let env = Env::new("report-missing");
+    let mut daemon = env.start();
+    let (c, _) = env.connect();
+    let (pane, owner_pid) = reporting_pane(&c, &env.dir);
+    c.request(Request::Input {
+        pane,
+        data: b"PRESERVE-THIS-HISTORY\r".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, "PRESERVE-THIS-HISTORY");
+    c.request(Request::AgentReport {
+        pane,
+        report: AgentReport {
+            agent: "example".into(),
+            owner_pid,
+            instance: "process-a".into(),
+            sequence: 1,
+            status: AgentStatus::Idle,
+            session_id: Some("session-42".into()),
+            message: None,
+            resume_argv: Some(vec![env.dir.join("missing-agent").display().to_string()]),
+        },
+    })
+    .unwrap();
+    c.request(Request::Shutdown { kill_panes: true }).unwrap();
+    daemon.wait_exit();
+    drop(c);
+    let _restored = env.start();
+    let (c, _) = env.connect();
+    wait_match(&c, pane, "not found|No such file|no such file");
+    wait_for_reporting_shell(&c, pane);
+    assert!(capture(&c, pane).contains("PRESERVE-THIS-HISTORY"));
+    c.request(Request::SaveSnapshot).unwrap();
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.dir.join("state/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(snapshot["panes"][0]["id"], pane);
+    let history =
+        std::fs::read_to_string(env.dir.join(format!("state/scrollback/{pane}.ansi"))).unwrap();
+    assert!(history.contains("PRESERVE-THIS-HISTORY"));
 }
