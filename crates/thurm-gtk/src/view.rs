@@ -969,15 +969,14 @@ impl TermView {
         keycode: u32,
         state: gdk::ModifierType,
     ) {
-        self.state.borrow_mut().down.remove(&keycode);
-        if self.is_offline() {
+        // Released to the terminal exactly when it got the press: not for a shortcut's key, and
+        // whatever the modifiers are now.
+        let pressed = self.state.borrow_mut().down.remove(&keycode);
+        if self.is_offline() || !pressed {
             return;
         }
         let Some(event) = ctl.current_event() else { return };
         if self.im.filter_keypress(&event) || self.state.borrow().composing {
-            return;
-        }
-        if app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten().is_some() {
             return;
         }
         self.send_key(&event, keyval, keycode, state, keys::RELEASE, None);

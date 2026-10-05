@@ -374,7 +374,11 @@ fn bind_shortcut(bus: &gio::DBusConnection, session: String, trigger: &str, spec
     let token = format!("thurm{}_{serial}_bind", std::process::id());
     let opts = glib::VariantDict::new(None);
     opts.insert_value("handle_token", &token.to_variant());
-    let Ok(path) = glib::variant::ObjectPath::try_from(session.clone()) else { return };
+    // Not an object path: no session the portal could close either.
+    let Ok(path) = glib::variant::ObjectPath::try_from(session.clone()) else {
+        not_bound(spec);
+        return;
+    };
     let params = (path, shortcuts, String::new(), opts.end()).to_variant();
     let spec2 = spec.to_string();
     let session2 = session.clone();

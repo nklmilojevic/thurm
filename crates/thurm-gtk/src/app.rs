@@ -54,6 +54,8 @@ pub struct App {
     last_layout: RefCell<String>,
     save_scheduled: Cell<bool>,
     session_ready: Cell<bool>,
+    /// Restores in a row whose ListPanes or GetLayout failed.
+    restore_failures: Cell<u32>,
     terminating: Cell<bool>,
     reconnect_attempt: Cell<u32>,
     reconnecting: Cell<bool>,
@@ -289,6 +291,7 @@ impl App {
             last_layout: RefCell::new(String::new()),
             save_scheduled: Cell::new(false),
             session_ready: Cell::new(false),
+            restore_failures: Cell::new(0),
             terminating: Cell::new(false),
             reconnect_attempt: Cell::new(0),
             reconnecting: Cell::new(false),
@@ -763,11 +766,41 @@ impl App {
     fn restore_session(self: &Rc<Self>) {
         let Some(core) = self.core(LOCAL) else { return };
         let panes = core.request(&json!("ListPanes"));
+        let saved = core.request(&json!("GetLayout"));
+        // Nothing is changed (or saved over the daemon's layout) unless both answered: a failed
+        // request is not an empty session.
+        let layout = match saved.get("Layout") {
+            Some(Value::Null) => Some(Layout::default()),
+            Some(Value::String(s)) => serde_json::from_str::<Layout>(s).ok(),
+            _ => None,
+        };
+        let (Some(listed), Some(mut layout)) = (panes.get("Panes").and_then(Value::as_array), layout)
+        else {
+            let n = self.restore_failures.get() + 1;
+            self.restore_failures.set(n);
+            log::warn!("restoring the session failed ({n}): ListPanes {panes}, GetLayout {saved}");
+            if n >= 5 {
+                self.toast(
+                    "Could not read the saved session from thurmd; it is left as it was. Quit and reopen Thurm to try again.",
+                    10.0,
+                );
+                return;
+            }
+            glib::timeout_add_local_once(Duration::from_millis(250 << n), || {
+                with_app(|a| {
+                    if !a.session_ready.get() {
+                        a.restore_session();
+                    }
+                });
+            });
+            return;
+        };
+        self.restore_failures.set(0);
         let mut alive = HashSet::new();
         {
             let mut infos = self.infos.borrow_mut();
             infos.retain(|k, _| k.is_remote());
-            for p in panes.get("Panes").and_then(Value::as_array).into_iter().flatten() {
+            for p in listed {
                 if let Ok(info) = serde_json::from_value::<PaneInfo>(p.clone()) {
                     if info.alive {
                         alive.insert(info.id);
@@ -776,12 +809,6 @@ impl App {
                 }
             }
         }
-        let mut layout = core
-            .request(&json!("GetLayout"))
-            .get("Layout")
-            .and_then(Value::as_str)
-            .and_then(|s| serde_json::from_str::<Layout>(s).ok())
-            .unwrap_or_default();
         let remote_names = self.ui().remote_names();
         let placed: HashSet<PaneKey> = self.all_tabs().iter().flat_map(|t| t.panes()).collect();
         let keep = |host: Option<&str>, id: PaneId| -> bool {
@@ -2844,11 +2871,16 @@ impl App {
     fn resync(self: &Rc<Self>) {
         let Some(core) = self.core(LOCAL) else { return };
         let panes = core.request(&json!("ListPanes"));
+        // Without an answer, keep every view: an empty list would drop them all.
+        let Some(list) = panes.get("Panes").and_then(Value::as_array) else {
+            log::warn!("resync: ListPanes failed: {panes}");
+            return;
+        };
         let mut listed = HashSet::new();
         {
             let mut infos = self.infos.borrow_mut();
             infos.retain(|k, _| k.is_remote());
-            for p in panes.get("Panes").and_then(Value::as_array).into_iter().flatten() {
+            for p in list {
                 if let Ok(info) = serde_json::from_value::<PaneInfo>(p.clone()) {
                     listed.insert(info.id);
                     infos.insert(PaneKey::local(info.id), info);
