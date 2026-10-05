@@ -4,6 +4,12 @@
 
 mod remote;
 
+// For Rust front ends (thurm-gtk) linking this crate as a library.
+pub use remote::{
+    thurm_remote_call, thurm_remote_kick, thurm_remote_status_cb, thurm_remotes_start,
+    thurm_remotes_stop, thurm_remotes_sync,
+};
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;

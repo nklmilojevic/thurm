@@ -42,7 +42,8 @@ pub enum Method {
 impl Method {
     pub fn label(self) -> &'static str {
         match self {
-            Method::Copy => "Copy this Mac's Thurm",
+            Method::Copy if cfg!(target_os = "macos") => "Copy this Mac's Thurm",
+            Method::Copy => "Copy this computer's Thurm",
             Method::Download => "Download the Linux build",
             Method::Nix => "Install with Nix",
         }
@@ -115,6 +116,41 @@ pub fn same_build(ours: &str, theirs: &str) -> bool {
     }
 }
 
+/// Our own binaries run there: the same target, or (a Linux app's helpers) static Linux
+/// binaries of the same architecture.
+fn copyable(target: &str, local_bins: Option<&Path>) -> bool {
+    let ours = crate::current_target();
+    if target == ours {
+        return true;
+    }
+    let arch = |t: &str| t.split('-').next().unwrap_or("").to_string();
+    target.contains("-linux-")
+        && ours.contains("-linux-")
+        && arch(target) == arch(ours)
+        && local_bins
+            .and_then(local_binaries)
+            .is_some_and(|(thurm, thurmd)| is_static_elf(&thurm) && is_static_elf(&thurmd))
+}
+
+/// A 64-bit little-endian ELF executable without a program interpreter (statically linked).
+fn is_static_elf(path: &Path) -> bool {
+    let Ok(data) = std::fs::read(path) else {
+        return false;
+    };
+    if data.len() < 64 || &data[..4] != b"\x7fELF" || data[4] != 2 || data[5] != 1 {
+        return false;
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([data[o], data[o + 1]]) as usize;
+    let phoff = u64::from_le_bytes(data[0x20..0x28].try_into().unwrap_or_default()) as usize;
+    let (size, count) = (u16_at(0x36), u16_at(0x38));
+    (0..count).all(|i| {
+        let o = phoff + i * size;
+        // PT_INTERP: dynamically linked.
+        data.get(o..o + 4)
+            .is_some_and(|t| u32::from_le_bytes(t.try_into().unwrap_or_default()) != 3)
+    })
+}
+
 /// Probes the host and its daemon and lists the ways to put our build there.
 pub fn plan(ssh: &Ssh, socket: Option<&str>, local_bins: Option<&Path>) -> Result<Plan, SshError> {
     let host = crate::probe(ssh)?;
@@ -126,7 +162,7 @@ pub fn plan(ssh: &Ssh, socket: Option<&str>, local_bins: Option<&Path>) -> Resul
     let mut methods = Vec::new();
     let mut problem = None;
     match host.artifact_target() {
-        Some(t) if t == crate::current_target() => {
+        Some(t) if copyable(t, local_bins) => {
             if local_bins.and_then(local_binaries).is_some() {
                 methods.push(Method::Copy);
             } else {
@@ -501,6 +537,33 @@ pub fn upgrade_daemon(
 
 #[cfg(test)]
 mod tests {
+    /// A minimal 64-bit ELF with one program header of type `ptype`.
+    fn elf(ptype: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 64 + 56];
+        d[..4].copy_from_slice(b"\x7fELF");
+        d[4] = 2;
+        d[5] = 1;
+        d[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        d[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        d[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+        d[64..68].copy_from_slice(&ptype.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn static_elf_detection() {
+        let dir = std::env::temp_dir().join(format!("thurm-elf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (st, dy, txt) = (dir.join("static"), dir.join("dynamic"), dir.join("text"));
+        std::fs::write(&st, elf(1)).unwrap();
+        std::fs::write(&dy, elf(3)).unwrap();
+        std::fs::write(&txt, b"#!/bin/sh\n").unwrap();
+        assert!(is_static_elf(&st));
+        assert!(!is_static_elf(&dy));
+        assert!(!is_static_elf(&txt));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

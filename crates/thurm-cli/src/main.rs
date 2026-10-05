@@ -46,6 +46,18 @@ fn remote_mode() -> bool {
 }
 
 #[derive(Subcommand)]
+enum WorkspaceCmd {
+    /// Rename the workspace a pane is in (default: this one). With `new-tab --window`, which
+    /// prints the new pane's id: `thurm workspace rename --pane $(thurm new-tab --window) api`.
+    Rename {
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+        #[arg(required = true)]
+        name: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum RemoteCmd {
     /// Add a host: checks the connection, offers to install Thurm there, writes `[[remote]]`.
     Add {
@@ -263,6 +275,11 @@ enum Cmd {
         pane: Option<PaneId>,
         title: Vec<String>,
     },
+    /// The app's workspaces.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceCmd,
+    },
     /// Scroll a pane's viewport.
     Scroll {
         #[arg(short, long)]
@@ -290,10 +307,11 @@ enum Cmd {
     Save,
     /// Daemon control.
     Daemon {
-        /// install-launchd / uninstall-launchd: start the daemon at login (a per-user
-        /// LaunchAgent), so sessions are there before the app is opened. upgrade: replace a
-        /// daemon left running by an older Thurm with this one's, keeping every pane running.
-        #[arg(value_parser = ["status", "start", "stop", "upgrade", "install-launchd", "uninstall-launchd"])]
+        /// install-launchd / uninstall-launchd (macOS), install-systemd / uninstall-systemd
+        /// (Linux): start the daemon at login, so sessions are there before the app is opened.
+        /// upgrade: replace a daemon left running by an older Thurm with this one's, keeping
+        /// every pane running.
+        #[arg(value_parser = ["status", "start", "stop", "upgrade", "install-launchd", "uninstall-launchd", "install-systemd", "uninstall-systemd"])]
         action: String,
     },
     /// Print the config file path.
@@ -792,8 +810,79 @@ fn daemon_cmd(action: &str, json: bool) -> R {
             }
             Ok(ExitCode::SUCCESS)
         }
+        "install-systemd" => {
+            let daemon = find_daemon().ok_or("thurmd not found next to thurm or on PATH")?;
+            let path = systemd_unit_path();
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let socket = std::env::var_os("THURM_SOCKET").map(std::path::PathBuf::from);
+            std::fs::write(&path, systemd_unit(&daemon, socket.as_deref()))?;
+            let systemctl = |args: &[&str]| {
+                std::process::Command::new("systemctl")
+                    .arg("--user")
+                    .args(args)
+                    .status()
+                    .is_ok_and(|s| s.success())
+            };
+            systemctl(&["daemon-reload"]);
+            // Enabled for the next login; a daemon running now keeps serving its sessions.
+            let ok = systemctl(&["enable", SYSTEMD_UNIT]);
+            println!(
+                "{SYSTEMD_UNIT} {} ({})",
+                if ok {
+                    "installed and enabled"
+                } else {
+                    "installed; enable it with systemctl --user"
+                },
+                path.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        "uninstall-systemd" => {
+            let path = systemd_unit_path();
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "disable", SYSTEMD_UNIT])
+                .status();
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "daemon-reload"])
+                        .status();
+                    println!("{SYSTEMD_UNIT} removed; the running daemon keeps its sessions")
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("{SYSTEMD_UNIT} is not installed")
+                }
+                Err(e) => return Err(e.into()),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         _ => unreachable!(),
     }
+}
+
+const SYSTEMD_UNIT: &str = "thurmd.service";
+
+fn systemd_unit_path() -> std::path::PathBuf {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+        });
+    config.join("systemd/user").join(SYSTEMD_UNIT)
+}
+
+/// A user unit that starts `thurmd` at login, in the foreground. Not restarted, so
+/// `thurm daemon stop` stops it until the next login (like the macOS LaunchAgent).
+fn systemd_unit(daemon: &std::path::Path, socket: Option<&std::path::Path>) -> String {
+    let mut exec = format!("{} --foreground", daemon.display());
+    if let Some(s) = socket {
+        exec.push_str(&format!(" --socket {}", s.display()));
+    }
+    format!(
+        "[Unit]\nDescription=Thurm session daemon\n\n[Service]\nType=simple\nExecStart={exec}\nRestart=no\n\n[Install]\nWantedBy=default.target\n"
+    )
 }
 
 const LAUNCHD_LABEL: &str = "com.thurm.daemon";
@@ -1247,6 +1336,16 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                 title: (!t.is_empty()).then_some(t),
             }))?;
         }
+        Cmd::Workspace {
+            action: WorkspaceCmd::Rename { pane, name },
+        } => {
+            let pane = current_pane(pane)?;
+            let name = name.join(" ").trim().to_owned();
+            if name.is_empty() {
+                return Err("workspace name is empty".into());
+            }
+            c.request(Request::Ui(UiCommand::RenameWorkspace { pane, name }))?;
+        }
         Cmd::Scroll { pane, to } => {
             let pane = current_pane(pane)?;
             let scroll = match to.as_str() {
@@ -1324,6 +1423,23 @@ fn ui(c: &Client, cmd: UiCommand) {
             let _ = std::process::Command::new("open")
                 .args(["-b", "com.thurm.terminal"])
                 .status();
+        }
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some() {
+            // The Linux app, next to this binary or on PATH; it picks up panes that aren't in
+            // its layout.
+            let app = std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.join("thurm-gtk")))
+                .filter(|p| p.is_file())
+                .or_else(|| thurm_config::which("thurm-gtk"));
+            if let Some(app) = app {
+                let _ = std::process::Command::new(app)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
         }
     }
 }

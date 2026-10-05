@@ -508,11 +508,17 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private let scroll = NSScrollView()
     private let table = NSTableView()
     private var rows: [AgentBox] = []
+    private let handle = DragHandle()
     private var height: NSLayoutConstraint!
     private static let rowHeight: CGFloat = 40
     private static let headerHeight: CGFloat = 30
-    /// Rows shown before the panel scrolls.
-    private static let maxVisibleRows = 5
+    /// Kept for the tab list when the panel is dragged taller.
+    private static let minTabsHeight: CGFloat = 160
+    /// Rows shown before the panel scrolls: `window.sidebar_agent_rows`, or where the header
+    /// is being dragged to.
+    private var visibleRows: Int { draggedRows ?? SessionManager.shared.config.sidebarAgentRows }
+    private var draggedRows: Int?
+    private var shownLimit = 0
 
     init() {
         super.init(frame: .zero)
@@ -540,7 +546,27 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
 
-        for v in [separator, header, summary, scroll] as [NSView] {
+        handle.toolTip = "Drag to show more or fewer agents"
+        var start = 0
+        handle.began = { [weak self] in start = self?.visibleRows ?? 0 }
+        handle.dragged = { [weak self] dy in
+            guard let self else { return }
+            let available = (self.superview?.bounds.height ?? 0) - Self.headerHeight - Self.minTabsHeight
+            let fit = max(1, Int(available / Self.rowHeight), start)
+            self.draggedRows = min(fit, max(1, start + Int((dy / Self.rowHeight).rounded())))
+            self.updateHeight()
+        }
+        handle.ended = { [weak self] in
+            guard let self, let rows = self.draggedRows else { return }
+            if rows != SessionManager.shared.config.sidebarAgentRows {
+                _ = Core.shared.request(object: ["SetSetting": ["key": "window.sidebar_agent_rows", "value": String(rows)]])
+            }
+            // The setting takes over when the config reloads.
+            SessionManager.shared.config.sidebarAgentRows = rows
+            self.draggedRows = nil
+        }
+
+        for v in [separator, header, summary, scroll, handle] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
         }
@@ -559,6 +585,10 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+            handle.topAnchor.constraint(equalTo: topAnchor),
+            handle.leadingAnchor.constraint(equalTo: leadingAnchor),
+            handle.trailingAnchor.constraint(equalTo: trailingAnchor),
+            handle.heightAnchor.constraint(equalToConstant: Self.headerHeight),
         ])
         isHidden = true
     }
@@ -569,7 +599,7 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     func reload() {
         let next = agentRows()
-        if next.count == rows.count,
+        if next.count == rows.count, shownLimit == visibleRows,
            zip(next, rows).allSatisfy({ $0.pane == $1.pane && $0.hiddenWorkspace == $1.hiddenWorkspace && $0.row == $1.row }) {
             // A click selects its row even when it changes nothing shown: put the selection back.
             let current = rows.firstIndex { $0.row.selected }
@@ -585,20 +615,25 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         summary.stringValue = [waiting > 0 ? "\(waiting) waiting" : nil, working > 0 ? "\(working) working" : nil]
             .compactMap { $0 }.joined(separator: " · ")
         table.reloadData()
-        // The source list style pads below the last row: size to the table itself, or the
-        // rows don't fit and scrolling to the selected one cuts off the first. Its intrinsic
-        // height, not its frame: the frame stretches to fill the scroll view, so after the panel
-        // had more agents it would count the empty space as padding and never shrink.
-        let visible = min(rows.count, Self.maxVisibleRows)
-        let padding = rows.isEmpty ? 0 : max(0, table.intrinsicContentSize.height - table.rect(ofRow: rows.count - 1).maxY)
-        let content = visible == 0 ? 0 : table.rect(ofRow: visible - 1).maxY + padding
-        height.constant = rows.isEmpty ? 0 : Self.headerHeight + content
+        updateHeight()
         if let i = rows.firstIndex(where: { $0.row.selected }) {
             table.selectRowIndexes([i], byExtendingSelection: false)
             table.scrollRowToVisible(i)
         } else {
             table.deselectAll(nil)
         }
+    }
+
+    private func updateHeight() {
+        shownLimit = visibleRows
+        // The source list style pads below the last row: size to the table itself, or the
+        // rows don't fit and scrolling to the selected one cuts off the first. Its intrinsic
+        // height, not its frame: the frame stretches to fill the scroll view, so after the panel
+        // had more agents it would count the empty space as padding and never shrink.
+        let visible = min(rows.count, shownLimit)
+        let padding = rows.isEmpty ? 0 : max(0, table.intrinsicContentSize.height - table.rect(ofRow: rows.count - 1).maxY)
+        let content = visible == 0 ? 0 : table.rect(ofRow: visible - 1).maxY + padding
+        height.constant = rows.isEmpty ? 0 : Self.headerHeight + content
     }
 
     /// Every agent pane: this window's tabs first, then other windows, then hidden workspaces.
@@ -752,5 +787,31 @@ final class TabRowView: NSTableCellView {
         }
         dot.layer?.backgroundColor = color.cgColor
         toolTip = [tab.title, tab.subtitle].compactMap { $0 }.joined(separator: "\n")
+    }
+}
+
+/// The agents panel's header: dragging it up shows more agents, down fewer.
+private final class DragHandle: NSView {
+    var began: () -> Void = {}
+    /// Points moved up since the drag began.
+    var dragged: (CGFloat) -> Void = { _ in }
+    var ended: () -> Void = {}
+    private var startY: CGFloat = 0
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .resizeUpDown)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        startY = event.locationInWindow.y
+        began()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        dragged(event.locationInWindow.y - startY)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        ended()
     }
 }

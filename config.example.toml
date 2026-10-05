@@ -48,6 +48,8 @@ pane_headers = false
 # Tab location: "native" or "sidebar".
 tab_style = "sidebar"
 sidebar_width = 240.0
+# Agents shown in the sidebar before its panel scrolls (drag the "Agents" header to change).
+sidebar_agent_rows = 5
 
 [cursor]
 # Shape: "block", "beam", or "underline".

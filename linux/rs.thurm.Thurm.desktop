@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Name=Thurm
+GenericName=Terminal
+Comment=Terminal for persistent sessions, coding agents and remote work
+Exec=thurm-gtk
+Icon=rs.thurm.Thurm
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;terminal;agent;
+StartupWMClass=rs.thurm.Thurm
+Actions=new-tab;new-workspace;quick-terminal;
+
+[Desktop Action new-tab]
+Name=New Tab
+Exec=thurm-gtk --new-tab
+
+[Desktop Action new-workspace]
+Name=New Workspace
+Exec=thurm-gtk --new-workspace
+
+[Desktop Action quick-terminal]
+Name=Quick Terminal
+Exec=thurm-gtk --quick-terminal

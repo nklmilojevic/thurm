@@ -846,6 +846,7 @@ final class SessionManager: NSObject, CoreDelegate {
             }
             c.content.needsDisplay = true
         }
+        refreshSidebars()
         updateSecureInput()
     }
 
@@ -1201,6 +1202,13 @@ final class SessionManager: NSObject, CoreDelegate {
             if let pane = key("pane"), let c = controller(for: pane) {
                 let title = jsonString(d["title"])
                 c.titleOverride = (title?.isEmpty ?? true) ? nil : title
+                scheduleLayoutSave()
+            }
+        case "RenameWorkspace":
+            let name = (jsonString(d["name"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if let pane = key("pane"), !name.isEmpty, let ws = workspace(containing: pane) {
+                ws.name = name
+                refreshSidebars()
                 scheduleLayoutSave()
             }
         default:

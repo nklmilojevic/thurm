@@ -1,0 +1,24 @@
+[package]
+name = "thurm-gtk"
+description = "The Thurm Linux front end (GTK 4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "thurm-gtk"
+path = "src/main.rs"
+
+# GTK only exists on the Linux build; elsewhere the binary is a stub, so the workspace still
+# builds and tests on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+thurm-ffi = { path = "../thurm-ffi" }
+thurm-proto.workspace = true
+thurm-config.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+log.workspace = true
+env_logger.workspace = true
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+pangocairo = "0.22"

@@ -79,6 +79,12 @@ extension SessionManager {
         workspaces.first { $0.id == id }
     }
 
+    /// The workspace showing `pane`, or holding it in a hidden tab.
+    func workspace(containing pane: PaneKey) -> Workspace? {
+        if let c = controller(for: pane) { return workspace(c.workspaceID) }
+        return workspaces.first { $0.hiddenTabs.contains { $0.root.panes.contains(pane) } }
+    }
+
     var currentWorkspace: Workspace? {
         currentController.flatMap { workspace($0.workspaceID) }
     }

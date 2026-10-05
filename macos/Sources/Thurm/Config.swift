@@ -123,6 +123,8 @@ final class AppConfig {
     /// `window.blur` > 0: blur what is behind a translucent window.
     var blur = 0
     var sidebarWidth: CGFloat = 240
+    /// Agents the sidebar lists before its agents panel scrolls.
+    var sidebarAgentRows = 5
 
     // [cursor]
     var cursorBlink = false
@@ -264,6 +266,7 @@ final class AppConfig {
             blur = min(100, max(0, jsonInt(w["blur"]) ?? blur))
             quitAfterLastWindow = jsonBool(w["quit_after_last_window"]) ?? quitAfterLastWindow
             sidebarWidth = CGFloat(min(480, max(180, jsonDouble(w["sidebar_width"]) ?? Double(sidebarWidth))))
+            sidebarAgentRows = min(100, max(1, jsonInt(w["sidebar_agent_rows"]) ?? sidebarAgentRows))
         }
         if let cur = c["cursor"] as? [String: Any] {
             cursorBlink = jsonBool(cur["blink"]) ?? cursorBlink
