@@ -33,14 +33,15 @@ impl Daemon {
             if st.terminal_attachment.is_some() {
                 return Err("a terminal is already attached to this pane".into());
             }
-            if st.pending_input.is_some() {
-                return Err("cannot attach while pane startup input is pending".into());
+            if st.pending_input.is_some() || st.agent.prompt.is_pending() {
+                return Err("cannot attach while pane input is pending".into());
             }
             let original = st.info.size;
             let size = sanitize_size(size);
             st.pty
                 .resize(size)
                 .map_err(|e| format!("cannot resize pane: {e}"))?;
+            st.agent.prompt.interrupted();
             st.terminal_attachment = Some((client.id, original));
             st.term.resize(size);
             st.info.size = size;

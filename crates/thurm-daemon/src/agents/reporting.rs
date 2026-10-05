@@ -596,6 +596,30 @@ mod tests {
     }
 
     #[test]
+    fn reported_permission_continuation_completes_the_reserved_prompt() {
+        let mut tracker = tracker();
+        let mut report = report();
+        tracker.apply_report(&report, 100, 42, "Example").unwrap();
+        tracker.refresh();
+        let token = tracker.prompt.reserve(AgentStatus::Idle).unwrap();
+        for status in [
+            AgentStatus::Working,
+            AgentStatus::NeedsInput,
+            AgentStatus::Working,
+            AgentStatus::Done,
+        ] {
+            report.sequence += 1;
+            report.status = status;
+            tracker.apply_report(&report, 100, 42, "Example").unwrap();
+            tracker.refresh();
+        }
+        assert_eq!(
+            tracker.prompt.outcome(token, AgentStatus::Done).unwrap(),
+            Some(thurm_proto::AgentPromptOutcome::Completed)
+        );
+    }
+
+    #[test]
     fn dead_owner_cannot_keep_a_live_process_group() {
         for birth in [None, Some(101)] {
             let mut tracker = tracker();

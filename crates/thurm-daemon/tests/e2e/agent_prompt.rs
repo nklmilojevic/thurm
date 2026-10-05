@@ -67,6 +67,48 @@ fn prompt_timeout_does_not_accept_old_done_state() {
 }
 
 #[test]
+fn prompt_and_terminal_attachment_have_one_input_owner() {
+    let (_env, _daemon, client, pane) = setup("prompt-attachment");
+    client
+        .request(Request::AttachTerminal {
+            pane,
+            size: PaneSize::default(),
+        })
+        .unwrap();
+    assert!(submit(&client, pane, "must-not-arrive", false, 1000).is_err());
+    assert!(!capture(&client, pane).contains("must-not-arrive"));
+    client.request(Request::DetachTerminal { pane }).unwrap();
+
+    submit(&client, pane, "pending-marker", false, 1000).unwrap();
+    assert!(
+        client
+            .request(Request::AttachTerminal {
+                pane,
+                size: PaneSize::default()
+            })
+            .is_err()
+    );
+    hook(&client, pane, "prompt-submit", None);
+    hook(&client, pane, "stop", None);
+
+    let worker = {
+        let client = client.clone();
+        std::thread::spawn(move || submit(&client, pane, "attach-during-turn", true, 3000))
+    };
+    wait_match(&client, pane, "attach-during-turn");
+    hook(&client, pane, "prompt-submit", None);
+    client
+        .request(Request::AttachTerminal {
+            pane,
+            size: PaneSize::default(),
+        })
+        .unwrap();
+    client.request(Request::DetachTerminal { pane }).unwrap();
+    hook(&client, pane, "stop", None);
+    assert!(worker.join().unwrap().is_err());
+}
+
+#[test]
 fn prompt_tracks_fast_turn_and_rejects_a_replacement_session() {
     let (_env, _daemon, client, pane) = setup("prompt-turn");
     let worker = {

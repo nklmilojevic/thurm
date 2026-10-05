@@ -32,7 +32,7 @@ impl Daemon {
         let defs = self.agent_defs.read().clone();
         let idle_after = Duration::from_millis(self.config.read().agents.idle_after_ms);
         self.with_pane(pane, |p, st| {
-            if !st.info.alive || st.pending_input.is_some() {
+            if !st.info.alive || st.pending_input.is_some() || st.terminal_attachment.is_some() {
                 return Err("pane is not ready for an agent prompt".into());
             }
             let process = st
@@ -47,8 +47,16 @@ impl Daemon {
                 .ok_or("cannot identify the foreground process start time")?;
             let tail = agents::tail(&st.term.screen_text(), 20);
             let idle = st.term.last_output.elapsed();
-            st.agent
-                .update(&defs, Some(&process), &tail, idle, idle_after);
+            let invalidated = st.agent.invalidate_dead_report_owner();
+            let changed = st
+                .agent
+                .update(&defs, Some(&process), &tail, idle, idle_after)
+                .is_some();
+            if invalidated || changed {
+                st.info.agent = st.agent.state().cloned();
+                st.info.title = pane_title(st, Some(&process));
+                self.broadcast(Event::PaneInfo(st.info.clone()), false);
+            }
             let agent = st.agent.state().ok_or("no agent is running in this pane")?;
             let status = agent.status;
             if agent.permission.is_some() || st.pty.password_mode() {
@@ -88,7 +96,14 @@ impl Daemon {
                 return Ok(AgentPromptOutcome::Exited);
             };
             {
-                let st = pane.state.lock();
+                let mut st = pane.state.lock();
+                if st.terminal_attachment.is_some() {
+                    return Err("pane input belongs to an attached terminal".into());
+                }
+                if st.agent.invalidate_dead_report_owner() {
+                    st.info.agent = st.agent.state().cloned();
+                    self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                }
                 if !st.info.alive {
                     return Ok(AgentPromptOutcome::Exited);
                 }

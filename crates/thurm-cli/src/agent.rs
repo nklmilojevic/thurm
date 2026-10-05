@@ -6,6 +6,8 @@ use thurm_proto::{AgentReport, AgentStatus, PaneId, Request, Response};
 
 #[derive(Subcommand)]
 pub enum AgentCmd {
+    /// Submit a prompt to an agent and optionally wait for that turn.
+    Prompt(crate::agent_prompt::PromptArgs),
     /// Show the process, state source, and detection rules for a pane.
     Explain {
         #[arg(long)]
@@ -66,6 +68,7 @@ enum Status {
 
 pub fn run(c: &Client, action: AgentCmd, json: bool) -> crate::R {
     let request = match action {
+        AgentCmd::Prompt(args) => return crate::agent_prompt::run(c, args, json),
         AgentCmd::Explain { pane } => Request::AgentExplain {
             pane: crate::current_pane(pane)?,
         },

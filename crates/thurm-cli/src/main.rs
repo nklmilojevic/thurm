@@ -8,6 +8,7 @@ mod events;
 mod layouts;
 mod attach;
 mod agent;
+mod agent_prompt;
 mod remote;
 
 use std::io::{IsTerminal, Read, Write};

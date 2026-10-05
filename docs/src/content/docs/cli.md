@@ -62,6 +62,11 @@ Use `thurm COMMAND --help` for the full argument list.
 | `presets` | List agent launch presets |
 | `launch PRESET` | Launch a preset; `--split DIRECTION`, `--cwd PATH` |
 | `agents` | List agent panes and status |
+| `agent prompt TEXT...` | Submit a prompt to the current agent; `--pane ID`, `--wait`, `--timeout SECONDS`; see [Agent prompts](/agent-prompts/) |
+| `agent explain` | Show the process, status source, and detection evidence; `--pane ID` |
+| `agent report` / `agent release` | Report agent state and session details; see [Agent reporting](/agent-integration/) |
+| `attach --pane ID` | Open an interactive terminal connection; see [Terminal attachment](/attach/) |
+| `events` | Stream state changes as JSON Lines; `--pane ID`; see [Layouts and events](/workflows/) |
 | `fork` | Fork an agent session; `--pane ID`, `--split DIRECTION` |
 | `hooks install\|uninstall\|status` | Manage hooks; `--agent claude\|codex` |
 | `explain` | Explain the last finished command; `--pane ID`; needs enabled AI |
@@ -70,7 +75,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `set KEY VALUE` | Write a setting and reload |
 | `theme [SPEC]` | List themes, or select a theme |
 | `save` | Write a session snapshot |
-| `layout` | Print layout JSON |
+| `layout [export\|apply]` | Print layout JSON, export a tab template, or apply a template; see [Layouts and events](/workflows/) |
 | `daemon ACTION` | Control the daemon; see [Sessions](/sessions/) |
 | `socket-path` | Print the daemon socket path |
 | `remote add\|list\|remove\|status\|install` | Manage remote hosts; see [Remote workspaces](/remote/) |
