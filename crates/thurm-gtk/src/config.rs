@@ -60,6 +60,11 @@ impl UiConfig {
         self.cfg.window.opacity.clamp(0.05, 1.0)
     }
 
+    /// The quick terminal's background: `quick_terminal.opacity`, else the window's.
+    pub fn quick_opacity(&self) -> f64 {
+        self.cfg.quick_terminal.opacity.map_or(self.opacity(), |o| o.clamp(0.05, 1.0))
+    }
+
     pub fn font_size(&self) -> f64 {
         self.cfg.font.size.clamp(4.0, 200.0)
     }

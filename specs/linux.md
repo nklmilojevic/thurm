@@ -44,6 +44,9 @@ tunnel), panes keyed by (host, id).
   monitor showing the main window (GTK cannot see the pointer outside its windows), `main` the
   first monitor. The hotkey hides it whenever it is shown (macOS: only when it has focus, else
   focuses it), because a Wayland compositor may not focus the window it shows.
+- **Closing the window**: with `window.quit_after_last_window` off (the default) Thurm keeps
+  running without a window, as it stays in the Dock on macOS: the quick-terminal hotkey still
+  works, and opening Thurm again shows the window. Quit from the menu to end it.
 - **Updates**: no Sparkle; packages are updated by the package manager.
 - **Secure keyboard entry**: macOS-only. Linux shows the lock badge on password prompts (input
   is not observable by other Wayland clients anyway).
