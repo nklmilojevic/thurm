@@ -2315,6 +2315,7 @@ impl App {
                         AgentStatus::NeedsInput => "dialog-warning-symbolic",
                         AgentStatus::Working => "content-loading-symbolic",
                         AgentStatus::Done => "object-select-symbolic",
+                        AgentStatus::Error => "dialog-error-symbolic",
                         AgentStatus::Idle => "media-playback-pause-symbolic",
                     })
                     .upcast::<gio::Icon>()
@@ -2670,8 +2671,10 @@ impl App {
         let old = self.infos.borrow_mut().insert(key.clone(), info.clone());
         let old_agent = old.as_ref().and_then(|o| o.agent.clone());
         let status = info.agent.as_ref().map(|a| a.status);
-        if matches!(status, Some(AgentStatus::Done) | Some(AgentStatus::NeedsInput))
-            && old_agent.as_ref().map(|a| a.status) != status
+        if matches!(
+            status,
+            Some(AgentStatus::Done | AgentStatus::Error | AgentStatus::NeedsInput)
+        ) && old_agent.as_ref().map(|a| a.status) != status
         {
             remote::agent_settled(self, &key);
         }

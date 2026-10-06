@@ -16,6 +16,7 @@ use crate::keys;
 use crate::kitty::{Image, Media, MediaReader};
 pub use crate::mode::TermMode;
 use crate::osc::{OscEvent, OscState};
+use crate::program_status::{self, ProgramStatus};
 use crate::vt::{self, GridRef, KittyPlacement, Vt};
 
 // libghostty-vt mode identifiers.
@@ -125,6 +126,8 @@ pub enum TermEvent {
     CommandFinished(Option<i32>),
     CommandLine(String),
     Progress(Option<proto::Progress>),
+    /// The program status records (OSC 7501) changed; these are all of them now.
+    ProgramStatus(Vec<proto::ProgramRecord>),
     ImageFreed(u32),
 }
 
@@ -491,6 +494,8 @@ pub struct Terminal {
     events: Vec<TermEvent>,
     /// Selection selector of a pending OSC 52 clipboard read.
     clipboard_load: Option<char>,
+    /// What programs reported about themselves (OSC 7501).
+    programs: ProgramStatus,
     size: PaneSize,
     cfg: EngineConfig,
     links: HashMap<String, u16>,
@@ -543,6 +548,7 @@ impl Terminal {
             alt_screen: false,
             events: Vec::new(),
             clipboard_load: None,
+            programs: ProgramStatus::default(),
             size,
             links: HashMap::new(),
             link_list: Vec::new(),
@@ -698,13 +704,20 @@ impl Terminal {
                 }
                 Chunk::Osc(body) => {
                     self.handle_osc(&body);
-                    // A shared OSC (52) follows as a Pass chunk too: forward it once.
+                    // A shared OSC (52) follows as a Pass chunk too: forward it once. Program
+                    // status is the daemon's alone.
                     if let Some(f) = &mut self.forward
                         && !crate::filter::osc_is_passed(&body)
+                        && program_status_body(&body).is_none()
                     {
                         f.extend_from_slice(b"\x1b]");
                         f.extend_from_slice(&body);
                         f.push(0x07);
+                    }
+                }
+                Chunk::Reset => {
+                    if self.programs.clear() {
+                        self.program_status_changed();
                     }
                 }
             }
@@ -1005,6 +1018,10 @@ impl Terminal {
             self.handle_osc52(rest);
             return;
         }
+        if let Some(rest) = program_status_body(body) {
+            self.handle_program_status(rest);
+            return;
+        }
         let ev = self.osc.parse(body);
         if let Some(OscEvent::PromptStart { redraw: Some(r) }) = ev {
             self.shell_redraws = r;
@@ -1025,6 +1042,9 @@ impl Terminal {
                 self.prompt_start = self.track(Point::new(self.cursor_point().line, 0));
                 self.at_prompt = !self.is_alt_screen();
                 self.events.push(TermEvent::PromptStart);
+                if self.programs.prompt_started() {
+                    self.program_status_changed();
+                }
             }
             OscEvent::InputStart => {
                 self.mark_prompt();
@@ -1048,6 +1068,52 @@ impl Terminal {
             OscEvent::CommandFinished(code) => self.events.push(TermEvent::CommandFinished(code)),
             OscEvent::CommandLine(c) => self.events.push(TermEvent::CommandLine(c)),
         }
+    }
+
+    /// `OSC 7501 ; …`: a program reports its status, or asks whether the terminal listens.
+    fn handle_program_status(&mut self, body: &[u8]) {
+        match program_status::parse(body) {
+            Some(program_status::Parsed::Query) => self
+                .events
+                .push(TermEvent::PtyWrite(program_status::QUERY_REPLY.to_vec())),
+            Some(report) => {
+                if self.programs.apply(report) {
+                    self.program_status_changed();
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn program_status_changed(&mut self) {
+        self.events
+            .push(TermEvent::ProgramStatus(self.programs.records()));
+    }
+
+    /// What programs reported about themselves (OSC 7501), least recently updated first.
+    pub fn program_status(&self) -> Vec<proto::ProgramRecord> {
+        self.programs.records()
+    }
+
+    /// The records as reported, for [`Terminal::restore_program_status`] in another terminal.
+    pub fn program_status_handoff(&self) -> Vec<proto::ProgramRecord> {
+        self.programs.stored().to_vec()
+    }
+
+    pub fn restore_program_status(&mut self, records: Vec<proto::ProgramRecord>) {
+        self.programs.restore(records);
+    }
+
+    /// The process attached to the terminal exited: what it was doing is over. Returns
+    /// whether the records changed.
+    pub fn program_exited(&mut self) -> bool {
+        self.programs.process_exited()
+    }
+
+    /// The user came back to the terminal: reported results are no longer news. Returns
+    /// whether the records changed.
+    pub fn acknowledge_program_status(&mut self) -> bool {
+        self.programs.acknowledge()
     }
 
     /// `OSC 52 ; selection ; ?`: paste, as the config allows.
@@ -2210,6 +2276,9 @@ impl Terminal {
     pub fn reset(&mut self) {
         self.vt.write(b"\x1bc");
         self.collect_events();
+        if self.programs.clear() {
+            self.program_status_changed();
+        }
         self.filter.take_scroll_region();
         self.scroll_region = None;
         self.vt.set_selection(None);
@@ -2853,6 +2922,11 @@ fn regex_escape_if_invalid(q: &str) -> String {
 
 /// `path` without relative entries (`.`, `bin`, empty): a program found through one depends
 /// on the directory the shell happens to be in.
+/// The report of an `OSC 7501 ; …` body.
+fn program_status_body(body: &[u8]) -> Option<&[u8]> {
+    body.strip_prefix(program_status::OSC)?.strip_prefix(b";")
+}
+
 fn absolute_path_entries(path: &str) -> String {
     path.split(':')
         .filter(|e| e.starts_with('/'))

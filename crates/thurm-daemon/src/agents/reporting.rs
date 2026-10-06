@@ -404,8 +404,16 @@ impl AgentTracker {
         if self.attention_flag {
             rules.push("program notification requested attention".into());
         }
+        if let Some(p) = &self.program {
+            rules.push(format!(
+                "program status (OSC 7501): {} {:?}",
+                p.kind, p.status
+            ));
+        }
         let source = if self.current.is_none() {
             "none"
+        } else if self.program.is_some() {
+            "program-status"
         } else if active_hook && self.public_report_active() {
             "report"
         } else if active_hook {

@@ -1778,3 +1778,39 @@ fn osc52_is_forwarded_once() {
         .count();
     assert_eq!(stores, 1);
 }
+
+#[test]
+fn program_status_records() {
+    let mut t = term(20, 5);
+    t.advance(b"\x1b]7501;?\x1b\\");
+    assert!(
+        t.drain_events()
+            .contains(&TermEvent::PtyWrite(b"\x1b]7501;?\x1b\\".to_vec()))
+    );
+    // Not part of the screen, and with the BEL terminator too.
+    t.advance(b"\x1b]7501;state=working:app=brew\x07\x1b]7501;state=done:id=x\x1b\\");
+    let ids =
+        |t: &Terminal| -> Vec<String> { t.program_status().into_iter().map(|r| r.id).collect() };
+    assert_eq!(ids(&t), ["", "x"]);
+    assert!(matches!(t.drain_events().last(), Some(TermEvent::ProgramStatus(r)) if r.len() == 2));
+    // Switching screens leaves records alone; a prompt drops what was running.
+    t.advance(b"\x1b[?1049h\x1b[?1049l");
+    assert_eq!(ids(&t), ["", "x"]);
+    t.advance(b"\x1b]133;A\x07");
+    assert_eq!(ids(&t), ["x"]);
+    assert!(t.acknowledge_program_status());
+    assert!(t.program_status()[0].seen);
+    // A full reset removes every record, in stream order.
+    t.advance(b"\x1bc\x1b]7501;state=blocked\x07");
+    assert_eq!(ids(&t), [""]);
+    t.reset();
+    assert!(t.program_status().is_empty());
+    // Malformed reports change nothing.
+    t.drain_events();
+    t.advance(b"\x1b]7501;state=bogus\x07\x1b]7501\x07");
+    assert!(
+        t.drain_events()
+            .iter()
+            .all(|e| !matches!(e, TermEvent::ProgramStatus(_)))
+    );
+}

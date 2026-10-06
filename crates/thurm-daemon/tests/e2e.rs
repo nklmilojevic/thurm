@@ -9,6 +9,9 @@ mod agent_prompt;
 #[path = "e2e/layouts.rs"]
 mod layouts;
 
+#[path = "e2e/program_status.rs"]
+mod program_status;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;

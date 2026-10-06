@@ -63,7 +63,7 @@ impl PromptTracker {
             AgentStatus::NeedsInput => {
                 return Err("the agent needs input; answer its request first".into());
             }
-            AgentStatus::Idle | AgentStatus::Done => {}
+            AgentStatus::Idle | AgentStatus::Done | AgentStatus::Error => {}
         }
         self.pending = true;
         Ok(PromptToken {
@@ -87,7 +87,12 @@ impl PromptTracker {
         if turns == 1 && status == AgentStatus::NeedsInput {
             return Ok(Some(AgentPromptOutcome::NeedsInput));
         }
-        if turns == 1 && matches!(status, AgentStatus::Idle | AgentStatus::Done) {
+        if turns == 1
+            && matches!(
+                status,
+                AgentStatus::Idle | AgentStatus::Done | AgentStatus::Error
+            )
+        {
             return Ok(Some(AgentPromptOutcome::Completed));
         }
         Ok(None)

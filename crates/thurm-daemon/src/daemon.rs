@@ -53,6 +53,10 @@ const QUIET: Duration = Duration::from_millis(2);
 /// Screen lines the model reads for titles, requests and turn summaries.
 const AI_SCREEN_LINES: usize = 60;
 
+/// Notifications program status reports may cause per pane within `PROGRAM_ALERT_WINDOW`.
+const PROGRAM_ALERTS: usize = 3;
+const PROGRAM_ALERT_WINDOW: Duration = Duration::from_secs(10);
+
 /// How long before the daemon notices a SIGTERM a pane whose shell died still counts for the
 /// session save. Quitting the app signals the daemon and the shells at once, and the reader
 /// can see the shell go before the signal handler has run (and the main thread notices the
@@ -300,6 +304,10 @@ pub struct PaneState {
     /// Last git probe: when, for which directory, and whether one is in flight.
     git_probe: Option<(Instant, String)>,
     git_pending: bool,
+    /// Progress the program reported with OSC 9;4 (program status progress shows otherwise).
+    osc_progress: Option<thurm_proto::Progress>,
+    /// When program status reports last caused notifications (see `PROGRAM_ALERTS`).
+    program_alerts: Vec<Instant>,
 }
 
 /// What [`Daemon::install_pane`] needs: a new pane, or one handed over by the previous daemon.
@@ -628,6 +636,8 @@ impl Daemon {
                 shell_integration_seen: p.shell_integration_seen,
                 git_probe: None,
                 git_pending: false,
+                osc_progress: None,
+                program_alerts: Vec::new(),
             }),
         });
         self.panes.lock().insert(id, pane.clone());
@@ -948,7 +958,8 @@ impl Daemon {
                             info_changed = true;
                         }
                         // Whatever reported progress is done (or died without clearing it).
-                        if st.info.progress.take().is_some() {
+                        if st.osc_progress.take().is_some() {
+                            st.info.progress = None;
                             info_changed = true;
                         }
                         if let Some((_, input)) = st.pending_input.take() {
@@ -986,7 +997,13 @@ impl Daemon {
                         }
                     }
                     TermEvent::Progress(p) => {
-                        st.info.progress = p;
+                        st.osc_progress = p;
+                        st.info.progress =
+                            p.or_else(|| agents::program::progress(&st.info.programs));
+                        info_changed = true;
+                    }
+                    TermEvent::ProgramStatus(_) => {
+                        outgoing.extend(self.sync_programs(pane.id, &mut st));
                         info_changed = true;
                     }
                     // Subscribers run their own copy of the terminal and free images there.
@@ -1021,6 +1038,13 @@ impl Daemon {
             let mut st = pane.state.lock();
             st.info.alive = false;
             st.info.exit_code = code;
+            if st.term.program_exited() {
+                let events = self.sync_programs(pane.id, &mut st);
+                self.broadcast(Event::PaneInfo(st.info.clone()), false);
+                for ev in events {
+                    self.broadcast(ev, true);
+                }
+            }
             if st.hold {
                 let msg = match code {
                     Some(c) => format!("\r\n\x1b[2m[process exited with code {c}]\x1b[0m"),
@@ -1172,6 +1196,51 @@ impl Daemon {
                         }]
                     });
                 }
+            }
+        }
+    }
+
+    /// The pane's program status records changed (OSC 7501, an exit, an acknowledgement):
+    /// re-derive its progress and agent state from them. Returns the notifications to send;
+    /// the caller sends the pane's info.
+    fn sync_programs(&self, pane: PaneId, st: &mut PaneState) -> Vec<Event> {
+        st.info.programs = st.term.program_status();
+        st.info.progress = st
+            .osc_progress
+            .or_else(|| agents::program::progress(&st.info.programs));
+        st.agent
+            .set_programs(&st.info.programs, &self.agent_defs.read());
+        let before = st.info.agent.clone();
+        let Some(new) = st.agent.refresh() else {
+            return Vec::new();
+        };
+        let mut events = self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
+        st.info.agent = new;
+        st.info.title = pane_title(st, st.info.foreground.as_ref());
+        // A program can change its status as fast as it writes.
+        let now = Instant::now();
+        st.program_alerts
+            .retain(|t| now.duration_since(*t) < PROGRAM_ALERT_WINDOW);
+        events.retain(|ev| {
+            if !matches!(ev, Event::Notify { .. }) {
+                return true;
+            }
+            if st.program_alerts.len() >= PROGRAM_ALERTS {
+                return false;
+            }
+            st.program_alerts.push(now);
+            true
+        });
+        events
+    }
+
+    /// The user is back at the pane: what programs reported having finished is no longer news.
+    fn acknowledge_programs(&self, pane: PaneId, st: &mut PaneState) {
+        if st.term.acknowledge_program_status() {
+            let events = self.sync_programs(pane, st);
+            self.broadcast(Event::PaneInfo(st.info.clone()), false);
+            for ev in events {
+                self.broadcast(ev, true);
             }
         }
     }
@@ -1571,6 +1640,7 @@ impl Daemon {
                 agent_report: st.agent.report_handoff(),
                 agent_prompt: st.agent.pending_prompt_handoff(),
                 terminal_size_after_detach: st.terminal_attachment.map(|(_, size)| size.into()),
+                programs: st.term.program_status_handoff(),
             });
         }
         upgrade::Handoff {
@@ -1614,6 +1684,7 @@ impl Daemon {
             }
             term.set_shell_token(p.shell_token.clone());
             term.set_shell_path(p.shell_path.clone());
+            term.restore_program_status(p.programs.clone());
             let alive = p.exited.is_none();
             let info = PaneInfo {
                 id: p.id,
@@ -1655,6 +1726,8 @@ impl Daemon {
                             st.agent.restore_pending_prompt(prompt);
                         }
                         st.info.agent = st.agent.state().cloned();
+                        // Old news: notified by the image we replaced.
+                        let _ = self.sync_programs(p.id, &mut st);
                     }
                 }
                 Err(e) => log::warn!("pane {}: {e}", p.id),
@@ -1887,15 +1960,26 @@ impl Daemon {
             ),
             AgentStatus::Done if was != Some(AgentStatus::Done) => (
                 true,
-                (n.enabled && n.agent_done).then(|| match a.turn_ms {
-                    Some(ms) => format!("finished after {}", agents::human_duration(ms)),
-                    None => "finished".into(),
+                (n.enabled && n.agent_done).then(|| match (&a.message, a.turn_ms) {
+                    (Some(m), _) => m.clone(),
+                    (None, Some(ms)) => format!("finished after {}", agents::human_duration(ms)),
+                    (None, None) => "finished".into(),
                 }),
+            ),
+            AgentStatus::Error if was != Some(AgentStatus::Error) => (
+                true,
+                (n.enabled && n.agent_done)
+                    .then(|| a.message.clone().unwrap_or_else(|| "failed".into())),
             ),
             _ => return Vec::new(),
         };
         let notify = body.map(|body| (a.name.clone(), body));
-        if ai_cfg.notifications() && !st.info.password_input && self.ai.unavailable().is_none() {
+        // A program that reports its status says itself what it wants or did.
+        if ai_cfg.notifications()
+            && !st.agent.program_reported()
+            && !st.info.password_input
+            && self.ai.unavailable().is_none()
+        {
             let job = AiJob::Detail {
                 pane,
                 episode: st.agent.episode(),
@@ -2059,6 +2143,7 @@ impl Daemon {
                         st.agent.prompt.interrupted();
                     }
                     st.agent.user_answer(&data);
+                    self.acknowledge_programs(pane, st);
                     p.write(data);
                 })?;
                 Ok(Response::Ok)
@@ -2069,6 +2154,7 @@ impl Daemon {
                         st.agent.prompt.interrupted();
                     }
                     st.agent.user_input();
+                    self.acknowledge_programs(pane, st);
                     p.write(st.term.paste(&text));
                 })?;
                 Ok(Response::Ok)
@@ -2079,6 +2165,7 @@ impl Daemon {
                     if !bytes.is_empty() {
                         st.agent.prompt.interrupted();
                         st.agent.user_answer(&bytes);
+                        self.acknowledge_programs(pane, st);
                         p.write(bytes);
                     }
                 })?;
@@ -2136,6 +2223,7 @@ impl Daemon {
                     // Looking at a finished agent acknowledges it (Done → Idle).
                     if focused {
                         st.agent.acknowledge();
+                        self.acknowledge_programs(pane, st);
                         if let Some(new) = st.agent.refresh() {
                             st.info.agent = new;
                             self.broadcast(Event::PaneInfo(st.info.clone()), false);
@@ -2552,9 +2640,11 @@ impl Daemon {
                             }
                         }
                     }
-                    WaitCondition::AgentStatus(want) => {
-                        st.agent.state().is_some_and(|a| a.status == *want)
-                    }
+                    WaitCondition::AgentStatus(want) => st.agent.state().is_some_and(|a| {
+                        // Finished either way.
+                        a.status == *want
+                            || (*want == AgentStatus::Done && a.status == AgentStatus::Error)
+                    }),
                     WaitCondition::AgentFree => {
                         settle
                             && match st.agent.state() {

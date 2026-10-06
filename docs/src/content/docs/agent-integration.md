@@ -4,7 +4,23 @@ title: Agent reporting and diagnostics
 
 Use `thurm agent explain --pane ID` to inspect an agent. Add `--json` for structured output. The result contains the foreground process and arguments, the state source, matched detection rules, recent screen text, and the idle threshold. Screen text can contain private data. The command reads the current screen when requested.
 
-The source is `report`, `hook`, `notification`, `ai`, `screen-and-activity`, or `none`. A foreground report or hook overrides screen rules. The listed rules also show matching screen patterns when a report overrides them.
+The source is `program-status`, `report`, `hook`, `notification`, `ai`, `screen-and-activity`, or `none`. A program status record overrides everything else; a foreground report or hook overrides screen rules. The listed rules also show matching screen patterns when a report overrides them.
+
+## Program status (OSC 7501)
+
+Any program can report its own state with the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status), an escape sequence written to the terminal. It needs no Thurm command, socket or process checks, so it also works over ssh and for programs that are not agents.
+
+```sh
+status() {
+  printf '\e]7501;state=%s:app=sync:msg=%s\e\\' "$1" "$(printf '%s' "$2" | base64 | tr -d '\n')"
+}
+status working "Syncing photos"
+rsync -a ~/Photos backup:/photos && status done "Photos synced" || status error "rsync failed"
+```
+
+Thurm answers the feature query `OSC 7501 ; ? ST` with the same body. The states map to agent states: `idle`, `working`, `blocked` (needs input), `done`, and `error`. The pane shows the most pressing record: blocked, then error, working, done and idle, the latest report first among equals. `app` names the program, or a built-in agent by kind or name (`claude`, `claude-code`). `msg` becomes the status message and notification text, and `progress` drives the pane's progress bar unless OSC 9;4 sets one. Records with an `id` and a `title` show as `title: msg`.
+
+Working, blocked and idle records end at the next shell prompt (OSC 133;A) or when the pane's process exits. Done and error records stay until you focus the pane or type in it. A full reset (RIS) removes every record. `thurm info` lists the records under `programs`. Notifications from records are limited to three per pane in ten seconds.
 
 ## Report lifecycle state
 

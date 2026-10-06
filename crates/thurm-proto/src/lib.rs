@@ -487,6 +487,51 @@ pub struct PaneInfo {
     /// Git status of the working directory, when it is inside a repository.
     #[serde(default)]
     pub git: Option<GitInfo>,
+    /// What the programs in the pane say they are doing (OSC 7501), least recently updated
+    /// first.
+    #[serde(default)]
+    pub programs: Vec<ProgramRecord>,
+}
+
+/// One record of the Program Status Protocol (OSC 7501).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProgramRecord {
+    /// Path of the record (`build/test`); empty for the root record.
+    pub id: String,
+    pub state: ProgramState,
+    /// What the program waits for (blocked records only).
+    pub kind: Option<BlockedKind>,
+    /// 0-100 (working and blocked records only).
+    pub progress: Option<u8>,
+    /// Machine-readable program name, as reported or taken from the nearest ancestor.
+    pub app: Option<String>,
+    /// Short label of the record.
+    pub title: Option<String>,
+    /// What the record is doing, waiting for, or finished.
+    pub message: Option<String>,
+    /// The user has seen this done or error record.
+    pub seen: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Error,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedKind {
+    /// Approval to do something.
+    Permission,
+    /// The user must type an answer.
+    Question,
+    /// A login, token, or credential.
+    Auth,
 }
 
 /// Progress reported by the running program (ConEmu OSC 9;4).
@@ -610,6 +655,9 @@ pub enum AgentStatus {
     NeedsInput,
     /// Finished a turn the user hasn't looked at yet (hooks only); becomes Idle on input.
     Done,
+    /// Failed and stopped, and the user hasn't looked yet (program status reports only);
+    /// becomes Idle on input.
+    Error,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

@@ -1586,6 +1586,7 @@ fn pane_json(p: &PaneInfo) -> serde_json::Value {
         "idle_ms": p.idle_ms,
         "password_input": p.password_input,
         "restored": p.restored,
+        "programs": p.programs,
     })
 }
 

@@ -2,7 +2,7 @@ import AppKit
 import QuartzCore
 
 /// Small colored dot shown in the native tab (window.tab.accessoryView) for agent status:
-/// Working = blue, Idle = gray, NeedsInput = orange, Done (unseen) = green.
+/// Working = blue, Idle = gray, NeedsInput = orange, Done (unseen) = green, Error (unseen) = red.
 final class AgentDotView: NSView {
     var status: AgentStatus? {
         didSet {
@@ -37,6 +37,9 @@ final class AgentDotView: NSView {
         case .some(.done):
             layer.backgroundColor = NSColor.systemGreen.cgColor
             toolTip = "Agent finished"
+        case .some(.error):
+            layer.backgroundColor = NSColor.systemRed.cgColor
+            toolTip = "Agent failed"
         case .some(.idle):
             layer.backgroundColor = NSColor.systemGray.cgColor
             toolTip = "Agent idle"
@@ -270,6 +273,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             case .needsInput: prefix = "● "
             case .working: prefix = "◌ "
             case .done: prefix = "✓ "
+            case .error: prefix = "✗ "
             case .idle: prefix = ""
             }
         }

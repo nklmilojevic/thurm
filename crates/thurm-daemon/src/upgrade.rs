@@ -82,6 +82,9 @@ pub struct PaneHandoff {
     /// Restore this size because exec closes the attached terminal connection.
     #[serde(default)]
     pub terminal_size_after_detach: Option<PaneSizeSnap>,
+    /// What programs reported about themselves (OSC 7501).
+    #[serde(default)]
+    pub programs: Vec<thurm_proto::ProgramRecord>,
 }
 
 impl PaneHandoff {

@@ -148,14 +148,17 @@ enum AgentStatus: String {
     case needsInput = "NeedsInput"
     /// Finished a turn the user hasn't looked at (hooks only).
     case done = "Done"
+    /// Failed and stopped, and the user hasn't looked (program status reports).
+    case error = "Error"
 
-    /// Higher is more urgent (used to summarize a tab), like tty7: waiting > working > done.
+    /// Higher is more urgent (used to summarize a tab), like tty7: waiting > failed > working > done.
     var urgency: Int {
         switch self {
         case .idle: return 0
         case .done: return 1
         case .working: return 2
-        case .needsInput: return 3
+        case .error: return 3
+        case .needsInput: return 4
         }
     }
 }

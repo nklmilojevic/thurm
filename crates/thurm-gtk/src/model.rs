@@ -549,7 +549,8 @@ pub fn urgency(status: AgentStatus) -> u8 {
         AgentStatus::Idle => 0,
         AgentStatus::Done => 1,
         AgentStatus::Working => 2,
-        AgentStatus::NeedsInput => 3,
+        AgentStatus::Error => 3,
+        AgentStatus::NeedsInput => 4,
     }
 }
 
@@ -569,6 +570,7 @@ pub fn status_prefix(status: Option<AgentStatus>) -> &'static str {
         Some(AgentStatus::NeedsInput) => "● ",
         Some(AgentStatus::Working) => "◌ ",
         Some(AgentStatus::Done) => "✓ ",
+        Some(AgentStatus::Error) => "✗ ",
         _ => "",
     }
 }
@@ -579,6 +581,7 @@ pub fn status_color(status: AgentStatus) -> &'static str {
         AgentStatus::Working => "#0a84ff",
         AgentStatus::NeedsInput => "#ff9f0a",
         AgentStatus::Done => "#30d158",
+        AgentStatus::Error => "#ff453a",
         AgentStatus::Idle => "#8e8e93",
     }
 }
@@ -589,6 +592,7 @@ pub fn status_label(status: AgentStatus) -> &'static str {
         AgentStatus::Idle => "Idle",
         AgentStatus::NeedsInput => "NeedsInput",
         AgentStatus::Done => "Done",
+        AgentStatus::Error => "Error",
     }
 }
 
@@ -677,6 +681,11 @@ pub fn status_detail(info: &PaneInfo) -> String {
             }
             s
         }
+        AgentStatus::Error => agent
+            .message
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "Failed".into()),
         AgentStatus::Idle => "Idle".into(),
     }
 }
