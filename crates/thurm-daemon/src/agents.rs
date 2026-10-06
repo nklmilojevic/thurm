@@ -31,6 +31,11 @@ pub struct AgentTracker {
     hook: Option<HookState>,
     /// The pane's foreground process group, as last seen (monitor tick or hook event).
     fg_pgrp: Option<u32>,
+    /// The pane's window title, as last seen.
+    title: Option<String>,
+    /// The agent (process group, kind) that showed its working spinner in the title: while it
+    /// runs, the title says when it works.
+    title_spun: Option<(Option<u32>, String)>,
     /// Show the transcript's session title as the topic (`agents.session_titles`).
     pub titles: bool,
     /// Bumped whenever the agent or its status changes: what the model said about one
@@ -241,6 +246,20 @@ impl AgentTracker {
     /// an agent can start and finish before the next one.
     pub fn saw_foreground(&mut self, pgrp: Option<u32>) {
         self.fg_pgrp = pgrp;
+    }
+
+    /// Whether the title's spinner decides the current agent's status.
+    fn title_decides(&self) -> bool {
+        self.title_spun.as_ref().is_some_and(|(pgrp, kind)| {
+            *pgrp == self.fg_pgrp && self.current.as_ref().is_some_and(|c| &c.kind == kind)
+        })
+    }
+
+    /// The pane's window title now, read by the next `update`.
+    pub fn saw_title(&mut self, title: Option<&str>) {
+        if self.title.as_deref() != title {
+            self.title = title.map(str::to_owned);
+        }
     }
 
     /// Apply an agent hook event, sent from process group `pgrp` (the agent's). The next
@@ -507,6 +526,18 @@ impl AgentTracker {
             h.answered = false;
             h.status = AgentStatus::Idle;
         }
+        let spinning = def.is_some_and(|d| {
+            self.title
+                .as_deref()
+                .is_some_and(|t| d.title_spinner(t).is_some())
+        });
+        let agent = def.map(|d| (self.fg_pgrp, d.kind.clone()));
+        if spinning {
+            self.title_spun = agent.clone();
+        }
+        // Neither output (the user's typing echoed, a redrawn status line) nor working text
+        // left on the screen says anything once the title does.
+        let title_decides = agent.is_some() && self.title_spun == agent;
         let next = def.map(|d| {
             let screen_tail = current_activity(&d.kind, screen_tail);
             let attention =
@@ -521,7 +552,7 @@ impl AgentTracker {
                     .is_some_and(|(h, w)| w && h == screen_hash(screen_tail));
             let status = if attention || waiting {
                 AgentStatus::NeedsInput
-            } else if working || idle < idle_after {
+            } else if spinning || (!title_decides && (working || idle < idle_after)) {
                 AgentStatus::Working
             } else {
                 AgentStatus::Idle
@@ -541,6 +572,7 @@ impl AgentTracker {
         });
         if next.is_none() {
             self.attention_flag = false;
+            self.title_spun = None;
             // The next agent here is a new session.
             if self.current.is_some() {
                 self.ai = AiNotes::default();
@@ -781,6 +813,151 @@ mod tests {
             Some(None)
         );
         assert_eq!(t.last_kind.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn title_spinner_decides_once_seen() {
+        let defs = thurm_config::builtin_agents();
+        let mut t = AgentTracker::default();
+        let idle_after = Duration::from_millis(1500);
+        let claude = proc("claude");
+        let status = |t: &AgentTracker| t.state().unwrap().status;
+        // Before the spinner shows, output activity still counts (a title-less agent).
+        t.saw_title(Some("✳ Claude Code"));
+        t.update(&defs, Some(&claude), "❯ ", Duration::ZERO, idle_after);
+        assert_eq!(status(&t), AgentStatus::Working);
+        t.saw_title(Some("◐ Fix the sidebar"));
+        t.update(
+            &defs,
+            Some(&claude),
+            "✽ Hyperspacing… (12s)",
+            Duration::from_secs(5),
+            idle_after,
+        );
+        assert_eq!(status(&t), AgentStatus::Working);
+        // The user types at the prompt: echoed output, but the title says idle.
+        t.saw_title(Some("✳ Fix the sidebar"));
+        t.update(
+            &defs,
+            Some(&claude),
+            "❯ do it for",
+            Duration::ZERO,
+            idle_after,
+        );
+        assert_eq!(status(&t), AgentStatus::Idle);
+        // Permission prompts still win.
+        t.update(
+            &defs,
+            Some(&claude),
+            "Do you want to proceed?",
+            Duration::ZERO,
+            idle_after,
+        );
+        assert_eq!(status(&t), AgentStatus::NeedsInput);
+        // The next agent in the pane starts over.
+        t.update(&defs, Some(&proc("fish")), "", Duration::ZERO, idle_after);
+        t.update(&defs, Some(&claude), "❯ ", Duration::ZERO, idle_after);
+        assert_eq!(status(&t), AgentStatus::Working);
+    }
+
+    #[test]
+    fn idle_title_beats_working_text_left_on_screen() {
+        let defs = thurm_config::builtin_agents();
+        let mut t = AgentTracker::default();
+        let idle_after = Duration::from_millis(1500);
+        let quiet = Duration::from_secs(5);
+        let claude = proc("claude");
+        t.saw_title(Some("◑ Task"));
+        t.update(
+            &defs,
+            Some(&claude),
+            "(esc to interrupt)",
+            quiet,
+            idle_after,
+        );
+        assert_eq!(t.state().unwrap().status, AgentStatus::Working);
+        t.saw_title(Some("✳ Task"));
+        t.update(
+            &defs,
+            Some(&claude),
+            "(esc to interrupt)\n❯ ",
+            quiet,
+            idle_after,
+        );
+        assert_eq!(t.state().unwrap().status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn spinner_history_belongs_to_one_agent() {
+        let defs = thurm_config::builtin_agents();
+        let mut t = AgentTracker::default();
+        let idle_after = Duration::from_millis(1500);
+        let quiet = Duration::from_secs(5);
+        t.saw_title(Some("◐ Task"));
+        t.update(&defs, Some(&proc_in("claude", 10)), "", quiet, idle_after);
+        t.saw_title(Some("✳ Task"));
+        t.update(
+            &defs,
+            Some(&proc_in("claude", 10)),
+            "",
+            Duration::ZERO,
+            idle_after,
+        );
+        assert_eq!(t.state().unwrap().status, AgentStatus::Idle);
+        // pi replaces it before a tick sees the shell: its output counts again.
+        t.saw_title(Some("pi"));
+        t.update(
+            &defs,
+            Some(&proc_in("pi", 20)),
+            "",
+            Duration::ZERO,
+            idle_after,
+        );
+        assert_eq!(t.state().unwrap().kind, "pi");
+        assert_eq!(t.state().unwrap().status, AgentStatus::Working);
+        // So does another Claude Code in a new process group.
+        t.saw_title(Some("✳ Claude Code"));
+        t.update(
+            &defs,
+            Some(&proc_in("claude", 30)),
+            "",
+            Duration::ZERO,
+            idle_after,
+        );
+        assert_eq!(t.state().unwrap().status, AgentStatus::Working);
+    }
+
+    #[test]
+    fn codex_title_spinner_and_pi_screen() {
+        let defs = thurm_config::builtin_agents();
+        let idle_after = Duration::from_millis(1500);
+        let quiet = Duration::from_secs(5);
+        let mut t = AgentTracker::default();
+        t.saw_title(Some("⠙ thurm"));
+        t.update(&defs, Some(&proc("codex")), "›", quiet, idle_after);
+        assert_eq!(t.state().unwrap().status, AgentStatus::Working);
+        t.saw_title(Some("thurm"));
+        t.update(
+            &defs,
+            Some(&proc("codex")),
+            "› typing",
+            Duration::ZERO,
+            idle_after,
+        );
+        assert_eq!(t.state().unwrap().status, AgentStatus::Idle);
+
+        let mut t = AgentTracker::default();
+        t.update(
+            &defs,
+            Some(&proc("pi")),
+            "── ⠴ Working ───",
+            quiet,
+            idle_after,
+        );
+        assert_eq!(t.state().unwrap().kind, "pi");
+        assert_eq!(t.state().unwrap().status, AgentStatus::Working);
+        t.update(&defs, Some(&proc("pi")), "> ", quiet, idle_after);
+        assert_eq!(t.state().unwrap().status, AgentStatus::Idle);
     }
 
     #[test]

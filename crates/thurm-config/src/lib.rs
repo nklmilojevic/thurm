@@ -1575,10 +1575,10 @@ clipboard_read = "always"
         assert_eq!(t.palette[0], 0x111111);
         let defs = c.agent_defs();
         assert_eq!(defs.iter().filter(|d| d.kind == "claude").count(), 1);
-        assert_eq!(
-            defs.iter().find(|d| d.kind == "claude").unwrap().name,
-            "Claude"
-        );
+        let claude = defs.iter().find(|d| d.kind == "claude").unwrap();
+        assert_eq!(claude.name, "Claude");
+        // Fields added later (`working_title`) default when a definition leaves them out.
+        assert!(claude.working_title.is_empty());
         assert!(c.ui_json(true).contains("\"theme\""));
     }
 

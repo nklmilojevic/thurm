@@ -126,6 +126,7 @@ install_hooks = true
 # name = "My Bot"
 # processes = ["mybot"]
 # working = ["esc to interrupt"]
+# working_title = ["⠋", "⠙", "⠹"]   # title spinner frames: the title then decides
 # attention = ["Approve?"]
 # launch = ["mybot"]
 # resume = ["mybot", "--continue"]

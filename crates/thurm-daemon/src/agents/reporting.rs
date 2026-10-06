@@ -397,6 +397,9 @@ impl AgentTracker {
                     rules.push(format!("{}.working: {pattern}", def.kind));
                 }
             }
+            if let Some(pattern) = self.title.as_deref().and_then(|t| def.title_spinner(t)) {
+                rules.push(format!("{}.working_title: {pattern}", def.kind));
+            }
         }
         if self.attention_flag {
             rules.push("program notification requested attention".into());
@@ -437,7 +440,9 @@ impl AgentTracker {
             rules.push("foreground hook state overrides screen and output activity".into());
         } else {
             rules.push(
-                if idle < idle_after {
+                if self.title_decides() {
+                    "the title's spinner decides, output activity is ignored"
+                } else if idle < idle_after {
                     "output is inside the idle interval"
                 } else {
                     "output is outside the idle interval"
