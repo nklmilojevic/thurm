@@ -1154,7 +1154,7 @@ final class SessionManager: NSObject, CoreDelegate {
             if old?.progress != info.progress { c.content.views[key]?.setProgress(info.progress) }
         }
         // A handoff's agent finished or asks for something: bring its commits back.
-        if let status = info.agent?.status, status == .done || status == .needsInput,
+        if let status = info.agent?.status, status == .done || status == .error || status == .needsInput,
            old?.agent?.status != status {
             Remotes.shared.agentSettled(key)
         }

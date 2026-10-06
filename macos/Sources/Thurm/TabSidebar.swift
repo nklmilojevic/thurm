@@ -782,6 +782,7 @@ final class TabRowView: NSTableCellView {
         case .some(.working): color = .systemBlue
         case .some(.needsInput): color = .systemOrange
         case .some(.done): color = .systemGreen
+        case .some(.error): color = .systemRed
         case .some(.idle): color = .systemGray
         case .none: color = .clear
         }

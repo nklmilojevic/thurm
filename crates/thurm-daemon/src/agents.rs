@@ -7,6 +7,8 @@
 //! Agents with hooks installed (`thurm hooks install`) report their state directly through
 //! `thurm agent-hook`; while the hooked agent is in the foreground that state wins over the
 //! screen heuristics, and adds a session id, a Done state and turn timing.
+//!
+//! A program that reports its own status (OSC 7501, see [`program`]) is believed over both.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,6 +18,7 @@ use thurm_proto::{AgentState, AgentStatus, ProcessInfo};
 
 use crate::transcript::TitleReader;
 
+pub mod program;
 pub mod prompt_handoff;
 pub mod reporting;
 
@@ -45,6 +48,13 @@ pub struct AgentTracker {
     report_owner: Option<reporting::ReportOwner>,
     report_resume: Option<Vec<String>>,
     retired_report_instances: std::collections::HashSet<String>,
+    /// What the pane's programs reported about themselves, when it decides the status.
+    program: Option<program::ProgramLead>,
+    /// The current state stands for a program only known from its report.
+    from_program: bool,
+    /// The current state before the program's report overrides it: what to fall back to once
+    /// the report is gone.
+    plain: Option<AgentState>,
 }
 
 /// What the on-device model said about the current agent session (`[ai]`).
@@ -199,7 +209,7 @@ impl AgentTracker {
         tail: &str,
         program_title: Option<&str>,
     ) -> Vec<AiWant> {
-        let Some(state) = &self.current else {
+        let Some(state) = self.current.as_ref().filter(|_| !self.from_program) else {
             return Vec::new();
         };
         let tail = current_activity(&state.kind, tail);
@@ -218,7 +228,12 @@ impl AgentTracker {
                 prompt: self.ai.prompt.clone(),
             });
         }
-        if status && !state.hooked && state.status == AgentStatus::Idle && !tail.is_empty() {
+        if status
+            && !state.hooked
+            && self.program.is_none()
+            && state.status == AgentStatus::Idle
+            && !tail.is_empty()
+        {
             let hash = screen_hash(tail);
             if self.ai.status_asked != Some(hash) {
                 self.ai.status_asked = Some(hash);
@@ -392,10 +407,21 @@ impl AgentTracker {
     /// Re-derive the state from the hook alone (between monitor ticks). Returns
     /// `Some(new_state)` when it changed.
     pub fn refresh(&mut self) -> Option<Option<AgentState>> {
-        let mut base = self
-            .current
-            .clone()
-            .or_else(|| self.hook_state().filter(|_| self.hook_in_foreground()))?;
+        if self.from_program && self.program.is_none() {
+            // The program has nothing more to say; the next `update` sees what runs.
+            self.from_program = false;
+            return self.set(None);
+        }
+        // A state that stands for a program is the program's latest report alone.
+        let base = match self.plain.clone().filter(|_| !self.from_program) {
+            Some(c) => Some(c),
+            None => self.hook_state().filter(|_| self.hook_in_foreground()),
+        };
+        let Some(mut base) = base else {
+            let next = self.program_state();
+            self.from_program = next.is_some();
+            return next.and_then(|n| self.set(Some(n)));
+        };
         if !base.hooked {
             // Re-derived by `with_ai`.
             base.message = None;
@@ -466,7 +492,10 @@ impl AgentTracker {
         state
     }
 
-    fn set(&mut self, next: Option<AgentState>) -> Option<Option<AgentState>> {
+    /// Make `plain`, with the program's report over it, the current state.
+    fn set(&mut self, plain: Option<AgentState>) -> Option<Option<AgentState>> {
+        let next = plain.clone().map(|s| self.with_program(s));
+        self.plain = plain;
         self.prompt.observe(self.fg_pgrp, next.as_ref());
         if let Some(n) = &next {
             self.last_kind = Some(n.kind.clone());
@@ -514,6 +543,7 @@ impl AgentTracker {
             && self.hook_in_foreground()
             && fg.is_some_and(|p| !crate::procinfo::is_shell(&p.name));
         if unknown_hooked {
+            self.from_program = false;
             let next = self.hook_state().map(|s| self.with_ai(self.with_hook(s)));
             return self.set(next);
         }
@@ -586,6 +616,9 @@ impl AgentTracker {
                 h.message = None;
             }
         }
+        // No agent runs, but a program said what it does.
+        let next = next.or_else(|| self.program_state());
+        self.from_program = def.is_none() && next.is_some();
         self.set(next)
     }
 }

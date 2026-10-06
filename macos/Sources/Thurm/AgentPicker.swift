@@ -32,6 +32,7 @@ struct AgentPane {
             let done = agent.turnMs.map { "Done in \(formatDuration($0))" } ?? "Done"
             // The turn's summary (`ai.notifications`).
             return agent.message.map { "\(done) · \($0)" } ?? done
+        case .error: return agent.message ?? "Failed"
         case .idle: return "Idle"
         }
     }

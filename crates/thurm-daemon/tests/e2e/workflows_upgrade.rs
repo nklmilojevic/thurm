@@ -1,6 +1,6 @@
 use super::*;
 
-fn upgrade(env: &Env, daemon: &Daemon, client: &Client) -> Arc<Client> {
+pub(crate) fn upgrade(env: &Env, daemon: &Daemon, client: &Client) -> Arc<Client> {
     let mut request = env.socket.as_os_str().to_owned();
     request.push(".upgrade");
     std::fs::write(PathBuf::from(request), env!("CARGO_BIN_EXE_thurmd")).unwrap();
