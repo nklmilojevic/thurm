@@ -16,8 +16,8 @@ pub struct AgentDef {
     pub argv: Vec<String>,
     /// Screen text meaning "the agent is working" (e.g. "esc to interrupt").
     pub working: Vec<String>,
-    /// Window-title text meaning "the agent is working" (its spinner). Once the agent has
-    /// shown one, the title decides between working and idle instead of output activity.
+    /// Window-title words meaning "the agent is working" (its spinner frames). Once the agent
+    /// has shown one, the title decides between working and idle instead of output activity.
     pub working_title: Vec<String>,
     /// Screen text meaning "the agent waits for the user" (permission prompts, questions).
     pub attention: Vec<String>,
@@ -266,6 +266,17 @@ pub fn builtin_agents() -> Vec<AgentDef> {
 }
 
 impl AgentDef {
+    /// The `working_title` pattern `title` shows as a word of its own ("◐ Task", "thurm ⠙"):
+    /// a braille letter inside a word of the session's name is no spinner.
+    pub fn title_spinner(&self, title: &str) -> Option<&str> {
+        title.split_whitespace().find_map(|word| {
+            self.working_title
+                .iter()
+                .find(|p| p.as_str() == word)
+                .map(String::as_str)
+        })
+    }
+
     /// Does this definition describe the given process?
     pub fn matches(&self, name: &str, argv: &[String]) -> bool {
         let base = name.rsplit('/').next().unwrap_or(name);
@@ -324,5 +335,17 @@ mod tests {
             "python3.12",
             &["python3.12".into(), "/usr/bin/aider".into()]
         ));
+    }
+
+    #[test]
+    fn title_spinner_is_a_word_of_its_own() {
+        let claude = def("claude");
+        assert_eq!(claude.title_spinner("◐ Fix the sidebar"), Some("◐"));
+        assert_eq!(claude.title_spinner("⠂ Fix the sidebar"), Some("⠂"));
+        assert_eq!(claude.title_spinner("✳ Fix the sidebar"), None);
+        // Braille in the session's name.
+        assert_eq!(claude.title_spinner("✳ Translate ⠓⠑⠇⠇⠕"), None);
+        assert_eq!(def("codex").title_spinner("thurm ⠙"), Some("⠙"));
+        assert_eq!(def("codex").title_spinner("thurm"), None);
     }
 }

@@ -397,12 +397,8 @@ impl AgentTracker {
                     rules.push(format!("{}.working: {pattern}", def.kind));
                 }
             }
-            if let Some(title) = &self.title {
-                for pattern in &def.working_title {
-                    if title.contains(pattern.as_str()) {
-                        rules.push(format!("{}.working_title: {pattern}", def.kind));
-                    }
-                }
+            if let Some(pattern) = self.title.as_deref().and_then(|t| def.title_spinner(t)) {
+                rules.push(format!("{}.working_title: {pattern}", def.kind));
             }
         }
         if self.attention_flag {

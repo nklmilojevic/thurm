@@ -529,7 +529,7 @@ impl AgentTracker {
         let spinning = def.is_some_and(|d| {
             self.title
                 .as_deref()
-                .is_some_and(|t| d.working_title.iter().any(|w| t.contains(w.as_str())))
+                .is_some_and(|t| d.title_spinner(t).is_some())
         });
         let agent = def.map(|d| (self.fg_pgrp, d.kind.clone()));
         if spinning {
