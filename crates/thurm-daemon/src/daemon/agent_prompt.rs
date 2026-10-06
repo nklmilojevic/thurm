@@ -53,6 +53,7 @@ impl Daemon {
                 .ok_or("cannot identify the foreground process start time")?;
             let tail = agents::tail(&st.term.screen_text(), 20);
             let idle = st.term.last_output.elapsed();
+            st.agent.saw_title(st.term.title());
             let invalidated = st.agent.invalidate_dead_report_owner();
             let changed = if detect {
                 st.agent

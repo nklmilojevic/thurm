@@ -1319,6 +1319,8 @@ impl Daemon {
                             String::new()
                         };
                         let tail = agents::tail(&screen, 20);
+                        let pane_st = &mut *st;
+                        pane_st.agent.saw_title(pane_st.term.title());
                         if let Some(new) =
                             st.agent.update(&defs, fg.as_ref(), &tail, idle, idle_after)
                         {
@@ -2326,6 +2328,7 @@ impl Daemon {
                     let fg = st.pty.foreground_pgrp().and_then(procinfo::process_info);
                     let screen = agents::tail(&st.term.screen_text(), 20);
                     let idle = st.term.last_output.elapsed();
+                    st.agent.saw_title(st.term.title());
                     if detect
                         && let Some(new) =
                             st.agent

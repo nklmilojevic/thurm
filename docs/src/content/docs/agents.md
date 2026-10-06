@@ -68,6 +68,8 @@ presets = [{ name = "My Bot", command = ["mybot"] }]
 An empty preset list uses installed built-in agents. To define another agent,
 add an `[[agents.define]]` block. `processes` matches executable names; `argv`
 matches parts of process arguments. `working` and `attention` match screen text.
+`working_title` matches the window title's spinner; once the agent shows it, the
+title decides between working and idle instead of output activity.
 Optional launch, resume, and fork commands control how Thurm starts that agent.
 See the [configuration reference](/configuration-reference/) for a full example.
 
