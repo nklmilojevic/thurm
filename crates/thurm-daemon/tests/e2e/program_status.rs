@@ -85,6 +85,17 @@ fn programs_report_their_status() {
             .iter()
             .all(|r| r.app.as_deref() == Some("terraform"))
     );
+    // A request answered within the same read was still one ("Sure?").
+    run(
+        &c,
+        pane,
+        r"sleep 0.5; printf '\033]7501;state=blocked:app=terraform:msg=U3VyZT8=\033\\\033]7501;state=working:app=terraform\033\\'",
+    );
+    assert_eq!(
+        next_notification(&rx, pane),
+        ("terraform".into(), "Sure?".into())
+    );
+
     // Typing acknowledges results, so this one comes after the last key.
     run(
         &c,
@@ -122,4 +133,35 @@ fn programs_report_their_status() {
     wait_info(&c, pane, "reset", |i| {
         i.programs.is_empty() && i.agent.is_none()
     });
+}
+
+#[test]
+fn records_survive_an_upgrade_without_notifying_again() {
+    let env = Env::new("program-status-upgrade");
+    let daemon = env.start();
+    let (c, _) = env.connect();
+    let pane = create(&c, &env.dir);
+    // "Apply?"
+    run(
+        &c,
+        pane,
+        r"printf '\033]7501;state=blocked:app=terraform:msg=QXBwbHk/\033\\'",
+    );
+    wait_info(&c, pane, "blocked", |i| !i.programs.is_empty());
+    let c = super::workflows_upgrade::upgrade(&env, &daemon, &c);
+    let (c2, rx) = env.connect();
+    let i = info(&c, pane);
+    let a = i.agent.expect("restored program state");
+    assert_eq!(
+        (a.name.as_str(), a.status),
+        ("terraform", AgentStatus::NeedsInput)
+    );
+    assert_eq!(i.programs.len(), 1);
+    // Old news.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !rx.try_iter().any(|e| matches!(e, Event::Notify { .. })),
+        "notified again"
+    );
+    drop(c2);
 }

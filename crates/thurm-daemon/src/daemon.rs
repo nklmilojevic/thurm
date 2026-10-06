@@ -19,7 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use thurm_config::{AgentDef, Config};
 use thurm_proto::{
     AgentState, AgentStatus, CreatePane, Event, Layout, PROTOCOL_VERSION, PaneId, PaneInfo,
-    PaneSize, Request, Response, ServerMessage, WaitCondition, WaitOutcome,
+    PaneSize, ProgramRecord, Request, Response, ServerMessage, WaitCondition, WaitOutcome,
 };
 use thurm_term::{EngineConfig, MouseOutcome, TermEvent, Terminal};
 
@@ -1002,8 +1002,10 @@ impl Daemon {
                             p.or_else(|| agents::program::progress(&st.info.programs));
                         info_changed = true;
                     }
-                    TermEvent::ProgramStatus(_) => {
-                        outgoing.extend(self.sync_programs(pane.id, &mut st));
+                    // Each report in turn: a request answered within the same read still
+                    // notifies.
+                    TermEvent::ProgramStatus(records) => {
+                        outgoing.extend(self.sync_programs(pane.id, &mut st, records));
                         info_changed = true;
                     }
                     // Subscribers run their own copy of the terminal and free images there.
@@ -1039,7 +1041,8 @@ impl Daemon {
             st.info.alive = false;
             st.info.exit_code = code;
             if st.term.program_exited() {
-                let events = self.sync_programs(pane.id, &mut st);
+                let records = st.term.program_status();
+                let events = self.sync_programs(pane.id, &mut st, records);
                 self.broadcast(Event::PaneInfo(st.info.clone()), false);
                 for ev in events {
                     self.broadcast(ev, true);
@@ -1200,23 +1203,21 @@ impl Daemon {
         }
     }
 
-    /// The pane's program status records changed (OSC 7501, an exit, an acknowledgement):
-    /// re-derive its progress and agent state from them. Returns the notifications to send;
-    /// the caller sends the pane's info.
-    fn sync_programs(&self, pane: PaneId, st: &mut PaneState) -> Vec<Event> {
-        st.info.programs = st.term.program_status();
-        st.info.progress = st
-            .osc_progress
-            .or_else(|| agents::program::progress(&st.info.programs));
-        st.agent
-            .set_programs(&st.info.programs, &self.agent_defs.read());
+    /// The pane's program status records are now `records` (OSC 7501, an exit, an
+    /// acknowledgement): re-derive its progress and agent state from them. Returns the
+    /// notifications to send; the caller sends the pane's info.
+    fn sync_programs(
+        &self,
+        pane: PaneId,
+        st: &mut PaneState,
+        records: Vec<ProgramRecord>,
+    ) -> Vec<Event> {
         let before = st.info.agent.clone();
-        let Some(new) = st.agent.refresh() else {
+        if !self.apply_programs(st, records) {
             return Vec::new();
-        };
-        let mut events = self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
-        st.info.agent = new;
-        st.info.title = pane_title(st, st.info.foreground.as_ref());
+        }
+        let mut events =
+            self.agent_notifications(pane, st, before.as_ref(), st.info.agent.as_ref());
         // A program can change its status as fast as it writes.
         let now = Instant::now();
         st.program_alerts
@@ -1234,10 +1235,28 @@ impl Daemon {
         events
     }
 
+    /// Like [`Daemon::sync_programs`], without notifications. Returns whether the agent state
+    /// changed.
+    fn apply_programs(&self, st: &mut PaneState, records: Vec<ProgramRecord>) -> bool {
+        st.info.programs = records;
+        st.info.progress = st
+            .osc_progress
+            .or_else(|| agents::program::progress(&st.info.programs));
+        st.agent
+            .set_programs(&st.info.programs, &self.agent_defs.read());
+        let Some(new) = st.agent.refresh() else {
+            return false;
+        };
+        st.info.agent = new;
+        st.info.title = pane_title(st, st.info.foreground.as_ref());
+        true
+    }
+
     /// The user is back at the pane: what programs reported having finished is no longer news.
     fn acknowledge_programs(&self, pane: PaneId, st: &mut PaneState) {
         if st.term.acknowledge_program_status() {
-            let events = self.sync_programs(pane, st);
+            let records = st.term.program_status();
+            let events = self.sync_programs(pane, st, records);
             self.broadcast(Event::PaneInfo(st.info.clone()), false);
             for ev in events {
                 self.broadcast(ev, true);
@@ -1727,7 +1746,8 @@ impl Daemon {
                         }
                         st.info.agent = st.agent.state().cloned();
                         // Old news: notified by the image we replaced.
-                        let _ = self.sync_programs(p.id, &mut st);
+                        let records = st.term.program_status();
+                        self.apply_programs(&mut st, records);
                     }
                 }
                 Err(e) => log::warn!("pane {}: {e}", p.id),
@@ -1960,10 +1980,11 @@ impl Daemon {
             ),
             AgentStatus::Done if was != Some(AgentStatus::Done) => (
                 true,
+                // A program says what it finished; a hooked turn says how long it took.
                 (n.enabled && n.agent_done).then(|| match (&a.message, a.turn_ms) {
-                    (Some(m), _) => m.clone(),
-                    (None, Some(ms)) => format!("finished after {}", agents::human_duration(ms)),
-                    (None, None) => "finished".into(),
+                    (Some(m), _) if st.agent.program_reported() => m.clone(),
+                    (_, Some(ms)) => format!("finished after {}", agents::human_duration(ms)),
+                    (_, None) => "finished".into(),
                 }),
             ),
             AgentStatus::Error if was != Some(AgentStatus::Error) => (

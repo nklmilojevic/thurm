@@ -98,7 +98,7 @@ impl AgentTracker {
     /// A state for a program that reports but isn't otherwise known as an agent.
     pub(super) fn program_state(&self) -> Option<AgentState> {
         let p = self.program.as_ref()?;
-        Some(self.with_program(AgentState {
+        Some(AgentState {
             name: p.name.clone(),
             kind: p.kind.clone(),
             status: p.status,
@@ -109,7 +109,7 @@ impl AgentTracker {
             hooked: true,
             topic: None,
             permission: None,
-        }))
+        })
     }
 
     pub(super) fn with_program(&self, mut state: AgentState) -> AgentState {
@@ -307,6 +307,36 @@ mod tests {
                 .unwrap()
                 .status,
             AgentStatus::Working
+        );
+    }
+
+    #[test]
+    fn a_cleared_report_gives_the_detected_state_back() {
+        let defs = thurm_config::builtin_agents();
+        let mut t = AgentTracker::default();
+        let mut s = ProgramStatus::default();
+        let idle_after = Duration::from_millis(1500);
+        let claude = ProcessInfo {
+            pid: 9,
+            name: "claude".into(),
+            argv: vec!["claude".into()],
+        };
+        t.update(&defs, Some(&claude), "", Duration::ZERO, idle_after);
+        // "Approve?"
+        t.set_programs(
+            &records(&mut s, &["state=blocked:app=claude:msg=QXBwcm92ZT8="]),
+            &defs,
+        );
+        let a = t.refresh().unwrap().unwrap();
+        assert_eq!(
+            (a.status, a.message.as_deref()),
+            (AgentStatus::NeedsInput, Some("Approve?"))
+        );
+        t.set_programs(&records(&mut s, &["state=clear"]), &defs);
+        let a = t.refresh().unwrap().unwrap();
+        assert_eq!(
+            (a.status, a.message, a.hooked),
+            (AgentStatus::Working, None, false)
         );
     }
 }

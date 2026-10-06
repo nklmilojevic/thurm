@@ -52,6 +52,9 @@ pub struct AgentTracker {
     program: Option<program::ProgramLead>,
     /// The current state stands for a program only known from its report.
     from_program: bool,
+    /// The current state before the program's report overrides it: what to fall back to once
+    /// the report is gone.
+    plain: Option<AgentState>,
 }
 
 /// What the on-device model said about the current agent session (`[ai]`).
@@ -410,7 +413,7 @@ impl AgentTracker {
             return self.set(None);
         }
         // A state that stands for a program is the program's latest report alone.
-        let base = match self.current.clone().filter(|_| !self.from_program) {
+        let base = match self.plain.clone().filter(|_| !self.from_program) {
             Some(c) => Some(c),
             None => self.hook_state().filter(|_| self.hook_in_foreground()),
         };
@@ -423,7 +426,7 @@ impl AgentTracker {
             // Re-derived by `with_ai`.
             base.message = None;
         }
-        let next = Some(self.with_program(self.with_ai(self.with_hook(base))));
+        let next = Some(self.with_ai(self.with_hook(base)));
         self.set(next)
     }
 
@@ -489,7 +492,10 @@ impl AgentTracker {
         state
     }
 
-    fn set(&mut self, next: Option<AgentState>) -> Option<Option<AgentState>> {
+    /// Make `plain`, with the program's report over it, the current state.
+    fn set(&mut self, plain: Option<AgentState>) -> Option<Option<AgentState>> {
+        let next = plain.clone().map(|s| self.with_program(s));
+        self.plain = plain;
         self.prompt.observe(self.fg_pgrp, next.as_ref());
         if let Some(n) = &next {
             self.last_kind = Some(n.kind.clone());
@@ -538,9 +544,7 @@ impl AgentTracker {
             && fg.is_some_and(|p| !crate::procinfo::is_shell(&p.name));
         if unknown_hooked {
             self.from_program = false;
-            let next = self
-                .hook_state()
-                .map(|s| self.with_program(self.with_ai(self.with_hook(s))));
+            let next = self.hook_state().map(|s| self.with_ai(self.with_hook(s)));
             return self.set(next);
         }
         if let Some(h) = &mut self.hook
@@ -583,7 +587,7 @@ impl AgentTracker {
             } else {
                 AgentStatus::Idle
             };
-            self.with_program(self.with_ai(self.with_hook(AgentState {
+            self.with_ai(self.with_hook(AgentState {
                 name: d.name.clone(),
                 kind: d.kind.clone(),
                 status,
@@ -594,7 +598,7 @@ impl AgentTracker {
                 hooked: false,
                 topic: None,
                 permission: None,
-            })))
+            }))
         });
         if next.is_none() {
             self.attention_flag = false;

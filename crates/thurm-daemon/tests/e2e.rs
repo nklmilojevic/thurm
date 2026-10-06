@@ -532,6 +532,9 @@ fn agent_hooks_drive_status_and_wait() {
     ));
     let a = agent(&c, pane).unwrap();
     assert_eq!((a.status, a.turns), (AgentStatus::Done, 1));
+    // A hooked turn's notification says how long it took.
+    let (_, body) = next_notification(&rx, pane);
+    assert!(body.starts_with("finished after "), "{body}");
 
     // The session's title (from its transcript) names the pane.
     let transcript = env.dir.join("session.jsonl");
