@@ -4,17 +4,17 @@
 //! the hook's own group is not the agent's. The agent is the nearest ancestor on the pane's
 //! terminal.
 
-/// One process: its group and its terminal's foreground group (`None`: no terminal).
+/// One process: its parent, its group and whether it has a controlling terminal.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Proc {
     ppid: u32,
     pgid: u32,
-    tpgid: Option<u32>,
+    tty: bool,
 }
 
-/// The agent's group: the nearest ancestor (or this process) in its terminal's foreground,
-/// else the nearest one on a terminal (the agent left the foreground before the hook came),
-/// else this process' own group.
+/// The agent's group: that of the nearest ancestor (or this process) on a terminal, else this
+/// process' own. Whether it is in the foreground doesn't matter: a backgrounded agent's shell
+/// is, and is farther up.
 pub fn agent_pgrp() -> u32 {
     let own = unsafe { libc::getpgrp() } as u32;
     pick(ancestry(std::process::id()), own)
@@ -31,11 +31,7 @@ fn ancestry(mut pid: u32) -> Vec<Proc> {
 }
 
 fn pick(chain: Vec<Proc>, own: u32) -> u32 {
-    chain
-        .iter()
-        .find(|p| p.tpgid == Some(p.pgid))
-        .or_else(|| chain.iter().find(|p| p.tpgid.is_some()))
-        .map_or(own, |p| p.pgid)
+    chain.iter().find(|p| p.tty).map_or(own, |p| p.pgid)
 }
 
 #[cfg(target_os = "macos")]
@@ -51,12 +47,11 @@ fn proc_info(pid: u32) -> Option<Proc> {
             size,
         )
     };
-    // No terminal: e_tdev is NODEV and e_tpgid 0.
-    let tty = info.e_tdev != u32::MAX && info.e_tpgid != 0;
     (n == size).then_some(Proc {
         ppid: info.pbi_ppid,
         pgid: info.pbi_pgid,
-        tpgid: tty.then_some(info.e_tpgid),
+        // No terminal: e_tdev is NODEV and e_tpgid 0.
+        tty: info.e_tdev != u32::MAX && info.e_tpgid != 0,
     })
 }
 
@@ -71,12 +66,10 @@ fn proc_info(pid: u32) -> Option<Proc> {
         .take(6)
         .collect();
     let num = |i: usize| f.get(i)?.parse::<i64>().ok();
-    let tty = num(4)? != 0;
-    let tpgid = num(5)?;
     Some(Proc {
         ppid: num(1)? as u32,
         pgid: num(2)? as u32,
-        tpgid: (tty && tpgid > 0).then_some(tpgid as u32),
+        tty: num(4)? != 0 && num(5)? > 0,
     })
 }
 
@@ -89,37 +82,33 @@ fn proc_info(_pid: u32) -> Option<Proc> {
 mod tests {
     use super::*;
 
-    fn p(pgid: u32, tpgid: Option<u32>) -> Proc {
-        Proc {
-            ppid: 0,
-            pgid,
-            tpgid,
-        }
+    fn p(pgid: u32, tty: bool) -> Proc {
+        Proc { ppid: 0, pgid, tty }
     }
 
     #[test]
-    fn detached_hook_resolves_to_the_foreground_agent() {
-        // thurm and `sh -c` in their own session, under claude (group 10) on the terminal.
-        let chain = vec![p(30, None), p(30, None), p(10, Some(10)), p(5, Some(10))];
+    fn detached_hook_resolves_to_the_agent() {
+        // thurm and `sh -c` in their own session, under claude (group 10) and its shell (5).
+        let chain = vec![p(30, false), p(30, false), p(10, true), p(5, true)];
         assert_eq!(pick(chain, 30), 10);
     }
 
     #[test]
     fn hook_in_the_agent_group_keeps_it() {
-        let chain = vec![p(10, Some(10)), p(10, Some(10)), p(5, Some(10))];
+        let chain = vec![p(10, true), p(10, true), p(5, true)];
         assert_eq!(pick(chain, 10), 10);
     }
 
     #[test]
-    fn agent_out_of_the_foreground_is_the_nearest_on_the_terminal() {
-        // `git pull` (group 40) took the foreground before the hook arrived.
-        let chain = vec![p(30, None), p(10, Some(40)), p(5, Some(40))];
+    fn backgrounded_agent_beats_its_foreground_shell() {
+        // The agent (10) was suspended; its shell (5) has the terminal's foreground.
+        let chain = vec![p(30, false), p(10, true), p(5, true)];
         assert_eq!(pick(chain, 30), 10);
     }
 
     #[test]
     fn no_terminal_anywhere_falls_back_to_the_own_group() {
-        assert_eq!(pick(vec![p(30, None)], 30), 30);
+        assert_eq!(pick(vec![p(30, false)], 30), 30);
         assert_eq!(pick(Vec::new(), 30), 30);
     }
 

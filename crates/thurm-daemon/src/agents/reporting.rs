@@ -444,7 +444,7 @@ impl AgentTracker {
             rules.push("foreground hook state overrides screen and output activity".into());
         } else {
             rules.push(
-                if self.title_spun {
+                if self.title_decides() {
                     "the title's spinner decides, output activity is ignored"
                 } else if idle < idle_after {
                     "output is inside the idle interval"
