@@ -79,6 +79,9 @@ pub struct PaneHandoff {
     /// A submitted prompt that has not started a turn.
     #[serde(default)]
     pub agent_prompt: Option<crate::agents::prompt_handoff::PendingPromptHandoff>,
+    /// The hooked agent and its session id (from images that wrote it).
+    #[serde(default)]
+    pub agent_hook: Option<crate::agents::hook_handoff::HookHandoff>,
     /// Restore this size because exec closes the attached terminal connection.
     #[serde(default)]
     pub terminal_size_after_detach: Option<PaneSizeSnap>,
