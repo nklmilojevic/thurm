@@ -41,7 +41,7 @@ xcrun notarytool submit "$SUBMIT" "${AUTH[@]}" --wait --timeout 30m \
     --output-format plist > "$WORK/result.plist" || true
 STATUS="$(result status)"
 ID="$(result id)"
-[[ "$ID" =~ ^[0-9a-fA-F-]{36}$ ]] || ID=""
+[[ "$ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || ID=""
 # The wait timed out while Apple was still processing: keep waiting for the same submission.
 if [[ -z "$STATUS" && -n "$ID" ]]; then
     echo "==> still in progress after 30m, waiting for $ID"
