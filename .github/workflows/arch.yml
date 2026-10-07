@@ -1,8 +1,8 @@
 name: Arch package
 
 # Builds linux/arch/PKGBUILD (the AUR package) from the checkout in an Arch container and
-# installs it, when something it builds or packages changes. A full release build, so not on
-# every pull request.
+# installs it, when something it builds or packages changes on main. A full release build, so
+# pull requests run it only for changes to the packaging.
 on:
   push:
     branches: [main]
@@ -22,22 +22,11 @@ on:
       - Cargo.lock
       - rust-toolchain.toml
       - .github/workflows/arch.yml
+  # On pull requests only when the packaging itself changes; code is covered by CI's tests.
   pull_request:
     paths:
       - linux/**
-      - scripts/linux/**
-      - scripts/third-party-licenses.py
-      - crates/**
-      - vendor/**
-      - shell-integration/**
-      - skills/**
-      - macos/Resources/fonts/**
-      - nix/ghostty-zig-deps.nix
-      - licenses/**
-      - completions/**
-      - Cargo.toml
-      - Cargo.lock
-      - rust-toolchain.toml
+      - scripts/linux/arch-package.sh
       - .github/workflows/arch.yml
 
 permissions:
