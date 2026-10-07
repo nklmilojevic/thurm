@@ -14,9 +14,54 @@ env:
   CARGO_TERM_COLOR: always
 
 # Every action is pinned to a commit (the tag it was taken from is in the comment).
+#
+# A pull request runs the tests of what it changes; main runs everything (Release builds from
+# commits that passed there, and builds the packages itself).
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+      linux-app: ${{ steps.diff.outputs.linux-app }}
+      release-scripts: ${{ steps.diff.outputs.release-scripts }}
+      docs: ${{ steps.diff.outputs.docs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # The pull request's merge commit against its base: what it changes. A rename counts
+          # for both paths, and a failed diff fails the job rather than skipping every suite.
+          files=""
+          if [[ "$EVENT" == pull_request ]]; then
+            files="$(git diff --no-renames --name-only "$BASE" HEAD)"
+          fi
+          area() {
+            if [[ "$EVENT" != pull_request ]] || grep -Eq "$2" <<<"$files"; then
+              echo "$1=true"
+            else
+              echo "$1=false"
+            fi >> "$GITHUB_OUTPUT"
+          }
+          # Everything the crates build, embed or test with, and this workflow.
+          rust='crates/|vendor/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|shell-integration/|completions/|skills/|licenses/|config\.example\.toml$|macos/Resources/fonts/|scripts/third-party-licenses\.py$|scripts/linux/smoke|\.github/workflows/ci\.yml$'
+          area rust "^($rust)"
+          # The Linux app also reads the icons and data in linux/ when run from the checkout.
+          area linux-app "^($rust|linux/(share|icons)/)"
+          area release-scripts '^(macos/build\.sh$|macos/package-dmg\.sh$|macos/release/|\.github/workflows/ci\.yml$)'
+          area docs '^(docs/|config\.example\.toml$|\.github/workflows/ci\.yml$)'
+          cat "$GITHUB_OUTPUT"
+
   rust:
     name: Rust
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     # Thurm ships for Apple silicon only.
     runs-on: macos-26
     steps:
@@ -42,6 +87,8 @@ jobs:
   linux:
     # Remote hosts run the static musl builds of thurm and thurmd (remote workspaces).
     name: Linux (${{ matrix.target }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -66,9 +113,12 @@ jobs:
           version: 0.16.0
       - name: musl and sshd
         run: sudo apt-get update && sudo apt-get install -y musl-tools openssh-server openssh-client
+      # The shipped static binaries: main only (pull requests run the tests below).
       - name: Build
+        if: github.event_name == 'push'
         run: cargo build --release --locked --target ${{ matrix.target }} -p thurm-cli -p thurm-daemon
       - name: Static
+        if: github.event_name == 'push'
         run: |
           for b in thurm thurmd; do
             file "target/${{ matrix.target }}/release/$b"
@@ -89,6 +139,8 @@ jobs:
   linux-app:
     # The Linux app (crates/thurm-gtk, GTK 4 + libadwaita), and a headless run of it.
     name: Linux app (${{ matrix.runner }})
+    needs: changes
+    if: needs.changes.outputs.linux-app == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -180,6 +232,8 @@ jobs:
 
   release-scripts:
     name: Release scripts
+    needs: changes
+    if: needs.changes.outputs.release-scripts == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -193,6 +247,8 @@ jobs:
 
   docs:
     name: Documentation
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:

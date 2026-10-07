@@ -1,12 +1,13 @@
 name: Nix
 
-# The flake's package (`nix build .#thurm`), built when what it depends on changes.
+# The flake's package (`nix build .#thurm`), built on main when what it depends on changes, and
+# on pull requests that change the flake, its Nix files or the locked dependencies.
 on:
   push:
     branches: [main]
     paths: [flake.nix, flake.lock, 'nix/**', Cargo.toml, Cargo.lock, 'crates/**', 'vendor/**', 'shell-integration/**', 'completions/**', rust-toolchain.toml, .github/workflows/nix.yml]
   pull_request:
-    paths: [flake.nix, flake.lock, 'nix/**', Cargo.toml, Cargo.lock, 'crates/**', 'vendor/**', 'shell-integration/**', 'completions/**', rust-toolchain.toml, .github/workflows/nix.yml]
+    paths: [flake.nix, flake.lock, 'nix/**', Cargo.lock, rust-toolchain.toml, .github/workflows/nix.yml]
 
 permissions:
   contents: read
