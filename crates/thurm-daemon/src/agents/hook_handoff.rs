@@ -5,6 +5,8 @@
 //! last session here" (`claude --continue`), which is another pane's when they share a
 //! directory.
 
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 use thurm_proto::AgentStatus;
 
@@ -19,7 +21,10 @@ pub struct HookHandoff {
     session_id: Option<String>,
     message: Option<String>,
     turn_ms: Option<u64>,
+    /// How long the turn running at the handoff had been going.
+    turn_elapsed_ms: Option<u64>,
     turns: u32,
+    answered: bool,
     transcript: Option<String>,
     pgrp: u32,
     birth: u64,
@@ -36,7 +41,11 @@ impl AgentTracker {
             session_id: h.session_id.clone(),
             message: h.message.clone(),
             turn_ms: h.turn_ms,
+            turn_elapsed_ms: h
+                .turn_started
+                .map(|at| at.elapsed().as_millis().min(u64::MAX as u128) as u64),
             turns: h.turns,
+            answered: h.answered,
             transcript: h
                 .transcript
                 .as_ref()
@@ -65,14 +74,20 @@ impl AgentTracker {
             status: saved.status,
             session_id: saved.session_id,
             message: saved.message,
-            turn_started: None,
+            turn_started: saved
+                .turn_elapsed_ms
+                .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms))),
             turn_ms: saved.turn_ms,
             turns: saved.turns,
             transcript,
-            answered: false,
+            answered: saved.answered,
             pgrp: Some(saved.pgrp),
             permission: None,
         });
+        // Published now: a snapshot before the next monitor tick must have the session.
+        if !self.public_report_active() {
+            self.refresh();
+        }
     }
 }
 
@@ -105,6 +120,72 @@ mod tests {
         new.restore_hook_handoff(saved);
         assert_eq!(new.session_id(), Some("abc-123"));
         assert_eq!(new.hook_handoff(), old.hook_handoff());
+    }
+
+    fn handed_off(old: &AgentTracker) -> AgentTracker {
+        let saved = old.hook_handoff().expect("handoff");
+        let saved: HookHandoff =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        let mut new = AgentTracker::default();
+        new.saw_foreground(Some(own_pgrp()));
+        new.restore_hook_handoff(saved);
+        new
+    }
+
+    #[test]
+    fn the_restored_session_is_published_at_once() {
+        let pgrp = own_pgrp();
+        let mut old = AgentTracker::default();
+        old.apply_hook(
+            Some(pgrp),
+            "claude",
+            "Claude Code",
+            "session-start",
+            Some("abc-123".into()),
+            None,
+        );
+        // No monitor tick or hook after the handoff.
+        let new = handed_off(&old);
+        let state = new.state().expect("hooked agent");
+        assert_eq!(state.session_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn a_turn_across_the_handoff_keeps_its_duration() {
+        let pgrp = own_pgrp();
+        let mut old = AgentTracker::default();
+        old.apply_hook(
+            Some(pgrp),
+            "claude",
+            "Claude Code",
+            "prompt-submit",
+            Some("abc-123".into()),
+            None,
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let mut new = handed_off(&old);
+        new.apply_hook(Some(pgrp), "claude", "Claude Code", "stop", None, None);
+        let turn_ms = new.hook.as_ref().and_then(|h| h.turn_ms);
+        assert!(turn_ms.is_some_and(|ms| ms >= 50), "{turn_ms:?}");
+    }
+
+    #[test]
+    fn an_answered_request_stays_answered() {
+        let pgrp = own_pgrp();
+        let mut old = AgentTracker::default();
+        old.apply_hook(
+            Some(pgrp),
+            "claude",
+            "Claude Code",
+            "permission-prompt",
+            Some("abc-123".into()),
+            Some("Allow?".into()),
+        );
+        old.user_answer(b"\r");
+        assert!(old.hook.as_ref().is_some_and(|h| h.answered));
+        let new = handed_off(&old);
+        let h = new.hook.as_ref().expect("hook");
+        assert_eq!((h.answered, h.status), (true, AgentStatus::Working));
     }
 
     #[test]

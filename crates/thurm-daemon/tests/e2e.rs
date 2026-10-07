@@ -1977,17 +1977,18 @@ fn hooked_session_survives_in_place_upgrade() {
     wait_agent(&c, pane, "claude");
     upgrade_in_place(&env, &daemon, c);
     let (c, _) = env.connect();
-    // An idle agent sends no hook after the upgrade: its session must come along.
-    let a = agent(&c, pane).expect("hooked agent after the upgrade");
-    assert_eq!(
-        (a.status, a.session_id.as_deref()),
-        (AgentStatus::Done, Some("sess-42"))
-    );
+    // An idle agent sends no hook after the upgrade: its session must come along, and be
+    // saved even before the first monitor tick.
     c.request(Request::SaveSnapshot).unwrap();
     let snapshot: serde_json::Value =
         serde_json::from_slice(&std::fs::read(env.dir.join("state/session.json")).unwrap())
             .unwrap();
     assert_eq!(snapshot["panes"][0]["agent_session"], "sess-42");
+    let a = agent(&c, pane).expect("hooked agent after the upgrade");
+    assert_eq!(
+        (a.status, a.session_id.as_deref()),
+        (AgentStatus::Done, Some("sess-42"))
+    );
 }
 
 #[test]
