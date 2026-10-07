@@ -1268,6 +1268,8 @@ fn in_place_upgrade_loses_no_output() {
     let daemon = env.start();
     let (c, _events) = env.connect();
     let pane = create(&c, &env.dir);
+    // Typed before the prompt, the input is echoed first and the prompt lands ahead of line-1.
+    wait_match(&c, pane, r"\$");
     // 4000 numbered lines in bursts, with the upgrade in the middle of them.
     c.request(Request::Input {
         pane,
