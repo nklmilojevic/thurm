@@ -33,11 +33,23 @@ if [[ "$TARGET" == *.app ]]; then
     ditto -c -k --sequesterRsrc --keepParent "$TARGET" "$SUBMIT"
 fi
 
+# A key of the last notarytool result, empty when it has none (or the result is no plist).
+result() { plutil -extract "$1" raw -o - "$WORK/result.plist" 2>/dev/null || true; }
+
 echo "==> notarytool submit $(basename "$TARGET")"
 xcrun notarytool submit "$SUBMIT" "${AUTH[@]}" --wait --timeout 30m \
     --output-format plist > "$WORK/result.plist" || true
-STATUS="$(/usr/libexec/PlistBuddy -c 'Print status' "$WORK/result.plist" 2>/dev/null || echo unknown)"
-ID="$(/usr/libexec/PlistBuddy -c 'Print id' "$WORK/result.plist" 2>/dev/null || true)"
+STATUS="$(result status)"
+ID="$(result id)"
+[[ "$ID" =~ ^[0-9a-fA-F-]{36}$ ]] || ID=""
+# The wait timed out while Apple was still processing: keep waiting for the same submission.
+if [[ -z "$STATUS" && -n "$ID" ]]; then
+    echo "==> still in progress after 30m, waiting for $ID"
+    xcrun notarytool wait "$ID" "${AUTH[@]}" --timeout 45m \
+        --output-format plist > "$WORK/result.plist" || true
+    STATUS="$(result status)"
+fi
+STATUS="${STATUS:-unknown}"
 if [[ "$STATUS" != Accepted ]]; then
     cat "$WORK/result.plist" >&2 || true
     if [[ -n "$ID" ]]; then
