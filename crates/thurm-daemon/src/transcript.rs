@@ -57,6 +57,10 @@ impl TitleReader {
         self.path.as_os_str() == path
     }
 
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// The session's title: the user's `/rename` name, else the generated one.
     pub fn title(&self) -> Option<&str> {
         self.custom.as_deref().or(self.ai.as_deref())

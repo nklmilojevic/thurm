@@ -1658,6 +1658,7 @@ impl Daemon {
                 shell_path: st.term.shell_path().map(str::to_owned),
                 agent_report: st.agent.report_handoff(),
                 agent_prompt: st.agent.pending_prompt_handoff(),
+                agent_hook: st.agent.hook_handoff(),
                 terminal_size_after_detach: st.terminal_attachment.map(|(_, size)| size.into()),
                 programs: st.term.program_status_handoff(),
             });
@@ -1741,6 +1742,9 @@ impl Daemon {
                         if let Some(report) = p.agent_report {
                             st.agent.restore_report_handoff(report);
                         }
+                        if let Some(hook) = p.agent_hook {
+                            st.agent.restore_hook_handoff(hook);
+                        }
                         if let Some(prompt) = p.agent_prompt {
                             st.agent.restore_pending_prompt(prompt);
                         }
@@ -1814,11 +1818,31 @@ impl Daemon {
                             .agent
                             .as_ref()
                             .and_then(|k| defs.iter().find(|d| &d.kind == k));
+                        // "The last one here" is only this pane's while no other pane ran
+                        // the same agent in the same directory.
+                        let shared = snap
+                            .panes
+                            .iter()
+                            .filter(|o| o.agent == p.agent && o.cwd == p.cwd)
+                            .count()
+                            > 1;
                         // The exact session when hooks reported one, else "the last one here".
                         let resume =
                             def.and_then(|d| match (&d.resume_session, &p.agent_session) {
                                 (Some(cmd), Some(id)) => {
                                     Some(cmd.iter().map(|a| a.replace("{session}", id)).collect())
+                                }
+                                _ if shared => {
+                                    if d.resume.is_some()
+                                        && let Some(pane) = self.pane(id)
+                                    {
+                                        pane.state.lock().term.print(&format!(
+                                            "\r\n[{} not resumed: its session is unknown and \
+                                             other panes ran it here]\r\n",
+                                            d.name
+                                        ));
+                                    }
+                                    None
                                 }
                                 _ => d.resume.clone(),
                             });

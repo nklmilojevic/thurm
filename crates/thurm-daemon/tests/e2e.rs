@@ -1904,22 +1904,7 @@ fn agent_reporting_survives_in_place_upgrade() {
         report: report.clone(),
     })
     .unwrap();
-    let mut request_path = env.socket.as_os_str().to_owned();
-    request_path.push(".upgrade");
-    std::fs::write(PathBuf::from(request_path), env!("CARGO_BIN_EXE_thurmd")).unwrap();
-    assert_eq!(
-        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR2) },
-        0
-    );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while c.is_alive() {
-        assert!(
-            Instant::now() < deadline,
-            "upgrade did not close the connection"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    drop(c);
+    upgrade_in_place(&env, &daemon, c);
     let (c, _) = env.connect();
     assert_eq!(agent(&c, pane).unwrap().status, AgentStatus::Working);
     report.sequence = 8;
@@ -1942,6 +1927,115 @@ fn agent_reporting_survives_in_place_upgrade() {
     report.sequence = 10;
     c.request(Request::AgentReport { pane, report }).unwrap();
     assert_eq!(agent(&c, pane).unwrap().status, AgentStatus::Done);
+}
+
+/// Wait until the pane's agent is `kind` (the monitor ticks every 500 ms).
+fn wait_agent(c: &Client, pane: PaneId, kind: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while agent(c, pane).is_none_or(|a| a.kind != kind) {
+        assert!(
+            Instant::now() < deadline,
+            "{kind} never showed up in pane {pane}: {:?}",
+            agent(c, pane)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn upgrade_in_place(env: &Env, daemon: &Daemon, c: Arc<Client>) {
+    let mut request_path = env.socket.as_os_str().to_owned();
+    request_path.push(".upgrade");
+    std::fs::write(PathBuf::from(request_path), env!("CARGO_BIN_EXE_thurmd")).unwrap();
+    assert_eq!(
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR2) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.is_alive() {
+        assert!(
+            Instant::now() < deadline,
+            "upgrade did not close the connection"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn hooked_session_survives_in_place_upgrade() {
+    let env = Env::new("hook-upgrade");
+    let daemon = env.start();
+    let (c, _) = env.connect();
+    let pane = create(&c, &env.dir);
+    c.request(Request::Input {
+        pane,
+        data: b"/bin/cat\r".to_vec(),
+    })
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    hook(&c, pane, "session-start", Some("sess-42"));
+    hook(&c, pane, "stop", None);
+    wait_agent(&c, pane, "claude");
+    upgrade_in_place(&env, &daemon, c);
+    let (c, _) = env.connect();
+    // An idle agent sends no hook after the upgrade: its session must come along.
+    let a = agent(&c, pane).expect("hooked agent after the upgrade");
+    assert_eq!(
+        (a.status, a.session_id.as_deref()),
+        (AgentStatus::Done, Some("sess-42"))
+    );
+    c.request(Request::SaveSnapshot).unwrap();
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(env.dir.join("state/session.json")).unwrap())
+            .unwrap();
+    assert_eq!(snapshot["panes"][0]["agent_session"], "sess-42");
+}
+
+#[test]
+fn restore_resumes_the_last_session_only_where_it_is_unambiguous() {
+    let env = Env::new("resume-shared");
+    std::fs::write(
+        env.dir.join("config/config.toml"),
+        r#"
+        [terminal]
+        shell = ["/bin/sh"]
+        [[agents.define]]
+        kind = "claude"
+        name = "Claude Code"
+        processes = ["cat"]
+        resume = ["echo", "RESUMED-LAST"]
+        resume_session = ["echo", "RESUMED-{session}"]
+        "#,
+    )
+    .unwrap();
+    let alone = env.dir.join("alone");
+    std::fs::create_dir_all(&alone).unwrap();
+    let mut daemon = env.start();
+    let (c, _) = env.connect();
+    let hooked = create(&c, &env.dir);
+    let unknown = create(&c, &env.dir);
+    let single = create(&c, &alone);
+    for pane in [hooked, unknown, single] {
+        c.request(Request::Input {
+            pane,
+            data: b"/bin/cat\r".to_vec(),
+        })
+        .unwrap();
+        wait_agent(&c, pane, "claude");
+    }
+    hook(&c, hooked, "session-start", Some("sess-42"));
+    c.request(Request::Shutdown { kill_panes: true }).unwrap();
+    daemon.wait_exit();
+    drop(c);
+
+    let _restored = env.start();
+    let (c, _) = env.connect();
+    wait_match(&c, hooked, "RESUMED-sess-42");
+    wait_match(&c, single, "RESUMED-LAST");
+    // "The last one here" would be the hooked pane's session, a second time.
+    wait_match(&c, unknown, "not resumed");
+    std::thread::sleep(Duration::from_millis(3000));
+    let text = capture(&c, unknown);
+    assert!(!text.contains("RESUMED"), "{text}");
 }
 
 /// Run only inside the pane created by the owner-exit test.
