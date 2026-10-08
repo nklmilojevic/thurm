@@ -8,7 +8,7 @@
     "preview": "astro preview"
   },
   "dependencies": {
-    "@astrojs/starlight": "0.42.5",
+    "@astrojs/starlight": "0.42.6",
     "@catppuccin/starlight": "2.1.0",
     "@fontsource-variable/geist": "5.3.0",
     "@fontsource-variable/jetbrains-mono": "5.3.0",
