@@ -99,11 +99,7 @@ pub fn update_badge(app: &App) {
         .infos
         .borrow()
         .iter()
-        .filter(|(_, i)| {
-            i.agent
-                .as_ref()
-                .is_some_and(|a| a.status == AgentStatus::NeedsInput)
-        })
+        .filter(|(_, i)| i.agent.as_ref().is_some_and(|a| a.status == AgentStatus::NeedsInput))
         .map(|(k, _)| k.clone())
         .collect();
     let active = app.win().is_some_and(|w| w.window.is_active());

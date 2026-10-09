@@ -292,14 +292,8 @@ impl Sidebar {
                 }
             }
             *self.agent_keys.borrow_mut() = agents.iter().map(|a| a.key.clone()).collect();
-            let waiting = agents
-                .iter()
-                .filter(|a| a.status == Some(AgentStatus::NeedsInput))
-                .count();
-            let working = agents
-                .iter()
-                .filter(|a| a.status == Some(AgentStatus::Working))
-                .count();
+            let waiting = agents.iter().filter(|a| a.status == Some(AgentStatus::NeedsInput)).count();
+            let working = agents.iter().filter(|a| a.status == Some(AgentStatus::Working)).count();
             let mut parts = Vec::new();
             if waiting > 0 {
                 parts.push(format!("{waiting} waiting"));
@@ -332,9 +326,7 @@ impl Sidebar {
         let weak = Rc::downgrade(tab);
         let r = row.downgrade();
         click.connect_pressed(move |_, _, x, y| {
-            let (Some(tab), Some(row)) = (weak.upgrade(), r.upgrade()) else {
-                return;
-            };
+            let (Some(tab), Some(row)) = (weak.upgrade(), r.upgrade()) else { return };
             app::with_app(|a| a.set_menu_tab(&tab));
             let menu = gio::Menu::new();
             menu.append(Some("Close Tab"), Some("app.close_menu_tab"));
@@ -365,12 +357,8 @@ impl Sidebar {
         let weak = Rc::downgrade(tab);
         let r = row.downgrade();
         drop.connect_drop(move |_, value, _, y| {
-            let (Some(tab), Some(row)) = (weak.upgrade(), r.upgrade()) else {
-                return false;
-            };
-            let Ok(from) = value.get::<u32>() else {
-                return false;
-            };
+            let (Some(tab), Some(row)) = (weak.upgrade(), r.upgrade()) else { return false };
+            let Ok(from) = value.get::<u32>() else { return false };
             let after = y > row.height() as f64 / 2.0;
             app::with_app(|a| a.move_tab(from as usize, &tab, after));
             true
@@ -386,12 +374,9 @@ fn selected_tab_row(groups: &[Group], collapsed: &[String]) -> Option<usize> {
             let header = g.name.is_some();
             let is_collapsed = g.name.as_ref().is_some_and(|n| collapsed.contains(n));
             // A collapsed group still has a visible header row.
-            std::iter::once(false).filter(move |_| header).chain(
-                g.rows
-                    .iter()
-                    .filter(move |_| !is_collapsed)
-                    .map(|r| r.selected),
-            )
+            std::iter::once(false)
+                .filter(move |_| header)
+                .chain(g.rows.iter().filter(move |_| !is_collapsed).map(|r| r.selected))
         })
         .position(|s| s)
 }
@@ -403,13 +388,9 @@ fn dot(status: Option<AgentStatus>) -> gtk::Box {
     d.set_size_request(8, 8);
     if let Some(s) = status {
         let provider = gtk::CssProvider::new();
-        provider.load_from_string(&format!(
-            ".thurm-dot {{ background-color: {}; }}",
-            model::status_color(s)
-        ));
+        provider.load_from_string(&format!(".thurm-dot {{ background-color: {}; }}", model::status_color(s)));
         #[allow(deprecated)]
-        d.style_context()
-            .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        d.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
     d
 }
@@ -495,29 +476,20 @@ mod tests {
             group(Some("home-ops"), &[false, false, true]),
         ];
         // Both headers remain visible above the selected tab.
-        assert_eq!(
-            selected_tab_row(&groups, &["registry".into(), "hosting".into()]),
-            Some(5)
-        );
+        assert_eq!(selected_tab_row(&groups, &["registry".into(), "hosting".into()]), Some(5));
         assert_eq!(selected_tab_row(&groups, &["registry".into()]), Some(6));
         assert_eq!(selected_tab_row(&groups, &[]), Some(8));
     }
 
     #[test]
     fn selection_before_collapsed_group_does_not_move() {
-        let groups = [
-            group(Some("first"), &[false, true]),
-            group(Some("last"), &[false]),
-        ];
+        let groups = [group(Some("first"), &[false, true]), group(Some("last"), &[false])];
         assert_eq!(selected_tab_row(&groups, &["last".into()]), Some(2));
     }
 
     #[test]
     fn hidden_selection_has_no_visible_row() {
-        let groups = [
-            group(Some("hidden"), &[true]),
-            group(Some("visible"), &[false]),
-        ];
+        let groups = [group(Some("hidden"), &[true]), group(Some("visible"), &[false])];
         assert_eq!(selected_tab_row(&groups, &["hidden".into()]), None);
     }
 

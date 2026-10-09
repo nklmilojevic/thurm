@@ -251,19 +251,12 @@ impl Tab {
         let focused = self.focused.borrow().clone();
         let multiple = frames.len() > 1;
         for k in &keys {
-            let Some(view) = app::with_app(|a| a.view(k)).flatten() else {
-                continue;
-            };
+            let Some(view) = app::with_app(|a| a.view(k)).flatten() else { continue };
             match frames.iter().find(|(f, _)| f == k) {
                 Some((_, r)) => {
                     view.root.set_child_visible(true);
                     view.root.size_allocate(
-                        &gtk::Allocation::new(
-                            r.x as i32,
-                            r.y as i32,
-                            r.w.max(1.0) as i32,
-                            r.h.max(1.0) as i32,
-                        ),
+                        &gtk::Allocation::new(r.x as i32, r.y as i32, r.w.max(1.0) as i32, r.h.max(1.0) as i32),
                         -1,
                     );
                     view.set_dimmed(multiple && *k != focused);
@@ -273,30 +266,15 @@ impl Tab {
         }
         for (wdg, d) in self.dividers.borrow().iter() {
             let r = match d.axis {
-                model::Axis::Horizontal => Rect::new(
-                    d.line.x - HIT_SLOP,
-                    d.line.y,
-                    d.line.w + 2.0 * HIT_SLOP,
-                    d.line.h,
-                ),
-                model::Axis::Vertical => Rect::new(
-                    d.line.x,
-                    d.line.y - HIT_SLOP,
-                    d.line.w,
-                    d.line.h + 2.0 * HIT_SLOP,
-                ),
+                model::Axis::Horizontal => Rect::new(d.line.x - HIT_SLOP, d.line.y, d.line.w + 2.0 * HIT_SLOP, d.line.h),
+                model::Axis::Vertical => Rect::new(d.line.x, d.line.y - HIT_SLOP, d.line.w, d.line.h + 2.0 * HIT_SLOP),
             };
             wdg.set_cursor_from_name(Some(match d.axis {
                 model::Axis::Horizontal => "col-resize",
                 model::Axis::Vertical => "row-resize",
             }));
             wdg.size_allocate(
-                &gtk::Allocation::new(
-                    r.x as i32,
-                    r.y as i32,
-                    r.w.max(1.0) as i32,
-                    r.h.max(1.0) as i32,
-                ),
+                &gtk::Allocation::new(r.x as i32, r.y as i32, r.w.max(1.0) as i32, r.h.max(1.0) as i32),
                 -1,
             );
         }
@@ -335,9 +313,7 @@ impl Tab {
         });
         let dw = d.downgrade();
         drag.connect_drag_update(move |_, ox, oy| {
-            let (Some(t), Some(d)) = (weak.upgrade(), dw.upgrade()) else {
-                return;
-            };
+            let (Some(t), Some(d)) = (weak.upgrade(), dw.upgrade()) else { return };
             let (sx, sy) = start.get();
             let (px, py) = (sx + ox, sy + oy);
             let found = t
@@ -401,9 +377,7 @@ impl Tab {
         let key = self.focused.borrow().clone();
         let resp = app::with_app(|a| {
             a.core(&key.host).map(|c| {
-                c.request(
-                    &json!({"Search": {"pane": key.id, "query": query, "direction": direction}}),
-                )
+                c.request(&json!({"Search": {"pane": key.id, "query": query, "direction": direction}}))
             })
         })
         .flatten()
@@ -412,9 +386,7 @@ impl Tab {
             .pointer("/Search/found")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        self.find
-            .status
-            .set_text(if found { "" } else { "No matches" });
+        self.find.status.set_text(if found { "" } else { "No matches" });
         app::with_app(|a| {
             if let Some(v) = a.view(&key) {
                 v.area.queue_draw();
@@ -426,9 +398,7 @@ impl Tab {
         let key = self.focused.borrow().clone();
         app::with_app(|a| {
             if let Some(c) = a.core(&key.host) {
-                c.send(
-                    &json!({"Search": {"pane": key.id, "query": null, "direction": "Backward"}}),
-                );
+                c.send(&json!({"Search": {"pane": key.id, "query": null, "direction": "Backward"}}));
             }
             if let Some(v) = a.view(&key) {
                 v.area.queue_draw();

@@ -22,11 +22,7 @@ pub struct Item {
 }
 
 impl Item {
-    pub fn new(
-        title: impl Into<String>,
-        detail: impl Into<String>,
-        action: impl Fn() + 'static,
-    ) -> Item {
+    pub fn new(title: impl Into<String>, detail: impl Into<String>, action: impl Fn() + 'static) -> Item {
         Item {
             title: title.into(),
             detail: detail.into(),
@@ -122,11 +118,7 @@ pub fn show(
             gdk::Key::Down | gdk::Key::Up => {
                 let i = l.selected_row().map_or(0, |r| r.index());
                 let n = OPEN.with(|o| o.borrow().as_ref().map_or(0, |o| o.shown.len())) as i32;
-                let next = if key == gdk::Key::Down {
-                    (i + 1).min(n - 1)
-                } else {
-                    (i - 1).max(0)
-                };
+                let next = if key == gdk::Key::Down { (i + 1).min(n - 1) } else { (i - 1).max(0) };
                 select(&l, next);
                 glib::Propagation::Stop
             }
@@ -142,9 +134,7 @@ pub fn show(
                 let i = l.selected_row().map_or(-1, |r| r.index());
                 let rename = OPEN.with(|o| {
                     o.borrow().as_ref().and_then(|o| {
-                        o.shown
-                            .get(i as usize)
-                            .and_then(|&j| o.items[j].rename.clone())
+                        o.shown.get(i as usize).and_then(|&j| o.items[j].rename.clone())
                     })
                 });
                 if let Some(r) = rename {

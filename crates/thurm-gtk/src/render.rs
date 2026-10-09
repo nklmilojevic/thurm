@@ -98,9 +98,7 @@ impl Snapshot {
                     }
                 }
                 None => {
-                    let ch = char::from_u32(cell.ch)
-                        .filter(|ch| *ch > ' ')
-                        .unwrap_or(' ');
+                    let ch = char::from_u32(cell.ch).filter(|ch| *ch > ' ').unwrap_or(' ');
                     text.push(ch);
                     map.push(c as u16);
                 }
@@ -189,12 +187,7 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    pub fn new(
-        ctx: &pango::Context,
-        cfg: &thurm_config::Config,
-        features: &[String],
-        size: f64,
-    ) -> Fonts {
+    pub fn new(ctx: &pango::Context, cfg: &thurm_config::Config, features: &[String], size: f64) -> Fonts {
         let font = &cfg.font;
         let mut cascade: Vec<String> = vec![font.family.clone()];
         cascade.extend(font.fallback.iter().cloned());
@@ -219,20 +212,10 @@ impl Fonts {
         };
         let descs = [
             face(None, pango::Weight::Normal, pango::Style::Normal),
+            face(font.family_bold.as_ref(), pango::Weight::Bold, pango::Style::Normal),
+            face(font.family_italic.as_ref(), pango::Weight::Normal, pango::Style::Italic),
             face(
-                font.family_bold.as_ref(),
-                pango::Weight::Bold,
-                pango::Style::Normal,
-            ),
-            face(
-                font.family_italic.as_ref(),
-                pango::Weight::Normal,
-                pango::Style::Italic,
-            ),
-            face(
-                font.family_bold_italic
-                    .as_ref()
-                    .or(font.family_bold.as_ref()),
+                font.family_bold_italic.as_ref().or(font.family_bold.as_ref()),
                 pango::Weight::Bold,
                 pango::Style::Italic,
             ),
@@ -255,21 +238,15 @@ impl Fonts {
         let letter_spacing = font.letter_spacing.clamp(-20.0, 100.0);
         let cell_w = (advance + letter_spacing).round().max(1.0);
         let natural = ascent + descent;
-        let cell_h = (natural.ceil() * font.line_height.clamp(0.5, 4.0))
-            .ceil()
-            .max(1.0);
+        let cell_h = (natural.ceil() * font.line_height.clamp(0.5, 4.0)).ceil().max(1.0);
         let top_pad = (cell_h - natural) / 2.0;
         let baseline = (top_pad + ascent).round().clamp(1.0, cell_h - 1.0);
         let line = (metrics.underline_thickness() as f64 / s).round().max(1.0);
-        let mut underline_offset = (-(metrics.underline_position() as f64) / s)
-            .round()
-            .max(1.0);
+        let mut underline_offset = (-(metrics.underline_position() as f64) / s).round().max(1.0);
         if baseline + underline_offset + line > cell_h {
             underline_offset = (cell_h - baseline - line).max(0.0);
         }
-        let strike_offset = (metrics.strikethrough_position() as f64 / s)
-            .round()
-            .max(1.0);
+        let strike_offset = (metrics.strikethrough_position() as f64 / s).round().max(1.0);
 
         Fonts {
             cell_w,
@@ -294,11 +271,7 @@ impl Fonts {
             return Some(id);
         }
         let scaled = font.downcast_ref::<pangocairo::Font>()?.scaled_font()?;
-        let family = font
-            .describe()
-            .family()
-            .map(|f| f.to_string())
-            .unwrap_or_default();
+        let family = font.describe().family().map(|f| f.to_string()).unwrap_or_default();
         let mut fonts = self.fonts.borrow_mut();
         fonts.push(FontEntry {
             scaled,
@@ -332,11 +305,7 @@ impl Fonts {
             key.push(
                 scalar
                     | (((cell.flags & 3) as u32) << 21)
-                    | if cell.flags & FLAG_WIDE != 0 {
-                        1 << 23
-                    } else {
-                        0
-                    },
+                    | if cell.flags & FLAG_WIDE != 0 { 1 << 23 } else { 0 },
             );
             if let Some(s) = cl {
                 cluster_text.push((c as u16, s));
@@ -357,12 +326,7 @@ impl Fonts {
             return hit;
         }
 
-        let cluster_at = |c: u16| {
-            cluster_text
-                .iter()
-                .find(|(cc, _)| *cc == c)
-                .map(|(_, s)| s.as_str())
-        };
+        let cluster_at = |c: u16| cluster_text.iter().find(|(cc, _)| *cc == c).map(|(_, s)| s.as_str());
         let mut out = Vec::new();
         // Style runs: spaces never break a run (ligatures may span them).
         let mut text = String::new();
@@ -376,15 +340,14 @@ impl Fonts {
                     && cluster_at((c + 1) as u16).is_none()
             })
         };
-        let mut flush =
-            |text: &mut String, map: &mut Vec<u16>, space: &mut Vec<bool>, style: u16| {
-                if !text.is_empty() && space.iter().any(|s| !s) {
-                    self.shape_run(text, map, space, style, &blank_after, &mut out);
-                }
-                text.clear();
-                map.clear();
-                space.clear();
-            };
+        let mut flush = |text: &mut String, map: &mut Vec<u16>, space: &mut Vec<bool>, style: u16| {
+            if !text.is_empty() && space.iter().any(|s| !s) {
+                self.shape_run(text, map, space, style, &blank_after, &mut out);
+            }
+            text.clear();
+            map.clear();
+            space.clear();
+        };
         for (c, cell) in cells.iter().enumerate() {
             if cell.flags & FLAG_WIDE_SPACER != 0 {
                 continue;
@@ -437,9 +400,7 @@ impl Fonts {
         layout.set_attributes(Some(&self.attrs));
         layout.set_single_paragraph_mode(true);
         layout.set_text(text);
-        let Some(line) = layout.line_readonly(0) else {
-            return;
-        };
+        let Some(line) = layout.line_readonly(0) else { return };
         let s = pango::SCALE as f64;
         let mut pen = 0.0;
         let mut cluster_start: HashMap<u16, f64> = HashMap::new();
@@ -644,16 +605,8 @@ pub fn paint(
     images: &mut ImageCache,
 ) {
     let info = &snap.info;
-    let default_bg = if snap.valid {
-        info.background
-    } else {
-        p.theme_bg
-    };
-    let default_fg = if snap.valid {
-        info.foreground
-    } else {
-        p.theme_fg
-    };
+    let default_bg = if snap.valid { info.background } else { p.theme_bg };
+    let default_fg = if snap.valid { info.foreground } else { p.theme_fg };
     let _ = cr.save();
     cr.set_operator(cairo::Operator::Source);
     rgba(cr, default_bg, p.opacity);
@@ -743,13 +696,7 @@ fn paint_grid(
                 c += 1;
             }
             rgb(cr, bg);
-            fill(
-                cr,
-                p.pad_x + start as f64 * cw,
-                y,
-                (c - start) as f64 * cw,
-                ch,
-            );
+            fill(cr, p.pad_x + start as f64 * cw, y, (c - start) as f64 * cw, ch);
         }
     }
 
@@ -763,18 +710,10 @@ fn paint_grid(
         && ccol < cols
         && (p.cursor_on || !p.focused)
         && p.preedit.is_none_or(|s| s.is_empty());
-    let shape = if p.focused {
-        info.cursor_shape
-    } else {
-        CURSOR_HOLLOW
-    };
+    let shape = if p.focused { info.cursor_shape } else { CURSOR_HOLLOW };
     let cursor_cell = snap.cell(crow, ccol).copied().unwrap_or_default();
     let cursor_color = if info.cursor_color & NO_COLOR != 0 {
-        if cursor_cell.fg & NO_COLOR != 0 {
-            info.foreground
-        } else {
-            foreground_of(&cursor_cell, info)
-        }
+        if cursor_cell.fg & NO_COLOR != 0 { info.foreground } else { foreground_of(&cursor_cell, info) }
     } else {
         info.cursor_color
     };
@@ -886,11 +825,7 @@ fn paint_grid(
             }
             let fg = text_color(src.row, c, cell);
             let x = p.pad_x + c as f64 * cw;
-            let width = if cell.flags & FLAG_WIDE != 0 {
-                2.0 * cw
-            } else {
-                cw
-            };
+            let width = if cell.flags & FLAG_WIDE != 0 { 2.0 * cw } else { cw };
             if style != 0 {
                 let color = if cell.ul & NO_COLOR != 0 { fg } else { cell.ul };
                 rgb(cr, color);
@@ -963,25 +898,15 @@ fn underline(cr: &cairo::Context, fonts: &Fonts, style: u8, x: f64, y: f64, widt
             let mid = top + h / 2.0;
             cr.set_line_width(t);
             let mut px = x;
-            cr.move_to(
-                px,
-                mid + amp * (std::f64::consts::TAU * px / fonts.cell_w).sin(),
-            );
+            cr.move_to(px, mid + amp * (std::f64::consts::TAU * px / fonts.cell_w).sin());
             while px < x + width {
                 px = (px + 1.0).min(x + width);
-                cr.line_to(
-                    px,
-                    mid + amp * (std::f64::consts::TAU * px / fonts.cell_w).sin(),
-                );
+                cr.line_to(px, mid + amp * (std::f64::consts::TAU * px / fonts.cell_w).sin());
             }
             let _ = cr.stroke();
         }
         4 | 5 => {
-            let dash = if style == 4 {
-                t
-            } else {
-                (0.4 * fonts.cell_w).max(2.0)
-            };
+            let dash = if style == 4 { t } else { (0.4 * fonts.cell_w).max(2.0) };
             // Phase from the absolute x, so patterns continue across cells.
             let mut px = x - (x % (2.0 * dash));
             while px < x + width {
@@ -1015,10 +940,7 @@ fn paint_symbol(cr: &cairo::Context, fonts: &Fonts, g: &ShapedGlyph, x: f64, y: 
     let tx = x + (box_w - w) / 2.0;
     let ty = y + (box_h - h) / 2.0;
     let _ = cr.save();
-    cr.translate(
-        tx - ink.x() as f64 / s * scale,
-        ty - ink.y() as f64 / s * scale,
-    );
+    cr.translate(tx - ink.x() as f64 / s * scale, ty - ink.y() as f64 / s * scale);
     cr.scale(scale, scale);
     cr.set_scaled_font(&entry.scaled);
     rgb(cr, color);
@@ -1035,9 +957,7 @@ fn paint_images(
     layer: impl Fn(i32) -> bool,
 ) {
     for pl in snap.images.iter().filter(|pl| layer(pl.z)) {
-        let Some(entry) = images.get_mut(&pl.image) else {
-            continue;
-        };
+        let Some(entry) = images.get_mut(&pl.image) else { continue };
         entry.last_used = Instant::now();
         let tw = entry.surface.width() as f64;
         let th = entry.surface.height() as f64;
@@ -1096,13 +1016,7 @@ mod tests {
     #[test]
     fn features() {
         assert_eq!(
-            feature_settings(&[
-                "-calt".into(),
-                "ss01".into(),
-                "+zero".into(),
-                "cv01=2".into(),
-                "bad".into()
-            ]),
+            feature_settings(&["-calt".into(), "ss01".into(), "+zero".into(), "cv01=2".into(), "bad".into()]),
             "calt=0,ss01=1,zero=1,cv01=2"
         );
     }

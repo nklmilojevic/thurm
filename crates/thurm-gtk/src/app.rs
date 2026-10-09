@@ -85,18 +85,8 @@ pub fn run() -> std::process::ExitCode {
         "Show or hide the quick terminal",
         None,
     );
-    for (name, help) in [
-        ("new-tab", "Open a new tab"),
-        ("new-workspace", "Open a new workspace"),
-    ] {
-        gtk_app.add_main_option(
-            name,
-            glib::Char::from(0),
-            glib::OptionFlags::NONE,
-            glib::OptionArg::None,
-            help,
-            None,
-        );
+    for (name, help) in [("new-tab", "Open a new tab"), ("new-workspace", "Open a new workspace")] {
+        gtk_app.add_main_option(name, glib::Char::from(0), glib::OptionFlags::NONE, glib::OptionArg::None, help, None);
     }
     gtk_app.connect_command_line(|gtk_app, cmd| {
         let opts = cmd.options_dict();
@@ -210,8 +200,7 @@ pub fn system_is_dark() -> bool {
     }
     gtk::Settings::default().is_some_and(|s| {
         s.is_gtk_application_prefer_dark_theme()
-            || s.gtk_theme_name()
-                .is_some_and(|n| n.to_lowercase().contains("dark"))
+            || s.gtk_theme_name().is_some_and(|n| n.to_lowercase().contains("dark"))
     })
 }
 
@@ -232,9 +221,7 @@ fn connect_local(epoch: u64, upgraded: &Cell<bool>) -> Result<Core, ConnectError
         let core = match Core::connect(daemon.as_deref(), epoch) {
             Ok(c) => c,
             Err(e) if e.contains("protocol mismatch") => {
-                if !upgraded.get()
-                    && let Some(path) = daemon.as_deref()
-                {
+                if !upgraded.get() && let Some(path) = daemon.as_deref() {
                     upgraded.set(true);
                     let rc = core::upgrade_daemon(path);
                     log::info!("in-place daemon upgrade: {rc}");
@@ -254,10 +241,7 @@ fn connect_local(epoch: u64, upgraded: &Cell<bool>) -> Result<Core, ConnectError
                 "The running thurmd refused the connection: {e}. Quit Thurm and run `thurm daemon stop` (layout and scrollback are restored), then open Thurm again."
             )));
         }
-        let build = resp
-            .pointer("/Hello/build")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let build = resp.pointer("/Hello/build").and_then(Value::as_str).unwrap_or("");
         if !upgraded.get()
             && !build.is_empty()
             && build != core::build_id()
@@ -441,18 +425,12 @@ impl App {
     /// The window's workspace.
     pub fn current_workspace(&self) -> Option<u64> {
         let w = self.win()?;
-        let tab = w
-            .selected_tab()
-            .or_else(|| w.ordered_tabs().into_iter().next())?;
+        let tab = w.selected_tab().or_else(|| w.ordered_tabs().into_iter().next())?;
         Some(tab.workspace.get()).filter(|id| *id != 0)
     }
 
     pub fn workspace(&self, id: u64) -> Option<Workspace> {
-        self.workspaces
-            .borrow()
-            .iter()
-            .find(|w| w.id == id)
-            .cloned()
+        self.workspaces.borrow().iter().find(|w| w.id == id).cloned()
     }
 
     /// The daemon new panes of the window go to.
@@ -660,10 +638,9 @@ impl App {
                     self.paste(&k);
                 }
             }
-            "select_all" => self.pane_send(
-                focused,
-                |id| json!({"Selection": {"pane": id, "op": "SelectAll"}}),
-            ),
+            "select_all" => self.pane_send(focused, |id| {
+                json!({"Selection": {"pane": id, "op": "SelectAll"}})
+            }),
             "clear_screen" => self.pane_send(focused, |id| json!({"ClearScreen": {"pane": id}})),
             "clear_scrollback" => {
                 self.pane_send(focused, |id| json!({"ClearScrollback": {"pane": id}}))
@@ -679,11 +656,7 @@ impl App {
                     if !t.find_visible() {
                         t.show_find();
                     }
-                    t.search(if name == "find_next" {
-                        "Forward"
-                    } else {
-                        "Backward"
-                    });
+                    t.search(if name == "find_next" { "Forward" } else { "Backward" });
                 }
             }
             "increase_font_size" => self.change_font(1.0),
@@ -743,7 +716,8 @@ impl App {
             }
             n if n.starts_with("workspace_") => {
                 if let Ok(i) = n["workspace_".len()..].parse::<usize>() {
-                    let ids: Vec<u64> = self.workspaces_by_recency().iter().map(|w| w.id).collect();
+                    let ids: Vec<u64> =
+                        self.workspaces_by_recency().iter().map(|w| w.id).collect();
                     if let Some(&id) = ids.get(i - 1) {
                         self.switch_workspace(id);
                     }
@@ -800,8 +774,7 @@ impl App {
             Some(Value::String(s)) => serde_json::from_str::<Layout>(s).ok(),
             _ => None,
         };
-        let (Some(listed), Some(mut layout)) =
-            (panes.get("Panes").and_then(Value::as_array), layout)
+        let (Some(listed), Some(mut layout)) = (panes.get("Panes").and_then(Value::as_array), layout)
         else {
             let n = self.restore_failures.get() + 1;
             self.restore_failures.set(n);
@@ -985,12 +958,7 @@ impl App {
         if w.fullscreen {
             win.window.fullscreen();
         }
-        if let Some(ws) = self
-            .workspaces
-            .borrow_mut()
-            .iter_mut()
-            .find(|x| x.id == ws_id)
-        {
+        if let Some(ws) = self.workspaces.borrow_mut().iter_mut().find(|x| x.id == ws_id) {
             ws.last_active = model::now_secs();
         }
         true
@@ -1024,11 +992,7 @@ impl App {
         let rows = ui.cfg.window.rows.clamp(3, 1000) as f64;
         let w = (cols * f.cell_w + 2.0 * px + 1.0).ceil();
         let h = (rows * f.cell_h + 2.0 * py + 1.0).ceil() + 47.0;
-        let side = if ui.sidebar_tabs() {
-            ui.sidebar_width()
-        } else {
-            0.0
-        };
+        let side = if ui.sidebar_tabs() { ui.sidebar_width() } else { 0.0 };
         win.window.set_default_size((w + side) as i32, h as i32);
     }
 
@@ -1146,10 +1110,8 @@ impl App {
             }
         }
         self.terminating.set(true);
-        if matches!(
-            self.ui().cfg.session.quit,
-            thurm_config::QuitBehavior::Terminate
-        ) && let Some(c) = self.core(LOCAL)
+        if matches!(self.ui().cfg.session.quit, thurm_config::QuitBehavior::Terminate)
+            && let Some(c) = self.core(LOCAL)
         {
             c.request_timeout(&json!({"Shutdown": {"kill_panes": true}}), 3000);
         }
@@ -1196,9 +1158,7 @@ impl App {
             if before > 0 && ws.hidden_tabs.is_empty() {
                 emptied.push(ws.id);
             }
-            ws.hidden_selected = ws
-                .hidden_selected
-                .min(ws.hidden_tabs.len().saturating_sub(1));
+            ws.hidden_selected = ws.hidden_selected.min(ws.hidden_tabs.len().saturating_sub(1));
         }
         wss.retain(|w| !emptied.contains(&w.id));
     }
@@ -1217,9 +1177,7 @@ impl App {
     /// Shows workspace `id` in the window; the old tabs go hidden (their shells keep running).
     pub fn show_workspace(self: &Rc<Self>, id: u64) {
         let Some(win) = self.win() else { return };
-        let Some(target) = self.workspace(id) else {
-            return;
-        };
+        let Some(target) = self.workspace(id) else { return };
         let old = win.ordered_tabs();
         let cur = self.current_workspace();
         let mut created = Vec::new();
@@ -1248,12 +1206,7 @@ impl App {
             let sel = selected
                 .and_then(|s| old.iter().position(|t| Rc::ptr_eq(t, &s)))
                 .unwrap_or(0);
-            if let Some(ws) = self
-                .workspaces
-                .borrow_mut()
-                .iter_mut()
-                .find(|w| w.id == cur)
-            {
+            if let Some(ws) = self.workspaces.borrow_mut().iter_mut().find(|w| w.id == cur) {
                 ws.hidden_tabs = kept;
                 ws.hidden_selected = sel;
             }
@@ -1468,10 +1421,7 @@ impl App {
                     self.remotes.phase_label(self, &ws.host)
                 ));
             }
-            detail.push_str(&format!(
-                "{tabs} {}",
-                if tabs == 1 { "tab" } else { "tabs" }
-            ));
+            detail.push_str(&format!("{tabs} {}", if tabs == 1 { "tab" } else { "tabs" }));
             if Some(ws.id) == current {
                 detail.push_str(" · this window");
             } else {
@@ -1495,13 +1445,9 @@ impl App {
         for name in self.ui().remote_names() {
             let phase = self.remotes.phase_label(self, &name);
             let n = name.clone();
-            items.push(Item::new(
-                format!("New Workspace on {name}"),
-                phase,
-                move || {
-                    with_app(|a| a.new_workspace(&n));
-                },
-            ));
+            items.push(Item::new(format!("New Workspace on {name}"), phase, move || {
+                with_app(|a| a.new_workspace(&n));
+            }));
         }
         palette::show(
             &win,
@@ -1587,10 +1533,7 @@ impl App {
     }
 
     fn new_pane_size(&self, like: Option<&PaneKey>) -> (u16, u16, u16, u16) {
-        if let Some(v) = like
-            .and_then(|k| self.view(k))
-            .filter(|v| v.area.width() > 0)
-        {
+        if let Some(v) = like.and_then(|k| self.view(k)).filter(|v| v.area.width() > 0) {
             let (c, r) = v.grid_size();
             let (cw, ch) = v.cell_pixels();
             return (c, r, cw, ch);
@@ -1794,9 +1737,7 @@ impl App {
             retain_tabs(&mut ws.hidden_tabs, &|h, id| {
                 PaneKey::new(h.unwrap_or(&host), id) != *key
             });
-            ws.hidden_selected = ws
-                .hidden_selected
-                .min(ws.hidden_tabs.len().saturating_sub(1));
+            ws.hidden_selected = ws.hidden_selected.min(ws.hidden_tabs.len().saturating_sub(1));
         }
         let Some(tab) = self.tab_of(key) else {
             self.focus_changed();
@@ -1866,9 +1807,7 @@ impl App {
             self.quit();
             return;
         }
-        self.workspaces
-            .borrow_mut()
-            .retain(|w| !w.hidden_tabs.is_empty());
+        self.workspaces.borrow_mut().retain(|w| !w.hidden_tabs.is_empty());
         let ws = self.make_workspace(LOCAL);
         let id = ws.id;
         self.workspaces.borrow_mut().push(ws);
@@ -1933,21 +1872,9 @@ impl App {
         };
         let handoff = tab.handoff.borrow().clone();
         if let Some(info) = handoff.and_then(|h| self.remotes.handoff(&h)) {
-            let host = info
-                .get("host")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let branch = info
-                .get("branch")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let worktree = info
-                .get("worktree")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let host = info.get("host").and_then(Value::as_str).unwrap_or("").to_string();
+            let branch = info.get("branch").and_then(Value::as_str).unwrap_or("").to_string();
+            let worktree = info.get("worktree").and_then(Value::as_str).unwrap_or("").to_string();
             dialogs::ask(
                 &w.window,
                 &format!("Close the handoff on {host}?"),
@@ -1955,11 +1882,7 @@ impl App {
                     "Closing the tab stops the agent. You can also remove its worktree, {branch} in {worktree}: committed work is fetched first, and the branch stays on {host} unless your default branch contains it."
                 ),
                 &[
-                    dialogs::button(
-                        "remove",
-                        "Close and Remove Worktree",
-                        dialogs::Style::Destructive,
-                    ),
+                    dialogs::button("remove", "Close and Remove Worktree", dialogs::Style::Destructive),
                     dialogs::button("keep", "Close, Keep Worktree", dialogs::Style::Default),
                     dialogs::button("cancel", "Cancel", dialogs::Style::Default),
                 ],
@@ -2028,9 +1951,7 @@ impl App {
     }
 
     fn move_focus(&self, dir: Direction) {
-        let Some(tab) = self.current_tab() else {
-            return;
-        };
+        let Some(tab) = self.current_tab() else { return };
         if tab.zoomed.borrow().is_some() {
             return;
         }
@@ -2041,9 +1962,7 @@ impl App {
     }
 
     fn resize_focused(&self, axis: Axis, delta: f64) {
-        let Some(tab) = self.current_tab() else {
-            return;
-        };
+        let Some(tab) = self.current_tab() else { return };
         let cur = tab.focused.borrow().clone();
         if tab.tree.borrow_mut().resize(&cur, axis, delta) {
             tab.relayout();
@@ -2052,9 +1971,7 @@ impl App {
     }
 
     fn toggle_zoom(&self) {
-        let Some(tab) = self.current_tab() else {
-            return;
-        };
+        let Some(tab) = self.current_tab() else { return };
         if tab.panes().len() < 2 && tab.zoomed.borrow().is_none() {
             return;
         }
@@ -2071,17 +1988,12 @@ impl App {
     /// Tabs in the order Alt+1…9 count them: the sidebar's (grouped by repository) when it
     /// shows the tabs, else the tab bar's.
     pub fn display_order(&self) -> Vec<Rc<Tab>> {
-        let Some(w) = self.win() else {
-            return Vec::new();
-        };
+        let Some(w) = self.win() else { return Vec::new() };
         let tabs = w.ordered_tabs();
         if !self.ui().sidebar_tabs() {
             return tabs;
         }
-        self.grouped_tabs(&tabs)
-            .into_iter()
-            .flat_map(|(_, t)| t)
-            .collect()
+        self.grouped_tabs(&tabs).into_iter().flat_map(|(_, t)| t).collect()
     }
 
     fn select_tab_number(&self, n: usize) {
@@ -2109,11 +2021,7 @@ impl App {
         let Some(cur) = w.selected_tab() else { return };
         let n = tabs.len();
         let i = tabs.iter().position(|t| Rc::ptr_eq(t, &cur)).unwrap_or(0);
-        let next = if forward {
-            (i + 1) % n
-        } else {
-            (i + n - 1) % n
-        };
+        let next = if forward { (i + 1) % n } else { (i + n - 1) % n };
         self.select_tab(&tabs[next]);
     }
 
@@ -2248,9 +2156,7 @@ impl App {
         let any = !agents.is_empty();
         for (k, hidden) in agents {
             let Some(info) = infos.get(&k) else { continue };
-            let Some(agent) = info.agent.as_ref() else {
-                continue;
-            };
+            let Some(agent) = info.agent.as_ref() else { continue };
             let mut parts: Vec<String> = Vec::new();
             if k.is_remote() {
                 parts.push(k.host.clone());
@@ -2267,13 +2173,9 @@ impl App {
             });
             parts.retain(|p| !p.is_empty());
             let key = k.clone();
-            items.push(Item::new(
-                model::agent_title(info),
-                parts.join(" · "),
-                move || {
-                    with_app(|a| a.focus_agent(&key));
-                },
-            ));
+            items.push(Item::new(model::agent_title(info), parts.join(" · "), move || {
+                with_app(|a| a.focus_agent(&key));
+            }));
         }
         let host = self.current_host();
         for p in self.presets(&host) {
@@ -2344,13 +2246,9 @@ impl App {
             }
         }
         for (label, action) in integrations::palette_items() {
-            items.push(Item::new(
-                format!("Integrations: {label}"),
-                "Thurm",
-                move || {
-                    action();
-                },
-            ));
+            items.push(Item::new(format!("Integrations: {label}"), "Thurm", move || {
+                action();
+            }));
         }
         if let Some(k) = self.focused_pane()
             && let Some(agent) = self
@@ -2358,36 +2256,24 @@ impl App {
                 .and_then(|i| i.agent)
                 .filter(|a| a.session_id.is_some())
         {
-            items.push(Item::new(
-                format!("Fork {} Session", agent.name),
-                "in a split",
-                || {
-                    with_app(|a| a.split_focused(Direction::Right, None, true));
-                },
-            ));
+            items.push(Item::new(format!("Fork {} Session", agent.name), "in a split", || {
+                with_app(|a| a.split_focused(Direction::Right, None, true));
+            }));
         }
         items.extend(remote::palette_items(self));
         let host = self.current_host();
         for p in self.presets(&host) {
             let detail = p.command.join(" ");
             let n1 = p.name.clone();
-            items.push(Item::new(
-                format!("Launch {}", p.name),
-                detail.clone(),
-                move || {
-                    with_app(|a| {
-                        a.new_tab(Some(&n1), None, None);
-                    });
-                },
-            ));
+            items.push(Item::new(format!("Launch {}", p.name), detail.clone(), move || {
+                with_app(|a| {
+                    a.new_tab(Some(&n1), None, None);
+                });
+            }));
             let n2 = p.name.clone();
-            items.push(Item::new(
-                format!("Launch {} in Split", p.name),
-                detail,
-                move || {
-                    with_app(|a| a.split_focused(Direction::Right, Some(&n2), false));
-                },
-            ));
+            items.push(Item::new(format!("Launch {} in Split", p.name), detail, move || {
+                with_app(|a| a.split_focused(Direction::Right, Some(&n2), false));
+            }));
         }
         palette::show(&win, items, "Type a command…", None, 0, None);
     }
@@ -2486,16 +2372,11 @@ impl App {
         let mut rest = Vec::new();
         for t in tabs {
             let focused = t.focused.borrow().clone();
-            let handoff = t
-                .handoff
-                .borrow()
-                .as_ref()
-                .and_then(|h| self.remotes.handoff(h));
+            let handoff = t.handoff.borrow().as_ref().and_then(|h| self.remotes.handoff(h));
             let key_name = match handoff {
-                Some(h) => h
-                    .get("repo")
-                    .and_then(Value::as_str)
-                    .map(|r| (r.to_string(), r.rsplit('/').next().unwrap_or(r).to_string())),
+                Some(h) => h.get("repo").and_then(Value::as_str).map(|r| {
+                    (r.to_string(), r.rsplit('/').next().unwrap_or(r).to_string())
+                }),
                 None => infos.get(&focused).and_then(|i| i.git.as_ref()).map(|g| {
                     let base = g.root.rsplit('/').next().unwrap_or(&g.root).to_string();
                     if focused.is_remote() {
@@ -2564,16 +2445,11 @@ impl App {
                         }
                     });
                     let mut subtitle = String::new();
-                    let handoff = t
-                        .handoff
-                        .borrow()
-                        .as_ref()
-                        .and_then(|h| self.remotes.handoff(h));
+                    let handoff = t.handoff.borrow().as_ref().and_then(|h| self.remotes.handoff(h));
                     if let Some(h) = handoff {
                         let host = h.get("host").and_then(Value::as_str).unwrap_or("");
                         let branch = h.get("branch").and_then(Value::as_str).unwrap_or("");
-                        subtitle =
-                            glib::markup_escape_text(&format!("{host} · {branch}")).to_string();
+                        subtitle = glib::markup_escape_text(&format!("{host} · {branch}")).to_string();
                         let id = h.get("id").and_then(Value::as_str).unwrap_or("");
                         if self.remotes.handoff_error(id).is_some() {
                             subtitle.push_str(" · fetch failed");
@@ -2659,8 +2535,9 @@ impl App {
         let focused = self.focused_pane();
         let infos = self.infos.borrow();
         for (k, v) in self.views.borrow().iter() {
-            let lock =
-                on && Some(k) == focused.as_ref() && infos.get(k).is_some_and(|i| i.password_input);
+            let lock = on
+                && Some(k) == focused.as_ref()
+                && infos.get(k).is_some_and(|i| i.password_input);
             v.set_lock(lock);
         }
     }
@@ -2811,8 +2688,7 @@ impl App {
             self.seen_waiting.borrow_mut().remove(&key);
         }
         let old_permission = old_agent.as_ref().and_then(|a| a.permission);
-        if old_permission.is_some()
-            && old_permission != info.agent.as_ref().and_then(|a| a.permission)
+        if old_permission.is_some() && old_permission != info.agent.as_ref().and_then(|a| a.permission)
         {
             notify::withdraw_permission(self, &key);
         }
@@ -2892,27 +2768,21 @@ impl App {
                     if self.win().is_none() {
                         return Err(thurm_proto::LAYOUT_NO_WINDOW.into());
                     }
-                    let json = p
-                        .get("json")
-                        .and_then(Value::as_str)
+                    let json = p.get("json").and_then(Value::as_str)
                         .ok_or("missing tab layout")?;
                     let tab: TabLayout = serde_json::from_str(json).map_err(|e| e.to_string())?;
                     let ids = thurm_proto::template::validate_tab(&tab)?;
                     for &id in &ids {
                         let key = PaneKey::new(host, id);
                         let info = core.request(&json!({"PaneInfo": {"pane": id}}));
-                        let info = info
-                            .get("PaneInfo")
+                        let info = info.get("PaneInfo")
                             .ok_or("a layout pane no longer exists")?;
                         let info = serde_json::from_value::<PaneInfo>(info.clone())
                             .map_err(|e| e.to_string())?;
                         self.infos.borrow_mut().insert(key, info);
                     }
-                    if core
-                        .request(&json!({"CommitLayout": {"request_id": request_id}}))
-                        .as_str()
-                        != Some("Ok")
-                    {
+                    if core.request(&json!({"CommitLayout": {"request_id": request_id}}))
+                        .as_str() != Some("Ok") {
                         return Err("layout was cancelled before installation".into());
                     }
                     for &id in &ids {
@@ -2996,7 +2866,8 @@ impl App {
                     return;
                 }
                 self.fetch_info(&k);
-                let dir = Direction::parse(p.get("dir").and_then(Value::as_str).unwrap_or("right"));
+                let dir =
+                    Direction::parse(p.get("dir").and_then(Value::as_str).unwrap_or("right"));
                 let target = p
                     .get("target")
                     .and_then(Value::as_u64)
@@ -3030,12 +2901,7 @@ impl App {
                 }
             }
             "RenameWorkspace" => {
-                let name = p
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
+                let name = p.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
                 if !name.is_empty()
                     && let Some(id) = key.as_ref().and_then(|k| self.workspace_containing(k))
                 {
@@ -3314,15 +3180,8 @@ impl App {
     pub fn open_link(self: &Rc<Self>, url: &str, key: &PaneKey) {
         let host = key.is_remote().then(|| key.host.clone());
         let resp = core::remote_call(&json!({"op": "link", "url": url, "host": host}));
-        let action = resp
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("ignore");
-        let path = resp
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let action = resp.get("action").and_then(Value::as_str).unwrap_or("ignore");
+        let path = resp.get("path").and_then(Value::as_str).unwrap_or("").to_string();
         let Some(w) = self.win() else { return };
         match action {
             "open" => {
@@ -3422,8 +3281,7 @@ impl App {
         ui.warnings.extend(warnings);
         for (name, accels) in &bindings {
             let a: Vec<&str> = accels.iter().map(String::as_str).collect();
-            self.gtk_app
-                .set_accels_for_action(&format!("app.{name}"), &a);
+            self.gtk_app.set_accels_for_action(&format!("app.{name}"), &a);
         }
         *self.keymap.borrow_mut() = actions::keymap(&bindings);
         let problem = ui.problem();
@@ -3512,16 +3370,8 @@ impl App {
         menu.append_section(None, &top);
         let lists: Vec<(Option<&str>, Option<bool>, String)> = if ui.follows_appearance() {
             vec![
-                (
-                    Some("Light Appearance"),
-                    Some(false),
-                    ui.theme_spec.light.clone(),
-                ),
-                (
-                    Some("Dark Appearance"),
-                    Some(true),
-                    ui.theme_spec.dark.clone(),
-                ),
+                (Some("Light Appearance"), Some(false), ui.theme_spec.light.clone()),
+                (Some("Dark Appearance"), Some(true), ui.theme_spec.dark.clone()),
             ]
         } else {
             vec![(None, None, ui.theme.name.clone())]
@@ -3529,11 +3379,7 @@ impl App {
         for (title, dark, current) in lists {
             let section = gio::Menu::new();
             let mut by_letter: std::collections::BTreeMap<String, gio::Menu> = Default::default();
-            for t in ui
-                .themes
-                .iter()
-                .filter(|t| dark.is_none_or(|d| t.dark == d))
-            {
+            for t in ui.themes.iter().filter(|t| dark.is_none_or(|d| t.dark == d)) {
                 let label = if t.name == current {
                     format!("✓ {}", t.name)
                 } else {
@@ -3550,7 +3396,10 @@ impl App {
                     } else {
                         "0–9".into()
                     };
-                    by_letter.entry(key).or_default().append_item(&item);
+                    by_letter
+                        .entry(key)
+                        .or_default()
+                        .append_item(&item);
                 }
             }
             let more = gio::Menu::new();
@@ -3567,11 +3416,7 @@ impl App {
         let spec = {
             let ui = self.ui();
             if ui.follows_appearance() {
-                let dark = ui
-                    .themes
-                    .iter()
-                    .find(|t| t.name == name)
-                    .is_some_and(|t| t.dark);
+                let dark = ui.themes.iter().find(|t| t.name == name).is_some_and(|t| t.dark);
                 if dark {
                     format!("light:{},dark:{name}", ui.theme_spec.light)
                 } else {
@@ -3587,9 +3432,7 @@ impl App {
     }
 
     fn set_theme(&self, spec: &str) -> bool {
-        let Some(c) = self.core(LOCAL) else {
-            return false;
-        };
+        let Some(c) = self.core(LOCAL) else { return false };
         let r = c.request(&json!({"SetTheme": {"spec": spec}}));
         if let Some(e) = r.get("error").and_then(Value::as_str) {
             self.toast(&format!("Theme: {e}"), 6.0);
@@ -3675,9 +3518,7 @@ impl App {
                 let _ = rc.preview_theme(name);
             }
         }
-        let Some(theme) = c.preview_theme(name) else {
-            return;
-        };
+        let Some(theme) = c.preview_theme(name) else { return };
         if let Ok(t) = serde_json::from_value::<thurm_config::Theme>(theme) {
             self.ui.borrow_mut().theme = t;
             if let Some(w) = self.win() {
@@ -3810,12 +3651,7 @@ fn sort_value(v: Value) -> Value {
         Value::Object(m) => {
             let mut entries: Vec<(String, Value)> = m.into_iter().collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-            Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(k, v)| (k, sort_value(v)))
-                    .collect(),
-            )
+            Value::Object(entries.into_iter().map(|(k, v)| (k, sort_value(v))).collect())
         }
         Value::Array(a) => Value::Array(a.into_iter().map(sort_value).collect()),
         other => other,

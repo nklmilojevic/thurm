@@ -84,14 +84,8 @@ pub fn show(app: &Rc<App>) {
     let click = gtk::GestureClick::new();
     click.connect_released(move |_, n, _, y| {
         let Some(p) = weak.upgrade() else { return };
-        let Some(row) = p.list.row_at_y(y as i32).filter(|_| n == 1) else {
-            return;
-        };
-        let key = p
-            .keys
-            .borrow()
-            .get(row.index() as usize)
-            .map(|(k, _)| k.clone());
+        let Some(row) = p.list.row_at_y(y as i32).filter(|_| n == 1) else { return };
+        let key = p.keys.borrow().get(row.index() as usize).map(|(k, _)| k.clone());
         if let Some(k) = key {
             app::with_app(|a| a.focus_agent(&k));
             p.window.present();
@@ -101,11 +95,9 @@ pub fn show(app: &Rc<App>) {
     let weak = Rc::downgrade(&panel);
     panel.list.connect_row_activated(move |_, row| {
         let Some(p) = weak.upgrade() else { return };
-        let port = p
-            .keys
-            .borrow()
-            .get(row.index() as usize)
-            .and_then(|(k, port)| (!k.is_remote()).then_some(*port).flatten());
+        let port = p.keys.borrow().get(row.index() as usize).and_then(|(k, port)| {
+            (!k.is_remote()).then_some(*port).flatten()
+        });
         if let Some(port) = port {
             let _ = gio::AppInfo::launch_default_for_uri(
                 &format!("http://localhost:{port}"),
@@ -142,9 +134,7 @@ pub fn show(app: &Rc<App>) {
 }
 
 fn refresh(app: &Rc<App>) {
-    let Some(panel) = PANEL.with(|p| p.borrow().clone()) else {
-        return;
-    };
+    let Some(panel) = PANEL.with(|p| p.borrow().clone()) else { return };
     let mut hosts = vec![LOCAL.to_string()];
     hosts.extend(app.connected_remotes());
     panel.rows.borrow_mut().retain(|(h, _)| hosts.contains(h));
@@ -152,9 +142,7 @@ fn refresh(app: &Rc<App>) {
         if panel.pending.borrow().contains(&host) {
             continue;
         }
-        let Some(core) = app.core(&host) else {
-            continue;
-        };
+        let Some(core) = app.core(&host) else { continue };
         panel.pending.borrow_mut().push(host.clone());
         let weak = Rc::downgrade(&panel);
         core.request_async(&json!({"Processes": {"pane": null}}), 5000, move |resp| {
@@ -232,15 +220,9 @@ impl Panel {
                         .collect::<Vec<_>>()
                         .join(", ");
                     let command = format!("{}{}", "  ".repeat(d.min(8)), proc.command);
-                    let row = header_row(
-                        &[&key.to_string(), &proc.pid.to_string(), &ports, &command],
-                        false,
-                    );
+                    let row = header_row(&[&key.to_string(), &proc.pid.to_string(), &ports, &command], false);
                     if !ports.is_empty()
-                        && let Some(l) = row
-                            .first_child()
-                            .and_then(|c| c.next_sibling())
-                            .and_then(|c| c.next_sibling())
+                        && let Some(l) = row.first_child().and_then(|c| c.next_sibling()).and_then(|c| c.next_sibling())
                     {
                         l.add_css_class("success");
                     }
@@ -252,3 +234,4 @@ impl Panel {
         *self.keys.borrow_mut() = keys;
     }
 }
+
