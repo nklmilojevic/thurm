@@ -44,7 +44,11 @@ fn arms(ch: u32) -> Option<(i32, i32, i32, i32)> {
         return None;
     }
     let entry = TABLE.split(' ').nth((ch - 0x2500) as usize)?;
-    let d: Vec<i32> = entry.chars().filter_map(|c| c.to_digit(10)).map(|d| d as i32).collect();
+    let d: Vec<i32> = entry
+        .chars()
+        .filter_map(|c| c.to_digit(10))
+        .map(|d| d as i32)
+        .collect();
     (d.len() == 4).then(|| (d[0], d[1], d[2], d[3]))
 }
 
@@ -102,7 +106,15 @@ fn line_width(w: i32, h: i32, light: i32, heavy: bool) -> i32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn line_rects(up: i32, right: i32, down: i32, left: i32, w: i32, h: i32, light: i32) -> Vec<BoxRect> {
+fn line_rects(
+    up: i32,
+    right: i32,
+    down: i32,
+    left: i32,
+    w: i32,
+    h: i32,
+    light: i32,
+) -> Vec<BoxRect> {
     let l = light_width(w, h, light);
     let heavy = (l + 1).max(l * 2);
     let span = |weight: i32| match weight {
@@ -122,10 +134,34 @@ fn line_rects(up: i32, right: i32, down: i32, left: i32, w: i32, h: i32, light: 
     let full_start_x = if v_span > 0 { v_start } else { cx };
     let full_end_y = if h_span > 0 { h_start + h_span } else { cy + 1 };
     let full_start_y = if h_span > 0 { h_start } else { cy };
-    let inner_end_x = |p: i32| if p == 3 { start(cx, 3) + l } else { start(cx, p) + span(p) };
-    let inner_start_x = |p: i32| if p == 3 { start(cx, 3) + 2 * l } else { start(cx, p) };
-    let inner_end_y = |p: i32| if p == 3 { start(cy, 3) + l } else { start(cy, p) + span(p) };
-    let inner_start_y = |p: i32| if p == 3 { start(cy, 3) + 2 * l } else { start(cy, p) };
+    let inner_end_x = |p: i32| {
+        if p == 3 {
+            start(cx, 3) + l
+        } else {
+            start(cx, p) + span(p)
+        }
+    };
+    let inner_start_x = |p: i32| {
+        if p == 3 {
+            start(cx, 3) + 2 * l
+        } else {
+            start(cx, p)
+        }
+    };
+    let inner_end_y = |p: i32| {
+        if p == 3 {
+            start(cy, 3) + l
+        } else {
+            start(cy, p) + span(p)
+        }
+    };
+    let inner_start_y = |p: i32| {
+        if p == 3 {
+            start(cy, 3) + 2 * l
+        } else {
+            start(cy, p)
+        }
+    };
 
     let mut out = Vec::new();
     let mut add = |x0: i32, y0: i32, x1: i32, y1: i32| {
@@ -139,46 +175,137 @@ fn line_rects(up: i32, right: i32, down: i32, left: i32, w: i32, h: i32, light: 
     };
 
     if left == 1 || left == 2 {
-        let end = if up == 3 && down == 3 && right == 0 { v_start + l } else { full_end_x };
+        let end = if up == 3 && down == 3 && right == 0 {
+            v_start + l
+        } else {
+            full_end_x
+        };
         let y = start(cy, left);
         add(0, y, end, y + span(left));
     } else if left == 3 {
         let s = start(cy, 3);
-        add(0, s, if up > 0 { inner_end_x(up) } else { full_end_x }, s + l);
-        add(0, s + 2 * l, if down > 0 { inner_end_x(down) } else { full_end_x }, s + 3 * l);
+        add(
+            0,
+            s,
+            if up > 0 { inner_end_x(up) } else { full_end_x },
+            s + l,
+        );
+        add(
+            0,
+            s + 2 * l,
+            if down > 0 {
+                inner_end_x(down)
+            } else {
+                full_end_x
+            },
+            s + 3 * l,
+        );
     }
     if right == 1 || right == 2 {
-        let begin = if up == 3 && down == 3 && left == 0 { v_start + 2 * l } else { full_start_x };
+        let begin = if up == 3 && down == 3 && left == 0 {
+            v_start + 2 * l
+        } else {
+            full_start_x
+        };
         let y = start(cy, right);
         add(begin, y, w, y + span(right));
     } else if right == 3 {
         let s = start(cy, 3);
-        add(if up > 0 { inner_start_x(up) } else { full_start_x }, s, w, s + l);
-        add(if down > 0 { inner_start_x(down) } else { full_start_x }, s + 2 * l, w, s + 3 * l);
+        add(
+            if up > 0 {
+                inner_start_x(up)
+            } else {
+                full_start_x
+            },
+            s,
+            w,
+            s + l,
+        );
+        add(
+            if down > 0 {
+                inner_start_x(down)
+            } else {
+                full_start_x
+            },
+            s + 2 * l,
+            w,
+            s + 3 * l,
+        );
     }
     if up == 1 || up == 2 {
-        let end = if left == 3 && right == 3 && down == 0 { h_start + l } else { full_end_y };
+        let end = if left == 3 && right == 3 && down == 0 {
+            h_start + l
+        } else {
+            full_end_y
+        };
         let x = start(cx, up);
         add(x, 0, x + span(up), end);
     } else if up == 3 {
         let s = start(cx, 3);
-        add(s, 0, s + l, if left > 0 { inner_end_y(left) } else { full_end_y });
-        add(s + 2 * l, 0, s + 3 * l, if right > 0 { inner_end_y(right) } else { full_end_y });
+        add(
+            s,
+            0,
+            s + l,
+            if left > 0 {
+                inner_end_y(left)
+            } else {
+                full_end_y
+            },
+        );
+        add(
+            s + 2 * l,
+            0,
+            s + 3 * l,
+            if right > 0 {
+                inner_end_y(right)
+            } else {
+                full_end_y
+            },
+        );
     }
     if down == 1 || down == 2 {
-        let begin = if left == 3 && right == 3 && up == 0 { h_start + 2 * l } else { full_start_y };
+        let begin = if left == 3 && right == 3 && up == 0 {
+            h_start + 2 * l
+        } else {
+            full_start_y
+        };
         let x = start(cx, down);
         add(x, begin, x + span(down), h);
     } else if down == 3 {
         let s = start(cx, 3);
-        add(s, if left > 0 { inner_start_y(left) } else { full_start_y }, s + l, h);
-        add(s + 2 * l, if right > 0 { inner_start_y(right) } else { full_start_y }, s + 3 * l, h);
+        add(
+            s,
+            if left > 0 {
+                inner_start_y(left)
+            } else {
+                full_start_y
+            },
+            s + l,
+            h,
+        );
+        add(
+            s + 2 * l,
+            if right > 0 {
+                inner_start_y(right)
+            } else {
+                full_start_y
+            },
+            s + 3 * l,
+            h,
+        );
     }
     out
 }
 
 /// `count` dashes per cell, the gap split across both ends so neighbouring cells tile evenly.
-fn dash_rects(horizontal: bool, heavy: bool, count: i32, w: i32, h: i32, light: i32) -> Vec<BoxRect> {
+fn dash_rects(
+    horizontal: bool,
+    heavy: bool,
+    count: i32,
+    w: i32,
+    h: i32,
+    light: i32,
+) -> Vec<BoxRect> {
     let t = line_width(w, h, light, heavy);
     let length = if horizontal { w } else { h };
     let mut out = Vec::new();
@@ -213,8 +340,16 @@ fn rounded_corner(ch: u32, w: i32, h: i32, light: i32) -> Vec<BoxRect> {
     let ccx = if right { lx + r } else { lx - r };
     let ccy = if down { ly + r } else { ly - r };
     let half = t as f64 / 2.0 + 1.0;
-    let (qx0, qx1) = if right { (lx - half, ccx) } else { (ccx, lx + half) };
-    let (qy0, qy1) = if down { (ly - half, ccy) } else { (ccy, ly + half) };
+    let (qx0, qx1) = if right {
+        (lx - half, ccx)
+    } else {
+        (ccx, lx + half)
+    };
+    let (qy0, qy1) = if down {
+        (ly - half, ccy)
+    } else {
+        (ccy, ly + half)
+    };
     let x0 = qx0.floor() as i32;
     let y0 = qy0.floor() as i32;
     let x1 = qx1.ceil() as i32;
@@ -304,7 +439,16 @@ fn block_rects(ch: u32, w: i32, h: i32) -> Vec<BoxRect> {
 
 /// Paints `ch` into the cell at (x, y) in `color` (0xRRGGBB).
 #[allow(clippy::too_many_arguments)]
-pub fn paint(cr: &gtk::cairo::Context, ch: u32, x: f64, y: f64, w: i32, h: i32, light: i32, color: u32) {
+pub fn paint(
+    cr: &gtk::cairo::Context,
+    ch: u32,
+    x: f64,
+    y: f64,
+    w: i32,
+    h: i32,
+    light: i32,
+    color: u32,
+) {
     let (r, g, b, a) = (
         ((color >> 16) & 0xff) as f64 / 255.0,
         ((color >> 8) & 0xff) as f64 / 255.0,

@@ -194,9 +194,12 @@ impl MainWindow {
     pub fn apply_config(&self, ui: &UiConfig) {
         let sidebar = ui.sidebar_tabs();
         self.tab_bar.set_visible(!sidebar);
-        self.sidebar.root.set_visible(sidebar && self.sidebar_button.is_active());
+        self.sidebar
+            .root
+            .set_visible(sidebar && self.sidebar_button.is_active());
         self.sidebar_button.set_visible(sidebar);
-        self.sidebar.set_agent_rows(ui.cfg.window.sidebar_agent_rows);
+        self.sidebar
+            .set_agent_rows(ui.cfg.window.sidebar_agent_rows);
         if sidebar && (self.paned.position() - ui.sidebar_width() as i32).abs() > 1 {
             self.paned.set_position(ui.sidebar_width() as i32);
         }
@@ -280,7 +283,8 @@ impl MainWindow {
     }
 
     pub fn toggle_sidebar(&self) {
-        self.sidebar_button.set_active(!self.sidebar_button.is_active());
+        self.sidebar_button
+            .set_active(!self.sidebar_button.is_active());
     }
 
     /// Tabs in tab-view order.
@@ -289,7 +293,9 @@ impl MainWindow {
         (0..self.tab_view.n_pages())
             .filter_map(|i| {
                 let page = self.tab_view.nth_page(i);
-                tabs.iter().find(|t| t.root.upcast_ref::<gtk::Widget>() == &page.child()).cloned()
+                tabs.iter()
+                    .find(|t| t.root.upcast_ref::<gtk::Widget>() == &page.child())
+                    .cloned()
             })
             .collect()
     }
@@ -304,7 +310,9 @@ impl MainWindow {
     }
 
     pub fn selected_tab(&self) -> Option<Rc<Tab>> {
-        self.tab_view.selected_page().and_then(|p| self.tab_for_page(&p))
+        self.tab_view
+            .selected_page()
+            .and_then(|p| self.tab_for_page(&p))
     }
 
     /// Adds `tab` after the selected one (or at the end).
@@ -341,15 +349,34 @@ impl MainWindow {
 /// and checkmarks are current.
 pub fn main_menu(a: &app::App) -> gio::Menu {
     let menu = gio::Menu::new();
-    for m in [Menu::Shell, Menu::Edit, Menu::View, Menu::Window, Menu::App, Menu::Help] {
+    for m in [
+        Menu::Shell,
+        Menu::Edit,
+        Menu::View,
+        Menu::Window,
+        Menu::App,
+        Menu::Help,
+    ] {
         let sub = gio::Menu::new();
         let mut section = gio::Menu::new();
-        for def in ACTIONS.iter().filter(|d| d.menu == m && !actions::hidden_from_menu(d.name)) {
+        for def in ACTIONS
+            .iter()
+            .filter(|d| d.menu == m && !actions::hidden_from_menu(d.name))
+        {
             if !a.action_visible(def.name) {
                 continue;
             }
-            if matches!(def.name, "about" | "quit" | "split_right" | "copy" | "increase_font_size" | "zoom_split" | "previous_tab" | "move_tab_to_new_workspace")
-                && section.n_items() > 0
+            if matches!(
+                def.name,
+                "about"
+                    | "quit"
+                    | "split_right"
+                    | "copy"
+                    | "increase_font_size"
+                    | "zoom_split"
+                    | "previous_tab"
+                    | "move_tab_to_new_workspace"
+            ) && section.n_items() > 0
             {
                 sub.append_section(None, &section);
                 section = gio::Menu::new();

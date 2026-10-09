@@ -29,8 +29,14 @@ impl Menu {
     }
 
     /// The palette lists the app menu last.
-    pub const PALETTE_ORDER: [Menu; 6] =
-        [Menu::Shell, Menu::Edit, Menu::View, Menu::Window, Menu::Help, Menu::App];
+    pub const PALETTE_ORDER: [Menu; 6] = [
+        Menu::Shell,
+        Menu::Edit,
+        Menu::View,
+        Menu::Window,
+        Menu::Help,
+        Menu::App,
+    ];
 }
 
 pub struct ActionDef {
@@ -60,32 +66,97 @@ pub const ACTIONS: &[ActionDef] = &[
     // Thurm
     a("about", "About Thurm", Menu::App, &[]),
     a("open_config", "Settings…", Menu::App, &["<Control>comma"]),
-    a("reload_config", "Reload Configuration", Menu::App, &["<Control><Shift>r"]),
+    a(
+        "reload_config",
+        "Reload Configuration",
+        Menu::App,
+        &["<Control><Shift>r"],
+    ),
     a("remotes", "Remotes…", Menu::App, &[]),
     a("quit", "Quit Thurm", Menu::App, &["<Control><Shift>q"]),
     // Shell
     a("new_tab", "New Tab", Menu::Shell, &["<Control><Shift>t"]),
-    a("new_workspace", "New Workspace", Menu::Shell, &["<Control><Shift>n"]),
-    a("switch_workspace", "Switch Workspace…", Menu::Shell, &["<Control><Alt>o"]),
-    a("switch_agent", "Switch to Agent…", Menu::Shell, &["<Control><Alt>a"]),
+    a(
+        "new_workspace",
+        "New Workspace",
+        Menu::Shell,
+        &["<Control><Shift>n"],
+    ),
+    a(
+        "switch_workspace",
+        "Switch Workspace…",
+        Menu::Shell,
+        &["<Control><Alt>o"],
+    ),
+    a(
+        "switch_agent",
+        "Switch to Agent…",
+        Menu::Shell,
+        &["<Control><Alt>a"],
+    ),
     a("rename_workspace", "Rename Workspace…", Menu::Shell, &[]),
     a("close_workspace", "Close Workspace…", Menu::Shell, &[]),
-    a("split_right", "Split Right", Menu::Shell, &["<Control><Shift>d", "<Control><Shift>o"]),
-    a("split_down", "Split Down", Menu::Shell, &["<Control><Shift>e"]),
-    a("command_palette", "Command Palette…", Menu::Shell, &["<Control><Shift>p"]),
+    a(
+        "split_right",
+        "Split Right",
+        Menu::Shell,
+        &["<Control><Shift>d", "<Control><Shift>o"],
+    ),
+    a(
+        "split_down",
+        "Split Down",
+        Menu::Shell,
+        &["<Control><Shift>e"],
+    ),
+    a(
+        "command_palette",
+        "Command Palette…",
+        Menu::Shell,
+        &["<Control><Shift>p"],
+    ),
     a("processes", "Processes & Ports…", Menu::Shell, &[]),
-    a("close_pane", "Close Pane", Menu::Shell, &["<Control><Shift>w"]),
-    a("close_tab", "Close Tab", Menu::Shell, &["<Control><Shift><Alt>w"]),
+    a(
+        "close_pane",
+        "Close Pane",
+        Menu::Shell,
+        &["<Control><Shift>w"],
+    ),
+    a(
+        "close_tab",
+        "Close Tab",
+        Menu::Shell,
+        &["<Control><Shift><Alt>w"],
+    ),
     // Edit
     a("copy", "Copy", Menu::Edit, &["<Control><Shift>c"]),
     a("paste", "Paste", Menu::Edit, &["<Control><Shift>v"]),
-    a("select_all", "Select All", Menu::Edit, &["<Control><Shift>a"]),
-    a("clear_screen", "Clear Screen", Menu::Edit, &["<Control><Shift>k"]),
-    a("clear_scrollback", "Clear Scrollback", Menu::Edit, &["<Control><Shift><Alt>k"]),
+    a(
+        "select_all",
+        "Select All",
+        Menu::Edit,
+        &["<Control><Shift>a"],
+    ),
+    a(
+        "clear_screen",
+        "Clear Screen",
+        Menu::Edit,
+        &["<Control><Shift>k"],
+    ),
+    a(
+        "clear_scrollback",
+        "Clear Scrollback",
+        Menu::Edit,
+        &["<Control><Shift><Alt>k"],
+    ),
     a("explain", "Explain Last Command", Menu::Edit, &[]),
     a("find", "Find…", Menu::Edit, &["<Control><Shift>f"]),
     a("find_next", "Find Next", Menu::Edit, &["<Control><Shift>g"]),
-    a("find_previous", "Find Previous", Menu::Edit, &["<Control><Shift>h"]),
+    a(
+        "find_previous",
+        "Find Previous",
+        Menu::Edit,
+        &["<Control><Shift>h"],
+    ),
     // View
     a(
         "increase_font_size",
@@ -93,28 +164,113 @@ pub const ACTIONS: &[ActionDef] = &[
         Menu::View,
         &["<Control>equal", "<Control>plus", "<Control><Shift>plus"],
     ),
-    a("decrease_font_size", "Decrease Font Size", Menu::View, &["<Control>minus"]),
-    a("reset_font_size", "Reset Font Size", Menu::View, &["<Control>0"]),
+    a(
+        "decrease_font_size",
+        "Decrease Font Size",
+        Menu::View,
+        &["<Control>minus"],
+    ),
+    a(
+        "reset_font_size",
+        "Reset Font Size",
+        Menu::View,
+        &["<Control>0"],
+    ),
     a("toggle_tab_style", "Tabs in Sidebar", Menu::View, &[]),
-    a("toggle_sidebar", "Hide Sidebar", Menu::View, &["<Control><Shift>b"]),
+    a(
+        "toggle_sidebar",
+        "Hide Sidebar",
+        Menu::View,
+        &["<Control><Shift>b"],
+    ),
     a("browse_themes", "Theme: Browse Themes…", Menu::View, &[]),
-    a("follow_appearance", "Theme: Match System Appearance", Menu::View, &[]),
-    a("zoom_split", "Zoom Split", Menu::View, &["<Control><Shift>Return"]),
-    a("equalize_splits", "Equalize Splits", Menu::View, &["<Control><Alt>equal"]),
-    a("focus_left", "Select Split Left", Menu::View, &["<Control><Alt>Left"]),
-    a("focus_right", "Select Split Right", Menu::View, &["<Control><Alt>Right"]),
-    a("focus_up", "Select Split Above", Menu::View, &["<Control><Alt>Up"]),
-    a("focus_down", "Select Split Below", Menu::View, &["<Control><Alt>Down"]),
-    a("resize_left", "Move Divider Left", Menu::View, &["<Control><Shift><Alt>Left"]),
-    a("resize_right", "Move Divider Right", Menu::View, &["<Control><Shift><Alt>Right"]),
-    a("resize_up", "Move Divider Up", Menu::View, &["<Control><Shift><Alt>Up"]),
-    a("resize_down", "Move Divider Down", Menu::View, &["<Control><Shift><Alt>Down"]),
-    a("toggle_fullscreen", "Toggle Full Screen", Menu::View, &["F11"]),
+    a(
+        "follow_appearance",
+        "Theme: Match System Appearance",
+        Menu::View,
+        &[],
+    ),
+    a(
+        "zoom_split",
+        "Zoom Split",
+        Menu::View,
+        &["<Control><Shift>Return"],
+    ),
+    a(
+        "equalize_splits",
+        "Equalize Splits",
+        Menu::View,
+        &["<Control><Alt>equal"],
+    ),
+    a(
+        "focus_left",
+        "Select Split Left",
+        Menu::View,
+        &["<Control><Alt>Left"],
+    ),
+    a(
+        "focus_right",
+        "Select Split Right",
+        Menu::View,
+        &["<Control><Alt>Right"],
+    ),
+    a(
+        "focus_up",
+        "Select Split Above",
+        Menu::View,
+        &["<Control><Alt>Up"],
+    ),
+    a(
+        "focus_down",
+        "Select Split Below",
+        Menu::View,
+        &["<Control><Alt>Down"],
+    ),
+    a(
+        "resize_left",
+        "Move Divider Left",
+        Menu::View,
+        &["<Control><Shift><Alt>Left"],
+    ),
+    a(
+        "resize_right",
+        "Move Divider Right",
+        Menu::View,
+        &["<Control><Shift><Alt>Right"],
+    ),
+    a(
+        "resize_up",
+        "Move Divider Up",
+        Menu::View,
+        &["<Control><Shift><Alt>Up"],
+    ),
+    a(
+        "resize_down",
+        "Move Divider Down",
+        Menu::View,
+        &["<Control><Shift><Alt>Down"],
+    ),
+    a(
+        "toggle_fullscreen",
+        "Toggle Full Screen",
+        Menu::View,
+        &["F11"],
+    ),
     // Window
     a("minimize", "Minimize", Menu::Window, &[]),
     a("maximize", "Zoom", Menu::Window, &[]),
-    a("previous_tab", "Show Previous Tab", Menu::Window, &["<Control>Page_Up"]),
-    a("next_tab", "Show Next Tab", Menu::Window, &["<Control>Page_Down"]),
+    a(
+        "previous_tab",
+        "Show Previous Tab",
+        Menu::Window,
+        &["<Control>Page_Up"],
+    ),
+    a(
+        "next_tab",
+        "Show Next Tab",
+        Menu::Window,
+        &["<Control>Page_Down"],
+    ),
     a("select_tab_1", "Select Tab 1", Menu::Window, &["<Alt>1"]),
     a("select_tab_2", "Select Tab 2", Menu::Window, &["<Alt>2"]),
     a("select_tab_3", "Select Tab 3", Menu::Window, &["<Alt>3"]),
@@ -123,20 +279,80 @@ pub const ACTIONS: &[ActionDef] = &[
     a("select_tab_6", "Select Tab 6", Menu::Window, &["<Alt>6"]),
     a("select_tab_7", "Select Tab 7", Menu::Window, &["<Alt>7"]),
     a("select_tab_8", "Select Tab 8", Menu::Window, &["<Alt>8"]),
-    a("select_last_tab", "Select Last Tab", Menu::Window, &["<Alt>9"]),
-    a("move_tab_to_new_workspace", "Move Tab to New Workspace", Menu::Window, &[]),
+    a(
+        "select_last_tab",
+        "Select Last Tab",
+        Menu::Window,
+        &["<Alt>9"],
+    ),
+    a(
+        "move_tab_to_new_workspace",
+        "Move Tab to New Workspace",
+        Menu::Window,
+        &[],
+    ),
     a("quick_terminal", "Quick Terminal", Menu::Window, &[]),
-    a("workspace_1", "Workspace 1", Menu::Window, &["<Control><Alt>1"]),
-    a("workspace_2", "Workspace 2", Menu::Window, &["<Control><Alt>2"]),
-    a("workspace_3", "Workspace 3", Menu::Window, &["<Control><Alt>3"]),
-    a("workspace_4", "Workspace 4", Menu::Window, &["<Control><Alt>4"]),
-    a("workspace_5", "Workspace 5", Menu::Window, &["<Control><Alt>5"]),
-    a("workspace_6", "Workspace 6", Menu::Window, &["<Control><Alt>6"]),
-    a("workspace_7", "Workspace 7", Menu::Window, &["<Control><Alt>7"]),
-    a("workspace_8", "Workspace 8", Menu::Window, &["<Control><Alt>8"]),
-    a("workspace_9", "Workspace 9", Menu::Window, &["<Control><Alt>9"]),
+    a(
+        "workspace_1",
+        "Workspace 1",
+        Menu::Window,
+        &["<Control><Alt>1"],
+    ),
+    a(
+        "workspace_2",
+        "Workspace 2",
+        Menu::Window,
+        &["<Control><Alt>2"],
+    ),
+    a(
+        "workspace_3",
+        "Workspace 3",
+        Menu::Window,
+        &["<Control><Alt>3"],
+    ),
+    a(
+        "workspace_4",
+        "Workspace 4",
+        Menu::Window,
+        &["<Control><Alt>4"],
+    ),
+    a(
+        "workspace_5",
+        "Workspace 5",
+        Menu::Window,
+        &["<Control><Alt>5"],
+    ),
+    a(
+        "workspace_6",
+        "Workspace 6",
+        Menu::Window,
+        &["<Control><Alt>6"],
+    ),
+    a(
+        "workspace_7",
+        "Workspace 7",
+        Menu::Window,
+        &["<Control><Alt>7"],
+    ),
+    a(
+        "workspace_8",
+        "Workspace 8",
+        Menu::Window,
+        &["<Control><Alt>8"],
+    ),
+    a(
+        "workspace_9",
+        "Workspace 9",
+        Menu::Window,
+        &["<Control><Alt>9"],
+    ),
     // Help
-    a("open_config_file", "Open Configuration File", Menu::Help, &[]),
+    a(
+        "open_config_file",
+        "Open Configuration File",
+        Menu::Help,
+        &[],
+    ),
 ];
 
 /// Actions only reachable through key bindings (no menu item of their own).
@@ -244,9 +460,7 @@ pub fn parse_binding(spec: &str) -> Option<String> {
         "pagedown" | "page_down" => "Page_Down".into(),
         "home" => "Home".into(),
         "end" => "End".into(),
-        k if k.len() > 1 && k.starts_with('f') && k[1..].parse::<u8>().is_ok() => {
-            k.to_uppercase()
-        }
+        k if k.len() > 1 && k.starts_with('f') && k[1..].parse::<u8>().is_ok() => k.to_uppercase(),
         k if k.chars().count() == 1 => k.to_string(),
         k => gdk::Key::from_name(k).map(|_| k.to_string())?,
     };
@@ -340,12 +554,21 @@ mod tests {
 
     #[test]
     fn parses_bindings() {
-        assert_eq!(parse_binding("ctrl+shift+d").as_deref(), Some("<Control><Shift>d"));
+        assert_eq!(
+            parse_binding("ctrl+shift+d").as_deref(),
+            Some("<Control><Shift>d")
+        );
         assert_eq!(parse_binding("cmd+d").as_deref(), Some("<Control><Shift>d"));
-        assert_eq!(parse_binding("cmd+shift+d").as_deref(), Some("<Control><Shift><Alt>d"));
+        assert_eq!(
+            parse_binding("cmd+shift+d").as_deref(),
+            Some("<Control><Shift><Alt>d")
+        );
         assert_eq!(parse_binding("alt+1").as_deref(), Some("<Alt>1"));
         assert_eq!(parse_binding("f11").as_deref(), Some("F11"));
-        assert_eq!(parse_binding("ctrl+enter").as_deref(), Some("<Control>Return"));
+        assert_eq!(
+            parse_binding("ctrl+enter").as_deref(),
+            Some("<Control>Return")
+        );
         assert_eq!(parse_binding("ctrl++").as_deref(), Some("<Control>plus"));
         assert_eq!(parse_binding("hyper+x"), None);
     }

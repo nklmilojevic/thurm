@@ -33,7 +33,9 @@ pub fn ask(
     for b in buttons {
         dialog.add_response(b.id, b.label);
         match b.style {
-            Style::Suggested => dialog.set_response_appearance(b.id, adw::ResponseAppearance::Suggested),
+            Style::Suggested => {
+                dialog.set_response_appearance(b.id, adw::ResponseAppearance::Suggested)
+            }
             Style::Destructive => {
                 dialog.set_response_appearance(b.id, adw::ResponseAppearance::Destructive)
             }
@@ -74,12 +76,19 @@ pub fn confirm(
     destructive: bool,
     done: impl FnOnce() + 'static,
 ) {
-    let style = if destructive { Style::Destructive } else { Style::Suggested };
+    let style = if destructive {
+        Style::Destructive
+    } else {
+        Style::Suggested
+    };
     ask(
         parent,
         title,
         body,
-        &[button("ok", ok_label, style), button("cancel", "Cancel", Style::Default)],
+        &[
+            button("ok", ok_label, style),
+            button("cancel", "Cancel", Style::Default),
+        ],
         move |r| {
             if r == "ok" {
                 done();
@@ -90,7 +99,13 @@ pub fn confirm(
 
 /// An informational message with OK.
 pub fn inform(parent: &impl IsA<gtk::Widget>, title: &str, body: &str) {
-    ask(parent, title, body, &[button("ok", "OK", Style::Default)], |_| {});
+    ask(
+        parent,
+        title,
+        body,
+        &[button("ok", "OK", Style::Default)],
+        |_| {},
+    );
 }
 
 /// A dialog with text fields; `done` gets the values when confirmed.
@@ -136,7 +151,11 @@ pub fn prompt(
     });
     dialog.present(Some(parent));
     if let Some(first) = list.first_child().and_then(|c| {
-        if c.is::<gtk::Entry>() { Some(c) } else { c.next_sibling() }
+        if c.is::<gtk::Entry>() {
+            Some(c)
+        } else {
+            c.next_sibling()
+        }
     }) {
         glib::idle_add_local_once(move || {
             first.grab_focus();
@@ -150,9 +169,15 @@ mod tests {
 
     #[test]
     fn enter_cancels_destructive_dialogs() {
-        let close = [button("ok", "Close", Style::Destructive), button("cancel", "Cancel", Style::Default)];
+        let close = [
+            button("ok", "Close", Style::Destructive),
+            button("cancel", "Cancel", Style::Default),
+        ];
         assert_eq!(default_response(&close), Some("cancel"));
-        let save = [button("ok", "Save", Style::Suggested), button("cancel", "Cancel", Style::Default)];
+        let save = [
+            button("ok", "Save", Style::Suggested),
+            button("cancel", "Cancel", Style::Default),
+        ];
         assert_eq!(default_response(&save), Some("ok"));
     }
 }

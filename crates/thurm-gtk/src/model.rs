@@ -180,7 +180,9 @@ impl SplitNode {
                     Direction::Up | Direction::Down => Axis::Vertical,
                 };
                 let (first, second) = match dir {
-                    Direction::Right | Direction::Down => (SplitNode::Leaf(k), SplitNode::Leaf(pane)),
+                    Direction::Right | Direction::Down => {
+                        (SplitNode::Leaf(k), SplitNode::Leaf(pane))
+                    }
                     Direction::Left | Direction::Up => (SplitNode::Leaf(pane), SplitNode::Leaf(k)),
                 };
                 SplitNode::Split {
@@ -523,7 +525,11 @@ pub fn display_title(info: Option<&PaneInfo>) -> String {
     }
     if let Some(cwd) = &info.cwd {
         let last = cwd.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-        return if last.is_empty() { cwd.clone() } else { last.to_string() };
+        return if last.is_empty() {
+            cwd.clone()
+        } else {
+            last.to_string()
+        };
     }
     "Thurm".into()
 }
@@ -538,7 +544,9 @@ pub fn has_running_process(info: &PaneInfo) -> bool {
     if !info.alive {
         return false;
     }
-    let Some(fg) = &info.foreground else { return false };
+    let Some(fg) = &info.foreground else {
+        return false;
+    };
     let name = fg.name.trim_start_matches('-');
     let name = name.rsplit('/').next().unwrap_or(name);
     !name.is_empty() && !SHELLS.contains(&name)
@@ -815,7 +823,9 @@ mod tests {
         };
         let node = SplitNode::from_layout(&stored, LOCAL);
         match &node {
-            SplitNode::Split { axis, ratio, first, .. } => {
+            SplitNode::Split {
+                axis, ratio, first, ..
+            } => {
                 assert_eq!(*axis, Axis::Horizontal);
                 assert!((ratio - 0.7).abs() < 1e-9);
                 assert_eq!(**first, leaf(2));
@@ -823,7 +833,13 @@ mod tests {
             _ => panic!(),
         }
         let back = node.to_layout();
-        assert!(matches!(back, LayoutNode::Split { dir: SplitDir::Right, .. }));
+        assert!(matches!(
+            back,
+            LayoutNode::Split {
+                dir: SplitDir::Right,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -839,7 +855,9 @@ mod tests {
 
     #[test]
     fn split_and_remove() {
-        let t = leaf(1).split(&k(1), k(2), Direction::Right).split(&k(2), k(3), Direction::Up);
+        let t = leaf(1)
+            .split(&k(1), k(2), Direction::Right)
+            .split(&k(2), k(3), Direction::Up);
         assert_eq!(t.panes(), vec![k(1), k(3), k(2)]);
         let t = t.remove(&k(3)).unwrap();
         assert_eq!(t.panes(), vec![k(1), k(2)]);
@@ -856,21 +874,30 @@ mod tests {
 
     #[test]
     fn equalize_three_in_a_row() {
-        let mut t = leaf(1)
-            .split(&k(1), k(2), Direction::Right)
-            .split(&k(2), k(3), Direction::Right);
+        let mut t =
+            leaf(1)
+                .split(&k(1), k(2), Direction::Right)
+                .split(&k(2), k(3), Direction::Right);
         t.equalize();
         let mut frames = Vec::new();
-        t.layout(Rect::new(0.0, 0.0, 302.0, 10.0), &mut frames, &mut Vec::new());
+        t.layout(
+            Rect::new(0.0, 0.0, 302.0, 10.0),
+            &mut frames,
+            &mut Vec::new(),
+        );
         let widths: Vec<f64> = frames.iter().map(|(_, r)| r.w).collect();
-        assert!(widths.iter().all(|w| (w - 100.0).abs() <= 1.0), "{widths:?}");
+        assert!(
+            widths.iter().all(|w| (w - 100.0).abs() <= 1.0),
+            "{widths:?}"
+        );
     }
 
     #[test]
     fn resize_moves_the_nearest_matching_split() {
-        let mut t = leaf(1)
-            .split(&k(1), k(2), Direction::Right)
-            .split(&k(2), k(3), Direction::Down);
+        let mut t =
+            leaf(1)
+                .split(&k(1), k(2), Direction::Right)
+                .split(&k(2), k(3), Direction::Down);
         assert!(t.resize(&k(3), Axis::Horizontal, 0.05));
         match &t {
             SplitNode::Split { ratio, .. } => assert!((ratio - 0.55).abs() < 1e-9),
@@ -903,8 +930,14 @@ mod tests {
 
     #[test]
     fn paths_and_durations() {
-        assert_eq!(abbreviate_path("/home/u/dev/personal/thurm", Some("/home/u")), "~/d/p/thurm");
-        assert_eq!(abbreviate_path("/home/u/.config/thurm", Some("/home/u")), "~/.c/thurm");
+        assert_eq!(
+            abbreviate_path("/home/u/dev/personal/thurm", Some("/home/u")),
+            "~/d/p/thurm"
+        );
+        assert_eq!(
+            abbreviate_path("/home/u/.config/thurm", Some("/home/u")),
+            "~/.c/thurm"
+        );
         assert_eq!(abbreviate_path("/tmp", Some("/home/u")), "/tmp");
         assert_eq!(format_duration(42_000), "42s");
         assert_eq!(format_duration(185_000), "3m 05s");
@@ -922,7 +955,10 @@ mod tests {
 
     #[test]
     fn escaping() {
-        assert_eq!(shell_escape("~/a b/(x).png").as_deref(), Some("~/a\\ b/\\(x\\).png"));
+        assert_eq!(
+            shell_escape("~/a b/(x).png").as_deref(),
+            Some("~/a\\ b/\\(x\\).png")
+        );
         assert_eq!(shell_escape("/tmp/x\nrm -rf ~"), None);
         assert_eq!(shell_escape("/tmp/x\ry"), None);
     }

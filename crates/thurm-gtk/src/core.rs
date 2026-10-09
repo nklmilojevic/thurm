@@ -84,7 +84,9 @@ unsafe extern "C" fn on_event(ctx: *mut c_void, json: *const c_char) {
         return;
     }
     let token = unsafe { &*(ctx as *const Token) };
-    let text = unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned();
+    let text = unsafe { CStr::from_ptr(json) }
+        .to_string_lossy()
+        .into_owned();
     let value: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(_) => {
@@ -121,7 +123,9 @@ unsafe extern "C" fn on_remote_status(_ctx: *mut c_void, json: *const c_char) {
     if json.is_null() {
         return;
     }
-    let text = unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned();
+    let text = unsafe { CStr::from_ptr(json) }
+        .to_string_lossy()
+        .into_owned();
     if let Ok(value) = serde_json::from_str::<Value>(&text) {
         glib::idle_add_once(move || {
             crate::app::with_app(|app| app.remote_status(value));
@@ -540,12 +544,18 @@ impl Core {
         } {
             return None;
         }
-        let fits = (1..=Self::MAX_IMAGE_SIDE).contains(&w) && (1..=Self::MAX_IMAGE_SIDE).contains(&h);
+        let fits =
+            (1..=Self::MAX_IMAGE_SIDE).contains(&w) && (1..=Self::MAX_IMAGE_SIDE).contains(&h);
         let n = w as usize * h as usize * 4;
         let out = (fits && !rgba.is_null()).then(|| {
             let src = unsafe { std::slice::from_raw_parts(rgba, n) };
             let mut out = vec![0u8; n];
-            for (d, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
+            for (d, s) in out
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<4>().0)
+            {
                 let a = s[3] as u32;
                 let pm = |c: u8| ((c as u32 * a + 127) / 255) as u8;
                 // Little-endian ARGB32: B, G, R, A.
@@ -602,7 +612,13 @@ impl Grid<'_> {
         if link == 0 {
             return None;
         }
-        unsafe { borrowed(thurm_ffi::thurm_grid_link(self.core.client, self.pane, link - 1)) }
+        unsafe {
+            borrowed(thurm_ffi::thurm_grid_link(
+                self.core.client,
+                self.pane,
+                link - 1,
+            ))
+        }
     }
 
     pub fn images(&self) -> Vec<thurm_image_placement> {

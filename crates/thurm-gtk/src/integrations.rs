@@ -32,7 +32,9 @@ pub fn share_dir() -> Option<PathBuf> {
         dirs_data().join("thurm"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../linux/share"),
     ];
-    candidates.into_iter().find(|d| d.join("fonts").is_dir() || d.join("skills").is_dir())
+    candidates
+        .into_iter()
+        .find(|d| d.join("fonts").is_dir() || d.join("skills").is_dir())
 }
 
 fn dirs_data() -> PathBuf {
@@ -85,7 +87,11 @@ pub fn load_state_list(key: &str) -> Vec<String> {
     load_state()
         .get(key)
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -119,7 +125,11 @@ pub fn save_drop_image(png: &[u8]) -> Option<String> {
         .filter(|d| d.is_absolute() && d.is_dir())
         .unwrap_or_else(thurm_config::state_dir);
     let dir = base.join("thurm-drops");
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).ok()?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .ok()?;
     // Not a symlink to somewhere else, and private even if it existed before.
     if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
         return None;
@@ -141,7 +151,10 @@ pub fn save_drop_image(png: &[u8]) -> Option<String> {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let path = dir.join(format!("image-{:08x}.png", (nanos as u64) ^ std::process::id() as u64));
+    let path = dir.join(format!(
+        "image-{:08x}.png",
+        (nanos as u64) ^ std::process::id() as u64
+    ));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -183,7 +196,10 @@ pub fn show_in_file_manager(path: &str) {
 // MARK: integrations
 
 fn bin_dir() -> Option<PathBuf> {
-    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf)
 }
 
 fn bundled_cli() -> Option<PathBuf> {
@@ -196,16 +212,20 @@ fn cli_link() -> PathBuf {
 
 /// The CLI is reachable: `thurm` next to the app is what PATH finds (packages install it so).
 fn cli_installed() -> bool {
-    let Some(cli) = bundled_cli() else { return true };
+    let Some(cli) = bundled_cli() else {
+        return true;
+    };
     let link = cli_link();
     std::fs::canonicalize(&link).ok() == std::fs::canonicalize(&cli).ok()
-        || thurm_config::which("thurm")
-            .and_then(|p| std::fs::canonicalize(p).ok())
+        || thurm_config::which("thurm").and_then(|p| std::fs::canonicalize(p).ok())
             == std::fs::canonicalize(&cli).ok()
 }
 
 fn skill_source() -> Option<PathBuf> {
-    let mut c: Vec<PathBuf> = share_dir().map(|d| d.join("skills/thurm")).into_iter().collect();
+    let mut c: Vec<PathBuf> = share_dir()
+        .map(|d| d.join("skills/thurm"))
+        .into_iter()
+        .collect();
     c.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills/thurm"));
     c.into_iter().find(|p| p.join("SKILL.md").is_file())
 }
@@ -248,7 +268,11 @@ pub fn menu() -> gio::Menu {
     let menu = gio::Menu::new();
     if bundled_cli().is_some() {
         menu.append(
-            Some(if cli_installed() { "✓ Uninstall Command-Line Tool" } else { "Install Command-Line Tool" }),
+            Some(if cli_installed() {
+                "✓ Uninstall Command-Line Tool"
+            } else {
+                "Install Command-Line Tool"
+            }),
             Some("app.integ_cli"),
         );
     }
@@ -265,7 +289,8 @@ pub fn menu() -> gio::Menu {
         menu.append_item(&item);
     }
     if home().join(".claude").is_dir() && skill_source().is_some() {
-        let linked = std::fs::canonicalize(skill_link()).ok() == skill_source().and_then(|s| std::fs::canonicalize(s).ok());
+        let linked = std::fs::canonicalize(skill_link()).ok()
+            == skill_source().and_then(|s| std::fs::canonicalize(s).ok());
         menu.append(
             Some(if linked {
                 "✓ Uninstall thurm Skill for Claude Code"
@@ -276,7 +301,11 @@ pub fn menu() -> gio::Menu {
         );
     }
     menu.append(
-        Some(if systemd_enabled() { "✓ Don't Start Daemon at Login" } else { "Start Daemon at Login" }),
+        Some(if systemd_enabled() {
+            "✓ Don't Start Daemon at Login"
+        } else {
+            "Start Daemon at Login"
+        }),
         Some("app.integ_systemd"),
     );
     menu
@@ -286,11 +315,25 @@ pub fn menu() -> gio::Menu {
 pub fn palette_items() -> Vec<(String, Rc<dyn Fn()>)> {
     let mut out: Vec<(String, Rc<dyn Fn()>)> = Vec::new();
     if bundled_cli().is_some() {
-        let label = if cli_installed() { "Uninstall Command-Line Tool" } else { "Install Command-Line Tool" };
-        out.push((label.into(), Rc::new(|| app::with_app(|a| a.activate("integ_cli")).unwrap_or(()))));
+        let label = if cli_installed() {
+            "Uninstall Command-Line Tool"
+        } else {
+            "Install Command-Line Tool"
+        };
+        out.push((
+            label.into(),
+            Rc::new(|| app::with_app(|a| a.activate("integ_cli")).unwrap_or(())),
+        ));
     }
-    let label = if systemd_enabled() { "Don't Start Daemon at Login" } else { "Start Daemon at Login" };
-    out.push((label.into(), Rc::new(|| app::with_app(|a| a.activate("integ_systemd")).unwrap_or(()))));
+    let label = if systemd_enabled() {
+        "Don't Start Daemon at Login"
+    } else {
+        "Start Daemon at Login"
+    };
+    out.push((
+        label.into(),
+        Rc::new(|| app::with_app(|a| a.activate("integ_systemd")).unwrap_or(())),
+    ));
     out
 }
 
@@ -327,12 +370,17 @@ fn report(app: &App, title: &str, result: Result<String, String>) {
 fn toggle_cli(app: &Rc<App>) {
     let Some(cli) = bundled_cli() else { return };
     let link = cli_link();
-    let result = if cli_installed() && std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()) {
+    let result = if cli_installed()
+        && std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink())
+    {
         std::fs::remove_file(&link)
             .map(|_| format!("Removed {}.", link.display()))
             .map_err(|e| e.to_string())
     } else if std::fs::symlink_metadata(&link).is_ok_and(|m| !m.file_type().is_symlink()) {
-        Err(format!("{} exists and is not a link; not replacing it.", link.display()))
+        Err(format!(
+            "{} exists and is not a link; not replacing it.",
+            link.display()
+        ))
     } else {
         let _ = std::fs::remove_file(&link);
         if let Some(d) = link.parent() {
@@ -346,16 +394,29 @@ fn toggle_cli(app: &Rc<App>) {
 }
 
 fn toggle_hooks(app: &Rc<App>, agent: &str) {
-    let Some(h) = hooks_status().into_iter().find(|h| h.get("agent").and_then(Value::as_str) == Some(agent)) else {
+    let Some(h) = hooks_status()
+        .into_iter()
+        .find(|h| h.get("agent").and_then(Value::as_str) == Some(agent))
+    else {
         return;
     };
-    let name = h.get("name").and_then(Value::as_str).unwrap_or(agent).to_string();
-    let path = h.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = h
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(agent)
+        .to_string();
+    let path = h
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let install = !hooks_complete(&h);
     let (title, body, ok) = if install {
         (
             format!("Install {name} hooks?"),
-            format!("Adds Thurm's hooks to {path} (a backup of the current file is kept), so Thurm shows when {name} is working, waiting for you or done. Running sessions pick them up after a restart."),
+            format!(
+                "Adds Thurm's hooks to {path} (a backup of the current file is kept), so Thurm shows when {name} is working, waiting for you or done. Running sessions pick them up after a restart."
+            ),
             "Install",
         )
     } else {
@@ -369,7 +430,12 @@ fn toggle_hooks(app: &Rc<App>, agent: &str) {
     let agent = agent.to_string();
     dialogs::confirm(&w.window, &title, &body, ok, !install, move || {
         run_cli(
-            vec!["hooks".into(), if install { "install" } else { "uninstall" }.into(), "--agent".into(), agent.clone()],
+            vec![
+                "hooks".into(),
+                if install { "install" } else { "uninstall" }.into(),
+                "--agent".into(),
+                agent.clone(),
+            ],
             "Agent Hooks",
         );
     });
@@ -390,14 +456,23 @@ fn toggle_skill(app: &Rc<App>) {
             let _ = std::fs::create_dir_all(d);
         }
         std::os::unix::fs::symlink(&src, &link)
-            .map(|_| format!("Linked {}. New Claude Code sessions can use it.", link.display()))
+            .map(|_| {
+                format!(
+                    "Linked {}. New Claude Code sessions can use it.",
+                    link.display()
+                )
+            })
             .map_err(|e| e.to_string())
     };
     report(app, "thurm Skill", result);
 }
 
 fn toggle_systemd(_app: &Rc<App>) {
-    let action = if systemd_enabled() { "uninstall-systemd" } else { "install-systemd" };
+    let action = if systemd_enabled() {
+        "uninstall-systemd"
+    } else {
+        "install-systemd"
+    };
     run_cli(vec!["daemon".into(), action.into()], "Daemon at Login");
 }
 

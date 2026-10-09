@@ -75,40 +75,47 @@ impl Remotes {
             .and_then(|s| s.get("message").and_then(Value::as_str))
             .unwrap_or("")
             .to_string();
-        Some(match status.as_ref().and_then(|s| s.get("phase").and_then(Value::as_str)) {
-            None | Some("connecting") => format!("Connecting to {host}…"),
-            Some("needs_attention") => {
-                let mut m = format!("{host} needs attention");
-                if !message.is_empty() {
-                    m.push('\n');
-                    m.push_str(&message);
+        Some(
+            match status
+                .as_ref()
+                .and_then(|s| s.get("phase").and_then(Value::as_str))
+            {
+                None | Some("connecting") => format!("Connecting to {host}…"),
+                Some("needs_attention") => {
+                    let mut m = format!("{host} needs attention");
+                    if !message.is_empty() {
+                        m.push('\n');
+                        m.push_str(&message);
+                    }
+                    m + "\nThurm › Remotes… to retry"
                 }
-                m + "\nThurm › Remotes… to retry"
-            }
-            Some("not_installed") => {
-                format!("Thurm is not installed on {host}.\nThurm › Remotes… to install it.")
-            }
-            Some("upgrade_needed") => format!(
-                "{host} runs another version of Thurm\n{}\nThurm › Remotes… to upgrade it.",
-                first_line(&message)
-            ),
-            Some("disabled") => format!("{host} is disabled (enabled = false in its [[remote]])."),
-            Some(_) => {
-                let retry = status
-                    .as_ref()
-                    .and_then(|s| s.get("retry_at").and_then(Value::as_f64))
-                    .map(|t| (t - now()).ceil());
-                let mut m = match retry {
-                    Some(s) if s > 0.0 => format!("Disconnected — reconnecting in {s} s…"),
-                    _ => "Disconnected — reconnecting…".into(),
-                };
-                if !message.is_empty() {
-                    m.push('\n');
-                    m.push_str(first_line(&message));
+                Some("not_installed") => {
+                    format!("Thurm is not installed on {host}.\nThurm › Remotes… to install it.")
                 }
-                m
-            }
-        })
+                Some("upgrade_needed") => format!(
+                    "{host} runs another version of Thurm\n{}\nThurm › Remotes… to upgrade it.",
+                    first_line(&message)
+                ),
+                Some("disabled") => {
+                    format!("{host} is disabled (enabled = false in its [[remote]]).")
+                }
+                Some(_) => {
+                    let retry = status
+                        .as_ref()
+                        .and_then(|s| s.get("retry_at").and_then(Value::as_f64))
+                        .map(|t| (t - now()).ceil());
+                    let mut m = match retry {
+                        Some(s) if s > 0.0 => format!("Disconnected — reconnecting in {s} s…"),
+                        _ => "Disconnected — reconnecting…".into(),
+                    };
+                    if !message.is_empty() {
+                        m.push('\n');
+                        m.push_str(first_line(&message));
+                    }
+                    m
+                }
+            },
+        )
     }
 
     pub fn presets(&self, host: &str) -> Vec<AgentPreset> {
@@ -131,8 +138,8 @@ impl Remotes {
         self.handoffs.borrow().iter().find_map(|h| {
             (h.get("host").and_then(Value::as_str) == Some(key.host.as_str())
                 && h.get("pane").and_then(Value::as_u64) == Some(key.id))
-                .then(|| h.get("id").and_then(Value::as_str).map(str::to_string))
-                .flatten()
+            .then(|| h.get("id").and_then(Value::as_str).map(str::to_string))
+            .flatten()
         })
     }
 
@@ -182,15 +189,35 @@ pub fn start(app: &Rc<App>) {
 
 /// A tunnel's state changed.
 pub fn status_changed(app: &Rc<App>, status: Value) {
-    let Some(name) = status.get("name").and_then(Value::as_str).map(str::to_string) else {
+    let Some(name) = status
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
         return;
     };
-    let phase = status.get("phase").and_then(Value::as_str).unwrap_or("").to_string();
-    let socket = status.get("socket").and_then(Value::as_str).unwrap_or("").to_string();
+    let phase = status
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let socket = status
+        .get("socket")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let old_phase = app.remotes.phase(&name);
-    app.remotes.statuses.borrow_mut().insert(name.clone(), status);
+    app.remotes
+        .statuses
+        .borrow_mut()
+        .insert(name.clone(), status);
     // The Remotes window's checklist follows the host's state.
-    let shown = app.remotes.window.borrow().as_ref().and_then(|w| w.selected.borrow().clone());
+    let shown = app
+        .remotes
+        .window
+        .borrow()
+        .as_ref()
+        .and_then(|w| w.selected.borrow().clone());
     if old_phase.as_deref() != Some(phase.as_str())
         && shown.as_deref() == Some(name.as_str())
         && app.remotes.reports.borrow().contains_key(&name)
@@ -243,9 +270,10 @@ fn update_overlays(app: &App, host: &str) {
 
 /// A 1 s timer refreshes the "reconnecting in N s" countdowns while one is pending.
 fn sync_countdown(app: &App) {
-    let needed = app.remotes.statuses.borrow().iter().any(|(h, s)| {
-        !app.is_connected(h) && s.get("retry_at").and_then(Value::as_f64).is_some()
-    });
+    let needed =
+        app.remotes.statuses.borrow().iter().any(|(h, s)| {
+            !app.is_connected(h) && s.get("retry_at").and_then(Value::as_f64).is_some()
+        });
     let running = app.remotes.countdown.borrow().is_some();
     if needed && !running {
         let id = glib::timeout_add_seconds_local(1, || {
@@ -391,10 +419,16 @@ fn remote_connected(app: &Rc<App>, host: &str) {
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    app.remotes.presets.borrow_mut().insert(host.to_string(), presets);
+    app.remotes
+        .presets
+        .borrow_mut()
+        .insert(host.to_string(), presets);
     if gone > 0 {
         app.toast(
-            &format!("{gone} {} on {host} ended while it was away", if gone == 1 { "pane" } else { "panes" }),
+            &format!(
+                "{gone} {} on {host} ended while it was away",
+                if gone == 1 { "pane" } else { "panes" }
+            ),
             5.0,
         );
     }
@@ -422,7 +456,8 @@ fn remote_connected(app: &Rc<App>, host: &str) {
 }
 
 pub fn clipboard_write_allowed(host: &str) -> bool {
-    core::remote_call(&json!({"op": "clipboard_write", "host": host})) == Value::String("allow".into())
+    core::remote_call(&json!({"op": "clipboard_write", "host": host}))
+        == Value::String("allow".into())
 }
 
 /// OSC 52 read: local panes get the clipboard; remote ones per `clipboard_read`.
@@ -431,20 +466,29 @@ pub fn clipboard_request(app: &Rc<App>, key: &PaneKey) {
         let key = key.clone();
         move |allow: bool| {
             app::with_app(|a| {
-                let Some(core) = a.core(&key.host) else { return };
+                let Some(core) = a.core(&key.host) else {
+                    return;
+                };
                 if !allow {
                     core.send(&json!({"ClipboardReply": {"pane": key.id, "text": ""}}));
                     return;
                 }
                 let k = key.clone();
-                a.display().clipboard().read_text_async(None::<&gtk::gio::Cancellable>, move |res| {
-                    let text = res.ok().flatten().map(|t| t.to_string()).unwrap_or_default();
-                    app::with_app(|a| {
-                        if let Some(c) = a.core(&k.host) {
-                            c.send(&json!({"ClipboardReply": {"pane": k.id, "text": text}}));
-                        }
-                    });
-                });
+                a.display().clipboard().read_text_async(
+                    None::<&gtk::gio::Cancellable>,
+                    move |res| {
+                        let text = res
+                            .ok()
+                            .flatten()
+                            .map(|t| t.to_string())
+                            .unwrap_or_default();
+                        app::with_app(|a| {
+                            if let Some(c) = a.core(&k.host) {
+                                c.send(&json!({"ClipboardReply": {"pane": k.id, "text": text}}));
+                            }
+                        });
+                    },
+                );
             });
         }
     };
@@ -456,12 +500,16 @@ pub fn clipboard_request(app: &Rc<App>, key: &PaneKey) {
     match decision.as_str() {
         Some("allow") => reply(true),
         Some("ask") => {
-            let Some(w) = app.win() else { return reply(false) };
+            let Some(w) = app.win() else {
+                return reply(false);
+            };
             let host = key.host.clone();
             dialogs::ask(
                 &w.window,
                 &format!("{host} wants to read your clipboard"),
-                &format!("A program in a pane on {host} asked for the contents of this computer's clipboard (OSC 52)."),
+                &format!(
+                    "A program in a pane on {host} asked for the contents of this computer's clipboard (OSC 52)."
+                ),
                 &[
                     button("once", "Allow Once", Style::Suggested),
                     button("always", &format!("Always for {host}"), Style::Default),
@@ -498,13 +546,22 @@ pub fn agent_settled(app: &Rc<App>, key: &PaneKey) {
 }
 
 fn fetch_handoff(app: &Rc<App>, id: &str, quiet: bool) {
-    let before = app.remotes.handoff(id).and_then(|h| h.get("fetched").cloned());
+    let before = app
+        .remotes
+        .handoff(id)
+        .and_then(|h| h.get("fetched").cloned());
     let id = id.to_string();
     core::remote_call_async(json!({"op": "handoff_fetch", "id": id}), move |r| {
         app::with_app(|a| {
             if let Some(e) = r.get("error").and_then(Value::as_str) {
-                a.remotes.handoff_errors.borrow_mut().insert(id.clone(), e.to_string());
-                a.toast(&format!("Fetching the handoff failed: {}", first_line(e)), 5.0);
+                a.remotes
+                    .handoff_errors
+                    .borrow_mut()
+                    .insert(id.clone(), e.to_string());
+                a.toast(
+                    &format!("Fetching the handoff failed: {}", first_line(e)),
+                    5.0,
+                );
             } else {
                 a.remotes.handoff_errors.borrow_mut().remove(&id);
                 if !quiet || r.get("fetched").cloned() != before {
@@ -524,11 +581,20 @@ pub fn cleanup_handoff(app: &Rc<App>, id: &str, remove: bool) {
     if !remove {
         return;
     }
-    let Some(h) = app.remotes.handoff(id) else { return };
-    let host = h.get("host").and_then(Value::as_str).unwrap_or("").to_string();
+    let Some(h) = app.remotes.handoff(id) else {
+        return;
+    };
+    let host = h
+        .get("host")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if !app.is_connected(&host) {
         core::remote_call(&json!({"op": "handoff_defer", "id": id}));
-        app.toast(&format!("{host} is offline: the worktree is removed once it is back"), 5.0);
+        app.toast(
+            &format!("{host} is offline: the worktree is removed once it is back"),
+            5.0,
+        );
         return;
     }
     run_cleanup(app, id.to_string(), false);
@@ -536,30 +602,36 @@ pub fn cleanup_handoff(app: &Rc<App>, id: &str, remove: bool) {
 
 fn run_cleanup(app: &Rc<App>, id: String, force: bool) {
     let _ = app;
-    core::remote_call_async(json!({"op": "handoff_cleanup", "id": id, "force": force}), move |r| {
-        app::with_app(|a| {
-            let Some(w) = a.win() else { return };
-            if let Some(e) = r.get("error").and_then(Value::as_str) {
-                let id = id.clone();
-                dialogs::ask(
-                    &w.window,
-                    "Remove it anyway?",
-                    e,
-                    &[button("remove", "Remove", Style::Destructive), button("cancel", "Keep", Style::Default)],
-                    move |resp| {
-                        if resp == "remove" {
-                            app::with_app(|a| run_cleanup(a, id.clone(), true));
-                        }
-                    },
-                );
-            } else if let Some(m) = r.get("message").and_then(Value::as_str) {
-                a.toast(m, 5.0);
-            } else {
-                dialogs::inform(&w.window, "Could not remove the handoff", &r.to_string());
-            }
-            a.remotes.reload_handoffs();
-        });
-    });
+    core::remote_call_async(
+        json!({"op": "handoff_cleanup", "id": id, "force": force}),
+        move |r| {
+            app::with_app(|a| {
+                let Some(w) = a.win() else { return };
+                if let Some(e) = r.get("error").and_then(Value::as_str) {
+                    let id = id.clone();
+                    dialogs::ask(
+                        &w.window,
+                        "Remove it anyway?",
+                        e,
+                        &[
+                            button("remove", "Remove", Style::Destructive),
+                            button("cancel", "Keep", Style::Default),
+                        ],
+                        move |resp| {
+                            if resp == "remove" {
+                                app::with_app(|a| run_cleanup(a, id.clone(), true));
+                            }
+                        },
+                    );
+                } else if let Some(m) = r.get("message").and_then(Value::as_str) {
+                    a.toast(m, 5.0);
+                } else {
+                    dialogs::inform(&w.window, "Could not remove the handoff", &r.to_string());
+                }
+                a.remotes.reload_handoffs();
+            });
+        },
+    );
 }
 
 fn hand_off(app: &Rc<App>, host: &str, repo: &str) {
@@ -601,24 +673,45 @@ fn start_handoff(host: String, repo: String, preset: Option<String>) {
                     return;
                 }
                 a.remotes.reload_handoffs();
-                let id = h.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                let worktree = h.get("worktree").and_then(Value::as_str).map(str::to_string);
-                let branch = h.get("branch").and_then(Value::as_str).unwrap_or("").to_string();
+                let id = h
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let worktree = h
+                    .get("worktree")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let branch = h
+                    .get("branch")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let Some(core) = a.core(&host) else { return };
                 let req = json!({"CreatePane": {
                     "command": null, "cwd": worktree, "env": [],
                     "size": {"cols": 120, "rows": 36, "cell_width": a.fonts().cell_w as u16, "cell_height": a.fonts().cell_h as u16},
                     "agent_preset": preset, "inherit_cwd_from": null, "hold": false, "fork_from": null,
                 }});
-                let Some(pane) = core.request(&req).pointer("/PaneCreated/pane").and_then(Value::as_u64) else {
+                let Some(pane) = core
+                    .request(&req)
+                    .pointer("/PaneCreated/pane")
+                    .and_then(Value::as_u64)
+                else {
                     return;
                 };
                 let key = PaneKey::new(&host, pane);
                 a.place_new_tab(key, Some(id.clone()), true);
-                core::remote_call_async(json!({"op": "handoff_set_pane", "id": id, "pane": pane}), |_| {
-                    app::with_app(|a| a.remotes.reload_handoffs());
-                });
-                a.toast(&format!("{branch} on {host}: results come back as thurm-{host}/{branch}"), 5.0);
+                core::remote_call_async(
+                    json!({"op": "handoff_set_pane", "id": id, "pane": pane}),
+                    |_| {
+                        app::with_app(|a| a.remotes.reload_handoffs());
+                    },
+                );
+                a.toast(
+                    &format!("{branch} on {host}: results come back as thurm-{host}/{branch}"),
+                    5.0,
+                );
             });
         },
     );
@@ -640,9 +733,13 @@ pub fn palette_items(app: &Rc<App>) -> Vec<Item> {
             for host in app.connected_remotes() {
                 let r = repo.clone();
                 let h = host.clone();
-                items.push(Item::new(format!("Hand Off to {host}…"), name.clone(), move || {
-                    app::with_app(|a| hand_off(a, &h, &r));
-                }));
+                items.push(Item::new(
+                    format!("Hand Off to {host}…"),
+                    name.clone(),
+                    move || {
+                        app::with_app(|a| hand_off(a, &h, &r));
+                    },
+                ));
             }
         }
     }
@@ -659,14 +756,22 @@ pub fn palette_items(app: &Rc<App>) -> Vec<Item> {
     for host in &names {
         if !app.is_connected(host) {
             let h = host.clone();
-            items.push(Item::new(format!("Reconnect to {host}"), app.remotes.phase_label(app, host), move || {
-                core::remote_kick(Some(&h), true);
-            }));
+            items.push(Item::new(
+                format!("Reconnect to {host}"),
+                app.remotes.phase_label(app, host),
+                move || {
+                    core::remote_kick(Some(&h), true);
+                },
+            ));
         }
     }
-    items.push(Item::new("Remotes…", "connection state, install, upgrade", || {
-        app::with_app(show_window);
-    }));
+    items.push(Item::new(
+        "Remotes…",
+        "connection state, install, upgrade",
+        || {
+            app::with_app(show_window);
+        },
+    ));
     items
 }
 
@@ -769,7 +874,12 @@ pub fn show_window(app: &Rc<App>) {
     });
     rw.check_again.connect_clicked(|_| {
         app::with_app(|a| {
-            let sel = a.remotes.window.borrow().as_ref().and_then(|w| w.selected.borrow().clone());
+            let sel = a
+                .remotes
+                .window
+                .borrow()
+                .as_ref()
+                .and_then(|w| w.selected.borrow().clone());
             if let Some(h) = sel {
                 doctor(a, &h);
             }
@@ -777,7 +887,12 @@ pub fn show_window(app: &Rc<App>) {
     });
     rw.retry.connect_clicked(|_| {
         app::with_app(|a| {
-            let sel = a.remotes.window.borrow().as_ref().and_then(|w| w.selected.borrow().clone());
+            let sel = a
+                .remotes
+                .window
+                .borrow()
+                .as_ref()
+                .and_then(|w| w.selected.borrow().clone());
             if let Some(h) = sel {
                 core::remote_kick(Some(&h), true);
             }
@@ -825,7 +940,10 @@ impl RemotesWindow {
                 .to_string();
             let row = adw::ActionRow::new();
             row.set_title(&r.name);
-            row.set_subtitle(&glib::markup_escape_text(&format!("{}   {}", r.host, build)));
+            row.set_subtitle(&glib::markup_escape_text(&format!(
+                "{}   {}",
+                r.host, build
+            )));
             let badge = gtk::Label::new(Some(&state));
             badge.add_css_class(match state.as_str() {
                 "connected" => "success",
@@ -845,17 +963,32 @@ impl RemotesWindow {
             .status(&host)
             .and_then(|s| s.get("message").and_then(Value::as_str).map(str::to_string))
             .unwrap_or_default();
-        let busy = app.remotes.busy.borrow().get(&host).cloned().unwrap_or_default();
+        let busy = app
+            .remotes
+            .busy
+            .borrow()
+            .get(&host)
+            .cloned()
+            .unwrap_or_default();
         self.status.set_text(if remotes.is_empty() {
             "No hosts yet: Add Host… connects to one over ssh."
         } else {
             ""
         });
         if !remotes.is_empty() {
-            self.status.set_text(&[busy.as_str(), message.as_str()].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join("\n"));
+            self.status.set_text(
+                &[busy.as_str(), message.as_str()]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
         }
-        self.retry.set_sensitive(!host.is_empty() && !app.remotes.busy.borrow().contains_key(&host));
-        self.check_again.set_sensitive(!host.is_empty() && app.remotes.fixing.borrow().is_none());
+        self.retry
+            .set_sensitive(!host.is_empty() && !app.remotes.busy.borrow().contains_key(&host));
+        self.check_again
+            .set_sensitive(!host.is_empty() && app.remotes.fixing.borrow().is_none());
         while let Some(r) = self.checks.first_child() {
             self.checks.remove(&r);
         }
@@ -905,9 +1038,16 @@ fn check_row(app: &Rc<App>, host: &str, c: &Value) -> adw::ActionRow {
         row.add_suffix(&b);
     } else if state == "fail" || state == "warn" {
         let fix = c.get("fix").filter(|f| !f.is_null());
-        let terminal = c.get("terminal").and_then(Value::as_str).map(str::to_string);
+        let terminal = c
+            .get("terminal")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         if let Some(f) = fix {
-            let label = f.get("label").and_then(Value::as_str).unwrap_or("Fix").to_string();
+            let label = f
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("Fix")
+                .to_string();
             let b = gtk::Button::with_label(&label);
             b.set_valign(gtk::Align::Center);
             b.set_sensitive(fixing.is_none());
@@ -923,7 +1063,11 @@ fn check_row(app: &Rc<App>, host: &str, c: &Value) -> adw::ActionRow {
             row.add_suffix(&b);
         }
         if let Some(script) = terminal {
-            let b = gtk::Button::with_label(if fix.is_some() { "In a Tab…" } else { "Run in a Tab…" });
+            let b = gtk::Button::with_label(if fix.is_some() {
+                "In a Tab…"
+            } else {
+                "Run in a Tab…"
+            });
             b.set_valign(gtk::Align::Center);
             let (h, title) = (host.to_string(), s("title"));
             b.connect_clicked(move |_| {
@@ -941,7 +1085,11 @@ fn bins() -> Value {
 
 fn set_busy(app: &Rc<App>, host: &str, text: Option<&str>) {
     match text {
-        Some(t) => app.remotes.busy.borrow_mut().insert(host.to_string(), t.to_string()),
+        Some(t) => app
+            .remotes
+            .busy
+            .borrow_mut()
+            .insert(host.to_string(), t.to_string()),
         None => app.remotes.busy.borrow_mut().remove(host),
     };
     if let Some(w) = app.remotes.window.borrow().clone() {
@@ -951,14 +1099,25 @@ fn set_busy(app: &Rc<App>, host: &str, text: Option<&str>) {
 
 fn doctor(app: &Rc<App>, host: &str) {
     let first = !app.remotes.reports.borrow().contains_key(host);
-    set_busy(app, host, Some(if first { "Checking…" } else { "Checking again…" }));
+    set_busy(
+        app,
+        host,
+        Some(if first {
+            "Checking…"
+        } else {
+            "Checking again…"
+        }),
+    );
     let h = host.to_string();
-    core::remote_call_async(json!({"op": "doctor", "name": host, "bins": bins()}), move |r| {
-        app::with_app(|a| {
-            a.remotes.reports.borrow_mut().insert(h.clone(), r);
-            set_busy(a, &h, None);
-        });
-    });
+    core::remote_call_async(
+        json!({"op": "doctor", "name": host, "bins": bins()}),
+        move |r| {
+            app::with_app(|a| {
+                a.remotes.reports.borrow_mut().insert(h.clone(), r);
+                set_busy(a, &h, None);
+            });
+        },
+    );
 }
 
 fn run_fix(app: &Rc<App>, host: &str, id: &str, title: &str, confirm: Option<&str>) {
@@ -1000,102 +1159,149 @@ fn run_fix(app: &Rc<App>, host: &str, id: &str, title: &str, confirm: Option<&st
 /// Runs a doctor's script on the host in a new local tab (`ssh -t …`), kept open.
 fn run_in_tab(app: &Rc<App>, host: &str, script: &str, title: &str) {
     let argv = core::remote_call(&json!({"op": "terminal_argv", "name": host, "script": script}));
-    let Some(argv) = argv.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>()) else {
+    let Some(argv) = argv.as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    }) else {
         return;
     };
-    let Some(key) = app.create_pane(LOCAL, None, None, Some(argv), None, true) else { return };
+    let Some(key) = app.create_pane(LOCAL, None, None, Some(argv), None, true) else {
+        return;
+    };
     app.place_new_tab(key, None, true);
-    app.toast(&format!("{title} on {host}: when it is done, Check Again in Thurm › Remotes…"), 6.0);
+    app.toast(
+        &format!("{title} on {host}: when it is done, Check Again in Thurm › Remotes…"),
+        6.0,
+    );
 }
 
 /// Plan, then install, then upgrade the remote daemon.
 fn install(app: &Rc<App>, host: &str) {
     let h = host.to_string();
     set_busy(app, host, Some("Checking…"));
-    core::remote_call_async(json!({"op": "plan", "name": host, "bins": bins()}), move |plan| {
-        app::with_app(|a| {
-            set_busy(a, &h, None);
-            let Some(w) = a.remotes.window.borrow().clone() else { return };
-            if let Some(e) = plan.get("error").and_then(Value::as_str) {
-                dialogs::inform(&w.window, &format!("Could not reach {h}"), e);
-                return;
-            }
-            if plan.get("installed").and_then(Value::as_bool) == Some(true) {
-                upgrade_daemon(a, &h, &plan);
-                return;
-            }
-            let methods: Vec<String> = plan
-                .get("methods")
-                .and_then(Value::as_array)
-                .map(|m| m.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            let labels: Vec<String> = plan
-                .get("labels")
-                .and_then(Value::as_array)
-                .map(|m| m.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            let os = plan.pointer("/host/os").and_then(Value::as_str).unwrap_or("");
-            let arch = plan.pointer("/host/arch").and_then(Value::as_str).unwrap_or("");
-            if methods.is_empty() {
-                let problem = plan
-                    .get("problem")
+    core::remote_call_async(
+        json!({"op": "plan", "name": host, "bins": bins()}),
+        move |plan| {
+            app::with_app(|a| {
+                set_busy(a, &h, None);
+                let Some(w) = a.remotes.window.borrow().clone() else {
+                    return;
+                };
+                if let Some(e) = plan.get("error").and_then(Value::as_str) {
+                    dialogs::inform(&w.window, &format!("Could not reach {h}"), e);
+                    return;
+                }
+                if plan.get("installed").and_then(Value::as_bool) == Some(true) {
+                    upgrade_daemon(a, &h, &plan);
+                    return;
+                }
+                let methods: Vec<String> = plan
+                    .get("methods")
+                    .and_then(Value::as_array)
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let labels: Vec<String> = plan
+                    .get("labels")
+                    .and_then(Value::as_array)
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let os = plan
+                    .pointer("/host/os")
                     .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("No build fits {os} {arch}."));
-                dialogs::inform(&w.window, &format!("Thurm cannot be installed on {h}"), &problem);
-                return;
-            }
-            let mut buttons = Vec::new();
-            for (m, l) in methods.iter().zip(labels.iter()).take(3) {
-                buttons.push(button(m, l, Style::Default));
-            }
-            buttons.push(button("cancel", "Cancel", Style::Default));
-            let h2 = h.clone();
-            dialogs::ask(
-                &w.window,
-                &format!("Install Thurm {} on {h}?", core::build_id()),
-                &format!("{os} {arch}. Thurm goes to ~/.local/share/thurm/bin there (and ~/.local/bin/thurm when that directory exists)."),
-                &buttons,
-                move |method| {
-                    if method == "cancel" {
-                        return;
-                    }
-                    app::with_app(|a| {
-                        set_busy(a, &h2, Some("Installing…"));
-                        let h3 = h2.clone();
-                        core::remote_call_async(
-                            json!({"op": "install", "name": h2, "method": method, "bins": bins()}),
-                            move |r| {
-                                app::with_app(|a| {
-                                    set_busy(a, &h3, None);
-                                    if let Some(e) = r.get("error").and_then(Value::as_str) {
-                                        if let Some(w) = a.remotes.window.borrow().as_ref() {
-                                            dialogs::inform(&w.window, &format!("Could not install Thurm on {h3}"), e);
+                    .unwrap_or("");
+                let arch = plan
+                    .pointer("/host/arch")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if methods.is_empty() {
+                    let problem = plan
+                        .get("problem")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("No build fits {os} {arch}."));
+                    dialogs::inform(
+                        &w.window,
+                        &format!("Thurm cannot be installed on {h}"),
+                        &problem,
+                    );
+                    return;
+                }
+                let mut buttons = Vec::new();
+                for (m, l) in methods.iter().zip(labels.iter()).take(3) {
+                    buttons.push(button(m, l, Style::Default));
+                }
+                buttons.push(button("cancel", "Cancel", Style::Default));
+                let h2 = h.clone();
+                dialogs::ask(
+                    &w.window,
+                    &format!("Install Thurm {} on {h}?", core::build_id()),
+                    &format!(
+                        "{os} {arch}. Thurm goes to ~/.local/share/thurm/bin there (and ~/.local/bin/thurm when that directory exists)."
+                    ),
+                    &buttons,
+                    move |method| {
+                        if method == "cancel" {
+                            return;
+                        }
+                        app::with_app(|a| {
+                            set_busy(a, &h2, Some("Installing…"));
+                            let h3 = h2.clone();
+                            core::remote_call_async(
+                                json!({"op": "install", "name": h2, "method": method, "bins": bins()}),
+                                move |r| {
+                                    app::with_app(|a| {
+                                        set_busy(a, &h3, None);
+                                        if let Some(e) = r.get("error").and_then(Value::as_str) {
+                                            if let Some(w) = a.remotes.window.borrow().as_ref() {
+                                                dialogs::inform(
+                                                    &w.window,
+                                                    &format!("Could not install Thurm on {h3}"),
+                                                    e,
+                                                );
+                                            }
+                                            return;
                                         }
-                                        return;
-                                    }
-                                    let plan = core::remote_call(&json!({"op": "plan", "name": h3, "bins": bins()}));
-                                    upgrade_daemon(a, &h3, &plan);
-                                });
-                            },
-                        );
-                    });
-                },
-            );
-        });
-    });
+                                        let plan = core::remote_call(
+                                            &json!({"op": "plan", "name": h3, "bins": bins()}),
+                                        );
+                                        upgrade_daemon(a, &h3, &plan);
+                                    });
+                                },
+                            );
+                        });
+                    },
+                );
+            });
+        },
+    );
 }
 
 fn upgrade_daemon(app: &Rc<App>, host: &str, plan: &Value) {
     let daemon = plan.get("daemon").filter(|d| !d.is_null());
-    let running = daemon.and_then(|d| d.get("running")).and_then(Value::as_bool) == Some(true);
-    let same = daemon.and_then(|d| d.get("build")).and_then(Value::as_str) == Some(core::build_id().as_str());
+    let running = daemon
+        .and_then(|d| d.get("running"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let same = daemon.and_then(|d| d.get("build")).and_then(Value::as_str)
+        == Some(core::build_id().as_str());
     if !running || same {
         core::remote_kick(Some(host), true);
         doctor(app, host);
         return;
     }
-    let hot = daemon.and_then(|d| d.get("hot_upgrade")).and_then(Value::as_bool) == Some(true);
+    let hot = daemon
+        .and_then(|d| d.get("hot_upgrade"))
+        .and_then(Value::as_bool)
+        == Some(true);
     let h = host.to_string();
     let go = move || {
         app::with_app(|a| {
@@ -1109,7 +1315,11 @@ fn upgrade_daemon(app: &Rc<App>, host: &str, plan: &Value) {
                         if let Some(e) = r.get("error").and_then(Value::as_str)
                             && let Some(w) = a.remotes.window.borrow().as_ref()
                         {
-                            dialogs::inform(&w.window, &format!("Could not upgrade the daemon on {h2}"), e);
+                            dialogs::inform(
+                                &w.window,
+                                &format!("Could not upgrade the daemon on {h2}"),
+                                e,
+                            );
                         }
                         core::remote_kick(Some(&h2), true);
                         doctor(a, &h2);
@@ -1132,7 +1342,13 @@ fn upgrade_daemon(app: &Rc<App>, host: &str, plan: &Value) {
 }
 
 fn add_host(app: &Rc<App>, name: &str, target: &str) {
-    let Some(parent) = app.remotes.window.borrow().as_ref().map(|w| w.window.clone()) else {
+    let Some(parent) = app
+        .remotes
+        .window
+        .borrow()
+        .as_ref()
+        .map(|w| w.window.clone())
+    else {
         return;
     };
     dialogs::prompt(
@@ -1141,7 +1357,11 @@ fn add_host(app: &Rc<App>, name: &str, target: &str) {
         "Thurm connects with the system ssh: the host needs a key that works without a prompt (an agent is fine). Connect once with ssh in a terminal to accept its host key.",
         &[
             ("Name", "devbox", name),
-            ("SSH target", "me@devbox, a Host alias, or ssh://me@devbox:2222", target),
+            (
+                "SSH target",
+                "me@devbox, a Host alias, or ssh://me@devbox:2222",
+                target,
+            ),
         ],
         "Add",
         |values| {
@@ -1156,38 +1376,43 @@ fn add_host(app: &Rc<App>, name: &str, target: &str) {
                     w.status.set_text(&format!("Connecting to {target}…"));
                 }
                 let (n, t) = (name.clone(), target.clone());
-                core::remote_call_async(json!({"op": "add", "name": name, "target": target}), move |r| {
-                    app::with_app(|a| {
-                        let w = a.remotes.window.borrow().clone();
-                        if let Some(w) = &w {
-                            w.add.set_sensitive(true);
-                        }
-                        if let Some(e) = r.get("error").and_then(Value::as_str) {
-                            if let Some(w) = w {
-                                let (n2, t2) = (n.clone(), t.clone());
-                                dialogs::ask(
-                                    &w.window,
-                                    &format!("Could not add {n}"),
-                                    e,
-                                    &[button("edit", "Edit", Style::Suggested), button("cancel", "Cancel", Style::Default)],
-                                    move |r| {
-                                        if r == "edit" {
-                                            app::with_app(|a| add_host(a, &n2, &t2));
-                                        }
-                                    },
-                                );
+                core::remote_call_async(
+                    json!({"op": "add", "name": name, "target": target}),
+                    move |r| {
+                        app::with_app(|a| {
+                            let w = a.remotes.window.borrow().clone();
+                            if let Some(w) = &w {
+                                w.add.set_sensitive(true);
                             }
-                            return;
-                        }
-                        a.reload_config(false);
-                        if let Some(w) = &w {
-                            *w.selected.borrow_mut() = Some(n.clone());
-                        }
-                        doctor(a, &n);
-                    });
-                });
+                            if let Some(e) = r.get("error").and_then(Value::as_str) {
+                                if let Some(w) = w {
+                                    let (n2, t2) = (n.clone(), t.clone());
+                                    dialogs::ask(
+                                        &w.window,
+                                        &format!("Could not add {n}"),
+                                        e,
+                                        &[
+                                            button("edit", "Edit", Style::Suggested),
+                                            button("cancel", "Cancel", Style::Default),
+                                        ],
+                                        move |r| {
+                                            if r == "edit" {
+                                                app::with_app(|a| add_host(a, &n2, &t2));
+                                            }
+                                        },
+                                    );
+                                }
+                                return;
+                            }
+                            a.reload_config(false);
+                            if let Some(w) = &w {
+                                *w.selected.borrow_mut() = Some(n.clone());
+                            }
+                            doctor(a, &n);
+                        });
+                    },
+                );
             });
         },
     );
 }
-

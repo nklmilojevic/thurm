@@ -54,14 +54,21 @@ mod imp {
             let chars: Vec<char> = self.text.borrow().chars().collect();
             let (start, end) = super::unit_at(&chars, offset as usize, granularity);
             let s: String = chars[start..end].iter().collect();
-            Some((start as u32, end as u32, glib::Bytes::from_owned(s.into_bytes())))
+            Some((
+                start as u32,
+                end as u32,
+                glib::Bytes::from_owned(s.into_bytes()),
+            ))
         }
 
         fn selection(&self) -> Vec<gtk::AccessibleTextRange> {
             Vec::new()
         }
 
-        fn attributes(&self, _offset: u32) -> Vec<(gtk::AccessibleTextRange, glib::GString, glib::GString)> {
+        fn attributes(
+            &self,
+            _offset: u32,
+        ) -> Vec<(gtk::AccessibleTextRange, glib::GString, glib::GString)> {
             Vec::new()
         }
 
@@ -103,7 +110,11 @@ impl TermArea {
 }
 
 /// The character, word or line around `offset` as a [start, end) char range.
-fn unit_at(chars: &[char], offset: usize, granularity: gtk::AccessibleTextGranularity) -> (usize, usize) {
+fn unit_at(
+    chars: &[char],
+    offset: usize,
+    granularity: gtk::AccessibleTextGranularity,
+) -> (usize, usize) {
     let n = chars.len();
     let offset = offset.min(n);
     match granularity {
@@ -155,13 +166,34 @@ mod tests {
     #[test]
     fn units() {
         let chars: Vec<char> = "ls -la\nhello world".chars().collect();
-        assert_eq!(unit_at(&chars, 8, gtk::AccessibleTextGranularity::Line), (7, 18));
-        assert_eq!(unit_at(&chars, 14, gtk::AccessibleTextGranularity::Word), (13, 18));
+        assert_eq!(
+            unit_at(&chars, 8, gtk::AccessibleTextGranularity::Line),
+            (7, 18)
+        );
+        assert_eq!(
+            unit_at(&chars, 14, gtk::AccessibleTextGranularity::Word),
+            (13, 18)
+        );
         // Separators are units too, so word navigation can step over them.
-        assert_eq!(unit_at(&chars, 2, gtk::AccessibleTextGranularity::Word), (2, 4));
-        assert_eq!(unit_at(&chars, 12, gtk::AccessibleTextGranularity::Word), (12, 13));
-        assert_eq!(unit_at(&chars, 6, gtk::AccessibleTextGranularity::Word), (6, 7));
-        assert_eq!(unit_at(&chars, 18, gtk::AccessibleTextGranularity::Word), (13, 18));
-        assert_eq!(unit_at(&chars, 0, gtk::AccessibleTextGranularity::Character), (0, 1));
+        assert_eq!(
+            unit_at(&chars, 2, gtk::AccessibleTextGranularity::Word),
+            (2, 4)
+        );
+        assert_eq!(
+            unit_at(&chars, 12, gtk::AccessibleTextGranularity::Word),
+            (12, 13)
+        );
+        assert_eq!(
+            unit_at(&chars, 6, gtk::AccessibleTextGranularity::Word),
+            (6, 7)
+        );
+        assert_eq!(
+            unit_at(&chars, 18, gtk::AccessibleTextGranularity::Word),
+            (13, 18)
+        );
+        assert_eq!(
+            unit_at(&chars, 0, gtk::AccessibleTextGranularity::Character),
+            (0, 1)
+        );
     }
 }

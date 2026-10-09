@@ -111,11 +111,13 @@ impl QuickTerminal {
     pub fn show(&self) {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
-        let duration = app::with_app(|a| a.ui().cfg.quick_terminal.animation_duration.clamp(0.0, 5.0))
-            .unwrap_or(0.2);
+        let duration =
+            app::with_app(|a| a.ui().cfg.quick_terminal.animation_duration.clamp(0.0, 5.0))
+                .unwrap_or(0.2);
         self.shown.set(true);
         if !self.window.is_visible() {
-            self.window.set_opacity(if duration > 0.0 { 0.0 } else { 1.0 });
+            self.window
+                .set_opacity(if duration > 0.0 { 0.0 } else { 1.0 });
         }
         self.window.present();
         let k = self.tab.focused.borrow().clone();
@@ -133,8 +135,9 @@ impl QuickTerminal {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         self.shown.set(false);
-        let duration = app::with_app(|a| a.ui().cfg.quick_terminal.animation_duration.clamp(0.0, 5.0))
-            .unwrap_or(0.2);
+        let duration =
+            app::with_app(|a| a.ui().cfg.quick_terminal.animation_duration.clamp(0.0, 5.0))
+                .unwrap_or(0.2);
         let window = self.window.clone();
         let done = move || {
             let still = app::with_app(|a| {
@@ -302,7 +305,10 @@ pub fn portal_trigger(spec: &str) -> Option<String> {
         "return" | "enter" => "Return".into(),
         "escape" | "esc" => "Escape".into(),
         "backspace" => "BackSpace".into(),
-        k if k.len() > 1 && k.starts_with('f') && k[1..].parse::<u8>().is_ok_and(|n| (1..=20).contains(&n)) => {
+        k if k.len() > 1
+            && k.starts_with('f')
+            && k[1..].parse::<u8>().is_ok_and(|n| (1..=20).contains(&n)) =>
+        {
             k.to_uppercase()
         }
         k if k.len() == 1 && k.chars().all(|c| c.is_ascii_alphanumeric()) => k.to_string(),
@@ -333,24 +339,32 @@ fn bind_portal(trigger: String, spec: String) {
     opts.insert_value("session_handle_token", &token.to_variant());
     let bus2 = bus.clone();
     let spec2 = spec.clone();
-    let sent = portal_request(&bus, &token, "CreateSession", (opts.end(),).to_variant(), move |code, results| {
-        let dict = glib::VariantDict::new(Some(&results));
-        let session = dict
-            .lookup_value("session_handle", None)
-            .and_then(|v| v.str().map(str::to_string));
-        let Some(session) = session.filter(|_| code == 0) else {
-            not_bound(&spec2);
-            return;
-        };
-        if SERIAL.with(Cell::get) != serial {
-            // The hotkey changed while the portal was answering.
-            close_session(&session);
-            return;
-        }
-        bind_shortcut(&bus2, session, &trigger, &spec2, serial);
-    });
+    let sent = portal_request(
+        &bus,
+        &token,
+        "CreateSession",
+        (opts.end(),).to_variant(),
+        move |code, results| {
+            let dict = glib::VariantDict::new(Some(&results));
+            let session = dict
+                .lookup_value("session_handle", None)
+                .and_then(|v| v.str().map(str::to_string));
+            let Some(session) = session.filter(|_| code == 0) else {
+                not_bound(&spec2);
+                return;
+            };
+            if SERIAL.with(Cell::get) != serial {
+                // The hotkey changed while the portal was answering.
+                close_session(&session);
+                return;
+            }
+            bind_shortcut(&bus2, session, &trigger, &spec2, serial);
+        },
+    );
     if !sent {
-        log::info!("no GlobalShortcuts portal; bind `thurm-gtk --quick-terminal` in the desktop's keyboard settings for {spec}");
+        log::info!(
+            "no GlobalShortcuts portal; bind `thurm-gtk --quick-terminal` in the desktop's keyboard settings for {spec}"
+        );
         return;
     }
     // Toggle on activation, once for every binding to come: only the current session counts.
@@ -376,9 +390,18 @@ fn bind_portal(trigger: String, spec: String) {
 
 /// The session holds the hotkey only once the portal says the binding succeeded (the user can
 /// refuse it).
-fn bind_shortcut(bus: &gio::DBusConnection, session: String, trigger: &str, spec: &str, serial: u32) {
+fn bind_shortcut(
+    bus: &gio::DBusConnection,
+    session: String,
+    trigger: &str,
+    spec: &str,
+    serial: u32,
+) {
     let props = glib::VariantDict::new(None);
-    props.insert_value("description", &"Show or hide the quick terminal".to_variant());
+    props.insert_value(
+        "description",
+        &"Show or hide the quick terminal".to_variant(),
+    );
     props.insert_value("preferred_trigger", &trigger.to_variant());
     let shortcuts = vec![("quick-terminal".to_string(), props.end())];
     let token = format!("thurm{}_{serial}_bind", std::process::id());
@@ -452,7 +475,10 @@ fn portal_request(
                 bus2.signal_unsubscribe(id);
             }
             if let Some(f) = done.borrow_mut().take() {
-                f(params.child_value(0).get::<u32>().unwrap_or(2), params.child_value(1));
+                f(
+                    params.child_value(0).get::<u32>().unwrap_or(2),
+                    params.child_value(1),
+                );
             }
         },
     );
@@ -500,7 +526,10 @@ mod tests {
     #[test]
     fn triggers() {
         assert_eq!(portal_trigger("ctrl+grave").as_deref(), Some("CTRL+grave"));
-        assert_eq!(portal_trigger("cmd+shift+space").as_deref(), Some("LOGO+SHIFT+space"));
+        assert_eq!(
+            portal_trigger("cmd+shift+space").as_deref(),
+            Some("LOGO+SHIFT+space")
+        );
         assert_eq!(portal_trigger("f12").as_deref(), Some("F12"));
         assert_eq!(portal_trigger("hyper+x"), None);
         // Bare or Shift-only keys would be taken from every app.

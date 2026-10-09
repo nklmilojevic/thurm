@@ -62,7 +62,10 @@ impl UiConfig {
 
     /// The quick terminal's background: `quick_terminal.opacity`, else the window's.
     pub fn quick_opacity(&self) -> f64 {
-        self.cfg.quick_terminal.opacity.map_or(self.opacity(), |o| o.clamp(0.05, 1.0))
+        self.cfg
+            .quick_terminal
+            .opacity
+            .map_or(self.opacity(), |o| o.clamp(0.05, 1.0))
     }
 
     pub fn font_size(&self) -> f64 {
@@ -112,7 +115,11 @@ impl UiConfig {
 pub fn luminance(c: u32) -> f64 {
     let lin = |v: u32| {
         let v = v as f64 / 255.0;
-        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
     };
     0.2126 * lin((c >> 16) & 0xff) + 0.7152 * lin((c >> 8) & 0xff) + 0.0722 * lin(c & 0xff)
 }

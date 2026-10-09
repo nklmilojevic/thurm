@@ -402,8 +402,8 @@ impl TermView {
         if self.state.borrow().restored_toast_shown || !self.state.borrow().subscribed {
             return;
         }
-        let restored = app::with_app(|a| a.pane_info(&self.key).is_some_and(|i| i.restored))
-            .unwrap_or(false);
+        let restored =
+            app::with_app(|a| a.pane_info(&self.key).is_some_and(|i| i.restored)).unwrap_or(false);
         if restored {
             self.state.borrow_mut().restored_toast_shown = true;
             self.show_toast("Session restored", 2.5);
@@ -418,9 +418,9 @@ impl TermView {
             .as_ref()
             .is_some_and(|p| p.state == ProgressState::Indeterminate);
         *self.progress_state.borrow_mut() = progress;
-        self.progress.set_visible(self.progress_state.borrow().is_some());
-        self.progress_started
-            .set(indeterminate.then(Instant::now));
+        self.progress
+            .set_visible(self.progress_state.borrow().is_some());
+        self.progress_started.set(indeterminate.then(Instant::now));
         self.progress.queue_draw();
         self.ensure_tick();
     }
@@ -623,7 +623,9 @@ impl TermView {
         ]);
         let weak = Rc::downgrade(self);
         drop.connect_drop(move |_, value, _, _| {
-            let Some(v) = weak.upgrade() else { return false };
+            let Some(v) = weak.upgrade() else {
+                return false;
+            };
             v.dropped(value)
         });
         self.area.add_controller(drop);
@@ -703,7 +705,8 @@ impl TermView {
                 s.clusters.insert((r, c), text);
             }
             for cell in g.cells {
-                if cell.link != 0 && !s.links.contains_key(&cell.link)
+                if cell.link != 0
+                    && !s.links.contains_key(&cell.link)
                     && let Some(uri) = g.link(cell.link)
                 {
                     s.links.insert(cell.link, uri);
@@ -743,7 +746,8 @@ impl TermView {
         }
         // Pixels no placement used for 2 s are dropped.
         st.images.retain(|id, e| {
-            snap.images.iter().any(|pl| pl.image == *id) || e.last_used.elapsed() < Duration::from_secs(2)
+            snap.images.iter().any(|pl| pl.image == *id)
+                || e.last_used.elapsed() < Duration::from_secs(2)
         });
         st.snapshot = snap;
     }
@@ -756,9 +760,17 @@ impl TermView {
         let Some((opacity, cursor_blink, thickness, dim_amount, theme_fg, theme_bg)) =
             app::with_app(|a| {
                 let ui = a.ui();
-                let quick = a.quick.borrow().as_ref().is_some_and(|q| q.tab.panes().contains(&self.key));
+                let quick = a
+                    .quick
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|q| q.tab.panes().contains(&self.key));
                 (
-                    if quick { ui.quick_opacity() } else { ui.opacity() },
+                    if quick {
+                        ui.quick_opacity()
+                    } else {
+                        ui.opacity()
+                    },
                     ui.cfg.cursor.blink,
                     ui.cursor_thickness(),
                     ui.unfocused_dim(),
@@ -867,7 +879,9 @@ impl TermView {
     }
 
     fn draw_progress(&self, cr: &gtk::cairo::Context, w: i32, h: i32) {
-        let Some(p) = *self.progress_state.borrow() else { return };
+        let Some(p) = *self.progress_state.borrow() else {
+            return;
+        };
         let (r, g, b) = match p.state {
             ProgressState::Error => (1.0, 0.27, 0.23),
             ProgressState::Paused => (1.0, 0.8, 0.0),
@@ -905,7 +919,9 @@ impl TermView {
     ) -> glib::Propagation {
         // An offline pane takes no input, but the app's shortcuts still work (to switch away).
         if self.is_offline() {
-            if let Some(action) = app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten() {
+            if let Some(action) =
+                app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten()
+            {
                 app::with_app(|a| a.activate(action));
             }
             return glib::Propagation::Stop;
@@ -921,7 +937,8 @@ impl TermView {
         }
         // The app's shortcuts, except while the input method composes (its keys pick candidates).
         if !composing
-            && let Some(action) = app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten()
+            && let Some(action) =
+                app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten()
         {
             app::with_app(|a| a.activate(action));
             return glib::Propagation::Stop;
@@ -979,7 +996,9 @@ impl TermView {
         if self.is_offline() {
             return;
         }
-        let Some(event) = ctl.current_event() else { return };
+        let Some(event) = ctl.current_event() else {
+            return;
+        };
         // The input method sees every release (it may track the key).
         self.im.filter_keypress(&event);
         if delivered {
@@ -1055,8 +1074,8 @@ impl TermView {
 
     fn completion_allowed(&self) -> bool {
         let enabled = app::with_app(|a| a.ui().cfg.terminal.tab_completion).unwrap_or(false);
-        let at_prompt = app::with_app(|a| a.pane_info(&self.key).is_some_and(|i| i.at_prompt))
-            .unwrap_or(false);
+        let at_prompt =
+            app::with_app(|a| a.pane_info(&self.key).is_some_and(|i| i.at_prompt)).unwrap_or(false);
         enabled
             && at_prompt
             && !self.is_offline()
@@ -1068,9 +1087,13 @@ impl TermView {
         if !self.completion_allowed() {
             return false;
         }
-        let Some(core) = self.core() else { return false };
+        let Some(core) = self.core() else {
+            return false;
+        };
         let resp = core.request_timeout(&json!({"Complete": {"pane": self.key.id}}), 1000);
-        let Some(c) = parse_completions(&resp) else { return false };
+        let Some(c) = parse_completions(&resp) else {
+            return false;
+        };
         if c.items.is_empty() {
             return false;
         }
@@ -1150,9 +1173,14 @@ impl TermView {
             below
         };
         let width = 560.0f64.min(self.area.width() as f64 - 8.0);
-        self.popup.set_margin_start(x.max(0.0).min((self.area.width() as f64 - 220.0).max(0.0)) as i32);
+        self.popup
+            .set_margin_start(x.max(0.0).min((self.area.width() as f64 - 220.0).max(0.0)) as i32);
         self.popup.set_margin_top(top as i32);
-        if let Some(sw) = self.popup.first_child().and_downcast::<gtk::ScrolledWindow>() {
+        if let Some(sw) = self
+            .popup
+            .first_child()
+            .and_downcast::<gtk::ScrolledWindow>()
+        {
             sw.set_max_content_height(height as i32);
             sw.set_max_content_width(width as i32);
         }
@@ -1169,7 +1197,9 @@ impl TermView {
 
     fn move_completion(&self, delta: i32) {
         let mut st = self.state.borrow_mut();
-        let Some(c) = st.completion.as_mut() else { return };
+        let Some(c) = st.completion.as_mut() else {
+            return;
+        };
         let n = c.items.len() as i32;
         c.selected = ((c.selected as i32 + delta).rem_euclid(n)) as usize;
         let sel = c.selected;
@@ -1182,7 +1212,9 @@ impl TermView {
     }
 
     fn accept_completion(&self) {
-        let Some(c) = self.state.borrow_mut().completion.take() else { return };
+        let Some(c) = self.state.borrow_mut().completion.take() else {
+            return;
+        };
         self.popup.set_visible(false);
         if let Some(item) = c.items.get(c.selected) {
             self.insert_completion(&item.text, &c.word, !is_directory(item));
@@ -1212,16 +1244,22 @@ impl TermView {
             }
             let Some(core) = v.core() else { return };
             let weak = Rc::downgrade(&v);
-            core.request_async(&json!({"Complete": {"pane": v.key.id}}), 2000, move |resp| {
-                let Some(v) = weak.upgrade() else { return };
-                if v.state.borrow().completion_query != query || v.state.borrow().completion.is_none() {
-                    return;
-                }
-                match parse_completions(&resp).filter(|c| !c.items.is_empty()) {
-                    Some(c) if v.completion_allowed() => v.show_completion(c.word, c.items),
-                    _ => v.close_completion(),
-                }
-            });
+            core.request_async(
+                &json!({"Complete": {"pane": v.key.id}}),
+                2000,
+                move |resp| {
+                    let Some(v) = weak.upgrade() else { return };
+                    if v.state.borrow().completion_query != query
+                        || v.state.borrow().completion.is_none()
+                    {
+                        return;
+                    }
+                    match parse_completions(&resp).filter(|c| !c.items.is_empty()) {
+                        Some(c) if v.completion_allowed() => v.show_completion(c.word, c.items),
+                        _ => v.close_completion(),
+                    }
+                },
+            );
         });
     }
 
@@ -1238,7 +1276,9 @@ impl TermView {
             return (0, 0, false);
         };
         let scroll_y = if st.smooth_active {
-            ((st.smooth_pos - st.snapshot.info.display_offset as f64).clamp(0.0, 0.999) * fonts.cell_h).round()
+            ((st.smooth_pos - st.snapshot.info.display_offset as f64).clamp(0.0, 0.999)
+                * fonts.cell_h)
+                .round()
         } else {
             0.0
         };
@@ -1291,7 +1331,11 @@ impl TermView {
             self.close_completion();
             if button == BUTTON_LEFT && state.contains(gdk::ModifierType::CONTROL_MASK) {
                 let (col, row, _) = self.cell_at(x, y);
-                let link = self.state.borrow().snapshot.link_at(row as usize, col as usize);
+                let link = self
+                    .state
+                    .borrow()
+                    .snapshot
+                    .link_at(row as usize, col as usize);
                 if let Some((url, _)) = link {
                     let key = self.key.clone();
                     app::with_app(|a| a.open_link(&url, &key));
@@ -1351,7 +1395,12 @@ impl TermView {
     }
 
     fn motion(&self, state: gdk::ModifierType, x: f64, y: f64) {
-        if self.state.borrow().pointer.is_none() || self.area.cursor().is_some_and(|c| c.name().as_deref() == Some("none")) {
+        if self.state.borrow().pointer.is_none()
+            || self
+                .area
+                .cursor()
+                .is_some_and(|c| c.name().as_deref() == Some("none"))
+        {
             self.area.set_cursor_from_name(Some("text"));
         }
         self.state.borrow_mut().pointer = Some((x, y));
@@ -1388,7 +1437,12 @@ impl TermView {
         };
         if self.state.borrow().hover != hover {
             self.state.borrow_mut().hover = hover;
-            self.area.set_cursor_from_name(Some(if hover == Hover::None { "text" } else { "pointer" }));
+            self.area
+                .set_cursor_from_name(Some(if hover == Hover::None {
+                    "text"
+                } else {
+                    "pointer"
+                }));
             self.area.queue_draw();
         }
     }
@@ -1397,9 +1451,13 @@ impl TermView {
         if self.is_offline() {
             return;
         }
-        let (multiplier, smooth_cfg) =
-            app::with_app(|a| (a.ui().scroll_multiplier(), a.ui().cfg.terminal.smooth_scroll))
-                .unwrap_or((3.0, true));
+        let (multiplier, smooth_cfg) = app::with_app(|a| {
+            (
+                a.ui().scroll_multiplier(),
+                a.ui().cfg.terminal.smooth_scroll,
+            )
+        })
+        .unwrap_or((3.0, true));
         let cell_h = self.fonts.borrow().cell_h;
         let modes = self.snapshot_modes();
         let raw = modes & render::MODE_MOUSE_ANY != 0;
@@ -1466,7 +1524,9 @@ impl TermView {
             st.sent_offset = want;
             let id = self.key.id;
             drop(st);
-            self.with_core(|c| c.send(&json!({"Scroll": {"pane": id, "scroll": {"Offset": want}}})));
+            self.with_core(|c| {
+                c.send(&json!({"Scroll": {"pane": id, "scroll": {"Offset": want}}}))
+            });
             st = self.state.borrow_mut();
         }
         let offset = st.snapshot.info.display_offset;
@@ -1580,7 +1640,8 @@ impl TermView {
                     let text: String = st.announce_queue.drain(..).collect::<Vec<_>>().join("\n");
                     drop(st);
                     let text: String = text.chars().take(1000).collect();
-                    v.area.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
+                    v.area
+                        .announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
                 }
             });
         });
@@ -1619,8 +1680,12 @@ fn new_rows(old: &[String], new: &[String]) -> Vec<String> {
 }
 
 pub fn grid_size_for(w: f64, h: f64, fonts: &Fonts, pad: (f64, f64)) -> (u16, u16) {
-    let cols = ((w - 2.0 * pad.0) / fonts.cell_w).floor().clamp(2.0, 1000.0) as u16;
-    let rows = ((h - 2.0 * pad.1) / fonts.cell_h).floor().clamp(1.0, 1000.0) as u16;
+    let cols = ((w - 2.0 * pad.0) / fonts.cell_w)
+        .floor()
+        .clamp(2.0, 1000.0) as u16;
+    let rows = ((h - 2.0 * pad.1) / fonts.cell_h)
+        .floor()
+        .clamp(1.0, 1000.0) as u16;
     (cols, rows)
 }
 
@@ -1638,7 +1703,11 @@ fn common_prefix<'a>(mut items: impl Iterator<Item = &'a str>) -> String {
     };
     let mut prefix: Vec<char> = first.chars().collect();
     for s in items {
-        let n = prefix.iter().zip(s.chars()).take_while(|(a, b)| **a == *b).count();
+        let n = prefix
+            .iter()
+            .zip(s.chars())
+            .take_while(|(a, b)| **a == *b)
+            .count();
         prefix.truncate(n);
     }
     prefix.into_iter().collect()
@@ -1657,7 +1726,10 @@ mod tests {
 
     #[test]
     fn prefix() {
-        assert_eq!(common_prefix(["checkout", "cherry-pick", "check"].into_iter()), "che");
+        assert_eq!(
+            common_prefix(["checkout", "cherry-pick", "check"].into_iter()),
+            "che"
+        );
         assert_eq!(common_prefix(["a"].into_iter()), "a");
     }
 
