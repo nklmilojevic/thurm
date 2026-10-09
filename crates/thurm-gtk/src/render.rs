@@ -420,50 +420,42 @@ impl Fonts {
                 continue;
             };
             let symbol = self.fonts.borrow()[fid].symbol;
-            // Clusters carry absolute byte ranges of the text: each one's column.
-            let Ok(iter) = pango::GlyphItemIter::new_start(&run, text) else {
-                pen = x;
-                continue;
-            };
-            for (start_glyph, start_index, _, end_glyph, _, _) in iter {
-                let si = start_index.max(0) as usize;
+            // Each glyph's cluster starts at a byte of the text: that byte's column. Not
+            // pango::GlyphItemIter: its binding keeps texts under 22 bytes inline and hands
+            // pango a pointer that dangles once the iterator moves, so pango counts
+            // characters in stale stack memory and aborts.
+            let offset = run.item().offset().max(0) as usize;
+            for (gi, (info, &cluster)) in infos.iter().zip(gs.log_clusters()).enumerate() {
+                let si = offset + cluster.max(0) as usize;
                 if si >= map.len() || space[si] {
                     continue;
                 }
                 let col = map[si];
-                let (a, b) = if start_glyph <= end_glyph {
-                    (start_glyph, end_glyph)
-                } else {
-                    (end_glyph + 1, start_glyph + 1)
-                };
-                for gi in a.max(0) as usize..(b.max(0) as usize).min(infos.len()) {
-                    let info = &infos[gi];
-                    let glyph = info.glyph();
-                    if glyph == pango::GLYPH_EMPTY || glyph & pango::GLYPH_UNKNOWN_FLAG != 0 {
-                        continue;
-                    }
-                    let start = *cluster_start.entry(col).or_insert(xs[gi]);
-                    let geo = info.geometry();
-                    out.push(if symbol {
-                        ShapedGlyph {
-                            col,
-                            x: 0.0,
-                            y: 0.0,
-                            font: fid,
-                            glyph,
-                            span: if blank_after(col as usize) { 2 } else { 1 },
-                        }
-                    } else {
-                        ShapedGlyph {
-                            col,
-                            x: xs[gi] - start + geo.x_offset() as f64 / s,
-                            y: geo.y_offset() as f64 / s,
-                            font: fid,
-                            glyph,
-                            span: 0,
-                        }
-                    });
+                let glyph = info.glyph();
+                if glyph == pango::GLYPH_EMPTY || glyph & pango::GLYPH_UNKNOWN_FLAG != 0 {
+                    continue;
                 }
+                let start = *cluster_start.entry(col).or_insert(xs[gi]);
+                let geo = info.geometry();
+                out.push(if symbol {
+                    ShapedGlyph {
+                        col,
+                        x: 0.0,
+                        y: 0.0,
+                        font: fid,
+                        glyph,
+                        span: if blank_after(col as usize) { 2 } else { 1 },
+                    }
+                } else {
+                    ShapedGlyph {
+                        col,
+                        x: xs[gi] - start + geo.x_offset() as f64 / s,
+                        y: geo.y_offset() as f64 / s,
+                        font: fid,
+                        glyph,
+                        span: 0,
+                    }
+                });
             }
             pen = x;
         }
@@ -1033,6 +1025,40 @@ mod tests {
         Cell {
             ch: ch as u32,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn short_mixed_script_glyphs_land_on_their_cells() {
+        let mut cfg = thurm_config::Config::default();
+        cfg.font.family = "DejaVu Sans Mono".into();
+        let ctx = pangocairo::FontMap::new().create_context();
+        let fonts = Fonts::new(&ctx, &cfg, &[], 14.0);
+        // Under 22 bytes, and three scripts: pango splits it into items at nonzero offsets.
+        let row = "ab αβ жз";
+        let cells: Vec<Cell> = row.chars().map(cell).collect();
+        let expected: Vec<u16> = vec![0, 1, 3, 4, 6, 7];
+
+        let layout = pango::Layout::new(&ctx);
+        layout.set_font_description(Some(&fonts.descs[0]));
+        layout.set_text(row);
+        let line = layout.line_readonly(0).unwrap();
+        assert!(line.runs().iter().any(|r| r.item().offset() > 0));
+
+        let cols = |glyphs: &[ShapedGlyph]| glyphs.iter().map(|g| g.col).collect::<Vec<_>>();
+        assert_eq!(cols(&fonts.shape_row(&cells, &|_| None)), expected);
+        let mut map = Vec::new();
+        let mut space = Vec::new();
+        for (c, ch) in row.chars().enumerate() {
+            for _ in 0..ch.len_utf8() {
+                map.push(c as u16);
+                space.push(ch == ' ');
+            }
+        }
+        for _ in 0..200 {
+            let mut out = Vec::new();
+            fonts.shape_run(row, &map, &space, 0, &|_| false, &mut out);
+            assert_eq!(cols(&out), expected);
         }
     }
 
