@@ -267,6 +267,8 @@ pub struct WindowConfig {
     pub tab_style: TabStyle,
     /// Width of the tab sidebar in points.
     pub sidebar_width: f64,
+    /// Show the agents panel below the sidebar's tabs.
+    pub sidebar_agents: bool,
     /// Rows the sidebar's agents panel shows before it scrolls (dragging its header sets it).
     pub sidebar_agent_rows: u32,
 }
@@ -288,6 +290,7 @@ impl Default for WindowConfig {
             pane_gap: 6.0,
             tab_style: TabStyle::Sidebar,
             sidebar_width: 240.0,
+            sidebar_agents: true,
             sidebar_agent_rows: 5,
         }
     }
@@ -1619,6 +1622,9 @@ clipboard_read = "always"
         assert!(out.contains("# Tabs:"), "comments kept");
         let out = with_setting(&out, "window.sidebar_width", "300.0").unwrap();
         assert_eq!(Config::parse(&out).unwrap().window.sidebar_width, 300.0);
+        assert!(Config::parse(&out).unwrap().window.sidebar_agents);
+        let out = with_setting(&out, "window.sidebar_agents", "false").unwrap();
+        assert!(!Config::parse(&out).unwrap().window.sidebar_agents);
         assert!(with_setting(&out, "window.tab_style", "\"diagonal\"").is_err());
         assert!(with_setting(&out, "window.nope", "1").is_err());
         assert!(with_setting(&out, "tab_style", "1").is_err());

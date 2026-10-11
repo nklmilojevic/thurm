@@ -640,6 +640,7 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     /// Every agent pane: this window's tabs first, then other windows, then hidden workspaces.
     private func agentRows() -> [AgentBox] {
+        guard SessionManager.shared.config.sidebarAgents else { return [] }
         let key = NSApp.keyWindow?.windowController as? TerminalWindowController
         return SessionManager.shared.agentPanes(first: controller).map { a in
             // Where it runs first (the repository or directory, and the workspace when hidden),

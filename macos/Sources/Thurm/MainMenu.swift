@@ -124,6 +124,7 @@ enum MainMenu {
         menu.addItem(item("Reset Font Size", #selector(AppDelegate.resetFontSize(_:)), "0"))
         menu.addItem(.separator())
         menu.addItem(item("Tabs in Sidebar", #selector(AppDelegate.toggleSidebarTabs(_:)), "s", [.command, .control]))
+        menu.addItem(item("Agents in Sidebar", #selector(AppDelegate.toggleSidebarAgents(_:))))
         menu.addItem(item("Hide Sidebar", #selector(AppDelegate.toggleTabSidebar(_:)), "b"))
         let theme = NSMenu(title: "Theme")
         theme.delegate = ThemeMenu.shared
