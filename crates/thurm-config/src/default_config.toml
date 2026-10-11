@@ -1,6 +1,10 @@
 # Thurm configuration. Every setting is optional; the values below are the defaults.
 # Changes are picked up with "Reload Configuration" (⌘⇧,) or `thurm reload`.
 
+# The updates Thurm has made to this file: it turns on features that came after the file was
+# written, then raises this. Leave it as it is.
+config_version = 1
+
 [font]
 # A family or a face name ("TX-02 Retina ExtraCondensed"). JetBrains Mono ships with Thurm.
 family = "JetBrains Mono"

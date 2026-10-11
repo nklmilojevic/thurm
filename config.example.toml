@@ -5,6 +5,10 @@
 # Optional overrides and custom entries are commented out. Remove the leading
 # "# " from an example setting to use it.
 
+# The updates Thurm has made to this file: it turns on features that came after the file was
+# written, then raises this. Leave it as it is.
+config_version = 1
+
 [font]
 # Use a font family or face name. Sizes and spacing are in points.
 family = "JetBrains Mono"

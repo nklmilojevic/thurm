@@ -18,6 +18,8 @@ pub use themes::{Theme, builtin_theme, builtin_theme_names, is_own_theme};
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct Config {
+    /// How many of the config migrations this file has had (see `MIGRATIONS`).
+    pub config_version: usize,
     pub font: FontConfig,
     pub window: WindowConfig,
     pub cursor: CursorConfig,
@@ -1434,7 +1436,49 @@ fn check_range(key: &str, value: f64, lo: f64, hi: f64) -> Result<(), String> {
 /// Commented default config written on first launch.
 pub const DEFAULT_CONFIG_TOML: &str = include_str!("default_config.toml");
 
-/// Write the default config if none exists. Returns the path.
+/// Settings every existing config gets once, in order, when a Thurm that has them first runs:
+/// a feature that is on by default but sits turned off in config files written before it was.
+/// Append only; the file records how many it has had in `config_version`, which the default
+/// config sets to their number.
+const MIGRATIONS: &[(&str, &str)] = &[("window.pane_headers", "true")];
+
+/// Returns `text` with the migrations it has not had applied, and `config_version` raised to
+/// match (inserted before the first table when missing); `None` when it is current.
+fn migrate(text: &str) -> Result<Option<String>, String> {
+    let from = Config::parse(text)?.config_version;
+    if from >= MIGRATIONS.len() {
+        return Ok(None);
+    }
+    let out = MIGRATIONS
+        .iter()
+        .skip(from)
+        .try_fold(text.to_owned(), |t, (key, value)| with_setting(&t, key, value))?;
+    let mut doc: toml_edit::DocumentMut = out.parse().map_err(|e| format!("{e}"))?;
+    let version = toml_edit::value(MIGRATIONS.len() as i64);
+    match doc.get_mut("config_version") {
+        Some(item) => *item = version,
+        None => {
+            // Top-level keys print first: the file's opening comment, kept by the first table,
+            // moves up above it.
+            let mut opening = String::new();
+            if let Some(t) = doc.iter_mut().find_map(|(_, item)| item.as_table_mut()) {
+                let decor = t.decor_mut();
+                opening = decor.prefix().and_then(|p| p.as_str()).unwrap_or("").to_owned();
+                decor.set_prefix("\n");
+            }
+            doc.insert("config_version", version);
+            if let Some((mut key, _)) = doc.get_key_value_mut("config_version") {
+                key.leaf_decor_mut().set_prefix(opening);
+            }
+        }
+    }
+    let out = doc.to_string();
+    check_edit(text, &out)?;
+    Ok(Some(out))
+}
+
+/// Write the default config if none exists, else apply the [`MIGRATIONS`] it has not had yet.
+/// Returns the path.
 pub fn ensure_default_config() -> std::io::Result<PathBuf> {
     let path = config_path();
     if !path.exists() {
@@ -1442,8 +1486,22 @@ pub fn ensure_default_config() -> std::io::Result<PathBuf> {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(&path, DEFAULT_CONFIG_TOML)?;
+    } else {
+        migrate_config(&path);
     }
     Ok(path)
+}
+
+/// Applies the migrations `path` has not had. The version is in the file itself, so the
+/// change and its record land in one atomic write. A config Thurm can't parse, or one that
+/// is read-only (the user's, or a link into the Nix store), is left alone and tried again
+/// on the next launch.
+fn migrate_config(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let Ok(Some(out)) = migrate(&text) else { return };
+    if std::fs::metadata(path).is_ok_and(|m| !m.permissions().readonly()) {
+        let _ = replace_file(path, out.as_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -1610,6 +1668,53 @@ clipboard_read = "always"
         let c = Config::parse("[colors]\ntheme = \"light:thurm-light,dark:dracula\"").unwrap();
         assert_eq!(c.theme_for(false).name, "thurm-light");
         assert_eq!(c.theme_for(true).name, "dracula");
+    }
+
+    const OLD_CONFIG: &str = "# Mine.\n\n[window]\n# Headers.\npane_headers = false # off\n";
+
+    #[test]
+    fn migrations_turn_features_on_once() {
+        let out = migrate(OLD_CONFIG).unwrap().unwrap();
+        let cfg = Config::parse(&out).unwrap();
+        assert!(cfg.window.pane_headers);
+        assert_eq!(cfg.config_version, MIGRATIONS.len());
+        assert!(out.starts_with("# Mine.\n"), "{out}");
+        assert!(out.contains("# Headers.") && out.contains("# off"));
+
+        // Turned off again after the migration: the user's choice stays.
+        let off = with_setting(&out, "window.pane_headers", "false").unwrap();
+        assert_eq!(migrate(&off).unwrap(), None);
+    }
+
+    #[test]
+    fn read_only_configs_are_left_for_later() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("thurm-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, OLD_CONFIG).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        migrate_config(&path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_CONFIG);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        migrate_config(&path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(Config::parse(&text).unwrap().window.pane_headers);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn migrations_apply_to_the_default_config() {
+        // A new config is current, and every migration matches the shipped default.
+        assert_eq!(Config::parse_strict(DEFAULT_CONFIG_TOML).unwrap().config_version, MIGRATIONS.len());
+        assert_eq!(migrate(DEFAULT_CONFIG_TOML).unwrap(), None);
+        let all = MIGRATIONS
+            .iter()
+            .try_fold(DEFAULT_CONFIG_TOML.to_owned(), |t, (k, v)| with_setting(&t, k, v))
+            .unwrap();
+        assert_eq!(all, DEFAULT_CONFIG_TOML);
     }
 
     #[test]
@@ -1821,7 +1926,9 @@ clipboard_read = "always"
         let text = include_str!("../../../config.example.toml");
         let (c, warnings) = Config::parse_with_warnings(text).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(c, Config::default());
+        // Copied, it is current: no migration changes what its user set.
+        assert_eq!(c.config_version, MIGRATIONS.len());
+        assert_eq!(Config { config_version: 0, ..c }, Config::default());
     }
 
     #[test]
