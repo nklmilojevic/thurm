@@ -554,6 +554,7 @@ impl App {
             ("rename_workspace", has_ws),
             ("close_workspace", has_ws),
             ("toggle_sidebar", sidebar),
+            ("toggle_sidebar_agents", sidebar),
             ("explain", explain),
         ] {
             if let Some(a) = self
@@ -588,6 +589,13 @@ impl App {
                     "✓ Tabs in Sidebar".into()
                 } else {
                     "Tabs in Sidebar".into()
+                }
+            }
+            "toggle_sidebar_agents" => {
+                if self.ui().cfg.window.sidebar_agents {
+                    "✓ Agents in Sidebar".into()
+                } else {
+                    "Agents in Sidebar".into()
                 }
             }
             _ => actions::find(name).map_or(name.to_string(), |d| d.label.to_string()),
@@ -674,6 +682,7 @@ impl App {
             "decrease_font_size" => self.change_font(-1.0),
             "reset_font_size" => self.change_font(0.0),
             "toggle_tab_style" => self.toggle_tab_style(),
+            "toggle_sidebar_agents" => self.toggle_sidebar_agents(),
             "toggle_sidebar" => {
                 if let Some(w) = self.win() {
                     w.toggle_sidebar();
@@ -2513,7 +2522,12 @@ impl App {
         }
         let here = self.focused_pane();
         let mut agents = Vec::new();
-        for (k, hidden) in self.agent_panes() {
+        let agent_panes = if self.ui().cfg.window.sidebar_agents {
+            self.agent_panes()
+        } else {
+            Vec::new()
+        };
+        for (k, hidden) in agent_panes {
             let infos = self.infos.borrow();
             let Some(info) = infos.get(&k) else { continue };
             let mut parts = Vec::new();
@@ -3379,6 +3393,20 @@ impl App {
             self.ui.borrow_mut().cfg.window.tab_style = next;
             self.apply_config();
             self.refresh_sidebar();
+        }
+    }
+
+    fn toggle_sidebar_agents(&self) {
+        let value = if self.ui().cfg.window.sidebar_agents {
+            "false"
+        } else {
+            "true"
+        };
+        if let Some(c) = self.core(LOCAL) {
+            let r = c.request(&json!({"SetSetting": {"key": "window.sidebar_agents", "value": value}}));
+            if let Some(e) = r.get("error").and_then(Value::as_str) {
+                self.toast(&format!("Agents: {e}"), 6.0);
+            }
         }
     }
 

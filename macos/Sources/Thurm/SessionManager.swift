@@ -801,6 +801,15 @@ final class SessionManager: NSObject, CoreDelegate {
         }
     }
 
+    /// View > Agents in Sidebar: switch `window.sidebar_agents` (persisted; every window follows).
+    func toggleSidebarAgents() {
+        let resp = Core.shared.request(object: ["SetSetting": ["key": "window.sidebar_agents",
+                                                               "value": config.sidebarAgents ? "false" : "true"]])
+        if let d = resp as? [String: Any], let e = d["error"] as? String {
+            currentController?.content.focusedView?.showToast("Agents: \(e)", duration: 6)
+        }
+    }
+
     func updateSecureInput() {
         var requested = false
         if config.autoSecureInput, let c = currentController, let info = panes[c.focusedPane] {

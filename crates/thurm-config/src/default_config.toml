@@ -42,6 +42,8 @@ pane_gap = 6.0
 # Tabs: "native" (in the titlebar) or "sidebar" (vertical, grouped by repository). View > Tabs.
 tab_style = "sidebar"
 sidebar_width = 240.0
+# List every pane running an agent below the sidebar's tabs. View > Agents in Sidebar.
+sidebar_agents = true
 # Agents listed in the sidebar before its agents panel scrolls; drag the panel's header to change.
 sidebar_agent_rows = 5
 

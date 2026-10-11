@@ -96,6 +96,7 @@ pub const ACTIONS: &[ActionDef] = &[
     a("decrease_font_size", "Decrease Font Size", Menu::View, &["<Control>minus"]),
     a("reset_font_size", "Reset Font Size", Menu::View, &["<Control>0"]),
     a("toggle_tab_style", "Tabs in Sidebar", Menu::View, &[]),
+    a("toggle_sidebar_agents", "Agents in Sidebar", Menu::View, &[]),
     a("toggle_sidebar", "Hide Sidebar", Menu::View, &["<Control><Shift>b"]),
     a("browse_themes", "Theme: Browse Themes…", Menu::View, &[]),
     a("follow_appearance", "Theme: Match System Appearance", Menu::View, &[]),
