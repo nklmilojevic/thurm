@@ -41,13 +41,19 @@ final class TabStrip: NSView {
     override func layout() {
         super.layout()
         let h = bounds.height
-        let ws = workspace.fittingSize
-        workspace.frame = NSRect(x: 0, y: (h - ws.height) / 2, width: min(ws.width, 180), height: ws.height)
         let button: CGFloat = 28
         newTab.frame = NSRect(x: bounds.maxX - button, y: (h - button) / 2, width: button, height: button)
         palette.frame = newTab.frame.offsetBy(dx: -button - 4, dy: 0)
-        let left = workspace.frame.maxX + 14
-        track.frame = NSRect(x: left, y: 0, width: max(0, palette.frame.minX - 12 - left), height: h)
+        // The buttons keep their room; the workspace takes at most a third of the rest, shows
+        // just its icon when that is tight, and gives way to the tabs when there is no room.
+        let room = max(0, palette.frame.minX - 12)
+        workspace.compact = room < 360
+        let ws = workspace.fittingSize
+        let width = room < 160 ? 0 : workspace.compact ? 28 : min(ws.width, 180, room / 3)
+        workspace.isHidden = width == 0
+        workspace.frame = NSRect(x: 0, y: (h - ws.height) / 2, width: width, height: ws.height)
+        let left = width > 0 ? width + 14 : 0
+        track.frame = NSRect(x: left, y: 0, width: max(0, room - left), height: h)
     }
 
     /// Re-reads the window's tabs, the workspace and the theme.
@@ -95,6 +101,7 @@ private final class WorkspaceBlock: NSView {
         for f in [name, detail] {
             f.lineBreakMode = .byTruncatingTail
             f.maximumNumberOfLines = 1
+            f.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         }
         for v in [icon, name, detail] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
@@ -119,6 +126,14 @@ private final class WorkspaceBlock: NSView {
         fatalError("init(coder:) is not supported")
     }
 
+    /// Just the icon, when the strip is short of room.
+    var compact = false {
+        didSet {
+            name.isHidden = compact
+            detail.isHidden = compact
+        }
+    }
+
     func update(name text: String, host: HostId, fg: NSColor) {
         let remote = host != localHost
         let symbol = remote ? "globe" : "laptopcomputer"
@@ -140,7 +155,9 @@ private final class WorkspaceBlock: NSView {
 }
 
 /// The tabs: equal-width pills in a faint rounded track, the selected one raised, thin
-/// separators between the others. A pill dragged sideways moves its tab.
+/// separators between the others. A pill dragged sideways moves its tab. Pills shrink to fit
+/// (to just the icon when narrow); tabs that still do not fit go into an overflow menu, the
+/// selected one always staying in view.
 private final class TabTrack: NSView {
     struct Tab {
         weak var window: NSWindow?
@@ -155,19 +172,44 @@ private final class TabTrack: NSView {
         didSet { sync() }
     }
     private var pills: [TabPill] = []
+    /// Indices into `tabs` of the pills in view, in order; the rest are in the overflow menu.
+    private var shown: [Int] = []
+    private let overflow = NSButton()
+    private let overflowMenu = NSMenu()
+
+    static let minPill: CGFloat = 40
+    static let maxPill: CGFloat = 260
+    static let overflowWidth: CGFloat = 28
 
     override var isFlipped: Bool { true }
     override var mouseDownCanMoveWindow: Bool { true }
 
-    /// The pill being dragged, where it started, and the slot it would drop into.
+    /// The pill being dragged, its slot among the shown pills, where the pointer holds it, and
+    /// the slot it would drop into.
     private var drag: (pill: TabPill, from: Int, grabX: CGFloat, to: Int)?
+
+    init() {
+        super.init(frame: .zero)
+        overflow.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "More Tabs")
+        overflow.isBordered = false
+        overflow.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
+        overflow.toolTip = "More Tabs"
+        overflow.target = self
+        overflow.action = #selector(showOverflow(_:))
+        overflow.isHidden = true
+        addSubview(overflow)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
 
     private func sync() {
         if let d = drag, !pills.contains(where: { $0 === d.pill }) { drag = nil }
         while pills.count > tabs.count { pills.removeLast().removeFromSuperview() }
         while pills.count < tabs.count {
             let p = TabPill()
-            addSubview(p)
+            addSubview(p, positioned: .below, relativeTo: overflow)
             pills.append(p)
         }
         for (p, t) in zip(pills, tabs) { p.tab = t }
@@ -175,27 +217,72 @@ private final class TabTrack: NSView {
         needsDisplay = true
     }
 
-    private var pillWidth: CGFloat {
-        guard !tabs.isEmpty else { return 0 }
-        return min(260, max(90, (bounds.width - 6) / CGFloat(tabs.count)))
+    /// Which tabs are in view at this width, and the width of their pills.
+    private func fit() -> (shown: [Int], width: CGFloat, overflows: Bool) {
+        let avail = bounds.width - 6
+        guard !tabs.isEmpty, avail > 0 else { return ([], 0, false) }
+        let all = Array(tabs.indices)
+        if CGFloat(tabs.count) * Self.minPill <= avail {
+            return (all, min(Self.maxPill, avail / CGFloat(tabs.count)), false)
+        }
+        let count = max(1, Int((avail - Self.overflowWidth) / Self.minPill))
+        var picked = Array(all.prefix(count))
+        if let sel = tabs.firstIndex(where: \.selected), !picked.contains(sel) {
+            picked[picked.count - 1] = sel
+        }
+        return (picked, max(1, (avail - Self.overflowWidth) / CGFloat(picked.count)), true)
     }
+
+    private var pillWidth: CGFloat = 0
 
     override func layout() {
         super.layout()
-        let w = pillWidth
+        let (picked, w, overflows) = fit()
+        shown = picked
+        pillWidth = w
         let h = max(0, bounds.height - 6)
-        guard let d = drag else {
-            for (i, p) in pills.enumerated() {
-                p.frame = NSRect(x: 3 + CGFloat(i) * w, y: 3, width: w, height: h)
-            }
-            return
+        for (i, p) in pills.enumerated() where !picked.contains(i) {
+            p.isHidden = true
         }
-        // The others close up around the slot the dragged pill would drop into.
-        var slot = 0
-        for p in pills where p !== d.pill {
-            if slot == d.to { slot += 1 }
-            p.frame = NSRect(x: 3 + CGFloat(slot) * w, y: 3, width: w, height: h)
-            slot += 1
+        let order = shown.map { pills[$0] }
+        if let d = drag {
+            // The others close up around the slot the dragged pill would drop into.
+            var slot = 0
+            for p in order where p !== d.pill {
+                if slot == d.to { slot += 1 }
+                p.isHidden = false
+                p.frame = NSRect(x: 3 + CGFloat(slot) * w, y: 3, width: w, height: h)
+                slot += 1
+            }
+        } else {
+            for (slot, p) in order.enumerated() {
+                p.isHidden = false
+                p.frame = NSRect(x: 3 + CGFloat(slot) * w, y: 3, width: w, height: h)
+            }
+        }
+        overflow.isHidden = !overflows
+        overflow.frame = NSRect(x: 3 + CGFloat(order.count) * w, y: 3, width: Self.overflowWidth, height: h)
+        let fg = colorFromRGB(SessionManager.shared.config.theme.foreground)
+        overflow.contentTintColor = fg.withAlphaComponent(0.6)
+    }
+
+    @objc private func showOverflow(_ sender: NSButton) {
+        overflowMenu.removeAllItems()
+        for (i, t) in tabs.enumerated() where !shown.contains(i) {
+            let item = NSMenuItem(title: t.title, action: #selector(selectFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = t.window
+            item.image = t.icon.tile(size: 16, stacked: t.stacked, badge: t.status == .idle ? nil : t.status)
+            overflowMenu.addItem(item)
+        }
+        overflowMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 6), in: sender)
+    }
+
+    @objc private func selectFromMenu(_ item: NSMenuItem) {
+        guard let target = item.representedObject as? NSWindow else { return }
+        target.makeKeyAndOrderFront(nil)
+        if let c = target.windowController as? TerminalWindowController, let view = c.content.focusedView {
+            target.makeFirstResponder(view)
         }
     }
 
@@ -205,16 +292,17 @@ private final class TabTrack: NSView {
     func dragged(_ pill: TabPill, event: NSEvent, downAt start: NSPoint) {
         let p = convert(event.locationInWindow, from: nil)
         if drag == nil {
-            guard abs(p.x - start.x) > 4, let from = pills.firstIndex(where: { $0 === pill }) else { return }
+            guard abs(p.x - start.x) > 4,
+                  let from = shown.firstIndex(where: { $0 < pills.count && pills[$0] === pill }) else { return }
             drag = (pill, from, start.x - pill.frame.minX, from)
-            addSubview(pill, positioned: .above, relativeTo: nil)
+            addSubview(pill, positioned: .below, relativeTo: overflow)
             needsDisplay = true
         }
-        guard var d = drag else { return }
+        guard var d = drag, pillWidth > 0 else { return }
         let w = pillWidth
-        let x = min(max(p.x - d.grabX, 3), 3 + CGFloat(pills.count - 1) * w)
+        let x = min(max(p.x - d.grabX, 3), 3 + CGFloat(shown.count - 1) * w)
         pill.frame.origin.x = x
-        let to = min(max(Int(((x - 3) / w).rounded()), 0), pills.count - 1)
+        let to = min(max(Int(((x - 3) / w).rounded()), 0), shown.count - 1)
         if to != d.to {
             d.to = to
             drag = d
@@ -228,13 +316,14 @@ private final class TabTrack: NSView {
         }
     }
 
-    /// Button released: a dragged pill's tab moves to its slot in the window's tab group.
+    /// Button released: a dragged pill's tab moves to the place in the window's tab group of the
+    /// tab whose slot it took.
     func dropped(_ pill: TabPill) {
         guard let d = drag, d.pill === pill else { return }
         drag = nil
         needsDisplay = true
-        if d.to != d.from, let w = pill.tab?.window, let group = w.tabGroup {
-            group.insertWindow(w, at: d.to)
+        if d.to != d.from, d.to < shown.count, let w = pill.tab?.window, let group = w.tabGroup {
+            group.insertWindow(w, at: shown[d.to])
         }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.15
@@ -251,11 +340,12 @@ private final class TabTrack: NSView {
         let r = bounds.height / 2
         fg.withAlphaComponent(0.035).setFill()
         NSBezierPath(roundedRect: bounds, xRadius: r, yRadius: r).fill()
-        // Separators between neighbours that are both unselected (none while dragging).
-        guard drag == nil else { return }
+        // Separators between neighbours that are both unselected (none while dragging, nor
+        // between a change of tabs and the layout that follows it).
+        guard drag == nil, shown.allSatisfy({ $0 < tabs.count && $0 < pills.count }) else { return }
         fg.withAlphaComponent(0.14).setFill()
-        for i in 1..<max(1, pills.count) where !tabs[i].selected && !tabs[i - 1].selected {
-            let x = pills[i].frame.minX
+        for slot in 1..<max(1, shown.count) where !tabs[shown[slot]].selected && !tabs[shown[slot - 1]].selected {
+            let x = pills[shown[slot]].frame.minX
             NSRect(x: x - 0.5, y: bounds.midY - 8, width: 1, height: 16).fill()
         }
     }
@@ -270,6 +360,9 @@ private final class TabPill: NSView {
     private let icon = NSImageView()
     private let title = NSTextField(labelWithString: "")
     private let close = NSButton()
+    private lazy var iconLeading = icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10)
+    /// Too narrow for a title: just the icon, centered.
+    private var compact: Bool { bounds.width < 80 }
     private var hovering = false {
         didSet { if hovering != oldValue { update() } }
     }
@@ -291,7 +384,7 @@ private final class TabPill: NSView {
         }
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            iconLeading,
             icon.centerYAnchor.constraint(equalTo: centerYAnchor),
             icon.widthAnchor.constraint(equalToConstant: 26),
             icon.heightAnchor.constraint(equalToConstant: 22),
@@ -312,6 +405,12 @@ private final class TabPill: NSView {
 
     override var isFlipped: Bool { true }
 
+    override func setFrameSize(_ newSize: NSSize) {
+        let was = compact
+        super.setFrameSize(newSize)
+        if compact != was || compact { update() }
+    }
+
     private func update() {
         guard let tab else { return }
         let fg = colorFromRGB(SessionManager.shared.config.theme.foreground)
@@ -319,7 +418,9 @@ private final class TabPill: NSView {
         if title.stringValue != tab.title { title.stringValue = tab.title }
         title.textColor = fg.withAlphaComponent(tab.selected ? 0.95 : 0.55)
         close.contentTintColor = fg.withAlphaComponent(0.55)
-        close.isHidden = !hovering
+        title.isHidden = compact
+        close.isHidden = !hovering || compact
+        iconLeading.constant = compact ? max(0, (bounds.width - 26) / 2) : 10
         toolTip = tab.title
         needsDisplay = true
     }
