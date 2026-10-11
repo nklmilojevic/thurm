@@ -1439,9 +1439,10 @@ pub const DEFAULT_CONFIG_TOML: &str = include_str!("default_config.toml");
 /// Append only; the position is the migration's version.
 const MIGRATIONS: &[(&str, &str)] = &[("window.pane_headers", "true")];
 
-/// Where the number of [`MIGRATIONS`] already applied to the config file is kept.
-fn config_version_path() -> PathBuf {
-    state_dir().join("config-version")
+/// Where the number of [`MIGRATIONS`] already applied to each config file is kept: a line
+/// `<count> <path>` per config file (`THURM_CONFIG_DIR` and `XDG_CONFIG_HOME` pick others).
+fn config_versions_path() -> PathBuf {
+    state_dir().join("config-versions")
 }
 
 /// Returns `text` with the migrations after the first `from` applied.
@@ -1452,41 +1453,84 @@ fn migrate(text: &str, from: usize) -> Result<String, String> {
         .try_fold(text.to_owned(), |t, (key, value)| with_setting(&t, key, value))
 }
 
+fn read_versions(versions: &Path) -> Vec<(usize, String)> {
+    std::fs::read_to_string(versions)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (n, path) = l.split_once(' ')?;
+            Some((n.parse().ok()?, path.to_owned()))
+        })
+        .collect()
+}
+
+fn write_versions(versions: &Path, table: &[(usize, String)]) -> std::io::Result<()> {
+    if let Some(dir) = versions.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text: String = table.iter().map(|(n, p)| format!("{n} {p}\n")).collect();
+    replace_file(versions, text.as_bytes())
+}
+
+/// `table` with `key` at the current version.
+fn current(table: &[(usize, String)], key: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<_> = table.iter().filter(|(_, p)| p != key).cloned().collect();
+    out.push((MIGRATIONS.len(), key.to_owned()));
+    out
+}
+
 /// Write the default config if none exists, else apply the [`MIGRATIONS`] it has not had yet.
 /// Returns the path.
 pub fn ensure_default_config() -> std::io::Result<PathBuf> {
     let path = config_path();
-    ensure_config_at(&path, &config_version_path())?;
+    let ensured = ensure_config_at(&path, &config_versions_path());
+    // Migrations that could not be recorded wait for the next launch; the config is there.
+    if ensured.is_err() && !path.exists() {
+        ensured?;
+    }
     Ok(path)
 }
 
-fn ensure_config_at(path: &Path, version: &Path) -> std::io::Result<()> {
+fn ensure_config_at(path: &Path, versions: &Path) -> std::io::Result<()> {
+    // Keyed by the path as given, not its target: a Home Manager link points somewhere new on
+    // every switch.
+    let key = path.display().to_string();
+    let table = read_versions(versions);
     if !path.exists() {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(path, DEFAULT_CONFIG_TOML)?;
-    } else {
-        let from = std::fs::read_to_string(version)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        if from >= MIGRATIONS.len() {
-            return Ok(());
-        }
-        // A file Thurm can't parse or write (a read-only link) is left alone and tried again.
-        let text = std::fs::read_to_string(path)?;
-        let Ok(out) = migrate(&text, from) else {
-            return Ok(());
-        };
-        if out != text && replace_file(path, out.as_bytes()).is_err() {
-            return Ok(());
-        }
+        // Unrecorded, the migrations run on it later and change nothing: it has the defaults.
+        return write_versions(versions, &current(&table, &key));
     }
-    if let Some(dir) = version.parent() {
-        std::fs::create_dir_all(dir)?;
+    let from = table
+        .iter()
+        .find(|(_, p)| *p == key)
+        .map_or(0, |(n, _)| *n);
+    if from >= MIGRATIONS.len() {
+        return Ok(());
     }
-    std::fs::write(version, MIGRATIONS.len().to_string())
+    // A file Thurm can't parse, or one that is read-only (the user's, or a link into the Nix
+    // store), is left alone and tried again on the next launch.
+    let text = std::fs::read_to_string(path)?;
+    let Ok(out) = migrate(&text, from) else {
+        return Ok(());
+    };
+    if out == text {
+        return write_versions(versions, &current(&table, &key));
+    }
+    if std::fs::metadata(path)?.permissions().readonly() {
+        return Ok(());
+    }
+    // Recorded first, so a config is never migrated twice (which would undo the user turning a
+    // setting off again); if it then cannot be rewritten, the record is taken back. Should that
+    // fail too, the config misses these migrations rather than getting them twice.
+    write_versions(versions, &current(&table, &key))?;
+    if replace_file(path, out.as_bytes()).is_err() {
+        let _ = write_versions(versions, &table);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1655,31 +1699,86 @@ clipboard_read = "always"
         assert_eq!(c.theme_for(true).name, "dracula");
     }
 
-    #[test]
-    fn migrations_turn_features_on_once() {
-        let dir = std::env::temp_dir().join(format!("thurm-migrate-{}", std::process::id()));
+    fn migration_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("thurm-migrate-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (path, version) = (dir.join("config.toml"), dir.join("state/config-version"));
-        let old = "[window]\n# Headers.\npane_headers = false # off\n";
-        std::fs::write(&path, old).unwrap();
+        dir
+    }
 
-        ensure_config_at(&path, &version).unwrap();
+    const OLD_CONFIG: &str = "[window]\n# Headers.\npane_headers = false # off\n";
+
+    #[test]
+    fn migrations_turn_features_on_once() {
+        let dir = migration_dir("once");
+        let (path, versions) = (dir.join("config.toml"), dir.join("state/config-versions"));
+        std::fs::write(&path, OLD_CONFIG).unwrap();
+
+        ensure_config_at(&path, &versions).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(Config::parse(&text).unwrap().window.pane_headers);
         assert!(text.contains("# Headers.") && text.contains("# off"));
-        assert_eq!(std::fs::read_to_string(&version).unwrap(), MIGRATIONS.len().to_string());
 
         // Turned off again after the migration: the user's choice stays.
-        std::fs::write(&path, old).unwrap();
-        ensure_config_at(&path, &version).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        std::fs::write(&path, OLD_CONFIG).unwrap();
+        ensure_config_at(&path, &versions).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_CONFIG);
 
         // A new config is already current.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&versions).unwrap();
+        ensure_config_at(&path, &versions).unwrap();
+        std::fs::write(&path, OLD_CONFIG).unwrap();
+        ensure_config_at(&path, &versions).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_CONFIG);
         std::fs::remove_dir_all(&dir).unwrap();
-        ensure_config_at(&path, &version).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_CONFIG_TOML);
-        assert_eq!(std::fs::read_to_string(&version).unwrap(), MIGRATIONS.len().to_string());
+    }
+
+    #[test]
+    fn migrations_are_tracked_per_config_file() {
+        let dir = migration_dir("per-file");
+        let versions = dir.join("config-versions");
+        let (a, b) = (dir.join("a.toml"), dir.join("b.toml"));
+        std::fs::write(&a, OLD_CONFIG).unwrap();
+        std::fs::write(&b, OLD_CONFIG).unwrap();
+        ensure_config_at(&a, &versions).unwrap();
+        ensure_config_at(&b, &versions).unwrap();
+        for p in [&a, &b] {
+            let text = std::fs::read_to_string(p).unwrap();
+            assert!(Config::parse(&text).unwrap().window.pane_headers, "{}", p.display());
+        }
+        assert_eq!(read_versions(&versions).len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_configs_are_left_for_later() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = migration_dir("read-only");
+        let (path, versions) = (dir.join("config.toml"), dir.join("config-versions"));
+        std::fs::write(&path, OLD_CONFIG).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        ensure_config_at(&path, &versions).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_CONFIG);
+        assert!(read_versions(&versions).is_empty());
+
+        // Writable again: migrated then.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_config_at(&path, &versions).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(Config::parse(&text).unwrap().window.pane_headers);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn migrations_wait_for_a_place_to_record_them() {
+        let dir = migration_dir("unrecorded");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, OLD_CONFIG).unwrap();
+        // The versions file's directory is a file: it cannot be written.
+        std::fs::write(dir.join("state"), "").unwrap();
+        assert!(ensure_config_at(&path, &dir.join("state/config-versions")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_CONFIG);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
