@@ -1434,16 +1434,59 @@ fn check_range(key: &str, value: f64, lo: f64, hi: f64) -> Result<(), String> {
 /// Commented default config written on first launch.
 pub const DEFAULT_CONFIG_TOML: &str = include_str!("default_config.toml");
 
-/// Write the default config if none exists. Returns the path.
+/// Settings every existing config gets once, in order, when a Thurm that has them first runs:
+/// a feature that is on by default but sits turned off in config files written before it was.
+/// Append only; the position is the migration's version.
+const MIGRATIONS: &[(&str, &str)] = &[("window.pane_headers", "true")];
+
+/// Where the number of [`MIGRATIONS`] already applied to the config file is kept.
+fn config_version_path() -> PathBuf {
+    state_dir().join("config-version")
+}
+
+/// Returns `text` with the migrations after the first `from` applied.
+fn migrate(text: &str, from: usize) -> Result<String, String> {
+    MIGRATIONS
+        .iter()
+        .skip(from)
+        .try_fold(text.to_owned(), |t, (key, value)| with_setting(&t, key, value))
+}
+
+/// Write the default config if none exists, else apply the [`MIGRATIONS`] it has not had yet.
+/// Returns the path.
 pub fn ensure_default_config() -> std::io::Result<PathBuf> {
     let path = config_path();
+    ensure_config_at(&path, &config_version_path())?;
+    Ok(path)
+}
+
+fn ensure_config_at(path: &Path, version: &Path) -> std::io::Result<()> {
     if !path.exists() {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&path, DEFAULT_CONFIG_TOML)?;
+        std::fs::write(path, DEFAULT_CONFIG_TOML)?;
+    } else {
+        let from = std::fs::read_to_string(version)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if from >= MIGRATIONS.len() {
+            return Ok(());
+        }
+        // A file Thurm can't parse or write (a read-only link) is left alone and tried again.
+        let text = std::fs::read_to_string(path)?;
+        let Ok(out) = migrate(&text, from) else {
+            return Ok(());
+        };
+        if out != text && replace_file(path, out.as_bytes()).is_err() {
+            return Ok(());
+        }
     }
-    Ok(path)
+    if let Some(dir) = version.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(version, MIGRATIONS.len().to_string())
 }
 
 #[cfg(test)]
@@ -1610,6 +1653,41 @@ clipboard_read = "always"
         let c = Config::parse("[colors]\ntheme = \"light:thurm-light,dark:dracula\"").unwrap();
         assert_eq!(c.theme_for(false).name, "thurm-light");
         assert_eq!(c.theme_for(true).name, "dracula");
+    }
+
+    #[test]
+    fn migrations_turn_features_on_once() {
+        let dir = std::env::temp_dir().join(format!("thurm-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, version) = (dir.join("config.toml"), dir.join("state/config-version"));
+        let old = "[window]\n# Headers.\npane_headers = false # off\n";
+        std::fs::write(&path, old).unwrap();
+
+        ensure_config_at(&path, &version).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(Config::parse(&text).unwrap().window.pane_headers);
+        assert!(text.contains("# Headers.") && text.contains("# off"));
+        assert_eq!(std::fs::read_to_string(&version).unwrap(), MIGRATIONS.len().to_string());
+
+        // Turned off again after the migration: the user's choice stays.
+        std::fs::write(&path, old).unwrap();
+        ensure_config_at(&path, &version).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+
+        // A new config is already current.
+        std::fs::remove_dir_all(&dir).unwrap();
+        ensure_config_at(&path, &version).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_CONFIG_TOML);
+        assert_eq!(std::fs::read_to_string(&version).unwrap(), MIGRATIONS.len().to_string());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn migrations_apply_to_the_default_config() {
+        let out = migrate(DEFAULT_CONFIG_TOML, 0).unwrap();
+        Config::parse_strict(&out).unwrap();
+        assert_eq!(out, DEFAULT_CONFIG_TOML);
     }
 
     #[test]
