@@ -902,10 +902,26 @@ fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// The theme chosen in this process when the config file cannot record it (read-only, e.g.
+/// managed by Nix or Home Manager): [`Config::load`] puts it over the file's for this session.
+static SESSION_THEME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Sets (or with `None` clears) the session's theme, as [`SESSION_THEME`].
+pub fn set_session_theme(spec: Option<&ThemeSpec>) {
+    *SESSION_THEME.lock().unwrap_or_else(|e| e.into_inner()) = spec.map(ThemeSpec::to_string);
+}
+
+fn with_session_theme(mut cfg: Config) -> Config {
+    if let Some(spec) = SESSION_THEME.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        cfg.colors.theme = Some(spec);
+    }
+    cfg
+}
+
 impl Config {
     /// Load the config file; a missing file yields the defaults.
     pub fn load() -> Result<Config, ConfigError> {
-        Self::load_from(&config_path())
+        Self::load_with_warnings().map(|(cfg, _)| cfg)
     }
 
     pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
@@ -951,8 +967,14 @@ impl Config {
 
     /// Like [`Config::load`], with the warnings of [`Config::parse_with_warnings`].
     pub fn load_with_warnings() -> Result<(Config, Vec<String>), ConfigError> {
-        let path = config_path();
-        match std::fs::read_to_string(&path) {
+        Self::load_with_warnings_from(&config_path())
+    }
+
+    /// The config file at `path` as [`Config::load_with_warnings`] reads it, the session's theme
+    /// over its own.
+    fn load_with_warnings_from(path: &Path) -> Result<(Config, Vec<String>), ConfigError> {
+        let path = path.to_owned();
+        let loaded = match std::fs::read_to_string(&path) {
             Ok(text) => Self::parse_with_warnings(&text).map_err(|message| ConfigError {
                 path: path.clone(),
                 message,
@@ -962,7 +984,8 @@ impl Config {
                 path,
                 message: e.to_string(),
             }),
-        }
+        };
+        loaded.map(|(cfg, warnings)| (with_session_theme(cfg), warnings))
     }
 
     pub fn theme_spec(&self) -> ThemeSpec {
@@ -1715,6 +1738,26 @@ clipboard_read = "always"
             .try_fold(DEFAULT_CONFIG_TOML.to_owned(), |t, (k, v)| with_setting(&t, k, v))
             .unwrap();
         assert_eq!(all, DEFAULT_CONFIG_TOML);
+    }
+
+    #[test]
+    fn session_theme_overrides_the_file() {
+        let dir = std::env::temp_dir().join(format!("thurm-session-theme-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[colors]\ntheme = \"nord\"").unwrap();
+        let theme = |dark| {
+            let (cfg, _) = Config::load_with_warnings_from(&path).unwrap();
+            cfg.theme_for(dark).name
+        };
+
+        set_session_theme(Some(&ThemeSpec::parse("light:thurm-light,dark:dracula")));
+        let (dark, light) = (theme(true), theme(false));
+        set_session_theme(None);
+        assert_eq!((dark.as_str(), light.as_str()), ("dracula", "thurm-light"));
+        assert_eq!(theme(true), "nord");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

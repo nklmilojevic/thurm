@@ -1437,6 +1437,25 @@ pub unsafe extern "C" fn thurm_preview_theme(
     into_c(serde_json::to_string(&shown).unwrap_or_default())
 }
 
+/// Use theme `spec` (as `colors.theme`) in place of the config file's for the rest of this
+/// process, when the file cannot record it; `NULL` goes back to the file's. Reload the config
+/// and the engines afterwards. Returns `NULL`, or why `spec` is not a theme. Free the result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_set_session_theme(spec: *const c_char) -> *mut c_char {
+    let Some(spec) = (unsafe { opt_str(spec) }) else {
+        thurm_config::set_session_theme(None);
+        return std::ptr::null_mut();
+    };
+    let spec = thurm_config::ThemeSpec::parse(spec);
+    match spec.validate() {
+        Ok(()) => {
+            thurm_config::set_session_theme(Some(&spec));
+            std::ptr::null_mut()
+        }
+        Err(e) => into_c(e),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn thurm_config_json(dark: bool) -> *mut c_char {
     let _ = thurm_config::ensure_default_config();

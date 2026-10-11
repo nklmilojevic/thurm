@@ -336,6 +336,17 @@ final class Core {
         }
     }
 
+    /// Uses theme `spec` instead of the config file's for this session (nil: the file's again),
+    /// and redraws every connection's panes in it. Returns why `spec` is not a theme, if it isn't.
+    func setSessionTheme(_ spec: String?) -> String? {
+        if let raw = thurm_set_session_theme(spec) {
+            defer { thurm_string_free(raw) }
+            return String(cString: raw)
+        }
+        for c in clients.values { thurm_reload_engine(c) }
+        return nil
+    }
+
     func paste(_ pane: PaneKey, text: String) {
         guard let c = clients[pane.host] else { return }
         thurm_paste(c, pane.id, text)
