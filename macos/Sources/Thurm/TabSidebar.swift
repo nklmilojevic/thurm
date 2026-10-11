@@ -738,7 +738,9 @@ final class TabRowView: NSTableCellView {
         shortcut.setContentHuggingPriority(.required, for: .horizontal)
         NSLayoutConstraint.activate([
             icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            icon.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            // Centered on the row, not the title: the status dot on its corner stays inside
+            // the selection.
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
             icon.widthAnchor.constraint(equalToConstant: 20),
             icon.heightAnchor.constraint(equalToConstant: 20),
             dot.centerXAnchor.constraint(equalTo: icon.trailingAnchor, constant: -1),
