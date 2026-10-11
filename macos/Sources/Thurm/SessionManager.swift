@@ -9,6 +9,9 @@ final class SessionManager: NSObject, CoreDelegate {
     var config = AppConfig()
     /// Cmd+Plus / Cmd+Minus override of `config.fontSize` (not persisted).
     private(set) var fontSizeOverride: CGFloat?
+    /// View > Tabs in Sidebar when config.toml cannot record it (read-only, e.g. managed by Nix
+    /// or Home Manager): the choice holds for this session, over reloads.
+    private var sidebarTabsOverride: Bool?
     var effectiveFontSize: CGFloat { fontSizeOverride ?? config.fontSize }
 
     private(set) var controllers: [TerminalWindowController] = []
@@ -777,12 +780,19 @@ final class SessionManager: NSObject, CoreDelegate {
         }
     }
 
-    /// View > Tabs in Sidebar: switch `window.tab_style` (persisted; every window follows).
+    /// View > Tabs in Sidebar: switch `window.tab_style` (every window follows). Saved to the
+    /// config when it can be written; otherwise it switches for this session only.
     func toggleSidebarTabs() {
-        let next = config.sidebarTabs ? "native" : "sidebar"
-        let resp = Core.shared.request(object: ["SetSetting": ["key": "window.tab_style", "value": "\"\(next)\""]])
-        if let d = resp as? [String: Any], let e = d["error"] as? String {
-            currentController?.content.focusedView?.showToast("Tabs: \(e)", duration: 6)
+        let sidebar = !config.sidebarTabs
+        let resp = Core.shared.request(object: ["SetSetting": ["key": "window.tab_style",
+                                                               "value": sidebar ? "\"sidebar\"" : "\"native\""]])
+        if let d = resp as? [String: Any], d["error"] != nil {
+            sidebarTabsOverride = sidebar
+            config.sidebarTabs = sidebar
+            applyConfigToUI()
+        } else {
+            // Saved: the reload that follows carries it.
+            sidebarTabsOverride = nil
         }
     }
 
@@ -842,6 +852,7 @@ final class SessionManager: NSObject, CoreDelegate {
             Core.shared.request("\"ReloadConfig\"")
         }
         config = AppConfig.load()
+        if let o = sidebarTabsOverride { config.sidebarTabs = o }
         applyConfigToUI()
         Core.shared.reloadRemoteEngines()
         Remotes.shared.configChanged()

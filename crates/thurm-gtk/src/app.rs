@@ -46,6 +46,9 @@ pub struct App {
     ui: RefCell<UiConfig>,
     fonts: RefCell<Rc<Fonts>>,
     font_override: Cell<Option<f64>>,
+    /// View › Tabs in Sidebar when config.toml cannot record it (read-only, e.g. managed by Nix
+    /// or Home Manager): the choice holds for this session, over reloads.
+    tab_style_override: Cell<Option<thurm_config::TabStyle>>,
     keymap: RefCell<HashMap<Combo, &'static str>>,
     pub infos: RefCell<HashMap<PaneKey, PaneInfo>>,
     views: RefCell<HashMap<PaneKey, Rc<TermView>>>,
@@ -283,6 +286,7 @@ impl App {
             ui: RefCell::new(ui),
             fonts: RefCell::new(fonts),
             font_override: Cell::new(None),
+            tab_style_override: Cell::new(None),
             keymap: RefCell::new(actions::keymap(&bindings)),
             infos: RefCell::new(HashMap::new()),
             views: RefCell::new(HashMap::new()),
@@ -3288,6 +3292,9 @@ impl App {
             c.request(&json!("ReloadConfig"));
         }
         let mut ui = UiConfig::load(system_is_dark());
+        if let Some(style) = self.tab_style_override.get() {
+            ui.cfg.window.tab_style = style;
+        }
         let mut warnings = Vec::new();
         let bindings = actions::bindings(&ui.cfg.keybindings, &mut warnings);
         ui.warnings.extend(warnings);
@@ -3350,17 +3357,26 @@ impl App {
         self.apply_config();
     }
 
+    /// Saved to the config when it can be written; otherwise it switches for this session only.
     fn toggle_tab_style(&self) {
-        let value = if self.ui().sidebar_tabs() {
-            "\"native\""
+        use thurm_config::TabStyle;
+        let (next, value) = if self.ui().sidebar_tabs() {
+            (TabStyle::Native, "\"native\"")
         } else {
-            "\"sidebar\""
+            (TabStyle::Sidebar, "\"sidebar\"")
         };
-        if let Some(c) = self.core(LOCAL) {
+        let saved = self.core(LOCAL).is_some_and(|c| {
             let r = c.request(&json!({"SetSetting": {"key": "window.tab_style", "value": value}}));
-            if let Some(e) = r.get("error").and_then(Value::as_str) {
-                self.toast(&format!("Tabs: {e}"), 6.0);
-            }
+            r.get("error").is_none()
+        });
+        if saved {
+            // The reload that follows carries it.
+            self.tab_style_override.set(None);
+        } else {
+            self.tab_style_override.set(Some(next));
+            self.ui.borrow_mut().cfg.window.tab_style = next;
+            self.apply_config();
+            self.refresh_sidebar();
         }
     }
 
