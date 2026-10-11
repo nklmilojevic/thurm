@@ -377,6 +377,13 @@ final class TabContentView: NSView {
                 (rect: $0.1, focused: $0.0 == focusedPane && frames.count > 1)
             }
             chrome.opacity = controller?.opacity ?? SessionManager.shared.config.opacity
+            chrome.windowRadius = (window as? TerminalWindow)?.cornerRadius ?? 0
+            chrome.windowCorners = window.map { w in
+                let b = w.contentView?.bounds ?? .zero
+                return [NSPoint(x: b.minX, y: b.minY), NSPoint(x: b.maxX, y: b.minY),
+                        NSPoint(x: b.minX, y: b.maxY), NSPoint(x: b.maxX, y: b.maxY)]
+                    .map { convert($0, from: w.contentView) }
+            } ?? []
             chrome.needsDisplay = true
             for (id, header) in headers {
                 header.update(focused: id == focusedPane)
@@ -715,12 +722,16 @@ final class TabContentView: NSView {
     var host: HostId { root.panes.first?.host ?? localHost }
 }
 
-/// Split cards' gutters (in the sidebar's color) and outlines (brighter around the focused pane),
-/// over the panes so the rounded corners cover the terminals' square ones. Clicks pass through.
+/// Split cards' gutters (in the sidebar's color) and faint outlines, over the panes so the rounded
+/// corners cover the terminals' square ones. Clicks pass through. A card corner near a window
+/// corner follows the window's curve, so the two stay concentric.
 private final class CardChrome: NSView {
     var area: NSRect = .zero
     var cards: [(rect: NSRect, focused: Bool)] = []
     var opacity: CGFloat = 1
+    var windowRadius: CGFloat = 0
+    /// The window's corners, in this view.
+    var windowCorners: [NSPoint] = []
 
     override var isFlipped: Bool { true }
 
@@ -730,21 +741,53 @@ private final class CardChrome: NSView {
         let cfg = SessionManager.shared.config
         let base = colorFromRGB(cfg.theme.background)
         let fg = colorFromRGB(cfg.theme.foreground)
-        let r = TabContentView.cardRadius
         let gutter = NSBezierPath(rect: area)
         gutter.windingRule = .evenOdd
-        for card in cards {
-            gutter.append(NSBezierPath(roundedRect: card.rect, xRadius: r, yRadius: r))
+        let radii = cards.map { corners(of: $0.rect) }
+        for (card, r) in zip(cards, radii) {
+            gutter.append(Self.path(card.rect, radii: r))
         }
         let bg = base.withAlphaComponent(opacity)
         (bg.shadow(withLevel: cfg.theme.isDark ? 0.18 : 0.05) ?? bg).setFill()
         gutter.fill()
-        for card in cards {
-            let outline = NSBezierPath(roundedRect: card.rect.insetBy(dx: 0.5, dy: 0.5), xRadius: r - 0.5, yRadius: r - 0.5)
-            let color = base.blended(withFraction: card.focused ? 0.3 : 0.12, of: fg) ?? fg
+        // A hairline a step off the card, a touch brighter around the focused pane.
+        for (card, r) in zip(cards, radii) {
+            let outline = Self.path(card.rect.insetBy(dx: 0.5, dy: 0.5), radii: r.map { $0 - 0.5 })
+            let color = base.blended(withFraction: card.focused ? 0.1 : 0.06, of: fg) ?? fg
             color.withAlphaComponent(max(opacity, 0.6)).setStroke()
             outline.lineWidth = 1
             outline.stroke()
         }
+    }
+
+    /// Radii of `rect`'s corners (top left, top right, bottom right, bottom left): the window's,
+    /// less the distance, where a window corner is close; else the cards' own.
+    private func corners(of rect: NSRect) -> [CGFloat] {
+        let base = TabContentView.cardRadius
+        let points = [NSPoint(x: rect.minX, y: rect.minY), NSPoint(x: rect.maxX, y: rect.minY),
+                      NSPoint(x: rect.maxX, y: rect.maxY), NSPoint(x: rect.minX, y: rect.maxY)]
+        return points.map { p in
+            guard windowRadius > base else { return base }
+            let inset = windowCorners.map { max(abs($0.x - p.x), abs($0.y - p.y)) }.min() ?? .infinity
+            return inset < windowRadius ? max(base, windowRadius - inset) : base
+        }
+    }
+
+    /// A rounded rectangle with its own radius per corner, clockwise from the top left (flipped).
+    private static func path(_ r: NSRect, radii: [CGFloat]) -> NSBezierPath {
+        let limit = min(r.width, r.height) / 2
+        let (tl, tr, br, bl) = (min(radii[0], limit), min(radii[1], limit), min(radii[2], limit), min(radii[3], limit))
+        let p = NSBezierPath()
+        p.move(to: NSPoint(x: r.minX + tl, y: r.minY))
+        p.line(to: NSPoint(x: r.maxX - tr, y: r.minY))
+        p.appendArc(from: NSPoint(x: r.maxX, y: r.minY), to: NSPoint(x: r.maxX, y: r.minY + tr), radius: tr)
+        p.line(to: NSPoint(x: r.maxX, y: r.maxY - br))
+        p.appendArc(from: NSPoint(x: r.maxX, y: r.maxY), to: NSPoint(x: r.maxX - br, y: r.maxY), radius: br)
+        p.line(to: NSPoint(x: r.minX + bl, y: r.maxY))
+        p.appendArc(from: NSPoint(x: r.minX, y: r.maxY), to: NSPoint(x: r.minX, y: r.maxY - bl), radius: bl)
+        p.line(to: NSPoint(x: r.minX, y: r.minY + tl))
+        p.appendArc(from: NSPoint(x: r.minX, y: r.minY), to: NSPoint(x: r.minX + tl, y: r.minY), radius: tl)
+        p.close()
+        return p
     }
 }

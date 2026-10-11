@@ -88,6 +88,17 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         return maxX
     }
 
+    /// The window's corner radius: AppKit's own (private `_cornerRadius`) when it answers, else
+    /// what macOS 27 draws (about 18pt); square in full screen.
+    var cornerRadius: CGFloat {
+        if styleMask.contains(.fullScreen) { return 0 }
+        if responds(to: NSSelectorFromString("_cornerRadius")),
+           let r = value(forKey: "_cornerRadius") as? CGFloat, r > 0 {
+            return r
+        }
+        return 18
+    }
+
     /// Terminal background used to tint the titlebar.
     var titlebarColor: NSColor? {
         didSet { syncTitlebar() }
