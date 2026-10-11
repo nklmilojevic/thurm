@@ -233,9 +233,10 @@ final class TabContentView: NSView {
     }
 
     /// Pane headers show while more than one pane is on screen (`window.pane_headers`), and
-    /// always in `fullHeight` mode.
+    /// always in `fullHeight` mode or under the horizontal tab strip.
     var showsHeaders: Bool {
-        SessionManager.shared.config.paneHeaders && (hasMultipleVisiblePanes || fullHeight)
+        SessionManager.shared.config.paneHeaders
+            && (hasMultipleVisiblePanes || fullHeight || (window as? TerminalWindow)?.tabStrip != nil)
     }
 
     /// Where the split tree lays out, and the space between its panes.

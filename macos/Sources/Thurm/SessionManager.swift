@@ -767,13 +767,17 @@ final class SessionManager: NSObject, CoreDelegate {
 
     private var sidebarRefreshPending = false
 
-    /// Reload every vertical tab sidebar on the next main-loop turn (coalesced).
+    /// Reload every vertical tab sidebar and horizontal tab strip on the next main-loop turn
+    /// (coalesced).
     func refreshSidebars() {
-        guard config.sidebarTabs, !sidebarRefreshPending else { return }
+        guard !sidebarRefreshPending else { return }
         sidebarRefreshPending = true
         DispatchQueue.main.async {
             self.sidebarRefreshPending = false
-            for c in self.liveControllers { c.sidebar?.reload() }
+            for c in self.liveControllers {
+                c.sidebar?.reload()
+                (c.window as? TerminalWindow)?.tabStrip?.reload()
+            }
         }
     }
 

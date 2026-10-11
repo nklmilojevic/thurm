@@ -151,6 +151,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         guard let window = window as? TerminalWindow else { return }
         let cfg = SessionManager.shared.config
         if cfg.sidebarTabs {
+            window.tabStrip = nil
             guard tabSplit == nil else { return }
             let frame = window.frame
             window.suppressTabBar = true
@@ -180,6 +181,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             }
             if hadSplit { window.setFrame(frame, display: true) }
             window.suppressTabBar = false
+            if !isQuick, window.tabStrip == nil {
+                let strip = TabStrip()
+                strip.controller = self
+                window.tabStrip = strip
+            }
         }
         content.needsLayout = true
     }
