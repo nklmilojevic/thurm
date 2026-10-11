@@ -12,6 +12,7 @@ use gtk::{gdk, gio, glib};
 use crate::actions::{self, ACTIONS, Menu};
 use crate::app;
 use crate::config::{UiConfig, blend, css_rgb, css_rgba};
+use crate::core::PaneKey;
 use crate::sidebar::Sidebar;
 use crate::tab::Tab;
 
@@ -22,7 +23,22 @@ pub struct MainWindow {
     pub sidebar: Rc<Sidebar>,
     paned: gtk::Paned,
     title: adw::WindowTitle,
+    header: adw::HeaderBar,
+    toolbar: adw::ToolbarView,
     sidebar_button: gtk::ToggleButton,
+    /// Full height (vertical tabs with pane headers): the header bar sits over the sidebar and
+    /// the panes run to the top of the window.
+    full_height: std::cell::Cell<bool>,
+    /// With the sidebar hidden, the top-left pane's header holds these (window controls,
+    /// sidebar, new tab, menu)...
+    lead_controls: gtk::Box,
+    /// ...and the top-right one the window controls.
+    trail_controls: gtk::WindowControls,
+    /// The panes whose headers hold them.
+    placed: RefCell<Option<(Option<PaneKey>, Option<PaneKey>)>>,
+    /// Bumped by every placement and reset, so a queued placement that is no longer the latest
+    /// does nothing.
+    placement: Rc<std::cell::Cell<u64>>,
     /// The palette and other window-wide overlays go here.
     pub overlay: gtk::Overlay,
     pub tabs: RefCell<Vec<Rc<Tab>>>,
@@ -50,15 +66,28 @@ impl MainWindow {
         new_tab.set_tooltip_text(Some("New Tab (Ctrl+Shift+T)"));
         new_tab.set_action_name(Some("app.new_tab"));
         header.pack_start(&new_tab);
-        let menu_button = gtk::MenuButton::new();
-        menu_button.set_icon_name("open-menu-symbolic");
-        menu_button.set_tooltip_text(Some("Main Menu"));
+        let menu_button = main_menu_button();
         menu_button.set_primary(true);
-        menu_button.set_create_popup_func(|b| {
-            let model = app::with_app(|a| main_menu(a)).unwrap_or_else(gio::Menu::new);
-            b.set_menu_model(Some(&model));
-        });
         header.pack_end(&menu_button);
+
+        let lead_controls = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        lead_controls.append(&gtk::WindowControls::new(gtk::PackType::Start));
+        let show_sidebar = gtk::Button::from_icon_name("sidebar-show-symbolic");
+        show_sidebar.set_tooltip_text(Some("Show Sidebar (Ctrl+Shift+B)"));
+        show_sidebar.set_action_name(Some("app.toggle_sidebar"));
+        let new_tab2 = gtk::Button::from_icon_name("tab-new-symbolic");
+        new_tab2.set_tooltip_text(Some("New Tab (Ctrl+Shift+T)"));
+        new_tab2.set_action_name(Some("app.new_tab"));
+        for b in [&show_sidebar, &new_tab2] {
+            b.add_css_class("flat");
+            b.add_css_class("thurm-window-button");
+            lead_controls.append(b);
+        }
+        let menu2 = main_menu_button();
+        menu2.add_css_class("flat");
+        menu2.add_css_class("thurm-window-button");
+        lead_controls.append(&menu2);
+        let trail_controls = gtk::WindowControls::new(gtk::PackType::End);
 
         let tab_view = adw::TabView::new();
         tab_view.set_shortcuts(adw::TabViewShortcuts::empty());
@@ -105,7 +134,14 @@ impl MainWindow {
             sidebar,
             paned,
             title,
+            header,
+            toolbar,
             sidebar_button,
+            full_height: std::cell::Cell::new(false),
+            lead_controls,
+            trail_controls,
+            placed: RefCell::new(None),
+            placement: Rc::new(std::cell::Cell::new(0)),
             overlay,
             tabs: RefCell::new(Vec::new()),
             css,
@@ -139,6 +175,7 @@ impl MainWindow {
         self.sidebar_button.connect_toggled(move |b| {
             if let Some(w) = weak.upgrade() {
                 w.sidebar.root.set_visible(b.is_active());
+                w.replace_controls();
                 app::with_app(|a| a.sidebar_toggled());
             }
         });
@@ -193,6 +230,7 @@ impl MainWindow {
 
     pub fn apply_config(&self, ui: &UiConfig) {
         let sidebar = ui.sidebar_tabs();
+        self.set_full_height(sidebar && ui.pane_headers());
         self.tab_bar.set_visible(!sidebar);
         self.sidebar.root.set_visible(sidebar && self.sidebar_button.is_active());
         self.sidebar_button.set_visible(sidebar);
@@ -247,7 +285,18 @@ impl MainWindow {
             .thurm-completion .thurm-completion-detail, .thurm-palette .detail {{ font-size: {small}px; }}
             .thurm-palette entry {{ font-family: "{font}"; font-size: {big}px; background: transparent; border: none; box-shadow: none; outline: none; padding: 10px 14px; }}
             .thurm-palette .footer {{ font-size: {small}px; opacity: 0.55; margin: 4px 16px 8px 16px; }}
-            .thurm-dot {{ min-width: 8px; min-height: 8px; border-radius: 4px; }}
+            .thurm-sidebar headerbar {{ background-color: transparent; box-shadow: none; }}
+            .thurm-pane-header {{ background-color: {bg_a}; color: {fg}; }}
+            .thurm-card-top {{ border-radius: 7px 7px 0 0; }}
+            .thurm-card-bottom {{ border-radius: 0 0 7px 7px; }}
+            .thurm-pane-title {{ font-size: 13px; font-weight: 600; opacity: 0.6; }}
+            .thurm-pane-header.focused .thurm-pane-title {{ opacity: 1; }}
+            .thurm-pane-icon {{ opacity: 0.55; }}
+            .thurm-pane-header.focused .thurm-pane-icon {{ opacity: 0.9; }}
+            button.thurm-pane-button {{ min-width: 22px; min-height: 22px; padding: 0; opacity: 0.45; }}
+            .thurm-pane-header:not(.focused) button.thurm-pane-button {{ opacity: 0.3; }}
+            .thurm-pane-header windowcontrols button {{ min-width: 22px; min-height: 22px; padding: 0; }}
+            button.thurm-window-button {{ min-width: 26px; min-height: 26px; padding: 0; }}
             "#,
             bg_a = css_rgba(bg, opacity),
             quick_a = css_rgba(bg, ui.quick_opacity()),
@@ -267,6 +316,80 @@ impl MainWindow {
         self.css.load_from_string(&css);
         self.window.add_css_class("thurm");
         self.paned.add_css_class("thurm-main");
+    }
+
+    /// Moves the header bar over the sidebar (full height) or back above everything.
+    fn set_full_height(&self, full: bool) {
+        if self.full_height.replace(full) == full && self.header.parent().is_some() {
+            return;
+        }
+        if self.header.parent().is_some() {
+            if self.header.parent().as_ref() == Some(self.sidebar.root.upcast_ref()) {
+                self.sidebar.root.remove(&self.header);
+            } else {
+                self.toolbar.remove(&self.header);
+            }
+        }
+        if full {
+            self.sidebar.root.prepend(&self.header);
+        } else {
+            self.toolbar.add_top_bar(&self.header);
+        }
+        self.header.set_show_end_title_buttons(!full);
+        self.title.set_visible(!full);
+        self.replace_controls();
+    }
+
+    /// Takes the controls out of the pane headers; the selected tab puts them back on its next
+    /// layout.
+    fn replace_controls(&self) {
+        for w in [self.lead_controls.upcast_ref::<gtk::Widget>(), self.trail_controls.upcast_ref()] {
+            if let Some(p) = w.parent().and_downcast::<gtk::Box>() {
+                p.remove(w);
+            }
+        }
+        *self.placed.borrow_mut() = None;
+        self.placement.set(self.placement.get() + 1);
+        if let Some(t) = self.selected_tab() {
+            t.relayout();
+        }
+    }
+
+    /// Called from the tab's layout: puts the window controls into the headers of its top-left
+    /// (`lead`, when the sidebar is hidden) and top-right (`trail`) panes, after the layout.
+    pub fn place_controls_later(&self, tab: std::rc::Weak<Tab>, lead: Option<PaneKey>, trail: Option<PaneKey>) {
+        let Some(t) = tab.upgrade() else { return };
+        if !self.full_height.get() || !self.selected_tab().is_some_and(|s| Rc::ptr_eq(&s, &t)) {
+            return;
+        }
+        let lead = lead.filter(|_| !self.sidebar_shown());
+        let want = (lead, trail);
+        if self.placed.borrow().as_ref() == Some(&want) {
+            return;
+        }
+        *self.placed.borrow_mut() = Some(want.clone());
+        let generation = self.placement.get() + 1;
+        self.placement.set(generation);
+        let current = self.placement.clone();
+        let lead_w = self.lead_controls.clone();
+        let trail_w = self.trail_controls.clone();
+        glib::idle_add_local_once(move || {
+            // A mode change, sidebar toggle or newer layout came first.
+            if current.get() != generation {
+                return;
+            }
+            for w in [lead_w.upcast_ref::<gtk::Widget>(), trail_w.upcast_ref()] {
+                if let Some(p) = w.parent().and_downcast::<gtk::Box>() {
+                    p.remove(w);
+                }
+            }
+            if let Some(h) = want.0.as_ref().and_then(|k| t.header(k)) {
+                h.lead.append(&lead_w);
+            }
+            if let Some(h) = want.1.as_ref().and_then(|k| t.header(k)) {
+                h.trail.append(&trail_w);
+            }
+        });
     }
 
     pub fn set_title(&self, title: &str, subtitle: &str) {
@@ -335,6 +458,17 @@ impl MainWindow {
             self.tab_view.set_selected_page(page);
         }
     }
+}
+
+fn main_menu_button() -> gtk::MenuButton {
+    let b = gtk::MenuButton::new();
+    b.set_icon_name("open-menu-symbolic");
+    b.set_tooltip_text(Some("Main Menu"));
+    b.set_create_popup_func(|b| {
+        let model = app::with_app(|a| main_menu(a)).unwrap_or_else(gio::Menu::new);
+        b.set_menu_model(Some(&model));
+    });
+    b
 }
 
 /// The main menu, as the macOS menu bar: one submenu per menu, rebuilt on every open so titles

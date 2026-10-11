@@ -1,7 +1,9 @@
 //! One tab: its split tree laid out like TabContentView (SplitView.swift) with 1 px dividers
-//! you can drag, zoom, the unfocused-split dim, and the tab's find bar.
+//! you can drag, zoom, the unfocused-split dim, and the tab's find bar. With pane headers the
+//! panes become rounded cards, each under its header.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 use gtk::prelude::*;
@@ -10,11 +12,15 @@ use serde_json::{Value, json};
 use thurm_proto::layout::TabLayout;
 
 use crate::app;
+use crate::config::blend;
 use crate::core::{HostId, PaneKey};
 use crate::model::{self, Divider, Rect, SplitNode};
+use crate::paneheader::{self, PaneHeader};
 
 /// Pixels on each side of a divider that still grab it.
 const HIT_SLOP: f64 = 3.0;
+/// Corner radius of the split cards.
+const CARD_RADIUS: f64 = 8.0;
 
 pub struct Tab {
     /// The tab page's widget.
@@ -30,6 +36,11 @@ pub struct Tab {
     pub host: HostId,
     dividers: RefCell<Vec<(gtk::DrawingArea, Divider)>>,
     frames: RefCell<Vec<(PaneKey, Rect)>>,
+    headers: RefCell<HashMap<PaneKey, Rc<PaneHeader>>>,
+    /// Gutters and card outlines, drawn over the panes; clicks pass through.
+    chrome: gtk::DrawingArea,
+    /// The cards as last laid out, and whether each is the focused one among several.
+    cards: RefCell<Vec<(Rect, bool)>>,
     find: FindBar,
     pub page: RefCell<Option<adw::TabPage>>,
 }
@@ -99,6 +110,9 @@ impl Tab {
             host,
             dividers: RefCell::new(Vec::new()),
             frames: RefCell::new(Vec::new()),
+            headers: RefCell::new(HashMap::new()),
+            chrome: gtk::DrawingArea::new(),
+            cards: RefCell::new(Vec::new()),
             find: FindBar {
                 revealer,
                 entry,
@@ -108,6 +122,14 @@ impl Tab {
         });
 
         *slot.borrow_mut() = Rc::downgrade(&tab);
+        tab.chrome.set_can_target(false);
+        tab.chrome.set_parent(&tab.container);
+        let weak = Rc::downgrade(&tab);
+        tab.chrome.set_draw_func(move |_, cr, w, h| {
+            if let Some(t) = weak.upgrade() {
+                t.draw_chrome(cr, w as f64, h as f64);
+            }
+        });
 
         // Enter searches older output, Shift+Enter newer; no search while typing.
         let keys = gtk::EventControllerKey::new();
@@ -197,10 +219,20 @@ impl Tab {
     /// ones no longer in the tree.
     pub fn sync_children(self: &Rc<Self>) {
         let keys = self.panes();
-        let wanted: Vec<gtk::Widget> = keys
+        {
+            let mut headers = self.headers.borrow_mut();
+            headers.retain(|k, _| keys.contains(k));
+            for k in &keys {
+                headers.entry(k.clone()).or_insert_with(|| PaneHeader::new(k.clone()));
+            }
+        }
+        let mut wanted: Vec<gtk::Widget> = keys
             .iter()
             .filter_map(|k| app::with_app(|a| a.ensure_view(k).root.clone().upcast()))
             .collect();
+        let headers = self.headers.borrow();
+        wanted.extend(keys.iter().filter_map(|k| headers.get(k)).map(|h| h.root.clone().upcast()));
+        wanted.push(self.chrome.clone().upcast());
         // Remove children that are not wanted (old panes, old dividers).
         let mut child = self.container.first_child();
         while let Some(c) = child {
@@ -218,17 +250,80 @@ impl Tab {
                 w.set_parent(&self.container);
             }
         }
+        // Over the panes and headers (dividers go above it).
+        self.chrome.insert_before(&self.container, None::<&gtk::Widget>);
         self.container.queue_allocate();
     }
 
+    /// Whether this tab runs the full height of a vertical-tabs window (its headers then take
+    /// the window title's place, so even a single pane has one).
+    fn full_height(&self) -> bool {
+        self.page.borrow().is_some()
+            && app::with_app(|a| {
+                let ui = a.ui();
+                ui.sidebar_tabs() && ui.pane_headers()
+            })
+            .unwrap_or(false)
+    }
+
+    fn draw_chrome(&self, cr: &gtk::cairo::Context, w: f64, h: f64) {
+        let cards = self.cards.borrow();
+        if cards.is_empty() {
+            return;
+        }
+        let Some((bg, fg, dark, opacity)) = app::with_app(|a| {
+            let ui = a.ui();
+            (ui.theme.background, ui.theme.foreground, ui.theme_is_dark(), ui.opacity())
+        }) else {
+            return;
+        };
+        let rgb = |c: u32| {
+            (
+                ((c >> 16) & 0xff) as f64 / 255.0,
+                ((c >> 8) & 0xff) as f64 / 255.0,
+                (c & 0xff) as f64 / 255.0,
+            )
+        };
+        // Gutters in the sidebar's color, around the cards' rounded corners.
+        cr.rectangle(0.0, 0.0, w, h);
+        for (r, _) in cards.iter() {
+            crate::paneicon::rounded(cr, r.x, r.y, r.w, r.h, CARD_RADIUS);
+        }
+        cr.set_fill_rule(gtk::cairo::FillRule::EvenOdd);
+        let g = rgb(blend(bg, 0x000000, if dark { 0.18 } else { 0.05 }));
+        cr.set_source_rgba(g.0, g.1, g.2, opacity);
+        let _ = cr.fill();
+        cr.set_fill_rule(gtk::cairo::FillRule::Winding);
+        cr.set_line_width(1.0);
+        for (r, focused) in cards.iter() {
+            crate::paneicon::rounded(cr, r.x + 0.5, r.y + 0.5, r.w - 1.0, r.h - 1.0, CARD_RADIUS - 0.5);
+            let c = rgb(blend(bg, fg, if *focused { 0.3 } else { 0.12 }));
+            cr.set_source_rgba(c.0, c.1, c.2, opacity.max(0.6));
+            let _ = cr.stroke();
+        }
+    }
+
     fn allocate(self: &Rc<Self>, w: i32, h: i32) {
-        let rect = Rect::new(0.0, 0.0, w as f64, h as f64);
+        let full = Rect::new(0.0, 0.0, w as f64, h as f64);
+        let (headers_on, gap) = app::with_app(|a| {
+            let ui = a.ui();
+            (ui.pane_headers(), ui.pane_gap())
+        })
+        .unwrap_or((false, 0.0));
+        let full_height = self.full_height();
+        let zoomed = self.zoomed.borrow().clone().filter(|z| self.contains(z));
+        let visible = if zoomed.is_some() { 1 } else { self.panes().len() };
+        let cards = headers_on && (visible > 1 || full_height);
+        let rect = if cards {
+            Rect::new(gap, gap, (full.w - 2.0 * gap).max(1.0), (full.h - 2.0 * gap).max(1.0))
+        } else {
+            full
+        };
         let mut frames = Vec::new();
         let mut dividers = Vec::new();
-        let zoomed = self.zoomed.borrow().clone();
         match &zoomed {
-            Some(z) if self.contains(z) => frames.push((z.clone(), rect)),
-            _ => self.tree.borrow().layout(rect, &mut frames, &mut dividers),
+            Some(z) => frames.push((z.clone(), rect)),
+            None => self.tree.borrow().layout(rect, if cards { gap } else { model::GAP }, &mut frames, &mut dividers),
         }
         // Divider widgets: one per divider, on top of the panes.
         {
@@ -250,19 +345,67 @@ impl Tab {
         let keys = self.panes();
         let focused = self.focused.borrow().clone();
         let multiple = frames.len() > 1;
+        let headers = self.headers.borrow();
+        let top = frames.iter().map(|(_, r)| r.y).fold(f64::INFINITY, f64::min);
         for k in &keys {
             let Some(view) = app::with_app(|a| a.view(k)).flatten() else { continue };
+            let header = headers.get(k);
             match frames.iter().find(|(f, _)| f == k) {
                 Some((_, r)) => {
                     view.root.set_child_visible(true);
+                    let mut body = *r;
+                    if cards && let Some(hd) = header {
+                        // Inside the card's 1 px border: the header, then the terminal.
+                        let inner = Rect::new(r.x + 1.0, r.y + 1.0, (r.w - 2.0).max(1.0), (r.h - 2.0).max(1.0));
+                        let hh = paneheader::HEIGHT as f64;
+                        hd.root.set_child_visible(true);
+                        set_card_part(hd.root.upcast_ref(), "thurm-card-top");
+                        hd.root.size_allocate(
+                            &gtk::Allocation::new(inner.x as i32, inner.y as i32, inner.w as i32, hh as i32),
+                            -1,
+                        );
+                        hd.moves_window.set(full_height && (r.y - top).abs() < 1.0);
+                        let info = app::with_app(|a| a.infos.borrow().get(k).cloned()).flatten();
+                        hd.update(info.as_ref(), *k == focused);
+                        body = Rect::new(inner.x, inner.y + hh, inner.w, (inner.h - hh).max(1.0));
+                    } else if let Some(hd) = header {
+                        hd.root.set_child_visible(false);
+                    }
+                    set_card_part(view.root.upcast_ref(), if cards { "thurm-card-bottom" } else { "" });
                     view.root.size_allocate(
-                        &gtk::Allocation::new(r.x as i32, r.y as i32, r.w.max(1.0) as i32, r.h.max(1.0) as i32),
+                        &gtk::Allocation::new(body.x as i32, body.y as i32, body.w.max(1.0) as i32, body.h.max(1.0) as i32),
                         -1,
                     );
                     view.set_dimmed(multiple && *k != focused);
                 }
-                None => view.root.set_child_visible(false),
+                None => {
+                    view.root.set_child_visible(false);
+                    if let Some(hd) = header {
+                        hd.root.set_child_visible(false);
+                    }
+                }
             }
+        }
+        drop(headers);
+        *self.cards.borrow_mut() = if cards {
+            frames.iter().map(|(k, r)| (*r, multiple && *k == focused)).collect()
+        } else {
+            Vec::new()
+        };
+        self.chrome.set_child_visible(cards);
+        self.chrome.size_allocate(&gtk::Allocation::new(0, 0, w.max(1), h.max(1)), -1);
+        self.chrome.queue_draw();
+        if full_height {
+            // The window controls go into the top corner panes' headers.
+            let in_row: Vec<&(PaneKey, Rect)> = frames.iter().filter(|(_, r)| (r.y - top).abs() < 1.0).collect();
+            let lead = in_row.iter().min_by(|a, b| a.1.x.total_cmp(&b.1.x)).map(|(k, _)| k.clone());
+            let trail = in_row.iter().max_by(|a, b| a.1.max_x().total_cmp(&b.1.max_x())).map(|(k, _)| k.clone());
+            let weak = Rc::downgrade(self);
+            app::with_app(|a| {
+                if let Some(win) = a.win() {
+                    win.place_controls_later(weak, lead, trail);
+                }
+            });
         }
         for (wdg, d) in self.dividers.borrow().iter() {
             let r = match d.axis {
@@ -283,7 +426,12 @@ impl Tab {
 
     fn divider_widget(self: &Rc<Self>) -> gtk::DrawingArea {
         let d = gtk::DrawingArea::new();
-        d.set_draw_func(|area, cr, w, h| {
+        let tab = Rc::downgrade(self);
+        d.set_draw_func(move |area, cr, w, h| {
+            // Cards have gutters instead of lines.
+            if tab.upgrade().is_some_and(|t| !t.cards.borrow().is_empty()) {
+                return;
+            }
             let color = app::with_app(|a| a.divider_color()).unwrap_or(0x444444);
             cr.set_source_rgb(
                 ((color >> 16) & 0xff) as f64 / 255.0,
@@ -341,6 +489,23 @@ impl Tab {
 
     pub fn relayout(&self) {
         self.container.queue_allocate();
+    }
+
+    /// The header of `key` (for the window controls).
+    pub fn header(&self, key: &PaneKey) -> Option<Rc<PaneHeader>> {
+        self.headers.borrow().get(key).cloned()
+    }
+
+    /// Re-reads the panes' titles and icons into their headers.
+    pub fn refresh_headers(&self) {
+        if self.cards.borrow().is_empty() {
+            return;
+        }
+        let focused = self.focused.borrow().clone();
+        for (k, h) in self.headers.borrow().iter() {
+            let info = app::with_app(|a| a.infos.borrow().get(k).cloned()).flatten();
+            h.update(info.as_ref(), *k == focused);
+        }
     }
 
     /// Pane frames as last laid out (directional focus, nearest pane).
@@ -408,4 +573,17 @@ impl Tab {
         self.find.status.set_text("");
         self.find.revealer.set_reveal_child(false);
     }
+}
+
+/// Rounds a card's header (`thurm-card-top`) or terminal (`thurm-card-bottom`) and clips its
+/// content to the corners, so nothing shows through a translucent gutter there; `""` squares it.
+fn set_card_part(w: &gtk::Widget, part: &str) {
+    for c in ["thurm-card-top", "thurm-card-bottom"] {
+        if c == part {
+            w.add_css_class(c);
+        } else {
+            w.remove_css_class(c);
+        }
+    }
+    w.set_overflow(if part.is_empty() { gtk::Overflow::Visible } else { gtk::Overflow::Hidden });
 }

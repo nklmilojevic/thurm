@@ -227,14 +227,16 @@ impl SplitNode {
         }
     }
 
-    /// Frames of every pane and the dividers inside `rect`.
-    pub fn layout(&self, rect: Rect, out: &mut Vec<(PaneKey, Rect)>, dividers: &mut Vec<Divider>) {
-        self.layout_at(rect, &mut Vec::new(), out, dividers);
+    /// Frames of every pane and the dividers inside `rect`, `gap` apart (`GAP`, or the cards'
+    /// gap with `window.pane_headers`).
+    pub fn layout(&self, rect: Rect, gap: f64, out: &mut Vec<(PaneKey, Rect)>, dividers: &mut Vec<Divider>) {
+        self.layout_at(rect, gap, &mut Vec::new(), out, dividers);
     }
 
     fn layout_at(
         &self,
         rect: Rect,
+        gap: f64,
         path: &mut Vec<bool>,
         out: &mut Vec<(PaneKey, Rect)>,
         dividers: &mut Vec<Divider>,
@@ -247,7 +249,7 @@ impl SplitNode {
                 first,
                 second,
             } => {
-                let (a, line, b) = divide(rect, *axis, *ratio);
+                let (a, line, b) = divide_gap(rect, *axis, *ratio, gap);
                 dividers.push(Divider {
                     line,
                     axis: *axis,
@@ -255,10 +257,10 @@ impl SplitNode {
                     container: rect,
                 });
                 path.push(false);
-                first.layout_at(a, path, out, dividers);
+                first.layout_at(a, gap, path, out, dividers);
                 path.pop();
                 path.push(true);
-                second.layout_at(b, path, out, dividers);
+                second.layout_at(b, gap, path, out, dividers);
                 path.pop();
             }
         }
@@ -347,26 +349,26 @@ impl SplitNode {
     }
 }
 
-/// Splits `rect` at `ratio` with a `GAP`-wide line between the parts.
-pub fn divide(rect: Rect, axis: Axis, ratio: f64) -> (Rect, Rect, Rect) {
+/// Splits `rect` at `ratio` with a `gap`-wide line between the parts.
+pub fn divide_gap(rect: Rect, axis: Axis, ratio: f64, gap: f64) -> (Rect, Rect, Rect) {
     let r = ratio.clamp(MIN_RATIO, MAX_RATIO);
     match axis {
         Axis::Horizontal => {
-            let avail = (rect.w - GAP).max(0.0);
+            let avail = (rect.w - gap).max(0.0);
             let w1 = (avail * r).round();
             (
                 Rect::new(rect.x, rect.y, w1, rect.h),
-                Rect::new(rect.x + w1, rect.y, GAP, rect.h),
-                Rect::new(rect.x + w1 + GAP, rect.y, avail - w1, rect.h),
+                Rect::new(rect.x + w1, rect.y, gap, rect.h),
+                Rect::new(rect.x + w1 + gap, rect.y, avail - w1, rect.h),
             )
         }
         Axis::Vertical => {
-            let avail = (rect.h - GAP).max(0.0);
+            let avail = (rect.h - gap).max(0.0);
             let h1 = (avail * r).round();
             (
                 Rect::new(rect.x, rect.y, rect.w, h1),
-                Rect::new(rect.x, rect.y + h1, rect.w, GAP),
-                Rect::new(rect.x, rect.y + h1 + GAP, rect.w, avail - h1),
+                Rect::new(rect.x, rect.y + h1, rect.w, gap),
+                Rect::new(rect.x, rect.y + h1 + gap, rect.w, avail - h1),
             )
         }
     }
@@ -848,10 +850,19 @@ mod tests {
 
     #[test]
     fn divide_keeps_a_gap() {
-        let (a, line, b) = divide(Rect::new(0.0, 0.0, 101.0, 50.0), Axis::Horizontal, 0.5);
+        let (a, line, b) = divide_gap(Rect::new(0.0, 0.0, 101.0, 50.0), Axis::Horizontal, 0.5, GAP);
         assert_eq!(a.w + line.w + b.w, 101.0);
         assert_eq!(line.x, a.w);
         assert_eq!(b.x, a.w + 1.0);
+    }
+
+    #[test]
+    fn layout_gap_separates_cards() {
+        let t = leaf(1).split(&k(1), k(2), Direction::Right);
+        let (mut frames, mut dividers) = (Vec::new(), Vec::new());
+        t.layout(Rect::new(0.0, 0.0, 206.0, 50.0), 6.0, &mut frames, &mut dividers);
+        assert_eq!(frames[1].1.x - (frames[0].1.x + frames[0].1.w), 6.0);
+        assert_eq!(dividers[0].line.w, 6.0);
     }
 
     #[test]
@@ -861,7 +872,7 @@ mod tests {
             .split(&k(2), k(3), Direction::Right);
         t.equalize();
         let mut frames = Vec::new();
-        t.layout(Rect::new(0.0, 0.0, 302.0, 10.0), &mut frames, &mut Vec::new());
+        t.layout(Rect::new(0.0, 0.0, 302.0, 10.0), GAP, &mut frames, &mut Vec::new());
         let widths: Vec<f64> = frames.iter().map(|(_, r)| r.w).collect();
         assert!(widths.iter().all(|w| (w - 100.0).abs() <= 1.0), "{widths:?}");
     }

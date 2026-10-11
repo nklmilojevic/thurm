@@ -73,6 +73,15 @@ impl UiConfig {
         self.cfg.window.unfocused_split_dim.clamp(0.0, 1.0)
     }
 
+    pub fn pane_headers(&self) -> bool {
+        self.cfg.window.pane_headers
+    }
+
+    /// Space between split cards (and around them) when pane headers show.
+    pub fn pane_gap(&self) -> f64 {
+        self.cfg.window.pane_gap.clamp(0.0, 64.0)
+    }
+
     pub fn scroll_multiplier(&self) -> f64 {
         self.cfg.terminal.scroll_multiplier.clamp(0.1, 100.0)
     }

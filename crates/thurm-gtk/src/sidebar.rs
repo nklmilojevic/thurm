@@ -11,6 +11,7 @@ use thurm_proto::AgentStatus;
 use crate::app;
 use crate::core::PaneKey;
 use crate::model;
+use crate::paneicon::PaneIcon;
 use crate::tab::Tab;
 
 #[derive(Clone, PartialEq)]
@@ -22,6 +23,7 @@ pub struct TabRow {
     pub shortcut: String,
     pub selected: bool,
     pub tooltip: String,
+    pub icon: PaneIcon,
 }
 
 #[derive(Clone, PartialEq)]
@@ -31,6 +33,7 @@ pub struct AgentRow {
     pub subtitle: String,
     pub status: Option<AgentStatus>,
     pub selected: bool,
+    pub icon: PaneIcon,
 }
 
 #[derive(Clone, PartialEq)]
@@ -381,18 +384,45 @@ fn selected_tab_row(groups: &[Group], collapsed: &[String]) -> Option<usize> {
         .position(|s| s)
 }
 
-fn dot(status: Option<AgentStatus>) -> gtk::Box {
-    let d = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    d.add_css_class("thurm-dot");
-    d.set_valign(gtk::Align::Center);
-    d.set_size_request(8, 8);
-    if let Some(s) = status {
-        let provider = gtk::CssProvider::new();
-        provider.load_from_string(&format!(".thurm-dot {{ background-color: {}; }}", model::status_color(s)));
-        #[allow(deprecated)]
-        d.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-    }
-    d
+/// The row's icon tile, with the agent status as a badge on its corner (idle agents show none).
+fn tile(icon: PaneIcon, status: Option<AgentStatus>) -> gtk::DrawingArea {
+    const TILE: f64 = 20.0;
+    const PAD: f64 = 3.0;
+    let art = gtk::DrawingArea::new();
+    art.set_content_width((TILE + PAD) as i32);
+    art.set_content_height((TILE + PAD) as i32);
+    art.set_valign(gtk::Align::Center);
+    let status = status.filter(|s| *s != AgentStatus::Idle);
+    art.set_draw_func(move |_, cr, _, _| {
+        cr.save().ok();
+        cr.translate(0.0, PAD);
+        icon.draw_tile(cr, TILE);
+        cr.restore().ok();
+        let Some(s) = status else { return };
+        // A ring in the sidebar's color sets the badge off the tile.
+        let ring = app::with_app(|a| {
+            let ui = a.ui();
+            crate::config::blend(ui.theme.background, 0x000000, if ui.theme_is_dark() { 0.18 } else { 0.05 })
+        })
+        .unwrap_or(0x000000);
+        let (cx, cy) = (TILE - 1.0, PAD + 1.0);
+        cr.arc(cx, cy, 5.5, 0.0, std::f64::consts::TAU);
+        cr.set_source_rgb(
+            ((ring >> 16) & 0xff) as f64 / 255.0,
+            ((ring >> 8) & 0xff) as f64 / 255.0,
+            (ring & 0xff) as f64 / 255.0,
+        );
+        let _ = cr.fill();
+        let c = u32::from_str_radix(model::status_color(s).trim_start_matches('#'), 16).unwrap_or(0x888888);
+        cr.arc(cx, cy, 4.0, 0.0, std::f64::consts::TAU);
+        cr.set_source_rgb(
+            ((c >> 16) & 0xff) as f64 / 255.0,
+            ((c >> 8) & 0xff) as f64 / 255.0,
+            (c & 0xff) as f64 / 255.0,
+        );
+        let _ = cr.fill();
+    });
+    art
 }
 
 fn tab_row(r: &TabRow) -> gtk::ListBoxRow {
@@ -402,7 +432,7 @@ fn tab_row(r: &TabRow) -> gtk::ListBoxRow {
     grid.set_margin_end(8);
     grid.set_margin_top(4);
     grid.set_margin_bottom(4);
-    grid.attach(&dot(r.status), 0, 0, 1, 1);
+    grid.attach(&tile(r.icon, r.status), 0, 0, 1, 1);
     let title = gtk::Label::new(Some(&r.title));
     title.set_xalign(0.0);
     title.set_hexpand(true);
@@ -437,6 +467,7 @@ fn agent_row(a: &AgentRow) -> gtk::ListBoxRow {
         shortcut: String::new(),
         selected: a.selected,
         tooltip: format!("{}\n{}", a.title, a.subtitle),
+        icon: a.icon,
     };
     let row = tab_row(&r);
     if let Some(grid) = row.child().and_downcast::<gtk::Grid>()
@@ -463,6 +494,7 @@ mod tests {
                     shortcut: String::new(),
                     selected,
                     tooltip: String::new(),
+                    icon: PaneIcon::Shell,
                 })
                 .collect(),
         }
