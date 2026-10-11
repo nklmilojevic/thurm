@@ -3365,9 +3365,11 @@ impl App {
         } else {
             (TabStyle::Sidebar, "\"sidebar\"")
         };
+        // Saved, the daemon answers with the config's path; an error, no answer or anything
+        // else means switching for this session only.
         let saved = self.core(LOCAL).is_some_and(|c| {
             let r = c.request(&json!({"SetSetting": {"key": "window.tab_style", "value": value}}));
-            r.get("error").is_none()
+            r.get("Text").is_some_and(Value::is_string)
         });
         if saved {
             // The reload that follows carries it.

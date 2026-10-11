@@ -786,13 +786,14 @@ final class SessionManager: NSObject, CoreDelegate {
         let sidebar = !config.sidebarTabs
         let resp = Core.shared.request(object: ["SetSetting": ["key": "window.tab_style",
                                                                "value": sidebar ? "\"sidebar\"" : "\"native\""]])
-        if let d = resp as? [String: Any], d["error"] != nil {
+        // Saved, the daemon answers with the config's path; the reload that follows carries it.
+        // An error, no answer or anything else: switch for this session only.
+        if JSON.variant(resp)?.name == "Text" {
+            sidebarTabsOverride = nil
+        } else {
             sidebarTabsOverride = sidebar
             config.sidebarTabs = sidebar
             applyConfigToUI()
-        } else {
-            // Saved: the reload that follows carries it.
-            sidebarTabsOverride = nil
         }
     }
 

@@ -378,11 +378,12 @@ final class TabContentView: NSView {
             }
             chrome.opacity = controller?.opacity ?? SessionManager.shared.config.opacity
             chrome.windowRadius = (window as? TerminalWindow)?.cornerRadius ?? 0
+            // The window's own corners (above the titlebar with native tabs, where this view
+            // starts below it), from its frame in window coordinates.
             chrome.windowCorners = window.map { w in
-                let b = w.contentView?.bounds ?? .zero
-                return [NSPoint(x: b.minX, y: b.minY), NSPoint(x: b.maxX, y: b.minY),
-                        NSPoint(x: b.minX, y: b.maxY), NSPoint(x: b.maxX, y: b.maxY)]
-                    .map { convert($0, from: w.contentView) }
+                let s = w.frame.size
+                return [NSPoint(x: 0, y: 0), NSPoint(x: s.width, y: 0), NSPoint(x: 0, y: s.height),
+                        NSPoint(x: s.width, y: s.height)].map { convert($0, from: nil) }
             } ?? []
             chrome.needsDisplay = true
             for (id, header) in headers {
