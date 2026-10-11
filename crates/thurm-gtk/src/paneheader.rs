@@ -31,7 +31,8 @@ pub struct PaneHeader {
     status: Cell<Option<AgentStatus>>,
     /// Dragging the header moves the window (full-height windows).
     pub moves_window: Cell<bool>,
-    shown: RefCell<String>,
+    /// The title and tooltip as last set.
+    shown: RefCell<(String, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -98,7 +99,7 @@ impl PaneHeader {
             kind: Cell::new(PaneIcon::Shell),
             status: Cell::new(None),
             moves_window: Cell::new(false),
-            shown: RefCell::new(String::new()),
+            shown: RefCell::new((String::new(), String::new())),
         });
 
         for (b, tip) in [
@@ -213,14 +214,18 @@ impl PaneHeader {
         if self.key.is_remote() {
             text = format!("{} · {text}", self.key.host);
         }
-        if *self.shown.borrow() != text {
+        let tip = match info.and_then(|i| i.cwd.as_deref()) {
+            Some(cwd) => format!("{text}\n{cwd}"),
+            None => text.clone(),
+        };
+        let mut shown = self.shown.borrow_mut();
+        if shown.0 != text {
             self.title.set_text(&text);
-            let tip = match info.and_then(|i| i.cwd.as_deref()) {
-                Some(cwd) => format!("{text}\n{cwd}"),
-                None => text.clone(),
-            };
+            shown.0 = text;
+        }
+        if shown.1 != tip {
             self.root.set_tooltip_text(Some(&tip));
-            *self.shown.borrow_mut() = text;
+            shown.1 = tip;
         }
     }
 }

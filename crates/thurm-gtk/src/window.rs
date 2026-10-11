@@ -36,6 +36,9 @@ pub struct MainWindow {
     trail_controls: gtk::WindowControls,
     /// The panes whose headers hold them.
     placed: RefCell<Option<(Option<PaneKey>, Option<PaneKey>)>>,
+    /// Bumped by every placement and reset, so a queued placement that is no longer the latest
+    /// does nothing.
+    placement: Rc<std::cell::Cell<u64>>,
     /// The palette and other window-wide overlays go here.
     pub overlay: gtk::Overlay,
     pub tabs: RefCell<Vec<Rc<Tab>>>,
@@ -138,6 +141,7 @@ impl MainWindow {
             lead_controls,
             trail_controls,
             placed: RefCell::new(None),
+            placement: Rc::new(std::cell::Cell::new(0)),
             overlay,
             tabs: RefCell::new(Vec::new()),
             css,
@@ -281,10 +285,10 @@ impl MainWindow {
             .thurm-completion .thurm-completion-detail, .thurm-palette .detail {{ font-size: {small}px; }}
             .thurm-palette entry {{ font-family: "{font}"; font-size: {big}px; background: transparent; border: none; box-shadow: none; outline: none; padding: 10px 14px; }}
             .thurm-palette .footer {{ font-size: {small}px; opacity: 0.55; margin: 4px 16px 8px 16px; }}
-            .thurm-dot {{ min-width: 8px; min-height: 8px; border-radius: 4px; }}
-            .thurm-dot.badge {{ min-width: 7px; min-height: 7px; border-radius: 6px; border: 1.5px solid {side}; }}
             .thurm-sidebar headerbar {{ background-color: transparent; box-shadow: none; }}
             .thurm-pane-header {{ background-color: {bg_a}; color: {fg}; }}
+            .thurm-card-top {{ border-radius: 7px 7px 0 0; }}
+            .thurm-card-bottom {{ border-radius: 0 0 7px 7px; }}
             .thurm-pane-title {{ font-size: 13px; font-weight: 600; opacity: 0.6; }}
             .thurm-pane-header.focused .thurm-pane-title {{ opacity: 1; }}
             .thurm-pane-icon {{ opacity: 0.55; }}
@@ -345,6 +349,7 @@ impl MainWindow {
             }
         }
         *self.placed.borrow_mut() = None;
+        self.placement.set(self.placement.get() + 1);
         if let Some(t) = self.selected_tab() {
             t.relayout();
         }
@@ -363,9 +368,16 @@ impl MainWindow {
             return;
         }
         *self.placed.borrow_mut() = Some(want.clone());
+        let generation = self.placement.get() + 1;
+        self.placement.set(generation);
+        let current = self.placement.clone();
         let lead_w = self.lead_controls.clone();
         let trail_w = self.trail_controls.clone();
         glib::idle_add_local_once(move || {
+            // A mode change, sidebar toggle or newer layout came first.
+            if current.get() != generation {
+                return;
+            }
             for w in [lead_w.upcast_ref::<gtk::Widget>(), trail_w.upcast_ref()] {
                 if let Some(p) = w.parent().and_downcast::<gtk::Box>() {
                     p.remove(w);

@@ -359,6 +359,7 @@ impl Tab {
                         let inner = Rect::new(r.x + 1.0, r.y + 1.0, (r.w - 2.0).max(1.0), (r.h - 2.0).max(1.0));
                         let hh = paneheader::HEIGHT as f64;
                         hd.root.set_child_visible(true);
+                        set_card_part(hd.root.upcast_ref(), "thurm-card-top");
                         hd.root.size_allocate(
                             &gtk::Allocation::new(inner.x as i32, inner.y as i32, inner.w as i32, hh as i32),
                             -1,
@@ -370,6 +371,7 @@ impl Tab {
                     } else if let Some(hd) = header {
                         hd.root.set_child_visible(false);
                     }
+                    set_card_part(view.root.upcast_ref(), if cards { "thurm-card-bottom" } else { "" });
                     view.root.size_allocate(
                         &gtk::Allocation::new(body.x as i32, body.y as i32, body.w.max(1.0) as i32, body.h.max(1.0) as i32),
                         -1,
@@ -571,4 +573,17 @@ impl Tab {
         self.find.status.set_text("");
         self.find.revealer.set_reveal_child(false);
     }
+}
+
+/// Rounds a card's header (`thurm-card-top`) or terminal (`thurm-card-bottom`) and clips its
+/// content to the corners, so nothing shows through a translucent gutter there; `""` squares it.
+fn set_card_part(w: &gtk::Widget, part: &str) {
+    for c in ["thurm-card-top", "thurm-card-bottom"] {
+        if c == part {
+            w.add_css_class(c);
+        } else {
+            w.remove_css_class(c);
+        }
+    }
+    w.set_overflow(if part.is_empty() { gtk::Overflow::Visible } else { gtk::Overflow::Hidden });
 }
