@@ -12,6 +12,8 @@ final class SessionManager: NSObject, CoreDelegate {
     /// View > Tabs in Sidebar when config.toml cannot record it (read-only, e.g. managed by Nix
     /// or Home Manager): the choice holds for this session, over reloads.
     private var sidebarTabsOverride: Bool?
+    /// View > Agents in Sidebar when config.toml cannot record it, as `sidebarTabsOverride`.
+    private var sidebarAgentsOverride: Bool?
     var effectiveFontSize: CGFloat { fontSizeOverride ?? config.fontSize }
 
     private(set) var controllers: [TerminalWindowController] = []
@@ -801,12 +803,20 @@ final class SessionManager: NSObject, CoreDelegate {
         }
     }
 
-    /// View > Agents in Sidebar: switch `window.sidebar_agents` (persisted; every window follows).
+    /// View > Agents in Sidebar: switch `window.sidebar_agents` (every window follows). Saved to
+    /// the config when it can be written; otherwise it switches for this session only.
     func toggleSidebarAgents() {
+        let agents = !config.sidebarAgents
         let resp = Core.shared.request(object: ["SetSetting": ["key": "window.sidebar_agents",
-                                                               "value": config.sidebarAgents ? "false" : "true"]])
-        if let d = resp as? [String: Any], let e = d["error"] as? String {
-            currentController?.content.focusedView?.showToast("Agents: \(e)", duration: 6)
+                                                               "value": agents ? "true" : "false"]])
+        // Saved, the daemon answers with the config's path; the reload that follows carries it.
+        // An error, no answer or anything else: switch for this session only.
+        if JSON.variant(resp)?.name == "Text" {
+            sidebarAgentsOverride = nil
+        } else {
+            sidebarAgentsOverride = agents
+            config.sidebarAgents = agents
+            applyConfigToUI()
         }
     }
 
@@ -867,6 +877,7 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         config = AppConfig.load()
         if let o = sidebarTabsOverride { config.sidebarTabs = o }
+        if let o = sidebarAgentsOverride { config.sidebarAgents = o }
         applyConfigToUI()
         Core.shared.reloadRemoteEngines()
         Remotes.shared.configChanged()
