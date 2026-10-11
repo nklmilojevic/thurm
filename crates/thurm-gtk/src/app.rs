@@ -550,6 +550,7 @@ impl App {
             ("rename_workspace", has_ws),
             ("close_workspace", has_ws),
             ("toggle_sidebar", sidebar),
+            ("toggle_sidebar_agents", sidebar),
             ("explain", explain),
         ] {
             if let Some(a) = self
