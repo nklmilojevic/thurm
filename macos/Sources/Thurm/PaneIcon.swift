@@ -79,6 +79,30 @@ enum PaneIcon: Equatable {
         return image
     }
 
+    /// The tile for a tab: `stacked` peeks a second tile out behind it (a split tab), and `badge`
+    /// puts the agent status on its corner.
+    func tile(size: CGFloat, stacked: Bool, badge: AgentStatus?) -> NSImage {
+        let front = tile(size: size)
+        let offset: CGFloat = stacked ? 4 : 0
+        let extra: CGFloat = 2
+        let ring = SessionManager.shared.config.sidebarColor
+        return NSImage(size: NSSize(width: size + offset + extra, height: size + extra), flipped: true) { _ in
+            if stacked {
+                front.draw(in: NSRect(x: offset, y: extra, width: size, height: size), from: .zero,
+                           operation: .sourceOver, fraction: 0.55)
+            }
+            front.draw(in: NSRect(x: 0, y: extra, width: size, height: size))
+            if let badge {
+                let c = NSPoint(x: size - 1.5, y: extra + 1.5)
+                ring.setFill()
+                NSBezierPath(ovalIn: NSRect(x: c.x - 5, y: c.y - 5, width: 10, height: 10)).fill()
+                badge.color.setFill()
+                NSBezierPath(ovalIn: NSRect(x: c.x - 3.5, y: c.y - 3.5, width: 7, height: 7)).fill()
+            }
+            return true
+        }
+    }
+
     private static var cache: [String: NSImage] = [:]
 
     private static func drawn(_ size: CGFloat, _ draw: @escaping (NSRect) -> Void) -> NSImage {

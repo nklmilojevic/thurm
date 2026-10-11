@@ -25,12 +25,47 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         didSet {
             guard suppressTabBar != oldValue else { return }
             for vc in titlebarAccessoryViewControllers where isTabBar(vc) {
-                vc.isHidden = suppressTabBar
+                vc.isHidden = hidesTabBar
             }
             applyTabBarVisibility()
             syncTitlebar()
             syncSidebarItem()
         }
+    }
+
+    /// Horizontal tabs: the strip takes AppKit's tab bar's place in the titlebar row.
+    var tabStrip: TabStrip? {
+        didSet {
+            guard tabStrip !== oldValue else { return }
+            oldValue?.removeFromSuperview()
+            for vc in titlebarAccessoryViewControllers where isTabBar(vc) {
+                vc.isHidden = hidesTabBar
+            }
+            installTabStrip()
+            applyTabBarVisibility()
+        }
+    }
+
+    /// AppKit's tab bar stays installed but hidden under vertical tabs or the strip.
+    private var hidesTabBar: Bool { suppressTabBar || tabStrip != nil }
+
+    /// The strip goes into the titlebar itself, after the traffic lights.
+    private func installTabStrip() {
+        guard let strip = tabStrip, let bar = titlebarView else { return }
+        guard strip.superview !== bar else { return }
+        strip.removeFromSuperview()
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(strip)
+        let lights = standardWindowButton(.zoomButton).map { $0.convert($0.bounds, to: bar).maxX } ?? 70
+        let centerY = standardWindowButton(.closeButton).map { strip.centerYAnchor.constraint(equalTo: $0.centerYAnchor) }
+            ?? strip.centerYAnchor.constraint(equalTo: bar.centerYAnchor)
+        NSLayoutConstraint.activate([
+            strip.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: lights + 16),
+            strip.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -10),
+            strip.heightAnchor.constraint(equalToConstant: TabStrip.height),
+            centerY,
+        ])
+        strip.reload()
     }
 
     /// With vertical tabs, the sidebar's part of the titlebar holds the sidebar button (next to
@@ -53,14 +88,14 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
     /// visibility: hide its container directly, and show the title instead.
     private func applyTabBarVisibility() {
         guard let tabBar = titlebarView?.firstDescendant(className: "NSTabBar") else {
-            titleLabel.isHidden = hidesTitle
+            titleLabel.isHidden = hidesTitle || tabStrip != nil
             return
         }
         let clip = tabBar.firstAncestor(className: "NSTitlebarAccessoryClipView")
             ?? tabBar.firstAncestor(className: "NSTitlebarAccessoryContainerView")
-        (clip ?? tabBar).isHidden = suppressTabBar
-        titleLabel.isHidden = !suppressTabBar || hidesTitle
-        if !suppressTabBar { scheduleTabBarBackgroundSync() }
+        (clip ?? tabBar).isHidden = hidesTabBar
+        titleLabel.isHidden = !suppressTabBar || hidesTitle || tabStrip != nil
+        if !hidesTabBar { scheduleTabBarBackgroundSync() }
     }
 
     /// Vertical tabs with pane headers: each header names its pane, so the title stays empty.
@@ -167,6 +202,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(60)) { [weak self] in
             self?.syncTitlebar()
             self?.installTitleLabel()
+            self?.installTabStrip()
             self?.setupTabBar()
             self?.scheduleTabBarBackgroundSync()
         }
@@ -223,7 +259,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
                                 width: frame.width,
                                 color: titlebarColor,
                                 appearance: effectiveAppearance.name,
-                                suppressed: suppressTabBar)
+                                suppressed: hidesTabBar)
         if key != tabBarSyncKey {
             tabBarSyncKey = key
             tabBarSyncPasses = 3
@@ -233,7 +269,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         tabBarSyncPasses = max(0, tabBarSyncPasses - 1)
         lastTabBarSync = now
         syncTabBarBackground()
-        if suppressTabBar { applyTabBarVisibility() }
+        if hidesTabBar { applyTabBarVisibility() }
     }
 
     /// What decides whether `update()` walks the tab bar.
@@ -262,7 +298,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         tabBarObserver = nil
         // Must be set before adding, or AppKit asserts during layout.
         vc.layoutAttribute = .right
-        vc.isHidden = suppressTabBar
+        vc.isHidden = hidesTabBar
         super.addTitlebarAccessoryViewController(vc)
         // Wait a tick: with several restored tabs the bar is not fully populated yet.
         DispatchQueue.main.async { [weak self] in self?.setupTabBar() }
@@ -351,6 +387,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         // layers we neutralised; re-apply across it.
         tabSelectionObservation = group.observe(\.selectedWindow) { [weak self] _, _ in
             DispatchQueue.main.async {
+                SessionManager.shared.refreshSidebars()
                 self?.syncTabBarBackground()
                 for ms in [50, 150, 300, 600] {
                     DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms)) {
