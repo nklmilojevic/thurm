@@ -49,6 +49,8 @@ pub struct App {
     /// View › Tabs in Sidebar when config.toml cannot record it (read-only, e.g. managed by Nix
     /// or Home Manager): the choice holds for this session, over reloads.
     tab_style_override: Cell<Option<thurm_config::TabStyle>>,
+    /// View › Agents in Sidebar when config.toml cannot record it, as `tab_style_override`.
+    sidebar_agents_override: Cell<Option<bool>>,
     keymap: RefCell<HashMap<Combo, &'static str>>,
     pub infos: RefCell<HashMap<PaneKey, PaneInfo>>,
     views: RefCell<HashMap<PaneKey, Rc<TermView>>>,
@@ -287,6 +289,7 @@ impl App {
             fonts: RefCell::new(fonts),
             font_override: Cell::new(None),
             tab_style_override: Cell::new(None),
+            sidebar_agents_override: Cell::new(None),
             keymap: RefCell::new(actions::keymap(&bindings)),
             infos: RefCell::new(HashMap::new()),
             views: RefCell::new(HashMap::new()),
@@ -3309,6 +3312,9 @@ impl App {
         if let Some(style) = self.tab_style_override.get() {
             ui.cfg.window.tab_style = style;
         }
+        if let Some(on) = self.sidebar_agents_override.get() {
+            ui.cfg.window.sidebar_agents = on;
+        }
         let mut warnings = Vec::new();
         let bindings = actions::bindings(&ui.cfg.keybindings, &mut warnings);
         ui.warnings.extend(warnings);
@@ -3396,17 +3402,24 @@ impl App {
         }
     }
 
+    /// Saved to the config when it can be written; otherwise it switches for this session only.
     fn toggle_sidebar_agents(&self) {
-        let value = if self.ui().cfg.window.sidebar_agents {
-            "false"
-        } else {
-            "true"
-        };
-        if let Some(c) = self.core(LOCAL) {
+        let next = !self.ui().cfg.window.sidebar_agents;
+        let value = if next { "true" } else { "false" };
+        // Saved, the daemon answers with the config's path; an error, no answer or anything
+        // else means switching for this session only.
+        let saved = self.core(LOCAL).is_some_and(|c| {
             let r = c.request(&json!({"SetSetting": {"key": "window.sidebar_agents", "value": value}}));
-            if let Some(e) = r.get("error").and_then(Value::as_str) {
-                self.toast(&format!("Agents: {e}"), 6.0);
-            }
+            r.get("Text").is_some_and(Value::is_string)
+        });
+        if saved {
+            // The reload that follows carries it.
+            self.sidebar_agents_override.set(None);
+        } else {
+            self.sidebar_agents_override.set(Some(next));
+            self.ui.borrow_mut().cfg.window.sidebar_agents = next;
+            self.apply_config();
+            self.refresh_sidebar();
         }
     }
 
