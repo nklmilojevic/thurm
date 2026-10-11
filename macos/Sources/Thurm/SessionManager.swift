@@ -14,6 +14,8 @@ final class SessionManager: NSObject, CoreDelegate {
     private var sidebarTabsOverride: Bool?
     /// View > Agents in Sidebar when config.toml cannot record it, as `sidebarTabsOverride`.
     private var sidebarAgentsOverride: Bool?
+    /// A theme chosen when config.toml cannot record it is in use (see `setTheme`).
+    private var sessionTheme = false
     var effectiveFontSize: CGFloat { fontSizeOverride ?? config.fontSize }
 
     private(set) var controllers: [TerminalWindowController] = []
@@ -187,15 +189,29 @@ final class SessionManager: NSObject, CoreDelegate {
         }
     }
 
-    /// Writes `colors.theme` through the daemon, which reloads every client.
+    /// Writes `colors.theme` through the daemon, which reloads every client. When the config
+    /// cannot be written, the theme switches for this session only.
     @discardableResult
     func setTheme(_ spec: String) -> Bool {
         let resp = Core.shared.request(object: ["SetTheme": ["spec": spec]])
-        if let d = resp as? [String: Any], let e = d["error"] as? String {
+        // Saved: the reload that follows carries it. An error, no answer or anything else:
+        // switch for this session only.
+        if JSON.variant(resp)?.name == "Ok" {
+            // The daemon's reload may have come first and still used the session's theme.
+            if sessionTheme {
+                sessionTheme = false
+                _ = Core.shared.setSessionTheme(nil)
+                reloadConfig(notifyDaemon: false)
+            }
+            return true
+        }
+        if let e = Core.shared.setSessionTheme(spec) {
             currentController?.content.focusedView?.showToast("Theme: \(e)", duration: 6)
             return false
         }
-        return resp != nil
+        sessionTheme = true
+        reloadConfig(notifyDaemon: false)
+        return true
     }
 
     // MARK: Theme picker

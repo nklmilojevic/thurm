@@ -51,6 +51,8 @@ pub struct App {
     tab_style_override: Cell<Option<thurm_config::TabStyle>>,
     /// View › Agents in Sidebar when config.toml cannot record it, as `tab_style_override`.
     sidebar_agents_override: Cell<Option<bool>>,
+    /// A theme chosen when config.toml cannot record it is in use (see `set_theme`).
+    session_theme: Cell<bool>,
     keymap: RefCell<HashMap<Combo, &'static str>>,
     pub infos: RefCell<HashMap<PaneKey, PaneInfo>>,
     views: RefCell<HashMap<PaneKey, Rc<TermView>>>,
@@ -290,6 +292,7 @@ impl App {
             font_override: Cell::new(None),
             tab_style_override: Cell::new(None),
             sidebar_agents_override: Cell::new(None),
+            session_theme: Cell::new(false),
             keymap: RefCell::new(actions::keymap(&bindings)),
             infos: RefCell::new(HashMap::new()),
             views: RefCell::new(HashMap::new()),
@@ -3502,14 +3505,39 @@ impl App {
         }
     }
 
+    /// Saved to the config when it can be written; otherwise it switches for this session only.
     fn set_theme(&self, spec: &str) -> bool {
-        let Some(c) = self.core(LOCAL) else { return false };
-        let r = c.request(&json!({"SetTheme": {"spec": spec}}));
-        if let Some(e) = r.get("error").and_then(Value::as_str) {
+        // Saved, the daemon answers Ok; an error, no answer or anything else means switching
+        // for this session only.
+        let saved = self.core(LOCAL).is_some_and(|c| {
+            let r = c.request(&json!({"SetTheme": {"spec": spec}}));
+            r.as_str() == Some("Ok")
+        });
+        if saved {
+            // The daemon's reload may have come first and still used the session's theme.
+            if self.session_theme.replace(false) {
+                thurm_config::set_session_theme(None);
+                self.reload_theme();
+            }
+            return true;
+        }
+        let spec = thurm_config::ThemeSpec::parse(spec);
+        if let Err(e) = spec.validate() {
             self.toast(&format!("Theme: {e}"), 6.0);
             return false;
         }
+        thurm_config::set_session_theme(Some(&spec));
+        self.session_theme.set(true);
+        self.reload_theme();
         true
+    }
+
+    /// The UI and every connection's panes re-read the config, for a theme it did not save.
+    fn reload_theme(&self) {
+        self.reload_config(false);
+        if let Some(c) = self.core(LOCAL) {
+            c.reload_engine();
+        }
     }
 
     fn toggle_follow_appearance(&self) {

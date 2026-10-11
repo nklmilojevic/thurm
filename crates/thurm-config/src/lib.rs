@@ -900,10 +900,26 @@ fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// The theme chosen in this process when the config file cannot record it (read-only, e.g.
+/// managed by Nix or Home Manager): [`Config::load`] puts it over the file's for this session.
+static SESSION_THEME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Sets (or with `None` clears) the session's theme, as [`SESSION_THEME`].
+pub fn set_session_theme(spec: Option<&ThemeSpec>) {
+    *SESSION_THEME.lock().unwrap_or_else(|e| e.into_inner()) = spec.map(ThemeSpec::to_string);
+}
+
+fn with_session_theme(mut cfg: Config) -> Config {
+    if let Some(spec) = SESSION_THEME.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        cfg.colors.theme = Some(spec);
+    }
+    cfg
+}
+
 impl Config {
     /// Load the config file; a missing file yields the defaults.
     pub fn load() -> Result<Config, ConfigError> {
-        Self::load_from(&config_path())
+        Self::load_from(&config_path()).map(with_session_theme)
     }
 
     pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
@@ -950,7 +966,7 @@ impl Config {
     /// Like [`Config::load`], with the warnings of [`Config::parse_with_warnings`].
     pub fn load_with_warnings() -> Result<(Config, Vec<String>), ConfigError> {
         let path = config_path();
-        match std::fs::read_to_string(&path) {
+        let loaded = match std::fs::read_to_string(&path) {
             Ok(text) => Self::parse_with_warnings(&text).map_err(|message| ConfigError {
                 path: path.clone(),
                 message,
@@ -960,7 +976,8 @@ impl Config {
                 path,
                 message: e.to_string(),
             }),
-        }
+        };
+        loaded.map(|(cfg, warnings)| (with_session_theme(cfg), warnings))
     }
 
     pub fn theme_spec(&self) -> ThemeSpec {
@@ -1610,6 +1627,17 @@ clipboard_read = "always"
         let c = Config::parse("[colors]\ntheme = \"light:thurm-light,dark:dracula\"").unwrap();
         assert_eq!(c.theme_for(false).name, "thurm-light");
         assert_eq!(c.theme_for(true).name, "dracula");
+    }
+
+    #[test]
+    fn session_theme_overrides_the_file() {
+        let file = Config::parse("[colors]\ntheme = \"nord\"").unwrap();
+        set_session_theme(Some(&ThemeSpec::parse("light:thurm-light,dark:dracula")));
+        let cfg = with_session_theme(file.clone());
+        set_session_theme(None);
+        assert_eq!(cfg.theme_for(true).name, "dracula");
+        assert_eq!(cfg.theme_for(false).name, "thurm-light");
+        assert_eq!(with_session_theme(file).theme_for(true).name, "nord");
     }
 
     #[test]

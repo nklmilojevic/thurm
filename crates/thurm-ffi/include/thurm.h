@@ -399,6 +399,12 @@ char *thurm_config_json(bool dark);
  * NULL for an unknown theme (nothing changes). Free the result. */
 char *thurm_preview_theme(thurm_client *client, const char *name);
 
+/* Use theme `spec` (a name or "light:NAME,dark:NAME") in place of the config file's for the rest
+ * of this process, when the file cannot record it; NULL goes back to the file's. Reload the
+ * config and the engines afterwards. Returns NULL, or why `spec` is not a theme. Free the
+ * result. */
+char *thurm_set_session_theme(const char *spec);
+
 /* Stop the running daemon even if it speaks another protocol version (SIGTERM: it saves the
  * session first). Blocks until it exited. Use when Hello is refused after an update. */
 bool thurm_terminate_daemon(void);
