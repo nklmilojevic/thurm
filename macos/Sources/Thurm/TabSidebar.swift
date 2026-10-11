@@ -19,13 +19,14 @@ struct SidebarTab {
     var status: AgentStatus?
     var shortcut: Int?
     var selected: Bool
+    var icon: PaneIcon = .shell
 }
 
 extension SidebarTab: Equatable {
     static func == (a: SidebarTab, b: SidebarTab) -> Bool {
         a.controller === b.controller && a.title == b.title && a.subtitle == b.subtitle && a.branch == b.branch
             && a.added == b.added && a.removed == b.removed && a.status == b.status
-            && a.shortcut == b.shortcut && a.selected == b.selected
+            && a.shortcut == b.shortcut && a.selected == b.selected && a.icon == b.icon
     }
 }
 
@@ -314,7 +315,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                                  subtitle: dir,
                                  status: status,
                                  shortcut: tabShortcut(index: index, count: windows.count),
-                                 selected: w === window)
+                                 selected: w === window,
+                                 icon: PaneIcon(info))
             if let g = git {
                 tab.branch = c.host == localHost ? g.branch : "\(c.host) · \(g.branch)"
                 tab.added = g.added
@@ -649,7 +651,8 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
                                  status: a.agent.status,
                                  shortcut: nil,
                                  selected: a.controller != nil && a.controller === key
-                                     && a.controller?.focusedPane == a.pane)
+                                     && a.controller?.focusedPane == a.pane,
+                                 icon: PaneIcon(SessionManager.shared.panes[a.pane]))
             return AgentBox(pane: a.pane, hiddenWorkspace: a.hidden?.id, row: row)
         }
     }
@@ -700,10 +703,11 @@ func abbreviatePath(_ path: String) -> String {
     return parts.joined(separator: "/")
 }
 
-/// One sidebar row: status dot, title over branch/diff (or directory), Cmd+N hint.
+/// One sidebar row: icon tile with a status dot, title over branch/diff (or directory), Cmd+N hint.
 final class TabRowView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("TabRow")
 
+    private let icon = NSImageView()
     private let dot = NSView()
     private let title = NSTextField(labelWithString: "")
     private let subtitle = NSTextField(labelWithString: "")
@@ -714,6 +718,7 @@ final class TabRowView: NSTableCellView {
         identifier = Self.identifier
         dot.wantsLayer = true
         dot.layer?.cornerRadius = 4
+        dot.layer?.borderWidth = 1.5
         title.font = .systemFont(ofSize: 13)
         title.lineBreakMode = .byTruncatingTail
         subtitle.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
@@ -723,7 +728,7 @@ final class TabRowView: NSTableCellView {
         title.maximumNumberOfLines = 1
         shortcut.font = .systemFont(ofSize: 11)
         shortcut.textColor = .tertiaryLabelColor
-        for v in [dot, title, subtitle, shortcut] {
+        for v in [icon, dot, title, subtitle, shortcut] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
         }
@@ -731,11 +736,15 @@ final class TabRowView: NSTableCellView {
         subtitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         shortcut.setContentHuggingPriority(.required, for: .horizontal)
         NSLayoutConstraint.activate([
-            dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            dot.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            icon.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 20),
+            icon.heightAnchor.constraint(equalToConstant: 20),
+            dot.centerXAnchor.constraint(equalTo: icon.trailingAnchor, constant: -1),
+            dot.centerYAnchor.constraint(equalTo: icon.topAnchor, constant: 1),
             dot.widthAnchor.constraint(equalToConstant: 8),
             dot.heightAnchor.constraint(equalToConstant: 8),
-            title.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 8),
+            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
             title.topAnchor.constraint(equalTo: topAnchor, constant: 4),
             title.trailingAnchor.constraint(lessThanOrEqualTo: shortcut.leadingAnchor, constant: -6),
             subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
@@ -777,16 +786,11 @@ final class TabRowView: NSTableCellView {
             let dir = tab.subtitle ?? ""
             subtitle.stringValue = dir == tab.title || tab.title.hasSuffix(dir) ? "" : dir
         }
-        let color: NSColor
-        switch tab.status {
-        case .some(.working): color = .systemBlue
-        case .some(.needsInput): color = .systemOrange
-        case .some(.done): color = .systemGreen
-        case .some(.error): color = .systemRed
-        case .some(.idle): color = .systemGray
-        case .none: color = .clear
-        }
-        dot.layer?.backgroundColor = color.cgColor
+        icon.image = tab.icon.tile(size: 20)
+        // A badge on the tile; idle agents show none.
+        dot.isHidden = tab.status == nil || tab.status == .idle
+        dot.layer?.backgroundColor = tab.status?.color.cgColor
+        dot.layer?.borderColor = SessionManager.shared.config.sidebarColor.cgColor
         toolTip = [tab.title, tab.subtitle].compactMap { $0 }.joined(separator: "\n")
     }
 }

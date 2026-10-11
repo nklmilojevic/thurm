@@ -117,6 +117,8 @@ final class AppConfig {
     var rows = 32
     var confirmClose = true
     var unfocusedSplitDim: CGFloat = 0.25
+    var paneHeaders = true
+    var paneGap: CGFloat = 6
     /// `window.tab_style == "sidebar"`: vertical tabs instead of the native tab bar.
     var sidebarTabs = true
     var quitAfterLastWindow = false
@@ -262,6 +264,8 @@ final class AppConfig {
             confirmClose = jsonBool(w["confirm_close"]) ?? confirmClose
             unfocusedSplitDim = CGFloat(min(1, max(0, jsonDouble(w["unfocused_split_dim"])
                 ?? Double(unfocusedSplitDim))))
+            paneHeaders = jsonBool(w["pane_headers"]) ?? paneHeaders
+            paneGap = CGFloat(clamped(w["pane_gap"], 0, 64) ?? Double(paneGap))
             if let style = jsonString(w["tab_style"]) { sidebarTabs = style == "sidebar" }
             blur = min(100, max(0, jsonInt(w["blur"]) ?? blur))
             quitAfterLastWindow = jsonBool(w["quit_after_last_window"]) ?? quitAfterLastWindow
@@ -312,6 +316,13 @@ final class AppConfig {
         if let remotes = c["remote"] as? [[String: Any]] {
             remoteNames = remotes.compactMap { jsonString($0["name"]) }
         }
+    }
+
+    /// The sidebar's background (and the gutters between split cards): a step off the terminal
+    /// background, darker like Catppuccin's mantle.
+    var sidebarColor: NSColor {
+        let base = colorFromRGB(theme.background, alpha: opacity)
+        return base.shadow(withLevel: theme.isDark ? 0.18 : 0.05) ?? base
     }
 
     /// Color used for the thin split dividers.

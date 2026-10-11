@@ -204,6 +204,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         window.appearance = NSAppearance(named: cfg.theme.isDark ? .darkAqua : .aqua)
         (window as? TerminalWindow)?.titlebarColor = colorFromRGB(cfg.theme.background, alpha: opacity)
         applyTabStyle()
+        (window as? TerminalWindow)?.hidesTitle = cfg.sidebarTabs && cfg.paneHeaders
         // A step off the terminal background (darker, like Catppuccin's mantle): solid, so it
         // doesn't pick up the desktop through the window.
         let base = colorFromRGB(cfg.theme.background, alpha: opacity)
@@ -217,7 +218,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             window.backgroundColor = colorFromRGB(cfg.theme.background)
         }
         applyBlur(opacity < 1 && cfg.blur > 0)
-        content.applyUpdateBadgeTheme()
+        content.applyConfig()
         content.needsDisplay = true
     }
 
