@@ -210,6 +210,8 @@ final class TabContentView: NSView {
 
     private(set) var root: SplitNode
     private(set) var views: [PaneKey: TerminalView] = [:]
+    private var headers: [PaneKey: PaneHeader] = [:]
+    private let chrome = CardChrome()
     private(set) var focusedPane: PaneKey
     private(set) var zoomedPane: PaneKey?
 
@@ -218,6 +220,44 @@ final class TabContentView: NSView {
     private var dragging: SplitDivider?
 
     static let gap: CGFloat = 1
+    /// With pane headers, splits are rounded cards this far apart (and from the window edges):
+    /// `window.pane_gap`.
+    private var cardGap: CGFloat { SessionManager.shared.config.paneGap }
+    static let cardRadius: CGFloat = 8
+
+    /// With vertical tabs and pane headers the panes run the full height of the window, under
+    /// the (empty) titlebar: each pane's header takes the place of the window title.
+    var fullHeight: Bool {
+        let cfg = SessionManager.shared.config
+        return cfg.paneHeaders && controller?.tabSplit != nil
+    }
+
+    /// Pane headers show while more than one pane is on screen (`window.pane_headers`), and
+    /// always in `fullHeight` mode.
+    var showsHeaders: Bool {
+        SessionManager.shared.config.paneHeaders && (hasMultipleVisiblePanes || fullHeight)
+    }
+
+    /// Where the split tree lays out, and the space between its panes.
+    private var splitArea: NSRect {
+        guard showsHeaders else { return paneArea }
+        var area = paneArea.insetBy(dx: cardGap, dy: cardGap)
+        // The top headers' text lines up with the traffic lights.
+        if fullHeight, let close = window?.standardWindowButton(.closeButton), close.superview != nil {
+            let lights = convert(close.bounds, from: close).midY
+            let top = max(paneArea.minY + cardGap, lights - 1 - PaneHeader.height / 2)
+            area.size.height += area.minY - top
+            area.origin.y = top
+        }
+        return area
+    }
+    private var splitGap: CGFloat { showsHeaders ? cardGap : Self.gap }
+
+    /// Each visible pane's rectangle: its card with headers, else its whole view.
+    private var visibleFrames: [(PaneKey, CGRect)] {
+        if let z = zoomedPane { return [(z, showsHeaders ? splitArea : paneArea)] }
+        return root.frames(in: splitArea, gap: splitGap)
+    }
 
     init(root: SplitNode, focused: PaneKey, zoomed: PaneKey?) {
         self.root = root
@@ -226,6 +266,7 @@ final class TabContentView: NSView {
         if let z = zoomed, panes.contains(z) { self.zoomedPane = z } else { self.zoomedPane = nil }
         super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         autoresizingMask = [.width, .height]
+        addSubview(chrome)
         syncViews()
         setUpdateBadge(Updater.shared.badgeText)
     }
@@ -257,11 +298,12 @@ final class TabContentView: NSView {
             view.detach()
             view.removeFromSuperview()
             views.removeValue(forKey: id)
+            headers.removeValue(forKey: id)?.removeFromSuperview()
         }
         for id in root.panes where views[id] == nil {
             let view = TerminalView(pane: id)
             views[id] = view
-            addSubview(view, positioned: .below, relativeTo: findBar)
+            addSubview(view, positioned: .below, relativeTo: chrome)
         }
         needsLayout = true
         needsDisplay = true
@@ -279,7 +321,8 @@ final class TabContentView: NSView {
 
     /// `bounds` minus the safe-area insets (the titlebar and tab bar sit on top of the rest).
     var paneArea: NSRect {
-        let inset = safeAreaInsets
+        var inset = safeAreaInsets
+        if fullHeight { inset.top = 0 }
         return NSRect(x: bounds.minX + inset.left, y: bounds.minY + inset.top,
                       width: max(0, bounds.width - inset.left - inset.right),
                       height: max(0, bounds.height - inset.top - inset.bottom))
@@ -287,17 +330,60 @@ final class TabContentView: NSView {
 
     func layoutPanes() {
         let full = paneArea
-        if let z = zoomedPane, let zv = views[z] {
-            for (id, view) in views {
-                view.isHidden = id != z
-            }
-            zv.frame = full
-        } else {
-            for (id, rect) in root.frames(in: full, gap: TabContentView.gap) {
-                guard let view = views[id] else { continue }
-                view.isHidden = false
+        let cards = showsHeaders
+        let frames = visibleFrames
+        let controls = titlebarControlsMaxX
+        let visible = Set(frames.map(\.0))
+        for (id, view) in views {
+            view.isHidden = !visible.contains(id)
+            headers[id]?.isHidden = !visible.contains(id)
+        }
+        for (id, rect) in frames {
+            guard let view = views[id] else { continue }
+            guard cards else {
                 view.frame = rect
+                continue
             }
+            // Inside the card's 1pt border: the header, then the terminal.
+            let inner = rect.insetBy(dx: 1, dy: 1)
+            let header = headers[id] ?? {
+                let h = PaneHeader(pane: id)
+                h.content = self
+                headers[id] = h
+                addSubview(h, positioned: .below, relativeTo: chrome)
+                return h
+            }()
+            header.isHidden = false
+            header.frame = NSRect(x: inner.minX, y: inner.minY, width: inner.width, height: PaneHeader.height)
+            // A top pane at the window's leading edge (sidebar collapsed) keeps its icon and
+            // title clear of the traffic lights and toolbar buttons.
+            if let controls, inner.minX < controls, rect.minY <= splitArea.minY + 1 {
+                header.leadingInset = controls - inner.minX + 10
+            } else {
+                header.leadingInset = PaneHeader.leading
+            }
+            view.frame = NSRect(x: inner.minX, y: inner.minY + PaneHeader.height, width: inner.width,
+                                height: max(0, inner.height - PaneHeader.height))
+        }
+        chrome.isHidden = !cards
+        if controls != settledControls {
+            settledControls = controls
+            recheckTitlebarControls()
+        }
+        if cards {
+            chrome.frame = bounds
+            chrome.area = full
+            chrome.cards = frames.map {
+                (rect: $0.1, focused: $0.0 == focusedPane && frames.count > 1)
+            }
+            chrome.opacity = controller?.opacity ?? SessionManager.shared.config.opacity
+            chrome.needsDisplay = true
+            for (id, header) in headers {
+                header.update(focused: id == focusedPane)
+            }
+        } else {
+            for header in headers.values { header.removeFromSuperview() }
+            headers.removeAll()
         }
         for view in views.values {
             view.visibilityChanged()
@@ -316,9 +402,27 @@ final class TabContentView: NSView {
         needsDisplay = true
     }
 
+    /// `TerminalWindow.leadingControlsMaxX` in this view, when the panes run under the titlebar.
+    private var titlebarControlsMaxX: CGFloat? {
+        guard fullHeight, let window = window as? TerminalWindow else { return nil }
+        let maxX = window.leadingControlsMaxX
+        return maxX > 0 ? convert(NSPoint(x: maxX, y: 0), from: nil).x : nil
+    }
+
+    /// AppKit lays the toolbar out after the content (sidebar collapsed or shown): check again
+    /// once it has, and move the headers if its buttons moved.
+    private var settledControls: CGFloat?
+    private func recheckTitlebarControls() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.titlebarControlsMaxX != self.settledControls else { return }
+            self.settledControls = self.titlebarControlsMaxX
+            self.layoutPanes()
+        }
+    }
+
     private var currentDividers: [SplitDivider] {
         if zoomedPane != nil { return [] }
-        return root.dividers(in: paneArea, gap: TabContentView.gap)
+        return root.dividers(in: splitArea, gap: splitGap)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -327,10 +431,20 @@ final class TabContentView: NSView {
         let area = paneArea
         colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity).setFill()
         NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: area.minY - bounds.minY).fill()
-        guard zoomedPane == nil else { return }
-        SessionManager.shared.config.dividerColor.setFill()
-        for d in currentDividers {
-            d.rect.fill()
+        guard showsHeaders else {
+            guard zoomedPane == nil else { return }
+            cfg.dividerColor.setFill()
+            for d in currentDividers {
+                d.rect.fill()
+            }
+            return
+        }
+        // Cards: the header strips in the terminal's color, under the headers. The gutters and
+        // outlines are `CardChrome`'s, drawn over the terminals' square corners.
+        let bg = colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity)
+        bg.setFill()
+        for (_, rect) in visibleFrames {
+            NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: 1 + PaneHeader.height).fill()
         }
     }
 
@@ -372,7 +486,7 @@ final class TabContentView: NSView {
         }
         root = root.settingRatio(at: d.path, to: ratio)
         // Refresh the stored divider geometry so later drags use the new container rects.
-        dragging = root.dividers(in: paneArea, gap: TabContentView.gap).first { $0.path == d.path }
+        dragging = root.dividers(in: splitArea, gap: splitGap).first { $0.path == d.path }
         needsLayout = true
     }
 
@@ -421,7 +535,7 @@ final class TabContentView: NSView {
         if wasFocused {
             let oldFrame = views[pane]?.frame ?? .zero
             let center = CGPoint(x: oldFrame.midX, y: oldFrame.midY)
-            let frames = newRoot.frames(in: paneArea, gap: TabContentView.gap)
+            let frames = newRoot.frames(in: splitArea, gap: splitGap)
             nextFocus = frames.min(by: { a, b in
                 hypot(a.1.midX - center.x, a.1.midY - center.y) < hypot(b.1.midX - center.x, b.1.midY - center.y)
             })?.0 ?? (newRoot.panes.first ?? pane)
@@ -452,6 +566,8 @@ final class TabContentView: NSView {
         let changed = pane != focusedPane
         focusedPane = pane
         for view in views.values { view.needsRender = true }
+        if changed { refreshHeaders() }
+        if changed && showsHeaders { layoutPanes() }
         if changed {
             controller?.focusedPaneChanged()
         }
@@ -573,6 +689,21 @@ final class TabContentView: NSView {
         updateBadge?.applyTheme()
     }
 
+    // MARK: Pane headers
+
+    /// Re-reads titles and focus into the headers (pane info changed, focus moved, theme).
+    func refreshHeaders() {
+        for (id, header) in headers { header.update(focused: id == focusedPane) }
+        if showsHeaders { needsDisplay = true }
+    }
+
+    /// After a config reload: headers turned on or off, or the theme changed.
+    func applyConfig() {
+        applyUpdateBadgeTheme()
+        layoutPanes()
+        window?.invalidateCursorRects(for: self)
+    }
+
     // MARK: Persistence
 
     func tabLayout(title: String?) -> TabLayout {
@@ -582,4 +713,38 @@ final class TabContentView: NSView {
 
     /// The host of this tab's panes.
     var host: HostId { root.panes.first?.host ?? localHost }
+}
+
+/// Split cards' gutters (in the sidebar's color) and outlines (brighter around the focused pane),
+/// over the panes so the rounded corners cover the terminals' square ones. Clicks pass through.
+private final class CardChrome: NSView {
+    var area: NSRect = .zero
+    var cards: [(rect: NSRect, focused: Bool)] = []
+    var opacity: CGFloat = 1
+
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let cfg = SessionManager.shared.config
+        let base = colorFromRGB(cfg.theme.background)
+        let fg = colorFromRGB(cfg.theme.foreground)
+        let r = TabContentView.cardRadius
+        let gutter = NSBezierPath(rect: area)
+        gutter.windingRule = .evenOdd
+        for card in cards {
+            gutter.append(NSBezierPath(roundedRect: card.rect, xRadius: r, yRadius: r))
+        }
+        let bg = base.withAlphaComponent(opacity)
+        (bg.shadow(withLevel: cfg.theme.isDark ? 0.18 : 0.05) ?? bg).setFill()
+        gutter.fill()
+        for card in cards {
+            let outline = NSBezierPath(roundedRect: card.rect.insetBy(dx: 0.5, dy: 0.5), xRadius: r - 0.5, yRadius: r - 0.5)
+            let color = base.blended(withFraction: card.focused ? 0.3 : 0.12, of: fg) ?? fg
+            color.withAlphaComponent(max(opacity, 0.6)).setStroke()
+            outline.lineWidth = 1
+            outline.stroke()
+        }
+    }
 }

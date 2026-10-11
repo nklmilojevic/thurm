@@ -113,6 +113,7 @@ impl Config {
                 0.0,
                 1.0,
             ),
+            ("window.pane_gap", w.pane_gap, 0.0, 64.0),
             ("window.sidebar_width", w.sidebar_width, 0.0, 2000.0),
             ("cursor.thickness", self.cursor.thickness, 0.0, 20.0),
             (
@@ -261,6 +262,8 @@ pub struct WindowConfig {
     pub unfocused_split_dim: f64,
     /// Show the per-pane header strip with agent status in splits.
     pub pane_headers: bool,
+    /// Space between split panes (and around them) when pane headers show, in points.
+    pub pane_gap: f64,
     pub tab_style: TabStyle,
     /// Width of the tab sidebar in points.
     pub sidebar_width: f64,
@@ -281,7 +284,8 @@ impl Default for WindowConfig {
             confirm_close: true,
             quit_after_last_window: false,
             unfocused_split_dim: 0.25,
-            pane_headers: false,
+            pane_headers: true,
+            pane_gap: 6.0,
             tab_style: TabStyle::Sidebar,
             sidebar_width: 240.0,
             sidebar_agent_rows: 5,

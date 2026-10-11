@@ -36,7 +36,9 @@ confirm_close = true
 # Quit when the last window closes (like most macOS terminals, off: the app stays in the Dock).
 quit_after_last_window = false
 unfocused_split_dim = 0.25
-pane_headers = false
+pane_headers = true
+# Space between split panes when pane headers show, in points.
+pane_gap = 6.0
 # Tabs: "native" (in the titlebar) or "sidebar" (vertical, grouped by repository). View > Tabs.
 tab_style = "sidebar"
 sidebar_width = 240.0

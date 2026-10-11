@@ -1150,6 +1150,7 @@ final class SessionManager: NSObject, CoreDelegate {
         panes[key] = info
         if let c = controller(for: key) {
             c.updateTitle()
+            c.content.refreshHeaders()
             c.content.views[key]?.maybeShowRestoredToast()
             if old?.progress != info.progress { c.content.views[key]?.setProgress(info.progress) }
         }

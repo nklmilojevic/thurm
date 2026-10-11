@@ -53,14 +53,39 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
     /// visibility: hide its container directly, and show the title instead.
     private func applyTabBarVisibility() {
         guard let tabBar = titlebarView?.firstDescendant(className: "NSTabBar") else {
-            titleLabel.isHidden = false
+            titleLabel.isHidden = hidesTitle
             return
         }
         let clip = tabBar.firstAncestor(className: "NSTitlebarAccessoryClipView")
             ?? tabBar.firstAncestor(className: "NSTitlebarAccessoryContainerView")
         (clip ?? tabBar).isHidden = suppressTabBar
-        titleLabel.isHidden = !suppressTabBar
+        titleLabel.isHidden = !suppressTabBar || hidesTitle
         if !suppressTabBar { scheduleTabBarBackgroundSync() }
+    }
+
+    /// Vertical tabs with pane headers: each header names its pane, so the title stays empty.
+    var hidesTitle = false {
+        didSet { if hidesTitle != oldValue { applyTabBarVisibility() } }
+    }
+
+    /// Right edge, in window coordinates, of the titlebar's leading controls: the traffic lights
+    /// and, with vertical tabs, the sidebar and New Tab buttons (which follow the traffic lights
+    /// when the sidebar is collapsed). Pane headers under the titlebar start past it.
+    var leadingControlsMaxX: CGFloat {
+        guard let bar = titlebarView else { return 0 }
+        var maxX: CGFloat = 0
+        func walk(_ view: NSView) {
+            for sub in view.subviews where !sub.isHidden && sub.alphaValue > 0 {
+                if sub is NSControl, sub !== titleLabel {
+                    let frame = sub.convert(sub.bounds, to: nil)
+                    if frame.minX < self.frame.width / 2 { maxX = max(maxX, frame.maxX) }
+                } else {
+                    walk(sub)
+                }
+            }
+        }
+        walk(bar)
+        return maxX
     }
 
     /// Terminal background used to tint the titlebar.

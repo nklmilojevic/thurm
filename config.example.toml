@@ -44,7 +44,9 @@ confirm_close = true
 quit_after_last_window = false
 # Dim panes without focus: 0.0 disables dimming; 1.0 gives full dimming.
 unfocused_split_dim = 0.25
-pane_headers = false
+pane_headers = true
+# Space between split panes (and around them) when pane headers show, in points.
+pane_gap = 6.0
 # Tab location: "native" or "sidebar".
 tab_style = "sidebar"
 sidebar_width = 240.0
