@@ -18,6 +18,7 @@ use crate::core::{self, Core, HostId, LOCAL, PaneKey};
 use crate::dialogs;
 use crate::model::{self, Axis, Direction, SplitNode, Workspace};
 use crate::palette::{self, Item};
+use crate::paneicon::PaneIcon;
 use crate::render::Fonts;
 use crate::sidebar::{AgentRow, Group, TabRow};
 use crate::tab::Tab;
@@ -587,6 +588,12 @@ impl App {
             }
             _ => actions::find(name).map_or(name.to_string(), |d| d.label.to_string()),
         }
+    }
+
+    /// A pane header's button (or a double-click on it): `action` on that pane.
+    pub fn pane_header_action(self: &Rc<Self>, key: &PaneKey, action: &str) {
+        self.focus_pane(key);
+        self.run_action(action);
     }
 
     fn run_action(self: &Rc<Self>, name: &str) {
@@ -2489,6 +2496,7 @@ impl App {
                             .map(|n| format!("Alt+{n}"))
                             .unwrap_or_default(),
                         selected: selected.as_ref().is_some_and(|s| Rc::ptr_eq(s, t)),
+                        icon: PaneIcon::of(info),
                     });
                     index += 1;
                 }
@@ -2519,6 +2527,7 @@ impl App {
                 subtitle: parts.join(" · "),
                 status: info.agent.as_ref().map(|a| a.status),
                 selected: Some(&k) == here.as_ref() && w.window.is_active(),
+                icon: PaneIcon::of(Some(info)),
                 key: k.clone(),
             });
         }
@@ -2669,6 +2678,9 @@ impl App {
 
     pub fn pane_info_updated(self: &Rc<Self>, key: PaneKey, info: PaneInfo) {
         let old = self.infos.borrow_mut().insert(key.clone(), info.clone());
+        if let Some(t) = self.tab_of(&key) {
+            t.refresh_headers();
+        }
         let old_agent = old.as_ref().and_then(|o| o.agent.clone());
         let status = info.agent.as_ref().map(|a| a.status);
         if matches!(

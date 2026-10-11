@@ -11,6 +11,7 @@ use thurm_proto::AgentStatus;
 use crate::app;
 use crate::core::PaneKey;
 use crate::model;
+use crate::paneicon::PaneIcon;
 use crate::tab::Tab;
 
 #[derive(Clone, PartialEq)]
@@ -22,6 +23,7 @@ pub struct TabRow {
     pub shortcut: String,
     pub selected: bool,
     pub tooltip: String,
+    pub icon: PaneIcon,
 }
 
 #[derive(Clone, PartialEq)]
@@ -31,6 +33,7 @@ pub struct AgentRow {
     pub subtitle: String,
     pub status: Option<AgentStatus>,
     pub selected: bool,
+    pub icon: PaneIcon,
 }
 
 #[derive(Clone, PartialEq)]
@@ -381,6 +384,27 @@ fn selected_tab_row(groups: &[Group], collapsed: &[String]) -> Option<usize> {
         .position(|s| s)
 }
 
+/// The row's icon tile, with the agent status as a badge on its corner (idle agents show none).
+fn tile(icon: PaneIcon, status: Option<AgentStatus>) -> gtk::Overlay {
+    let art = gtk::DrawingArea::new();
+    art.set_content_width(20);
+    art.set_content_height(20);
+    art.set_draw_func(move |_, cr, w, _| icon.draw_tile(cr, w as f64));
+    let o = gtk::Overlay::new();
+    o.set_child(Some(&art));
+    o.set_valign(gtk::Align::Center);
+    if let Some(s) = status.filter(|s| *s != AgentStatus::Idle) {
+        let badge = dot(Some(s));
+        badge.add_css_class("badge");
+        badge.set_halign(gtk::Align::End);
+        badge.set_valign(gtk::Align::Start);
+        badge.set_margin_end(-3);
+        badge.set_margin_top(-3);
+        o.add_overlay(&badge);
+    }
+    o
+}
+
 fn dot(status: Option<AgentStatus>) -> gtk::Box {
     let d = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     d.add_css_class("thurm-dot");
@@ -402,7 +426,7 @@ fn tab_row(r: &TabRow) -> gtk::ListBoxRow {
     grid.set_margin_end(8);
     grid.set_margin_top(4);
     grid.set_margin_bottom(4);
-    grid.attach(&dot(r.status), 0, 0, 1, 1);
+    grid.attach(&tile(r.icon, r.status), 0, 0, 1, 1);
     let title = gtk::Label::new(Some(&r.title));
     title.set_xalign(0.0);
     title.set_hexpand(true);
@@ -437,6 +461,7 @@ fn agent_row(a: &AgentRow) -> gtk::ListBoxRow {
         shortcut: String::new(),
         selected: a.selected,
         tooltip: format!("{}\n{}", a.title, a.subtitle),
+        icon: a.icon,
     };
     let row = tab_row(&r);
     if let Some(grid) = row.child().and_downcast::<gtk::Grid>()
@@ -463,6 +488,7 @@ mod tests {
                     shortcut: String::new(),
                     selected,
                     tooltip: String::new(),
+                    icon: PaneIcon::Shell,
                 })
                 .collect(),
         }

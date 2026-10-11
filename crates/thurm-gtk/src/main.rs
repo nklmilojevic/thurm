@@ -25,6 +25,10 @@ mod notify;
 #[cfg(target_os = "linux")]
 mod palette;
 #[cfg(target_os = "linux")]
+mod paneheader;
+#[cfg(target_os = "linux")]
+mod paneicon;
+#[cfg(target_os = "linux")]
 mod processes;
 #[cfg(target_os = "linux")]
 mod quick;
