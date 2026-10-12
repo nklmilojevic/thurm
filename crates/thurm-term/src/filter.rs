@@ -775,6 +775,19 @@ mod tests {
     }
 
     #[test]
+    fn private_osc_is_kept_whole_with_its_terminator() {
+        let (pass, seqs) = run(b"a\x1b]7501;state=done\x07b\x1b]7501;?\x1b\\c");
+        assert_eq!(pass, b"abc");
+        assert_eq!(
+            seqs,
+            vec![
+                Chunk::Private(b"\x1b]7501;state=done\x07".to_vec()),
+                Chunk::Private(b"\x1b]7501;?\x1b\\".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
     fn unterminated_tails() {
         fn tail(b: &[u8]) -> &[u8] {
             &b[unterminated_tail(b)..]
