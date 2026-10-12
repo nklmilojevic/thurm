@@ -483,9 +483,11 @@ fn title_keeps_a_command_that_did_not_start_the_program() {
     let nvim = fake_nvim(&env.dir);
     // `v` runs a program that runs Neovim as its own job: not the shell's.
     let shell = "printf '\\033]633;E;v\\007\\033]0;v ~/src\\007'";
+    let job = "if (my $p = fork) { waitpid $p, 0 } else { setpgid 0, 0; \
+               $SIG{TTOU} = q(IGNORE); tcsetpgrp 0, getpgrp; exec @ARGV }";
     c.request(Request::Input {
         pane,
-        data: format!("{shell}; sh -mc '{} 5; true'\r", nvim.display()).into_bytes(),
+        data: format!("{shell}; perl -MPOSIX -e '{job}' {} 5\r", nvim.display()).into_bytes(),
     })
     .unwrap();
     assert_eq!(program_title(&c, pane), "v ~/src");
