@@ -198,9 +198,7 @@ if [[ -d "$ROOT/skills" ]]; then
     cp -R "$ROOT/skills" "$APP/Contents/Resources/skills"
 fi
 # The Icon Composer icon: Assets.car for macOS 26 and later, AppIcon.icns for older systems.
-xcrun actool "$HERE/Resources/AppIcon.icon" --compile "$APP/Contents/Resources" \
-    --platform macosx --minimum-deployment-target 14.0 --app-icon AppIcon --include-all-app-icons \
-    --output-partial-info-plist "$(mktemp -d)/AppIcon.plist" --errors --warnings >/dev/null
+"$HERE/compile-icon.sh" "$APP/Contents/Resources"
 # Thurm's license and the notices of everything it includes.
 python3 "$ROOT/scripts/third-party-licenses.py"
 cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_LICENSES" "$APP/Contents/Resources/"
