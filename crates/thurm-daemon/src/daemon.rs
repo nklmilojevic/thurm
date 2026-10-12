@@ -992,8 +992,12 @@ impl Daemon {
                                 && secs > 0
                                 && start.elapsed() >= Duration::from_secs(secs)
                             {
-                                let what =
-                                    st.command_line.clone().unwrap_or_else(|| "Command".into());
+                                // Only the command's name: its arguments can hold secrets.
+                                let what = st
+                                    .command_line
+                                    .as_deref()
+                                    .and_then(command_name)
+                                    .unwrap_or("Command");
                                 let status = match code {
                                     Some(0) | None => "finished".to_owned(),
                                     Some(c) => format!("failed (exit {c})"),
@@ -2844,14 +2848,16 @@ fn command_word(title: &str) -> &str {
     first.rsplit('/').next().unwrap_or(first)
 }
 
-/// Whether the shell's command line `line` runs `word` (a title's command), past variable
-/// assignments (`FOO=1 lg`).
+/// The command the shell's command line `line` runs, past variable assignments (`FOO=1 lg`).
+fn command_name(line: &str) -> Option<&str> {
+    line.split_whitespace()
+        .find(|w| !w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && !k.contains('/')))
+        .map(command_word)
+}
+
+/// Whether the shell's command line `line` runs `word` (a title's command).
 fn starts_command(line: &str, word: &str) -> bool {
-    !word.is_empty()
-        && line
-            .split_whitespace()
-            .find(|w| !w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && !k.contains('/')))
-            .is_some_and(|w| command_word(w) == word)
+    !word.is_empty() && command_name(line) == Some(word)
 }
 
 /// Whether `word` (a title's command) starts the foreground program `def`, which runs as
@@ -3043,6 +3049,8 @@ mod tests {
         assert!(!starts_command("git status", "lg"));
         assert!(!starts_command("", ""));
         assert!(!starts_command("lg", ""));
+        assert_eq!(command_name("TOKEN=s3cret curl -H 'Authorization: x' url"), Some("curl"));
+        assert_eq!(command_name("FOO=1"), None);
     }
 
     #[test]
