@@ -87,23 +87,23 @@ fn process_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
-/// The definition for the foreground process. `name` is its executable (on macOS resolved
-/// through symlinks, so a `vim` linked to Neovim is Neovim), which decides over what it was
-/// started as (argv[0]); an interpreter is the program its arguments name, if any.
+/// The definition for the foreground process. `name` is its executable, resolved through
+/// symlinks (a `vim` linked to Neovim is Neovim): what it was started as (argv[0]) does not
+/// decide. An interpreter is the program its arguments name, if any.
 pub fn identify<'a>(defs: &'a [ProgramDef], name: &str, argv: &[String]) -> Option<&'a ProgramDef> {
-    let executable = unwrapped(basename(name.trim_start_matches('-')));
+    let executable = executable_name(name);
     let interpreted = is_interpreter(executable)
         .then(|| defs.iter().find(|d| d.interpreted_by(argv)))
         .flatten();
-    interpreted
-        .or_else(|| defs.iter().find(|d| d.runs(executable)))
-        .or_else(|| {
-            let first = unwrapped(basename(argv.first()?.trim_start_matches('-')));
-            defs.iter().find(|d| d.runs(first))
-        })
+    interpreted.or_else(|| defs.iter().find(|d| d.runs(executable)))
 }
 
-/// The program Nix's wrappers run: `.nvim-wrapped` is `nvim`.
+/// The program a path or process name runs: its basename, without a login shell's `-` or
+/// the `.…-wrapped` Nix's wrappers give it (`.nvim-wrapped` is `nvim`).
+pub fn executable_name(name: &str) -> &str {
+    unwrapped(basename(name.trim_start_matches('-')))
+}
+
 fn unwrapped(name: &str) -> &str {
     name.strip_prefix('.')
         .and_then(|n| n.strip_suffix("-wrapped"))
@@ -224,8 +224,28 @@ mod tests {
         assert_eq!(id("/nix/store/x-neovim/bin/nvim", &["/home/u/.nix-profile/bin/vi"]), Some("neovim"));
         assert_eq!(id(".nvim-wrapped", &["nvim"]), Some("neovim"));
         assert_eq!(id("vim", &["vim"]), Some("vim"));
-        // An executable no entry knows falls back to its argv[0].
-        assert_eq!(id("sleep", &["/tmp/x/nvim", "5"]), Some("neovim"));
+        // Started under a known name, it still is the executable it runs (`exec -a nvim sleep`).
+        assert_eq!(id("sleep", &["nvim", "5"]), None);
+    }
+
+    #[test]
+    fn sofka_eyes_wind_against_the_face() {
+        // Nonzero filling cuts a subpath out only when it winds the other way.
+        let areas: Vec<f64> = SOFKA_PATH
+            .split('Z')
+            .filter(|p| !p.is_empty())
+            .map(|sub| {
+                let n: Vec<f64> = sub
+                    .split(|c: char| c.is_ascii_alphabetic() || c == ' ')
+                    .filter_map(|v| v.parse().ok())
+                    .collect();
+                let pts: Vec<(f64, f64)> = n.chunks(2).map(|c| (c[0], c[1])).collect();
+                let next = pts.iter().cycle().skip(1);
+                pts.iter().zip(next).map(|(a, b)| a.0 * b.1 - b.0 * a.1).sum::<f64>() / 2.0
+            })
+            .collect();
+        assert_eq!(areas.len(), 3);
+        assert!(areas[0] > 0.0 && areas[1] < 0.0 && areas[2] < 0.0, "{areas:?}");
     }
 
     #[test]

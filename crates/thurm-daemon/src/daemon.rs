@@ -310,6 +310,10 @@ pub struct PaneState {
     program_alerts: Vec<Instant>,
     /// The foreground program's display name, for titles (`programs.names`).
     program_name: Option<String>,
+    /// The title's command word, when it starts the foreground program (`vim` for Neovim).
+    program_command: Option<String>,
+    /// The last `names_program` answer: for which word and program.
+    command_check: Option<((String, String), bool)>,
 }
 
 /// What [`Daemon::install_pane`] needs: a new pane, or one handed over by the previous daemon.
@@ -643,6 +647,8 @@ impl Daemon {
                 osc_progress: None,
                 program_alerts: Vec::new(),
                 program_name: None,
+                program_command: None,
+                command_check: None,
             }),
         });
         self.panes.lock().insert(id, pane.clone());
@@ -915,7 +921,7 @@ impl Daemon {
                     TermEvent::Title(_) => {
                         // Through `pane_title`: an agent's session topic stays put while the
                         // agent repaints its own title ("◑ Fix login bug") with every frame.
-                        let title = pane_title(&st, st.info.foreground.as_ref(), &self.program_defs.read());
+                        let title = pane_title(&st, st.info.foreground.as_ref());
                         if title != st.info.title {
                             st.info.title = title;
                             info_changed = true;
@@ -1253,7 +1259,7 @@ impl Daemon {
             return false;
         };
         st.info.agent = new;
-        st.info.title = pane_title(st, st.info.foreground.as_ref(), &self.program_defs.read());
+        st.info.title = pane_title(st, st.info.foreground.as_ref());
         true
     }
 
@@ -1277,7 +1283,7 @@ impl Daemon {
         let events = f(&mut st);
         if let Some(new) = st.agent.refresh() {
             st.info.agent = new;
-            st.info.title = pane_title(&st, st.info.foreground.as_ref(), &self.program_defs.read());
+            st.info.title = pane_title(&st, st.info.foreground.as_ref());
             self.broadcast(Event::PaneInfo(st.info.clone()), false);
         }
         for ev in events {
@@ -1455,13 +1461,37 @@ impl Daemon {
                             st.git_probe = Some((Instant::now(), cwd));
                         }
                     }
+                    let executable = fg.as_ref().map(procinfo::executable);
                     let program = fg
                         .as_ref()
+                        .zip(executable.as_deref())
                         .filter(|_| programs.detect)
-                        .and_then(|p| thurm_config::identify(&program_defs, &procinfo::executable(p), &p.argv));
+                        .and_then(|(p, exe)| thurm_config::identify(&program_defs, exe, &p.argv));
                     st.info.program = program.map(ProgramDef::to_match);
                     st.program_name = program.filter(|_| programs.names).map(|d| d.name.clone());
-                    st.info.title = pane_title(&st, fg.as_ref(), &self.program_defs.read());
+                    let word = st.term.title().map(command_word).unwrap_or("").to_owned();
+                    st.program_command = match (program.filter(|_| programs.names), &fg, &executable) {
+                        (Some(def), Some(p), Some(exe)) => {
+                            let key = (word.clone(), def.id.clone());
+                            let named = match &st.command_check {
+                                Some((k, named)) if *k == key => *named,
+                                _ => {
+                                    // The shell's PATH when it started, where it looked the word up.
+                                    let path = st
+                                        .info
+                                        .pid
+                                        .and_then(|pid| procinfo::env_var(pid, "PATH"))
+                                        .or_else(|| std::env::var("PATH").ok());
+                                    let named = names_program(&word, def, p, exe, &program_defs, path.as_deref());
+                                    st.command_check = Some((key, named));
+                                    named
+                                }
+                            };
+                            named.then_some(word)
+                        }
+                        _ => None,
+                    };
+                    st.info.title = pane_title(&st, fg.as_ref());
                     st.info.foreground = fg;
                     if let Some((due, _)) = &st.pending_input
                         && Instant::now() >= *due
@@ -2450,7 +2480,7 @@ impl Daemon {
                         let events =
                             self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
                         st.info.agent = new;
-                        st.info.title = pane_title(st, st.info.foreground.as_ref(), &self.program_defs.read());
+                        st.info.title = pane_title(st, st.info.foreground.as_ref());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
                         for ev in events {
                             self.broadcast(ev, true);
@@ -2481,12 +2511,12 @@ impl Daemon {
                                 .update(&defs, fg.as_ref(), &screen, idle, idle_after)
                     {
                         st.info.agent = new;
-                        st.info.title = pane_title(st, fg.as_ref(), &self.program_defs.read());
+                        st.info.title = pane_title(st, fg.as_ref());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
                     }
                     if !detect && let Some(new) = st.agent.update_report_foreground(fg.as_ref()) {
                         st.info.agent = new;
-                        st.info.title = pane_title(st, fg.as_ref(), &self.program_defs.read());
+                        st.info.title = pane_title(st, fg.as_ref());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
                     }
                     let mut result = st.agent.explain(pane, &defs, fg, &screen, idle, idle_after);
@@ -2521,7 +2551,7 @@ impl Daemon {
                         let events =
                             self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
                         st.info.agent = new;
-                        st.info.title = pane_title(st, st.info.foreground.as_ref(), &self.program_defs.read());
+                        st.info.title = pane_title(st, st.info.foreground.as_ref());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
                         for ev in events {
                             self.broadcast(ev, true);
@@ -2549,7 +2579,7 @@ impl Daemon {
                     st.agent
                         .release_report(owner_pid, birth, &instance, sequence)?;
                     st.info.agent = st.agent.state().cloned();
-                    st.info.title = pane_title(st, st.info.foreground.as_ref(), &self.program_defs.read());
+                    st.info.title = pane_title(st, st.info.foreground.as_ref());
                     self.broadcast(Event::PaneInfo(st.info.clone()), false);
                     Ok(())
                 })??;
@@ -2763,11 +2793,7 @@ fn interactive_qos() {
     }
 }
 
-fn pane_title(
-    st: &PaneState,
-    fg: Option<&thurm_proto::ProcessInfo>,
-    programs: &[ProgramDef],
-) -> String {
+fn pane_title(st: &PaneState, fg: Option<&thurm_proto::ProcessInfo>) -> String {
     // What the agent session is about beats the agent's own generic title ("✳ Claude Code").
     if let Some(topic) = st.agent.state().and_then(|a| a.topic.as_ref()) {
         return topic.clone();
@@ -2775,7 +2801,7 @@ fn pane_title(
     let program = st.program_name.as_deref().filter(|_| st.agent.state().is_none());
     if let Some(t) = st.term.title().filter(|t| !t.trim().is_empty()) {
         return match (program, fg) {
-            (Some(name), Some(p)) => with_program_name(t, p, name, programs),
+            (Some(name), Some(p)) => with_program_name(t, p, name, st.program_command.as_deref()),
             _ => t.to_owned(),
         };
     }
@@ -2804,15 +2830,53 @@ fn pane_title(
     }
 }
 
-/// `title` with its leading command word ("nvim" in the shell's "nvim ~/src") replaced by
-/// the foreground program's display name, when that word is the process or a command of a
-/// known program: the shell names the command typed (`vim`), the process is what it ran
-/// (Neovim, when vim links to it).
+/// The command a title starts with, as the shell shows what runs ("nvim" in "nvim ~/src").
+fn command_word(title: &str) -> &str {
+    let first = title.split_whitespace().next().unwrap_or("");
+    first.rsplit('/').next().unwrap_or(first)
+}
+
+/// Whether `word` (a title's command) starts the foreground program `def`, which runs as
+/// `executable`: one of the process' own names, another of the program's commands, or a
+/// command on `path` that resolves to the same executable (a `vim` linked to Neovim, or a
+/// wrapper script beside the binary it runs).
+fn names_program(
+    word: &str,
+    def: &ProgramDef,
+    fg: &thurm_proto::ProcessInfo,
+    executable: &str,
+    programs: &[ProgramDef],
+    path: Option<&str>,
+) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let own = [Some(fg.name.as_str()), fg.argv.first().map(String::as_str)];
+    if own.into_iter().flatten().any(|n| command_word(n) == word) {
+        return true;
+    }
+    if thurm_config::identify(programs, word, &[]).is_some_and(|d| d.id == def.id) {
+        return true;
+    }
+    let executable = thurm_config::executable_name(executable);
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(word))
+        .find(|p| p.is_file())
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .is_some_and(|p| {
+            p.file_name()
+                .is_some_and(|n| thurm_config::executable_name(&n.to_string_lossy()) == executable)
+        })
+}
+
+/// `title` with its leading command word replaced by the foreground program's display name,
+/// when that word is the program (`command`, see `names_program`) or the process itself.
 fn with_program_name(
     title: &str,
     fg: &thurm_proto::ProcessInfo,
     name: &str,
-    programs: &[ProgramDef],
+    command: Option<&str>,
 ) -> String {
     let (first, rest) = title.split_at(title.find(char::is_whitespace).unwrap_or(title.len()));
     let first_base = first.rsplit('/').next().unwrap_or(first);
@@ -2820,8 +2884,7 @@ fn with_program_name(
         .into_iter()
         .flatten()
         .any(|p| p.rsplit('/').next() == Some(first_base));
-    let is_program = thurm_config::identify(programs, first_base, &[]).is_some();
-    if (is_process || is_program) && !first_base.is_empty() {
+    if (is_process || command == Some(first_base)) && !first_base.is_empty() {
         format!("{name}{rest}")
     } else {
         title.to_owned()
@@ -2939,18 +3002,45 @@ mod tests {
             name: "nvim".into(),
             argv: vec!["/opt/homebrew/bin/nvim".into(), "package.json".into()],
         };
-        let programs = thurm_config::builtin_programs();
-        let t = |title| with_program_name(title, &fg, "Neovim", &programs);
+        let t = |title| with_program_name(title, &fg, "Neovim", Some("vim"));
         assert_eq!(t("nvim ~/apps/replay-web"), "Neovim ~/apps/replay-web");
         assert_eq!(t("nvim"), "Neovim");
         assert_eq!(t("/opt/homebrew/bin/nvim x"), "Neovim x");
         // The program's own title is left alone.
         assert_eq!(t("package.json (~/apps) - NVIM"), "package.json (~/apps) - NVIM");
         assert_eq!(t("nvimx y"), "nvimx y");
-        // `vim` that runs Neovim (a link, or Nix's wrapper exec'ing the unwrapped nvim).
+        // The command that started Neovim (see names_program).
         assert_eq!(t("vim -R Cargo.toml ~/src"), "Neovim -R Cargo.toml ~/src");
-        // A word that is no program's stays.
+        // Other words stay, another program's included (a title Neovim set).
         assert_eq!(t("cd ~/src"), "cd ~/src");
+        assert_eq!(t("git status"), "git status");
+    }
+
+    #[test]
+    fn title_commands_name_only_the_foreground_program() {
+        let programs = thurm_config::builtin_programs();
+        let neovim = programs.iter().find(|d| d.id == "neovim").unwrap();
+        let fg = thurm_proto::ProcessInfo {
+            pid: 1,
+            name: "nvim".into(),
+            argv: vec!["/nix/store/x-neovim-unwrapped/bin/nvim".into()],
+        };
+        // A PATH where vim is a link to a wrapper named nvim (as Nix installs Neovim).
+        let dir = std::env::temp_dir().join(format!("thurm-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("nvim"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("nvim"), dir.join("bin/vim")).unwrap();
+        std::fs::write(dir.join("bin/vi"), "#!/bin/sh\n").unwrap();
+        let path = dir.join("bin").display().to_string();
+        let names = |word| names_program(word, neovim, &fg, "nvim", &programs, Some(&path));
+        assert!(names("nvim"));
+        assert!(names("vim"));
+        // A vi of its own, another program, or a word no program has.
+        assert!(!names("vi"));
+        assert!(!names("git"));
+        assert!(!names("cd"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

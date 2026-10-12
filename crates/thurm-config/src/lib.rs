@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use agents::{AgentDef, builtin_agents};
-pub use programs::{CATEGORIES, ProgramDef, builtin_programs, identify, marks};
+pub use programs::{CATEGORIES, ProgramDef, builtin_programs, executable_name, identify, marks};
 pub use themes::{Theme, builtin_theme, builtin_theme_names, is_own_theme};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
