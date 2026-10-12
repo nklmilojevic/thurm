@@ -1225,8 +1225,9 @@ final class SessionManager: NSObject, CoreDelegate {
             NSApp.requestUserAttention(.informationalRequest)
         }
         updateDockBadge()
-        // The sidebar's agent list covers every pane, including hidden workspaces'.
-        if old?.agent != info.agent { refreshSidebars() }
+        // The sidebar's agent list covers every pane, including hidden workspaces'; its tiles
+        // follow the program even when the title stays.
+        if old?.agent != info.agent || PaneIcon(old) != PaneIcon(info) { refreshSidebars() }
         if old?.passwordInput != info.passwordInput {
             updateSecureInput()
         }

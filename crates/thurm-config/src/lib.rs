@@ -6,6 +6,7 @@
 
 mod agents;
 pub mod hooks;
+mod programs;
 mod themes;
 
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use agents::{AgentDef, builtin_agents};
+pub use programs::{CATEGORIES, ProgramDef, builtin_programs, executable_name, identify, marks};
 pub use themes::{Theme, builtin_theme, builtin_theme_names, is_own_theme};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -29,6 +31,7 @@ pub struct Config {
     pub security: SecurityConfig,
     pub notifications: NotificationConfig,
     pub agents: AgentsConfig,
+    pub programs: ProgramsConfig,
     pub ai: AiConfig,
     pub updates: UpdatesConfig,
     pub quick_terminal: QuickTerminalConfig,
@@ -522,6 +525,29 @@ impl Default for AgentsConfig {
             define: Vec::new(),
             presets: Vec::new(),
             install_hooks: true,
+        }
+    }
+}
+
+/// Programs other than agents shown with their own icon and name.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ProgramsConfig {
+    /// Recognize the foreground program for pane icons.
+    pub detect: bool,
+    /// Show the program's display name in place of its process name in titles ("Neovim
+    /// package.json" for "nvim package.json").
+    pub names: bool,
+    /// Additional / overriding program definitions.
+    pub define: Vec<ProgramDef>,
+}
+
+impl Default for ProgramsConfig {
+    fn default() -> Self {
+        Self {
+            detect: true,
+            names: true,
+            define: Vec::new(),
         }
     }
 }
@@ -1030,6 +1056,15 @@ impl Config {
         defs
     }
 
+    /// User program definitions ahead of the built-ins (same `id` overrides).
+    pub fn program_defs(&self) -> Vec<ProgramDef> {
+        let user = &self.programs.define;
+        let builtins = builtin_programs()
+            .into_iter()
+            .filter(|b| !user.iter().any(|d| d.id == b.id));
+        user.iter().cloned().chain(builtins).collect()
+    }
+
     /// Launch presets: explicit ones from the config, otherwise one per built-in agent
     /// whose executable is on `PATH`.
     pub fn agent_presets(&self) -> Vec<thurm_proto::AgentPreset> {
@@ -1073,6 +1108,7 @@ impl Config {
             font_features: Vec<String>,
             agent_presets: Vec<thurm_proto::AgentPreset>,
             config_path: String,
+            program_icons: std::collections::BTreeMap<&'static str, &'static str>,
         }
         serde_json::to_string(&Ui {
             config: self,
@@ -1082,6 +1118,7 @@ impl Config {
             font_features: self.font_features(),
             agent_presets: self.agent_presets(),
             config_path: config_path().display().to_string(),
+            program_icons: programs::marks().collect(),
         })
         .expect("serializable")
     }

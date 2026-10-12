@@ -491,6 +491,24 @@ pub struct PaneInfo {
     /// first.
     #[serde(default)]
     pub programs: Vec<ProgramRecord>,
+    /// The known program in the foreground (Neovim, Node), for its icon and name.
+    #[serde(default)]
+    pub program: Option<ProgramMatch>,
+}
+
+/// A foreground process recognized from the `[[programs.define]]` table.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProgramMatch {
+    /// Stable identifier ("neovim").
+    pub id: String,
+    /// Display name ("Neovim").
+    pub name: String,
+    /// A category ("editor"), a mark ("neovim"), or on macOS an SF Symbol name.
+    pub icon: String,
+    /// The sidebar tile's color, `0xrrggbb` (none: the neutral tile).
+    pub color: Option<u32>,
+    /// The icon's color on the tile.
+    pub ink: Option<u32>,
 }
 
 /// One record of the Program Status Protocol (OSC 7501).

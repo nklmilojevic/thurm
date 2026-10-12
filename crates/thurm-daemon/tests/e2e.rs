@@ -440,6 +440,51 @@ fn password_prompt_is_detected() {
     }
 }
 
+#[test]
+fn foreground_program_is_identified_and_named() {
+    let env = Env::new("program");
+    let _daemon = env.start();
+    let (c, _events) = env.connect();
+    let pane = create(&c, &env.dir);
+    // `vim` linked to Neovim (here a copy of sleep named nvim) is Neovim.
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| Path::new(p).exists()).unwrap();
+    std::fs::copy(sleep, env.dir.join("nvim")).unwrap();
+    // A copied system binary runs only signed as itself.
+    #[cfg(target_os = "macos")]
+    assert!(
+        std::process::Command::new("codesign")
+            .args(["-s", "-", "-f"])
+            .arg(env.dir.join("nvim"))
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    std::os::unix::fs::symlink(env.dir.join("nvim"), env.dir.join("vim")).unwrap();
+    c.request(Request::Input {
+        pane,
+        data: format!("{} 5\r", env.dir.join("vim").display()).into_bytes(),
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let Response::PaneInfo(i) = c.request(Request::PaneInfo { pane }).unwrap() else {
+            panic!("no pane info");
+        };
+        if let Some(p) = &i.program {
+            assert_eq!((p.id.as_str(), p.icon.as_str()), ("neovim", "neovim"));
+            assert_eq!(i.title, "Neovim");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "program not identified ({:?})",
+            i.foreground
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn serde_json_string(l: &Layout) -> String {
     // thurm-proto re-exports serde_json only through to_json.
     thurm_proto::to_json(l)

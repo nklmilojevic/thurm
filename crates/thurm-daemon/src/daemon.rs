@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::{Mutex, RwLock};
 
-use thurm_config::{AgentDef, Config};
+use thurm_config::{AgentDef, Config, ProgramDef};
 use thurm_proto::{
     AgentState, AgentStatus, CreatePane, Event, Layout, PROTOCOL_VERSION, PaneId, PaneInfo,
     PaneSize, ProgramRecord, Request, Response, ServerMessage, WaitCondition, WaitOutcome,
@@ -308,6 +308,12 @@ pub struct PaneState {
     osc_progress: Option<thurm_proto::Progress>,
     /// When program status reports last caused notifications (see `PROGRAM_ALERTS`).
     program_alerts: Vec<Instant>,
+    /// The foreground program's display name, for titles (`programs.names`).
+    program_name: Option<String>,
+    /// The title's command word, when it starts the foreground program (`vim` for Neovim).
+    program_command: Option<String>,
+    /// The last `names_program` answer: for which word and program.
+    command_check: Option<((String, String), bool)>,
 }
 
 /// What [`Daemon::install_pane`] needs: a new pane, or one handed over by the previous daemon.
@@ -329,6 +335,7 @@ pub struct Daemon {
     /// System appearance reported by the GUI (dark until told otherwise).
     dark: AtomicBool,
     agent_defs: RwLock<Vec<AgentDef>>,
+    program_defs: RwLock<Vec<ProgramDef>>,
     panes: Mutex<HashMap<PaneId, Arc<Pane>>>,
     clients: Mutex<HashMap<u64, Arc<Client>>>,
     layout: Mutex<Option<String>>,
@@ -381,6 +388,7 @@ impl Daemon {
             engine: RwLock::new(EngineConfig::from_config(&config, true)),
             dark: AtomicBool::new(true),
             agent_defs: RwLock::new(config.agent_defs()),
+            program_defs: RwLock::new(config.program_defs()),
             config: RwLock::new(config),
             panes: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
@@ -638,6 +646,9 @@ impl Daemon {
                 git_pending: false,
                 osc_progress: None,
                 program_alerts: Vec::new(),
+                program_name: None,
+                program_command: None,
+                command_check: None,
             }),
         });
         self.panes.lock().insert(id, pane.clone());
@@ -1355,16 +1366,18 @@ impl Daemon {
                     .lock()
                     .retain(|(_, at)| at.elapsed() < TEARDOWN_GRACE);
             }
-            let (idle_after, interval, detect, ai_cfg) = {
+            let (idle_after, interval, detect, ai_cfg, programs) = {
                 let c = self.config.read();
                 (
                     Duration::from_millis(c.agents.idle_after_ms),
                     Duration::from_secs(c.session.snapshot_interval_secs.max(1)),
                     c.agents.detect,
                     c.ai.clone(),
+                    c.programs.clone(),
                 )
             };
             let defs = self.agent_defs.read().clone();
+            let program_defs = self.program_defs.read().clone();
             for pane in self.all_panes() {
                 let mut events = Vec::new();
                 {
@@ -1448,6 +1461,36 @@ impl Daemon {
                             st.git_probe = Some((Instant::now(), cwd));
                         }
                     }
+                    let executable = fg.as_ref().map(procinfo::executable);
+                    let program = fg
+                        .as_ref()
+                        .zip(executable.as_deref())
+                        .filter(|_| programs.detect)
+                        .and_then(|(p, exe)| thurm_config::identify(&program_defs, exe, &p.argv));
+                    st.info.program = program.map(ProgramDef::to_match);
+                    st.program_name = program.filter(|_| programs.names).map(|d| d.name.clone());
+                    let word = st.term.title().map(command_word).unwrap_or("").to_owned();
+                    st.program_command = match (program.filter(|_| programs.names), &fg, &executable) {
+                        (Some(def), Some(p), Some(exe)) => {
+                            let key = (word.clone(), def.id.clone());
+                            let named = match &st.command_check {
+                                Some((k, named)) if *k == key => *named,
+                                _ => {
+                                    // The shell's PATH when it started, where it looked the word up.
+                                    let path = st
+                                        .info
+                                        .pid
+                                        .and_then(|pid| procinfo::env_var(pid, "PATH"))
+                                        .or_else(|| std::env::var("PATH").ok());
+                                    let named = names_program(&word, def, p, exe, &program_defs, path.as_deref());
+                                    st.command_check = Some((key, named));
+                                    named
+                                }
+                            };
+                            named.then_some(word)
+                        }
+                        _ => None,
+                    };
                     st.info.title = pane_title(&st, fg.as_ref());
                     st.info.foreground = fg;
                     if let Some((due, _)) = &st.pending_input
@@ -2621,6 +2664,7 @@ impl Daemon {
         }
         *self.engine.write() = EngineConfig::from_config(&cfg, self.dark.load(Ordering::Relaxed));
         *self.agent_defs.write() = cfg.agent_defs();
+        *self.program_defs.write() = cfg.program_defs();
         *self.config.write() = cfg;
         let engine = self.engine.read().clone();
         for pane in self.all_panes() {
@@ -2754,8 +2798,12 @@ fn pane_title(st: &PaneState, fg: Option<&thurm_proto::ProcessInfo>) -> String {
     if let Some(topic) = st.agent.state().and_then(|a| a.topic.as_ref()) {
         return topic.clone();
     }
+    let program = st.program_name.as_deref().filter(|_| st.agent.state().is_none());
     if let Some(t) = st.term.title().filter(|t| !t.trim().is_empty()) {
-        return t.to_owned();
+        return match (program, fg) {
+            (Some(name), Some(p)) => with_program_name(t, p, name, st.program_command.as_deref()),
+            _ => t.to_owned(),
+        };
     }
     if let Some(a) = st.agent.state() {
         return a.name.clone();
@@ -2763,7 +2811,7 @@ fn pane_title(st: &PaneState, fg: Option<&thurm_proto::ProcessInfo>) -> String {
     if let Some(p) = fg
         && !procinfo::is_shell(&p.name)
     {
-        return p.name.clone();
+        return program.unwrap_or(&p.name).to_owned();
     }
     match &st.info.cwd {
         Some(c) => {
@@ -2779,6 +2827,67 @@ fn pane_title(st: &PaneState, fg: Option<&thurm_proto::ProcessInfo>) -> String {
             }
         }
         None => fg.map(|p| p.name.clone()).unwrap_or_else(|| "shell".into()),
+    }
+}
+
+/// The command a title starts with, as the shell shows what runs ("nvim" in "nvim ~/src").
+fn command_word(title: &str) -> &str {
+    let first = title.split_whitespace().next().unwrap_or("");
+    first.rsplit('/').next().unwrap_or(first)
+}
+
+/// Whether `word` (a title's command) starts the foreground program `def`, which runs as
+/// `executable`: one of the process' own names, another of the program's commands, or a
+/// command on `path` that resolves to the same executable (a `vim` linked to Neovim, or a
+/// wrapper script beside the binary it runs).
+fn names_program(
+    word: &str,
+    def: &ProgramDef,
+    fg: &thurm_proto::ProcessInfo,
+    executable: &str,
+    programs: &[ProgramDef],
+    path: Option<&str>,
+) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let own = [Some(fg.name.as_str()), fg.argv.first().map(String::as_str)];
+    if own.into_iter().flatten().any(|n| command_word(n) == word) {
+        return true;
+    }
+    if thurm_config::identify(programs, word, &[]).is_some_and(|d| d.id == def.id) {
+        return true;
+    }
+    let executable = thurm_config::executable_name(executable);
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(word))
+        .find(|p| p.is_file())
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .is_some_and(|p| {
+            p.file_name()
+                .is_some_and(|n| thurm_config::executable_name(&n.to_string_lossy()) == executable)
+        })
+}
+
+/// `title` with its leading command word replaced by the foreground program's display name,
+/// when that word is the program (`command`, see `names_program`) or the process itself.
+fn with_program_name(
+    title: &str,
+    fg: &thurm_proto::ProcessInfo,
+    name: &str,
+    command: Option<&str>,
+) -> String {
+    let (first, rest) = title.split_at(title.find(char::is_whitespace).unwrap_or(title.len()));
+    let first_base = first.rsplit('/').next().unwrap_or(first);
+    let is_process = [Some(fg.name.as_str()), fg.argv.first().map(String::as_str)]
+        .into_iter()
+        .flatten()
+        .any(|p| p.rsplit('/').next() == Some(first_base));
+    if (is_process || command == Some(first_base)) && !first_base.is_empty() {
+        format!("{name}{rest}")
+    } else {
+        title.to_owned()
     }
 }
 
@@ -2885,6 +2994,54 @@ fn ensure_hooks(command: Option<&[String]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_name_replaces_the_command_word() {
+        let fg = thurm_proto::ProcessInfo {
+            pid: 1,
+            name: "nvim".into(),
+            argv: vec!["/opt/homebrew/bin/nvim".into(), "package.json".into()],
+        };
+        let t = |title| with_program_name(title, &fg, "Neovim", Some("vim"));
+        assert_eq!(t("nvim ~/apps/replay-web"), "Neovim ~/apps/replay-web");
+        assert_eq!(t("nvim"), "Neovim");
+        assert_eq!(t("/opt/homebrew/bin/nvim x"), "Neovim x");
+        // The program's own title is left alone.
+        assert_eq!(t("package.json (~/apps) - NVIM"), "package.json (~/apps) - NVIM");
+        assert_eq!(t("nvimx y"), "nvimx y");
+        // The command that started Neovim (see names_program).
+        assert_eq!(t("vim -R Cargo.toml ~/src"), "Neovim -R Cargo.toml ~/src");
+        // Other words stay, another program's included (a title Neovim set).
+        assert_eq!(t("cd ~/src"), "cd ~/src");
+        assert_eq!(t("git status"), "git status");
+    }
+
+    #[test]
+    fn title_commands_name_only_the_foreground_program() {
+        let programs = thurm_config::builtin_programs();
+        let neovim = programs.iter().find(|d| d.id == "neovim").unwrap();
+        let fg = thurm_proto::ProcessInfo {
+            pid: 1,
+            name: "nvim".into(),
+            argv: vec!["/nix/store/x-neovim-unwrapped/bin/nvim".into()],
+        };
+        // A PATH where vim is a link to a wrapper named nvim (as Nix installs Neovim).
+        let dir = std::env::temp_dir().join(format!("thurm-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("nvim"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("nvim"), dir.join("bin/vim")).unwrap();
+        std::fs::write(dir.join("bin/vi"), "#!/bin/sh\n").unwrap();
+        let path = dir.join("bin").display().to_string();
+        let names = |word| names_program(word, neovim, &fg, "nvim", &programs, Some(&path));
+        assert!(names("nvim"));
+        assert!(names("vim"));
+        // A vi of its own, another program, or a word no program has.
+        assert!(!names("vi"));
+        assert!(!names("git"));
+        assert!(!names("cd"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn client_backlog_counts_bytes() {
