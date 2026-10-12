@@ -64,7 +64,7 @@ impl Daemon {
             .is_some();
             if invalidated || changed {
                 st.info.agent = st.agent.state().cloned();
-                st.info.title = pane_title(st, Some(&process));
+                st.info.title = pane_title(st, Some(&process), &self.program_defs.read());
                 self.broadcast(Event::PaneInfo(st.info.clone()), false);
             }
             let agent = st.agent.state().ok_or("no agent is running in this pane")?;

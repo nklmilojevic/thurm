@@ -173,6 +173,28 @@ presets = []
 # launch, resume, resume_session, and fork_session are optional commands.
 # {session} is replaced with the session ID reported by agent hooks.
 
+[programs]
+# Show known programs (Neovim, Node, htop) with an icon for their kind in headers and the sidebar.
+detect = true
+# Show the program's name in place of its process name in titles ("Neovim" for "nvim").
+names = true
+# Add a program definition, or use an existing id to override it.
+# Remove the comment prefix from the full block to enable this example.
+# The default list of custom definitions is empty.
+# [[programs.define]]
+# id = "mytool"
+# name = "My Tool"
+# processes = ["mytool"]
+# argv = ["mytool/cli.js"]
+# icon = "build"
+# color = "#3776ab"
+# ink = "#ffffff"
+# processes matches executable names, and a trailing * matches any suffix.
+# argv matches parts of an interpreter's arguments.
+# icon is a kind of program (editor, runtime, git, build, container, cluster, database,
+# monitor, multiplexer, remote, files, docs), a mark (neovim, vim, sofka), or an SF Symbol
+# name on macOS. color and ink are optional.
+
 [ai]
 # Use the on-device Apple Intelligence model. Requires macOS 26 or later, Apple silicon,
 # and Apple Intelligence turned on in System Settings. Text never leaves the Mac.

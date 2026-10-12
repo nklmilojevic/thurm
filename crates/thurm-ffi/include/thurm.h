@@ -390,7 +390,7 @@ uint64_t thurm_image_serial(thurm_client *client, thurm_pane_id pane, uint32_t i
 /* Load ~/.config/thurm/config.toml (creating a commented default on first run) and return
  * the UI JSON: {"config":{...},"theme":{...},"theme_spec":{"light":"...","dark":"..."},
  * "themes":[{"name":"...","dark":true},...],"font_features":[...],"agent_presets":[...],
- * "config_path":"..."} or {"error":"...","config":{defaults...},...}. `theme` is resolved for
+ * "config_path":"...","program_icons":{"neovim":"M...",...}} or {"error":"...","config":{defaults...},...}. `theme` is resolved for
  * the `dark` system appearance. Free the result. */
 char *thurm_config_json(bool dark);
 

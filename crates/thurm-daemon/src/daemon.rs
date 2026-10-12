@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::{Mutex, RwLock};
 
-use thurm_config::{AgentDef, Config};
+use thurm_config::{AgentDef, Config, ProgramDef};
 use thurm_proto::{
     AgentState, AgentStatus, CreatePane, Event, Layout, PROTOCOL_VERSION, PaneId, PaneInfo,
     PaneSize, ProgramRecord, Request, Response, ServerMessage, WaitCondition, WaitOutcome,
@@ -308,6 +308,8 @@ pub struct PaneState {
     osc_progress: Option<thurm_proto::Progress>,
     /// When program status reports last caused notifications (see `PROGRAM_ALERTS`).
     program_alerts: Vec<Instant>,
+    /// The foreground program's display name, for titles (`programs.names`).
+    program_name: Option<String>,
 }
 
 /// What [`Daemon::install_pane`] needs: a new pane, or one handed over by the previous daemon.
@@ -329,6 +331,7 @@ pub struct Daemon {
     /// System appearance reported by the GUI (dark until told otherwise).
     dark: AtomicBool,
     agent_defs: RwLock<Vec<AgentDef>>,
+    program_defs: RwLock<Vec<ProgramDef>>,
     panes: Mutex<HashMap<PaneId, Arc<Pane>>>,
     clients: Mutex<HashMap<u64, Arc<Client>>>,
     layout: Mutex<Option<String>>,
@@ -381,6 +384,7 @@ impl Daemon {
             engine: RwLock::new(EngineConfig::from_config(&config, true)),
             dark: AtomicBool::new(true),
             agent_defs: RwLock::new(config.agent_defs()),
+            program_defs: RwLock::new(config.program_defs()),
             config: RwLock::new(config),
             panes: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
@@ -638,6 +642,7 @@ impl Daemon {
                 git_pending: false,
                 osc_progress: None,
                 program_alerts: Vec::new(),
+                program_name: None,
             }),
         });
         self.panes.lock().insert(id, pane.clone());
@@ -910,7 +915,7 @@ impl Daemon {
                     TermEvent::Title(_) => {
                         // Through `pane_title`: an agent's session topic stays put while the
                         // agent repaints its own title ("◑ Fix login bug") with every frame.
-                        let title = pane_title(&st, st.info.foreground.as_ref());
+                        let title = pane_title(&st, st.info.foreground.as_ref(), &self.program_defs.read());
                         if title != st.info.title {
                             st.info.title = title;
                             info_changed = true;
@@ -1248,7 +1253,7 @@ impl Daemon {
             return false;
         };
         st.info.agent = new;
-        st.info.title = pane_title(st, st.info.foreground.as_ref());
+        st.info.title = pane_title(st, st.info.foreground.as_ref(), &self.program_defs.read());
         true
     }
 
@@ -1272,7 +1277,7 @@ impl Daemon {
         let events = f(&mut st);
         if let Some(new) = st.agent.refresh() {
             st.info.agent = new;
-            st.info.title = pane_title(&st, st.info.foreground.as_ref());
+            st.info.title = pane_title(&st, st.info.foreground.as_ref(), &self.program_defs.read());
             self.broadcast(Event::PaneInfo(st.info.clone()), false);
         }
         for ev in events {
@@ -1355,16 +1360,18 @@ impl Daemon {
                     .lock()
                     .retain(|(_, at)| at.elapsed() < TEARDOWN_GRACE);
             }
-            let (idle_after, interval, detect, ai_cfg) = {
+            let (idle_after, interval, detect, ai_cfg, programs) = {
                 let c = self.config.read();
                 (
                     Duration::from_millis(c.agents.idle_after_ms),
                     Duration::from_secs(c.session.snapshot_interval_secs.max(1)),
                     c.agents.detect,
                     c.ai.clone(),
+                    c.programs.clone(),
                 )
             };
             let defs = self.agent_defs.read().clone();
+            let program_defs = self.program_defs.read().clone();
             for pane in self.all_panes() {
                 let mut events = Vec::new();
                 {
@@ -1448,7 +1455,13 @@ impl Daemon {
                             st.git_probe = Some((Instant::now(), cwd));
                         }
                     }
-                    st.info.title = pane_title(&st, fg.as_ref());
+                    let program = fg
+                        .as_ref()
+                        .filter(|_| programs.detect)
+                        .and_then(|p| thurm_config::identify(&program_defs, &procinfo::executable(p), &p.argv));
+                    st.info.program = program.map(ProgramDef::to_match);
+                    st.program_name = program.filter(|_| programs.names).map(|d| d.name.clone());
+                    st.info.title = pane_title(&st, fg.as_ref(), &self.program_defs.read());
                     st.info.foreground = fg;
                     if let Some((due, _)) = &st.pending_input
                         && Instant::now() >= *due
@@ -2437,7 +2450,7 @@ impl Daemon {
                         let events =
                             self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
                         st.info.agent = new;
-                        st.info.title = pane_title(st, st.info.foreground.as_ref());
+                        st.info.title = pane_title(st, st.info.foreground.as_ref(), &self.program_defs.read());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
                         for ev in events {
                             self.broadcast(ev, true);
@@ -2468,12 +2481,12 @@ impl Daemon {
                                 .update(&defs, fg.as_ref(), &screen, idle, idle_after)
                     {
                         st.info.agent = new;
-                        st.info.title = pane_title(st, fg.as_ref());
+                        st.info.title = pane_title(st, fg.as_ref(), &self.program_defs.read());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
                     }
                     if !detect && let Some(new) = st.agent.update_report_foreground(fg.as_ref()) {
                         st.info.agent = new;
-                        st.info.title = pane_title(st, fg.as_ref());
+                        st.info.title = pane_title(st, fg.as_ref(), &self.program_defs.read());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
                     }
                     let mut result = st.agent.explain(pane, &defs, fg, &screen, idle, idle_after);
@@ -2508,7 +2521,7 @@ impl Daemon {
                         let events =
                             self.agent_notifications(pane, st, before.as_ref(), new.as_ref());
                         st.info.agent = new;
-                        st.info.title = pane_title(st, st.info.foreground.as_ref());
+                        st.info.title = pane_title(st, st.info.foreground.as_ref(), &self.program_defs.read());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
                         for ev in events {
                             self.broadcast(ev, true);
@@ -2536,7 +2549,7 @@ impl Daemon {
                     st.agent
                         .release_report(owner_pid, birth, &instance, sequence)?;
                     st.info.agent = st.agent.state().cloned();
-                    st.info.title = pane_title(st, st.info.foreground.as_ref());
+                    st.info.title = pane_title(st, st.info.foreground.as_ref(), &self.program_defs.read());
                     self.broadcast(Event::PaneInfo(st.info.clone()), false);
                     Ok(())
                 })??;
@@ -2621,6 +2634,7 @@ impl Daemon {
         }
         *self.engine.write() = EngineConfig::from_config(&cfg, self.dark.load(Ordering::Relaxed));
         *self.agent_defs.write() = cfg.agent_defs();
+        *self.program_defs.write() = cfg.program_defs();
         *self.config.write() = cfg;
         let engine = self.engine.read().clone();
         for pane in self.all_panes() {
@@ -2749,13 +2763,21 @@ fn interactive_qos() {
     }
 }
 
-fn pane_title(st: &PaneState, fg: Option<&thurm_proto::ProcessInfo>) -> String {
+fn pane_title(
+    st: &PaneState,
+    fg: Option<&thurm_proto::ProcessInfo>,
+    programs: &[ProgramDef],
+) -> String {
     // What the agent session is about beats the agent's own generic title ("✳ Claude Code").
     if let Some(topic) = st.agent.state().and_then(|a| a.topic.as_ref()) {
         return topic.clone();
     }
+    let program = st.program_name.as_deref().filter(|_| st.agent.state().is_none());
     if let Some(t) = st.term.title().filter(|t| !t.trim().is_empty()) {
-        return t.to_owned();
+        return match (program, fg) {
+            (Some(name), Some(p)) => with_program_name(t, p, name, programs),
+            _ => t.to_owned(),
+        };
     }
     if let Some(a) = st.agent.state() {
         return a.name.clone();
@@ -2763,7 +2785,7 @@ fn pane_title(st: &PaneState, fg: Option<&thurm_proto::ProcessInfo>) -> String {
     if let Some(p) = fg
         && !procinfo::is_shell(&p.name)
     {
-        return p.name.clone();
+        return program.unwrap_or(&p.name).to_owned();
     }
     match &st.info.cwd {
         Some(c) => {
@@ -2779,6 +2801,30 @@ fn pane_title(st: &PaneState, fg: Option<&thurm_proto::ProcessInfo>) -> String {
             }
         }
         None => fg.map(|p| p.name.clone()).unwrap_or_else(|| "shell".into()),
+    }
+}
+
+/// `title` with its leading command word ("nvim" in the shell's "nvim ~/src") replaced by
+/// the foreground program's display name, when that word is the process or a command of a
+/// known program: the shell names the command typed (`vim`), the process is what it ran
+/// (Neovim, when vim links to it).
+fn with_program_name(
+    title: &str,
+    fg: &thurm_proto::ProcessInfo,
+    name: &str,
+    programs: &[ProgramDef],
+) -> String {
+    let (first, rest) = title.split_at(title.find(char::is_whitespace).unwrap_or(title.len()));
+    let first_base = first.rsplit('/').next().unwrap_or(first);
+    let is_process = [Some(fg.name.as_str()), fg.argv.first().map(String::as_str)]
+        .into_iter()
+        .flatten()
+        .any(|p| p.rsplit('/').next() == Some(first_base));
+    let is_program = thurm_config::identify(programs, first_base, &[]).is_some();
+    if (is_process || is_program) && !first_base.is_empty() {
+        format!("{name}{rest}")
+    } else {
+        title.to_owned()
     }
 }
 
@@ -2885,6 +2931,27 @@ fn ensure_hooks(command: Option<&[String]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_name_replaces_the_command_word() {
+        let fg = thurm_proto::ProcessInfo {
+            pid: 1,
+            name: "nvim".into(),
+            argv: vec!["/opt/homebrew/bin/nvim".into(), "package.json".into()],
+        };
+        let programs = thurm_config::builtin_programs();
+        let t = |title| with_program_name(title, &fg, "Neovim", &programs);
+        assert_eq!(t("nvim ~/apps/replay-web"), "Neovim ~/apps/replay-web");
+        assert_eq!(t("nvim"), "Neovim");
+        assert_eq!(t("/opt/homebrew/bin/nvim x"), "Neovim x");
+        // The program's own title is left alone.
+        assert_eq!(t("package.json (~/apps) - NVIM"), "package.json (~/apps) - NVIM");
+        assert_eq!(t("nvimx y"), "nvimx y");
+        // `vim` that runs Neovim (a link, or Nix's wrapper exec'ing the unwrapped nvim).
+        assert_eq!(t("vim -R Cargo.toml ~/src"), "Neovim -R Cargo.toml ~/src");
+        // A word that is no program's stays.
+        assert_eq!(t("cd ~/src"), "cd ~/src");
+    }
 
     #[test]
     fn client_backlog_counts_bytes() {

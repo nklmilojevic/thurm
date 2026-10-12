@@ -139,6 +139,25 @@ install_hooks = true
 # launch = ["mybot"]
 # resume = ["mybot", "--continue"]
 
+[programs]
+# Show known programs (Neovim, Node, htop…) with an icon for their kind in pane headers and
+# the sidebar.
+detect = true
+# Show the program's name in place of its process name in titles ("Neovim" for "nvim").
+names = true
+
+# Teach Thurm about another program, or override a built-in one by its id:
+# [[programs.define]]
+# id = "mytool"
+# name = "My Tool"
+# processes = ["mytool"]       # executable names; "python*" matches any suffix
+# argv = ["mytool/cli.js"]     # parts of an interpreter's arguments (node mytool/cli.js)
+# icon = "build"               # a kind of program, a mark, or on macOS an SF Symbol name
+# color = "#3776ab"            # the sidebar tile's color (default: neutral)
+# ink = "#ffffff"              # the icon's color on the tile
+#   kinds: editor runtime git build container cluster database monitor multiplexer remote
+#   files docs; marks: neovim vim sofka
+
 [ai]
 # Apple Intelligence's on-device model (macOS 26+, Apple silicon, Apple Intelligence turned
 # on in System Settings). Nothing leaves the Mac. Off until enabled; the switches below pick

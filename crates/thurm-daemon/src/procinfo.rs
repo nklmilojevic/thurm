@@ -12,6 +12,22 @@ fn basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
 }
 
+/// The executable `p` runs, resolved through symlinks (a `vim` linked to Neovim is `nvim`),
+/// which names the program; `name` stays what it was started as on Linux.
+#[cfg(target_os = "linux")]
+pub fn executable(p: &ProcessInfo) -> String {
+    std::fs::read_link(format!("/proc/{}/exe", p.pid))
+        .ok()
+        .and_then(|e| e.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| p.name.clone())
+}
+
+/// The executable `p` runs: `name` already is (`proc_pidpath` resolves symlinks).
+#[cfg(not(target_os = "linux"))]
+pub fn executable(p: &ProcessInfo) -> String {
+    p.name.clone()
+}
+
 #[cfg(target_os = "linux")]
 fn name(pid: u32) -> Option<String> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
