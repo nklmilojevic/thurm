@@ -23,6 +23,8 @@ pub struct Effects {
     pub notifications: Vec<(String, String)>,
     /// Progress reports (OSC 9;4): `None` clears.
     pub progress: Vec<Option<thurm_proto::Progress>>,
+    /// Program status reports (OSC 7501), in stream order.
+    pub programs: Vec<crate::program_status::Report>,
     /// Answer for color scheme queries (CSI ? 996 n): dark or light.
     pub dark: bool,
     /// Answer for XTWINOPS size queries.
@@ -210,6 +212,54 @@ unsafe extern "C" fn on_progress(
     unsafe { (*(ud as *mut Effects)).progress.push(p) };
 }
 
+unsafe extern "C" fn on_program_status(
+    _: ffi::Terminal,
+    ud: *mut c_void,
+    report: *const ffi::TerminalProgramStatus,
+) {
+    use crate::program_status::{Report, invisible_format};
+    use ffi::{ProgramStatusKind as K, ProgramStatusState as St};
+    use thurm_proto::{BlockedKind, ProgramRecord, ProgramState};
+    let r = unsafe { &*report };
+    let text = |s: &ffi::String| -> Option<String> {
+        let s: String = String::from_utf8_lossy(unsafe { ghostty_str(s) })
+            .chars()
+            .filter(|c| !invisible_format(*c))
+            .collect();
+        (!s.is_empty()).then_some(s)
+    };
+    let state = match r.state {
+        St::IDLE => ProgramState::Idle,
+        St::WORKING => ProgramState::Working,
+        St::DONE => ProgramState::Done,
+        St::BLOCKED => ProgramState::Blocked,
+        St::ERROR => ProgramState::Error,
+        St::CLEAR => {
+            let report = Report::Clear(text(&r.id));
+            unsafe { (*(ud as *mut Effects)).programs.push(report) };
+            return;
+        }
+        _ => return,
+    };
+    let kind = match r.kind {
+        K::PERMISSION => Some(BlockedKind::Permission),
+        K::QUESTION => Some(BlockedKind::Question),
+        K::AUTH => Some(BlockedKind::Auth),
+        _ => None,
+    };
+    let report = Report::Set(ProgramRecord {
+        id: text(&r.id).unwrap_or_default(),
+        state,
+        kind,
+        progress: u8::try_from(r.progress).ok().filter(|&p| p <= 100),
+        app: text(&r.app),
+        title: text(&r.title),
+        message: text(&r.message),
+        seen: false,
+    });
+    unsafe { (*(ud as *mut Effects)).programs.push(report) };
+}
+
 unsafe extern "C" fn on_pwd(_: ffi::Terminal, ud: *mut c_void) {
     unsafe { (*(ud as *mut Effects)).pwd_changed = true };
 }
@@ -362,6 +412,7 @@ impl Vt {
         let scheme: ffi::TerminalColorSchemeFn = Some(on_color_scheme);
         let notify: ffi::TerminalDesktopNotificationFn = Some(on_notification);
         let progress: ffi::TerminalProgressReportFn = Some(on_progress);
+        let programs: ffi::TerminalProgramStatusFn = Some(on_program_status);
         let clipboard: ffi::TerminalClipboardWriteFn = Some(on_clipboard);
         unsafe {
             use ffi::TerminalOption as O;
@@ -376,6 +427,7 @@ impl Vt {
             ffi::ghostty_terminal_set(raw, O::COLOR_SCHEME, fn_ptr(scheme));
             ffi::ghostty_terminal_set(raw, O::DESKTOP_NOTIFICATION, fn_ptr(notify));
             ffi::ghostty_terminal_set(raw, O::PROGRESS_REPORT, fn_ptr(progress));
+            ffi::ghostty_terminal_set(raw, O::PROGRAM_STATUS, fn_ptr(programs));
             ffi::ghostty_terminal_set(raw, O::CLIPBOARD_WRITE, fn_ptr(clipboard));
             // Kitty graphics start off (see `set_kitty_graphics`). Thurm reads files and shared
             // memory itself (see `kitty`), so libghostty-vt never gets to.

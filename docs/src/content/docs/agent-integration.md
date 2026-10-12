@@ -18,7 +18,7 @@ status working "Syncing photos"
 rsync -a ~/Photos backup:/photos && status done "Photos synced" || status error "rsync failed"
 ```
 
-Thurm answers the feature query `OSC 7501 ; ? ST` with the same body. The states map to agent states: `idle`, `working`, `blocked` (needs input), `done`, and `error`. The pane shows the most pressing record: blocked, then error, working, done and idle, the latest report first among equals. `app` names the program, or a built-in agent by kind or name (`claude`, `claude-code`). `msg` becomes the status message and notification text, and `progress` drives the pane's progress bar unless OSC 9;4 sets one. Records with an `id` and a `title` show as `title: msg`.
+Thurm answers the feature query `OSC 7501 ; ? ST` with the states and kinds it accepts: `OSC 7501 ; ?:states=idle,working,done,blocked,error:kinds=permission,question,auth ST`. The states map to agent states: `idle`, `working`, `blocked` (needs input), `done`, and `error`. The pane shows the most pressing record: blocked, then error, working, done and idle, the latest report first among equals. `app` names the program, or a built-in agent by kind or name (`claude`, `claude-code`). `msg` becomes the status message and notification text, and `progress` drives the pane's progress bar unless OSC 9;4 sets one. Records with an `id` and a `title` show as `title: msg`.
 
 Working, blocked and idle records end at the next shell prompt (OSC 133;A) or when the pane's process exits. Done and error records stay until you focus the pane or type in it. A full reset (RIS) removes every record. `thurm info` lists the records under `programs`. Notifications from records are limited to three per pane in ten seconds.
 

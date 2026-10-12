@@ -132,8 +132,8 @@ impl AgentTracker {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use thurm_proto::{BlockedKind, ProcessInfo};
-    use thurm_term::program_status::{ProgramStatus, parse};
+    use thurm_proto::{BlockedKind, PaneSize, ProcessInfo};
+    use thurm_term::{EngineConfig, Terminal};
 
     fn rec(id: &str, state: ProgramState) -> ProgramRecord {
         ProgramRecord {
@@ -212,18 +212,29 @@ mod tests {
         assert_eq!(progress(&[a]).unwrap().percent, Some(10));
     }
 
-    fn records(t: &mut ProgramStatus, reports: &[&str]) -> Vec<ProgramRecord> {
+    fn terminal() -> Terminal {
+        let size = PaneSize {
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        Terminal::new(size, EngineConfig::default())
+    }
+
+    /// Feeds `OSC 7501` reports to the terminal; returns its records.
+    fn records(t: &mut Terminal, reports: &[&str]) -> Vec<ProgramRecord> {
         for r in reports {
-            t.apply(parse(r.as_bytes()).unwrap());
+            t.advance(format!("\x1b]7501;{r}\x07").as_bytes());
         }
-        t.records()
+        t.program_status()
     }
 
     #[test]
     fn a_reporting_program_shows_until_its_result_is_seen() {
         let defs = thurm_config::builtin_agents();
         let mut t = AgentTracker::default();
-        let mut s = ProgramStatus::default();
+        let mut s = terminal();
         let idle_after = Duration::from_millis(1500);
         let quiet = Duration::from_secs(5);
         let brew = ProcessInfo {
@@ -256,8 +267,8 @@ mod tests {
         t.set_programs(&records(&mut s, &["state=done:app=brew"]), &defs);
         assert_eq!(t.refresh().unwrap().unwrap().status, AgentStatus::Done);
         // The result outlives the program and the prompt.
-        s.prompt_started();
-        t.set_programs(&s.records(), &defs);
+        s.advance(b"\x1b]133;A\x07");
+        t.set_programs(&s.program_status(), &defs);
         assert_eq!(t.refresh(), None);
         let shell = ProcessInfo {
             pid: 5,
@@ -266,8 +277,8 @@ mod tests {
         };
         assert_eq!(t.update(&defs, Some(&shell), "", quiet, idle_after), None);
         // Seen, it is gone.
-        s.acknowledge();
-        t.set_programs(&s.records(), &defs);
+        s.acknowledge_program_status();
+        t.set_programs(&s.program_status(), &defs);
         assert_eq!(t.refresh(), Some(None));
         assert_eq!(t.update(&defs, Some(&shell), "", quiet, idle_after), None);
     }
@@ -276,7 +287,7 @@ mod tests {
     fn a_detected_agent_reporting_its_status_is_believed() {
         let defs = thurm_config::builtin_agents();
         let mut t = AgentTracker::default();
-        let mut s = ProgramStatus::default();
+        let mut s = terminal();
         let idle_after = Duration::from_millis(1500);
         let claude = ProcessInfo {
             pid: 9,
@@ -299,8 +310,8 @@ mod tests {
         t.set_programs(&records(&mut s, &["state=error:app=claude-code"]), &defs);
         assert_eq!(t.refresh().unwrap().unwrap().status, AgentStatus::Error);
         // Seen, the screen speaks again.
-        s.acknowledge();
-        t.set_programs(&s.records(), &defs);
+        s.acknowledge_program_status();
+        t.set_programs(&s.program_status(), &defs);
         assert_eq!(
             t.update(&defs, Some(&claude), "", Duration::ZERO, idle_after)
                 .unwrap()
@@ -314,7 +325,7 @@ mod tests {
     fn a_cleared_report_gives_the_detected_state_back() {
         let defs = thurm_config::builtin_agents();
         let mut t = AgentTracker::default();
-        let mut s = ProgramStatus::default();
+        let mut s = terminal();
         let idle_after = Duration::from_millis(1500);
         let claude = ProcessInfo {
             pid: 9,

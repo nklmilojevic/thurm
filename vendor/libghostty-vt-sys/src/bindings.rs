@@ -313,7 +313,7 @@ unsafe extern "C" {
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct AllocatorVtable {
-    #[doc = " Return a pointer to `len` bytes with specified `alignment`, or return\n `NULL` indicating the allocation failed.\n\n   be a power of two between 1 and 16 inclusive."]
+    #[doc = " Return a pointer to `len` bytes with specified `alignment`, or return\n `NULL` indicating the allocation failed.\n\n   of low bits of the returned address that must be zero. This is not\n   a byte count: convert it with `1 << alignment` before passing it to\n   aligned_alloc or posix_memalign. For example:\n   - 1: the lowest bit must be zero (2-byte aligned)\n   - 2: the lowest two bits must be zero (4-byte aligned)\n   - 4: the lowest four bits must be zero (16-byte aligned)\n   This matches Zig's `std.mem.Alignment`."]
     pub alloc: ::std::option::Option<
         unsafe extern "C" fn(
             ctx: *mut ::std::os::raw::c_void,
@@ -1843,6 +1843,117 @@ unsafe extern "C" {
         out_written: *mut usize,
     ) -> Result::Type;
 }
+pub mod OscCommandType {
+    #[doc = " OSC command types.\n"]
+    pub type Type = ::std::os::raw::c_int;
+    pub const INVALID: Type = 0;
+    pub const CHANGE_WINDOW_TITLE: Type = 1;
+    pub const CHANGE_WINDOW_ICON: Type = 2;
+    pub const SEMANTIC_PROMPT: Type = 3;
+    pub const CLIPBOARD_CONTENTS: Type = 4;
+    pub const REPORT_PWD: Type = 5;
+    pub const MOUSE_SHAPE: Type = 6;
+    pub const COLOR_OPERATION: Type = 7;
+    pub const KITTY_COLOR_PROTOCOL: Type = 8;
+    pub const SHOW_DESKTOP_NOTIFICATION: Type = 9;
+    pub const HYPERLINK_START: Type = 10;
+    pub const HYPERLINK_END: Type = 11;
+    pub const CONEMU_SLEEP: Type = 12;
+    pub const CONEMU_SHOW_MESSAGE_BOX: Type = 13;
+    pub const CONEMU_CHANGE_TAB_TITLE: Type = 14;
+    pub const CONEMU_PROGRESS_REPORT: Type = 15;
+    pub const CONEMU_WAIT_INPUT: Type = 16;
+    pub const CONEMU_GUIMACRO: Type = 17;
+    pub const CONEMU_RUN_PROCESS: Type = 18;
+    pub const CONEMU_OUTPUT_ENVIRONMENT_VARIABLE: Type = 19;
+    pub const CONEMU_XTERM_EMULATION: Type = 20;
+    pub const CONEMU_COMMENT: Type = 21;
+    pub const KITTY_TEXT_SIZING: Type = 22;
+    pub const KITTY_CLIPBOARD_PROTOCOL: Type = 23;
+    pub const KITTY_DND_PROTOCOL: Type = 24;
+    pub const CONTEXT_SIGNAL: Type = 25;
+    pub const KITTY_DESKTOP_NOTIFICATION: Type = 26;
+    #[doc = " An OSC sequence whose number the parser does not implement. Read it\n with the GHOSTTY_OSC_DATA_UNKNOWN_* data types.\n\n Only produced when GHOSTTY_OSC_OPT_UNKNOWN_MAX_BYTES is nonzero.\n Otherwise these sequences are GHOSTTY_OSC_COMMAND_INVALID."]
+    pub const UNKNOWN: Type = 27;
+    #[doc = " A program status report or support query (OSC 7501), which a program\n sends to say what it is doing, such as working or waiting on the user.\n\n The OSC parser only identifies this command. To receive the report's\n contents, use a terminal with GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS\n instead (see GhosttyTerminalProgramStatus)."]
+    pub const PROGRAM_STATUS: Type = 28;
+    #[doc = " A program status report or support query (OSC 7501), which a program\n sends to say what it is doing, such as working or waiting on the user.\n\n The OSC parser only identifies this command. To receive the report's\n contents, use a terminal with GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS\n instead (see GhosttyTerminalProgramStatus)."]
+    pub const TYPE_MAX_VALUE: Type = 2147483647;
+}
+pub mod OscTerminator {
+    #[doc = " How an OSC sequence was ended.\n\n Programs can end an OSC sequence in two ways. When you reply to a\n sequence, end the reply the same way the program ended its request.\n Some programs only recognize replies that match.\n"]
+    pub type Type = ::std::os::raw::c_int;
+    #[doc = " The string terminator (ST): ESC followed by a backslash (0x1B 0x5C)."]
+    pub const ST: Type = 0;
+    #[doc = " The bell character, BEL (byte 0x07)."]
+    pub const BEL: Type = 1;
+    #[doc = " The bell character, BEL (byte 0x07)."]
+    pub const MAX_VALUE: Type = 2147483647;
+}
+pub mod OscOption {
+    #[doc = " OSC parser options, set with ghostty_osc_set().\n"]
+    pub type Type = ::std::os::raw::c_int;
+    #[doc = " The most bytes to keep from each OSC sequence whose number the parser\n does not implement.\n\n Zero, the default, discards these sequences and they produce\n GHOSTTY_OSC_COMMAND_INVALID. Any other value makes them produce\n GHOSTTY_OSC_COMMAND_UNKNOWN. A NULL value pointer sets the limit back\n to zero.\n\n A sequence longer than the limit is still reported. Its content holds\n the first bytes up to the limit, and GHOSTTY_OSC_DATA_UNKNOWN_TRUNCATED\n is true.\n\n Limits up to 2048 bytes use a buffer the parser already owns and never\n allocate memory. Larger limits allocate memory from the parser's\n allocator for each unknown sequence.\n\n Input type: size_t*"]
+    pub const GHOSTTY_OSC_OPT_UNKNOWN_MAX_BYTES: Type = 0;
+    #[doc = " The most bytes to keep from each OSC sequence whose number the parser\n does not implement.\n\n Zero, the default, discards these sequences and they produce\n GHOSTTY_OSC_COMMAND_INVALID. Any other value makes them produce\n GHOSTTY_OSC_COMMAND_UNKNOWN. A NULL value pointer sets the limit back\n to zero.\n\n A sequence longer than the limit is still reported. Its content holds\n the first bytes up to the limit, and GHOSTTY_OSC_DATA_UNKNOWN_TRUNCATED\n is true.\n\n Limits up to 2048 bytes use a buffer the parser already owns and never\n allocate memory. Larger limits allocate memory from the parser's\n allocator for each unknown sequence.\n\n Input type: size_t*"]
+    pub const GHOSTTY_OSC_OPT_MAX_VALUE: Type = 2147483647;
+}
+pub mod OscCommandData {
+    #[doc = " OSC command data types.\n\n These values specify what type of data to extract from an OSC command\n using `ghostty_osc_command_data`.\n"]
+    pub type Type = ::std::os::raw::c_int;
+    #[doc = " Invalid data type. Never results in any data extraction."]
+    pub const INVALID: Type = 0;
+    #[doc = " Window title string data.\n\n Valid for: GHOSTTY_OSC_COMMAND_CHANGE_WINDOW_TITLE\n\n Output type: const char ** (pointer to null-terminated string)\n\n Lifetime: Valid until the next call to any ghostty_osc_* function with\n the same parser instance. Memory is owned by the parser."]
+    pub const CHANGE_WINDOW_TITLE_STR: Type = 1;
+    #[doc = " The raw bytes of an unknown sequence: everything that was passed to\n ghostty_osc_next(), including the number at the start. For example,\n the sequence `ESC ] 7400;status=busy BEL` gives\n `7400;status=busy`. The bytes are not null-terminated.\n\n Valid for: GHOSTTY_OSC_COMMAND_UNKNOWN\n\n Output type: GhosttyString *\n\n Lifetime: Valid until the next call to any ghostty_osc_* function with\n the same parser instance. Memory is owned by the parser."]
+    pub const UNKNOWN_CONTENT: Type = 2;
+    #[doc = " True if the unknown sequence was longer than\n GHOSTTY_OSC_OPT_UNKNOWN_MAX_BYTES, or memory ran out while reading it.\n In that case the content holds only the beginning of the sequence.\n\n Valid for: GHOSTTY_OSC_COMMAND_UNKNOWN\n\n Output type: bool *"]
+    pub const UNKNOWN_TRUNCATED: Type = 3;
+    #[doc = " How the unknown sequence was ended, based on the terminator passed to\n ghostty_osc_end(). If you reply to the sequence, end the reply the same\n way.\n\n Valid for: GHOSTTY_OSC_COMMAND_UNKNOWN\n\n Output type: GhosttyOscTerminator *"]
+    pub const UNKNOWN_TERMINATOR: Type = 4;
+    #[doc = " How the unknown sequence was ended, based on the terminator passed to\n ghostty_osc_end(). If you reply to the sequence, end the reply the same\n way.\n\n Valid for: GHOSTTY_OSC_COMMAND_UNKNOWN\n\n Output type: GhosttyOscTerminator *"]
+    pub const MAX_VALUE: Type = 2147483647;
+}
+unsafe extern "C" {
+    #[doc = " Create a new OSC parser instance.\n\n Creates a new OSC (Operating System Command) parser using the provided\n allocator. The parser must be freed using ghostty_vt_osc_free() when\n no longer needed.\n\n"]
+    pub fn ghostty_osc_new(allocator: *const Allocator, parser: *mut OscParser) -> Result::Type;
+}
+unsafe extern "C" {
+    #[doc = " Free an OSC parser instance.\n\n Releases all resources associated with the OSC parser. After this call,\n the parser handle becomes invalid and must not be used.\n\n"]
+    pub fn ghostty_osc_free(parser: OscParser);
+}
+unsafe extern "C" {
+    #[doc = " Reset an OSC parser instance to its initial state.\n\n Resets the parser state, clearing any partially parsed OSC sequences\n and returning the parser to its initial state. This is useful for\n reusing a parser instance or recovering from parse errors.\n\n"]
+    pub fn ghostty_osc_reset(parser: OscParser);
+}
+unsafe extern "C" {
+    #[doc = " Set an option on an OSC parser.\n\n `value` points to the option's input type, which is listed in the\n documentation for each GhosttyOscOption value. Pass NULL to restore the\n option's default.\n\n Options stay set across ghostty_osc_reset(). You can change an option\n at any time, but a sequence that is already being parsed may keep the\n old setting. It is simplest to set options before the first sequence.\n\n         is NULL\n"]
+    pub fn ghostty_osc_set(
+        parser: OscParser,
+        option: OscOption::Type,
+        value: *const ::std::os::raw::c_void,
+    ) -> Result::Type;
+}
+unsafe extern "C" {
+    #[doc = " Parse the next byte in an OSC sequence.\n\n Processes a single byte as part of an OSC sequence. The parser maintains\n internal state to track the progress through the sequence. Call this\n function for each byte in the sequence data.\n\n When finished pumping the parser with bytes, call ghostty_osc_end\n to get the final result.\n\n"]
+    pub fn ghostty_osc_next(parser: OscParser, byte: u8);
+}
+unsafe extern "C" {
+    #[doc = " Finalize OSC parsing and retrieve the parsed command.\n\n Call this after feeding every byte of the sequence to ghostty_osc_next(),\n except the byte that ended it. Pass that byte here as the terminator.\n\n If the sequence is not a valid command, this returns NULL. You don't need\n to check for NULL before calling ghostty_osc_command_type(), which\n returns GHOSTTY_OSC_COMMAND_INVALID for it.\n\n Commands that reply to the program, such as color queries, end their\n reply the same way the request ended. A terminator of 0x07 (BEL) gets a\n BEL reply, and any other byte gets an ST reply. Commands that don't\n reply ignore the terminator.\n\n If the program cancelled the sequence with CAN (0x18) or SUB (0x1A),\n pass that byte as the terminator. The sequence is then discarded and\n this returns NULL, whatever command it contained. This matches xterm.\n The \"Ending a Sequence\" section of the overview has an example.\n\n The returned command handle is valid until the next call to any\n `ghostty_osc_*` function with the same parser instance with the exception\n of command introspection functions such as `ghostty_osc_command_type`.\n\n        0x5C for ST, or 0x18 (CAN) or 0x1A (SUB) if it was cancelled\n         a valid command or was cancelled\n"]
+    pub fn ghostty_osc_end(parser: OscParser, terminator: u8) -> OscCommand;
+}
+unsafe extern "C" {
+    #[doc = " Get the type of an OSC command.\n\n Returns the type identifier for the given OSC command. This can be used\n to determine what kind of command was parsed and what data might be\n available from it.\n\n"]
+    pub fn ghostty_osc_command_type(command: OscCommand) -> OscCommandType::Type;
+}
+unsafe extern "C" {
+    #[doc = " Extract data from an OSC command.\n\n Extracts typed data from the given OSC command based on the specified\n data type. The output pointer must be of the appropriate type for the\n requested data kind. Valid command types, output types, and memory\n safety information are documented in the `GhosttyOscCommandData` enum.\n\n"]
+    pub fn ghostty_osc_command_data(
+        command: OscCommand,
+        data: OscCommandData::Type,
+        out: *mut ::std::os::raw::c_void,
+    ) -> bool;
+}
 pub mod SizeReportStyle {
     #[doc = " Size report style.\n\n Determines the output format for the terminal size report."]
     pub type Type = ::std::os::raw::c_int;
@@ -1854,7 +1965,9 @@ pub mod SizeReportStyle {
     pub const CSI_16_T: Type = 2;
     #[doc = " XTWINOPS text area size in characters: ESC [ 8 ; rows ; cols t"]
     pub const CSI_18_T: Type = 3;
-    #[doc = " XTWINOPS text area size in characters: ESC [ 8 ; rows ; cols t"]
+    #[doc = " XTWINOPS screen size in characters: ESC [ 9 ; rows ; cols t\n\n  The physical screen size is not known, so this reports the text\n  area size in characters, the same as CSI 18 t."]
+    pub const CSI_19_T: Type = 4;
+    #[doc = " XTWINOPS screen size in characters: ESC [ 9 ; rows ; cols t\n\n  The physical screen size is not known, so this reports the text\n  area size in characters, the same as CSI 18 t."]
     pub const STYLE_MAX_VALUE: Type = 2147483647;
 }
 #[doc = " Terminal size information for encoding size reports."]
@@ -2223,7 +2336,9 @@ pub mod TerminalScrollViewportTag {
     pub const DELTA: Type = 2;
     #[doc = " Scroll to an absolute row offset from the top of the scrollable\n area. Row 0 is the top of the scrollback and the requested row\n becomes the first visible row of the viewport. The value is\n clamped so the viewport never scrolls beyond the top of the\n active area. If the terminal has no scrollback (e.g. the\n alternate screen is active), the viewport always remains on the\n active area.\n\n This is the same row space as the offset field of\n GhosttyTerminalScrollbar, so a scrollbar position obtained from\n GHOSTTY_TERMINAL_DATA_SCROLLBAR round-trips cleanly."]
     pub const ROW: Type = 3;
-    #[doc = " Scroll to an absolute row offset from the top of the scrollable\n area. Row 0 is the top of the scrollback and the requested row\n becomes the first visible row of the viewport. The value is\n clamped so the viewport never scrolls beyond the top of the\n active area. If the terminal has no scrollback (e.g. the\n alternate screen is active), the viewport always remains on the\n active area.\n\n This is the same row space as the offset field of\n GhosttyTerminalScrollbar, so a scrollbar position obtained from\n GHOSTTY_TERMINAL_DATA_SCROLLBAR round-trips cleanly."]
+    #[doc = " Scroll by a number of prompts relative to the viewport top. Negative\n values move backward and positive values move forward. Requires semantic\n prompt markers from the shell. Zero or no matching prompt is a no-op.\n If fewer prompts remain than requested, move to the last matching prompt,\n clamped to the active area.\n\n Moving forward through a final prompt continuation can snap to the active\n area even when there is no newer prompt."]
+    pub const DELTA_PROMPT: Type = 4;
+    #[doc = " Scroll by a number of prompts relative to the viewport top. Negative\n values move backward and positive values move forward. Requires semantic\n prompt markers from the shell. Zero or no matching prompt is a no-op.\n If fewer prompts remain than requested, move to the last matching prompt,\n clamped to the active area.\n\n Moving forward through a final prompt continuation can snap to the active\n area even when there is no newer prompt."]
     pub const MAX_VALUE: Type = 2147483647;
 }
 #[doc = " Scroll viewport value.\n"]
@@ -2234,6 +2349,8 @@ pub union TerminalScrollViewportValue {
     pub delta: isize,
     #[doc = " Absolute row offset (only used with GHOSTTY_SCROLL_VIEWPORT_ROW)."]
     pub row: usize,
+    #[doc = " Prompt delta (only used with GHOSTTY_SCROLL_VIEWPORT_DELTA_PROMPT)."]
+    pub delta_prompt: isize,
     #[doc = " Padding for ABI compatibility. Do not use."]
     pub _padding: [u64; 2usize],
 }
@@ -2247,6 +2364,8 @@ const _: () = {
         [::std::mem::offset_of!(TerminalScrollViewportValue, delta) - 0usize];
     ["Offset of field: TerminalScrollViewportValue::row"]
         [::std::mem::offset_of!(TerminalScrollViewportValue, row) - 0usize];
+    ["Offset of field: TerminalScrollViewportValue::delta_prompt"]
+        [::std::mem::offset_of!(TerminalScrollViewportValue, delta_prompt) - 0usize];
     ["Offset of field: TerminalScrollViewportValue::_padding"]
         [::std::mem::offset_of!(TerminalScrollViewportValue, _padding) - 0usize];
 };
@@ -2331,16 +2450,84 @@ const _: () = {
     ["Offset of field: TerminalScrollbar::len"]
         [::std::mem::offset_of!(TerminalScrollbar, len) - 16usize];
 };
+#[doc = " Memory held by a terminal.\n\n Read with ghostty_terminal_get() and\n `GHOSTTY_TERMINAL_DATA_MEMORY_USAGE`. This helps applications that host\n many terminals stay within a memory budget, for example by compressing\n or closing the terminals that hold the most memory first.\n\n Most of a terminal's memory goes to its screen contents and scrollback,\n which are stored in fixed-size blocks called pages. Resident bytes are\n the physical memory pages use right now, and are the figure to budget\n against. Virtual bytes are the address space reserved for pages.\n Compressing scrollback lowers the resident figure but not the virtual\n one, because each page's space stays reserved for decompression.\n\n This is a sized struct. Set `size` before the call, most easily with\n GHOSTTY_INIT_SIZED(). Later versions of libghostty-vt may add fields to\n the end of this struct, and the size tells the library which version\n your program was compiled against. This lets older programs keep working\n with newer versions of the library.\n\n Each screen has its own set of fields, named with a `primary_` or\n `alternate_` prefix. The primary screen holds shell output and all of\n the scrollback. The alternate screen is used by full-screen programs\n such as text editors, and its fields are all zero until a program first\n switches to it. Add the two sets together for the terminal's total.\n\n Everything the terminal displays is stored inside pages, including\n colors, styles and hyperlinks, so those are already part of the page\n figures. Images are stored separately and have their own fields. Small\n structures outside of pages, such as the window title and internal\n bookkeeping, are not counted. They are small next to the pages once a\n terminal has any scrollback.\n\n On macOS, the operating system takes back memory freed by compression\n lazily, when something else needs it. Until then, the memory use the\n system reports for your process (its RSS) can be higher than the\n resident figures here.\n\n"]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct TerminalMemoryUsage {
+    #[doc = " Size of this struct in bytes. Set by the caller."]
+    pub size: usize,
+    #[doc = " Whether compressing scrollback can free memory on this platform. When\n false, ghostty_terminal_compress() reports\n `GHOSTTY_TERMINAL_COMPRESSION_RESULT_UNSUPPORTED` and the compressed\n fields are always zero. To reduce a terminal's memory on such a\n platform, you have to do something else, such as closing it."]
+    pub compression_supported: bool,
+    #[doc = " Number of pages in the primary screen, including compressed pages."]
+    pub primary_pages: u64,
+    #[doc = " Bytes of address space reserved for the primary screen's pages. This\n includes compressed pages and spare pages kept ready for reuse.\n Always at least `primary_resident_bytes`."]
+    pub primary_virtual_bytes: u64,
+    #[doc = " Bytes of physical memory used by the primary screen's pages. A\n compressed page counts only its compressed size. Use this figure for\n memory budgets."]
+    pub primary_resident_bytes: u64,
+    #[doc = " Number of the primary screen's pages that are compressed."]
+    pub primary_compressed_pages: u64,
+    #[doc = " Bytes of compressed data held for the primary screen's compressed\n pages. This is already included in `primary_resident_bytes`."]
+    pub primary_compressed_bytes: u64,
+    #[doc = " Bytes of image data stored for the primary screen through the Kitty\n graphics protocol. This is not included in `primary_resident_bytes`.\n Always zero when libghostty-vt is built without Kitty graphics."]
+    pub primary_image_bytes: u64,
+    #[doc = " The same as `primary_pages`, for the alternate screen."]
+    pub alternate_pages: u64,
+    #[doc = " The same as `primary_virtual_bytes`, for the alternate screen."]
+    pub alternate_virtual_bytes: u64,
+    #[doc = " The same as `primary_resident_bytes`, for the alternate screen."]
+    pub alternate_resident_bytes: u64,
+    #[doc = " The same as `primary_compressed_pages`, for the alternate screen."]
+    pub alternate_compressed_pages: u64,
+    #[doc = " The same as `primary_compressed_bytes`, for the alternate screen."]
+    pub alternate_compressed_bytes: u64,
+    #[doc = " The same as `primary_image_bytes`, for the alternate screen."]
+    pub alternate_image_bytes: u64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of TerminalMemoryUsage"][::std::mem::size_of::<TerminalMemoryUsage>() - 112usize];
+    ["Alignment of TerminalMemoryUsage"][::std::mem::align_of::<TerminalMemoryUsage>() - 8usize];
+    ["Offset of field: TerminalMemoryUsage::size"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, size) - 0usize];
+    ["Offset of field: TerminalMemoryUsage::compression_supported"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, compression_supported) - 8usize];
+    ["Offset of field: TerminalMemoryUsage::primary_pages"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, primary_pages) - 16usize];
+    ["Offset of field: TerminalMemoryUsage::primary_virtual_bytes"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, primary_virtual_bytes) - 24usize];
+    ["Offset of field: TerminalMemoryUsage::primary_resident_bytes"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, primary_resident_bytes) - 32usize];
+    ["Offset of field: TerminalMemoryUsage::primary_compressed_pages"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, primary_compressed_pages) - 40usize];
+    ["Offset of field: TerminalMemoryUsage::primary_compressed_bytes"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, primary_compressed_bytes) - 48usize];
+    ["Offset of field: TerminalMemoryUsage::primary_image_bytes"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, primary_image_bytes) - 56usize];
+    ["Offset of field: TerminalMemoryUsage::alternate_pages"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, alternate_pages) - 64usize];
+    ["Offset of field: TerminalMemoryUsage::alternate_virtual_bytes"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, alternate_virtual_bytes) - 72usize];
+    ["Offset of field: TerminalMemoryUsage::alternate_resident_bytes"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, alternate_resident_bytes) - 80usize];
+    ["Offset of field: TerminalMemoryUsage::alternate_compressed_pages"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, alternate_compressed_pages) - 88usize];
+    ["Offset of field: TerminalMemoryUsage::alternate_compressed_bytes"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, alternate_compressed_bytes) - 96usize];
+    ["Offset of field: TerminalMemoryUsage::alternate_image_bytes"]
+        [::std::mem::offset_of!(TerminalMemoryUsage, alternate_image_bytes) - 104usize];
+};
 #[doc = " Callback function type for bell.\n\n Called when the terminal receives a BEL character (0x07).\n\n"]
 pub type TerminalBellFn = ::std::option::Option<
     unsafe extern "C" fn(terminal: Terminal, userdata: *mut ::std::os::raw::c_void),
 >;
 pub mod TerminalUnknownSequenceTag {
-    #[doc = " Unsupported terminal sequence tags.\n\n Only APC sequences are currently reported. Additional sequence types may\n be added without changing the callback shape.\n"]
+    #[doc = " The kind of unsupported sequence passed to a\n GhosttyTerminalUnknownSequenceFn callback.\n\n New kinds may be added in later versions. Callbacks should ignore any\n tag they don't handle.\n"]
     pub type Type = ::std::os::raw::c_int;
     #[doc = " Application Program Command (APC)."]
     pub const GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_APC: Type = 0;
-    #[doc = " Application Program Command (APC)."]
+    #[doc = " Operating System Command (OSC). The value is in `value.osc`."]
+    pub const GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_OSC: Type = 1;
+    #[doc = " Operating System Command (OSC). The value is in `value.osc`."]
     pub const GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_MAX_VALUE: Type = 2147483647;
 }
 #[doc = " An unsupported string terminal sequence.\n\n The content is borrowed and valid only for the callback duration. It\n contains the bytes between the sequence introducer and terminator, may\n contain arbitrary binary data, and is not null-terminated.\n"]
@@ -2372,12 +2559,47 @@ impl Default for TerminalUnknownStringSequence {
         }
     }
 }
+#[doc = " An OSC sequence whose number libghostty-vt does not implement.\n\n OSC sequences start with `ESC ]`, followed by a number that identifies\n the command, usually a `;`, and then the command's data. The sequence\n ends with either BEL or ESC followed by a backslash. For example, a\n program might write:\n\n ESC ] 7400;status=busy BEL\n\n For that sequence, `content` is `7400;status=busy` and `terminator`\n is GHOSTTY_OSC_TERMINATOR_BEL. See the Unsupported Sequences section of\n the terminal documentation for a complete example.\n"]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct TerminalUnknownOscSequence {
+    #[doc = " True if the sequence was longer than\n GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES, or memory ran out while\n reading it. In that case `content` holds only the beginning of the\n sequence."]
+    pub truncated: bool,
+    #[doc = " Everything between `ESC ]` and the terminator, including the number\n at the start. The bytes are not null-terminated and are only valid\n until the callback returns. Copy them if you need them later."]
+    pub content: String,
+    #[doc = " How the program ended the sequence. If you send a reply, end it the\n same way."]
+    pub terminator: OscTerminator::Type,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of TerminalUnknownOscSequence"]
+        [::std::mem::size_of::<TerminalUnknownOscSequence>() - 32usize];
+    ["Alignment of TerminalUnknownOscSequence"]
+        [::std::mem::align_of::<TerminalUnknownOscSequence>() - 8usize];
+    ["Offset of field: TerminalUnknownOscSequence::truncated"]
+        [::std::mem::offset_of!(TerminalUnknownOscSequence, truncated) - 0usize];
+    ["Offset of field: TerminalUnknownOscSequence::content"]
+        [::std::mem::offset_of!(TerminalUnknownOscSequence, content) - 8usize];
+    ["Offset of field: TerminalUnknownOscSequence::terminator"]
+        [::std::mem::offset_of!(TerminalUnknownOscSequence, terminator) - 24usize];
+};
+impl Default for TerminalUnknownOscSequence {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[doc = " Unsupported terminal sequence value.\n"]
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union TerminalUnknownSequenceValue {
     #[doc = " Application Program Command (APC)."]
     pub apc: TerminalUnknownStringSequence,
+    #[doc = " Operating System Command (OSC)."]
+    pub osc: TerminalUnknownOscSequence,
     #[doc = " Padding for ABI compatibility. Do not use.\n\n 128 bytes leaves room for future structured sequence payloads, such as\n CSI with borrowed parameter, separator, and intermediate arrays, without\n changing the tagged union's ABI."]
     pub _padding: [u64; 16usize],
 }
@@ -2389,6 +2611,8 @@ const _: () = {
         [::std::mem::align_of::<TerminalUnknownSequenceValue>() - 8usize];
     ["Offset of field: TerminalUnknownSequenceValue::apc"]
         [::std::mem::offset_of!(TerminalUnknownSequenceValue, apc) - 0usize];
+    ["Offset of field: TerminalUnknownSequenceValue::osc"]
+        [::std::mem::offset_of!(TerminalUnknownSequenceValue, osc) - 0usize];
     ["Offset of field: TerminalUnknownSequenceValue::_padding"]
         [::std::mem::offset_of!(TerminalUnknownSequenceValue, _padding) - 0usize];
 };
@@ -2428,7 +2652,7 @@ impl Default for TerminalUnknownSequence {
         }
     }
 }
-#[doc = " Callback function type for unsupported terminal sequences.\n\n Called synchronously for normally terminated sequences whose identifier is\n not supported by the active terminal handler. Aborted sequences, malformed\n recognized commands, and explicitly disabled known protocols are ignored.\n\n Capture must also be enabled with a nonzero\n GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES value. Installing this callback alone\n does not retain sequence content or allocate memory.\n\n"]
+#[doc = " Callback function type for unsupported terminal sequences.\n\n Called once for each complete sequence that libghostty-vt does not\n implement. Check `sequence->tag` first, because more kinds of sequences\n may be reported in later versions.\n\n These are not reported:\n\n - Sequences the program cancelled partway through with CAN or SUB.\n - Sequences libghostty-vt implements, even when their contents are\n   malformed.\n - Supported protocols that the embedder turned off.\n\n The callback runs during ghostty_terminal_vt_write(). It may write a reply\n to the pty, and that reply stays in order with the terminal's own\n replies. It must not call ghostty_terminal_vt_write() on the same\n terminal.\n\n Nothing is reported until GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES is also\n set to a nonzero value. Installing the callback by itself keeps no data\n and allocates no memory.\n\n"]
 pub type TerminalUnknownSequenceFn = ::std::option::Option<
     unsafe extern "C" fn(
         terminal: Terminal,
@@ -2817,6 +3041,278 @@ pub type TerminalProgressReportFn = ::std::option::Option<
         report: *const TerminalProgressReport,
     ),
 >;
+pub mod ProgramStatusState {
+    #[doc = " What a program says it is doing, in a program status report (OSC 7501).\n\n See GhosttyTerminalProgramStatus for an overview of the protocol.\n"]
+    pub type Type = ::std::os::raw::c_int;
+    #[doc = " At rest, waiting for the user's next instruction. For example, an\n interactive tool sitting at its own prompt."]
+    pub const IDLE: Type = 0;
+    #[doc = " Running on its own. The report may include a progress percentage."]
+    pub const WORKING: Type = 1;
+    #[doc = " Finished a piece of work, and the result is ready for the user to\n look at."]
+    pub const DONE: Type = 2;
+    #[doc = " Can't continue until the user does something. `kind` says what the\n program needs and `message` says why. The report may include a\n progress percentage."]
+    pub const BLOCKED: Type = 3;
+    #[doc = " Failed and stopped."]
+    pub const ERROR: Type = 4;
+    #[doc = " Not a real state. Remove the record with this report's id and every\n record beneath it. If the id is empty, remove every record."]
+    pub const CLEAR: Type = 5;
+    #[doc = " Not a real state. Remove the record with this report's id and every\n record beneath it. If the id is empty, remove every record."]
+    pub const MAX_VALUE: Type = 2147483647;
+}
+pub mod ProgramStatusKind {
+    #[doc = " What a blocked program needs from the user, in a program status report\n (OSC 7501).\n"]
+    pub type Type = ::std::os::raw::c_int;
+    #[doc = " The program didn't say, or the state isn't\n GHOSTTY_PROGRAM_STATUS_STATE_BLOCKED."]
+    pub const NONE: Type = 0;
+    #[doc = " Approval to do something, such as \"Apply these changes?\"."]
+    pub const PERMISSION: Type = 1;
+    #[doc = " An answer the user has to type."]
+    pub const QUESTION: Type = 2;
+    #[doc = " A login, password, token, or other credential."]
+    pub const AUTH: Type = 3;
+    #[doc = " A login, password, token, or other credential."]
+    pub const MAX_VALUE: Type = 2147483647;
+}
+#[doc = " A program status report (OSC 7501).\n\n The program status protocol lets a program tell the terminal what it is\n doing: idle, working, done, waiting on the user, or failed, and why. It\n is meant for long-running work like builds, deploys, and coding agents,\n where the user is often looking at something else and wants to know when\n the work finishes or needs them. The protocol only describes state. How\n to show it, if at all, is up to your application.\n\n The full specification is at\n https://www.superlogical.com/rex/docs/build/program-status\n\n For example, a program waiting for the user to approve a change sends\n this, where ST is the string terminator (ESC \\ or BEL):\n\n ESC ] 7501 ; state=blocked:kind=permission:app=terraform:msg=QXBwbHk/ ST\n\n The callback then receives a report with:\n\n - `state`: GHOSTTY_PROGRAM_STATUS_STATE_BLOCKED\n - `kind`: GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION\n - `progress`: -1, because the program didn't send one, so the work is\n   indeterminate\n - `id`: empty, because this is the root record\n - `app`: \"terraform\"\n - `title`: empty\n - `message`: \"Apply?\", decoded from the base64 in `msg`\n\n Only reports that pass every check in the specification reach the\n callback. Text that the program didn't send is an empty string (len=0),\n never NULL. All strings are only valid during the callback, so copy any\n you want to keep.\n\n This is a sized struct. Later versions may add fields at the end, and\n `size` tells you which fields are present. Every field below has been\n present since this struct was introduced.\n"]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct TerminalProgramStatus {
+    #[doc = " Size of this struct in bytes."]
+    pub size: usize,
+    #[doc = " What the program is doing."]
+    pub state: ProgramStatusState::Type,
+    #[doc = " What the program needs from the user. Only set for\n GHOSTTY_PROGRAM_STATUS_STATE_BLOCKED. It is\n GHOSTTY_PROGRAM_STATUS_KIND_NONE for other states, when the program\n didn't say, or when it sent a kind this version doesn't know."]
+    pub kind: ProgramStatusKind::Type,
+    #[doc = " How far along the work is, from 0 through 100, or -1 when there is\n no percentage. Only set for GHOSTTY_PROGRAM_STATUS_STATE_WORKING and\n GHOSTTY_PROGRAM_STATUS_STATE_BLOCKED. For those states, -1 means the\n work is indeterminate: the program is busy but has no percentage to\n report. It is also -1 for other states and when the program sent a\n value outside that range."]
+    pub progress: i8,
+    #[doc = " Which record this report is about. Empty for the root record.\n\n A program that only reports on itself leaves this empty. A program\n that reports on several things at once gives each its own id, such as\n \"us-east\" and \"eu-west\" for a deploy to two regions. A \"/\" makes one\n record the child of another, so \"build/test\" is a child of \"build\".\n The parent record doesn't have to exist."]
+    pub id: String,
+    #[doc = " A stable name for the program that a machine can match on, such as\n \"cargo\", \"terraform\", or \"claude-code\". Use it as a key for grouping,\n filtering, or choosing an icon. It is not a label. The label is\n `title`. Empty when the report didn't include one. See\n GhosttyTerminalProgramStatusFn for how an empty app is filled in from\n a parent record."]
+    pub app: String,
+    #[doc = " A short label for the record, meant for people. Programs that report\n several records use this to tell them apart."]
+    pub title: String,
+    #[doc = " One line of text for people, saying what the record is doing,\n waiting for, or has finished. You may shorten it to fit, but don't\n try to read meaning into it."]
+    pub message: String,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of TerminalProgramStatus"][::std::mem::size_of::<TerminalProgramStatus>() - 88usize];
+    ["Alignment of TerminalProgramStatus"]
+        [::std::mem::align_of::<TerminalProgramStatus>() - 8usize];
+    ["Offset of field: TerminalProgramStatus::size"]
+        [::std::mem::offset_of!(TerminalProgramStatus, size) - 0usize];
+    ["Offset of field: TerminalProgramStatus::state"]
+        [::std::mem::offset_of!(TerminalProgramStatus, state) - 8usize];
+    ["Offset of field: TerminalProgramStatus::kind"]
+        [::std::mem::offset_of!(TerminalProgramStatus, kind) - 12usize];
+    ["Offset of field: TerminalProgramStatus::progress"]
+        [::std::mem::offset_of!(TerminalProgramStatus, progress) - 16usize];
+    ["Offset of field: TerminalProgramStatus::id"]
+        [::std::mem::offset_of!(TerminalProgramStatus, id) - 24usize];
+    ["Offset of field: TerminalProgramStatus::app"]
+        [::std::mem::offset_of!(TerminalProgramStatus, app) - 40usize];
+    ["Offset of field: TerminalProgramStatus::title"]
+        [::std::mem::offset_of!(TerminalProgramStatus, title) - 56usize];
+    ["Offset of field: TerminalProgramStatus::message"]
+        [::std::mem::offset_of!(TerminalProgramStatus, message) - 72usize];
+};
+impl Default for TerminalProgramStatus {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " Callback function type for program status reports (OSC 7501).\n\n Called synchronously each time the running program sends a valid\n report. See GhosttyTerminalProgramStatus for what a report contains.\n\n The terminal doesn't store reports, so your application keeps them. To\n follow the specification, keep one record per id. A report with an empty\n id is about the root record, the program itself. The records follow\n these rules:\n\n - A report replaces its record completely. A value the report leaves\n   out is gone from the record afterwards. It doesn't keep its old value.\n - A GHOSTTY_PROGRAM_STATUS_STATE_CLEAR report removes the record with\n   its id and every record beneath it, so clearing \"build\" also removes\n   \"build/test\". A clear report with an empty id removes every record.\n - A record without an app takes it from its nearest ancestor that has\n   one. If the root record has app \"deploy\" and the record \"us-east\"\n   has none, show \"us-east\" with app \"deploy\" too.\n - When a new shell prompt starts (GHOSTTY_SEMANTIC_PROMPT_PROMPT_START\n   from the GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT callback) or the program\n   running in the terminal exits, remove `working` and `blocked` records.\n   You may remove `idle` records too. Keep `done` and `error` records\n   until the user has seen them, for example until they next focus the\n   terminal.\n - Keep at most 256 records, and allow at least 64. When a new record\n   would go over your limit, remove the one that was updated longest ago.\n\n A full reset (RIS, `ESC c`) removes every record. When that happens,\n the terminal calls this with a GHOSTTY_PROGRAM_STATUS_STATE_CLEAR report\n and an empty id, and then calls the GHOSTTY_TERMINAL_OPT_RESET callback.\n\n `title` and `message` are already decoded and contain no control\n characters, but they are still untrusted text from the program. Don't\n treat them as markup. If you show them outside the terminal, such as in\n a tab or a notification, remove invisible formatting characters like\n text direction overrides, and say which terminal the text came from so\n a program can't pretend to be one running elsewhere.\n\n Example, where `Records`, `records_clear`, and `records_put` stand in for\n your application's own storage:\n\n void on_program_status(GhosttyTerminal terminal,\n                        void* userdata,\n                        const GhosttyTerminalProgramStatus* report) {\n   (void)terminal;\n   Records* records = userdata;\n\n   if (report->state == GHOSTTY_PROGRAM_STATUS_STATE_CLEAR) {\n     // Remove this record and every record beneath it. An empty id\n     // removes every record.\n     records_clear(records, report->id);\n     return;\n   }\n\n   // Replace the whole record. The strings are only valid during this\n   // call, so records_put must copy them.\n   records_put(records, report->id, report->state, report->message);\n }\n\n // Set write_pty too, so programs that check for support get a reply.\n ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_USERDATA, records);\n ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY,\n                      (const void*)on_write_pty);\n ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS,\n                      (const void*)on_program_status);\n\n               call.\n"]
+pub type TerminalProgramStatusFn = ::std::option::Option<
+    unsafe extern "C" fn(
+        terminal: Terminal,
+        userdata: *mut ::std::os::raw::c_void,
+        report: *const TerminalProgramStatus,
+    ),
+>;
+pub mod SemanticPromptKind {
+    #[doc = " The step of a command that a shell integration event reports.\n\n More kinds may be added in later versions, so ignore any kind you don't\n handle.\n"]
+    pub type Type = ::std::os::raw::c_int;
+    #[doc = " Never reported. This exists so that a zeroed value is not mistaken\n for a real event."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_INVALID: Type = 0;
+    #[doc = " The shell started drawing a prompt. `prompt_kind` says which one."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_PROMPT_START: Type = 1;
+    #[doc = " The prompt is drawn and the user can start typing a command."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_INPUT_START: Type = 2;
+    #[doc = " The user submitted the command and it started running. Anything the\n terminal receives after this is the command's output."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START: Type = 3;
+    #[doc = " The command finished running."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_COMMAND_END: Type = 4;
+    #[doc = " The command finished running."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_MAX_VALUE: Type = 2147483647;
+}
+pub mod SemanticPromptPromptKind {
+    #[doc = " Which prompt a `GHOSTTY_SEMANTIC_PROMPT_PROMPT_START` event starts.\n\n Most shells only draw a primary prompt. Some also draw a prompt on the\n right side of the line, or a prompt at the start of each extra line\n when a command spans several lines.\n"]
+    pub type Type = ::std::os::raw::c_int;
+    #[doc = " The main prompt shown before each command. This is used when the\n shell doesn't say which prompt it is drawing."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY: Type = 0;
+    #[doc = " A prompt drawn at the right edge of the line, such as zsh's\n RPROMPT."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_PROMPT_RIGHT: Type = 1;
+    #[doc = " A prompt at the start of an extra line of a command that spans\n several lines."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_PROMPT_CONTINUATION: Type = 2;
+    #[doc = " Another prompt for an extra line of input, such as bash's PS2.\n Shells differ in whether they report extra lines as continuation or\n secondary prompts, so most applications should treat the two the\n same."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_PROMPT_SECONDARY: Type = 3;
+    #[doc = " Another prompt for an extra line of input, such as bash's PS2.\n Shells differ in whether they report extra lines as continuation or\n secondary prompts, so most applications should treat the two the\n same."]
+    pub const GHOSTTY_SEMANTIC_PROMPT_PROMPT_MAX_VALUE: Type = 2147483647;
+}
+#[doc = " A shell integration event, passed to the\n `GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT` callback.\n\n `kind` says which step of the command this is. The other fields only\n carry information for the kinds listed on each field, and are zero or\n empty otherwise.\n\n Strings are only valid during the callback. Copy them if you need them\n later.\n\n This is a sized struct. Later versions may add fields at the end, and\n `size` tells you which fields are present. Every field below has been\n present since this struct was introduced, so you only need to check\n `size` before reading fields added later. Two fields are likely to be\n added in the future:\n\n - An identifier the shell assigns to each command.\n - A flag on `GHOSTTY_SEMANTIC_PROMPT_PROMPT_START` that says the shell\n   redrew a prompt it had already drawn, instead of starting a new one.\n\n Neither exists yet.\n"]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct TerminalSemanticPrompt {
+    #[doc = " Size of this struct in bytes."]
+    pub size: usize,
+    #[doc = " Which step of the command this event reports."]
+    pub kind: SemanticPromptKind::Type,
+    #[doc = " Which prompt is starting. Set for\n `GHOSTTY_SEMANTIC_PROMPT_PROMPT_START`. Always\n `GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY` for other kinds."]
+    pub prompt_kind: SemanticPromptPromptKind::Type,
+    #[doc = " True if the shell reported the command's exit code. Only ever true\n for `GHOSTTY_SEMANTIC_PROMPT_COMMAND_END`."]
+    pub has_exit_code: bool,
+    #[doc = " The command's exit code. Only meaningful when `has_exit_code` is\n true. Exit codes can be negative, for example on Windows, so use\n `has_exit_code` rather than a special value to tell whether one was\n reported."]
+    pub exit_code: i32,
+    #[doc = " The command line that is about to run, for\n `GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START`. The shell sends it encoded,\n and this is the decoded text. Empty (len=0) if the shell didn't send\n one or it couldn't be decoded."]
+    pub command: String,
+    #[doc = " A description of what went wrong, for\n `GHOSTTY_SEMANTIC_PROMPT_COMMAND_END` when the shell sent one. Empty\n (len=0) otherwise. Few shells send this. The exit code is the usual\n way to tell whether a command failed."]
+    pub error: String,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of TerminalSemanticPrompt"][::std::mem::size_of::<TerminalSemanticPrompt>() - 56usize];
+    ["Alignment of TerminalSemanticPrompt"]
+        [::std::mem::align_of::<TerminalSemanticPrompt>() - 8usize];
+    ["Offset of field: TerminalSemanticPrompt::size"]
+        [::std::mem::offset_of!(TerminalSemanticPrompt, size) - 0usize];
+    ["Offset of field: TerminalSemanticPrompt::kind"]
+        [::std::mem::offset_of!(TerminalSemanticPrompt, kind) - 8usize];
+    ["Offset of field: TerminalSemanticPrompt::prompt_kind"]
+        [::std::mem::offset_of!(TerminalSemanticPrompt, prompt_kind) - 12usize];
+    ["Offset of field: TerminalSemanticPrompt::has_exit_code"]
+        [::std::mem::offset_of!(TerminalSemanticPrompt, has_exit_code) - 16usize];
+    ["Offset of field: TerminalSemanticPrompt::exit_code"]
+        [::std::mem::offset_of!(TerminalSemanticPrompt, exit_code) - 20usize];
+    ["Offset of field: TerminalSemanticPrompt::command"]
+        [::std::mem::offset_of!(TerminalSemanticPrompt, command) - 24usize];
+    ["Offset of field: TerminalSemanticPrompt::error"]
+        [::std::mem::offset_of!(TerminalSemanticPrompt, error) - 40usize];
+};
+impl Default for TerminalSemanticPrompt {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " Callback function type for semantic_prompt.\n\n Called when the shell reports a step of a command. Each command goes\n through four steps, in this order: the prompt starts, input starts,\n output starts, and the command ends. Then the next prompt starts.\n\n Shells differ in what they report. Many don't send the command line or\n the exit code, and some skip steps, so handle each event on its own\n instead of expecting a strict order. A shell may also start the same\n prompt more than once, for example when it redraws the prompt after a\n resize, so treat a repeated `GHOSTTY_SEMANTIC_PROMPT_PROMPT_START` as\n harmless.\n\n The terminal has already updated its screen when this is called. A\n sequence the terminal rejects as malformed is never reported.\n\n              call.\n"]
+pub type TerminalSemanticPromptFn = ::std::option::Option<
+    unsafe extern "C" fn(
+        terminal: Terminal,
+        userdata: *mut ::std::os::raw::c_void,
+        event: *const TerminalSemanticPrompt,
+    ),
+>;
+#[doc = " Callback function type for reset.\n\n Called when the running program performs a full reset (RIS, `ESC c`).\n A full reset clears the screen and scrollback, returns modes to their\n defaults, and clears the title and working directory. Use this callback\n to reset any state your application keeps about what's running in the\n terminal, such as the current command.\n\n The terminal has already reset itself when this is called. The\n GHOSTTY_TERMINAL_OPT_TITLE_CHANGED and GHOSTTY_TERMINAL_OPT_PWD_CHANGED\n callbacks are not called for the cleared title and working directory,\n so update anything you show for them here. A full reset also removes\n any progress report and program status records. If you set\n GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT or\n GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS, those callbacks are called before\n this one.\n\n A soft reset (DECSTR, `CSI ! p`) keeps the screen, title and working\n directory, and doesn't call this.\n\n"]
+pub type TerminalResetFn = ::std::option::Option<
+    unsafe extern "C" fn(terminal: Terminal, userdata: *mut ::std::os::raw::c_void),
+>;
+pub mod TerminalResizeWindowTag {
+    #[doc = " The kind of window resize request passed to a\n GhosttyTerminalResizeWindowFn callback.\n\n New kinds may be added in later versions. Callbacks should ignore any\n tag they don't handle.\n"]
+    pub type Type = ::std::os::raw::c_int;
+    #[doc = " Resize the window's text area to a size in rows and columns\n (CSI 8 ; rows ; columns t). The value is in `value.grid`."]
+    pub const GHOSTTY_TERMINAL_RESIZE_WINDOW_GRID: Type = 0;
+    #[doc = " Resize the window's text area to a size in rows and columns\n (CSI 8 ; rows ; columns t). The value is in `value.grid`."]
+    pub const GHOSTTY_TERMINAL_RESIZE_WINDOW_MAX_VALUE: Type = 2147483647;
+}
+#[doc = " A request to resize the window's text area to a size in rows and columns.\n"]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct TerminalResizeWindowGrid {
+    #[doc = " Requested height in rows, or 0 to keep the current height."]
+    pub rows: u16,
+    #[doc = " Requested width in columns, or 0 to keep the current width."]
+    pub columns: u16,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of TerminalResizeWindowGrid"]
+        [::std::mem::size_of::<TerminalResizeWindowGrid>() - 4usize];
+    ["Alignment of TerminalResizeWindowGrid"]
+        [::std::mem::align_of::<TerminalResizeWindowGrid>() - 2usize];
+    ["Offset of field: TerminalResizeWindowGrid::rows"]
+        [::std::mem::offset_of!(TerminalResizeWindowGrid, rows) - 0usize];
+    ["Offset of field: TerminalResizeWindowGrid::columns"]
+        [::std::mem::offset_of!(TerminalResizeWindowGrid, columns) - 2usize];
+};
+#[doc = " Window resize request value.\n"]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union TerminalResizeWindowValue {
+    #[doc = " Size in rows and columns (GHOSTTY_TERMINAL_RESIZE_WINDOW_GRID)."]
+    pub grid: TerminalResizeWindowGrid,
+    #[doc = " Padding for ABI compatibility. Do not use."]
+    pub _padding: [u64; 2usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of TerminalResizeWindowValue"]
+        [::std::mem::size_of::<TerminalResizeWindowValue>() - 16usize];
+    ["Alignment of TerminalResizeWindowValue"]
+        [::std::mem::align_of::<TerminalResizeWindowValue>() - 8usize];
+    ["Offset of field: TerminalResizeWindowValue::grid"]
+        [::std::mem::offset_of!(TerminalResizeWindowValue, grid) - 0usize];
+    ["Offset of field: TerminalResizeWindowValue::_padding"]
+        [::std::mem::offset_of!(TerminalResizeWindowValue, _padding) - 0usize];
+};
+impl Default for TerminalResizeWindowValue {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " A request from the running program to resize the window.\n"]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TerminalResizeWindow {
+    pub tag: TerminalResizeWindowTag::Type,
+    pub value: TerminalResizeWindowValue,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of TerminalResizeWindow"][::std::mem::size_of::<TerminalResizeWindow>() - 24usize];
+    ["Alignment of TerminalResizeWindow"][::std::mem::align_of::<TerminalResizeWindow>() - 8usize];
+    ["Offset of field: TerminalResizeWindow::tag"]
+        [::std::mem::offset_of!(TerminalResizeWindow, tag) - 0usize];
+    ["Offset of field: TerminalResizeWindow::value"]
+        [::std::mem::offset_of!(TerminalResizeWindow, value) - 8usize];
+};
+impl Default for TerminalResizeWindow {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " Callback function type for window resize requests.\n\n Called synchronously when the running program asks to resize the window,\n such as with CSI 8 ; rows ; columns t. Check `request->tag` first, because\n more kinds of requests may be reported in later versions. The terminal is\n not resized by this: the embedder decides whether to allow the request,\n and if so resizes its window and the terminal. Letting any\n program resize the window is a nuisance at best, so consider making this\n opt-in for users.\n\n"]
+pub type TerminalResizeWindowFn = ::std::option::Option<
+    unsafe extern "C" fn(
+        terminal: Terminal,
+        userdata: *mut ::std::os::raw::c_void,
+        request: *const TerminalResizeWindow,
+    ),
+>;
 #[doc = " Callback function type for color scheme queries (CSI ? 996 n).\n\n Called when the terminal receives a color scheme device status report\n query. Return true and fill *out_scheme with the current color scheme,\n or return false to silently ignore the query.\n\n"]
 pub type TerminalColorSchemeFn = ::std::option::Option<
     unsafe extern "C" fn(
@@ -2837,7 +3333,7 @@ pub type TerminalDeviceAttributesFn = ::std::option::Option<
 pub type TerminalEnquiryFn = ::std::option::Option<
     unsafe extern "C" fn(terminal: Terminal, userdata: *mut ::std::os::raw::c_void) -> String,
 >;
-#[doc = " Callback function type for terminal size reports.\n\n Called in response to XTWINOPS size queries (CSI 14/16/18 t) and when VT\n input enables in-band size reports (mode 2048).\n Return true and fill *out_size with the current terminal geometry,\n or return false to suppress the report.\n\n mode 2048 report\n"]
+#[doc = " Callback function type for terminal size reports.\n\n Called in response to XTWINOPS size queries (CSI 14/16/18/19 t) and when VT\n input enables in-band size reports (mode 2048).\n Return true and fill *out_size with the current terminal geometry,\n or return false to suppress the report.\n\n mode 2048 report\n"]
 pub type TerminalSizeFn = ::std::option::Option<
     unsafe extern "C" fn(
         terminal: Terminal,
@@ -2903,7 +3399,7 @@ pub mod TerminalOption {
     pub const XTVERSION: Type = 4;
     #[doc = " Callback invoked when the terminal title changes via escape\n sequences (e.g. OSC 0 or OSC 2). Set to NULL to ignore title\n change events.\n\n Input type: GhosttyTerminalTitleChangedFn"]
     pub const TITLE_CHANGED: Type = 5;
-    #[doc = " Callback invoked in response to XTWINOPS size queries\n (CSI 14/16/18 t). Set to NULL to silently ignore size queries.\n\n Input type: GhosttyTerminalSizeFn"]
+    #[doc = " Callback invoked in response to XTWINOPS size queries\n (CSI 14/16/18/19 t). Set to NULL to silently ignore size queries.\n\n Input type: GhosttyTerminalSizeFn"]
     pub const SIZE: Type = 6;
     #[doc = " Callback invoked in response to a color scheme device status\n report query (CSI ? 996 n). Return true and fill the out pointer\n to report the current scheme, or return false to silently ignore.\n Set to NULL to ignore color scheme queries.\n\n Input type: GhosttyTerminalColorSchemeFn"]
     pub const COLOR_SCHEME: Type = 7;
@@ -2957,13 +3453,13 @@ pub mod TerminalOption {
     pub const CONTINUATION_MAX_BYTES: Type = 31;
     #[doc = " Enable window title reports in response to CSI 21 t.\n\n This is disabled by default because a running program can set a title and\n query it back into the pty input stream, potentially injecting commands\n that execute after user interaction. Passing NULL or a pointer to false\n disables title reporting.\n\n Input type: bool*"]
     pub const TITLE_REPORT: Type = 32;
-    #[doc = " Set the reset default for a terminal mode.\n\n This unconditionally updates both the current value and the value restored\n by a full terminal reset (RIS).\n\n Some recognized modes represent transitions or mirror additional terminal\n state and cannot safely be configured as reset defaults. Those modes return\n GHOSTTY_INVALID_VALUE. A NULL value pointer also returns\n GHOSTTY_INVALID_VALUE.\n\n Input type: GhosttyTerminalModeConfig*"]
+    #[doc = " Set the reset default for a terminal mode.\n\n This unconditionally updates both the current value and the value restored\n by a terminal reset. RIS restores every mode, and DECSTR only a subset.\n\n Some recognized modes represent transitions or mirror additional terminal\n state and cannot safely be configured as reset defaults. Those modes return\n GHOSTTY_INVALID_VALUE. A NULL value pointer also returns\n GHOSTTY_INVALID_VALUE.\n\n Input type: GhosttyTerminalModeConfig*"]
     pub const MODE_DEFAULT: Type = 33;
-    #[doc = " Set the current value of a terminal mode.\n\n This does not change the value restored by a full terminal reset (RIS).\n A NULL value pointer or unknown mode returns GHOSTTY_INVALID_VALUE.\n\n Input type: GhosttyTerminalModeConfig*"]
+    #[doc = " Set the current value of a terminal mode.\n\n This does not change the value restored by a reset (RIS or DECSTR).\n A NULL value pointer or unknown mode returns GHOSTTY_INVALID_VALUE.\n\n Input type: GhosttyTerminalModeConfig*"]
     pub const MODE: Type = 34;
-    #[doc = " Callback invoked for unsupported terminal sequence identifiers. Set to\n NULL to ignore unsupported sequences. Capture must also be enabled with\n GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES.\n\n Input type: GhosttyTerminalUnknownSequenceFn"]
+    #[doc = " Callback for escape sequences that libghostty-vt does not implement.\n Set to NULL to stop receiving them.\n\n GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES must also be set, or the\n callback is never called. See the Unsupported Sequences section of the\n terminal documentation for an example.\n\n Input type: GhosttyTerminalUnknownSequenceFn"]
     pub const UNKNOWN_SEQUENCE: Type = 35;
-    #[doc = " Set the maximum content bytes retained for each unsupported terminal\n sequence. A NULL value pointer or zero disables capture and prevents\n unknown-sequence callbacks.\n\n When this limit is hit, the unknown sequence callback will still\n be invoked but `truncated` will be set to true.\n\n Input type: size_t*"]
+    #[doc = " The most bytes of each unsupported sequence to keep and pass to the\n GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE callback. The same limit applies\n to APC and OSC sequences.\n\n Zero, the default, turns unsupported sequence reporting off. A NULL\n value pointer also sets it to zero.\n\n A sequence longer than the limit is still reported. Its content holds\n the first bytes up to the limit, and `truncated` is true.\n\n Choose a limit that fits the largest sequence you expect. Unknown OSC\n sequences up to 2048 bytes are kept in a buffer the terminal already\n owns, so limits up to 2048 add no memory allocations for OSC. Larger\n limits allocate memory for each unknown OSC sequence. Unknown APC\n sequences are always kept in allocated memory.\n\n Input type: size_t*"]
     pub const UNKNOWN_MAX_BYTES: Type = 36;
     #[doc = " Set the name of the terminfo entry this terminal runs as, reported\n in response to an XTGETTCAP query for \"TN\" (e.g. \"xterm-256color\").\n\n The string data is copied into the terminal. A NULL value pointer\n clears the name (equivalent to setting an empty string). A name\n longer than 128 bytes returns GHOSTTY_INVALID_VALUE.\n\n If this is unset then we don't report anything for an XTGETTCAP\n TN query, because we don't know what the embedding terminal around\n libghostty is advertising itself as.\n\n Input type: GhosttyString*"]
     pub const TERMINFO_NAME: Type = 37;
@@ -2975,7 +3471,19 @@ pub mod TerminalOption {
     pub const RESIZE_PULL_SCROLLBACK: Type = 40;
     #[doc = " Callback invoked when the running program asks the terminal to\n stop updating the screen and when it allows updates again. Today\n this is driven by synchronized output (mode 2026). Set to NULL to\n ignore these events.\n\n See GhosttyTerminalRenderHoldFn for how to use this in a renderer.\n\n Input type: GhosttyTerminalRenderHoldFn"]
     pub const RENDER_HOLD: Type = 41;
-    #[doc = " Callback invoked when the running program asks the terminal to\n stop updating the screen and when it allows updates again. Today\n this is driven by synchronized output (mode 2026). Set to NULL to\n ignore these events.\n\n See GhosttyTerminalRenderHoldFn for how to use this in a renderer.\n\n Input type: GhosttyTerminalRenderHoldFn"]
+    #[doc = " Callback invoked when the shell reports a step of a command: a prompt\n starts, input starts, output starts, or the command ends. Set to NULL\n to ignore these events.\n\n Input type: GhosttyTerminalSemanticPromptFn"]
+    pub const SEMANTIC_PROMPT: Type = 42;
+    #[doc = " Callback invoked after the running program performs a full reset\n (RIS, ESC c). Set to NULL to ignore resets.\n\n Input type: GhosttyTerminalResetFn"]
+    pub const RESET: Type = 43;
+    #[doc = " Enable checksum reports in response to DECRQCRA (CSI Pi ; Pg ; Pt ; Pl ;\n Pb ; Pr * y).\n\n This is disabled by default because a running program can checksum the\n screen one cell at a time and so read back everything on it, including\n output from other programs. Passing NULL or a pointer to false disables\n checksum reporting.\n\n While this is disabled, XTCHECKSUM (CSI Ps # y), which changes how the\n checksum is calculated, is ignored as well.\n\n Input type: bool*"]
+    pub const XT_CHECKSUM_REPORT: Type = 44;
+    #[doc = " Set how the DECRQCRA checksum is calculated after a reset (RIS or DECSTR).\n This also changes the current calculation.\n\n The value holds the same bits as XTCHECKSUM (CSI Ps # y) and xterm's\n checksumExtension resource, which a running program can still use to\n change the calculation until the next reset:\n\n   - 1: don't negate the result\n   - 2: don't add the video attributes of each cell\n   - 4: don't omit blanks\n   - 8: count cells that were never written to as spaces\n   - 16: use full codepoints instead of the DEC 8-bit values\n\n Zero, or passing NULL, is the calculation of a real DEC terminal.\n Values above 31 return GHOSTTY_INVALID_VALUE.\n\n Input type: uint8_t*"]
+    pub const XT_CHECKSUM_EXTENSION: Type = 45;
+    #[doc = " Callback invoked when the running program sends a program status\n report via OSC 7501. Set to NULL to ignore these reports.\n\n Programs may ask whether the terminal supports the protocol by\n sending `OSC 7501 ; ?`. While this callback is set, the terminal\n answers through GHOSTTY_TERMINAL_OPT_WRITE_PTY with `?` followed by\n the states and kinds it accepts:\n\n program:  ESC ] 7501 ; ? ST\n terminal: ESC ] 7501 ; ?:states=idle,working,done,blocked,error:kinds=permission,question,auth ST\n\n While this callback is NULL, the query gets no reply, so a program\n that asks sees the protocol as unsupported. Asking is optional, so\n programs may send reports anyway. Those are dropped. Set a write_pty\n callback too, or programs never see the reply.\n\n Input type: GhosttyTerminalProgramStatusFn"]
+    pub const PROGRAM_STATUS: Type = 46;
+    #[doc = " Callback invoked when the running program asks to resize the window,\n such as with CSI 8 ; rows ; columns t. Set to NULL to ignore resize\n requests.\n\n Input type: GhosttyTerminalResizeWindowFn"]
+    pub const RESIZE_WINDOW: Type = 47;
+    #[doc = " Callback invoked when the running program asks to resize the window,\n such as with CSI 8 ; rows ; columns t. Set to NULL to ignore resize\n requests.\n\n Input type: GhosttyTerminalResizeWindowFn"]
     pub const MAX_VALUE: Type = 2147483647;
 }
 pub mod TerminalData {
@@ -3063,7 +3571,11 @@ pub mod TerminalData {
     pub const CURSOR_AT_PROMPT: Type = 39;
     #[doc = " The configured maximum decoded bytes per Kitty clipboard protocol\n (OSC 5522) write transaction. See\n GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES.\n\n Output type: size_t *"]
     pub const CLIPBOARD_WRITE_MAX_BYTES: Type = 40;
-    #[doc = " The configured maximum decoded bytes per Kitty clipboard protocol\n (OSC 5522) write transaction. See\n GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES.\n\n Output type: size_t *"]
+    #[doc = " The mouse pointer shape requested by the application through OSC 22.\n\n Initially GHOSTTY_MOUSE_SHAPE_TEXT. Excludes host hover overrides.\n\n Output type: GhosttyMouseShape *"]
+    pub const MOUSE_SHAPE: Type = 41;
+    #[doc = " How much memory the terminal holds. See GhosttyTerminalMemoryUsage\n for what each field means.\n\n Set the struct's `size` field before the call, for example with\n GHOSTTY_INIT_SIZED(). If `size` is too small, this returns\n GHOSTTY_INVALID_VALUE and leaves the struct unchanged.\n\n This never decompresses scrollback, but it does look at every page, so\n avoid reading it after every write.\n\n Output type: GhosttyTerminalMemoryUsage *"]
+    pub const MEMORY_USAGE: Type = 42;
+    #[doc = " How much memory the terminal holds. See GhosttyTerminalMemoryUsage\n for what each field means.\n\n Set the struct's `size` field before the call, for example with\n GHOSTTY_INIT_SIZED(). If `size` is too small, this returns\n GHOSTTY_INVALID_VALUE and leaves the struct unchanged.\n\n This never decompresses scrollback, but it does look at every page, so\n avoid reading it after every write.\n\n Output type: GhosttyTerminalMemoryUsage *"]
     pub const MAX_VALUE: Type = 2147483647;
 }
 unsafe extern "C" {
@@ -3084,7 +3596,7 @@ unsafe extern "C" {
     pub fn ghostty_terminal_reset(terminal: Terminal);
 }
 unsafe extern "C" {
-    #[doc = " Resize the terminal to the given dimensions.\n\n Changes the number of columns and rows in the terminal. The primary\n screen will reflow content if wraparound mode is enabled; the alternate\n screen does not reflow. If the dimensions are unchanged, this is a no-op.\n\n This also updates the terminal's pixel dimensions (used for image\n protocols and size reports), disables synchronized output mode (allowed\n by the spec so that resize results are shown immediately), and sends an\n in-band size report if mode 2048 is enabled.\n\n If synchronized output was enabled, the GHOSTTY_TERMINAL_OPT_RENDER_HOLD\n callback is invoked to report that the hold ended.\n\n"]
+    #[doc = " Resize the terminal to the given dimensions.\n\n Changes the number of columns and rows in the terminal. The primary\n screen will reflow content if wraparound mode is enabled; the alternate\n screen does not reflow. If the dimensions are unchanged, the grid is\n left as is, but everything below still applies.\n\n This also updates the terminal's pixel dimensions (used for image\n protocols and size reports), disables synchronized output mode (allowed\n by the spec so that resize results are shown immediately), and sends an\n in-band size report if mode 2048 is enabled.\n\n If synchronized output was enabled, the GHOSTTY_TERMINAL_OPT_RENDER_HOLD\n callback is invoked to report that the hold ended.\n\n"]
     pub fn ghostty_terminal_resize(
         terminal: Terminal,
         cols: u16,
@@ -3137,7 +3649,7 @@ unsafe extern "C" {
     ) -> Result::Type;
 }
 unsafe extern "C" {
-    #[doc = " Scroll the terminal viewport.\n\n Scrolls the terminal's viewport according to the given behavior.\n When using GHOSTTY_SCROLL_VIEWPORT_DELTA, set the delta field in\n the value union to specify the number of rows to scroll (negative\n for up, positive for down). When using GHOSTTY_SCROLL_VIEWPORT_ROW,\n set the row field to the absolute row offset from the top of the\n scrollable area (the same row space as the offset field of\n GhosttyTerminalScrollbar). For other behaviors, the value is ignored.\n\n"]
+    #[doc = " Scroll the terminal viewport.\n\n Scrolls the terminal's viewport according to the given behavior.\n When using GHOSTTY_SCROLL_VIEWPORT_DELTA, set the delta field in\n the value union to specify the number of rows to scroll (negative\n for up, positive for down). When using GHOSTTY_SCROLL_VIEWPORT_ROW,\n set the row field to the absolute row offset from the top of the\n scrollable area (the same row space as the offset field of\n GhosttyTerminalScrollbar). When using\n GHOSTTY_SCROLL_VIEWPORT_DELTA_PROMPT, set delta_prompt to the signed\n number of prompts to move. See GHOSTTY_SCROLL_VIEWPORT_DELTA_PROMPT for\n the navigation behavior. For other behaviors, the value is ignored.\n\n"]
     pub fn ghostty_terminal_scroll_viewport(terminal: Terminal, behavior: TerminalScrollViewport);
 }
 unsafe extern "C" {
@@ -3829,80 +4341,6 @@ unsafe extern "C" {
         out_ref: *mut GridRef,
     ) -> Result::Type;
 }
-pub mod OscCommandType {
-    #[doc = " OSC command types.\n"]
-    pub type Type = ::std::os::raw::c_int;
-    pub const INVALID: Type = 0;
-    pub const CHANGE_WINDOW_TITLE: Type = 1;
-    pub const CHANGE_WINDOW_ICON: Type = 2;
-    pub const SEMANTIC_PROMPT: Type = 3;
-    pub const CLIPBOARD_CONTENTS: Type = 4;
-    pub const REPORT_PWD: Type = 5;
-    pub const MOUSE_SHAPE: Type = 6;
-    pub const COLOR_OPERATION: Type = 7;
-    pub const KITTY_COLOR_PROTOCOL: Type = 8;
-    pub const SHOW_DESKTOP_NOTIFICATION: Type = 9;
-    pub const HYPERLINK_START: Type = 10;
-    pub const HYPERLINK_END: Type = 11;
-    pub const CONEMU_SLEEP: Type = 12;
-    pub const CONEMU_SHOW_MESSAGE_BOX: Type = 13;
-    pub const CONEMU_CHANGE_TAB_TITLE: Type = 14;
-    pub const CONEMU_PROGRESS_REPORT: Type = 15;
-    pub const CONEMU_WAIT_INPUT: Type = 16;
-    pub const CONEMU_GUIMACRO: Type = 17;
-    pub const CONEMU_RUN_PROCESS: Type = 18;
-    pub const CONEMU_OUTPUT_ENVIRONMENT_VARIABLE: Type = 19;
-    pub const CONEMU_XTERM_EMULATION: Type = 20;
-    pub const CONEMU_COMMENT: Type = 21;
-    pub const KITTY_TEXT_SIZING: Type = 22;
-    pub const KITTY_CLIPBOARD_PROTOCOL: Type = 23;
-    pub const KITTY_DND_PROTOCOL: Type = 24;
-    pub const CONTEXT_SIGNAL: Type = 25;
-    pub const KITTY_DESKTOP_NOTIFICATION: Type = 26;
-    pub const TYPE_MAX_VALUE: Type = 2147483647;
-}
-pub mod OscCommandData {
-    #[doc = " OSC command data types.\n\n These values specify what type of data to extract from an OSC command\n using `ghostty_osc_command_data`.\n"]
-    pub type Type = ::std::os::raw::c_int;
-    #[doc = " Invalid data type. Never results in any data extraction."]
-    pub const INVALID: Type = 0;
-    #[doc = " Window title string data.\n\n Valid for: GHOSTTY_OSC_COMMAND_CHANGE_WINDOW_TITLE\n\n Output type: const char ** (pointer to null-terminated string)\n\n Lifetime: Valid until the next call to any ghostty_osc_* function with\n the same parser instance. Memory is owned by the parser."]
-    pub const CHANGE_WINDOW_TITLE_STR: Type = 1;
-    #[doc = " Window title string data.\n\n Valid for: GHOSTTY_OSC_COMMAND_CHANGE_WINDOW_TITLE\n\n Output type: const char ** (pointer to null-terminated string)\n\n Lifetime: Valid until the next call to any ghostty_osc_* function with\n the same parser instance. Memory is owned by the parser."]
-    pub const MAX_VALUE: Type = 2147483647;
-}
-unsafe extern "C" {
-    #[doc = " Create a new OSC parser instance.\n\n Creates a new OSC (Operating System Command) parser using the provided\n allocator. The parser must be freed using ghostty_vt_osc_free() when\n no longer needed.\n\n"]
-    pub fn ghostty_osc_new(allocator: *const Allocator, parser: *mut OscParser) -> Result::Type;
-}
-unsafe extern "C" {
-    #[doc = " Free an OSC parser instance.\n\n Releases all resources associated with the OSC parser. After this call,\n the parser handle becomes invalid and must not be used.\n\n"]
-    pub fn ghostty_osc_free(parser: OscParser);
-}
-unsafe extern "C" {
-    #[doc = " Reset an OSC parser instance to its initial state.\n\n Resets the parser state, clearing any partially parsed OSC sequences\n and returning the parser to its initial state. This is useful for\n reusing a parser instance or recovering from parse errors.\n\n"]
-    pub fn ghostty_osc_reset(parser: OscParser);
-}
-unsafe extern "C" {
-    #[doc = " Parse the next byte in an OSC sequence.\n\n Processes a single byte as part of an OSC sequence. The parser maintains\n internal state to track the progress through the sequence. Call this\n function for each byte in the sequence data.\n\n When finished pumping the parser with bytes, call ghostty_osc_end\n to get the final result.\n\n"]
-    pub fn ghostty_osc_next(parser: OscParser, byte: u8);
-}
-unsafe extern "C" {
-    #[doc = " Finalize OSC parsing and retrieve the parsed command.\n\n Call this function after feeding all bytes of an OSC sequence to the parser\n using ghostty_osc_next() with the exception of the terminating character\n (ESC or ST). This function finalizes the parsing process and returns the\n parsed OSC command.\n\n The return value is never NULL. Invalid commands will return a command\n with type GHOSTTY_OSC_COMMAND_INVALID.\n\n The terminator parameter specifies the byte that terminated the OSC sequence\n (typically 0x07 for BEL or 0x5C for ST after ESC). This information is\n preserved in the parsed command so that responses can use the same terminator\n format for better compatibility with the calling program. For commands that\n do not require a response, this parameter is ignored and the resulting\n command will not retain the terminator information.\n\n The returned command handle is valid until the next call to any\n `ghostty_osc_*` function with the same parser instance with the exception\n of command introspection functions such as `ghostty_osc_command_type`.\n\n"]
-    pub fn ghostty_osc_end(parser: OscParser, terminator: u8) -> OscCommand;
-}
-unsafe extern "C" {
-    #[doc = " Get the type of an OSC command.\n\n Returns the type identifier for the given OSC command. This can be used\n to determine what kind of command was parsed and what data might be\n available from it.\n\n"]
-    pub fn ghostty_osc_command_type(command: OscCommand) -> OscCommandType::Type;
-}
-unsafe extern "C" {
-    #[doc = " Extract data from an OSC command.\n\n Extracts typed data from the given OSC command based on the specified\n data type. The output pointer must be of the appropriate type for the\n requested data kind. Valid command types, output types, and memory\n safety information are documented in the `GhosttyOscCommandData` enum.\n\n"]
-    pub fn ghostty_osc_command_data(
-        command: OscCommand,
-        data: OscCommandData::Type,
-        out: *mut ::std::os::raw::c_void,
-    ) -> bool;
-}
 pub mod SgrAttributeTag {
     #[doc = " SGR attribute tags.\n\n These values identify the type of an SGR attribute in a tagged union.\n Use the tag to determine which field in the attribute value union to access.\n"]
     pub type Type = ::std::os::raw::c_int;
@@ -4103,7 +4541,7 @@ unsafe extern "C" {
     #[doc = " Get the value from an SGR attribute.\n\n This function returns a pointer to the value union from an SGR attribute. Use\n the tag to determine which field of the union is valid. Primarily useful in\n WebAssembly environments where accessing struct fields directly is difficult.\n\n"]
     pub fn ghostty_sgr_attribute_value(attr: *mut SgrAttribute) -> *mut SgrAttributeValue;
 }
-#[doc = " Result of decoding an image.\n\n The `data` buffer must be allocated through the allocator provided to\n the decode callback. The library takes ownership and will free it\n with the same allocator."]
+#[doc = " A decoded image, filled in by a decode callback such as\n GhosttySysDecodePngFn.\n\n Pixels are 8-bit RGBA: four bytes per pixel, stored row by row starting\n at the top-left corner, with no padding between rows. A complete image\n is therefore `width * height * 4` bytes long.\n\n The pixel buffer must be allocated with the allocator passed to the\n decode callback. When the callback returns true, the library takes\n ownership of the buffer and frees it with that same allocator."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct SysImage {
@@ -4111,9 +4549,9 @@ pub struct SysImage {
     pub width: u32,
     #[doc = " Image height in pixels."]
     pub height: u32,
-    #[doc = " Pointer to the decoded RGBA pixel data."]
+    #[doc = " The decoded RGBA pixels, allocated with the allocator passed to\n the decode callback."]
     pub data: *mut u8,
-    #[doc = " Length of the pixel data in bytes."]
+    #[doc = " Length of `data` in bytes. This must be the exact size that was\n requested from the allocator, because the library uses it to free\n the buffer."]
     pub data_len: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -4154,7 +4592,7 @@ pub type SysLogFn = ::std::option::Option<
         message_len: usize,
     ),
 >;
-#[doc = " Callback type for PNG decoding.\n\n Decodes raw PNG data into RGBA pixels. The output pixel data must be\n allocated through the provided allocator. The library takes ownership\n of the buffer and will free it with the same allocator.\n"]
+#[doc = " Callback type for PNG decoding.\n\n The library calls this when it receives a PNG image and needs the raw\n pixels. The callback decodes the PNG bytes in @p data and describes\n the result in @p out. See the example in the @ref sys overview for a\n complete callback.\n\n ### On success\n\n Allocate the pixel buffer with ghostty_alloc() and @p allocator, write\n the decoded pixels into it, set all four fields of @p out, and return\n true. The library then owns the buffer and frees it with the same\n allocator. See GhosttySysImage for the expected pixel layout.\n\n The allocator limits how much memory a single image may use, so\n ghostty_alloc() can return NULL for very large images. Treat that as\n a failure.\n\n ### On failure\n\n Free anything that was allocated and return false. The library does\n not read @p out in this case, and the image is rejected.\n\n ### The output struct starts zeroed\n\n The library sets every field of @p out to zero before it calls the\n callback. This has two practical effects:\n\n - If the callback returns true but `data` is still NULL, the library\n   treats the call as a failure.\n - Language bindings can store a pointer into @p out directly. Some\n   runtimes, such as Go, require memory to be initialized before a\n   pointer is written into it, and this guarantee satisfies that\n   requirement.\n\n Only @p out is zeroed. Memory returned by ghostty_alloc() is not.\n\n callback.\n\n                  call, and filled in by the callback on success.\n         false on failure"]
 pub type SysDecodePngFn = ::std::option::Option<
     unsafe extern "C" fn(
         userdata: *mut ::std::os::raw::c_void,
@@ -4784,6 +5222,45 @@ unsafe extern "C" {
         out_len: *mut usize,
     ) -> Result::Type;
 }
+pub mod MouseShape {
+    #[doc = " Mouse pointer shapes based on the W3C cursor names.\n\n Hosts map these values to their native pointer shapes; not every platform\n supports every shape. These are pointer shapes, not terminal text cursors.\n"]
+    pub type Type = ::std::os::raw::c_int;
+    pub const DEFAULT: Type = 0;
+    pub const CONTEXT_MENU: Type = 1;
+    pub const HELP: Type = 2;
+    pub const POINTER: Type = 3;
+    pub const PROGRESS: Type = 4;
+    pub const WAIT: Type = 5;
+    pub const CELL: Type = 6;
+    pub const CROSSHAIR: Type = 7;
+    pub const TEXT: Type = 8;
+    pub const VERTICAL_TEXT: Type = 9;
+    pub const ALIAS: Type = 10;
+    pub const COPY: Type = 11;
+    pub const MOVE: Type = 12;
+    pub const NO_DROP: Type = 13;
+    pub const NOT_ALLOWED: Type = 14;
+    pub const GRAB: Type = 15;
+    pub const GRABBING: Type = 16;
+    pub const ALL_SCROLL: Type = 17;
+    pub const COL_RESIZE: Type = 18;
+    pub const ROW_RESIZE: Type = 19;
+    pub const N_RESIZE: Type = 20;
+    pub const E_RESIZE: Type = 21;
+    pub const S_RESIZE: Type = 22;
+    pub const W_RESIZE: Type = 23;
+    pub const NE_RESIZE: Type = 24;
+    pub const NW_RESIZE: Type = 25;
+    pub const SE_RESIZE: Type = 26;
+    pub const SW_RESIZE: Type = 27;
+    pub const EW_RESIZE: Type = 28;
+    pub const NS_RESIZE: Type = 29;
+    pub const NESW_RESIZE: Type = 30;
+    pub const NWSE_RESIZE: Type = 31;
+    pub const ZOOM_IN: Type = 32;
+    pub const ZOOM_OUT: Type = 33;
+    pub const MAX_VALUE: Type = 2147483647;
+}
 pub mod PasteSource {
     #[doc = " Why a paste happened."]
     pub type Type = ::std::os::raw::c_int;
@@ -4928,7 +5405,7 @@ unsafe extern "C" {
     pub fn ghostty_search_free(search: Search);
 }
 unsafe extern "C" {
-    #[doc = " Make a bounded amount of search progress.\n\n This only works on data the search has already copied and never\n reads the terminal, so it is safe to call while another thread\n modifies the terminal. Call it in a loop while the status is\n GHOSTTY_SEARCH_STATUS_RUNNING. When the status becomes\n GHOSTTY_SEARCH_STATUS_FEED_REQUIRED, call ghostty_search_feed() to\n unblock it.\n\n         search is NULL\n"]
+    #[doc = " Make a bounded amount of search progress.\n\n This only works on data the search has already copied and never\n reads the terminal, so it is safe to call while another thread\n modifies the terminal. Call it in a loop while the status is\n GHOSTTY_SEARCH_STATUS_RUNNING. When the status becomes\n GHOSTTY_SEARCH_STATUS_FEED_REQUIRED, call ghostty_search_feed() to\n unblock it.\n\n         search is NULL or the terminal was freed\n"]
     pub fn ghostty_search_tick(search: Search, out_status: *mut SearchStatus::Type)
     -> Result::Type;
 }
@@ -4973,7 +5450,9 @@ pub mod SnapshotDecoderOption {
     pub const MAX_CONTINUATION_BYTES: Type = 0;
     #[doc = " Retain the decoded continuation on the returned terminal.\n\n When true, terminals returned by ghostty_snapshot_decoder_ready() and\n ghostty_snapshot_decoder_decode() use\n GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES as their continuation\n tracking limit. The existing ghostty_terminal_continuation_* APIs can then\n export the exact unfinished VT or UTF-8 input restored from the snapshot.\n\n This is false by default. A maximum continuation size of zero leaves\n tracking disabled. With a nonzero maximum, tracking remains enabled even\n when the decoded continuation is empty. Exporting an empty continuation\n does not disable it. Callers that do not need ongoing tracking must still\n set GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES to zero after export and\n before writing post-snapshot input.\n\n Input type: bool *"]
     pub const RETAIN_CONTINUATION: Type = 1;
-    #[doc = " Retain the decoded continuation on the returned terminal.\n\n When true, terminals returned by ghostty_snapshot_decoder_ready() and\n ghostty_snapshot_decoder_decode() use\n GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES as their continuation\n tracking limit. The existing ghostty_terminal_continuation_* APIs can then\n export the exact unfinished VT or UTF-8 input restored from the snapshot.\n\n This is false by default. A maximum continuation size of zero leaves\n tracking disabled. With a nonzero maximum, tracking remains enabled even\n when the decoded continuation is empty. Exporting an empty continuation\n does not disable it. Callers that do not need ongoing tracking must still\n set GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES to zero after export and\n before writing post-snapshot input.\n\n Input type: bool *"]
+    #[doc = " Compress scrollback history while it is restored.\n\n By default, restoring a snapshot leaves all of its scrollback history\n uncompressed, even if the terminal that produced the snapshot had\n compressed it. The history stays that size until the application calls\n ghostty_terminal_compress(). For a terminal with a lot of scrollback,\n that can be many times more memory than the terminal needed before.\n\n When this option is true, the decoder compresses each history page right\n after restoring it. The restored terminal starts out compressed, and the\n decode never holds more than one uncompressed history page at a time.\n The result is the same as decoding normally and then calling\n ghostty_terminal_compress() with GHOSTTY_TERMINAL_COMPRESSION_MODE_FULL,\n without the memory spike in between.\n\n A history page that is on screen when it is restored stays uncompressed.\n This only happens if the viewport is scrolled to the top of the\n scrollback during an incremental decode. Compressed history is\n uncompressed automatically when it is accessed later, for example by\n scrolling or searching.\n\n This only changes how the restored terminal stores its history in\n memory. The snapshot format is unchanged, so it works with any snapshot.\n On platforms that do not support scrollback compression, this option is\n accepted and has no effect.\n\n This is false by default.\n\n Input type: bool *"]
+    pub const COMPRESS_HISTORY: Type = 2;
+    #[doc = " Compress scrollback history while it is restored.\n\n By default, restoring a snapshot leaves all of its scrollback history\n uncompressed, even if the terminal that produced the snapshot had\n compressed it. The history stays that size until the application calls\n ghostty_terminal_compress(). For a terminal with a lot of scrollback,\n that can be many times more memory than the terminal needed before.\n\n When this option is true, the decoder compresses each history page right\n after restoring it. The restored terminal starts out compressed, and the\n decode never holds more than one uncompressed history page at a time.\n The result is the same as decoding normally and then calling\n ghostty_terminal_compress() with GHOSTTY_TERMINAL_COMPRESSION_MODE_FULL,\n without the memory spike in between.\n\n A history page that is on screen when it is restored stays uncompressed.\n This only happens if the viewport is scrolled to the top of the\n scrollback during an incremental decode. Compressed history is\n uncompressed automatically when it is accessed later, for example by\n scrolling or searching.\n\n This only changes how the restored terminal stores its history in\n memory. The snapshot format is unchanged, so it works with any snapshot.\n On platforms that do not support scrollback compression, this option is\n accepted and has no effect.\n\n This is false by default.\n\n Input type: bool *"]
     pub const MAX_VALUE: Type = 2147483647;
 }
 pub mod SnapshotDecoderData {
@@ -4997,7 +5476,9 @@ pub mod SnapshotDecoderData {
     pub const PROGRESS_REMAINING: Type = 7;
     #[doc = " Whether decoded continuation tracking is retained on returned terminals.\n\n This value is available in every non-failed decoder state.\n\n Output type: bool *"]
     pub const RETAIN_CONTINUATION: Type = 8;
-    #[doc = " Whether decoded continuation tracking is retained on returned terminals.\n\n This value is available in every non-failed decoder state.\n\n Output type: bool *"]
+    #[doc = " Whether history is compressed while it is restored.\n\n See GHOSTTY_SNAPSHOT_DECODER_OPT_COMPRESS_HISTORY. This value is\n available in every non-failed decoder state.\n\n Output type: bool *"]
+    pub const COMPRESS_HISTORY: Type = 9;
+    #[doc = " Whether history is compressed while it is restored.\n\n See GHOSTTY_SNAPSHOT_DECODER_OPT_COMPRESS_HISTORY. This value is\n available in every non-failed decoder state.\n\n Output type: bool *"]
     pub const MAX_VALUE: Type = 2147483647;
 }
 unsafe extern "C" {
@@ -5059,7 +5540,7 @@ unsafe extern "C" {
     ) -> Result::Type;
 }
 unsafe extern "C" {
-    #[doc = " Decode one history page into the terminal returned by READY.\n\n Each GHOSTTY_SUCCESS consumes and validates one PAGE record. Query the\n GHOSTTY_SNAPSHOT_DECODER_DATA_PROGRESS_* values before calling next again.\n GHOSTTY_NO_VALUE means FINISH was validated; repeated calls after FINISH\n also return GHOSTTY_NO_VALUE.\n\n The terminal may be rendered, resized, and fed live PTY input between calls.\n If a history page can no longer be applied safely, it is still consumed and\n validated and progress reports zero rows. The decoder applies history\n to the caller-owned terminal produced by its READY operation.\n\n A decoding error invalidates the decoder's source position. The terminal\n remains caller-owned and usable with its already-restored history, but only\n ghostty_snapshot_decoder_free() may subsequently be called on the decoder.\n\n         error code on failure\n"]
+    #[doc = " Decode one history page into the terminal returned by READY.\n\n Each GHOSTTY_SUCCESS consumes and validates one PAGE record. Query the\n GHOSTTY_SNAPSHOT_DECODER_DATA_PROGRESS_* values before calling next again.\n GHOSTTY_NO_VALUE means FINISH was validated; repeated calls after FINISH\n also return GHOSTTY_NO_VALUE.\n\n The terminal may be rendered, resized, and fed live PTY input between calls.\n If a history page can no longer be applied safely, it is still consumed and\n validated and progress reports zero rows. The decoder applies history\n to the caller-owned terminal produced by its READY operation.\n\n If GHOSTTY_SNAPSHOT_DECODER_OPT_COMPRESS_HISTORY is true, the page is\n compressed before this function returns, unless it is visible in the\n terminal's viewport.\n\n A decoding error invalidates the decoder's source position. The terminal\n remains caller-owned and usable with its already-restored history, but only\n ghostty_snapshot_decoder_free() may subsequently be called on the decoder.\n\n         error code on failure\n"]
     pub fn ghostty_snapshot_decoder_next(decoder: SnapshotDecoder) -> Result::Type;
 }
 unsafe extern "C" {

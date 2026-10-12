@@ -1782,11 +1782,20 @@ fn osc52_is_forwarded_once() {
 #[test]
 fn program_status_records() {
     let mut t = term(20, 5);
+    // The support query is answered with what this terminal accepts, in the query's terminator.
+    let reply = |t: &mut Terminal| {
+        t.drain_events().into_iter().find_map(|e| match e {
+            TermEvent::PtyWrite(b) if b.starts_with(b"\x1b]7501;?:states=") => Some(b),
+            _ => None,
+        })
+    };
     t.advance(b"\x1b]7501;?\x1b\\");
-    assert!(
-        t.drain_events()
-            .contains(&TermEvent::PtyWrite(b"\x1b]7501;?\x1b\\".to_vec()))
-    );
+    assert!(reply(&mut t).is_some_and(|b| b.ends_with(b"\x1b\\")));
+    t.advance(b"\x1b]7501;?\x07");
+    assert!(reply(&mut t).is_some_and(|b| b.ends_with(b"\x07")));
+    // Clients' copies of the pane don't get reports.
+    assert_eq!(t.advance_forward(b"a\x1b]7501;state=idle\x07b"), b"ab");
+    t.drain_events();
     // Not part of the screen, and with the BEL terminator too.
     t.advance(b"\x1b]7501;state=working:app=brew\x07\x1b]7501;state=done:id=x\x1b\\");
     let ids =
