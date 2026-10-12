@@ -198,6 +198,17 @@ struct ProgressReport: Equatable {
 }
 
 /// Swift view of `thurm_proto::PaneInfo`.
+/// A foreground process the daemon recognized (`[[programs.define]]`).
+struct ProgramMatch: Hashable {
+    var id: String
+    var name: String
+    /// A kind of program ("editor"), a mark ("neovim"), or an SF Symbol name.
+    var icon: String
+    /// The sidebar tile's color (none: the neutral tile), and the icon's on it.
+    var color: UInt32?
+    var ink: UInt32?
+}
+
 struct PaneInfo {
     var id: UInt64
     /// The daemon it came from.
@@ -207,6 +218,8 @@ struct PaneInfo {
     /// The pane's process (its shell).
     var pid: UInt32?
     var foregroundName: String?
+    /// The known program in the foreground (Neovim, Node).
+    var program: ProgramMatch?
     var agent: AgentState?
     var alive: Bool
     var passwordInput: Bool
@@ -226,6 +239,13 @@ struct PaneInfo {
             foregroundName = jsonString(fg["name"])
         } else {
             foregroundName = nil
+        }
+        if let p = d["program"] as? [String: Any], let id = jsonString(p["id"]) {
+            program = ProgramMatch(id: id, name: jsonString(p["name"]) ?? id, icon: jsonString(p["icon"]) ?? "",
+                                   color: (p["color"] as? NSNumber)?.uint32Value,
+                                   ink: (p["ink"] as? NSNumber)?.uint32Value)
+        } else {
+            program = nil
         }
         if let a = d["agent"] as? [String: Any],
            let statusName = jsonString(a["status"]),

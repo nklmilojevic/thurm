@@ -4,8 +4,9 @@ import AppKit
 /// a small app-style tile.
 enum PaneIcon: Equatable {
     case shell
-    /// A program other than the shell in the foreground (htop, vim, a dev server).
-    case program
+    /// A program other than the shell in the foreground: one the daemon recognized (Neovim,
+    /// htop), or any other (nil).
+    case program(ProgramMatch?)
     case claude
     case codex
     /// Any other coding agent.
@@ -16,7 +17,7 @@ enum PaneIcon: Equatable {
         case "claude"?: self = .claude
         case "codex"?: self = .codex
         case .some: self = .agent
-        case .none: self = info?.hasRunningProcess == true ? .program : .shell
+        case .none: self = info?.hasRunningProcess == true ? .program(info?.program) : .shell
         }
     }
 
@@ -32,10 +33,11 @@ enum PaneIcon: Equatable {
             }
         case .claude, .codex:
             image = Self.drawn(size) { rect in Self.logo(self, in: rect).fill() }
+        case .program(let p?) where Self.mark(p) != nil:
+            image = Self.drawn(size) { rect in Self.mark(p)?.fill(in: rect) }
         case .program, .agent:
-            let name = self == .program ? "gauge.with.dots.needle.33percent" : "sparkle"
             let config = NSImage.SymbolConfiguration(pointSize: size * 0.85, weight: .medium)
-            image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
                 .withSymbolConfiguration(config) ?? NSImage()
         }
         image.isTemplate = true
@@ -55,6 +57,9 @@ enum PaneIcon: Equatable {
             case .claude: (fill, ink) = (NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1), .white)
             case .codex: (fill, ink) = (.white, .black)
             case .agent: (fill, ink) = (NSColor(srgbRed: 0.35, green: 0.38, blue: 0.9, alpha: 1), .white)
+            case .program(let p?):
+                (fill, ink) = (p.color.map { colorFromRGB($0) } ?? NSColor(white: 0.1, alpha: 1),
+                               p.ink.map { colorFromRGB($0) } ?? NSColor(white: 0.88, alpha: 1))
             case .shell, .program: (fill, ink) = (NSColor(white: 0.1, alpha: 1), NSColor(srgbRed: 0.35, green: 0.85, blue: 0.4, alpha: 1))
             }
             fill.setFill()
@@ -65,13 +70,15 @@ enum PaneIcon: Equatable {
             let inner = rect.insetBy(dx: size * 0.22, dy: size * 0.22)
             ink.set()
             switch self {
+            case .program(let p?):
+                if let mark = Self.mark(p) {
+                    mark.fill(in: inner)
+                } else {
+                    Self.symbol(symbolName, in: inner, color: ink)
+                }
             case .shell, .program: Self.prompt(in: inner, lineWidth: max(1, size / 14)).stroke()
             case .claude, .codex: Self.logo(self, in: inner).fill()
-            case .agent:
-                let config = NSImage.SymbolConfiguration(pointSize: inner.width, weight: .semibold)
-                    .applying(.init(paletteColors: [ink]))
-                NSImage(systemSymbolName: "sparkle", accessibilityDescription: nil)?
-                    .withSymbolConfiguration(config)?.draw(in: inner)
+            case .agent: Self.symbol("sparkle", in: inner, color: ink)
             }
             return true
         }
@@ -104,6 +111,51 @@ enum PaneIcon: Equatable {
     }
 
     private static var cache: [String: NSImage] = [:]
+
+    /// SF Symbols for the kinds of program in `programs.rs`' `CATEGORIES`.
+    private static let categorySymbols: [String: String] = [
+        "editor": "square.and.pencil",
+        "runtime": "cube.fill",
+        "git": "plusminus.circle",
+        "build": "hammer",
+        "container": "shippingbox",
+        "cluster": "helm",
+        "database": "cylinder.split.1x2",
+        "monitor": "gauge.with.dots.needle.33percent",
+        "multiplexer": "rectangle.split.2x2",
+        "remote": "network",
+        "files": "folder",
+        "docs": "book",
+    ]
+
+    /// The SF Symbol drawn for programs (their kind's, or one the config names) and agents.
+    private var symbolName: String {
+        switch self {
+        case .program(let p?):
+            let name = Self.categorySymbols[p.icon] ?? p.icon
+            return NSImage(systemSymbolName: name, accessibilityDescription: nil) == nil
+                ? "gauge.with.dots.needle.33percent" : name
+        case .agent: return "sparkle"
+        default: return "gauge.with.dots.needle.33percent"
+        }
+    }
+
+    /// The program's own mark (Neovim's, Sofka's), if it has one.
+    private static func mark(_ p: ProgramMatch) -> NSBezierPath? {
+        SessionManager.shared.config.programMarks[p.icon].map(parse)
+    }
+
+    /// `name` in `color`, as large as fits `rect` without stretching.
+    private static func symbol(_ name: String, in rect: NSRect, color: NSColor) {
+        let config = NSImage.SymbolConfiguration(pointSize: rect.width, weight: .semibold)
+            .applying(.init(paletteColors: [color]))
+        guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config) else { return }
+        let scale = min(rect.width / image.size.width, rect.height / image.size.height)
+        let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+        image.draw(in: NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2,
+                              width: size.width, height: size.height))
+    }
 
     private static func drawn(_ size: CGFloat, _ draw: @escaping (NSRect) -> Void) -> NSImage {
         NSImage(size: NSSize(width: size, height: size), flipped: true) { rect in
@@ -138,7 +190,7 @@ enum PaneIcon: Equatable {
         return path
     }
 
-    /// Absolute M/L/C/Z path data, as the constants below hold it.
+    /// Absolute M/L/C/Z path data, as the constants below and the config's marks hold it.
     private static func parse(_ d: String) -> NSBezierPath {
         let path = NSBezierPath()
         let scanner = Scanner(string: d)
@@ -167,4 +219,15 @@ enum PaneIcon: Equatable {
 
     /// OpenAI's mark (Codex), from LobeHub Icons (MIT), arcs flattened to curves.
     private static let openAIPath = "M9.205 8.658L9.205 6.398C9.205 6.208 9.277 6.065 9.443 5.97L13.986 3.354C14.605 2.997 15.342 2.831 16.103 2.831C18.957 2.831 20.765 5.043 20.765 7.397C20.765 7.564 20.765 7.754 20.741 7.944L16.031 5.185C15.903 5.104 15.755 5.06 15.603 5.06C15.451 5.06 15.303 5.104 15.175 5.185L9.205 8.658ZM19.814 17.458L19.814 12.06C19.814 11.727 19.671 11.49 19.385 11.323L13.415 7.85L15.365 6.732C15.436 6.686 15.518 6.661 15.603 6.661C15.688 6.661 15.77 6.686 15.841 6.732L20.384 9.349C21.693 10.109 22.573 11.727 22.573 13.297C22.573 15.105 21.503 16.77 19.813 17.46ZM7.802 12.703L5.852 11.561C5.685 11.466 5.613 11.323 5.613 11.133L5.613 5.899C5.613 3.354 7.563 1.427 10.204 1.427C11.204 1.427 12.131 1.76 12.916 2.355L8.23 5.067C7.945 5.233 7.802 5.471 7.802 5.804L7.802 12.702ZM12 15.128L9.205 13.558L9.205 10.228L12 8.658L14.795 10.228L14.795 13.558L12 15.128ZM13.796 22.358C12.796 22.358 11.869 22.026 11.084 21.431L15.77 18.719C16.055 18.553 16.198 18.315 16.198 17.982L16.198 11.084L18.172 12.226C18.339 12.321 18.41 12.464 18.41 12.654L18.41 17.887C18.41 20.432 16.436 22.359 13.796 22.359ZM8.159 17.055L3.615 14.438C2.307 13.677 1.427 12.06 1.427 10.49C1.424 9.598 1.687 8.725 2.183 7.984C2.679 7.242 3.385 6.665 4.21 6.327L4.21 11.75C4.21 12.083 4.353 12.321 4.638 12.488L10.585 15.937L8.635 17.055C8.564 17.102 8.482 17.126 8.397 17.126C8.312 17.126 8.23 17.102 8.159 17.055ZM7.897 20.955C5.209 20.955 3.235 18.934 3.235 16.436C3.235 16.246 3.259 16.056 3.282 15.866L7.968 18.576C8.254 18.743 8.539 18.743 8.824 18.576L14.794 15.128L14.794 17.388C14.794 17.578 14.724 17.721 14.557 17.816L10.014 20.432C9.395 20.789 8.658 20.955 7.897 20.955ZM13.796 23.785C14.705 23.785 15.601 23.577 16.417 23.176C17.233 22.776 17.946 22.194 18.502 21.475C19.057 20.756 19.441 19.919 19.623 19.029C22.287 18.339 24 15.84 24 13.296C24 11.631 23.287 10.014 22.002 8.848C22.121 8.348 22.192 7.849 22.192 7.35C22.192 3.949 19.433 1.403 16.246 1.403C15.604 1.403 14.986 1.498 14.366 1.713C13.816 1.172 13.167 0.743 12.453 0.449C11.74 0.155 10.976 0.003 10.205 0C9.296 -0 8.399 0.208 7.584 0.609C6.768 1.009 6.055 1.591 5.499 2.311C4.943 3.03 4.56 3.867 4.378 4.757C1.713 5.447 0 7.945 0 10.49C0 12.156 0.713 13.773 1.998 14.938C1.879 15.438 1.808 15.938 1.808 16.437C1.808 19.838 4.567 22.383 7.754 22.383C8.396 22.383 9.014 22.288 9.634 22.074C10.184 22.615 10.834 23.045 11.547 23.338C12.261 23.632 13.024 23.784 13.796 23.787Z"
+}
+
+private extension NSBezierPath {
+    /// Fills this 24x24 path scaled into `rect`.
+    func fill(in rect: NSRect) {
+        guard let path = copy() as? NSBezierPath else { return }
+        var t = AffineTransform(translationByX: rect.minX, byY: rect.minY)
+        t.scale(rect.width / 24)
+        path.transform(using: t)
+        path.fill()
+    }
 }

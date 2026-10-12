@@ -180,6 +180,8 @@ final class AppConfig {
     var followsAppearance: Bool { themeLight != themeDark }
     var themes: [ThemeChoice] = []
     var agentPresets: [AgentPreset] = []
+    /// Programs with their own mark: 24x24 path data by icon id (`[programs]`).
+    var programMarks: [String: String] = [:]
     /// `[[remote]]` hosts, by name (connected in the background; see Remote.swift).
     var remoteNames: [String] = []
     var configPath = ""
@@ -226,6 +228,9 @@ final class AppConfig {
                 guard let name = jsonString(p["name"]) else { return nil }
                 return AgentPreset(name: name, command: (p["command"] as? [String]) ?? [])
             }
+        }
+        if let marks = root["program_icons"] as? [String: String] {
+            programMarks = marks
         }
         if let t = root["theme"] as? [String: Any] {
             self.theme = Theme(json: t)
