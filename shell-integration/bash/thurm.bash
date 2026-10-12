@@ -61,6 +61,14 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
     [[ "${BASH_COMMAND-}" == _thurm_prompt_start* ]] && return
     if [[ -z "$_thurm_executing" ]]; then
       _thurm_executing=1
+      # The command line (bash-preexec's, else the first command), which names the program
+      # it starts.
+      local line=${1-${BASH_COMMAND-}}
+      line=${line%%$'\n'*}
+      line=${line//\\/\\\\}
+      line=${line//;/\\x3b}
+      line=${line//[[:cntrl:]]/ }
+      builtin printf '\e]633;E;%s\a' "$line"
       builtin printf '\e]133;C\a'
     fi
   }

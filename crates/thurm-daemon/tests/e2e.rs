@@ -447,25 +447,54 @@ fn foreground_program_is_identified_and_named() {
     let (c, _events) = env.connect();
     let pane = create(&c, &env.dir);
     // `vim` linked to Neovim (here a copy of sleep named nvim) is Neovim.
-    let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| Path::new(p).exists()).unwrap();
-    std::fs::copy(sleep, env.dir.join("nvim")).unwrap();
-    // A copied system binary runs only signed as itself.
-    #[cfg(target_os = "macos")]
-    assert!(
-        std::process::Command::new("codesign")
-            .args(["-s", "-", "-f"])
-            .arg(env.dir.join("nvim"))
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
-    std::os::unix::fs::symlink(env.dir.join("nvim"), env.dir.join("vim")).unwrap();
+    let nvim = fake_nvim(&env.dir);
+    std::os::unix::fs::symlink(&nvim, env.dir.join("vim")).unwrap();
     c.request(Request::Input {
         pane,
         data: format!("{} 5\r", env.dir.join("vim").display()).into_bytes(),
     })
     .unwrap();
+    assert_eq!(program_title(&c, pane), "Neovim");
+}
+
+#[test]
+fn title_names_the_program_an_alias_started() {
+    let env = Env::new("program-alias");
+    let _daemon = env.start();
+    let (c, _events) = env.connect();
+    let pane = create(&c, &env.dir);
+    let nvim = fake_nvim(&env.dir);
+    // What a shell running its alias `v` reports, before running Neovim.
+    let shell = "printf '\\033]633;E;v -R\\007\\033]0;v ~/src\\007'";
+    c.request(Request::Input {
+        pane,
+        data: format!("{shell}; {} 5\r", nvim.display()).into_bytes(),
+    })
+    .unwrap();
+    assert_eq!(program_title(&c, pane), "Neovim ~/src");
+}
+
+/// A copy of sleep named nvim, which Thurm takes for Neovim.
+fn fake_nvim(dir: &Path) -> std::path::PathBuf {
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| Path::new(p).exists()).unwrap();
+    let nvim = dir.join("nvim");
+    std::fs::copy(sleep, &nvim).unwrap();
+    // A copied system binary runs only signed as itself.
+    #[cfg(target_os = "macos")]
+    assert!(
+        std::process::Command::new("codesign")
+            .args(["-s", "-", "-f"])
+            .arg(&nvim)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    nvim
+}
+
+/// The pane's title once Neovim is identified in its foreground.
+fn program_title(c: &Client, pane: PaneId) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let Response::PaneInfo(i) = c.request(Request::PaneInfo { pane }).unwrap() else {
@@ -473,8 +502,7 @@ fn foreground_program_is_identified_and_named() {
         };
         if let Some(p) = &i.program {
             assert_eq!((p.id.as_str(), p.icon.as_str()), ("neovim", "neovim"));
-            assert_eq!(i.title, "Neovim");
-            break;
+            return i.title;
         }
         assert!(
             Instant::now() < deadline,

@@ -993,7 +993,7 @@ impl Daemon {
                                 && start.elapsed() >= Duration::from_secs(secs)
                             {
                                 let what =
-                                    st.command_line.take().unwrap_or_else(|| "Command".into());
+                                    st.command_line.clone().unwrap_or_else(|| "Command".into());
                                 let status = match code {
                                     Some(0) | None => "finished".to_owned(),
                                     Some(c) => format!("failed (exit {c})"),
@@ -1006,6 +1006,7 @@ impl Daemon {
                                 });
                             }
                         }
+                        st.command_line = None;
                     }
                     TermEvent::Progress(p) => {
                         st.osc_progress = p;
@@ -1471,6 +1472,13 @@ impl Daemon {
                     st.program_name = program.filter(|_| programs.names).map(|d| d.name.clone());
                     let word = st.term.title().map(command_word).unwrap_or("").to_owned();
                     st.program_command = match (program.filter(|_| programs.names), &fg, &executable) {
+                        // The command line the shell ran: its word started the program, an
+                        // alias or a function included (`lg` for lazygit).
+                        (Some(_), Some(_), Some(_))
+                            if st.command_line.as_deref().is_some_and(|c| starts_command(c, &word)) =>
+                        {
+                            Some(word)
+                        }
                         (Some(def), Some(p), Some(exe)) => {
                             let key = (word.clone(), def.id.clone());
                             let named = match &st.command_check {
@@ -2836,6 +2844,16 @@ fn command_word(title: &str) -> &str {
     first.rsplit('/').next().unwrap_or(first)
 }
 
+/// Whether the shell's command line `line` runs `word` (a title's command), past variable
+/// assignments (`FOO=1 lg`).
+fn starts_command(line: &str, word: &str) -> bool {
+    !word.is_empty()
+        && line
+            .split_whitespace()
+            .find(|w| !w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && !k.contains('/')))
+            .is_some_and(|w| command_word(w) == word)
+}
+
 /// Whether `word` (a title's command) starts the foreground program `def`, which runs as
 /// `executable`: one of the process' own names, another of the program's commands, or a
 /// command on `path` that resolves to the same executable (a `vim` linked to Neovim, or a
@@ -3014,6 +3032,17 @@ mod tests {
         // Other words stay, another program's included (a title Neovim set).
         assert_eq!(t("cd ~/src"), "cd ~/src");
         assert_eq!(t("git status"), "git status");
+    }
+
+    #[test]
+    fn command_line_names_its_command() {
+        assert!(starts_command("lg", "lg"));
+        assert!(starts_command("lg --debug", "lg"));
+        assert!(starts_command("FOO=1 BAR=x lg", "lg"));
+        assert!(starts_command("~/bin/lg", "lg"));
+        assert!(!starts_command("git status", "lg"));
+        assert!(!starts_command("", ""));
+        assert!(!starts_command("lg", ""));
     }
 
     #[test]
