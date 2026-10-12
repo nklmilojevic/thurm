@@ -474,6 +474,23 @@ fn title_names_the_program_an_alias_started() {
     assert_eq!(program_title(&c, pane), "Neovim ~/src");
 }
 
+#[test]
+fn title_keeps_a_command_that_did_not_start_the_program() {
+    let env = Env::new("program-alias-child");
+    let _daemon = env.start();
+    let (c, _events) = env.connect();
+    let pane = create(&c, &env.dir);
+    let nvim = fake_nvim(&env.dir);
+    // `v` runs a program that runs Neovim as its own job: not the shell's.
+    let shell = "printf '\\033]633;E;v\\007\\033]0;v ~/src\\007'";
+    c.request(Request::Input {
+        pane,
+        data: format!("{shell}; sh -mc '{} 5; true'\r", nvim.display()).into_bytes(),
+    })
+    .unwrap();
+    assert_eq!(program_title(&c, pane), "v ~/src");
+}
+
 /// A copy of sleep named nvim, which Thurm takes for Neovim.
 fn fake_nvim(dir: &Path) -> std::path::PathBuf {
     let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| Path::new(p).exists()).unwrap();

@@ -1477,9 +1477,11 @@ impl Daemon {
                     let word = st.term.title().map(command_word).unwrap_or("").to_owned();
                     st.program_command = match (program.filter(|_| programs.names), &fg, &executable) {
                         // The command line the shell ran: its word started the program, an
-                        // alias or a function included (`lg` for lazygit).
-                        (Some(_), Some(_), Some(_))
-                            if st.command_line.as_deref().is_some_and(|c| starts_command(c, &word)) =>
+                        // alias or a function included (`lg` for lazygit). Only a program the
+                        // shell itself runs: lazygit's editor is not `lg`.
+                        (Some(_), Some(p), Some(_))
+                            if st.command_line.as_deref().is_some_and(|c| starts_command(c, &word))
+                                && st.info.pid.is_some_and(|sh| procinfo::parent(p.pid) == Some(sh)) =>
                         {
                             Some(word)
                         }
