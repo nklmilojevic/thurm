@@ -197,9 +197,8 @@ fi
 if [[ -d "$ROOT/skills" ]]; then
     cp -R "$ROOT/skills" "$APP/Contents/Resources/skills"
 fi
-if [[ -f "$HERE/Resources/AppIcon.icns" ]]; then
-    cp "$HERE/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-fi
+# The Icon Composer icon: Assets.car for macOS 26 and later, AppIcon.icns for older systems.
+"$HERE/compile-icon.sh" "$APP/Contents/Resources"
 # Thurm's license and the notices of everything it includes.
 python3 "$ROOT/scripts/third-party-licenses.py"
 cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_LICENSES" "$APP/Contents/Resources/"

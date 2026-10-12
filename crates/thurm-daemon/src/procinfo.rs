@@ -227,6 +227,8 @@ mod tests {
         let birth = process_birth(me).expect("self process birth");
         assert_eq!(process_birth(me), Some(birth));
         assert!(process_birth(u32::MAX).is_none());
+        assert_eq!(parent(me), Some(unsafe { libc::getppid() } as u32));
+        assert!(parent(u32::MAX).is_none());
     }
 }
 
@@ -485,6 +487,30 @@ mod proc_tests {
         assert_eq!(find_var(env.into_iter(), "EMPTY").as_deref(), Some(""));
         assert_eq!(find_var(env.into_iter(), "PAT"), None);
     }
+}
+
+/// The pid of `pid`'s parent.
+#[cfg(target_os = "linux")]
+pub fn parent(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The first field after the name is field 3; ppid is field 4.
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn parent(pid: u32) -> Option<u32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (n == size).then_some(info.pbi_ppid)
 }
 
 /// Process birth, used to distinguish a reused PID from its previous process.

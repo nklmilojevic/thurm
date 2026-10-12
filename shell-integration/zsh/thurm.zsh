@@ -44,6 +44,12 @@ _thurm_precmd() {
 }
 
 _thurm_preexec() {
+  # The command line (its first), which names the program it starts: an alias's too.
+  local line=${1%%$'\n'*}
+  line=${line//\\/\\\\}
+  line=${line//;/\\x3b}
+  line=${line//[[:cntrl:]]/ }
+  builtin printf '\e]633;E;%s\a' "$line"
   builtin printf '\e]133;C\a'
   _thurm_executing=1
 }

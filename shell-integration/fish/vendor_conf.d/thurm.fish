@@ -33,6 +33,10 @@ if status is-interactive; and not set -q __thurm_fish_loaded
     end
 
     function __thurm_preexec --on-event fish_preexec
+        # The command line (its first), which names the program it starts: an alias's too.
+        set -l line (string split -m1 \n -- $argv[1])[1]
+        set line (string replace -a '\\' '\\\\' -- $line | string replace -a ';' '\\x3b' | string replace -ra '[\x00-\x1f]' ' ')
+        printf '\e]633;E;%s\a' "$line"
         printf '\e]133;C\a'
     end
 

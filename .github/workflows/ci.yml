@@ -25,6 +25,7 @@ jobs:
       rust: ${{ steps.diff.outputs.rust }}
       linux-app: ${{ steps.diff.outputs.linux-app }}
       release-scripts: ${{ steps.diff.outputs.release-scripts }}
+      app-icon: ${{ steps.diff.outputs.app-icon }}
       docs: ${{ steps.diff.outputs.docs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -54,7 +55,8 @@ jobs:
           area rust "^($rust)"
           # The Linux app also reads the icons and data in linux/ when run from the checkout.
           area linux-app "^($rust|linux/(share|icons)/)"
-          area release-scripts '^(macos/build\.sh$|macos/package-dmg\.sh$|macos/release/|\.github/workflows/ci\.yml$)'
+          area release-scripts '^(macos/build\.sh$|macos/compile-icon\.sh$|macos/package-dmg\.sh$|macos/release/|\.github/workflows/ci\.yml$)'
+          area app-icon '^(macos/Resources/AppIcon\.icon/|macos/compile-icon\.sh$|macos/build\.sh$|\.github/workflows/ci\.yml$)'
           area docs '^(docs/|config\.example\.toml$|\.github/workflows/ci\.yml$)'
           cat "$GITHUB_OUTPUT"
 
@@ -243,7 +245,18 @@ jobs:
       - name: Appcast tests
         run: uv run --no-project python -m unittest discover -s macos/release -v
       - name: Shell syntax
-        run: for f in macos/build.sh macos/package-dmg.sh macos/release/*.sh; do bash -n "$f"; done
+        run: for f in macos/build.sh macos/compile-icon.sh macos/package-dmg.sh macos/release/*.sh; do bash -n "$f"; done
+
+  app-icon:
+    # The Icon Composer icon is compiled with Xcode's actool, which only macOS has.
+    name: App icon
+    needs: changes
+    if: needs.changes.outputs.app-icon == 'true'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Compile
+        run: macos/compile-icon.sh "$RUNNER_TEMP/Resources"
 
   docs:
     name: Documentation
