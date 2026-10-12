@@ -16,7 +16,7 @@ use crate::keys;
 use crate::kitty::{Image, Media, MediaReader};
 pub use crate::mode::TermMode;
 use crate::osc::{OscEvent, OscState};
-use crate::program_status::{self, ProgramStatus};
+use crate::program_status::ProgramStatus;
 use crate::vt::{self, GridRef, KittyPlacement, Vt};
 
 // libghostty-vt mode identifiers.
@@ -702,22 +702,19 @@ impl Terminal {
                         }
                     }
                 }
+                Chunk::Private(b) => {
+                    self.vt.write(&b);
+                    self.collect_events();
+                }
                 Chunk::Osc(body) => {
                     self.handle_osc(&body);
-                    // A shared OSC (52) follows as a Pass chunk too: forward it once. Program
-                    // status is the daemon's alone.
+                    // A shared OSC (52) follows as a Pass chunk too: forward it once.
                     if let Some(f) = &mut self.forward
                         && !crate::filter::osc_is_passed(&body)
-                        && program_status_body(&body).is_none()
                     {
                         f.extend_from_slice(b"\x1b]");
                         f.extend_from_slice(&body);
                         f.push(0x07);
-                    }
-                }
-                Chunk::Reset => {
-                    if self.programs.clear() {
-                        self.program_status_changed();
                     }
                 }
             }
@@ -805,6 +802,7 @@ impl Terminal {
         let clipboard = std::mem::take(&mut fx.clipboard);
         let notifications = std::mem::take(&mut fx.notifications);
         let progress = std::mem::take(&mut fx.progress);
+        let programs = std::mem::take(&mut fx.programs);
         for b in pty {
             self.events.push(TermEvent::PtyWrite(b));
         }
@@ -827,6 +825,13 @@ impl Terminal {
         }
         for p in progress {
             self.events.push(TermEvent::Progress(p));
+        }
+        let mut programs_changed = false;
+        for report in programs {
+            programs_changed |= self.programs.apply(report);
+        }
+        if programs_changed {
+            self.program_status_changed();
         }
         for text in clipboard {
             self.events.push(TermEvent::ClipboardStore(text));
@@ -1018,10 +1023,6 @@ impl Terminal {
             self.handle_osc52(rest);
             return;
         }
-        if let Some(rest) = program_status_body(body) {
-            self.handle_program_status(rest);
-            return;
-        }
         let ev = self.osc.parse(body);
         if let Some(OscEvent::PromptStart { redraw: Some(r) }) = ev {
             self.shell_redraws = r;
@@ -1067,21 +1068,6 @@ impl Terminal {
             }
             OscEvent::CommandFinished(code) => self.events.push(TermEvent::CommandFinished(code)),
             OscEvent::CommandLine(c) => self.events.push(TermEvent::CommandLine(c)),
-        }
-    }
-
-    /// `OSC 7501 ; …`: a program reports its status, or asks whether the terminal listens.
-    fn handle_program_status(&mut self, body: &[u8]) {
-        match program_status::parse(body) {
-            Some(program_status::Parsed::Query) => self
-                .events
-                .push(TermEvent::PtyWrite(program_status::QUERY_REPLY.to_vec())),
-            Some(report) => {
-                if self.programs.apply(report) {
-                    self.program_status_changed();
-                }
-            }
-            None => {}
         }
     }
 
@@ -2274,11 +2260,9 @@ impl Terminal {
     }
 
     pub fn reset(&mut self) {
+        // libghostty-vt reports the program status records cleared.
         self.vt.write(b"\x1bc");
         self.collect_events();
-        if self.programs.clear() {
-            self.program_status_changed();
-        }
         self.filter.take_scroll_region();
         self.scroll_region = None;
         self.vt.set_selection(None);
@@ -2922,11 +2906,6 @@ fn regex_escape_if_invalid(q: &str) -> String {
 
 /// `path` without relative entries (`.`, `bin`, empty): a program found through one depends
 /// on the directory the shell happens to be in.
-/// The report of an `OSC 7501 ; …` body.
-fn program_status_body(body: &[u8]) -> Option<&[u8]> {
-    body.strip_prefix(program_status::OSC)?.strip_prefix(b";")
-}
-
 fn absolute_path_entries(path: &str) -> String {
     path.split(':')
         .filter(|e| e.starts_with('/'))

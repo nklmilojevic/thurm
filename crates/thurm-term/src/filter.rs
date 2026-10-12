@@ -21,6 +21,10 @@ const INTERCEPTED_OSC: &[u32] = &[
 /// Intercepted OSC numbers libghostty-vt gets too (it handles other parts of them).
 const SHARED_OSC: &[u32] = &[52];
 
+/// Intercepted OSC numbers libghostty-vt handles, as they came, but that are the daemon's
+/// alone: clients' copies of the pane don't get them.
+const PRIVATE_OSC: &[u32] = &[7501];
+
 /// Whether the filter passes this intercepted OSC on as well (see `SHARED_OSC`): then the
 /// passed copy is the one to forward.
 pub fn osc_is_passed(body: &[u8]) -> bool {
@@ -40,8 +44,8 @@ pub enum Chunk<'a> {
     Apc(Vec<u8>),
     /// OSC body (without `ESC ]` and the terminator), for an intercepted number.
     Osc(Vec<u8>),
-    /// A full reset (RIS) was passed just before.
-    Reset,
+    /// A whole OSC for the VT parser, not to forward (see `PRIVATE_OSC`).
+    Private(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,9 +212,6 @@ impl StreamFilter {
                                     // RIS resets everything.
                                     self.scroll_region = Some(None);
                                     self.media_more = false;
-                                    flush_pass!(i + 1);
-                                    pass_start = i + 1;
-                                    out.push(Chunk::Reset);
                                 }
                                 _ => {}
                             }
@@ -587,7 +588,13 @@ impl StreamFilter {
         self.state = State::Ground;
         let body = std::mem::take(&mut self.buf);
         let num = osc_number(&body);
-        if num.is_some_and(|n| INTERCEPTED_OSC.contains(&n)) {
+        if num.is_some_and(|n| PRIVATE_OSC.contains(&n)) {
+            let mut raw = Vec::with_capacity(body.len() + 4);
+            raw.extend_from_slice(b"\x1b]");
+            raw.extend_from_slice(&body);
+            raw.extend_from_slice(if self.osc_bel { b"\x07" } else { b"\x1b\\" });
+            out.push(Chunk::Private(raw));
+        } else if num.is_some_and(|n| INTERCEPTED_OSC.contains(&n)) {
             let raw = num.is_some_and(|n| SHARED_OSC.contains(&n)).then(|| {
                 let mut raw = Vec::with_capacity(body.len() + 4);
                 raw.extend_from_slice(b"\x1b]");
@@ -751,7 +758,7 @@ mod tests {
                         Chunk::Pass(b) => pass.extend_from_slice(&b),
                         Chunk::Apc(a) => seqs.push(Chunk::Apc(a)),
                         Chunk::Osc(o) => seqs.push(Chunk::Osc(o)),
-                        Chunk::Reset => seqs.push(Chunk::Reset),
+                        Chunk::Private(o) => seqs.push(Chunk::Private(o)),
                     }
                 }
             }
@@ -765,6 +772,19 @@ mod tests {
         let bytes: Vec<&[u8]> = input.chunks(1).collect();
         assert_eq!(collect(&bytes), whole, "byte by byte");
         whole
+    }
+
+    #[test]
+    fn private_osc_is_kept_whole_with_its_terminator() {
+        let (pass, seqs) = run(b"a\x1b]7501;state=done\x07b\x1b]7501;?\x1b\\c");
+        assert_eq!(pass, b"abc");
+        assert_eq!(
+            seqs,
+            vec![
+                Chunk::Private(b"\x1b]7501;state=done\x07".to_vec()),
+                Chunk::Private(b"\x1b]7501;?\x1b\\".to_vec()),
+            ]
+        );
     }
 
     #[test]
@@ -857,22 +877,7 @@ mod tests {
         // RIS ends it too.
         let (pass, seqs) = run(b"\x1b_Ga=T,t=f,m=1;L3Rt\x1b\\\x1bc\x1b_Gm=0;AAAA\x1b\\");
         assert_eq!(pass, b"\x1bc\x1b_Gm=0;AAAA\x1b\\");
-        assert_eq!(seqs.len(), 2);
-        assert_eq!(seqs[1], Chunk::Reset);
-    }
-
-    #[test]
-    fn reset_is_ordered_with_intercepted_sequences() {
-        let (pass, seqs) = run(b"\x1b]7501;state=done\x07a\x1bcb\x1b]7501;state=idle\x1b\\");
-        assert_eq!(pass, b"a\x1bcb");
-        assert_eq!(
-            seqs,
-            vec![
-                Chunk::Osc(b"7501;state=done".to_vec()),
-                Chunk::Reset,
-                Chunk::Osc(b"7501;state=idle".to_vec()),
-            ]
-        );
+        assert_eq!(seqs.len(), 1);
     }
 
     #[test]

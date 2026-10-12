@@ -37,13 +37,15 @@ fn programs_report_their_status() {
     let pane = create(&c, &env.dir);
     c.request(Request::Subscribe { pane }).unwrap();
 
-    // Feature detection: the reply is the query.
+    // Feature detection: the reply is the query, with what the terminal accepts.
     run(
         &c,
         pane,
-        r"stty raw -echo; printf '\033]7501;?\033\\'; dd bs=1 count=10 2>/dev/null | od -An -c; stty sane",
+        // Byte by byte up to ST's `\`: `read -d` is not POSIX (dash has none). The terminal is
+        // sane again before anything is printed, so the next command isn't typed into raw mode.
+        r#"stty raw -echo; printf '\033]7501;?\033\\'; r=$(while c=$(dd bs=1 count=1 2>/dev/null); [ "$c" != '\' ]; do printf '%s' "$c"; done); stty sane; printf '%s' "$r" | od -An -c"#,
     );
-    wait_match(&c, pane, r"033\s+]\s+7\s+5\s+0\s+1\s+;\s+\?\s+033\s+\\");
+    wait_match(&c, pane, r"033\s+]\s+7\s+5\s+0\s+1\s+;\s+\?\s+:\s+s");
 
     // "Apply?"
     run(

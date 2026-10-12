@@ -43,8 +43,8 @@
           ghostty = pkgs.fetchFromGitHub {
             owner = "ghostty-org";
             repo = "ghostty";
-            rev = "b40acce58dcf77df52231c3798ea58e924647c89";
-            hash = "sha256-jGBYacSDg7Ya/P3OpkuM+EK+kW4JAPIiGTxEdWMc6PQ=";
+            rev = "1e9e14af5df14211892f5fc15fd21a49c7d94868";
+            hash = "sha256-wP1vCVq/9k0fJba1t+T6fGYt4wU4qAJ6BxwUaiETWpk=";
           };
           # Its Zig packages, fetched ahead (the build has no network): Ghostty's own list.
           ghosttyZigDeps = pkgs.callPackage ./nix/ghostty-zig-deps.nix { };

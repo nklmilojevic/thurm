@@ -15,23 +15,21 @@ touch "$scratch/root/build.zig"
 
 fetch_local() { (cd "$scratch/root" && zig fetch --global-cache-dir "$cache" "$1"); }
 
-# `name = "<package hash>"` followed by its `url = "..."`.
-awk '/name = "/ && !hash { split($0, a, "\""); hash = a[2]; next }
-     /url = "/ && hash { split($0, a, "\""); print hash, a[2]; hash = "" }' \
+# Each package: `"<package hash>" = fetchzip|fetchurl|fetchZigGit {`, then its `url` (and `rev`
+# for git), up to `};`.
+awk '/^    "[^"]+" = fetch[A-Za-z]+ \{$/ { split($0, a, "\""); hash = a[2]; kind = $3; url = rev = ""; next }
+     hash && /^      url = "/ { split($0, a, "\""); url = a[2] }
+     hash && /^      rev = "/ { split($0, a, "\""); rev = a[2] }
+     hash && /^    };$/ { print hash, kind, url, rev; hash = "" }' \
     "$repo/nix/ghostty-zig-deps.nix" |
-    while read -r hash url; do
+    while read -r hash kind url rev; do
         [ -d "$cache/p/$hash" ] && continue
         src="$scratch/src"
         rm -rf "$src"
-        case "$url" in
-        git+*)
-            # git+https://host/repo[.git]#<commit>
-            remote="${url#git+}"
-            rev="${remote##*#}"
-            remote="${remote%%#*}"
-            remote="${remote%%\?*}"
+        case "$kind" in
+        fetchZigGit)
             git init -q "$src"
-            git -C "$src" fetch -q --depth 1 "$remote" "$rev"
+            git -C "$src" fetch -q --depth 1 "$url" "$rev"
             git -C "$src" checkout -q FETCH_HEAD
             rm -rf "$src/.git"
             ;;
@@ -43,6 +41,9 @@ awk '/name = "/ && !hash { split($0, a, "\""); hash = a[2]; next }
             ;;
         esac
         got="$(fetch_local "$src")"
-        [ "$got" = "$hash" ] || echo "warning: $url unpacked as $got, expected $hash" >&2
+        if [ "$got" != "$hash" ]; then
+            echo "error: $url unpacked as $got, expected $hash" >&2
+            exit 1
+        fi
     done
 echo "zig packages ready in $cache/p ($(ls "$cache/p" | wc -l))"
