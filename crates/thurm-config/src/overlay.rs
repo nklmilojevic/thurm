@@ -39,48 +39,80 @@ pub fn holds(overlay: &str, key: &str) -> bool {
         .is_some_and(|t| get_path(&t, &segments(key)).is_some())
 }
 
-/// `base` (the text of `config.toml`) with `overlay` merged over it, as the text to load and the
-/// warnings about the overlay. The overlay cannot fail a load: a setting that names no option,
-/// does not parse or does not validate is left out with a warning. A `base` that is not a valid
-/// config is an error.
-pub fn merge(base: &str, overlay: &str) -> Result<(String, Vec<String>), String> {
+/// What the overlay contributes to a load.
+pub struct Merged {
+    /// The text to load.
+    pub text: String,
+    /// What was left out of the overlay, and why.
+    pub warnings: Vec<String>,
+    /// The overlay's settings that took effect, as dotted paths (a table's contents by path).
+    pub applied: Vec<String>,
+}
+
+/// `base` (the text of `config.toml`) with `overlay` merged over it. The overlay cannot fail a
+/// load: a setting that names no option, does not parse or does not validate is left out with a
+/// warning. A `base` that is not a valid config is an error.
+pub fn merge(base: &str, overlay: &str) -> Result<Merged, String> {
     let base_table: Table = toml::from_str(base).map_err(|e| e.to_string())?;
     let base_warnings = Config::parse_with_warnings(base)?.1;
-    let overlay_table: Table = match toml::from_str(overlay) {
+    let mut warnings = Vec::new();
+    let mut overlay_table: Table = match toml::from_str(overlay) {
         Ok(table) => table,
-        Err(e) => return Ok((base.to_owned(), vec![format!("settings.toml ignored: {e}")])),
+        Err(e) => {
+            return Ok(Merged {
+                text: base.to_owned(),
+                warnings: vec![format!("settings.toml ignored: {e}")],
+                applied: vec![],
+            });
+        }
     };
-    if overlay_table.is_empty() {
-        return Ok((base.to_owned(), vec![]));
+    if overlay_table.remove("config_version").is_some() {
+        warnings.push("settings.toml: config_version is not a setting, ignored".to_owned());
+    }
+    let settings = leaves(&overlay_table);
+    if settings.is_empty() {
+        return Ok(Merged {
+            text: base.to_owned(),
+            warnings,
+            applied: vec![],
+        });
     }
     let mut merged = base_table.clone();
     merge_tables(&mut merged, &overlay_table);
     let whole = toml::to_string(&merged).map_err(|e| e.to_string())?;
-    if let Ok((_, warnings)) = Config::parse_with_warnings(&whole)
-        && warnings.iter().all(|w| base_warnings.contains(w))
+    if let Ok((_, new)) = Config::parse_with_warnings(&whole)
+        && new.iter().all(|w| base_warnings.contains(w))
     {
-        return Ok((whole, vec![]));
+        let applied = settings.iter().map(|(path, _)| path.join(".")).collect();
+        return Ok(Merged {
+            text: whole,
+            warnings,
+            applied,
+        });
     }
     // Something in the overlay is wrong: keep every setting that works, one at a time.
     let mut current = base_table;
-    let mut warnings = Vec::new();
-    for (path, value) in leaves(&overlay_table) {
+    let mut applied = Vec::new();
+    for (path, value) in settings {
         let key = path.join(".");
-        if path == ["config_version"] {
-            warnings.push(format!("settings.toml: {key} is not a setting, ignored"));
-            continue;
-        }
         let mut candidate = current.clone();
         set_path(&mut candidate, &path, value);
         let text = toml::to_string(&candidate).map_err(|e| e.to_string())?;
         match Config::parse_with_warnings(&text) {
-            Ok((_, new)) if new.iter().all(|w| base_warnings.contains(w)) => current = candidate,
+            Ok((_, new)) if new.iter().all(|w| base_warnings.contains(w)) => {
+                current = candidate;
+                applied.push(key);
+            }
             Ok(_) => warnings.push(format!("settings.toml: {key} is not a setting, ignored")),
             Err(e) => warnings.push(format!("settings.toml: {key} ignored: {e}")),
         }
     }
     let text = toml::to_string(&current).map_err(|e| e.to_string())?;
-    Ok((text, warnings))
+    Ok(Merged {
+        text,
+        warnings,
+        applied,
+    })
 }
 
 /// Sets `key` in the overlay beside `config` to the TOML value `literal`, or removes it for
@@ -97,7 +129,7 @@ pub fn write(config: &Path, key: &str, literal: Option<&str>) -> Result<(), Stri
         .transpose()?;
     let out = edit(&text, key, value)?;
     let base = read(config).map_err(|e| format!("{}: {e}", config.display()))?;
-    let (_, warnings) = merge(&base, &out)?;
+    let warnings = merge(&base, &out)?.warnings;
     let prefix = format!("settings.toml: {key} ");
     if let Some(w) = warnings.iter().find(|w| w.starts_with(&prefix)) {
         return Err(w.clone());
@@ -192,9 +224,17 @@ fn get_path<'a>(table: &'a Table, path: &[String]) -> Option<&'a Value> {
 fn set_path(table: &mut Table, path: &[String], value: Value) {
     match path {
         [] => {}
-        [last] => {
-            table.insert(last.clone(), value);
-        }
+        [last] => match table.get_mut(last) {
+            // An empty table names a setting without a value: it must not clear what is there.
+            Some(Value::Table(existing)) if matches!(&value, Value::Table(_)) => {
+                if let Value::Table(new) = &value {
+                    merge_tables(existing, new);
+                }
+            }
+            _ => {
+                table.insert(last.clone(), value);
+            }
+        },
         [first, rest @ ..] => {
             let child = table
                 .entry(first.clone())
@@ -220,13 +260,14 @@ fn merge_tables(base: &mut Table, overlay: &Table) {
     }
 }
 
-/// The non-table values of `table` with their paths (arrays of tables count as values).
+/// The settings of `table` with their paths: its values, arrays of tables, and empty tables (a
+/// table with contents is only its contents).
 fn leaves(table: &Table) -> Vec<(Vec<String>, Value)> {
     fn walk(table: &Table, prefix: &mut Vec<String>, out: &mut Vec<(Vec<String>, Value)>) {
         for (key, value) in table {
             prefix.push(key.clone());
             match value {
-                Value::Table(child) => walk(child, prefix, out),
+                Value::Table(child) if !child.is_empty() => walk(child, prefix, out),
                 _ => out.push((prefix.clone(), value.clone())),
             }
             prefix.pop();
@@ -255,7 +296,7 @@ mod tests {
     fn overlay_wins_key_by_key() {
         let base = "[font]\nsize = 14.0\nfamily = \"Menlo\"\n";
         let overlay = "[font]\nsize = 15.0\n[window]\ntab_style = \"native\"\n";
-        let (text, warnings) = merge(base, overlay).unwrap();
+        let Merged { text, warnings, .. } = merge(base, overlay).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         let cfg = Config::parse(&text).unwrap();
         assert_eq!((cfg.font.size, cfg.font.family.as_str()), (15.0, "Menlo"));
@@ -268,7 +309,7 @@ mod tests {
         let base = "[font]\nsize = 14.0\n";
         let overlay =
             "[font]\nfamliy = \"x\"\nsize = 1.0\n[window]\nopacity = \"half\"\nblur = 3\n";
-        let (text, warnings) = merge(base, overlay).unwrap();
+        let Merged { text, warnings, .. } = merge(base, overlay).unwrap();
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(
             warnings
@@ -294,7 +335,8 @@ mod tests {
 
     #[test]
     fn an_unreadable_overlay_is_ignored_with_a_warning() {
-        let (text, warnings) = merge("[font]\nsize = 14.0\n", "[font\nsize =").unwrap();
+        let Merged { text, warnings, .. } =
+            merge("[font]\nsize = 14.0\n", "[font\nsize =").unwrap();
         assert_eq!(text, "[font]\nsize = 14.0\n");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
@@ -368,6 +410,51 @@ mod tests {
         assert!(!cfg.window.pane_headers);
         assert_eq!(cfg.font.family, "Menlo");
         std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn config_version_in_the_overlay_never_applies() {
+        let fast = merge(
+            DEFAULT_CONFIG_TOML,
+            "config_version = 3\n[font]\nsize = 15.0\n",
+        )
+        .unwrap();
+        let slow = merge(
+            DEFAULT_CONFIG_TOML,
+            "config_version = 3\n[font]\nsize = 1.0\n",
+        )
+        .unwrap();
+        for merged in [fast, slow] {
+            assert!(
+                merged.warnings.iter().any(|w| w.contains("config_version")),
+                "{:?}",
+                merged.warnings
+            );
+            assert_eq!(Config::parse(&merged.text).unwrap().config_version, 9);
+        }
+    }
+
+    #[test]
+    fn unknown_empty_tables_are_reported() {
+        let merged = merge("", "[nonsense]\n").unwrap();
+        assert!(
+            merged
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("settings.toml: nonsense ")),
+            "{:?}",
+            merged.warnings
+        );
+        let merged = merge("", "[keybindings]\n").unwrap();
+        assert!(merged.warnings.is_empty(), "{:?}", merged.warnings);
+        assert_eq!(merged.applied, vec!["keybindings".to_owned()]);
+    }
+
+    #[test]
+    fn applied_lists_only_the_settings_that_took_effect() {
+        let merged = merge("", "[font]\nsize = 1.0\nfamily = \"Menlo\"\n").unwrap();
+        assert_eq!(merged.applied, vec!["font.family".to_owned()]);
+        assert_eq!(merged.warnings.len(), 1, "{:?}", merged.warnings);
     }
 
     #[test]

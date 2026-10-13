@@ -413,13 +413,22 @@ pub fn view_at(config: &Path) -> Json {
         Err(e) => (defaults.clone(), vec![], Some(e.message)),
     };
     let base: Table = toml::from_str(&base_text).unwrap_or_default();
-    let over: Table = toml::from_str(&overlay_text).unwrap_or_default();
+    let applied = overlay::merge(&base_text, &overlay_text)
+        .map(|merged| merged.applied)
+        .unwrap_or_default();
     let docs = scan(DEFAULT_CONFIG_TOML).docs;
     let settings: Vec<Json> = schema()
         .iter()
         .map(|s| {
             let path: Vec<&str> = s.key.split('.').collect();
-            let source = if lookup_toml(&over, &path).is_some() {
+            let warning = warnings
+                .iter()
+                .find(|w| w.starts_with(&format!("settings.toml: {} ", s.key)))
+                .cloned();
+            let from_overlay = applied
+                .iter()
+                .any(|a| *a == s.key || a.starts_with(&format!("{}.", s.key)));
+            let source = if from_overlay {
                 "overlay"
             } else if lookup_toml(&base, &path).is_some() {
                 "file"
@@ -440,6 +449,7 @@ pub fn view_at(config: &Path) -> Json {
                 "default": default,
                 "source": source,
                 "doc": doc_for(&docs, &s.key),
+                "warning": warning,
             });
             if let Kind::Enum(options) = s.kind {
                 item["options"] = json!(options);
@@ -516,23 +526,26 @@ fn set_notice(config: &Path, key: &str, state: &str, value: &Json) -> Result<(),
     if key == row || value.is_null() {
         return overlay::write(config, &row, None);
     }
+    let prefix = format!("{row}.");
+    let field = key.strip_prefix(prefix.as_str()).unwrap_or_default();
+    if NOTICE_FIELDS.iter().all(|(name, _, _)| *name != field) {
+        return Err(format!("{key:?} is not a setting"));
+    }
     let (cfg, _) = Config::load_with_warnings_from(config).map_err(|e| e.to_string())?;
     let current = serde_json::to_value(&cfg).unwrap_or(Json::Null);
-    let overlay_text = overlay::read(&overlay::path_beside(config)).map_err(|e| e.to_string())?;
+    let mut cells = Vec::new();
     for (name, _, kind) in NOTICE_FIELDS {
-        let field_key = format!("{row}.{name}");
-        let new = if field_key == key {
+        let new = if *name == field {
             value.clone()
-        } else if overlay::holds(&overlay_text, &field_key) {
-            continue;
         } else {
             lookup_json(&current, &["notifications", state, *name])
                 .cloned()
                 .unwrap_or(Json::Null)
         };
-        overlay::write(config, &field_key, Some(&literal(*kind, &new)?))?;
+        let cell = literal(*kind, &new).map_err(|e| format!("{key}: {e}"))?;
+        cells.push(format!("{name} = {cell}"));
     }
-    Ok(())
+    overlay::write(config, &row, Some(&format!("{{ {} }}", cells.join(", "))))
 }
 
 /// [`set_at`] for the config file of this user.
@@ -648,7 +661,10 @@ fn lookup_json<'a>(value: &'a Json, path: &[&str]) -> Option<&'a Json> {
 #[derive(Default)]
 struct Scan {
     docs: BTreeMap<String, String>,
+    /// Tables and their headers, active or commented out.
     present: BTreeSet<String>,
+    /// Options (`key = value` lines, active or commented out), by dotted path.
+    options: BTreeSet<String>,
 }
 
 fn scan(text: &str) -> Scan {
@@ -683,6 +699,7 @@ fn scan(text: &str) -> Scan {
             } else {
                 format!("{section}.{name}")
             };
+            scan.options.insert(path.clone());
             scan.docs
                 .entry(path.clone())
                 .or_insert_with(|| doc_above(&lines, i));
@@ -783,10 +800,29 @@ mod tests {
             );
         }
         let text = scan(DEFAULT_CONFIG_TOML);
+        // Every option the file mentions, active or commented out, has an entry: except the
+        // examples inside a table entry (`[[remote]]`'s fields) and the parts of an inline table.
+        let tables: Vec<String> = schema()
+            .into_iter()
+            .filter(|s| s.kind == Kind::Table)
+            .map(|s| s.key)
+            .collect();
+        for key in text.options.iter().filter(|k| *k != "config_version") {
+            let documented = keys.contains(key)
+                || keys.iter().any(|k| k.starts_with(&format!("{key}.")))
+                || tables.iter().any(|t| key.starts_with(&format!("{t}.")));
+            assert!(
+                documented,
+                "{key} is in default_config.toml but has no settings entry"
+            );
+        }
         for key in &keys {
             let parent = key.rsplit_once('.').map(|(p, _)| p);
+            let in_file = text.options.contains(key)
+                || text.present.contains(key)
+                || parent.is_some_and(|p| text.options.contains(p));
             assert!(
-                text.present.contains(key) || parent.is_some_and(|p| text.present.contains(p)),
+                in_file,
                 "{key} has a settings entry but is not in default_config.toml"
             );
         }
@@ -880,6 +916,47 @@ mod tests {
         assert_eq!(view["overlay_exists"], true);
         assert_eq!(view["config_read_only"], false);
         assert!(view["error"].is_null());
+        std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_notification_row_is_written_whole_or_not_at_all() {
+        let config = temp_config("row", DEFAULT_CONFIG_TOML);
+        assert!(set_at(&config, "notifications.waiting.sound", &json!(5)).is_err());
+        assert!(set_at(&config, "notifications.waiting.typo", &json!(true)).is_err());
+        assert!(
+            !overlay::path_beside(&config).exists(),
+            "a refused cell wrote something"
+        );
+        set_at(&config, "notifications.waiting.notify", &json!(false)).unwrap();
+        let text = std::fs::read_to_string(overlay::path_beside(&config)).unwrap();
+        assert!(
+            text.contains("badge = true") && text.contains("sound = \"default\""),
+            "{text}"
+        );
+        let (cfg, warnings) = Config::load_with_warnings_from(&config).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!cfg.notifications.waiting.notify && cfg.notifications.waiting.badge);
+        std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_dropped_overlay_setting_is_not_shown_as_the_overlays() {
+        let config = temp_config("dropped", "[font]\nsize = 14.0\n");
+        std::fs::write(overlay::path_beside(&config), "[font]\nsize = 1.0\n").unwrap();
+        let view = view_at(&config);
+        let size = view["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == "font.size")
+            .unwrap()
+            .clone();
+        assert_eq!(size["source"], "file");
+        assert!(
+            size["warning"].as_str().unwrap().contains("font.size"),
+            "{size}"
+        );
         std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
     }
 

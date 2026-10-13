@@ -1186,7 +1186,10 @@ impl Config {
         };
         let overlay_path = overlay::path_beside(&path);
         let (text, mut warnings) = match overlay::read(&overlay_path) {
-            Ok(overlay) => overlay::merge(&text, &overlay).map_err(fail)?,
+            Ok(overlay) => {
+                let merged = overlay::merge(&text, &overlay).map_err(fail)?;
+                (merged.text, merged.warnings)
+            }
             Err(e) => (text, vec![format!("{}: {e}", overlay_path.display())]),
         };
         let (cfg, unknown) = Self::parse_with_warnings(&text).map_err(fail)?;

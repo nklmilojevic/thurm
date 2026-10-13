@@ -20,13 +20,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
     private var selectedSection: String?
     private var query = ""
     private var selectingInSidebar = false
-    /// Writes waiting for a pause (sliders), by key.
-    private var pending: [String: DispatchWorkItem] = [:]
     /// The light and dark popups of each `colors.theme` control.
     private var themePopups: [String: (light: NSPopUpButton, dark: NSPopUpButton)] = [:]
 
     /// The label of a font popup's entry that leaves a face to the family.
     private static let sameAsFamily = "Same as family"
+    /// The last entry of a theme popup: choose a theme file instead.
+    private static let otherTheme = "Other\u{2026}"
 
     func show() {
         if window == nil { build() }
@@ -253,6 +253,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             doc.preferredMaxLayoutWidth = 380
             views.append(doc)
         }
+        if let warning = item.warning {
+            let note = NSTextField(wrappingLabelWithString: "settings.toml value ignored: \(warning)")
+            note.font = .systemFont(ofSize: 11)
+            note.textColor = .systemRed
+            note.preferredMaxLayoutWidth = 380
+            views.append(note)
+        }
         let stack = NSStackView(views: views)
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -312,8 +319,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
                     grid.cell(atColumnIndex: index + 1, rowIndex: r + 1).contentView = control(for: cell)
                 }
             }
-            grid.cell(atColumnIndex: columns.count + 1, rowIndex: r + 1).contentView =
-                resetButton(key: "notifications.\(state)")
+            // Reset is offered only when settings.toml sets a cell of this row.
+            if items.contains(where: { $0.row == state && $0.isOverridden }) {
+                grid.cell(atColumnIndex: columns.count + 1, rowIndex: r + 1).contentView =
+                    resetButton(key: "notifications.\(state)")
+            }
         }
         return grid
     }
@@ -365,13 +375,22 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             if let text = item.value as? String, let rgb = HexColor.parse(text) {
                 well.color = NSColor(srgbRed: CGFloat(rgb.red) / 255, green: CGFloat(rgb.green) / 255,
                                      blue: CGFloat(rgb.blue) / 255, alpha: 1)
+            } else {
+                // Unset: the theme's color, faded, so a chosen color reads as the override.
+                well.color = themeColor(for: item.key) ?? .gray
+                well.alphaValue = 0.4
+                well.toolTip = "The theme's color. Choose a color to override it."
             }
             well.target = self
             well.action = #selector(colorChanged(_:))
             well.identifier = key
             well.widthAnchor.constraint(equalToConstant: 44).isActive = true
             well.heightAnchor.constraint(equalToConstant: 24).isActive = true
-            return well
+            if item.value is String { return well }
+            let theme = NSTextField(labelWithString: "Theme")
+            theme.font = .systemFont(ofSize: 11)
+            theme.textColor = .secondaryLabelColor
+            return NSStackView(views: [well, theme])
         case .list, .text:
             let field = NSTextField(string: item.text)
             field.placeholderString = item.kind == .list ? "Comma-separated" : nil
@@ -428,6 +447,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             var all = names
             if !all.contains(selected) { all.insert(selected, at: 0) }
             popup.addItems(withTitles: all)
+            popup.menu?.addItem(.separator())
+            popup.addItem(withTitle: SettingsWindow.otherTheme)
             popup.selectItem(withTitle: selected)
             popup.target = self
             popup.action = #selector(themeChanged(_:))
@@ -499,27 +520,18 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         reload()
     }
 
-    /// Commits after a pause, so a slider's drag saves once.
-    private func commitLater(_ key: String, _ value: @escaping () -> Any) {
-        pending[key]?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            self?.pending[key] = nil
-            self?.commit(key, value())
-        }
-        pending[key] = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
-    }
-
-    private func settingValue(_ key: String, _ number: Double) -> Any {
-        guard let item = doc?.settings.first(where: { $0.key == key }) else { return number }
-        if item.kind == .int { return Int(number.rounded()) }
-        return (number * 100).rounded() / 100
-    }
-
+    /// Saves a number typed into a field. Input that is not a finite number, or not one the
+    /// setting can take, is refused: the field goes back to the saved value.
     private func setNumber(_ key: String, _ text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
-        guard let number = Double(trimmed) else { reload(); return }
-        commit(key, settingValue(key, number))
+        guard let kind = doc?.settings.first(where: { $0.key == key })?.kind,
+              let number = SettingNumber.parse(text),
+              let value = SettingNumber.value(number, kind: kind)
+        else {
+            NSSound.beep()
+            reload()
+            return
+        }
+        commit(key, value)
     }
 
     private func identifierKey(_ sender: Any?) -> String? {
@@ -538,8 +550,38 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
 
     @objc private func themeChanged(_ sender: NSPopUpButton) {
         guard let key = identifierKey(sender), let popups = themePopups[key] else { return }
-        commit(key, ColorThemeSpec.encode(light: popups.light.titleOfSelectedItem ?? "",
-                                          dark: popups.dark.titleOfSelectedItem ?? ""))
+        var light = popups.light.titleOfSelectedItem ?? ""
+        var dark = popups.dark.titleOfSelectedItem ?? ""
+        if sender.titleOfSelectedItem == SettingsWindow.otherTheme {
+            // A theme file: saved only if it loads (commit reports the error otherwise).
+            guard let path = chooseThemeFile() else { reload(); return }
+            if sender === popups.light { light = path } else { dark = path }
+        }
+        commit(key, ColorThemeSpec.encode(light: light, dark: dark))
+    }
+
+    private func chooseThemeFile() -> String? {
+        let panel = NSOpenPanel()
+        panel.message = "Choose a theme file (Thurm's TOML, or an iTerm2-style palette)."
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return url.path
+    }
+
+    /// The color a theme gives `key`, for an unset color control.
+    private func themeColor(for key: String) -> NSColor? {
+        let theme = SessionManager.shared.config.theme
+        switch key {
+        case "colors.foreground": return colorFromRGB(theme.foreground)
+        case "colors.background": return colorFromRGB(theme.background)
+        case "colors.cursor": return colorFromRGB(theme.cursor)
+        case "colors.cursor_text": return colorFromRGB(theme.cursorText)
+        case "colors.selection_foreground": return colorFromRGB(theme.selectionForeground)
+        case "colors.selection_background": return colorFromRGB(theme.selectionBackground)
+        default: return nil
+        }
     }
 
     @objc private func fontChanged(_ sender: NSPopUpButton) {
@@ -558,14 +600,26 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         commit(key, hex)
     }
 
-    @objc private func stepped(_ sender: NSStepper) {
-        guard let key = identifierKey(sender) else { return }
-        commit(key, settingValue(key, sender.doubleValue))
+    private func setting(_ key: String) -> SettingItem? {
+        doc?.settings.first { $0.key == key }
     }
 
+    @objc private func stepped(_ sender: NSStepper) {
+        guard let key = identifierKey(sender), let item = setting(key),
+              let value = SettingNumber.value(sender.doubleValue, kind: item.kind)
+        else {
+            NSSound.beep()
+            return
+        }
+        commit(key, value)
+    }
+
+    /// A slider saves when the drag ends (or a key moves it). Committing rebuilds the controls,
+    /// so nothing is saved while the mouse is down: the drag only moves the readout.
     @objc private func sliderMoved(_ sender: NSSlider) {
-        guard let key = identifierKey(sender) else { return }
-        let value = settingValue(key, sender.doubleValue)
+        guard let key = identifierKey(sender), let item = setting(key),
+              let value = SettingNumber.value(sender.doubleValue, kind: item.kind)
+        else { return }
         let readout = (sender.superview as? NSStackView)?.arrangedSubviews
             .compactMap { $0 as? NSTextField }
             .first { $0.identifier?.rawValue == "readout" }
@@ -574,11 +628,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         } else {
             readout?.stringValue = String(format: "%g", (value as? Double) ?? 0)
         }
-        if NSApp.currentEvent?.type == .leftMouseUp {
-            pending[key]?.cancel()
+        switch NSApp.currentEvent?.type {
+        case .leftMouseDown?, .leftMouseDragged?:
+            return
+        default:
             commit(key, value)
-        } else {
-            commitLater(key) { value }
         }
     }
 
@@ -653,10 +707,6 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         }
     }
 
-    func windowWillClose(_ notification: Notification) {
-        for work in pending.values { work.cancel() }
-        pending = [:]
-    }
 }
 
 /// A container whose origin is its top-left corner, so the form starts at the top.

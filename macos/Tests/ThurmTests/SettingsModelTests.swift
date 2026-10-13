@@ -123,6 +123,30 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(ColorThemeSpec.encode(light: "a", dark: "b"), "light:a,dark:b")
     }
 
+    func testNumbersTypedIntoFieldsParseOnlyWhenFinite() {
+        XCTAssertEqual(SettingNumber.parse("0.125"), 0.125)
+        XCTAssertEqual(SettingNumber.parse(" 2,5 "), 2.5)
+        XCTAssertNil(SettingNumber.parse("inf"))
+        XCTAssertNil(SettingNumber.parse("-inf"))
+        XCTAssertNil(SettingNumber.parse("nan"))
+        XCTAssertNil(SettingNumber.parse("1e400"))
+        XCTAssertNil(SettingNumber.parse(""))
+        XCTAssertNil(SettingNumber.parse("ten"))
+    }
+
+    func testFloatsKeepTheirPrecisionAndIntegersRound() throws {
+        XCTAssertEqual(try XCTUnwrap(SettingNumber.value(0.125, kind: .float)) as? Double, 0.125)
+        XCTAssertEqual(try XCTUnwrap(SettingNumber.value(2.5, kind: .int)) as? Int, 3)
+        XCTAssertEqual(try XCTUnwrap(SettingNumber.value(16, kind: .int)) as? Int, 16)
+    }
+
+    func testNumbersThatCannotBeSavedAreRefused() {
+        XCTAssertNil(SettingNumber.value(.infinity, kind: .float))
+        XCTAssertNil(SettingNumber.value(.nan, kind: .int))
+        XCTAssertNil(SettingNumber.value(1e30, kind: .int))
+        XCTAssertNil(SettingNumber.value(-1e30, kind: .int))
+    }
+
     func testHexColorsParseAndFormat() throws {
         let color = try XCTUnwrap(HexColor.parse("#0e1116"))
         XCTAssertEqual(color.red, 0x0e)

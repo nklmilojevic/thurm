@@ -42,6 +42,8 @@ struct SettingItem {
     /// For a cell of the notification matrix: the state (row) and the field (column).
     let row: String?
     let column: String?
+    /// Why settings.toml's value for this setting was left out, if it was.
+    let warning: String?
 
     init?(json: [String: Any]) {
         guard let key = jsonString(json["key"]),
@@ -60,6 +62,7 @@ struct SettingItem {
         max = jsonDouble(json["max"])
         row = jsonString(json["row"])
         column = jsonString(json["column"])
+        warning = jsonString(json["warning"])
     }
 
     /// Whether settings.toml sets this option, so that Reset has something to remove.
@@ -164,6 +167,31 @@ enum ColorThemeSpec {
 
     static func encode(light: String, dark: String) -> String {
         light == dark ? dark : "light:\(light),dark:\(dark)"
+    }
+}
+
+/// The numbers a number control takes and gives back.
+enum SettingNumber {
+    /// The number typed into a field (`,` or `.` as the decimal separator); nil unless it is finite.
+    static func parse(_ text: String) -> Double? {
+        let normalized = text.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
+        guard let value = Double(normalized), value.isFinite else { return nil }
+        return value
+    }
+
+    /// The value saved for `number` in a control of `kind`: whole numbers for `int` (rounded),
+    /// full precision for `float`. Nil when the number cannot be saved for that kind.
+    static func value(_ number: Double, kind: SettingKind) -> Any? {
+        guard number.isFinite else { return nil }
+        switch kind {
+        case .int:
+            let whole = number.rounded()
+            // Stay well inside Int, so the conversion cannot trap.
+            guard abs(whole) < 9.0e18 else { return nil }
+            return Int(whole)
+        default:
+            return number
+        }
     }
 }
 
