@@ -2931,6 +2931,17 @@ impl App {
                     self.focus_agent(&k);
                 }
             }
+            "Equalize" => {
+                let tab = match &key {
+                    Some(k) => self.tab_of(k),
+                    None => self.current_tab(),
+                };
+                if let Some(t) = tab {
+                    t.tree.borrow_mut().equalize();
+                    t.relayout();
+                    self.schedule_save();
+                }
+            }
             "SetTabTitle" => {
                 if let Some(t) = key.and_then(|k| self.tab_of(&k)) {
                     *t.title.borrow_mut() = p
