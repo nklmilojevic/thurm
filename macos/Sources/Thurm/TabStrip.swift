@@ -154,6 +154,12 @@ private final class WorkspaceBlock: NSView {
     }
 }
 
+extension Notification.Name {
+    /// A tab's window needs attention (a bell or a finished agent in one of its panes). The
+    /// window is the object.
+    static let tabAttention = Notification.Name("ThurmTabAttention")
+}
+
 /// The tabs: equal-width pills in a faint rounded track, the selected one raised, thin
 /// separators between the others. A pill dragged sideways moves its tab. Pills shrink to fit
 /// (to just the icon when narrow); tabs that still do not fit go into an overflow menu, the
@@ -307,7 +313,8 @@ private final class TabTrack: NSView {
             d.to = to
             drag = d
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.15
+                ctx.duration = Motion.duration(Motion.fast)
+                ctx.timingFunction = Motion.timingFunction
                 ctx.allowsImplicitAnimation = true
                 layoutSubtreeIfNeeded()
                 needsLayout = true
@@ -326,7 +333,8 @@ private final class TabTrack: NSView {
             group.insertWindow(w, at: shown[d.to])
         }
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15
+            ctx.duration = Motion.duration(Motion.fast)
+            ctx.timingFunction = Motion.timingFunction
             ctx.allowsImplicitAnimation = true
             needsLayout = true
             layoutSubtreeIfNeeded()
@@ -365,6 +373,13 @@ private final class TabPill: NSView {
     private var hovering = false {
         didSet { if hovering != oldValue { update() } }
     }
+    /// The selected surface eases in and out, so a selection that changes mid-flight retargets.
+    private var selection = Tween(0)
+    private let selectionMotion = MotionDriver()
+    /// The one-shot attention ring: 0 when it starts, 1 when it has faded out.
+    private var ring = Tween(1)
+    private let ringMotion = MotionDriver()
+    private var attention: NSObjectProtocol?
 
     init() {
         super.init(frame: .zero)
@@ -396,10 +411,18 @@ private final class TabPill: NSView {
         ])
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
                                        owner: self))
+        attention = NotificationCenter.default.addObserver(forName: .tabAttention, object: nil, queue: .main) { [weak self] note in
+            guard let self, let window = note.object as? NSWindow, window === self.tab?.window else { return }
+            self.pulse()
+        }
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not supported")
+    }
+
+    deinit {
+        if let attention { NotificationCenter.default.removeObserver(attention) }
     }
 
     override var isFlipped: Bool { true }
@@ -421,20 +444,52 @@ private final class TabPill: NSView {
         close.isHidden = !hovering || compact
         iconLeading.constant = compact ? max(0, (bounds.width - 26) / 2) : 10
         toolTip = tab.title
+        let target: Double = tab.selected ? 1 : 0
+        if selection.to != target {
+            let now = CACurrentMediaTime()
+            selection.move(to: target, duration: Motion.fast, at: now)
+            if !selection.isFinished(at: now) {
+                selectionMotion.run(on: self, for: Motion.fast) { [weak self] _ in self?.needsDisplay = true }
+            }
+        }
         needsDisplay = true
     }
 
+    /// A one-shot ring around the tab: the window wants attention from a background pane.
+    func pulse() {
+        guard let tab, !tab.selected, Motion.duration(Motion.pulse) > 0 else { return }
+        let now = CACurrentMediaTime()
+        ring = Tween(0)
+        ring.move(to: 1, duration: Motion.pulse, at: now)
+        ringMotion.run(on: self, for: Motion.pulse) { [weak self] _ in self?.needsDisplay = true }
+    }
+
     override func draw(_ dirtyRect: NSRect) {
-        guard let tab, tab.selected || hovering else { return }
+        guard let tab else { return }
         let chrome = SessionManager.shared.config.chrome
+        let now = CACurrentMediaTime()
+        let selected = CGFloat(selection.value(at: now))
         let r = bounds.height / 2
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: r - 0.5, yRadius: r - 0.5)
-        (tab.selected ? chrome.controlSelected : chrome.control).setFill()
-        path.fill()
-        if tab.selected {
-            chrome.stroke.setStroke()
+        if hovering && !tab.selected {
+            chrome.control.setFill()
+            path.fill()
+        }
+        if selected > 0.001 {
+            chrome.controlSelected.withAlphaComponent(chrome.controlSelected.alphaComponent * selected).setFill()
+            path.fill()
+            chrome.stroke.withAlphaComponent(chrome.stroke.alphaComponent * selected).setStroke()
             path.lineWidth = ChromeStroke.width
             path.stroke()
+        }
+        let p = min(1, max(0, CGFloat(ring.value(at: now))))
+        if p < 1 {
+            let grow = 3 * p
+            let ringPath = NSBezierPath(roundedRect: bounds.insetBy(dx: -grow + 0.5, dy: -grow + 0.5),
+                                        xRadius: r + grow - 0.5, yRadius: r + grow - 0.5)
+            chrome.contentPrimary.withAlphaComponent(0.4 * (1 - p)).setStroke()
+            ringPath.lineWidth = 1.5
+            ringPath.stroke()
         }
     }
 

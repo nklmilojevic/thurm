@@ -1165,6 +1165,9 @@ final class SessionManager: NSObject, CoreDelegate {
                 if !NSApp.isActive || !isPaneFocused(id) {
                     NSApp.requestUserAttention(.informationalRequest)
                 }
+                if !isPaneFocused(id) {
+                    NotificationCenter.default.post(name: .tabAttention, object: controller(for: id)?.window)
+                }
             }
         case "Notify":
             if let id = key {
@@ -1213,6 +1216,9 @@ final class SessionManager: NSObject, CoreDelegate {
         if let status = info.agent?.status, status == .done || status == .error || status == .needsInput,
            old?.agent?.status != status {
             Remotes.shared.agentSettled(key)
+        }
+        if info.agent?.status == .done, old?.agent?.status != .done, !isPaneFocused(key) {
+            NotificationCenter.default.post(name: .tabAttention, object: controller(for: key)?.window)
         }
         let wasWaiting = old?.agent?.status == .needsInput
         let waiting = info.agent?.status == .needsInput

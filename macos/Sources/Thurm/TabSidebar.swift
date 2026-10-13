@@ -111,8 +111,8 @@ final class TabSplitViewController: NSSplitViewController {
         togglingSidebar = true
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(saveWidth), object: nil)
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.2
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            ctx.duration = Motion.duration(Motion.standard)
+            ctx.timingFunction = Motion.timingFunction
             side.animator().isCollapsed = collapse
         }, completionHandler: { [weak self] in
             if !collapse { self?.placeDivider() }

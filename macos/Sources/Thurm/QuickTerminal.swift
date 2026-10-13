@@ -150,7 +150,7 @@ final class QuickTerminal {
     }
 
     private func animateTo(_ w: NSWindow, frame: NSRect, alpha: CGFloat, completion: (() -> Void)?) {
-        let duration = config.quickAnimationDuration
+        let duration = Motion.duration(config.quickAnimationDuration)
         guard duration > 0 else {
             w.setFrame(frame, display: true)
             w.alphaValue = alpha
@@ -159,7 +159,7 @@ final class QuickTerminal {
         }
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = duration
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            ctx.timingFunction = Motion.timingFunction
             w.animator().setFrame(frame, display: true)
             w.animator().alphaValue = alpha
         }, completionHandler: completion)
