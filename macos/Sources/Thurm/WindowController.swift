@@ -436,6 +436,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     @objc func resizeUp(_ sender: Any?) { content.resizeFocused(axis: .vertical, delta: -0.05) }
     @objc func resizeDown(_ sender: Any?) { content.resizeFocused(axis: .vertical, delta: 0.05) }
 
+    @objc func movePaneLeft(_ sender: Any?) { content.movePane(.left) }
+    @objc func movePaneRight(_ sender: Any?) { content.movePane(.right) }
+    @objc func movePaneUp(_ sender: Any?) { content.movePane(.up) }
+    @objc func movePaneDown(_ sender: Any?) { content.movePane(.down) }
+
     @objc func showFind(_ sender: Any?) {
         content.showFindBar()
     }
