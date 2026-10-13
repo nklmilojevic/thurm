@@ -80,9 +80,9 @@ _set-version version:
         macos/Resources/Info.plist
     grep -q '<string>{{ version }}</string>' macos/Resources/Info.plist
     if command -v cargo >/dev/null; then
-        cargo update --workspace --offline -q
+        cargo update --workspace -q
     else
-        nix develop -c cargo update --workspace --offline -q
+        nix develop -c cargo update --workspace -q
     fi
     grep -q '^version = "{{ version }}"' Cargo.toml
 
