@@ -77,6 +77,10 @@ impl UiConfig {
         self.cfg.window.pane_headers
     }
 
+    pub fn auto_balance(&self) -> bool {
+        self.cfg.window.auto_balance
+    }
+
     /// Space between split cards (and around them) when pane headers show.
     pub fn pane_gap(&self) -> f64 {
         self.cfg.window.pane_gap.clamp(0.0, 64.0)

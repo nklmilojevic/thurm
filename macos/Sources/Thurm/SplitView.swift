@@ -65,6 +65,18 @@ indirect enum SplitNode {
         }
     }
 
+    /// Exchanges the places of two panes (their splits stay where they are).
+    func swapping(_ a: PaneKey, _ b: PaneKey) -> SplitNode {
+        switch self {
+        case .leaf(let id):
+            if id == a { return .leaf(b) }
+            if id == b { return .leaf(a) }
+            return self
+        case .split(let axis, let ratio, let first, let second):
+            return .split(axis: axis, ratio: ratio, first: first.swapping(a, b), second: second.swapping(a, b))
+        }
+    }
+
     /// Removes a pane; nil when the tree becomes empty.
     func removing(_ id: PaneKey) -> SplitNode? {
         switch self {
@@ -630,6 +642,7 @@ final class TabContentView: NSView {
         let t = target.flatMap { root.contains($0) ? $0 : nil } ?? focusedPane
         zoomedPane = nil
         root = root.inserting(newPane, at: t, direction: direction)
+        if SessionManager.shared.config.autoBalance { root = root.equalized() }
         syncViews()
         layoutPanes()
         focus(newPane)
@@ -642,12 +655,13 @@ final class TabContentView: NSView {
         guard root.contains(pane) else { return views.isEmpty }
         let wasFocused = pane == focusedPane
         if zoomedPane == pane { zoomedPane = nil }
-        guard let newRoot = root.removing(pane) else {
+        guard var newRoot = root.removing(pane) else {
             views[pane]?.detach()
             views[pane]?.removeFromSuperview()
             views.removeValue(forKey: pane)
             return true
         }
+        if SessionManager.shared.config.autoBalance { newRoot = newRoot.equalized() }
         // Pick the spatially nearest pane as the new focus.
         var nextFocus = focusedPane
         if wasFocused {
@@ -692,10 +706,16 @@ final class TabContentView: NSView {
     }
 
     func moveFocus(_ direction: FocusDirection) {
-        guard zoomedPane == nil, let current = views[focusedPane] else { return }
+        guard zoomedPane == nil, let target = neighbor(of: focusedPane, direction) else { return }
+        focus(target)
+    }
+
+    /// The pane next to `pane` in `direction`: overlapping ones first, then the closest.
+    private func neighbor(of pane: PaneKey, _ direction: FocusDirection) -> PaneKey? {
+        guard let current = views[pane] else { return nil }
         let cur = current.frame
         var best: (PaneKey, CGFloat)?
-        for (id, view) in views where id != focusedPane {
+        for (id, view) in views where id != pane {
             let f = view.frame
             let overlap: Bool
             let distance: CGFloat
@@ -724,9 +744,16 @@ final class TabContentView: NSView {
                 best = (id, score)
             }
         }
-        if let target = best?.0 {
-            focus(target)
-        }
+        return best?.0
+    }
+
+    /// Swaps the focused pane with its neighbour in `direction`; the focus stays on it.
+    func movePane(_ direction: FocusDirection) {
+        guard zoomedPane == nil, let target = neighbor(of: focusedPane, direction) else { return }
+        root = root.swapping(focusedPane, target)
+        layoutPanes()
+        window?.invalidateCursorRects(for: self)
+        SessionManager.shared.scheduleLayoutSave()
     }
 
     func toggleZoom() {

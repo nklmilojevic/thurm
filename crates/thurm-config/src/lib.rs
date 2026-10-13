@@ -265,6 +265,8 @@ pub struct WindowConfig {
     pub quit_after_last_window: bool,
     /// Dim unfocused split panes (0 = off, 1 = fully).
     pub unfocused_split_dim: f64,
+    /// Rebalance a tab's splits (as View > Equalize Splits does) when a pane opens or closes.
+    pub auto_balance: bool,
     /// Show the per-pane header strip with agent status in splits.
     pub pane_headers: bool,
     /// Space between split panes (and around them) when pane headers show, in points.
@@ -291,6 +293,7 @@ impl Default for WindowConfig {
             confirm_close: true,
             quit_after_last_window: false,
             unfocused_split_dim: 0.25,
+            auto_balance: true,
             pane_headers: true,
             pane_gap: 6.0,
             tab_style: TabStyle::Sidebar,
@@ -1500,7 +1503,10 @@ pub const DEFAULT_CONFIG_TOML: &str = include_str!("default_config.toml");
 /// a feature that is on by default but sits turned off in config files written before it was.
 /// Append only; the file records how many it has had in `config_version`, which the default
 /// config sets to their number.
-const MIGRATIONS: &[(&str, &str)] = &[("window.pane_headers", "true")];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("window.pane_headers", "true"),
+    ("window.auto_balance", "true"),
+];
 
 /// Returns `text` with the migrations it has not had applied, and `config_version` raised to
 /// match (inserted before the first table when missing); `None` when it is current.
@@ -1744,6 +1750,16 @@ clipboard_read = "always"
         // Turned off again after the migration: the user's choice stays.
         let off = with_setting(&out, "window.pane_headers", "false").unwrap();
         assert_eq!(migrate(&off).unwrap(), None);
+    }
+
+    #[test]
+    fn auto_balance_comes_on_for_files_from_before_it() {
+        let v1 = "config_version = 1\n\n[window]\npane_headers = true\n";
+        let out = migrate(v1).unwrap().unwrap();
+        assert!(Config::parse(&out).unwrap().window.auto_balance);
+        let off = with_setting(&out, "window.auto_balance", "false").unwrap();
+        assert_eq!(migrate(&off).unwrap(), None);
+        assert!(!Config::parse(&off).unwrap().window.auto_balance);
     }
 
     #[test]

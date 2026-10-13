@@ -58,6 +58,11 @@ let package = Package(
                 .linkedLibrary("resolv"),
             ]
         ),
+        .testTarget(
+            name: "ThurmTests",
+            dependencies: ["Thurm"],
+            path: "Tests/ThurmTests"
+        ),
         // Runs prompts on Apple Intelligence's on-device model for thurmd (`[ai]` in the
         // config). Weakly linked: the framework only exists on macOS 26 and later.
         .executableTarget(

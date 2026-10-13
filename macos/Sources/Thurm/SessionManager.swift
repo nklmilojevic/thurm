@@ -33,6 +33,8 @@ final class SessionManager: NSObject, CoreDelegate {
     /// Layout saving starts only after the initial restore, so a failed start never
     /// overwrites the stored layout with an empty one.
     private var sessionReady = false
+    /// Called after each successful restore, once the session is usable.
+    var onSessionReady: (() -> Void)?
     /// Restores in a row whose ListPanes or GetLayout failed.
     private var restoreFailures = 0
     private var lastLayoutJSON: String?
@@ -462,6 +464,7 @@ final class SessionManager: NSObject, CoreDelegate {
         sessionReady = true
         saveLayoutNow(force: true)
         focusChanged()
+        onSessionReady?()
     }
 
     /// A saved window's tabs as a workspace in the background.
@@ -676,7 +679,7 @@ final class SessionManager: NSObject, CoreDelegate {
 
     /// Cmd+D / Cmd+Shift+D.
     func splitFocused(in c: TerminalWindowController, direction: SplitDirName, preset: String? = nil,
-                      fork: Bool = false) {
+                      fork: Bool = false, cwd: String? = nil) {
         let target = c.focusedPane
         var size = gridSize(forPoints: c.content.focusedView?.frame.size ?? c.content.bounds.size)
         if direction == .right || direction == .left {
@@ -685,7 +688,7 @@ final class SessionManager: NSObject, CoreDelegate {
             size.rows = max(1, size.rows / 2)
         }
         guard let id = createPane(cols: size.cols, rows: size.rows, inheritFrom: target, preset: preset,
-                                  forkFrom: fork ? target : nil) else { return }
+                                  forkFrom: fork ? target : nil, cwd: cwd) else { return }
         c.content.split(target: target, newPane: id, direction: direction)
         scheduleLayoutSave()
     }
@@ -1345,6 +1348,8 @@ final class SessionManager: NSObject, CoreDelegate {
             }
         case "Focus":
             if let pane = key("pane") { focusPane(pane, activate: true) }
+        case "Equalize":
+            if let pane = key("pane") { controller(for: pane)?.content.equalize() }
         case "Scroll":
             // The viewport lives in the app's copy of the terminal.
             if let pane = key("pane"), let scroll = d["scroll"] {
