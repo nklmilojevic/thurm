@@ -225,6 +225,8 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(SettingList.parse(" a, b ,,c "), ["a", "b", "c"])
         XCTAssertTrue(SettingList.isEditableAsText(["a", "b"]))
         XCTAssertFalse(SettingList.isEditableAsText(["a,b", "c"]))
+        XCTAssertFalse(SettingList.isEditableAsText([" a", "b"]))
+        XCTAssertFalse(SettingList.isEditableAsText(["a", "", "b"]))
         XCTAssertTrue(SettingList.isEditableAsText(nil))
     }
 

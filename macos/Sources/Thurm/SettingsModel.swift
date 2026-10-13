@@ -282,15 +282,17 @@ enum SystemSounds {
     }
 }
 
-/// A list setting as one text field: its elements comma-separated. A list with an element that
-/// itself holds a comma can't round-trip through that, so it is edited in the file instead.
+/// A list setting as one text field: its elements comma-separated. A list that wouldn't come back
+/// unchanged through that (an element with a comma, surrounding spaces, or nothing in it) is edited
+/// in the file instead.
 enum SettingList {
     static func elements(_ value: Any?) -> [String] {
         (value as? [Any])?.compactMap { $0 as? String } ?? []
     }
 
     static func isEditableAsText(_ value: Any?) -> Bool {
-        !elements(value).contains { $0.contains(",") }
+        let list = elements(value)
+        return parse(list.joined(separator: ", ")) == list
     }
 
     static func parse(_ text: String) -> [String] {
