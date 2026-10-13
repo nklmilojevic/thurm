@@ -50,7 +50,7 @@ final class QuickTerminalWindow: NSPanel {
         case .right: layer.maskedCorners = right
         case .center: layer.maskedCorners = top.union(bottom)
         }
-        layer.cornerRadius = 16
+        layer.cornerRadius = ChromeRadius.window
         layer.cornerCurve = .continuous
         layer.masksToBounds = true
         invalidateShadow()

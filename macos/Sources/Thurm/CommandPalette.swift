@@ -163,8 +163,8 @@ final class CommandPalette: NSObject, NSTableViewDataSource, NSTableViewDelegate
         // Themed like the terminal (see `applyStyle`).
         let effect = NSView(frame: rect)
         effect.wantsLayer = true
-        effect.layer?.cornerRadius = 10
-        effect.layer?.borderWidth = 1
+        effect.layer?.cornerRadius = ChromeRadius.window
+        effect.layer?.borderWidth = ChromeStroke.width
         effect.layer?.masksToBounds = true
         effect.autoresizingMask = [.width, .height]
         panel.contentView = effect

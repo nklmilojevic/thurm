@@ -160,7 +160,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     private var reloadHeld = false
     /// The rows as last shown: agents retitle their panes several times a second, which
     /// mostly changes nothing the sidebar shows.
-    private var shown: (names: [String], tabs: [[SidebarTab]])?
+    private var shown: (names: [String], tabs: [[SidebarTab]], theme: Theme)?
 
     private let outline = NSOutlineView()
     private var groups: [SidebarGroup] = []
@@ -340,8 +340,9 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         }
         if !other.tabs.isEmpty { order.append(other) }
         let names = order.map(\.name), tabs = order.map(\.tabs)
-        if shown.map({ $0.names == names && $0.tabs == tabs }) != true {
-            shown = (names, tabs)
+        let theme = SessionManager.shared.config.theme
+        if shown.map({ $0.names == names && $0.tabs == tabs && $0.theme == theme }) != true {
+            shown = (names, tabs, theme)
             for g in order { g.boxes = g.tabs.map(TabBox.init) }
             groups = order
             showHeaders = groups.count > 1
@@ -449,7 +450,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         if let g = item as? SidebarGroup {
             let label = NSTextField(labelWithString: g.name)
             label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-            label.textColor = .secondaryLabelColor
+            label.textColor = SessionManager.shared.config.chrome.contentSecondary
             label.lineBreakMode = .byTruncatingTail
             return label
         }
@@ -521,14 +522,14 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private var visibleRows: Int { draggedRows ?? SessionManager.shared.config.sidebarAgentRows }
     private var draggedRows: Int?
     private var shownLimit = 0
+    /// The theme the header and rows were colored with; a reload with another one repaints them.
+    private var themed: Theme?
 
     init() {
         super.init(frame: .zero)
         separator.boxType = .separator
         header.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-        header.textColor = .secondaryLabelColor
         summary.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        summary.textColor = .tertiaryLabelColor
         summary.alignment = .right
 
         let column = NSTableColumn(identifier: .init("agent"))
@@ -600,8 +601,15 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     func reload() {
+        let theme = SessionManager.shared.config.theme
+        let repaint = theme != themed
+        if repaint {
+            themed = theme
+            header.textColor = SessionManager.shared.config.chrome.contentSecondary
+            summary.textColor = SessionManager.shared.config.chrome.contentTertiary
+        }
         let next = agentRows()
-        if next.count == rows.count, shownLimit == visibleRows,
+        if !repaint, next.count == rows.count, shownLimit == visibleRows,
            zip(next, rows).allSatisfy({ $0.pane == $1.pane && $0.hiddenWorkspace == $1.hiddenWorkspace && $0.row == $1.row }) {
             // A click selects its row even when it changes nothing shown: put the selection back.
             let current = rows.firstIndex { $0.row.selected }
@@ -723,12 +731,12 @@ final class TabRowView: NSTableCellView {
         title.font = .systemFont(ofSize: 13)
         title.lineBreakMode = .byTruncatingTail
         subtitle.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        subtitle.textColor = .secondaryLabelColor
+        subtitle.textColor = SessionManager.shared.config.chrome.contentSecondary
         subtitle.lineBreakMode = .byTruncatingMiddle
         subtitle.maximumNumberOfLines = 1
         title.maximumNumberOfLines = 1
         shortcut.font = .systemFont(ofSize: 11)
-        shortcut.textColor = .tertiaryLabelColor
+        shortcut.textColor = SessionManager.shared.config.chrome.contentTertiary
         for v in [icon, dot, title, subtitle, shortcut] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
@@ -772,16 +780,17 @@ final class TabRowView: NSTableCellView {
             // shorten the branch rather than the diff counts.
             let para = NSMutableParagraphStyle()
             para.lineBreakMode = .byTruncatingMiddle
-            let base: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.secondaryLabelColor,
+            let chrome = SessionManager.shared.config.chrome
+            let base: [NSAttributedString.Key: Any] = [.foregroundColor: chrome.contentSecondary,
                                                       .font: subtitle.font!, .paragraphStyle: para]
             let s = NSMutableAttributedString(string: branch, attributes: base)
             if tab.added > 0 {
                 s.append(NSAttributedString(string: "  +\(tab.added)",
-                                            attributes: base.merging([.foregroundColor: NSColor.systemGreen]) { $1 }))
+                                            attributes: base.merging([.foregroundColor: chrome.success]) { $1 }))
             }
             if tab.removed > 0 {
                 s.append(NSAttributedString(string: " −\(tab.removed)",
-                                            attributes: base.merging([.foregroundColor: NSColor.systemRed]) { $1 }))
+                                            attributes: base.merging([.foregroundColor: chrome.danger]) { $1 }))
             }
             subtitle.attributedStringValue = s
         } else {

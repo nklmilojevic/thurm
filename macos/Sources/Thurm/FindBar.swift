@@ -12,10 +12,8 @@ final class FindBar: NSView, NSSearchFieldDelegate {
     init() {
         super.init(frame: NSRect(x: 0, y: 0, width: 340, height: 34))
         wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
-        layer?.cornerRadius = 8
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor.separatorColor.cgColor
+        layer?.cornerRadius = ChromeRadius.control
+        layer?.borderWidth = ChromeStroke.width
         shadow = NSShadow()
         layer?.shadowOpacity = 0.25
         layer?.shadowRadius = 6
@@ -28,7 +26,6 @@ final class FindBar: NSView, NSSearchFieldDelegate {
         field.action = #selector(fieldAction(_:))
         field.translatesAutoresizingMaskIntoConstraints = false
 
-        status.textColor = NSColor.secondaryLabelColor
         status.font = NSFont.systemFont(ofSize: 11)
         status.translatesAutoresizingMaskIntoConstraints = false
         status.setContentHuggingPriority(.required, for: .horizontal)
@@ -53,10 +50,19 @@ final class FindBar: NSView, NSSearchFieldDelegate {
             stack.bottomAnchor.constraint(equalTo: bottomAnchor),
             field.widthAnchor.constraint(greaterThanOrEqualToConstant: 180),
         ])
+        applyTheme()
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not supported")
+    }
+
+    /// Re-read on every config reload: the bar lives as long as the window.
+    func applyTheme() {
+        let chrome = SessionManager.shared.config.chrome
+        layer?.backgroundColor = chrome.surfaceRaised.withAlphaComponent(0.96).cgColor
+        layer?.borderColor = chrome.stroke.cgColor
+        status.textColor = chrome.contentSecondary
     }
 
     private static func button(symbol: String, fallback: String, target: AnyObject, action: Selector) -> NSButton {

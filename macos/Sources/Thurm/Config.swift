@@ -12,7 +12,7 @@ enum QuickTerminalPosition: String {
 }
 
 /// Resolved color theme (colors are 0xRRGGBB).
-struct Theme {
+struct Theme: Equatable {
     var name: String
     var foreground: UInt32
     var background: UInt32
@@ -126,6 +126,8 @@ final class AppConfig {
     var quitAfterLastWindow = false
     /// `window.blur` > 0: blur what is behind a translucent window.
     var blur = 0
+    /// `window.material`: the chrome's backdrop when the window is translucent.
+    var material = WindowMaterial.theme
     var sidebarWidth: CGFloat = 240
     /// `window.sidebar_agents`: the agents panel below the sidebar's tabs.
     var sidebarAgents = true
@@ -278,6 +280,7 @@ final class AppConfig {
             paneGap = CGFloat(clamped(w["pane_gap"], 0, 64) ?? Double(paneGap))
             if let style = jsonString(w["tab_style"]) { sidebarTabs = style == "sidebar" }
             blur = min(100, max(0, jsonInt(w["blur"]) ?? blur))
+            if let m = jsonString(w["material"]).flatMap(WindowMaterial.init(rawValue:)) { material = m }
             quitAfterLastWindow = jsonBool(w["quit_after_last_window"]) ?? quitAfterLastWindow
             sidebarWidth = CGFloat(min(480, max(180, jsonDouble(w["sidebar_width"]) ?? Double(sidebarWidth))))
             sidebarAgents = jsonBool(w["sidebar_agents"]) ?? sidebarAgents
@@ -332,14 +335,11 @@ final class AppConfig {
     /// The sidebar's background (and the gutters between split cards): a step off the terminal
     /// background, darker like Catppuccin's mantle.
     var sidebarColor: NSColor {
-        let base = colorFromRGB(theme.background, alpha: opacity)
-        return base.shadow(withLevel: theme.isDark ? 0.18 : 0.05) ?? base
+        chrome.surface.withAlphaComponent(opacity)
     }
 
     /// Color used for the thin split dividers.
     var dividerColor: NSColor {
-        let fg = colorFromRGB(theme.foreground)
-        let bg = colorFromRGB(theme.background)
-        return bg.blended(withFraction: 0.25, of: fg) ?? fg
+        chrome.divider
     }
 }

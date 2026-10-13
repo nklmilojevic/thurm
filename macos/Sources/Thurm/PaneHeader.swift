@@ -1,14 +1,15 @@
 import AppKit
 
 extension AgentStatus {
-    /// The status dot's color (sidebar rows, pane headers).
+    /// The status dot's color (sidebar rows, pane headers, tabs).
     var color: NSColor {
+        let chrome = SessionManager.shared.config.chrome
         switch self {
-        case .working: return .systemBlue
-        case .needsInput: return .systemOrange
-        case .done: return .systemGreen
-        case .error: return .systemRed
-        case .idle: return .systemGray
+        case .working: return chrome.info
+        case .needsInput: return chrome.warning
+        case .done: return chrome.success
+        case .error: return chrome.danger
+        case .idle: return chrome.contentTertiary
         }
     }
 }
@@ -108,7 +109,7 @@ final class PaneHeader: NSView {
         toolTip = [text, info?.cwd].compactMap { $0 }.joined(separator: "\n")
 
         let fg = colorFromRGB(cfg.theme.foreground)
-        title.textColor = fg.withAlphaComponent(focused ? 1 : 0.6)
+        title.textColor = focused ? cfg.chrome.contentPrimary : cfg.chrome.contentSecondary
         icon.contentTintColor = fg.withAlphaComponent(focused ? 0.9 : 0.55)
         for case let b as NSButton in buttons.arrangedSubviews {
             b.contentTintColor = fg.withAlphaComponent(focused ? 0.45 : 0.3)
