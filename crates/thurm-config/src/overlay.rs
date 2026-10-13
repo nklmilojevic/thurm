@@ -80,7 +80,8 @@ pub fn merge(base: &str, overlay: &str) -> Result<Merged, String> {
     let mut merged = base_table.clone();
     merge_tables(&mut merged, &overlay_table);
     let whole = toml::to_string(&merged).map_err(|e| e.to_string())?;
-    if let Ok((_, new)) = Config::parse_with_warnings(&whole)
+    if names_options(&overlay_table)
+        && let Ok((_, new)) = Config::parse_with_warnings(&whole)
         && new.iter().all(|w| base_warnings.contains(w))
     {
         let applied = settings.iter().map(|(path, _)| path.join(".")).collect();
@@ -95,11 +96,15 @@ pub fn merge(base: &str, overlay: &str) -> Result<Merged, String> {
     let mut applied = Vec::new();
     for (path, value) in settings {
         let key = path.join(".");
+        let mut alone = Table::new();
+        set_path(&mut alone, &path, value.clone());
         let mut candidate = current.clone();
         set_path(&mut candidate, &path, value);
         let text = toml::to_string(&candidate).map_err(|e| e.to_string())?;
         match Config::parse_with_warnings(&text) {
-            Ok((_, new)) if new.iter().all(|w| base_warnings.contains(w)) => {
+            Ok((_, new))
+                if names_options(&alone) && new.iter().all(|w| base_warnings.contains(w)) =>
+            {
                 current = candidate;
                 applied.push(key);
             }
@@ -113,6 +118,16 @@ pub fn merge(base: &str, overlay: &str) -> Result<Merged, String> {
         warnings,
         applied,
     })
+}
+
+/// Whether every setting in `table` names an option. Checked on its own: comparing with the
+/// warnings of `config.toml` would let an unknown key the file also sets slip through. Values
+/// are judged in the merged config, so one that fails to load here on its own still passes.
+fn names_options(table: &Table) -> bool {
+    let Ok(text) = toml::to_string(table) else {
+        return false;
+    };
+    Config::parse_with_warnings(&text).map_or(true, |(_, warnings)| warnings.is_empty())
 }
 
 /// Sets `key` in the overlay beside `config` to the TOML value `literal`, or removes it for
@@ -432,6 +447,23 @@ mod tests {
             );
             assert_eq!(Config::parse(&merged.text).unwrap().config_version, 9);
         }
+    }
+
+    #[test]
+    fn an_unknown_key_config_toml_also_sets_is_still_reported() {
+        let base = "[window]\nnonsense = 1\n";
+        let merged = merge(base, "[window]\nnonsense = 2\n").unwrap();
+        assert!(
+            merged
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("settings.toml: window.nonsense ")),
+            "{:?}",
+            merged.warnings
+        );
+        assert!(merged.applied.is_empty(), "{:?}", merged.applied);
+        let merged = merge(base, "[window]\nnonsense = 2\n[font]\nsize = 15.0\n").unwrap();
+        assert_eq!(merged.applied, vec!["font.size".to_owned()]);
     }
 
     #[test]
