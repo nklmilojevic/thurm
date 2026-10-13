@@ -35,14 +35,15 @@ struct PopupStyle {
 
     init(config: AppConfig) {
         let t = config.theme
+        let chrome = config.chrome
         font = FontShaper.terminalFont(config: config, size: config.fontSize)
         detailFont = FontShaper.terminalFont(config: config, size: max(8, config.fontSize - 2))
-        background = colorFromRGB(t.background)
-        text = colorFromRGB(t.foreground)
-        secondary = colorFromRGB(t.foreground, alpha: 0.55)
+        background = chrome.surfaceRaised
+        text = chrome.contentPrimary
+        secondary = chrome.contentSecondary
         selection = colorFromRGB(t.selectionBackground)
         selectionText = colorFromRGB(t.selectionForeground)
-        border = colorFromRGB(t.foreground, alpha: 0.14)
+        border = chrome.stroke
     }
 }
 
@@ -88,8 +89,8 @@ final class CompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDelegat
         // view (and the table column in it) with no width, so rows render empty.
         let effect = background
         effect.wantsLayer = true
-        effect.layer?.cornerRadius = 8
-        effect.layer?.borderWidth = 1
+        effect.layer?.cornerRadius = ChromeRadius.control
+        effect.layer?.borderWidth = ChromeStroke.width
         effect.layer?.masksToBounds = true
 
         let col = NSTableColumn(identifier: .init("c"))

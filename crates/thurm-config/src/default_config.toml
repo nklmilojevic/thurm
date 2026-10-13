@@ -3,7 +3,7 @@
 
 # The updates Thurm has made to this file: it turns on features that came after the file was
 # written, then raises this. Leave it as it is.
-config_version = 2
+config_version = 3
 
 [font]
 # A family or a face name ("TX-02 Retina ExtraCondensed"). JetBrains Mono ships with Thurm.
@@ -32,6 +32,9 @@ padding_y = 6.0
 opacity = 1.0
 # Blur what is behind the window when opacity < 1 (any value > 0 turns it on).
 blur = 0
+# The backdrop of the chrome when opacity < 1: "theme" (the terminal background), "system" (blur),
+# "blend" (blur with the background over it) or "modern" (blur tinted as glass).
+material = "theme"
 # Treat Option as Alt/Meta: "none", "left", "right" or "both".
 option_as_alt = "none"
 columns = 110

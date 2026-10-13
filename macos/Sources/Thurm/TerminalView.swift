@@ -706,12 +706,13 @@ final class TerminalView: NSView, NSTextInputClient {
         toastView?.removeFromSuperview()
         let label = NSTextField(labelWithString: text)
         label.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        label.textColor = NSColor.white
+        let chrome = SessionManager.shared.config.chrome
+        label.textColor = chrome.contentPrimary
         label.sizeToFit()
         let box = NSView(frame: NSRect(x: 0, y: 0, width: label.frame.width + 20, height: label.frame.height + 8))
         box.wantsLayer = true
-        box.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.75).cgColor
-        box.layer?.cornerRadius = 7
+        box.layer?.backgroundColor = chrome.surfaceRaised.withAlphaComponent(0.92).cgColor
+        box.layer?.cornerRadius = ChromeRadius.control
         label.frame.origin = NSPoint(x: 10, y: 4)
         box.addSubview(label)
         addSubview(box)

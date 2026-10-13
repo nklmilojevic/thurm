@@ -236,6 +236,21 @@ pub enum TabStyle {
     Sidebar,
 }
 
+/// What the window chrome sits on when `window.opacity` is below 1 (see `window.blur`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowMaterial {
+    /// The terminal background alone (plus `window.blur`, when set).
+    #[default]
+    Theme,
+    /// Behind-window blur under the chrome, as macOS draws it.
+    System,
+    /// Blur with the terminal background blended over it.
+    Blend,
+    /// Blur tinted lightly with the terminal background, so the chrome reads as glass.
+    Modern,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum OptionAsAlt {
@@ -255,6 +270,8 @@ pub struct WindowConfig {
     pub opacity: f64,
     /// Background blur radius (requires opacity < 1).
     pub blur: u32,
+    /// The backdrop of the chrome when opacity < 1.
+    pub material: WindowMaterial,
     pub option_as_alt: OptionAsAlt,
     /// Initial size of new windows, in cells.
     pub columns: u16,
@@ -287,6 +304,7 @@ impl Default for WindowConfig {
             padding_y: 6.0,
             opacity: 1.0,
             blur: 0,
+            material: WindowMaterial::Theme,
             option_as_alt: OptionAsAlt::None,
             columns: 110,
             rows: 32,
@@ -1506,6 +1524,7 @@ pub const DEFAULT_CONFIG_TOML: &str = include_str!("default_config.toml");
 const MIGRATIONS: &[(&str, &str)] = &[
     ("window.pane_headers", "true"),
     ("window.auto_balance", "true"),
+    ("window.material", "\"theme\""),
 ];
 
 /// Returns `text` with the migrations it has not had applied, and `config_version` raised to
@@ -1779,6 +1798,13 @@ clipboard_read = "always"
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(Config::parse(&text).unwrap().window.pane_headers);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn window_material_is_one_of_four() {
+        let out = with_setting(DEFAULT_CONFIG_TOML, "window.material", "\"modern\"").unwrap();
+        assert_eq!(Config::parse(&out).unwrap().window.material, WindowMaterial::Modern);
+        assert!(with_setting(&out, "window.material", "\"glass\"").is_err());
     }
 
     #[test]
