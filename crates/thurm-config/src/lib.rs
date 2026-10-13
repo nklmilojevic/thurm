@@ -12,6 +12,7 @@ mod themes;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use thurm_proto::AgentStatus;
 
 pub use agents::{AgentDef, builtin_agents};
 pub use programs::{CATEGORIES, ProgramDef, builtin_programs, executable_name, identify, marks};
@@ -474,26 +475,113 @@ impl Default for SecurityConfig {
 #[serde(default)]
 pub struct NotificationConfig {
     pub enabled: bool,
-    /// Notify when a detected agent needs input and the pane isn't focused.
-    pub agent_needs_input: bool,
-    /// Notify when an agent finishes a turn in an unfocused pane (needs `thurm hooks install`).
-    pub agent_done: bool,
     /// Notify when a command running longer than this finishes in an unfocused pane (0 = off).
     pub command_finished_secs: u64,
     /// Honor OSC 9 / OSC 99 / OSC 777 notifications from programs.
     pub program_notifications: bool,
     pub bell_badge: bool,
+    /// What an agent in each state does: the tab's indicator, a notification, the Dock badge
+    /// and a sound.
+    pub working: StateNotice,
+    pub waiting: StateNotice,
+    pub blocked: StateNotice,
+    pub finished: StateNotice,
+    pub failed: StateNotice,
+    pub idle: StateNotice,
+}
+
+/// One state's row of the notification matrix.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct StateNotice {
+    /// Show the state on the pane's tab.
+    pub tab_indicator: bool,
+    /// Post a desktop notification when an agent enters the state in an unfocused pane.
+    pub notify: bool,
+    /// Count the pane on the Dock badge until it is seen.
+    pub badge: bool,
+    /// `"default"`, `"none"`, or a sound file's name (macOS looks it up in `~/Library/Sounds`
+    /// and the app bundle).
+    pub sound: String,
+}
+
+impl Default for StateNotice {
+    fn default() -> Self {
+        Self {
+            tab_indicator: true,
+            notify: false,
+            badge: false,
+            sound: "none".into(),
+        }
+    }
 }
 
 impl Default for NotificationConfig {
     fn default() -> Self {
+        let alert = StateNotice {
+            tab_indicator: true,
+            notify: true,
+            badge: true,
+            sound: "default".into(),
+        };
         Self {
             enabled: true,
-            agent_needs_input: true,
-            agent_done: true,
             command_finished_secs: 15,
             program_notifications: true,
             bell_badge: true,
+            working: StateNotice::default(),
+            waiting: alert.clone(),
+            blocked: alert.clone(),
+            finished: alert.clone(),
+            failed: alert,
+            idle: StateNotice::default(),
+        }
+    }
+}
+
+/// The states of the notification matrix: what an agent in a pane is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeState {
+    Working,
+    /// Asks for input.
+    Waiting,
+    /// Asks for approval (a permission prompt the user can answer).
+    Blocked,
+    /// Finished a turn, or a program reported it done.
+    Finished,
+    /// Failed and stopped.
+    Failed,
+    Idle,
+}
+
+impl NoticeState {
+    /// The state of an agent with `status`; `prompt` is whether it shows a permission prompt.
+    pub fn of(status: AgentStatus, prompt: bool) -> Self {
+        match status {
+            AgentStatus::Working => Self::Working,
+            AgentStatus::Idle => Self::Idle,
+            AgentStatus::NeedsInput if prompt => Self::Blocked,
+            AgentStatus::NeedsInput => Self::Waiting,
+            AgentStatus::Done => Self::Finished,
+            AgentStatus::Error => Self::Failed,
+        }
+    }
+}
+
+impl NotificationConfig {
+    /// The row for the state `agent` is in.
+    pub fn for_agent(&self, agent: &thurm_proto::AgentState) -> &StateNotice {
+        self.notice(NoticeState::of(agent.status, agent.permission.is_some()))
+    }
+
+    pub fn notice(&self, state: NoticeState) -> &StateNotice {
+        match state {
+            NoticeState::Working => &self.working,
+            NoticeState::Waiting => &self.waiting,
+            NoticeState::Blocked => &self.blocked,
+            NoticeState::Finished => &self.finished,
+            NoticeState::Failed => &self.failed,
+            NoticeState::Idle => &self.idle,
         }
     }
 }
@@ -1500,7 +1588,33 @@ pub const DEFAULT_CONFIG_TOML: &str = include_str!("default_config.toml");
 /// a feature that is on by default but sits turned off in config files written before it was.
 /// Append only; the file records how many it has had in `config_version`, which the default
 /// config sets to their number.
-const MIGRATIONS: &[(&str, &str)] = &[("window.pane_headers", "true")];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("window.pane_headers", "true"),
+    (
+        "notifications.working",
+        "{ tab_indicator = true, notify = false, badge = false, sound = \"none\" }",
+    ),
+    (
+        "notifications.waiting",
+        "{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }",
+    ),
+    (
+        "notifications.blocked",
+        "{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }",
+    ),
+    (
+        "notifications.finished",
+        "{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }",
+    ),
+    (
+        "notifications.failed",
+        "{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }",
+    ),
+    (
+        "notifications.idle",
+        "{ tab_indicator = true, notify = false, badge = false, sound = \"none\" }",
+    ),
+];
 
 /// Returns `text` with the migrations it has not had applied, and `config_version` raised to
 /// match (inserted before the first table when missing); `None` when it is current.
@@ -2009,6 +2123,58 @@ clipboard_read = "always"
         // Copied, it is current: no migration changes what its user set.
         assert_eq!(c.config_version, MIGRATIONS.len());
         assert_eq!(Config { config_version: 0, ..c }, Config::default());
+    }
+
+    #[test]
+    fn agent_status_maps_to_a_notice_state() {
+        use AgentStatus::*;
+        assert_eq!(NoticeState::of(NeedsInput, false), NoticeState::Waiting);
+        assert_eq!(NoticeState::of(NeedsInput, true), NoticeState::Blocked);
+        assert_eq!(NoticeState::of(Done, false), NoticeState::Finished);
+        assert_eq!(NoticeState::of(Error, true), NoticeState::Failed);
+        assert_eq!(NoticeState::of(Working, false), NoticeState::Working);
+        assert_eq!(NoticeState::of(Idle, false), NoticeState::Idle);
+    }
+
+    #[test]
+    fn default_matrix_keeps_the_notifications_that_were_always_on() {
+        let n = NotificationConfig::default();
+        let alert = StateNotice {
+            tab_indicator: true,
+            notify: true,
+            badge: true,
+            sound: "default".into(),
+        };
+        let quiet = StateNotice {
+            tab_indicator: true,
+            notify: false,
+            badge: false,
+            sound: "none".into(),
+        };
+        assert_eq!(n.notice(NoticeState::Waiting), &alert);
+        assert_eq!(n.notice(NoticeState::Blocked), &alert);
+        assert_eq!(n.notice(NoticeState::Finished), &alert);
+        assert_eq!(n.notice(NoticeState::Failed), &alert);
+        assert_eq!(n.notice(NoticeState::Working), &quiet);
+        assert_eq!(n.notice(NoticeState::Idle), &quiet);
+    }
+
+    #[test]
+    fn notice_states_parse_as_tables() {
+        let cfg = Config::parse(
+            "[notifications]\nworking = { tab_indicator = false, notify = true, badge = true, sound = \"Glass\" }\n",
+        )
+        .unwrap();
+        let n = &cfg.notifications;
+        let working = StateNotice {
+            tab_indicator: false,
+            notify: true,
+            badge: true,
+            sound: "Glass".into(),
+        };
+        assert_eq!(n.notice(NoticeState::Working), &working);
+        assert_eq!(n.notice(NoticeState::Waiting), &NotificationConfig::default().waiting);
+        assert!(Config::parse("[notifications]\nwaiting = { notify = \"yes\" }\n").is_err());
     }
 
     #[test]

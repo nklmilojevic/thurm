@@ -7,7 +7,7 @@
 
 # The updates Thurm has made to this file: it turns on features that came after the file was
 # written, then raises this. Leave it as it is.
-config_version = 1
+config_version = 7
 
 [font]
 # Use a font family or face name. Sizes and spacing are in points.
@@ -129,16 +129,22 @@ confirm_multiline_paste = true
 
 [notifications]
 enabled = true
-# Notify when an agent in a pane without focus needs input.
-agent_needs_input = true
-# Notify when an agent turn ends in a pane without focus. Requires agent hooks.
-agent_done = true
 # Notify when a command takes at least this many seconds and ends without focus.
 # Set to 0 to disable these command notifications.
 command_finished_secs = 15
 # Allow OSC 9, OSC 99, and OSC 777 notifications from programs.
 program_notifications = true
 bell_badge = true
+# What an agent does in each state: a tab indicator, a desktop notification (in a pane without
+# focus), a Dock badge (until seen) and a sound ("default", "none", or a sound file's name).
+# States: working, waiting (needs input), blocked (asks for a permission), finished (ended a
+# turn; needs agent hooks), failed, idle.
+working = { tab_indicator = true, notify = false, badge = false, sound = "none" }
+waiting = { tab_indicator = true, notify = true, badge = true, sound = "default" }
+blocked = { tab_indicator = true, notify = true, badge = true, sound = "default" }
+finished = { tab_indicator = true, notify = true, badge = true, sound = "default" }
+failed = { tab_indicator = true, notify = true, badge = true, sound = "default" }
+idle = { tab_indicator = true, notify = false, badge = false, sound = "none" }
 
 [agents]
 detect = true

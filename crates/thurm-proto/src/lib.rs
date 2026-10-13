@@ -447,6 +447,9 @@ pub enum Event {
         /// The agent's permission prompt this is about, answerable with
         /// [`Request::AnswerPermission`].
         permission: Option<u64>,
+        /// The sound to play (see `[notifications.<state>]`); unset is the default sound.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sound: Option<String>,
     },
     /// OSC 52 copy.
     ClipboardStore {

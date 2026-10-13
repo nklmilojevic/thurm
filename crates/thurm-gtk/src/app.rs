@@ -14,6 +14,7 @@ use thurm_proto::{AgentStatus, PaneId, PaneInfo};
 
 use crate::actions::{self, ACTIONS, Combo};
 use crate::config::UiConfig;
+use thurm_config::NoticeState;
 use crate::core::{self, Core, HostId, LOCAL, PaneKey};
 use crate::dialogs;
 use crate::model::{self, Axis, Direction, SplitNode, Workspace};
@@ -2320,6 +2321,7 @@ impl App {
         let infos = self.infos.borrow();
         let order = self.display_order();
         let count = order.len();
+        let notices = self.ui().cfg.notifications.clone();
         for (i, t) in order.iter().enumerate() {
             let focused = t.focused.borrow().clone();
             let base = t
@@ -2327,7 +2329,14 @@ impl App {
                 .borrow()
                 .clone()
                 .unwrap_or_else(|| model::display_title(infos.get(&focused)));
-            let status = model::tab_status(t.panes().iter().filter_map(|k| infos.get(k)));
+            let shown = |k: &PaneKey| {
+                infos
+                    .get(k)
+                    .filter(|p| {
+                        p.agent.as_ref().is_some_and(|a| notices.for_agent(a).tab_indicator)
+                    })
+            };
+            let status = model::tab_status(t.panes().iter().filter_map(shown));
             let host = if t.host == LOCAL {
                 String::new()
             } else {
@@ -2718,9 +2727,12 @@ impl App {
             .as_ref()
             .is_some_and(|a| a.status == AgentStatus::NeedsInput);
         let waiting = status == Some(AgentStatus::NeedsInput);
+        let state = |a: &thurm_proto::AgentState| NoticeState::of(a.status, a.permission.is_some());
+        let old_state = old_agent.as_ref().map(state);
+        let new_state = info.agent.as_ref().map(state);
         let old_message = old_agent.as_ref().and_then(|a| a.message.clone());
         let new_message = info.agent.as_ref().and_then(|a| a.message.clone());
-        if !waiting || !was_waiting || old_message != new_message {
+        if old_state != new_state || old_message != new_message {
             self.seen_waiting.borrow_mut().remove(&key);
         }
         let old_permission = old_agent.as_ref().and_then(|a| a.permission);

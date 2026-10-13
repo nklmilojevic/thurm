@@ -1,6 +1,36 @@
 import AppKit
 import UserNotifications
 
+/// The states of the notification matrix (`[notifications]` in config.toml).
+enum NoticeState: String, CaseIterable {
+    case working, waiting, blocked, finished, failed, idle
+}
+
+/// One state's row of the matrix: its tab indicator, notification, Dock badge and sound.
+struct StateNotice: Equatable {
+    var tabIndicator = true
+    var notify = false
+    var badge = false
+    /// "default", "none", or a sound file's name.
+    var sound = "none"
+}
+
+extension AgentState {
+    var noticeState: NoticeState {
+        switch status {
+        case .working: return .working
+        case .idle: return .idle
+        case .needsInput: return permission == nil ? .waiting : .blocked
+        case .done: return .finished
+        case .error: return .failed
+        }
+    }
+}
+
+extension AppConfig {
+    func notice(for agent: AgentState) -> StateNotice { notices[agent.noticeState] ?? StateNotice() }
+}
+
 /// Desktop notifications through UNUserNotificationCenter. Only works for a real, bundled and
 /// signed app; when run as a bare executable (e.g. `swift run`) everything is a no-op, because
 /// `UNUserNotificationCenter.current()` raises for processes without a bundle identifier.
@@ -62,13 +92,17 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
 
     /// Posts a notification for `pane`. Clicking it focuses the pane. With `permission` (the
     /// agent's permission prompt) it also offers to approve or deny it.
-    func post(pane: PaneKey, title: String, body: String, permission: UInt64? = nil) {
+    func post(pane: PaneKey, title: String, body: String, sound: String = "default", permission: UInt64? = nil) {
         guard isAvailable else { return }
         requestAuthorizationIfNeeded()
         let content = UNMutableNotificationContent()
         content.title = title.isEmpty ? "Thurm" : title
         content.body = body
-        content.sound = .default
+        switch sound {
+        case "none": content.sound = nil
+        case "default": content.sound = .default
+        default: content.sound = UNNotificationSound(named: UNNotificationSoundName(sound))
+        }
         content.userInfo = [Notifications.paneKey: pane.number, Notifications.hostKey: pane.host]
         var identifier = "pane-\(pane.host)-\(pane.id)-\(UUID().uuidString)"
         if let permission = permission {

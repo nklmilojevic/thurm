@@ -3,7 +3,7 @@
 
 # The updates Thurm has made to this file: it turns on features that came after the file was
 # written, then raises this. Leave it as it is.
-config_version = 1
+config_version = 7
 
 [font]
 # A family or a face name ("TX-02 Retina ExtraCondensed"). JetBrains Mono ships with Thurm.
@@ -109,12 +109,18 @@ confirm_multiline_paste = true
 
 [notifications]
 enabled = true
-agent_needs_input = true
-# When an agent finishes a turn (Claude Code / Codex hooks: `thurm hooks install`).
-agent_done = true
 command_finished_secs = 15
 program_notifications = true
 bell_badge = true
+# What an agent does in each state: a tab indicator, a desktop notification (in an unfocused
+# pane), a Dock badge (until seen) and a sound. States: working, waiting (needs input), blocked
+# (asks for a permission), finished (ended a turn; needs `thurm hooks install`), failed, idle.
+working = { tab_indicator = true, notify = false, badge = false, sound = "none" }
+waiting = { tab_indicator = true, notify = true, badge = true, sound = "default" }
+blocked = { tab_indicator = true, notify = true, badge = true, sound = "default" }
+finished = { tab_indicator = true, notify = true, badge = true, sound = "default" }
+failed = { tab_indicator = true, notify = true, badge = true, sound = "default" }
+idle = { tab_indicator = true, notify = false, badge = false, sound = "none" }
 
 [agents]
 detect = true

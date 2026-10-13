@@ -256,15 +256,16 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     func updateTitle() {
         guard let window = window else { return }
         let panes = SessionManager.shared.panes
+        let config = SessionManager.shared.config
         let info = panes[content.focusedPane]
         let base = titleOverride ?? info?.displayTitle ?? "Thurm"
 
-        // Most urgent agent status among the tab's panes.
+        // Most urgent agent status among the tab's panes whose state shows on the tab.
         var status: AgentStatus?
         var agentName: String?
         var detail: String?
         for id in content.paneIds {
-            guard let agent = panes[id]?.agent else { continue }
+            guard let agent = panes[id]?.agent, config.notice(for: agent).tabIndicator else { continue }
             if status == nil || agent.status.urgency > status!.urgency {
                 status = agent.status
                 agentName = agent.name

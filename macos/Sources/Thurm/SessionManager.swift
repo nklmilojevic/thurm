@@ -25,7 +25,8 @@ final class SessionManager: NSObject, CoreDelegate {
     var panes: [PaneKey: PaneInfo] = [:]
     /// Panes waiting for input that the user has looked at since they started waiting; they
     /// don't count toward the Dock badge until the agent asks again.
-    private var seenWaiting: Set<PaneKey> = []
+    /// Panes whose current agent state is on the Dock badge but the user has seen.
+    private var seenAlerts: Set<PaneKey> = []
     private weak var lastKeyController: TerminalWindowController?
     private weak var lastRegularKeyController: TerminalWindowController?
 
@@ -859,16 +860,22 @@ final class SessionManager: NSObject, CoreDelegate {
         }
     }
 
+    /// Whether the pane's agent state counts on the Dock badge.
+    private func onBadge(_ id: PaneKey) -> Bool {
+        guard let agent = panes[id]?.agent else { return false }
+        return config.notice(for: agent).badge
+    }
+
     func updateDockBadge() {
         // On screen in the active window's tab counts as read.
         if NSApp.isActive, let c = NSApp.keyWindow?.windowController as? TerminalWindowController {
-            for id in c.content.visiblePaneIds where panes[id]?.agent?.status == .needsInput {
-                seenWaiting.insert(id)
+            for id in c.content.visiblePaneIds where onBadge(id) {
+                seenAlerts.insert(id)
             }
         }
-        seenWaiting = seenWaiting.filter { panes[$0]?.agent?.status == .needsInput }
+        seenAlerts = seenAlerts.filter { onBadge($0) }
         let count = panes.values.filter { info in
-            info.agent?.status == .needsInput && !seenWaiting.contains(info.key)
+            onBadge(info.key) && !seenAlerts.contains(info.key)
         }.count
         NSApp.dockTile.badgeLabel = count > 0 ? "\(count)" : nil
     }
@@ -1170,6 +1177,7 @@ final class SessionManager: NSObject, CoreDelegate {
                 let body = jsonString(dict?["body"]) ?? ""
                 if config.notificationsEnabled && (!NSApp.isActive || !isPaneFocused(id)) {
                     Notifications.shared.post(pane: id, title: title, body: body,
+                                              sound: jsonString(dict?["sound"]) ?? "default",
                                               permission: jsonUInt64(dict?["permission"]))
                 }
             }
@@ -1213,9 +1221,9 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         let wasWaiting = old?.agent?.status == .needsInput
         let waiting = info.agent?.status == .needsInput
-        // A new request (or a different one) is unread again.
-        if !waiting || !wasWaiting || old?.agent?.message != info.agent?.message {
-            seenWaiting.remove(key)
+        // A new state (or a different message) is unread again.
+        if old?.agent?.noticeState != info.agent?.noticeState || old?.agent?.message != info.agent?.message {
+            seenAlerts.remove(key)
         }
         // Answered, or retired by keys typed in the pane: its buttons would do nothing.
         if old?.agent?.permission != nil && old?.agent?.permission != info.agent?.permission {

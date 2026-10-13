@@ -151,8 +151,15 @@ final class AppConfig {
     // [notifications]
     var notificationsEnabled = true
     var programNotifications = true
-    var agentNeedsInput = true
     var bellBadge = true
+    var notices: [NoticeState: StateNotice] = [
+        .working: StateNotice(tabIndicator: true, notify: false, badge: false, sound: "none"),
+        .waiting: StateNotice(tabIndicator: true, notify: true, badge: true, sound: "default"),
+        .blocked: StateNotice(tabIndicator: true, notify: true, badge: true, sound: "default"),
+        .finished: StateNotice(tabIndicator: true, notify: true, badge: true, sound: "default"),
+        .failed: StateNotice(tabIndicator: true, notify: true, badge: true, sound: "default"),
+        .idle: StateNotice(tabIndicator: true, notify: false, badge: false, sound: "none"),
+    ]
 
     // [ai]
     var aiExplain = false
@@ -301,8 +308,16 @@ final class AppConfig {
         if let n = c["notifications"] as? [String: Any] {
             notificationsEnabled = jsonBool(n["enabled"]) ?? notificationsEnabled
             programNotifications = jsonBool(n["program_notifications"]) ?? programNotifications
-            agentNeedsInput = jsonBool(n["agent_needs_input"]) ?? agentNeedsInput
             bellBadge = jsonBool(n["bell_badge"]) ?? bellBadge
+            for state in NoticeState.allCases {
+                guard let row = n[state.rawValue] as? [String: Any] else { continue }
+                var notice = notices[state] ?? StateNotice()
+                notice.tabIndicator = jsonBool(row["tab_indicator"]) ?? notice.tabIndicator
+                notice.notify = jsonBool(row["notify"]) ?? notice.notify
+                notice.badge = jsonBool(row["badge"]) ?? notice.badge
+                notice.sound = jsonString(row["sound"]) ?? notice.sound
+                notices[state] = notice
+            }
         }
         if let ai = c["ai"] as? [String: Any] {
             aiExplain = (jsonBool(ai["enabled"]) ?? false) && (jsonBool(ai["explain"]) ?? true)
