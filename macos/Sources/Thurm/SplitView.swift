@@ -889,17 +889,20 @@ private final class CardChrome: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let chrome = SessionManager.shared.config.chrome
-        let gutter = NSBezierPath(rect: area)
-        gutter.windingRule = .evenOdd
+        // Cards are cut out one by one rather than with an even-odd path: during a zoom they
+        // overlap, and the overlap would flip back to gutter over the terminals.
         let radii = cards.map { corners(of: $0.rect) }
-        for (card, r) in zip(cards, radii) {
-            gutter.append(Self.path(card.rect, radii: r))
-        }
+        let context = NSGraphicsContext.current
         chrome.surface.withAlphaComponent(opacity).setFill()
-        gutter.fill()
+        NSBezierPath(rect: area).fill()
+        context?.saveGraphicsState()
+        context?.compositingOperation = .clear
+        for (card, r) in zip(cards, radii) {
+            Self.path(card.rect, radii: r).fill()
+        }
+        context?.restoreGraphicsState()
         // A hairline around each card, a touch brighter around the focused pane. Light on dark
         // themes, so it reads as an edge.
-        let context = NSGraphicsContext.current
         context?.saveGraphicsState()
         if chrome.isDark { context?.compositingOperation = .plusLighter }
         for (card, r) in zip(cards, radii) {
