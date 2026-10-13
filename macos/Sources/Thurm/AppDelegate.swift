@@ -1,6 +1,10 @@
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+    /// URLs and files that arrive before the session is up (a cold launch).
+    private var sessionStarted = false
+    private var pendingExternalURLs: [URL] = []
+
     // MARK: Lifecycle
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -34,9 +38,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         FontShaper.registerBundledFonts()
         Notifications.shared.setup()
         SecureInput.shared.restoreUserPreference()
+        // Queued URLs run once the session is restored; a failed start never restores them.
+        SessionManager.shared.onSessionReady = { [weak self] in
+            DispatchQueue.main.async { self?.sessionDidBecomeReady() }
+        }
         SessionManager.shared.start()
         Updater.shared.start()
         NSApp.activate()
+    }
+
+    private func sessionDidBecomeReady() {
+        sessionStarted = true
+        let pending = pendingExternalURLs
+        pendingExternalURLs = []
+        pending.forEach(openExternal)
+    }
+
+    /// `thurm://` URLs, and files or folders from Finder (Open With, a Dock drop, `open -a Thurm`).
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard sessionStarted else {
+            pendingExternalURLs += urls
+            return
+        }
+        NSApp.activate()
+        urls.forEach(openExternal)
     }
 
     /// Opened from the disk image (or translocated by Gatekeeper to a random read-only path): the
@@ -143,6 +168,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         menu.addItem(NSMenuItem(title: "New Workspace", action: #selector(newWorkspace(_:)), keyEquivalent: ""))
         for item in menu.items { item.target = self }
         return menu
+    }
+
+    /// Opens a file or folder, or runs a `thurm://` route. Invalid input does nothing.
+    private func openExternal(_ url: URL) {
+        let session = SessionManager.shared
+        let request: ExternalRequest
+        if url.isFileURL {
+            guard let dir = ExternalRoute.directory(forOpened: url) else { return }
+            request = .tab(cwd: dir)
+        } else {
+            guard let parsed = ExternalRoute.parse(url) else { return }
+            request = parsed
+        }
+        let front = session.currentRegularController
+        let focusedIsRemote = front.map { session.workspace($0.workspaceID)?.isRemote ?? ($0.host != localHost) }
+            ?? false
+        switch ExternalRoute.placement(for: request, focusedIsRemote: focusedIsRemote, hasWindow: front != nil) {
+        case .tab(let cwd, let local):
+            session.newTab(from: session.currentController, cwd: cwd, host: local ? localHost : nil, reveal: local)
+        case .split(let cwd, let direction):
+            if let c = front { session.splitFocused(in: c, direction: direction, cwd: cwd) }
+        case .newWorkspace(let cwd):
+            session.newWorkspace(cwd: cwd)
+        case .settings:
+            session.openConfigFile()
+        case .workspace(let name):
+            session.showWorkspace(named: name)
+        }
     }
 
     // MARK: Actions
