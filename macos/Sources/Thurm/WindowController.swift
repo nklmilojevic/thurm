@@ -221,10 +221,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         content.needsDisplay = true
     }
 
-    /// Behind-window blur for translucent windows. With `window.blur` it is a visual effect view
-    /// at the back of the window's frame view, under the (translucent) terminal content. Without
-    /// blur, a `window.material` other than `theme` backs only the chrome (the sidebar, or the
-    /// titlebar holding the tabs), so the terminal's transparent cells stay unblurred.
+    /// Behind-window blur for translucent windows. With `window.blur` it is an untinted visual
+    /// effect view at the back of the window's frame view, under the (translucent) terminal
+    /// content. A `window.material` other than `theme` backs only the chrome (the sidebar, or the
+    /// titlebar holding the tabs), so its tint never reaches the terminal's transparent cells.
     private var blurView: NSVisualEffectView?
     private var chromeBackdrop: NSVisualEffectView?
 
@@ -232,12 +232,12 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         guard let window = window, let frameView = window.contentView?.superview else { return }
         let cfg = SessionManager.shared.config
         let full = on && cfg.blur > 0
-        let chromeOnly = on && !full && cfg.material != .theme
-        blurView = Self.backdrop(blurView, in: full ? frameView : nil, material: cfg.material,
+        let chrome = on && cfg.material != .theme
+        blurView = Self.backdrop(blurView, in: full ? frameView : nil, tint: 0,
                                  background: cfg.theme.background)
         let chromeHost = sidebar?.view ?? (window as? TerminalWindow)?.titlebarView
-        chromeBackdrop = Self.backdrop(chromeBackdrop, in: chromeOnly ? chromeHost : nil,
-                                       material: cfg.material, background: cfg.theme.background)
+        chromeBackdrop = Self.backdrop(chromeBackdrop, in: chrome ? chromeHost : nil,
+                                       tint: cfg.material.tint, background: cfg.theme.background)
     }
 
     /// AppKit swaps the titlebar into another window in full screen (and back).
@@ -246,9 +246,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         applyBlur(opacity < 1 && (cfg.blur > 0 || cfg.material != .theme))
     }
 
-    /// The blur behind `host`'s content, with the terminal background laid over it at the
-    /// material's tint. A nil `host` removes it.
-    private static func backdrop(_ existing: NSVisualEffectView?, in host: NSView?, material: WindowMaterial,
+    /// The blur behind `host`'s content, with the terminal background laid over it at `tint`.
+    /// A nil `host` removes it.
+    private static func backdrop(_ existing: NSVisualEffectView?, in host: NSView?, tint alpha: CGFloat,
                                  background: UInt32) -> NSVisualEffectView? {
         guard let host else {
             existing?.removeFromSuperview()
@@ -274,8 +274,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             tint.autoresizingMask = [.width, .height]
             v.addSubview(tint)
         }
-        tint.isHidden = material.tint == 0
-        tint.layer?.backgroundColor = colorFromRGB(background, alpha: material.tint).cgColor
+        tint.isHidden = alpha == 0
+        tint.layer?.backgroundColor = colorFromRGB(background, alpha: alpha).cgColor
         return v
     }
 
