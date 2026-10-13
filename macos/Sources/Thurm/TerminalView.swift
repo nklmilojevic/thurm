@@ -75,6 +75,9 @@ final class TerminalView: NSView, NSTextInputClient {
     private var blinkEpoch = CACurrentMediaTime()
     private var lastBlinkOn = true
     private var flashStart: CFTimeInterval = 0
+    /// The unfocused-split dim, eased in and out as focus moves between the panes of a tab.
+    private var dimTween = Tween(0)
+    private var dimDrawn: Float = 0
 
     // Overlays.
     private var lockBadge: NSImageView?
@@ -433,6 +436,7 @@ final class TerminalView: NSView, NSTextInputClient {
     /// True while the next refresh has work: a pending draw, scroll or animation.
     private var wantsTick: Bool {
         needsRender || pendingScroll != nil || smoothActive || flashStart > 0 || renderer.wantsAnotherFrame
+            || !dimTween.isFinished(at: CACurrentMediaTime())
     }
 
     /// Pauses the display link when nothing animates, so an idle pane costs no wakeups. New
@@ -499,6 +503,7 @@ final class TerminalView: NSView, NSTextInputClient {
             render = true
         }
         if flashStart > 0 { render = true }
+        if Float(dimTween.value(at: now)) != dimDrawn { render = true }
         if renderer.wantsAnotherFrame { render = true }
         if render { renderNow() }
     }
@@ -590,17 +595,15 @@ final class TerminalView: NSView, NSTextInputClient {
 
         var flash: Float = 0
         if flashStart > 0 {
-            let t = Float((CACurrentMediaTime() - flashStart) / 0.25)
+            let t = (CACurrentMediaTime() - flashStart) / 0.25
             if t >= 1 {
                 flashStart = 0
             } else {
-                flash = 1 - t
+                flash = Float(max(0, 1 - Motion.curve.value(at: t)))
             }
         }
-        var dim: Float = 0
-        if let c = container, c.hasMultipleVisiblePanes, c.focusedPane != pane {
-            dim = Float(config.unfocusedSplitDim)
-        }
+        let dim = Float(dimTween.value(at: CACurrentMediaTime()))
+        dimDrawn = dim
         let opacity = Float((window?.windowController as? TerminalWindowController)?.opacity ?? config.opacity)
         if layer.isOpaque != (opacity >= 1) { layer.isOpaque = opacity >= 1 }
         let params = RenderParams(pane: pane,
@@ -634,6 +637,14 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Visual bell.
     func flash() {
         flashStart = CACurrentMediaTime()
+        wakeLink()
+    }
+
+    /// Dims the pane while another pane of its tab has focus. The dim eases in and out.
+    func setDimmed(_ dimmed: Bool) {
+        let target = dimmed ? Double(config.unfocusedSplitDim) : 0
+        guard dimTween.to != target else { return }
+        dimTween.move(to: target, duration: Motion.fast, at: CACurrentMediaTime())
         wakeLink()
     }
 
@@ -714,16 +725,26 @@ final class TerminalView: NSView, NSTextInputClient {
         box.layer?.cornerRadius = 7
         label.frame.origin = NSPoint(x: 10, y: 4)
         box.addSubview(label)
+        box.alphaValue = 0
         addSubview(box)
         toastView = box
         layoutOverlays()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = Motion.duration(Motion.fast)
+            ctx.timingFunction = Motion.timingFunction
+            box.animator().alphaValue = 1
+        }
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(fadeToast), object: nil)
         perform(#selector(fadeToast), with: nil, afterDelay: duration)
     }
 
     @objc private func fadeToast() {
-        toastView?.animator().alphaValue = 0
-        perform(#selector(removeToast), with: nil, afterDelay: 0.35)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = Motion.duration(Motion.fast)
+            ctx.timingFunction = Motion.timingFunction
+            toastView?.animator().alphaValue = 0
+        }
+        perform(#selector(removeToast), with: nil, afterDelay: Motion.duration(Motion.fast))
     }
 
     @objc private func removeToast() {

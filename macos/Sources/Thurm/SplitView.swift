@@ -218,6 +218,15 @@ final class TabContentView: NSView {
     private(set) var findBar: FindBar?
     private var updateBadge: UpdateBadge?
     private var dragging: SplitDivider?
+    /// Pane rectangles where a zoom change started; `zoomProgress` eases them to the layout.
+    private var zoomFrom: [PaneKey: CGRect] = [:]
+    private var zoomProgress = Tween(1)
+    private let zoomMotion = MotionDriver()
+    /// Path of the divider under the pointer or being dragged, and how far its highlight has
+    /// eased in.
+    private var highlightedPath: [Bool]?
+    private var dividerEmphasis = Tween(0)
+    private let dividerMotion = MotionDriver()
 
     static let gap: CGFloat = 1
     /// With pane headers, splits are rounded cards this far apart (and from the window edges):
@@ -254,10 +263,27 @@ final class TabContentView: NSView {
     }
     private var splitGap: CGFloat { showsHeaders ? cardGap : Self.gap }
 
-    /// Each visible pane's rectangle: its card with headers, else its whole view.
+    /// Each visible pane's rectangle: its card with headers, else its whole view. During a zoom
+    /// change, the rectangles on the way from where the panes were.
     private var visibleFrames: [(PaneKey, CGRect)] {
+        let targets = targetFrames
+        let now = CACurrentMediaTime()
+        guard !zoomProgress.isFinished(at: now) else { return targets }
+        let t = CGFloat(zoomProgress.value(at: now))
+        return targets.map { id, rect in
+            (id, Self.blend(zoomFrom[id] ?? zoomFrom.values.first ?? rect, rect, t))
+        }
+    }
+
+    private var targetFrames: [(PaneKey, CGRect)] {
         if let z = zoomedPane { return [(z, showsHeaders ? splitArea : paneArea)] }
         return root.frames(in: splitArea, gap: splitGap)
+    }
+
+    private static func blend(_ a: CGRect, _ b: CGRect, _ t: CGFloat) -> CGRect {
+        CGRect(x: a.minX + (b.minX - a.minX) * t, y: a.minY + (b.minY - a.minY) * t,
+               width: max(0, a.width + (b.width - a.width) * t),
+               height: max(0, a.height + (b.height - a.height) * t))
     }
 
     init(root: SplitNode, focused: PaneKey, zoomed: PaneKey?) {
@@ -339,6 +365,7 @@ final class TabContentView: NSView {
             view.isHidden = !visible.contains(id)
             headers[id]?.isHidden = !visible.contains(id)
         }
+        updateDimming()
         for (id, rect) in frames {
             guard let view = views[id] else { continue }
             guard cards else {
@@ -387,6 +414,7 @@ final class TabContentView: NSView {
                         NSPoint(x: s.width, y: s.height)].map { convert($0, from: nil) }
             } ?? []
             chrome.needsDisplay = true
+            syncDividerHighlight()
             for (id, header) in headers {
                 header.update(focused: id == focusedPane)
             }
@@ -432,6 +460,66 @@ final class TabContentView: NSView {
     private var currentDividers: [SplitDivider] {
         if zoomedPane != nil { return [] }
         return root.dividers(in: splitArea, gap: splitGap)
+    }
+
+    /// Dims every pane but the focused one while the tab shows several.
+    private func updateDimming() {
+        let multiple = hasMultipleVisiblePanes
+        for (id, view) in views {
+            view.setDimmed(multiple && id != focusedPane)
+        }
+    }
+
+    /// Hands the highlighted divider and its emphasis to the card chrome, which draws it.
+    private func syncDividerHighlight(at now: CFTimeInterval = CACurrentMediaTime()) {
+        let divider = highlightedPath.flatMap { path in currentDividers.first { $0.path == path } }
+        chrome.highlight = divider.map { ($0.rect, $0.axis, CGFloat(dividerEmphasis.value(at: now))) }
+        chrome.needsDisplay = true
+    }
+
+    /// Highlights the divider at `path` (nil: none) and eases the highlight in or out.
+    private func setDividerHighlight(_ path: [Bool]?) {
+        if let path { highlightedPath = path }
+        let target = path == nil ? 0.0 : 1.0
+        guard dividerEmphasis.to != target else { return }
+        let now = CACurrentMediaTime()
+        dividerEmphasis.move(to: target, duration: Motion.fast, at: now)
+        syncDividerHighlight(at: now)
+        if !dividerEmphasis.isFinished(at: now) {
+            dividerMotion.run(on: self, for: Motion.fast) { [weak self] time in
+                self?.syncDividerHighlight(at: time)
+            }
+        }
+    }
+
+    /// Runs a zoom change as a move: the panes glide from where they were to the new layout.
+    /// Their terminals hold their grid until it settles, so the text does not reflow per frame.
+    private func transitionZoom(_ change: () -> Void) {
+        let duration = Motion.duration(Motion.standard)
+        guard duration > 0 else {
+            change()
+            layoutPanes()
+            return
+        }
+        zoomFrom = Dictionary(uniqueKeysWithValues: visibleFrames)
+        change()
+        zoomProgress = Tween(0)
+        zoomProgress.move(to: 1, duration: duration, at: CACurrentMediaTime())
+        views.values.forEach { $0.holdGridSize = true }
+        zoomMotion.run(on: self, for: duration) { [weak self] time in
+            self?.zoomTick(time)
+        }
+        layoutPanes()
+    }
+
+    private func zoomTick(_ now: CFTimeInterval) {
+        guard zoomProgress.isFinished(at: now) else {
+            needsLayout = true
+            return
+        }
+        zoomFrom = [:]
+        layoutPanes()
+        views.values.forEach { $0.holdGridSize = false }
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -502,10 +590,27 @@ final class TabContentView: NSView {
     override func mouseUp(with event: NSEvent) {
         if dragging != nil {
             dragging = nil
+            setDividerHighlight(dividerAt(convert(event.locationInWindow, from: nil))?.path)
             SessionManager.shared.scheduleLayoutSave()
         } else {
             super.mouseUp(with: event)
         }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        setDividerHighlight(dividerAt(convert(event.locationInWindow, from: nil))?.path)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if dragging == nil { setDividerHighlight(nil) }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                       owner: self))
     }
 
     override func resetCursorRects() {
@@ -561,8 +666,7 @@ final class TabContentView: NSView {
     func focus(_ pane: PaneKey) {
         guard let view = views[pane] else { return }
         if let z = zoomedPane, z != pane {
-            zoomedPane = nil
-            layoutPanes()
+            transitionZoom { zoomedPane = nil }
         }
         setFocusedPane(pane)
         window?.makeFirstResponder(view)
@@ -576,6 +680,7 @@ final class TabContentView: NSView {
         focusedPane = pane
         for view in views.values { view.needsRender = true }
         if changed { refreshHeaders() }
+        if changed { updateDimming() }
         if changed && showsHeaders { layoutPanes() }
         if changed {
             controller?.focusedPaneChanged()
@@ -622,8 +727,7 @@ final class TabContentView: NSView {
 
     func toggleZoom() {
         guard root.panes.count > 1 || zoomedPane != nil else { return }
-        zoomedPane = zoomedPane == nil ? focusedPane : nil
-        layoutPanes()
+        transitionZoom { zoomedPane = zoomedPane == nil ? focusedPane : nil }
         window?.invalidateCursorRects(for: self)
         if let view = views[focusedPane] { window?.makeFirstResponder(view) }
         SessionManager.shared.scheduleLayoutSave()
@@ -734,6 +838,8 @@ private final class CardChrome: NSView {
     var windowRadius: CGFloat = 0
     /// The window's corners, in this view.
     var windowCorners: [NSPoint] = []
+    /// The divider being hovered or dragged, and how far its highlight has eased in (0...1).
+    var highlight: (rect: NSRect, axis: SplitAxis, amount: CGFloat)?
 
     override var isFlipped: Bool { true }
 
@@ -759,6 +865,15 @@ private final class CardChrome: NSView {
             color.withAlphaComponent(max(opacity, 0.6)).setStroke()
             outline.lineWidth = 1
             outline.stroke()
+        }
+        if let highlight, highlight.amount > 0 {
+            let r = highlight.rect
+            let width = 1 + 2 * highlight.amount
+            let bar = highlight.axis == .horizontal
+                ? NSRect(x: r.midX - width / 2, y: r.minY, width: width, height: r.height)
+                : NSRect(x: r.minX, y: r.midY - width / 2, width: r.width, height: width)
+            (base.blended(withFraction: 0.35 * highlight.amount, of: fg) ?? fg).setFill()
+            NSBezierPath(rect: bar).fill()
         }
     }
 
