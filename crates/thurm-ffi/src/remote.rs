@@ -466,10 +466,10 @@ fn call(c: Call) -> Result<Value, String> {
 fn remote_setting_literal(key: &str, value: &serde_json::Value) -> Result<String, String> {
     // A JSON string is also a TOML basic string.
     match (key, value) {
-        ("host", serde_json::Value::String(s)) if !s.trim().is_empty() => {
+        ("host", serde_json::Value::String(s)) => {
+            thurm_remote::ssh::validate_target(s.trim())?;
             Ok(json!(s.trim()).to_string())
         }
-        ("host", _) => Err("the ssh target can't be empty".into()),
         ("enabled", serde_json::Value::Bool(b)) => Ok(b.to_string()),
         ("clipboard_read", serde_json::Value::String(s))
             if matches!(s.as_str(), "ask" | "always" | "never") =>
@@ -548,6 +548,9 @@ mod tests {
             "\"never\""
         );
         assert!(remote_setting_literal("host", &json!("")).is_err());
+        assert!(remote_setting_literal("host", &json!("a b")).is_err());
+        assert!(remote_setting_literal("host", &json!("-oProxyCommand=evil")).is_err());
+        assert!(remote_setting_literal("host", &json!(1)).is_err());
         assert!(remote_setting_literal("clipboard_read", &json!("maybe")).is_err());
         assert!(remote_setting_literal("enabled", &json!("yes")).is_err());
         assert!(remote_setting_literal("name", &json!("x")).is_err());

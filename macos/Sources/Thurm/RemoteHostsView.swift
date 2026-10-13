@@ -10,6 +10,9 @@ struct RemoteHostRows: View {
 
     private var hosts: [RemoteHostEntry] { RemoteHostEntry.entries(item.value) }
     private var readOnly: Bool { store.doc?.configReadOnly == true }
+    /// Add, Set and Remove edit config.toml, whose hosts settings.toml replaces when it sets
+    /// `remote`.
+    private var editable: Bool { !readOnly && !item.isOverridden }
 
     var body: some View {
         if item.isOverridden {
@@ -30,7 +33,7 @@ struct RemoteHostRows: View {
             }
             Spacer()
             Button("Add Host\u{2026}") { remotes.sheet = .add }
-                .disabled(readOnly)
+                .disabled(!editable)
         }
     }
 }
@@ -65,7 +68,7 @@ private struct OverlayHostsNote: View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
-            Text("settings.toml sets these hosts, so changes here to config.toml don't apply.")
+            Text("settings.toml sets these hosts: edit them there, or Reset to use config.toml's.")
                 .font(.callout)
             Spacer(minLength: 8)
             Button("Edit in settings.toml\u{2026}") { store.editTable(item) }
@@ -144,7 +147,10 @@ private struct HostDetails: View {
         RemoteHostEntry.entries(store.setting("remote")?.value).first { $0.name == name }
     }
     private var status: RemoteStatus? { Remotes.shared.statuses[name] }
-    private var readOnly: Bool { store.doc?.configReadOnly == true }
+    /// See `RemoteHostRows.editable`.
+    private var editable: Bool {
+        store.doc?.configReadOnly != true && store.setting("remote")?.isOverridden != true
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -195,7 +201,7 @@ private struct HostDetails: View {
                         }
                         .help("Whether programs on this host may read this Mac's clipboard (OSC 52).")
                     }
-                    .disabled(readOnly)
+                    .disabled(!editable)
                 }
                 if let status, status.remoteBuild != nil || status.os != nil {
                     Section("Host") {
@@ -228,7 +234,7 @@ private struct HostDetails: View {
             Divider()
             HStack {
                 Button("Remove Host\u{2026}", role: .destructive) { confirmingRemove = true }
-                    .disabled(readOnly || host == nil)
+                    .disabled(!editable || host == nil)
                 Spacer()
                 Button("Reconnect") { remotes.retry(name) }
                     .disabled(remotes.busy[name] != nil)

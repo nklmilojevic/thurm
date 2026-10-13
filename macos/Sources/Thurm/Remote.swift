@@ -779,6 +779,8 @@ final class RemoteHosts: ObservableObject {
     /// The last `doctor` answer per host.
     @Published private(set) var reports: [HostId: [String: Any]] = [:]
     @Published private(set) var checking: Set<HostId> = []
+    /// Hosts to check again once their running check ends.
+    private var recheckAfter: Set<HostId> = []
     /// The check whose fix runs, per host.
     @Published private(set) var fixing: [HostId: String] = [:]
     /// The sheet open over the settings window.
@@ -807,13 +809,21 @@ final class RemoteHosts: ObservableObject {
 
     /// Runs `doctor` for `host` again (after a fix, an install, Check Again).
     func recheck(_ host: HostId) {
-        guard !checking.contains(host) else { return }
+        guard !checking.contains(host) else {
+            // The config changed under a check: its answer may be for the old target.
+            recheckAfter.insert(host)
+            return
+        }
         checking.insert(host)
         let bins: Any = Core.helpersPath ?? NSNull()
         DispatchQueue.global(qos: .userInitiated).async {
             let r = Core.shared.remoteCall(["op": "doctor", "name": host, "bins": bins])
             DispatchQueue.main.async {
                 self.checking.remove(host)
+                if self.recheckAfter.remove(host) != nil {
+                    self.recheck(host)
+                    return
+                }
                 self.reports[host] = (r as? [String: Any]) ?? ["error": "Unexpected answer."]
             }
         }
@@ -907,7 +917,10 @@ final class RemoteHosts: ObservableObject {
     /// Sets `key` (`host`, `enabled` or `clipboard_read`) of `host` in config.toml.
     func set(_ host: HostId, _ key: String, _ value: Any, done: @escaping (String?) -> Void = { _ in }) {
         edit(["op": "set", "name": host, "key": key, "value": value]) { error in
-            if error == nil, key == "host" || key == "enabled" { self.reports[host] = nil }
+            if error == nil, key == "host" {
+                self.reports[host] = nil
+                self.recheck(host)
+            }
             done(error)
         }
     }
