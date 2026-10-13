@@ -102,6 +102,14 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertTrue(doc.groups(matching: "zzz").isEmpty)
     }
 
+    func testValuesAreEditedInTheFileThatSetsThem() throws {
+        let doc = try document()
+        let item = { (key: String) in try XCTUnwrap(doc.settings.first { $0.key == key }) }
+        XCTAssertEqual(doc.editPath(for: try item("font.family")), doc.configPath)
+        XCTAssertEqual(doc.editPath(for: try item("font.size")), doc.overlayPath)
+        XCTAssertEqual(doc.editPath(for: try item("window.tab_style")), doc.overlayPath)
+    }
+
     func testMalformedDocumentIsRefused() {
         XCTAssertNil(SettingsDocument(json: "[1, 2]"))
         XCTAssertNil(SettingsDocument(json: "not json"))

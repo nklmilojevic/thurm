@@ -419,9 +419,19 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             let summary = NSTextField(labelWithString: tableSummary(item.value))
             summary.font = .systemFont(ofSize: 12)
             summary.textColor = .secondaryLabelColor
-            let edit = NSButton(title: "Edit in File\u{2026}", target: self, action: #selector(openOverlay(_:)))
+            // Edited where it is set: a list in settings.toml would hide config.toml's whole.
+            let inConfig = item.source == .file
+            let edit = NSButton(title: inConfig ? "Open config.toml\u{2026}" : "Edit in settings.toml\u{2026}",
+                                target: self, action: #selector(editTable(_:)))
             edit.bezelStyle = .rounded
             edit.controlSize = .small
+            edit.identifier = key
+            if inConfig, doc?.configReadOnly == true {
+                edit.toolTip = "config.toml is managed by another tool: change these entries there. "
+                    + "Entries in settings.toml would replace them all."
+            } else if !inConfig {
+                edit.toolTip = "Entries in settings.toml replace any in config.toml."
+            }
             return NSStackView(views: [summary, edit])
         }
     }
@@ -694,6 +704,16 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         var urls = [URL(fileURLWithPath: doc.configPath)]
         if doc.overlayExists { urls.append(URL(fileURLWithPath: doc.overlayPath)) }
         NSWorkspace.shared.activateFileViewerSelecting(urls.filter { FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    @objc private func editTable(_ sender: NSButton) {
+        guard let key = identifierKey(sender), let item = setting(key), let doc else { return }
+        let path = doc.editPath(for: item)
+        if path == doc.overlayPath {
+            openOverlay(sender)
+        } else {
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        }
     }
 
     @objc private func openOverlay(_ sender: Any?) {

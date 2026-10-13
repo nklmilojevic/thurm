@@ -129,6 +129,12 @@ struct SettingsDocument {
             return items.isEmpty ? nil : (section: section, items: items)
         }
     }
+
+    /// The file to edit a value the window can't: where it is set now. A list or table in
+    /// settings.toml replaces config.toml's whole, so one config.toml sets is edited there.
+    func editPath(for item: SettingItem) -> String {
+        item.source == .file ? configPath : overlayPath
+    }
 }
 
 /// Search over settings: a query matches when each of its words appears in the setting's label,
