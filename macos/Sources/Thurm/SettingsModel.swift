@@ -380,3 +380,35 @@ enum HexColor {
         String(format: "#%02x%02x%02x", red, green, blue)
     }
 }
+
+/// A `[[remote]]` host, as the `remote` setting's value lists it.
+struct RemoteHostEntry: Equatable, Identifiable {
+    let name: String
+    /// The ssh target.
+    let target: String
+    let enabled: Bool
+    /// `ask`, `always` or `never`.
+    let clipboardRead: String
+
+    var id: String { name }
+
+    static let clipboardChoices = ["ask", "always", "never"]
+
+    init(name: String, target: String, enabled: Bool = true, clipboardRead: String = "ask") {
+        self.name = name
+        self.target = target
+        self.enabled = enabled
+        self.clipboardRead = clipboardRead
+    }
+
+    init?(json: [String: Any]) {
+        guard let name = jsonString(json["name"]) else { return nil }
+        self.init(name: name, target: jsonString(json["host"]) ?? "", enabled: jsonBool(json["enabled"]) ?? true,
+                  clipboardRead: jsonString(json["clipboard_read"]) ?? "ask")
+    }
+
+    /// The hosts of the `remote` setting's value (none when it is unset).
+    static func entries(_ value: Any?) -> [RemoteHostEntry] {
+        (value as? [[String: Any]] ?? []).compactMap(RemoteHostEntry.init(json:))
+    }
+}

@@ -288,3 +288,22 @@ final class SettingsStoreNavigationTests: XCTestCase {
         XCTAssertEqual(store.selectedSection, "window")
     }
 }
+
+final class RemoteHostEntryTests: XCTestCase {
+    func testEntriesReadTheRemoteValueWithItsDefaults() {
+        let value = JSON.decode("""
+        [{"name": "devbox", "host": "me@devbox", "enabled": false, "clipboard_read": "never"},
+         {"name": "pi", "host": "pi"},
+         {"host": "nameless"}]
+        """)
+        XCTAssertEqual(RemoteHostEntry.entries(value), [
+            RemoteHostEntry(name: "devbox", target: "me@devbox", enabled: false, clipboardRead: "never"),
+            RemoteHostEntry(name: "pi", target: "pi"),
+        ])
+    }
+
+    func testAnUnsetValueHasNoHosts() {
+        XCTAssertEqual(RemoteHostEntry.entries(NSNull()), [])
+        XCTAssertEqual(RemoteHostEntry.entries(nil), [])
+    }
+}

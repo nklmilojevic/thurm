@@ -176,6 +176,16 @@ enum Call {
         name: String,
         target: String,
     },
+    /// Removes `[[remote]]` `name` (its daemon and panes keep running there).
+    Remove {
+        name: String,
+    },
+    /// Sets `key` of `[[remote]]` `name`: `host`, `enabled` or `clipboard_read`.
+    Set {
+        name: String,
+        key: String,
+        value: serde_json::Value,
+    },
     /// What the host needs, with fixes (`thurm remote doctor`).
     Doctor {
         name: String,
@@ -337,6 +347,23 @@ fn call(c: Call) -> Result<Value, String> {
             }
             json!({ "name": name, "host": host })
         }
+        Call::Remove { name } => {
+            thurm_config::edit_config(|t| thurm_config::with_remote_removed(t, &name))?;
+            if let Some(m) = MANAGER.lock().as_mut() {
+                sync(m);
+            }
+            json!("Ok")
+        }
+        Call::Set { name, key, value } => {
+            let literal = remote_setting_literal(&key, &value)?;
+            thurm_config::edit_config(|t| {
+                thurm_config::with_remote_setting(t, &name, &key, &literal)
+            })?;
+            if let Some(m) = MANAGER.lock().as_mut() {
+                sync(m);
+            }
+            json!("Ok")
+        }
         Call::Doctor { name, bins } => {
             let (r, ssh) = ssh_for(&name)?;
             let report = doctor::run(
@@ -435,6 +462,24 @@ fn call(c: Call) -> Result<Value, String> {
     })
 }
 
+/// `value` for `key` of a `[[remote]]` as a TOML literal, if the window may set that key.
+fn remote_setting_literal(key: &str, value: &serde_json::Value) -> Result<String, String> {
+    // A JSON string is also a TOML basic string.
+    match (key, value) {
+        ("host", serde_json::Value::String(s)) => {
+            thurm_remote::ssh::validate_target(s.trim())?;
+            Ok(json!(s.trim()).to_string())
+        }
+        ("enabled", serde_json::Value::Bool(b)) => Ok(b.to_string()),
+        ("clipboard_read", serde_json::Value::String(s))
+            if matches!(s.as_str(), "ask" | "always" | "never") =>
+        {
+            Ok(value.to_string())
+        }
+        _ => Err(format!("{key} can't be set to {value}")),
+    }
+}
+
 /// One remote operation: `json` is {"op": "...", ...} (see `Call`); answers the result as
 /// JSON or {"error": "..."}. Operations that talk to a host block (ssh); call them off the
 /// main thread. Free the result.
@@ -473,6 +518,8 @@ mod tests {
             r#"{"op":"doctor","name":"pi","bins":null}"#,
             r#"{"op":"doctor_fix","name":"pi","id":"hooks.claude","bins":null}"#,
             r#"{"op":"terminal_argv","name":"pi","script":"exec claude"}"#,
+            r#"{"op":"remove","name":"pi"}"#,
+            r#"{"op":"set","name":"pi","key":"enabled","value":false}"#,
         ] {
             serde_json::from_str::<Call>(s).unwrap_or_else(|e| panic!("{s}: {e}"));
         }
@@ -484,5 +531,28 @@ mod tests {
         assert_eq!(v, json!({"action": "copy_path", "path": "/etc/hosts"}));
         let v = call(Call::ClipboardRead { host: None }).unwrap();
         assert_eq!(v, json!("allow"));
+    }
+
+    #[test]
+    fn remote_setting_literals() {
+        assert_eq!(
+            remote_setting_literal("enabled", &json!(false)).unwrap(),
+            "false"
+        );
+        assert_eq!(
+            remote_setting_literal("host", &json!(" me@pi ")).unwrap(),
+            "\"me@pi\""
+        );
+        assert_eq!(
+            remote_setting_literal("clipboard_read", &json!("never")).unwrap(),
+            "\"never\""
+        );
+        assert!(remote_setting_literal("host", &json!("")).is_err());
+        assert!(remote_setting_literal("host", &json!("a b")).is_err());
+        assert!(remote_setting_literal("host", &json!("-oProxyCommand=evil")).is_err());
+        assert!(remote_setting_literal("host", &json!(1)).is_err());
+        assert!(remote_setting_literal("clipboard_read", &json!("maybe")).is_err());
+        assert!(remote_setting_literal("enabled", &json!("yes")).is_err());
+        assert!(remote_setting_literal("name", &json!("x")).is_err());
     }
 }
