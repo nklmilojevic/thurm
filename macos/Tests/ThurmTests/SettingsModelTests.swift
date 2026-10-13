@@ -166,4 +166,125 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertNil(HexColor.parse("red"))
         XCTAssertEqual(HexColor.format(red: 14, green: 17, blue: 22), "#0e1116")
     }
+
+    func testSummariesKeepTheFirstSentenceAndCutLongOnes() {
+        XCTAssertEqual(SettingText.summary("Font size in points. Larger values read better."), "Font size in points.")
+        XCTAssertEqual(SettingText.summary("  No period here  "), "No period here")
+        XCTAssertEqual(SettingText.summary(""), "")
+        let long = String(repeating: "word ", count: 40)
+        let cut = SettingText.summary(long)
+        XCTAssertTrue(cut.hasSuffix("word\u{2026}"))
+        XCTAssertLessThanOrEqual(cut.count, SettingText.summaryLimit + 1)
+    }
+
+    func testOptionTitlesReadAsLabels() {
+        XCTAssertEqual(SettingText.optionTitle("copy-paste"), "Copy paste")
+        XCTAssertEqual(SettingText.optionTitle("sidebar"), "Sidebar")
+    }
+
+    func testSubgroupsFollowTheKeysTables() throws {
+        let appearance = [
+            item("cursor.style", section: "appearance"),
+            item("colors.theme", section: "appearance"),
+            item("colors.foreground", section: "appearance"),
+            item("window.opacity", section: "appearance"),
+        ]
+        let groups = SettingGroups.split(appearance)
+        XCTAssertEqual(groups.map(\.heading), [nil, "Theme", "Colors", "Cursor"])
+        XCTAssertEqual(groups[0].items.map(\.key), ["window.opacity"])
+        XCTAssertEqual(groups[1].items.map(\.key), ["colors.theme"])
+        let notifications = try document().settings.filter { $0.section == "notifications" }
+        let matrixGroups = SettingGroups.split(notifications)
+        XCTAssertEqual(matrixGroups.map(\.heading), [nil, "States"])
+        XCTAssertFalse(matrixGroups[0].isMatrix)
+        XCTAssertTrue(matrixGroups[1].isMatrix)
+    }
+
+    func testEverySectionHasAnIcon() {
+        for id in ["appearance", "font", "window", "terminal", "session", "security", "notifications",
+                   "agents", "ai", "programs", "updates", "quick_terminal", "keys", "remotes"] {
+            XCTAssertNotEqual(SettingsSectionIcons.symbol(for: id), "gearshape", id)
+        }
+        XCTAssertEqual(SettingsSectionIcons.symbol(for: "unknown"), "gearshape")
+    }
+
+    func testSystemSoundsAreTheSoundFilesByName() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thurm-sounds-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for file in ["Glass.aiff", "Basso.aiff", "Ping.WAV", ".DS_Store", "README.txt"] {
+            FileManager.default.createFile(atPath: directory.appendingPathComponent(file).path, contents: nil)
+        }
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("Pack.aiff"),
+                                                withIntermediateDirectories: false)
+        XCTAssertEqual(SystemSounds.names(in: [directory.path]), ["Basso", "Glass", "Ping"])
+    }
+
+    func testListsWithACommaInAnItemAreNotEditedAsText() {
+        XCTAssertEqual(SettingList.parse(" a, b ,,c "), ["a", "b", "c"])
+        XCTAssertTrue(SettingList.isEditableAsText(["a", "b"]))
+        XCTAssertFalse(SettingList.isEditableAsText(["a,b", "c"]))
+        XCTAssertFalse(SettingList.isEditableAsText([" a", "b"]))
+        XCTAssertFalse(SettingList.isEditableAsText(["a", "", "b"]))
+        XCTAssertTrue(SettingList.isEditableAsText(nil))
+    }
+
+    func testAnItemKnowsWhatConfigTomlSetsForIt() throws {
+        let items = try XCTUnwrap(SettingsDocument(json: """
+        {"config_path": "", "overlay_path": "", "config_read_only": false, "overlay_exists": true,
+         "sections": [{"id": "appearance", "label": "Appearance"}],
+         "settings": [
+           {"key": "colors.cursor", "section": "appearance", "label": "Cursor", "kind": "color",
+            "value": "#ff0000", "default": null, "source": "overlay", "file_value": "#00ff00", "doc": ""},
+           {"key": "colors.background", "section": "appearance", "label": "Background", "kind": "color",
+            "value": null, "default": null, "source": "default", "file_value": null, "doc": ""}
+         ], "warnings": [], "error": null}
+        """)).settings
+        XCTAssertEqual(items[0].fileValue as? String, "#00ff00")
+        XCTAssertNil(items[1].fileValue)
+    }
+
+    func testNoticeSaysWhatTheFilesMean() throws {
+        let doc = try document()
+        let notice = try XCTUnwrap(doc.notice)
+        XCTAssertFalse(notice.isError)
+        XCTAssertTrue(notice.text.contains("read-only"))
+        XCTAssertTrue(notice.text.contains("font.famliy"))
+        let broken = try XCTUnwrap(SettingsDocument(json: """
+        {"config_path": "", "overlay_path": "", "config_read_only": false, "overlay_exists": false,
+         "sections": [], "settings": [], "warnings": [], "error": "bad line"}
+        """))
+        XCTAssertEqual(broken.notice?.isError, true)
+        let clean = try XCTUnwrap(SettingsDocument(json: """
+        {"config_path": "", "overlay_path": "", "config_read_only": false, "overlay_exists": false,
+         "sections": [], "settings": [], "warnings": [], "error": null}
+        """))
+        XCTAssertNil(clean.notice)
+    }
+
+    private func item(_ key: String, section: String) -> SettingItem {
+        SettingItem(json: ["key": key, "section": section, "label": key, "kind": "text",
+                           "value": "", "default": "", "source": "default", "doc": ""])!
+    }
+}
+
+final class SettingsStoreNavigationTests: XCTestCase {
+    func testPickingASectionLeavesTheSearch() {
+        let store = SettingsStore()
+        store.selectedSection = "font"
+        store.query = "blink"
+        XCTAssertNil(store.selectedSection)
+        store.selectedSection = "font"
+        XCTAssertEqual(store.query, "")
+        XCTAssertEqual(store.selectedSection, "font")
+    }
+
+    func testClearingTheSearchReturnsToTheSectionBeforeIt() {
+        let store = SettingsStore()
+        store.selectedSection = "window"
+        store.query = "size"
+        store.query = ""
+        XCTAssertEqual(store.selectedSection, "window")
+    }
 }

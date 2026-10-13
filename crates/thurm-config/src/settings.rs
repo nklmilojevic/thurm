@@ -451,6 +451,9 @@ pub fn view_at(config: &Path) -> Json {
                 "value": lookup_json(&cfg, &path).cloned().unwrap_or(Json::Null),
                 "default": default,
                 "source": source,
+                "file_value": lookup_toml(&base, &path)
+                    .and_then(|v| serde_json::to_value(v).ok())
+                    .unwrap_or(Json::Null),
                 "doc": doc_for(&docs, &s.key),
                 "warning": warning,
             });
