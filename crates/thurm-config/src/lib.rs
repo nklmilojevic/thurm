@@ -488,6 +488,25 @@ pub struct NotificationConfig {
     pub finished: StateNotice,
     pub failed: StateNotice,
     pub idle: StateNotice,
+    /// Replaced by `waiting` and `blocked`: `false` still turns their notifications off.
+    #[serde(default, skip_serializing)]
+    agent_needs_input: Option<bool>,
+    /// Replaced by `finished` and `failed`: `false` still turns their notifications off.
+    #[serde(default, skip_serializing)]
+    agent_done: Option<bool>,
+}
+
+impl NotificationConfig {
+    fn apply_replaced_keys(&mut self) {
+        if self.agent_needs_input == Some(false) {
+            self.waiting.notify = false;
+            self.blocked.notify = false;
+        }
+        if self.agent_done == Some(false) {
+            self.finished.notify = false;
+            self.failed.notify = false;
+        }
+    }
 }
 
 /// One state's row of the notification matrix.
@@ -535,6 +554,8 @@ impl Default for NotificationConfig {
             finished: alert.clone(),
             failed: alert,
             idle: StateNotice::default(),
+            agent_needs_input: None,
+            agent_done: None,
         }
     }
 }
@@ -1061,10 +1082,11 @@ impl Config {
     pub fn parse_with_warnings(text: &str) -> Result<(Config, Vec<String>), String> {
         let mut unknown = Vec::new();
         let de = toml::Deserializer::parse(text).map_err(|e| e.to_string())?;
-        let cfg: Config = serde_ignored::deserialize(de, |path| {
+        let mut cfg: Config = serde_ignored::deserialize(de, |path| {
             unknown.push(format!("unknown setting `{path}` ignored"));
         })
         .map_err(|e| e.to_string())?;
+        cfg.notifications.apply_replaced_keys();
         cfg.validate()?;
         Ok((cfg, unknown))
     }
@@ -2175,6 +2197,27 @@ clipboard_read = "always"
         assert_eq!(n.notice(NoticeState::Working), &working);
         assert_eq!(n.notice(NoticeState::Waiting), &NotificationConfig::default().waiting);
         assert!(Config::parse("[notifications]\nwaiting = { notify = \"yes\" }\n").is_err());
+    }
+
+    #[test]
+    fn replaced_notification_keys_still_turn_their_states_off() {
+        let text = "[notifications]\nagent_needs_input = false\nagent_done = false\n";
+        let (cfg, warnings) = Config::parse_with_warnings(text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let n = &cfg.notifications;
+        let replaced = [
+            NoticeState::Waiting,
+            NoticeState::Blocked,
+            NoticeState::Finished,
+            NoticeState::Failed,
+        ];
+        for state in replaced {
+            assert!(!n.notice(state).notify, "{state:?}");
+            assert!(n.notice(state).badge, "{state:?}");
+        }
+        // `true` changes nothing.
+        let (cfg, _) = Config::parse_with_warnings("[notifications]\nagent_done = true\n").unwrap();
+        assert_eq!(cfg.notifications.finished, NotificationConfig::default().finished);
     }
 
     #[test]

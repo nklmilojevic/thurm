@@ -926,8 +926,10 @@ final class SessionManager: NSObject, CoreDelegate {
                 view.metricsChanged()
             }
             c.content.needsDisplay = true
+            c.updateTitle()
         }
         refreshSidebars()
+        updateDockBadge()
         updateSecureInput()
     }
 
@@ -1221,8 +1223,12 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         let wasWaiting = old?.agent?.status == .needsInput
         let waiting = info.agent?.status == .needsInput
-        // A new state (or a different message) is unread again.
-        if old?.agent?.noticeState != info.agent?.noticeState || old?.agent?.message != info.agent?.message {
+        // A new state, message, or permission prompt is unread again.
+        let prompt = info.agent?.permission
+        let newPrompt = prompt != nil && prompt != old?.agent?.permission
+        let newState = old?.agent?.noticeState != info.agent?.noticeState
+        let newMessage = old?.agent?.message != info.agent?.message
+        if newState || newMessage || newPrompt {
             seenAlerts.remove(key)
         }
         // Answered, or retired by keys typed in the pane: its buttons would do nothing.

@@ -2035,6 +2035,15 @@ impl Daemon {
         }
     }
 
+    /// Whether an agent going from `before` to `after` is news: it entered another state of the
+    /// notification matrix, or showed a permission prompt it did not show before.
+    fn is_agent_news(before: Option<&AgentState>, after: &AgentState) -> bool {
+        let state = |a: &AgentState| NoticeState::of(a.status, a.permission.is_some());
+        let new_prompt =
+            after.permission.is_some() && after.permission != before.and_then(|b| b.permission);
+        before.map(state) != Some(state(after)) || new_prompt
+    }
+
     /// Notifications for an agent entering a state of the notification matrix
     /// (`[notifications.<state>]`): needs input, a permission prompt, a finished turn, a failure,
     /// or (if enabled) working or idle. With `ai.notifications` the model first says what the
@@ -2053,11 +2062,7 @@ impl Daemon {
         let Some(a) = after else {
             return Vec::new();
         };
-        let was = before.map(|b| b.status);
-        // A permission prompt right after another request is news too.
-        let new_prompt =
-            a.permission.is_some() && a.permission != before.and_then(|b| b.permission);
-        if was == Some(a.status) && !new_prompt {
+        if !Self::is_agent_news(before, a) {
             return Vec::new();
         }
         let state = NoticeState::of(a.status, a.permission.is_some());
@@ -3026,6 +3031,42 @@ fn ensure_hooks(command: Option<&[String]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent(status: AgentStatus, permission: Option<u64>) -> AgentState {
+        AgentState {
+            name: "Claude Code".into(),
+            kind: "claude".into(),
+            status,
+            session_id: None,
+            message: None,
+            turn_ms: None,
+            turns: 0,
+            hooked: false,
+            topic: None,
+            permission,
+        }
+    }
+
+    #[test]
+    fn a_prompt_going_away_while_still_waiting_is_news() {
+        let blocked = agent(AgentStatus::NeedsInput, Some(7));
+        let waiting = agent(AgentStatus::NeedsInput, None);
+        assert!(Daemon::is_agent_news(Some(&blocked), &waiting));
+        assert!(!Daemon::is_agent_news(Some(&waiting), &waiting));
+        assert!(Daemon::is_agent_news(Some(&waiting), &blocked));
+        // A different prompt while already blocked is news; the same one is not.
+        assert!(Daemon::is_agent_news(
+            Some(&blocked),
+            &agent(AgentStatus::NeedsInput, Some(8))
+        ));
+        assert!(!Daemon::is_agent_news(Some(&blocked), &blocked));
+        let working = agent(AgentStatus::Working, None);
+        assert!(Daemon::is_agent_news(Some(&working), &waiting));
+        assert!(!Daemon::is_agent_news(
+            Some(&working),
+            &agent(AgentStatus::Working, None)
+        ));
+    }
 
     #[test]
     fn program_name_replaces_the_command_word() {

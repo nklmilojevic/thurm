@@ -2732,10 +2732,12 @@ impl App {
         let new_state = info.agent.as_ref().map(state);
         let old_message = old_agent.as_ref().and_then(|a| a.message.clone());
         let new_message = info.agent.as_ref().and_then(|a| a.message.clone());
-        if old_state != new_state || old_message != new_message {
+        let old_permission = old_agent.as_ref().and_then(|a| a.permission);
+        let new_permission = info.agent.as_ref().and_then(|a| a.permission);
+        let new_prompt = new_permission.is_some() && new_permission != old_permission;
+        if old_state != new_state || old_message != new_message || new_prompt {
             self.seen_waiting.borrow_mut().remove(&key);
         }
-        let old_permission = old_agent.as_ref().and_then(|a| a.permission);
         if old_permission.is_some() && old_permission != info.agent.as_ref().and_then(|a| a.permission)
         {
             notify::withdraw_permission(self, &key);
