@@ -479,9 +479,13 @@ final class TabContentView: NSView {
 
     /// Highlights the divider at `path` (nil: none) and eases the highlight in or out.
     private func setDividerHighlight(_ path: [Bool]?) {
+        let pathChanged = path != nil && path != highlightedPath
         if let path { highlightedPath = path }
         let target = path == nil ? 0.0 : 1.0
-        guard dividerEmphasis.to != target else { return }
+        guard dividerEmphasis.to != target else {
+            if pathChanged { syncDividerHighlight() }
+            return
+        }
         let now = CACurrentMediaTime()
         dividerEmphasis.move(to: target, duration: Motion.fast, at: now)
         syncDividerHighlight(at: now)
