@@ -1,6 +1,10 @@
 import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+    /// URLs and files that arrive before the session is up (a cold launch).
+    private var sessionStarted = false
+    private var pendingExternalURLs: [URL] = []
+
     // MARK: Lifecycle
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -37,6 +41,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         SessionManager.shared.start()
         Updater.shared.start()
         NSApp.activate()
+        sessionStarted = true
+        let pending = pendingExternalURLs
+        pendingExternalURLs = []
+        pending.forEach(openExternal)
+    }
+
+    /// `thurm://` URLs, and files or folders from Finder (Open With, a Dock drop, `open -a Thurm`).
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard sessionStarted else {
+            pendingExternalURLs += urls
+            return
+        }
+        NSApp.activate()
+        urls.forEach(openExternal)
     }
 
     /// Opened from the disk image (or translocated by Gatekeeper to a random read-only path): the
@@ -143,6 +161,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         menu.addItem(NSMenuItem(title: "New Workspace", action: #selector(newWorkspace(_:)), keyEquivalent: ""))
         for item in menu.items { item.target = self }
         return menu
+    }
+
+    /// Opens a file or folder, or runs a `thurm://` route. Invalid input does nothing.
+    private func openExternal(_ url: URL) {
+        let session = SessionManager.shared
+        if url.isFileURL {
+            guard let dir = ExternalRoute.directory(forOpened: url) else { return }
+            session.newTab(from: session.currentController, cwd: dir)
+            return
+        }
+        guard let request = ExternalRoute.parse(url) else { return }
+        switch request {
+        case .tab(let cwd):
+            session.newTab(from: session.currentController, cwd: cwd)
+        case .window(let cwd):
+            session.newWindow(cwd: cwd)
+        case .split(let cwd, let direction):
+            if let c = session.currentRegularController {
+                session.splitFocused(in: c, direction: direction, cwd: cwd)
+            } else {
+                session.newWindow(cwd: cwd)
+            }
+        case .settings:
+            session.openConfigFile()
+        case .workspace(let name):
+            session.showWorkspace(named: name)
+        }
     }
 
     // MARK: Actions

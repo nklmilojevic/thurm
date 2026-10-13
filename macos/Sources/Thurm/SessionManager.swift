@@ -674,9 +674,19 @@ final class SessionManager: NSObject, CoreDelegate {
         return pane
     }
 
+    /// A window of its own with a shell in `cwd` (a `thurm://new-window` URL).
+    func newWindow(cwd: String?) {
+        let size = gridSize(forPoints: defaultContentSize())
+        guard let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, cwd: cwd) else { return }
+        let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
+        c.workspaceID = makeWorkspace(host: pane.host).id
+        showAsNewWindow(c, frame: nil)
+        scheduleLayoutSave()
+    }
+
     /// Cmd+D / Cmd+Shift+D.
     func splitFocused(in c: TerminalWindowController, direction: SplitDirName, preset: String? = nil,
-                      fork: Bool = false) {
+                      fork: Bool = false, cwd: String? = nil) {
         let target = c.focusedPane
         var size = gridSize(forPoints: c.content.focusedView?.frame.size ?? c.content.bounds.size)
         if direction == .right || direction == .left {
@@ -685,7 +695,7 @@ final class SessionManager: NSObject, CoreDelegate {
             size.rows = max(1, size.rows / 2)
         }
         guard let id = createPane(cols: size.cols, rows: size.rows, inheritFrom: target, preset: preset,
-                                  forkFrom: fork ? target : nil) else { return }
+                                  forkFrom: fork ? target : nil, cwd: cwd) else { return }
         c.content.split(target: target, newPane: id, direction: direction)
         scheduleLayoutSave()
     }

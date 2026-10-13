@@ -286,6 +286,19 @@ extension SessionManager {
         scheduleLayoutSave()
     }
 
+    /// A `thurm://workspace/<name>` URL: brings the named workspace forward, opening it when hidden.
+    /// Unknown names do nothing; no workspace is created.
+    func showWorkspace(named name: String) {
+        guard let ws = workspaces.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            return
+        }
+        if let c = controllerShowing(ws) {
+            c.window?.makeKeyAndOrderFront(nil)
+        } else {
+            openWorkspaceInNewWindow(ws)
+        }
+    }
+
     /// ⌘⇧N: a new workspace with a fresh shell (on `host`), in the front window.
     func newWorkspace(host: HostId = localHost) {
         let ws = makeWorkspace(host: host)
