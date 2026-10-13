@@ -223,7 +223,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
 
     override func becomeMain() {
         super.becomeMain()
-        titleLabel.textColor = .labelColor
+        titleLabel.textColor = SessionManager.shared.config.chrome.contentPrimary
         installTitleLabel()
         observeTabGroup()
         syncTitlebar()
@@ -233,7 +233,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
 
     override func resignMain() {
         super.resignMain()
-        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.textColor = SessionManager.shared.config.chrome.contentSecondary
         scheduleTabBarBackgroundSync()
     }
 

@@ -194,7 +194,7 @@ final class UpdateBadge: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 11
-        layer?.borderWidth = 1
+        layer?.borderWidth = ChromeStroke.width
         dot.wantsLayer = true
         dot.layer?.cornerRadius = 3
         label.font = .systemFont(ofSize: 11, weight: .medium)
@@ -208,15 +208,11 @@ final class UpdateBadge: NSView {
     }
 
     func applyTheme() {
-        let theme = SessionManager.shared.config.theme
-        let bg = colorFromRGB(theme.background)
-        let fg = colorFromRGB(theme.foreground)
-        layer?.backgroundColor = (theme.isDark ? bg.highlight(withLevel: 0.08) : bg.shadow(withLevel: 0.04))?.cgColor
-        layer?.borderColor = fg.withAlphaComponent(0.18).cgColor
-        label.textColor = fg
-        // ANSI green, like a finished agent.
-        let green = theme.palette.count > 2 ? colorFromRGB(theme.palette[2]) : NSColor.systemGreen
-        dot.layer?.backgroundColor = green.cgColor
+        let chrome = SessionManager.shared.config.chrome
+        layer?.backgroundColor = chrome.surfaceRaised.cgColor
+        layer?.borderColor = chrome.strokeStrong.cgColor
+        label.textColor = chrome.contentPrimary
+        dot.layer?.backgroundColor = chrome.success.cgColor
     }
 
     override var fittingSize: NSSize {

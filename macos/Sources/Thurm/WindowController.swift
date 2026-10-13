@@ -27,25 +27,14 @@ final class AgentDotView: NSView {
 
     private func refresh() {
         guard let layer = layer else { return }
+        layer.backgroundColor = status?.color.cgColor ?? NSColor.clear.cgColor
         switch status {
-        case .some(.working):
-            layer.backgroundColor = NSColor.systemBlue.cgColor
-            toolTip = "Agent working"
-        case .some(.needsInput):
-            layer.backgroundColor = NSColor.systemOrange.cgColor
-            toolTip = "Agent needs input"
-        case .some(.done):
-            layer.backgroundColor = NSColor.systemGreen.cgColor
-            toolTip = "Agent finished"
-        case .some(.error):
-            layer.backgroundColor = NSColor.systemRed.cgColor
-            toolTip = "Agent failed"
-        case .some(.idle):
-            layer.backgroundColor = NSColor.systemGray.cgColor
-            toolTip = "Agent idle"
-        case .none:
-            layer.backgroundColor = NSColor.clear.cgColor
-            toolTip = nil
+        case .some(.working): toolTip = "Agent working"
+        case .some(.needsInput): toolTip = "Agent needs input"
+        case .some(.done): toolTip = "Agent finished"
+        case .some(.error): toolTip = "Agent failed"
+        case .some(.idle): toolTip = "Agent idle"
+        case .none: toolTip = nil
         }
     }
 }
@@ -211,10 +200,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         (window as? TerminalWindow)?.titlebarColor = colorFromRGB(cfg.theme.background, alpha: opacity)
         applyTabStyle()
         (window as? TerminalWindow)?.hidesTitle = cfg.sidebarTabs && cfg.paneHeaders
-        // A step off the terminal background (darker, like Catppuccin's mantle): solid, so it
-        // doesn't pick up the desktop through the window.
-        let base = colorFromRGB(cfg.theme.background, alpha: opacity)
-        sidebar?.backgroundColor = base.shadow(withLevel: cfg.theme.isDark ? 0.18 : 0.05) ?? base
+        sidebar?.backgroundColor = cfg.sidebarColor
         // The quick terminal's rounded corners need a transparent window.
         if opacity < 1 || isQuick {
             window.isOpaque = false
@@ -223,13 +209,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             window.isOpaque = true
             window.backgroundColor = colorFromRGB(cfg.theme.background)
         }
-        applyBlur(opacity < 1 && cfg.blur > 0)
+        applyBlur(opacity < 1 && (cfg.blur > 0 || cfg.material != .theme))
         content.applyConfig()
         content.needsDisplay = true
     }
 
     /// Behind-window blur for translucent windows: a visual effect view at the back of the
-    /// window's frame view, under the (translucent) terminal content.
+    /// window's frame view, under the (translucent) terminal content, tinted by `window.material`.
     private var blurView: NSVisualEffectView?
 
     private func applyBlur(_ on: Bool) {
@@ -239,6 +225,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             blurView = nil
             return
         }
+        let cfg = SessionManager.shared.config
         let v = blurView ?? NSVisualEffectView()
         v.material = .underWindowBackground
         v.blendingMode = .behindWindow
@@ -248,6 +235,19 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         if v.superview !== frameView {
             frameView.addSubview(v, positioned: .below, relativeTo: frameView.subviews.first)
         }
+        let tintID = NSUserInterfaceItemIdentifier("thurmBlurTint")
+        let tint: NSView
+        if let existing = v.subviews.first(where: { $0.identifier == tintID }) {
+            tint = existing
+        } else {
+            tint = NSView(frame: v.bounds)
+            tint.identifier = tintID
+            tint.wantsLayer = true
+            tint.autoresizingMask = [.width, .height]
+            v.addSubview(tint)
+        }
+        tint.isHidden = cfg.material.tint == 0
+        tint.layer?.backgroundColor = colorFromRGB(cfg.theme.background, alpha: cfg.material.tint).cgColor
         blurView = v
     }
 

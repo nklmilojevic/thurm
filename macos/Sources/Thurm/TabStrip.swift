@@ -334,16 +334,15 @@ private final class TabTrack: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let cfg = SessionManager.shared.config
-        let fg = colorFromRGB(cfg.theme.foreground)
+        let chrome = SessionManager.shared.config.chrome
         // The track.
         let r = bounds.height / 2
-        fg.withAlphaComponent(0.035).setFill()
+        chrome.control.setFill()
         NSBezierPath(roundedRect: bounds, xRadius: r, yRadius: r).fill()
         // Separators between neighbours that are both unselected (none while dragging, nor
         // between a change of tabs and the layout that follows it).
         guard drag == nil, shown.allSatisfy({ $0 < tabs.count && $0 < pills.count }) else { return }
-        fg.withAlphaComponent(0.14).setFill()
+        chrome.strokeStrong.setFill()
         for slot in 1..<max(1, shown.count) where !tabs[shown[slot]].selected && !tabs[shown[slot - 1]].selected {
             let x = pills[shown[slot]].frame.minX
             NSRect(x: x - 0.5, y: bounds.midY - 8, width: 1, height: 16).fill()
@@ -413,11 +412,11 @@ private final class TabPill: NSView {
 
     private func update() {
         guard let tab else { return }
-        let fg = colorFromRGB(SessionManager.shared.config.theme.foreground)
+        let chrome = SessionManager.shared.config.chrome
         icon.image = tab.icon.tile(size: 20, stacked: tab.stacked, badge: tab.status == .idle ? nil : tab.status)
         if title.stringValue != tab.title { title.stringValue = tab.title }
-        title.textColor = fg.withAlphaComponent(tab.selected ? 0.95 : 0.55)
-        close.contentTintColor = fg.withAlphaComponent(0.55)
+        title.textColor = tab.selected ? chrome.contentPrimary : chrome.contentSecondary
+        close.contentTintColor = chrome.contentSecondary
         title.isHidden = compact
         close.isHidden = !hovering || compact
         iconLeading.constant = compact ? max(0, (bounds.width - 26) / 2) : 10
@@ -427,15 +426,14 @@ private final class TabPill: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let tab, tab.selected || hovering else { return }
-        let cfg = SessionManager.shared.config
-        let fg = colorFromRGB(cfg.theme.foreground)
+        let chrome = SessionManager.shared.config.chrome
         let r = bounds.height / 2
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: r - 0.5, yRadius: r - 0.5)
-        fg.withAlphaComponent(tab.selected ? 0.07 : 0.035).setFill()
+        (tab.selected ? chrome.controlSelected : chrome.control).setFill()
         path.fill()
         if tab.selected {
-            fg.withAlphaComponent(0.08).setStroke()
-            path.lineWidth = 1
+            chrome.stroke.setStroke()
+            path.lineWidth = ChromeStroke.width
             path.stroke()
         }
     }

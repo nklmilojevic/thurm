@@ -223,7 +223,7 @@ final class TabContentView: NSView {
     /// With pane headers, splits are rounded cards this far apart (and from the window edges):
     /// `window.pane_gap`.
     private var cardGap: CGFloat { SessionManager.shared.config.paneGap }
-    static let cardRadius: CGFloat = 8
+    static let cardRadius: CGFloat = ChromeRadius.pane
 
     /// With vertical tabs and pane headers the panes run the full height of the window, under
     /// the (empty) titlebar: each pane's header takes the place of the window title.
@@ -709,6 +709,7 @@ final class TabContentView: NSView {
     /// After a config reload: headers turned on or off, or the theme changed.
     func applyConfig() {
         applyUpdateBadgeTheme()
+        findBar?.applyTheme()
         layoutPanes()
         window?.invalidateCursorRects(for: self)
     }
@@ -740,26 +741,28 @@ private final class CardChrome: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     override func draw(_ dirtyRect: NSRect) {
-        let cfg = SessionManager.shared.config
-        let base = colorFromRGB(cfg.theme.background)
-        let fg = colorFromRGB(cfg.theme.foreground)
+        let chrome = SessionManager.shared.config.chrome
         let gutter = NSBezierPath(rect: area)
         gutter.windingRule = .evenOdd
         let radii = cards.map { corners(of: $0.rect) }
         for (card, r) in zip(cards, radii) {
             gutter.append(Self.path(card.rect, radii: r))
         }
-        let bg = base.withAlphaComponent(opacity)
-        (bg.shadow(withLevel: cfg.theme.isDark ? 0.18 : 0.05) ?? bg).setFill()
+        chrome.surface.withAlphaComponent(opacity).setFill()
         gutter.fill()
-        // A hairline a step off the card, a touch brighter around the focused pane.
+        // A hairline around each card, a touch brighter around the focused pane. Light on dark
+        // themes, so it reads as an edge.
+        let context = NSGraphicsContext.current
+        context?.saveGraphicsState()
+        if chrome.isDark { context?.compositingOperation = .plusLighter }
         for (card, r) in zip(cards, radii) {
             let outline = Self.path(card.rect.insetBy(dx: 0.5, dy: 0.5), radii: r.map { $0 - 0.5 })
-            let color = base.blended(withFraction: card.focused ? 0.1 : 0.06, of: fg) ?? fg
-            color.withAlphaComponent(max(opacity, 0.6)).setStroke()
-            outline.lineWidth = 1
+            let color = card.focused ? chrome.strokeStrong : chrome.stroke
+            color.withAlphaComponent(color.alphaComponent * max(opacity, 0.6)).setStroke()
+            outline.lineWidth = ChromeStroke.width
             outline.stroke()
         }
+        context?.restoreGraphicsState()
     }
 
     /// Radii of `rect`'s corners (top left, top right, bottom right, bottom left): the window's,
