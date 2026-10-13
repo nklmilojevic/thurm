@@ -1339,6 +1339,8 @@ final class SessionManager: NSObject, CoreDelegate {
             }
         case "Focus":
             if let pane = key("pane") { focusPane(pane, activate: true) }
+        case "Equalize":
+            if let pane = key("pane") { controller(for: pane)?.content.equalize() }
         case "Scroll":
             // The viewport lives in the app's copy of the terminal.
             if let pane = key("pane"), let scroll = d["scroll"] {

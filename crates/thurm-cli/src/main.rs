@@ -283,6 +283,11 @@ enum Cmd {
     Agents,
     /// Focus a pane in the GUI.
     Focus { pane: PaneId },
+    /// Equalize the splits of a pane's tab (Equalize Splits in the View menu).
+    Equalize {
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+    },
     /// Close (kill) a pane.
     Close { pane: Option<PaneId> },
     /// Set the tab title of a pane (empty to reset).
@@ -1390,6 +1395,10 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
         Cmd::Focus { pane } => {
             c.request(Request::Ui(UiCommand::Focus { pane }))?;
         }
+        Cmd::Equalize { pane } => {
+            let pane = current_pane(pane)?;
+            c.request(Request::Ui(UiCommand::Equalize { pane }))?;
+        }
         Cmd::Close { pane } => {
             let pane = current_pane(pane)?;
             c.request(Request::ClosePane { pane })?;
@@ -1738,6 +1747,10 @@ mod tests {
             _ => panic!(),
         }
         assert!(Cli::try_parse_from(["thurm", "wait", "--agent-free", "-t", "30"]).is_ok());
+        assert!(matches!(
+            Cli::try_parse_from(["thurm", "equalize", "-p", "3"]).unwrap().cmd,
+            Cmd::Equalize { pane: Some(3) }
+        ));
         let c = Cli::try_parse_from(["thurm", "--remote", "devbox", "agents"]).unwrap();
         assert_eq!(c.remote.as_deref(), Some("devbox"));
         let c = Cli::try_parse_from([
