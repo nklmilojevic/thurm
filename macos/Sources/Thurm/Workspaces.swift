@@ -299,6 +299,14 @@ extension SessionManager {
         }
     }
 
+    /// A `thurm://new-workspace` URL: a new local workspace whose shell starts in `cwd`, shown
+    /// in the front window.
+    func newWorkspace(cwd: String?) {
+        let size = gridSize(forPoints: currentRegularController?.content.bounds.size ?? defaultContentSize())
+        guard let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, cwd: cwd) else { return }
+        newWindow(pane: pane, workspace: makeWorkspace(host: pane.host))
+    }
+
     /// ⌘⇧N: a new workspace with a fresh shell (on `host`), in the front window.
     func newWorkspace(host: HostId = localHost) {
         let ws = makeWorkspace(host: host)

@@ -33,6 +33,8 @@ final class SessionManager: NSObject, CoreDelegate {
     /// Layout saving starts only after the initial restore, so a failed start never
     /// overwrites the stored layout with an empty one.
     private var sessionReady = false
+    /// Called after each successful restore, once the session is usable.
+    var onSessionReady: (() -> Void)?
     /// Restores in a row whose ListPanes or GetLayout failed.
     private var restoreFailures = 0
     private var lastLayoutJSON: String?
@@ -462,6 +464,7 @@ final class SessionManager: NSObject, CoreDelegate {
         sessionReady = true
         saveLayoutNow(force: true)
         focusChanged()
+        onSessionReady?()
     }
 
     /// A saved window's tabs as a workspace in the background.
@@ -672,16 +675,6 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         scheduleLayoutSave()
         return pane
-    }
-
-    /// A window of its own with a shell in `cwd` (a `thurm://new-window` URL).
-    func newWindow(cwd: String?) {
-        let size = gridSize(forPoints: defaultContentSize())
-        guard let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, cwd: cwd) else { return }
-        let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
-        c.workspaceID = makeWorkspace(host: pane.host).id
-        showAsNewWindow(c, frame: nil)
-        scheduleLayoutSave()
     }
 
     /// Cmd+D / Cmd+Shift+D.

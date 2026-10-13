@@ -18,8 +18,10 @@ final class ExternalRouteTests: XCTestCase {
     func testOpenRoutes() {
         XCTAssertEqual(parse("thurm://open?path=/Users/me/code"), .tab(cwd: "/Users/me/code"))
         XCTAssertEqual(parse("thurm://open"), .tab(cwd: nil))
-        XCTAssertEqual(parse("thurm://new-window?path=/Users/me/code"), .window(cwd: "/Users/me/code"))
-        XCTAssertEqual(parse("thurm://new-window"), .window(cwd: nil))
+        XCTAssertEqual(parse("thurm://new-workspace?path=/Users/me/code"), .newWorkspace(cwd: "/Users/me/code"))
+        XCTAssertEqual(parse("thurm://new-workspace"), .newWorkspace(cwd: nil))
+        XCTAssertNil(parse("thurm://new-window?path=/Users/me/code"))
+        XCTAssertNil(parse("thurm://new-workspace?path=/Users/me/missing"))
     }
 
     func testSplitRoutes() {
@@ -52,7 +54,7 @@ final class ExternalRouteTests: XCTestCase {
     func testCommandsAndUnknownPartsAreRefused() {
         XCTAssertNil(parse("thurm://open?path=/Users/me/code&cmd=rm%20-rf%20~"))
         XCTAssertNil(parse("thurm://open?cmd=ls"))
-        XCTAssertNil(parse("thurm://new-window?path=/Users/me/code&cmd=ls"))
+        XCTAssertNil(parse("thurm://new-workspace?path=/Users/me/code&cmd=ls"))
         XCTAssertNil(parse("thurm://split?path=/Users/me/code&input=ls"))
         XCTAssertNil(parse("thurm://open?path=/Users/me/code&path=/Users/me/code"))
         XCTAssertNil(parse("thurm://open/extra?path=/Users/me/code"))
@@ -68,6 +70,40 @@ final class ExternalRouteTests: XCTestCase {
 
     func testSchemeIsCaseInsensitive() {
         XCTAssertEqual(parse("THURM://settings"), .settings)
+    }
+
+    func testRemoteFocusNeverReceivesLocalPath() {
+        XCTAssertEqual(placement(.tab(cwd: "/Users/me/code"), remote: true),
+                       .tab(cwd: "/Users/me/code", local: true))
+        XCTAssertEqual(placement(.tab(cwd: nil), remote: true), .tab(cwd: nil, local: false))
+        XCTAssertEqual(placement(.split(cwd: "/Users/me/code", direction: .down), remote: true),
+                       .tab(cwd: "/Users/me/code", local: true))
+        XCTAssertEqual(placement(.split(cwd: nil, direction: .right), remote: true),
+                       .split(cwd: nil, direction: .right))
+    }
+
+    func testLocalFocusSplitsAndTabs() {
+        XCTAssertEqual(placement(.tab(cwd: "/Users/me/code"), remote: false),
+                       .tab(cwd: "/Users/me/code", local: true))
+        XCTAssertEqual(placement(.split(cwd: "/Users/me/code", direction: .right), remote: false),
+                       .split(cwd: "/Users/me/code", direction: .right))
+    }
+
+    func testNoWindowOpensATab() {
+        XCTAssertEqual(ExternalRoute.placement(for: .split(cwd: "/Users/me/code", direction: .down),
+                                               focusedIsRemote: false, hasWindow: false),
+                       .tab(cwd: "/Users/me/code", local: true))
+    }
+
+    func testNewWorkspaceAndSettingsPlacement() {
+        XCTAssertEqual(placement(.newWorkspace(cwd: "/Users/me/code"), remote: true),
+                       .newWorkspace(cwd: "/Users/me/code"))
+        XCTAssertEqual(placement(.settings, remote: true), .settings)
+        XCTAssertEqual(placement(.workspace(name: "Work"), remote: false), .workspace(name: "Work"))
+    }
+
+    private func placement(_ request: ExternalRequest, remote: Bool) -> Placement {
+        ExternalRoute.placement(for: request, focusedIsRemote: remote, hasWindow: true)
     }
 
     func testDirectoryForOpenedItems() {

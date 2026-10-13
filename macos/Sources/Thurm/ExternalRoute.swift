@@ -4,8 +4,19 @@ import Foundation
 /// shell starts: any app can open a URL, so no request carries a command or input for a pane.
 enum ExternalRequest: Equatable {
     case tab(cwd: String?)
-    case window(cwd: String?)
     case split(cwd: String?, direction: SplitDirName)
+    case newWorkspace(cwd: String?)
+    case settings
+    case workspace(name: String)
+}
+
+/// Where a request lands in the window. A local path never lands in a remote workspace or
+/// splits a remote pane.
+enum Placement: Equatable {
+    /// `local`: a tab on this Mac's daemon, in the local workspace, revealed.
+    case tab(cwd: String?, local: Bool)
+    case split(cwd: String?, direction: SplitDirName)
+    case newWorkspace(cwd: String?)
     case settings
     case workspace(name: String)
 }
@@ -46,8 +57,8 @@ enum ExternalRoute {
         switch route {
         case "open" where noSubpath && names.isSubset(of: ["path"]) && pathValid:
             return .tab(cwd: path)
-        case "new-window" where noSubpath && names.isSubset(of: ["path"]) && pathValid:
-            return .window(cwd: path)
+        case "new-workspace" where noSubpath && names.isSubset(of: ["path"]) && pathValid:
+            return .newWorkspace(cwd: path)
         case "split" where noSubpath && names.isSubset(of: ["path", "direction"]) && pathValid:
             switch params["direction"] ?? "right" {
             case "right": return .split(cwd: path, direction: .right)
@@ -62,6 +73,25 @@ enum ExternalRoute {
             return .workspace(name: name)
         default:
             return nil
+        }
+    }
+
+    /// Where `request` lands, given whether the front window's focused pane is on a remote host
+    /// and whether there is a window at all.
+    static func placement(for request: ExternalRequest, focusedIsRemote: Bool, hasWindow: Bool) -> Placement {
+        switch request {
+        case .tab(let cwd):
+            return .tab(cwd: cwd, local: cwd != nil)
+        case .split(let cwd, let direction):
+            guard hasWindow else { return .tab(cwd: cwd, local: cwd != nil) }
+            if focusedIsRemote && cwd != nil { return .tab(cwd: cwd, local: true) }
+            return .split(cwd: cwd, direction: direction)
+        case .newWorkspace(let cwd):
+            return .newWorkspace(cwd: cwd)
+        case .settings:
+            return .settings
+        case .workspace(let name):
+            return .workspace(name: name)
         }
     }
 
