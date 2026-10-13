@@ -413,9 +413,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         let key = NSUserInterfaceItemIdentifier(item.key)
         let number = (item.value as? NSNumber)?.doubleValue ?? 0
         if let lo = item.min, let hi = item.max {
-            let slider = NSSlider(value: number, minValue: lo, maxValue: hi, target: self,
-                                  action: #selector(sliderMoved(_:)))
+            let slider = ReleaseSlider(value: number, minValue: lo, maxValue: hi, target: self,
+                                       action: #selector(sliderMoved(_:)))
             slider.identifier = key
+            slider.onRelease = { [weak self] slider in self?.saveSlider(slider) }
             slider.widthAnchor.constraint(equalToConstant: 180).isActive = true
             let readout = NSTextField(labelWithString: item.text)
             readout.alignment = .right
@@ -614,8 +615,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         commit(key, value)
     }
 
-    /// A slider saves when the drag ends (or a key moves it). Committing rebuilds the controls,
-    /// so nothing is saved while the mouse is down: the drag only moves the readout.
+    /// A slider saves when the mouse is released (`ReleaseSlider`) or a key moves it. Committing
+    /// rebuilds the controls, so nothing is saved while the mouse is down: the drag only moves
+    /// the readout.
     @objc private func sliderMoved(_ sender: NSSlider) {
         guard let key = identifierKey(sender), let item = setting(key),
               let value = SettingNumber.value(sender.doubleValue, kind: item.kind)
@@ -629,11 +631,23 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             readout?.stringValue = String(format: "%g", (value as? Double) ?? 0)
         }
         switch NSApp.currentEvent?.type {
-        case .leftMouseDown?, .leftMouseDragged?:
+        case .leftMouseDown?, .leftMouseDragged?, .leftMouseUp?:
             return
         default:
             commit(key, value)
         }
+    }
+
+    private func saveSlider(_ slider: NSSlider) {
+        guard let key = identifierKey(slider), let item = setting(key),
+              let value = SettingNumber.value(slider.doubleValue, kind: item.kind)
+        else { return }
+        // A click that leaves the value as it was must not turn it into an override.
+        if let current = (item.value as? NSNumber)?.doubleValue,
+           let chosen = (value as? NSNumber)?.doubleValue, current == chosen {
+            return
+        }
+        commit(key, value)
     }
 
     @objc private func resetClicked(_ sender: NSButton) {
@@ -729,4 +743,15 @@ private enum FontFamilies {
         }
         return (monospaced, other)
     }()
+}
+
+/// A slider that reports the end of a mouse interaction: `NSSlider` tracks the mouse inside
+/// `mouseDown(with:)` and returns once it is released, whether or not a last action was sent.
+private final class ReleaseSlider: NSSlider {
+    var onRelease: ((NSSlider) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        onRelease?(self)
+    }
 }
