@@ -1726,7 +1726,14 @@ fn migrate(text: &str) -> Result<Option<String>, String> {
             with_setting(&t, key, &value)
         })?;
     let mut doc: toml_edit::DocumentMut = out.parse().map_err(|e| format!("{e}"))?;
-    if let Some(n) = doc.get_mut("notifications").and_then(|n| n.as_table_mut()) {
+    if let Some(n) = doc.get_mut("notifications").and_then(|n| n.as_table_like_mut()) {
+        // A row an earlier migration wrote while the switch stayed in the file also goes off:
+        // once the switch is gone, nothing else would keep it off.
+        for state in &off {
+            if let Some(row) = n.get_mut(state).and_then(|r| r.as_table_like_mut()) {
+                row.insert("notify", toml_edit::value(false));
+            }
+        }
         n.remove("agent_needs_input");
         n.remove("agent_done");
     }
@@ -2325,6 +2332,26 @@ clipboard_read = "always"
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(cfg.notifications.notice(NoticeState::Waiting).notify);
         assert!(!cfg.notifications.notice(NoticeState::Blocked).notify);
+    }
+
+    #[test]
+    fn migration_turns_off_rows_written_before_the_switch_was_dropped() {
+        let at = MIGRATIONS
+            .iter()
+            .position(|(key, _)| *key == "notifications.finished")
+            .unwrap();
+        let old = format!(
+            "config_version = {at}\n\n[notifications]\nagent_needs_input = false\n\
+             waiting = {{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }}\n\
+             blocked = {{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }}\n"
+        );
+        let out = migrate(&old).unwrap().unwrap();
+        let (cfg, warnings) = Config::parse_with_warnings(&out).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let n = &cfg.notifications;
+        assert!(!n.waiting.notify && !n.blocked.notify);
+        assert!(n.finished.notify && n.failed.notify);
+        assert!(!out.contains("agent_needs_input"));
     }
 
     #[test]
