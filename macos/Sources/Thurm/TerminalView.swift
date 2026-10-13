@@ -503,7 +503,7 @@ final class TerminalView: NSView, NSTextInputClient {
             render = true
         }
         if flashStart > 0 { render = true }
-        if Float(dimTween.value(at: now)) != dimDrawn { render = true }
+        if dimValue(at: now) != dimDrawn { render = true }
         if renderer.wantsAnotherFrame { render = true }
         if render { renderNow() }
     }
@@ -602,7 +602,7 @@ final class TerminalView: NSView, NSTextInputClient {
                 flash = Float(max(0, 1 - Motion.curve.value(at: t)))
             }
         }
-        let dim = Float(dimTween.value(at: CACurrentMediaTime()))
+        let dim = dimValue(at: CACurrentMediaTime())
         dimDrawn = dim
         let opacity = Float((window?.windowController as? TerminalWindowController)?.opacity ?? config.opacity)
         if layer.isOpaque != (opacity >= 1) { layer.isOpaque = opacity >= 1 }
@@ -638,6 +638,11 @@ final class TerminalView: NSView, NSTextInputClient {
     func flash() {
         flashStart = CACurrentMediaTime()
         wakeLink()
+    }
+
+    /// The curve overshoots, so the eased dim can leave 0...1 for a moment.
+    private func dimValue(at time: CFTimeInterval) -> Float {
+        Float(min(1, max(0, dimTween.value(at: time))))
     }
 
     /// Dims the pane while another pane of its tab has focus. The dim eases in and out.
