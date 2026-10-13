@@ -25,6 +25,11 @@ final class AgentDotView: NSView {
 
     override var intrinsicContentSize: NSSize { frame.size }
 
+    /// Repaints in the current theme's status colors, after a config reload.
+    func applyTheme() {
+        refresh()
+    }
+
     private func refresh() {
         guard let layer = layer else { return }
         layer.backgroundColor = status?.color.cgColor ?? NSColor.clear.cgColor
@@ -198,6 +203,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         // Chrome follows the terminal theme, not the system, so glass over a dark theme is dark.
         window.appearance = NSAppearance(named: cfg.theme.isDark ? .darkAqua : .aqua)
         (window as? TerminalWindow)?.titlebarColor = colorFromRGB(cfg.theme.background, alpha: opacity)
+        (window as? TerminalWindow)?.applyTitleColor()
+        dot.applyTheme()
         applyTabStyle()
         (window as? TerminalWindow)?.hidesTitle = cfg.sidebarTabs && cfg.paneHeaders
         sidebar?.backgroundColor = cfg.sidebarColor
@@ -214,26 +221,40 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         content.needsDisplay = true
     }
 
-    /// Behind-window blur for translucent windows: a visual effect view at the back of the
-    /// window's frame view, under the (translucent) terminal content, tinted by `window.material`.
+    /// Behind-window blur for translucent windows. With `window.blur` it is a visual effect view
+    /// at the back of the window's frame view, under the (translucent) terminal content. Without
+    /// blur, a `window.material` other than `theme` backs only the sidebar, so the terminal's
+    /// transparent cells stay unblurred.
     private var blurView: NSVisualEffectView?
+    private var sidebarBackdrop: NSVisualEffectView?
 
     private func applyBlur(_ on: Bool) {
         guard let window = window, let frameView = window.contentView?.superview else { return }
-        if !on {
-            blurView?.removeFromSuperview()
-            blurView = nil
-            return
-        }
         let cfg = SessionManager.shared.config
-        let v = blurView ?? NSVisualEffectView()
+        let full = on && cfg.blur > 0
+        let sidebarOnly = on && !full && cfg.material != .theme
+        blurView = Self.backdrop(blurView, in: full ? frameView : nil, material: cfg.material,
+                                 background: cfg.theme.background)
+        sidebarBackdrop = Self.backdrop(sidebarBackdrop, in: sidebarOnly ? sidebar?.view : nil,
+                                        material: cfg.material, background: cfg.theme.background)
+    }
+
+    /// The blur behind `host`'s content, with the terminal background laid over it at the
+    /// material's tint. A nil `host` removes it.
+    private static func backdrop(_ existing: NSVisualEffectView?, in host: NSView?, material: WindowMaterial,
+                                 background: UInt32) -> NSVisualEffectView? {
+        guard let host else {
+            existing?.removeFromSuperview()
+            return nil
+        }
+        let v = existing ?? NSVisualEffectView()
         v.material = .underWindowBackground
         v.blendingMode = .behindWindow
         v.state = .active
-        v.frame = frameView.bounds
+        v.frame = host.bounds
         v.autoresizingMask = [.width, .height]
-        if v.superview !== frameView {
-            frameView.addSubview(v, positioned: .below, relativeTo: frameView.subviews.first)
+        if v.superview !== host {
+            host.addSubview(v, positioned: .below, relativeTo: host.subviews.first)
         }
         let tintID = NSUserInterfaceItemIdentifier("thurmBlurTint")
         let tint: NSView
@@ -246,9 +267,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             tint.autoresizingMask = [.width, .height]
             v.addSubview(tint)
         }
-        tint.isHidden = cfg.material.tint == 0
-        tint.layer?.backgroundColor = colorFromRGB(cfg.theme.background, alpha: cfg.material.tint).cgColor
-        blurView = v
+        tint.isHidden = material.tint == 0
+        tint.layer?.backgroundColor = colorFromRGB(background, alpha: material.tint).cgColor
+        return v
     }
 
     // MARK: Title and agent status

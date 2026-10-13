@@ -221,9 +221,15 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
 
     override func mergeAllWindows(_ sender: Any?) {}
 
+    /// The title's color follows the theme, and whether the window is the main one.
+    func applyTitleColor() {
+        let chrome = SessionManager.shared.config.chrome
+        titleLabel.textColor = isMainWindow ? chrome.contentPrimary : chrome.contentSecondary
+    }
+
     override func becomeMain() {
         super.becomeMain()
-        titleLabel.textColor = SessionManager.shared.config.chrome.contentPrimary
+        applyTitleColor()
         installTitleLabel()
         observeTabGroup()
         syncTitlebar()
@@ -233,7 +239,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
 
     override func resignMain() {
         super.resignMain()
-        titleLabel.textColor = SessionManager.shared.config.chrome.contentSecondary
+        applyTitleColor()
         scheduleTabBarBackgroundSync()
     }
 

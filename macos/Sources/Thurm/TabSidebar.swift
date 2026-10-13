@@ -160,7 +160,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     private var reloadHeld = false
     /// The rows as last shown: agents retitle their panes several times a second, which
     /// mostly changes nothing the sidebar shows.
-    private var shown: (names: [String], tabs: [[SidebarTab]])?
+    private var shown: (names: [String], tabs: [[SidebarTab]], theme: Theme)?
 
     private let outline = NSOutlineView()
     private var groups: [SidebarGroup] = []
@@ -340,8 +340,9 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         }
         if !other.tabs.isEmpty { order.append(other) }
         let names = order.map(\.name), tabs = order.map(\.tabs)
-        if shown.map({ $0.names == names && $0.tabs == tabs }) != true {
-            shown = (names, tabs)
+        let theme = SessionManager.shared.config.theme
+        if shown.map({ $0.names == names && $0.tabs == tabs && $0.theme == theme }) != true {
+            shown = (names, tabs, theme)
             for g in order { g.boxes = g.tabs.map(TabBox.init) }
             groups = order
             showHeaders = groups.count > 1
@@ -521,14 +522,14 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private var visibleRows: Int { draggedRows ?? SessionManager.shared.config.sidebarAgentRows }
     private var draggedRows: Int?
     private var shownLimit = 0
+    /// The theme the header and rows were colored with; a reload with another one repaints them.
+    private var themed: Theme?
 
     init() {
         super.init(frame: .zero)
         separator.boxType = .separator
         header.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-        header.textColor = SessionManager.shared.config.chrome.contentSecondary
         summary.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        summary.textColor = SessionManager.shared.config.chrome.contentTertiary
         summary.alignment = .right
 
         let column = NSTableColumn(identifier: .init("agent"))
@@ -600,8 +601,15 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     func reload() {
+        let theme = SessionManager.shared.config.theme
+        let repaint = theme != themed
+        if repaint {
+            themed = theme
+            header.textColor = SessionManager.shared.config.chrome.contentSecondary
+            summary.textColor = SessionManager.shared.config.chrome.contentTertiary
+        }
         let next = agentRows()
-        if next.count == rows.count, shownLimit == visibleRows,
+        if !repaint, next.count == rows.count, shownLimit == visibleRows,
            zip(next, rows).allSatisfy({ $0.pane == $1.pane && $0.hiddenWorkspace == $1.hiddenWorkspace && $0.row == $1.row }) {
             // A click selects its row even when it changes nothing shown: put the selection back.
             let current = rows.firstIndex { $0.row.selected }

@@ -12,7 +12,7 @@ enum QuickTerminalPosition: String {
 }
 
 /// Resolved color theme (colors are 0xRRGGBB).
-struct Theme {
+struct Theme: Equatable {
     var name: String
     var foreground: UInt32
     var background: UInt32
