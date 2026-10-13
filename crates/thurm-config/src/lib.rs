@@ -1718,7 +1718,7 @@ fn migrate(text: &str) -> Result<Option<String>, String> {
         .try_fold(text.to_owned(), |t, (key, value)| {
             let state = key.strip_prefix("notifications.");
             let value = match state {
-                Some(s) if off.iter().any(|o| *o == s) => {
+                Some(s) if off.contains(&s) => {
                     value.replace("notify = true", "notify = false")
                 }
                 _ => value.to_string(),
