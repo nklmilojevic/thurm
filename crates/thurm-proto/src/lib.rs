@@ -1081,6 +1081,10 @@ pub enum UiCommand {
     Focus {
         pane: PaneId,
     },
+    /// Give every split of the tab `pane` is in the same space per pane (Equalize Splits).
+    Equalize {
+        pane: PaneId,
+    },
     SetTabTitle {
         pane: PaneId,
         title: Option<String>,

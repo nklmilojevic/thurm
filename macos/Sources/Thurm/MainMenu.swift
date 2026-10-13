@@ -150,6 +150,13 @@ enum MainMenu {
         menu.addItem(item("Move Divider Down", #selector(TerminalWindowController.resizeDown(_:)), downArrow,
                           resizeMods))
         menu.addItem(.separator())
+        let moveMods: NSEvent.ModifierFlags = [.command, .control, .shift]
+        menu.addItem(item("Move Pane Left", #selector(TerminalWindowController.movePaneLeft(_:)), leftArrow, moveMods))
+        menu.addItem(item("Move Pane Right", #selector(TerminalWindowController.movePaneRight(_:)), rightArrow,
+                          moveMods))
+        menu.addItem(item("Move Pane Up", #selector(TerminalWindowController.movePaneUp(_:)), upArrow, moveMods))
+        menu.addItem(item("Move Pane Down", #selector(TerminalWindowController.movePaneDown(_:)), downArrow, moveMods))
+        menu.addItem(.separator())
         menu.addItem(item("Toggle Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control]))
         return menu
     }

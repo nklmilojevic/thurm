@@ -7,7 +7,7 @@
 
 # The updates Thurm has made to this file: it turns on features that came after the file was
 # written, then raises this. Leave it as it is.
-config_version = 1
+config_version = 2
 
 [font]
 # Use a font family or face name. Sizes and spacing are in points.
@@ -48,6 +48,8 @@ confirm_close = true
 quit_after_last_window = false
 # Dim panes without focus: 0.0 disables dimming; 1.0 gives full dimming.
 unfocused_split_dim = 0.25
+# Even out a tab's splits when a pane opens or closes. A dragged divider holds until then.
+auto_balance = true
 pane_headers = true
 # Space between split panes (and around them) when pane headers show, in points.
 pane_gap = 6.0
