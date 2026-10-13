@@ -1684,8 +1684,11 @@ impl App {
             tab.focused.borrow().clone()
         };
         *tab.zoomed.borrow_mut() = None;
-        let tree = tab.tree.borrow().clone();
-        *tab.tree.borrow_mut() = tree.split(&target, key.clone(), dir);
+        let mut tree = tab.tree.borrow().clone().split(&target, key.clone(), dir);
+        if self.ui().auto_balance() {
+            tree.equalize();
+        }
+        *tab.tree.borrow_mut() = tree;
         tab.sync_children();
         self.focus_pane(&key);
         self.schedule_save();
@@ -1781,7 +1784,10 @@ impl App {
         }
         let tree = tab.tree.borrow().clone();
         match tree.remove(key) {
-            Some(rest) => {
+            Some(mut rest) => {
+                if self.ui().auto_balance() {
+                    rest.equalize();
+                }
                 *tab.tree.borrow_mut() = rest;
                 tab.sync_children();
                 if was_focused {
@@ -2937,6 +2943,17 @@ impl App {
             "Focus" => {
                 if let Some(k) = key {
                     self.focus_agent(&k);
+                }
+            }
+            "Equalize" => {
+                let tab = match &key {
+                    Some(k) => self.tab_of(k),
+                    None => self.current_tab(),
+                };
+                if let Some(t) = tab {
+                    t.tree.borrow_mut().equalize();
+                    t.relayout();
+                    self.schedule_save();
                 }
             }
             "SetTabTitle" => {

@@ -3,7 +3,7 @@
 
 # The updates Thurm has made to this file: it turns on features that came after the file was
 # written, then raises this. Leave it as it is.
-config_version = 7
+config_version = 8
 
 [font]
 # A family or a face name ("TX-02 Retina ExtraCondensed"). JetBrains Mono ships with Thurm.
@@ -40,6 +40,9 @@ confirm_close = true
 # Quit when the last window closes (like most macOS terminals, off: the app stays in the Dock).
 quit_after_last_window = false
 unfocused_split_dim = 0.25
+# Give the panes of a tab the same space again whenever one opens or closes (dragged dividers
+# stay until then). View > Equalize Splits does it on demand.
+auto_balance = true
 pane_headers = true
 # Space between split panes when pane headers show, in points.
 pane_gap = 6.0
