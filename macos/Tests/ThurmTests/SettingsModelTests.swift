@@ -213,10 +213,34 @@ final class SettingsModelTests: XCTestCase {
             .appendingPathComponent("thurm-sounds-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        for file in ["Glass.aiff", "Basso.aiff", ".DS_Store"] {
+        for file in ["Glass.aiff", "Basso.aiff", "Ping.WAV", ".DS_Store", "README.txt"] {
             FileManager.default.createFile(atPath: directory.appendingPathComponent(file).path, contents: nil)
         }
-        XCTAssertEqual(SystemSounds.names(in: [directory.path]), ["Basso", "Glass"])
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("Pack.aiff"),
+                                                withIntermediateDirectories: false)
+        XCTAssertEqual(SystemSounds.names(in: [directory.path]), ["Basso", "Glass", "Ping"])
+    }
+
+    func testListsWithACommaInAnItemAreNotEditedAsText() {
+        XCTAssertEqual(SettingList.parse(" a, b ,,c "), ["a", "b", "c"])
+        XCTAssertTrue(SettingList.isEditableAsText(["a", "b"]))
+        XCTAssertFalse(SettingList.isEditableAsText(["a,b", "c"]))
+        XCTAssertTrue(SettingList.isEditableAsText(nil))
+    }
+
+    func testAnItemKnowsWhatConfigTomlSetsForIt() throws {
+        let items = try XCTUnwrap(SettingsDocument(json: """
+        {"config_path": "", "overlay_path": "", "config_read_only": false, "overlay_exists": true,
+         "sections": [{"id": "appearance", "label": "Appearance"}],
+         "settings": [
+           {"key": "colors.cursor", "section": "appearance", "label": "Cursor", "kind": "color",
+            "value": "#ff0000", "default": null, "source": "overlay", "file_value": "#00ff00", "doc": ""},
+           {"key": "colors.background", "section": "appearance", "label": "Background", "kind": "color",
+            "value": null, "default": null, "source": "default", "file_value": null, "doc": ""}
+         ], "warnings": [], "error": null}
+        """)).settings
+        XCTAssertEqual(items[0].fileValue as? String, "#00ff00")
+        XCTAssertNil(items[1].fileValue)
     }
 
     func testNoticeSaysWhatTheFilesMean() throws {

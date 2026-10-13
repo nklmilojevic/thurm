@@ -34,6 +34,8 @@ struct SettingItem {
     /// The value as JSON (`NSNull` when unset).
     let value: Any?
     let defaultValue: Any?
+    /// What config.toml itself sets (`nil` when it doesn't), whatever settings.toml says.
+    let fileValue: Any?
     let source: SettingSource
     let doc: String
     let options: [String]
@@ -55,6 +57,7 @@ struct SettingItem {
         label = jsonString(json["label"]) ?? key
         value = json["value"]
         defaultValue = json["default"]
+        fileValue = json["file_value"] is NSNull ? nil : json["file_value"]
         source = jsonString(json["source"]).flatMap(SettingSource.init(rawValue:)) ?? .default
         doc = jsonString(json["doc"]) ?? ""
         options = (json["options"] as? [String]) ?? []
@@ -259,16 +262,39 @@ enum SettingsSectionIcons {
 /// The sounds a notification can play: `default`, `none`, and the sound files of the system and
 /// of the user (`~/Library/Sounds`), by name.
 enum SystemSounds {
+    /// The file types `NSSound(named:)` plays from the sound folders.
+    static let extensions: Set<String> = ["aiff", "aif", "aifc", "caf", "wav", "mp3", "m4a", "snd"]
+
     static func names(in directories: [String] = ["/System/Library/Sounds",
                                                   FileManager.default.homeDirectoryForCurrentUser
                                                       .appendingPathComponent("Library/Sounds").path]) -> [String] {
         var names = Set<String>()
         for directory in directories {
-            for file in (try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? [] where !file.hasPrefix(".") {
-                names.insert((file as NSString).deletingPathExtension)
+            let urls = (try? FileManager.default.contentsOfDirectory(
+                at: URL(fileURLWithPath: directory), includingPropertiesForKeys: [.isRegularFileKey],
+                options: .skipsHiddenFiles)) ?? []
+            for url in urls where extensions.contains(url.pathExtension.lowercased()) {
+                guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+                names.insert(url.deletingPathExtension().lastPathComponent)
             }
         }
         return names.sorted()
+    }
+}
+
+/// A list setting as one text field: its elements comma-separated. A list with an element that
+/// itself holds a comma can't round-trip through that, so it is edited in the file instead.
+enum SettingList {
+    static func elements(_ value: Any?) -> [String] {
+        (value as? [Any])?.compactMap { $0 as? String } ?? []
+    }
+
+    static func isEditableAsText(_ value: Any?) -> Bool {
+        !elements(value).contains { $0.contains(",") }
+    }
+
+    static func parse(_ text: String) -> [String] {
+        text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 }
 

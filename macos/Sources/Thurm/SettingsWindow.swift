@@ -28,8 +28,9 @@ final class SettingsWindow: NSObject {
         w.toolbarStyle = .unified
         w.setContentSize(NSSize(width: 780, height: 560))
         w.contentMinSize = NSSize(width: 640, height: 420)
+        // A frame saved by an earlier launch wins; only a first open is centered.
+        if !w.setFrameUsingName("SettingsWindow") { w.center() }
         w.setFrameAutosaveName("SettingsWindow")
-        w.center()
         store.window = w
         window = w
     }

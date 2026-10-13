@@ -402,6 +402,20 @@ private struct TextValue: View {
     @FocusState private var focused: Bool
 
     var body: some View {
+        if item.kind == .list && !SettingList.isEditableAsText(item.value) {
+            HStack(spacing: 8) {
+                Text("\(SettingList.elements(item.value).count) items")
+                    .foregroundStyle(.secondary)
+                Button("Edit in File\u{2026}") { store.editTable(item) }
+                    .controlSize(.small)
+                    .help("An item contains a comma, so the list is edited in the file.")
+            }
+        } else {
+            field
+        }
+    }
+
+    private var field: some View {
         TextField(item.kind == .list ? "Comma-separated" : "", text: $text)
             .textFieldStyle(.roundedBorder)
             .multilineTextAlignment(isNumber ? .trailing : .leading)
@@ -418,7 +432,7 @@ private struct TextValue: View {
     private func apply() {
         guard text != item.text else { return }
         guard isNumber else {
-            store.commit(item.key, text)
+            store.commit(item.key, item.kind == .list ? SettingList.parse(text) as Any : text)
             return
         }
         guard let number = SettingNumber.parse(text), let value = SettingNumber.value(number, kind: item.kind)
@@ -438,12 +452,26 @@ private struct FontPicker: View {
     let store: SettingsStore
     private static let sameAsFamily = "Same as family"
 
+    /// The bold, italic and bold italic settings pick a face: the family's own faces come first.
+    private var faces: [(name: String, title: String)] {
+        guard item.key != "font.family",
+              let family = store.doc?.settings.first(where: { $0.key == "font.family" })?.text,
+              let members = NSFontManager.shared.availableMembers(ofFontFamily: family)
+        else { return [] }
+        return members.compactMap { member in
+            guard let name = member.first as? String else { return nil }
+            let style = member.count > 1 ? (member[1] as? String) ?? name : name
+            return (name, "\(family) \(style)")
+        }
+    }
+
     var body: some View {
         let families = FontFamilies.all
+        let faces = self.faces
         var current = item.text
         if !item.isNullable && current.isEmpty { current = families.monospaced.first ?? "" }
         let selected = current.isEmpty ? Self.sameAsFamily : current
-        let known = Set(families.monospaced + families.other + [Self.sameAsFamily])
+        let known = Set(families.monospaced + families.other + faces.map(\.name) + [Self.sameAsFamily])
         return Picker("", selection: Binding(
             get: { selected },
             set: { title in store.commit(item.key, title == Self.sameAsFamily ? NSNull() : title) }
@@ -453,6 +481,13 @@ private struct FontPicker: View {
             }
             if !known.contains(selected) {
                 Text(selected).tag(selected)
+            }
+            if !faces.isEmpty {
+                Divider()
+                ForEach(faces, id: \.name) { face in
+                    Text(face.title).tag(face.name)
+                }
+                Divider()
             }
             ForEach(families.monospaced, id: \.self) { family in
                 Text(family).tag(family)
@@ -469,33 +504,46 @@ private struct FontPicker: View {
     }
 }
 
-/// A color: the theme's own (shown faded), or a custom one picked with a color well.
+/// A color: the theme's own (shown faded), config.toml's, or a custom one picked with a color
+/// well. Only settings.toml can be reset here, so when config.toml sets the color the choice is
+/// between that and a custom one, not the theme's.
 private struct ColorControl: View {
     let item: SettingItem
     let store: SettingsStore
     @State private var color = Color.gray
 
-    private var custom: Bool { item.value is String }
+    private enum Mode: Hashable { case theme, file, custom }
+
+    private var fileColor: String? { item.fileValue as? String }
+
+    private var mode: Mode {
+        if item.source == .overlay, item.value is String { return .custom }
+        return fileColor == nil ? .theme : .file
+    }
 
     var body: some View {
         HStack(spacing: 8) {
             Picker("", selection: Binding(
-                get: { custom },
-                set: { setCustom($0) }
+                get: { mode },
+                set: { choose($0) }
             )) {
-                Text("Theme default").tag(false)
-                Text("Custom").tag(true)
+                if fileColor == nil {
+                    Text("Theme default").tag(Mode.theme)
+                } else {
+                    Text("config.toml").tag(Mode.file)
+                }
+                Text("Custom").tag(Mode.custom)
             }
             .labelsHidden()
             .fixedSize()
-            if custom {
+            switch mode {
+            case .custom:
                 ColorPicker("", selection: $color, supportsOpacity: false)
                     .labelsHidden()
-            } else {
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(Color(nsColor: store.themeColor(for: item.key) ?? .gray).opacity(0.5))
-                    .frame(width: 28, height: 18)
-                    .overlay(RoundedRectangle(cornerRadius: 4, style: .continuous).stroke(.separator))
+            case .file:
+                swatch(fileColor.flatMap(HexColor.parse).map(nsColor) ?? .gray, opacity: 1)
+            case .theme:
+                swatch(store.themeColor(for: item.key) ?? .gray, opacity: 0.5)
             }
         }
         .onAppear(perform: sync)
@@ -503,20 +551,37 @@ private struct ColorControl: View {
         .onChange(of: color) { _, new in saveColor(new) }
     }
 
+    private func swatch(_ fill: NSColor, opacity: Double) -> some View {
+        RoundedRectangle(cornerRadius: 4, style: .continuous)
+            .fill(Color(nsColor: fill).opacity(opacity))
+            .frame(width: 28, height: 18)
+            .overlay(RoundedRectangle(cornerRadius: 4, style: .continuous).stroke(.separator))
+    }
+
+    private func nsColor(_ rgb: (red: Int, green: Int, blue: Int)) -> NSColor {
+        NSColor(srgbRed: CGFloat(rgb.red) / 255, green: CGFloat(rgb.green) / 255, blue: CGFloat(rgb.blue) / 255,
+                alpha: 1)
+    }
+
     private func sync() {
         guard let rgb = (item.value as? String).flatMap(HexColor.parse) else { return }
         color = Color(red: Double(rgb.red) / 255, green: Double(rgb.green) / 255, blue: Double(rgb.blue) / 255)
     }
 
-    private func setCustom(_ on: Bool) {
-        if on {
-            store.commit(item.key, hexString(store.themeColor(for: item.key) ?? .gray))
-        } else {
+    private func choose(_ new: Mode) {
+        guard new != mode else { return }
+        switch new {
+        case .custom:
+            let start = (item.value as? String).flatMap(HexColor.parse).map(nsColor)
+                ?? store.themeColor(for: item.key) ?? .gray
+            store.commit(item.key, hexString(start))
+        case .theme, .file:
             store.commit(item.key, NSNull())
         }
     }
 
     private func saveColor(_ new: Color) {
+        guard mode == .custom else { return }
         let hex = hexString(NSColor(new))
         guard let saved = (item.value as? String).flatMap(HexColor.parse) else { return }
         if hexString(saved) == hex { return }
