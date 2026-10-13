@@ -221,9 +221,15 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
 
     override func mergeAllWindows(_ sender: Any?) {}
 
+    /// The title's color follows the theme, and whether the window is the main one.
+    func applyTitleColor() {
+        let chrome = SessionManager.shared.config.chrome
+        titleLabel.textColor = isMainWindow ? chrome.contentPrimary : chrome.contentSecondary
+    }
+
     override func becomeMain() {
         super.becomeMain()
-        titleLabel.textColor = .labelColor
+        applyTitleColor()
         installTitleLabel()
         observeTabGroup()
         syncTitlebar()
@@ -233,7 +239,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
 
     override func resignMain() {
         super.resignMain()
-        titleLabel.textColor = .secondaryLabelColor
+        applyTitleColor()
         scheduleTabBarBackgroundSync()
     }
 
@@ -402,7 +408,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
 
     /// In full screen the titlebar lives in a separate `NSToolbarFullScreenWindow` whose parent
     /// is this window (as in Ghostty's `titlebarContainer`).
-    private var titlebarView: NSView? {
+    var titlebarView: NSView? {
         if styleMask.contains(.fullScreen) {
             for w in NSApp.windows where w.className == "NSToolbarFullScreenWindow" && w.parent === self {
                 if let v = w.contentView?.rootView.firstDescendant(className: "NSTitlebarView") { return v }
@@ -419,6 +425,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         titlebarView.layer?.backgroundColor = suppressTabBar ? nil : titlebarColor?.cgColor
         // Its subviews paint the stock titlebar material over our color.
         titlebarView.superview?.firstDescendant(className: "NSTitlebarBackgroundView")?.isHidden = true
+        (windowController as? TerminalWindowController)?.refreshBlur()
         syncTabBarBackground()
     }
 

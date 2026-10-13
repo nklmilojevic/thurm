@@ -7,7 +7,7 @@
 
 # The updates Thurm has made to this file: it turns on features that came after the file was
 # written, then raises this. Leave it as it is.
-config_version = 8
+config_version = 9
 
 [font]
 # Use a font family or face name. Sizes and spacing are in points.
@@ -39,6 +39,8 @@ padding_y = 6.0
 opacity = 1.0
 # Any value above 0 enables blur.
 blur = 0
+# Backdrop of the chrome when opacity is below 1: "theme", "system", "blend" or "modern".
+material = "theme"
 # Treat the Option key as Alt: "none", "left", "right", or "both".
 option_as_alt = "none"
 # Initial window size in terminal cells.

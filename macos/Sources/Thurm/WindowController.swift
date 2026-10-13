@@ -25,27 +25,21 @@ final class AgentDotView: NSView {
 
     override var intrinsicContentSize: NSSize { frame.size }
 
+    /// Repaints in the current theme's status colors, after a config reload.
+    func applyTheme() {
+        refresh()
+    }
+
     private func refresh() {
         guard let layer = layer else { return }
+        layer.backgroundColor = status?.color.cgColor ?? NSColor.clear.cgColor
         switch status {
-        case .some(.working):
-            layer.backgroundColor = NSColor.systemBlue.cgColor
-            toolTip = "Agent working"
-        case .some(.needsInput):
-            layer.backgroundColor = NSColor.systemOrange.cgColor
-            toolTip = "Agent needs input"
-        case .some(.done):
-            layer.backgroundColor = NSColor.systemGreen.cgColor
-            toolTip = "Agent finished"
-        case .some(.error):
-            layer.backgroundColor = NSColor.systemRed.cgColor
-            toolTip = "Agent failed"
-        case .some(.idle):
-            layer.backgroundColor = NSColor.systemGray.cgColor
-            toolTip = "Agent idle"
-        case .none:
-            layer.backgroundColor = NSColor.clear.cgColor
-            toolTip = nil
+        case .some(.working): toolTip = "Agent working"
+        case .some(.needsInput): toolTip = "Agent needs input"
+        case .some(.done): toolTip = "Agent finished"
+        case .some(.error): toolTip = "Agent failed"
+        case .some(.idle): toolTip = "Agent idle"
+        case .none: toolTip = nil
         }
     }
 }
@@ -209,12 +203,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         // Chrome follows the terminal theme, not the system, so glass over a dark theme is dark.
         window.appearance = NSAppearance(named: cfg.theme.isDark ? .darkAqua : .aqua)
         (window as? TerminalWindow)?.titlebarColor = colorFromRGB(cfg.theme.background, alpha: opacity)
+        (window as? TerminalWindow)?.applyTitleColor()
+        dot.applyTheme()
         applyTabStyle()
         (window as? TerminalWindow)?.hidesTitle = cfg.sidebarTabs && cfg.paneHeaders
-        // A step off the terminal background (darker, like Catppuccin's mantle): solid, so it
-        // doesn't pick up the desktop through the window.
-        let base = colorFromRGB(cfg.theme.background, alpha: opacity)
-        sidebar?.backgroundColor = base.shadow(withLevel: cfg.theme.isDark ? 0.18 : 0.05) ?? base
+        sidebar?.backgroundColor = cfg.sidebarColor
         // The quick terminal's rounded corners need a transparent window.
         if opacity < 1 || isQuick {
             window.isOpaque = false
@@ -223,32 +216,67 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             window.isOpaque = true
             window.backgroundColor = colorFromRGB(cfg.theme.background)
         }
-        applyBlur(opacity < 1 && cfg.blur > 0)
+        refreshBlur()
         content.applyConfig()
         content.needsDisplay = true
     }
 
-    /// Behind-window blur for translucent windows: a visual effect view at the back of the
-    /// window's frame view, under the (translucent) terminal content.
+    /// Behind-window blur for translucent windows. With `window.blur` it is an untinted visual
+    /// effect view at the back of the window's frame view, under the (translucent) terminal
+    /// content. A `window.material` other than `theme` backs only the chrome (the sidebar, or the
+    /// titlebar holding the tabs), so its tint never reaches the terminal's transparent cells.
     private var blurView: NSVisualEffectView?
+    private var chromeBackdrop: NSVisualEffectView?
 
     private func applyBlur(_ on: Bool) {
         guard let window = window, let frameView = window.contentView?.superview else { return }
-        if !on {
-            blurView?.removeFromSuperview()
-            blurView = nil
-            return
+        let cfg = SessionManager.shared.config
+        let full = on && cfg.blur > 0
+        let chrome = on && cfg.material != .theme
+        blurView = Self.backdrop(blurView, in: full ? frameView : nil, tint: 0,
+                                 background: cfg.theme.background)
+        let chromeHost = sidebar?.view ?? (window as? TerminalWindow)?.titlebarView
+        chromeBackdrop = Self.backdrop(chromeBackdrop, in: chrome ? chromeHost : nil,
+                                       tint: cfg.material.tint, background: cfg.theme.background)
+    }
+
+    /// AppKit swaps the titlebar into another window in full screen (and back).
+    func refreshBlur() {
+        let cfg = SessionManager.shared.config
+        applyBlur(opacity < 1 && (cfg.blur > 0 || cfg.material != .theme))
+    }
+
+    /// The blur behind `host`'s content, with the terminal background laid over it at `tint`.
+    /// A nil `host` removes it.
+    private static func backdrop(_ existing: NSVisualEffectView?, in host: NSView?, tint alpha: CGFloat,
+                                 background: UInt32) -> NSVisualEffectView? {
+        guard let host else {
+            existing?.removeFromSuperview()
+            return nil
         }
-        let v = blurView ?? NSVisualEffectView()
+        let v = existing ?? NSVisualEffectView()
         v.material = .underWindowBackground
         v.blendingMode = .behindWindow
         v.state = .active
-        v.frame = frameView.bounds
+        v.frame = host.bounds
         v.autoresizingMask = [.width, .height]
-        if v.superview !== frameView {
-            frameView.addSubview(v, positioned: .below, relativeTo: frameView.subviews.first)
+        if v.superview !== host {
+            host.addSubview(v, positioned: .below, relativeTo: host.subviews.first)
         }
-        blurView = v
+        let tintID = NSUserInterfaceItemIdentifier("thurmBlurTint")
+        let tint: NSView
+        if let existing = v.subviews.first(where: { $0.identifier == tintID }) {
+            tint = existing
+        } else {
+            tint = NSView(frame: v.bounds)
+            tint.identifier = tintID
+            tint.wantsLayer = true
+            tint.autoresizingMask = [.width, .height]
+            v.addSubview(tint)
+        }
+        tint.isHidden = alpha == 0
+        tint.layer?.backgroundColor = colorFromRGB(background, alpha: alpha).cgColor
+        return v
     }
 
     // MARK: Title and agent status
