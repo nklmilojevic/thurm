@@ -14,6 +14,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
     private let notice = NSTextField(wrappingLabelWithString: "")
     private var noticeView: NSView?
     private let formStack = NSStackView()
+    private static let sidebarWidth: CGFloat = 200
     private let formScroll = NSScrollView()
     private var doc: SettingsDocument?
     private var sections: [SettingSection] = []
@@ -43,7 +44,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
         w.title = "Settings"
         w.isReleasedWhenClosed = false
         w.delegate = self
-        w.minSize = NSSize(width: 700, height: 420)
+        w.contentMinSize = NSSize(width: 700, height: 420)
         w.center()
 
         search.placeholderString = "Search settings"
@@ -76,7 +77,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             sideScroll.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             sideScroll.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             sideScroll.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: 200),
+            sidebar.widthAnchor.constraint(equalToConstant: Self.sidebarWidth),
         ])
 
         notice.font = .systemFont(ofSize: 12)
@@ -219,6 +220,22 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             let empty = NSTextField(labelWithString: "No settings match \u{201C}\(query)\u{201D}.")
             empty.textColor = .secondaryLabelColor
             formStack.addArrangedSubview(empty)
+        }
+        fitWidth()
+    }
+
+    /// Keeps the window wide enough for the form shown: its rows have fixed-width labels and
+    /// controls, so a narrower window would clip them.
+    private func fitWidth() {
+        guard let window, let content = window.contentView else { return }
+        let scroller = NSScroller.scrollerWidth(for: .regular, scrollerStyle: formScroll.scrollerStyle)
+        let needed = Self.sidebarWidth + 1 + 24 + formStack.fittingSize.width + 24 + scroller
+        let minimum = max(700, ceil(needed))
+        window.contentMinSize = NSSize(width: minimum, height: window.contentMinSize.height)
+        if content.frame.width < minimum {
+            var frame = window.frame
+            frame.size.width += minimum - content.frame.width
+            window.setFrame(frame, display: true, animate: false)
         }
     }
 
@@ -465,10 +482,21 @@ final class SettingsWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, N
             label.font = .systemFont(ofSize: 11)
             label.textColor = .secondaryLabelColor
         }
-        let row = NSStackView(views: [lightLabel, light, darkLabel, dark])
-        row.orientation = .horizontal
-        row.spacing = 6
-        return row
+        // Light above dark, so the pair is no wider than any other control.
+        func line(_ label: NSTextField, _ popup: NSPopUpButton) -> NSStackView {
+            label.alignment = .right
+            label.widthAnchor.constraint(equalToConstant: 32).isActive = true
+            popup.widthAnchor.constraint(equalToConstant: 208).isActive = true
+            let line = NSStackView(views: [label, popup])
+            line.orientation = .horizontal
+            line.spacing = 6
+            return line
+        }
+        let column = NSStackView(views: [line(lightLabel, light), line(darkLabel, dark)])
+        column.orientation = .vertical
+        column.alignment = .trailing
+        column.spacing = 6
+        return column
     }
 
     private func fontPopup(_ item: SettingItem) -> NSPopUpButton {
