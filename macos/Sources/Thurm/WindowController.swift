@@ -216,27 +216,34 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             window.isOpaque = true
             window.backgroundColor = colorFromRGB(cfg.theme.background)
         }
-        applyBlur(opacity < 1 && (cfg.blur > 0 || cfg.material != .theme))
+        refreshBlur()
         content.applyConfig()
         content.needsDisplay = true
     }
 
     /// Behind-window blur for translucent windows. With `window.blur` it is a visual effect view
     /// at the back of the window's frame view, under the (translucent) terminal content. Without
-    /// blur, a `window.material` other than `theme` backs only the sidebar, so the terminal's
-    /// transparent cells stay unblurred.
+    /// blur, a `window.material` other than `theme` backs only the chrome (the sidebar, or the
+    /// titlebar holding the tabs), so the terminal's transparent cells stay unblurred.
     private var blurView: NSVisualEffectView?
-    private var sidebarBackdrop: NSVisualEffectView?
+    private var chromeBackdrop: NSVisualEffectView?
 
     private func applyBlur(_ on: Bool) {
         guard let window = window, let frameView = window.contentView?.superview else { return }
         let cfg = SessionManager.shared.config
         let full = on && cfg.blur > 0
-        let sidebarOnly = on && !full && cfg.material != .theme
+        let chromeOnly = on && !full && cfg.material != .theme
         blurView = Self.backdrop(blurView, in: full ? frameView : nil, material: cfg.material,
                                  background: cfg.theme.background)
-        sidebarBackdrop = Self.backdrop(sidebarBackdrop, in: sidebarOnly ? sidebar?.view : nil,
-                                        material: cfg.material, background: cfg.theme.background)
+        let chromeHost = sidebar?.view ?? (window as? TerminalWindow)?.titlebarView
+        chromeBackdrop = Self.backdrop(chromeBackdrop, in: chromeOnly ? chromeHost : nil,
+                                       material: cfg.material, background: cfg.theme.background)
+    }
+
+    /// AppKit swaps the titlebar into another window in full screen (and back).
+    func refreshBlur() {
+        let cfg = SessionManager.shared.config
+        applyBlur(opacity < 1 && (cfg.blur > 0 || cfg.material != .theme))
     }
 
     /// The blur behind `host`'s content, with the terminal background laid over it at the
