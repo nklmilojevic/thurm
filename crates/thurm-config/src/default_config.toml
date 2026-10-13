@@ -9,26 +9,37 @@ config_version = 9
 # A family or a face name ("TX-02 Retina ExtraCondensed"). JetBrains Mono ships with Thurm.
 family = "JetBrains Mono"
 # Optional faces for styled text; derived from `family` when unset.
+# Bold face.
 # family_bold = "JetBrains Mono ExtraBold"
+# Italic face.
 # family_italic = "..."
+# Bold italic face.
 # family_bold_italic = "..."
+# Font size in points.
 size = 16.0
 # Programming ligatures (=>, !=, ->, ...). Needs a font that ships them.
 ligatures = true
 # Extra OpenType features, e.g. ["ss01", "zero", "cv02"]. Prefix with "-" to disable.
 features = []
+# Line height multiplier.
 line_height = 1.0
+# Extra horizontal spacing in points.
 letter_spacing = 0.0
 # Thicker strokes (CoreText font smoothing), and how much: 0-255.
 thicken = true
+# How much to thicken: 0 (none) to 255 (CoreText's full smoothing).
 thicken_strength = 255
+# Fallback families tried before the system cascade list.
 fallback = ["SF Mono", "Menlo"]
 # Icons from the bundled Symbols Nerd Font when the font has none (Starship, lsd, eza...).
 nerd_font_symbols = true
 
 [window]
+# Space around the cells, in points.
 padding_x = 8.0
+# Space above and below the cells, in points.
 padding_y = 6.0
+# Background opacity (0 to 1).
 opacity = 1.0
 # Blur what is behind the window when opacity < 1 (any value > 0 turns it on).
 blur = 0
@@ -37,20 +48,26 @@ blur = 0
 material = "theme"
 # Treat Option as Alt/Meta: "none", "left", "right" or "both".
 option_as_alt = "none"
+# Initial size of new windows, in cells.
 columns = 110
+# Initial rows of new windows, in cells.
 rows = 32
+# Ask before closing a tab or window with a running process.
 confirm_close = true
 # Quit when the last window closes (like most macOS terminals, off: the app stays in the Dock).
 quit_after_last_window = false
+# Dim unfocused split panes (0 = off, 1 = fully).
 unfocused_split_dim = 0.25
 # Give the panes of a tab the same space again whenever one opens or closes (dragged dividers
 # stay until then). View > Equalize Splits does it on demand.
 auto_balance = true
+# Show the per-pane header strip with agent status in splits.
 pane_headers = true
 # Space between split panes when pane headers show, in points.
 pane_gap = 6.0
 # Tabs: "native" (in the titlebar) or "sidebar" (vertical, grouped by repository). View > Tabs.
 tab_style = "sidebar"
+# Width of the tab sidebar in points.
 sidebar_width = 240.0
 # List every pane running an agent below the sidebar's tabs. View > Agents in Sidebar.
 sidebar_agents = true
@@ -58,8 +75,11 @@ sidebar_agents = true
 sidebar_agent_rows = 5
 
 [cursor]
+# Cursor shape: "block", "beam" or "underline".
 style = "block"   # block | beam | underline
+# Blink the cursor.
 blink = false
+# Beam and underline thickness in points.
 thickness = 2.0
 
 [colors]
@@ -70,19 +90,43 @@ thickness = 2.0
 # Follow the system appearance with "light:NAME,dark:NAME". View > Theme sets this too.
 # theme = "thurm"
 # theme = "light:catppuccin-latte,dark:catppuccin-mocha"
+# Text color, "#rrggbb" (the theme's when unset).
+# foreground = "#d6dde6"
+# Background color, "#rrggbb" (the theme's when unset).
 # background = "#0e1116"
+# Cursor color, "#rrggbb" (the theme's when unset).
+# cursor = "#9fb4c8"
+# Text under the cursor, "#rrggbb" (the theme's when unset).
+# cursor_text = "#0e1116"
+# Selected text color, "#rrggbb" (the theme's when unset).
+# selection_foreground = "#0e1116"
+# Selection color, "#rrggbb" (the theme's when unset).
+# selection_background = "#9fb4c8"
+# Up to 16 ANSI palette colors, in order (black, red, green, ...).
 # palette = ["#1b2029", "#e06c75", ...]
+# Draw bold text with the bright palette variant.
 bold_is_bright = false
 
 [terminal]
+# Scrollback lines kept per pane.
 scrollback = 10000
+# Command to run instead of the login shell, as a list of arguments.
 # shell = ["/opt/homebrew/bin/fish", "-l"]
+# `TERM` value exported to programs.
 term = "xterm-256color"
+# Inject shell integration (OSC 133 prompt marks, OSC 7 cwd) into zsh, bash and fish.
 shell_integration = true
+# What programs may do with the clipboard over OSC 52: "disabled", "copy", "paste" or "copy-paste".
 osc52 = "copy"           # disabled | copy | paste | copy-paste
+# Enable the kitty keyboard protocol.
 kitty_keyboard = true
+# Enable the kitty graphics protocol.
 kitty_graphics = true
+# Max memory for kitty graphics per pane, in MiB.
 image_memory_mib = 320
+# Characters that end a word for double-click selection.
+word_separators = ",│`|:\"' ()[]{}<>\t"
+# Copy to the clipboard as soon as a selection is made.
 copy_on_select = false
 # Lines scrolled per line of wheel/trackpad movement.
 scroll_multiplier = 3.0
@@ -92,31 +136,41 @@ smooth_scroll = true
 # shell's own completion runs.
 tab_completion = true
 
+# Variables for every shell and the programs it starts.
 [terminal.env]
 # EDITOR = "nvim"
 
 [session]
 # Keep layout, working directories and scrollback across app restarts and reboots.
 persist = true
+# Lines of scrollback per pane written to the snapshot.
 scrollback_lines = 4000
+# Seconds between snapshots of the session.
 snapshot_interval_secs = 15
 # "detach": quitting the app leaves shells running and reattaches next launch.
 # "terminate": quitting kills the shells (layout and scrollback are still restored).
 quit = "detach"
 # Re-run an agent's resume command (e.g. `claude --continue`) when restoring after a reboot.
 resume_agents = true
+# Exit the daemon this many seconds after the last pane closed (0 = never).
 daemon_idle_exit_secs = 0
 
 [security]
 # Enable Secure Keyboard Entry while a password prompt is detected (echo off).
 auto_secure_input = true
+# Show a lock badge in the pane while secure input is active.
 secure_input_indicator = true
+# Ask before pasting text containing newlines into a shell outside bracketed paste.
 confirm_multiline_paste = true
 
 [notifications]
+# Turn all notifications on or off.
 enabled = true
+# Notify when a command running longer than this finishes in an unfocused pane (0 = off).
 command_finished_secs = 15
+# Honor OSC 9 / OSC 99 / OSC 777 notifications from programs.
 program_notifications = true
+# Count a bell in an unfocused pane on the Dock badge.
 bell_badge = true
 # What an agent does in each state: a tab indicator, a desktop notification (in an unfocused
 # pane), a Dock badge (until seen) and a sound. States: working, waiting (needs input), blocked
@@ -129,7 +183,9 @@ failed = { tab_indicator = true, notify = true, badge = true, sound = "default" 
 idle = { tab_indicator = true, notify = false, badge = false, sound = "none" }
 
 [agents]
+# Recognize agent CLIs (Claude Code, Codex...) in panes.
 detect = true
+# Milliseconds without output after which a working agent counts as idle.
 idle_after_ms = 1500
 # Name tabs after what the agent session is about (Claude Code's own session title, or the
 # name given with /rename). Needs `thurm hooks install`.
@@ -212,6 +268,7 @@ animation_duration = 0.2
 # Background opacity (0..1), when it should differ from window.opacity.
 # opacity = 0.9
 
+# Key bindings on top of the defaults: "chord" = "action".
 [keybindings]
 # "cmd+shift+d" = "split_down"
 # "cmd+d" = "split_right"

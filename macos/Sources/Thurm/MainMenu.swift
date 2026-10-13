@@ -45,7 +45,7 @@ enum MainMenu {
         menu.addItem(item("About Thurm", #selector(NSApplication.orderFrontStandardAboutPanel(_:))))
         for updates in Updater.shared.menuItems() { menu.addItem(updates) }
         menu.addItem(.separator())
-        menu.addItem(item("Settings…", #selector(AppDelegate.openConfig(_:)), ","))
+        menu.addItem(item("Settings…", #selector(AppDelegate.showSettings(_:)), ","))
         menu.addItem(item("Reload Configuration", #selector(AppDelegate.reloadConfig(_:)), ",", [.command, .shift]))
         menu.addItem(item("Remotes…", #selector(AppDelegate.showRemotes(_:))))
         let integrations = NSMenu(title: "Integrations")

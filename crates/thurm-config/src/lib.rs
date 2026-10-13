@@ -6,7 +6,9 @@
 
 mod agents;
 pub mod hooks;
+mod overlay;
 mod programs;
+pub mod settings;
 mod themes;
 
 use std::path::{Path, PathBuf};
@@ -1169,22 +1171,27 @@ impl Config {
         Self::load_with_warnings_from(&config_path())
     }
 
-    /// The config file at `path` as [`Config::load_with_warnings`] reads it, the session's theme
-    /// over its own.
+    /// The config file at `path`, with the settings overlay beside it merged over it (see
+    /// `overlay`), as [`Config::load_with_warnings`] reads it; the session's theme over both.
     fn load_with_warnings_from(path: &Path) -> Result<(Config, Vec<String>), ConfigError> {
         let path = path.to_owned();
-        let loaded = match std::fs::read_to_string(&path) {
-            Ok(text) => Self::parse_with_warnings(&text).map_err(|message| ConfigError {
-                path: path.clone(),
-                message,
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Config::default(), vec![])),
-            Err(e) => Err(ConfigError {
-                path,
-                message: e.to_string(),
-            }),
+        let fail = |message: String| ConfigError {
+            path: path.clone(),
+            message,
         };
-        loaded.map(|(cfg, warnings)| (with_session_theme(cfg), warnings))
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(fail(e.to_string())),
+        };
+        let overlay_path = overlay::path_beside(&path);
+        let (text, mut warnings) = match overlay::read(&overlay_path) {
+            Ok(overlay) => overlay::merge(&text, &overlay).map_err(fail)?,
+            Err(e) => (text, vec![format!("{}: {e}", overlay_path.display())]),
+        };
+        let (cfg, unknown) = Self::parse_with_warnings(&text).map_err(fail)?;
+        warnings.extend(unknown);
+        Ok((with_session_theme(cfg), warnings))
     }
 
     pub fn theme_spec(&self) -> ThemeSpec {
@@ -1492,8 +1499,14 @@ pub fn write_theme(spec: &ThemeSpec) -> Result<(), String> {
     write_setting("colors.theme", &value_literal(&spec.to_string()))
 }
 
-/// Persist one setting (see [`with_setting`]) in the config file.
+/// Persist one setting (see [`with_setting`]) in the config file, or in the settings overlay
+/// when the overlay already sets it (it would win over the file otherwise).
 pub fn write_setting(key: &str, value: &str) -> Result<(), String> {
+    let config = config_path();
+    let overlay = overlay::read(&overlay::path_beside(&config)).map_err(|e| e.to_string())?;
+    if overlay::holds(&overlay, key) {
+        return overlay::write(&config, key, Some(value));
+    }
     edit_config(|text| with_setting(text, key, value))
 }
 

@@ -423,6 +423,19 @@ uint32_t thurm_protocol_version(void);
 /* Path of the config file. Free the result. */
 char *thurm_config_path(void);
 
+/* The settings window's view of the config as JSON: every setting with its value, default,
+ * source ("default", "file" or "overlay"), comment and range or choices, the sections, the
+ * files, and the warnings and error of loading. Free the result. */
+char *thurm_settings_json(void);
+
+/* Sets the setting `key` (dotted, such as "font.size") to `json` (a JSON value) in
+ * settings.toml, which wins over config.toml; a `json` of null resets it. Returns NULL, or why
+ * it was refused. Free the result. Reload the config afterwards. */
+char *thurm_settings_set(const char *key, const char *json);
+
+/* Path of settings.toml, created with a header when it does not exist. Free the result. */
+char *thurm_settings_overlay_path(void);
+
 /* ---------------------------------------------------------------------------------------
  * Remote workspaces (`[[remote]]` in the config).
  * ------------------------------------------------------------------------------------- */
