@@ -500,16 +500,57 @@ pub struct NotificationConfig {
 }
 
 impl NotificationConfig {
-    fn apply_replaced_keys(&mut self) {
+    /// Turns off the states a `false` legacy switch covers, unless the file writes their row:
+    /// an explicit row always wins. `written` are the `[notifications]` keys of the file.
+    fn apply_replaced_keys(&mut self, written: &[String]) {
+        let free = |state: &str| !written.iter().any(|w| w == state);
         if self.agent_needs_input == Some(false) {
-            self.waiting.notify = false;
-            self.blocked.notify = false;
+            if free("waiting") {
+                self.waiting.notify = false;
+            }
+            if free("blocked") {
+                self.blocked.notify = false;
+            }
         }
         if self.agent_done == Some(false) {
-            self.finished.notify = false;
-            self.failed.notify = false;
+            if free("finished") {
+                self.finished.notify = false;
+            }
+            if free("failed") {
+                self.failed.notify = false;
+            }
         }
     }
+}
+
+/// The `[notifications]` keys `text` sets.
+fn notification_keys(text: &str) -> Vec<String> {
+    toml::from_str::<toml::Table>(text)
+        .ok()
+        .and_then(|t| {
+            t.get("notifications")?
+                .as_table()
+                .map(|n| n.keys().cloned().collect())
+        })
+        .unwrap_or_default()
+}
+
+/// The states whose notifications the legacy `[notifications]` switches in `text` turn off.
+fn legacy_states_off(text: &str) -> Vec<&'static str> {
+    let switch = |key: &str| {
+        toml::from_str::<toml::Table>(text)
+            .ok()
+            .and_then(|t| t.get("notifications")?.get(key)?.as_bool())
+            == Some(false)
+    };
+    let mut states = Vec::new();
+    if switch("agent_needs_input") {
+        states.extend(["waiting", "blocked"]);
+    }
+    if switch("agent_done") {
+        states.extend(["finished", "failed"]);
+    }
+    states
 }
 
 /// One state's row of the notification matrix.
@@ -1089,7 +1130,8 @@ impl Config {
             unknown.push(format!("unknown setting `{path}` ignored"));
         })
         .map_err(|e| e.to_string())?;
-        cfg.notifications.apply_replaced_keys();
+        cfg.notifications
+            .apply_replaced_keys(&notification_keys(text));
         cfg.validate()?;
         Ok((cfg, unknown))
     }
@@ -1649,11 +1691,26 @@ fn migrate(text: &str) -> Result<Option<String>, String> {
     if from >= MIGRATIONS.len() {
         return Ok(None);
     }
+    // A row for a state its legacy switch turns off starts off, and the switches are dropped.
+    let off = legacy_states_off(text);
     let out = MIGRATIONS
         .iter()
         .skip(from)
-        .try_fold(text.to_owned(), |t, (key, value)| with_setting(&t, key, value))?;
+        .try_fold(text.to_owned(), |t, (key, value)| {
+            let state = key.strip_prefix("notifications.");
+            let value = match state {
+                Some(s) if off.iter().any(|o| *o == s) => {
+                    value.replace("notify = true", "notify = false")
+                }
+                _ => value.to_string(),
+            };
+            with_setting(&t, key, &value)
+        })?;
     let mut doc: toml_edit::DocumentMut = out.parse().map_err(|e| format!("{e}"))?;
+    if let Some(n) = doc.get_mut("notifications").and_then(|n| n.as_table_mut()) {
+        n.remove("agent_needs_input");
+        n.remove("agent_done");
+    }
     let version = toml_edit::value(MIGRATIONS.len() as i64);
     match doc.get_mut("config_version") {
         Some(item) => *item = version,
@@ -2232,6 +2289,41 @@ clipboard_read = "always"
         // `true` changes nothing.
         let (cfg, _) = Config::parse_with_warnings("[notifications]\nagent_done = true\n").unwrap();
         assert_eq!(cfg.notifications.finished, NotificationConfig::default().finished);
+    }
+
+    #[test]
+    fn explicit_rows_beat_replaced_switches() {
+        let text = "[notifications]\nagent_needs_input = false\n\
+            waiting = { tab_indicator = true, notify = true, badge = true, sound = \"default\" }\n";
+        let (cfg, warnings) = Config::parse_with_warnings(text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(cfg.notifications.notice(NoticeState::Waiting).notify);
+        assert!(!cfg.notifications.notice(NoticeState::Blocked).notify);
+    }
+
+    #[test]
+    fn migration_keeps_replaced_switches_off() {
+        let text = "[notifications]\nagent_needs_input = false\nagent_done = false\n";
+        let out = migrate(text).unwrap().unwrap();
+        assert!(
+            !out.contains("agent_needs_input") && !out.contains("agent_done"),
+            "{out}"
+        );
+        let (cfg, warnings) = Config::parse_with_warnings(&out).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let n = &cfg.notifications;
+        let replaced = [
+            NoticeState::Waiting,
+            NoticeState::Blocked,
+            NoticeState::Finished,
+            NoticeState::Failed,
+        ];
+        for state in replaced {
+            assert!(!n.notice(state).notify, "{state:?}");
+            assert!(n.notice(state).badge, "{state:?}");
+        }
+        assert!(!n.notice(NoticeState::Idle).notify);
+        assert_eq!(cfg.config_version, MIGRATIONS.len());
     }
 
     #[test]
