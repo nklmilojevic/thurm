@@ -266,3 +266,23 @@ final class SettingsModelTests: XCTestCase {
                            "value": "", "default": "", "source": "default", "doc": ""])!
     }
 }
+
+final class SettingsStoreNavigationTests: XCTestCase {
+    func testPickingASectionLeavesTheSearch() {
+        let store = SettingsStore()
+        store.selectedSection = "font"
+        store.query = "blink"
+        XCTAssertNil(store.selectedSection)
+        store.selectedSection = "font"
+        XCTAssertEqual(store.query, "")
+        XCTAssertEqual(store.selectedSection, "font")
+    }
+
+    func testClearingTheSearchReturnsToTheSectionBeforeIt() {
+        let store = SettingsStore()
+        store.selectedSection = "window"
+        store.query = "size"
+        store.query = ""
+        XCTAssertEqual(store.selectedSection, "window")
+    }
+}

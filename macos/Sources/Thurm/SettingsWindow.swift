@@ -39,8 +39,24 @@ final class SettingsWindow: NSObject {
 /// The settings the window shows, and the saves that go back to Rust.
 final class SettingsStore: ObservableObject {
     @Published private(set) var doc: SettingsDocument?
-    @Published var selectedSection: String?
-    @Published var query = ""
+    /// The section shown, or `nil` while searching, so that clicking any section (even the one
+    /// shown before the search) leaves the results for it.
+    @Published var selectedSection: String? {
+        didSet {
+            if selectedSection != nil && !query.isEmpty { query = "" }
+        }
+    }
+    @Published var query = "" {
+        didSet {
+            if query.isEmpty {
+                if selectedSection == nil { selectedSection = sectionBeforeSearch }
+            } else if let shown = selectedSection {
+                sectionBeforeSearch = shown
+                selectedSection = nil
+            }
+        }
+    }
+    private var sectionBeforeSearch: String?
     weak var window: NSWindow?
 
     var sections: [SettingSection] { doc?.populatedSections ?? [] }
@@ -52,6 +68,10 @@ final class SettingsStore: ObservableObject {
         if let raw { thurm_string_free(raw) }
         doc = SettingsDocument(json: text)
         let ids = sections.map(\.id)
+        if !query.isEmpty {
+            if sectionBeforeSearch.map(ids.contains) != true { sectionBeforeSearch = ids.first }
+            return
+        }
         if let id = selectedSection, ids.contains(id) { return }
         selectedSection = ids.first
     }
