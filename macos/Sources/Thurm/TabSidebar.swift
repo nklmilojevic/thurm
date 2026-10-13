@@ -295,6 +295,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         agents.reload()
         let windows = controller?.orderedTabs ?? [window]
         let panes = SessionManager.shared.panes
+        let config = SessionManager.shared.config
         var byRoot: [String: SidebarGroup] = [:]
         var order: [SidebarGroup] = []
         let other = SidebarGroup(name: "Terminals")
@@ -303,7 +304,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             let info = panes[c.focusedPane]
             var status: AgentStatus?
             for id in c.content.paneIds {
-                if let a = panes[id]?.agent, status == nil || a.status.urgency > status!.urgency {
+                if let a = panes[id]?.agent, config.notice(for: a).tabIndicator,
+                   status == nil || a.status.urgency > status!.urgency {
                     status = a.status
                 }
             }

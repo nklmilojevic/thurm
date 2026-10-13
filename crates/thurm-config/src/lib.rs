@@ -12,6 +12,7 @@ mod themes;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use thurm_proto::AgentStatus;
 
 pub use agents::{AgentDef, builtin_agents};
 pub use programs::{CATEGORIES, ProgramDef, builtin_programs, executable_name, identify, marks};
@@ -495,26 +496,175 @@ impl Default for SecurityConfig {
 #[serde(default)]
 pub struct NotificationConfig {
     pub enabled: bool,
-    /// Notify when a detected agent needs input and the pane isn't focused.
-    pub agent_needs_input: bool,
-    /// Notify when an agent finishes a turn in an unfocused pane (needs `thurm hooks install`).
-    pub agent_done: bool,
     /// Notify when a command running longer than this finishes in an unfocused pane (0 = off).
     pub command_finished_secs: u64,
     /// Honor OSC 9 / OSC 99 / OSC 777 notifications from programs.
     pub program_notifications: bool,
     pub bell_badge: bool,
+    /// What an agent in each state does: the tab's indicator, a notification, the Dock badge
+    /// and a sound.
+    pub working: StateNotice,
+    pub waiting: StateNotice,
+    pub blocked: StateNotice,
+    pub finished: StateNotice,
+    pub failed: StateNotice,
+    pub idle: StateNotice,
+    /// Replaced by `waiting` and `blocked`: `false` still turns their notifications off.
+    #[serde(default, skip_serializing)]
+    agent_needs_input: Option<bool>,
+    /// Replaced by `finished` and `failed`: `false` still turns their notifications off.
+    #[serde(default, skip_serializing)]
+    agent_done: Option<bool>,
+}
+
+impl NotificationConfig {
+    /// Turns off the states a `false` legacy switch covers, unless the file writes their row:
+    /// an explicit row always wins. `written` are the `[notifications]` keys of the file.
+    fn apply_replaced_keys(&mut self, written: &[String]) {
+        let free = |state: &str| !written.iter().any(|w| w == state);
+        if self.agent_needs_input == Some(false) {
+            if free("waiting") {
+                self.waiting.notify = false;
+            }
+            if free("blocked") {
+                self.blocked.notify = false;
+            }
+        }
+        if self.agent_done == Some(false) {
+            if free("finished") {
+                self.finished.notify = false;
+            }
+            if free("failed") {
+                self.failed.notify = false;
+            }
+        }
+    }
+}
+
+/// The `[notifications]` keys `text` sets.
+fn notification_keys(text: &str) -> Vec<String> {
+    toml::from_str::<toml::Table>(text)
+        .ok()
+        .and_then(|t| {
+            t.get("notifications")?
+                .as_table()
+                .map(|n| n.keys().cloned().collect())
+        })
+        .unwrap_or_default()
+}
+
+/// The states whose notifications the legacy `[notifications]` switches in `text` turn off.
+fn legacy_states_off(text: &str) -> Vec<&'static str> {
+    let switch = |key: &str| {
+        toml::from_str::<toml::Table>(text)
+            .ok()
+            .and_then(|t| t.get("notifications")?.get(key)?.as_bool())
+            == Some(false)
+    };
+    let mut states = Vec::new();
+    if switch("agent_needs_input") {
+        states.extend(["waiting", "blocked"]);
+    }
+    if switch("agent_done") {
+        states.extend(["finished", "failed"]);
+    }
+    states
+}
+
+/// One state's row of the notification matrix.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct StateNotice {
+    /// Show the state on the pane's tab.
+    pub tab_indicator: bool,
+    /// Post a desktop notification when an agent enters the state in an unfocused pane.
+    pub notify: bool,
+    /// Count the pane on the Dock badge until it is seen.
+    pub badge: bool,
+    /// `"default"`, `"none"`, or a sound file's name (macOS looks it up in `~/Library/Sounds`
+    /// and the app bundle).
+    pub sound: String,
+}
+
+impl Default for StateNotice {
+    fn default() -> Self {
+        Self {
+            tab_indicator: true,
+            notify: false,
+            badge: false,
+            sound: "none".into(),
+        }
+    }
 }
 
 impl Default for NotificationConfig {
     fn default() -> Self {
+        let alert = StateNotice {
+            tab_indicator: true,
+            notify: true,
+            badge: true,
+            sound: "default".into(),
+        };
         Self {
             enabled: true,
-            agent_needs_input: true,
-            agent_done: true,
             command_finished_secs: 15,
             program_notifications: true,
             bell_badge: true,
+            working: StateNotice::default(),
+            waiting: alert.clone(),
+            blocked: alert.clone(),
+            finished: alert.clone(),
+            failed: alert,
+            idle: StateNotice::default(),
+            agent_needs_input: None,
+            agent_done: None,
+        }
+    }
+}
+
+/// The states of the notification matrix: what an agent in a pane is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeState {
+    Working,
+    /// Asks for input.
+    Waiting,
+    /// Asks for approval (a permission prompt the user can answer).
+    Blocked,
+    /// Finished a turn, or a program reported it done.
+    Finished,
+    /// Failed and stopped.
+    Failed,
+    Idle,
+}
+
+impl NoticeState {
+    /// The state of an agent with `status`; `prompt` is whether it shows a permission prompt.
+    pub fn of(status: AgentStatus, prompt: bool) -> Self {
+        match status {
+            AgentStatus::Working => Self::Working,
+            AgentStatus::Idle => Self::Idle,
+            AgentStatus::NeedsInput if prompt => Self::Blocked,
+            AgentStatus::NeedsInput => Self::Waiting,
+            AgentStatus::Done => Self::Finished,
+            AgentStatus::Error => Self::Failed,
+        }
+    }
+}
+
+impl NotificationConfig {
+    /// The row for the state `agent` is in.
+    pub fn for_agent(&self, agent: &thurm_proto::AgentState) -> &StateNotice {
+        self.notice(NoticeState::of(agent.status, agent.permission.is_some()))
+    }
+
+    pub fn notice(&self, state: NoticeState) -> &StateNotice {
+        match state {
+            NoticeState::Working => &self.working,
+            NoticeState::Waiting => &self.waiting,
+            NoticeState::Blocked => &self.blocked,
+            NoticeState::Finished => &self.finished,
+            NoticeState::Failed => &self.failed,
+            NoticeState::Idle => &self.idle,
         }
     }
 }
@@ -994,10 +1144,12 @@ impl Config {
     pub fn parse_with_warnings(text: &str) -> Result<(Config, Vec<String>), String> {
         let mut unknown = Vec::new();
         let de = toml::Deserializer::parse(text).map_err(|e| e.to_string())?;
-        let cfg: Config = serde_ignored::deserialize(de, |path| {
+        let mut cfg: Config = serde_ignored::deserialize(de, |path| {
             unknown.push(format!("unknown setting `{path}` ignored"));
         })
         .map_err(|e| e.to_string())?;
+        cfg.notifications
+            .apply_replaced_keys(&notification_keys(text));
         cfg.validate()?;
         Ok((cfg, unknown))
     }
@@ -1525,6 +1677,30 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("window.pane_headers", "true"),
     ("window.auto_balance", "true"),
     ("window.material", "\"theme\""),
+    (
+        "notifications.working",
+        "{ tab_indicator = true, notify = false, badge = false, sound = \"none\" }",
+    ),
+    (
+        "notifications.waiting",
+        "{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }",
+    ),
+    (
+        "notifications.blocked",
+        "{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }",
+    ),
+    (
+        "notifications.finished",
+        "{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }",
+    ),
+    (
+        "notifications.failed",
+        "{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }",
+    ),
+    (
+        "notifications.idle",
+        "{ tab_indicator = true, notify = false, badge = false, sound = \"none\" }",
+    ),
 ];
 
 /// Returns `text` with the migrations it has not had applied, and `config_version` raised to
@@ -1534,10 +1710,22 @@ fn migrate(text: &str) -> Result<Option<String>, String> {
     if from >= MIGRATIONS.len() {
         return Ok(None);
     }
+    // A row written for a state its legacy switch turns off starts off. The switches stay: rows
+    // the file already has (or lacks) are left alone, and parsing lets a row beat its switch.
+    let off = legacy_states_off(text);
     let out = MIGRATIONS
         .iter()
         .skip(from)
-        .try_fold(text.to_owned(), |t, (key, value)| with_setting(&t, key, value))?;
+        .try_fold(text.to_owned(), |t, (key, value)| {
+            let state = key.strip_prefix("notifications.");
+            let value = match state {
+                Some(s) if off.contains(&s) => {
+                    value.replace("notify = true", "notify = false")
+                }
+                _ => value.to_string(),
+            };
+            with_setting(&t, key, &value)
+        })?;
     let mut doc: toml_edit::DocumentMut = out.parse().map_err(|e| format!("{e}"))?;
     let version = toml_edit::value(MIGRATIONS.len() as i64);
     match doc.get_mut("config_version") {
@@ -2051,6 +2239,134 @@ clipboard_read = "always"
         // Copied, it is current: no migration changes what its user set.
         assert_eq!(c.config_version, MIGRATIONS.len());
         assert_eq!(Config { config_version: 0, ..c }, Config::default());
+    }
+
+    #[test]
+    fn agent_status_maps_to_a_notice_state() {
+        use AgentStatus::*;
+        assert_eq!(NoticeState::of(NeedsInput, false), NoticeState::Waiting);
+        assert_eq!(NoticeState::of(NeedsInput, true), NoticeState::Blocked);
+        assert_eq!(NoticeState::of(Done, false), NoticeState::Finished);
+        assert_eq!(NoticeState::of(Error, true), NoticeState::Failed);
+        assert_eq!(NoticeState::of(Working, false), NoticeState::Working);
+        assert_eq!(NoticeState::of(Idle, false), NoticeState::Idle);
+    }
+
+    #[test]
+    fn default_matrix_keeps_the_notifications_that_were_always_on() {
+        let n = NotificationConfig::default();
+        let alert = StateNotice {
+            tab_indicator: true,
+            notify: true,
+            badge: true,
+            sound: "default".into(),
+        };
+        let quiet = StateNotice {
+            tab_indicator: true,
+            notify: false,
+            badge: false,
+            sound: "none".into(),
+        };
+        assert_eq!(n.notice(NoticeState::Waiting), &alert);
+        assert_eq!(n.notice(NoticeState::Blocked), &alert);
+        assert_eq!(n.notice(NoticeState::Finished), &alert);
+        assert_eq!(n.notice(NoticeState::Failed), &alert);
+        assert_eq!(n.notice(NoticeState::Working), &quiet);
+        assert_eq!(n.notice(NoticeState::Idle), &quiet);
+    }
+
+    #[test]
+    fn notice_states_parse_as_tables() {
+        let cfg = Config::parse(
+            "[notifications]\nworking = { tab_indicator = false, notify = true, badge = true, sound = \"Glass\" }\n",
+        )
+        .unwrap();
+        let n = &cfg.notifications;
+        let working = StateNotice {
+            tab_indicator: false,
+            notify: true,
+            badge: true,
+            sound: "Glass".into(),
+        };
+        assert_eq!(n.notice(NoticeState::Working), &working);
+        assert_eq!(n.notice(NoticeState::Waiting), &NotificationConfig::default().waiting);
+        assert!(Config::parse("[notifications]\nwaiting = { notify = \"yes\" }\n").is_err());
+    }
+
+    #[test]
+    fn replaced_notification_keys_still_turn_their_states_off() {
+        let text = "[notifications]\nagent_needs_input = false\nagent_done = false\n";
+        let (cfg, warnings) = Config::parse_with_warnings(text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let n = &cfg.notifications;
+        let replaced = [
+            NoticeState::Waiting,
+            NoticeState::Blocked,
+            NoticeState::Finished,
+            NoticeState::Failed,
+        ];
+        for state in replaced {
+            assert!(!n.notice(state).notify, "{state:?}");
+            assert!(n.notice(state).badge, "{state:?}");
+        }
+        // `true` changes nothing.
+        let (cfg, _) = Config::parse_with_warnings("[notifications]\nagent_done = true\n").unwrap();
+        assert_eq!(cfg.notifications.finished, NotificationConfig::default().finished);
+    }
+
+    #[test]
+    fn explicit_rows_beat_replaced_switches() {
+        let text = "[notifications]\nagent_needs_input = false\n\
+            waiting = { tab_indicator = true, notify = true, badge = true, sound = \"default\" }\n";
+        let (cfg, warnings) = Config::parse_with_warnings(text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(cfg.notifications.notice(NoticeState::Waiting).notify);
+        assert!(!cfg.notifications.notice(NoticeState::Blocked).notify);
+    }
+
+    #[test]
+    fn migration_leaves_existing_rows_and_switches_alone() {
+        let at = MIGRATIONS
+            .iter()
+            .position(|(key, _)| *key == "notifications.finished")
+            .unwrap();
+        // `waiting` was written earlier and turned on by hand; `blocked`'s row was removed.
+        let old = format!(
+            "config_version = {at}\n\n[notifications]\nagent_needs_input = false\nagent_done = false\n\
+             waiting = {{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }}\n"
+        );
+        let out = migrate(&old).unwrap().unwrap();
+        assert!(
+            out.contains("agent_needs_input = false") && out.contains("agent_done = false"),
+            "{out}"
+        );
+        let (cfg, warnings) = Config::parse_with_warnings(&out).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let n = &cfg.notifications;
+        assert!(n.waiting.notify);
+        assert!(!n.blocked.notify);
+        assert!(!n.finished.notify && !n.failed.notify);
+    }
+
+    #[test]
+    fn migration_keeps_replaced_switches_off() {
+        let text = "[notifications]\nagent_needs_input = false\nagent_done = false\n";
+        let out = migrate(text).unwrap().unwrap();
+        let (cfg, warnings) = Config::parse_with_warnings(&out).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let n = &cfg.notifications;
+        let replaced = [
+            NoticeState::Waiting,
+            NoticeState::Blocked,
+            NoticeState::Finished,
+            NoticeState::Failed,
+        ];
+        for state in replaced {
+            assert!(!n.notice(state).notify, "{state:?}");
+            assert!(n.notice(state).badge, "{state:?}");
+        }
+        assert!(!n.notice(NoticeState::Idle).notify);
+        assert_eq!(cfg.config_version, MIGRATIONS.len());
     }
 
     #[test]

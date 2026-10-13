@@ -71,7 +71,8 @@ final class TabStrip: NSView {
             let info = panes[c.focusedPane]
             var status: AgentStatus?
             for id in c.content.paneIds {
-                if let a = panes[id]?.agent, status == nil || a.status.urgency > status!.urgency { status = a.status }
+                if let a = panes[id]?.agent, sm.config.notice(for: a).tabIndicator,
+                   status == nil || a.status.urgency > status!.urgency { status = a.status }
             }
             let base = c.titleOverride ?? info?.displayTitle ?? "Thurm"
             return TabTrack.Tab(window: w,

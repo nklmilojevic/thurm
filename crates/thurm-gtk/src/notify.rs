@@ -6,7 +6,6 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use serde_json::{Value, json};
-use thurm_proto::AgentStatus;
 
 use crate::app::{self, App};
 use crate::core::PaneKey;
@@ -92,14 +91,15 @@ pub fn withdraw_permission(app: &App, key: &PaneKey) {
     app.gtk_app.withdraw_notification(&permission_id(key));
 }
 
-/// Agents waiting for input that the user has not seen yet; a pane counts as seen once it is
-/// on screen in the active window while waiting.
+/// Agents in a state with a badge (`[notifications.<state>]`) that the user has not seen yet; a
+/// pane counts as seen once it is on screen in the active window.
 pub fn update_badge(app: &App) {
-    let waiting: Vec<PaneKey> = app
+    let badge = app.ui().cfg.notifications.clone();
+    let badged: Vec<PaneKey> = app
         .infos
         .borrow()
         .iter()
-        .filter(|(_, i)| i.agent.as_ref().is_some_and(|a| a.status == AgentStatus::NeedsInput))
+        .filter(|(_, i)| i.agent.as_ref().is_some_and(|a| badge.for_agent(a).badge))
         .map(|(k, _)| k.clone())
         .collect();
     let active = app.win().is_some_and(|w| w.window.is_active());
@@ -107,13 +107,13 @@ pub fn update_badge(app: &App) {
     if active && let Some(tab) = app.current_tab() {
         let zoomed = tab.zoomed.borrow().clone();
         for k in tab.panes() {
-            if zoomed.as_ref().is_none_or(|z| *z == k) && waiting.contains(&k) {
+            if zoomed.as_ref().is_none_or(|z| *z == k) && badged.contains(&k) {
                 seen.insert(k);
             }
         }
     }
-    seen.retain(|k| waiting.contains(k));
-    let count = waiting.iter().filter(|k| !seen.contains(k)).count();
+    seen.retain(|k| badged.contains(k));
+    let count = badged.iter().filter(|k| !seen.contains(k)).count();
     drop(seen);
     launcher_count(count);
 }

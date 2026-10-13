@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::{Mutex, RwLock};
 
-use thurm_config::{AgentDef, Config, ProgramDef};
+use thurm_config::{AgentDef, Config, NoticeState, ProgramDef};
 use thurm_proto::{
     AgentState, AgentStatus, CreatePane, Event, Layout, PROTOCOL_VERSION, PaneId, PaneInfo,
     PaneSize, ProgramRecord, Request, Response, ServerMessage, WaitCondition, WaitOutcome,
@@ -89,7 +89,8 @@ enum AiJob {
         agent: String,
         hint: Option<String>,
         screen: String,
-        notify: Option<(String, String)>,
+        notify: (String, String),
+        sound: String,
     },
 }
 
@@ -951,6 +952,7 @@ impl Daemon {
                                 title,
                                 body,
                                 permission: None,
+                                sound: None,
                             });
                         }
                     }
@@ -1007,6 +1009,7 @@ impl Daemon {
                                     title: format!("{what} {status}"),
                                     body: format!("after {}s", start.elapsed().as_secs()),
                                     permission: None,
+                                    sound: None,
                                 });
                             }
                         }
@@ -1185,6 +1188,7 @@ impl Daemon {
                     hint,
                     screen,
                     notify,
+                    sound,
                 } => {
                     let ask = if done {
                         ai::summary(&agent, &screen)
@@ -1199,9 +1203,10 @@ impl Daemon {
                             st.agent.set_ai_detail(episode, d.clone());
                         }
                         // The user already answered (or the agent moved on): old news.
-                        let Some((title, body)) = notify.filter(|_| current) else {
+                        if !current {
                             return Vec::new();
-                        };
+                        }
+                        let (title, body) = notify;
                         let body = match (&detail, done) {
                             (Some(d), true) => format!("{d} ({body})"),
                             (Some(d), false) => d.clone(),
@@ -1212,6 +1217,7 @@ impl Daemon {
                             title,
                             body,
                             permission,
+                            sound: Some(sound.clone()),
                         }]
                     });
                 }
@@ -2029,9 +2035,19 @@ impl Daemon {
         }
     }
 
-    /// Notifications for an agent status change: needs input, and (hooks) finished a turn.
-    /// With `ai.notifications` the model first says what the agent asks for or did (shown in
-    /// the agent switcher too), and the notification waits for it.
+    /// Whether an agent going from `before` to `after` is news: it entered another state of the
+    /// notification matrix, or showed a permission prompt it did not show before.
+    fn is_agent_news(before: Option<&AgentState>, after: &AgentState) -> bool {
+        let state = |a: &AgentState| NoticeState::of(a.status, a.permission.is_some());
+        let new_prompt =
+            after.permission.is_some() && after.permission != before.and_then(|b| b.permission);
+        before.map(state) != Some(state(after)) || new_prompt
+    }
+
+    /// Notifications for an agent entering a state of the notification matrix
+    /// (`[notifications.<state>]`): needs input, a permission prompt, a finished turn, a failure,
+    /// or (if enabled) working or idle. With `ai.notifications` the model first says what the
+    /// agent asks for or did (shown in the agent switcher too), and the notification waits for it.
     fn agent_notifications(
         &self,
         pane: PaneId,
@@ -2046,38 +2062,34 @@ impl Daemon {
         let Some(a) = after else {
             return Vec::new();
         };
-        let was = before.map(|b| b.status);
-        // A permission prompt right after another request is news too.
-        let new_prompt =
-            a.permission.is_some() && a.permission != before.and_then(|b| b.permission);
-        let (done, body) = match a.status {
-            AgentStatus::NeedsInput if was != Some(AgentStatus::NeedsInput) || new_prompt => (
-                false,
-                (n.enabled && n.agent_needs_input).then(|| {
-                    a.message
-                        .clone()
-                        .unwrap_or_else(|| "is waiting for your input".into())
-                }),
-            ),
-            AgentStatus::Done if was != Some(AgentStatus::Done) => (
-                true,
-                // A program says what it finished; a hooked turn says how long it took.
-                (n.enabled && n.agent_done).then(|| match (&a.message, a.turn_ms) {
-                    (Some(m), _) if st.agent.program_reported() => m.clone(),
-                    (_, Some(ms)) => format!("finished after {}", agents::human_duration(ms)),
-                    (_, None) => "finished".into(),
-                }),
-            ),
-            AgentStatus::Error if was != Some(AgentStatus::Error) => (
-                true,
-                (n.enabled && n.agent_done)
-                    .then(|| a.message.clone().unwrap_or_else(|| "failed".into())),
-            ),
-            _ => return Vec::new(),
+        if !Self::is_agent_news(before, a) {
+            return Vec::new();
+        }
+        let state = NoticeState::of(a.status, a.permission.is_some());
+        let notice = n.notice(state);
+        if !n.enabled || !notice.notify {
+            return Vec::new();
+        }
+        let done = matches!(state, NoticeState::Finished | NoticeState::Failed);
+        let body = match state {
+            NoticeState::Waiting | NoticeState::Blocked => a
+                .message
+                .clone()
+                .unwrap_or_else(|| "is waiting for your input".into()),
+            // A program says what it finished; a hooked turn says how long it took.
+            NoticeState::Finished => match (&a.message, a.turn_ms) {
+                (Some(m), _) if st.agent.program_reported() => m.clone(),
+                (_, Some(ms)) => format!("finished after {}", agents::human_duration(ms)),
+                (_, None) => "finished".into(),
+            },
+            NoticeState::Failed => a.message.clone().unwrap_or_else(|| "failed".into()),
+            NoticeState::Working => "is working".into(),
+            NoticeState::Idle => "is idle".into(),
         };
-        let notify = body.map(|body| (a.name.clone(), body));
+        let notify = (a.name.clone(), body);
         // A program that reports its status says itself what it wants or did.
         if ai_cfg.notifications()
+            && (done || matches!(state, NoticeState::Waiting | NoticeState::Blocked))
             && !st.agent.program_reported()
             && !st.info.password_input
             && self.ai.unavailable().is_none()
@@ -2090,21 +2102,20 @@ impl Daemon {
                 hint: a.message.clone(),
                 screen: agents::tail(&st.term.screen_text(), AI_SCREEN_LINES),
                 notify: notify.clone(),
+                sound: notice.sound.clone(),
             };
             if self.ai_tx.try_send(job).is_ok() {
                 return Vec::new();
             }
         }
-        let permission = a.permission.filter(|_| !done);
-        notify
-            .map(|(title, body)| Event::Notify {
-                pane,
-                title,
-                body,
-                permission,
-            })
-            .into_iter()
-            .collect()
+        let (title, body) = notify;
+        vec![Event::Notify {
+            pane,
+            title,
+            body,
+            permission: a.permission.filter(|_| !done),
+            sound: Some(notice.sound.clone()),
+        }]
     }
 
     fn with_pane<T>(
@@ -3020,6 +3031,42 @@ fn ensure_hooks(command: Option<&[String]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent(status: AgentStatus, permission: Option<u64>) -> AgentState {
+        AgentState {
+            name: "Claude Code".into(),
+            kind: "claude".into(),
+            status,
+            session_id: None,
+            message: None,
+            turn_ms: None,
+            turns: 0,
+            hooked: false,
+            topic: None,
+            permission,
+        }
+    }
+
+    #[test]
+    fn a_prompt_going_away_while_still_waiting_is_news() {
+        let blocked = agent(AgentStatus::NeedsInput, Some(7));
+        let waiting = agent(AgentStatus::NeedsInput, None);
+        assert!(Daemon::is_agent_news(Some(&blocked), &waiting));
+        assert!(!Daemon::is_agent_news(Some(&waiting), &waiting));
+        assert!(Daemon::is_agent_news(Some(&waiting), &blocked));
+        // A different prompt while already blocked is news; the same one is not.
+        assert!(Daemon::is_agent_news(
+            Some(&blocked),
+            &agent(AgentStatus::NeedsInput, Some(8))
+        ));
+        assert!(!Daemon::is_agent_news(Some(&blocked), &blocked));
+        let working = agent(AgentStatus::Working, None);
+        assert!(Daemon::is_agent_news(Some(&working), &waiting));
+        assert!(!Daemon::is_agent_news(
+            Some(&working),
+            &agent(AgentStatus::Working, None)
+        ));
+    }
 
     #[test]
     fn program_name_replaces_the_command_word() {
