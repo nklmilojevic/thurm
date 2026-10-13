@@ -114,6 +114,8 @@ private struct DetailPane: View {
                                     if item.kind == .theme {
                                         ThemeRow(item: item, store: store, slot: .light)
                                         ThemeRow(item: item, store: store, slot: .dark)
+                                    } else if item.key == "remote" {
+                                        RemoteHostRows(item: item, store: store)
                                     } else {
                                         SettingRow(item: item, store: store)
                                     }
@@ -127,6 +129,7 @@ private struct DetailPane: View {
                 .formStyle(.grouped)
             }
         }
+        .remoteHostSheets(store: store)
     }
 
     private var title: String {
@@ -200,7 +203,7 @@ private struct SettingRow: View {
 }
 
 /// The Reset button of a row, or the same space left empty.
-private struct ResetSlot: View {
+struct ResetSlot: View {
     let item: SettingItem
     let store: SettingsStore
 

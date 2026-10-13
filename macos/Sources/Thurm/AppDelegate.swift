@@ -217,7 +217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     @objc func showRemotes(_ sender: Any?) {
-        RemotesWindow.shared.show()
+        RemoteHosts.shared.show()
     }
 
     @objc func showProcesses(_ sender: Any?) {

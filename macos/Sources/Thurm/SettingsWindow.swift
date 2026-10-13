@@ -18,6 +18,17 @@ final class SettingsWindow: NSObject {
         window?.makeKeyAndOrderFront(nil)
     }
 
+    /// Shows the window on `section` (leaving a search).
+    func show(section: String) {
+        show()
+        store.selectedSection = section
+    }
+
+    /// Re-reads the settings while the window is open (a host added or changed elsewhere).
+    func reload() {
+        if window?.isVisible == true { store.reload() }
+    }
+
     private func build() {
         let controller = NSHostingController(rootView: SettingsView(store: store))
         controller.sizingOptions = []
