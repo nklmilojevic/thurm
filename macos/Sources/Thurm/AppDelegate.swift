@@ -192,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case .newWorkspace(let cwd):
             session.newWorkspace(cwd: cwd)
         case .settings:
-            session.openConfigFile()
+            SettingsWindow.shared.show()
         case .workspace(let name):
             session.showWorkspace(named: name)
         }
@@ -206,6 +206,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func openConfig(_ sender: Any?) {
         SessionManager.shared.openConfigFile()
+    }
+
+    @objc func showSettings(_ sender: Any?) {
+        SettingsWindow.shared.show()
     }
 
     @objc func reloadConfig(_ sender: Any?) {

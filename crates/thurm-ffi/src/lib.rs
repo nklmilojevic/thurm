@@ -1529,6 +1529,38 @@ pub extern "C" fn thurm_config_path() -> *mut c_char {
     into_c(thurm_config::config_path().display().to_string())
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn thurm_settings_json() -> *mut c_char {
+    into_c(thurm_config::settings::view().to_string())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_settings_set(
+    key: *const c_char,
+    json: *const c_char,
+) -> *mut c_char {
+    let (Some(key), Some(json)) = (unsafe { opt_str(key) }, unsafe { opt_str(json) }) else {
+        return into_c("no setting or value given".into());
+    };
+    let value: serde_json::Value = match serde_json::from_str(json) {
+        Ok(value) => value,
+        Err(e) => return into_c(e.to_string()),
+    };
+    match thurm_config::settings::set(key, &value) {
+        Ok(()) => std::ptr::null_mut(),
+        Err(e) => into_c(e),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn thurm_settings_overlay_path() -> *mut c_char {
+    into_c(
+        thurm_config::settings::open_overlay()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
