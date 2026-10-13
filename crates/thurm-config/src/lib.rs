@@ -1710,7 +1710,8 @@ fn migrate(text: &str) -> Result<Option<String>, String> {
     if from >= MIGRATIONS.len() {
         return Ok(None);
     }
-    // A row for a state its legacy switch turns off starts off, and the switches are dropped.
+    // A row written for a state its legacy switch turns off starts off. The switches stay: rows
+    // the file already has (or lacks) are left alone, and parsing lets a row beat its switch.
     let off = legacy_states_off(text);
     let out = MIGRATIONS
         .iter()
@@ -1726,17 +1727,6 @@ fn migrate(text: &str) -> Result<Option<String>, String> {
             with_setting(&t, key, &value)
         })?;
     let mut doc: toml_edit::DocumentMut = out.parse().map_err(|e| format!("{e}"))?;
-    if let Some(n) = doc.get_mut("notifications").and_then(|n| n.as_table_like_mut()) {
-        // A row an earlier migration wrote while the switch stayed in the file also goes off:
-        // once the switch is gone, nothing else would keep it off.
-        for state in &off {
-            if let Some(row) = n.get_mut(state).and_then(|r| r.as_table_like_mut()) {
-                row.insert("notify", toml_edit::value(false));
-            }
-        }
-        n.remove("agent_needs_input");
-        n.remove("agent_done");
-    }
     let version = toml_edit::value(MIGRATIONS.len() as i64);
     match doc.get_mut("config_version") {
         Some(item) => *item = version,
@@ -2335,33 +2325,33 @@ clipboard_read = "always"
     }
 
     #[test]
-    fn migration_turns_off_rows_written_before_the_switch_was_dropped() {
+    fn migration_leaves_existing_rows_and_switches_alone() {
         let at = MIGRATIONS
             .iter()
             .position(|(key, _)| *key == "notifications.finished")
             .unwrap();
+        // `waiting` was written earlier and turned on by hand; `blocked`'s row was removed.
         let old = format!(
-            "config_version = {at}\n\n[notifications]\nagent_needs_input = false\n\
-             waiting = {{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }}\n\
-             blocked = {{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }}\n"
+            "config_version = {at}\n\n[notifications]\nagent_needs_input = false\nagent_done = false\n\
+             waiting = {{ tab_indicator = true, notify = true, badge = true, sound = \"default\" }}\n"
         );
         let out = migrate(&old).unwrap().unwrap();
+        assert!(
+            out.contains("agent_needs_input = false") && out.contains("agent_done = false"),
+            "{out}"
+        );
         let (cfg, warnings) = Config::parse_with_warnings(&out).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         let n = &cfg.notifications;
-        assert!(!n.waiting.notify && !n.blocked.notify);
-        assert!(n.finished.notify && n.failed.notify);
-        assert!(!out.contains("agent_needs_input"));
+        assert!(n.waiting.notify);
+        assert!(!n.blocked.notify);
+        assert!(!n.finished.notify && !n.failed.notify);
     }
 
     #[test]
     fn migration_keeps_replaced_switches_off() {
         let text = "[notifications]\nagent_needs_input = false\nagent_done = false\n";
         let out = migrate(text).unwrap().unwrap();
-        assert!(
-            !out.contains("agent_needs_input") && !out.contains("agent_done"),
-            "{out}"
-        );
         let (cfg, warnings) = Config::parse_with_warnings(&out).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         let n = &cfg.notifications;
