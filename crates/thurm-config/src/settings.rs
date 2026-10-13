@@ -526,7 +526,11 @@ fn is_notice_state(name: &str) -> bool {
 /// back to the file's.
 fn set_notice(config: &Path, key: &str, state: &str, value: &Json) -> Result<(), String> {
     let row = format!("notifications.{state}");
-    if key == row || value.is_null() {
+    // The overlay holds whole rows, so a row is only ever reset; its cells are set one by one.
+    if key == row && !value.is_null() {
+        return Err(format!("{key}: set its cells, or null to reset the row"));
+    }
+    if value.is_null() {
         return overlay::write(config, &row, None);
     }
     let prefix = format!("{row}.");
@@ -959,6 +963,24 @@ mod tests {
         assert!(
             size["warning"].as_str().unwrap().contains("font.size"),
             "{size}"
+        );
+        std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_notification_row_takes_only_null() {
+        let config = temp_config("row-null", "");
+        set_at(&config, "notifications.waiting.notify", &json!(false)).unwrap();
+        let overlay = overlay::path_beside(&config);
+        let before = std::fs::read_to_string(&overlay).unwrap();
+        assert!(set_at(&config, "notifications.waiting", &json!({ "notify": true })).is_err());
+        assert!(set_at(&config, "notifications.waiting", &json!(true)).is_err());
+        assert_eq!(std::fs::read_to_string(&overlay).unwrap(), before);
+        set_at(&config, "notifications.waiting", &Json::Null).unwrap();
+        assert!(
+            !std::fs::read_to_string(&overlay)
+                .unwrap()
+                .contains("waiting")
         );
         std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
     }
