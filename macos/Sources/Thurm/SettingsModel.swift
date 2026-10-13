@@ -80,9 +80,15 @@ struct SettingItem {
     }
 }
 
-struct SettingSection: Equatable {
+struct SettingSection: Equatable, Identifiable {
     let id: String
     let label: String
+}
+
+/// A line above the form: what the config file's state means for the edits.
+struct SettingsNotice: Equatable {
+    let text: String
+    let isError: Bool
 }
 
 /// The whole window: `thurm_settings_json`.
@@ -134,6 +140,135 @@ struct SettingsDocument {
     /// settings.toml replaces config.toml's whole, so one config.toml sets is edited there.
     func editPath(for item: SettingItem) -> String {
         item.source == .file ? configPath : overlayPath
+    }
+
+    /// What the file state means for the edits, in one line; nil when there is nothing to say.
+    var notice: SettingsNotice? {
+        var parts: [String] = []
+        if let error {
+            parts.append("config.toml could not be loaded (\(error)). Thurm uses the defaults until it is fixed.")
+        } else if configReadOnly {
+            parts.append("config.toml is read-only (another tool manages it). Changes are saved to settings.toml.")
+        }
+        if let first = warnings.first {
+            let more = warnings.count > 1 ? " (+\(warnings.count - 1) more)" : ""
+            parts.append("Ignored in settings.toml: \(first)\(more).")
+        }
+        guard !parts.isEmpty else { return nil }
+        return SettingsNotice(text: parts.joined(separator: " "), isError: error != nil)
+    }
+}
+
+/// The text a setting shows in a form.
+enum SettingText {
+    static let summaryLimit = 90
+
+    /// The first sentence of a setting's doc, cut at a word boundary past `limit` characters.
+    static func summary(_ text: String, limit: Int = summaryLimit) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var sentence = trimmed
+        var index = trimmed.startIndex
+        while index < trimmed.endIndex {
+            let next = trimmed.index(after: index)
+            if ".!?".contains(trimmed[index]), next == trimmed.endIndex || trimmed[next].isWhitespace {
+                sentence = String(trimmed[...index])
+                break
+            }
+            index = next
+        }
+        guard sentence.count > limit else { return sentence }
+        let cut = sentence.prefix(limit)
+        guard let space = cut.lastIndex(of: " ") else { return cut + "\u{2026}" }
+        return String(cut[..<space]) + "\u{2026}"
+    }
+
+    /// An enum value as a label: `copy-paste` reads as "Copy paste".
+    static func optionTitle(_ value: String) -> String {
+        let spaced = value.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ")
+        return spaced.prefix(1).uppercased() + spaced.dropFirst()
+    }
+}
+
+/// The subgroups of a section's rows: a heading for each table of keys that shares a section
+/// with others (`colors.*`, `cursor.*` in Appearance), and the notification matrix.
+struct SettingGroup {
+    let heading: String?
+    let items: [SettingItem]
+
+    var isMatrix: Bool { items.contains { $0.row != nil } }
+}
+
+enum SettingGroups {
+    private static let tables = ["colors": "Colors", "cursor": "Cursor"]
+    private static let headingOrder = ["Theme", "Colors", "Cursor"]
+
+    static func heading(for item: SettingItem) -> String? {
+        if item.key == "colors.theme" { return "Theme" }
+        let table = item.key.split(separator: ".").first.map(String.init) ?? ""
+        return tables[table]
+    }
+
+    /// The groups of `items` in the order they show: plain rows first, by heading, then the matrix.
+    static func split(_ items: [SettingItem]) -> [SettingGroup] {
+        var headings: [String?] = []
+        var buckets: [String: [SettingItem]] = [:]
+        for item in items where item.row == nil {
+            let heading = heading(for: item)
+            let key = heading ?? ""
+            if buckets[key] == nil { headings.append(heading) }
+            buckets[key, default: []].append(item)
+        }
+        func rank(_ heading: String?) -> Int {
+            guard let heading else { return 0 }
+            return headingOrder.firstIndex(of: heading).map { $0 + 1 } ?? headingOrder.count + 1
+        }
+        let ordered = headings.enumerated()
+            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+            .map(\.element)
+        var groups = ordered.map { SettingGroup(heading: $0, items: buckets[$0 ?? ""] ?? []) }
+        let matrix = items.filter { $0.row != nil }
+        if !matrix.isEmpty { groups.append(SettingGroup(heading: "States", items: matrix)) }
+        return groups
+    }
+}
+
+/// The SF Symbol of each section's tile in the sidebar.
+enum SettingsSectionIcons {
+    private static let symbols = [
+        "appearance": "paintpalette",
+        "font": "textformat",
+        "window": "macwindow",
+        "terminal": "terminal",
+        "session": "clock.arrow.circlepath",
+        "security": "lock.shield",
+        "notifications": "bell.badge",
+        "agents": "sparkles",
+        "ai": "apple.intelligence",
+        "programs": "app.badge",
+        "updates": "arrow.down.circle",
+        "quick_terminal": "rectangle.topthird.inset.filled",
+        "keys": "keyboard",
+        "remotes": "network",
+    ]
+
+    static func symbol(for section: String) -> String {
+        symbols[section] ?? "gearshape"
+    }
+}
+
+/// The sounds a notification can play: `default`, `none`, and the sound files of the system and
+/// of the user (`~/Library/Sounds`), by name.
+enum SystemSounds {
+    static func names(in directories: [String] = ["/System/Library/Sounds",
+                                                  FileManager.default.homeDirectoryForCurrentUser
+                                                      .appendingPathComponent("Library/Sounds").path]) -> [String] {
+        var names = Set<String>()
+        for directory in directories {
+            for file in (try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? [] where !file.hasPrefix(".") {
+                names.insert((file as NSString).deletingPathExtension)
+            }
+        }
+        return names.sorted()
     }
 }
 
