@@ -425,9 +425,12 @@ pub fn view_at(config: &Path) -> Json {
                 .iter()
                 .find(|w| w.starts_with(&format!("settings.toml: {} ", s.key)))
                 .cloned();
-            let from_overlay = applied
-                .iter()
-                .any(|a| *a == s.key || a.starts_with(&format!("{}.", s.key)));
+            // A whole notification row in the overlay also sets each of its cells.
+            let from_overlay = applied.iter().any(|a| {
+                *a == s.key
+                    || a.starts_with(&format!("{}.", s.key))
+                    || s.key.starts_with(&format!("{a}."))
+            });
             let source = if from_overlay {
                 "overlay"
             } else if lookup_toml(&base, &path).is_some() {
@@ -957,6 +960,38 @@ mod tests {
             size["warning"].as_str().unwrap().contains("font.size"),
             "{size}"
         );
+        std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_saved_notification_cell_shows_its_row_as_the_overlays() {
+        let config = temp_config("row-source", "");
+        set_at(&config, "notifications.waiting.sound", &json!("none")).unwrap();
+        let view = view_at(&config);
+        let sources: Vec<(String, String)> = view["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| {
+                let key = s["key"].as_str()?;
+                let state = key.strip_prefix("notifications.")?.split('.').next()?;
+                (key.matches('.').count() == 2).then(|| {
+                    (
+                        state.to_owned(),
+                        s["source"].as_str().unwrap_or("").to_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert!(sources.iter().any(|(state, _)| state == "waiting"));
+        for (state, source) in &sources {
+            let expected = if state == "waiting" {
+                "overlay"
+            } else {
+                "default"
+            };
+            assert_eq!(source, expected, "{state}");
+        }
         std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
     }
 
