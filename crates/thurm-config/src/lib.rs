@@ -1506,11 +1506,16 @@ pub fn write_theme(spec: &ThemeSpec) -> Result<(), String> {
 /// when the overlay already sets it (it would win over the file otherwise).
 pub fn write_setting(key: &str, value: &str) -> Result<(), String> {
     let config = config_path();
-    let overlay = overlay::read(&overlay::path_beside(&config)).map_err(|e| e.to_string())?;
-    if overlay::holds(&overlay, key) {
+    if overlay_holds(&config, key) {
         return overlay::write(&config, key, Some(value));
     }
     edit_config(|text| with_setting(text, key, value))
+}
+
+/// Whether the settings overlay beside `config` sets `key`. An overlay that can't be read is
+/// skipped by loading too (with a warning), so it holds nothing here either.
+fn overlay_holds(config: &Path, key: &str) -> bool {
+    overlay::read(&overlay::path_beside(config)).is_ok_and(|text| overlay::holds(&text, key))
 }
 
 /// Returns `text` (a config file) with a `[[remote]]` entry for `remote` added, keeping
@@ -1796,6 +1801,22 @@ fn migrate_config(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreadable_overlay_holds_nothing() {
+        let dir = std::env::temp_dir().join(format!("thurm-overlay-holds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let overlay = overlay::path_beside(&config);
+        std::fs::write(&overlay, "[font]\nsize = 14.0\n").unwrap();
+        assert!(overlay_holds(&config, "font.size"));
+        std::fs::remove_file(&overlay).unwrap();
+        std::fs::create_dir(&overlay).unwrap();
+        assert!(!overlay_holds(&config, "font.size"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn remotes_parse_and_validate() {
