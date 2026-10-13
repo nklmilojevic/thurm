@@ -282,9 +282,12 @@ final class TabContentView: NSView {
         let now = CACurrentMediaTime()
         guard !zoomProgress.isFinished(at: now) else { return targets }
         let t = CGFloat(zoomProgress.value(at: now))
-        return targets.map { id, rect in
+        let moving = targets.map { id, rect in
             (id, Self.blend(zoomFrom[id] ?? zoomFrom.values.first ?? rect, rect, t))
         }
+        // Panes leaving the layout hold their old rectangles until the zoom settles.
+        let leaving = zoomFrom.filter { id, _ in !targets.contains { $0.0 == id } }
+        return moving + leaving.map { ($0.key, $0.value) }
     }
 
     private var targetFrames: [(PaneKey, CGRect)] {
@@ -519,6 +522,9 @@ final class TabContentView: NSView {
         }
         zoomFrom = Dictionary(uniqueKeysWithValues: visibleFrames)
         change()
+        if let z = zoomedPane, let view = views[z] {
+            addSubview(view, positioned: .below, relativeTo: chrome)
+        }
         zoomProgress = Tween(0)
         zoomProgress.move(to: 1, duration: duration, at: CACurrentMediaTime())
         views.values.forEach { $0.holdGridSize = true }
@@ -581,7 +587,11 @@ final class TabContentView: NSView {
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         dragging = dividerAt(p)
-        if dragging == nil { super.mouseDown(with: event) }
+        if let path = dragging?.path {
+            setDividerHighlight(path)
+        } else {
+            super.mouseDown(with: event)
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
