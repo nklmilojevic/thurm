@@ -106,6 +106,10 @@ enum PhonePairing {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: cli)
             p.arguments = ["status", "--json"]
+            // Without a terminal, the Tailscale app's binary starts its GUI instead of the CLI.
+            var env = ProcessInfo.processInfo.environment
+            env["TAILSCALE_BE_CLI"] = "1"
+            p.environment = env
             let out = Pipe()
             p.standardOutput = out
             p.standardError = FileHandle.nullDevice
