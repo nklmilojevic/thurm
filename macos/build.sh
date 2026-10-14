@@ -161,6 +161,13 @@ SPARKLE="$(find "$HERE/.build/artifacts" -path '*Sparkle.xcframework/macos-*/Spa
 ditto "$SPARKLE" "$APP/Contents/Frameworks/Sparkle.framework"
 # thurmd runs it for the `[ai]` features (Apple Intelligence's on-device model).
 cp "$INTELLIGENCE_BIN" "$APP/Contents/Helpers/thurm-intelligence"
+# A Nix toolchain first on PATH links Nix's libiconv, which macOS refuses to load into a signed
+# app: an installed thurmd would never start (and a running daemon could not be upgraded).
+for f in "$APP/Contents/MacOS/Thurm" "$APP"/Contents/Helpers/*; do
+    if otool -L "$f" | grep -q '/nix/store/'; then
+        die "$(basename "$f") links libraries from /nix/store; build with /usr/bin first on PATH"
+    fi
+done
 cp "$HERE/Resources/Info.plist" "$APP/Contents/Info.plist"
 plist() { /usr/libexec/PlistBuddy -c "$1" "$APP/Contents/Info.plist"; }
 plist "Set :CFBundleShortVersionString $VERSION"
