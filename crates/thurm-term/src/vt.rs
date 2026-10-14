@@ -365,15 +365,8 @@ impl Vt {
             r == ffi::Result::SUCCESS && !raw.is_null(),
             "ghostty_terminal_new failed ({r})"
         );
-        // libghostty-vt prunes whole pages (a few hundred rows), so the limit gets a page of
-        // margin to keep at least `scrollback` lines.
-        let max_lines = if scrollback == 0 { 0 } else { scrollback + 512 };
+        set_scrollback(raw, scrollback);
         unsafe {
-            ffi::ghostty_terminal_set(
-                raw,
-                ffi::TerminalOption::SCROLLBACK_MAX_LINES,
-                (&max_lines as *const usize).cast(),
-            );
             // No byte limit on top: the line limit alone decides.
             ffi::ghostty_terminal_set(raw, ffi::TerminalOption::SCROLLBACK_MAX_BYTES, ptr::null());
         }
@@ -715,6 +708,11 @@ impl Vt {
 }
 
 impl Vt {
+    /// Keep at least `lines` of scrollback (0: none).
+    pub fn set_scrollback(&mut self, lines: usize) {
+        set_scrollback(self.raw, lines);
+    }
+
     /// The cursor a program gets by default, and back with DECSCUSR 0.
     pub fn set_default_cursor(&mut self, style: CursorStyle::Type, blink: bool) {
         unsafe {
@@ -1550,6 +1548,19 @@ pub struct RenderCursor {
 
 pub use ffi::RenderStateCursorVisualStyle as CursorVisual;
 pub use ffi::TerminalCursorStyle as CursorStyle;
+
+fn set_scrollback(raw: ffi::Terminal, lines: usize) {
+    // libghostty-vt prunes whole pages (a few hundred rows), so the limit gets a page of
+    // margin to keep at least `lines` lines.
+    let max_lines = if lines == 0 { 0 } else { lines + 512 };
+    unsafe {
+        ffi::ghostty_terminal_set(
+            raw,
+            ffi::TerminalOption::SCROLLBACK_MAX_LINES,
+            (&max_lines as *const usize).cast(),
+        );
+    }
+}
 
 impl Render {
     /// The cursor's style (DECSCUSR, or the default), visibility (DECTCEM) and blinking, as

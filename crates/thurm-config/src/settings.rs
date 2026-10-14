@@ -568,7 +568,7 @@ pub fn open_overlay() -> std::io::Result<PathBuf> {
     overlay::ensure(&config_path())
 }
 
-/// `value` as the TOML literal the option of `kind` takes.
+/// `value` as the TOML literal the option of `kind` takes. Numbers keep two decimals.
 fn literal(kind: Kind, value: &Json) -> Result<String, String> {
     let text = || value.as_str().ok_or_else(|| "expected text".to_owned());
     match kind {
@@ -586,6 +586,8 @@ fn literal(kind: Kind, value: &Json) -> Result<String, String> {
                 .as_f64()
                 .filter(|x| x.is_finite())
                 .ok_or("expected a number")?;
+            within(x, range)?;
+            let x = (x * 100.0).round() / 100.0;
             within(x, range)?;
             Ok(format!("{x:?}"))
         }
@@ -895,6 +897,24 @@ mod tests {
             std::fs::read_to_string(&config).unwrap(),
             DEFAULT_CONFIG_TOML
         );
+        std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn numbers_are_saved_with_two_decimals() {
+        let config = temp_config("decimals", DEFAULT_CONFIG_TOML);
+        set_at(
+            &config,
+            "window.unfocused_split_dim",
+            &json!(0.4302884615384616),
+        )
+        .unwrap();
+        set_at(&config, "terminal.scroll_multiplier", &json!(1.006)).unwrap();
+        let text = std::fs::read_to_string(overlay::path_beside(&config)).unwrap();
+        assert!(text.contains("unfocused_split_dim = 0.43\n"), "{text}");
+        assert!(text.contains("scroll_multiplier = 1.01\n"), "{text}");
+        assert!(set_at(&config, "terminal.scroll_multiplier", &json!(0.005)).is_err());
+        assert!(set_at(&config, "window.opacity", &json!(1.004)).is_err());
         std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
     }
 

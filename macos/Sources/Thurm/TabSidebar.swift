@@ -64,8 +64,11 @@ final class TabSplitViewController: NSSplitViewController {
 
     let sidebar = TabSidebarViewController()
     private let host = NSViewController()
+    /// `window.sidebar_width` as last applied, so a reload moves the divider only when it changed.
+    private var configuredWidth: CGFloat
 
     init(content: TabContentView, width: CGFloat) {
+        configuredWidth = width
         super.init(nibName: nil, bundle: nil)
         host.view = content
         let side = NSSplitViewItem(sidebarWithViewController: sidebar)
@@ -95,6 +98,16 @@ final class TabSplitViewController: NSSplitViewController {
             splitView.setPosition(w, ofDividerAt: 0)
             sidebar.preferredWidth = nil
         }
+    }
+
+    /// After a config reload: a new `window.sidebar_width` moves the divider (or, while the
+    /// sidebar is collapsed, is where it opens).
+    func applyConfiguredWidth(_ width: CGFloat) {
+        guard abs(width - configuredWidth) >= 1 else { return }
+        configuredWidth = width
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(saveWidth), object: nil)
+        sidebar.preferredWidth = width
+        if !sidebarCollapsed && !togglingSidebar { placeDivider() }
     }
 
     var sidebarCollapsed: Bool {
@@ -141,6 +154,7 @@ final class TabSplitViewController: NSSplitViewController {
     @objc private func saveWidth() {
         let w = (pendingWidth).rounded()
         guard abs(w - SessionManager.shared.config.sidebarWidth) >= 1 else { return }
+        configuredWidth = w
         _ = Core.shared.request(object: ["SetSetting": ["key": "window.sidebar_width", "value": String(format: "%.1f", w)]])
     }
 }

@@ -142,10 +142,21 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertNil(SettingNumber.parse("ten"))
     }
 
-    func testFloatsKeepTheirPrecisionAndIntegersRound() throws {
-        XCTAssertEqual(try XCTUnwrap(SettingNumber.value(0.125, kind: .float)) as? Double, 0.125)
+    func testFloatsKeepTwoDecimalsAndIntegersRound() throws {
+        XCTAssertEqual(try XCTUnwrap(SettingNumber.value(0.4302884615384616, kind: .float)) as? Double, 0.43)
+        XCTAssertEqual(try XCTUnwrap(SettingNumber.value(0.125, kind: .float)) as? Double, 0.13)
+        XCTAssertEqual(try XCTUnwrap(SettingNumber.value(240, kind: .float)) as? Double, 240)
         XCTAssertEqual(try XCTUnwrap(SettingNumber.value(2.5, kind: .int)) as? Int, 3)
         XCTAssertEqual(try XCTUnwrap(SettingNumber.value(16, kind: .int)) as? Int, 16)
+    }
+
+    func testNumbersShowAtMostTwoDecimals() {
+        XCTAssertEqual(SettingNumber.format(0.4302884615384616), "0.43")
+        XCTAssertEqual(SettingNumber.format(0.5), "0.5")
+        XCTAssertEqual(SettingNumber.format(16), "16")
+        XCTAssertEqual(SettingNumber.format(239.996), "240")
+        XCTAssertEqual(SettingNumber.format(-0.001), "0")
+        XCTAssertEqual(SettingNumber.format(10_000_000), "10000000")
     }
 
     func testNumbersThatCannotBeSavedAreRefused() {

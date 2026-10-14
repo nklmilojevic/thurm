@@ -1086,6 +1086,57 @@ fn scrollback_keeps_the_configured_lines() {
 }
 
 #[test]
+fn a_reloaded_scrollback_applies_to_a_running_terminal() {
+    let cfg = EngineConfig {
+        scrollback: 0,
+        ..EngineConfig::default()
+    };
+    let mut t = Terminal::new(
+        PaneSize {
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        },
+        cfg.clone(),
+    );
+    t.set_config(EngineConfig {
+        scrollback: 1_000,
+        ..cfg
+    });
+    let out: String = (0..3_000).map(|i| format!("line {i}\r\n")).collect();
+    t.advance(out.as_bytes());
+    assert!(t.vt.history() >= 1_000, "{} lines kept", t.vt.history());
+}
+
+#[test]
+fn a_smaller_reloaded_scrollback_drops_history_now() {
+    let cfg = EngineConfig {
+        scrollback: 10_000,
+        ..EngineConfig::default()
+    };
+    let mut t = Terminal::new(
+        PaneSize {
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        },
+        cfg.clone(),
+    );
+    let out: String = (0..8_000).map(|i| format!("line {i}\r\n")).collect();
+    t.advance(out.as_bytes());
+    assert!(t.vt.history() >= 7_000, "{} lines kept", t.vt.history());
+    t.set_config(EngineConfig {
+        scrollback: 1_000,
+        ..cfg
+    });
+    // Whole pages go, so a page past the limit (and its margin) may stay.
+    let kept = t.vt.history();
+    assert!((1_000..3_000).contains(&kept), "{kept} lines kept");
+}
+
+#[test]
 fn kitty_png_images_are_decoded() {
     use base64::Engine;
     let mut png = Vec::new();
@@ -1724,6 +1775,41 @@ fn cursor_style_is_libghosttys() {
     let mut copy = term(20, 4);
     copy.replay(&t.serialize_state());
     assert_eq!(cursor(&mut copy), (CursorShape::Block, true));
+}
+
+#[test]
+fn an_attached_copy_follows_a_new_cursor_style() {
+    let mut t = term(20, 4);
+    let mut copy = term(20, 4);
+    copy.replay(&t.serialize_state());
+    let beam = EngineConfig {
+        cursor_style: thurm_config::CursorStyle::Beam,
+        ..EngineConfig::default()
+    };
+    t.set_config(beam.clone());
+    copy.set_config(beam);
+    for t in [&mut t, &mut copy] {
+        let c = t.snapshot(1, &mut ClientView::new()).unwrap().frame.cursor;
+        assert_eq!(c.shape, CursorShape::Beam);
+    }
+}
+
+#[test]
+fn a_program_cursor_like_the_default_stays_the_programs() {
+    let mut t = term(20, 4);
+    t.advance(b"\x1b[2 q");
+    let mut copy = term(20, 4);
+    copy.replay(&t.serialize_state());
+    let beam = EngineConfig {
+        cursor_style: thurm_config::CursorStyle::Beam,
+        ..EngineConfig::default()
+    };
+    t.set_config(beam.clone());
+    copy.set_config(beam);
+    for t in [&mut t, &mut copy] {
+        let c = t.snapshot(1, &mut ClientView::new()).unwrap().frame.cursor;
+        assert_eq!(c.shape, CursorShape::Block);
+    }
 }
 
 #[test]
