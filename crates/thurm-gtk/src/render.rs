@@ -538,6 +538,8 @@ pub struct PaintParams<'a> {
     pub cursor_thickness: f64,
     /// Unfocused-split dim (0: none).
     pub dim: f64,
+    /// The dim's fill: the default background scaled by this (`config::dim_fill`).
+    pub dim_fill: f64,
     /// Bell flash strength 0..1.
     pub flash: f64,
     /// Smooth scrolling: pixels the grid is drawn lower, with the peek line above.
@@ -632,7 +634,7 @@ pub fn paint(
     }
 
     if p.dim > 0.001 {
-        rgba(cr, default_bg, p.dim);
+        rgba(cr, crate::config::blend(default_bg, 0x000000, 1.0 - p.dim_fill), p.dim);
         let _ = cr.paint();
     }
     if p.flash > 0.001 {

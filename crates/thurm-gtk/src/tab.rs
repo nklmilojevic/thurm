@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use thurm_proto::layout::TabLayout;
 
 use crate::app;
-use crate::config::blend;
+use crate::config::{blend, surface_shade};
 use crate::core::{HostId, PaneKey};
 use crate::model::{self, Divider, Rect, SplitNode};
 use crate::paneheader::{self, PaneHeader};
@@ -290,7 +290,7 @@ impl Tab {
             crate::paneicon::rounded(cr, r.x, r.y, r.w, r.h, CARD_RADIUS);
         }
         cr.set_fill_rule(gtk::cairo::FillRule::EvenOdd);
-        let g = rgb(blend(bg, 0x000000, if dark { 0.18 } else { 0.05 }));
+        let g = rgb(blend(bg, 0x000000, surface_shade(dark)));
         cr.set_source_rgba(g.0, g.1, g.2, opacity);
         let _ = cr.fill();
         cr.set_fill_rule(gtk::cairo::FillRule::Winding);

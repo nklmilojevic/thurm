@@ -44,7 +44,7 @@ struct ChromePalette {
         }
         isDark = theme.isDark
         canvas = bg
-        surface = bg.shadow(withLevel: isDark ? 0.18 : 0.05) ?? bg
+        surface = bg.shadow(withLevel: Self.surfaceShade(isDark: isDark)) ?? bg
         surfaceRaised = mix(0.05)
         divider = mix(0.25)
         control = ink(0.035)
@@ -64,6 +64,17 @@ struct ChromePalette {
         info = accent
         stroke = ink(0.09)
         strokeStrong = ink(0.14)
+    }
+
+    /// How far `surface` is shaded toward black from the canvas.
+    static func surfaceShade(isDark: Bool) -> CGFloat { isDark ? 0.18 : 0.05 }
+
+    /// The unfocused-split dim lays the background scaled by this over the pane, so at the full
+    /// `dim` the pane's background lands on `surface` and the pane sinks into the gutters, in
+    /// any theme. A dim weaker than the shade gets a black fill and stops short of `surface`.
+    static func dimFill(dim: CGFloat, isDark: Bool) -> Float {
+        guard dim > 0 else { return 0 }
+        return Float(max(0, 1 - surfaceShade(isDark: isDark) / dim))
     }
 }
 

@@ -402,7 +402,7 @@ fn tile(icon: PaneIcon, status: Option<AgentStatus>) -> gtk::DrawingArea {
         // A ring in the sidebar's color sets the badge off the tile.
         let ring = app::with_app(|a| {
             let ui = a.ui();
-            crate::config::blend(ui.theme.background, 0x000000, if ui.theme_is_dark() { 0.18 } else { 0.05 })
+            crate::config::blend(ui.theme.background, 0x000000, crate::config::surface_shade(ui.theme_is_dark()))
         })
         .unwrap_or(0x000000);
         let (cx, cy) = (TILE - 1.0, PAD + 1.0);

@@ -391,6 +391,8 @@ struct RenderParams {
     var cursorThickness: Int
     /// Unfocused split dimming (0...1).
     var dim: Float
+    /// The dim's fill: the default background scaled by this (`ChromePalette.dimFill`).
+    var dimFill: Float
     /// Visual bell flash (0...1).
     var flash: Float
     var opacity: Float
@@ -560,8 +562,11 @@ final class TerminalRenderer {
 
         // Unfocused split dimming and bell flash.
         if p.dim > 0.001 {
-            overlay.append(QuadInstance(rect: SIMD4<Float>(0, 0, vw, vh), color: rgba(defaultBg, p.dim),
-                                        kind: QuadKind.solid))
+            var fill = rgba(defaultBg, p.dim)
+            fill.x *= p.dimFill
+            fill.y *= p.dimFill
+            fill.z *= p.dimFill
+            overlay.append(QuadInstance(rect: SIMD4<Float>(0, 0, vw, vh), color: fill, kind: QuadKind.solid))
         }
         if p.flash > 0.001 {
             let flashColor: UInt32 = snapshot.valid ? snapshot.info.foreground : p.themeForeground

@@ -11,7 +11,7 @@ use gtk::{gdk, gio, glib};
 
 use crate::actions::{self, ACTIONS, Menu};
 use crate::app;
-use crate::config::{UiConfig, blend, css_rgb, css_rgba};
+use crate::config::{UiConfig, blend, css_rgb, css_rgba, surface_shade};
 use crate::core::PaneKey;
 use crate::sidebar::Sidebar;
 use crate::tab::Tab;
@@ -248,7 +248,7 @@ impl MainWindow {
         let bg = theme.background;
         let fg = theme.foreground;
         let opacity = ui.opacity();
-        let sidebar_bg = blend(bg, 0x000000, if dark { 0.18 } else { 0.05 });
+        let sidebar_bg = blend(bg, 0x000000, surface_shade(dark));
         let divider = blend(bg, fg, 0.25);
         let font = &ui.cfg.font.family;
         let size = ui.font_size();

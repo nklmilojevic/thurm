@@ -616,6 +616,8 @@ final class TerminalView: NSView, NSTextInputClient {
                                   cursorOn: lastBlinkOn,
                                   cursorThickness: max(1, Int((config.cursorThickness * backingScale).rounded())),
                                   dim: dim,
+                                  dimFill: ChromePalette.dimFill(dim: config.unfocusedSplitDim,
+                                                                 isDark: config.theme.isDark),
                                   flash: flash,
                                   opacity: opacity,
                                   themeBackground: config.theme.background,

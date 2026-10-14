@@ -753,7 +753,7 @@ impl TermView {
         if let Some(core) = self.core() {
             self.take_snapshot(&core);
         }
-        let Some((opacity, cursor_blink, thickness, dim_amount, theme_fg, theme_bg)) =
+        let Some((opacity, cursor_blink, thickness, dim_amount, dim_fill, theme_fg, theme_bg)) =
             app::with_app(|a| {
                 let ui = a.ui();
                 let quick = a.quick.borrow().as_ref().is_some_and(|q| q.tab.panes().contains(&self.key));
@@ -762,6 +762,7 @@ impl TermView {
                     ui.cfg.cursor.blink,
                     ui.cursor_thickness(),
                     ui.unfocused_dim(),
+                    ui.unfocused_dim_fill(),
                     ui.theme.foreground,
                     ui.theme.background,
                 )
@@ -821,6 +822,7 @@ impl TermView {
             cursor_on,
             cursor_thickness: thickness,
             dim: if st.dimmed { dim_amount } else { 0.0 },
+            dim_fill,
             flash,
             scroll_y,
             hover: st.hover,
