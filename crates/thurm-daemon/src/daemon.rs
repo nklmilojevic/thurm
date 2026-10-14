@@ -231,14 +231,18 @@ pub struct Client {
     /// Approximate bytes queued in `tx` (see [`message_weight`]); the writer subtracts what it
     /// wrote.
     pub queued: std::sync::atomic::AtomicUsize,
+    /// Messages sent but not yet flushed to the socket; the writer subtracts them after a flush.
+    pub unflushed: std::sync::atomic::AtomicUsize,
 }
 
 impl Client {
     pub fn send(&self, msg: ServerMessage) {
         self.queued
             .fetch_add(message_weight(&msg), Ordering::Relaxed);
+        self.unflushed.fetch_add(1, Ordering::AcqRel);
         if self.tx.send(msg).is_err() {
             self.queued.store(0, Ordering::Relaxed);
+            self.unflushed.store(0, Ordering::Release);
         }
     }
 
@@ -460,10 +464,28 @@ impl Daemon {
             ui: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
+            unflushed: std::sync::atomic::AtomicUsize::new(0),
         });
         self.clients.lock().insert(id, client.clone());
         *self.last_activity.lock() = Instant::now();
         (client, rx)
+    }
+
+    /// Waits up to `timeout` for every client's sent messages to reach its socket, so the reply
+    /// to a shutdown request is not lost when the process exits right after.
+    pub fn wait_clients_flushed(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let pending = self
+                .clients
+                .lock()
+                .values()
+                .any(|c| c.unflushed.load(Ordering::Acquire) > 0);
+            if !pending {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     pub fn remove_client(&self, id: u64) {
@@ -1940,6 +1962,7 @@ impl Daemon {
 
     pub fn handle(self: &Arc<Self>, client: &Arc<Client>, id: u64, req: Request) {
         *self.last_activity.lock() = Instant::now();
+        let shutting_down = matches!(req, Request::Shutdown { .. });
         let result = match req {
             Request::AgentPrompt {
                 pane,
@@ -2030,8 +2053,14 @@ impl Daemon {
                 .unwrap_or_else(|_| Err("the daemon hit an internal error".into()))
             }
         };
+        let ok = result.is_ok();
         if id != 0 {
             client.send(ServerMessage::Response { id, result });
+        }
+        // Only once the reply is queued: the main loop exits soon after it sees the flag, and
+        // waits only for replies already queued (see `wait_clients_flushed`).
+        if shutting_down && ok {
+            self.shutdown.store(true, Ordering::Release);
         }
     }
 
@@ -2462,7 +2491,7 @@ impl Daemon {
             Request::Shutdown { kill_panes } => {
                 log::info!("shutdown requested (kill panes: {kill_panes})");
                 let _ = self.save_session();
-                self.shutdown.store(true, Ordering::Relaxed);
+                // `handle` sets `shutdown` after queuing this reply.
                 Ok(Response::Ok)
             }
             Request::ListAgentPresets => {
@@ -3138,6 +3167,7 @@ mod tests {
             ui: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
+            unflushed: std::sync::atomic::AtomicUsize::new(0),
         };
         // A few big outputs are a backlog, not only thousands of messages.
         for _ in 0..70 {
@@ -3149,6 +3179,38 @@ mod tests {
         assert!(c.backlogged() && !c.caught_up());
         c.queued.store(0, Ordering::Relaxed);
         assert!(!c.backlogged());
+    }
+
+    /// The main loop exits soon after it sees `shutdown`, waiting only for queued replies, so the
+    /// flag must not go up before the reply to the shutdown request is queued.
+    #[test]
+    fn shutdown_reply_is_queued_before_the_flag() {
+        let dir = std::env::temp_dir().join(format!("thurm-shutdown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (client, rx) = daemon.add_client();
+        let watcher = {
+            let daemon = daemon.clone();
+            let client = client.clone();
+            std::thread::spawn(move || {
+                while !daemon.shutdown.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                client.unflushed.load(Ordering::Acquire)
+            })
+        };
+        daemon.handle(&client, 7, Request::Shutdown { kill_panes: false });
+        assert!(watcher.join().unwrap() > 0, "shutdown was visible before its reply");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerMessage::Response { id: 7, result: Ok(Response::Ok) })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

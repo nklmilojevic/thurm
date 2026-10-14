@@ -56,21 +56,34 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
                     Ordering::Relaxed,
                 );
             };
-            while let Ok(msg) = rx.recv() {
+            'write: while let Ok(msg) = rx.recv() {
                 if write_msg(&mut w, &msg).is_err() {
                     break;
                 }
                 written(&msg);
+                let mut batch = 1;
                 // Drain whatever else is queued before flushing.
                 while let Ok(msg) = rx.try_recv() {
                     if write_msg(&mut w, &msg).is_err() {
-                        return;
+                        break 'write;
                     }
                     written(&msg);
+                    batch += 1;
                 }
                 if std::io::Write::flush(&mut w).is_err() {
                     break;
                 }
+                if let Some(counter) = counter.upgrade() {
+                    let pending = &counter.unflushed;
+                    let flushed = |n: usize| Some(n.saturating_sub(batch));
+                    let _ = pending.try_update(Ordering::AcqRel, Ordering::Acquire, flushed);
+                }
+            }
+            // Nothing still queued will reach the socket, so a shutdown must not wait for it.
+            // Dropped first: later sends then fail, and reset the count themselves.
+            drop(rx);
+            if let Some(counter) = counter.upgrade() {
+                counter.unflushed.store(0, Ordering::Release);
             }
         });
 

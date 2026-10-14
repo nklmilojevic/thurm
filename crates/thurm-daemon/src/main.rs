@@ -228,7 +228,9 @@ fn main() {
             let _ = daemon.save_session();
             break;
         }
-        if daemon.shutdown.load(Ordering::Relaxed) {
+        if daemon.shutdown.load(Ordering::Acquire) {
+            // The reply to the shutdown request is still on its way to the client.
+            daemon.wait_clients_flushed(Duration::from_millis(500));
             break;
         }
         if upgrade_requested.swap(false, Ordering::Relaxed) {
