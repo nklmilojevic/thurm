@@ -2505,6 +2505,7 @@ impl Daemon {
                 self.push.follow(&device, pane, token, state)?;
                 Ok(Response::Ok)
             }
+            Request::Ping => Ok(Response::Ok),
             Request::UnfollowAgent { device, pane } => {
                 self.push.unfollow(&device, pane)?;
                 Ok(Response::Ok)

@@ -339,7 +339,14 @@ pub enum Request {
         device: String,
         pane: PaneId,
     },
+    /// Nothing; answers Ok. The iOS app sends it while open, so the daemon can tell a phone
+    /// that went away without closing its connection (see `MOBILE_SILENCE`).
+    Ping,
 }
+
+/// A mobile client silent this long is taken for gone: iOS suspends apps without closing their
+/// connections, and a pane it had resized must return to the other client's size.
+pub const MOBILE_SILENCE: std::time::Duration = std::time::Duration::from_secs(45);
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CreatePane {

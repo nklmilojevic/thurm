@@ -27,6 +27,15 @@ pub fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
     }
 }
 
+/// `MOBILE_SILENCE`, or `THURM_MOBILE_SILENCE_MS` (tests).
+fn mobile_silence() -> std::time::Duration {
+    std::env::var("THURM_MOBILE_SILENCE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(thurm_proto::MOBILE_SILENCE)
+}
+
 fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
     if !thurm_config::peer_may_use_daemon(&stream) {
         log::warn!("rejecting connection from another user");
@@ -88,7 +97,13 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
         });
 
     let mut reader = std::io::BufReader::new(stream);
+    let mut silence_limited = false;
     loop {
+        // A phone that stopped talking (suspended, out of range) is gone: it pings while open.
+        if !silence_limited && client.mobile.load(Ordering::Relaxed) {
+            silence_limited = true;
+            let _ = reader.get_ref().set_read_timeout(Some(mobile_silence()));
+        }
         match codec::read_frame(&mut reader) {
             Ok(Some(frame)) => match codec::decode::<Envelope>(&frame) {
                 Ok(env) => daemon.handle(&client, env.id, env.request),
@@ -114,6 +129,15 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
                 },
             },
             Ok(None) => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                log::info!("client {} (mobile) went quiet; dropping it", client.id);
+                break;
+            }
             Err(e) => {
                 log::debug!("client {} read error: {e}", client.id);
                 break;

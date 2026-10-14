@@ -410,3 +410,48 @@ fn followed_agents_post_live_activity_updates_until_the_pane_closes() {
     assert_eq!(end["state"]["status"], "ended");
     assert_eq!(end["state"]["agent"], "Claude Code");
 }
+
+/// iOS suspends the app without closing its connection: a phone that stops talking is dropped,
+/// and the pane it had resized goes back to the Mac's size.
+#[test]
+fn a_silent_phone_is_dropped_and_gives_the_pane_back() {
+    let env = Env::new("silent-phone");
+    let _daemon = env.start_with(&[("THURM_MOBILE_SILENCE_MS", Path::new("800"))]);
+    let (mac, _) = env.connect();
+    let pane = create(&mac, &env.dir);
+    mac.request(Request::Resize {
+        pane,
+        size: size(120, 40),
+    })
+    .unwrap();
+
+    let caps = [thurm_proto::CAP_MOBILE, thurm_proto::CAP_ACTIVE_SIZE];
+    let (mut phone, hello) = raw_hello(&env, PROTOCOL_VERSION, &caps);
+    assert!(hello.is_ok(), "{hello:?}");
+    let r = raw_request(
+        &mut phone,
+        2,
+        Request::Resize {
+            pane,
+            size: size(50, 30),
+        },
+    );
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+    assert_eq!(pane_size(&mac, pane), (50, 30));
+
+    // Pinging keeps it: still the phone's size after longer than the silence limit.
+    for id in 3..6 {
+        std::thread::sleep(Duration::from_millis(400));
+        let r = raw_request(&mut phone, id, Request::Ping);
+        assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+    }
+    assert_eq!(pane_size(&mac, pane), (50, 30));
+
+    // Then silence, with the connection still open.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pane_size(&mac, pane) != (120, 40) {
+        assert!(Instant::now() < deadline, "the silent phone kept the pane");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(phone);
+}
