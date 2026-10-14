@@ -2,10 +2,10 @@
 
 #[path = "active_size.rs"]
 mod active_size;
-#[path = "terminal_attach.rs"]
-mod terminal_attach;
 mod agent_prompt;
 mod layouts;
+#[path = "terminal_attach.rs"]
+mod terminal_attach;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -529,6 +529,7 @@ impl Daemon {
     }
 
     pub fn remove_client(&self, id: u64) {
+        log::info!("client {id} gone");
         self.clients.lock().remove(&id);
         for p in self.all_panes() {
             let mut st = p.state.lock();
@@ -1545,36 +1546,50 @@ impl Daemon {
                     st.info.program = program.map(ProgramDef::to_match);
                     st.program_name = program.filter(|_| programs.names).map(|d| d.name.clone());
                     let word = st.term.title().map(command_word).unwrap_or("").to_owned();
-                    st.program_command = match (program.filter(|_| programs.names), &fg, &executable) {
-                        // The command line the shell ran: its word started the program, an
-                        // alias or a function included (`lg` for lazygit). Only a program the
-                        // shell itself runs: lazygit's editor is not `lg`.
-                        (Some(_), Some(p), Some(_))
-                            if st.command_line.as_deref().is_some_and(|c| starts_command(c, &word))
-                                && st.info.pid.is_some_and(|sh| procinfo::parent(p.pid) == Some(sh)) =>
-                        {
-                            Some(word)
-                        }
-                        (Some(def), Some(p), Some(exe)) => {
-                            let key = (word.clone(), def.id.clone());
-                            let named = match &st.command_check {
-                                Some((k, named)) if *k == key => *named,
-                                _ => {
-                                    // The shell's PATH when it started, where it looked the word up.
-                                    let path = st
+                    st.program_command =
+                        match (program.filter(|_| programs.names), &fg, &executable) {
+                            // The command line the shell ran: its word started the program, an
+                            // alias or a function included (`lg` for lazygit). Only a program the
+                            // shell itself runs: lazygit's editor is not `lg`.
+                            (Some(_), Some(p), Some(_))
+                                if st
+                                    .command_line
+                                    .as_deref()
+                                    .is_some_and(|c| starts_command(c, &word))
+                                    && st
                                         .info
                                         .pid
-                                        .and_then(|pid| procinfo::env_var(pid, "PATH"))
-                                        .or_else(|| std::env::var("PATH").ok());
-                                    let named = names_program(&word, def, p, exe, &program_defs, path.as_deref());
-                                    st.command_check = Some((key, named));
-                                    named
-                                }
-                            };
-                            named.then_some(word)
-                        }
-                        _ => None,
-                    };
+                                        .is_some_and(|sh| procinfo::parent(p.pid) == Some(sh)) =>
+                            {
+                                Some(word)
+                            }
+                            (Some(def), Some(p), Some(exe)) => {
+                                let key = (word.clone(), def.id.clone());
+                                let named = match &st.command_check {
+                                    Some((k, named)) if *k == key => *named,
+                                    _ => {
+                                        // The shell's PATH when it started, where it looked the word up.
+                                        let path = st
+                                            .info
+                                            .pid
+                                            .and_then(|pid| procinfo::env_var(pid, "PATH"))
+                                            .or_else(|| std::env::var("PATH").ok());
+                                        let named = names_program(
+                                            &word,
+                                            def,
+                                            p,
+                                            exe,
+                                            &program_defs,
+                                            path.as_deref(),
+                                        );
+                                        st.command_check = Some((key, named));
+                                        named
+                                    }
+                                };
+                                named.then_some(word)
+                            }
+                            _ => None,
+                        };
                     st.info.title = pane_title(&st, fg.as_ref());
                     st.info.foreground = fg;
                     if let Some((due, _)) = &st.pending_input
@@ -2222,6 +2237,20 @@ impl Daemon {
                 client
                     .active_size
                     .store(has(thurm_proto::CAP_ACTIVE_SIZE), Ordering::Relaxed);
+                log::info!(
+                    "client {} hello: {name} (protocol {version}{}{})",
+                    client.id,
+                    if has(thurm_proto::CAP_MOBILE) {
+                        ", mobile"
+                    } else {
+                        ""
+                    },
+                    if has(thurm_proto::CAP_ACTIVE_SIZE) {
+                        ", active size"
+                    } else {
+                        ""
+                    },
+                );
                 *client.name.lock() = name;
                 Ok(Response::Hello {
                     version: PROTOCOL_VERSION,
@@ -2468,9 +2497,11 @@ impl Daemon {
             }
             Request::GetLayout => Ok(Response::Layout(self.sanitized_layout(&[]))),
             Request::ApplyLayout { json, timeout_ms } => {
-                let result = self.apply_layout(client.id, json, timeout_ms)
+                let result = self
+                    .apply_layout(client.id, json, timeout_ms)
                     .unwrap_or_else(|error| thurm_proto::LayoutResult {
-                        committed: false, error: Some(error),
+                        committed: false,
+                        error: Some(error),
                     });
                 Ok(Response::LayoutResult(result))
             }
@@ -2935,7 +2966,10 @@ fn pane_title(st: &PaneState, fg: Option<&thurm_proto::ProcessInfo>) -> String {
     if let Some(topic) = st.agent.state().and_then(|a| a.topic.as_ref()) {
         return topic.clone();
     }
-    let program = st.program_name.as_deref().filter(|_| st.agent.state().is_none());
+    let program = st
+        .program_name
+        .as_deref()
+        .filter(|_| st.agent.state().is_none());
     if let Some(t) = st.term.title().filter(|t| !t.trim().is_empty()) {
         return match (program, fg) {
             (Some(name), Some(p)) => with_program_name(t, p, name, st.program_command.as_deref()),
@@ -2976,7 +3010,10 @@ fn command_word(title: &str) -> &str {
 /// The command the shell's command line `line` runs, past variable assignments (`FOO=1 lg`).
 fn command_name(line: &str) -> Option<&str> {
     line.split_whitespace()
-        .find(|w| !w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && !k.contains('/')))
+        .find(|w| {
+            !w.split_once('=')
+                .is_some_and(|(k, _)| !k.is_empty() && !k.contains('/'))
+        })
         .map(command_word)
 }
 
@@ -3192,7 +3229,10 @@ mod tests {
         assert_eq!(t("nvim"), "Neovim");
         assert_eq!(t("/opt/homebrew/bin/nvim x"), "Neovim x");
         // The program's own title is left alone.
-        assert_eq!(t("package.json (~/apps) - NVIM"), "package.json (~/apps) - NVIM");
+        assert_eq!(
+            t("package.json (~/apps) - NVIM"),
+            "package.json (~/apps) - NVIM"
+        );
         assert_eq!(t("nvimx y"), "nvimx y");
         // The command that started Neovim (see names_program).
         assert_eq!(t("vim -R Cargo.toml ~/src"), "Neovim -R Cargo.toml ~/src");
@@ -3210,7 +3250,10 @@ mod tests {
         assert!(!starts_command("git status", "lg"));
         assert!(!starts_command("", ""));
         assert!(!starts_command("lg", ""));
-        assert_eq!(command_name("TOKEN=s3cret curl -H 'Authorization: x' url"), Some("curl"));
+        assert_eq!(
+            command_name("TOKEN=s3cret curl -H 'Authorization: x' url"),
+            Some("curl")
+        );
         assert_eq!(command_name("FOO=1"), None);
     }
 
@@ -3290,10 +3333,16 @@ mod tests {
             })
         };
         daemon.handle(&client, 7, Request::Shutdown { kill_panes: false });
-        assert!(watcher.join().unwrap() > 0, "shutdown was visible before its reply");
+        assert!(
+            watcher.join().unwrap() > 0,
+            "shutdown was visible before its reply"
+        );
         assert!(matches!(
             rx.try_recv(),
-            Ok(ServerMessage::Response { id: 7, result: Ok(Response::Ok) })
+            Ok(ServerMessage::Response {
+                id: 7,
+                result: Ok(Response::Ok)
+            })
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }

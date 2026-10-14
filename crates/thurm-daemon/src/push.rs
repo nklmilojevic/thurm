@@ -52,13 +52,30 @@ pub struct ActivityState {
 }
 
 impl ActivityState {
-    /// Same status and title (`since` only moves with them).
+    /// Nothing worth an update: same status, agent and prompt. Title changes ride along with
+    /// the next of those (agents animate their titles, and iOS budgets activity updates).
     fn same_as(&self, other: &ActivityState) -> bool {
         self.status == other.status
-            && self.title == other.title
             && self.agent == other.agent
             && self.permission == other.permission
     }
+}
+
+/// A title for the lock screen: without the spinners agents animate in it (braille, circles,
+/// stars), so it doesn't flicker or change for nothing.
+pub fn clean_title(title: &str) -> String {
+    let spinner =
+        |c: char| ('\u{2800}'..='\u{28FF}').contains(&c) || "◐◓◑◒◴◷◶◵✳✶✻✽✢✺·•⋯…".contains(c);
+    let words: Vec<&str> = title
+        .split_whitespace()
+        .filter(|w| !w.chars().all(spinner))
+        .collect();
+    let joined = words.join(" ");
+    joined
+        .trim_matches(|c: char| c == '|' || c == '-' || c == ':' || c.is_whitespace())
+        .chars()
+        .take(120)
+        .collect()
 }
 
 enum Job {
@@ -354,10 +371,17 @@ pub fn activity_state(info: &thurm_proto::PaneInfo, since: u64) -> Option<Activi
             AgentStatus::Idle => "idle",
         }
     };
+    // The agent's own name for the session when it has one ("Fix the sidebar"), else the title.
+    let title = agent
+        .topic
+        .as_deref()
+        .map(clean_title)
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| clean_title(&info.title));
     Some(ActivityState {
         agent: agent.name.clone(),
         status: status.to_owned(),
-        title: info.title.chars().take(120).collect(),
+        title,
         since,
         permission: agent.permission,
     })
@@ -436,6 +460,37 @@ mod tests {
         );
         assert_ne!(signature("key", 1, "body"), signature("key", 2, "body"));
         assert_ne!(signature("key", 1, "body"), signature("other", 1, "body"));
+    }
+
+    #[test]
+    fn titles_lose_their_spinners() {
+        assert_eq!(clean_title("⠴ ⠦ | nix-config"), "nix-config");
+        assert_eq!(clean_title("thurm ⠙"), "thurm");
+        assert_eq!(clean_title("◐ Fix the sidebar"), "Fix the sidebar");
+        assert_eq!(clean_title("✳ Translate ⠓⠑⠇⠇⠕"), "Translate");
+        assert_eq!(clean_title("Test | nix-config"), "Test | nix-config");
+    }
+
+    #[test]
+    fn title_changes_alone_are_not_updates() {
+        let a = ActivityState {
+            agent: "Codex".into(),
+            status: "working".into(),
+            title: "⠴ nix-config".into(),
+            since: 1,
+            permission: None,
+        };
+        let spun = ActivityState {
+            title: "⠦ nix-config".into(),
+            since: 2,
+            ..a.clone()
+        };
+        assert!(a.same_as(&spun));
+        let done = ActivityState {
+            status: "done".into(),
+            ..a.clone()
+        };
+        assert!(!a.same_as(&done));
     }
 
     #[test]

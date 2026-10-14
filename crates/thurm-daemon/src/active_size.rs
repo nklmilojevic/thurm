@@ -30,6 +30,12 @@ impl Daemon {
                 let used = TICK.fetch_add(1, Ordering::Relaxed);
                 st.wanted.insert(client.id, Wanted { size, used });
             }
+            log::info!(
+                "pane {pane}: client {} wants {}x{}",
+                client.id,
+                size.cols,
+                size.rows
+            );
             self.set_size(st, size);
         })
     }
@@ -53,9 +59,24 @@ impl Daemon {
             return;
         };
         if st.terminal_attachment.is_some() || gone.size != st.info.size {
+            log::info!(
+                "pane {}: client {client} left; it did not set the current {}x{}",
+                st.info.id,
+                st.info.size.cols,
+                st.info.size.rows
+            );
             return;
         }
-        if let Some(next) = st.wanted.values().max_by_key(|w| w.used).copied() {
+        let next = st.wanted.values().max_by_key(|w| w.used).copied();
+        log::info!(
+            "pane {}: client {client} left; size goes to {}",
+            st.info.id,
+            next.map_or("(nobody else wants one)".to_owned(), |n| format!(
+                "{}x{}",
+                n.size.cols, n.size.rows
+            ))
+        );
+        if let Some(next) = next {
             self.set_size(st, next.size);
         }
     }
