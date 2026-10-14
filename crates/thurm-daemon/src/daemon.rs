@@ -2536,6 +2536,7 @@ impl Daemon {
                 let state = self.with_pane(pane, |_, st| {
                     crate::push::activity_state(&st.info, crate::push::now())
                 })?;
+                log::info!("pane {pane}: a live activity follows it (device {device:.6}…)");
                 self.push.follow(&device, pane, token, state)?;
                 Ok(Response::Ok)
             }

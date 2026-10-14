@@ -100,6 +100,8 @@ pub struct Notice {
 }
 
 pub struct Pusher {
+    /// When each pane last sent a notice (see `notify`).
+    last_notice: Mutex<std::collections::HashMap<PaneId, std::time::Instant>>,
     devices: Mutex<Vec<Device>>,
     follows: Mutex<Vec<Follow>>,
     path: PathBuf,
@@ -129,6 +131,7 @@ impl Pusher {
             .unwrap_or_default();
         let (tx, rx) = bounded::<Job>(64);
         let pusher = Pusher {
+            last_notice: Mutex::new(std::collections::HashMap::new()),
             devices: Mutex::new(devices),
             follows: Mutex::new(follows),
             path,
@@ -220,9 +223,27 @@ impl Pusher {
     /// Queues `notice` for every registered device (dropped when the queue is full: a stuck
     /// relay must not hold up the daemon).
     pub fn notify(&self, notice: Notice) {
-        if !self.devices.lock().is_empty() {
-            let _ = self.tx.try_send(Job::Notice(notice));
+        if self.devices.lock().is_empty() || !self.fresh(&notice) {
+            return;
         }
+        let _ = self.tx.try_send(Job::Notice(notice));
+    }
+
+    /// One buzz per pane per moment: a turn's end often raises two notices together (finished,
+    /// then the agent's own "waiting for input"). Permission prompts always go: each has its
+    /// own Allow / Deny.
+    fn fresh(&self, notice: &Notice) -> bool {
+        const QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+        let now = std::time::Instant::now();
+        let mut last = self.last_notice.lock();
+        let recent = last
+            .get(&notice.pane)
+            .is_some_and(|t| now.duration_since(*t) < QUIET);
+        if recent && notice.permission.is_none() {
+            return false;
+        }
+        last.insert(notice.pane, now);
+        true
     }
 
     /// `device` follows `pane` in a Live Activity with push `token` (replacing an earlier one).
@@ -460,6 +481,25 @@ mod tests {
         );
         assert_ne!(signature("key", 1, "body"), signature("key", 2, "body"));
         assert_ne!(signature("key", 1, "body"), signature("other", 1, "body"));
+    }
+
+    #[test]
+    fn a_turns_notices_buzz_once_but_prompts_always() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-fresh-{}", std::process::id()));
+        let p = Pusher::new(&dir);
+        let n = |pane, permission| Notice {
+            pane,
+            title: "Claude Code".into(),
+            permission,
+        };
+        assert!(p.fresh(&n(1, None)));
+        assert!(
+            !p.fresh(&n(1, None)),
+            "the second notice of the same moment"
+        );
+        assert!(p.fresh(&n(2, None)), "another pane");
+        assert!(p.fresh(&n(1, Some(7))), "a permission prompt");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
