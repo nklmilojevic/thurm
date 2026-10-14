@@ -219,10 +219,16 @@ final class TerminalView: NSView, NSTextInputClient {
         updateScale()
     }
 
+    /// `.topLeft` on screen: AppKit flips this (flipped) view's layer, and gravity follows the
+    /// layer's own coordinates, where `.topLeft` is the bottom left on screen.
+    private var topLeftGravity: CALayerContentsGravity {
+        metalLayer?.contentsAreFlipped() == true ? .bottomLeft : .topLeft
+    }
+
     override func setFrameSize(_ newSize: NSSize) {
         let changed = newSize != frame.size
         if !holdGridSize && !waitingForResizeFrame {
-            metalLayer?.contentsGravity = .topLeft
+            metalLayer?.contentsGravity = topLeftGravity
         }
         super.setFrameSize(newSize)
         if holdGridSize {
@@ -300,8 +306,9 @@ final class TerminalView: NSView, NSTextInputClient {
         didSet {
             if holdGridSize {
                 waitingForResizeFrame = true
-                // Pin the held frame to the left edge so the text slides with the sidebar.
-                metalLayer?.contentsGravity = .topLeft
+                // Pin the held frame to the top left so the text moves with the pane's corner
+                // (the sidebar sliding, a split opening or closing above it).
+                metalLayer?.contentsGravity = topLeftGravity
             }
             guard oldValue, !holdGridSize else { return }
             updateGridSize()
@@ -1390,8 +1397,11 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     override func resetCursorRects() {
-        // Inset so the dividers' resize cursors (which extend into the panes) win.
-        addCursorRect(bounds.insetBy(dx: 4, dy: 4), cursor: .iBeam)
+        // Inset so the dividers' resize cursors (which extend into the panes) win. A pane
+        // opening or closing can be thinner than the inset, which leaves no rect (null).
+        let rect = bounds.insetBy(dx: 4, dy: 4)
+        guard !rect.isNull, !rect.isEmpty else { return }
+        addCursorRect(rect, cursor: .iBeam)
     }
 
     private func cellPosition(_ point: NSPoint) -> CellPosition {
