@@ -464,8 +464,7 @@ final class TabContentView: NSView {
             } else {
                 header.leadingInset = PaneHeader.leading
             }
-            view.frame = NSRect(x: inner.minX, y: inner.minY + PaneHeader.height, width: inner.width,
-                                height: max(0, inner.height - PaneHeader.height))
+            view.frame = terminalFrame(in: rect, cards: true)
         }
         chrome.isHidden = !cards
         if controls != settledControls {
@@ -511,6 +510,16 @@ final class TabContentView: NSView {
                                  width: size.width, height: size.height)
         }
         needsDisplay = true
+    }
+
+    /// A pane's terminal in its rectangle: all of it, or with cards inside the card's 1pt
+    /// border and below the header.
+    private func terminalFrame(in rect: CGRect, cards: Bool) -> CGRect {
+        guard cards else { return rect }
+        let inner = CGRect(x: rect.minX + 1, y: rect.minY + 1, width: max(0, rect.width - 2),
+                           height: max(0, rect.height - 2))
+        return NSRect(x: inner.minX, y: inner.minY + PaneHeader.height, width: inner.width,
+                      height: max(0, inner.height - PaneHeader.height))
     }
 
     /// `TerminalWindow.leadingControlsMaxX` in this view, when the panes run under the titlebar.
@@ -599,12 +608,16 @@ final class TabContentView: NSView {
         views.values.forEach { $0.holdGridSize = true }
         change()
         syncViews(keepingClosed: true)
-        // The new panes take their final size (the others hold theirs) before the move starts.
-        layoutPanes()
         let targets = Dictionary(targetFrames, uniquingKeysWith: { first, _ in first })
+        let cards = showsHeaders
         for id in Set(views.keys).subtracting(before) {
             guard let side = root.side(of: id), let rect = targets[id] else { continue }
             entering[id] = SplitNode.collapsed(rect, axis: side.axis, second: side.second)
+            // The new terminal takes its final grid size, unseen, before the move starts.
+            if let view = views[id] {
+                view.alphaValue = 0
+                view.frame = terminalFrame(in: rect, cards: cards)
+            }
         }
         for id in leaving.keys {
             guard let side = oldRoot.side(of: id), let rect = from[id] else { continue }
@@ -653,7 +666,7 @@ final class TabContentView: NSView {
         NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: area.minY - bounds.minY).fill()
         let bg = colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity)
         func surface(_ id: PaneKey) -> NSColor {
-            let scale = ChromePalette.dimmedBackgroundScale(drawn: views[id]?.dimDrawn ?? 0,
+            let scale = ChromePalette.dimmedBackgroundScale(drawn: (views[id] ?? leaving[id]?.view)?.dimDrawn ?? 0,
                                                             dim: cfg.unfocusedSplitDim,
                                                             isDark: cfg.theme.isDark)
             return NSColor(srgbRed: bg.redComponent * scale, green: bg.greenComponent * scale,
