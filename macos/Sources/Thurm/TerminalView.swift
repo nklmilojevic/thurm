@@ -592,7 +592,9 @@ final class TerminalView: NSView, NSTextInputClient {
         // grid draws whatever snapshot it has: its drawable keeps the size that snapshot had.
         let sized = renderer.snapshot.cols == cols && renderer.snapshot.rows == rows
         if sized { resizeTimedOut = false }
-        guard sized || resizeTimedOut || holdGridSize else {
+        // Only our own resize is waited for. A size another client set (the phone, while it is
+        // the one in use) is drawn as it is, pinned top left, until this view is used again.
+        guard sized || resizeTimedOut || holdGridSize || !waitingForResizeFrame else {
             needsRender = true
             return
         }

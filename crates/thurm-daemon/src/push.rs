@@ -63,13 +63,15 @@ impl ActivityState {
 
 enum Job {
     Notice(Notice),
-    Activity {
-        device: Device,
-        token: String,
-        pane: PaneId,
-        state: ActivityState,
-        end: bool,
-    },
+    Activity(Box<ActivityJob>),
+}
+
+struct ActivityJob {
+    device: Device,
+    token: String,
+    pane: PaneId,
+    state: ActivityState,
+    end: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,13 +140,14 @@ impl Pusher {
                                 }
                             }
                         }
-                        Job::Activity {
-                            device,
-                            token,
-                            pane,
-                            state,
-                            end,
-                        } => {
+                        Job::Activity(job) => {
+                            let ActivityJob {
+                                device,
+                                token,
+                                pane,
+                                state,
+                                end,
+                            } = *job;
                             let body = activity_body(&device, &token, pane, &state, end);
                             if let Err(e) = post(&agent, &device, "/v1/activity", &body) {
                                 log::warn!(
@@ -167,9 +170,25 @@ impl Pusher {
             return Err("push registration needs a device id and a secret".into());
         }
         let mut devices = self.devices.lock();
-        devices.retain(|d| d.device != device.device);
+        // The same phone registering again (a new relay, a new code) replaces its old
+        // registration, so it is not notified twice.
+        let replaced: Vec<String> = devices
+            .iter()
+            .filter(|d| {
+                d.device == device.device || (d.host == device.host && d.name == device.name)
+            })
+            .map(|d| d.device.clone())
+            .collect();
+        devices.retain(|d| !replaced.contains(&d.device));
         devices.push(device);
-        self.save(&devices)
+        self.save(&devices)?;
+        let mut follows = self.follows.lock();
+        let before = follows.len();
+        follows.retain(|f| !replaced.contains(&f.device));
+        if follows.len() != before {
+            save_json(&self.follows_path, &*follows)?;
+        }
+        Ok(())
     }
 
     pub fn unregister(&self, device: &str) -> Result<(), String> {
@@ -257,13 +276,13 @@ impl Pusher {
                 }),
             };
             if let Some((shown, end)) = shown {
-                let _ = self.tx.try_send(Job::Activity {
+                let _ = self.tx.try_send(Job::Activity(Box::new(ActivityJob {
                     device: device.clone(),
                     token: f.token.clone(),
                     pane,
                     state: shown,
                     end,
-                });
+                })));
             }
             changed = true;
             f.last = state.clone();
@@ -459,14 +478,29 @@ mod tests {
         p.register(d.clone()).unwrap();
         p.register(d.clone()).unwrap();
         let again = Pusher::new(&dir);
-        assert_eq!(*again.devices.lock(), vec![d]);
+        assert_eq!(*again.devices.lock(), vec![d.clone()]);
+        // The same phone through another relay replaces it; another phone does not.
+        let moved = Device {
+            device: "d2".into(),
+            relay: "https://other.example.net".into(),
+            ..d.clone()
+        };
+        p.register(moved.clone()).unwrap();
+        let ipad = Device {
+            device: "d3".into(),
+            name: "iPad".into(),
+            ..d.clone()
+        };
+        p.register(ipad.clone()).unwrap();
+        assert_eq!(*p.devices.lock(), vec![moved, ipad]);
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(dir.join("push-devices.json"))
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
-        again.unregister("d1").unwrap();
+        p.unregister("d2").unwrap();
+        p.unregister("d3").unwrap();
         assert!(Pusher::new(&dir).devices.lock().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
