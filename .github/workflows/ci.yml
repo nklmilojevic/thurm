@@ -27,6 +27,7 @@ jobs:
       release-scripts: ${{ steps.diff.outputs.release-scripts }}
       app-icon: ${{ steps.diff.outputs.app-icon }}
       docs: ${{ steps.diff.outputs.docs }}
+      ios: ${{ steps.diff.outputs.ios }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -58,6 +59,8 @@ jobs:
           area release-scripts '^(macos/build\.sh$|macos/compile-icon\.sh$|macos/package-dmg\.sh$|macos/release/|\.github/workflows/ci\.yml$)'
           area app-icon '^(macos/Resources/AppIcon\.icon/|macos/compile-icon\.sh$|macos/build\.sh$|\.github/workflows/ci\.yml$)'
           area docs '^(docs/|config\.example\.toml$|\.github/workflows/ci\.yml$)'
+          # The iOS app compiles the Mac app's renderer sources too.
+          area ios "^($rust|ios/|macos/Sources/Thurm/(Renderer|GlyphAtlas|FontShaper|BoxDrawing|Models)\.swift$|macos/Resources/AppIcon\.icon/)"
           cat "$GITHUB_OUTPUT"
 
   rust:
@@ -89,6 +92,34 @@ jobs:
         run: python3 scripts/third-party-licenses.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  ios:
+    name: iOS app
+    needs: changes
+    if: needs.changes.outputs.ios == 'true'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: 1.99.0
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+      - name: Core
+        run: PROFILE=debug ./ios/build-core.sh
+      - name: Project
+        run: brew install xcodegen && cd ios && xcodegen generate
+      - name: Test
+        run: |
+          set -o pipefail
+          cd ios
+          device=$(xcrun simctl list devices available -j \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for r in d for x in d[r] if "iPhone" in x["name"]))')
+          xcodebuild -project Thurm.xcodeproj -scheme Thurm -destination "id=$device" \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO test
 
   linux:
     # Remote hosts run the static musl builds of thurm and thurmd (remote workspaces).
