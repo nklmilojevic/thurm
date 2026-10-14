@@ -169,15 +169,22 @@ fn parse_probe(out: &str) -> HostInfo {
 
 /// Starts the host's daemon on `socket` unless one runs there already (`thurmd` exits at
 /// once when the socket answers).
+/// Starts the daemon on `$1` unless one answers there (thurmd exits then). `thurmd` is looked for
+/// next to `thurm`, and next to what `thurm` links to (`~/.local/bin/thurm` → the Mac app's
+/// `Contents/Helpers`), then on PATH.
+const START: &str = concat!(
+    "TH=\"${THURM_HOME:-$HOME}\"; ",
+    "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
+    "T=; P=\"$(command -v thurm)\"; ",
+    "if [ -n \"$P\" ]; then R=\"$(readlink -f \"$P\" 2>/dev/null)\"; ",
+    "for D in \"$(dirname \"$P\")\" \"$(dirname \"${R:-$P}\")\"; do ",
+    "if [ -x \"$D/thurmd\" ]; then T=\"$D/thurmd\"; break; fi; done; fi; ",
+    "[ -n \"$T\" ] || T=\"$(command -v thurmd)\"; ",
+    "[ -n \"$T\" ] || { echo \"thurmd is not installed\" >&2; exit 3; }; ",
+    "exec \"$T\" --daemonize --socket \"$1\" </dev/null >/dev/null 2>&1"
+);
+
 pub fn start_daemon(ssh: &dyn RemoteExec, socket: &str) -> Result<(), SshError> {
-    const START: &str = concat!(
-        "TH=\"${THURM_HOME:-$HOME}\"; ",
-        "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
-        "D=\"$(dirname \"$(command -v thurm)\")\"; ",
-        "if [ -x \"$D/thurmd\" ]; then T=\"$D/thurmd\"; else T=\"$(command -v thurmd)\"; fi; ",
-        "[ -n \"$T\" ] || { echo \"thurmd is not installed\" >&2; exit 3; }; ",
-        "exec \"$T\" --daemonize --socket \"$1\" </dev/null >/dev/null 2>&1"
-    );
     ssh.run(START, &[socket], None, Duration::from_secs(30))
         .map(|_| ())
 }
@@ -210,9 +217,44 @@ mod tests {
         );
     }
 
+    /// The Mac app's install: `~/.local/bin/thurm` links into the bundle, thurmd is beside the
+    /// link's target only.
+    #[test]
+    fn start_finds_thurmd_beside_a_linked_thurm() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let base = std::env::temp_dir().join(format!("thurm-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (home, helpers) = (base.join("home"), base.join("app/Helpers"));
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(&helpers).unwrap();
+        let marker = base.join("started");
+        for (name, body) in [
+            ("thurm", "#!/bin/sh\nexit 0\n".to_owned()),
+            ("thurmd", format!("#!/bin/sh\necho \"$@\" > {}\n", marker.display())),
+        ] {
+            let f = helpers.join(name);
+            std::fs::write(&f, body).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        symlink(helpers.join("thurm"), home.join(".local/bin/thurm")).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", START, "thurm", "/tmp/x.sock"])
+            .env("THURM_HOME", &home)
+            .env("THURM_BASE_PATH", "/usr/bin:/bin")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "--daemonize --socket /tmp/x.sock"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn scripts_are_safe_to_quote() {
         ssh::quote(PROBE).unwrap();
+        ssh::quote(START).unwrap();
         assert!(PROBE.contains(ssh::PRELUDE));
         assert!(PROBE.contains(ssh::REMOTE_PATH));
         assert!(PROBE.contains(ssh::REMOTE_BIN_DIR));
