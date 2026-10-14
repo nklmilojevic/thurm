@@ -231,14 +231,18 @@ pub struct Client {
     /// Approximate bytes queued in `tx` (see [`message_weight`]); the writer subtracts what it
     /// wrote.
     pub queued: std::sync::atomic::AtomicUsize,
+    /// Messages sent but not yet flushed to the socket; the writer subtracts them after a flush.
+    pub unflushed: std::sync::atomic::AtomicUsize,
 }
 
 impl Client {
     pub fn send(&self, msg: ServerMessage) {
         self.queued
             .fetch_add(message_weight(&msg), Ordering::Relaxed);
+        self.unflushed.fetch_add(1, Ordering::AcqRel);
         if self.tx.send(msg).is_err() {
             self.queued.store(0, Ordering::Relaxed);
+            self.unflushed.store(0, Ordering::Release);
         }
     }
 
@@ -460,10 +464,28 @@ impl Daemon {
             ui: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
+            unflushed: std::sync::atomic::AtomicUsize::new(0),
         });
         self.clients.lock().insert(id, client.clone());
         *self.last_activity.lock() = Instant::now();
         (client, rx)
+    }
+
+    /// Waits up to `timeout` for every client's sent messages to reach its socket, so the reply
+    /// to a shutdown request is not lost when the process exits right after.
+    pub fn wait_clients_flushed(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let pending = self
+                .clients
+                .lock()
+                .values()
+                .any(|c| c.unflushed.load(Ordering::Acquire) > 0);
+            if !pending {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     pub fn remove_client(&self, id: u64) {
@@ -3138,6 +3160,7 @@ mod tests {
             ui: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
+            unflushed: std::sync::atomic::AtomicUsize::new(0),
         };
         // A few big outputs are a backlog, not only thousands of messages.
         for _ in 0..70 {
