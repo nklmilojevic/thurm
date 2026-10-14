@@ -592,6 +592,24 @@ impl Terminal {
         self.vt.set_default_cursor(style, self.cfg.cursor_blink);
     }
 
+    /// Whether the cursor (now drawn as `shown`) follows the configured one rather than a
+    /// program's DECSCUSR, even one that chose the same cursor. libghostty-vt doesn't say, but
+    /// it moves only a cursor that follows the default to a new default: so one is tried, and
+    /// the configured one put back.
+    fn cursor_follows_default(&mut self, shown: vt::CursorVisual::Type) -> bool {
+        let probe = if shown == vt::CursorVisual::BLOCK {
+            vt::CursorStyle::UNDERLINE
+        } else {
+            vt::CursorStyle::BLOCK
+        };
+        self.vt.set_default_cursor(probe, self.cfg.cursor_blink);
+        self.render.update(&self.vt);
+        let follows = self.render.cursor().style != shown;
+        self.apply_cursor();
+        self.render.update(&self.vt);
+        follows
+    }
+
     fn apply_theme(&mut self) {
         self.vt.effects().dark = self.cfg.dark;
         self.vt.effects().copy_allowed =
@@ -2517,23 +2535,18 @@ impl Terminal {
         if kitty != 0 {
             out.push_str(&format!("\x1b[={kitty};1u"));
         }
-        // DECSCUSR (the render state's update keeps its dirty rows for the next frame). The
-        // configured cursor goes as a reset, so the copy keeps following `cursor.style` and
-        // `cursor.blink` when they change.
+        // DECSCUSR (the render state's update keeps its dirty rows for the next frame). A
+        // cursor that follows the configured one goes as a reset, so the copy keeps following
+        // `cursor.style` and `cursor.blink` when they change.
         self.render.update(&self.vt);
         let rc = self.render.cursor();
-        let style = match rc.style {
-            vt::CursorVisual::BAR => thurm_config::CursorStyle::Beam,
-            vt::CursorVisual::UNDERLINE => thurm_config::CursorStyle::Underline,
-            _ => thurm_config::CursorStyle::Block,
-        };
-        let code = if (style, rc.blinking) == (self.cfg.cursor_style, self.cfg.cursor_blink) {
+        let code = if self.cursor_follows_default(rc.style) {
             0
         } else {
-            let steady = match style {
-                thurm_config::CursorStyle::Beam => 6,
-                thurm_config::CursorStyle::Underline => 4,
-                thurm_config::CursorStyle::Block => 2,
+            let steady = match rc.style {
+                vt::CursorVisual::BAR => 6,
+                vt::CursorVisual::UNDERLINE => 4,
+                _ => 2,
             };
             steady - u8::from(rc.blinking)
         };

@@ -1768,6 +1768,24 @@ fn an_attached_copy_follows_a_new_cursor_style() {
 }
 
 #[test]
+fn a_program_cursor_like_the_default_stays_the_programs() {
+    let mut t = term(20, 4);
+    t.advance(b"\x1b[2 q");
+    let mut copy = term(20, 4);
+    copy.replay(&t.serialize_state());
+    let beam = EngineConfig {
+        cursor_style: thurm_config::CursorStyle::Beam,
+        ..EngineConfig::default()
+    };
+    t.set_config(beam.clone());
+    copy.set_config(beam);
+    for t in [&mut t, &mut copy] {
+        let c = t.snapshot(1, &mut ClientView::new()).unwrap().frame.cursor;
+        assert_eq!(c.shape, CursorShape::Block);
+    }
+}
+
+#[test]
 fn color_scheme_reports() {
     let mut t = term(20, 4);
     let mut cfg = EngineConfig {

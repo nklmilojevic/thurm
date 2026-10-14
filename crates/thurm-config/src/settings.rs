@@ -586,6 +586,7 @@ fn literal(kind: Kind, value: &Json) -> Result<String, String> {
                 .as_f64()
                 .filter(|x| x.is_finite())
                 .ok_or("expected a number")?;
+            within(x, range)?;
             let x = (x * 100.0).round() / 100.0;
             within(x, range)?;
             Ok(format!("{x:?}"))
@@ -908,11 +909,12 @@ mod tests {
             &json!(0.4302884615384616),
         )
         .unwrap();
-        set_at(&config, "terminal.scroll_multiplier", &json!(0.005)).unwrap();
+        set_at(&config, "terminal.scroll_multiplier", &json!(1.006)).unwrap();
         let text = std::fs::read_to_string(overlay::path_beside(&config)).unwrap();
         assert!(text.contains("unfocused_split_dim = 0.43\n"), "{text}");
-        assert!(text.contains("scroll_multiplier = 0.01\n"), "{text}");
-        assert!(set_at(&config, "terminal.scroll_multiplier", &json!(0.004)).is_err());
+        assert!(text.contains("scroll_multiplier = 1.01\n"), "{text}");
+        assert!(set_at(&config, "terminal.scroll_multiplier", &json!(0.005)).is_err());
+        assert!(set_at(&config, "window.opacity", &json!(1.004)).is_err());
         std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
     }
 
