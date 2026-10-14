@@ -46,6 +46,42 @@ impl std::fmt::Display for SshError {
 
 impl std::error::Error for SshError {}
 
+/// Runs remote scripts: the system `ssh` ([`Ssh`]) on the desktop, an in-process ssh session's
+/// exec channels in the iOS app.
+pub trait RemoteExec {
+    /// Runs `script` remotely (see [`remote_command`]) and returns its stdout. `input` is
+    /// written to its stdin.
+    fn run(
+        &self,
+        script: &str,
+        args: &[&str],
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<String, SshError>;
+}
+
+impl RemoteExec for Ssh {
+    fn run(
+        &self,
+        script: &str,
+        args: &[&str],
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<String, SshError> {
+        Ssh::run(self, script, args, input, timeout)
+    }
+}
+
+/// The remote command line for `script` with `args`: `sh -c '<script>' thurm '<arg>'...`.
+pub fn remote_command(script: &str, args: &[&str]) -> Result<String, String> {
+    let mut line = format!("sh -c {} thurm", quote(script)?);
+    for a in args {
+        line.push(' ');
+        line.push_str(&quote(a)?);
+    }
+    Ok(line)
+}
+
 /// How to run ssh for one `[[remote]]` host.
 #[derive(Debug, Clone)]
 pub struct Ssh {
@@ -101,11 +137,7 @@ impl Ssh {
 
     /// `ssh ... -T host sh -c '<script>' thurm '<arg>'...`, no forwarding of any kind.
     pub fn command(&self, script: &str, args: &[&str]) -> Result<Command, String> {
-        let mut line = format!("sh -c {} thurm", quote(script)?);
-        for a in args {
-            line.push(' ');
-            line.push_str(&quote(a)?);
-        }
+        let line = remote_command(script, args)?;
         let mut cmd = Command::new(&self.program);
         cmd.args(self.base_args())
             // A command connection forwards nothing, not even what the user's config asks for.

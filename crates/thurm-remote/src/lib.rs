@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub use ssh::{Ssh, SshError};
+pub use ssh::{RemoteExec, Ssh, SshError};
 
 /// What `thurm remote-info` prints on a host (JSON), so the app can tell whether that host
 /// runs its build without a daemon connection.
@@ -138,7 +138,7 @@ const PROBE: &str = concat!(
 );
 
 /// One ssh round trip: platform, install state and build of the host.
-pub fn probe(ssh: &Ssh) -> Result<HostInfo, SshError> {
+pub fn probe(ssh: &dyn RemoteExec) -> Result<HostInfo, SshError> {
     let out = ssh.run(PROBE, &[], None, Duration::from_secs(30))?;
     Ok(parse_probe(&out))
 }
@@ -169,7 +169,7 @@ fn parse_probe(out: &str) -> HostInfo {
 
 /// Starts the host's daemon on `socket` unless one runs there already (`thurmd` exits at
 /// once when the socket answers).
-pub fn start_daemon(ssh: &Ssh, socket: &str) -> Result<(), SshError> {
+pub fn start_daemon(ssh: &dyn RemoteExec, socket: &str) -> Result<(), SshError> {
     const START: &str = concat!(
         "TH=\"${THURM_HOME:-$HOME}\"; ",
         "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",

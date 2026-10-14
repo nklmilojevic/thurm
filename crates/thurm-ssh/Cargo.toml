@@ -1,0 +1,19 @@
+[package]
+name = "thurm-ssh"
+description = "In-process ssh transport to remote thurmd (the iOS app, which cannot run the system ssh)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thurm-proto.workspace = true
+thurm-client.workspace = true
+thurm-remote.workspace = true
+log.workspace = true
+serde.workspace = true
+russh = { version = "0.64", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+
+[dev-dependencies]
+p256 = { version = "0.14", features = ["ecdsa"] }
+tokio = { version = "1", features = ["macros"] }
