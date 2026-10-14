@@ -576,7 +576,6 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     private func renderNow() {
-        guard !holdGridSize else { return }
         lastRenderTime = CACurrentMediaTime()
         let perfStart = Perf.enabled ? CACurrentMediaTime() : 0
         defer { if Perf.enabled { Perf.shared.rendered(pane: pane, start: perfStart, generation: renderer.snapshot.info.generation) } }
@@ -589,14 +588,17 @@ final class TerminalView: NSView, NSTextInputClient {
         let oldCursor = (renderer.snapshot.info.cursor_col, renderer.snapshot.info.cursor_row)
         let perfGrid = Perf.enabled ? CACurrentMediaTime() : 0
         if renderer.snapshot.update(pane: pane) { accessibilityGridChanged() }
-        // A previous resize can still be in flight when another layout change occurs.
+        // A previous resize can still be in flight when another layout change occurs. A held
+        // grid draws whatever snapshot it has: its drawable keeps the size that snapshot had.
         let sized = renderer.snapshot.cols == cols && renderer.snapshot.rows == rows
         if sized { resizeTimedOut = false }
-        guard sized || resizeTimedOut else {
+        guard sized || resizeTimedOut || holdGridSize else {
             needsRender = true
             return
         }
-        if waitingForResizeFrame {
+        // A held grid keeps its drawable too: frames still draw (new output, the dim easing
+        // in or out during a layout move) at the held size, pinned to the top left.
+        if waitingForResizeFrame && !holdGridSize {
             waitingForResizeFrame = false
             updateDrawableSize()
         }
