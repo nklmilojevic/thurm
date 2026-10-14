@@ -162,6 +162,9 @@ final class MetalContext {
     let device: MTLDevice
     let queue: MTLCommandQueue
     let pipeline: MTLRenderPipelineState
+    /// For the dim and flash covers: shades the color under them in proportion to its alpha
+    /// and keeps that alpha, so a translucent pane stays as translucent as its gutters.
+    let coverPipeline: MTLRenderPipelineState
     /// 1×1 transparent texture bound when a slot has nothing to show.
     let emptyTexture: MTLTexture
     /// The most recently committed frame (all panes share this serial queue).
@@ -205,6 +208,11 @@ final class MetalContext {
             att.destinationRGBBlendFactor = .oneMinusSourceAlpha
             att.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            desc.label = "Thurm covers"
+            att.sourceRGBBlendFactor = .destinationAlpha
+            att.sourceAlphaBlendFactor = .zero
+            att.destinationAlphaBlendFactor = .one
+            coverPipeline = try device.makeRenderPipelineState(descriptor: desc)
         } catch {
             tlog("could not build the Metal pipeline: \(error)")
             return nil
@@ -512,6 +520,7 @@ final class TerminalRenderer {
                     clip = MTLScissorRect(x: 0, y: top, width: p.viewportWidth, height: max(0, height))
                 }
                 for (i, seg) in segments.enumerated() {
+                    if i == overlayStart { encoder.setRenderPipelineState(ctx.coverPipeline) }
                     encoder.setScissorRect(i >= overlayStart ? full : clip)
                     encoder.setVertexBufferOffset(seg.start * stride, index: 0)
                     encoder.setFragmentTexture(seg.texture ?? ctx.emptyTexture, index: 2)

@@ -633,6 +633,10 @@ pub fn paint(
         let _ = cr.restore();
     }
 
+    // The covers shade what is under them and keep its alpha (atop), so a translucent pane
+    // stays as translucent as its gutters.
+    let _ = cr.save();
+    cr.set_operator(cairo::Operator::Atop);
     if p.dim > 0.001 {
         rgba(cr, crate::config::blend(default_bg, 0x000000, 1.0 - p.dim_fill), p.dim);
         let _ = cr.paint();
@@ -641,6 +645,7 @@ pub fn paint(
         rgba(cr, default_fg, 0.22 * p.flash);
         let _ = cr.paint();
     }
+    let _ = cr.restore();
 }
 
 struct RowSrc<'a> {

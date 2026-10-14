@@ -344,6 +344,9 @@ final class TabContentView: NSView {
         }
         for id in root.panes where views[id] == nil {
             let view = TerminalView(pane: id)
+            view.onDimDrawn = { [weak self] in
+                if self?.showsHeaders == true { self?.needsDisplay = true }
+            }
             views[id] = view
             addSubview(view, positioned: .below, relativeTo: chrome)
         }
@@ -558,11 +561,16 @@ final class TabContentView: NSView {
             }
             return
         }
-        // Cards: the header strips in the terminal's color, under the headers. The gutters and
-        // outlines are `CardChrome`'s, drawn over the terminals' square corners.
+        // Cards: the header strips in the terminal's color, under the headers, shaded with the
+        // pane's dim. The gutters and outlines are `CardChrome`'s, drawn over the terminals'
+        // square corners.
         let bg = colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity)
-        bg.setFill()
-        for (_, rect) in visibleFrames {
+        for (id, rect) in visibleFrames {
+            let scale = ChromePalette.dimmedBackgroundScale(drawn: views[id]?.dimDrawn ?? 0,
+                                                            dim: cfg.unfocusedSplitDim,
+                                                            isDark: cfg.theme.isDark)
+            NSColor(srgbRed: bg.redComponent * scale, green: bg.greenComponent * scale,
+                    blue: bg.blueComponent * scale, alpha: bg.alphaComponent).setFill()
             NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: 1 + PaneHeader.height).fill()
         }
     }

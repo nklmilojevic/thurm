@@ -76,6 +76,12 @@ struct ChromePalette {
         guard dim > 0 else { return 0 }
         return Float(max(0, 1 - surfaceShade(isDark: isDark) / dim))
     }
+
+    /// The background of a pane drawn at `drawn` dim (on its way to `dim`), as a scale of the
+    /// undimmed background: what the dim cover leaves of it.
+    static func dimmedBackgroundScale(drawn: Float, dim: CGFloat, isDark: Bool) -> CGFloat {
+        CGFloat(1 - drawn * (1 - dimFill(dim: dim, isDark: isDark)))
+    }
 }
 
 extension AppConfig {

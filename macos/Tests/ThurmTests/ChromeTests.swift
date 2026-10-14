@@ -14,6 +14,16 @@ final class ChromeTests: XCTestCase {
         }
     }
 
+    /// An unfocused header strip follows the body: undimmed at 0, the gutter color at full dim.
+    func testDimmedHeaderFollowsTheBody() {
+        for dark in [true, false] {
+            let shade = ChromePalette.surfaceShade(isDark: dark)
+            XCTAssertEqual(ChromePalette.dimmedBackgroundScale(drawn: 0, dim: 0.25, isDark: dark), 1)
+            XCTAssertEqual(ChromePalette.dimmedBackgroundScale(drawn: 0.25, dim: 0.25, isDark: dark), 1 - shade,
+                           accuracy: 1e-5)
+        }
+    }
+
     func testDimWeakerThanShadeFillsBlack() {
         XCTAssertEqual(ChromePalette.dimFill(dim: 0, isDark: true), 0)
         XCTAssertEqual(ChromePalette.dimFill(dim: 0.1, isDark: true), 0)

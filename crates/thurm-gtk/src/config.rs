@@ -148,6 +148,11 @@ pub fn dim_fill(dim: f64, dark: bool) -> f64 {
     if dim <= 0.0 { 0.0 } else { (1.0 - surface_shade(dark) / dim).max(0.0) }
 }
 
+/// `bg` under the unfocused-split dim's cover: the gutter color once `dim` reaches the shade.
+pub fn dimmed_background(bg: u32, dim: f64, dark: bool) -> u32 {
+    blend(bg, 0x000000, dim * (1.0 - dim_fill(dim, dark)))
+}
+
 /// `a` moved `t` of the way to `b`.
 pub fn blend(a: u32, b: u32, t: f64) -> u32 {
     let ch = |s: u32| {
@@ -191,9 +196,11 @@ mod tests {
             for dim in [0.25, 0.5, 1.0] {
                 let fill = blend(bg, 0x000000, 1.0 - dim_fill(dim, dark));
                 let dimmed = blend(bg, fill, dim);
+                let header = dimmed_background(bg, dim, dark);
                 for s in [16, 8, 0] {
-                    let (a, b) = ((dimmed >> s) & 0xff, (gutter >> s) & 0xff);
+                    let (a, b, h) = ((dimmed >> s) & 0xff, (gutter >> s) & 0xff, (header >> s) & 0xff);
                     assert!(a.abs_diff(b) <= 1, "{bg:06x} at {dim}: {dimmed:06x} vs {gutter:06x}");
+                    assert!(h.abs_diff(b) <= 1, "{bg:06x} at {dim}: header {header:06x} vs {gutter:06x}");
                 }
             }
         }
