@@ -808,7 +808,7 @@ private func numericValue(_ value: Any?) -> Double? {
 }
 
 private func displayText(_ value: Double) -> String {
-    value == value.rounded() ? String(Int(value)) : String(value)
+    SettingNumber.format(value)
 }
 
 private func hexString(_ color: NSColor) -> String {

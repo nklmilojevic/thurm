@@ -659,6 +659,9 @@ impl Terminal {
         let graphics = (cfg.kitty_graphics, cfg.image_memory);
         let changed = graphics != (self.cfg.kitty_graphics, self.cfg.image_memory);
         let scheme_changed = cfg.dark != self.cfg.dark;
+        if cfg.scrollback != self.cfg.scrollback {
+            self.vt.set_scrollback(cfg.scrollback);
+        }
         self.cfg = cfg;
         // Programs that asked (mode 2031) hear about appearance changes.
         if scheme_changed && self.vt.mode(vt::mode(2031, false)) {
@@ -2514,14 +2517,26 @@ impl Terminal {
         if kitty != 0 {
             out.push_str(&format!("\x1b[={kitty};1u"));
         }
-        // DECSCUSR (the render state's update keeps its dirty rows for the next frame).
+        // DECSCUSR (the render state's update keeps its dirty rows for the next frame). The
+        // configured cursor goes as a reset, so the copy keeps following `cursor.style` and
+        // `cursor.blink` when they change.
         self.render.update(&self.vt);
         let rc = self.render.cursor();
-        let code = match rc.style {
-            vt::CursorVisual::BAR => 6,
-            vt::CursorVisual::UNDERLINE => 4,
-            _ => 2,
-        } - u8::from(rc.blinking);
+        let style = match rc.style {
+            vt::CursorVisual::BAR => thurm_config::CursorStyle::Beam,
+            vt::CursorVisual::UNDERLINE => thurm_config::CursorStyle::Underline,
+            _ => thurm_config::CursorStyle::Block,
+        };
+        let code = if (style, rc.blinking) == (self.cfg.cursor_style, self.cfg.cursor_blink) {
+            0
+        } else {
+            let steady = match style {
+                thurm_config::CursorStyle::Beam => 6,
+                thurm_config::CursorStyle::Underline => 4,
+                thurm_config::CursorStyle::Block => 2,
+            };
+            steady - u8::from(rc.blinking)
+        };
         out.push_str(&format!("\x1b[{code} q"));
         let (palette, defaults) = (self.vt.palette(), self.vt.default_palette());
         for i in 0..256usize {

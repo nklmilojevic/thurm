@@ -146,7 +146,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         let cfg = SessionManager.shared.config
         if cfg.sidebarTabs {
             window.tabStrip = nil
-            guard tabSplit == nil else { return }
+            if let tabSplit {
+                tabSplit.applyConfiguredWidth(cfg.sidebarWidth)
+                return
+            }
             let frame = window.frame
             window.suppressTabBar = true
             // The glass sidebar runs under the titlebar; the terminal keeps to the safe area.

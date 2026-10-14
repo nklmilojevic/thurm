@@ -78,6 +78,7 @@ struct SettingItem {
     var text: String {
         if let s = value as? String { return s }
         if let list = value as? [String] { return list.joined(separator: ", ") }
+        if let n = value as? NSNumber, kind == .float { return SettingNumber.format(n.doubleValue) }
         if let n = value as? NSNumber, kind != .bool { return n.stringValue }
         return ""
     }
@@ -348,8 +349,11 @@ enum SettingNumber {
         return value
     }
 
-    /// The value saved for `number` in a control of `kind`: whole numbers for `int` (rounded),
-    /// full precision for `float`. Nil when the number cannot be saved for that kind.
+    /// The decimals a `float` setting keeps.
+    static let decimals = 2
+
+    /// The value saved for `number` in a control of `kind`: whole numbers for `int`, two
+    /// decimals for `float` (rounded). Nil when the number cannot be saved for that kind.
     static func value(_ number: Double, kind: SettingKind) -> Any? {
         guard number.isFinite else { return nil }
         switch kind {
@@ -358,9 +362,27 @@ enum SettingNumber {
             // Stay well inside Int, so the conversion cannot trap.
             guard abs(whole) < 9.0e18 else { return nil }
             return Int(whole)
+        case .float:
+            return rounded(number)
         default:
             return number
         }
+    }
+
+    /// `number` to `decimals` places.
+    static func rounded(_ number: Double) -> Double {
+        let scale = pow(10, Double(decimals))
+        return (number * scale).rounded() / scale
+    }
+
+    /// `number` as a control shows it: at most `decimals` places, no trailing zeros.
+    static func format(_ number: Double) -> String {
+        var text = String(format: "%.\(decimals)f", rounded(number))
+        if text.contains(".") {
+            while text.hasSuffix("0") { text.removeLast() }
+            if text.hasSuffix(".") { text.removeLast() }
+        }
+        return text == "-0" ? "0" : text
     }
 }
 
