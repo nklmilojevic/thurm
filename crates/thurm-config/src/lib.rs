@@ -896,18 +896,19 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Per-user state directory for snapshots
-/// (`~/Library/Application Support/Thurm` on macOS, `~/.local/state/thurm` elsewhere).
+/// (`~/Library/Application Support/Thurm` on macOS and in the iOS app's container,
+/// `~/.local/state/thurm` elsewhere).
 pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("THURM_STATE_DIR") {
         return PathBuf::from(dir);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         dirs::data_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("Thurm")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     {
         dirs::state_dir()
             .or_else(dirs::data_local_dir)
@@ -1080,9 +1081,9 @@ pub fn remote_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("THURM_REMOTE_DIR") {
         return PathBuf::from(dir);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     let base = dirs::cache_dir().map(|d| d.join("Thurm"));
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     let base = dirs::cache_dir().map(|d| d.join("thurm"));
     base.unwrap_or_else(std::env::temp_dir).join("remote")
 }

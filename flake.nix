@@ -109,6 +109,11 @@
           "rust-src"
           "rust-analyzer"
         ];
+        # The iOS app's core (ios/build-core.sh).
+        targets = [
+          "aarch64-apple-ios"
+          "aarch64-apple-ios-sim"
+        ];
       };
     in
     {
@@ -135,6 +140,8 @@
           # Docs: cd docs && bun install && bun run dev
           bun
           gh
+          # ios/project.yml → Thurm.xcodeproj
+          xcodegen
         ];
 
         RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
@@ -142,7 +149,7 @@
         # No Nix compiler or SDK: cargo links with Xcode's clang, and swift/xcrun must see
         # Xcode's developer dir and SDK.
         shellHook = ''
-          unset DEVELOPER_DIR SDKROOT MACOSX_DEPLOYMENT_TARGET NIX_CFLAGS_COMPILE NIX_LDFLAGS
+          unset DEVELOPER_DIR SDKROOT MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET NIX_CFLAGS_COMPILE NIX_LDFLAGS
         '';
       };
 

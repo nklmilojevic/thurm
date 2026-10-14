@@ -14,8 +14,15 @@ thurm-proto.workspace = true
 thurm-config.workspace = true
 thurm-client.workspace = true
 thurm-term.workspace = true
-thurm-remote.workspace = true
+thurm-remote = { workspace = true, optional = true }
 serde.workspace = true
 parking_lot.workspace = true
 serde_json.workspace = true
 log.workspace = true
+
+[features]
+default = ["desktop"]
+# Remote workspaces over the system ssh (spawns processes; macOS and Linux front ends).
+desktop = ["dep:thurm-remote"]
+# The iOS app: no process spawning, remote hosts over an in-process ssh transport.
+mobile = []

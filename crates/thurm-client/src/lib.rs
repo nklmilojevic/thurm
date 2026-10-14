@@ -80,7 +80,7 @@ pub fn daemon_pid(socket: &Path) -> Option<u32> {
     use std::os::fd::AsRawFd;
     let stream = connect_daemon(socket).ok()?;
     let fd = stream.as_raw_fd();
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         let mut pid: libc::pid_t = 0;
         let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
@@ -95,7 +95,7 @@ pub fn daemon_pid(socket: &Path) -> Option<u32> {
         };
         (rc == 0 && pid > 0).then_some(pid as u32)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     {
         let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -320,6 +320,18 @@ impl Client {
         on_disconnect: impl FnOnce() + Send + 'static,
     ) -> Result<Arc<Client>, ClientError> {
         let stream = connect_socket(&opts)?;
+        Self::from_stream(stream, opts.client_name, opts.ui, on_event, on_disconnect)
+    }
+
+    /// Like [`Client::connect`], over an already connected stream: the daemon socket, or one end
+    /// of a pair whose other end a transport (an in-process ssh channel) relays to the daemon.
+    pub fn from_stream(
+        stream: UnixStream,
+        client_name: &str,
+        ui: bool,
+        on_event: impl Fn(Event) + Send + 'static,
+        on_disconnect: impl FnOnce() + Send + 'static,
+    ) -> Result<Arc<Client>, ClientError> {
         let read_half = stream.try_clone()?;
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
@@ -372,9 +384,9 @@ impl Client {
             })?;
 
         let hello = client.request(Request::Hello {
-            client: opts.client_name.to_owned(),
+            client: client_name.to_owned(),
             version: PROTOCOL_VERSION,
-            ui: opts.ui,
+            ui,
             capabilities: thurm_proto::CAPABILITIES
                 .iter()
                 .map(|c| (*c).to_owned())

@@ -2,9 +2,11 @@
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
+#[cfg(feature = "desktop")]
 mod remote;
 
 // For Rust front ends (thurm-gtk) linking this crate as a library.
+#[cfg(feature = "desktop")]
 pub use remote::{
     thurm_remote_call, thurm_remote_kick, thurm_remote_status_cb, thurm_remotes_start,
     thurm_remotes_stop, thurm_remotes_sync,
