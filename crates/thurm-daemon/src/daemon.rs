@@ -2231,12 +2231,15 @@ impl Daemon {
                 }
                 let has = |cap: &str| capabilities.iter().any(|c| c == cap);
                 client.ui.store(ui, Ordering::Relaxed);
-                client
-                    .mobile
-                    .store(has(thurm_proto::CAP_MOBILE), Ordering::Relaxed);
-                client
-                    .active_size
-                    .store(has(thurm_proto::CAP_ACTIVE_SIZE), Ordering::Relaxed);
+                // Capabilities belong to the client's build: a later Hello on the same connection
+                // (the Mac app asks again to read the daemon's version, without listing them)
+                // must not drop them.
+                if has(thurm_proto::CAP_MOBILE) {
+                    client.mobile.store(true, Ordering::Relaxed);
+                }
+                if has(thurm_proto::CAP_ACTIVE_SIZE) {
+                    client.active_size.store(true, Ordering::Relaxed);
+                }
                 log::info!(
                     "client {} hello: {name} (protocol {version}{}{})",
                     client.id,

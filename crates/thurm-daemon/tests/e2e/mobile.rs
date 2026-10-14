@@ -455,3 +455,42 @@ fn a_silent_phone_is_dropped_and_gives_the_pane_back() {
     }
     drop(phone);
 }
+
+/// The Mac app says Hello again on its connection (to read the daemon's version) without
+/// listing capabilities: its active size must survive that, or the phone keeps the pane.
+#[test]
+fn a_second_hello_keeps_the_clients_capabilities() {
+    let env = Env::new("second-hello");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let r = mac.request(Request::Hello {
+        client: "Thurm.app".into(),
+        version: PROTOCOL_VERSION,
+        ui: true,
+        capabilities: vec![],
+    });
+    assert!(matches!(r, Ok(Response::Hello { .. })), "{r:?}");
+    let (phone, _) = mobile(&env);
+    let pane = create(&mac, &env.dir);
+    mac.request(Request::Resize {
+        pane,
+        size: size(120, 40),
+    })
+    .unwrap();
+    phone
+        .request(Request::Resize {
+            pane,
+            size: size(50, 30),
+        })
+        .unwrap();
+    assert_eq!(pane_size(&mac, pane), (50, 30));
+    drop(phone);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pane_size(&mac, pane) != (120, 40) {
+        assert!(
+            Instant::now() < deadline,
+            "the Mac did not get its size back"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
