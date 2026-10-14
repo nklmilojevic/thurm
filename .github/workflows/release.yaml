@@ -496,3 +496,55 @@ jobs:
         run: |
           macos/release/ci-keychain.sh delete "$RUNNER_TEMP/thurm-signing.keychain-db"
           rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/sparkle-ed25519"
+
+  ios:
+    # The iOS app to TestFlight, from the same commit as the Mac build. Uses the App Store
+    # Connect API key the notarization uses (it needs the App Manager role) and the
+    # IOS_DEVELOPMENT_TEAM variable; skipped until that is set.
+    name: iOS (${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }})
+    needs: [plan, build]
+    if: always() && needs.build.result == 'success'
+    runs-on: macos-26
+    timeout-minutes: 90
+    concurrency:
+      group: release-ios-${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }}
+      cancel-in-progress: false
+    env:
+      DEVELOPMENT_TEAM: ${{ vars.IOS_DEVELOPMENT_TEAM }}
+    steps:
+      - name: Check the configuration
+        id: check
+        env:
+          HAVE_KEY: ${{ secrets.NOTARY_API_KEY_P8 != '' }}
+        run: |
+          if [[ -z "$DEVELOPMENT_TEAM" || "$HAVE_KEY" != true ]]; then
+            echo "::notice::iOS upload skipped: set the IOS_DEVELOPMENT_TEAM variable (and the NOTARY_API_KEY_* secrets)."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: steps.check.outputs.run == 'true'
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || needs.plan.outputs.sha }}
+          fetch-depth: 0 # the build number is the commit count
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        if: steps.check.outputs.run == 'true'
+        with:
+          toolchain: 1.99.0
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.check.outputs.run == 'true'
+        with:
+          version: 0.16.0
+      - name: Archive and upload
+        if: steps.check.outputs.run == 'true'
+        env:
+          ASC_KEY_P8: ${{ secrets.NOTARY_API_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+        run: |
+          brew install xcodegen
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)" \
+          BUILD_NUMBER="$(git rev-list --count HEAD)" \
+          ./ios/release/testflight.sh
