@@ -91,6 +91,8 @@ func colorFromRGB(_ rgb: UInt32, alpha: CGFloat = 1) -> NSColor {
 
 /// The UI relevant part of the user's config, parsed from `thurm_config_json()`
 /// (see `Config::ui_json` in crates/thurm-config).
+extension AppConfig: FontSettings {}
+
 final class AppConfig {
     // [font]
     var fontFamily = "JetBrains Mono"

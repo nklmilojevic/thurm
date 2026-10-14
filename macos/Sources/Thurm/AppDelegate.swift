@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             NSApp.terminate(nil)
             return
         }
+        FontShaper.settings = { (SessionManager.shared.config, SessionManager.shared.effectiveFontSize) }
         FontShaper.registerBundledFonts()
         Notifications.shared.setup()
         SecureInput.shared.restoreUserPreference()

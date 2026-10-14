@@ -7,6 +7,33 @@ func tlog(_ message: String) {
     NSLog("%@", "Thurm: " + message)
 }
 
+// MARK: - Panes
+
+/// A daemon the app talks to: this Mac's (`localHost`) or a `[[remote]]` host's, by name.
+typealias HostId = String
+
+/// This Mac's own daemon.
+let localHost: HostId = "local"
+
+/// A pane is identified by its daemon and that daemon's id: two daemons number their panes
+/// independently, so ids alone collide.
+struct PaneKey: Hashable, CustomStringConvertible {
+    let host: HostId
+    let id: UInt64
+
+    init(_ host: HostId, _ id: UInt64) {
+        self.host = host
+        self.id = id
+    }
+
+    static func local(_ id: UInt64) -> PaneKey { PaneKey(localHost, id) }
+
+    var isRemote: Bool { host != localHost }
+    /// The id as request payloads carry it.
+    var number: NSNumber { NSNumber(value: id) }
+    var description: String { isRemote ? "\(host):\(id)" : "\(id)" }
+}
+
 // MARK: - Constants mirrored from thurm.h
 //
 // The C enums in thurm.h are anonymous, which Swift imports with platform dependent integer
