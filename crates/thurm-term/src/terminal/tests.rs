@@ -1110,6 +1110,33 @@ fn a_reloaded_scrollback_applies_to_a_running_terminal() {
 }
 
 #[test]
+fn a_smaller_reloaded_scrollback_drops_history_now() {
+    let cfg = EngineConfig {
+        scrollback: 10_000,
+        ..EngineConfig::default()
+    };
+    let mut t = Terminal::new(
+        PaneSize {
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        },
+        cfg.clone(),
+    );
+    let out: String = (0..8_000).map(|i| format!("line {i}\r\n")).collect();
+    t.advance(out.as_bytes());
+    assert!(t.vt.history() >= 7_000, "{} lines kept", t.vt.history());
+    t.set_config(EngineConfig {
+        scrollback: 1_000,
+        ..cfg
+    });
+    // Whole pages go, so a page past the limit (and its margin) may stay.
+    let kept = t.vt.history();
+    assert!((1_000..3_000).contains(&kept), "{kept} lines kept");
+}
+
+#[test]
 fn kitty_png_images_are_decoded() {
     use base64::Engine;
     let mut png = Vec::new();
