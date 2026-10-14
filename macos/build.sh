@@ -257,12 +257,14 @@ DEST_DIR=/Applications
 [[ -w "$DEST_DIR" ]] || { DEST_DIR="$HOME/Applications"; mkdir -p "$DEST_DIR"; }
 DEST="$DEST_DIR/Thurm.app"
 
-if pgrep -xq Thurm; then
+# The Mac app only: the iOS app in a simulator runs a process named Thurm too.
+mac_app_running() { pgrep -qf '\.app/Contents/MacOS/Thurm$'; }
+if mac_app_running; then
     log "Quitting Thurm (tabs stay open in the daemon)"
     osascript -e 'tell application id "com.thurm.terminal" to quit' >/dev/null 2>&1 \
         || osascript -e 'tell application "Thurm" to quit' >/dev/null 2>&1 || true
-    for _ in $(seq 1 40); do pgrep -xq Thurm || break; sleep 0.25; done
-    pgrep -xq Thurm && die "Thurm is still running; quit it and run again"
+    for _ in $(seq 1 40); do mac_app_running || break; sleep 0.25; done
+    mac_app_running && die "Thurm is still running; quit it and run again"
 fi
 
 log "Installing $DEST"
