@@ -38,6 +38,8 @@ pub struct Config {
     pub ai: AiConfig,
     pub updates: UpdatesConfig,
     pub quick_terminal: QuickTerminalConfig,
+    /// Agent notifications to paired phones, through a push relay (`[push]`).
+    pub push: PushConfig,
     /// Extra key bindings: `"cmd+shift+d" = "split_down"`.
     pub keybindings: std::collections::BTreeMap<String, String>,
     /// Other machines running `thurmd`, shown as remote workspaces (`[[remote]]`).
@@ -772,6 +774,18 @@ impl AiConfig {
     pub fn explain(&self) -> bool {
         self.enabled && self.explain
     }
+}
+
+/// Push notifications to the iOS app. The phone registers with `relay` (handed to it in the
+/// pairing code, with `code`) and gives each daemon its device id and secret; the daemon then
+/// posts agent notices there. Off while `relay` is empty.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct PushConfig {
+    /// Base URL of the push relay, e.g. `https://push.example.net`.
+    pub relay: String,
+    /// Registration code the relay asks of new devices (put in the pairing code).
+    pub code: String,
 }
 
 /// Automatic updates (Sparkle), read by the app.

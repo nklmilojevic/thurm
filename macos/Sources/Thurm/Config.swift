@@ -170,6 +170,13 @@ final class AppConfig {
     // [ai]
     var aiExplain = false
 
+    // [push]
+    struct Push {
+        var relay: String?
+        var code: String?
+    }
+    var push = Push()
+
     // [updates]
     var updateChannel = "auto"
     var checkForUpdates = true
@@ -329,6 +336,10 @@ final class AppConfig {
         }
         if let ai = c["ai"] as? [String: Any] {
             aiExplain = (jsonBool(ai["enabled"]) ?? false) && (jsonBool(ai["explain"]) ?? true)
+        }
+        if let p = c["push"] as? [String: Any] {
+            push = Push(relay: jsonString(p["relay"]).flatMap { $0.isEmpty ? nil : $0 },
+                        code: jsonString(p["code"]).flatMap { $0.isEmpty ? nil : $0 })
         }
         if let u = c["updates"] as? [String: Any] {
             updateChannel = jsonString(u["channel"]) ?? updateChannel

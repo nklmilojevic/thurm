@@ -241,6 +241,12 @@ notifications = true
 # Edit > Explain Last Command and `thurm explain`.
 explain = true
 
+[push]
+# Agent notifications on paired iPhones and iPads go through this push relay (empty: off).
+relay = ""
+# The code the relay asks of new devices; Pair iPhone puts it in the pairing code.
+code = ""
+
 [updates]
 # "release" (tagged releases), "tip" (a build of every commit to main), or "auto": the
 # channel of the installed build. Also under Thurm > Update Channel.

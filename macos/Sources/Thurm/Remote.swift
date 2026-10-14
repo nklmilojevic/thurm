@@ -764,6 +764,7 @@ extension SessionManager {
 enum RemoteHostSheet: Hashable, Identifiable {
     case add
     case details(HostId)
+    case pairPhone
 
     var id: Self { self }
 }
