@@ -576,7 +576,6 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     private func renderNow() {
-        guard !holdGridSize else { return }
         lastRenderTime = CACurrentMediaTime()
         let perfStart = Perf.enabled ? CACurrentMediaTime() : 0
         defer { if Perf.enabled { Perf.shared.rendered(pane: pane, start: perfStart, generation: renderer.snapshot.info.generation) } }
@@ -596,7 +595,9 @@ final class TerminalView: NSView, NSTextInputClient {
             needsRender = true
             return
         }
-        if waitingForResizeFrame {
+        // A held grid keeps its drawable too: frames still draw (new output, the dim easing
+        // in or out during a layout move) at the held size, pinned to the top left.
+        if waitingForResizeFrame && !holdGridSize {
             waitingForResizeFrame = false
             updateDrawableSize()
         }
