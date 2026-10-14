@@ -58,6 +58,7 @@ pub const CAPABILITIES: &[&str] = &[
     "temp-file",
     "remote-layout",
     CAP_ACTIVE_SIZE,
+    "push",
 ];
 
 /// The pane takes the size of the client that used it last (see the daemon's `active_size`)
@@ -310,6 +311,21 @@ pub enum Request {
     /// Transfer pane ownership to the selected desktop before it installs the tab.
     CommitLayout {
         request_id: u64,
+    },
+    /// The iOS app asks for this daemon's agent notices on its lock screen: they are posted to
+    /// `relay` for `device`, signed with `secret` (HMAC-SHA256). `host` is what the app calls
+    /// this daemon, sent back so a notification action reaches it; `name` names the device.
+    /// Registering the same device again replaces it.
+    RegisterPushDevice {
+        device: String,
+        relay: String,
+        secret: String,
+        host: String,
+        name: String,
+    },
+    /// Stops the notices for `device`.
+    UnregisterPushDevice {
+        device: String,
     },
 }
 

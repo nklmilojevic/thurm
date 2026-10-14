@@ -237,3 +237,103 @@ fn mobile_clients_get_notifications_but_no_window_commands() {
         }
     }
 }
+
+/// A relay that answers 200 to every request and hands over each one's headers and body.
+fn fake_relay() -> (String, Receiver<(String, String)>) {
+    use std::io::{BufRead, BufReader, Read};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (tx, rx) = unbounded();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            let mut len = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+                head.push_str(&line);
+            }
+            let mut body = vec![0; len];
+            let _ = reader.read_exact(&mut body);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let _ = tx.send((head, String::from_utf8_lossy(&body).into_owned()));
+        }
+    });
+    (url, rx)
+}
+
+#[test]
+fn permission_prompts_reach_registered_phones_when_the_app_is_closed() {
+    let env = Env::new("push");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (relay, posts) = fake_relay();
+    let r = mac.request(Request::RegisterPushDevice {
+        device: "dev-1".into(),
+        relay,
+        secret: "s".repeat(64),
+        host: "studio".into(),
+        name: "iPhone".into(),
+    });
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+
+    let pane = create(&mac, &env.dir);
+    mac.request(Request::Input {
+        pane,
+        data: b"/bin/cat\r".to_vec(),
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(mac.request(Request::PaneInfo { pane }), Ok(Response::PaneInfo(i))
+        if i.foreground.as_ref().is_some_and(|f| f.name == "cat"))
+    {
+        assert!(Instant::now() < deadline, "cat never became the foreground");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+
+    let (head, body) = posts
+        .recv_timeout(Duration::from_secs(10))
+        .expect("nothing reached the relay");
+    assert!(head.starts_with("POST /v1/push "), "{head}");
+    let lower = head.to_ascii_lowercase();
+    assert!(lower.contains("x-thurm-signature:"), "{head}");
+    assert!(lower.contains("x-thurm-timestamp:"), "{head}");
+    let b: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(b["device"], "dev-1");
+    assert_eq!(b["host"], "studio");
+    assert_eq!(b["pane"], pane);
+    assert!(b["permission"].is_u64(), "{body}");
+    assert_eq!(b["body"], "asks for permission");
+
+    // With the app open, the phone hears it live instead.
+    let (_phone, phone_events) = mobile(&env);
+    hook(&mac, pane, "stop", None);
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if let Event::Notify {
+            permission: Some(_),
+            ..
+        } = phone_events
+            .recv_timeout(left)
+            .expect("the open app got no notice")
+        {
+            break;
+        }
+    }
+    assert!(
+        posts.recv_timeout(Duration::from_secs(1)).is_err(),
+        "pushed while the app was open"
+    );
+}

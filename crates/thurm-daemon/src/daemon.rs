@@ -360,6 +360,8 @@ pub struct Daemon {
     git_rx: crossbeam_channel::Receiver<(PaneId, String)>,
     ai: ai::Model,
     ai_tx: Sender<AiJob>,
+    /// Agent notices to paired phones.
+    push: crate::push::Pusher,
     ai_rx: Receiver<AiJob>,
     store: Option<Store>,
     /// One session save at a time: the monitor's autosave, SIGTERM, upgrades and requests.
@@ -414,6 +416,7 @@ impl Daemon {
             git_rx: git_channel.1,
             ai: ai::Model::new(),
             ai_tx: ai_channel.0,
+            push: crate::push::Pusher::new(&thurm_config::state_dir()),
             ai_rx: ai_channel.1,
             store,
             save_lock: Mutex::new(()),
@@ -446,6 +449,21 @@ impl Daemon {
     /// the other way round.
     fn broadcast(&self, event: Event, ui_only: bool) {
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
+        // A phone with the app open hears it live; otherwise its lock screen does.
+        if let Event::Notify {
+            pane,
+            title,
+            permission,
+            ..
+        } = &event
+            && !clients.iter().any(|c| c.mobile.load(Ordering::Relaxed))
+        {
+            self.push.notify(crate::push::Notice {
+                pane: *pane,
+                title: title.clone(),
+                permission: *permission,
+            });
+        }
         let desktop_only = matches!(event, Event::Ui(_));
         for c in clients {
             let app =
@@ -2447,6 +2465,26 @@ impl Daemon {
                         committed: false, error: Some(error),
                     });
                 Ok(Response::LayoutResult(result))
+            }
+            Request::RegisterPushDevice {
+                device,
+                relay,
+                secret,
+                host,
+                name,
+            } => {
+                self.push.register(crate::push::Device {
+                    device,
+                    relay,
+                    secret,
+                    host,
+                    name,
+                })?;
+                Ok(Response::Ok)
+            }
+            Request::UnregisterPushDevice { device } => {
+                self.push.unregister(&device)?;
+                Ok(Response::Ok)
             }
             Request::CommitLayout { request_id } => {
                 self.commit_layout(client.id, request_id)?;
