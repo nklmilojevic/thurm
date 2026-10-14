@@ -14,12 +14,27 @@ enum Motion {
     /// cubic-bezier(0.4, -0.4, 0.2, 1.2): a quick start that settles with a 1.7% overshoot.
     static let curve = CubicBezier(x1: 0.4, y1: -0.4, x2: 0.2, y2: 1.2)
     static let timingFunction = CAMediaTimingFunction(controlPoints: 0.4, -0.4, 0.2, 1.2)
+    /// cubic-bezier(0.2, 0.9, 0.3, 1.0): split panes opening and closing. Most of the way in the
+    /// first moments, then a long settle with no overshoot, so a growing pane never pokes past
+    /// its place.
+    static let paneCurve = CubicBezier(x1: 0.2, y1: 0.9, x2: 0.3, y2: 1.0)
 
     /// Whether the user asked for less motion (Accessibility > Display > Reduce motion).
     static var reduced: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     /// `duration`, or 0 under reduce motion: callers then apply the end state at once.
     static func duration(_ duration: TimeInterval) -> TimeInterval { reduced ? 0 : duration }
+
+    /// The opacity of content that appears or disappears with a layout move at eased progress
+    /// `t`: leaving content smoothsteps out over the first half, arriving content waits out the
+    /// first half and smoothsteps in over the second, so the two never show at once.
+    static func crossFade(_ t: Double, appearing: Bool) -> Double {
+        func smoothstep(_ u: Double) -> Double {
+            let u = min(1, max(0, u))
+            return u * u * (3 - 2 * u)
+        }
+        return appearing ? smoothstep(2 * t - 1) : 1 - smoothstep(2 * t)
+    }
 }
 
 /// A CSS-style cubic-bezier timing curve. `value(at:)` maps a time fraction to eased progress: it
@@ -73,16 +88,18 @@ struct Tween {
     private(set) var to: Double
     private var start: CFTimeInterval = 0
     private var duration: TimeInterval = 0
+    private let curve: CubicBezier
 
-    init(_ value: Double) {
+    init(_ value: Double, curve: CubicBezier = Motion.curve) {
         from = value
         to = value
+        self.curve = curve
     }
 
     func value(at now: CFTimeInterval) -> Double {
         guard duration > 0 else { return to }
         let t = min(1, max(0, (now - start) / duration))
-        return from + (to - from) * Motion.curve.value(at: t)
+        return from + (to - from) * curve.value(at: t)
     }
 
     func isFinished(at now: CFTimeInterval) -> Bool {

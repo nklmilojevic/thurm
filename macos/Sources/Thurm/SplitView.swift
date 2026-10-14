@@ -90,6 +90,26 @@ indirect enum SplitNode {
         }
     }
 
+    /// The split that holds `id` as a direct child: its axis, and whether `id` is the second
+    /// (right or bottom) child. Nil for a lone pane or one not in the tree.
+    func side(of id: PaneKey) -> (axis: SplitAxis, second: Bool)? {
+        guard case .split(let axis, _, let first, let second) = self else { return nil }
+        if case .leaf(let leaf) = first, leaf == id { return (axis, false) }
+        if case .leaf(let leaf) = second, leaf == id { return (axis, true) }
+        return first.side(of: id) ?? second.side(of: id)
+    }
+
+    /// `rect` flattened onto its outer edge along `axis`: the far edge for a second child, the
+    /// near one for a first. A pane opens out of this edge and closes into it.
+    static func collapsed(_ rect: CGRect, axis: SplitAxis, second: Bool) -> CGRect {
+        switch axis {
+        case .horizontal:
+            return CGRect(x: second ? rect.maxX : rect.minX, y: rect.minY, width: 0, height: rect.height)
+        case .vertical:
+            return CGRect(x: rect.minX, y: second ? rect.maxY : rect.minY, width: rect.width, height: 0)
+        }
+    }
+
     /// Frames of every pane inside `rect`, leaving `gap` points for each divider.
     func frames(in rect: CGRect, gap: CGFloat) -> [(PaneKey, CGRect)] {
         switch self {
@@ -230,10 +250,16 @@ final class TabContentView: NSView {
     private(set) var findBar: FindBar?
     private var updateBadge: UpdateBadge?
     private var dragging: SplitDivider?
-    /// Pane rectangles where a zoom change started; `zoomProgress` eases them to the layout.
-    private var zoomFrom: [PaneKey: CGRect] = [:]
-    private var zoomProgress = Tween(1)
-    private let zoomMotion = MotionDriver()
+    /// Pane rectangles where a layout move (zoom, a pane opening or closing) started;
+    /// `layoutProgress` eases them to the layout.
+    private var motionFrom: [PaneKey: CGRect] = [:]
+    private var layoutProgress = Tween(1)
+    private let layoutMotion = MotionDriver()
+    /// Panes opening in the current move, from the split edge they grow out of.
+    private var entering: [PaneKey: CGRect] = [:]
+    /// Panes closing in the current move: their views (detached, showing their last frame) and
+    /// headers, and the split edge they shrink into. They go once the move settles.
+    private var leaving: [PaneKey: (view: TerminalView, header: PaneHeader?, to: CGRect)] = [:]
     /// Path of the divider under the pointer or being dragged, and how far its highlight has
     /// eased in.
     private var highlightedPath: [Bool]?
@@ -275,19 +301,35 @@ final class TabContentView: NSView {
     }
     private var splitGap: CGFloat { showsHeaders ? cardGap : Self.gap }
 
-    /// Each visible pane's rectangle: its card with headers, else its whole view. During a zoom
-    /// change, the rectangles on the way from where the panes were.
+    private var isMoving: Bool { !layoutProgress.isFinished(at: CACurrentMediaTime()) }
+
+    /// Each visible pane's rectangle: its card with headers, else its whole view. During a layout
+    /// move, the rectangles on the way from where the panes were.
     private var visibleFrames: [(PaneKey, CGRect)] {
         let targets = targetFrames
         let now = CACurrentMediaTime()
-        guard !zoomProgress.isFinished(at: now) else { return targets }
-        let t = CGFloat(zoomProgress.value(at: now))
+        guard !layoutProgress.isFinished(at: now) else { return targets }
+        let t = CGFloat(layoutProgress.value(at: now))
         let moving = targets.map { id, rect in
-            (id, Self.blend(zoomFrom[id] ?? zoomFrom.values.first ?? rect, rect, t))
+            (id, Self.blend(motionFrom[id] ?? entering[id] ?? motionFrom.values.first ?? rect, rect, t))
         }
-        // Panes leaving the layout hold their old rectangles until the zoom settles.
-        let leaving = zoomFrom.filter { id, _ in !targets.contains { $0.0 == id } }
-        return moving + leaving.map { ($0.key, $0.value) }
+        // Panes hidden by a zoom hold their old rectangles until it settles; closing ones
+        // shrink into their split edge.
+        let held = motionFrom.filter { id, _ in leaving[id] == nil && !targets.contains { $0.0 == id } }
+        let closing = leaving.compactMap { id, pane in
+            motionFrom[id].map { (id, Self.blend($0, pane.to, t)) }
+        }
+        return moving + held.map { ($0.key, $0.value) } + closing
+    }
+
+    /// How much of a pane's content shows during a layout move: opening panes fade in, closing
+    /// ones fade out (see `Motion.crossFade`).
+    private func contentOpacity(_ id: PaneKey, at now: CFTimeInterval) -> CGFloat {
+        guard !layoutProgress.isFinished(at: now) else { return 1 }
+        let t = layoutProgress.value(at: now)
+        if entering[id] != nil { return CGFloat(Motion.crossFade(t, appearing: true)) }
+        if leaving[id] != nil { return CGFloat(Motion.crossFade(t, appearing: false)) }
+        return 1
     }
 
     private var targetFrames: [(PaneKey, CGRect)] {
@@ -333,14 +375,21 @@ final class TabContentView: NSView {
 
     // MARK: View management
 
-    /// Creates views for new panes and removes views of panes no longer in the tree.
-    private func syncViews() {
+    /// Creates views for new panes and removes views of panes no longer in the tree. With
+    /// `keepingClosed`, the views of removed panes stay on screen in `leaving` for a layout move
+    /// to close (the move fills in where they shrink to).
+    private func syncViews(keepingClosed: Bool = false) {
         let ids = Set(root.panes)
         for (id, view) in views where !ids.contains(id) {
             view.detach()
-            view.removeFromSuperview()
             views.removeValue(forKey: id)
-            headers.removeValue(forKey: id)?.removeFromSuperview()
+            let header = headers.removeValue(forKey: id)
+            if keepingClosed {
+                leaving[id] = (view, header, .zero)
+            } else {
+                view.removeFromSuperview()
+                header?.removeFromSuperview()
+            }
         }
         for id in root.panes where views[id] == nil {
             let view = TerminalView(pane: id)
@@ -384,15 +433,21 @@ final class TabContentView: NSView {
             headers[id]?.isHidden = !visible.contains(id)
         }
         updateDimming()
+        let now = CACurrentMediaTime()
         for (id, rect) in frames {
-            guard let view = views[id] else { continue }
+            guard let view = views[id] ?? leaving[id]?.view else { continue }
+            let opacity = contentOpacity(id, at: now)
+            view.alphaValue = opacity
             guard cards else {
+                leaving[id]?.header?.isHidden = true
                 view.frame = rect
                 continue
             }
-            // Inside the card's 1pt border: the header, then the terminal.
-            let inner = rect.insetBy(dx: 1, dy: 1)
-            let header = headers[id] ?? {
+            // Inside the card's 1pt border: the header, then the terminal. Not `insetBy`: a
+            // card opening or closing gets thinner than its border, and that inset is null.
+            let inner = CGRect(x: rect.minX + 1, y: rect.minY + 1, width: max(0, rect.width - 2),
+                               height: max(0, rect.height - 2))
+            let header = headers[id] ?? leaving[id]?.header ?? {
                 let h = PaneHeader(pane: id)
                 h.content = self
                 headers[id] = h
@@ -400,6 +455,7 @@ final class TabContentView: NSView {
                 return h
             }()
             header.isHidden = false
+            header.alphaValue = opacity
             header.frame = NSRect(x: inner.minX, y: inner.minY, width: inner.width, height: PaneHeader.height)
             // A top pane at the window's leading edge (sidebar collapsed) keeps its icon and
             // title clear of the traffic lights and toolbar buttons.
@@ -408,8 +464,7 @@ final class TabContentView: NSView {
             } else {
                 header.leadingInset = PaneHeader.leading
             }
-            view.frame = NSRect(x: inner.minX, y: inner.minY + PaneHeader.height, width: inner.width,
-                                height: max(0, inner.height - PaneHeader.height))
+            view.frame = terminalFrame(in: rect, cards: true)
         }
         chrome.isHidden = !cards
         if controls != settledControls {
@@ -455,6 +510,16 @@ final class TabContentView: NSView {
                                  width: size.width, height: size.height)
         }
         needsDisplay = true
+    }
+
+    /// A pane's terminal in its rectangle: all of it, or with cards inside the card's 1pt
+    /// border and below the header.
+    private func terminalFrame(in rect: CGRect, cards: Bool) -> CGRect {
+        guard cards else { return rect }
+        let inner = CGRect(x: rect.minX + 1, y: rect.minY + 1, width: max(0, rect.width - 2),
+                           height: max(0, rect.height - 2))
+        return NSRect(x: inner.minX, y: inner.minY + PaneHeader.height, width: inner.width,
+                      height: max(0, inner.height - PaneHeader.height))
     }
 
     /// `TerminalWindow.leadingControlsMaxX` in this view, when the panes run under the titlebar.
@@ -515,34 +580,80 @@ final class TabContentView: NSView {
     }
 
     /// Runs a zoom change as a move: the panes glide from where they were to the new layout.
-    /// Their terminals hold their grid until it settles, so the text does not reflow per frame.
     private func transitionZoom(_ change: () -> Void) {
+        transitionLayout(curve: Motion.curve) {
+            change()
+            if let z = zoomedPane, let view = views[z] {
+                addSubview(view, positioned: .below, relativeTo: chrome)
+            }
+        }
+    }
+
+    /// Runs a layout change as a move: the panes glide from where they were to the new layout,
+    /// new panes grow out of their split edge and fade in, and closed ones shrink into theirs
+    /// and fade out. Terminals hold their grid until it settles, so the text does not reflow
+    /// per frame; a new pane sizes its grid for its place first, so it opens at its final size.
+    private func transitionLayout(curve: CubicBezier, _ change: () -> Void) {
         let duration = Motion.duration(Motion.standard)
+        let from = Dictionary(visibleFrames, uniquingKeysWith: { first, _ in first })
+        let oldRoot = root
+        let before = Set(views.keys)
+        finishLayoutMove()
         guard duration > 0 else {
             change()
+            syncViews()
             layoutPanes()
             return
         }
-        zoomFrom = Dictionary(uniqueKeysWithValues: visibleFrames)
-        change()
-        if let z = zoomedPane, let view = views[z] {
-            addSubview(view, positioned: .below, relativeTo: chrome)
-        }
-        zoomProgress = Tween(0)
-        zoomProgress.move(to: 1, duration: duration, at: CACurrentMediaTime())
         views.values.forEach { $0.holdGridSize = true }
-        zoomMotion.run(on: self, for: duration) { [weak self] time in
-            self?.zoomTick(time)
+        change()
+        syncViews(keepingClosed: true)
+        let targets = Dictionary(targetFrames, uniquingKeysWith: { first, _ in first })
+        let cards = showsHeaders
+        for id in Set(views.keys).subtracting(before) {
+            guard let side = root.side(of: id), let rect = targets[id] else { continue }
+            entering[id] = SplitNode.collapsed(rect, axis: side.axis, second: side.second)
+            // The new terminal takes its final grid size, unseen, before the move starts.
+            if let view = views[id] {
+                view.alphaValue = 0
+                view.frame = terminalFrame(in: rect, cards: cards)
+            }
+        }
+        for id in leaving.keys {
+            guard let side = oldRoot.side(of: id), let rect = from[id] else { continue }
+            leaving[id]?.to = SplitNode.collapsed(rect, axis: side.axis, second: side.second)
+        }
+        motionFrom = from
+        views.values.forEach { $0.holdGridSize = true }
+        layoutProgress = Tween(0, curve: curve)
+        layoutProgress.move(to: 1, duration: duration, at: CACurrentMediaTime())
+        layoutMotion.run(on: self, for: duration) { [weak self] time in
+            self?.layoutTick(time)
         }
         layoutPanes()
     }
 
-    private func zoomTick(_ now: CFTimeInterval) {
-        guard zoomProgress.isFinished(at: now) else {
+    private func layoutTick(_ now: CFTimeInterval) {
+        guard layoutProgress.isFinished(at: now) else {
             needsLayout = true
             return
         }
-        zoomFrom = [:]
+        finishLayoutMove()
+    }
+
+    /// Settles the layout move in progress, if any: closed panes go, terminals take their size.
+    private func finishLayoutMove() {
+        layoutMotion.stop()
+        layoutProgress = Tween(1)
+        let moved = !motionFrom.isEmpty || !leaving.isEmpty
+        motionFrom = [:]
+        entering = [:]
+        for pane in leaving.values {
+            pane.view.removeFromSuperview()
+            pane.header?.removeFromSuperview()
+        }
+        leaving = [:]
+        guard moved else { return }
         layoutPanes()
         views.values.forEach { $0.holdGridSize = false }
     }
@@ -553,8 +664,24 @@ final class TabContentView: NSView {
         let area = paneArea
         colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity).setFill()
         NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: area.minY - bounds.minY).fill()
+        let bg = colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity)
+        func surface(_ id: PaneKey) -> NSColor {
+            let scale = ChromePalette.dimmedBackgroundScale(drawn: (views[id] ?? leaving[id]?.view)?.dimDrawn ?? 0,
+                                                            dim: cfg.unfocusedSplitDim,
+                                                            isDark: cfg.theme.isDark)
+            return NSColor(srgbRed: bg.redComponent * scale, green: bg.greenComponent * scale,
+                           blue: bg.blueComponent * scale, alpha: bg.alphaComponent)
+        }
+        // During a layout move, each pane's surface under its terminal: what shows where a held
+        // grid does not reach and where content fades in or out.
+        if isMoving {
+            for (id, rect) in visibleFrames {
+                surface(id).setFill()
+                rect.fill()
+            }
+        }
         guard showsHeaders else {
-            guard zoomedPane == nil else { return }
+            guard zoomedPane == nil, !isMoving else { return }
             cfg.dividerColor.setFill()
             for d in currentDividers {
                 d.rect.fill()
@@ -564,13 +691,8 @@ final class TabContentView: NSView {
         // Cards: the header strips in the terminal's color, under the headers, shaded with the
         // pane's dim. The gutters and outlines are `CardChrome`'s, drawn over the terminals'
         // square corners.
-        let bg = colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity)
         for (id, rect) in visibleFrames {
-            let scale = ChromePalette.dimmedBackgroundScale(drawn: views[id]?.dimDrawn ?? 0,
-                                                            dim: cfg.unfocusedSplitDim,
-                                                            isDark: cfg.theme.isDark)
-            NSColor(srgbRed: bg.redComponent * scale, green: bg.greenComponent * scale,
-                    blue: bg.blueComponent * scale, alpha: bg.alphaComponent).setFill()
+            surface(id).setFill()
             NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: 1 + PaneHeader.height).fill()
         }
     }
@@ -658,11 +780,11 @@ final class TabContentView: NSView {
     /// Inserts `newPane` next to `target` (default: focused pane) and focuses it.
     func split(target: PaneKey? = nil, newPane: PaneKey, direction: SplitDirName) {
         let t = target.flatMap { root.contains($0) ? $0 : nil } ?? focusedPane
-        zoomedPane = nil
-        root = root.inserting(newPane, at: t, direction: direction)
-        if SessionManager.shared.config.autoBalance { root = root.equalized() }
-        syncViews()
-        layoutPanes()
+        transitionLayout(curve: Motion.paneCurve) {
+            zoomedPane = nil
+            root = root.inserting(newPane, at: t, direction: direction)
+            if SessionManager.shared.config.autoBalance { root = root.equalized() }
+        }
         focus(newPane)
         window?.invalidateCursorRects(for: self)
     }
@@ -674,6 +796,7 @@ final class TabContentView: NSView {
         let wasFocused = pane == focusedPane
         if zoomedPane == pane { zoomedPane = nil }
         guard var newRoot = root.removing(pane) else {
+            finishLayoutMove()
             views[pane]?.detach()
             views[pane]?.removeFromSuperview()
             views.removeValue(forKey: pane)
@@ -690,9 +813,7 @@ final class TabContentView: NSView {
                 hypot(a.1.midX - center.x, a.1.midY - center.y) < hypot(b.1.midX - center.x, b.1.midY - center.y)
             })?.0 ?? (newRoot.panes.first ?? pane)
         }
-        root = newRoot
-        syncViews()
-        layoutPanes()
+        transitionLayout(curve: Motion.paneCurve) { root = newRoot }
         window?.invalidateCursorRects(for: self)
         if wasFocused { focus(nextFocus) }
         return false
@@ -899,6 +1020,8 @@ private final class CardChrome: NSView {
         let chrome = SessionManager.shared.config.chrome
         // Cards are cut out one by one rather than with an even-odd path: during a zoom they
         // overlap, and the overlap would flip back to gutter over the terminals.
+        // A card opening or closing can be flatter than its outline; it has nothing to show.
+        let cards = cards.filter { $0.rect.width >= 1 && $0.rect.height >= 1 }
         let radii = cards.map { corners(of: $0.rect) }
         let context = NSGraphicsContext.current
         chrome.surface.withAlphaComponent(opacity).setFill()
