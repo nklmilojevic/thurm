@@ -77,7 +77,9 @@ final class TerminalView: NSView, NSTextInputClient {
     private var flashStart: CFTimeInterval = 0
     /// The unfocused-split dim, eased in and out as focus moves between the panes of a tab.
     private var dimTween = Tween(0)
-    private var dimDrawn: Float = 0
+    private(set) var dimDrawn: Float = 0
+    /// Called when a frame drew a different dim, so the pane's header can follow it.
+    var onDimDrawn: (() -> Void)?
 
     // Overlays.
     private var lockBadge: NSImageView?
@@ -603,7 +605,10 @@ final class TerminalView: NSView, NSTextInputClient {
             }
         }
         let dim = dimValue(at: CACurrentMediaTime())
-        dimDrawn = dim
+        if dim != dimDrawn {
+            dimDrawn = dim
+            onDimDrawn?()
+        }
         let opacity = Float((window?.windowController as? TerminalWindowController)?.opacity ?? config.opacity)
         if layer.isOpaque != (opacity >= 1) { layer.isOpaque = opacity >= 1 }
         let params = RenderParams(pane: pane,
@@ -616,6 +621,8 @@ final class TerminalView: NSView, NSTextInputClient {
                                   cursorOn: lastBlinkOn,
                                   cursorThickness: max(1, Int((config.cursorThickness * backingScale).rounded())),
                                   dim: dim,
+                                  dimFill: ChromePalette.dimFill(dim: config.unfocusedSplitDim,
+                                                                 isDark: config.theme.isDark),
                                   flash: flash,
                                   opacity: opacity,
                                   themeBackground: config.theme.background,

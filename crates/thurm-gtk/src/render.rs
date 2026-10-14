@@ -538,6 +538,8 @@ pub struct PaintParams<'a> {
     pub cursor_thickness: f64,
     /// Unfocused-split dim (0: none).
     pub dim: f64,
+    /// The dim's fill: the default background scaled by this (`config::dim_fill`).
+    pub dim_fill: f64,
     /// Bell flash strength 0..1.
     pub flash: f64,
     /// Smooth scrolling: pixels the grid is drawn lower, with the peek line above.
@@ -631,14 +633,19 @@ pub fn paint(
         let _ = cr.restore();
     }
 
+    // The covers shade what is under them and keep its alpha (atop), so a translucent pane
+    // stays as translucent as its gutters.
+    let _ = cr.save();
+    cr.set_operator(cairo::Operator::Atop);
     if p.dim > 0.001 {
-        rgba(cr, default_bg, p.dim);
+        rgba(cr, crate::config::blend(default_bg, 0x000000, 1.0 - p.dim_fill), p.dim);
         let _ = cr.paint();
     }
     if p.flash > 0.001 {
         rgba(cr, default_fg, 0.22 * p.flash);
         let _ = cr.paint();
     }
+    let _ = cr.restore();
 }
 
 struct RowSrc<'a> {

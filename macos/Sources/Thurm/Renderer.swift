@@ -162,6 +162,9 @@ final class MetalContext {
     let device: MTLDevice
     let queue: MTLCommandQueue
     let pipeline: MTLRenderPipelineState
+    /// For the dim and flash covers: shades the color under them in proportion to its alpha
+    /// and keeps that alpha, so a translucent pane stays as translucent as its gutters.
+    let coverPipeline: MTLRenderPipelineState
     /// 1×1 transparent texture bound when a slot has nothing to show.
     let emptyTexture: MTLTexture
     /// The most recently committed frame (all panes share this serial queue).
@@ -205,6 +208,11 @@ final class MetalContext {
             att.destinationRGBBlendFactor = .oneMinusSourceAlpha
             att.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            desc.label = "Thurm covers"
+            att.sourceRGBBlendFactor = .destinationAlpha
+            att.sourceAlphaBlendFactor = .zero
+            att.destinationAlphaBlendFactor = .one
+            coverPipeline = try device.makeRenderPipelineState(descriptor: desc)
         } catch {
             tlog("could not build the Metal pipeline: \(error)")
             return nil
@@ -391,6 +399,8 @@ struct RenderParams {
     var cursorThickness: Int
     /// Unfocused split dimming (0...1).
     var dim: Float
+    /// The dim's fill: the default background scaled by this (`ChromePalette.dimFill`).
+    var dimFill: Float
     /// Visual bell flash (0...1).
     var flash: Float
     var opacity: Float
@@ -510,6 +520,7 @@ final class TerminalRenderer {
                     clip = MTLScissorRect(x: 0, y: top, width: p.viewportWidth, height: max(0, height))
                 }
                 for (i, seg) in segments.enumerated() {
+                    if i == overlayStart { encoder.setRenderPipelineState(ctx.coverPipeline) }
                     encoder.setScissorRect(i >= overlayStart ? full : clip)
                     encoder.setVertexBufferOffset(seg.start * stride, index: 0)
                     encoder.setFragmentTexture(seg.texture ?? ctx.emptyTexture, index: 2)
@@ -560,8 +571,11 @@ final class TerminalRenderer {
 
         // Unfocused split dimming and bell flash.
         if p.dim > 0.001 {
-            overlay.append(QuadInstance(rect: SIMD4<Float>(0, 0, vw, vh), color: rgba(defaultBg, p.dim),
-                                        kind: QuadKind.solid))
+            var fill = rgba(defaultBg, p.dim)
+            fill.x *= p.dimFill
+            fill.y *= p.dimFill
+            fill.z *= p.dimFill
+            overlay.append(QuadInstance(rect: SIMD4<Float>(0, 0, vw, vh), color: fill, kind: QuadKind.solid))
         }
         if p.flash > 0.001 {
             let flashColor: UInt32 = snapshot.valid ? snapshot.info.foreground : p.themeForeground

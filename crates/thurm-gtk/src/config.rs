@@ -73,6 +73,11 @@ impl UiConfig {
         self.cfg.window.unfocused_split_dim.clamp(0.0, 1.0)
     }
 
+    /// The unfocused-split dim's fill, as a scale of the background (see `dim_fill`).
+    pub fn unfocused_dim_fill(&self) -> f64 {
+        dim_fill(self.unfocused_dim(), self.theme_is_dark())
+    }
+
     pub fn pane_headers(&self) -> bool {
         self.cfg.window.pane_headers
     }
@@ -130,6 +135,24 @@ pub fn luminance(c: u32) -> f64 {
     0.2126 * lin((c >> 16) & 0xff) + 0.7152 * lin((c >> 8) & 0xff) + 0.0722 * lin(c & 0xff)
 }
 
+/// How far the sidebar and the gutters between split cards are shaded toward black from the
+/// terminal background.
+pub fn surface_shade(dark: bool) -> f64 {
+    if dark { 0.18 } else { 0.05 }
+}
+
+/// The unfocused-split dim lays the background scaled by this over the pane, so at the full
+/// `dim` the pane's background lands on the gutter color and the pane sinks into the gutters,
+/// in any theme. A dim weaker than the shade gets a black fill and stops short of it.
+pub fn dim_fill(dim: f64, dark: bool) -> f64 {
+    if dim <= 0.0 { 0.0 } else { (1.0 - surface_shade(dark) / dim).max(0.0) }
+}
+
+/// `bg` under the unfocused-split dim's cover: the gutter color once `dim` reaches the shade.
+pub fn dimmed_background(bg: u32, dim: f64, dark: bool) -> u32 {
+    blend(bg, 0x000000, dim * (1.0 - dim_fill(dim, dark)))
+}
+
 /// `a` moved `t` of the way to `b`.
 pub fn blend(a: u32, b: u32, t: f64) -> u32 {
     let ch = |s: u32| {
@@ -164,5 +187,29 @@ mod tests {
         assert!(luminance(0xffffff) > 0.99);
         assert_eq!(blend(0x000000, 0xffffff, 0.25), 0x404040);
         assert_eq!(css_rgb(0x1e1e2e), "#1e1e2e");
+    }
+
+    #[test]
+    fn full_dim_lands_on_the_gutter_color() {
+        for (bg, dark) in [(0x1e1e2e, true), (0xeff1f5, false), (0x282c34, true), (0xfdf6e3, false)] {
+            let gutter = blend(bg, 0x000000, surface_shade(dark));
+            for dim in [0.25, 0.5, 1.0] {
+                let fill = blend(bg, 0x000000, 1.0 - dim_fill(dim, dark));
+                let dimmed = blend(bg, fill, dim);
+                let header = dimmed_background(bg, dim, dark);
+                for s in [16, 8, 0] {
+                    let (a, b, h) = ((dimmed >> s) & 0xff, (gutter >> s) & 0xff, (header >> s) & 0xff);
+                    assert!(a.abs_diff(b) <= 1, "{bg:06x} at {dim}: {dimmed:06x} vs {gutter:06x}");
+                    assert!(h.abs_diff(b) <= 1, "{bg:06x} at {dim}: header {header:06x} vs {gutter:06x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dim_weaker_than_the_shade_fills_black() {
+        assert_eq!(dim_fill(0.0, true), 0.0);
+        assert_eq!(dim_fill(0.1, true), 0.0);
+        assert!(dim_fill(0.1, false) > 0.0);
     }
 }

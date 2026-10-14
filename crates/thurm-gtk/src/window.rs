@@ -11,7 +11,7 @@ use gtk::{gdk, gio, glib};
 
 use crate::actions::{self, ACTIONS, Menu};
 use crate::app;
-use crate::config::{UiConfig, blend, css_rgb, css_rgba};
+use crate::config::{UiConfig, blend, css_rgb, css_rgba, dimmed_background, surface_shade};
 use crate::core::PaneKey;
 use crate::sidebar::Sidebar;
 use crate::tab::Tab;
@@ -248,7 +248,7 @@ impl MainWindow {
         let bg = theme.background;
         let fg = theme.foreground;
         let opacity = ui.opacity();
-        let sidebar_bg = blend(bg, 0x000000, if dark { 0.18 } else { 0.05 });
+        let sidebar_bg = blend(bg, 0x000000, surface_shade(dark));
         let divider = blend(bg, fg, 0.25);
         let font = &ui.cfg.font.family;
         let size = ui.font_size();
@@ -287,6 +287,7 @@ impl MainWindow {
             .thurm-palette .footer {{ font-size: {small}px; opacity: 0.55; margin: 4px 16px 8px 16px; }}
             .thurm-sidebar headerbar {{ background-color: transparent; box-shadow: none; }}
             .thurm-pane-header {{ background-color: {bg_a}; color: {fg}; }}
+            .thurm-pane-header:not(.focused) {{ background-color: {dimmed_a}; }}
             .thurm-card-top {{ border-radius: 7px 7px 0 0; }}
             .thurm-card-bottom {{ border-radius: 0 0 7px 7px; }}
             .thurm-pane-title {{ font-size: 13px; font-weight: 600; opacity: 0.6; }}
@@ -299,6 +300,7 @@ impl MainWindow {
             button.thurm-window-button {{ min-width: 26px; min-height: 26px; padding: 0; }}
             "#,
             bg_a = css_rgba(bg, opacity),
+            dimmed_a = css_rgba(dimmed_background(bg, ui.unfocused_dim(), dark), opacity),
             quick_a = css_rgba(bg, ui.quick_opacity()),
             bg = css_rgb(bg),
             fg = css_rgb(fg),
