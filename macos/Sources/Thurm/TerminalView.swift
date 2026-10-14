@@ -588,10 +588,11 @@ final class TerminalView: NSView, NSTextInputClient {
         let oldCursor = (renderer.snapshot.info.cursor_col, renderer.snapshot.info.cursor_row)
         let perfGrid = Perf.enabled ? CACurrentMediaTime() : 0
         if renderer.snapshot.update(pane: pane) { accessibilityGridChanged() }
-        // A previous resize can still be in flight when another layout change occurs.
+        // A previous resize can still be in flight when another layout change occurs. A held
+        // grid draws whatever snapshot it has: its drawable keeps the size that snapshot had.
         let sized = renderer.snapshot.cols == cols && renderer.snapshot.rows == rows
         if sized { resizeTimedOut = false }
-        guard sized || resizeTimedOut else {
+        guard sized || resizeTimedOut || holdGridSize else {
             needsRender = true
             return
         }
