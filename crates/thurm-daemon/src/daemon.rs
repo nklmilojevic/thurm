@@ -450,19 +450,27 @@ impl Daemon {
     fn broadcast(&self, event: Event, ui_only: bool) {
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
         // A phone with the app open hears it live; otherwise its lock screen does.
-        if let Event::Notify {
-            pane,
-            title,
-            permission,
-            ..
-        } = &event
-            && !clients.iter().any(|c| c.mobile.load(Ordering::Relaxed))
-        {
-            self.push.notify(crate::push::Notice {
-                pane: *pane,
-                title: title.clone(),
-                permission: *permission,
-            });
+        let app_open = clients.iter().any(|c| c.mobile.load(Ordering::Relaxed));
+        match &event {
+            Event::Notify {
+                pane,
+                title,
+                permission,
+                ..
+            } if !app_open => {
+                self.push.notify(crate::push::Notice {
+                    pane: *pane,
+                    title: title.clone(),
+                    permission: *permission,
+                });
+            }
+            Event::PaneInfo(info) => self.push.agent_changed(
+                info.id,
+                crate::push::activity_state(info, crate::push::now()),
+                !app_open,
+            ),
+            Event::PaneClosed { pane } => self.push.agent_changed(*pane, None, true),
+            _ => {}
         }
         let desktop_only = matches!(event, Event::Ui(_));
         for c in clients {
@@ -2484,6 +2492,21 @@ impl Daemon {
             }
             Request::UnregisterPushDevice { device } => {
                 self.push.unregister(&device)?;
+                Ok(Response::Ok)
+            }
+            Request::FollowAgent {
+                device,
+                pane,
+                token,
+            } => {
+                let state = self.with_pane(pane, |_, st| {
+                    crate::push::activity_state(&st.info, crate::push::now())
+                })?;
+                self.push.follow(&device, pane, token, state)?;
+                Ok(Response::Ok)
+            }
+            Request::UnfollowAgent { device, pane } => {
+                self.push.unfollow(&device, pane)?;
                 Ok(Response::Ok)
             }
             Request::CommitLayout { request_id } => {

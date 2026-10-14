@@ -337,3 +337,76 @@ fn permission_prompts_reach_registered_phones_when_the_app_is_closed() {
         "pushed while the app was open"
     );
 }
+
+#[test]
+fn followed_agents_post_live_activity_updates_until_the_pane_closes() {
+    let env = Env::new("activity");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (relay, posts) = fake_relay();
+    let r = mac.request(Request::RegisterPushDevice {
+        device: "dev-1".into(),
+        relay,
+        secret: "s".repeat(64),
+        host: "studio".into(),
+        name: "iPhone".into(),
+    });
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+    let pane = create(&mac, &env.dir);
+    mac.request(Request::Input {
+        pane,
+        data: b"/bin/cat\r".to_vec(),
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(mac.request(Request::PaneInfo { pane }), Ok(Response::PaneInfo(i))
+        if i.foreground.as_ref().is_some_and(|f| f.name == "cat"))
+    {
+        assert!(Instant::now() < deadline, "cat never became the foreground");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    hook(&mac, pane, "prompt-submit", None);
+
+    // Following needs a registered device and a hex token.
+    let bad = mac.request(Request::FollowAgent {
+        device: "nobody".into(),
+        pane,
+        token: "ab12".into(),
+    });
+    assert!(bad.is_err(), "{bad:?}");
+    let r = mac.request(Request::FollowAgent {
+        device: "dev-1".into(),
+        pane,
+        token: "ab12cd".into(),
+    });
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+
+    let activity = |what: &str| -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let (head, body) = posts
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("no {what}"));
+            if head.starts_with("POST /v1/activity ") {
+                return serde_json::from_str(&body).unwrap();
+            }
+        }
+    };
+    let first = activity("first update");
+    assert_eq!(first["event"], "update");
+    assert_eq!(first["token"], "ab12cd");
+    assert_eq!(first["state"]["status"], "working");
+    assert_eq!(first["state"]["agent"], "Claude Code");
+
+    hook(&mac, pane, "permission-prompt", None);
+    let asked = activity("permission update");
+    assert_eq!(asked["state"]["status"], "permission");
+    assert!(asked["state"]["permission"].is_u64());
+
+    mac.request(Request::ClosePane { pane }).unwrap();
+    let end = activity("end");
+    assert_eq!(end["event"], "end");
+    assert_eq!(end["state"]["status"], "ended");
+    assert_eq!(end["state"]["agent"], "Claude Code");
+}

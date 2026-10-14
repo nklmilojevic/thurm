@@ -2,6 +2,10 @@
 //! device id, secret); each notice is posted to the relay, which holds the APNs key, signed
 //! with the device's secret. A notice carries the pane's title and what it wants (permission
 //! or attention), never terminal content.
+//!
+//! The app can also follow an agent in a Live Activity: the activity's push token is kept
+//! with the pane, and the agent's state (status, pane title, since when) is posted for it on
+//! every change, until the agent leaves or the pane closes.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,6 +27,51 @@ pub struct Device {
     pub name: String,
 }
 
+/// A Live Activity following a pane's agent.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Follow {
+    pub device: String,
+    pub pane: PaneId,
+    pub token: String,
+    /// The state last sent, to send only changes.
+    #[serde(default)]
+    pub last: Option<ActivityState>,
+}
+
+/// What a Live Activity shows: no terminal content.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ActivityState {
+    /// The agent's name ("Claude Code").
+    pub agent: String,
+    /// working, needs_input, permission, done, error or idle.
+    pub status: String,
+    pub title: String,
+    /// When the status began (Unix seconds).
+    pub since: u64,
+    pub permission: Option<u64>,
+}
+
+impl ActivityState {
+    /// Same status and title (`since` only moves with them).
+    fn same_as(&self, other: &ActivityState) -> bool {
+        self.status == other.status
+            && self.title == other.title
+            && self.agent == other.agent
+            && self.permission == other.permission
+    }
+}
+
+enum Job {
+    Notice(Notice),
+    Activity {
+        device: Device,
+        token: String,
+        pane: PaneId,
+        state: ActivityState,
+        end: bool,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Notice {
     pub pane: PaneId,
@@ -33,22 +82,38 @@ pub struct Notice {
 
 pub struct Pusher {
     devices: Mutex<Vec<Device>>,
+    follows: Mutex<Vec<Follow>>,
     path: PathBuf,
-    tx: Sender<Notice>,
+    follows_path: PathBuf,
+    tx: Sender<Job>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl Pusher {
     /// Devices are kept in `state_dir/push-devices.json`.
     pub fn new(state_dir: &Path) -> Pusher {
         let path = state_dir.join("push-devices.json");
+        let follows_path = state_dir.join("push-activities.json");
         let devices = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        let (tx, rx) = bounded::<Notice>(64);
+        let follows = std::fs::read(&follows_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let (tx, rx) = bounded::<Job>(64);
         let pusher = Pusher {
             devices: Mutex::new(devices),
+            follows: Mutex::new(follows),
             path,
+            follows_path,
             tx,
         };
         let devices_path = pusher.path.clone();
@@ -59,15 +124,35 @@ impl Pusher {
                     .timeout_global(Some(Duration::from_secs(10)))
                     .build()
                     .into();
-                for notice in rx {
-                    // Read the devices again: registrations change while this runs.
-                    let devices: Vec<Device> = std::fs::read(&devices_path)
-                        .ok()
-                        .and_then(|b| serde_json::from_slice(&b).ok())
-                        .unwrap_or_default();
-                    for d in devices {
-                        if let Err(e) = post(&agent, &d, &notice) {
-                            log::warn!("push to {} for {}: {e}", d.relay, d.name);
+                for job in rx {
+                    match job {
+                        Job::Notice(notice) => {
+                            // Read the devices again: registrations change while this runs.
+                            let devices: Vec<Device> = std::fs::read(&devices_path)
+                                .ok()
+                                .and_then(|b| serde_json::from_slice(&b).ok())
+                                .unwrap_or_default();
+                            for d in devices {
+                                if let Err(e) = post(&agent, &d, "/v1/push", &body(&d, &notice)) {
+                                    log::warn!("push to {} for {}: {e}", d.relay, d.name);
+                                }
+                            }
+                        }
+                        Job::Activity {
+                            device,
+                            token,
+                            pane,
+                            state,
+                            end,
+                        } => {
+                            let body = activity_body(&device, &token, pane, &state, end);
+                            if let Err(e) = post(&agent, &device, "/v1/activity", &body) {
+                                log::warn!(
+                                    "live activity to {} for {}: {e}",
+                                    device.relay,
+                                    device.name
+                                );
+                            }
                         }
                     }
                 }
@@ -90,24 +175,119 @@ impl Pusher {
     pub fn unregister(&self, device: &str) -> Result<(), String> {
         let mut devices = self.devices.lock();
         devices.retain(|d| d.device != device);
-        self.save(&devices)
+        self.save(&devices)?;
+        let mut follows = self.follows.lock();
+        follows.retain(|f| f.device != device);
+        save_json(&self.follows_path, &*follows)
     }
 
     /// Queues `notice` for every registered device (dropped when the queue is full: a stuck
     /// relay must not hold up the daemon).
     pub fn notify(&self, notice: Notice) {
         if !self.devices.lock().is_empty() {
-            let _ = self.tx.try_send(notice);
+            let _ = self.tx.try_send(Job::Notice(notice));
+        }
+    }
+
+    /// `device` follows `pane` in a Live Activity with push `token` (replacing an earlier one).
+    /// The current state goes out at once.
+    pub fn follow(
+        &self,
+        device: &str,
+        pane: PaneId,
+        token: String,
+        state: Option<ActivityState>,
+    ) -> Result<(), String> {
+        if !self.devices.lock().iter().any(|d| d.device == device) {
+            return Err("register the device for push first".into());
+        }
+        if token.is_empty() || token.len() > 400 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("bad activity token".into());
+        }
+        {
+            let mut follows = self.follows.lock();
+            follows.retain(|f| !(f.device == device && f.pane == pane));
+            follows.push(Follow {
+                device: device.to_owned(),
+                pane,
+                token,
+                last: None,
+            });
+            save_json(&self.follows_path, &*follows)?;
+        }
+        self.agent_changed(pane, state, true);
+        Ok(())
+    }
+
+    pub fn unfollow(&self, device: &str, pane: PaneId) -> Result<(), String> {
+        let mut follows = self.follows.lock();
+        follows.retain(|f| !(f.device == device && f.pane == pane));
+        save_json(&self.follows_path, &*follows)
+    }
+
+    /// `pane`'s agent is now `state` (None: gone, which ends its activities). `send`: whether
+    /// to post now (false while a phone has the app open and updates its activities itself;
+    /// the change goes out with the next one).
+    pub fn agent_changed(&self, pane: PaneId, state: Option<ActivityState>, send: bool) {
+        let mut follows = self.follows.lock();
+        if !follows.iter().any(|f| f.pane == pane) {
+            return;
+        }
+        let devices = self.devices.lock().clone();
+        let mut changed = false;
+        follows.retain_mut(|f| {
+            let unchanged = match (&f.last, &state) {
+                (Some(last), Some(now)) => last.same_as(now),
+                _ => false,
+            };
+            if unchanged || !send {
+                return true;
+            }
+            let Some(device) = devices.iter().find(|d| d.device == f.device) else {
+                changed = true;
+                return false;
+            };
+            // An ending activity keeps showing its last state, as ended.
+            let shown = match &state {
+                Some(s) => Some((s.clone(), false)),
+                None => f.last.clone().map(|mut s| {
+                    s.status = "ended".into();
+                    s.since = now_secs();
+                    (s, true)
+                }),
+            };
+            if let Some((shown, end)) = shown {
+                let _ = self.tx.try_send(Job::Activity {
+                    device: device.clone(),
+                    token: f.token.clone(),
+                    pane,
+                    state: shown,
+                    end,
+                });
+            }
+            changed = true;
+            f.last = state.clone();
+            state.is_some()
+        });
+        if changed {
+            let _ = save_json(&self.follows_path, &*follows);
         }
     }
 
     fn save(&self, devices: &[Device]) -> Result<(), String> {
+        save_json(&self.path, devices)
+    }
+}
+
+/// Writes `value` to `path` as JSON, 0600, atomically.
+fn save_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
+    {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        if let Some(dir) = self.path.parent() {
+        if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = path.with_extension("json.tmp");
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -115,10 +295,57 @@ impl Pusher {
             .mode(0o600)
             .open(&tmp)
             .map_err(|e| e.to_string())?;
-        f.write_all(&serde_json::to_vec(devices).map_err(|e| e.to_string())?)
+        f.write_all(&serde_json::to_vec(value).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
     }
+}
+
+/// The request body the relay gets for a Live Activity update or end.
+pub fn activity_body(
+    device: &Device,
+    token: &str,
+    pane: PaneId,
+    state: &ActivityState,
+    end: bool,
+) -> String {
+    serde_json::json!({
+        "device": device.device,
+        "host": device.host,
+        "pane": pane,
+        "token": token,
+        "event": if end { "end" } else { "update" },
+        "state": state,
+    })
+    .to_string()
+}
+
+/// A pane's agent as a Live Activity shows it, or None when the pane has no agent.
+pub fn activity_state(info: &thurm_proto::PaneInfo, since: u64) -> Option<ActivityState> {
+    use thurm_proto::AgentStatus;
+    let agent = info.agent.as_ref()?;
+    let status = if agent.permission.is_some() {
+        "permission"
+    } else {
+        match agent.status {
+            AgentStatus::Working => "working",
+            AgentStatus::NeedsInput => "needs_input",
+            AgentStatus::Done => "done",
+            AgentStatus::Error => "error",
+            AgentStatus::Idle => "idle",
+        }
+    };
+    Some(ActivityState {
+        agent: agent.name.clone(),
+        status: status.to_owned(),
+        title: info.title.chars().take(120).collect(),
+        since,
+        permission: agent.permission,
+    })
+}
+
+pub fn now() -> u64 {
+    now_secs()
 }
 
 /// HTTPS only, except to this machine (tests, a relay on the same host).
@@ -164,19 +391,15 @@ pub fn signature(secret: &str, timestamp: u64, body: &str) -> String {
         .collect()
 }
 
-fn post(agent: &ureq::Agent, device: &Device, notice: &Notice) -> Result<(), String> {
-    let body = body(device, notice);
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let url = format!("{}/v1/push", device.relay.trim_end_matches('/'));
+fn post(agent: &ureq::Agent, device: &Device, path: &str, body: &str) -> Result<(), String> {
+    let ts = now_secs();
+    let url = format!("{}{path}", device.relay.trim_end_matches('/'));
     agent
         .post(&url)
         .header("Content-Type", "application/json")
         .header("X-Thurm-Timestamp", ts.to_string())
-        .header("X-Thurm-Signature", signature(&device.secret, ts, &body))
-        .send(&body)
+        .header("X-Thurm-Signature", signature(&device.secret, ts, body))
+        .send(body)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }

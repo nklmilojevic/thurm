@@ -327,6 +327,18 @@ pub enum Request {
     UnregisterPushDevice {
         device: String,
     },
+    /// The iOS app shows `pane`'s agent in a Live Activity: post its state changes for
+    /// `device` (registered with [`Request::RegisterPushDevice`]) with the activity's push
+    /// `token`, until the agent leaves, the pane closes, or [`Request::UnfollowAgent`].
+    FollowAgent {
+        device: String,
+        pane: PaneId,
+        token: String,
+    },
+    UnfollowAgent {
+        device: String,
+        pane: PaneId,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
