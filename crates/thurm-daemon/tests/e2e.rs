@@ -12,6 +12,9 @@ mod layouts;
 #[path = "e2e/program_status.rs"]
 mod program_status;
 
+#[path = "e2e/mobile.rs"]
+mod mobile;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;

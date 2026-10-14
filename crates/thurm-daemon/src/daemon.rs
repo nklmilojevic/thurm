@@ -1,5 +1,7 @@
 //! Daemon state: panes, clients, frame pump, monitor loop and request handling.
 
+#[path = "active_size.rs"]
+mod active_size;
 #[path = "terminal_attach.rs"]
 mod terminal_attach;
 mod agent_prompt;
@@ -227,6 +229,10 @@ pub struct Client {
     pub id: u64,
     pub tx: Sender<ServerMessage>,
     pub ui: AtomicBool,
+    /// The iOS app ([`thurm_proto::CAP_MOBILE`]).
+    pub mobile: AtomicBool,
+    /// Its panes follow the active client's size ([`thurm_proto::CAP_ACTIVE_SIZE`]).
+    pub active_size: AtomicBool,
     pub name: Mutex<String>,
     /// Approximate bytes queued in `tx` (see [`message_weight`]); the writer subtracts what it
     /// wrote.
@@ -292,6 +298,8 @@ pub struct PaneState {
     pub hold: bool,
     pub subscribers: HashMap<u64, Subscriber>,
     pub terminal_attachment: Option<(u64, PaneSize)>,
+    /// Per client, the size it shows the pane at (see `active_size`).
+    pub wanted: HashMap<u64, active_size::Wanted>,
     pub agent: AgentTracker,
     osc_cwd: Option<String>,
     command_started: Option<Instant>,
@@ -432,13 +440,17 @@ impl Daemon {
         v
     }
 
-    /// Sends `event` to every client (`ui_only`: the apps). A pane's state and notifications
-    /// are sent with the pane locked, so they arrive in the order they happened. Pane lock,
-    /// then client lock, never the other way round.
+    /// Sends `event` to every client (`ui_only`: the apps; the iOS app too, except for UI
+    /// commands meant for a desktop window). A pane's state and notifications are sent with the
+    /// pane locked, so they arrive in the order they happened. Pane lock, then client lock, never
+    /// the other way round.
     fn broadcast(&self, event: Event, ui_only: bool) {
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
+        let desktop_only = matches!(event, Event::Ui(_));
         for c in clients {
-            if !ui_only || c.ui.load(Ordering::Relaxed) {
+            let app =
+                c.ui.load(Ordering::Relaxed) || (!desktop_only && c.mobile.load(Ordering::Relaxed));
+            if !ui_only || app {
                 c.send(ServerMessage::Event(event.clone()));
             }
         }
@@ -462,6 +474,8 @@ impl Daemon {
             id,
             tx,
             ui: AtomicBool::new(false),
+            mobile: AtomicBool::new(false),
+            active_size: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
@@ -494,6 +508,7 @@ impl Daemon {
             let mut st = p.state.lock();
             st.subscribers.remove(&id);
             self.release_terminal(&mut st, id);
+            self.forget_size(&mut st, id);
         }
         *self.last_activity.lock() = Instant::now();
     }
@@ -655,6 +670,7 @@ impl Daemon {
                 hold: p.hold,
                 subscribers: HashMap::new(),
                 terminal_attachment: None,
+                wanted: HashMap::new(),
                 agent: AgentTracker::default(),
                 osc_cwd: p.osc_cwd,
                 command_started: None,
@@ -2165,14 +2181,21 @@ impl Daemon {
                 client: name,
                 version,
                 ui,
-                capabilities: _,
+                capabilities,
             } => {
-                if version != PROTOCOL_VERSION {
+                if !thurm_proto::protocol_compatible(version) {
                     return Err(format!(
                         "protocol mismatch: daemon {PROTOCOL_VERSION}, client {version}"
                     ));
                 }
+                let has = |cap: &str| capabilities.iter().any(|c| c == cap);
                 client.ui.store(ui, Ordering::Relaxed);
+                client
+                    .mobile
+                    .store(has(thurm_proto::CAP_MOBILE), Ordering::Relaxed);
+                client
+                    .active_size
+                    .store(has(thurm_proto::CAP_ACTIVE_SIZE), Ordering::Relaxed);
                 *client.name.lock() = name;
                 Ok(Response::Hello {
                     version: PROTOCOL_VERSION,
@@ -2266,21 +2289,12 @@ impl Daemon {
                 self.with_pane(pane, |_, st| Response::PaneInfo(st.info.clone()))
             }
             Request::Resize { pane, size } => {
-                let size = sanitize_size(size);
-                self.with_input_pane(client.id, pane, |_, st| {
-                    if st.info.size != size {
-                        if let Err(e) = st.pty.resize(size) {
-                            log::warn!("pane {pane}: resize to {}x{}: {e}", size.cols, size.rows);
-                        }
-                        st.term.resize(size);
-                        st.info.size = size;
-                        self.send_subscribers(st, Event::Resized { pane, size });
-                    }
-                })?;
+                self.resize_for(client, pane, size)?;
                 Ok(Response::Ok)
             }
             Request::Input { pane, data } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    self.used_by(client, st);
                     if !data.is_empty() {
                         st.agent.prompt.interrupted();
                     }
@@ -2292,6 +2306,7 @@ impl Daemon {
             }
             Request::Paste { pane, text } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    self.used_by(client, st);
                     if !text.is_empty() {
                         st.agent.prompt.interrupted();
                     }
@@ -2303,6 +2318,7 @@ impl Daemon {
             }
             Request::Key { pane, key } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    self.used_by(client, st);
                     let bytes = st.term.key(&key);
                     if !bytes.is_empty() {
                         st.agent.prompt.interrupted();
@@ -2316,6 +2332,7 @@ impl Daemon {
             Request::Mouse { pane, event } => {
                 let copy_on_select = self.config.read().terminal.copy_on_select;
                 let text = self.with_input_pane(client.id, pane, |p, st| {
+                    self.used_by(client, st);
                     let (outcome, bytes) = st.term.mouse(&event);
                     if !bytes.is_empty() {
                         st.agent.prompt.interrupted();
@@ -2356,6 +2373,9 @@ impl Daemon {
             }
             Request::Focus { pane, focused } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    if focused {
+                        self.used_by(client, st);
+                    }
                     if let Some(b) = st.term.focus(focused) {
                         if !b.is_empty() {
                             st.agent.prompt.interrupted();
@@ -2677,6 +2697,7 @@ impl Daemon {
                         return Vec::new();
                     }
                     if let Some(keys) = st.agent.answer_permission(prompt, allow) {
+                        self.used_by(client, st);
                         p.write(keys.to_vec());
                         answered = true;
                     }
@@ -3165,6 +3186,8 @@ mod tests {
             id: 1,
             tx,
             ui: AtomicBool::new(false),
+            mobile: AtomicBool::new(false),
+            active_size: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),

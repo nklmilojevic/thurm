@@ -320,7 +320,14 @@ impl Client {
         on_disconnect: impl FnOnce() + Send + 'static,
     ) -> Result<Arc<Client>, ClientError> {
         let stream = connect_socket(&opts)?;
-        Self::from_stream(stream, opts.client_name, opts.ui, on_event, on_disconnect)
+        Self::from_stream(
+            stream,
+            opts.client_name,
+            opts.ui,
+            &[],
+            on_event,
+            on_disconnect,
+        )
     }
 
     /// Like [`Client::connect`], over an already connected stream: the daemon socket, or one end
@@ -329,6 +336,7 @@ impl Client {
         stream: UnixStream,
         client_name: &str,
         ui: bool,
+        extra_capabilities: &[&str],
         on_event: impl Fn(Event) + Send + 'static,
         on_disconnect: impl FnOnce() + Send + 'static,
     ) -> Result<Arc<Client>, ClientError> {
@@ -389,9 +397,17 @@ impl Client {
             ui,
             capabilities: thurm_proto::CAPABILITIES
                 .iter()
+                .chain(extra_capabilities)
                 .map(|c| (*c).to_owned())
                 .collect(),
         })?;
+        if let Response::Hello { version, .. } = hello
+            && !thurm_proto::protocol_compatible(version)
+        {
+            return Err(ClientError::Daemon(format!(
+                "protocol mismatch: daemon {version}, client {PROTOCOL_VERSION}"
+            )));
+        }
         *client.hello.lock() = Some(hello);
         Ok(client)
     }
@@ -562,7 +578,7 @@ mod tests {
                         &ServerMessage::Response {
                             id: env.id,
                             result: Ok(Response::Hello {
-                                version: 1,
+                                version: PROTOCOL_VERSION,
                                 daemon_pid: 1,
                                 restored: false,
                                 build: String::new(),
@@ -626,7 +642,7 @@ mod tests {
                     &ServerMessage::Response {
                         id: env.id,
                         result: Ok(Response::Hello {
-                            version: 1,
+                            version: PROTOCOL_VERSION,
                             daemon_pid: 1,
                             restored: false,
                             build: String::new(),
@@ -681,7 +697,7 @@ mod tests {
             while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut r) {
                 let resp = match env.request {
                     Request::Hello { .. } => Response::Hello {
-                        version: 1,
+                        version: PROTOCOL_VERSION,
                         daemon_pid: 1,
                         restored: false,
                         build: String::new(),

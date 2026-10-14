@@ -24,6 +24,18 @@ pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
 /// or reordering variants or fields) bumps this.
 pub const PROTOCOL_VERSION: u32 = 18;
 
+/// The oldest peer this build still talks to. Apps and hosts update on different schedules (the
+/// iOS app through App Review), so a bump that keeps the rules above working for older peers
+/// leaves this alone; features newer than it are gated on [`CAPABILITIES`].
+pub const MIN_COMPATIBLE_PROTOCOL: u32 = 18;
+
+/// Whether a peer speaking `version` can talk to this build. The newer side decides: a daemon
+/// accepts any client from [`MIN_COMPATIBLE_PROTOCOL`] up (even newer than itself), and a client
+/// checks the daemon's version in the `Hello` answer.
+pub fn protocol_compatible(version: u32) -> bool {
+    version >= MIN_COMPATIBLE_PROTOCOL
+}
+
 /// A desktop can reject a layout before making changes when it has no window.
 /// The daemon can then try another desktop client.
 pub const LAYOUT_NO_WINDOW: &str = "no Thurm window is open";
@@ -41,7 +53,20 @@ pub const BUILD: &str = match option_env!("THURM_BUILD") {
 
 /// What this build supports beyond [`PROTOCOL_VERSION`], exchanged in `Hello` so a later
 /// version can accept older peers by capability instead of by exact version.
-pub const CAPABILITIES: &[&str] = &["hello-capabilities", "temp-file", "remote-layout"];
+pub const CAPABILITIES: &[&str] = &[
+    "hello-capabilities",
+    "temp-file",
+    "remote-layout",
+    CAP_ACTIVE_SIZE,
+];
+
+/// The pane takes the size of the client that used it last (see the daemon's `active_size`)
+/// instead of the last `Resize`.
+pub const CAP_ACTIVE_SIZE: &str = "active-size";
+
+/// Sent only by the iOS app: it gets notifications like a desktop UI, but takes no UI commands
+/// and does not count as an open window.
+pub const CAP_MOBILE: &str = "mobile";
 
 /// Environment variable exported into every pane with the pane's id.
 pub const ENV_PANE_ID: &str = "THURM_PANE_ID";
