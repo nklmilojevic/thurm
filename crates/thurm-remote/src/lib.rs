@@ -230,7 +230,10 @@ mod tests {
         let marker = base.join("started");
         for (name, body) in [
             ("thurm", "#!/bin/sh\nexit 0\n".to_owned()),
-            ("thurmd", format!("#!/bin/sh\necho \"$@\" > {}\n", marker.display())),
+            (
+                "thurmd",
+                format!("#!/bin/sh\necho \"$@\" > {}\n", marker.display()),
+            ),
         ] {
             let f = helpers.join(name);
             std::fs::write(&f, body).unwrap();
