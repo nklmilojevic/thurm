@@ -109,7 +109,7 @@
           "rust-src"
           "rust-analyzer"
         ];
-        # The iOS app's core (ios/build-core.sh).
+        # The iOS app's core (thurm-ffi's `mobile` feature, built by the iOS app's repository).
         targets = [
           "aarch64-apple-ios"
           "aarch64-apple-ios-sim"
@@ -140,8 +140,6 @@
           # Docs: cd docs && bun install && bun run dev
           bun
           gh
-          # ios/project.yml → Thurm.xcodeproj
-          xcodegen
         ];
 
         RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

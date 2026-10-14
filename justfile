@@ -70,7 +70,7 @@ watch:
     id="$(gh run list --repo {{ repo }} --workflow Release --limit 1 --json databaseId -q '.[0].databaseId')"
     gh run watch "$id" --repo {{ repo }} --exit-status
 
-# Write VERSION into Cargo.toml, Cargo.lock, Info.plist and the iOS project.
+# Write VERSION into Cargo.toml, Cargo.lock and Info.plist.
 _set-version version:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -79,8 +79,6 @@ _set-version version:
     perl -0pi -e 's|(<key>CFBundleShortVersionString</key>\s*<string>)[^<]*(</string>)|${1}{{ version }}${2}|' \
         macos/Resources/Info.plist
     grep -q '<string>{{ version }}</string>' macos/Resources/Info.plist
-    perl -pi -e 's|^(\s*MARKETING_VERSION: ).*|${1}{{ version }}|' ios/project.yml
-    grep -q 'MARKETING_VERSION: {{ version }}$' ios/project.yml
     if command -v cargo >/dev/null; then
         cargo update --workspace -q
     else

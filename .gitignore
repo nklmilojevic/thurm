@@ -12,8 +12,3 @@
 /docs/dist/
 /docs/.astro/
 __pycache__/
-/ios/ThurmCore.xcframework
-/ios/Thurm.xcodeproj
-/ios/Local.xcconfig
-/ios/Thurm/Info.plist
-/ios/build
