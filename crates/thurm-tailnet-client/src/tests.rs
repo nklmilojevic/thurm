@@ -243,3 +243,68 @@ fn a_send_that_stalls_late_gets_only_the_silence_left() {
         started.elapsed()
     );
 }
+
+/// One end of a socket pair whose other end is bridged to `url`'s TCP address: what
+/// libtailscale's `tailscale_dial` hands back.
+fn dialed(url: &str) -> OwnedFd {
+    let addr = url
+        .trim_start_matches("ws://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let tcp = std::net::TcpStream::connect(addr).unwrap();
+    let (mut t_rd, mut t_wr) = (theirs.try_clone().unwrap(), theirs);
+    let (mut c_rd, mut c_wr) = (tcp.try_clone().unwrap(), tcp);
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut t_rd, &mut c_wr);
+        let _ = c_wr.shutdown(std::net::Shutdown::Write);
+    });
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut c_rd, &mut t_wr);
+        let _ = t_wr.shutdown(std::net::Shutdown::Both);
+    });
+    OwnedFd::from(ours)
+}
+
+#[test]
+fn relays_over_a_dialed_socket() {
+    let server = server_rt();
+    let url = echo_server(&server);
+    let (mut stream, _session) = open_fd(dialed(&url), &url, CONNECT_TIMEOUT).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"over the tailnet").unwrap();
+    let mut got = [0u8; 16];
+    stream.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"OVER THE TAILNET");
+}
+
+#[test]
+fn a_refusal_over_a_dialed_socket_says_so() {
+    let server = server_rt();
+    let url = http_server(
+        &server,
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nforbidden",
+    );
+    assert!(matches!(
+        open_fd(dialed(&url), &url, CONNECT_TIMEOUT),
+        Err(ConnectError::Forbidden(_))
+    ));
+}
+
+#[test]
+fn a_dialed_socket_is_closed_when_connecting_fails() {
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    assert!(matches!(
+        open_fd(OwnedFd::from(ours), "https://x.ts.net/", CONNECT_TIMEOUT),
+        Err(ConnectError::BadUrl(_))
+    ));
+    let mut buf = [0u8; 1];
+    assert_eq!(theirs.read(&mut buf).unwrap(), 0);
+}

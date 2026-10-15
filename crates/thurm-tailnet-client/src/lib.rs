@@ -2,11 +2,13 @@
 //! `wss://<device>.<tailnet>.ts.net/v1/connect` (or `ws://` on a host's own tailnet address)
 //! whose binary messages carry the daemon's byte stream unchanged.
 //!
-//! The device reaches the tailnet through its own Tailscale (the Tailscale app on iOS); this
-//! only speaks WebSocket over TLS. The daemon admits the caller by its Tailscale identity, so
+//! The device reaches the tailnet through its own Tailscale (the Tailscale app on iOS), or the
+//! caller dials the daemon's device itself and passes the connected socket
+//! ([`connect_fd`], for an app embedding Tailscale); this only speaks WebSocket over TLS. The daemon admits the caller by its Tailscale identity, so
 //! there is no key or password here. The relay ends in a Unix socket pair, so the connection is
 //! an ordinary [`Client`] (the same trick as `thurm_ssh::Session::open_socket`).
 
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +16,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use thurm_client::{Client, ClientError};
 use thurm_proto::Event;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::runtime::Runtime;
 use tokio_tungstenite::tungstenite::{self, Message};
 
@@ -122,6 +124,29 @@ pub fn connect(
     )
 }
 
+/// Like [`connect`], over `fd`: a stream socket already connected to the daemon's device (say,
+/// by an embedded Tailscale's dial), on which this does TLS (for `url`'s host) and the upgrade.
+/// The socket is closed when the connection ends or fails.
+pub fn connect_fd(
+    fd: OwnedFd,
+    url: &str,
+    client_name: &str,
+    capabilities: &[&str],
+    on_event: impl Fn(Event) + Send + 'static,
+    on_disconnect: impl FnOnce() + Send + 'static,
+) -> Result<Remote, ConnectError> {
+    let deadline = std::time::Instant::now() + LIMITS.connect;
+    let opened = open_fd_with(fd, url, LIMITS)?;
+    hello(
+        opened,
+        deadline,
+        client_name,
+        capabilities,
+        on_event,
+        on_disconnect,
+    )
+}
+
 fn connect_with(
     url: &str,
     client_name: &str,
@@ -131,7 +156,26 @@ fn connect_with(
     on_disconnect: impl FnOnce() + Send + 'static,
 ) -> Result<Remote, ConnectError> {
     let deadline = std::time::Instant::now() + limits.connect;
-    let (stream, session) = open_with(url, limits)?;
+    let opened = open_with(url, limits)?;
+    hello(
+        opened,
+        deadline,
+        client_name,
+        capabilities,
+        on_event,
+        on_disconnect,
+    )
+}
+
+/// Says Hello over an opened relay, by `deadline`.
+fn hello(
+    (stream, session): (UnixStream, Session),
+    deadline: std::time::Instant,
+    client_name: &str,
+    capabilities: &[&str],
+    on_event: impl Fn(Event) + Send + 'static,
+    on_disconnect: impl FnOnce() + Send + 'static,
+) -> Result<Remote, ConnectError> {
     // A device that upgrades but whose daemon never answers must fail as quickly as one that
     // doesn't answer at all.
     let left = deadline
@@ -165,32 +209,113 @@ pub fn open(url: &str, timeout: Duration) -> Result<(UnixStream, Session), Conne
     )
 }
 
-fn open_with(url: &str, limits: Limits) -> Result<(UnixStream, Session), ConnectError> {
-    let timeout = limits.connect;
-    if !(url.starts_with("wss://") || url.starts_with("ws://")) {
-        return Err(ConnectError::BadUrl(url.to_owned()));
+/// Like [`open`], over `fd` (see [`connect_fd`]).
+pub fn open_fd(
+    fd: OwnedFd,
+    url: &str,
+    timeout: Duration,
+) -> Result<(UnixStream, Session), ConnectError> {
+    open_fd_with(
+        fd,
+        url,
+        Limits {
+            connect: timeout,
+            ..LIMITS
+        },
+    )
+}
+
+fn check_url(url: &str) -> Result<(), ConnectError> {
+    if url.starts_with("wss://") || url.starts_with("ws://") {
+        Ok(())
+    } else {
+        Err(ConnectError::BadUrl(url.to_owned()))
     }
+}
+
+fn runtime() -> Result<Session, ConnectError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .thread_name("thurm-tailnet")
         .enable_all()
         .build()
         .map_err(|e| ConnectError::Protocol(format!("starting the relay: {e}")))?;
-    let session = Session { rt: Some(rt) };
+    Ok(Session { rt: Some(rt) })
+}
+
+/// The handshake's result, with `timeout` as the limit.
+async fn handshake_within<S>(
+    timeout: Duration,
+    handshake: impl std::future::Future<
+        Output = Result<
+            (
+                tokio_tungstenite::WebSocketStream<S>,
+                tungstenite::handshake::client::Response,
+            ),
+            tungstenite::Error,
+        >,
+    >,
+) -> Result<tokio_tungstenite::WebSocketStream<S>, ConnectError> {
+    match tokio::time::timeout(timeout, handshake).await {
+        Ok(Ok((ws, _))) => Ok(ws),
+        Ok(Err(e)) => Err(classify(e)),
+        Err(_) => Err(ConnectError::Unreachable(format!(
+            "no answer within {} seconds",
+            timeout.as_secs()
+        ))),
+    }
+}
+
+fn open_with(url: &str, limits: Limits) -> Result<(UnixStream, Session), ConnectError> {
+    check_url(url)?;
+    let session = runtime()?;
     let rt = session.rt.as_ref().expect("just made");
     let ws = rt.block_on(async {
         let connector = tokio_tungstenite::Connector::Rustls(tls_config()?);
-        let handshake =
-            tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector));
-        match tokio::time::timeout(timeout, handshake).await {
-            Ok(Ok((ws, _))) => Ok(ws),
-            Ok(Err(e)) => Err(classify(e)),
-            Err(_) => Err(ConnectError::Unreachable(format!(
-                "no answer within {} seconds",
-                timeout.as_secs()
-            ))),
-        }
+        handshake_within(
+            limits.connect,
+            tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector)),
+        )
+        .await
     })?;
+    start(ws, session, limits)
+}
+
+fn open_fd_with(
+    fd: OwnedFd,
+    url: &str,
+    limits: Limits,
+) -> Result<(UnixStream, Session), ConnectError> {
+    check_url(url)?;
+    let socket = UnixStream::from(fd);
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| ConnectError::Protocol(format!("the dialed socket: {e}")))?;
+    let session = runtime()?;
+    let rt = session.rt.as_ref().expect("just made");
+    let ws = rt.block_on(async {
+        let socket = tokio::net::UnixStream::from_std(socket)
+            .map_err(|e| ConnectError::Protocol(format!("the dialed socket: {e}")))?;
+        let connector = tokio_tungstenite::Connector::Rustls(tls_config()?);
+        handshake_within(
+            limits.connect,
+            tokio_tungstenite::client_async_tls_with_config(url, socket, None, Some(connector)),
+        )
+        .await
+    })?;
+    start(ws, session, limits)
+}
+
+/// Relays `ws` to one end of a new socket pair, returned.
+fn start<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    session: Session,
+    limits: Limits,
+) -> Result<(UnixStream, Session), ConnectError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let rt = session.rt.as_ref().expect("made with it");
     let (ours, theirs) =
         UnixStream::pair().map_err(|e| ConnectError::Protocol(format!("socket pair: {e}")))?;
     theirs
@@ -247,13 +372,10 @@ fn classify(e: tungstenite::Error) -> ConnectError {
     }
 }
 
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
 /// Sends `msg`, giving up after `limit`: a peer that stopped reading must not hold the relay
 /// (and its silence check) forever.
-async fn send_within(
-    sink: &mut futures_util::stream::SplitSink<Ws, Message>,
+async fn send_within<S: AsyncRead + AsyncWrite + Unpin>(
+    sink: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
     msg: Message,
     limit: Duration,
 ) -> bool {
@@ -264,7 +386,11 @@ async fn send_within(
 }
 
 /// Copies the daemon's bytes both ways until either side ends, pinging while it's quiet.
-async fn relay(ws: Ws, local: tokio::net::UnixStream, limits: Limits) {
+async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    local: tokio::net::UnixStream,
+    limits: Limits,
+) {
     let (mut sink, mut stream) = ws.split();
     let (mut rd, mut wr) = local.into_split();
     // When the daemon was last heard from; the down side keeps it current.

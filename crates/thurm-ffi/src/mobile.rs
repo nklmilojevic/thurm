@@ -2,7 +2,8 @@
 //! (`thurm-ssh`), with the device key held by the app (see `thurm_device_key`), or over
 //! Tailscale where the daemon serves there (`thurm-tailnet-client`).
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_int, c_void};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use crate::{Ctx, into_c, new_connection, opt_str, thurm_client, thurm_event_cb, thurm_frame_cb};
@@ -135,7 +136,51 @@ pub unsafe extern "C" fn thurm_tailnet_connect(
         .unwrap_or("Thurm iOS")
         .to_owned();
     let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
-        let remote = thurm_tailnet_client::connect(
+        let remote =
+            thurm_tailnet_client::connect(&url, &name, &[thurm_proto::CAP_MOBILE], on_ev, on_disc)
+                .map_err(|e| e.to_string())?;
+        let transport: Box<dyn std::any::Any + Send> = Box::new(remote.session);
+        Ok((remote.client, Some(transport)))
+    });
+    match connected {
+        Ok(c) => c,
+        Err(e) => {
+            set_err(err, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Like `thurm_tailnet_connect`, over `fd`: a stream socket the app already connected to the
+/// daemon's device on port 443, with Tailscale embedded in the app (TailscaleKit's
+/// `tailscale_dial`). `url` names the daemon (its host is checked against the certificate).
+/// Takes `fd` over: it is closed when the connection ends, or now when connecting fails.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_tailnet_connect_fd(
+    fd: c_int,
+    url: *const c_char,
+    client_name: *const c_char,
+    on_event: thurm_event_cb,
+    on_frame: thurm_frame_cb,
+    ctx: *mut c_void,
+    err: *mut *mut c_char,
+) -> *mut thurm_client {
+    if fd < 0 {
+        set_err(err, "no socket".into());
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the caller hands over an open fd it no longer uses.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let Some(url) = (unsafe { opt_str(url) }).map(str::to_owned) else {
+        set_err(err, "no address".into());
+        return std::ptr::null_mut();
+    };
+    let name = unsafe { opt_str(client_name) }
+        .unwrap_or("Thurm iOS")
+        .to_owned();
+    let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
+        let remote = thurm_tailnet_client::connect_fd(
+            fd,
             &url,
             &name,
             &[thurm_proto::CAP_MOBILE],
