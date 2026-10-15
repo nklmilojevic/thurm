@@ -79,7 +79,7 @@ fn dropping_the_session_closes_the_stream() {
         .unwrap();
     drop(session);
     let mut buf = [0u8; 1];
-    assert_eq!(stream.read(&mut buf).unwrap_or(0), 0);
+    assert_eq!(stream.read(&mut buf).unwrap(), 0);
 }
 
 #[test]
@@ -139,4 +139,68 @@ fn only_websocket_urls() {
 fn errors_tell_what_to_check() {
     let e = ConnectError::Unreachable("connection refused".into()).to_string();
     assert!(e.contains("Tailscale connected on this device"), "{e}");
+}
+
+/// A WebSocket server that upgrades and then neither reads nor writes, holding the connection.
+fn silent_server(rt: &Runtime) -> String {
+    let ln = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+    let addr = ln.local_addr().unwrap();
+    rt.spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((tcp, _)) = ln.accept().await {
+            held.push(tokio_tungstenite::accept_async(tcp).await.unwrap());
+        }
+    });
+    format!("ws://{addr}/v1/connect")
+}
+
+const SHORT: Limits = Limits {
+    connect: Duration::from_secs(1),
+    ping_every: Duration::from_millis(200),
+    silent: Duration::from_secs(1),
+};
+
+#[test]
+fn a_daemon_that_never_says_hello_fails_within_the_limit() {
+    let server = server_rt();
+    let url = silent_server(&server);
+    let started = Instant::now();
+    // The silence check must not end it first: this is the Hello's deadline.
+    let limits = Limits {
+        silent: Duration::from_secs(30),
+        ..SHORT
+    };
+    let r = connect_with(&url, "test", &[], limits, |_| {}, || {});
+    assert!(
+        matches!(r, Err(ConnectError::DaemonUnavailable)),
+        "{:?}",
+        r.map(|_| ())
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+#[test]
+fn a_peer_that_stops_reading_ends_the_relay() {
+    let server = server_rt();
+    let url = silent_server(&server);
+    let (stream, _session) = open_with(&url, SHORT).unwrap();
+    let mut reader = stream.try_clone().unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // Write until the buffers fill and the relay's send stalls.
+    let mut writer = stream;
+    std::thread::spawn(move || {
+        let chunk = vec![0u8; 64 * 1024];
+        while writer.write_all(&chunk).is_ok() {}
+    });
+    let started = Instant::now();
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        reader.read(&mut buf).unwrap(),
+        0,
+        "the relay kept the stream open"
+    );
+    // The silence limit (1s) ends it, not whatever gives up on a stuck write later.
+    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
 }

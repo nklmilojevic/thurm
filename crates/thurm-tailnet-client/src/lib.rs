@@ -88,7 +88,23 @@ pub struct Remote {
     pub session: Session,
 }
 
-/// Connects to the daemon at `url` and says Hello (with `capabilities`, e.g. `CAP_MOBILE`).
+/// The relay's timing; tests shorten it.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    /// For everything up to the daemon's answer to Hello.
+    connect: Duration,
+    ping_every: Duration,
+    silent: Duration,
+}
+
+const LIMITS: Limits = Limits {
+    connect: CONNECT_TIMEOUT,
+    ping_every: PING_EVERY,
+    silent: SILENT_LIMIT,
+};
+
+/// Connects to the daemon at `url` and says Hello (with `capabilities`, e.g. `CAP_MOBILE`),
+/// within [`CONNECT_TIMEOUT`] in all.
 pub fn connect(
     url: &str,
     client_name: &str,
@@ -96,22 +112,61 @@ pub fn connect(
     on_event: impl Fn(Event) + Send + 'static,
     on_disconnect: impl FnOnce() + Send + 'static,
 ) -> Result<Remote, ConnectError> {
-    let (stream, session) = open(url, CONNECT_TIMEOUT)?;
-    let client = Client::from_stream(
+    connect_with(
+        url,
+        client_name,
+        capabilities,
+        LIMITS,
+        on_event,
+        on_disconnect,
+    )
+}
+
+fn connect_with(
+    url: &str,
+    client_name: &str,
+    capabilities: &[&str],
+    limits: Limits,
+    on_event: impl Fn(Event) + Send + 'static,
+    on_disconnect: impl FnOnce() + Send + 'static,
+) -> Result<Remote, ConnectError> {
+    let deadline = std::time::Instant::now() + limits.connect;
+    let (stream, session) = open_with(url, limits)?;
+    // A device that upgrades but whose daemon never answers must fail as quickly as one that
+    // doesn't answer at all.
+    let left = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(Duration::from_millis(500));
+    let client = Client::from_stream_timeout(
         stream,
         client_name,
         false,
         capabilities,
+        Some(left),
         on_event,
         on_disconnect,
     )
-    .map_err(ConnectError::Daemon)?;
+    .map_err(|e| match e {
+        ClientError::Timeout => ConnectError::DaemonUnavailable,
+        e => ConnectError::Daemon(e),
+    })?;
     Ok(Remote { client, session })
 }
 
 /// Opens the WebSocket at `url` and relays it to one end of a socket pair, returned with the
 /// session that keeps the relay running.
 pub fn open(url: &str, timeout: Duration) -> Result<(UnixStream, Session), ConnectError> {
+    open_with(
+        url,
+        Limits {
+            connect: timeout,
+            ..LIMITS
+        },
+    )
+}
+
+fn open_with(url: &str, limits: Limits) -> Result<(UnixStream, Session), ConnectError> {
+    let timeout = limits.connect;
     if !(url.starts_with("wss://") || url.starts_with("ws://")) {
         return Err(ConnectError::BadUrl(url.to_owned()));
     }
@@ -146,7 +201,7 @@ pub fn open(url: &str, timeout: Duration) -> Result<(UnixStream, Session), Conne
         tokio::net::UnixStream::from_std(theirs)
             .map_err(|e| ConnectError::Protocol(format!("socket pair: {e}")))?
     };
-    rt.spawn(relay(ws, theirs));
+    rt.spawn(relay(ws, theirs, limits));
     Ok((ours, session))
 }
 
@@ -195,8 +250,21 @@ fn classify(e: tungstenite::Error) -> ConnectError {
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Sends `msg`, giving up after `limit`: a peer that stopped reading must not hold the relay
+/// (and its silence check) forever.
+async fn send_within(
+    sink: &mut futures_util::stream::SplitSink<Ws, Message>,
+    msg: Message,
+    limit: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(limit, sink.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
 /// Copies the daemon's bytes both ways until either side ends, pinging while it's quiet.
-async fn relay(ws: Ws, local: tokio::net::UnixStream) {
+async fn relay(ws: Ws, local: tokio::net::UnixStream, limits: Limits) {
     let (mut sink, mut stream) = ws.split();
     let (mut rd, mut wr) = local.into_split();
     let (heard_tx, mut heard_rx) = tokio::sync::watch::channel(());
@@ -218,28 +286,30 @@ async fn relay(ws: Ws, local: tokio::net::UnixStream) {
     };
     let up = async {
         let mut buf = vec![0u8; 64 * 1024];
-        let mut ping = tokio::time::interval(PING_EVERY);
+        let mut ping = tokio::time::interval(limits.ping_every);
         ping.tick().await;
         let mut last_heard = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 n = rd.read(&mut buf) => match n {
                     Ok(0) | Err(_) => {
-                        let _ = sink.send(Message::Close(None)).await;
+                        send_within(&mut sink, Message::Close(None), Duration::from_secs(2)).await;
                         break;
                     }
                     Ok(n) => {
-                        if sink.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        let msg = Message::Binary(buf[..n].to_vec().into());
+                        if !send_within(&mut sink, msg, limits.silent).await {
+                            log::info!("tailnet: the daemon stopped reading; closing");
                             break;
                         }
                     }
                 },
                 _ = ping.tick() => {
-                    if last_heard.elapsed() > SILENT_LIMIT {
-                        log::info!("tailnet: no answer for {}s; closing", SILENT_LIMIT.as_secs());
+                    if last_heard.elapsed() > limits.silent {
+                        log::info!("tailnet: no answer for {}s; closing", limits.silent.as_secs());
                         break;
                     }
-                    if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    if !send_within(&mut sink, Message::Ping(Vec::new().into()), limits.silent).await {
                         break;
                     }
                 }
