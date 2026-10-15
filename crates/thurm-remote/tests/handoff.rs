@@ -215,13 +215,17 @@ fn parallel_handoffs_get_their_own_branches_and_worktrees() {
     assert_eq!(handoff::fetch(&f.host, &mut b).unwrap(), cb);
     assert_eq!(git(&f.repo, &["rev-parse", &a.tracking_ref()]), ca);
     assert_eq!(git(&f.repo, &["rev-parse", &b.tracking_ref()]), cb);
+    // Git 2.56 points the tracking ref at the base when the handoff pushes it by URL.
     let unfetched = Command::new("git")
         .arg("-C")
         .arg(&f.repo)
         .args(["rev-parse", "-q", "--verify", &c.tracking_ref()])
         .output()
         .unwrap();
-    assert!(!unfetched.status.success(), "c was never fetched");
+    assert!(
+        !unfetched.status.success() || String::from_utf8_lossy(&unfetched.stdout).trim() == c.base,
+        "c was never fetched"
+    );
 }
 
 #[test]
