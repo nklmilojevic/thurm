@@ -319,6 +319,9 @@ impl Pusher {
         token: String,
         state: Option<ActivityState>,
     ) -> Result<(), String> {
+        if !self.enabled() {
+            return Err("push notifications are off on this host ([push] relay is empty)".into());
+        }
         if !self.devices.lock().iter().any(|d| d.device == device) {
             return Err("register the device for push first".into());
         }
@@ -367,31 +370,46 @@ impl Pusher {
                 (Some(last), Some(now)) => last.same_as(now),
                 _ => false,
             };
-            if unchanged || (state.is_some() && open.contains(&f.device)) {
+            if unchanged {
+                return true;
+            }
+            if let Some(now) = &state
+                && open.contains(&f.device)
+            {
+                // The open app updates its activity itself: that is what it shows now, and
+                // what an end goes on showing.
+                f.last = Some(now.clone());
+                changed = true;
                 return true;
             }
             let Some(device) = devices.iter().find(|d| d.device == f.device) else {
                 changed = true;
                 return false;
             };
-            // An ending activity keeps showing its last state, as ended.
-            let shown = match &state {
-                Some(s) => Some((s.clone(), false)),
-                None => f.last.clone().map(|mut s| {
+            // An ending activity keeps showing its last state, as ended; one that never had a
+            // state (the agent was gone when it was followed) still ends.
+            let (shown, end) = match &state {
+                Some(s) => (s.clone(), false),
+                None => {
+                    let mut s = f.last.clone().unwrap_or(ActivityState {
+                        agent: String::new(),
+                        status: String::new(),
+                        title: String::new(),
+                        since: 0,
+                        permission: None,
+                    });
                     s.status = "ended".into();
                     s.since = now_secs();
                     (s, true)
-                }),
+                }
             };
-            if let Some((shown, end)) = shown {
-                self.queue_activity(ActivityJob {
-                    device: device.clone(),
-                    token: f.token.clone(),
-                    pane,
-                    state: shown,
-                    end,
-                });
-            }
+            self.queue_activity(ActivityJob {
+                device: device.clone(),
+                token: f.token.clone(),
+                pane,
+                state: shown,
+                end,
+            });
             changed = true;
             f.last = state.clone();
             state.is_some()
@@ -931,8 +949,8 @@ mod tests {
         };
         assert_eq!(
             last("d1", 4),
-            Some(Some(working.clone())),
-            "the open phone updates itself"
+            Some(Some(asking.clone())),
+            "the open phone updates itself: what it shows"
         );
         assert_eq!(
             last("d2", 4),
@@ -1076,6 +1094,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A relay answering 200 to every post, handing over each one's body.
+    fn capturing_relay() -> (String, crossbeam_channel::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) <= 2 {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; len];
+                let _ = reader.read_exact(&mut body);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+            }
+        });
+        (url, rx)
+    }
+
+    /// Every activity ends with what the phone last showed: updates the open app made itself
+    /// included, and one followed after its agent was gone too.
+    #[test]
+    fn every_activity_ends_with_what_it_showed() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-end-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (relay, posts) = capturing_relay();
+        let p = Pusher::new(&dir, true);
+        p.register(Device {
+            device: "d1".into(),
+            relay,
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        })
+        .unwrap();
+        let next = || -> serde_json::Value {
+            serde_json::from_str(&posts.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap()
+        };
+        let working = ActivityState {
+            agent: "Codex".into(),
+            status: "working".into(),
+            title: "nix-config".into(),
+            since: 1,
+            permission: None,
+        };
+        p.follow("d1", 4, "aa".into(), Some(working.clone()))
+            .unwrap();
+        assert_eq!(next()["state"]["status"], "working");
+        // The app is open and shows the prompt itself.
+        let asking = ActivityState {
+            status: "permission".into(),
+            title: "Fix the sidebar".into(),
+            permission: Some(7),
+            ..working
+        };
+        p.agent_changed(4, Some(asking), &["d1".to_owned()]);
+        p.agent_changed(4, None, &["d1".to_owned()]);
+        let end = next();
+        assert_eq!(end["event"], "end");
+        assert_eq!(end["state"]["status"], "ended");
+        assert_eq!(end["state"]["title"], "Fix the sidebar");
+
+        // Followed with no agent left: ends at once.
+        p.follow("d1", 5, "bb".into(), None).unwrap();
+        let end = next();
+        assert_eq!(end["event"], "end");
+        assert_eq!(end["token"], "bb");
+        assert!(p.follows.lock().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn plain_http_only_to_this_machine() {
         for ok in [
@@ -1122,6 +1221,10 @@ mod tests {
             .unwrap();
         p.set_enabled(false);
         assert!(p.register(d).is_err(), "registered while off");
+        assert!(
+            p.follow("d1", 5, "bb".into(), None).is_err(),
+            "followed while off"
+        );
         p.agent_changed(4, None, &[]);
         let follows = p.follows.lock();
         assert_eq!(follows.len(), 1, "ended while off");
