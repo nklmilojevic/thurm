@@ -509,7 +509,7 @@ pub fn view_at(config: &Path) -> Json {
     json!({
         "config_path": config.display().to_string(),
         "overlay_path": overlay_path.display().to_string(),
-        "config_read_only": std::fs::metadata(config).is_ok_and(|m| m.permissions().readonly()),
+        "config_read_only": crate::config_read_only(config),
         "overlay_exists": overlay_path.exists(),
         "sections": SECTIONS.iter().map(|(id, label)| json!({ "id": id, "label": label })).collect::<Vec<_>>(),
         "settings": settings,

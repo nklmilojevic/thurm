@@ -1659,6 +1659,25 @@ pub fn with_remote_setting(
     Ok(out)
 }
 
+/// Rewrites the `[[remote]]` hosts with `edit` (see [`with_remote_added`]). They are in
+/// config.toml, unless config.toml can't be written (a Home Manager link into the Nix store) or
+/// the settings overlay already sets `remote`, which replaces config.toml's hosts: then the
+/// edit goes to the overlay, which starts from config.toml's hosts. Returns the file edited.
+pub fn edit_remotes(edit: impl FnOnce(&str) -> Result<String, String>) -> Result<PathBuf, String> {
+    let config = config_path();
+    if !config_read_only(&config) && !overlay_holds(&config, "remote") {
+        edit_config(edit)?;
+        return Ok(config);
+    }
+    overlay::edit_remotes(&config, edit)
+}
+
+/// Whether `config` exists and can't be written, as a file Home Manager links into the Nix
+/// store.
+pub fn config_read_only(config: &Path) -> bool {
+    std::fs::metadata(config).is_ok_and(|m| m.permissions().readonly())
+}
+
 /// Rewrites the config file with `edit` applied to its text (created from the default if
 /// missing), atomically.
 pub fn edit_config(edit: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {

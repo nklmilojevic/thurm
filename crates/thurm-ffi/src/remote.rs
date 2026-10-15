@@ -357,14 +357,14 @@ fn call(c: Call) -> Result<Value, String> {
                 enabled: true,
                 clipboard_read: thurm_config::ClipboardRead::Ask,
             };
-            thurm_config::edit_config(|t| thurm_config::with_remote_added(t, &entry))?;
+            thurm_config::edit_remotes(|t| thurm_config::with_remote_added(t, &entry))?;
             if let Some(m) = MANAGER.lock().as_mut() {
                 sync(m);
             }
             json!({ "name": name, "host": host })
         }
         Call::Remove { name } => {
-            thurm_config::edit_config(|t| thurm_config::with_remote_removed(t, &name))?;
+            thurm_config::edit_remotes(|t| thurm_config::with_remote_removed(t, &name))?;
             if let Some(m) = MANAGER.lock().as_mut() {
                 sync(m);
             }
@@ -372,7 +372,7 @@ fn call(c: Call) -> Result<Value, String> {
         }
         Call::Set { name, key, value } => {
             let literal = remote_setting_literal(&key, &value)?;
-            thurm_config::edit_config(|t| {
+            thurm_config::edit_remotes(|t| {
                 thurm_config::with_remote_setting(t, &name, &key, &literal)
             })?;
             if let Some(m) = MANAGER.lock().as_mut() {
@@ -413,7 +413,7 @@ fn call(c: Call) -> Result<Value, String> {
             json!(ssh.interactive_argv(&script)?)
         }
         Call::AllowClipboard { name } => {
-            thurm_config::edit_config(|t| {
+            thurm_config::edit_remotes(|t| {
                 thurm_config::with_remote_setting(t, &name, "clipboard_read", "\"always\"")
             })?;
             json!("Ok")

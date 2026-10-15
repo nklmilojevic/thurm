@@ -164,12 +164,8 @@ pub fn add(o: AddOptions) -> R {
         enabled: true,
         clipboard_read: ClipboardRead::Ask,
     };
-    thurm_config::edit_config(|text| thurm_config::with_remote_added(text, &entry))?;
-    println!(
-        "Added [[remote]] {} to {}",
-        o.name,
-        thurm_config::config_path().display()
-    );
+    let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
+    println!("Added [[remote]] {} to {}", o.name, file.display());
 
     // The rest the host needs (lingering, PATH, agents, hooks), fixed where you agree.
     let report = doctor::run(&ssh, &o.name, o.socket.as_deref(), local_bins().as_deref())?;
@@ -487,7 +483,7 @@ pub fn install_cmd(name: &str, assume: Option<bool>) -> R {
 }
 
 pub fn remove(name: &str) -> R {
-    thurm_config::edit_config(|text| thurm_config::with_remote_removed(text, name))?;
+    thurm_config::edit_remotes(|text| thurm_config::with_remote_removed(text, name))?;
     reload_app();
     println!("Removed remote {name}. Its daemon and panes keep running there.");
     Ok(ExitCode::SUCCESS)

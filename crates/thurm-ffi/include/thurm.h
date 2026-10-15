@@ -470,9 +470,9 @@ void thurm_remote_kick(const char *name, bool restart);
  *        {"ok":true,"output":...} or {"ok":false,"would_stop_panes":true,"protocol":n}
  *   {"op":"add","name":"devbox","target":"me@devbox"}     {"name":...,"host":{...}} (checks ssh,
  *        writes [[remote]]; installing is doctor_fix "thurm")
- *   {"op":"remove","name":"devbox"}                       "Ok" (removes [[remote]] from config.toml)
+ *   {"op":"remove","name":"devbox"}                       "Ok" (removes the [[remote]])
  *   {"op":"set","name":"devbox","key":"enabled","value":false}   "Ok" (key: "host", "enabled"
- *        or "clipboard_read", in config.toml)
+ *        or "clipboard_read")
  *   {"op":"doctor","name":"devbox","bins":"..."}          {"plan":{...},"checks":[{"id":...,
  *        "title":...,"state":"ok"|"warn"|"fail"|"skip","detail":...,"fix":{"label":...,
  *        "confirm":...|null}|null,"terminal":"<script>"|null}, ...]}
