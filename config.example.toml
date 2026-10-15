@@ -255,6 +255,27 @@ animation_duration = 0.2
 # "cmd+shift+d" = "split_down"
 # "cmd+d" = "split_right"
 
+[tailscale]
+# Serve the daemon over Tailscale as a device of its own, so your phone and other
+# devices reach it at wss://HOSTNAME.YOUR-TAILNET.ts.net/v1/connect without ssh.
+# The first time, sign in with the link in Settings or `thurm tailscale status`.
+enabled = false
+# The device's name on the tailnet: one DNS label.
+hostname = "thurm"
+# Admit every tailnet member, not only the account that signed the device in.
+allow_tailnet_members = false
+# ACL tags to enroll with, such as ["tag:thurm"]. Needs allow_tailnet_members.
+advertise_tags = []
+# A file with a Tailscale auth key, to enroll without a browser.
+auth_key_file = ""
+# Also listen on this machine's tailnet addresses through its own Tailscale.
+host_listen = ""
+# host_listen = ":7297"
+# With host_listen: admit every identified caller, not only this machine's owner.
+host_allow_identified = false
+# A socket for `tailscale serve` to proxy to.
+serve_socket = false
+
 # Remote workspaces: thurmd on another machine, reached with the system ssh.
 # `thurm remote add devbox devbox` checks the connection and writes an entry.
 # [[remote]]
