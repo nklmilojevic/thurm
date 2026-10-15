@@ -756,3 +756,44 @@ fn a_closed_panes_notice_comes_down() {
     let b = next_post(&posts, "/v1/read", Duration::from_secs(10)).expect("the phone never heard");
     assert_eq!(b["pane"], pane);
 }
+
+/// A held pane outlives its process, but the agent's notice goes with it.
+#[test]
+fn a_held_panes_notice_comes_down_when_it_exits() {
+    let env = push_env("read-on-exit");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (relay, posts) = fake_relay();
+    register(&mac, "dev-1", &relay, "iPhone");
+    let pane = match mac
+        .request(Request::CreatePane(CreatePane {
+            cwd: Some(env.dir.display().to_string()),
+            size: size(80, 24),
+            hold: true,
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    run_cat(&mac, pane);
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+    next_push(&posts, Duration::from_secs(10)).expect("no notice");
+    // Typing here would read it: end the shell from outside instead.
+    let pid = match mac.request(Request::PaneInfo { pane }).unwrap() {
+        Response::PaneInfo(info) => info.pid.expect("the shell's pid"),
+        other => panic!("{other:?}"),
+    };
+    std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    let b = next_post(&posts, "/v1/read", Duration::from_secs(10)).expect("the phone never heard");
+    assert_eq!(b["pane"], pane);
+    assert!(
+        matches!(mac.request(Request::PaneInfo { pane }), Ok(Response::PaneInfo(i)) if !i.alive),
+        "the held pane went away"
+    );
+}

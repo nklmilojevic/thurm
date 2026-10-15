@@ -501,6 +501,12 @@ impl Daemon {
                 self.push.read(*pane, &open());
                 self.push.agent_changed(*pane, None, &[]);
             }
+            // A held pane outlives its process, but not its agent's notices (the apps take
+            // theirs down on exit too).
+            Event::PaneExited { pane, .. } => {
+                self.unread.lock().remove(pane);
+                self.push.read(*pane, &open());
+            }
             _ => {}
         }
         let desktop_only = matches!(event, Event::Ui(_));
