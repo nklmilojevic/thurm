@@ -282,24 +282,28 @@ impl std::error::Error for PairingError {}
 /// Exit status of [`EDIT`] when `authorized_keys` can't be written.
 const NOT_WRITABLE: i32 = 4;
 
-/// Replaces the device's key in `authorized_keys`: drops the lines ending in ` thurm-ios:$2`,
-/// appends `$1` (when given) with Thurm's options, through a temporary file and `mv`. Every other
+/// Replaces the device's key in `authorized_keys`: drops the lines Thurm wrote for device `$2`
+/// (exactly `restrict,port-forwarding ecdsa-sha2-nistp256 <blob> thurm-ios:$2`, nothing that only
+/// ends the same way), appends `$1` (when given) with Thurm's options, through a temporary file and `mv`. Every other
 /// line stays byte for byte, a last line without a newline included (one is put before the
 /// appended key only); a revoke that matches nothing leaves the file alone. A link (managed
 /// elsewhere) or an unreadable file is not touched.
 const EDIT: &str = concat!(
-    "TH=\"${THURM_HOME:-$HOME}\"; D=\"$TH/.ssh\"; F=\"$D/authorized_keys\"; T=\"$F.thurm-$$\"; N=\"\n\"; ",
+    // V: the device (`$2` inside `ours` would be the function's own argument).
+    "TH=\"${THURM_HOME:-$HOME}\"; D=\"$TH/.ssh\"; F=\"$D/authorized_keys\"; T=\"$F.thurm-$$\"; N=\"\n\"; V=\"$2\"; ",
     "nw() { [ -e /etc/NIXOS ] && echo nixos >&2; echo \"authorized_keys is not writable\" >&2; exit 4; }; ",
     "if [ -z \"$1\" ] && [ ! -e \"$F\" ] && [ ! -L \"$F\" ]; then exit 0; fi; ",
     "if [ -L \"$F\" ]; then nw; fi; ",
     "if [ -e \"$F\" ] && { [ ! -w \"$F\" ] || [ ! -r \"$F\" ]; }; then nw; fi; ",
     "umask 077; mkdir -p \"$D\" 2>/dev/null || nw; chmod 700 \"$D\" 2>/dev/null; ",
+    "ours() { case \"$L\" in \"restrict,port-forwarding ecdsa-sha2-nistp256 \"?*) ;; *) return 1 ;; esac; ",
+    "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; [ \"$R\" = \"$B thurm-ios:$V\" ]; }; ",
     // E: the line read had no newline (the last one). P: the last line written has none. M: a
     // line of the device was dropped.
     "P=; M=; { if [ -f \"$F\" ]; then while :; do E=; IFS= read -r L || E=1; ",
     "if [ -n \"$E\" ] && [ -z \"$L\" ]; then break; fi; ",
-    "case \"$L\" in *\" thurm-ios:$2\") M=1 ;; ",
-    "*) if [ -n \"$E\" ]; then printf \"%s\" \"$L\"; P=1; else printf \"%s$N\" \"$L\"; fi ;; esac; ",
+    "if ours; then M=1; ",
+    "elif [ -n \"$E\" ]; then printf \"%s\" \"$L\"; P=1; else printf \"%s$N\" \"$L\"; fi; ",
     "[ -z \"$E\" ] || break; done < \"$F\" || { rm -f \"$T\"; exit 1; }; fi; ",
     "if [ -n \"$1\" ]; then [ -z \"$P\" ] || printf \"$N\"; ",
     "printf \"%s$N\" \"restrict,port-forwarding $1 thurm-ios:$2\"; fi; ",
@@ -308,14 +312,17 @@ const EDIT: &str = concat!(
     "chmod 600 \"$T\" && mv -f \"$T\" \"$F\" || { rm -f \"$T\"; nw; }"
 );
 
-/// Prints the device names of the `thurm-ios:` keys in `authorized_keys`, one per line. No file:
+/// Prints the device names of the keys Thurm wrote in `authorized_keys` (the lines [`EDIT`] would
+/// replace), one per line. No file:
 /// none; a file it can't read: an error (its keys may still let phones in).
 const LIST: &str = concat!(
     "TH=\"${THURM_HOME:-$HOME}\"; F=\"$TH/.ssh/authorized_keys\"; N=\"\n\"; ",
     "[ -e \"$F\" ] || exit 0; ",
     "[ -r \"$F\" ] || { echo \"authorized_keys is not readable\" >&2; exit 4; }; ",
-    "while IFS= read -r L || [ -n \"$L\" ]; do C=\"${L##* }\"; ",
-    "case \"$C\" in thurm-ios:?*) printf \"%s$N\" \"${C#thurm-ios:}\" ;; esac; done < \"$F\""
+    "while IFS= read -r L || [ -n \"$L\" ]; do ",
+    "case \"$L\" in \"restrict,port-forwarding ecdsa-sha2-nistp256 \"?*) ;; *) continue ;; esac; ",
+    "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; C=\"${R#\"$B\" }\"; ",
+    "case \"$C\" in *\" \"*) ;; thurm-ios:?*) printf \"%s$N\" \"${C#thurm-ios:}\" ;; esac; done < \"$F\""
 );
 
 fn edit(ssh: &dyn RemoteExec, key: &str, device: &str) -> Result<(), PairingError> {
@@ -645,8 +652,11 @@ mod tests {
         assert_eq!(mode(&home.join(".ssh")), 0o700);
 
         // Other lines (no trailing newline, odd characters) stay as they are.
-        let other = "command=\"echo \\\"hi\\\" %s\",no-pty ssh-ed25519 AAAA  me@laptop\n  # a comment\n\nssh-rsa BBBB x thurm-ios:iPhone-old";
-        std::fs::write(&file, other).unwrap();
+        let old = format!("{KEY_OPTIONS} {} thurm-ios:iPhone-old", key.key);
+        let other = format!(
+            "command=\"echo \\\"hi\\\" %s\",no-pty ssh-ed25519 AAAA  me@laptop\n  # a comment\n\n{old}"
+        );
+        std::fs::write(&file, &other).unwrap();
         authorize(&local, &key).unwrap();
         authorize(&local, &key).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
@@ -661,6 +671,34 @@ mod tests {
         );
         revoke(&local, "iPhone-old").unwrap();
         assert!(devices(&local).unwrap().is_empty());
+
+        // Only lines Thurm wrote are the device's: anything that merely ends in
+        // ` thurm-ios:iPhone` survives re-pairing and revoking, and isn't listed.
+        let lookalikes = format!(
+            "# retired: thurm-ios:iPhone\n\
+             ssh-ed25519 AAAAC3Nz admin thurm-ios:iPhone\n\
+             ssh-ed25519 AAAAC3Nz thurm-ios:iPhone\n\
+             {KEY_OPTIONS} {} extra thurm-ios:iPhone\n\
+             no-pty {} thurm-ios:iPhone\n",
+            key.key, key.key
+        );
+        std::fs::write(&file, &lookalikes).unwrap();
+        assert!(devices(&local).unwrap().is_empty());
+        authorize(&local, &key).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("{lookalikes}{}\n", key.line())
+        );
+        assert_eq!(devices(&local).unwrap(), ["iPhone"]);
+        revoke(&local, "iPhone").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), lookalikes);
+        let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&file).unwrap());
+        revoke(&local, "iPhone").unwrap();
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&file).unwrap()),
+            inode,
+            "nothing of the device's left: the file is not rewritten"
+        );
         assert!(
             std::fs::read_dir(home.join(".ssh")).unwrap().all(|e| !e
                 .unwrap()
@@ -677,7 +715,7 @@ mod tests {
         std::fs::write(
             &file,
             format!(
-                "ssh-ed25519 AAAA one\n{} thurm-ios:iPad\nssh-rsa BBBB two",
+                "ssh-ed25519 AAAA one\n{KEY_OPTIONS} {} thurm-ios:iPad\nssh-rsa BBBB two",
                 key.key
             ),
         )

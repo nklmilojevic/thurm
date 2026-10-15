@@ -146,11 +146,18 @@ enum PhonePairing {
     static func devices(in file: URL = authorizedKeys) -> [Device] {
         guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [] }
         return text.split(separator: "\n").compactMap { line in
-            guard let comment = line.split(separator: " ").last, comment.hasPrefix(commentPrefix) else {
-                return nil
-            }
-            return Device(name: String(comment.dropFirst(commentPrefix.count)), line: String(line))
+            deviceName(ofLine: line).map { Device(name: $0, line: String(line)) }
         }
+    }
+
+    /// The device of a line Thurm wrote (exactly `restrict,port-forwarding ecdsa-sha2-nistp256
+    /// <key> thurm-ios:<device>`); nil for any other line, even one ending the same way.
+    static func deviceName(ofLine line: Substring) -> String? {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: false)
+        guard parts.count == 4, parts[0] == keyOptions, parts[1] == "ecdsa-sha2-nistp256", !parts[2].isEmpty,
+              parts[3].hasPrefix(commentPrefix), parts[3].count > commentPrefix.count
+        else { return nil }
+        return String(parts[3].dropFirst(commentPrefix.count))
     }
 
     /// Adds (or replaces, by device name) a device key. Creates ~/.ssh (0700) and the file (0600).
@@ -159,7 +166,7 @@ enum PhonePairing {
         try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
                                attributes: [.posixPermissions: 0o700])
         var lines = try lines(of: file)
-        lines.removeAll { $0.hasSuffix(" " + commentPrefix + device) }
+        lines.removeAll { deviceName(ofLine: $0[...]) == device }
         lines.append("\(keyOptions) \(key) \(commentPrefix)\(device)")
         try write(lines, to: file)
     }
@@ -296,6 +303,7 @@ struct PairPhoneSheet: View {
                 }
                 VStack(alignment: .leading, spacing: 8) {
                     Text("1. In the Thurm app on your iPhone, tap + and scan this code.")
+                        .fixedSize(horizontal: false, vertical: true)
                     Form {
                         TextField("Address", text: $host)
                         TextField("Port", value: $port, format: .number.grouping(.never))

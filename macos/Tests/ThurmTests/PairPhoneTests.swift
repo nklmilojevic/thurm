@@ -74,6 +74,32 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "ssh-ed25519 AAAA other@laptop\n")
     }
 
+    func testOnlyLinesThurmWroteAreDevices() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let file = dir.appendingPathComponent(".ssh/authorized_keys")
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let (key, device) = try XCTUnwrap(PhonePairing.validDeviceKey(deviceKey))
+        let lookalikes = """
+        # retired: thurm-ios:iPhone
+        ssh-ed25519 AAAAC3Nz admin thurm-ios:iPhone
+        ssh-ed25519 AAAAC3Nz thurm-ios:iPhone
+        restrict,port-forwarding \(key) extra thurm-ios:iPhone
+        no-pty \(key) thurm-ios:iPhone
+
+        """
+        try lookalikes.write(to: file, atomically: true, encoding: .utf8)
+        XCTAssertTrue(PhonePairing.devices(in: file).isEmpty)
+        try PhonePairing.add(key: key, device: device, to: file)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8),
+                       lookalikes + "restrict,port-forwarding \(key) thurm-ios:iPhone\n",
+                       "pairing again replaces only the line Thurm wrote")
+        let devices = PhonePairing.devices(in: file)
+        XCTAssertEqual(devices.map(\.name), ["iPhone"])
+        try PhonePairing.revoke(devices[0], in: file)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), lookalikes)
+    }
+
     func testPairingLinkRoundTrips() throws {
         let link = PhonePairing.payload(name: "studio", host: "studio.tail.ts.net", port: 22, user: "me",
                                         hostKeys: ["SHA256:abc"], relay: nil, code: nil)
