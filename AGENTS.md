@@ -26,7 +26,8 @@ What they share, and where a change on one side needs the other:
   into the app.
 - **Push relay API.** `thurmd` (`crates/thurm-daemon/src/push.rs`) posts to `POST /v1/push`,
   `POST /v1/activity` and `POST /v1/read` (a pane read elsewhere: the relay sends the app a silent
-  push with `read: {host, pane}`, and the app takes that pane's notices down), signed with the
+  push with `read: {host, pane, seq}`, and the app takes that pane's notices down, those whose
+  `seq` is not newer: a late silent push leaves a newer notice standing), signed with the
   device secret (`X-Thurm-Timestamp`, `X-Thurm-Signature`: HMAC-SHA256 of `<timestamp>.<body>`).
   The app registers with `POST /v1/devices` and leaves with `DELETE /v1/devices/{device}`;
   `thurmd` forgets a device only on a 404 with `X-Thurm-Device: unknown` (any other 404, from a

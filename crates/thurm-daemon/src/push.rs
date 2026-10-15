@@ -8,7 +8,9 @@
 //! every change, until the agent leaves or the pane closes.
 //!
 //! When a pane is read (on the Mac, or on another phone), the devices it sent notices to hear
-//! of it (`POST /v1/read`), so the notices leave their lock screens too.
+//! of it (`POST /v1/read`), so the notices leave their lock screens too. Notices carry a
+//! sequence number and a read the last one it covers: a read arriving late (iOS delays silent
+//! pushes) leaves a newer notice standing.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,12 +86,12 @@ pub fn clean_title(title: &str) -> String {
 }
 
 enum Job {
-    /// A notice for these devices.
-    Notice(Notice, Vec<Device>),
+    /// A notice (and its sequence number) for these devices.
+    Notice(Notice, u64, Vec<Device>),
     /// Live Activity updates are waiting in `Pusher::activities`.
     Activities,
-    /// The pane was read: its notices on these devices are stale.
-    Read(PaneId, Vec<Device>),
+    /// The pane was read: its notices on these devices up to this sequence number are stale.
+    Read(PaneId, u64, Vec<Device>),
 }
 
 struct ActivityJob {
@@ -115,8 +117,12 @@ pub struct Pusher {
     enabled: Arc<AtomicBool>,
     /// When each pane last sent a notice (see `notify`).
     last_notice: Mutex<std::collections::HashMap<PaneId, std::time::Instant>>,
-    /// The devices each pane sent notices to since it was last read (see `read`).
-    notified: Mutex<std::collections::HashMap<PaneId, Vec<String>>>,
+    /// Each pane's last notice since it was last read, and the devices it sent notices to (see
+    /// `read`).
+    notified: Mutex<std::collections::HashMap<PaneId, (u64, Vec<String>)>>,
+    /// The next notice's sequence number. Starts at the clock (milliseconds), so numbers keep
+    /// growing across daemon restarts.
+    next_seq: std::sync::atomic::AtomicU64,
     /// Shared with the push thread, which forgets a device the relay no longer knows.
     devices: Arc<Mutex<Vec<Device>>>,
     follows: Arc<Mutex<Vec<Follow>>>,
@@ -156,6 +162,12 @@ impl Pusher {
             enabled: Arc::new(AtomicBool::new(enabled)),
             last_notice: Mutex::new(std::collections::HashMap::new()),
             notified: Mutex::new(std::collections::HashMap::new()),
+            next_seq: std::sync::atomic::AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1),
+            ),
             devices: Arc::new(Mutex::new(devices)),
             follows: Arc::new(Mutex::new(follows)),
             activities: Arc::new(Mutex::new(Vec::new())),
@@ -191,11 +203,11 @@ impl Pusher {
                             }
                         };
                     match &job {
-                        Job::Notice(notice, devices) => {
-                            send("/v1/push", "push", devices, &|d| body(d, notice))
+                        Job::Notice(notice, seq, devices) => {
+                            send("/v1/push", "push", devices, &|d| body(d, notice, *seq))
                         }
-                        Job::Read(pane, devices) => {
-                            send("/v1/read", "read", devices, &|d| read_body(d, *pane))
+                        Job::Read(pane, seq, devices) => {
+                            send("/v1/read", "read", devices, &|d| read_body(d, *pane, *seq))
                         }
                         Job::Activities => {}
                     }
@@ -310,16 +322,18 @@ impl Pusher {
         if devices.is_empty() || !self.fresh(&notice) {
             return;
         }
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         {
             let mut notified = self.notified.lock();
-            let sent = notified.entry(notice.pane).or_default();
+            let (last, sent) = notified.entry(notice.pane).or_default();
+            *last = seq;
             for d in &devices {
                 if !sent.contains(&d.device) {
                     sent.push(d.device.clone());
                 }
             }
         }
-        let _ = self.tx.try_send(Job::Notice(notice, devices));
+        let _ = self.tx.try_send(Job::Notice(notice, seq, devices));
     }
 
     /// `pane` was read (or closed): the devices it sent notices to since it was last read take
@@ -327,7 +341,7 @@ impl Pusher {
     /// again at once.
     pub fn read(&self, pane: PaneId, open: &[String]) {
         self.last_notice.lock().remove(&pane);
-        let Some(notified) = self.notified.lock().remove(&pane) else {
+        let Some((seq, notified)) = self.notified.lock().remove(&pane) else {
             return;
         };
         if !self.enabled() {
@@ -341,7 +355,7 @@ impl Pusher {
             .cloned()
             .collect();
         if !devices.is_empty() {
-            let _ = self.tx.try_send(Job::Read(pane, devices));
+            let _ = self.tx.try_send(Job::Read(pane, seq, devices));
         }
     }
 
@@ -648,8 +662,8 @@ fn validate_relay(relay: &str) -> Result<(), String> {
     }
 }
 
-/// The request body the relay gets for `notice`, for `device`.
-pub fn body(device: &Device, notice: &Notice) -> String {
+/// The request body the relay gets for `notice` (sequence number `seq`), for `device`.
+pub fn body(device: &Device, notice: &Notice, seq: u64) -> String {
     let text = if notice.permission.is_some() {
         "asks for permission"
     } else {
@@ -662,16 +676,18 @@ pub fn body(device: &Device, notice: &Notice) -> String {
         "title": notice.title,
         "body": text,
         "permission": notice.permission,
+        "seq": seq,
     })
     .to_string()
 }
 
-/// The request body the relay gets when `pane` was read, for `device`.
-pub fn read_body(device: &Device, pane: PaneId) -> String {
+/// The request body the relay gets when `pane` was read, up to its notice `seq`, for `device`.
+pub fn read_body(device: &Device, pane: PaneId, seq: u64) -> String {
     serde_json::json!({
         "device": device.device,
         "host": device.host,
         "pane": pane,
+        "seq": seq,
     })
     .to_string()
 }
@@ -794,9 +810,11 @@ mod tests {
                 title: "Claude Code".into(),
                 permission: Some(9),
             },
+            42,
         ))
         .unwrap();
         assert_eq!(b["body"], "asks for permission");
+        assert_eq!(b["seq"], 42);
         assert_eq!(b["host"], "studio");
         assert_eq!(b["permission"], 9);
     }

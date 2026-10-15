@@ -672,7 +672,15 @@ fn a_pane_read_on_the_mac_clears_the_phones_notice() {
     run_cat(&mac, pane);
     hook(&mac, pane, "prompt-submit", None);
     hook(&mac, pane, "permission-prompt", None);
-    next_push(&posts, Duration::from_secs(10)).expect("no notice");
+    let first = next_push(&posts, Duration::from_secs(10)).expect("no notice");
+    hook(&mac, pane, "stop", None);
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+    let second = next_push(&posts, Duration::from_secs(10)).expect("no second notice");
+    assert!(
+        second["seq"].as_u64() > first["seq"].as_u64(),
+        "{first} {second}"
+    );
 
     mac.request(Request::Focus {
         pane,
@@ -683,6 +691,8 @@ fn a_pane_read_on_the_mac_clears_the_phones_notice() {
     assert_eq!(b["device"], "dev-1");
     assert_eq!(b["host"], "studio");
     assert_eq!(b["pane"], pane);
+    // Up to the last notice: one sent after this read stays when the read comes late.
+    assert_eq!(b["seq"], second["seq"]);
     assert!(heard_read(&mac_events, pane, Duration::from_secs(5)));
 
     // Already read: looking again or typing is no news.
