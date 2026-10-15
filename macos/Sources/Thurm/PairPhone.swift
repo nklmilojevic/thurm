@@ -497,7 +497,11 @@ struct PairPhoneSheet: View {
             message = "Added \(device) on this Mac. The app can connect now."
             deviceKey = ""
         } catch {
-            message = "Could not write ~/.ssh/authorized_keys: \(error.localizedDescription)"
+            // A failed pairing must not leave the key working on the remote hosts.
+            message = "Could not write ~/.ssh/authorized_keys: \(error.localizedDescription). "
+                + "The key was not added on any host."
+            devices = PhonePairing.devices()
+            return
         }
         devices = PhonePairing.devices()
         for h in remoteHosts where h.included && h.error == nil {
