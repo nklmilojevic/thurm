@@ -278,15 +278,25 @@ struct PairPhoneSheet: View {
         devices = PhonePairing.devices()
     }
 
+    /// Removes the phone's key, then has the daemon forget its push registration (no more
+    /// notices or Live Activity updates) and drop its connection if one is open.
     private func revoke(_ device: PhonePairing.Device) {
         do {
             try PhonePairing.revoke(device)
-            message = "Revoked \(device.name)."
         } catch {
             message = "Could not revoke \(device.name): its key still works. "
                 + "~/.ssh/authorized_keys: \(error.localizedDescription)"
+            devices = PhonePairing.devices()
+            return
         }
         devices = PhonePairing.devices()
+        message = "Revoked \(device.name)."
+        Core.shared.requestAsync(object: ["RevokePushDevices": ["name": device.name]], timeout: 5) { resp in
+            if resp == nil || (resp as? [String: Any])?["error"] != nil {
+                let why = ((resp as? [String: Any])?["error"] as? String) ?? "the daemon did not answer"
+                message = "Revoked \(device.name)'s key, but it may still get notifications: \(why)"
+            }
+        }
     }
 
     /// Whether sshd answers on this Mac (Remote Login).

@@ -42,6 +42,7 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
         return;
     }
     let (client, rx) = daemon.add_client();
+    *client.socket.lock() = stream.try_clone().ok();
     let write_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {

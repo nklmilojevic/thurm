@@ -234,6 +234,8 @@ pub struct Client {
     /// The push device the iOS app registered over this connection: while it is connected,
     /// that phone hears notices live instead of on its lock screen.
     pub push_device: Mutex<Option<String>>,
+    /// The connection, to drop it from outside its reader (a revoked phone).
+    pub socket: Mutex<Option<std::os::unix::net::UnixStream>>,
     /// Its panes follow the active client's size ([`thurm_proto::CAP_ACTIVE_SIZE`]).
     pub active_size: AtomicBool,
     pub name: Mutex<String>,
@@ -520,6 +522,7 @@ impl Daemon {
             ui: AtomicBool::new(false),
             mobile: AtomicBool::new(false),
             push_device: Mutex::new(None),
+            socket: Mutex::new(None),
             active_size: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
@@ -2549,6 +2552,23 @@ impl Daemon {
                 self.push.unregister(&device)?;
                 Ok(Response::Ok)
             }
+            Request::RevokePushDevices { name } => {
+                let gone = self.push.revoke_named(&name)?;
+                // Revoking its key leaves an ssh session already open: end the phone's connection.
+                let clients: Vec<_> = self.clients.lock().values().cloned().collect();
+                for c in clients {
+                    let device = c.push_device.lock().clone();
+                    if c.mobile.load(Ordering::Relaxed) && device.is_some_and(|d| gone.contains(&d))
+                    {
+                        log::info!("client {}: its phone was revoked; dropping it", c.id);
+                        if let Some(s) = c.socket.lock().as_ref() {
+                            let _ = s.shutdown(std::net::Shutdown::Both);
+                        }
+                    }
+                }
+                log::info!("revoked {name}: {} push device(s) forgotten", gone.len());
+                Ok(Response::Ok)
+            }
             Request::FollowAgent {
                 device,
                 pane,
@@ -3320,6 +3340,7 @@ mod tests {
             ui: AtomicBool::new(false),
             mobile: AtomicBool::new(false),
             push_device: Mutex::new(None),
+            socket: Mutex::new(None),
             active_size: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),

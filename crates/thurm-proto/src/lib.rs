@@ -327,6 +327,11 @@ pub enum Request {
     UnregisterPushDevice {
         device: String,
     },
+    /// The Mac revoked the phone `name` (as its device key's comment names it, `thurm-ios:<name>`,
+    /// spaces as dashes): forget its push devices, and drop its connections.
+    RevokePushDevices {
+        name: String,
+    },
     /// The iOS app shows `pane`'s agent in a Live Activity: post its state changes for
     /// `device` (registered with [`Request::RegisterPushDevice`]) with the activity's push
     /// `token`, until the agent leaves, the pane closes, or [`Request::UnfollowAgent`].

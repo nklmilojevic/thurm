@@ -238,6 +238,26 @@ impl Pusher {
         save_json(&self.follows_path, &*follows)
     }
 
+    /// Forgets every device registered under the phone name `name` (spaces as dashes, as its
+    /// device key's comment has it) and its activities. Returns their ids.
+    pub fn revoke_named(&self, name: &str) -> Result<Vec<String>, String> {
+        let mut devices = self.devices.lock();
+        let gone: Vec<String> = devices
+            .iter()
+            .filter(|d| d.name.replace(' ', "-") == name)
+            .map(|d| d.device.clone())
+            .collect();
+        if gone.is_empty() {
+            return Ok(gone);
+        }
+        devices.retain(|d| !gone.contains(&d.device));
+        self.save(&devices)?;
+        let mut follows = self.follows.lock();
+        follows.retain(|f| !gone.contains(&f.device));
+        save_json(&self.follows_path, &*follows)?;
+        Ok(gone)
+    }
+
     /// Queues `notice` for every registered device but those in `open` (phones with the app
     /// open, which hear it live). Dropped when the queue is full: a stuck relay must not hold up
     /// the daemon.
@@ -763,6 +783,49 @@ mod tests {
         assert_eq!(last("d1", 4), None, "the open phone's activity ends too");
         assert_eq!(last("d2", 4), None);
         assert!(last("d1", 5).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoking_a_phone_forgets_its_devices() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Pusher::new(&dir, true);
+        for (id, host, name) in [
+            ("d1", "studio", "Nikola's iPhone"),
+            ("d2", "laptop", "Nikola's iPhone"),
+            ("d3", "studio", "iPad"),
+        ] {
+            p.register(Device {
+                device: id.into(),
+                relay: "https://push.example.net".into(),
+                secret: "s".repeat(32),
+                host: host.into(),
+                name: name.into(),
+            })
+            .unwrap();
+        }
+        let working = ActivityState {
+            agent: "Codex".into(),
+            status: "working".into(),
+            title: "nix-config".into(),
+            since: 1,
+            permission: None,
+        };
+        p.follow("d1", 4, "aa".into(), Some(working)).unwrap();
+        assert_eq!(p.follows.lock().len(), 1);
+        let mut gone = p.revoke_named("Nikola's-iPhone").unwrap();
+        gone.sort();
+        assert_eq!(gone, ["d1", "d2"]);
+        let again = Pusher::new(&dir, true);
+        let left: Vec<String> = again
+            .devices
+            .lock()
+            .iter()
+            .map(|d| d.device.clone())
+            .collect();
+        assert_eq!(left, ["d3"]);
+        assert!(again.follows.lock().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

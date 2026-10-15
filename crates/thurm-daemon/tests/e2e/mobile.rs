@@ -602,3 +602,35 @@ fn only_the_phone_with_the_app_open_misses_the_push() {
         "the open iPhone was pushed too"
     );
 }
+
+/// Revoking a phone on the Mac (by its key's name) stops its notices and drops its connection.
+#[test]
+fn a_revoked_phone_is_forgotten_and_dropped() {
+    let env = push_env("push-revoke");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (relay, posts) = fake_relay();
+    let (phone, _phone_events) = mobile(&env);
+    register(&phone, "dev-1", &relay, "Nikola's iPhone");
+    let r = mac.request(Request::RevokePushDevices {
+        name: "Nikola's-iPhone".into(),
+    });
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while phone.request(Request::Ping).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "the revoked phone is still connected"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let pane = create(&mac, &env.dir);
+    run_cat(&mac, pane);
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+    assert!(
+        next_push(&posts, Duration::from_secs(2)).is_none(),
+        "the revoked phone was pushed"
+    );
+}
