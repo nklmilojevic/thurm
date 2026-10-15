@@ -284,7 +284,9 @@ const NOT_WRITABLE: i32 = 4;
 
 /// Replaces the device's key in `authorized_keys`: drops the lines ending in ` thurm-ios:$2`,
 /// appends `$1` (when given) with Thurm's options, through a temporary file and `mv`. Every other
-/// line stays as it is. A link (managed elsewhere) or an unreadable file is not touched.
+/// line stays byte for byte, a last line without a newline included (one is put before the
+/// appended key only); a revoke that matches nothing leaves the file alone. A link (managed
+/// elsewhere) or an unreadable file is not touched.
 const EDIT: &str = concat!(
     "TH=\"${THURM_HOME:-$HOME}\"; D=\"$TH/.ssh\"; F=\"$D/authorized_keys\"; T=\"$F.thurm-$$\"; N=\"\n\"; ",
     "nw() { [ -e /etc/NIXOS ] && echo nixos >&2; echo \"authorized_keys is not writable\" >&2; exit 4; }; ",
@@ -292,17 +294,26 @@ const EDIT: &str = concat!(
     "if [ -L \"$F\" ]; then nw; fi; ",
     "if [ -e \"$F\" ] && { [ ! -w \"$F\" ] || [ ! -r \"$F\" ]; }; then nw; fi; ",
     "umask 077; mkdir -p \"$D\" 2>/dev/null || nw; chmod 700 \"$D\" 2>/dev/null; ",
-    "{ if [ -f \"$F\" ]; then while IFS= read -r L || [ -n \"$L\" ]; do ",
-    "case \"$L\" in *\" thurm-ios:$2\") ;; *) printf \"%s$N\" \"$L\" ;; esac; done < \"$F\" || { rm -f \"$T\"; exit 1; }; fi; ",
-    "if [ -n \"$1\" ]; then printf \"%s$N\" \"restrict,port-forwarding $1 thurm-ios:$2\"; fi; ",
+    // E: the line read had no newline (the last one). P: the last line written has none. M: a
+    // line of the device was dropped.
+    "P=; M=; { if [ -f \"$F\" ]; then while :; do E=; IFS= read -r L || E=1; ",
+    "if [ -n \"$E\" ] && [ -z \"$L\" ]; then break; fi; ",
+    "case \"$L\" in *\" thurm-ios:$2\") M=1 ;; ",
+    "*) if [ -n \"$E\" ]; then printf \"%s\" \"$L\"; P=1; else printf \"%s$N\" \"$L\"; fi ;; esac; ",
+    "[ -z \"$E\" ] || break; done < \"$F\" || { rm -f \"$T\"; exit 1; }; fi; ",
+    "if [ -n \"$1\" ]; then [ -z \"$P\" ] || printf \"$N\"; ",
+    "printf \"%s$N\" \"restrict,port-forwarding $1 thurm-ios:$2\"; fi; ",
     "} > \"$T\" || { rm -f \"$T\"; nw; }; ",
+    "if [ -z \"$1\" ] && [ -z \"$M\" ]; then rm -f \"$T\"; exit 0; fi; ",
     "chmod 600 \"$T\" && mv -f \"$T\" \"$F\" || { rm -f \"$T\"; nw; }"
 );
 
-/// Prints the device names of the `thurm-ios:` keys in `authorized_keys`, one per line.
+/// Prints the device names of the `thurm-ios:` keys in `authorized_keys`, one per line. No file:
+/// none; a file it can't read: an error (its keys may still let phones in).
 const LIST: &str = concat!(
     "TH=\"${THURM_HOME:-$HOME}\"; F=\"$TH/.ssh/authorized_keys\"; N=\"\n\"; ",
-    "[ -r \"$F\" ] || exit 0; ",
+    "[ -e \"$F\" ] || exit 0; ",
+    "[ -r \"$F\" ] || { echo \"authorized_keys is not readable\" >&2; exit 4; }; ",
     "while IFS= read -r L || [ -n \"$L\" ]; do C=\"${L##* }\"; ",
     "case \"$C\" in thurm-ios:?*) printf \"%s$N\" \"${C#thurm-ios:}\" ;; esac; done < \"$F\""
 );
@@ -344,9 +355,18 @@ pub fn devices(ssh: &dyn RemoteExec) -> Result<Vec<String>, SshError> {
 /// What to put in the NixOS configuration when the host's keys are managed there.
 pub fn nixos_snippet(key: &DeviceKey) -> String {
     format!(
-        "users.users.<name>.openssh.authorizedKeys.keys = [\n  \"{}\"\n];",
-        key.line()
+        "users.users.<name>.openssh.authorizedKeys.keys = [\n  {}\n];",
+        nix_string(&key.line())
     )
+}
+
+/// `s` as a Nix double-quoted string: nothing in it can end the string or interpolate.
+fn nix_string(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace("${", "\\${");
+    format!("\"{escaped}\"")
 }
 
 #[cfg(test)]
@@ -577,6 +597,25 @@ mod tests {
         }
     }
 
+    /// A device name can't end the Nix string or interpolate into the configuration.
+    #[test]
+    fn nixos_snippet_is_one_string_literal() {
+        let k = DeviceKey::parse(&KEY.replace("iPhone", "a\"${builtins.x}")).unwrap();
+        let snippet = nixos_snippet(&k);
+        assert!(
+            snippet.ends_with(" thurm-ios:a\\\"\\${builtins.x}\"\n];"),
+            "{snippet}"
+        );
+        assert_eq!(nix_string("a\\b\"c${d}$e"), "\"a\\\\b\\\"c\\${d}$e\"");
+        assert_eq!(
+            nixos_snippet(&DeviceKey::parse(KEY).unwrap()),
+            format!(
+                "users.users.<name>.openssh.authorizedKeys.keys = [\n  \"{}\"\n];",
+                DeviceKey::parse(KEY).unwrap().line()
+            )
+        );
+    }
+
     #[test]
     fn scripts_are_safe_to_quote() {
         crate::ssh::quote(EDIT).unwrap();
@@ -630,6 +669,34 @@ mod tests {
                 .contains(".thurm-")),
             "no temporary file left"
         );
+
+        // A last line without a newline keeps it that way: revoking another device in the
+        // middle, and revoking one that isn't there (the file isn't even replaced).
+        use std::os::unix::fs::MetadataExt;
+        let last = "ssh-ed25519 AAAA one\nssh-rsa BBBB two";
+        std::fs::write(
+            &file,
+            format!(
+                "ssh-ed25519 AAAA one\n{} thurm-ios:iPad\nssh-rsa BBBB two",
+                key.key
+            ),
+        )
+        .unwrap();
+        revoke(&local, "iPad").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), last);
+        let inode = std::fs::metadata(&file).unwrap().ino();
+        revoke(&local, "nowhere").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), last);
+        assert_eq!(std::fs::metadata(&file).unwrap().ino(), inode);
+
+        // An unreadable file is an error, not "no devices": its keys may still let phones in.
+        std::fs::write(&file, key.line() + "\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            let err = devices(&local).unwrap_err();
+            assert!(err.to_string().contains("not readable"), "{err}");
+        }
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         // Managed elsewhere: a link, or a read-only file.
         std::fs::remove_file(&file).unwrap();
