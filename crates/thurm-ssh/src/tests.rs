@@ -211,6 +211,34 @@ fn refuses_a_host_key_other_than_the_paired_one() {
     assert!(e.contains("is not the one paired"), "{e}");
 }
 
+/// A key whose signing never returns (a Face ID prompt nobody answers).
+struct StuckKey(Arc<TestKey>);
+
+impl DeviceKey for StuckKey {
+    fn public_sec1(&self) -> Vec<u8> {
+        self.0.public_sec1()
+    }
+
+    fn sign(&self, _: &[u8]) -> Result<Vec<u8>, String> {
+        std::thread::sleep(Duration::from_secs(3600));
+        Err("woke up".into())
+    }
+}
+
+#[test]
+fn a_sign_in_that_never_finishes_times_out() {
+    let key = TestKey::new(1);
+    let server = serve(&key);
+    let start = std::time::Instant::now();
+    let r = Session::connect(
+        &target(&server),
+        Arc::new(StuckKey(key)),
+        Duration::from_secs(1),
+    );
+    assert!(matches!(r, Err(SshError::Transient(_))), "{:?}", r.err());
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+}
+
 #[test]
 fn reports_a_device_key_the_host_does_not_know() {
     let server = serve(&TestKey::new(1));

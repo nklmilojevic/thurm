@@ -160,6 +160,7 @@ pub struct Session {
 }
 
 impl Session {
+    /// Connecting and authenticating (a Face ID prompt included) each get `timeout`.
     pub fn connect(
         target: &Target,
         key: Arc<dyn DeviceKey>,
@@ -184,7 +185,7 @@ impl Session {
         let public = public_key(key.as_ref())?;
         let addr = (target.host.clone(), target.port);
         let user = target.user.clone();
-        let handle = rt.block_on(async move {
+        let result = rt.block_on(async move {
             let connect = client::connect(config, addr, handler);
             let mut handle = match tokio::time::timeout(timeout, connect).await {
                 Err(_) => return Err(SshError::Transient("ssh: connection timed out".into())),
@@ -199,10 +200,18 @@ impl Session {
                 }
                 Ok(Ok(h)) => h,
             };
-            let auth = handle
-                .authenticate_publickey_with(user, public, None, &mut Signer(key))
-                .await
-                .map_err(|SignError(e)| SshError::Attention(format!("ssh: signing: {e}")))?;
+            let mut signer = Signer(key);
+            let auth = handle.authenticate_publickey_with(user, public, None, &mut signer);
+            let auth = match tokio::time::timeout(timeout, auth).await {
+                Err(_) => {
+                    return Err(SshError::Transient(
+                        "ssh: the host or this device's key did not finish signing in".into(),
+                    ));
+                }
+                Ok(r) => {
+                    r.map_err(|SignError(e)| SshError::Attention(format!("ssh: signing: {e}")))?
+                }
+            };
             match auth {
                 AuthResult::Success => Ok(handle),
                 AuthResult::Failure { .. } => Err(SshError::Attention(
@@ -211,8 +220,15 @@ impl Session {
                         .into(),
                 )),
             }
-        })?;
-        Ok(Session { rt, handle })
+        });
+        match result {
+            Ok(handle) => Ok(Session { rt, handle }),
+            Err(e) => {
+                // Dropping the runtime would wait for a signing call that never returns.
+                rt.shutdown_background();
+                Err(e)
+            }
+        }
     }
 
     pub fn is_closed(&self) -> bool {
