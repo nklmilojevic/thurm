@@ -47,7 +47,14 @@ struct TailscaleStatus: Equatable {
         case "starting": return "Starting\u{2026}"
         case "needs_login": return "Needs you to sign in"
         case "needs_machine_auth": return "Waiting for a tailnet admin to approve it"
-        case "running": return https == "provisioning" ? "Getting a certificate\u{2026}" : "Serving"
+        case "running":
+            switch https {
+            case "ready": return "Serving"
+            case "provisioning": return "Getting a certificate\u{2026}"
+            case "magic_dns_off": return "Needs MagicDNS"
+            case "certs_off": return "Needs HTTPS certificates"
+            default: return "Waiting for HTTPS\u{2026}"
+            }
         case "stopped": return "Stopped"
         default: return "Error"
         }
@@ -64,6 +71,43 @@ struct TailscaleStatus: Equatable {
 
     /// The phone connects here: the node's own address, once it serves HTTPS.
     var pairingURL: String? { state == "running" && https == "ready" ? url : nil }
+
+    /// The line under the label: who may connect once serving, or what is in the way.
+    var detail: String? {
+        switch state {
+        case "running" where https == "ready":
+            return allowTailnetMembers ? "Every member of the tailnet may connect." :
+                "Only \(account ?? "the account that signed it in") may connect."
+        case "running":
+            return httpsError ?? (https == "provisioning" || https == "unavailable"
+                ? nil : "The phone connects only once this Mac serves HTTPS.")
+        case "needs_login":
+            return "Sign in once; it stays signed in when turned off."
+        case "error", "stopped":
+            return error
+        default:
+            return httpsError
+        }
+    }
+
+    /// Whether Sign Out is offered: whenever the node may hold a sign-in. An off node reports no
+    /// account, but the daemon signs it out all the same (and does nothing if it never signed in).
+    var canSignOut: Bool {
+        switch state {
+        case "running", "needs_machine_auth", "off", "stopped", "error": return true
+        default: return false
+        }
+    }
+
+    /// What a notification for this status would be about, or nil when it needs nothing.
+    var notificationKey: String? {
+        switch state {
+        case "needs_login" where authURL != nil: return "needs_login"
+        case "needs_machine_auth": return "needs_machine_auth"
+        case "error": return "error:\(error ?? "")"
+        default: return nil
+        }
+    }
 }
 
 /// This Mac's daemon serving over Tailscale: its status (from `TailscaleStatusChanged`), the
@@ -78,7 +122,8 @@ final class TailscaleService: ObservableObject {
     @Published private(set) var busy: String?
     @Published var failure: String?
 
-    /// What was last notified, so a status repeated by the daemon notifies once.
+    /// What was last notified, so a status repeated by the daemon notifies once. Only what was
+    /// posted: a state that arrives while notifications are off notifies once they are on.
     private var notified: String?
 
     func refresh() {
@@ -152,15 +197,12 @@ final class TailscaleService: ObservableObject {
     /// Posts what needs the user: a sign-in, an admin's approval, or a stop on an error. Each
     /// once until the state changes.
     private func notify(_ s: TailscaleStatus) {
-        let key: String?
-        switch s.state {
-        case "needs_login" where s.authURL != nil: key = "needs_login"
-        case "needs_machine_auth": key = "needs_machine_auth"
-        case "error": key = "error:\(s.error ?? "")"
-        default: key = nil
+        guard let key = s.notificationKey else {
+            notified = nil
+            return
         }
-        defer { notified = key }
-        guard let key, key != notified, SessionManager.shared.config.notificationsEnabled else { return }
+        guard key != notified, SessionManager.shared.config.notificationsEnabled else { return }
+        notified = key
         switch s.state {
         case "needs_login":
             Notifications.shared.post(id: "tailscale", title: "Sign in to Tailscale",
@@ -226,7 +268,7 @@ struct TailscaleRows: View {
                     .frame(width: 8, height: 8)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(s.label)
-                    if let detail = detail(s) {
+                    if let detail = s.detail {
                         Text(detail)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -297,24 +339,11 @@ struct TailscaleRows: View {
             Button("Open Machines") {
                 NSWorkspace.shared.open(URL(string: "https://login.tailscale.com/admin/machines")!)
             }
-        case "running":
-            Button("Sign Out\u{2026}") { confirmingSignOut = true }
         default:
             EmptyView()
         }
-    }
-
-    private func detail(_ s: TailscaleStatus) -> String? {
-        switch s.state {
-        case "running":
-            return s.allowTailnetMembers ? "Every member of the tailnet may connect." :
-                "Only \(s.account ?? "the account that signed it in") may connect."
-        case "needs_login":
-            return "Sign in once; it stays signed in when turned off."
-        case "error", "stopped":
-            return s.error
-        default:
-            return s.httpsError
+        if s.canSignOut {
+            Button("Sign Out\u{2026}") { confirmingSignOut = true }
         }
     }
 }
