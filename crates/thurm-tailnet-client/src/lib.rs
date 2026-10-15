@@ -267,11 +267,15 @@ async fn send_within(
 async fn relay(ws: Ws, local: tokio::net::UnixStream, limits: Limits) {
     let (mut sink, mut stream) = ws.split();
     let (mut rd, mut wr) = local.into_split();
-    let (heard_tx, mut heard_rx) = tokio::sync::watch::channel(());
+    // When the daemon was last heard from; the down side keeps it current.
+    let (heard_tx, heard_rx) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    // What's left of the silence limit: a send may wait that long and no longer, so a stalled
+    // send can't stretch the limit.
+    let budget = || limits.silent.saturating_sub(heard_rx.borrow().elapsed());
 
     let down = async {
         while let Some(msg) = stream.next().await {
-            let _ = heard_tx.send(());
+            let _ = heard_tx.send(tokio::time::Instant::now());
             match msg {
                 Ok(Message::Binary(b)) => {
                     if wr.write_all(&b).await.is_err() {
@@ -288,7 +292,6 @@ async fn relay(ws: Ws, local: tokio::net::UnixStream, limits: Limits) {
         let mut buf = vec![0u8; 64 * 1024];
         let mut ping = tokio::time::interval(limits.ping_every);
         ping.tick().await;
-        let mut last_heard = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 n = rd.read(&mut buf) => match n {
@@ -298,26 +301,20 @@ async fn relay(ws: Ws, local: tokio::net::UnixStream, limits: Limits) {
                     }
                     Ok(n) => {
                         let msg = Message::Binary(buf[..n].to_vec().into());
-                        if !send_within(&mut sink, msg, limits.silent).await {
+                        if !send_within(&mut sink, msg, budget()).await {
                             log::info!("tailnet: the daemon stopped reading; closing");
                             break;
                         }
                     }
                 },
                 _ = ping.tick() => {
-                    if last_heard.elapsed() > limits.silent {
+                    if budget().is_zero() {
                         log::info!("tailnet: no answer for {}s; closing", limits.silent.as_secs());
                         break;
                     }
-                    if !send_within(&mut sink, Message::Ping(Vec::new().into()), limits.silent).await {
+                    if !send_within(&mut sink, Message::Ping(Vec::new().into()), budget()).await {
                         break;
                     }
-                }
-                changed = heard_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    last_heard = tokio::time::Instant::now();
                 }
             }
         }

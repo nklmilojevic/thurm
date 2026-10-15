@@ -202,5 +202,44 @@ fn a_peer_that_stops_reading_ends_the_relay() {
         "the relay kept the stream open"
     );
     // The silence limit (1s) ends it, not whatever gives up on a stuck write later.
-    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_send_that_stalls_late_gets_only_the_silence_left() {
+    let server = server_rt();
+    let url = silent_server(&server);
+    let limits = Limits {
+        silent: Duration::from_secs(2),
+        ..SHORT
+    };
+    let started = Instant::now();
+    let (stream, _session) = open_with(&url, limits).unwrap();
+    let mut reader = stream.try_clone().unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // Quiet for most of the limit, then a send that stalls: it may not get a fresh limit.
+    let mut writer = stream;
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1600));
+        let chunk = vec![0u8; 64 * 1024];
+        while writer.write_all(&chunk).is_ok() {}
+    });
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        reader.read(&mut buf).unwrap(),
+        0,
+        "the relay kept the stream open"
+    );
+    // Silent since the start, so it ends near 2s, not 1.6s plus another 2s.
+    assert!(
+        started.elapsed() < Duration::from_millis(2800),
+        "{:?}",
+        started.elapsed()
+    );
 }
