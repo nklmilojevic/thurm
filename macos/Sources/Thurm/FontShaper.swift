@@ -219,7 +219,8 @@ final class FontShaper {
         byFamily[kCTFontFamilyNameAttribute as String] = name
         let familyDesc = CTFontDescriptorCreateWithAttributes(byFamily as CFDictionary)
         // Upright and regular weight asked for outright: with a cascade list, iOS otherwise
-        // picks any face of the family (Bold, Italic). Families without one take what they have.
+        // picks any face of the family (Bold, Italic). A family without an upright face gets its
+        // nearest one; the plain match is for when Core Text answers with another family.
         let upright = CTFontDescriptorCreateCopyWithSymbolicTraits(familyDesc, [], styleTraits)
         for desc in [upright, familyDesc].compactMap({ $0 }) {
             let familyFont = CTFontCreateWithFontDescriptor(desc, size, nil)
