@@ -542,6 +542,14 @@ thurm_client *thurm_tailnet_connect(const char *url, const char *client_name,
                                     thurm_event_cb on_event, thurm_frame_cb on_frame, void *ctx,
                                     char **err);
 
+/* Like thurm_tailnet_connect, over `fd`: a stream socket the app already connected to the
+ * daemon's device on port 443 with Tailscale embedded in the app (TailscaleKit's
+ * tailscale_dial). `url` names the daemon; its host is checked against the certificate. Takes
+ * `fd` over: closed when the connection ends, or at once when connecting fails. */
+thurm_client *thurm_tailnet_connect_fd(int fd, const char *url, const char *client_name,
+                                       thurm_event_cb on_event, thurm_frame_cb on_frame, void *ctx,
+                                       char **err);
+
 #ifdef __cplusplus
 }
 #endif

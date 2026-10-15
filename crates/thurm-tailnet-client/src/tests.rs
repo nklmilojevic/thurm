@@ -243,3 +243,177 @@ fn a_send_that_stalls_late_gets_only_the_silence_left() {
         started.elapsed()
     );
 }
+
+/// One end of a socket pair whose other end is bridged to `addr` over TCP: what libtailscale's
+/// `tailscale_dial` hands back.
+fn dialed(addr: std::net::SocketAddr) -> OwnedFd {
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let tcp = std::net::TcpStream::connect(addr).unwrap();
+    let (mut t_rd, mut t_wr) = (theirs.try_clone().unwrap(), theirs);
+    let (mut c_rd, mut c_wr) = (tcp.try_clone().unwrap(), tcp);
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut t_rd, &mut c_wr);
+        let _ = c_wr.shutdown(std::net::Shutdown::Write);
+    });
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut c_rd, &mut t_wr);
+        let _ = t_wr.shutdown(std::net::Shutdown::Both);
+    });
+    OwnedFd::from(ours)
+}
+
+/// A CA, and a server certificate it signed for `thurm.test`.
+struct TestPki {
+    ca: rustls::pki_types::CertificateDer<'static>,
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+fn test_pki() -> TestPki {
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["thurm.test".to_owned()])
+        .unwrap()
+        .signed_by(&leaf_key, &issuer)
+        .unwrap();
+    TestPki {
+        ca: ca.der().clone(),
+        chain: vec![leaf.der().clone()],
+        key: rustls::pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+    }
+}
+
+/// A client config trusting only `ca`.
+fn trusting(ca: &rustls::pki_types::CertificateDer<'static>) -> Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.clone()).unwrap();
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    )
+}
+
+/// A TLS WebSocket server (certificate for `thurm.test`) that echoes binary messages,
+/// upper-cased.
+fn tls_echo_server(rt: &Runtime, pki: &TestPki) -> std::net::SocketAddr {
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(pki.chain.clone(), pki.key.clone_key())
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let ln = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+    let addr = ln.local_addr().unwrap();
+    rt.spawn(async move {
+        while let Ok((tcp, _)) = ln.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await else {
+                    return;
+                };
+                while let Some(Ok(msg)) = ws.next().await {
+                    if let Message::Binary(b) = msg {
+                        let up: Vec<u8> = b.to_ascii_uppercase();
+                        if ws.send(Message::Binary(up.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[test]
+fn relays_over_a_dialed_socket_with_tls_for_the_url_host() {
+    let server = server_rt();
+    let pki = test_pki();
+    let addr = tls_echo_server(&server, &pki);
+    let (mut stream, _session) = open_fd_tls(
+        dialed(addr),
+        "wss://thurm.test/v1/connect",
+        LIMITS,
+        trusting(&pki.ca),
+    )
+    .unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"over the tailnet").unwrap();
+    let mut got = [0u8; 16];
+    stream.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"OVER THE TAILNET");
+}
+
+#[test]
+fn a_dialed_socket_to_another_host_is_refused() {
+    let server = server_rt();
+    let pki = test_pki();
+    let addr = tls_echo_server(&server, &pki);
+    // The certificate is for thurm.test: a socket dialed for another name must not pass.
+    let r = open_fd_tls(
+        dialed(addr),
+        "wss://other.test/v1/connect",
+        LIMITS,
+        trusting(&pki.ca),
+    );
+    assert!(
+        matches!(r, Err(ConnectError::Protocol(ref e)) if e.starts_with("TLS")),
+        "{:?}",
+        r.map(|_| ())
+    );
+}
+
+#[test]
+fn a_dialed_socket_with_an_untrusted_certificate_is_refused() {
+    let server = server_rt();
+    let pki = test_pki();
+    let addr = tls_echo_server(&server, &pki);
+    let stranger = test_pki();
+    let r = open_fd_tls(
+        dialed(addr),
+        "wss://thurm.test/v1/connect",
+        LIMITS,
+        trusting(&stranger.ca),
+    );
+    assert!(
+        matches!(r, Err(ConnectError::Protocol(ref e)) if e.starts_with("TLS")),
+        "{:?}",
+        r.map(|_| ())
+    );
+}
+
+#[test]
+fn a_dialed_socket_needs_wss() {
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    assert!(matches!(
+        open_fd(
+            OwnedFd::from(ours),
+            "ws://thurm.test/v1/connect",
+            CONNECT_TIMEOUT
+        ),
+        Err(ConnectError::BadUrl(_))
+    ));
+    // Taken over and closed.
+    let mut buf = [0u8; 1];
+    assert_eq!(theirs.read(&mut buf).unwrap(), 0);
+}
