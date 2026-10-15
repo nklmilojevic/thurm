@@ -164,3 +164,53 @@ func TestUnidentifiedIsForbidden(t *testing.T) {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 }
+
+func TestCloseAllDropsACallerStillBeingAdmitted(t *testing.T) {
+	d := newFakeDaemon(t)
+	dialing := make(chan struct{})
+	release := make(chan struct{})
+	g := &Gateway{
+		Via:      "node",
+		Identify: func(*http.Request) (admit.Caller, error) { return admit.Caller{UserID: 7}, nil },
+		Policy:   func() admit.Policy { return admit.Policy{OwnerID: 7, AllowFlag: "allow"} },
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			close(dialing)
+			<-release
+			return d.dial(ctx)
+		},
+		Logf: t.Logf,
+	}
+	srv := httptest.NewServer(g)
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	type result struct {
+		ws  *websocket.Conn
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ws, _, err := websocket.Dial(ctx, wsURL(srv, ConnectPath), nil)
+		done <- result{ws, err}
+	}()
+	<-dialing
+	// Admitted, still dialing the daemon: serving is turned off now.
+	g.CloseAll("tailscale serving turned off")
+	close(release)
+
+	r := <-done
+	if r.err == nil {
+		defer r.ws.CloseNow()
+		_, _, err := r.ws.Read(ctx)
+		if websocket.CloseStatus(err) != websocket.StatusGoingAway {
+			t.Fatalf("a caller admitted before CloseAll was proxied after it: %v", err)
+		}
+	}
+	g.mu.Lock()
+	n := len(g.conns)
+	g.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d connections tracked after CloseAll", n)
+	}
+}

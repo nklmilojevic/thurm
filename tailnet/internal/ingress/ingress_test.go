@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"io"
 	"testing"
 
 	"github.com/nklmilojevic/thurm/tailnet/internal/admit"
@@ -36,5 +38,37 @@ func TestTaggedDisplaysTheNode(t *testing.T) {
 	p := FromCaller(admit.Caller{Node: "ci-runner", Tags: []string{"tag:ci"}}, "host")
 	if p.Display != "ci-runner" || p.UserID != nil {
 		t.Fatalf("%+v", p)
+	}
+}
+
+// shortWriter takes at most three bytes a call, like a socket under pressure.
+type shortWriter struct{ bytes.Buffer }
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	return w.Buffer.Write(p[:min(len(p), 3)])
+}
+
+func TestWriteSendsEveryByteThroughShortWrites(t *testing.T) {
+	var short shortWriter
+	var whole bytes.Buffer
+	p := Principal{Kind: "tailscale", Display: "me@example.com", Via: "node"}
+	if err := Write(&short, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(&whole, p); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(short.Bytes(), whole.Bytes()) {
+		t.Fatalf("got %d bytes, want %d", short.Len(), whole.Len())
+	}
+}
+
+type stuckWriter struct{}
+
+func (stuckWriter) Write([]byte) (int, error) { return 0, nil }
+
+func TestWriteFailsWhenNothingIsWritten(t *testing.T) {
+	if err := Write(stuckWriter{}, Principal{Kind: "tailscale"}); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("got %v", err)
 	}
 }

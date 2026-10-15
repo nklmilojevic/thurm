@@ -39,6 +39,8 @@ type Gateway struct {
 
 	mu    sync.Mutex
 	conns map[*websocket.Conn]struct{}
+	// epoch counts CloseAll calls: a caller admitted before one is not proxied after it.
+	epoch uint64
 }
 
 func (g *Gateway) logf(format string, args ...any) {
@@ -61,6 +63,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden: the caller could not be identified", http.StatusForbidden)
 		return
 	}
+	g.mu.Lock()
+	epoch := g.epoch
+	g.mu.Unlock()
 	if err := g.Policy().Check(caller); err != nil {
 		g.logf("%s: refused %s (%s): %v", g.Via, caller.LoginName, caller.Node, err)
 		http.Error(w, err.Error(), http.StatusForbidden)
@@ -85,8 +90,13 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ws.SetReadLimit(-1)
-	g.track(ws, true)
-	defer g.track(ws, false)
+	if !g.track(ws, epoch) {
+		// Serving was turned off, or who may connect changed, while this caller was admitted.
+		ws.Close(websocket.StatusGoingAway, "access changed")
+		daemon.Close()
+		return
+	}
+	defer g.untrack(ws)
 	g.logf("%s: admitted %s (%s)", g.Via, caller.LoginName, caller.Node)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -102,23 +112,31 @@ func (g *Gateway) CloseAll(reason string) {
 	g.mu.Lock()
 	conns := g.conns
 	g.conns = nil
+	g.epoch++
 	g.mu.Unlock()
 	for ws := range conns {
 		ws.Close(websocket.StatusGoingAway, reason)
 	}
 }
 
-func (g *Gateway) track(ws *websocket.Conn, add bool) {
+// track registers a connection admitted at epoch, unless CloseAll ran since.
+func (g *Gateway) track(ws *websocket.Conn, epoch uint64) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if add {
-		if g.conns == nil {
-			g.conns = map[*websocket.Conn]struct{}{}
-		}
-		g.conns[ws] = struct{}{}
-	} else {
-		delete(g.conns, ws)
+	if epoch != g.epoch {
+		return false
 	}
+	if g.conns == nil {
+		g.conns = map[*websocket.Conn]struct{}{}
+	}
+	g.conns[ws] = struct{}{}
+	return true
+}
+
+func (g *Gateway) untrack(ws *websocket.Conn) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.conns, ws)
 }
 
 // pipe copies both ways until either side ends, then closes both.

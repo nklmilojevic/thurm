@@ -75,6 +75,16 @@ func Write(w io.Writer, p Principal) error {
 	buf := make([]byte, 8, 8+len(body))
 	binary.LittleEndian.PutUint32(buf[0:4], magic)
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(len(body)))
-	_, err = w.Write(append(buf, body...))
-	return err
+	buf = append(buf, body...)
+	for len(buf) > 0 {
+		n, err := w.Write(buf)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		buf = buf[n:]
+	}
+	return nil
 }

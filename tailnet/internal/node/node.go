@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -75,15 +76,24 @@ func (n *Node) Enable(cfg Config) error {
 	}
 	n.mu.Lock()
 	if n.srv != nil {
-		old := n.cfg
-		n.cfg = cfg
+		if !cfg.AllowMembers && n.st != nil && n.st.Self != nil && n.st.Self.IsTagged() {
+			tags := strings.Join(n.st.Self.Tags.AsSlice(), ", ")
+			n.mu.Unlock()
+			return fmt.Errorf("this node is tagged (%s), so it has no owner and owner-only access would admit nobody. Allow tailnet members, or sign out and enroll without tags", tags)
+		}
+		old, gw := n.cfg, n.gw
+		// The hostname changes once the rename succeeds, so a failed one is tried again.
+		next := cfg
+		next.Hostname = old.Hostname
+		n.cfg = next
 		n.mu.Unlock()
-		if cfg.AllowMembers != old.AllowMembers && !cfg.AllowMembers && n.gw != nil {
+		if cfg.AllowMembers != old.AllowMembers && !cfg.AllowMembers && gw != nil {
 			// Narrowing who may connect drops everyone; the owner reconnects.
-			n.gw.CloseAll("access changed")
+			gw.CloseAll("access changed")
 		}
 		if cfg.Hostname != old.Hostname {
 			if err := n.Rename(cfg.Hostname); err != nil {
+				n.changed()
 				return err
 			}
 		}
@@ -165,12 +175,28 @@ func (n *Node) Login(ctx context.Context) error {
 	return lc.StartLoginInteractive(ctx)
 }
 
-// Logout signs the node out and forgets it. A failed logout leaves the node running.
+// Logout signs the node out and forgets it. A failed logout leaves the node running. A node
+// that is off but signed in is started, without serving, to sign it out.
 func (n *Node) Logout(ctx context.Context) error {
 	n.mu.Lock()
-	lc := n.lc
+	lc, hostname := n.lc, n.cfg.Hostname
 	n.mu.Unlock()
 	if lc == nil {
+		if _, err := os.Stat(filepath.Join(n.Dir, "tailscaled.state")); errors.Is(err, os.ErrNotExist) {
+			return nil // never signed in
+		}
+		srv := &tsnet.Server{Dir: n.Dir, Hostname: hostname, UserLogf: n.userLogf, Logf: func(string, ...any) {}}
+		if err := srv.Start(); err != nil {
+			return fmt.Errorf("signing out of Tailscale: starting the node: %w", err)
+		}
+		defer srv.Close()
+		slc, err := srv.LocalClient()
+		if err != nil {
+			return fmt.Errorf("signing out of Tailscale: %w", err)
+		}
+		if err := slc.Logout(ctx); err != nil {
+			return fmt.Errorf("signing out of Tailscale: %w", err)
+		}
 		return nil
 	}
 	if err := lc.Logout(ctx); err != nil {
@@ -187,8 +213,10 @@ func (n *Node) Rename(hostname string) error {
 		return fmt.Errorf("invalid tailnet hostname %q: one DNS label of 1 to 63 letters, digits or hyphens", hostname)
 	}
 	n.mu.Lock()
-	n.cfg.Hostname = hostname
 	lc := n.lc
+	if lc == nil {
+		n.cfg.Hostname = hostname
+	}
 	n.mu.Unlock()
 	if lc == nil {
 		n.changed()
@@ -200,6 +228,12 @@ func (n *Node) Rename(hostname string) error {
 	if err != nil {
 		return fmt.Errorf("renaming the tailscale node: %w", err)
 	}
+	n.mu.Lock()
+	if n.lc == lc {
+		n.cfg.Hostname = hostname
+	}
+	n.mu.Unlock()
+	n.changed()
 	return nil
 }
 
@@ -355,16 +389,36 @@ func (n *Node) apply(ctx context.Context, gen int, lc *local.Client, msg ipn.Not
 	n.mu.Unlock()
 
 	if askLogin {
-		go func() {
-			if err := lc.StartLoginInteractive(ctx); err != nil && ctx.Err() == nil {
-				n.Logf("tailscale: requesting a sign-in link: %v", err)
-			}
-		}()
+		go n.askLogin(ctx, gen, lc)
 	}
 	if bind {
 		n.bindTLS(ctx, gen, st)
 	}
 	n.changed()
+}
+
+// askLogin asks for a sign-in link, again with backoff while asking fails and the node still
+// needs one.
+func (n *Node) askLogin(ctx context.Context, gen int, lc *local.Client) {
+	delay := 2 * time.Second
+	for {
+		err := lc.StartLoginInteractive(ctx)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		n.Logf("tailscale: requesting a sign-in link: %v", err)
+		if !n.fail(gen, fmt.Sprintf("requesting a sign-in link: %v", err)) {
+			return
+		}
+		sleep(ctx, delay)
+		delay = min(delay*2, time.Minute)
+		n.mu.Lock()
+		still := gen == n.gen && n.backend == "NeedsLogin" && n.authURL == ""
+		n.mu.Unlock()
+		if !still {
+			return
+		}
+	}
 }
 
 // bindTLS serves the gateway over HTTPS once the tailnet allows it, reporting why not

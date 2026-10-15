@@ -98,7 +98,9 @@ func main() {
 			log.Printf("bad command: %v", err)
 			continue
 		}
-		go h.run(c)
+		// In order: a later command must not finish before an earlier one (an apply turning
+		// the node on after an off was answered). Status changes go out on their own.
+		h.run(c)
 	}
 	// The daemon went away: stop serving, keeping the node signed in.
 	h.host.Stop()
