@@ -161,6 +161,9 @@ final class Remotes {
         let names = Set(SessionManager.shared.config.remoteNames)
         for host in statuses.keys where !names.contains(host) {
             statuses.removeValue(forKey: host)
+            // A host added again under this name starts afresh (its pending retry does nothing).
+            connectRetries[host] = nil
+            connectFailures[host] = nil
             Core.shared.disconnect(host)
         }
         syncCountdown()
