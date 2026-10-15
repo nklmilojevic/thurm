@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -17,6 +18,7 @@ import (
 
 	"tailscale.com/client/local"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/util/cmpver"
 
 	"github.com/nklmilojevic/thurm/tailnet/internal/admit"
 	"github.com/nklmilojevic/thurm/tailnet/internal/gateway"
@@ -25,6 +27,11 @@ import (
 
 // AllowFlag names the setting that admits every identified caller.
 const AllowFlag = "Admit every identified caller (tailscale.host_allow_identified)"
+
+// MinServeVersion is the first tailscaled whose serve proxy sets the identity headers, and
+// with them deletes any a caller sent. An older one passes a caller's own
+// Tailscale-User-Login through, so the serve socket would admit whoever claims the owner.
+const MinServeVersion = "1.44.0"
 
 // Config is what the host listeners run with.
 type Config struct {
@@ -102,6 +109,9 @@ func (h *Host) start(cfg Config) error {
 		}
 	}
 	if cfg.Serve {
+		if err := CheckServeVersion(st.Version); err != nil {
+			return err
+		}
 		if err := h.serve(); err != nil {
 			return err
 		}
@@ -265,16 +275,38 @@ func (h *Host) whois(r *http.Request) (admit.Caller, error) {
 	return status.WhoIs(r.Context(), &h.lc, r.RemoteAddr)
 }
 
-// fromHeaders reads who tailscale serve says the caller is. It sets these headers only for a
-// person; a tagged caller has none and is refused.
+// CheckServeVersion refuses a tailscaled whose serve proxy can't be trusted with identity.
+func CheckServeVersion(version string) error {
+	if cmpver.Less(version, MinServeVersion) {
+		return fmt.Errorf("this machine's Tailscale (%s) is too old to serve the socket: tailscale serve sets the caller's identity from %s on", version, MinServeVersion)
+	}
+	return nil
+}
+
+// fromHeaders reads who tailscale serve says the caller is. tailscaled deletes these headers
+// from the incoming request before setting them (MinServeVersion), and sets them only for a
+// person on the tailnet: a tagged or Funnel caller has none and is refused.
 func (h *Host) fromHeaders(r *http.Request) (admit.Caller, error) {
-	login := r.Header.Get("Tailscale-User-Login")
-	if login == "" {
-		return admit.Caller{}, errors.New("no Tailscale-User-Login header: the caller is tagged, or not proxied by tailscale serve")
+	if r.Header.Get("Tailscale-Funnel-Request") != "" {
+		return admit.Caller{}, errors.New("the caller came through Tailscale Funnel, from outside the tailnet")
+	}
+	logins := r.Header.Values("Tailscale-User-Login")
+	if len(logins) != 1 || logins[0] == "" {
+		return admit.Caller{}, errors.New("no single Tailscale-User-Login header: the caller is tagged, or not proxied by tailscale serve")
+	}
+	// Non-ASCII values arrive as MIME encoded-words.
+	var dec mime.WordDecoder
+	login, err := dec.DecodeHeader(logins[0])
+	if err != nil || login == "" {
+		return admit.Caller{}, fmt.Errorf("unreadable Tailscale-User-Login header %q", logins[0])
+	}
+	name, err := dec.DecodeHeader(r.Header.Get("Tailscale-User-Name"))
+	if err != nil {
+		name = ""
 	}
 	return admit.Caller{
 		LoginName:   login,
-		DisplayName: r.Header.Get("Tailscale-User-Name"),
+		DisplayName: name,
 		RemoteAddr:  r.Header.Get("X-Forwarded-For"),
 	}, nil
 }
