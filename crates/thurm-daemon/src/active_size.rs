@@ -30,6 +30,7 @@ impl Daemon {
                 let used = TICK.fetch_add(1, Ordering::Relaxed);
                 st.wanted.insert(client.id, Wanted { size, used });
             }
+            st.size_owner = Some(client.id);
             log::info!(
                 "pane {pane}: client {} wants {}x{}",
                 client.id,
@@ -50,15 +51,17 @@ impl Daemon {
         };
         w.used = TICK.fetch_add(1, Ordering::Relaxed);
         let size = w.size;
+        st.size_owner = Some(client.id);
         self.set_size(st, size);
     }
 
     /// `client` is gone: when the pane had its size, the last user left takes over.
     pub(super) fn forget_size(&self, st: &mut PaneState, client: u64) {
-        let Some(gone) = st.wanted.remove(&client) else {
+        if st.wanted.remove(&client).is_none() {
             return;
-        };
-        if st.terminal_attachment.is_some() || gone.size != st.info.size {
+        }
+        // Another client wanting the same size does not make it the owner.
+        if st.terminal_attachment.is_some() || st.size_owner != Some(client) {
             log::info!(
                 "pane {}: client {client} left; it did not set the current {}x{}",
                 st.info.id,
@@ -67,7 +70,13 @@ impl Daemon {
             );
             return;
         }
-        let next = st.wanted.values().max_by_key(|w| w.used).copied();
+        let next = st
+            .wanted
+            .iter()
+            .max_by_key(|(_, w)| w.used)
+            .map(|(id, w)| (*id, *w));
+        st.size_owner = next.map(|(id, _)| id);
+        let next = next.map(|(_, w)| w);
         log::info!(
             "pane {}: client {client} left; size goes to {}",
             st.info.id,

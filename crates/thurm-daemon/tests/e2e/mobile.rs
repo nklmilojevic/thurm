@@ -131,6 +131,33 @@ fn pane_takes_the_size_of_the_client_that_used_it_last() {
     }
 }
 
+/// A client leaving gives the size back only if the pane had its size: another one that wants
+/// the same size does not own it.
+#[test]
+fn a_client_with_the_same_size_leaving_keeps_the_owners_size() {
+    let env = Env::new("size-owner");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let pane = create(&mac, &env.dir);
+    let caps = [thurm_proto::CAP_ACTIVE_SIZE];
+    let (mut b, hello) = raw_hello(&env, PROTOCOL_VERSION, &caps);
+    assert!(hello.is_ok(), "{hello:?}");
+    let (mut c, hello) = raw_hello(&env, PROTOCOL_VERSION, &caps);
+    assert!(hello.is_ok(), "{hello:?}");
+    let (mut a, hello) = raw_hello(&env, PROTOCOL_VERSION, &[]);
+    assert!(hello.is_ok(), "{hello:?}");
+    for (s, size) in [(&mut b, size(80, 24)), (&mut c, size(120, 40)), (&mut a, size(80, 24))] {
+        let r = raw_request(s, 2, Request::Resize { pane, size });
+        assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+    }
+    assert_eq!(pane_size(&mac, pane), (80, 24));
+    drop(b);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(pane_size(&mac, pane), (80, 24), "B never owned the size");
+    drop(a);
+    drop(c);
+}
+
 #[test]
 fn clients_without_active_sizes_keep_last_resize_winning() {
     let env = Env::new("legacy-size");

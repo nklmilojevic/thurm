@@ -303,6 +303,8 @@ pub struct PaneState {
     pub terminal_attachment: Option<(u64, PaneSize)>,
     /// Per client, the size it shows the pane at (see `active_size`).
     pub wanted: HashMap<u64, active_size::Wanted>,
+    /// The client whose size the pane has now.
+    pub size_owner: Option<u64>,
     pub agent: AgentTracker,
     osc_cwd: Option<String>,
     command_started: Option<Instant>,
@@ -715,6 +717,7 @@ impl Daemon {
                 subscribers: HashMap::new(),
                 terminal_attachment: None,
                 wanted: HashMap::new(),
+                size_owner: None,
                 agent: AgentTracker::default(),
                 osc_cwd: p.osc_cwd,
                 command_started: None,
