@@ -2663,9 +2663,17 @@ impl App {
             }
             "PaneExited" | "PaneClosed" => {
                 if let Some(k) = key {
-                    notify::withdraw_permission(self, &k);
+                    notify::withdraw(self, &k);
                     self.infos.borrow_mut().remove(&k);
                     self.remove_pane_from_ui(&k);
+                }
+            }
+            // Read here or on a phone: off the launcher count and out of the notifications.
+            "PaneRead" => {
+                if let Some(k) = key {
+                    notify::withdraw(self, &k);
+                    self.seen_waiting.borrow_mut().insert(k);
+                    notify::update_badge(self);
                 }
             }
             "Bell" => {

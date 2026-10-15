@@ -59,6 +59,7 @@ pub const CAPABILITIES: &[&str] = &[
     "remote-layout",
     CAP_ACTIVE_SIZE,
     "push",
+    "pane-read",
 ];
 
 /// The pane takes the size of the client that used it last (see the daemon's `active_size`)
@@ -530,6 +531,11 @@ pub enum Event {
     ConfigReloaded,
     /// The saved layout changed. Read GetLayout for current state.
     LayoutChanged,
+    /// The user read the pane, on some device (focused it or typed in it), after an agent
+    /// notice: its notifications are no longer news anywhere.
+    PaneRead {
+        pane: PaneId,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]

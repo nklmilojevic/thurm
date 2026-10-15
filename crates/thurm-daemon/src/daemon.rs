@@ -7,7 +7,7 @@ mod layouts;
 #[path = "terminal_attach.rs"]
 mod terminal_attach;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
@@ -369,6 +369,8 @@ pub struct Daemon {
     ai_tx: Sender<AiJob>,
     /// Agent notices to paired phones.
     push: crate::push::Pusher,
+    /// Panes with an agent notice nobody has read yet (see `pane_read`).
+    unread: Mutex<HashSet<PaneId>>,
     ai_rx: Receiver<AiJob>,
     store: Option<Store>,
     /// One session save at a time: the monitor's autosave, SIGTERM, upgrades and requests.
@@ -425,6 +427,7 @@ impl Daemon {
             ai: ai::Model::new(),
             ai_tx: ai_channel.0,
             push,
+            unread: Mutex::new(HashSet::new()),
             ai_rx: ai_channel.1,
             store,
             save_lock: Mutex::new(()),
@@ -475,6 +478,7 @@ impl Daemon {
                 sound: Some(_),
                 ..
             } => {
+                self.unread.lock().insert(*pane);
                 self.push.notify(
                     crate::push::Notice {
                         pane: *pane,
@@ -489,7 +493,14 @@ impl Daemon {
                 crate::push::activity_state(info, crate::push::now()),
                 &open(),
             ),
-            Event::PaneClosed { pane } => self.push.agent_changed(*pane, None, &[]),
+            // Phones with the app open take the pane's notices down themselves.
+            Event::PaneRead { pane } => self.push.read(*pane, &open()),
+            Event::PaneClosed { pane } => {
+                // Its notices would open nothing.
+                self.unread.lock().remove(pane);
+                self.push.read(*pane, &open());
+                self.push.agent_changed(*pane, None, &[]);
+            }
             _ => {}
         }
         let desktop_only = matches!(event, Event::Ui(_));
@@ -499,6 +510,15 @@ impl Daemon {
             if !ui_only || app {
                 c.send(ServerMessage::Event(event.clone()));
             }
+        }
+    }
+
+    /// The user read `pane` on some device (focused it, typed in it, answered its prompt): an
+    /// agent notice still standing for it comes down everywhere, the desktops' and the phones'.
+    /// Only the first read after a notice says so.
+    fn pane_read(&self, pane: PaneId) {
+        if self.unread.lock().remove(&pane) {
+            self.broadcast(Event::PaneRead { pane }, true);
         }
     }
 
@@ -2395,6 +2415,9 @@ impl Daemon {
                     }
                     st.agent.user_answer(&data);
                     self.acknowledge_programs(pane, st);
+                    if !data.is_empty() {
+                        self.pane_read(pane);
+                    }
                     p.write(data);
                 })?;
                 Ok(Response::Ok)
@@ -2407,6 +2430,9 @@ impl Daemon {
                     }
                     st.agent.user_input();
                     self.acknowledge_programs(pane, st);
+                    if !text.is_empty() {
+                        self.pane_read(pane);
+                    }
                     p.write(st.term.paste(&text));
                 })?;
                 Ok(Response::Ok)
@@ -2419,6 +2445,7 @@ impl Daemon {
                         st.agent.prompt.interrupted();
                         st.agent.user_answer(&bytes);
                         self.acknowledge_programs(pane, st);
+                        self.pane_read(pane);
                         p.write(bytes);
                     }
                 })?;
@@ -2479,6 +2506,7 @@ impl Daemon {
                     }
                     // Looking at a finished agent acknowledges it (Done → Idle).
                     if focused {
+                        self.pane_read(pane);
                         st.agent.acknowledge();
                         self.acknowledge_programs(pane, st);
                         if let Some(new) = st.agent.refresh() {
@@ -2860,6 +2888,7 @@ impl Daemon {
                 if !answered {
                     return Err("that permission prompt is no longer showing".into());
                 }
+                self.pane_read(pane);
                 Ok(Response::Ok)
             }
             Request::SetTheme { spec } => {

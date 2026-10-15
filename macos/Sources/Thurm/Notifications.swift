@@ -136,6 +136,23 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
     }
 
+    /// The pane was read (here, or on a phone): none of its notifications is news any more.
+    func withdraw(pane: PaneKey) {
+        guard isAvailable else { return }
+        waitingForAuthorization?.removeAll { Notifications.pane(of: $0.content.userInfo) == pane }
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let ids = delivered.map(\.request)
+                .filter { Notifications.pane(of: $0.content.userInfo) == pane }
+                .map(\.identifier)
+            center.removeDeliveredNotifications(withIdentifiers: ids)
+        }
+    }
+
+    private static func pane(of info: [AnyHashable: Any]) -> PaneKey? {
+        jsonUInt64(info[paneKey]).map { PaneKey((info[hostKey] as? String) ?? localHost, $0) }
+    }
+
     // MARK: UNUserNotificationCenterDelegate
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,

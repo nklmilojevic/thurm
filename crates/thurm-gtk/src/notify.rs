@@ -14,6 +14,11 @@ fn permission_id(key: &PaneKey) -> String {
     format!("permission-{}-{}", key.host, key.id)
 }
 
+/// One notice per pane: a newer one replaces it.
+fn notice_id(key: &PaneKey) -> String {
+    format!("pane-{}-{}", key.host, key.id)
+}
+
 pub fn install(app: &Rc<App>) {
     let focus = gio::SimpleAction::new("focus-pane", Some(glib::VariantTy::new("(st)").unwrap()));
     focus.connect_activate(|_, p| {
@@ -82,13 +87,19 @@ pub fn post(app: &App, key: &PaneKey, payload: &Value) {
             );
             app.gtk_app.send_notification(Some(&permission_id(key)), &n);
         }
-        None => app.gtk_app.send_notification(None, &n),
+        None => app.gtk_app.send_notification(Some(&notice_id(key)), &n),
     }
 }
 
 /// Removes the pane's permission notification (answered, closed, or moved on).
 pub fn withdraw_permission(app: &App, key: &PaneKey) {
     app.gtk_app.withdraw_notification(&permission_id(key));
+}
+
+/// Removes all of the pane's notifications (read here or on a phone, or closed).
+pub fn withdraw(app: &App, key: &PaneKey) {
+    withdraw_permission(app, key);
+    app.gtk_app.withdraw_notification(&notice_id(key));
 }
 
 /// Agents in a state with a badge (`[notifications.<state>]`) that the user has not seen yet; a

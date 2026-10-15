@@ -6,6 +6,9 @@
 //! The app can also follow an agent in a Live Activity: the activity's push token is kept
 //! with the pane, and the agent's state (status, pane title, since when) is posted for it on
 //! every change, until the agent leaves or the pane closes.
+//!
+//! When a pane is read (on the Mac, or on another phone), the devices it sent notices to hear
+//! of it (`POST /v1/read`), so the notices leave their lock screens too.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -85,6 +88,8 @@ enum Job {
     Notice(Notice, Vec<Device>),
     /// Live Activity updates are waiting in `Pusher::activities`.
     Activities,
+    /// The pane was read: its notices on these devices are stale.
+    Read(PaneId, Vec<Device>),
 }
 
 struct ActivityJob {
@@ -110,6 +115,8 @@ pub struct Pusher {
     enabled: Arc<AtomicBool>,
     /// When each pane last sent a notice (see `notify`).
     last_notice: Mutex<std::collections::HashMap<PaneId, std::time::Instant>>,
+    /// The devices each pane sent notices to since it was last read (see `read`).
+    notified: Mutex<std::collections::HashMap<PaneId, Vec<String>>>,
     /// Shared with the push thread, which forgets a device the relay no longer knows.
     devices: Arc<Mutex<Vec<Device>>>,
     follows: Arc<Mutex<Vec<Follow>>>,
@@ -148,6 +155,7 @@ impl Pusher {
         let pusher = Pusher {
             enabled: Arc::new(AtomicBool::new(enabled)),
             last_notice: Mutex::new(std::collections::HashMap::new()),
+            notified: Mutex::new(std::collections::HashMap::new()),
             devices: Arc::new(Mutex::new(devices)),
             follows: Arc::new(Mutex::new(follows)),
             activities: Arc::new(Mutex::new(Vec::new())),
@@ -170,16 +178,26 @@ impl Pusher {
                     .into();
                 let on = || on.load(Ordering::Relaxed);
                 for job in rx {
-                    if let Job::Notice(notice, devices) = job {
-                        for d in devices.iter().take_while(|_| on()) {
-                            let _sending = store.sending.lock();
-                            // Queued before it was revoked or registered again: not for it now.
-                            if !store.registered(d) {
-                                continue;
+                    let send =
+                        |path, what, devices: &[Device], body: &dyn Fn(&Device) -> String| {
+                            for d in devices.iter().take_while(|_| on()) {
+                                let _sending = store.sending.lock();
+                                // Queued before it was revoked or registered again: not for it now.
+                                if !store.registered(d) {
+                                    continue;
+                                }
+                                let r = post(&agent, d, path, &body(d));
+                                store.check(d, what, r);
                             }
-                            let r = post(&agent, d, "/v1/push", &body(d, &notice));
-                            store.check(d, "push", r);
+                        };
+                    match &job {
+                        Job::Notice(notice, devices) => {
+                            send("/v1/push", "push", devices, &|d| body(d, notice))
                         }
+                        Job::Read(pane, devices) => {
+                            send("/v1/read", "read", devices, &|d| read_body(d, *pane))
+                        }
+                        Job::Activities => {}
                     }
                     // After every job: a wake-up lost to a full queue is made up by the next.
                     let waiting = std::mem::take(&mut *activities.lock());
@@ -292,7 +310,39 @@ impl Pusher {
         if devices.is_empty() || !self.fresh(&notice) {
             return;
         }
+        {
+            let mut notified = self.notified.lock();
+            let sent = notified.entry(notice.pane).or_default();
+            for d in &devices {
+                if !sent.contains(&d.device) {
+                    sent.push(d.device.clone());
+                }
+            }
+        }
         let _ = self.tx.try_send(Job::Notice(notice, devices));
+    }
+
+    /// `pane` was read (or closed): the devices it sent notices to since it was last read take
+    /// them down, but those in `open` (the app open hears it live). The next notice buzzes
+    /// again at once.
+    pub fn read(&self, pane: PaneId, open: &[String]) {
+        self.last_notice.lock().remove(&pane);
+        let Some(notified) = self.notified.lock().remove(&pane) else {
+            return;
+        };
+        if !self.enabled() {
+            return;
+        }
+        let devices: Vec<Device> = self
+            .devices
+            .lock()
+            .iter()
+            .filter(|d| notified.contains(&d.device) && !open.contains(&d.device))
+            .cloned()
+            .collect();
+        if !devices.is_empty() {
+            let _ = self.tx.try_send(Job::Read(pane, devices));
+        }
     }
 
     /// One buzz per pane per moment: a turn's end often raises two notices together (finished,
@@ -612,6 +662,16 @@ pub fn body(device: &Device, notice: &Notice) -> String {
         "title": notice.title,
         "body": text,
         "permission": notice.permission,
+    })
+    .to_string()
+}
+
+/// The request body the relay gets when `pane` was read, for `device`.
+pub fn read_body(device: &Device, pane: PaneId) -> String {
+    serde_json::json!({
+        "device": device.device,
+        "host": device.host,
+        "pane": pane,
     })
     .to_string()
 }
