@@ -250,11 +250,13 @@ func (n *Node) Status(s *status.Status) {
 	defer n.mu.Unlock()
 	s.Hostname = n.cfg.Hostname
 	s.AllowTailnetMembers = n.cfg.AllowMembers
-	s.HTTPS = n.https
 	if n.srv == nil {
+		// Never enabled leaves n.https empty, which the daemon can't read.
 		s.State = "off"
+		s.HTTPS = status.HTTPS{State: "unavailable"}
 		return
 	}
+	s.HTTPS = n.https
 	s.State = status.FromBackend(n.backend)
 	if n.errMsg != "" {
 		s.Error = &n.errMsg

@@ -265,7 +265,9 @@ auth_key_file = ""
 host_listen = ""
 # With host_listen: admit every caller Tailscale identifies, not only this machine's owner.
 host_allow_identified = false
-# Serve a socket for `tailscale serve` to proxy to (it tells who the caller is).
+# Serve a socket for `tailscale serve` to proxy to as HTTP (`tailscale serve unix:<socket>`),
+# which tells who the caller is. Needs Tailscale 1.94 or newer. A raw `--tcp` forward to it
+# is refused: it would pass a caller's claimed identity through.
 serve_socket = false
 
 [updates]

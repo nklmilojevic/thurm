@@ -812,7 +812,8 @@ pub struct TailscaleConfig {
     pub host_listen: String,
     /// Admit every caller this host's Tailscale identifies, not only the host's owner.
     pub host_allow_identified: bool,
-    /// Serve a Unix socket for `tailscale serve` to proxy to (identity from its headers).
+    /// Serve a Unix socket for `tailscale serve` to proxy to as HTTP (identity from its
+    /// headers). Needs Tailscale 1.94 or newer; a raw `--tcp` forward to it is refused.
     pub serve_socket: bool,
 }
 
