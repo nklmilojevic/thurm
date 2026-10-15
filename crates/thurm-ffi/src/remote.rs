@@ -13,7 +13,7 @@ use thurm_remote::doctor;
 use thurm_remote::handoff::{self, Registry, SshHost};
 use thurm_remote::install::{self, Method};
 use thurm_remote::tunnel::Supervisor;
-use thurm_remote::{Ssh, policy};
+use thurm_remote::{Ssh, pairing, policy};
 
 use crate::{Ctx, into_c, opt_str};
 
@@ -242,6 +242,22 @@ enum Call {
         id: String,
     },
     HandoffList,
+    /// Every enabled `[[remote]]` as the iOS pairing code describes it, or why it can't be in it.
+    PairingHosts,
+    /// Puts the iOS device key line `key` (`ecdsa-sha2-nistp256 … thurm-ios:<device>`) in
+    /// `name`'s authorized_keys.
+    AuthorizeDevice {
+        name: String,
+        key: String,
+    },
+    RevokeDevice {
+        name: String,
+        device: String,
+    },
+    /// The devices with a key on `name`.
+    PairedDevices {
+        name: String,
+    },
 }
 
 fn remote(name: &str) -> Result<thurm_config::RemoteConfig, String> {
@@ -459,6 +475,47 @@ fn call(c: Call) -> Result<Value, String> {
             json!(h)
         }
         Call::HandoffList => json!(reg.list()),
+        Call::PairingHosts => {
+            thurm_remote::ssh::prepare_dir().map_err(|e| e.to_string())?;
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            let entries: Vec<_> = cfg
+                .remote
+                .iter()
+                .filter(|r| r.enabled)
+                .map(|r| match Ssh::new(&r.host) {
+                    Ok(ssh) => pairing::host_entry(r, &ssh),
+                    Err(e) => pairing::HostEntry {
+                        name: r.name.clone(),
+                        error: Some(e),
+                        ..Default::default()
+                    },
+                })
+                .collect();
+            json!(entries)
+        }
+        Call::AuthorizeDevice { name, key } => {
+            let key = pairing::DeviceKey::parse(&key)?;
+            let (_, ssh) = ssh_for(&name)?;
+            match pairing::authorize(&ssh, &key) {
+                Ok(()) => json!({ "device": key.device }),
+                Err(e @ pairing::PairingError::NotWritable { nixos }) => json!({
+                    "error": e.to_string(),
+                    "not_writable": true,
+                    "line": key.line(),
+                    "nixos": nixos.then(|| pairing::nixos_snippet(&key)),
+                }),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Call::RevokeDevice { name, device } => {
+            let (_, ssh) = ssh_for(&name)?;
+            pairing::revoke(&ssh, &device).map_err(|e| e.to_string())?;
+            json!("Ok")
+        }
+        Call::PairedDevices { name } => {
+            let (_, ssh) = ssh_for(&name)?;
+            json!(pairing::devices(&ssh).map_err(|e| e.to_string())?)
+        }
     })
 }
 
@@ -520,6 +577,10 @@ mod tests {
             r#"{"op":"terminal_argv","name":"pi","script":"exec claude"}"#,
             r#"{"op":"remove","name":"pi"}"#,
             r#"{"op":"set","name":"pi","key":"enabled","value":false}"#,
+            r#"{"op":"pairing_hosts"}"#,
+            r#"{"op":"authorize_device","name":"pi","key":"ecdsa-sha2-nistp256 AAAA thurm-ios:iPhone"}"#,
+            r#"{"op":"revoke_device","name":"pi","device":"iPhone"}"#,
+            r#"{"op":"paired_devices","name":"pi"}"#,
         ] {
             serde_json::from_str::<Call>(s).unwrap_or_else(|e| panic!("{s}: {e}"));
         }
@@ -531,6 +592,13 @@ mod tests {
         assert_eq!(v, json!({"action": "copy_path", "path": "/etc/hosts"}));
         let v = call(Call::ClipboardRead { host: None }).unwrap();
         assert_eq!(v, json!("allow"));
+        // A bad key is refused before looking for the host.
+        let e = call(Call::AuthorizeDevice {
+            name: "nowhere".into(),
+            key: "ssh-ed25519 AAAA thurm-ios:iPhone".into(),
+        })
+        .unwrap_err();
+        assert!(e.contains("not a Thurm device key"), "{e}");
     }
 
     #[test]

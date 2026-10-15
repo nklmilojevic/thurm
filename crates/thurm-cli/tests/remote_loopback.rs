@@ -19,6 +19,7 @@ use thurm_proto::{CaptureOpts, CreatePane, Envelope, Request, Response, ServerMe
 use thurm_remote::Ssh;
 use thurm_remote::doctor::{self, State};
 use thurm_remote::install::{self, Method};
+use thurm_remote::pairing;
 use thurm_remote::tunnel::{Phase, Status, Supervisor};
 
 struct Sshd {
@@ -559,8 +560,65 @@ fn remote_workspace_over_loopback_ssh() {
     assert!(m.contains("Permission denied"), "{m}");
     drop(sup);
     assert_ne!(w._sshd.port, 0);
+
+    // 10. Pairing the iOS app with the host: its entry in the code (host key from this side's
+    //     known hosts), and the phone's key in its authorized_keys.
+    let entry = pairing::host_entry(&remote("loop", None), &w.ssh);
+    assert!(entry.error.is_none(), "{entry:?}");
+    assert_eq!(
+        (entry.host.as_str(), entry.port),
+        ("127.0.0.1", w._sshd.port)
+    );
+    let out = Command::new("ssh-keygen")
+        .arg("-lf")
+        .arg(w.base.join("keys/host.pub"))
+        .output()
+        .unwrap();
+    let fingerprint = String::from_utf8_lossy(&out.stdout)
+        .split(' ')
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    assert_eq!(entry.host_keys, [fingerprint]);
+
+    let keys = w.base.join("rhome/.ssh/authorized_keys");
+    let other = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINx8GUwWGlzynTf2livkowYPZiyb97ww3S3Lhj7csFN+ me@laptop\n";
+    std::fs::create_dir_all(keys.parent().unwrap()).unwrap();
+    std::fs::write(&keys, other).unwrap();
+    let key = pairing::DeviceKey::parse(DEVICE_KEY).unwrap();
+    pairing::authorize(&w.ssh, &key).unwrap();
+    pairing::authorize(&w.ssh, &key).unwrap();
+    let text = std::fs::read_to_string(&keys).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "{other}restrict,port-forwarding {} thurm-ios:iPhone\n",
+            key.key
+        ),
+        "added once, with Thurm's options"
+    );
+    let mode = std::fs::metadata(&keys).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(pairing::devices(&w.ssh).unwrap(), ["iPhone"]);
+    pairing::revoke(&w.ssh, "iPhone").unwrap();
+    assert_eq!(std::fs::read_to_string(&keys).unwrap(), other);
+    assert!(pairing::devices(&w.ssh).unwrap().is_empty());
+    // Managed elsewhere (read-only): a clear error, the file untouched.
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o400)).unwrap();
+    if unsafe { geteuid() } != 0 {
+        let err = pairing::authorize(&w.ssh, &key).unwrap_err();
+        assert!(
+            matches!(err, pairing::PairingError::NotWritable { .. }),
+            "{err}"
+        );
+        assert_eq!(err.to_string(), "authorized_keys is not writable");
+        assert_eq!(std::fs::read_to_string(&keys).unwrap(), other);
+    }
 }
+
+const DEVICE_KEY: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCX3gCbaYfg5u9YLs2Wl/JueENke93ZHXviQRq40gOlkHjaEa1MveakIBTyg0/VVXe/fFWxV3pteMd9Pe1sUf8g= thurm-ios:iPhone";
 
 unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn geteuid() -> u32;
 }
