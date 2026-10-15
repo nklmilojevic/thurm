@@ -15,6 +15,9 @@ mod program_status;
 #[path = "e2e/mobile.rs"]
 mod mobile;
 
+#[path = "e2e/tailnet.rs"]
+mod tailnet;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
