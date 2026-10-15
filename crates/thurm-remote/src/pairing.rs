@@ -296,20 +296,22 @@ const EDIT: &str = concat!(
     "if [ -L \"$F\" ]; then nw; fi; ",
     "if [ -e \"$F\" ] && { [ ! -w \"$F\" ] || [ ! -r \"$F\" ]; }; then nw; fi; ",
     "umask 077; mkdir -p \"$D\" 2>/dev/null || nw; chmod 700 \"$D\" 2>/dev/null; ",
-    // One edit at a time (two at once would each drop the other's key). The lock is a symlink
-    // to its holder, `<pid>@<host>`: `ln -s` takes it and names the holder in one atomic step,
-    // so there is never a lock without an owner. A holder on this host that is gone (killed
-    // mid-edit) is taken over; a live one, or one on another host sharing this home, is waited
-    // for, then given up on. Only the holder removes it.
-    "K=\"$D/.authorized_keys.thurm-lk\"; H=\"$(uname -n)\"; I=0; ",
-    "until ln -s \"$$@$H\" \"$K\" 2>/dev/null; do O=\"$(readlink \"$K\" 2>/dev/null)\"; I=$((I+1)); ",
-    "[ \"$I\" -lt 30 ] || { echo \"authorized_keys is being changed by another Thurm; try again\" >&2; exit 5; }; ",
-    "[ -n \"$O\" ] || continue; ",
-    "if [ \"${O#*@}\" = \"$H\" ] && ! kill -0 \"${O%%@*}\" 2>/dev/null; then ",
-    "[ \"$(readlink \"$K\" 2>/dev/null)\" = \"$O\" ] && rm -f \"$K\"; continue; fi; ",
-    "sleep 1; done; ",
-    "unlock() { [ \"$(readlink \"$K\" 2>/dev/null)\" = \"$$@$H\" ] && rm -f \"$K\"; }; ",
-    "trap unlock EXIT; trap \"exit 1\" INT TERM HUP; ",
+    // One edit at a time (two at once would each drop the other's key). With `flock`: a kernel
+    // lock on a file beside it, gone with its holder however that ends. Without (macOS): a
+    // symlink to the holder's pid, taken by `ln -s` atomically and removed by its own exit
+    // trap. It is never taken over (deciding a holder is gone and removing its lock can't be
+    // made atomic in a shell), so a holder killed outright leaves an error naming it. Waits
+    // THURM_PAIR_LOCK_WAIT seconds; THURM_PAIR_LOCK=link forces the symlink (tests).
+    "W=\"${THURM_PAIR_LOCK_WAIT:-30}\"; I=0; ",
+    "busy() { echo \"authorized_keys is being changed by another Thurm$1\" >&2; exit 5; }; ",
+    "if [ \"${THURM_PAIR_LOCK:-}\" != link ] && command -v flock >/dev/null 2>&1; then ",
+    "exec 9>>\"$D/.authorized_keys.thurm-lock\" || nw; ",
+    "until flock -n 9; do I=$((I+1)); [ \"$I\" -lt \"$W\" ] || busy; sleep 1; done; ",
+    "else K=\"$D/.authorized_keys.thurm-lk\"; ",
+    "until ln -s \"$$\" \"$K\" 2>/dev/null; do I=$((I+1)); ",
+    "[ \"$I\" -lt \"$W\" ] || busy \"; if none is, remove $K\"; sleep 1; done; ",
+    "unlock() { [ \"$(readlink \"$K\" 2>/dev/null)\" = \"$$\" ] && rm -f \"$K\"; }; ",
+    "trap unlock EXIT; trap \"exit 1\" INT TERM HUP; fi; ",
     "ours() { case \"$L\" in \"restrict,port-forwarding ecdsa-sha2-nistp256 \"?*) ;; *) return 1 ;; esac; ",
     "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; [ \"$R\" = \"$B thurm-ios:$V\" ]; }; ",
     // E: the line read had no newline (the last one). P: the last line written has none. M: a
@@ -589,7 +591,8 @@ mod tests {
     }
 
     /// The edit script, run by `/bin/sh` on a scratch home (the loopback tests run it over ssh).
-    struct Local(std::path::PathBuf);
+    /// The home, and environment the remote script would get from sshd.
+    struct Local(std::path::PathBuf, Vec<(&'static str, &'static str)>);
 
     impl RemoteExec for Local {
         fn run(
@@ -605,6 +608,7 @@ mod tests {
                 .arg("thurm")
                 .args(args)
                 .env("THURM_HOME", &self.0)
+                .envs(self.1.iter().copied())
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -637,71 +641,111 @@ mod tests {
         );
     }
 
-    /// Edits at the same moment (two Macs adding phones) each keep the other's key.
+    const LINK: (&str, &str) = ("THURM_PAIR_LOCK", "link");
+
+    /// Edits at the same moment (two Macs adding phones) each keep the other's key: with
+    /// `flock` when this machine has it, and with the symlink lock.
     #[test]
     fn concurrent_edits_keep_every_key() {
-        let home = std::env::temp_dir().join(format!("thurm-pairlock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-        let names: Vec<String> = (0..8).map(|i| format!("dev{i}")).collect();
-        let threads: Vec<_> = names
-            .iter()
-            .map(|name| {
-                let (home, k) = (
-                    home.clone(),
-                    DeviceKey::parse(&KEY.replace("iPhone", name)).unwrap(),
-                );
-                std::thread::spawn(move || authorize(&Local(home), &k).unwrap())
-            })
-            .collect();
-        for t in threads {
-            t.join().unwrap();
+        for env in [vec![], vec![LINK]] {
+            let home = std::env::temp_dir().join(format!(
+                "thurm-pairlock-{}-{}",
+                std::process::id(),
+                env.len()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).unwrap();
+            let names: Vec<String> = (0..8).map(|i| format!("dev{i}")).collect();
+            let threads: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    let (home, env) = (home.clone(), env.clone());
+                    let k = DeviceKey::parse(&KEY.replace("iPhone", name)).unwrap();
+                    std::thread::spawn(move || authorize(&Local(home, env), &k).unwrap())
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+            let mut listed = devices(&Local(home.clone(), vec![])).unwrap();
+            listed.sort();
+            assert_eq!(listed, names, "no key lost to another edit ({env:?})");
+            let link = home.join(".ssh/.authorized_keys.thurm-lk");
+            assert!(link.symlink_metadata().is_err(), "the lock is released");
+            let _ = std::fs::remove_dir_all(&home);
         }
-        let mut listed = devices(&Local(home.clone())).unwrap();
-        listed.sort();
-        assert_eq!(listed, names, "no key lost to another edit");
-        let lock = home.join(".ssh/.authorized_keys.thurm-lk");
-        assert!(lock.symlink_metadata().is_err(), "the lock is released");
-        let host = String::from_utf8(Command::new("uname").arg("-n").output().unwrap().stdout)
-            .unwrap()
-            .trim()
-            .to_owned();
-        let listed = |name: &str| {
-            devices(&Local(home.clone()))
-                .unwrap()
-                .contains(&name.to_owned())
-        };
+    }
 
-        // A lock whose holder is gone (killed mid-edit) is taken over, not waited out.
+    /// A held lock is waited for, and never taken over: not even one whose holder looks gone,
+    /// since two processes taking over the same lock could each remove the other's.
+    #[test]
+    fn a_held_lock_is_waited_for_and_never_taken_over() {
+        let home = std::env::temp_dir().join(format!("thurm-pairheld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let link = ssh.join(".authorized_keys.thurm-lk");
+        let file = ssh.join("authorized_keys");
+        let key = |name: &str| DeviceKey::parse(&KEY.replace("iPhone", name)).unwrap();
+
+        // Released while the edit waits (its holder finishing): the edit goes ahead then.
+        std::os::unix::fs::symlink("1", &link).unwrap();
+        let released = link.clone();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            std::fs::remove_file(released).unwrap();
+        });
+        let started = std::time::Instant::now();
+        authorize(&Local(home.clone(), vec![LINK]), &key("waited")).unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(2500),
+            "went ahead under a held lock after {:?}",
+            started.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(devices(&Local(home.clone(), vec![])).unwrap(), ["waited"]);
+
+        // Left by a holder that is gone: still not taken over. The edit gives up, names the
+        // lock to remove, and changes nothing.
         let mut gone = Command::new("true").spawn().unwrap();
         let pid = gone.id();
         gone.wait().unwrap();
-        std::os::unix::fs::symlink(format!("{pid}@{host}"), &lock).unwrap();
-        let k = DeviceKey::parse(&KEY.replace("iPhone", "late")).unwrap();
-        let started = std::time::Instant::now();
-        authorize(&Local(home.clone()), &k).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(listed("late"));
-        assert!(lock.symlink_metadata().is_err());
+        std::os::unix::fs::symlink(pid.to_string(), &link).unwrap();
+        let before = std::fs::read_to_string(&file).unwrap();
+        let env = vec![LINK, ("THURM_PAIR_LOCK_WAIT", "2")];
+        let err = authorize(&Local(home.clone(), env), &key("late"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("being changed by another Thurm"), "{err}");
+        assert!(err.contains(".authorized_keys.thurm-lk"), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+        assert!(link.symlink_metadata().is_ok(), "the lock is left alone");
+        std::fs::remove_file(&link).unwrap();
 
-        // A live holder is waited for, never taken over, however long its edit takes (a process
-        // that lives 3 s stands in for an editor paused mid-edit).
-        let mut holder = Command::new("sleep").arg("3").spawn().unwrap();
-        let pid = holder.id();
-        std::os::unix::fs::symlink(format!("{pid}@{host}"), &lock).unwrap();
-        // Reaped as soon as it ends: a zombie would still answer `kill -0`.
-        let reaper = std::thread::spawn(move || holder.wait().unwrap());
-        let k = DeviceKey::parse(&KEY.replace("iPhone", "waited")).unwrap();
-        let started = std::time::Instant::now();
-        authorize(&Local(home.clone()), &k).unwrap();
-        assert!(
-            started.elapsed() >= Duration::from_millis(2500),
-            "took a live holder's lock after {:?}",
-            started.elapsed()
-        );
-        reaper.join().unwrap();
-        assert!(listed("waited"));
-        assert!(lock.symlink_metadata().is_err());
+        // flock, when this machine has it: another process holding it is waited for.
+        let has_flock = Command::new("/bin/sh")
+            .args(["-c", "command -v flock"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        if has_flock {
+            let mut holder = Command::new("flock")
+                .arg(ssh.join(".authorized_keys.thurm-lock"))
+                .args(["sleep", "3"])
+                .spawn()
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            let started = std::time::Instant::now();
+            authorize(&Local(home.clone(), vec![]), &key("flocked")).unwrap();
+            assert!(started.elapsed() >= Duration::from_secs(2));
+            holder.wait().unwrap();
+            assert!(
+                devices(&Local(home.clone(), vec![]))
+                    .unwrap()
+                    .contains(&"flocked".to_owned())
+            );
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -719,7 +763,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("thurm-pairhome-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
-        let local = Local(home.clone());
+        let local = Local(home.clone(), vec![]);
         let file = home.join(".ssh/authorized_keys");
         let key = DeviceKey::parse(KEY).unwrap();
 
@@ -782,12 +826,12 @@ mod tests {
             "nothing of the device's left: the file is not rewritten"
         );
         assert!(
-            std::fs::read_dir(home.join(".ssh")).unwrap().all(|e| !e
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains(".thurm-")),
-            "no temporary file left"
+            std::fs::read_dir(home.join(".ssh")).unwrap().all(|e| {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                // flock's lock file stays; it locks nothing once its holder is gone.
+                !name.contains(".thurm-") || name == ".authorized_keys.thurm-lock"
+            }),
+            "no temporary file or link lock left"
         );
 
         // A last line without a newline keeps it that way: revoking another device in the
