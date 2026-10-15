@@ -296,6 +296,16 @@ const EDIT: &str = concat!(
     "if [ -L \"$F\" ]; then nw; fi; ",
     "if [ -e \"$F\" ] && { [ ! -w \"$F\" ] || [ ! -r \"$F\" ]; }; then nw; fi; ",
     "umask 077; mkdir -p \"$D\" 2>/dev/null || nw; chmod 700 \"$D\" 2>/dev/null; ",
+    // One edit at a time (two at once would each drop the other's key): `mkdir` of the lock is
+    // atomic everywhere. Its holder's pid is inside; a holder that is gone (killed mid-edit) or
+    // never wrote one leaves a lock taken over; a live one is waited for, then given up on.
+    "K=\"$D/.authorized_keys.thurm-lock\"; I=0; ",
+    "until mkdir \"$K\" 2>/dev/null; do O=\"$(cat \"$K/pid\" 2>/dev/null)\"; I=$((I+1)); ",
+    "[ \"$I\" -lt 30 ] || { echo \"authorized_keys is being changed by another Thurm; try again\" >&2; exit 5; }; ",
+    "if { [ -n \"$O\" ] && ! kill -0 \"$O\" 2>/dev/null; } || { [ -z \"$O\" ] && [ \"$I\" -gt 5 ]; }; then ",
+    "[ \"$(cat \"$K/pid\" 2>/dev/null)\" = \"$O\" ] && rm -rf \"$K\"; continue; fi; ",
+    "sleep 1; done; ",
+    "unlock() { rm -rf \"$K\"; }; trap unlock EXIT; trap \"exit 1\" INT TERM HUP; echo $$ > \"$K/pid\"; ",
     "ours() { case \"$L\" in \"restrict,port-forwarding ecdsa-sha2-nistp256 \"?*) ;; *) return 1 ;; esac; ",
     "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; [ \"$R\" = \"$B thurm-ios:$V\" ]; }; ",
     // E: the line read had no newline (the last one). P: the last line written has none. M: a
@@ -621,6 +631,51 @@ mod tests {
                 DeviceKey::parse(KEY).unwrap().line()
             )
         );
+    }
+
+    /// Edits at the same moment (two Macs adding phones) each keep the other's key.
+    #[test]
+    fn concurrent_edits_keep_every_key() {
+        let home = std::env::temp_dir().join(format!("thurm-pairlock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let names: Vec<String> = (0..8).map(|i| format!("dev{i}")).collect();
+        let threads: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let (home, k) = (
+                    home.clone(),
+                    DeviceKey::parse(&KEY.replace("iPhone", name)).unwrap(),
+                );
+                std::thread::spawn(move || authorize(&Local(home), &k).unwrap())
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let mut listed = devices(&Local(home.clone())).unwrap();
+        listed.sort();
+        assert_eq!(listed, names, "no key lost to another edit");
+        let lock = home.join(".ssh/.authorized_keys.thurm-lock");
+        assert!(!lock.exists(), "the lock is released");
+
+        // A lock whose holder is gone (killed mid-edit) is taken over, not waited out.
+        let mut gone = Command::new("true").spawn().unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        std::fs::write(lock.join("pid"), format!("{pid}\n")).unwrap();
+        let k = DeviceKey::parse(&KEY.replace("iPhone", "late")).unwrap();
+        let started = std::time::Instant::now();
+        authorize(&Local(home.clone()), &k).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            devices(&Local(home.clone()))
+                .unwrap()
+                .contains(&"late".to_owned())
+        );
+        assert!(!lock.exists());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
