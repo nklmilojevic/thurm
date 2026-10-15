@@ -422,21 +422,36 @@ impl Store {
         save_json(&self.follows_path, &*follows)
     }
 
+    /// Forgets `device` and its activities if it is still registered as it is: a registration
+    /// made since (another relay, a new secret) stays. Returns whether it was forgotten.
+    fn forget_registration(&self, device: &Device) -> Result<bool, String> {
+        let mut devices = self.devices.lock();
+        let before = devices.len();
+        devices.retain(|d| d != device);
+        if devices.len() == before {
+            return Ok(false);
+        }
+        save_json(&self.path, &*devices)?;
+        let mut follows = self.follows.lock();
+        follows.retain(|f| f.device != device.device);
+        save_json(&self.follows_path, &*follows)?;
+        Ok(true)
+    }
+
     /// After a post for `device`: the relay no longer knowing it (the phone deleted it, turning
     /// notifications off) means it is gone for good, here too.
     fn check(&self, device: &Device, what: &str, result: Result<(), PostError>) {
         match result {
             Ok(()) => {}
-            Err(PostError::Gone) => {
-                log::info!(
-                    "{what} to {}: the relay no longer knows {}; forgetting it",
+            Err(PostError::Gone) => match self.forget_registration(device) {
+                Ok(true) => log::info!(
+                    "{what} to {}: the relay no longer knows {}; forgot it",
                     device.relay,
                     device.name
-                );
-                if let Err(e) = self.forget(std::slice::from_ref(&device.device)) {
-                    log::warn!("forget push device {}: {e}", device.name);
-                }
-            }
+                ),
+                Ok(false) => {}
+                Err(e) => log::warn!("forget push device {}: {e}", device.name),
+            },
             Err(PostError::Other(e)) => {
                 log::warn!("{what} to {} for {}: {e}", device.relay, device.name);
             }
@@ -932,6 +947,33 @@ mod tests {
         let again = Pusher::new(&dir, true);
         assert_eq!(again.devices.lock().len(), 1, "forgotten on disk too");
         assert!(again.follows.lock().iter().all(|f| f.device != "d1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 404 for a post made before the phone registered again (another relay) is about the old
+    /// registration: the new one stays.
+    #[test]
+    fn a_stale_404_keeps_a_newer_registration() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Pusher::new(&dir, true);
+        let old = Device {
+            device: "d1".into(),
+            relay: "https://old.example.net".into(),
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        };
+        p.register(old.clone()).unwrap();
+        let new = Device {
+            relay: "https://new.example.net".into(),
+            ..old.clone()
+        };
+        p.register(new.clone()).unwrap();
+        p.store().check(&old, "push", Err(PostError::Gone));
+        assert_eq!(*p.devices.lock(), vec![new.clone()]);
+        p.store().check(&new, "push", Err(PostError::Gone));
+        assert!(p.devices.lock().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
