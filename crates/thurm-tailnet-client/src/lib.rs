@@ -286,7 +286,22 @@ fn open_fd_with(
     url: &str,
     limits: Limits,
 ) -> Result<(UnixStream, Session), ConnectError> {
-    check_url(url)?;
+    open_fd_tls(fd, url, limits, tls_config()?)
+}
+
+/// Over a socket the caller dialed, TLS is what ties the connection to `url`'s host: only
+/// `wss://` is accepted.
+fn open_fd_tls(
+    fd: OwnedFd,
+    url: &str,
+    limits: Limits,
+    tls: Arc<rustls::ClientConfig>,
+) -> Result<(UnixStream, Session), ConnectError> {
+    if !url.starts_with("wss://") {
+        return Err(ConnectError::BadUrl(format!(
+            "{url}: a dialed socket needs a wss:// address"
+        )));
+    }
     let socket = UnixStream::from(fd);
     socket
         .set_nonblocking(true)
@@ -296,7 +311,7 @@ fn open_fd_with(
     let ws = rt.block_on(async {
         let socket = tokio::net::UnixStream::from_std(socket)
             .map_err(|e| ConnectError::Protocol(format!("the dialed socket: {e}")))?;
-        let connector = tokio_tungstenite::Connector::Rustls(tls_config()?);
+        let connector = tokio_tungstenite::Connector::Rustls(tls);
         handshake_within(
             limits.connect,
             tokio_tungstenite::client_async_tls_with_config(url, socket, None, Some(connector)),
@@ -364,6 +379,13 @@ fn classify(e: tungstenite::Error) -> ConnectError {
                     "the address answered HTTP {code}, not a Thurm daemon"
                 )),
             }
+        }
+        // A certificate the address can't vouch for is not an unreachable address.
+        tungstenite::Error::Io(e)
+            if e.get_ref()
+                .is_some_and(|inner| inner.downcast_ref::<rustls::Error>().is_some()) =>
+        {
+            ConnectError::Protocol(format!("TLS: {e}"))
         }
         tungstenite::Error::Io(e) => ConnectError::Unreachable(e.to_string()),
         tungstenite::Error::Url(e) => ConnectError::BadUrl(e.to_string()),

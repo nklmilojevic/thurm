@@ -15,3 +15,8 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # ring, like russh: aws-lc-rs would need a C toolchain build for iOS.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
+
+[dev-dependencies]
+# A test CA and server certificate for the TLS checks.
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
