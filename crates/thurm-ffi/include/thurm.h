@@ -491,6 +491,14 @@ void thurm_remote_kick(const char *name, bool restart);
  *   {"op":"handoff_cleanup","id":"...","force":false}     {"branch_deleted":bool,"message":...}
  *   {"op":"handoff_defer","id":"..."}                     handoff (pending_cleanup)
  *   {"op":"handoff_list"}                                 [handoff, ...]
+ *   {"op":"pairing_hosts"}                                [{"name","host","port","user",
+ *        "host_keys":["SHA256:..."],"socket"|null,"proxy"?,"error"?}, ...] (enabled hosts; an
+ *        entry with "error" can't go in the iOS pairing code)
+ *   {"op":"authorize_device","name":"devbox","key":"ecdsa-sha2-nistp256 ... thurm-ios:iPhone"}
+ *        {"device":"iPhone"}, or {"error":...,"not_writable":true,"line":"<to add by hand>",
+ *        "nixos":"<snippet>"|null}
+ *   {"op":"revoke_device","name":"devbox","device":"iPhone"}   "Ok"
+ *   {"op":"paired_devices","name":"devbox"}                ["iPhone", ...]
  * A handoff: {"id":"devbox/<repo id>/<slug>","host":...,"repo":"<local path>","branch":
  * "agent/<slug>","worktree":"<remote path>","git_remote":"thurm-devbox","pane":n|null,...} */
 char *thurm_remote_call(const char *json);

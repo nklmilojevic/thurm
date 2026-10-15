@@ -7,11 +7,13 @@
 //! - [`install`]: putting the app's exact build on a host, and upgrading its daemon in place.
 //! - [`doctor`]: what a host needs (lingering, PATH, agents, hooks), and the fixes.
 //! - [`handoff`]: giving a local repository to a remote agent through git.
+//! - [`pairing`]: the iOS app's pairing code and its device keys on remote hosts.
 //! - [`policy`]: what remote panes may do on this Mac (clipboard, links).
 
 pub mod doctor;
 pub mod handoff;
 pub mod install;
+pub mod pairing;
 pub mod policy;
 pub mod ssh;
 pub mod tunnel;

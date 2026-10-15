@@ -30,13 +30,70 @@ enum PhonePairing {
         return "SHA256:" + digest.replacingOccurrences(of: "=", with: "")
     }
 
-    /// What the QR code carries (see `PairingPayload` in the iOS app).
+    /// A `[[remote]]` host for the code, as `pairing_hosts` describes it: its address, user and
+    /// port from `ssh -G`, its host keys from this Mac's known hosts.
+    struct RemoteHost: Identifiable, Equatable {
+        var name: String
+        /// Where the phone connects: `ssh -G`'s hostname until edited.
+        var address: String
+        var port: Int
+        var user: String
+        var hostKeys: [String]
+        var socket: String?
+        /// The ProxyJump or ProxyCommand the Mac uses for it (the phone can't).
+        var proxy: String?
+        /// Why it can't be in the code.
+        var error: String?
+        /// Checked in the sheet.
+        var included: Bool
+        var id: String { name }
+
+        init(name: String, address: String, port: Int = 22, user: String, hostKeys: [String],
+             socket: String? = nil, proxy: String? = nil, error: String? = nil) {
+            self.name = name
+            self.address = address
+            self.port = port
+            self.user = user
+            self.hostKeys = hostKeys
+            self.socket = socket
+            self.proxy = proxy
+            self.error = error
+            included = error == nil && !hostKeys.isEmpty
+        }
+
+        init?(json: Any?) {
+            guard let d = json as? [String: Any], let name = jsonString(d["name"]) else { return nil }
+            self.init(name: name, address: jsonString(d["host"]) ?? "", port: jsonInt(d["port"]) ?? 22,
+                      user: jsonString(d["user"]) ?? "", hostKeys: d["host_keys"] as? [String] ?? [],
+                      socket: jsonString(d["socket"]), proxy: jsonString(d["proxy"]),
+                      error: jsonString(d["error"]))
+        }
+
+        /// Checked, and something the phone can connect to and trust.
+        var inCode: Bool {
+            included && error == nil && !hostKeys.isEmpty
+                && !address.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+
+        /// Its entry in the code (`PairedHost` in the iOS app).
+        var payload: [String: Any] {
+            var d: [String: Any] = ["name": name, "host": address.trimmingCharacters(in: .whitespaces),
+                                    "port": port, "user": user, "host_keys": hostKeys]
+            if let socket { d["socket"] = socket }
+            return d
+        }
+    }
+
+    /// What the QR code carries (see `PairingPayload` in the iOS app). Remote hosts not checked
+    /// (or not usable) are left out.
     static func payload(name: String, host: String, port: Int, user: String, hostKeys: [String],
-                        relay: String?, code: String?) -> String {
+                        relay: String?, code: String?, remotes: [RemoteHost] = []) -> String {
         var d: [String: Any] = ["v": 1, "name": name, "host": host, "port": port, "user": user,
                                 "host_keys": hostKeys]
         if let relay, !relay.isEmpty { d["relay"] = relay }
         if let code, !code.isEmpty { d["code"] = code }
+        let remotes = remotes.filter(\.inCode)
+        if !remotes.isEmpty { d["remotes"] = remotes.map(\.payload) }
         let json = (try? JSONSerialization.data(withJSONObject: d, options: [.sortedKeys])) ?? Data()
         let b64 = json.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
@@ -158,10 +215,16 @@ enum PhonePairing {
         return local.hasSuffix(".local") ? local : local + ".local"
     }
 
-    static func qrImage(_ text: String) -> NSImage? {
+    /// Each remote host adds about 150 bytes: "M" keeps the code readable up to about six,
+    /// "L" beyond keeps it from getting too dense to scan.
+    static func correctionLevel(remotes: Int) -> String {
+        remotes > 6 ? "L" : "M"
+    }
+
+    static func qrImage(_ text: String, remotes: Int = 0) -> NSImage? {
         guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
         filter.setValue(Data(text.utf8), forKey: "inputMessage")
-        filter.setValue("M", forKey: "inputCorrectionLevel")
+        filter.setValue(correctionLevel(remotes: remotes), forKey: "inputCorrectionLevel")
         guard let image = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)) else {
             return nil
         }
@@ -180,13 +243,34 @@ struct PairPhoneSheet: View {
     @State private var devices = PhonePairing.devices()
     @State private var message: String?
     @State private var remoteLogin: Bool?
+    /// The `[[remote]]` hosts (`pairing_hosts`), with what the sheet changed.
+    @State private var remoteHosts: [PhonePairing.RemoteHost] = []
+    @State private var loadingHosts = true
+    /// Devices with a key on each remote host.
+    @State private var remoteDevices: [String: [String]] = [:]
+    /// What adding the device key did on each remote host.
+    @State private var keyResults: [String: KeyResult] = [:]
     private let hostKeys = PhonePairing.hostKeyFingerprints()
     private let user = NSUserName()
     private let push = SessionManager.shared.config.push
 
+    private enum KeyResult: Equatable {
+        case adding
+        case added
+        case failed(String)
+        /// The host's authorized_keys is managed elsewhere: what to add there by hand.
+        case manual(String, text: String)
+    }
+
+    private struct RemoteDevice: Hashable {
+        var host: String
+        var name: String
+    }
+
     private var link: String {
         PhonePairing.payload(name: Host.current().localizedName ?? host, host: host, port: port,
-                             user: user, hostKeys: hostKeys, relay: push.relay, code: push.code)
+                             user: user, hostKeys: hostKeys, relay: push.relay, code: push.code,
+                             remotes: remoteHosts)
     }
 
     var body: some View {
@@ -202,7 +286,8 @@ struct PairPhoneSheet: View {
                     .foregroundStyle(.red)
             }
             HStack(alignment: .top, spacing: 20) {
-                if let image = PhonePairing.qrImage(link), !host.isEmpty, !hostKeys.isEmpty {
+                if let image = PhonePairing.qrImage(link, remotes: remoteHosts.filter(\.inCode).count),
+                   !host.isEmpty, !hostKeys.isEmpty {
                     Image(nsImage: image)
                         .interpolation(.none)
                         .resizable()
@@ -227,6 +312,7 @@ struct PairPhoneSheet: View {
                     .disabled(host.isEmpty || hostKeys.isEmpty)
                 }
             }
+            remoteHostRows
             Divider()
             Text("2. Paste the device key the app shows (Universal Clipboard or AirDrop).")
             HStack {
@@ -238,17 +324,8 @@ struct PairPhoneSheet: View {
             if let message {
                 Text(message).font(.caption).foregroundStyle(.secondary)
             }
-            if !devices.isEmpty {
-                Text("Paired devices").font(.headline)
-                ForEach(devices) { d in
-                    HStack {
-                        Image(systemName: "iphone")
-                        Text(d.name)
-                        Spacer()
-                        Button("Revoke", role: .destructive) { revoke(d) }
-                    }
-                }
-            }
+            keyResultRows
+            pairedDevices
             HStack {
                 Spacer()
                 Button("Done") { remotes.sheet = nil }
@@ -256,26 +333,191 @@ struct PairPhoneSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 560)
+        .frame(width: 640)
         .onAppear {
             DispatchQueue.global(qos: .userInitiated).async {
                 let name = PhonePairing.defaultHostName()
                 DispatchQueue.main.async { if host.isEmpty { host = name } }
             }
             checkRemoteLogin()
+            loadRemoteHosts()
         }
     }
 
+    // MARK: Remote hosts
+
+    @ViewBuilder private var remoteHostRows: some View {
+        if loadingHosts {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Looking up remote hosts…").font(.caption).foregroundStyle(.secondary)
+            }
+        } else if !remoteHosts.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Remote hosts in the code").font(.headline)
+                ForEach($remoteHosts) { $h in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Toggle(isOn: $h.included) {
+                                Text(h.name).frame(width: 110, alignment: .leading).lineLimit(1)
+                            }
+                            .toggleStyle(.checkbox)
+                            .disabled(h.error != nil)
+                            TextField("Address", text: $h.address)
+                                .frame(width: 210)
+                                .disabled(!h.included || h.error != nil)
+                            Text(h.port == 22 ? h.user : "\(h.user) · port \(h.port)")
+                                .foregroundStyle(.secondary).lineLimit(1)
+                            Spacer()
+                            Text(state(of: h)).font(.caption)
+                                .foregroundStyle(h.error == nil ? Color.secondary : Color.orange)
+                                .lineLimit(2)
+                        }
+                        if h.included, h.error == nil, let proxy = h.proxy {
+                            Text("This Mac reaches it through \(proxy), which the phone can't use: enter an address the phone reaches directly.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        if h.included, h.error == nil, let hint = daemonHint(h.name) {
+                            Text(hint).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func state(of h: PhonePairing.RemoteHost) -> String {
+        if let error = h.error {
+            return error.hasPrefix("no known host key") ? "Connect to it from this Mac once" : error
+        }
+        if Remotes.shared.statuses[h.name]?.phase != "connected" { return "Not reachable now" }
+        return h.hostKeys.count == 1 ? "Host key found" : "\(h.hostKeys.count) host keys found"
+    }
+
+    /// A host whose daemon is older than this app's: the terminal works from the phone, push
+    /// and Live Activities may need the upgrade.
+    private func daemonHint(_ name: String) -> String? {
+        guard let s = Remotes.shared.statuses[name], s.phase == "upgrade_needed" || s.upgradeAvailable else {
+            return nil
+        }
+        return "Thurm there is older than this Mac's: notifications and Live Activities need its upgrade (Settings › Remotes)."
+    }
+
+    private func loadRemoteHosts() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let list = (Core.shared.remoteCall(["op": "pairing_hosts"]) as? [Any] ?? [])
+                .compactMap(PhonePairing.RemoteHost.init(json:))
+            DispatchQueue.main.async {
+                remoteHosts = list
+                loadingHosts = false
+                for h in list where h.error == nil { loadDevices(on: h.name) }
+            }
+        }
+    }
+
+    private func loadDevices(on name: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let list = Core.shared.remoteCall(["op": "paired_devices", "name": name]) as? [String]
+            DispatchQueue.main.async {
+                if let list { remoteDevices[name] = list }
+            }
+        }
+    }
+
+    @ViewBuilder private var keyResultRows: some View {
+        ForEach(remoteHosts.filter { keyResults[$0.name] != nil }) { h in
+            switch keyResults[h.name] {
+            case .adding:
+                Label("\(h.name): adding…", systemImage: "hourglass").font(.caption)
+            case .added:
+                Label("\(h.name): added", systemImage: "checkmark.circle").font(.caption)
+                    .foregroundStyle(.green)
+            case .failed(let why):
+                Label("\(h.name): \(why)", systemImage: "xmark.octagon").font(.caption)
+                    .foregroundStyle(.red)
+            case .manual(let why, let text):
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("\(h.name): \(why)", systemImage: "exclamationmark.triangle").font(.caption)
+                        .foregroundStyle(.orange)
+                    HStack(alignment: .top) {
+                        Text(text).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Spacer()
+                        Button("Copy") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(text, forType: .string)
+                        }
+                    }
+                }
+            case nil:
+                EmptyView()
+            }
+        }
+    }
+
+    @ViewBuilder private var pairedDevices: some View {
+        let onRemotes = remoteHosts.flatMap { h in
+            (remoteDevices[h.name] ?? []).map { RemoteDevice(host: h.name, name: $0) }
+        }
+        if !devices.isEmpty || !onRemotes.isEmpty {
+            Text("Paired devices").font(.headline)
+            ForEach(devices) { d in
+                deviceRow(d.name, on: "this Mac") { revoke(d) }
+            }
+            ForEach(onRemotes, id: \.self) { d in
+                deviceRow(d.name, on: d.host) { revoke(d) }
+            }
+        }
+    }
+
+    private func deviceRow(_ name: String, on host: String, revoke: @escaping () -> Void) -> some View {
+        HStack {
+            Image(systemName: "iphone")
+            Text(name)
+            Text(host).foregroundStyle(.secondary)
+            Spacer()
+            Button("Revoke", role: .destructive, action: revoke)
+        }
+    }
+
+    // MARK: Keys
+
     private func addKey() {
         guard let (key, device) = PhonePairing.validDeviceKey(deviceKey) else { return }
+        let line = deviceKey.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             try PhonePairing.add(key: key, device: device)
-            message = "Added \(device). The app can connect now."
+            message = "Added \(device) on this Mac. The app can connect now."
             deviceKey = ""
         } catch {
             message = "Could not write ~/.ssh/authorized_keys: \(error.localizedDescription)"
         }
         devices = PhonePairing.devices()
+        for h in remoteHosts where h.included && h.error == nil {
+            authorize(line, on: h.name)
+        }
+    }
+
+    private func authorize(_ line: String, on name: String) {
+        keyResults[name] = .adding
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = Core.shared.remoteCall(["op": "authorize_device", "name": name, "key": line]) as? [String: Any]
+            DispatchQueue.main.async {
+                if let r, r["error"] == nil {
+                    keyResults[name] = .added
+                    loadDevices(on: name)
+                } else if let r, jsonBool(r["not_writable"]) == true {
+                    if let nix = jsonString(r["nixos"]) {
+                        keyResults[name] = .manual("its keys are managed by NixOS; add the key to its configuration:",
+                                                   text: nix)
+                    } else {
+                        keyResults[name] = .manual("authorized_keys there is not writable; add this line by hand:",
+                                                   text: jsonString(r["line"]) ?? line)
+                    }
+                } else {
+                    keyResults[name] = .failed(jsonString(r?["error"]) ?? "no answer")
+                }
+            }
+        }
     }
 
     /// Removes the phone's key, then has the daemon forget its push registration (no more
@@ -292,10 +534,31 @@ struct PairPhoneSheet: View {
         }
         devices = PhonePairing.devices()
         message = "Revoked \(device.name)."
-        Core.shared.requestAsync(object: ["RevokePhone": ["name": device.name]], timeout: 15) { resp in
+        forgetPhone(device.name, on: localHost, label: device.name)
+    }
+
+    /// The same on a remote host, through ssh, then its daemon.
+    private func revoke(_ device: RemoteDevice) {
+        message = "Revoking \(device.name) on \(device.host)…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = Core.shared.remoteCall(["op": "revoke_device", "name": device.host, "device": device.name])
+            DispatchQueue.main.async {
+                if let e = (r as? [String: Any])?["error"] as? String ?? (r == nil ? "no answer" : nil) {
+                    message = "Could not revoke \(device.name) on \(device.host): its key still works. \(e)"
+                } else {
+                    message = "Revoked \(device.name) on \(device.host)."
+                    forgetPhone(device.name, on: device.host, label: "\(device.name) on \(device.host)")
+                }
+                loadDevices(on: device.host)
+            }
+        }
+    }
+
+    private func forgetPhone(_ name: String, on host: HostId, label: String) {
+        Core.shared.requestAsync(object: ["RevokePhone": ["name": name]], host: host, timeout: 15) { resp in
             if resp == nil || (resp as? [String: Any])?["error"] != nil {
                 let why = ((resp as? [String: Any])?["error"] as? String) ?? "the daemon did not answer"
-                message = "Revoked \(device.name)'s key, but it may still get notifications: \(why)"
+                message = "Revoked \(label)'s key, but it may still get notifications: \(why)"
             }
         }
     }
