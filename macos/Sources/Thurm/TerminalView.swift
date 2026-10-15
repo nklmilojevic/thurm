@@ -294,7 +294,9 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     private func updateDrawableSize() {
-        guard !waitingForResizeFrame || !hasDrawn else { return }
+        // A held grid keeps its drawable: a pane opening in a split took its final size before
+        // the move, and must not take the in-between bounds of the move.
+        guard !holdGridSize, !waitingForResizeFrame || !hasDrawn else { return }
         guard let layer = metalLayer else { return }
         let scale = backingScale
         let size = CGSize(width: max(1, (bounds.width * scale).rounded()),
