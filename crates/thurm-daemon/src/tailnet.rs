@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Sender, bounded};
 use parking_lot::Mutex;
@@ -120,6 +120,9 @@ pub struct Tailnet {
     /// The embedded node's state.
     state_dir: PathBuf,
     inner: Mutex<Inner>,
+    /// Held through each change of what is served, until the helper has answered it: changes
+    /// take effect in the order they were made (the helper runs commands in order too).
+    ops: Mutex<()>,
     status: Mutex<TailscaleStatus>,
     on_change: OnceLock<Box<dyn Fn(TailscaleStatus) + Send + Sync>>,
     next_id: AtomicU64,
@@ -131,9 +134,16 @@ impl Tailnet {
             socket,
             state_dir,
             inner: Mutex::new(Inner::default()),
+            ops: Mutex::new(()),
             status: Mutex::new(TailscaleStatus::default()),
             on_change: OnceLock::new(),
-            next_id: AtomicU64::new(1),
+            // Request ids start at the clock, so the ids of an image that adopted a helper never
+            // meet late answers to the image it replaced.
+            next_id: AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(1, |d| d.as_nanos() as u64),
+            ),
         })
     }
 
@@ -159,6 +169,7 @@ impl Tailnet {
         let this = self.clone();
         // Off the caller's thread: starting the helper and the node takes a moment.
         std::thread::spawn(move || {
+            let _ops = this.ops.lock();
             if let Err(e) = this.apply() {
                 log::warn!("tailscale: {e}");
             }
@@ -191,8 +202,19 @@ impl Tailnet {
                     .into(),
             );
         }
-        {
+        let _ops = self.ops.lock();
+        // A node enrolled with tags keeps them: it has no owner, whatever this asks for.
+        let tags = self.status().tags;
+        if !allow_tailnet_members && !tags.is_empty() {
+            return Err(format!(
+                "this node is tagged ({}), so it has no owner and owner-only access would admit \
+                 nobody. Allow tailnet members, or sign out and enroll without tags.",
+                tags.join(", ")
+            ));
+        }
+        let before = {
             let mut inner = self.inner.lock();
+            let before = inner.want.node.clone();
             let node = &mut inner.want.node;
             node.enabled = true;
             if let Some(h) = hostname {
@@ -203,28 +225,35 @@ impl Tailnet {
             if let Some(k) = auth_key {
                 node.auth_key = k;
             }
-        }
+            before
+        };
+        // Refused: what is served stays as it was.
         self.apply()
+            .inspect_err(|_| self.inner.lock().want.node = before)
     }
 
     /// Stop serving as the embedded node; it stays signed in (`Request::TailscaleDisable`).
     pub fn disable(self: &Arc<Self>) -> Answer {
+        let _ops = self.ops.lock();
         self.inner.lock().want.node.enabled = false;
         self.apply()
     }
 
     /// Ask for a sign-in link (`Request::TailscaleLogin`).
     pub fn login(self: &Arc<Self>) -> Answer {
+        let _ops = self.ops.lock();
         if !self.inner.lock().want.node.enabled {
             return Err("enable Tailscale before requesting a sign-in link".into());
         }
         self.request(serde_json::json!({"cmd": "login"}))
     }
 
-    /// Sign out and forget the node (`Request::TailscaleLogout`).
+    /// Sign out and forget the node (`Request::TailscaleLogout`). A node that is off is started,
+    /// without serving, to sign it out; nothing is reported done that wasn't.
     pub fn logout(self: &Arc<Self>) -> Answer {
+        let _ops = self.ops.lock();
         if self.inner.lock().helper.is_none() {
-            return Ok(self.status());
+            self.spawn()?;
         }
         let status = self.request(serde_json::json!({"cmd": "logout"}))?;
         // Signed out: the node is off until enabled (and signed in) again.
@@ -241,6 +270,7 @@ impl Tailnet {
                 "invalid tailnet hostname {hostname:?}: one DNS label of 1 to 63 letters, digits or hyphens"
             ));
         }
+        let _ops = self.ops.lock();
         self.inner.lock().want.node.hostname = hostname.clone();
         if self.inner.lock().helper.is_none() {
             let mut status = self.status.lock();
@@ -266,7 +296,8 @@ impl Tailnet {
         let _ = self.request(serde_json::json!({"cmd": "status"}));
     }
 
-    /// Starts the helper when something is to be served, and sends it what to serve.
+    /// Starts the helper when something is to be served, and sends it what to serve. Called
+    /// with `ops` held.
     fn apply(self: &Arc<Self>) -> Answer {
         let want = {
             let inner = self.inner.lock();
@@ -413,7 +444,7 @@ impl Tailnet {
         unsafe {
             libc::waitpid(pid, std::ptr::null_mut(), 0);
         }
-        let (restart, delay) = {
+        let restart = {
             let mut inner = self.inner.lock();
             if inner.helper.as_ref().map(|h| h.generation) != Some(generation) {
                 return;
@@ -422,9 +453,7 @@ impl Tailnet {
             for (_, tx) in inner.pending.drain() {
                 let _ = tx.send(Err("the Tailscale helper exited".into()));
             }
-            inner.failures += 1;
-            let delay = Duration::from_secs(1 << inner.failures.min(6)).min(MAX_BACKOFF);
-            (inner.want.any(), delay)
+            inner.want.any()
         };
         log::warn!("tailscale: helper {pid} exited");
         if !restart {
@@ -440,9 +469,37 @@ impl Tailnet {
             hostname: self.inner.lock().want.node.hostname.clone(),
             ..Default::default()
         });
-        std::thread::sleep(delay);
-        if let Err(e) = self.apply() {
-            log::warn!("tailscale: restarting the helper: {e}");
+        self.restart();
+    }
+
+    /// Starts the helper again after it exited, with growing pauses, until it runs or nothing
+    /// is to be served any more.
+    fn restart(self: &Arc<Self>) {
+        loop {
+            let delay = {
+                let mut inner = self.inner.lock();
+                inner.failures += 1;
+                Duration::from_secs(1 << inner.failures.min(6)).min(MAX_BACKOFF)
+            };
+            std::thread::sleep(delay);
+            let _ops = self.ops.lock();
+            {
+                let inner = self.inner.lock();
+                // Turned off meanwhile, or started again by a request.
+                if !inner.want.any() || inner.helper.is_some() {
+                    return;
+                }
+            }
+            match self.apply() {
+                Ok(_) => return,
+                Err(e) => {
+                    log::warn!("tailscale: restarting the helper: {e}");
+                    // A helper that started but exited again restarts through its own reader.
+                    if self.inner.lock().helper.is_some() {
+                        return;
+                    }
+                }
+            }
         }
     }
 
