@@ -27,6 +27,7 @@ jobs:
       release-scripts: ${{ steps.diff.outputs.release-scripts }}
       app-icon: ${{ steps.diff.outputs.app-icon }}
       docs: ${{ steps.diff.outputs.docs }}
+      go: ${{ steps.diff.outputs.go }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -58,6 +59,7 @@ jobs:
           area release-scripts '^(macos/build\.sh$|macos/compile-icon\.sh$|macos/package-dmg\.sh$|macos/release/|\.github/workflows/ci\.yml$)'
           area app-icon '^(macos/Resources/AppIcon\.icon/|macos/compile-icon\.sh$|macos/build\.sh$|\.github/workflows/ci\.yml$)'
           area docs '^(docs/|config\.example\.toml$|\.github/workflows/ci\.yml$)'
+          area go '^(tailnet/|\.github/workflows/ci\.yml$)'
           cat "$GITHUB_OUTPUT"
 
   rust:
@@ -141,6 +143,35 @@ jobs:
           THURM_REQUIRE_NETNS: "1"
           THURM_REQUIRE_SSHD: "1"
         run: cargo test --locked --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
+
+  go:
+    # The Tailscale helper (tailnet/, thurm-tailnet), with the Go version from its go.mod.
+    name: Go
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tailnet
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tailnet/go.mod
+          cache-dependency-path: tailnet/go.sum
+      - name: Format
+        run: |
+          unformatted="$(gofmt -l .)"
+          [[ -z "$unformatted" ]] || { echo "::error::not gofmt-formatted: $unformatted"; exit 1; }
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+      # The helper ships as a static binary next to thurmd.
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath -o /dev/null ./cmd/thurm-tailnet
 
   linux-app:
     # The Linux app (crates/thurm-gtk, GTK 4 + libadwaita), and a headless run of it.
@@ -226,6 +257,18 @@ jobs:
             END { end_step(); exit bad }
           ' .github/workflows/*.yml .github/workflows/*.yaml || {
             echo "::error::every dtolnay/rust-toolchain step must pin rust-toolchain.toml's version"
+            exit 1
+          }
+      # Go is pinned in tailnet/go.mod; the dev shell's go_1_<minor> must be that minor version.
+      - name: One Go version
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^go \([0-9]*\.[0-9]*\)\.[0-9]*$/\1/p' tailnet/go.mod)"
+          nix_pin="$(sed -n 's/^ *go_\([0-9]*\)_\([0-9]*\)$/\1.\2/p' flake.nix)"
+          echo "tailnet/go.mod: $pin"
+          echo "flake.nix: $nix_pin"
+          [[ -n "$pin" && "$pin" == "$nix_pin" ]] || {
+            echo "::error::tailnet/go.mod and flake.nix's dev shell pin different Go versions"
             exit 1
           }
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
