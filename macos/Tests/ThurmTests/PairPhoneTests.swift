@@ -145,6 +145,15 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertEqual(d["host_keys"] as? [String], ["SHA256:abc"], "older apps still pair over ssh")
     }
 
+    func testPairsWithoutHostKeysOnlyOverTailscale() {
+        XCTAssertTrue(PhonePairing.canPair(host: "studio", hostKeys: ["SHA256:abc"], tailnet: nil))
+        XCTAssertFalse(PhonePairing.canPair(host: "studio", hostKeys: [], tailnet: nil), "no way to trust it")
+        XCTAssertFalse(PhonePairing.canPair(host: "", hostKeys: ["SHA256:abc"], tailnet: nil), "no address")
+        XCTAssertTrue(PhonePairing.canPair(host: "studio", hostKeys: [],
+                                           tailnet: "wss://thurm.tail1234.ts.net/v1/connect"))
+        XCTAssertFalse(PhonePairing.canPair(host: "studio", hostKeys: [], tailnet: ""))
+    }
+
     func testTailscaleStatusPairsOnlyOnceServingHTTPS() throws {
         var json: [String: Any] = [
             "state": "running", "hostname": "thurm", "dns_name": "thurm.tail1234.ts.net",
