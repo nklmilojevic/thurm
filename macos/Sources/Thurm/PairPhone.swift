@@ -44,14 +44,36 @@ enum PhonePairing {
         return "thurm://pair?d=" + b64
     }
 
-    /// A device key line from the iOS app, checked: only its P-256 keys with Thurm's comment.
+    /// A device key line from the iOS app, checked: only its P-256 keys with Thurm's comment, on
+    /// one line (a line break would add a second, unrestricted key to authorized_keys).
     static func validDeviceKey(_ text: String) -> (key: String, device: String)? {
-        let parts = text.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ")
+        let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            return nil
+        }
+        let parts = line.split(separator: " ")
         guard parts.count == 3, parts[0] == "ecdsa-sha2-nistp256",
-              let blob = Data(base64Encoded: String(parts[1])), blob.count == 104,
+              let blob = Data(base64Encoded: String(parts[1])), isP256PublicKey(blob),
               parts[2].hasPrefix(commentPrefix), parts[2].count > commentPrefix.count
         else { return nil }
         return ("\(parts[0]) \(parts[1])", String(parts[2].dropFirst(commentPrefix.count)))
+    }
+
+    /// An ssh `ecdsa-sha2-nistp256` public key blob: the algorithm, the curve and a point on it.
+    static func isP256PublicKey(_ blob: Data) -> Bool {
+        var rest = blob[...]
+        func string() -> Data? {
+            guard rest.count >= 4 else { return nil }
+            let length = rest.prefix(4).reduce(0) { $0 << 8 | Int($1) }
+            rest = rest.dropFirst(4)
+            guard rest.count >= length else { return nil }
+            defer { rest = rest.dropFirst(length) }
+            return Data(rest.prefix(length))
+        }
+        guard string() == Data("ecdsa-sha2-nistp256".utf8), string() == Data("nistp256".utf8),
+              let point = string(), rest.isEmpty
+        else { return false }
+        return (try? P256.Signing.PublicKey(x963Representation: point)) != nil
     }
 
     static var authorizedKeys: URL {
@@ -79,19 +101,30 @@ enum PhonePairing {
         let fm = FileManager.default
         try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
                                attributes: [.posixPermissions: 0o700])
-        var lines = ((try? String(contentsOf: file, encoding: .utf8)) ?? "")
-            .split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        if lines.last == "" { lines.removeLast() }
+        var lines = try lines(of: file)
         lines.removeAll { $0.hasSuffix(" " + commentPrefix + device) }
         lines.append("\(keyOptions) \(key) \(commentPrefix)\(device)")
         try write(lines, to: file)
     }
 
     static func revoke(_ device: Device, in file: URL = authorizedKeys) throws {
-        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return }
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-            .filter { $0 != device.line }
-        try write(lines.last == "" ? Array(lines.dropLast()) : lines, to: file)
+        let lines = try lines(of: file)
+        guard lines.contains(device.line) else { return }
+        try write(lines.filter { $0 != device.line }, to: file)
+    }
+
+    /// The file's lines, none when it does not exist. Any other read error is thrown: writing
+    /// back what could not be read would drop every other key.
+    private static func lines(of file: URL) throws -> [String] {
+        let text: String
+        do {
+            text = try String(contentsOf: file, encoding: .utf8)
+        } catch CocoaError.fileReadNoSuchFile {
+            return []
+        }
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if lines.last == "" { lines.removeLast() }
+        return lines
     }
 
     private static func write(_ lines: [String], to file: URL) throws {
@@ -190,6 +223,8 @@ struct PairPhoneSheet: View {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(link, forType: .string)
                     }
+                    // Without the host keys the phone can never trust this Mac.
+                    .disabled(host.isEmpty || hostKeys.isEmpty)
                 }
             }
             Divider()
@@ -210,10 +245,7 @@ struct PairPhoneSheet: View {
                         Image(systemName: "iphone")
                         Text(d.name)
                         Spacer()
-                        Button("Revoke", role: .destructive) {
-                            try? PhonePairing.revoke(d)
-                            devices = PhonePairing.devices()
-                        }
+                        Button("Revoke", role: .destructive) { revoke(d) }
                     }
                 }
             }
@@ -242,6 +274,17 @@ struct PairPhoneSheet: View {
             deviceKey = ""
         } catch {
             message = "Could not write ~/.ssh/authorized_keys: \(error.localizedDescription)"
+        }
+        devices = PhonePairing.devices()
+    }
+
+    private func revoke(_ device: PhonePairing.Device) {
+        do {
+            try PhonePairing.revoke(device)
+            message = "Revoked \(device.name)."
+        } catch {
+            message = "Could not revoke \(device.name): its key still works. "
+                + "~/.ssh/authorized_keys: \(error.localizedDescription)"
         }
         devices = PhonePairing.devices()
     }

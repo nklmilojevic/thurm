@@ -18,6 +18,40 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertNil(PhonePairing.validDeviceKey("command=\"x\" " + deviceKey))
     }
 
+    func testRejectsALineBreakSmugglingASecondKey() {
+        let second = "ssh-ed25519\tAAAAC3NzaC1lZDI1NTE5AAAAINx8GUwWGlzynTf2livkowYPZiyb97ww3S3Lhj7csFN+\tx"
+        XCTAssertNil(PhonePairing.validDeviceKey(deviceKey + "\n" + second))
+        XCTAssertNil(PhonePairing.validDeviceKey(deviceKey.replacingOccurrences(of: "thurm-ios:", with: "thurm-ios:a\nb")))
+        XCTAssertNil(PhonePairing.validDeviceKey(deviceKey.replacingOccurrences(of: "iPhone", with: "i\tPhone")))
+    }
+
+    func testRejectsAKeyBlobOfTheRightLengthThatIsNoKey() {
+        let parts = deviceKey.split(separator: " ")
+        let garbage = Data(repeating: 0x41, count: 104).base64EncodedString()
+        XCTAssertNil(PhonePairing.validDeviceKey("\(parts[0]) \(garbage) \(parts[2])"))
+        // The right header, but a point that is not on the curve.
+        var blob = Data(base64Encoded: String(parts[1]))!
+        blob[blob.count - 1] ^= 0xFF
+        XCTAssertNil(PhonePairing.validDeviceKey("\(parts[0]) \(blob.base64EncodedString()) \(parts[2])"))
+    }
+
+    func testAnUnreadableFileIsNotReplaced() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let file = dir.appendingPathComponent(".ssh/authorized_keys")
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // Not UTF-8: unreadable as text.
+        try Data([0x73, 0x73, 0x68, 0xFF, 0xFE, 0x0A]).write(to: file)
+        let (key, device) = try XCTUnwrap(PhonePairing.validDeviceKey(deviceKey))
+        XCTAssertThrowsError(try PhonePairing.add(key: key, device: device, to: file))
+        XCTAssertThrowsError(try PhonePairing.revoke(.init(name: "x", line: "x"), in: file))
+        XCTAssertEqual(try Data(contentsOf: file), Data([0x73, 0x73, 0x68, 0xFF, 0xFE, 0x0A]))
+        // A missing file is an empty one.
+        try FileManager.default.removeItem(at: file)
+        try PhonePairing.add(key: key, device: device, to: file)
+        XCTAssertEqual(PhonePairing.devices(in: file).map(\.name), ["iPhone"])
+    }
+
     func testAddReplaceAndRevokeKeepOtherKeys() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let file = dir.appendingPathComponent(".ssh/authorized_keys")
