@@ -909,6 +909,7 @@ final class SessionManager: NSObject, CoreDelegate {
         Core.shared.reloadRemoteEngines()
         Remotes.shared.configChanged()
         Updater.shared.configChanged()
+        TailscaleService.shared.configChanged()
         let quickError = QuickTerminal.shared.configChanged()
         let view = currentController?.content.focusedView
         if let err = config.loadError {

@@ -92,9 +92,10 @@ struct TailscaleStatus: Equatable {
 
     /// Whether Sign Out is offered: whenever the node may hold a sign-in. An off node reports no
     /// account, but the daemon signs it out all the same (and does nothing if it never signed in).
+    /// A node waiting for sign-in may hold an expired one, and signing out also turns it off.
     var canSignOut: Bool {
         switch state {
-        case "running", "needs_machine_auth", "off", "stopped", "error": return true
+        case "running", "needs_login", "needs_machine_auth", "off", "stopped", "error": return true
         default: return false
         }
     }
@@ -110,6 +111,24 @@ struct TailscaleStatus: Equatable {
     }
 }
 
+/// Which Tailscale statuses get a notification: each state that needs the user once, until it
+/// changes. Only what was posted counts: a state that arrived while notifications were off
+/// notifies once they are on.
+struct TailscaleNotices {
+    private(set) var notified: String?
+
+    /// Whether to post for `status` now, recording it as posted if so.
+    mutating func shouldPost(_ status: TailscaleStatus, enabled: Bool) -> Bool {
+        guard let key = status.notificationKey else {
+            notified = nil
+            return false
+        }
+        guard key != notified, enabled else { return false }
+        notified = key
+        return true
+    }
+}
+
 /// This Mac's daemon serving over Tailscale: its status (from `TailscaleStatusChanged`), the
 /// sign-in and sign-out requests, and the notifications when it needs something.
 final class TailscaleService: ObservableObject {
@@ -122,9 +141,7 @@ final class TailscaleService: ObservableObject {
     @Published private(set) var busy: String?
     @Published var failure: String?
 
-    /// What was last notified, so a status repeated by the daemon notifies once. Only what was
-    /// posted: a state that arrives while notifications are off notifies once they are on.
-    private var notified: String?
+    private var notices = TailscaleNotices()
 
     func refresh() {
         Core.shared.requestAsync(object: "TailscaleStatus", timeout: 10) { [weak self] resp in
@@ -137,6 +154,11 @@ final class TailscaleService: ObservableObject {
         guard let status = TailscaleStatus(json: payload) else { return }
         unavailable = nil
         set(status)
+    }
+
+    /// The app's config reloaded: notifications may have been turned on for a state still waiting.
+    func configChanged() {
+        if let status { notify(status) }
     }
 
     func signIn() {
@@ -197,12 +219,7 @@ final class TailscaleService: ObservableObject {
     /// Posts what needs the user: a sign-in, an admin's approval, or a stop on an error. Each
     /// once until the state changes.
     private func notify(_ s: TailscaleStatus) {
-        guard let key = s.notificationKey else {
-            notified = nil
-            return
-        }
-        guard key != notified, SessionManager.shared.config.notificationsEnabled else { return }
-        notified = key
+        guard notices.shouldPost(s, enabled: SessionManager.shared.config.notificationsEnabled) else { return }
         switch s.state {
         case "needs_login":
             Notifications.shared.post(id: "tailscale", title: "Sign in to Tailscale",

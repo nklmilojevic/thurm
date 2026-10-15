@@ -31,12 +31,10 @@ final class TailscaleStatusTests: XCTestCase {
     }
 
     func testSignOutOfferedWheneverTheNodeMayHoldASignIn() throws {
-        for state in ["running", "needs_machine_auth", "off", "stopped", "error"] {
+        for state in ["running", "needs_login", "needs_machine_auth", "off", "stopped", "error"] {
             XCTAssertTrue(try status(state).canSignOut, state)
         }
-        for state in ["starting", "needs_login"] {
-            XCTAssertFalse(try status(state).canSignOut, state)
-        }
+        XCTAssertFalse(try status("starting").canSignOut)
     }
 
     func testNotificationKeys() throws {
@@ -48,5 +46,23 @@ final class TailscaleStatusTests: XCTestCase {
         for state in ["off", "starting", "running", "stopped"] {
             XCTAssertNil(try status(state).notificationKey, state)
         }
+    }
+
+    func testNoticeHeldWhileNotificationsAreOffPostsOnceTheyAreOn() throws {
+        let login = try status("needs_login", authURL: "https://login.tailscale.com/a/x")
+        var notices = TailscaleNotices()
+        XCTAssertFalse(notices.shouldPost(login, enabled: false))
+        XCTAssertFalse(notices.shouldPost(login, enabled: false))
+        XCTAssertTrue(notices.shouldPost(login, enabled: true))
+        XCTAssertFalse(notices.shouldPost(login, enabled: true), "once per state")
+    }
+
+    func testNoticePostsAgainAfterTheStateChanges() throws {
+        var notices = TailscaleNotices()
+        XCTAssertTrue(notices.shouldPost(try status("error", error: "boom"), enabled: true))
+        XCTAssertTrue(notices.shouldPost(try status("error", error: "bang"), enabled: true))
+        XCTAssertFalse(notices.shouldPost(try status("running", https: "ready"), enabled: true))
+        XCTAssertNil(notices.notified)
+        XCTAssertTrue(notices.shouldPost(try status("error", error: "bang"), enabled: true))
     }
 }
