@@ -169,11 +169,7 @@ pub fn edit_remotes(
         .parse::<DocumentMut>()
         .map_err(|e| format!("{}: {e}", config.display()))?
         .remove("remote")
-        .map(|hosts| match hosts.into_array_of_tables() {
-            Ok(tables) => Item::ArrayOfTables(tables),
-            Err(other) => other,
-        })
-        .filter(|hosts| !hosts.as_array_of_tables().is_some_and(|t| t.is_empty()));
+        .and_then(host_tables);
     let text = read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
     let mut doc: DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
     // Comments with no settings under them would end up below the hosts.
@@ -187,17 +183,13 @@ pub fn edit_remotes(
         .to_owned();
         doc = DocumentMut::new();
     }
-    match doc.get("remote") {
-        None => {
-            if let Some(hosts) = &base_hosts {
-                doc.insert("remote", hosts.clone());
-            }
-        }
-        // `remote = []`: no hosts, which an added one replaces.
-        Some(hosts) if hosts.as_array().is_some_and(|a| a.is_empty()) => {
-            doc.remove("remote");
-        }
-        Some(_) => {}
+    // The `with_remote_*` edits take `[[remote]]` tables; `remote = []` (no hosts) has none.
+    let hosts = match doc.remove("remote") {
+        None => base_hosts.clone(),
+        Some(hosts) => host_tables(hosts),
+    };
+    if let Some(hosts) = hosts {
+        doc.insert("remote", hosts);
     }
     let mut doc: DocumentMut = edit(&doc.to_string())?
         .parse()
@@ -221,6 +213,17 @@ pub fn edit_remotes(
     }
     replace_file(&file, out.as_bytes()).map_err(|e| format!("{}: {e}", file.display()))?;
     Ok(file)
+}
+
+/// `remote` as `[[remote]]` tables, also when written inline (`remote = [{ name = … }]`); `None`
+/// when it holds no hosts.
+fn host_tables(hosts: Item) -> Option<Item> {
+    match hosts.into_array_of_tables() {
+        Ok(tables) if tables.is_empty() => None,
+        Ok(tables) => Some(Item::ArrayOfTables(tables)),
+        Err(other) if other.as_array().is_some_and(|a| a.is_empty()) => None,
+        Err(other) => Some(other),
+    }
 }
 
 /// The overlay beside `config`, created with a short header when it does not exist yet.
@@ -441,6 +444,35 @@ mod tests {
         edit_remotes(&config, |t| crate::with_remote_removed(t, "devbox")).unwrap();
         assert!(!holds(&read(&path_beside(&config)).unwrap(), "remote"));
         assert_eq!(merged_hosts(&config), []);
+    }
+
+    #[test]
+    fn inline_overlay_hosts_can_be_edited() {
+        let config = temp_config("remotes-inline-overlay", "[font]\nsize = 14.0\n");
+        std::fs::write(
+            path_beside(&config),
+            "remote = [{ name = \"pi\", host = \"me@pi\", clipboard_read = \"never\" }]\n",
+        )
+        .unwrap();
+        let add = remote("devbox", "me@devbox");
+        edit_remotes(&config, |t| crate::with_remote_added(t, &add)).unwrap();
+        edit_remotes(&config, |t| {
+            crate::with_remote_setting(t, "devbox", "enabled", "false")
+        })
+        .unwrap();
+        edit_remotes(&config, |t| crate::with_remote_removed(t, "pi")).unwrap();
+        assert_eq!(merged_hosts(&config), [pair("devbox", "me@devbox")]);
+        let overlay = read(&path_beside(&config)).unwrap();
+        assert!(overlay.contains("enabled = false"), "{overlay}");
+
+        std::fs::write(
+            path_beside(&config),
+            "remote = [{ name = \"pi\", host = \"me@pi\", clipboard_read = \"never\" }]\n",
+        )
+        .unwrap();
+        edit_remotes(&config, |t| crate::with_remote_added(t, &add)).unwrap();
+        let overlay = read(&path_beside(&config)).unwrap();
+        assert!(overlay.contains("clipboard_read = \"never\""), "{overlay}");
     }
 
     #[test]
