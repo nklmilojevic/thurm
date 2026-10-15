@@ -192,9 +192,10 @@ final class Remotes {
                 }
             }
         } else {
-            // A tunnel set up again (or a daemon upgraded meanwhile) is tried straight away.
+            // A tunnel set up again (or a daemon upgraded meanwhile) is tried straight away. The
+            // failure count stays until a connect succeeds: the retry's own kick takes the tunnel
+            // down and up, which must not start the backoff over.
             connectRetries[host] = nil
-            connectFailures[host] = nil
             if Core.shared.isConnected(host) { connectionLost(host) }
         }
         if before?.phase != s.phase, ["needs_attention", "upgrade_needed", "not_installed"].contains(s.phase) {
