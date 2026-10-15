@@ -36,6 +36,10 @@ pub enum ClientError {
     Io(std::io::Error),
 }
 
+/// The [`ClientError::Daemon`] of a request whose answer this build cannot decode (a daemon of
+/// another build).
+pub const UNREADABLE_ANSWER: &str = "the daemon's answer could not be read";
+
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -397,7 +401,7 @@ impl Client {
                         if let Some(id) = codec::response_id(&frame)
                             && let Some(tx) = pending.lock().remove(&id)
                         {
-                            let _ = tx.send(Err("the daemon's answer could not be read".into()));
+                            let _ = tx.send(Err(UNREADABLE_ANSWER.into()));
                         }
                         continue;
                     };

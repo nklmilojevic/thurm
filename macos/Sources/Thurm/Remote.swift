@@ -116,7 +116,10 @@ final class Remotes {
     private var countdown: Timer?
     /// Failed connects in a row through a tunnel that is up, and the hosts waiting to retry.
     private var connectFailures: [HostId: Int] = [:]
-    private var connectRetries: [HostId: Bool] = [:]
+    /// The pending retry of each host, by token: a retry superseded by a newer one, or by the
+    /// tunnel going down meanwhile, does nothing.
+    private var connectRetries: [HostId: Int] = [:]
+    private var nextRetryToken = 0
     private var pathMonitor: NWPathMonitor?
     private var started = false
 
@@ -185,8 +188,11 @@ final class Remotes {
                     if Core.shared.isConnected(host) { connectFailures[host] = nil }
                 }
             }
-        } else if Core.shared.isConnected(host) {
-            connectionLost(host)
+        } else {
+            // A tunnel set up again (or a daemon upgraded meanwhile) is tried straight away.
+            connectRetries[host] = nil
+            connectFailures[host] = nil
+            if Core.shared.isConnected(host) { connectionLost(host) }
         }
         if before?.phase != s.phase, ["needs_attention", "upgrade_needed", "not_installed"].contains(s.phase) {
             tlog("\(host): \(s.label): \(s.message ?? "")")
@@ -215,11 +221,14 @@ final class Remotes {
         let failures = (connectFailures[host] ?? 0) + 1
         connectFailures[host] = failures
         let delay = min(60, pow(2, Double(failures - 1)))
-        connectRetries[host] = true
+        nextRetryToken += 1
+        let token = nextRetryToken
+        connectRetries[host] = token
         tlog("connecting to \(host) through its tunnel: \(why); again in \(Int(delay)) s")
         updateOverlays(host)
         SessionManager.shared.refreshSidebars()
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard Remotes.shared.connectRetries[host] == token else { return }
             Remotes.shared.connectRetries[host] = nil
             thurm_remote_kick(host, true)
         }
