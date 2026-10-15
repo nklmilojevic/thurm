@@ -215,14 +215,20 @@ fn mobile_clients_get_notifications_but_no_window_commands() {
     phone
         .request(Request::Ui(UiCommand::Focus { pane }))
         .unwrap();
-    let got = |rx: &Receiver<Event>| {
-        rx.recv_timeout(Duration::from_secs(1))
-            .into_iter()
-            .chain(rx.try_iter())
-            .any(|e| matches!(e, Event::Ui(UiCommand::Focus { .. })))
+    // Other events (pane and agent updates) can come first: wait for the one we want.
+    let got = |rx: &Receiver<Event>, wait: Duration| {
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(Event::Ui(UiCommand::Focus { .. })) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
     };
-    assert!(got(&mac_events), "the Mac app should get the UI command");
-    assert!(!got(&phone_events), "the phone is not a desktop window");
+    assert!(got(&mac_events, Duration::from_secs(5)), "the Mac app should get the UI command");
+    assert!(!got(&phone_events, Duration::from_secs(1)), "the phone is not a desktop window");
 
     // A phone alone is no open window.
     drop(mac);
