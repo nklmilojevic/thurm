@@ -172,6 +172,10 @@ impl Pusher {
                 for job in rx {
                     if let Job::Notice(notice, devices) = job {
                         for d in devices.iter().take_while(|_| on()) {
+                            // Queued before it was revoked or registered again: not for it now.
+                            if !store.registered(d) {
+                                continue;
+                            }
                             let r = post(&agent, d, "/v1/push", &body(d, &notice));
                             store.check(d, "push", r);
                         }
@@ -179,6 +183,9 @@ impl Pusher {
                     // After every job: a wake-up lost to a full queue is made up by the next.
                     let waiting = std::mem::take(&mut *activities.lock());
                     for job in waiting.into_iter().take_while(|_| on()) {
+                        if !store.registered(&job.device) {
+                            continue;
+                        }
                         let body =
                             activity_body(&job.device, &job.token, job.pane, &job.state, job.end);
                         let r = post(&agent, &job.device, "/v1/activity", &body);
@@ -420,6 +427,11 @@ impl Store {
         let mut follows = self.follows.lock();
         follows.retain(|f| !gone.contains(&f.device));
         save_json(&self.follows_path, &*follows)
+    }
+
+    /// `device` is registered as it is (not revoked, not registered again since).
+    fn registered(&self, device: &Device) -> bool {
+        self.devices.lock().contains(device)
     }
 
     /// Forgets `device` and its activities if it is still registered as it is: a registration
@@ -784,6 +796,69 @@ mod tests {
         assert!(
             posts.recv_timeout(Duration::from_millis(500)).is_err(),
             "posted after push went off"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What was queued for a device before it was revoked is not posted after.
+    #[test]
+    fn revoking_drops_what_is_queued_for_the_device() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = std::env::temp_dir().join(format!("thurm-push-revoked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A relay that holds each answer until told to go on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (posted, posts) = crossbeam_channel::unbounded();
+        let (go, wait) = crossbeam_channel::unbounded::<()>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                    line.clear();
+                }
+                let _ = posted.send(());
+                let _ = wait.recv();
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let p = Pusher::new(&dir, true);
+        p.register(Device {
+            device: "d1".into(),
+            relay,
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        })
+        .unwrap();
+        let working = ActivityState {
+            agent: "Codex".into(),
+            status: "working".into(),
+            title: "nix-config".into(),
+            since: 1,
+            permission: None,
+        };
+        let notice = |pane| Notice {
+            pane,
+            title: "Codex".into(),
+            permission: None,
+        };
+        p.notify(notice(1), &[]);
+        posts
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first notice");
+        // Queued while the relay holds the first one: a notice and a Live Activity update.
+        p.notify(notice(2), &[]);
+        p.follow("d1", 3, "aa".into(), Some(working)).unwrap();
+        assert_eq!(p.revoke_named("iPhone").unwrap(), ["d1"]);
+        for _ in 0..3 {
+            go.send(()).unwrap();
+        }
+        assert!(
+            posts.recv_timeout(Duration::from_millis(500)).is_err(),
+            "posted to a revoked phone"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
