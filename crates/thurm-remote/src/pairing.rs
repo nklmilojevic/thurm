@@ -296,16 +296,20 @@ const EDIT: &str = concat!(
     "if [ -L \"$F\" ]; then nw; fi; ",
     "if [ -e \"$F\" ] && { [ ! -w \"$F\" ] || [ ! -r \"$F\" ]; }; then nw; fi; ",
     "umask 077; mkdir -p \"$D\" 2>/dev/null || nw; chmod 700 \"$D\" 2>/dev/null; ",
-    // One edit at a time (two at once would each drop the other's key): `mkdir` of the lock is
-    // atomic everywhere. Its holder's pid is inside; a holder that is gone (killed mid-edit) or
-    // never wrote one leaves a lock taken over; a live one is waited for, then given up on.
-    "K=\"$D/.authorized_keys.thurm-lock\"; I=0; ",
-    "until mkdir \"$K\" 2>/dev/null; do O=\"$(cat \"$K/pid\" 2>/dev/null)\"; I=$((I+1)); ",
+    // One edit at a time (two at once would each drop the other's key). The lock is a symlink
+    // to its holder, `<pid>@<host>`: `ln -s` takes it and names the holder in one atomic step,
+    // so there is never a lock without an owner. A holder on this host that is gone (killed
+    // mid-edit) is taken over; a live one, or one on another host sharing this home, is waited
+    // for, then given up on. Only the holder removes it.
+    "K=\"$D/.authorized_keys.thurm-lk\"; H=\"$(uname -n)\"; I=0; ",
+    "until ln -s \"$$@$H\" \"$K\" 2>/dev/null; do O=\"$(readlink \"$K\" 2>/dev/null)\"; I=$((I+1)); ",
     "[ \"$I\" -lt 30 ] || { echo \"authorized_keys is being changed by another Thurm; try again\" >&2; exit 5; }; ",
-    "if { [ -n \"$O\" ] && ! kill -0 \"$O\" 2>/dev/null; } || { [ -z \"$O\" ] && [ \"$I\" -gt 5 ]; }; then ",
-    "[ \"$(cat \"$K/pid\" 2>/dev/null)\" = \"$O\" ] && rm -rf \"$K\"; continue; fi; ",
+    "[ -n \"$O\" ] || continue; ",
+    "if [ \"${O#*@}\" = \"$H\" ] && ! kill -0 \"${O%%@*}\" 2>/dev/null; then ",
+    "[ \"$(readlink \"$K\" 2>/dev/null)\" = \"$O\" ] && rm -f \"$K\"; continue; fi; ",
     "sleep 1; done; ",
-    "unlock() { rm -rf \"$K\"; }; trap unlock EXIT; trap \"exit 1\" INT TERM HUP; echo $$ > \"$K/pid\"; ",
+    "unlock() { [ \"$(readlink \"$K\" 2>/dev/null)\" = \"$$@$H\" ] && rm -f \"$K\"; }; ",
+    "trap unlock EXIT; trap \"exit 1\" INT TERM HUP; ",
     "ours() { case \"$L\" in \"restrict,port-forwarding ecdsa-sha2-nistp256 \"?*) ;; *) return 1 ;; esac; ",
     "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; [ \"$R\" = \"$B thurm-ios:$V\" ]; }; ",
     // E: the line read had no newline (the last one). P: the last line written has none. M: a
@@ -656,25 +660,48 @@ mod tests {
         let mut listed = devices(&Local(home.clone())).unwrap();
         listed.sort();
         assert_eq!(listed, names, "no key lost to another edit");
-        let lock = home.join(".ssh/.authorized_keys.thurm-lock");
-        assert!(!lock.exists(), "the lock is released");
+        let lock = home.join(".ssh/.authorized_keys.thurm-lk");
+        assert!(lock.symlink_metadata().is_err(), "the lock is released");
+        let host = String::from_utf8(Command::new("uname").arg("-n").output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let listed = |name: &str| {
+            devices(&Local(home.clone()))
+                .unwrap()
+                .contains(&name.to_owned())
+        };
 
         // A lock whose holder is gone (killed mid-edit) is taken over, not waited out.
         let mut gone = Command::new("true").spawn().unwrap();
         let pid = gone.id();
         gone.wait().unwrap();
-        std::fs::create_dir(&lock).unwrap();
-        std::fs::write(lock.join("pid"), format!("{pid}\n")).unwrap();
+        std::os::unix::fs::symlink(format!("{pid}@{host}"), &lock).unwrap();
         let k = DeviceKey::parse(&KEY.replace("iPhone", "late")).unwrap();
         let started = std::time::Instant::now();
         authorize(&Local(home.clone()), &k).unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(listed("late"));
+        assert!(lock.symlink_metadata().is_err());
+
+        // A live holder is waited for, never taken over, however long its edit takes (a process
+        // that lives 3 s stands in for an editor paused mid-edit).
+        let mut holder = Command::new("sleep").arg("3").spawn().unwrap();
+        let pid = holder.id();
+        std::os::unix::fs::symlink(format!("{pid}@{host}"), &lock).unwrap();
+        // Reaped as soon as it ends: a zombie would still answer `kill -0`.
+        let reaper = std::thread::spawn(move || holder.wait().unwrap());
+        let k = DeviceKey::parse(&KEY.replace("iPhone", "waited")).unwrap();
+        let started = std::time::Instant::now();
+        authorize(&Local(home.clone()), &k).unwrap();
         assert!(
-            devices(&Local(home.clone()))
-                .unwrap()
-                .contains(&"late".to_owned())
+            started.elapsed() >= Duration::from_millis(2500),
+            "took a live holder's lock after {:?}",
+            started.elapsed()
         );
-        assert!(!lock.exists());
+        reaper.join().unwrap();
+        assert!(listed("waited"));
+        assert!(lock.symlink_metadata().is_err());
         let _ = std::fs::remove_dir_all(&home);
     }
 
