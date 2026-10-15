@@ -67,11 +67,31 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertTrue(devices[0].line.hasPrefix("restrict,port-forwarding ecdsa-sha2-nistp256 "))
         let mode = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int
         XCTAssertEqual(mode, 0o600)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: file.deletingLastPathComponent().path),
+                       ["authorized_keys"], "no temporary file left behind")
 
         try PhonePairing.revoke(devices[0], in: file)
         devices = PhonePairing.devices(in: file)
         XCTAssertTrue(devices.isEmpty)
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "ssh-ed25519 AAAA other@laptop\n")
+    }
+
+    func testAFailedWriteChangesNothing() throws {
+        try XCTSkipIf(getuid() == 0, "root writes into read-only directories")
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let ssh = dir.appendingPathComponent(".ssh")
+        let file = ssh.appendingPathComponent("authorized_keys")
+        try FileManager.default.createDirectory(at: ssh, withIntermediateDirectories: true)
+        try "ssh-ed25519 AAAA other@laptop\n".write(to: file, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: ssh.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: ssh.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let (key, device) = try XCTUnwrap(PhonePairing.validDeviceKey(deviceKey))
+        XCTAssertThrowsError(try PhonePairing.add(key: key, device: device, to: file))
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "ssh-ed25519 AAAA other@laptop\n")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: ssh.path), ["authorized_keys"])
     }
 
     func testOnlyLinesThurmWroteAreDevices() throws {

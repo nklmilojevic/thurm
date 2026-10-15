@@ -191,9 +191,23 @@ enum PhonePairing {
         return lines
     }
 
+    /// Replaces the file in one step: the new contents go to a temporary file beside it, which gets
+    /// its permissions before `rename(2)` puts it in place. Whatever fails before that leaves the
+    /// file as it was, so an error means no key was added or removed.
     private static func write(_ lines: [String], to file: URL) throws {
-        try (lines.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        let fm = FileManager.default
+        let tmp = file.deletingLastPathComponent()
+            .appendingPathComponent(".\(file.lastPathComponent).thurm-\(UUID().uuidString)")
+        do {
+            try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: tmp, options: .withoutOverwriting)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+            guard rename(tmp.path, file.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        } catch {
+            try? fm.removeItem(at: tmp)
+            throw error
+        }
     }
 
     /// This Mac's name on the tailnet (MagicDNS), else its Bonjour name.
