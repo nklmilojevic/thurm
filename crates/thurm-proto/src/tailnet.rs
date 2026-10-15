@@ -116,7 +116,7 @@ pub struct TailscaleHttps {
     pub error: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpsState {
     /// The node isn't running.
@@ -128,6 +128,44 @@ pub enum HttpsState {
     CertsOff,
     Provisioning,
     Ready,
+}
+
+/// [`HttpsState`]'s wire form, which frames (postcard) keep.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HttpsStateRepr {
+    Unavailable,
+    MagicDnsOff,
+    CertsOff,
+    Provisioning,
+    Ready,
+}
+
+impl From<HttpsStateRepr> for HttpsState {
+    fn from(r: HttpsStateRepr) -> Self {
+        match r {
+            HttpsStateRepr::Unavailable => Self::Unavailable,
+            HttpsStateRepr::MagicDnsOff => Self::MagicDnsOff,
+            HttpsStateRepr::CertsOff => Self::CertsOff,
+            HttpsStateRepr::Provisioning => Self::Provisioning,
+            HttpsStateRepr::Ready => Self::Ready,
+        }
+    }
+}
+
+/// In the helper's JSON an empty, null or unknown state reads as `Unavailable`, so it can't
+/// cost the whole status.
+impl<'de> Deserialize<'de> for HttpsState {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        if !d.is_human_readable() {
+            return HttpsStateRepr::deserialize(d).map(Into::into);
+        }
+        let Some(s) = Option::<String>::deserialize(d)? else {
+            return Ok(Self::Unavailable);
+        };
+        let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&s);
+        Ok(HttpsStateRepr::deserialize(de).map_or(Self::Unavailable, Into::into))
+    }
 }
 
 /// Starts a connection on the daemon's socket for a tailnet caller: [`INGRESS_MAGIC`], the
@@ -234,6 +272,36 @@ mod tests {
         assert_eq!(s.state, TailscaleState::NeedsLogin);
         assert_eq!(s.https.state, HttpsState::MagicDnsOff);
         assert!(s.tags.is_empty());
+    }
+
+    #[test]
+    fn status_survives_an_unknown_https_state() {
+        for https in [r#""""#, r#""quantum""#, "null"] {
+            let s: TailscaleStatus = serde_json::from_str(&format!(
+                r#"{{"state":"running","hostname":"thurm","https":{{"state":{https}}},
+                    "host_urls":["ws://100.64.0.1:7297/v1/connect"]}}"#
+            ))
+            .unwrap();
+            assert_eq!(s.state, TailscaleState::Running);
+            assert_eq!(s.https.state, HttpsState::Unavailable);
+            assert_eq!(s.host_urls.len(), 1);
+        }
+    }
+
+    #[test]
+    fn https_state_round_trips_in_frames() {
+        for state in [
+            HttpsState::Unavailable,
+            HttpsState::MagicDnsOff,
+            HttpsState::CertsOff,
+            HttpsState::Provisioning,
+            HttpsState::Ready,
+        ] {
+            let bytes = postcard::to_stdvec(&state).unwrap();
+            assert_eq!(postcard::from_bytes::<HttpsState>(&bytes).unwrap(), state);
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(serde_json::from_str::<HttpsState>(&json).unwrap(), state);
+        }
     }
 
     #[test]
