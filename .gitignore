@@ -12,3 +12,6 @@
 /docs/dist/
 /docs/.astro/
 __pycache__/
+
+# Design notes stay local.
+specs/
