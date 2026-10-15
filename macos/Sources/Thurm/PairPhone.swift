@@ -84,6 +84,12 @@ enum PhonePairing {
         }
     }
 
+    /// The remote hosts the code carries, and so the ones Add Device Key authorizes the phone on:
+    /// a host left out of the code never gets its key.
+    static func inCode(_ remotes: [RemoteHost]) -> [RemoteHost] {
+        remotes.filter(\.inCode)
+    }
+
     /// What the QR code carries (see `PairingPayload` in the iOS app). Remote hosts not checked
     /// (or not usable) are left out.
     static func payload(name: String, host: String, port: Int, user: String, hostKeys: [String],
@@ -92,7 +98,7 @@ enum PhonePairing {
                                 "host_keys": hostKeys]
         if let relay, !relay.isEmpty { d["relay"] = relay }
         if let code, !code.isEmpty { d["code"] = code }
-        let remotes = remotes.filter(\.inCode)
+        let remotes = inCode(remotes)
         if !remotes.isEmpty { d["remotes"] = remotes.map(\.payload) }
         let json = (try? JSONSerialization.data(withJSONObject: d, options: [.sortedKeys])) ?? Data()
         let b64 = json.base64EncodedString()
@@ -518,7 +524,7 @@ struct PairPhoneSheet: View {
             return
         }
         devices = PhonePairing.devices()
-        for h in remoteHosts where h.included && h.error == nil {
+        for h in PhonePairing.inCode(remoteHosts) {
             authorize(line, on: h.name)
         }
     }

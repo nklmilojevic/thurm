@@ -175,6 +175,9 @@ final class PairPhoneTests: XCTestCase {
         let d = try decode(link)
         let remotes = try XCTUnwrap(d["remotes"] as? [[String: Any]])
         XCTAssertEqual(remotes.count, 1, "unchecked hosts, and hosts without keys or an address, are left out")
+        // Add Device Key authorizes the phone on exactly the hosts in the code.
+        XCTAssertEqual(PhonePairing.inCode([devbox, unchecked, noKeys, noAddress]).map(\.name),
+                       remotes.compactMap { $0["name"] as? String })
         let r = remotes[0]
         XCTAssertEqual(r["name"] as? String, "devbox")
         XCTAssertEqual(r["host"] as? String, "devbox.tail.ts.net")
