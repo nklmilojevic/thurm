@@ -72,6 +72,7 @@ jobs:
         with:
           toolchain: 1.99.0
           components: clippy, rustfmt
+          targets: aarch64-apple-ios
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # libghostty-vt (the terminal engine) is built from source with Zig.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -80,6 +81,9 @@ jobs:
       # --locked: a dependency change must come with its Cargo.lock.
       - name: Test
         run: cargo test --workspace --locked
+      # The iOS app's core: catches desktop-only code (process spawning, Linux-only libc) leaking in.
+      - name: iOS core
+        run: cargo clippy -p thurm-ffi --target aarch64-apple-ios --no-default-features --features mobile --locked -- -D warnings
       # Not committed (the builds generate it), but a broken generator should fail here, not at release.
       - name: Third-party licenses
         run: python3 scripts/third-party-licenses.py

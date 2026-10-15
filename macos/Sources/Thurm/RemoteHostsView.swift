@@ -32,6 +32,7 @@ struct RemoteHostRows: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Button("Pair iPhone\u{2026}") { remotes.sheet = .pairPhone }
             Button("Add Host\u{2026}") { remotes.sheet = .add }
                 .disabled(!editable)
         }
@@ -54,6 +55,7 @@ private struct RemoteHostSheets: ViewModifier {
             switch sheet {
             case .add: AddHostSheet(remotes: remotes)
             case .details(let host): HostDetails(name: host, store: store, remotes: remotes)
+            case .pairPhone: PairPhoneSheet(remotes: remotes)
             }
         }
     }

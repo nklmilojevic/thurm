@@ -109,6 +109,11 @@
           "rust-src"
           "rust-analyzer"
         ];
+        # The iOS app's core (thurm-ffi's `mobile` feature, built by the iOS app's repository).
+        targets = [
+          "aarch64-apple-ios"
+          "aarch64-apple-ios-sim"
+        ];
       };
     in
     {
@@ -142,7 +147,7 @@
         # No Nix compiler or SDK: cargo links with Xcode's clang, and swift/xcrun must see
         # Xcode's developer dir and SDK.
         shellHook = ''
-          unset DEVELOPER_DIR SDKROOT MACOSX_DEPLOYMENT_TARGET NIX_CFLAGS_COMPILE NIX_LDFLAGS
+          unset DEVELOPER_DIR SDKROOT MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET NIX_CFLAGS_COMPILE NIX_LDFLAGS
         '';
       };
 

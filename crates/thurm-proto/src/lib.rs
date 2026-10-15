@@ -24,6 +24,18 @@ pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
 /// or reordering variants or fields) bumps this.
 pub const PROTOCOL_VERSION: u32 = 18;
 
+/// The oldest peer this build still talks to. Apps and hosts update on different schedules (the
+/// iOS app through App Review), so a bump that keeps the rules above working for older peers
+/// leaves this alone; features newer than it are gated on [`CAPABILITIES`].
+pub const MIN_COMPATIBLE_PROTOCOL: u32 = 18;
+
+/// Whether a peer speaking `version` can talk to this build. The newer side decides: a daemon
+/// accepts any client from [`MIN_COMPATIBLE_PROTOCOL`] up (even newer than itself), and a client
+/// checks the daemon's version in the `Hello` answer.
+pub fn protocol_compatible(version: u32) -> bool {
+    version >= MIN_COMPATIBLE_PROTOCOL
+}
+
 /// A desktop can reject a layout before making changes when it has no window.
 /// The daemon can then try another desktop client.
 pub const LAYOUT_NO_WINDOW: &str = "no Thurm window is open";
@@ -41,7 +53,21 @@ pub const BUILD: &str = match option_env!("THURM_BUILD") {
 
 /// What this build supports beyond [`PROTOCOL_VERSION`], exchanged in `Hello` so a later
 /// version can accept older peers by capability instead of by exact version.
-pub const CAPABILITIES: &[&str] = &["hello-capabilities", "temp-file", "remote-layout"];
+pub const CAPABILITIES: &[&str] = &[
+    "hello-capabilities",
+    "temp-file",
+    "remote-layout",
+    CAP_ACTIVE_SIZE,
+    "push",
+];
+
+/// The pane takes the size of the client that used it last (see the daemon's `active_size`)
+/// instead of the last `Resize`.
+pub const CAP_ACTIVE_SIZE: &str = "active-size";
+
+/// Sent only by the iOS app: it gets notifications like a desktop UI, but takes no UI commands
+/// and does not count as an open window.
+pub const CAP_MOBILE: &str = "mobile";
 
 /// Environment variable exported into every pane with the pane's id.
 pub const ENV_PANE_ID: &str = "THURM_PANE_ID";
@@ -286,7 +312,47 @@ pub enum Request {
     CommitLayout {
         request_id: u64,
     },
+    /// The iOS app asks for this daemon's agent notices on its lock screen: they are posted to
+    /// `relay` for `device`, signed with `secret` (HMAC-SHA256). `host` is what the app calls
+    /// this daemon, sent back so a notification action reaches it; `name` names the device.
+    /// Registering the same device again replaces it.
+    RegisterPushDevice {
+        device: String,
+        relay: String,
+        secret: String,
+        host: String,
+        name: String,
+    },
+    /// Stops the notices for `device`.
+    UnregisterPushDevice {
+        device: String,
+    },
+    /// The Mac revoked the phone `name` (as its device key's comment names it, `thurm-ios:<name>`,
+    /// spaces as dashes): forget its push devices, and drop every phone's connection (which key a
+    /// connection came in with is unknown here; the others reconnect, the revoked one cannot).
+    RevokePhone {
+        name: String,
+    },
+    /// The iOS app shows `pane`'s agent in a Live Activity: post its state changes for
+    /// `device` (registered with [`Request::RegisterPushDevice`]) with the activity's push
+    /// `token`, until the agent leaves, the pane closes, or [`Request::UnfollowAgent`].
+    FollowAgent {
+        device: String,
+        pane: PaneId,
+        token: String,
+    },
+    UnfollowAgent {
+        device: String,
+        pane: PaneId,
+    },
+    /// Nothing; answers Ok. The iOS app sends it while open, so the daemon can tell a phone
+    /// that went away without closing its connection (see `MOBILE_SILENCE`).
+    Ping,
 }
+
+/// A mobile client silent this long is taken for gone: iOS suspends apps without closing their
+/// connections, and a pane it had resized must return to the other client's size.
+pub const MOBILE_SILENCE: std::time::Duration = std::time::Duration::from_secs(45);
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CreatePane {

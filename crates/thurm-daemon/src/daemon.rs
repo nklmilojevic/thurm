@@ -1,9 +1,11 @@
 //! Daemon state: panes, clients, frame pump, monitor loop and request handling.
 
-#[path = "terminal_attach.rs"]
-mod terminal_attach;
+#[path = "active_size.rs"]
+mod active_size;
 mod agent_prompt;
 mod layouts;
+#[path = "terminal_attach.rs"]
+mod terminal_attach;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -227,6 +229,15 @@ pub struct Client {
     pub id: u64,
     pub tx: Sender<ServerMessage>,
     pub ui: AtomicBool,
+    /// The iOS app ([`thurm_proto::CAP_MOBILE`]).
+    pub mobile: AtomicBool,
+    /// The push device the iOS app registered over this connection: while it is connected,
+    /// that phone hears notices live instead of on its lock screen.
+    pub push_device: Mutex<Option<String>>,
+    /// The connection, to drop it from outside its reader (a revoked phone).
+    pub socket: Mutex<Option<std::os::unix::net::UnixStream>>,
+    /// Its panes follow the active client's size ([`thurm_proto::CAP_ACTIVE_SIZE`]).
+    pub active_size: AtomicBool,
     pub name: Mutex<String>,
     /// Approximate bytes queued in `tx` (see [`message_weight`]); the writer subtracts what it
     /// wrote.
@@ -292,6 +303,10 @@ pub struct PaneState {
     pub hold: bool,
     pub subscribers: HashMap<u64, Subscriber>,
     pub terminal_attachment: Option<(u64, PaneSize)>,
+    /// Per client, the size it shows the pane at (see `active_size`).
+    pub wanted: HashMap<u64, active_size::Wanted>,
+    /// The client whose size the pane has now.
+    pub size_owner: Option<u64>,
     pub agent: AgentTracker,
     osc_cwd: Option<String>,
     command_started: Option<Instant>,
@@ -352,6 +367,8 @@ pub struct Daemon {
     git_rx: crossbeam_channel::Receiver<(PaneId, String)>,
     ai: ai::Model,
     ai_tx: Sender<AiJob>,
+    /// Agent notices to paired phones.
+    push: crate::push::Pusher,
     ai_rx: Receiver<AiJob>,
     store: Option<Store>,
     /// One session save at a time: the monitor's autosave, SIGTERM, upgrades and requests.
@@ -389,6 +406,7 @@ impl Daemon {
             .then(|| Store::new(state_dir.clone()));
         let git_channel = crossbeam_channel::bounded(256);
         let ai_channel = crossbeam_channel::bounded(64);
+        let push = crate::push::Pusher::new(&state_dir, !config.push.relay.is_empty());
         Arc::new(Daemon {
             engine: RwLock::new(EngineConfig::from_config(&config, true)),
             dark: AtomicBool::new(true),
@@ -406,6 +424,7 @@ impl Daemon {
             git_rx: git_channel.1,
             ai: ai::Model::new(),
             ai_tx: ai_channel.0,
+            push,
             ai_rx: ai_channel.1,
             store,
             save_lock: Mutex::new(()),
@@ -432,13 +451,52 @@ impl Daemon {
         v
     }
 
-    /// Sends `event` to every client (`ui_only`: the apps). A pane's state and notifications
-    /// are sent with the pane locked, so they arrive in the order they happened. Pane lock,
-    /// then client lock, never the other way round.
+    /// Sends `event` to every client (`ui_only`: the apps; the iOS app too, except for UI
+    /// commands meant for a desktop window). A pane's state and notifications are sent with the
+    /// pane locked, so they arrive in the order they happened. Pane lock, then client lock, never
+    /// the other way round.
     fn broadcast(&self, event: Event, ui_only: bool) {
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
+        // A phone with the app open hears it live; otherwise its lock screen does.
+        let open = || -> Vec<String> {
+            clients
+                .iter()
+                .filter(|c| c.mobile.load(Ordering::Relaxed))
+                .filter_map(|c| c.push_device.lock().clone())
+                .collect()
+        };
+        match &event {
+            // Agent notices only, which carry their state's sound (`[notifications.<state>]`): a
+            // program's own (OSC 9 / 99 / 777) and a finished command stay on the desktop.
+            Event::Notify {
+                pane,
+                title,
+                permission,
+                sound: Some(_),
+                ..
+            } => {
+                self.push.notify(
+                    crate::push::Notice {
+                        pane: *pane,
+                        title: title.clone(),
+                        permission: *permission,
+                    },
+                    &open(),
+                );
+            }
+            Event::PaneInfo(info) => self.push.agent_changed(
+                info.id,
+                crate::push::activity_state(info, crate::push::now()),
+                &open(),
+            ),
+            Event::PaneClosed { pane } => self.push.agent_changed(*pane, None, &[]),
+            _ => {}
+        }
+        let desktop_only = matches!(event, Event::Ui(_));
         for c in clients {
-            if !ui_only || c.ui.load(Ordering::Relaxed) {
+            let app =
+                c.ui.load(Ordering::Relaxed) || (!desktop_only && c.mobile.load(Ordering::Relaxed));
+            if !ui_only || app {
                 c.send(ServerMessage::Event(event.clone()));
             }
         }
@@ -462,6 +520,10 @@ impl Daemon {
             id,
             tx,
             ui: AtomicBool::new(false),
+            mobile: AtomicBool::new(false),
+            push_device: Mutex::new(None),
+            socket: Mutex::new(None),
+            active_size: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
@@ -489,11 +551,13 @@ impl Daemon {
     }
 
     pub fn remove_client(&self, id: u64) {
+        log::info!("client {id} gone");
         self.clients.lock().remove(&id);
         for p in self.all_panes() {
             let mut st = p.state.lock();
             st.subscribers.remove(&id);
             self.release_terminal(&mut st, id);
+            self.forget_size(&mut st, id);
         }
         *self.last_activity.lock() = Instant::now();
     }
@@ -655,6 +719,8 @@ impl Daemon {
                 hold: p.hold,
                 subscribers: HashMap::new(),
                 terminal_attachment: None,
+                wanted: HashMap::new(),
+                size_owner: None,
                 agent: AgentTracker::default(),
                 osc_cwd: p.osc_cwd,
                 command_started: None,
@@ -1503,36 +1569,50 @@ impl Daemon {
                     st.info.program = program.map(ProgramDef::to_match);
                     st.program_name = program.filter(|_| programs.names).map(|d| d.name.clone());
                     let word = st.term.title().map(command_word).unwrap_or("").to_owned();
-                    st.program_command = match (program.filter(|_| programs.names), &fg, &executable) {
-                        // The command line the shell ran: its word started the program, an
-                        // alias or a function included (`lg` for lazygit). Only a program the
-                        // shell itself runs: lazygit's editor is not `lg`.
-                        (Some(_), Some(p), Some(_))
-                            if st.command_line.as_deref().is_some_and(|c| starts_command(c, &word))
-                                && st.info.pid.is_some_and(|sh| procinfo::parent(p.pid) == Some(sh)) =>
-                        {
-                            Some(word)
-                        }
-                        (Some(def), Some(p), Some(exe)) => {
-                            let key = (word.clone(), def.id.clone());
-                            let named = match &st.command_check {
-                                Some((k, named)) if *k == key => *named,
-                                _ => {
-                                    // The shell's PATH when it started, where it looked the word up.
-                                    let path = st
+                    st.program_command =
+                        match (program.filter(|_| programs.names), &fg, &executable) {
+                            // The command line the shell ran: its word started the program, an
+                            // alias or a function included (`lg` for lazygit). Only a program the
+                            // shell itself runs: lazygit's editor is not `lg`.
+                            (Some(_), Some(p), Some(_))
+                                if st
+                                    .command_line
+                                    .as_deref()
+                                    .is_some_and(|c| starts_command(c, &word))
+                                    && st
                                         .info
                                         .pid
-                                        .and_then(|pid| procinfo::env_var(pid, "PATH"))
-                                        .or_else(|| std::env::var("PATH").ok());
-                                    let named = names_program(&word, def, p, exe, &program_defs, path.as_deref());
-                                    st.command_check = Some((key, named));
-                                    named
-                                }
-                            };
-                            named.then_some(word)
-                        }
-                        _ => None,
-                    };
+                                        .is_some_and(|sh| procinfo::parent(p.pid) == Some(sh)) =>
+                            {
+                                Some(word)
+                            }
+                            (Some(def), Some(p), Some(exe)) => {
+                                let key = (word.clone(), def.id.clone());
+                                let named = match &st.command_check {
+                                    Some((k, named)) if *k == key => *named,
+                                    _ => {
+                                        // The shell's PATH when it started, where it looked the word up.
+                                        let path = st
+                                            .info
+                                            .pid
+                                            .and_then(|pid| procinfo::env_var(pid, "PATH"))
+                                            .or_else(|| std::env::var("PATH").ok());
+                                        let named = names_program(
+                                            &word,
+                                            def,
+                                            p,
+                                            exe,
+                                            &program_defs,
+                                            path.as_deref(),
+                                        );
+                                        st.command_check = Some((key, named));
+                                        named
+                                    }
+                                };
+                                named.then_some(word)
+                            }
+                            _ => None,
+                        };
                     st.info.title = pane_title(&st, fg.as_ref());
                     st.info.foreground = fg;
                     if let Some((due, _)) = &st.pending_input
@@ -1964,6 +2044,20 @@ impl Daemon {
         *self.last_activity.lock() = Instant::now();
         let shutting_down = matches!(req, Request::Shutdown { .. });
         let result = match req {
+            // Answered once no post to the forgotten devices can still be on its way, which can
+            // take the relay's timeout: off this client's request thread.
+            req @ (Request::UnregisterPushDevice { .. } | Request::RevokePhone { .. }) => {
+                let daemon = self.clone();
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    let result = daemon.dispatch(&client, req);
+                    daemon.push.settle();
+                    if id != 0 {
+                        client.send(ServerMessage::Response { id, result });
+                    }
+                });
+                return;
+            }
             Request::AgentPrompt {
                 pane,
                 text,
@@ -2165,14 +2259,38 @@ impl Daemon {
                 client: name,
                 version,
                 ui,
-                capabilities: _,
+                capabilities,
             } => {
-                if version != PROTOCOL_VERSION {
+                if !thurm_proto::protocol_compatible(version) {
                     return Err(format!(
                         "protocol mismatch: daemon {PROTOCOL_VERSION}, client {version}"
                     ));
                 }
+                let has = |cap: &str| capabilities.iter().any(|c| c == cap);
                 client.ui.store(ui, Ordering::Relaxed);
+                // Capabilities belong to the client's build: a later Hello on the same connection
+                // (the Mac app asks again to read the daemon's version, without listing them)
+                // must not drop them.
+                if has(thurm_proto::CAP_MOBILE) {
+                    client.mobile.store(true, Ordering::Relaxed);
+                }
+                if has(thurm_proto::CAP_ACTIVE_SIZE) {
+                    client.active_size.store(true, Ordering::Relaxed);
+                }
+                log::info!(
+                    "client {} hello: {name} (protocol {version}{}{})",
+                    client.id,
+                    if has(thurm_proto::CAP_MOBILE) {
+                        ", mobile"
+                    } else {
+                        ""
+                    },
+                    if has(thurm_proto::CAP_ACTIVE_SIZE) {
+                        ", active size"
+                    } else {
+                        ""
+                    },
+                );
                 *client.name.lock() = name;
                 Ok(Response::Hello {
                     version: PROTOCOL_VERSION,
@@ -2266,21 +2384,12 @@ impl Daemon {
                 self.with_pane(pane, |_, st| Response::PaneInfo(st.info.clone()))
             }
             Request::Resize { pane, size } => {
-                let size = sanitize_size(size);
-                self.with_input_pane(client.id, pane, |_, st| {
-                    if st.info.size != size {
-                        if let Err(e) = st.pty.resize(size) {
-                            log::warn!("pane {pane}: resize to {}x{}: {e}", size.cols, size.rows);
-                        }
-                        st.term.resize(size);
-                        st.info.size = size;
-                        self.send_subscribers(st, Event::Resized { pane, size });
-                    }
-                })?;
+                self.resize_for(client, pane, size)?;
                 Ok(Response::Ok)
             }
             Request::Input { pane, data } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    self.used_by(client, st);
                     if !data.is_empty() {
                         st.agent.prompt.interrupted();
                     }
@@ -2292,6 +2401,7 @@ impl Daemon {
             }
             Request::Paste { pane, text } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    self.used_by(client, st);
                     if !text.is_empty() {
                         st.agent.prompt.interrupted();
                     }
@@ -2303,6 +2413,7 @@ impl Daemon {
             }
             Request::Key { pane, key } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    self.used_by(client, st);
                     let bytes = st.term.key(&key);
                     if !bytes.is_empty() {
                         st.agent.prompt.interrupted();
@@ -2316,6 +2427,7 @@ impl Daemon {
             Request::Mouse { pane, event } => {
                 let copy_on_select = self.config.read().terminal.copy_on_select;
                 let text = self.with_input_pane(client.id, pane, |p, st| {
+                    self.used_by(client, st);
                     let (outcome, bytes) = st.term.mouse(&event);
                     if !bytes.is_empty() {
                         st.agent.prompt.interrupted();
@@ -2356,6 +2468,9 @@ impl Daemon {
             }
             Request::Focus { pane, focused } => {
                 self.with_input_pane(client.id, pane, |p, st| {
+                    if focused {
+                        self.used_by(client, st);
+                    }
                     if let Some(b) = st.term.focus(focused) {
                         if !b.is_empty() {
                             st.agent.prompt.interrupted();
@@ -2422,11 +2537,67 @@ impl Daemon {
             }
             Request::GetLayout => Ok(Response::Layout(self.sanitized_layout(&[]))),
             Request::ApplyLayout { json, timeout_ms } => {
-                let result = self.apply_layout(client.id, json, timeout_ms)
+                let result = self
+                    .apply_layout(client.id, json, timeout_ms)
                     .unwrap_or_else(|error| thurm_proto::LayoutResult {
-                        committed: false, error: Some(error),
+                        committed: false,
+                        error: Some(error),
                     });
                 Ok(Response::LayoutResult(result))
+            }
+            Request::RegisterPushDevice {
+                device,
+                relay,
+                secret,
+                host,
+                name,
+            } => {
+                self.push.register(crate::push::Device {
+                    device: device.clone(),
+                    relay,
+                    secret,
+                    host,
+                    name,
+                })?;
+                *client.push_device.lock() = Some(device);
+                Ok(Response::Ok)
+            }
+            Request::UnregisterPushDevice { device } => {
+                self.push.unregister(&device)?;
+                Ok(Response::Ok)
+            }
+            Request::RevokePhone { name } => {
+                let gone = self.push.revoke_named(&name)?;
+                // Revoking its key leaves an ssh session already open, and which phone a
+                // connection is (the key it came in with) is not known here: drop them all. The
+                // others reconnect; the revoked one can no longer sign in.
+                let clients: Vec<_> = self.clients.lock().values().cloned().collect();
+                for c in clients.iter().filter(|c| c.mobile.load(Ordering::Relaxed)) {
+                    log::info!("client {}: a phone was revoked; dropping it", c.id);
+                    if let Some(s) = c.socket.lock().as_ref() {
+                        let _ = s.shutdown(std::net::Shutdown::Both);
+                    }
+                }
+                log::info!("revoked {name}: {} push device(s) forgotten", gone.len());
+                Ok(Response::Ok)
+            }
+            Request::FollowAgent {
+                device,
+                pane,
+                token,
+            } => {
+                let state = self.with_pane(pane, |_, st| {
+                    crate::push::activity_state(&st.info, crate::push::now())
+                })?;
+                log::info!("pane {pane}: a live activity follows it (device {device:.6}…)");
+                self.push.follow(&device, pane, token, state)?;
+                *client.push_device.lock() = Some(device);
+                Ok(Response::Ok)
+            }
+            Request::Ping => Ok(Response::Ok),
+            Request::UnfollowAgent { device, pane } => {
+                self.push.unfollow(&device, pane)?;
+                Ok(Response::Ok)
             }
             Request::CommitLayout { request_id } => {
                 self.commit_layout(client.id, request_id)?;
@@ -2677,6 +2848,7 @@ impl Daemon {
                         return Vec::new();
                     }
                     if let Some(keys) = st.agent.answer_permission(prompt, allow) {
+                        self.used_by(client, st);
                         p.write(keys.to_vec());
                         answered = true;
                     }
@@ -2719,6 +2891,7 @@ impl Daemon {
         *self.engine.write() = EngineConfig::from_config(&cfg, self.dark.load(Ordering::Relaxed));
         *self.agent_defs.write() = cfg.agent_defs();
         *self.program_defs.write() = cfg.program_defs();
+        self.push.set_enabled(!cfg.push.relay.is_empty());
         *self.config.write() = cfg;
         let engine = self.engine.read().clone();
         for pane in self.all_panes() {
@@ -2852,7 +3025,10 @@ fn pane_title(st: &PaneState, fg: Option<&thurm_proto::ProcessInfo>) -> String {
     if let Some(topic) = st.agent.state().and_then(|a| a.topic.as_ref()) {
         return topic.clone();
     }
-    let program = st.program_name.as_deref().filter(|_| st.agent.state().is_none());
+    let program = st
+        .program_name
+        .as_deref()
+        .filter(|_| st.agent.state().is_none());
     if let Some(t) = st.term.title().filter(|t| !t.trim().is_empty()) {
         return match (program, fg) {
             (Some(name), Some(p)) => with_program_name(t, p, name, st.program_command.as_deref()),
@@ -2893,7 +3069,10 @@ fn command_word(title: &str) -> &str {
 /// The command the shell's command line `line` runs, past variable assignments (`FOO=1 lg`).
 fn command_name(line: &str) -> Option<&str> {
     line.split_whitespace()
-        .find(|w| !w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && !k.contains('/')))
+        .find(|w| {
+            !w.split_once('=')
+                .is_some_and(|(k, _)| !k.is_empty() && !k.contains('/'))
+        })
         .map(command_word)
 }
 
@@ -3109,7 +3288,10 @@ mod tests {
         assert_eq!(t("nvim"), "Neovim");
         assert_eq!(t("/opt/homebrew/bin/nvim x"), "Neovim x");
         // The program's own title is left alone.
-        assert_eq!(t("package.json (~/apps) - NVIM"), "package.json (~/apps) - NVIM");
+        assert_eq!(
+            t("package.json (~/apps) - NVIM"),
+            "package.json (~/apps) - NVIM"
+        );
         assert_eq!(t("nvimx y"), "nvimx y");
         // The command that started Neovim (see names_program).
         assert_eq!(t("vim -R Cargo.toml ~/src"), "Neovim -R Cargo.toml ~/src");
@@ -3127,7 +3309,10 @@ mod tests {
         assert!(!starts_command("git status", "lg"));
         assert!(!starts_command("", ""));
         assert!(!starts_command("lg", ""));
-        assert_eq!(command_name("TOKEN=s3cret curl -H 'Authorization: x' url"), Some("curl"));
+        assert_eq!(
+            command_name("TOKEN=s3cret curl -H 'Authorization: x' url"),
+            Some("curl")
+        );
         assert_eq!(command_name("FOO=1"), None);
     }
 
@@ -3165,6 +3350,10 @@ mod tests {
             id: 1,
             tx,
             ui: AtomicBool::new(false),
+            mobile: AtomicBool::new(false),
+            push_device: Mutex::new(None),
+            socket: Mutex::new(None),
+            active_size: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
@@ -3205,11 +3394,84 @@ mod tests {
             })
         };
         daemon.handle(&client, 7, Request::Shutdown { kill_panes: false });
-        assert!(watcher.join().unwrap() > 0, "shutdown was visible before its reply");
+        assert!(
+            watcher.join().unwrap() > 0,
+            "shutdown was visible before its reply"
+        );
         assert!(matches!(
             rx.try_recv(),
-            Ok(ServerMessage::Response { id: 7, result: Ok(Response::Ok) })
+            Ok(ServerMessage::Response {
+                id: 7,
+                result: Ok(Response::Ok)
+            })
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only agent notices go to phones: a program's own notification (OSC 9 / 99 / 777) and a
+    /// finished command have no state sound and stay on the desktop.
+    #[test]
+    fn only_agent_notices_are_pushed() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = std::env::temp_dir().join(format!("thurm-push-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (tx, posts) = unbounded();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; len];
+                let _ = reader.read_exact(&mut body);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+            }
+        });
+        let mut config = Config::default();
+        config.push.relay = "https://push.example.net".into();
+        let daemon = Daemon::new(
+            config,
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        daemon
+            .push
+            .register(crate::push::Device {
+                device: "d1".into(),
+                relay,
+                secret: "s".repeat(32),
+                host: "studio".into(),
+                name: "iPhone".into(),
+            })
+            .unwrap();
+        let notify = |pane, sound: Option<&str>| Event::Notify {
+            pane,
+            title: "Build".into(),
+            body: "done".into(),
+            permission: None,
+            sound: sound.map(str::to_owned),
+        };
+        daemon.broadcast(notify(1, None), true);
+        daemon.broadcast(notify(2, Some("default")), true);
+        let body: serde_json::Value =
+            serde_json::from_str(&posts.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        assert_eq!(body["pane"], 2, "{body}");
+        assert!(
+            posts.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a program notification was pushed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

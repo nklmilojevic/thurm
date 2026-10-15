@@ -38,6 +38,8 @@ pub struct Config {
     pub ai: AiConfig,
     pub updates: UpdatesConfig,
     pub quick_terminal: QuickTerminalConfig,
+    /// Agent notifications to paired phones, through a push relay (`[push]`).
+    pub push: PushConfig,
     /// Extra key bindings: `"cmd+shift+d" = "split_down"`.
     pub keybindings: std::collections::BTreeMap<String, String>,
     /// Other machines running `thurmd`, shown as remote workspaces (`[[remote]]`).
@@ -774,6 +776,18 @@ impl AiConfig {
     }
 }
 
+/// Push notifications to the iOS app. The phone registers with `relay` (handed to it in the
+/// pairing code, with `code`) and gives each daemon its device id and secret; the daemon then
+/// posts agent notices there. Off while `relay` is empty.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct PushConfig {
+    /// Base URL of the push relay, e.g. `https://push.example.net`.
+    pub relay: String,
+    /// Registration code the relay asks of new devices (put in the pairing code).
+    pub code: String,
+}
+
 /// Automatic updates (Sparkle), read by the app.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -896,18 +910,19 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Per-user state directory for snapshots
-/// (`~/Library/Application Support/Thurm` on macOS, `~/.local/state/thurm` elsewhere).
+/// (`~/Library/Application Support/Thurm` on macOS and in the iOS app's container,
+/// `~/.local/state/thurm` elsewhere).
 pub fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("THURM_STATE_DIR") {
         return PathBuf::from(dir);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         dirs::data_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("Thurm")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     {
         dirs::state_dir()
             .or_else(dirs::data_local_dir)
@@ -1080,9 +1095,9 @@ pub fn remote_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("THURM_REMOTE_DIR") {
         return PathBuf::from(dir);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     let base = dirs::cache_dir().map(|d| d.join("Thurm"));
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     let base = dirs::cache_dir().map(|d| d.join("thurm"));
     base.unwrap_or_else(std::env::temp_dir).join("remote")
 }

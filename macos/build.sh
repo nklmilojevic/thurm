@@ -161,6 +161,13 @@ SPARKLE="$(find "$HERE/.build/artifacts" -path '*Sparkle.xcframework/macos-*/Spa
 ditto "$SPARKLE" "$APP/Contents/Frameworks/Sparkle.framework"
 # thurmd runs it for the `[ai]` features (Apple Intelligence's on-device model).
 cp "$INTELLIGENCE_BIN" "$APP/Contents/Helpers/thurm-intelligence"
+# A Nix toolchain first on PATH links Nix's libiconv, which macOS refuses to load into a signed
+# app: an installed thurmd would never start (and a running daemon could not be upgraded).
+for f in "$APP/Contents/MacOS/Thurm" "$APP"/Contents/Helpers/*; do
+    if otool -L "$f" | grep -q '/nix/store/'; then
+        die "$(basename "$f") links libraries from /nix/store; build with /usr/bin first on PATH"
+    fi
+done
 cp "$HERE/Resources/Info.plist" "$APP/Contents/Info.plist"
 plist() { /usr/libexec/PlistBuddy -c "$1" "$APP/Contents/Info.plist"; }
 plist "Set :CFBundleShortVersionString $VERSION"
@@ -250,12 +257,14 @@ DEST_DIR=/Applications
 [[ -w "$DEST_DIR" ]] || { DEST_DIR="$HOME/Applications"; mkdir -p "$DEST_DIR"; }
 DEST="$DEST_DIR/Thurm.app"
 
-if pgrep -xq Thurm; then
+# The Mac app only: the iOS app in a simulator runs a process named Thurm too.
+mac_app_running() { pgrep -qf '\.app/Contents/MacOS/Thurm$'; }
+if mac_app_running; then
     log "Quitting Thurm (tabs stay open in the daemon)"
     osascript -e 'tell application id "com.thurm.terminal" to quit' >/dev/null 2>&1 \
         || osascript -e 'tell application "Thurm" to quit' >/dev/null 2>&1 || true
-    for _ in $(seq 1 40); do pgrep -xq Thurm || break; sleep 0.25; done
-    pgrep -xq Thurm && die "Thurm is still running; quit it and run again"
+    for _ in $(seq 1 40); do mac_app_running || break; sleep 0.25; done
+    mac_app_running && die "Thurm is still running; quit it and run again"
 fi
 
 log "Installing $DEST"

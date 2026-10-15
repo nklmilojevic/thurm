@@ -334,6 +334,8 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
     ("programs.detect", "Detect programs", Kind::Bool),
     ("programs.names", "Show program names", Kind::Bool),
     ("programs.define", "Custom programs", Kind::Table),
+    ("push.relay", "Push relay", Kind::Text),
+    ("push.code", "Push relay code", Kind::Text),
     ("updates.channel", "Channel", Kind::Enum(UPDATE_CHANNEL)),
     (
         "updates.check_automatically",
@@ -644,7 +646,7 @@ fn section_of(key: &str) -> &'static str {
     match key.split('.').next() {
         Some("colors" | "cursor") => "appearance",
         Some("keybindings") => "keys",
-        Some("remote") => "remotes",
+        Some("remote" | "push") => "remotes",
         Some(top) => SECTIONS
             .iter()
             .find(|(id, _)| *id == top)

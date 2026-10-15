@@ -12,6 +12,7 @@ mod git;
 mod persist;
 mod procinfo;
 mod pty;
+mod push;
 mod server;
 mod shell;
 mod transcript;

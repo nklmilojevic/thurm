@@ -495,6 +495,35 @@ void thurm_remote_kick(const char *name, bool restart);
  * "agent/<slug>","worktree":"<remote path>","git_remote":"thurm-devbox","pane":n|null,...} */
 char *thurm_remote_call(const char *json);
 
+/* ---------------------------------------------------------------------------------------
+ * The iOS app (built with the `mobile` feature): paired hosts over an in-process ssh session.
+ * ------------------------------------------------------------------------------------- */
+
+/* The device's ssh key, held by the app (a Secure Enclave P-256 key). `sign` writes the
+ * 64-byte r||s ECDSA/SHA-256 signature of `data` to `sig` and returns true, or false when the
+ * user declined. Called on a background thread; may block (Face ID). */
+typedef struct {
+    void *ctx;
+    const uint8_t *public_sec1; /* uncompressed SEC1 point, 65 bytes */
+    size_t public_len;
+    bool (*sign)(void *ctx, const uint8_t *data, size_t len, uint8_t *sig);
+} thurm_device_key;
+
+/* Connect to a paired host's daemon as a mobile client: ssh (host keys pinned), start the
+ * daemon when none runs, Hello. `target_json`:
+ *   {"host":"mac.tailnet.ts.net","port":22,"user":"me","host_keys":["SHA256:..."],
+ *    "socket":null}
+ * Blocks while connecting: call it off the main thread. Returns NULL on failure with `err`
+ * set (free it); otherwise a client used like thurm_connect's. thurm_disconnect also closes
+ * the ssh session. */
+thurm_client *thurm_ssh_connect(const char *target_json, thurm_device_key key,
+                                const char *client_name, thurm_event_cb on_event,
+                                thurm_frame_cb on_frame, void *ctx, char **err);
+
+/* The device key as an authorized_keys line ending in `comment`, for pairing. Free the result;
+ * NULL when the key is unusable. */
+char *thurm_ssh_authorized_key(thurm_device_key key, const char *comment);
+
 #ifdef __cplusplus
 }
 #endif

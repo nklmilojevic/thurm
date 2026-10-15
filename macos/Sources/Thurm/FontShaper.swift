@@ -1,7 +1,27 @@
+#if canImport(AppKit)
 import AppKit
+#else
+import UIKit
+#endif
 import CoreText
 import Metal
 import CThurm
+
+/// The font settings shaping needs, from the app's config (`AppConfig` on the Mac).
+protocol FontSettings {
+    var fontFamily: String { get }
+    var fontFallback: [String] { get }
+    var fontFamilyBold: String? { get }
+    var fontFamilyItalic: String? { get }
+    var fontFamilyBoldItalic: String? { get }
+    var lineHeight: CGFloat { get }
+    var letterSpacing: CGFloat { get }
+    var fontThicken: Bool { get }
+    /// 0...1.
+    var thickenStrength: CGFloat { get }
+    var nerdFontSymbols: Bool { get }
+    var fontFeatures: [String] { get }
+}
 
 /// One positioned glyph of a shaped row.
 struct ShapedGlyph {
@@ -31,12 +51,15 @@ final class FontShaper {
 
     private static var instances: [CGFloat: FontShaper] = [:]
 
+    /// The current font settings and size (points), read when an instance is made. The app
+    /// sets it at launch.
+    static var settings: (() -> (any FontSettings, CGFloat))?
+
     static func shared(scale: CGFloat) -> FontShaper? {
         let s = max(1, scale)
         if let existing = instances[s] { return existing }
-        guard let ctx = MetalContext.shared else { return nil }
-        let manager = SessionManager.shared
-        guard let shaper = FontShaper(config: manager.config, fontSize: manager.effectiveFontSize,
+        guard let ctx = MetalContext.shared, let (config, fontSize) = settings?() else { return nil }
+        guard let shaper = FontShaper(config: config, fontSize: fontSize,
                                       scale: s, device: ctx.device)
         else { return nil }
         instances[s] = shaper
@@ -95,7 +118,7 @@ final class FontShaper {
     private var boxCache: [UInt32: [BoxRect]] = [:]
     private let fontAttributeKey = NSAttributedString.Key(rawValue: kCTFontAttributeName as String)
 
-    init?(config: AppConfig, fontSize: CGFloat, scale: CGFloat, device: MTLDevice) {
+    init?(config: any FontSettings, fontSize: CGFloat, scale: CGFloat, device: MTLDevice) {
         guard let cache = GlyphCache(device: device,
                                      thicken: config.fontThicken ? config.thickenStrength : nil)
         else { return nil }
@@ -169,7 +192,7 @@ final class FontShaper {
     }
 
     /// OpenType features and the fallback cascade (user fallbacks, then the bundled icons).
-    private static func extraAttributes(config: AppConfig) -> [String: Any] {
+    private static func extraAttributes(config: any FontSettings) -> [String: Any] {
         var attrs: [String: Any] = [:]
         let features = featureSettings(config.fontFeatures)
         if !features.isEmpty { attrs[kCTFontFeatureSettingsAttribute as String] = features }
@@ -207,15 +230,17 @@ final class FontShaper {
         return nil
     }
 
+    #if canImport(AppKit)
     /// The terminal font as an NSFont (point size), for UI that should match the grid.
-    static func terminalFont(config: AppConfig, size: CGFloat) -> NSFont {
+    static func terminalFont(config: any FontSettings, size: CGFloat) -> NSFont {
         let (font, _) = makeBaseFont(config: config, pixelSize: size)
         return font as NSFont
     }
+    #endif
 
     /// Resolves the configured font (then the fallbacks, then Menlo), with features and the
     /// fallback cascade list applied.
-    private static func makeBaseFont(config: AppConfig, pixelSize: CGFloat) -> (CTFont, CTFontDescriptor) {
+    private static func makeBaseFont(config: any FontSettings, pixelSize: CGFloat) -> (CTFont, CTFontDescriptor) {
         let extra = extraAttributes(config: config)
         var candidates = [config.fontFamily]
         candidates.append(contentsOf: config.fontFallback)
@@ -224,7 +249,11 @@ final class FontShaper {
             if let found = resolveWithDescriptor(name, size: pixelSize, extra: extra) { return found }
             tlog("font \"\(name)\" not available")
         }
+        #if canImport(AppKit)
         let system = NSFont.monospacedSystemFont(ofSize: pixelSize, weight: .regular) as CTFont
+        #else
+        let system = UIFont.monospacedSystemFont(ofSize: pixelSize, weight: .regular) as CTFont
+        #endif
         return (system, CTFontCopyFontDescriptor(system))
     }
 

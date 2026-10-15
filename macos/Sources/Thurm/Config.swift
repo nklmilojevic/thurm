@@ -91,6 +91,8 @@ func colorFromRGB(_ rgb: UInt32, alpha: CGFloat = 1) -> NSColor {
 
 /// The UI relevant part of the user's config, parsed from `thurm_config_json()`
 /// (see `Config::ui_json` in crates/thurm-config).
+extension AppConfig: FontSettings {}
+
 final class AppConfig {
     // [font]
     var fontFamily = "JetBrains Mono"
@@ -167,6 +169,13 @@ final class AppConfig {
 
     // [ai]
     var aiExplain = false
+
+    // [push]
+    struct Push {
+        var relay: String?
+        var code: String?
+    }
+    var push = Push()
 
     // [updates]
     var updateChannel = "auto"
@@ -327,6 +336,10 @@ final class AppConfig {
         }
         if let ai = c["ai"] as? [String: Any] {
             aiExplain = (jsonBool(ai["enabled"]) ?? false) && (jsonBool(ai["explain"]) ?? true)
+        }
+        if let p = c["push"] as? [String: Any] {
+            push = Push(relay: jsonString(p["relay"]).flatMap { $0.isEmpty ? nil : $0 },
+                        code: jsonString(p["code"]).flatMap { $0.isEmpty ? nil : $0 })
         }
         if let u = c["updates"] as? [String: Any] {
             updateChannel = jsonString(u["channel"]) ?? updateChannel

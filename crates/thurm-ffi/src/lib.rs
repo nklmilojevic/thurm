@@ -2,9 +2,13 @@
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
+#[cfg(feature = "mobile")]
+mod mobile;
+#[cfg(feature = "desktop")]
 mod remote;
 
 // For Rust front ends (thurm-gtk) linking this crate as a library.
+#[cfg(feature = "desktop")]
 pub use remote::{
     thurm_remote_call, thurm_remote_kick, thurm_remote_status_cb, thurm_remotes_start,
     thurm_remotes_stop, thurm_remotes_sync,
@@ -386,6 +390,9 @@ pub struct thurm_client {
     on_event: thurm_event_cb,
     on_frame: thurm_frame_cb,
     ctx: Ctx,
+    /// What carries the connection when it is not a plain socket (the iOS app's ssh session);
+    /// dropped after `client`.
+    _transport: Option<Box<dyn std::any::Any + Send>>,
 }
 
 #[derive(Clone, Copy)]
@@ -484,9 +491,46 @@ unsafe fn connect_to(
     let name = unsafe { opt_str(client_name) }
         .unwrap_or("Thurm.app")
         .to_owned();
+    let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
+        Client::connect(
+            ConnectOptions {
+                socket,
+                spawn_daemon: daemon,
+                client_name: &name,
+                ui: true,
+            },
+            on_ev,
+            on_disc,
+        )
+        .map(|c| (c, None))
+        .map_err(|e| e.to_string())
+    });
+    match connected {
+        Ok(client) => client,
+        Err(e) => {
+            if !err.is_null() {
+                unsafe { *err = into_c(e) };
+            }
+            std::ptr::null_mut()
+        }
+    }
+}
+
+type Transport = Option<Box<dyn std::any::Any + Send>>;
+
+/// A `thurm_client` for the connection `connect` makes with the event and disconnect handlers
+/// it is given.
+fn new_connection(
+    on_event: thurm_event_cb,
+    on_frame: thurm_frame_cb,
+    ctx: *mut c_void,
+    connect: impl FnOnce(
+        Box<dyn Fn(Event) + Send>,
+        Box<dyn FnOnce() + Send>,
+    ) -> Result<(Arc<Client>, Transport), String>,
+) -> Result<*mut thurm_client, String> {
     let shared = Arc::new(Shared::default());
     let ctx = Ctx(ctx);
-    let conn_ctx = ctx;
     let events_shared = shared.clone();
     // A panic here would end the connection's reader thread (and with it the pane updates).
     let on_ev = move |ev: Event| {
@@ -498,30 +542,15 @@ unsafe fn connect_to(
         }
     };
     let on_disc = move || emit_json(on_event, ctx, "\"Disconnected\"");
-    match Client::connect(
-        ConnectOptions {
-            socket,
-            spawn_daemon: daemon,
-            client_name: &name,
-            ui: true,
-        },
-        on_ev,
-        on_disc,
-    ) {
-        Ok(client) => Box::into_raw(Box::new(thurm_client {
-            client,
-            shared,
-            on_event,
-            on_frame,
-            ctx: conn_ctx,
-        })),
-        Err(e) => {
-            if !err.is_null() {
-                unsafe { *err = into_c(e.to_string()) };
-            }
-            std::ptr::null_mut()
-        }
-    }
+    let (client, transport) = connect(Box::new(on_ev), Box::new(on_disc))?;
+    Ok(Box::into_raw(Box::new(thurm_client {
+        client,
+        shared,
+        on_event,
+        on_frame,
+        ctx,
+        _transport: transport,
+    })))
 }
 
 /// Writes `data` to a new private file in the daemon's runtime directory (on the daemon's
