@@ -328,8 +328,9 @@ pub enum Request {
         device: String,
     },
     /// The Mac revoked the phone `name` (as its device key's comment names it, `thurm-ios:<name>`,
-    /// spaces as dashes): forget its push devices, and drop its connections.
-    RevokePushDevices {
+    /// spaces as dashes): forget its push devices, and drop every phone's connection (which key a
+    /// connection came in with is unknown here; the others reconnect, the revoked one cannot).
+    RevokePhone {
         name: String,
     },
     /// The iOS app shows `pane`'s agent in a Live Activity: post its state changes for

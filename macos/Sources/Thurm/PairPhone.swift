@@ -279,7 +279,8 @@ struct PairPhoneSheet: View {
     }
 
     /// Removes the phone's key, then has the daemon forget its push registration (no more
-    /// notices or Live Activity updates) and drop its connection if one is open.
+    /// notices or Live Activity updates) and drop the phones' open connections (the others
+    /// reconnect).
     private func revoke(_ device: PhonePairing.Device) {
         do {
             try PhonePairing.revoke(device)
@@ -291,7 +292,7 @@ struct PairPhoneSheet: View {
         }
         devices = PhonePairing.devices()
         message = "Revoked \(device.name)."
-        Core.shared.requestAsync(object: ["RevokePushDevices": ["name": device.name]], timeout: 5) { resp in
+        Core.shared.requestAsync(object: ["RevokePhone": ["name": device.name]], timeout: 5) { resp in
             if resp == nil || (resp as? [String: Any])?["error"] != nil {
                 let why = ((resp as? [String: Any])?["error"] as? String) ?? "the daemon did not answer"
                 message = "Revoked \(device.name)'s key, but it may still get notifications: \(why)"

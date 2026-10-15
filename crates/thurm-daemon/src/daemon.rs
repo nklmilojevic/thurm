@@ -2552,18 +2552,16 @@ impl Daemon {
                 self.push.unregister(&device)?;
                 Ok(Response::Ok)
             }
-            Request::RevokePushDevices { name } => {
+            Request::RevokePhone { name } => {
                 let gone = self.push.revoke_named(&name)?;
-                // Revoking its key leaves an ssh session already open: end the phone's connection.
+                // Revoking its key leaves an ssh session already open, and which phone a
+                // connection is (the key it came in with) is not known here: drop them all. The
+                // others reconnect; the revoked one can no longer sign in.
                 let clients: Vec<_> = self.clients.lock().values().cloned().collect();
-                for c in clients {
-                    let device = c.push_device.lock().clone();
-                    if c.mobile.load(Ordering::Relaxed) && device.is_some_and(|d| gone.contains(&d))
-                    {
-                        log::info!("client {}: its phone was revoked; dropping it", c.id);
-                        if let Some(s) = c.socket.lock().as_ref() {
-                            let _ = s.shutdown(std::net::Shutdown::Both);
-                        }
+                for c in clients.iter().filter(|c| c.mobile.load(Ordering::Relaxed)) {
+                    log::info!("client {}: a phone was revoked; dropping it", c.id);
+                    if let Some(s) = c.socket.lock().as_ref() {
+                        let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 }
                 log::info!("revoked {name}: {} push device(s) forgotten", gone.len());

@@ -603,7 +603,8 @@ fn only_the_phone_with_the_app_open_misses_the_push() {
     );
 }
 
-/// Revoking a phone on the Mac (by its key's name) stops its notices and drops its connection.
+/// Revoking a phone on the Mac (by its key's name) stops its notices and drops the phones'
+/// connections, one without a push registration too (which phone it is, is unknown).
 #[test]
 fn a_revoked_phone_is_forgotten_and_dropped() {
     let env = push_env("push-revoke");
@@ -612,19 +613,21 @@ fn a_revoked_phone_is_forgotten_and_dropped() {
     let (relay, posts) = fake_relay();
     let (phone, _phone_events) = mobile(&env);
     register(&phone, "dev-1", &relay, "Nikola's iPhone");
-    let r = mac.request(Request::RevokePushDevices {
+    let (unregistered, _events) = mobile(&env);
+    let r = mac.request(Request::RevokePhone {
         name: "Nikola's-iPhone".into(),
     });
     assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
 
     let deadline = Instant::now() + Duration::from_secs(5);
-    while phone.request(Request::Ping).is_ok() {
-        assert!(
-            Instant::now() < deadline,
-            "the revoked phone is still connected"
-        );
+    while phone.request(Request::Ping).is_ok() || unregistered.request(Request::Ping).is_ok() {
+        assert!(Instant::now() < deadline, "a phone is still connected");
         std::thread::sleep(Duration::from_millis(50));
     }
+    assert!(
+        mac.request(Request::Ping).is_ok(),
+        "the Mac app was dropped"
+    );
     let pane = create(&mac, &env.dir);
     run_cat(&mac, pane);
     hook(&mac, pane, "prompt-submit", None);
