@@ -43,6 +43,8 @@ final class TailscaleStatusTests: XCTestCase {
                        "needs_login")
         XCTAssertEqual(try status("needs_machine_auth").notificationKey, "needs_machine_auth")
         XCTAssertEqual(try status("error", error: "boom").notificationKey, "error:boom")
+        XCTAssertEqual(try status("stopped", error: "the Tailscale helper stopped; restarting it").notificationKey,
+                       "stopped:the Tailscale helper stopped; restarting it")
         for state in ["off", "starting", "running", "stopped"] {
             XCTAssertNil(try status(state).notificationKey, state)
         }

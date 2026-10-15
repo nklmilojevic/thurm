@@ -106,6 +106,8 @@ struct TailscaleStatus: Equatable {
         case "needs_login" where authURL != nil: return "needs_login"
         case "needs_machine_auth": return "needs_machine_auth"
         case "error": return "error:\(error ?? "")"
+        // Stopped on an error: the helper exited and is restarting, or the node stopped on one.
+        case "stopped" where error != nil: return "stopped:\(error ?? "")"
         default: return nil
         }
     }
