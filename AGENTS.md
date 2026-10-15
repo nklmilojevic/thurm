@@ -24,12 +24,16 @@ What they share, and where a change on one side needs the other:
   no process spawning or Linux-only code there (CI clippies that target). Changes to the C header
   or the Mac renderer sources (Renderer, GlyphAtlas, FontShaper, BoxDrawing, Models) rebuild
   into the app.
-- **Push relay API.** `thurmd` (`crates/thurm-daemon/src/push.rs`) posts to `POST /v1/push` and
-  `POST /v1/activity`, signed with the device secret (`X-Thurm-Timestamp`,
-  `X-Thurm-Signature`: HMAC-SHA256 of `<timestamp>.<body>`). The app registers with
-  `POST /v1/devices` and leaves with `DELETE /v1/devices/{device}`; `thurmd` forgets a device only
-  on a 404 with `X-Thurm-Device: unknown` (any other 404, from a proxy or an older relay, keeps
-  it). Body fields, headers, signatures and status codes must agree on both sides.
+- **Push relay API.** `thurmd` (`crates/thurm-daemon/src/push.rs`) posts to `POST /v1/push`,
+  `POST /v1/activity` and `POST /v1/read` (a pane read elsewhere: the relay sends the app a silent
+  push with `read: {host, pane, seq}`, and the app takes that pane's notices down, those whose
+  `seq` is not newer: a late silent push leaves a newer notice standing; a read without `seq` is
+  refused), signed with the
+  device secret (`X-Thurm-Timestamp`, `X-Thurm-Signature`: HMAC-SHA256 of `<timestamp>.<body>`).
+  The app registers with `POST /v1/devices` and leaves with `DELETE /v1/devices/{device}`;
+  `thurmd` forgets a device only on a 404 with `X-Thurm-Device: unknown` (any other 404, from a
+  proxy or an older relay, keeps it). Body fields, headers, signatures and status codes must
+  agree on both sides.
 - **Pairing.** The Mac's Pair iPhone sheet (`macos/Sources/Thurm/PairPhone.swift`) makes the
   `thurm://pair?d=` payload the app parses (`PairingPayload`), and keeps the app's device keys in
   `authorized_keys` under the comment `thurm-ios:<device name>`; revoking goes through

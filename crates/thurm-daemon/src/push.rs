@@ -6,6 +6,11 @@
 //! The app can also follow an agent in a Live Activity: the activity's push token is kept
 //! with the pane, and the agent's state (status, pane title, since when) is posted for it on
 //! every change, until the agent leaves or the pane closes.
+//!
+//! When a pane is read (on the Mac, or on another phone), the devices it sent notices to hear
+//! of it (`POST /v1/read`), so the notices leave their lock screens too. Notices carry a
+//! sequence number and a read the last one it covers: a read arriving late (iOS delays silent
+//! pushes) leaves a newer notice standing.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,10 +86,17 @@ pub fn clean_title(title: &str) -> String {
 }
 
 enum Job {
-    /// A notice for these devices.
-    Notice(Notice, Vec<Device>),
-    /// Live Activity updates are waiting in `Pusher::activities`.
-    Activities,
+    /// A notice (and its sequence number) for these devices.
+    Notice(Notice, u64, Vec<Device>),
+    /// Reads or Live Activity updates are waiting in `Pusher::reads` or `Pusher::activities`.
+    Waiting,
+}
+
+/// A pane was read: its notices on these devices, up to sequence number `seq`, are stale.
+struct ReadJob {
+    pane: PaneId,
+    seq: u64,
+    devices: Vec<Device>,
 }
 
 struct ActivityJob {
@@ -110,6 +122,12 @@ pub struct Pusher {
     enabled: Arc<AtomicBool>,
     /// When each pane last sent a notice (see `notify`).
     last_notice: Mutex<std::collections::HashMap<PaneId, std::time::Instant>>,
+    /// Each pane's last notice since it was last read, and the devices it sent notices to (see
+    /// `read`).
+    notified: Mutex<std::collections::HashMap<PaneId, (u64, Vec<String>)>>,
+    /// The next notice's sequence number. Starts at the clock (milliseconds), so numbers keep
+    /// growing across daemon restarts.
+    next_seq: std::sync::atomic::AtomicU64,
     /// Shared with the push thread, which forgets a device the relay no longer knows.
     devices: Arc<Mutex<Vec<Device>>>,
     follows: Arc<Mutex<Vec<Follow>>>,
@@ -117,6 +135,9 @@ pub struct Pusher {
     /// than in the bounded queue, so a busy relay delays them but never loses one (an end
     /// least of all).
     activities: Arc<Mutex<Vec<ActivityJob>>>,
+    /// Reads not posted yet, waiting outside the bounded queue like `activities`: a dropped
+    /// one would leave a notice on a lock screen for good.
+    reads: Arc<Mutex<Vec<ReadJob>>>,
     /// See `Store::sending`.
     sending: Arc<Mutex<()>>,
     path: PathBuf,
@@ -148,15 +169,24 @@ impl Pusher {
         let pusher = Pusher {
             enabled: Arc::new(AtomicBool::new(enabled)),
             last_notice: Mutex::new(std::collections::HashMap::new()),
+            notified: Mutex::new(std::collections::HashMap::new()),
+            next_seq: std::sync::atomic::AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1),
+            ),
             devices: Arc::new(Mutex::new(devices)),
             follows: Arc::new(Mutex::new(follows)),
             activities: Arc::new(Mutex::new(Vec::new())),
+            reads: Arc::new(Mutex::new(Vec::new())),
             sending: Arc::new(Mutex::new(())),
             path,
             follows_path,
             tx,
         };
         let activities = Arc::clone(&pusher.activities);
+        let reads = Arc::clone(&pusher.reads);
         let on = Arc::clone(&pusher.enabled);
         let store = pusher.store();
         std::thread::Builder::new()
@@ -169,29 +199,54 @@ impl Pusher {
                     .build()
                     .into();
                 let on = || on.load(Ordering::Relaxed);
-                for job in rx {
-                    if let Job::Notice(notice, devices) = job {
-                        for d in devices.iter().take_while(|_| on()) {
-                            let _sending = store.sending.lock();
-                            // Queued before it was revoked or registered again: not for it now.
-                            if !store.registered(d) {
-                                continue;
-                            }
-                            let r = post(&agent, d, "/v1/push", &body(d, &notice));
-                            store.check(d, "push", r);
-                        }
-                    }
-                    // After every job: a wake-up lost to a full queue is made up by the next.
-                    let waiting = std::mem::take(&mut *activities.lock());
-                    for job in waiting.into_iter().take_while(|_| on()) {
+                let send = |path, what, devices: &[Device], body: &dyn Fn(&Device) -> String| {
+                    for d in devices.iter().take_while(|_| on()) {
                         let _sending = store.sending.lock();
-                        if !store.registered(&job.device) {
+                        // Queued before it was revoked or registered again: not for it now.
+                        if !store.registered(d) {
                             continue;
                         }
-                        let body =
-                            activity_body(&job.device, &job.token, job.pane, &job.state, job.end);
-                        let r = post(&agent, &job.device, "/v1/activity", &body);
-                        store.check(&job.device, "live activity", r);
+                        let r = post(&agent, d, path, &body(d));
+                        store.check(d, what, r);
+                    }
+                };
+                while let Ok(job) = rx.recv() {
+                    let mut job = Some(job);
+                    loop {
+                        // Reads first taken, then every notice queued: a read exists only once its
+                        // notice is queued, so each read taken goes out after its notice. One the
+                        // other way round would leave a stale notice on the lock screen.
+                        let pending = std::mem::take(&mut *reads.lock());
+                        for j in job.take().into_iter().chain(rx.try_iter()) {
+                            if let Job::Notice(notice, seq, devices) = &j {
+                                send("/v1/push", "push", devices, &|d| body(d, notice, *seq));
+                            }
+                        }
+                        for r in pending {
+                            send("/v1/read", "read", &r.devices, &|d| {
+                                read_body(d, r.pane, r.seq)
+                            });
+                        }
+                        let waiting = std::mem::take(&mut *activities.lock());
+                        for job in waiting.into_iter().take_while(|_| on()) {
+                            let _sending = store.sending.lock();
+                            if !store.registered(&job.device) {
+                                continue;
+                            }
+                            let body = activity_body(
+                                &job.device,
+                                &job.token,
+                                job.pane,
+                                &job.state,
+                                job.end,
+                            );
+                            let r = post(&agent, &job.device, "/v1/activity", &body);
+                            store.check(&job.device, "live activity", r);
+                        }
+                        // Draining the queue may have taken the wake-up of what waits now.
+                        if reads.lock().is_empty() && activities.lock().is_empty() {
+                            break;
+                        }
                     }
                 }
             })
@@ -292,7 +347,49 @@ impl Pusher {
         if devices.is_empty() || !self.fresh(&notice) {
             return;
         }
-        let _ = self.tx.try_send(Job::Notice(notice, devices));
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let pane = notice.pane;
+        let ids: Vec<String> = devices.iter().map(|d| d.device.clone()).collect();
+        // Held across the send, so a read can't come between queueing and recording.
+        let mut notified = self.notified.lock();
+        if self.tx.try_send(Job::Notice(notice, seq, devices)).is_err() {
+            // Dropped: no device will see it, so no device has it to take down, and the next
+            // notice may buzz at once.
+            self.last_notice.lock().remove(&pane);
+            return;
+        }
+        let (last, sent) = notified.entry(pane).or_default();
+        *last = seq;
+        for id in ids {
+            if !sent.contains(&id) {
+                sent.push(id);
+            }
+        }
+    }
+
+    /// `pane` was read (or closed): the devices it sent notices to since it was last read take
+    /// them down, but those in `open` (the app open hears it live). The next notice buzzes
+    /// again at once.
+    pub fn read(&self, pane: PaneId, open: &[String]) {
+        self.last_notice.lock().remove(&pane);
+        let Some((seq, notified)) = self.notified.lock().remove(&pane) else {
+            return;
+        };
+        if !self.enabled() {
+            return;
+        }
+        let devices: Vec<Device> = self
+            .devices
+            .lock()
+            .iter()
+            .filter(|d| notified.contains(&d.device) && !open.contains(&d.device))
+            .cloned()
+            .collect();
+        if !devices.is_empty() {
+            self.reads.lock().push(ReadJob { pane, seq, devices });
+            // A full queue means the thread is busy: it posts what waits after its current job.
+            let _ = self.tx.try_send(Job::Waiting);
+        }
     }
 
     /// One buzz per pane per moment: a turn's end often raises two notices together (finished,
@@ -429,7 +526,7 @@ impl Pusher {
             waiting.push(job);
         }
         // A full queue means the thread is busy: it posts what waits after its current job.
-        let _ = self.tx.try_send(Job::Activities);
+        let _ = self.tx.try_send(Job::Waiting);
     }
 
     fn save(&self, devices: &[Device]) -> Result<(), String> {
@@ -598,8 +695,8 @@ fn validate_relay(relay: &str) -> Result<(), String> {
     }
 }
 
-/// The request body the relay gets for `notice`, for `device`.
-pub fn body(device: &Device, notice: &Notice) -> String {
+/// The request body the relay gets for `notice` (sequence number `seq`), for `device`.
+pub fn body(device: &Device, notice: &Notice, seq: u64) -> String {
     let text = if notice.permission.is_some() {
         "asks for permission"
     } else {
@@ -612,6 +709,18 @@ pub fn body(device: &Device, notice: &Notice) -> String {
         "title": notice.title,
         "body": text,
         "permission": notice.permission,
+        "seq": seq,
+    })
+    .to_string()
+}
+
+/// The request body the relay gets when `pane` was read, up to its notice `seq`, for `device`.
+pub fn read_body(device: &Device, pane: PaneId, seq: u64) -> String {
+    serde_json::json!({
+        "device": device.device,
+        "host": device.host,
+        "pane": pane,
+        "seq": seq,
     })
     .to_string()
 }
@@ -687,6 +796,129 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// With the push thread stuck on a relay and the queue full, a notice that could not be
+    /// queued is not counted as sent, and a read waits for the thread instead of being lost.
+    #[test]
+    fn a_full_queue_drops_notices_but_keeps_reads() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Accepts and never answers: the thread waits out its 10 s timeout on the first post.
+        let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = std::thread::spawn({
+            let relay = relay.try_clone().unwrap();
+            move || relay.accept().map(|(s, _)| s)
+        });
+        let p = Pusher::new(&dir, true);
+        p.register(Device {
+            device: "d1".into(),
+            relay: format!("http://127.0.0.1:{}", relay.local_addr().unwrap().port()),
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        })
+        .unwrap();
+        let n = |pane| Notice {
+            pane,
+            title: "Claude Code".into(),
+            permission: None,
+        };
+        p.notify(n(1), &[]);
+        let _stuck = held.join().unwrap();
+        while p.tx.try_send(Job::Waiting).is_ok() {}
+
+        p.notify(n(2), &[]);
+        assert!(
+            !p.notified.lock().contains_key(&2),
+            "a dropped notice counted"
+        );
+        assert!(p.fresh(&n(2)), "a dropped notice silenced the next one");
+        p.read(2, &[]);
+        assert!(p.reads.lock().is_empty(), "a read for a notice nobody got");
+
+        p.read(1, &[]);
+        let reads = p.reads.lock();
+        assert_eq!(reads.len(), 1, "the read was lost");
+        assert_eq!(
+            (reads[0].pane, reads[0].devices[0].device.as_str()),
+            (1, "d1")
+        );
+        drop(reads);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A notice still queued when its pane is read reaches the relay before the read: the other
+    /// way round, the phone would clear it and then show it.
+    #[test]
+    fn a_queued_notice_goes_out_before_its_read() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = std::env::temp_dir().join(format!("thurm-push-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = relay.local_addr().unwrap().port();
+        let (got, posts) = crossbeam_channel::unbounded::<(String, serde_json::Value)>();
+        let (release, held) = crossbeam_channel::bounded::<()>(0);
+        // Answers one request at a time; the first only once released.
+        std::thread::spawn(move || {
+            for (i, stream) in relay.incoming().enumerate() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut first, mut len) = (String::new(), 0);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if first.is_empty() {
+                        first = line.clone();
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; len];
+                let _ = reader.read_exact(&mut body);
+                let path = first.split(' ').nth(1).unwrap_or("").to_owned();
+                let _ = got.send((path, serde_json::from_slice(&body).unwrap_or_default()));
+                if i == 0 {
+                    let _ = held.recv();
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let p = Pusher::new(&dir, true);
+        p.register(Device {
+            device: "d1".into(),
+            relay: format!("http://127.0.0.1:{port}"),
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        })
+        .unwrap();
+        let n = |pane| Notice {
+            pane,
+            title: "Claude Code".into(),
+            permission: None,
+        };
+        let wait = Duration::from_secs(10);
+        p.notify(n(1), &[]);
+        assert_eq!(posts.recv_timeout(wait).unwrap().0, "/v1/push");
+        // The thread is held on pane 1's post: pane 2's notice waits in the queue, its read
+        // beside it.
+        p.notify(n(2), &[]);
+        p.read(2, &[]);
+        release.send(()).unwrap();
+        let order: Vec<(String, serde_json::Value)> =
+            (0..2).map(|_| posts.recv_timeout(wait).unwrap()).collect();
+        assert_eq!(order[0].0, "/v1/push", "{order:?}");
+        assert_eq!(order[0].1["pane"], 2);
+        assert_eq!(order[1].0, "/v1/read", "{order:?}");
+        assert_eq!(order[1].1["pane"], 2);
+        assert_eq!(order[1].1["seq"], order[0].1["seq"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn titles_lose_their_spinners() {
         assert_eq!(clean_title("⠴ ⠦ | nix-config"), "nix-config");
@@ -734,9 +966,11 @@ mod tests {
                 title: "Claude Code".into(),
                 permission: Some(9),
             },
+            42,
         ))
         .unwrap();
         assert_eq!(b["body"], "asks for permission");
+        assert_eq!(b["seq"], 42);
         assert_eq!(b["host"], "studio");
         assert_eq!(b["permission"], 9);
     }

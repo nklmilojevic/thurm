@@ -320,12 +320,34 @@ fn run_cat(c: &Client, pane: PaneId) {
 
 /// The next `/v1/push` post within `wait`, skipping Live Activity posts.
 fn next_push(posts: &Receiver<(String, String)>, wait: Duration) -> Option<serde_json::Value> {
+    next_post(posts, "/v1/push", wait)
+}
+
+/// The next post to `path` within `wait`, skipping the others.
+fn next_post(
+    posts: &Receiver<(String, String)>,
+    path: &str,
+    wait: Duration,
+) -> Option<serde_json::Value> {
     let deadline = Instant::now() + wait;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let (head, body) = posts.recv_timeout(left).ok()?;
-        if head.starts_with("POST /v1/push ") {
+        if head.starts_with(&format!("POST {path} ")) {
             return Some(serde_json::from_str(&body).unwrap());
+        }
+    }
+}
+
+/// Whether `events` carries a `PaneRead` for `pane` within `wait`.
+fn heard_read(events: &Receiver<Event>, pane: PaneId, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match events.recv_timeout(left) {
+            Ok(Event::PaneRead { pane: p }) if p == pane => return true,
+            Ok(_) => {}
+            Err(_) => return false,
         }
     }
 }
@@ -635,5 +657,143 @@ fn a_revoked_phone_is_forgotten_and_dropped() {
     assert!(
         next_push(&posts, Duration::from_secs(2)).is_none(),
         "the revoked phone was pushed"
+    );
+}
+
+/// Reading a pane on the Mac takes its notice off the phone's lock screen, once.
+#[test]
+fn a_pane_read_on_the_mac_clears_the_phones_notice() {
+    let env = push_env("read-on-mac");
+    let _daemon = env.start();
+    let (mac, mac_events) = env.connect();
+    let (relay, posts) = fake_relay();
+    register(&mac, "dev-1", &relay, "iPhone");
+    let pane = create(&mac, &env.dir);
+    run_cat(&mac, pane);
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+    let first = next_push(&posts, Duration::from_secs(10)).expect("no notice");
+    hook(&mac, pane, "stop", None);
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+    let second = next_push(&posts, Duration::from_secs(10)).expect("no second notice");
+    assert!(
+        second["seq"].as_u64() > first["seq"].as_u64(),
+        "{first} {second}"
+    );
+
+    mac.request(Request::Focus {
+        pane,
+        focused: true,
+    })
+    .unwrap();
+    let b = next_post(&posts, "/v1/read", Duration::from_secs(10)).expect("the phone never heard");
+    assert_eq!(b["device"], "dev-1");
+    assert_eq!(b["host"], "studio");
+    assert_eq!(b["pane"], pane);
+    // Up to the last notice: one sent after this read stays when the read comes late.
+    assert_eq!(b["seq"], second["seq"]);
+    assert!(heard_read(&mac_events, pane, Duration::from_secs(5)));
+
+    // Already read: looking again or typing is no news.
+    mac.request(Request::Focus {
+        pane,
+        focused: true,
+    })
+    .unwrap();
+    mac.request(Request::Input {
+        pane,
+        data: b"x".to_vec(),
+    })
+    .unwrap();
+    assert!(next_post(&posts, "/v1/read", Duration::from_secs(1)).is_none());
+    assert!(!heard_read(&mac_events, pane, Duration::from_millis(500)));
+}
+
+/// Reading a pane on one phone tells the Mac (live) and the other phones (through the relay),
+/// but not the phone that read it.
+#[test]
+fn a_pane_read_on_the_phone_reaches_the_mac_and_other_phones() {
+    let env = push_env("read-on-phone");
+    let _daemon = env.start();
+    let (mac, mac_events) = env.connect();
+    let (relay, posts) = fake_relay();
+    register(&mac, "dev-pocket", &relay, "iPad");
+    let pane = create(&mac, &env.dir);
+    run_cat(&mac, pane);
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+    next_push(&posts, Duration::from_secs(10)).expect("no notice");
+
+    let (phone, _phone_events) = mobile(&env);
+    register(&phone, "dev-open", &relay, "iPhone");
+    phone
+        .request(Request::Focus {
+            pane,
+            focused: true,
+        })
+        .unwrap();
+    assert!(heard_read(&mac_events, pane, Duration::from_secs(5)));
+    let b = next_post(&posts, "/v1/read", Duration::from_secs(10)).expect("the iPad never heard");
+    assert_eq!(b["device"], "dev-pocket");
+    assert!(next_post(&posts, "/v1/read", Duration::from_secs(1)).is_none());
+}
+
+/// A closed pane's notices would open nothing: they come down too.
+#[test]
+fn a_closed_panes_notice_comes_down() {
+    let env = push_env("read-on-close");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (relay, posts) = fake_relay();
+    register(&mac, "dev-1", &relay, "iPhone");
+    let pane = create(&mac, &env.dir);
+    run_cat(&mac, pane);
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+    next_push(&posts, Duration::from_secs(10)).expect("no notice");
+    mac.request(Request::ClosePane { pane }).unwrap();
+    let b = next_post(&posts, "/v1/read", Duration::from_secs(10)).expect("the phone never heard");
+    assert_eq!(b["pane"], pane);
+}
+
+/// A held pane outlives its process, but the agent's notice goes with it.
+#[test]
+fn a_held_panes_notice_comes_down_when_it_exits() {
+    let env = push_env("read-on-exit");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (relay, posts) = fake_relay();
+    register(&mac, "dev-1", &relay, "iPhone");
+    let pane = match mac
+        .request(Request::CreatePane(CreatePane {
+            cwd: Some(env.dir.display().to_string()),
+            size: size(80, 24),
+            hold: true,
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    run_cat(&mac, pane);
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+    next_push(&posts, Duration::from_secs(10)).expect("no notice");
+    // Typing here would read it: end the shell from outside instead.
+    let pid = match mac.request(Request::PaneInfo { pane }).unwrap() {
+        Response::PaneInfo(info) => info.pid.expect("the shell's pid"),
+        other => panic!("{other:?}"),
+    };
+    std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    let b = next_post(&posts, "/v1/read", Duration::from_secs(10)).expect("the phone never heard");
+    assert_eq!(b["pane"], pane);
+    assert!(
+        matches!(mac.request(Request::PaneInfo { pane }), Ok(Response::PaneInfo(i)) if !i.alive),
+        "the held pane went away"
     );
 }

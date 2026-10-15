@@ -1163,9 +1163,16 @@ final class SessionManager: NSObject, CoreDelegate {
             if let info = PaneInfo(json: payload, host: host) { paneInfoUpdated(info) }
         case "PaneExited", "PaneClosed":
             if let id = key {
-                Notifications.shared.withdrawPermission(pane: id)
+                Notifications.shared.withdraw(pane: id)
                 panes.removeValue(forKey: id)
                 removePaneFromUI(id)
+                updateDockBadge()
+            }
+        case "PaneRead":
+            // Read here or on a phone: off the Dock badge and out of Notification Center.
+            if let id = key {
+                Notifications.shared.withdraw(pane: id)
+                seenAlerts.insert(id)
                 updateDockBadge()
             }
         case "Bell":
