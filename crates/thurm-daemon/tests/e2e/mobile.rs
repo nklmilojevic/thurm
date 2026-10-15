@@ -146,7 +146,11 @@ fn a_client_with_the_same_size_leaving_keeps_the_owners_size() {
     assert!(hello.is_ok(), "{hello:?}");
     let (mut a, hello) = raw_hello(&env, PROTOCOL_VERSION, &[]);
     assert!(hello.is_ok(), "{hello:?}");
-    for (s, size) in [(&mut b, size(80, 24)), (&mut c, size(120, 40)), (&mut a, size(80, 24))] {
+    for (s, size) in [
+        (&mut b, size(80, 24)),
+        (&mut c, size(120, 40)),
+        (&mut a, size(80, 24)),
+    ] {
         let r = raw_request(s, 2, Request::Resize { pane, size });
         assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
     }
@@ -254,8 +258,14 @@ fn mobile_clients_get_notifications_but_no_window_commands() {
             }
         }
     };
-    assert!(got(&mac_events, Duration::from_secs(5)), "the Mac app should get the UI command");
-    assert!(!got(&phone_events, Duration::from_secs(1)), "the phone is not a desktop window");
+    assert!(
+        got(&mac_events, Duration::from_secs(5)),
+        "the Mac app should get the UI command"
+    );
+    assert!(
+        !got(&phone_events, Duration::from_secs(1)),
+        "the phone is not a desktop window"
+    );
 
     // A phone alone is no open window.
     drop(mac);

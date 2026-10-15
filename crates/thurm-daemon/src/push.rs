@@ -687,9 +687,21 @@ mod tests {
                 .find(|f| f.device == device && f.pane == pane)
                 .map(|f| f.last.clone())
         };
-        assert_eq!(last("d1", 4), Some(Some(working.clone())), "the open phone updates itself");
-        assert_eq!(last("d2", 4), Some(Some(asking)), "the other phone is sent the change");
-        assert_eq!(last("d1", 5), Some(Some(working)), "another pane's activity");
+        assert_eq!(
+            last("d1", 4),
+            Some(Some(working.clone())),
+            "the open phone updates itself"
+        );
+        assert_eq!(
+            last("d2", 4),
+            Some(Some(asking)),
+            "the other phone is sent the change"
+        );
+        assert_eq!(
+            last("d1", 5),
+            Some(Some(working)),
+            "another pane's activity"
+        );
         p.agent_changed(4, None, &open);
         assert_eq!(last("d1", 4), None, "the open phone's activity ends too");
         assert_eq!(last("d2", 4), None);

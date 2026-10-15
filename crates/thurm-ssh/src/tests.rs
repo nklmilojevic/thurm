@@ -236,7 +236,11 @@ fn a_sign_in_that_never_finishes_times_out() {
         Duration::from_secs(1),
     );
     assert!(matches!(r, Err(SshError::Transient(_))), "{:?}", r.err());
-    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
 }
 
 #[test]
