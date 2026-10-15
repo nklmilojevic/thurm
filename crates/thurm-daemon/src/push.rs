@@ -164,6 +164,8 @@ impl Pusher {
             .spawn(move || {
                 let agent: ureq::Agent = ureq::Agent::config_builder()
                     .timeout_global(Some(Duration::from_secs(10)))
+                    // `post` reads the status and headers of an error itself.
+                    .http_status_as_error(false)
                     .build()
                     .into();
                 let on = || on.load(Ordering::Relaxed);
@@ -500,7 +502,8 @@ impl Store {
 }
 
 enum PostError {
-    /// 404: the relay has no such device.
+    /// The relay has no such device: a 404 with `X-Thurm-Device: unknown`. Any other 404 (a
+    /// proxy, a route an older relay lacks) is not that.
     Gone,
     Other(String),
 }
@@ -635,10 +638,18 @@ fn post(agent: &ureq::Agent, device: &Device, path: &str, body: &str) -> Result<
         .header("X-Thurm-Timestamp", ts.to_string())
         .header("X-Thurm-Signature", signature(&device.secret, ts, body))
         .send(body)
-        .map(|_| ())
-        .map_err(|e| match e {
-            ureq::Error::StatusCode(404) => PostError::Gone,
-            e => PostError::Other(e.to_string()),
+        .map_err(|e| PostError::Other(e.to_string()))
+        .and_then(|response| {
+            let status = response.status();
+            let unknown = response
+                .headers()
+                .get("X-Thurm-Device")
+                .is_some_and(|v| v == "unknown");
+            match status.as_u16() {
+                200..=299 => Ok(()),
+                404 if unknown => Err(PostError::Gone),
+                _ => Err(PostError::Other(format!("http status: {status}"))),
+            }
         })
 }
 
@@ -1029,7 +1040,9 @@ mod tests {
                 while reader.read_line(&mut line).unwrap_or(0) > 2 {
                     line.clear();
                 }
-                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nX-Thurm-Device: unknown\r\nContent-Length: 0\r\n\r\n",
+                );
             }
         });
         let p = Pusher::new(&dir, true);
@@ -1064,6 +1077,59 @@ mod tests {
         let again = Pusher::new(&dir, true);
         assert_eq!(again.devices.lock().len(), 1, "forgotten on disk too");
         assert!(again.follows.lock().iter().all(|f| f.device != "d1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 404 that is not the relay saying it has no such device (a proxy, a route an older relay
+    /// lacks) leaves the registration alone.
+    #[test]
+    fn a_plain_404_keeps_the_device() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = std::env::temp_dir().join(format!("thurm-push-404-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (answered, answers) = crossbeam_channel::unbounded();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                    line.clear();
+                }
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                let _ = answered.send(());
+            }
+        });
+        let p = Pusher::new(&dir, true);
+        p.register(Device {
+            device: "d1".into(),
+            relay,
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        })
+        .unwrap();
+        for pane in 1..=2 {
+            p.notify(
+                Notice {
+                    pane,
+                    title: "Codex".into(),
+                    permission: Some(1),
+                },
+                &[],
+            );
+            answers
+                .recv_timeout(Duration::from_secs(10))
+                .expect("not posted");
+        }
+        // Both posts were answered, the second after the first was handled.
+        assert_eq!(
+            p.devices.lock().len(),
+            1,
+            "forgot the device on a plain 404"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

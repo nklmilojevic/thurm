@@ -27,8 +27,9 @@ What they share, and where a change on one side needs the other:
 - **Push relay API.** `thurmd` (`crates/thurm-daemon/src/push.rs`) posts to `POST /v1/push` and
   `POST /v1/activity`, signed with the device secret (`X-Thurm-Timestamp`,
   `X-Thurm-Signature`: HMAC-SHA256 of `<timestamp>.<body>`). The app registers with
-  `POST /v1/devices` and leaves with `DELETE /v1/devices/{device}`; `thurmd` forgets a device the
-  relay answers 404 for. Body fields, signatures and status codes must agree on both sides.
+  `POST /v1/devices` and leaves with `DELETE /v1/devices/{device}`; `thurmd` forgets a device only
+  on a 404 with `X-Thurm-Device: unknown` (any other 404, from a proxy or an older relay, keeps
+  it). Body fields, headers, signatures and status codes must agree on both sides.
 - **Pairing.** The Mac's Pair iPhone sheet (`macos/Sources/Thurm/PairPhone.swift`) makes the
   `thurm://pair?d=` payload the app parses (`PairingPayload`), and keeps the app's device keys in
   `authorized_keys` under the comment `thurm-ios:<device name>`; revoking goes through
