@@ -135,6 +135,8 @@
           rustToolchain
           # libghostty-vt is built from source with Zig 0.16.
           zig_0_16
+          # The Tailscale helper (tailnet/); the same minor version as tailnet/go.mod.
+          go_1_27
           python3
           uv
           # Docs: cd docs && bun install && bun run dev

@@ -11,6 +11,7 @@ mod agent;
 mod agent_prompt;
 mod hook_pgrp;
 mod remote;
+mod tailscale;
 
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
@@ -343,6 +344,14 @@ enum Cmd {
         #[arg(value_parser = ["status", "start", "stop", "upgrade", "install-launchd", "uninstall-launchd", "install-systemd", "uninstall-systemd"])]
         action: String,
     },
+    /// Serve this daemon over Tailscale: its own device on your tailnet, reached by your phone
+    /// and other devices without ssh.
+    Tailscale {
+        #[command(subcommand)]
+        action: tailscale::TailscaleCmd,
+    },
+    /// Show who the daemon sees on this connection.
+    Whoami,
     /// Print the config file path.
     ConfigPath,
     /// Print the daemon socket path (what `thurmd` and `thurm` use by default).
@@ -1438,6 +1447,8 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             c.request(Request::ClearScrollback { pane })?;
         }
         Cmd::Layout { action } => return layouts::run(c, action),
+        Cmd::Tailscale { action } => return tailscale::run(c, action, json),
+        Cmd::Whoami => return tailscale::whoami(c, json),
         Cmd::Reload => {
             c.request(Request::ReloadConfig)?;
             println!("configuration reloaded");

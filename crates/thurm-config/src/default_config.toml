@@ -247,6 +247,29 @@ relay = ""
 # The code the relay asks of new devices; Pair iPhone puts it in the pairing code.
 code = ""
 
+[tailscale]
+# Serve the daemon over Tailscale as its own device on your tailnet, so your phone and other
+# devices reach it at https://HOSTNAME.YOUR-TAILNET.ts.net without ssh. The first time, sign in
+# with the link in Settings or `thurm tailscale status`.
+enabled = false
+# The device's name on the tailnet.
+hostname = "thurm"
+# Admit every member of the tailnet, not only the account that signed the device in.
+allow_tailnet_members = false
+# ACL tags to enroll with, e.g. ["tag:thurm"]. A tagged device has no owner, so this needs
+# allow_tailnet_members.
+advertise_tags = []
+# A file holding a Tailscale auth key, to enroll without signing in in a browser.
+auth_key_file = ""
+# Also listen on this machine's tailnet addresses through its own Tailscale, e.g. ":7297".
+host_listen = ""
+# With host_listen: admit every caller Tailscale identifies, not only this machine's owner.
+host_allow_identified = false
+# Serve a socket for `tailscale serve` to proxy to as HTTP (`tailscale serve unix:<socket>`),
+# which tells who the caller is. Needs Tailscale 1.94 or newer. A raw `--tcp` forward to it
+# is refused: it would pass a caller's claimed identity through.
+serve_socket = false
+
 [updates]
 # "release" (tagged releases), "tip" (a build of every commit to main), or "auto": the
 # channel of the installed build. Also under Thurm > Update Channel.

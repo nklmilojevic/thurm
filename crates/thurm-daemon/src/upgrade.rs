@@ -44,6 +44,9 @@ pub struct Handoff {
     pub next_pane_id: PaneId,
     pub restored: bool,
     pub panes: Vec<PaneHandoff>,
+    /// The Tailscale helper's pid and control socket, which stay open across the exec.
+    #[serde(default)]
+    pub tailnet: Option<(i32, RawFd)>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -249,6 +252,7 @@ pub fn perform(
     }
     let fds: Vec<RawFd> = std::iter::once(listener_fd)
         .chain(lock_fd)
+        .chain(handoff.tailnet.map(|(_, fd)| fd))
         .chain(handoff.panes.iter().map(|p| p.fd))
         .collect();
     for &fd in &fds {

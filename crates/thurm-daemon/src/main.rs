@@ -15,6 +15,7 @@ mod pty;
 mod push;
 mod server;
 mod shell;
+mod tailnet;
 mod transcript;
 mod upgrade;
 
@@ -189,11 +190,14 @@ fn main() {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
     let daemon = daemon::Daemon::new(config, socket.clone(), state_dir.clone(), term.clone());
+    let mut tailnet = None;
     if let Some(h) = handoff {
+        tailnet = h.tailnet;
         daemon.adopt(h);
     } else if !args.no_restore {
         daemon.restore_session();
     }
+    daemon.start_tailnet(tailnet);
 
     {
         // A few, so one slow repository doesn't hold up every pane's status.

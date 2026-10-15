@@ -1,6 +1,6 @@
 //! Unix socket server: one reader and one writer thread per client connection.
 
-use std::io::BufWriter;
+use std::io::{BufWriter, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -36,12 +36,68 @@ fn mobile_silence() -> std::time::Duration {
         .unwrap_or(thurm_proto::MOBILE_SILENCE)
 }
 
+/// Reads how a connection starts: an ingress preamble (`thurm_proto::tailnet`), or the first
+/// frame, returned whole so it isn't lost.
+fn read_start<R: Read>(
+    r: &mut R,
+) -> std::io::Result<(Option<thurm_proto::Principal>, Option<Vec<u8>>)> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len)?;
+    let len = u32::from_le_bytes(len);
+    if len == thurm_proto::tailnet::INGRESS_MAGIC {
+        return Ok((Some(thurm_proto::tailnet::read_ingress(r)?), None));
+    }
+    let len = len as usize;
+    if len > codec::MAX_MESSAGE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "message too large",
+        ));
+    }
+    let mut frame = vec![0u8; len];
+    r.read_exact(&mut frame)?;
+    Ok((None, Some(frame)))
+}
+
 fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
     if !thurm_config::peer_may_use_daemon(&stream) {
         log::warn!("rejecting connection from another user");
         return;
     }
+    let mut reader = std::io::BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("clone stream: {e}");
+            return;
+        }
+    });
+    // A tailnet caller's connection starts with who it is (from the Tailscale helper); any
+    // other starts with its first frame.
+    let (principal, first_frame) = match read_start(&mut reader) {
+        Ok(start) => start,
+        Err(e) => {
+            log::debug!("connection dropped before its first message: {e}");
+            return;
+        }
+    };
+    let principal = principal.unwrap_or_else(|| {
+        let uid = thurm_config::peer_uid(&stream);
+        thurm_proto::Principal {
+            display: uid.map_or_else(|| "local".into(), |u| format!("uid {u}")),
+            uid,
+            ..Default::default()
+        }
+    });
     let (client, rx) = daemon.add_client();
+    if principal.kind == thurm_proto::PrincipalKind::Tailscale {
+        log::info!(
+            "client {} is {} over the tailnet ({})",
+            client.id,
+            principal.display,
+            principal.via.as_deref().unwrap_or("?")
+        );
+    }
+    *client.principal.lock() = Some(principal);
     *client.socket.lock() = stream.try_clone().ok();
     let write_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -97,7 +153,7 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
             }
         });
 
-    let mut reader = std::io::BufReader::new(stream);
+    let mut first_frame = first_frame;
     let mut silence_limited = false;
     loop {
         // A phone that stopped talking (suspended, out of range) is gone: it pings while open.
@@ -105,7 +161,11 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
             silence_limited = true;
             let _ = reader.get_ref().set_read_timeout(Some(mobile_silence()));
         }
-        match codec::read_frame(&mut reader) {
+        let frame = match first_frame.take() {
+            Some(frame) => Ok(Some(frame)),
+            None => codec::read_frame(&mut reader),
+        };
+        match frame {
             Ok(Some(frame)) => match codec::decode::<Envelope>(&frame) {
                 Ok(env) => daemon.handle(&client, env.id, env.request),
                 // A request this daemon doesn't know (a newer client): answer it with an

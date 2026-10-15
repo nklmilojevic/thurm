@@ -40,6 +40,8 @@ pub struct Config {
     pub quick_terminal: QuickTerminalConfig,
     /// Agent notifications to paired phones, through a push relay (`[push]`).
     pub push: PushConfig,
+    /// Serving the daemon over Tailscale (`[tailscale]`).
+    pub tailscale: TailscaleConfig,
     /// Extra key bindings: `"cmd+shift+d" = "split_down"`.
     pub keybindings: std::collections::BTreeMap<String, String>,
     /// Other machines running `thurmd`, shown as remote workspaces (`[[remote]]`).
@@ -788,6 +790,48 @@ pub struct PushConfig {
     pub code: String,
 }
 
+/// Serving the daemon over Tailscale through the `thurm-tailnet` helper: as an embedded node with
+/// its own name on the tailnet (`enabled`), and through this host's own Tailscale (`host_listen`,
+/// `serve_socket`). Every listener admits only callers Tailscale identifies; by default only the
+/// account that owns the node or host.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct TailscaleConfig {
+    /// Run the embedded node and serve HTTPS on it.
+    pub enabled: bool,
+    /// The node's name on the tailnet (one DNS label).
+    pub hostname: String,
+    /// Admit any member of the tailnet, not only the account that enrolled the node.
+    pub allow_tailnet_members: bool,
+    /// ACL tags the node enrolls with (`tag:name`); needs `allow_tailnet_members`.
+    pub advertise_tags: Vec<String>,
+    /// A file holding an auth key, to enroll the node without signing in.
+    pub auth_key_file: String,
+    /// Also listen on this host's tailnet addresses, through its own Tailscale: `:7297`, or one
+    /// address `100.64.0.1:7297`. Empty: off.
+    pub host_listen: String,
+    /// Admit every caller this host's Tailscale identifies, not only the host's owner.
+    pub host_allow_identified: bool,
+    /// Serve a Unix socket for `tailscale serve` to proxy to as HTTP (identity from its
+    /// headers). Needs Tailscale 1.94 or newer; a raw `--tcp` forward to it is refused.
+    pub serve_socket: bool,
+}
+
+impl Default for TailscaleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hostname: "thurm".into(),
+            allow_tailnet_members: false,
+            advertise_tags: Vec::new(),
+            auth_key_file: String::new(),
+            host_listen: String::new(),
+            host_allow_identified: false,
+            serve_socket: false,
+        }
+    }
+}
+
 /// Automatic updates (Sparkle), read by the app.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -1064,7 +1108,7 @@ pub fn peer_may_use_daemon(stream: &std::os::unix::net::UnixStream) -> bool {
     peer_uid(stream).is_some_and(|u| u == uid() || u == 0)
 }
 
-fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
     #[cfg(target_os = "linux")]

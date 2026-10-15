@@ -238,6 +238,8 @@ pub struct Client {
     pub socket: Mutex<Option<std::os::unix::net::UnixStream>>,
     /// Its panes follow the active client's size ([`thurm_proto::CAP_ACTIVE_SIZE`]).
     pub active_size: AtomicBool,
+    /// Who connected: a local peer, or a tailnet caller the Tailscale helper admitted.
+    pub principal: Mutex<Option<thurm_proto::Principal>>,
     pub name: Mutex<String>,
     /// Approximate bytes queued in `tx` (see [`message_weight`]); the writer subtracts what it
     /// wrote.
@@ -369,6 +371,8 @@ pub struct Daemon {
     ai_tx: Sender<AiJob>,
     /// Agent notices to paired phones.
     push: crate::push::Pusher,
+    /// Serving over Tailscale.
+    pub tailnet: Arc<crate::tailnet::Tailnet>,
     /// Panes with an agent notice nobody has read yet (see `pane_read`).
     unread: Mutex<HashSet<PaneId>>,
     ai_rx: Receiver<AiJob>,
@@ -409,6 +413,7 @@ impl Daemon {
         let git_channel = crossbeam_channel::bounded(256);
         let ai_channel = crossbeam_channel::bounded(64);
         let push = crate::push::Pusher::new(&state_dir, !config.push.relay.is_empty());
+        let tailnet = crate::tailnet::Tailnet::new(socket.clone(), state_dir.join("tailscale"));
         Arc::new(Daemon {
             engine: RwLock::new(EngineConfig::from_config(&config, true)),
             dark: AtomicBool::new(true),
@@ -427,6 +432,7 @@ impl Daemon {
             ai: ai::Model::new(),
             ai_tx: ai_channel.0,
             push,
+            tailnet,
             unread: Mutex::new(HashSet::new()),
             ai_rx: ai_channel.1,
             store,
@@ -550,6 +556,7 @@ impl Daemon {
             push_device: Mutex::new(None),
             socket: Mutex::new(None),
             active_size: AtomicBool::new(false),
+            principal: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
@@ -1863,7 +1870,24 @@ impl Daemon {
             next_pane_id: self.next_pane.load(Ordering::Relaxed),
             restored: self.restored.load(Ordering::Relaxed),
             panes,
+            tailnet: self.tailnet.handoff(),
         }
+    }
+
+    /// Starts serving over Tailscale as configured, taking over the previous image's helper
+    /// (`adopt`: its pid and control socket) after an in-place upgrade.
+    pub fn start_tailnet(self: &Arc<Self>, adopt: Option<(i32, RawFd)>) {
+        let weak = Arc::downgrade(self);
+        self.tailnet.on_change(move |status| {
+            if let Some(d) = weak.upgrade() {
+                d.broadcast(Event::TailscaleStatusChanged(status), false);
+            }
+        });
+        if let Some((pid, fd)) = adopt {
+            self.tailnet.adopt(pid, fd);
+        }
+        let cfg = self.config.read().tailscale.clone();
+        self.tailnet.configure(&cfg);
     }
 
     /// Takes over the panes of the image we replaced.
@@ -2078,6 +2102,22 @@ impl Daemon {
                 std::thread::spawn(move || {
                     let result = daemon.dispatch(&client, req);
                     daemon.push.settle();
+                    if id != 0 {
+                        client.send(ServerMessage::Response { id, result });
+                    }
+                });
+                return;
+            }
+            // The Tailscale helper can take a while (starting the node, signing out).
+            req @ (Request::TailscaleEnable { .. }
+            | Request::TailscaleDisable
+            | Request::TailscaleLogin
+            | Request::TailscaleLogout
+            | Request::TailscaleRename { .. }) => {
+                let daemon = self.clone();
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    let result = daemon.dispatch(&client, req);
                     if id != 0 {
                         client.send(ServerMessage::Response { id, result });
                     }
@@ -2629,6 +2669,25 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::Ping => Ok(Response::Ok),
+            Request::TailscaleStatus => Ok(Response::TailscaleStatus(self.tailnet.status())),
+            Request::TailscaleEnable {
+                hostname,
+                allow_tailnet_members,
+                advertise_tags,
+                auth_key,
+            } => self
+                .tailnet
+                .enable(hostname, allow_tailnet_members, advertise_tags, auth_key)
+                .map(Response::TailscaleStatus),
+            Request::TailscaleDisable => self.tailnet.disable().map(Response::TailscaleStatus),
+            Request::TailscaleLogin => self.tailnet.login().map(Response::TailscaleStatus),
+            Request::TailscaleLogout => self.tailnet.logout().map(Response::TailscaleStatus),
+            Request::TailscaleRename { hostname } => {
+                self.tailnet.rename(hostname).map(Response::TailscaleStatus)
+            }
+            Request::Whoami => Ok(Response::Whoami(
+                client.principal.lock().clone().unwrap_or_default(),
+            )),
             Request::UnfollowAgent { device, pane } => {
                 self.push.unfollow(&device, pane)?;
                 Ok(Response::Ok)
@@ -2927,6 +2986,7 @@ impl Daemon {
         *self.agent_defs.write() = cfg.agent_defs();
         *self.program_defs.write() = cfg.program_defs();
         self.push.set_enabled(!cfg.push.relay.is_empty());
+        self.tailnet.configure(&cfg.tailscale);
         *self.config.write() = cfg;
         let engine = self.engine.read().clone();
         for pane in self.all_panes() {
@@ -3389,6 +3449,7 @@ mod tests {
             push_device: Mutex::new(None),
             socket: Mutex::new(None),
             active_size: AtomicBool::new(false),
+            principal: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),

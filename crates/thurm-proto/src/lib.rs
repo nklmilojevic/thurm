@@ -9,11 +9,13 @@
 pub mod bytes;
 pub mod codec;
 pub mod layout;
+pub mod tailnet;
 pub mod template;
 
 use serde::{Deserialize, Serialize};
 
 pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
+pub use tailnet::{Principal, PrincipalKind, TailscaleStatus};
 
 /// Bumped whenever the wire format changes incompatibly.
 ///
@@ -60,11 +62,16 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_ACTIVE_SIZE,
     "push",
     "pane-read",
+    CAP_TAILSCALE,
 ];
 
 /// The pane takes the size of the client that used it last (see the daemon's `active_size`)
 /// instead of the last `Resize`.
 pub const CAP_ACTIVE_SIZE: &str = "active-size";
+
+/// The daemon serves over Tailscale (see [`tailnet`]): it answers the `Tailscale*` requests and
+/// `Whoami`, and reports `TailscaleStatusChanged`.
+pub const CAP_TAILSCALE: &str = "tailscale";
 
 /// Sent only by the iOS app: it gets notifications like a desktop UI, but takes no UI commands
 /// and does not count as an open window.
@@ -349,6 +356,35 @@ pub enum Request {
     /// Nothing; answers Ok. The iOS app sends it while open, so the daemon can tell a phone
     /// that went away without closing its connection (see `MOBILE_SILENCE`).
     Ping,
+    /// The state of serving over Tailscale.
+    TailscaleStatus,
+    /// Serve over the tailnet as an embedded node. Idempotent and runtime-only: the config's
+    /// `[tailscale]` decides again at the next start. A node enabled for the first time starts
+    /// Tailscale's sign-in (`auth_url` in the status) unless `auth_key` enrolls it; a rejected
+    /// key falls back to the sign-in. An enrolled node ignores `auth_key` and `advertise_tags`.
+    TailscaleEnable {
+        /// The node's name on the tailnet; `None` keeps the configured one.
+        hostname: Option<String>,
+        /// Admit any tailnet member, not only the account that enrolled the node. Required with
+        /// `advertise_tags`: a tagged node has no owner to admit.
+        allow_tailnet_members: bool,
+        /// ACL tags (`tag:name`) to enroll with; the key or account must be allowed them.
+        advertise_tags: Vec<String>,
+        auth_key: Option<String>,
+    },
+    /// Stop serving over the tailnet: tailnet connections close, sessions keep running, and the
+    /// node stays signed in, so the next enable needs no sign-in. Idempotent.
+    TailscaleDisable,
+    /// Ask Tailscale for a sign-in link for the enabled node.
+    TailscaleLogin,
+    /// Sign the node out and forget it. A failed logout leaves the node running.
+    TailscaleLogout,
+    /// Rename the enabled node without signing in again; `hostname` is one DNS label.
+    TailscaleRename {
+        hostname: String,
+    },
+    /// Who this connection is: a local peer or a tailnet caller.
+    Whoami,
 }
 
 /// A mobile client silent this long is taken for gone: iOS suspends apps without closing their
@@ -434,6 +470,8 @@ pub enum Response {
     AgentExplanation(AgentExplanation),
     AgentPrompt(AgentPromptOutcome),
     LayoutResult(LayoutResult),
+    TailscaleStatus(TailscaleStatus),
+    Whoami(Principal),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -536,6 +574,8 @@ pub enum Event {
     PaneRead {
         pane: PaneId,
     },
+    /// Serving over Tailscale changed state (sign-in link, running, error...).
+    TailscaleStatusChanged(TailscaleStatus),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]

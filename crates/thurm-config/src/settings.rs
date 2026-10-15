@@ -336,6 +336,30 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
     ("programs.define", "Custom programs", Kind::Table),
     ("push.relay", "Push relay", Kind::Text),
     ("push.code", "Push relay code", Kind::Text),
+    ("tailscale.enabled", "Serve over Tailscale", Kind::Bool),
+    ("tailscale.hostname", "Tailnet hostname", Kind::Text),
+    (
+        "tailscale.allow_tailnet_members",
+        "Allow tailnet members",
+        Kind::Bool,
+    ),
+    ("tailscale.advertise_tags", "Tailnet tags", Kind::List),
+    ("tailscale.auth_key_file", "Auth key file", Kind::Text),
+    (
+        "tailscale.host_listen",
+        "Listen through this Mac's Tailscale",
+        Kind::Text,
+    ),
+    (
+        "tailscale.host_allow_identified",
+        "Admit every identified caller",
+        Kind::Bool,
+    ),
+    (
+        "tailscale.serve_socket",
+        "Socket for tailscale serve",
+        Kind::Bool,
+    ),
     ("updates.channel", "Channel", Kind::Enum(UPDATE_CHANNEL)),
     (
         "updates.check_automatically",
@@ -646,7 +670,7 @@ fn section_of(key: &str) -> &'static str {
     match key.split('.').next() {
         Some("colors" | "cursor") => "appearance",
         Some("keybindings") => "keys",
-        Some("remote" | "push") => "remotes",
+        Some("remote" | "push" | "tailscale") => "remotes",
         Some(top) => SECTIONS
             .iter()
             .find(|(id, _)| *id == top)
