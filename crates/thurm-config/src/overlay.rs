@@ -155,6 +155,77 @@ pub fn write(config: &Path, key: &str, literal: Option<&str>) -> Result<(), Stri
     replace_file(&file, out.as_bytes()).map_err(|e| format!("{}: {e}", file.display()))
 }
 
+/// Applies `edit`, a rewrite of the `[[remote]]` entries, to the overlay beside `config`. An
+/// overlay that doesn't set `remote` yet starts from config.toml's hosts, so none go missing;
+/// one whose last host is removed keeps `remote = []` while config.toml has hosts, or they
+/// would come back. Returns the overlay's path.
+pub fn edit_remotes(
+    config: &Path,
+    edit: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<PathBuf, String> {
+    let file = path_beside(config);
+    let base = read(config).map_err(|e| format!("{}: {e}", config.display()))?;
+    let base_hosts = base
+        .parse::<DocumentMut>()
+        .map_err(|e| format!("{}: {e}", config.display()))?
+        .remove("remote")
+        .and_then(host_tables);
+    let text = read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut doc: DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    // Comments with no settings under them would end up below the hosts.
+    let mut lead = String::new();
+    if doc.is_empty() {
+        lead = if text.trim().is_empty() {
+            HEADER
+        } else {
+            text.trim_end()
+        }
+        .to_owned();
+        doc = DocumentMut::new();
+    }
+    // The `with_remote_*` edits take `[[remote]]` tables; `remote = []` (no hosts) has none.
+    let hosts = match doc.remove("remote") {
+        None => base_hosts.clone(),
+        Some(hosts) => host_tables(hosts),
+    };
+    if let Some(hosts) = hosts {
+        doc.insert("remote", hosts);
+    }
+    let mut doc: DocumentMut = edit(&doc.to_string())?
+        .parse()
+        .map_err(|e| format!("{e}"))?;
+    if base_hosts.is_some() && !doc.contains_key("remote") {
+        doc.insert("remote", toml_edit::value(toml_edit::Array::new()));
+    }
+    let out = match lead.trim_end() {
+        "" => doc.to_string(),
+        lead => format!("{lead}\n\n{doc}"),
+    };
+    let warnings = merge(&base, &out)?.warnings;
+    if let Some(w) = warnings
+        .iter()
+        .find(|w| w.starts_with("settings.toml: remote "))
+    {
+        return Err(w.clone());
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    replace_file(&file, out.as_bytes()).map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(file)
+}
+
+/// `remote` as `[[remote]]` tables, also when written inline (`remote = [{ name = … }]`); `None`
+/// when it holds no hosts.
+fn host_tables(hosts: Item) -> Option<Item> {
+    match hosts.into_array_of_tables() {
+        Ok(tables) if tables.is_empty() => None,
+        Ok(tables) => Some(Item::ArrayOfTables(tables)),
+        Err(other) if other.as_array().is_some_and(|a| a.is_empty()) => None,
+        Err(other) => Some(other),
+    }
+}
+
 /// The overlay beside `config`, created with a short header when it does not exist yet.
 pub fn ensure(config: &Path) -> io::Result<PathBuf> {
     let file = path_beside(config);
@@ -305,6 +376,117 @@ mod tests {
         let config = dir.join("config.toml");
         std::fs::write(&config, text).unwrap();
         config
+    }
+
+    fn merged_hosts(config: &Path) -> Vec<(String, String)> {
+        let overlay = read(&path_beside(config)).unwrap();
+        let text = merge(&std::fs::read_to_string(config).unwrap(), &overlay)
+            .unwrap()
+            .text;
+        Config::parse(&text)
+            .unwrap()
+            .remote
+            .into_iter()
+            .map(|r| (r.name, r.host))
+            .collect()
+    }
+
+    fn remote(name: &str, host: &str) -> crate::RemoteConfig {
+        crate::RemoteConfig {
+            name: name.into(),
+            host: host.into(),
+            socket: None,
+            enabled: true,
+            clipboard_read: crate::ClipboardRead::Ask,
+        }
+    }
+
+    fn pair(name: &str, host: &str) -> (String, String) {
+        (name.into(), host.into())
+    }
+
+    #[test]
+    fn hosts_edited_in_the_overlay_start_from_the_configs() {
+        let config = temp_config(
+            "remotes-seed",
+            "[[remote]]\nname = \"pi\"\nhost = \"me@pi\"\n",
+        );
+        let add = remote("devbox", "me@devbox");
+        edit_remotes(&config, |t| crate::with_remote_added(t, &add)).unwrap();
+        assert_eq!(
+            merged_hosts(&config),
+            [pair("pi", "me@pi"), pair("devbox", "me@devbox")]
+        );
+        let overlay = read(&path_beside(&config)).unwrap();
+        assert!(overlay.starts_with(HEADER), "{overlay}");
+
+        edit_remotes(&config, |t| crate::with_remote_removed(t, "pi")).unwrap();
+        edit_remotes(&config, |t| crate::with_remote_removed(t, "devbox")).unwrap();
+        assert_eq!(merged_hosts(&config), []);
+        assert!(holds(&read(&path_beside(&config)).unwrap(), "remote"));
+
+        edit_remotes(&config, |t| crate::with_remote_added(t, &add)).unwrap();
+        assert_eq!(merged_hosts(&config), [pair("devbox", "me@devbox")]);
+    }
+
+    #[test]
+    fn hosts_edited_in_the_overlay_without_config_hosts() {
+        let config = temp_config("remotes-none", "[font]\nsize = 14.0\n");
+        let add = remote("devbox", "me@devbox");
+        edit_remotes(&config, |t| crate::with_remote_added(t, &add)).unwrap();
+        assert_eq!(merged_hosts(&config), [pair("devbox", "me@devbox")]);
+        edit_remotes(&config, |t| {
+            crate::with_remote_setting(t, "devbox", "enabled", "false")
+        })
+        .unwrap();
+        let overlay = read(&path_beside(&config)).unwrap();
+        assert!(overlay.contains("enabled = false"), "{overlay}");
+        edit_remotes(&config, |t| crate::with_remote_removed(t, "devbox")).unwrap();
+        assert!(!holds(&read(&path_beside(&config)).unwrap(), "remote"));
+        assert_eq!(merged_hosts(&config), []);
+    }
+
+    #[test]
+    fn inline_overlay_hosts_can_be_edited() {
+        let config = temp_config("remotes-inline-overlay", "[font]\nsize = 14.0\n");
+        std::fs::write(
+            path_beside(&config),
+            "remote = [{ name = \"pi\", host = \"me@pi\", clipboard_read = \"never\" }]\n",
+        )
+        .unwrap();
+        let add = remote("devbox", "me@devbox");
+        edit_remotes(&config, |t| crate::with_remote_added(t, &add)).unwrap();
+        edit_remotes(&config, |t| {
+            crate::with_remote_setting(t, "devbox", "enabled", "false")
+        })
+        .unwrap();
+        edit_remotes(&config, |t| crate::with_remote_removed(t, "pi")).unwrap();
+        assert_eq!(merged_hosts(&config), [pair("devbox", "me@devbox")]);
+        let overlay = read(&path_beside(&config)).unwrap();
+        assert!(overlay.contains("enabled = false"), "{overlay}");
+
+        std::fs::write(
+            path_beside(&config),
+            "remote = [{ name = \"pi\", host = \"me@pi\", clipboard_read = \"never\" }]\n",
+        )
+        .unwrap();
+        edit_remotes(&config, |t| crate::with_remote_added(t, &add)).unwrap();
+        let overlay = read(&path_beside(&config)).unwrap();
+        assert!(overlay.contains("clipboard_read = \"never\""), "{overlay}");
+    }
+
+    #[test]
+    fn inline_config_hosts_are_seeded_as_tables() {
+        let config = temp_config(
+            "remotes-inline",
+            "remote = [{ name = \"pi\", host = \"me@pi\" }]\n",
+        );
+        let add = remote("devbox", "me@devbox");
+        edit_remotes(&config, |t| crate::with_remote_added(t, &add)).unwrap();
+        assert_eq!(
+            merged_hosts(&config),
+            [pair("pi", "me@pi"), pair("devbox", "me@devbox")]
+        );
     }
 
     #[test]

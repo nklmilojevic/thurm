@@ -949,7 +949,7 @@ final class RemoteHosts: ObservableObject {
         }
     }
 
-    /// Sets `key` (`host`, `enabled` or `clipboard_read`) of `host` in config.toml.
+    /// Sets `key` (`host`, `enabled` or `clipboard_read`) of `host`.
     func set(_ host: HostId, _ key: String, _ value: Any, done: @escaping (String?) -> Void = { _ in }) {
         edit(["op": "set", "name": host, "key": key, "value": value]) { error in
             if error == nil, key == "host" {
@@ -960,7 +960,7 @@ final class RemoteHosts: ObservableObject {
         }
     }
 
-    /// Runs a call that edits config.toml off the main thread, then reloads the config.
+    /// Runs a call that edits the hosts (`thurm_config::edit_remotes`) off the main thread, then reloads the config.
     private func edit(_ call: [String: Any], done: @escaping (String?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let r = Core.shared.remoteCall(call)
