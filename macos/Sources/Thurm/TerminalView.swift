@@ -37,6 +37,9 @@ final class TerminalView: NSView, NSTextInputClient {
     private var reportedSize: GridSize?
     private var reportedFocus: Bool?
     private var waitingForResizeFrame = false
+    /// A frame is on screen. Until then there is no last image to keep while a resize is
+    /// waited for, so the drawable follows the bounds at once.
+    private var hasDrawn = false
     /// The daemon didn't answer a resize in time: draw the frame we have at the new size.
     private var resizeTimedOut = false
     private var resizeFrameTimeout: DispatchWorkItem?
@@ -96,6 +99,9 @@ final class TerminalView: NSView, NSTextInputClient {
         self.pane = pane
         super.init(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
         wantsLayer = true
+        // A held frame larger than a shrinking view must not spill over its neighbours. AppKit
+        // sets the layer's `masksToBounds` from this, and it is off by default since macOS 14.
+        clipsToBounds = true
         layerContentsPlacement = .topLeft
         registerForDraggedTypes([.fileURL, .URL, .png, .tiff, .string])
         setProgress(SessionManager.shared.panes[pane]?.progress)
@@ -129,8 +135,6 @@ final class TerminalView: NSView, NSTextInputClient {
         // On a size change (splits, window resize) keep the last frame unscaled at the top
         // left until the next one is drawn, instead of stretching it to the new bounds.
         layer.contentsGravity = .topLeft
-        // A held frame larger than a shrinking view must not spill over its neighbours.
-        layer.masksToBounds = true
         layer.needsDisplayOnBoundsChange = false
         return layer
     }
@@ -290,7 +294,9 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     private func updateDrawableSize() {
-        guard !waitingForResizeFrame else { return }
+        // A held grid keeps its drawable: a pane opening in a split took its final size before
+        // the move, and must not take the in-between bounds of the move.
+        guard !holdGridSize, !waitingForResizeFrame || !hasDrawn else { return }
         guard let layer = metalLayer else { return }
         let scale = backingScale
         let size = CGSize(width: max(1, (bounds.width * scale).rounded()),
@@ -640,6 +646,7 @@ final class TerminalView: NSView, NSTextInputClient {
                                   hoverSpan: hoverSpan,
                                   scrollY: smoothScrollY)
         renderer.draw(layer: layer, params: params)
+        hasDrawn = true
         if Perf.enabled {
             Perf.shared.split(pane: pane, update: perfDraw - perfGrid, draw: CACurrentMediaTime() - perfDraw)
         }
