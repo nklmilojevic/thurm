@@ -111,6 +111,15 @@ for f in "$STATICLIB" "${BINARIES[@]}"; do
     [[ -f "$RUST_OUT/$f" ]] || die "missing $RUST_OUT/$f"
 done
 
+# thurm-tailnet, the Go helper thurmd runs to serve over Tailscale ([tailscale]).
+TAILNET_BIN="$HERE/build/thurm-tailnet"
+GO_VERSION="$(sed -n 's/^go //p' "$ROOT/tailnet/go.mod")"
+command -v go >/dev/null || die "go not found: Go $GO_VERSION builds thurm-tailnet (nix develop has it)"
+log "go build thurm-tailnet (Go $GO_VERSION)"
+mkdir -p "$HERE/build"
+(cd "$ROOT/tailnet" && GOOS=darwin GOARCH=arm64 GOTOOLCHAIN="go$GO_VERSION" \
+    go build -trimpath -ldflags "-s -w" -o "$TAILNET_BIN" ./cmd/thurm-tailnet)
+
 # ---------------------------------------------------------------------------------------
 # 2. C header for the CThurm module (copied, not symlinked, so SwiftPM sees a real file).
 # ---------------------------------------------------------------------------------------
@@ -161,6 +170,8 @@ SPARKLE="$(find "$HERE/.build/artifacts" -path '*Sparkle.xcframework/macos-*/Spa
 ditto "$SPARKLE" "$APP/Contents/Frameworks/Sparkle.framework"
 # thurmd runs it for the `[ai]` features (Apple Intelligence's on-device model).
 cp "$INTELLIGENCE_BIN" "$APP/Contents/Helpers/thurm-intelligence"
+# Found next to thurmd, which runs it when [tailscale] is on.
+cp "$TAILNET_BIN" "$APP/Contents/Helpers/thurm-tailnet"
 # A Nix toolchain first on PATH links Nix's libiconv, which macOS refuses to load into a signed
 # app: an installed thurmd would never start (and a running daemon could not be upgraded).
 for f in "$APP/Contents/MacOS/Thurm" "$APP"/Contents/Helpers/*; do
@@ -207,7 +218,7 @@ fi
 # The Icon Composer icon: Assets.car for macOS 26 and later, AppIcon.icns for older systems.
 "$HERE/compile-icon.sh" "$APP/Contents/Resources"
 # Thurm's license and the notices of everything it includes.
-python3 "$ROOT/scripts/third-party-licenses.py"
+python3 "$ROOT/scripts/third-party-licenses.py" --with-go
 cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_LICENSES" "$APP/Contents/Resources/"
 
 # ---------------------------------------------------------------------------------------
@@ -230,7 +241,7 @@ if [[ -n "$IDENTITY" ]]; then
     sign "$FW/Updater.app"
     sign "$APP/Contents/Frameworks/Sparkle.framework"
     # thurmd too: started at login it is the process macOS holds responsible for the shells.
-    for b in "${BINARIES[@]}" thurm-intelligence; do
+    for b in "${BINARIES[@]}" thurm-intelligence thurm-tailnet; do
         if [[ "$b" == thurmd ]]; then
             sign --entitlements "$ENTITLEMENTS" "$APP/Contents/Helpers/$b"
         else

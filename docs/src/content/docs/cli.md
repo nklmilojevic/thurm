@@ -78,6 +78,8 @@ Use `thurm COMMAND --help` for the full argument list.
 | `layout [export\|apply]` | Print layout JSON, export a tab template, or apply a template; see [Layouts and events](/workflows/) |
 | `daemon ACTION` | Control the daemon; see [Sessions](/sessions/) |
 | `socket-path` | Print the daemon socket path |
+| `tailscale status\|on\|off\|login\|logout\|rename` | Serve the daemon over Tailscale; see [Serve over Tailscale](/remote/#serve-over-tailscale) |
+| `whoami` | Show who the daemon sees on this connection |
 | `remote add\|list\|remove\|status\|install` | Manage remote hosts; see [Remote workspaces](/remote/) |
 | `remote doctor [NAME]` | Check what a host needs and offer fixes; `--fix`, `--yes` |
 | `handoff` | Hand the repository to a remote agent; `--remote NAME`, `--preset`, `--branch agent/NAME`, `--list`, `--fetch ID`, `--cleanup ID` |

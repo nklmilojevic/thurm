@@ -59,7 +59,7 @@ jobs:
           area release-scripts '^(macos/build\.sh$|macos/compile-icon\.sh$|macos/package-dmg\.sh$|macos/release/|\.github/workflows/ci\.yml$)'
           area app-icon '^(macos/Resources/AppIcon\.icon/|macos/compile-icon\.sh$|macos/build\.sh$|\.github/workflows/ci\.yml$)'
           area docs '^(docs/|config\.example\.toml$|\.github/workflows/ci\.yml$)'
-          area go '^(tailnet/|\.github/workflows/ci\.yml$)'
+          area go '^(tailnet/|scripts/third-party-licenses\.py$|\.github/workflows/ci\.yml$)'
           cat "$GITHUB_OUTPUT"
 
   rust:
@@ -172,6 +172,13 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: go build -trimpath -o /dev/null ./cmd/thurm-tailnet
+      # The macOS app's THIRD_PARTY_LICENSES lists the modules it links (cargo metadata too).
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: 1.99.0
+      - name: Third-party licenses
+        working-directory: .
+        run: python3 scripts/third-party-licenses.py --with-go
 
   linux-app:
     # The Linux app (crates/thurm-gtk, GTK 4 + libadwaita), and a headless run of it.

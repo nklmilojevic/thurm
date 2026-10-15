@@ -6,9 +6,13 @@ the release workflow generate it at build time, so dependency updates never leav
 Crates come from `cargo metadata` (the normal dependencies of thurm-ffi, thurm-daemon and
 thurm-cli on the shipped targets) and their own license files. Identical texts are printed
 once, with every crate that uses them. Other components are listed in EXTRA.
+
+With --with-go (the macOS app, which bundles thurm-tailnet), also the Go modules linked into
+thurm-tailnet (`go list -deps`) and Go's standard library.
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -85,7 +89,41 @@ def license_texts(pkg):
     return [f.read_text(errors="replace").strip() for f in files]
 
 
-def render():
+def go_modules():
+    """(label, license texts) of Go's standard library and every module linked into
+    thurm-tailnet for macOS."""
+    env = {**os.environ, "GOOS": "darwin", "GOARCH": "arm64"}
+
+    def go(*args):
+        return subprocess.run(["go", *args], cwd=ROOT / "tailnet", env=env, check=True,
+                              capture_output=True, text=True).stdout
+
+    # Kept here: not every Go installation ships its LICENSE (Nix's doesn't).
+    found = [(f"Go standard library {go('env', 'GOVERSION').strip()} (BSD-3-Clause)",
+              [(ROOT / "licenses/go-BSD-3-Clause.txt").read_text(errors="replace").strip()])]
+    fmt = "{{with .Module}}{{if not .Main}}{{.Path}}\t{{.Version}}\t{{.Dir}}{{end}}{{end}}"
+    modules = sorted({tuple(line.split("\t")) for line in go("list", "-deps", "-f", fmt, "./cmd/thurm-tailnet").splitlines()
+                      if line})
+    for path, version, directory in modules:
+        root = Path(directory)
+        files = sorted(p for p in root.iterdir() if p.is_file() and LICENSE_FILE.match(p.name))
+        found.append((f"{path} {version}", [f.read_text(errors="replace").strip() for f in files]))
+    return found
+
+
+def grouped(entries):
+    """License text -> labels, and the labels without a license file."""
+    groups = {}
+    missing = []
+    for label, texts in entries:
+        if not texts:
+            missing.append(label)
+        for text in texts:
+            groups.setdefault(text, []).append(label)
+    return groups, missing
+
+
+def render(with_go=False):
     groups = {}  # license text -> [crate labels]
     missing = []
     for pkg in sorted(shipped_packages().values(), key=lambda p: (p["name"], p["version"])):
@@ -115,11 +153,18 @@ def render():
         out += ["-" * 80, *labels, "-" * 80, "", text, ""]
     if missing:
         out += ["-" * 80, "Crates without a license file (license as declared):", *missing, ""]
+    if with_go:
+        go_groups, go_missing = grouped(go_modules())
+        out += [rule, "Go modules (thurm-tailnet, macOS app)", rule, ""]
+        for text, labels in go_groups.items():
+            out += ["-" * 80, *labels, "-" * 80, "", text, ""]
+        if go_missing:
+            out += ["-" * 80, "Go modules without a license file:", *go_missing, ""]
     return "\n".join(out).rstrip() + "\n"
 
 
 def main():
-    OUT.write_text(render())
+    OUT.write_text(render(with_go="--with-go" in sys.argv[1:]))
     return 0
 
 

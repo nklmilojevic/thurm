@@ -14,9 +14,10 @@ Shortcuts on this page are the macOS ones. On Linux, ⌘⇧P is Ctrl+Shift+P, �
 Ctrl+Alt+A, ⌘⇧O is Ctrl+Alt+O, and ⌘-click is Ctrl+click; **Thurm › Remotes…** is in
 the main menu (☰). See [Use Thurm](/usage/) for the full list.
 
-The connection is the system `ssh`, one tunnel per host. Thurm has no network
-layer, relay, or account of its own; Tailscale or any other network works
-underneath.
+The connection is the system `ssh`, one tunnel per host. Thurm has no relay or
+account of its own; Tailscale or any other network works underneath. Your phone
+and other devices can also reach a daemon over Tailscale without ssh: see
+[Serve over Tailscale](#serve-over-tailscale).
 
 ## Add a host
 
@@ -137,6 +138,64 @@ your tailnet policy (tags are examples):
 
 With no grant from `tag:devbox` to `tag:mac`, nothing on the devbox can open a
 connection to your Mac.
+
+## Serve over Tailscale
+
+`thurmd` can also be a device on your tailnet itself, so your iPhone and other
+devices reach it without Remote Login, `sshd` or `authorized_keys`:
+
+```sh
+thurm tailscale on
+```
+
+The first time, it prints a sign-in link (also under **Settings › Remotes ›
+Tailscale**, and as a notification). Sign in with your Tailscale account and the
+daemon joins your tailnet as `thurm` (`--hostname` changes the name), serving
+`wss://thurm.YOUR-TAILNET.ts.net/v1/connect` with the tailnet's HTTPS
+certificate. **Pair iPhone** then puts that address in the pairing code; the app
+connects there first, with ssh as the fallback. The phone needs the Tailscale
+app, signed in to the same tailnet.
+
+`thurm tailscale on` lasts until the daemon restarts. To keep it on, turn on
+**Serve over Tailscale** in Settings, or:
+
+```sh
+thurm set tailscale.enabled true
+```
+
+Who may connect:
+
+- **Only your account** (the default): the account that signed the device in.
+  Tailscale tells the daemon who each connection is from; anyone else is
+  refused, and so are tagged devices, which have no owner.
+- **Every tailnet member**: `allow_tailnet_members = true` (or
+  `--allow-tailnet-members`). Needed to enroll with ACL tags
+  (`advertise_tags`), since a tagged device has no owner.
+
+HTTPS needs MagicDNS and HTTPS certificates turned on for your tailnet (the
+admin console's DNS page); `thurm tailscale status` says when one is off.
+
+| Command | What it does |
+| --- | --- |
+| `thurm tailscale status` | State, address, account, and the sign-in link while one is needed |
+| `thurm tailscale off` | Stop serving; tailnet connections close, panes keep running, the device stays signed in |
+| `thurm tailscale login` | Ask for a new sign-in link |
+| `thurm tailscale logout` | Sign the device out and forget it |
+| `thurm tailscale rename NAME` | Rename the device without signing in again |
+| `thurm whoami` | Who the daemon sees on this connection |
+
+To enroll without a browser, put an auth key in a file and set
+`auth_key_file` (or pass `--auth-key-file`). The device's keys are kept in the
+daemon's state directory (`tailscale/`), never in the config.
+
+If your Mac already runs Tailscale, the daemon can listen through it instead of
+being a device of its own: `host_listen = ":7297"` serves on this Mac's tailnet
+addresses, and `serve_socket = true` gives `tailscale serve` a socket to proxy
+to (`thurm tailscale status` prints the command). Both admit only this Mac's
+owner unless `host_allow_identified = true`.
+
+The Tailscale part is a separate program, `thurm-tailnet`, next to `thurmd` in
+the app; the daemon starts it only while serving over Tailscale.
 
 ## What runs where
 

@@ -90,12 +90,21 @@ enum PhonePairing {
         remotes.filter(\.inCode)
     }
 
+    /// Whether there is a code to show: the phone needs this Mac's ssh address and host keys, or
+    /// its Tailscale address, which needs neither (as `PairingPayload` checks in the iOS app).
+    static func canPair(host: String, hostKeys: [String], tailnet: String?) -> Bool {
+        (!host.isEmpty && !hostKeys.isEmpty) || !(tailnet ?? "").isEmpty
+    }
+
     /// What the QR code carries (see `PairingPayload` in the iOS app). Remote hosts not checked
-    /// (or not usable) are left out.
+    /// (or not usable) are left out. `tailnet` is this Mac's daemon over Tailscale
+    /// (`wss://…/v1/connect`): an app that knows it connects there first, and over ssh when it
+    /// can't; older apps read only the ssh fields.
     static func payload(name: String, host: String, port: Int, user: String, hostKeys: [String],
-                        relay: String?, code: String?, remotes: [RemoteHost] = []) -> String {
+                        relay: String?, code: String?, remotes: [RemoteHost] = [], tailnet: String? = nil) -> String {
         var d: [String: Any] = ["v": 1, "name": name, "host": host, "port": port, "user": user,
                                 "host_keys": hostKeys]
+        if let tailnet, !tailnet.isEmpty { d["tailnet"] = ["url": tailnet] }
         if let relay, !relay.isEmpty { d["relay"] = relay }
         if let code, !code.isEmpty { d["code"] = code }
         let remotes = inCode(remotes)
@@ -280,6 +289,7 @@ struct PairPhoneSheet: View {
     private let hostKeys = PhonePairing.hostKeyFingerprints()
     private let user = NSUserName()
     private let push = SessionManager.shared.config.push
+    @ObservedObject private var tailscale = TailscaleService.shared
 
     private enum KeyResult: Equatable {
         case adding
@@ -297,24 +307,40 @@ struct PairPhoneSheet: View {
     private var link: String {
         PhonePairing.payload(name: Host.current().localizedName ?? host, host: host, port: port,
                              user: user, hostKeys: hostKeys, relay: push.relay, code: push.code,
-                             remotes: remoteHosts)
+                             remotes: remoteHosts, tailnet: tailscale.status?.pairingURL)
+    }
+
+    private var canPair: Bool {
+        PhonePairing.canPair(host: host, hostKeys: hostKeys, tailnet: tailscale.status?.pairingURL)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Pair iPhone or iPad").font(.title2.bold())
+            if let url = tailscale.status?.pairingURL {
+                Label("The app connects over Tailscale (\(URL(string: url)?.host ?? url)), with ssh as the fallback.",
+                      systemImage: "network")
+                    .foregroundStyle(.secondary)
+            }
             if remoteLogin == false {
-                Label("Remote Login is off. Turn it on in System Settings › General › Sharing so the app can connect.",
+                Label(tailscale.status?.pairingURL == nil
+                      ? "Remote Login is off. Turn it on in System Settings › General › Sharing so the app can connect."
+                      : "Remote Login is off: the app has no fallback when Tailscale is off on the phone.",
                       systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             }
             if hostKeys.isEmpty {
-                Label("This Mac's ssh host keys could not be read (/etc/ssh).", systemImage: "xmark.octagon")
-                    .foregroundStyle(.red)
+                if tailscale.status?.pairingURL == nil {
+                    Label("This Mac's ssh host keys could not be read (/etc/ssh).", systemImage: "xmark.octagon")
+                        .foregroundStyle(.red)
+                } else {
+                    Label("This Mac's ssh host keys could not be read (/etc/ssh): the app connects only over "
+                          + "Tailscale, with no ssh fallback.", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
             }
             HStack(alignment: .top, spacing: 20) {
-                if let image = PhonePairing.qrImage(link, remotes: remoteHosts.filter(\.inCode).count),
-                   !host.isEmpty, !hostKeys.isEmpty {
+                if canPair, let image = PhonePairing.qrImage(link, remotes: remoteHosts.filter(\.inCode).count) {
                     Image(nsImage: image)
                         .interpolation(.none)
                         .resizable()
@@ -336,8 +362,8 @@ struct PairPhoneSheet: View {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(link, forType: .string)
                     }
-                    // Without the host keys the phone can never trust this Mac.
-                    .disabled(host.isEmpty || hostKeys.isEmpty)
+                    // Without the host keys the phone can never trust this Mac over ssh.
+                    .disabled(!canPair)
                 }
             }
             remoteHostRows
@@ -369,6 +395,7 @@ struct PairPhoneSheet: View {
             }
             checkRemoteLogin()
             loadRemoteHosts()
+            tailscale.refresh()
         }
     }
 

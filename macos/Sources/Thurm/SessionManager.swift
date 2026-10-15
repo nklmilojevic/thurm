@@ -463,6 +463,7 @@ final class SessionManager: NSObject, CoreDelegate {
             }
         }
         sessionReady = true
+        TailscaleService.shared.refresh()
         saveLayoutNow(force: true)
         focusChanged()
         onSessionReady?()
@@ -908,6 +909,7 @@ final class SessionManager: NSObject, CoreDelegate {
         Core.shared.reloadRemoteEngines()
         Remotes.shared.configChanged()
         Updater.shared.configChanged()
+        TailscaleService.shared.configChanged()
         let quickError = QuickTerminal.shared.configChanged()
         let view = currentController?.content.focusedView
         if let err = config.loadError {
@@ -1148,6 +1150,7 @@ final class SessionManager: NSObject, CoreDelegate {
             c.updateTitle()
         }
         currentController?.content.focusedView?.showToast("Reconnected")
+        TailscaleService.shared.refresh()
         saveLayoutNow(force: true)
         focusChanged()
     }
@@ -1168,6 +1171,8 @@ final class SessionManager: NSObject, CoreDelegate {
                 removePaneFromUI(id)
                 updateDockBadge()
             }
+        case "TailscaleStatusChanged":
+            if host == localHost { TailscaleService.shared.update(payload) }
         case "PaneRead":
             // Read here or on a phone: off the Dock badge and out of Notification Center.
             if let id = key {

@@ -345,8 +345,14 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
+      # thurm-tailnet, the Tailscale helper bundled next to thurmd.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tailnet/go.mod
+          cache-dependency-path: tailnet/go.sum
       - name: Toolchain versions
         run: |
+          go version
           xcodebuild -version
           swift --version
           sw_vers
