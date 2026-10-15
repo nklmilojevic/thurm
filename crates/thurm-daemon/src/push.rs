@@ -105,8 +105,9 @@ pub struct Notice {
 
 /// Locks: `devices` before `follows`, never the other way round.
 pub struct Pusher {
-    /// `[push] relay` is set: off, nothing is registered or sent.
-    enabled: AtomicBool,
+    /// `[push] relay` is set: off, nothing is registered or sent. The push thread checks it
+    /// before each post, so what was queued before push went off is dropped.
+    enabled: Arc<AtomicBool>,
     /// When each pane last sent a notice (see `notify`).
     last_notice: Mutex<std::collections::HashMap<PaneId, std::time::Instant>>,
     devices: Mutex<Vec<Device>>,
@@ -142,7 +143,7 @@ impl Pusher {
             .unwrap_or_default();
         let (tx, rx) = bounded::<Job>(64);
         let pusher = Pusher {
-            enabled: AtomicBool::new(enabled),
+            enabled: Arc::new(AtomicBool::new(enabled)),
             last_notice: Mutex::new(std::collections::HashMap::new()),
             devices: Mutex::new(devices),
             follows: Mutex::new(follows),
@@ -152,6 +153,7 @@ impl Pusher {
             tx,
         };
         let activities = Arc::clone(&pusher.activities);
+        let on = Arc::clone(&pusher.enabled);
         std::thread::Builder::new()
             .name("thurm-push".into())
             .spawn(move || {
@@ -159,17 +161,18 @@ impl Pusher {
                     .timeout_global(Some(Duration::from_secs(10)))
                     .build()
                     .into();
+                let on = || on.load(Ordering::Relaxed);
                 for job in rx {
                     if let Job::Notice(notice, devices) = job {
-                        for d in devices {
-                            if let Err(e) = post(&agent, &d, "/v1/push", &body(&d, &notice)) {
+                        for d in devices.iter().take_while(|_| on()) {
+                            if let Err(e) = post(&agent, d, "/v1/push", &body(d, &notice)) {
                                 log::warn!("push to {} for {}: {e}", d.relay, d.name);
                             }
                         }
                     }
                     // After every job: a wake-up lost to a full queue is made up by the next.
                     let waiting = std::mem::take(&mut *activities.lock());
-                    for job in waiting {
+                    for job in waiting.into_iter().take_while(|_| on()) {
                         let body =
                             activity_body(&job.device, &job.token, job.pane, &job.state, job.end);
                         if let Err(e) = post(&agent, &job.device, "/v1/activity", &body) {
@@ -642,6 +645,60 @@ mod tests {
         p.unregister("d2").unwrap();
         p.unregister("d3").unwrap();
         assert!(Pusher::new(&dir, true).devices.lock().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What was queued before push went off is not posted after.
+    #[test]
+    fn turning_push_off_drops_what_is_queued() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = std::env::temp_dir().join(format!("thurm-push-queued-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A relay that holds its first answer until told to go on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (posted, posts) = crossbeam_channel::unbounded();
+        let (go, wait) = crossbeam_channel::unbounded::<()>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                    line.clear();
+                }
+                let _ = posted.send(());
+                let _ = wait.recv();
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let p = Pusher::new(&dir, true);
+        p.register(Device {
+            device: "d1".into(),
+            relay,
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        })
+        .unwrap();
+        let notice = |pane| Notice {
+            pane,
+            title: "Codex".into(),
+            permission: None,
+        };
+        p.notify(notice(1), &[]);
+        posts
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first notice");
+        // Queued while the relay holds the first one.
+        p.notify(notice(2), &[]);
+        p.set_enabled(false);
+        go.send(()).unwrap();
+        go.send(()).unwrap();
+        assert!(
+            posts.recv_timeout(Duration::from_millis(500)).is_err(),
+            "posted after push went off"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
