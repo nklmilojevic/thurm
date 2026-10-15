@@ -2044,6 +2044,20 @@ impl Daemon {
         *self.last_activity.lock() = Instant::now();
         let shutting_down = matches!(req, Request::Shutdown { .. });
         let result = match req {
+            // Answered once no post to the forgotten devices can still be on its way, which can
+            // take the relay's timeout: off this client's request thread.
+            req @ (Request::UnregisterPushDevice { .. } | Request::RevokePhone { .. }) => {
+                let daemon = self.clone();
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    let result = daemon.dispatch(&client, req);
+                    daemon.push.settle();
+                    if id != 0 {
+                        client.send(ServerMessage::Response { id, result });
+                    }
+                });
+                return;
+            }
             Request::AgentPrompt {
                 pane,
                 text,

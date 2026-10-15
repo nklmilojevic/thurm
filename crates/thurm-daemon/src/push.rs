@@ -117,6 +117,8 @@ pub struct Pusher {
     /// than in the bounded queue, so a busy relay delays them but never loses one (an end
     /// least of all).
     activities: Arc<Mutex<Vec<ActivityJob>>>,
+    /// See `Store::sending`.
+    sending: Arc<Mutex<()>>,
     path: PathBuf,
     follows_path: PathBuf,
     tx: Sender<Job>,
@@ -149,18 +151,14 @@ impl Pusher {
             devices: Arc::new(Mutex::new(devices)),
             follows: Arc::new(Mutex::new(follows)),
             activities: Arc::new(Mutex::new(Vec::new())),
+            sending: Arc::new(Mutex::new(())),
             path,
             follows_path,
             tx,
         };
         let activities = Arc::clone(&pusher.activities);
         let on = Arc::clone(&pusher.enabled);
-        let store = Store {
-            devices: Arc::clone(&pusher.devices),
-            follows: Arc::clone(&pusher.follows),
-            path: pusher.path.clone(),
-            follows_path: pusher.follows_path.clone(),
-        };
+        let store = pusher.store();
         std::thread::Builder::new()
             .name("thurm-push".into())
             .spawn(move || {
@@ -172,6 +170,7 @@ impl Pusher {
                 for job in rx {
                     if let Job::Notice(notice, devices) = job {
                         for d in devices.iter().take_while(|_| on()) {
+                            let _sending = store.sending.lock();
                             // Queued before it was revoked or registered again: not for it now.
                             if !store.registered(d) {
                                 continue;
@@ -183,6 +182,7 @@ impl Pusher {
                     // After every job: a wake-up lost to a full queue is made up by the next.
                     let waiting = std::mem::take(&mut *activities.lock());
                     for job in waiting.into_iter().take_while(|_| on()) {
+                        let _sending = store.sending.lock();
                         if !store.registered(&job.device) {
                             continue;
                         }
@@ -247,7 +247,14 @@ impl Pusher {
             follows: Arc::clone(&self.follows),
             path: self.path.clone(),
             follows_path: self.follows_path.clone(),
+            sending: Arc::clone(&self.sending),
         }
+    }
+
+    /// Waits for the post in flight, if any: after `unregister` or `revoke_named`, nothing more
+    /// reaches the devices they forgot. A post takes at most the relay timeout (10 s).
+    pub fn settle(&self) {
+        drop(self.sending.lock());
     }
 
     /// Forgets every device registered under the phone name `name` (spaces as dashes, as its
@@ -416,6 +423,9 @@ struct Store {
     follows: Arc<Mutex<Vec<Follow>>>,
     path: PathBuf,
     follows_path: PathBuf,
+    /// Held by the push thread from checking a post's device to the post's end: waiting for it
+    /// (`Pusher::settle`) means no post decided before a revocation is still on its way.
+    sending: Arc<Mutex<()>>,
 }
 
 impl Store {
@@ -853,9 +863,23 @@ mod tests {
         p.notify(notice(2), &[]);
         p.follow("d1", 3, "aa".into(), Some(working)).unwrap();
         assert_eq!(p.revoke_named("iPhone").unwrap(), ["d1"]);
+        // Settling waits for the post in flight, and only for it.
+        let p = Arc::new(p);
+        let (settled, done) = crossbeam_channel::unbounded();
+        let settling = Arc::clone(&p);
+        std::thread::spawn(move || {
+            settling.settle();
+            let _ = settled.send(());
+        });
+        assert!(
+            done.recv_timeout(Duration::from_millis(300)).is_err(),
+            "settled with a post in flight"
+        );
         for _ in 0..3 {
             go.send(()).unwrap();
         }
+        done.recv_timeout(Duration::from_secs(10))
+            .expect("never settled");
         assert!(
             posts.recv_timeout(Duration::from_millis(500)).is_err(),
             "posted to a revoked phone"

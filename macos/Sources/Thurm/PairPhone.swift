@@ -292,7 +292,7 @@ struct PairPhoneSheet: View {
         }
         devices = PhonePairing.devices()
         message = "Revoked \(device.name)."
-        Core.shared.requestAsync(object: ["RevokePhone": ["name": device.name]], timeout: 5) { resp in
+        Core.shared.requestAsync(object: ["RevokePhone": ["name": device.name]], timeout: 15) { resp in
             if resp == nil || (resp as? [String: Any])?["error"] != nil {
                 let why = ((resp as? [String: Any])?["error"] as? String) ?? "the daemon did not answer"
                 message = "Revoked \(device.name)'s key, but it may still get notifications: \(why)"
