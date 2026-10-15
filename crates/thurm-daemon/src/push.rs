@@ -110,8 +110,9 @@ pub struct Pusher {
     enabled: Arc<AtomicBool>,
     /// When each pane last sent a notice (see `notify`).
     last_notice: Mutex<std::collections::HashMap<PaneId, std::time::Instant>>,
-    devices: Mutex<Vec<Device>>,
-    follows: Mutex<Vec<Follow>>,
+    /// Shared with the push thread, which forgets a device the relay no longer knows.
+    devices: Arc<Mutex<Vec<Device>>>,
+    follows: Arc<Mutex<Vec<Follow>>>,
     /// Live Activity updates not posted yet, the latest per activity. They wait here rather
     /// than in the bounded queue, so a busy relay delays them but never loses one (an end
     /// least of all).
@@ -145,8 +146,8 @@ impl Pusher {
         let pusher = Pusher {
             enabled: Arc::new(AtomicBool::new(enabled)),
             last_notice: Mutex::new(std::collections::HashMap::new()),
-            devices: Mutex::new(devices),
-            follows: Mutex::new(follows),
+            devices: Arc::new(Mutex::new(devices)),
+            follows: Arc::new(Mutex::new(follows)),
             activities: Arc::new(Mutex::new(Vec::new())),
             path,
             follows_path,
@@ -154,6 +155,12 @@ impl Pusher {
         };
         let activities = Arc::clone(&pusher.activities);
         let on = Arc::clone(&pusher.enabled);
+        let store = Store {
+            devices: Arc::clone(&pusher.devices),
+            follows: Arc::clone(&pusher.follows),
+            path: pusher.path.clone(),
+            follows_path: pusher.follows_path.clone(),
+        };
         std::thread::Builder::new()
             .name("thurm-push".into())
             .spawn(move || {
@@ -165,9 +172,8 @@ impl Pusher {
                 for job in rx {
                     if let Job::Notice(notice, devices) = job {
                         for d in devices.iter().take_while(|_| on()) {
-                            if let Err(e) = post(&agent, d, "/v1/push", &body(d, &notice)) {
-                                log::warn!("push to {} for {}: {e}", d.relay, d.name);
-                            }
+                            let r = post(&agent, d, "/v1/push", &body(d, &notice));
+                            store.check(d, "push", r);
                         }
                     }
                     // After every job: a wake-up lost to a full queue is made up by the next.
@@ -175,13 +181,8 @@ impl Pusher {
                     for job in waiting.into_iter().take_while(|_| on()) {
                         let body =
                             activity_body(&job.device, &job.token, job.pane, &job.state, job.end);
-                        if let Err(e) = post(&agent, &job.device, "/v1/activity", &body) {
-                            log::warn!(
-                                "live activity to {} for {}: {e}",
-                                job.device.relay,
-                                job.device.name
-                            );
-                        }
+                        let r = post(&agent, &job.device, "/v1/activity", &body);
+                        store.check(&job.device, "live activity", r);
                     }
                 }
             })
@@ -230,31 +231,31 @@ impl Pusher {
     }
 
     pub fn unregister(&self, device: &str) -> Result<(), String> {
-        let mut devices = self.devices.lock();
-        devices.retain(|d| d.device != device);
-        self.save(&devices)?;
-        let mut follows = self.follows.lock();
-        follows.retain(|f| f.device != device);
-        save_json(&self.follows_path, &*follows)
+        self.store().forget(&[device.to_owned()])
+    }
+
+    fn store(&self) -> Store {
+        Store {
+            devices: Arc::clone(&self.devices),
+            follows: Arc::clone(&self.follows),
+            path: self.path.clone(),
+            follows_path: self.follows_path.clone(),
+        }
     }
 
     /// Forgets every device registered under the phone name `name` (spaces as dashes, as its
     /// device key's comment has it) and its activities. Returns their ids.
     pub fn revoke_named(&self, name: &str) -> Result<Vec<String>, String> {
-        let mut devices = self.devices.lock();
-        let gone: Vec<String> = devices
+        let gone: Vec<String> = self
+            .devices
+            .lock()
             .iter()
             .filter(|d| d.name.replace(' ', "-") == name)
             .map(|d| d.device.clone())
             .collect();
-        if gone.is_empty() {
-            return Ok(gone);
+        if !gone.is_empty() {
+            self.store().forget(&gone)?;
         }
-        devices.retain(|d| !gone.contains(&d.device));
-        self.save(&devices)?;
-        let mut follows = self.follows.lock();
-        follows.retain(|f| !gone.contains(&f.device));
-        save_json(&self.follows_path, &*follows)?;
         Ok(gone)
     }
 
@@ -402,6 +403,53 @@ impl Pusher {
     }
 }
 
+/// The registered devices and their activities, as saved.
+struct Store {
+    devices: Arc<Mutex<Vec<Device>>>,
+    follows: Arc<Mutex<Vec<Follow>>>,
+    path: PathBuf,
+    follows_path: PathBuf,
+}
+
+impl Store {
+    /// Forgets the devices `gone` and their activities.
+    fn forget(&self, gone: &[String]) -> Result<(), String> {
+        let mut devices = self.devices.lock();
+        devices.retain(|d| !gone.contains(&d.device));
+        save_json(&self.path, &*devices)?;
+        let mut follows = self.follows.lock();
+        follows.retain(|f| !gone.contains(&f.device));
+        save_json(&self.follows_path, &*follows)
+    }
+
+    /// After a post for `device`: the relay no longer knowing it (the phone deleted it, turning
+    /// notifications off) means it is gone for good, here too.
+    fn check(&self, device: &Device, what: &str, result: Result<(), PostError>) {
+        match result {
+            Ok(()) => {}
+            Err(PostError::Gone) => {
+                log::info!(
+                    "{what} to {}: the relay no longer knows {}; forgetting it",
+                    device.relay,
+                    device.name
+                );
+                if let Err(e) = self.forget(std::slice::from_ref(&device.device)) {
+                    log::warn!("forget push device {}: {e}", device.name);
+                }
+            }
+            Err(PostError::Other(e)) => {
+                log::warn!("{what} to {} for {}: {e}", device.relay, device.name);
+            }
+        }
+    }
+}
+
+enum PostError {
+    /// 404: the relay has no such device.
+    Gone,
+    Other(String),
+}
+
 /// Writes `value` to `path` as JSON, 0600, atomically.
 fn save_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
     {
@@ -523,7 +571,7 @@ pub fn signature(secret: &str, timestamp: u64, body: &str) -> String {
         .collect()
 }
 
-fn post(agent: &ureq::Agent, device: &Device, path: &str, body: &str) -> Result<(), String> {
+fn post(agent: &ureq::Agent, device: &Device, path: &str, body: &str) -> Result<(), PostError> {
     let ts = now_secs();
     let url = format!("{}{path}", device.relay.trim_end_matches('/'));
     agent
@@ -533,7 +581,10 @@ fn post(agent: &ureq::Agent, device: &Device, path: &str, body: &str) -> Result<
         .header("X-Thurm-Signature", signature(&device.secret, ts, body))
         .send(body)
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(404) => PostError::Gone,
+            e => PostError::Other(e.to_string()),
+        })
 }
 
 #[cfg(test)]
@@ -826,6 +877,61 @@ mod tests {
             .collect();
         assert_eq!(left, ["d3"]);
         assert!(again.follows.lock().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The phone deleted its device at the relay (notifications off): the next post finds it
+    /// gone, and the daemon forgets it too.
+    #[test]
+    fn a_device_the_relay_no_longer_knows_is_forgotten() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = std::env::temp_dir().join(format!("thurm-push-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                    line.clear();
+                }
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let p = Pusher::new(&dir, true);
+        for (id, relay) in [("d1", relay.as_str()), ("d2", "https://push.example.net")] {
+            p.register(Device {
+                device: id.into(),
+                relay: relay.into(),
+                secret: "s".repeat(32),
+                host: "studio".into(),
+                name: id.into(),
+            })
+            .unwrap();
+        }
+        p.follow("d1", 4, "aa".into(), None).unwrap();
+        let start = std::time::Instant::now();
+        p.notify(
+            Notice {
+                pane: 1,
+                title: "Codex".into(),
+                permission: Some(1),
+            },
+            &["d2".to_owned()],
+        );
+        while p.devices.lock().len() != 1 {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "still registered"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(p.devices.lock()[0].device, "d2", "only the gone device");
+        let again = Pusher::new(&dir, true);
+        assert_eq!(again.devices.lock().len(), 1, "forgotten on disk too");
+        assert!(again.follows.lock().iter().all(|f| f.device != "d1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
