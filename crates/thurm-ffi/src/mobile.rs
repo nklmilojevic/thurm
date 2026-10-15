@@ -1,5 +1,6 @@
 //! The iOS app's connections: a paired host's daemon over an in-process ssh session
-//! (`thurm-ssh`), with the device key held by the app (see `thurm_device_key`).
+//! (`thurm-ssh`), with the device key held by the app (see `thurm_device_key`), or over
+//! Tailscale where the daemon serves there (`thurm-tailnet-client`).
 
 use std::ffi::{c_char, c_void};
 use std::sync::Arc;
@@ -99,6 +100,49 @@ pub unsafe extern "C" fn thurm_ssh_connect(
     let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
         let remote =
             thurm_ssh::connect(&target, key, &name, on_ev, on_disc).map_err(|e| e.to_string())?;
+        let transport: Box<dyn std::any::Any + Send> = Box::new(remote.session);
+        Ok((remote.client, Some(transport)))
+    });
+    match connected {
+        Ok(c) => c,
+        Err(e) => {
+            set_err(err, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Connects to a daemon served over Tailscale: `url` is the pairing code's
+/// `wss://<device>.<tailnet>.ts.net/v1/connect`. The phone's own Tailscale carries it; the daemon
+/// admits this device by its Tailscale account. Blocks while connecting (at most a few seconds:
+/// a device whose Tailscale is off fails fast, to fall back to ssh), so call it off the main
+/// thread. NULL with `err` set on failure (free it); otherwise a client like `thurm_connect`'s,
+/// freed with `thurm_disconnect`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_tailnet_connect(
+    url: *const c_char,
+    client_name: *const c_char,
+    on_event: thurm_event_cb,
+    on_frame: thurm_frame_cb,
+    ctx: *mut c_void,
+    err: *mut *mut c_char,
+) -> *mut thurm_client {
+    let Some(url) = (unsafe { opt_str(url) }).map(str::to_owned) else {
+        set_err(err, "no address".into());
+        return std::ptr::null_mut();
+    };
+    let name = unsafe { opt_str(client_name) }
+        .unwrap_or("Thurm iOS")
+        .to_owned();
+    let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
+        let remote = thurm_tailnet_client::connect(
+            &url,
+            &name,
+            &[thurm_proto::CAP_MOBILE],
+            on_ev,
+            on_disc,
+        )
+        .map_err(|e| e.to_string())?;
         let transport: Box<dyn std::any::Any + Send> = Box::new(remote.session);
         Ok((remote.client, Some(transport)))
     });
