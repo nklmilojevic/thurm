@@ -58,7 +58,10 @@ fn accept(listener: UnixListener) -> UnixStream {
             daemon_pid: std::process::id(),
             restored: false,
             build: thurm_proto::BUILD.into(),
-            capabilities: Vec::new(),
+            capabilities: thurm_proto::CAPABILITIES
+                .iter()
+                .map(|c| (*c).to_owned())
+                .collect(),
         }),
     );
     stream

@@ -431,8 +431,12 @@ impl Client {
             .inspect_err(|_| {
                 let _ = closer.shutdown(std::net::Shutdown::Both);
             })?;
-        if let Response::Hello { version, .. } = hello
-            && !thurm_proto::protocol_compatible(version)
+        if let Response::Hello {
+            version,
+            capabilities,
+            ..
+        } = &hello
+            && !thurm_proto::hello_compatible(*version, capabilities)
         {
             let _ = closer.shutdown(std::net::Shutdown::Both);
             return Err(ClientError::Daemon(format!(
@@ -613,7 +617,10 @@ mod tests {
                                 daemon_pid: 1,
                                 restored: false,
                                 build: String::new(),
-                                capabilities: Vec::new(),
+                                capabilities: thurm_proto::CAPABILITIES
+                                    .iter()
+                                    .map(|c| (*c).to_owned())
+                                    .collect(),
                             }),
                         },
                     )
@@ -677,7 +684,10 @@ mod tests {
                             daemon_pid: 1,
                             restored: false,
                             build: String::new(),
-                            capabilities: Vec::new(),
+                            capabilities: thurm_proto::CAPABILITIES
+                                .iter()
+                                .map(|c| (*c).to_owned())
+                                .collect(),
                         }),
                     },
                 )
@@ -732,7 +742,10 @@ mod tests {
                         daemon_pid: 1,
                         restored: false,
                         build: String::new(),
-                        capabilities: Vec::new(),
+                        capabilities: thurm_proto::CAPABILITIES
+                            .iter()
+                            .map(|c| (*c).to_owned())
+                            .collect(),
                     },
                     Request::ListPanes => {
                         codec::write_message(

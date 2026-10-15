@@ -20,10 +20,11 @@ pub use tailnet::{Principal, PrincipalKind, TailscaleStatus};
 /// Bumped whenever the wire format changes incompatibly.
 ///
 /// Compatibility within a version: new `Request`, `Response` and `Event` variants go at the end
-/// of their enums (postcard encodes the variant index), and new fields only at the end of a
-/// struct, with `#[serde(default)]`. A daemon answers a request it doesn't know with an error
-/// and keeps the connection; a client skips a message it can't decode. Anything else (removing
-/// or reordering variants or fields) bumps this.
+/// of their enums (postcard encodes the variant index). A daemon answers a request it doesn't
+/// know with an error and keeps the connection; a client skips a message it can't decode.
+/// Fields cannot be added: postcard has no field tags, so a peer without the field fails on a
+/// message with it (and the other way round), `#[serde(default)]` or not. Carry new data in a
+/// new variant instead. Anything else (removing or reordering variants or fields) bumps this.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// The oldest peer this build still talks to. Apps and hosts update on different schedules (the
@@ -36,6 +37,13 @@ pub const MIN_COMPATIBLE_PROTOCOL: u32 = 18;
 /// checks the daemon's version in the `Hello` answer.
 pub fn protocol_compatible(version: u32) -> bool {
     version >= MIN_COMPATIBLE_PROTOCOL
+}
+
+/// Whether a daemon that answered `Hello` with `version` and `capabilities` can be talked to.
+/// Protocol 18 builds from before [`CAP_ACTIVE_SIZE`] send a [`PaneInfo`] without its `program`
+/// field, which this build cannot decode.
+pub fn hello_compatible(version: u32, capabilities: &[String]) -> bool {
+    protocol_compatible(version) && capabilities.iter().any(|c| c == CAP_ACTIVE_SIZE)
 }
 
 /// A desktop can reject a layout before making changes when it has no window.

@@ -164,4 +164,13 @@ mod tests {
         let event = crate::ServerMessage::Event(crate::Event::Bell { pane: 1 });
         assert_eq!(response_id(&postcard::to_stdvec(&event).unwrap()), None);
     }
+
+    #[test]
+    fn protocol_18_daemons_without_pane_program_are_refused() {
+        let ours: Vec<String> = CAPABILITIES.iter().map(|c| (*c).to_owned()).collect();
+        assert!(hello_compatible(PROTOCOL_VERSION, &ours));
+        let before = ["hello-capabilities", "temp-file", "remote-layout"].map(String::from);
+        assert!(!hello_compatible(18, &before));
+        assert!(!hello_compatible(17, &ours));
+    }
 }

@@ -168,7 +168,15 @@ pub fn ping(socket: &Path, timeout: Duration) -> Result<(u32, String), PingError
         match codec::read_message::<_, ServerMessage>(&mut r) {
             Ok(Some(ServerMessage::Response { id: 1, result })) => {
                 return match result {
-                    Ok(Response::Hello { version, build, .. }) => Ok((version, build)),
+                    Ok(Response::Hello {
+                        version,
+                        build,
+                        capabilities,
+                        ..
+                    }) if thurm_proto::hello_compatible(version, &capabilities) => {
+                        Ok((version, build))
+                    }
+                    Ok(Response::Hello { version, .. }) => Err(PingError::Protocol(version)),
                     Ok(other) => Err(PingError::Unreachable(format!("unexpected {other:?}"))),
                     Err(e) => match mismatched_protocol(&e) {
                         Some(v) => Err(PingError::Protocol(v)),
@@ -533,6 +541,12 @@ impl Inner {
         if version != PROTOCOL_VERSION {
             return Err(Failure::Upgrade(format!(
                 "the daemon on {} speaks protocol {version}, this app {PROTOCOL_VERSION}",
+                ssh.target
+            )));
+        }
+        if build.is_empty() {
+            return Err(Failure::Upgrade(format!(
+                "the daemon on {} is an older build this app cannot talk to",
                 ssh.target
             )));
         }

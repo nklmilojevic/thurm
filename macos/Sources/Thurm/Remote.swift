@@ -114,6 +114,9 @@ final class Remotes {
     var handoffErrors: [String: String] = [:]
 
     private var countdown: Timer?
+    /// Failed connects in a row through a tunnel that is up, and the hosts waiting to retry.
+    private var connectFailures: [HostId: Int] = [:]
+    private var connectRetries: [HostId: Bool] = [:]
     private var pathMonitor: NWPathMonitor?
     private var started = false
 
@@ -174,12 +177,12 @@ final class Remotes {
         statuses[s.name] = s
         let host = s.name
         if s.phase == "connected" {
-            if !Core.shared.isConnected(host) {
+            if !Core.shared.isConnected(host), connectRetries[host] == nil {
                 if let err = Core.shared.connectRemote(host, socket: s.socket) {
-                    tlog("connecting to \(host) through its tunnel: \(err)")
-                    thurm_remote_kick(host, true)
+                    connectFailed(host, err)
                 } else {
                     SessionManager.shared.remoteConnected(host)
+                    if Core.shared.isConnected(host) { connectFailures[host] = nil }
                 }
             }
         } else if Core.shared.isConnected(host) {
@@ -202,6 +205,24 @@ final class Remotes {
         SessionManager.shared.refreshSidebars()
         // The tunnel may still look alive; have it checked and replaced now.
         thurm_remote_kick(host, true)
+    }
+
+    /// Connecting to `host`'s daemon through a tunnel that is up failed (or its panes could not
+    /// be listed): try again after a growing delay, not straight away, which against a daemon
+    /// this build cannot talk to would loop on the main thread.
+    func connectFailed(_ host: HostId, _ why: String) {
+        Core.shared.disconnect(host)
+        let failures = (connectFailures[host] ?? 0) + 1
+        connectFailures[host] = failures
+        let delay = min(60, pow(2, Double(failures - 1)))
+        connectRetries[host] = true
+        tlog("connecting to \(host) through its tunnel: \(why); again in \(Int(delay)) s")
+        updateOverlays(host)
+        SessionManager.shared.refreshSidebars()
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            Remotes.shared.connectRetries[host] = nil
+            thurm_remote_kick(host, true)
+        }
     }
 
     private func tick() {
@@ -354,7 +375,7 @@ extension SessionManager {
     func remoteConnected(_ host: HostId) {
         sendAppearance(to: host)
         guard let fetched = fetchPanes(host: host) else {
-            Remotes.shared.connectionLost(host)
+            Remotes.shared.connectFailed(host, "its panes could not be listed")
             return
         }
         // Closes queued while it was away. They apply to the pane still running the process
