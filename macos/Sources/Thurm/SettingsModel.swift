@@ -203,7 +203,7 @@ struct SettingGroup {
 }
 
 enum SettingGroups {
-    private static let tables = ["colors": "Colors", "cursor": "Cursor"]
+    private static let tables = ["colors": "Colors", "cursor": "Cursor", "tailscale": "Tailscale"]
     private static let headingOrder = ["Theme", "Colors", "Cursor"]
 
     static func heading(for item: SettingItem) -> String? {

@@ -40,6 +40,7 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
     static let paneKey = "pane"
     static let hostKey = "host"
     static let permissionKey = "permission"
+    static let urlKey = "url"
 
     /// A coding agent's permission prompt, answerable from the notification.
     private static let permissionCategory = "agent-permission"
@@ -118,6 +119,24 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// Posts a notification of Thurm itself, not a pane's. One per `id`: a new one replaces it.
+    /// Clicking it opens `url`.
+    func post(id: String, title: String, body: String, url: URL?) {
+        guard isAvailable else { return }
+        requestAuthorizationIfNeeded()
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        if let url { content.userInfo = [Notifications.urlKey: url.absoluteString] }
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        if waitingForAuthorization != nil {
+            waitingForAuthorization?.append(request)
+        } else {
+            add(request)
+        }
+    }
+
     private func add(_ request: UNNotificationRequest) {
         UNUserNotificationCenter.current().add(request) { error in
             if let error = error {
@@ -169,6 +188,11 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
         let host = (info[Notifications.hostKey] as? String) ?? localHost
         let permission = jsonUInt64(info[Notifications.permissionKey])
         let action = response.actionIdentifier
+        if let url = (info[Notifications.urlKey] as? String).flatMap(URL.init(string:)) {
+            DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+            completionHandler()
+            return
+        }
         DispatchQueue.main.async {
             guard let id else { return }
             let pane = PaneKey(host, id)

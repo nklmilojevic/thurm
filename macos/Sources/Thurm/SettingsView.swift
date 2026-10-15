@@ -116,6 +116,8 @@ private struct DetailPane: View {
                                         ThemeRow(item: item, store: store, slot: .dark)
                                     } else if item.key == "remote" {
                                         RemoteHostRows(item: item, store: store)
+                                    } else if item.key == "tailscale.enabled" {
+                                        TailscaleRows(item: item, store: store)
                                     } else {
                                         SettingRow(item: item, store: store)
                                     }
@@ -185,7 +187,7 @@ private struct NoticeBar: View {
 
 /// A row: the label with its description on the left, the control in a column of its own on the
 /// right, and Reset (when settings.toml sets the value) after it.
-private struct SettingRow: View {
+struct SettingRow: View {
     let item: SettingItem
     let store: SettingsStore
 

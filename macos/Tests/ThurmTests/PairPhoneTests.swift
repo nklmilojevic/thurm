@@ -132,6 +132,38 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertEqual(d["host_keys"] as? [String], ["SHA256:abc"])
         XCTAssertNil(d["relay"])
         XCTAssertNil(d["remotes"], "no remote hosts, no key")
+        XCTAssertNil(d["tailnet"], "not serving over Tailscale, no key")
+    }
+
+    func testPairingLinkCarriesTheTailnetAddress() throws {
+        let link = PhonePairing.payload(name: "studio", host: "studio.tail.ts.net", port: 22, user: "me",
+                                        hostKeys: ["SHA256:abc"], relay: nil, code: nil,
+                                        tailnet: "wss://thurm.tail1234.ts.net/v1/connect")
+        let d = try decode(link)
+        let tailnet = try XCTUnwrap(d["tailnet"] as? [String: Any])
+        XCTAssertEqual(tailnet["url"] as? String, "wss://thurm.tail1234.ts.net/v1/connect")
+        XCTAssertEqual(d["host_keys"] as? [String], ["SHA256:abc"], "older apps still pair over ssh")
+    }
+
+    func testTailscaleStatusPairsOnlyOnceServingHTTPS() throws {
+        var json: [String: Any] = [
+            "state": "running", "hostname": "thurm", "dns_name": "thurm.tail1234.ts.net",
+            "url": "wss://thurm.tail1234.ts.net/v1/connect", "allow_tailnet_members": false,
+            "tags": [] as [String], "host_urls": [] as [String], "auth_url": NSNull(),
+            "account": ["login_name": "me@example.com", "display_name": "Me"],
+            "https": ["state": "provisioning", "error": NSNull()],
+        ]
+        let provisioning = try XCTUnwrap(TailscaleStatus(json: json))
+        XCTAssertEqual(provisioning.account, "me@example.com")
+        XCTAssertNil(provisioning.pairingURL, "no certificate yet")
+        json["https"] = ["state": "ready"]
+        XCTAssertEqual(TailscaleStatus(json: json)?.pairingURL, "wss://thurm.tail1234.ts.net/v1/connect")
+        json["state"] = "needs_login"
+        json["auth_url"] = "https://login.tailscale.com/a/x"
+        let login = try XCTUnwrap(TailscaleStatus(json: json))
+        XCTAssertNil(login.pairingURL)
+        XCTAssertEqual(login.authURL?.host, "login.tailscale.com")
+        XCTAssertNil(TailscaleStatus(json: ["hostname": "x"]), "no state")
     }
 
     private func decode(_ link: String) throws -> [String: Any] {
