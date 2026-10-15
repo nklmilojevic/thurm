@@ -244,6 +244,55 @@ fn mobile_clients_get_notifications_but_no_window_commands() {
     }
 }
 
+/// An `Env` with push on (`[push] relay` set; each device names its own relay).
+fn push_env(name: &str) -> Env {
+    let env = Env::new(name);
+    let path = env.dir.join("config/config.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str("\n[push]\nrelay = \"https://push.example.net\"\n");
+    std::fs::write(path, config).unwrap();
+    env
+}
+
+fn register(c: &Client, device: &str, relay: &str, name: &str) {
+    let r = c.request(Request::RegisterPushDevice {
+        device: device.into(),
+        relay: relay.into(),
+        secret: "s".repeat(64),
+        host: "studio".into(),
+        name: name.into(),
+    });
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+}
+
+/// Runs `/bin/cat` in `pane` and waits for it, so agent hooks have a process to belong to.
+fn run_cat(c: &Client, pane: PaneId) {
+    c.request(Request::Input {
+        pane,
+        data: b"/bin/cat\r".to_vec(),
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(c.request(Request::PaneInfo { pane }), Ok(Response::PaneInfo(i))
+        if i.foreground.as_ref().is_some_and(|f| f.name == "cat"))
+    {
+        assert!(Instant::now() < deadline, "cat never became the foreground");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The next `/v1/push` post within `wait`, skipping Live Activity posts.
+fn next_push(posts: &Receiver<(String, String)>, wait: Duration) -> Option<serde_json::Value> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let (head, body) = posts.recv_timeout(left).ok()?;
+        if head.starts_with("POST /v1/push ") {
+            return Some(serde_json::from_str(&body).unwrap());
+        }
+    }
+}
+
 /// A relay that answers 200 to every request and hands over each one's headers and body.
 fn fake_relay() -> (String, Receiver<(String, String)>) {
     use std::io::{BufRead, BufReader, Read};
@@ -277,18 +326,11 @@ fn fake_relay() -> (String, Receiver<(String, String)>) {
 
 #[test]
 fn permission_prompts_reach_registered_phones_when_the_app_is_closed() {
-    let env = Env::new("push");
+    let env = push_env("push");
     let _daemon = env.start();
     let (mac, _) = env.connect();
     let (relay, posts) = fake_relay();
-    let r = mac.request(Request::RegisterPushDevice {
-        device: "dev-1".into(),
-        relay,
-        secret: "s".repeat(64),
-        host: "studio".into(),
-        name: "iPhone".into(),
-    });
-    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+    register(&mac, "dev-1", &relay, "iPhone");
 
     let pane = create(&mac, &env.dir);
     mac.request(Request::Input {
@@ -321,7 +363,8 @@ fn permission_prompts_reach_registered_phones_when_the_app_is_closed() {
     assert_eq!(b["body"], "asks for permission");
 
     // With the app open, the phone hears it live instead.
-    let (_phone, phone_events) = mobile(&env);
+    let (phone, phone_events) = mobile(&env);
+    register(&phone, "dev-1", &relay, "iPhone");
     hook(&mac, pane, "stop", None);
     hook(&mac, pane, "prompt-submit", None);
     hook(&mac, pane, "permission-prompt", None);
@@ -346,7 +389,7 @@ fn permission_prompts_reach_registered_phones_when_the_app_is_closed() {
 
 #[test]
 fn followed_agents_post_live_activity_updates_until_the_pane_closes() {
-    let env = Env::new("activity");
+    let env = push_env("activity");
     let _daemon = env.start();
     let (mac, _) = env.connect();
     let (relay, posts) = fake_relay();
@@ -499,4 +542,26 @@ fn a_second_hello_keeps_the_clients_capabilities() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// One phone open, another in a pocket: only the open one goes without the push.
+#[test]
+fn only_the_phone_with_the_app_open_misses_the_push() {
+    let env = push_env("push-two-phones");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (relay, posts) = fake_relay();
+    let (phone, _phone_events) = mobile(&env);
+    register(&phone, "dev-open", &relay, "iPhone");
+    register(&mac, "dev-pocket", &relay, "iPad");
+    let pane = create(&mac, &env.dir);
+    run_cat(&mac, pane);
+    hook(&mac, pane, "prompt-submit", None);
+    hook(&mac, pane, "permission-prompt", None);
+    let b = next_push(&posts, Duration::from_secs(10)).expect("the iPad got nothing");
+    assert_eq!(b["device"], "dev-pocket");
+    assert!(
+        next_push(&posts, Duration::from_secs(1)).is_none(),
+        "the open iPhone was pushed too"
+    );
 }

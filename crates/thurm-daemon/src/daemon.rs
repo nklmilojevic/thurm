@@ -231,6 +231,9 @@ pub struct Client {
     pub ui: AtomicBool,
     /// The iOS app ([`thurm_proto::CAP_MOBILE`]).
     pub mobile: AtomicBool,
+    /// The push device the iOS app registered over this connection: while it is connected,
+    /// that phone hears notices live instead of on its lock screen.
+    pub push_device: Mutex<Option<String>>,
     /// Its panes follow the active client's size ([`thurm_proto::CAP_ACTIVE_SIZE`]).
     pub active_size: AtomicBool,
     pub name: Mutex<String>,
@@ -399,6 +402,7 @@ impl Daemon {
             .then(|| Store::new(state_dir.clone()));
         let git_channel = crossbeam_channel::bounded(256);
         let ai_channel = crossbeam_channel::bounded(64);
+        let push = crate::push::Pusher::new(&state_dir, !config.push.relay.is_empty());
         Arc::new(Daemon {
             engine: RwLock::new(EngineConfig::from_config(&config, true)),
             dark: AtomicBool::new(true),
@@ -416,7 +420,7 @@ impl Daemon {
             git_rx: git_channel.1,
             ai: ai::Model::new(),
             ai_tx: ai_channel.0,
-            push: crate::push::Pusher::new(&thurm_config::state_dir()),
+            push,
             ai_rx: ai_channel.1,
             store,
             save_lock: Mutex::new(()),
@@ -450,26 +454,38 @@ impl Daemon {
     fn broadcast(&self, event: Event, ui_only: bool) {
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
         // A phone with the app open hears it live; otherwise its lock screen does.
-        let app_open = clients.iter().any(|c| c.mobile.load(Ordering::Relaxed));
+        let open = || -> Vec<String> {
+            clients
+                .iter()
+                .filter(|c| c.mobile.load(Ordering::Relaxed))
+                .filter_map(|c| c.push_device.lock().clone())
+                .collect()
+        };
         match &event {
+            // Agent notices only, which carry their state's sound (`[notifications.<state>]`): a
+            // program's own (OSC 9 / 99 / 777) and a finished command stay on the desktop.
             Event::Notify {
                 pane,
                 title,
                 permission,
+                sound: Some(_),
                 ..
-            } if !app_open => {
-                self.push.notify(crate::push::Notice {
-                    pane: *pane,
-                    title: title.clone(),
-                    permission: *permission,
-                });
+            } => {
+                self.push.notify(
+                    crate::push::Notice {
+                        pane: *pane,
+                        title: title.clone(),
+                        permission: *permission,
+                    },
+                    &open(),
+                );
             }
             Event::PaneInfo(info) => self.push.agent_changed(
                 info.id,
                 crate::push::activity_state(info, crate::push::now()),
-                !app_open,
+                &open(),
             ),
-            Event::PaneClosed { pane } => self.push.agent_changed(*pane, None, true),
+            Event::PaneClosed { pane } => self.push.agent_changed(*pane, None, &[]),
             _ => {}
         }
         let desktop_only = matches!(event, Event::Ui(_));
@@ -501,6 +517,7 @@ impl Daemon {
             tx,
             ui: AtomicBool::new(false),
             mobile: AtomicBool::new(false),
+            push_device: Mutex::new(None),
             active_size: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
@@ -2516,12 +2533,13 @@ impl Daemon {
                 name,
             } => {
                 self.push.register(crate::push::Device {
-                    device,
+                    device: device.clone(),
                     relay,
                     secret,
                     host,
                     name,
                 })?;
+                *client.push_device.lock() = Some(device);
                 Ok(Response::Ok)
             }
             Request::UnregisterPushDevice { device } => {
@@ -2538,6 +2556,7 @@ impl Daemon {
                 })?;
                 log::info!("pane {pane}: a live activity follows it (device {device:.6}…)");
                 self.push.follow(&device, pane, token, state)?;
+                *client.push_device.lock() = Some(device);
                 Ok(Response::Ok)
             }
             Request::Ping => Ok(Response::Ok),
@@ -2837,6 +2856,7 @@ impl Daemon {
         *self.engine.write() = EngineConfig::from_config(&cfg, self.dark.load(Ordering::Relaxed));
         *self.agent_defs.write() = cfg.agent_defs();
         *self.program_defs.write() = cfg.program_defs();
+        self.push.set_enabled(!cfg.push.relay.is_empty());
         *self.config.write() = cfg;
         let engine = self.engine.read().clone();
         for pane in self.all_panes() {
@@ -3296,6 +3316,7 @@ mod tests {
             tx,
             ui: AtomicBool::new(false),
             mobile: AtomicBool::new(false),
+            push_device: Mutex::new(None),
             active_size: AtomicBool::new(false),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
@@ -3348,6 +3369,73 @@ mod tests {
                 result: Ok(Response::Ok)
             })
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only agent notices go to phones: a program's own notification (OSC 9 / 99 / 777) and a
+    /// finished command have no state sound and stay on the desktop.
+    #[test]
+    fn only_agent_notices_are_pushed() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let dir = std::env::temp_dir().join(format!("thurm-push-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (tx, posts) = unbounded();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; len];
+                let _ = reader.read_exact(&mut body);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+            }
+        });
+        let mut config = Config::default();
+        config.push.relay = "https://push.example.net".into();
+        let daemon = Daemon::new(
+            config,
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        daemon
+            .push
+            .register(crate::push::Device {
+                device: "d1".into(),
+                relay,
+                secret: "s".repeat(32),
+                host: "studio".into(),
+                name: "iPhone".into(),
+            })
+            .unwrap();
+        let notify = |pane, sound: Option<&str>| Event::Notify {
+            pane,
+            title: "Build".into(),
+            body: "done".into(),
+            permission: None,
+            sound: sound.map(str::to_owned),
+        };
+        daemon.broadcast(notify(1, None), true);
+        daemon.broadcast(notify(2, Some("default")), true);
+        let body: serde_json::Value =
+            serde_json::from_str(&posts.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        assert_eq!(body["pane"], 2, "{body}");
+        assert!(
+            posts.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a program notification was pushed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -8,6 +8,8 @@
 //! every change, until the agent leaves or the pane closes.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Sender, bounded};
@@ -79,8 +81,10 @@ pub fn clean_title(title: &str) -> String {
 }
 
 enum Job {
-    Notice(Notice),
-    Activity(Box<ActivityJob>),
+    /// A notice for these devices.
+    Notice(Notice, Vec<Device>),
+    /// Live Activity updates are waiting in `Pusher::activities`.
+    Activities,
 }
 
 struct ActivityJob {
@@ -99,11 +103,18 @@ pub struct Notice {
     pub permission: Option<u64>,
 }
 
+/// Locks: `devices` before `follows`, never the other way round.
 pub struct Pusher {
+    /// `[push] relay` is set: off, nothing is registered or sent.
+    enabled: AtomicBool,
     /// When each pane last sent a notice (see `notify`).
     last_notice: Mutex<std::collections::HashMap<PaneId, std::time::Instant>>,
     devices: Mutex<Vec<Device>>,
     follows: Mutex<Vec<Follow>>,
+    /// Live Activity updates not posted yet, the latest per activity. They wait here rather
+    /// than in the bounded queue, so a busy relay delays them but never loses one (an end
+    /// least of all).
+    activities: Arc<Mutex<Vec<ActivityJob>>>,
     path: PathBuf,
     follows_path: PathBuf,
     tx: Sender<Job>,
@@ -117,8 +128,8 @@ fn now_secs() -> u64 {
 }
 
 impl Pusher {
-    /// Devices are kept in `state_dir/push-devices.json`.
-    pub fn new(state_dir: &Path) -> Pusher {
+    /// Devices are kept in `state_dir/push-devices.json`. `enabled`: see [`Pusher::set_enabled`].
+    pub fn new(state_dir: &Path, enabled: bool) -> Pusher {
         let path = state_dir.join("push-devices.json");
         let follows_path = state_dir.join("push-activities.json");
         let devices = std::fs::read(&path)
@@ -131,14 +142,16 @@ impl Pusher {
             .unwrap_or_default();
         let (tx, rx) = bounded::<Job>(64);
         let pusher = Pusher {
+            enabled: AtomicBool::new(enabled),
             last_notice: Mutex::new(std::collections::HashMap::new()),
             devices: Mutex::new(devices),
             follows: Mutex::new(follows),
+            activities: Arc::new(Mutex::new(Vec::new())),
             path,
             follows_path,
             tx,
         };
-        let devices_path = pusher.path.clone();
+        let activities = Arc::clone(&pusher.activities);
         std::thread::Builder::new()
             .name("thurm-push".into())
             .spawn(move || {
@@ -147,35 +160,24 @@ impl Pusher {
                     .build()
                     .into();
                 for job in rx {
-                    match job {
-                        Job::Notice(notice) => {
-                            // Read the devices again: registrations change while this runs.
-                            let devices: Vec<Device> = std::fs::read(&devices_path)
-                                .ok()
-                                .and_then(|b| serde_json::from_slice(&b).ok())
-                                .unwrap_or_default();
-                            for d in devices {
-                                if let Err(e) = post(&agent, &d, "/v1/push", &body(&d, &notice)) {
-                                    log::warn!("push to {} for {}: {e}", d.relay, d.name);
-                                }
+                    if let Job::Notice(notice, devices) = job {
+                        for d in devices {
+                            if let Err(e) = post(&agent, &d, "/v1/push", &body(&d, &notice)) {
+                                log::warn!("push to {} for {}: {e}", d.relay, d.name);
                             }
                         }
-                        Job::Activity(job) => {
-                            let ActivityJob {
-                                device,
-                                token,
-                                pane,
-                                state,
-                                end,
-                            } = *job;
-                            let body = activity_body(&device, &token, pane, &state, end);
-                            if let Err(e) = post(&agent, &device, "/v1/activity", &body) {
-                                log::warn!(
-                                    "live activity to {} for {}: {e}",
-                                    device.relay,
-                                    device.name
-                                );
-                            }
+                    }
+                    // After every job: a wake-up lost to a full queue is made up by the next.
+                    let waiting = std::mem::take(&mut *activities.lock());
+                    for job in waiting {
+                        let body =
+                            activity_body(&job.device, &job.token, job.pane, &job.state, job.end);
+                        if let Err(e) = post(&agent, &job.device, "/v1/activity", &body) {
+                            log::warn!(
+                                "live activity to {} for {}: {e}",
+                                job.device.relay,
+                                job.device.name
+                            );
                         }
                     }
                 }
@@ -184,7 +186,20 @@ impl Pusher {
         pusher
     }
 
+    /// `[push] relay` is set. While it is empty, push is off: registrations are refused and
+    /// devices registered earlier get nothing.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
     pub fn register(&self, device: Device) -> Result<(), String> {
+        if !self.enabled() {
+            return Err("push notifications are off on this host ([push] relay is empty)".into());
+        }
         validate_relay(&device.relay)?;
         if device.device.is_empty() || device.secret.len() < 32 {
             return Err("push registration needs a device id and a secret".into());
@@ -220,13 +235,24 @@ impl Pusher {
         save_json(&self.follows_path, &*follows)
     }
 
-    /// Queues `notice` for every registered device (dropped when the queue is full: a stuck
-    /// relay must not hold up the daemon).
-    pub fn notify(&self, notice: Notice) {
-        if self.devices.lock().is_empty() || !self.fresh(&notice) {
+    /// Queues `notice` for every registered device but those in `open` (phones with the app
+    /// open, which hear it live). Dropped when the queue is full: a stuck relay must not hold up
+    /// the daemon.
+    pub fn notify(&self, notice: Notice, open: &[String]) {
+        if !self.enabled() {
             return;
         }
-        let _ = self.tx.try_send(Job::Notice(notice));
+        let devices: Vec<Device> = self
+            .devices
+            .lock()
+            .iter()
+            .filter(|d| !open.contains(&d.device))
+            .cloned()
+            .collect();
+        if devices.is_empty() || !self.fresh(&notice) {
+            return;
+        }
+        let _ = self.tx.try_send(Job::Notice(notice, devices));
     }
 
     /// One buzz per pane per moment: a turn's end often raises two notices together (finished,
@@ -272,7 +298,7 @@ impl Pusher {
             });
             save_json(&self.follows_path, &*follows)?;
         }
-        self.agent_changed(pane, state, true);
+        self.agent_changed(pane, state, &[]);
         Ok(())
     }
 
@@ -282,22 +308,28 @@ impl Pusher {
         save_json(&self.follows_path, &*follows)
     }
 
-    /// `pane`'s agent is now `state` (None: gone, which ends its activities). `send`: whether
-    /// to post now (false while a phone has the app open and updates its activities itself;
-    /// the change goes out with the next one).
-    pub fn agent_changed(&self, pane: PaneId, state: Option<ActivityState>, send: bool) {
+    /// `pane`'s agent is now `state` (None: gone, which ends its activities). Devices in `open`
+    /// have the app open and update their activities themselves: their change goes out with
+    /// the next one, but an end always goes.
+    pub fn agent_changed(&self, pane: PaneId, state: Option<ActivityState>, open: &[String]) {
+        if !self.enabled() {
+            return;
+        }
+        let devices = self.devices.lock().clone();
         let mut follows = self.follows.lock();
         if !follows.iter().any(|f| f.pane == pane) {
             return;
         }
-        let devices = self.devices.lock().clone();
         let mut changed = false;
         follows.retain_mut(|f| {
+            if f.pane != pane {
+                return true;
+            }
             let unchanged = match (&f.last, &state) {
                 (Some(last), Some(now)) => last.same_as(now),
                 _ => false,
             };
-            if unchanged || !send {
+            if unchanged || (state.is_some() && open.contains(&f.device)) {
                 return true;
             }
             let Some(device) = devices.iter().find(|d| d.device == f.device) else {
@@ -314,13 +346,13 @@ impl Pusher {
                 }),
             };
             if let Some((shown, end)) = shown {
-                let _ = self.tx.try_send(Job::Activity(Box::new(ActivityJob {
+                self.queue_activity(ActivityJob {
                     device: device.clone(),
                     token: f.token.clone(),
                     pane,
                     state: shown,
                     end,
-                })));
+                });
             }
             changed = true;
             f.last = state.clone();
@@ -329,6 +361,17 @@ impl Pusher {
         if changed {
             let _ = save_json(&self.follows_path, &*follows);
         }
+    }
+
+    /// Hands `job` to the push thread, replacing an update of the same activity still waiting.
+    fn queue_activity(&self, job: ActivityJob) {
+        {
+            let mut waiting = self.activities.lock();
+            waiting.retain(|w| !(w.device.device == job.device.device && w.token == job.token));
+            waiting.push(job);
+        }
+        // A full queue means the thread is busy: it posts what waits after its current job.
+        let _ = self.tx.try_send(Job::Activities);
     }
 
     fn save(&self, devices: &[Device]) -> Result<(), String> {
@@ -412,15 +455,17 @@ pub fn now() -> u64 {
     now_secs()
 }
 
-/// HTTPS only, except to this machine (tests, a relay on the same host).
+/// HTTPS only, except to this machine (tests, a relay on the same host). The host is parsed:
+/// `http://localhost.example.net` is not this machine.
 fn validate_relay(relay: &str) -> Result<(), String> {
-    let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
-        .iter()
-        .any(|p| relay.starts_with(p));
-    if relay.starts_with("https://") || local {
-        Ok(())
-    } else {
-        Err(format!("the push relay must use https: {relay}"))
+    let bad = || format!("the push relay must be an https URL: {relay}");
+    let uri: ureq::http::Uri = relay.parse().map_err(|_| bad())?;
+    let host = uri.host().ok_or_else(bad)?;
+    let local = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1");
+    match uri.scheme_str() {
+        Some("https") => Ok(()),
+        Some("http") if local => Ok(()),
+        _ => Err(bad()),
     }
 }
 
@@ -486,7 +531,7 @@ mod tests {
     #[test]
     fn a_turns_notices_buzz_once_but_prompts_always() {
         let dir = std::env::temp_dir().join(format!("thurm-push-fresh-{}", std::process::id()));
-        let p = Pusher::new(&dir);
+        let p = Pusher::new(&dir, true);
         let n = |pane, permission| Notice {
             pane,
             title: "Claude Code".into(),
@@ -560,7 +605,7 @@ mod tests {
     fn registrations_persist_privately_and_need_https() {
         let dir = std::env::temp_dir().join(format!("thurm-push-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let p = Pusher::new(&dir);
+        let p = Pusher::new(&dir, true);
         let mut d = Device {
             device: "d1".into(),
             relay: "http://example.net".into(),
@@ -572,7 +617,7 @@ mod tests {
         d.relay = "https://push.example.net".into();
         p.register(d.clone()).unwrap();
         p.register(d.clone()).unwrap();
-        let again = Pusher::new(&dir);
+        let again = Pusher::new(&dir, true);
         assert_eq!(*again.devices.lock(), vec![d.clone()]);
         // The same phone through another relay replaces it; another phone does not.
         let moved = Device {
@@ -596,7 +641,112 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         p.unregister("d2").unwrap();
         p.unregister("d3").unwrap();
-        assert!(Pusher::new(&dir).devices.lock().is_empty());
+        assert!(Pusher::new(&dir, true).devices.lock().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_phones_skip_updates_but_not_ends() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Pusher::new(&dir, true);
+        for (id, name) in [("d1", "iPhone"), ("d2", "iPad")] {
+            p.register(Device {
+                device: id.into(),
+                relay: "https://push.example.net".into(),
+                secret: "s".repeat(32),
+                host: "studio".into(),
+                name: name.into(),
+            })
+            .unwrap();
+        }
+        let working = ActivityState {
+            agent: "Codex".into(),
+            status: "working".into(),
+            title: "nix-config".into(),
+            since: 1,
+            permission: None,
+        };
+        p.follow("d1", 4, "aa".into(), Some(working.clone()))
+            .unwrap();
+        p.follow("d2", 4, "bb".into(), Some(working.clone()))
+            .unwrap();
+        p.follow("d1", 5, "cc".into(), Some(working.clone()))
+            .unwrap();
+        let asking = ActivityState {
+            status: "permission".into(),
+            permission: Some(7),
+            ..working.clone()
+        };
+        let open = ["d1".to_owned()];
+        p.agent_changed(4, Some(asking.clone()), &open);
+        let last = |device: &str, pane| {
+            p.follows
+                .lock()
+                .iter()
+                .find(|f| f.device == device && f.pane == pane)
+                .map(|f| f.last.clone())
+        };
+        assert_eq!(last("d1", 4), Some(Some(working.clone())), "the open phone updates itself");
+        assert_eq!(last("d2", 4), Some(Some(asking)), "the other phone is sent the change");
+        assert_eq!(last("d1", 5), Some(Some(working)), "another pane's activity");
+        p.agent_changed(4, None, &open);
+        assert_eq!(last("d1", 4), None, "the open phone's activity ends too");
+        assert_eq!(last("d2", 4), None);
+        assert!(last("d1", 5).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_http_only_to_this_machine() {
+        for ok in [
+            "https://push.example.net",
+            "http://127.0.0.1:8080",
+            "http://localhost",
+            "http://[::1]:9000/",
+        ] {
+            assert!(validate_relay(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://localhost.example.net",
+            "http://127.0.0.1.example.net",
+            "http://example.net",
+            "ftp://localhost",
+            "localhost",
+            "",
+        ] {
+            assert!(validate_relay(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_empty_relay_turns_push_off() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Pusher::new(&dir, true);
+        let d = Device {
+            device: "d1".into(),
+            relay: "https://push.example.net".into(),
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        };
+        p.register(d.clone()).unwrap();
+        let working = ActivityState {
+            agent: "Codex".into(),
+            status: "working".into(),
+            title: "nix-config".into(),
+            since: 1,
+            permission: None,
+        };
+        p.follow("d1", 4, "ab12".into(), Some(working.clone()))
+            .unwrap();
+        p.set_enabled(false);
+        assert!(p.register(d).is_err(), "registered while off");
+        p.agent_changed(4, None, &[]);
+        let follows = p.follows.lock();
+        assert_eq!(follows.len(), 1, "ended while off");
+        assert_eq!(follows[0].last, Some(working));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
