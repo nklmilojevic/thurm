@@ -114,6 +114,12 @@ final class Remotes {
     var handoffErrors: [String: String] = [:]
 
     private var countdown: Timer?
+    /// Failed connects in a row through a tunnel that is up, and the hosts waiting to retry.
+    private var connectFailures: [HostId: Int] = [:]
+    /// The pending retry of each host, by token: a retry superseded by a newer one, or by the
+    /// tunnel going down meanwhile, does nothing.
+    private var connectRetries: [HostId: Int] = [:]
+    private var nextRetryToken = 0
     private var pathMonitor: NWPathMonitor?
     private var started = false
 
@@ -155,6 +161,9 @@ final class Remotes {
         let names = Set(SessionManager.shared.config.remoteNames)
         for host in statuses.keys where !names.contains(host) {
             statuses.removeValue(forKey: host)
+            // A host added again under this name starts afresh (its pending retry does nothing).
+            connectRetries[host] = nil
+            connectFailures[host] = nil
             Core.shared.disconnect(host)
         }
         syncCountdown()
@@ -174,16 +183,20 @@ final class Remotes {
         statuses[s.name] = s
         let host = s.name
         if s.phase == "connected" {
-            if !Core.shared.isConnected(host) {
+            if !Core.shared.isConnected(host), connectRetries[host] == nil {
                 if let err = Core.shared.connectRemote(host, socket: s.socket) {
-                    tlog("connecting to \(host) through its tunnel: \(err)")
-                    thurm_remote_kick(host, true)
+                    connectFailed(host, err)
                 } else {
                     SessionManager.shared.remoteConnected(host)
+                    if Core.shared.isConnected(host) { connectFailures[host] = nil }
                 }
             }
-        } else if Core.shared.isConnected(host) {
-            connectionLost(host)
+        } else {
+            // A tunnel set up again (or a daemon upgraded meanwhile) is tried straight away. The
+            // failure count stays until a connect succeeds: the retry's own kick takes the tunnel
+            // down and up, which must not start the backoff over.
+            connectRetries[host] = nil
+            if Core.shared.isConnected(host) { connectionLost(host) }
         }
         if before?.phase != s.phase, ["needs_attention", "upgrade_needed", "not_installed"].contains(s.phase) {
             tlog("\(host): \(s.label): \(s.message ?? "")")
@@ -202,6 +215,27 @@ final class Remotes {
         SessionManager.shared.refreshSidebars()
         // The tunnel may still look alive; have it checked and replaced now.
         thurm_remote_kick(host, true)
+    }
+
+    /// Connecting to `host`'s daemon through a tunnel that is up failed (or its panes could not
+    /// be listed): try again after a growing delay, not straight away, which against a daemon
+    /// this build cannot talk to would loop on the main thread.
+    func connectFailed(_ host: HostId, _ why: String) {
+        Core.shared.disconnect(host)
+        let failures = (connectFailures[host] ?? 0) + 1
+        connectFailures[host] = failures
+        let delay = min(60, pow(2, Double(failures - 1)))
+        nextRetryToken += 1
+        let token = nextRetryToken
+        connectRetries[host] = token
+        tlog("connecting to \(host) through its tunnel: \(why); again in \(Int(delay)) s")
+        updateOverlays(host)
+        SessionManager.shared.refreshSidebars()
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            guard Remotes.shared.connectRetries[host] == token else { return }
+            Remotes.shared.connectRetries[host] = nil
+            thurm_remote_kick(host, true)
+        }
     }
 
     private func tick() {
@@ -354,7 +388,7 @@ extension SessionManager {
     func remoteConnected(_ host: HostId) {
         sendAppearance(to: host)
         guard let fetched = fetchPanes(host: host) else {
-            Remotes.shared.connectionLost(host)
+            Remotes.shared.connectFailed(host, "its panes could not be listed")
             return
         }
         // Closes queued while it was away. They apply to the pane still running the process

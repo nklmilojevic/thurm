@@ -291,7 +291,10 @@ fn fake_daemon(socket: &std::path::Path) -> Arc<Mutex<Vec<String>>> {
                         daemon_pid: 1,
                         restored: false,
                         build: "test".into(),
-                        capabilities: vec![],
+                        capabilities: thurm_proto::CAPABILITIES
+                            .iter()
+                            .map(|c| (*c).to_owned())
+                            .collect(),
                     })
                 }
                 _ => Ok(Response::Ok),

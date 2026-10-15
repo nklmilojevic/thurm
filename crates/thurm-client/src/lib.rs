@@ -36,6 +36,10 @@ pub enum ClientError {
     Io(std::io::Error),
 }
 
+/// The [`ClientError::Daemon`] of a request whose answer this build cannot decode (a daemon of
+/// another build).
+pub const UNREADABLE_ANSWER: &str = "the daemon's answer could not be read";
+
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -397,7 +401,7 @@ impl Client {
                         if let Some(id) = codec::response_id(&frame)
                             && let Some(tx) = pending.lock().remove(&id)
                         {
-                            let _ = tx.send(Err("the daemon's answer could not be read".into()));
+                            let _ = tx.send(Err(UNREADABLE_ANSWER.into()));
                         }
                         continue;
                     };
@@ -431,12 +435,27 @@ impl Client {
             .inspect_err(|_| {
                 let _ = closer.shutdown(std::net::Shutdown::Both);
             })?;
-        if let Response::Hello { version, .. } = hello
-            && !thurm_proto::protocol_compatible(version)
+        if let Response::Hello {
+            version,
+            capabilities,
+            ..
+        } = &hello
+            && !thurm_proto::hello_compatible(*version, capabilities)
         {
             let _ = closer.shutdown(std::net::Shutdown::Both);
+            // Callers read the daemon's version from the "protocol mismatch: daemon N" form and
+            // upgrade it in place, so an older build of this very version keeps it.
+            let why = if thurm_proto::protocol_compatible(*version) {
+                format!(
+                    ": the daemon is an older build of protocol {version} (without {}), whose \
+                     answers this client cannot read; upgrade it",
+                    thurm_proto::CAP_ACTIVE_SIZE
+                )
+            } else {
+                String::new()
+            };
             return Err(ClientError::Daemon(format!(
-                "protocol mismatch: daemon {version}, client {PROTOCOL_VERSION}"
+                "protocol mismatch: daemon {version}, client {PROTOCOL_VERSION}{why}"
             )));
         }
         *client.hello.lock() = Some(hello);
@@ -590,6 +609,51 @@ mod tests {
         assert_eq!(mismatched_protocol("no such pane: 3"), None);
     }
 
+    /// A daemon of this protocol from before `active-size`: refused with a message that says
+    /// so, and still upgradable in place (`probe_daemon` reads its version, without a build).
+    #[test]
+    fn older_build_of_this_protocol_is_refused_and_upgradable() {
+        let dir = std::env::temp_dir().join(format!("thurm-client-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = stream.unwrap();
+                let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut s) else {
+                    continue;
+                };
+                codec::write_message(
+                    &mut s,
+                    &ServerMessage::Response {
+                        id: env.id,
+                        result: Ok(Response::Hello {
+                            version: PROTOCOL_VERSION,
+                            daemon_pid: 1,
+                            restored: false,
+                            build: "older".into(),
+                            capabilities: vec!["hello-capabilities".into()],
+                        }),
+                    },
+                )
+                .unwrap();
+            }
+        });
+        let opts = || ConnectOptions {
+            socket: sock.clone(),
+            spawn_daemon: None,
+            client_name: "test",
+            ui: false,
+        };
+        let Err(ClientError::Daemon(e)) = Client::connect(opts(), |_| {}, || {}) else {
+            panic!("an older build was accepted")
+        };
+        assert!(e.contains("older build"), "{e}");
+        assert_eq!(mismatched_protocol(&e), Some(PROTOCOL_VERSION));
+        assert_eq!(probe_daemon(&sock).unwrap(), (PROTOCOL_VERSION, None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A daemon that answers Hello, never answers ListPanes, and hangs up on Capture.
     #[test]
     fn timeouts_and_hangups_end_waiting_requests() {
@@ -613,7 +677,10 @@ mod tests {
                                 daemon_pid: 1,
                                 restored: false,
                                 build: String::new(),
-                                capabilities: Vec::new(),
+                                capabilities: thurm_proto::CAPABILITIES
+                                    .iter()
+                                    .map(|c| (*c).to_owned())
+                                    .collect(),
                             }),
                         },
                     )
@@ -677,7 +744,10 @@ mod tests {
                             daemon_pid: 1,
                             restored: false,
                             build: String::new(),
-                            capabilities: Vec::new(),
+                            capabilities: thurm_proto::CAPABILITIES
+                                .iter()
+                                .map(|c| (*c).to_owned())
+                                .collect(),
                         }),
                     },
                 )
@@ -732,7 +802,10 @@ mod tests {
                         daemon_pid: 1,
                         restored: false,
                         build: String::new(),
-                        capabilities: Vec::new(),
+                        capabilities: thurm_proto::CAPABILITIES
+                            .iter()
+                            .map(|c| (*c).to_owned())
+                            .collect(),
                     },
                     Request::ListPanes => {
                         codec::write_message(

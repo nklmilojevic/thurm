@@ -62,7 +62,10 @@ fn exercise(stop: u8) {
                         daemon_pid: 1,
                         restored: false,
                         build: "test".into(),
-                        capabilities: vec![],
+                        capabilities: thurm_proto::CAPABILITIES
+                            .iter()
+                            .map(|c| (*c).to_owned())
+                            .collect(),
                     },
                     Request::AttachTerminal { pane, size } => {
                         stream

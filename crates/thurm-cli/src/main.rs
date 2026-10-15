@@ -700,10 +700,17 @@ fn sanitize(s: &str) -> String {
 
 fn daemon_cmd(action: &str, json: bool) -> R {
     match action {
-        "status" => match connect(false) {
-            Ok(c) => {
+        "status" => match connect(false).and_then(|c| match c.request(Request::ListPanes) {
+            // A daemon whose answer cannot be read is running but incompatible, so that
+            // `thurm remote install` still upgrades it. Other failures are errors.
+            Err(ClientError::Daemon(e)) if e == thurm_client::UNREADABLE_ANSWER => {
+                Err(ClientError::Daemon(e))
+            }
+            listed => Ok((c, listed)),
+        }) {
+            Ok((c, listed)) => {
                 let hello = c.hello.lock().clone();
-                let panes = match c.request(Request::ListPanes)? {
+                let panes = match listed? {
                     Response::Panes(p) => p.len(),
                     _ => 0,
                 };
