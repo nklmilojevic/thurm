@@ -532,6 +532,16 @@ thurm_client *thurm_ssh_connect(const char *target_json, thurm_device_key key,
  * NULL when the key is unusable. */
 char *thurm_ssh_authorized_key(thurm_device_key key, const char *comment);
 
+/* Connect to a daemon served over Tailscale as a mobile client. `url` is the pairing code's
+ * tailnet address, wss://<device>.<tailnet>.ts.net/v1/connect; the phone's Tailscale app
+ * carries it, and the daemon admits this device by its Tailscale account. Blocks for at most a
+ * few seconds (an unreachable address fails fast, to fall back to ssh): call it off the main
+ * thread. Returns NULL on failure with `err` set (free it); otherwise a client used like
+ * thurm_connect's, freed with thurm_disconnect. */
+thurm_client *thurm_tailnet_connect(const char *url, const char *client_name,
+                                    thurm_event_cb on_event, thurm_frame_cb on_frame, void *ctx,
+                                    char **err);
+
 #ifdef __cplusplus
 }
 #endif

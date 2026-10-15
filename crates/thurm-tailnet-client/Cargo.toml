@@ -1,0 +1,17 @@
+[package]
+name = "thurm-tailnet-client"
+description = "Connects to thurmd served over Tailscale (thurm-tailnet's WebSocket): the iOS app's transport where the phone runs Tailscale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thurm-proto.workspace = true
+thurm-client.workspace = true
+log.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# ring, like russh: aws-lc-rs would need a C toolchain build for iOS.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"

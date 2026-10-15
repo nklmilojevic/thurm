@@ -340,7 +340,30 @@ impl Client {
         on_event: impl Fn(Event) + Send + 'static,
         on_disconnect: impl FnOnce() + Send + 'static,
     ) -> Result<Arc<Client>, ClientError> {
+        Self::from_stream_timeout(
+            stream,
+            client_name,
+            ui,
+            extra_capabilities,
+            None,
+            on_event,
+            on_disconnect,
+        )
+    }
+
+    /// Like [`Client::from_stream`], giving the Hello at most `hello_timeout`. Whenever the
+    /// Hello fails the stream is shut down, so the reader (and whatever relays the stream) ends.
+    pub fn from_stream_timeout(
+        stream: UnixStream,
+        client_name: &str,
+        ui: bool,
+        extra_capabilities: &[&str],
+        hello_timeout: Option<Duration>,
+        on_event: impl Fn(Event) + Send + 'static,
+        on_disconnect: impl FnOnce() + Send + 'static,
+    ) -> Result<Arc<Client>, ClientError> {
         let read_half = stream.try_clone()?;
+        let closer = stream.try_clone()?;
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let client = Arc::new(Client {
@@ -391,19 +414,27 @@ impl Client {
                 on_disconnect();
             })?;
 
-        let hello = client.request(Request::Hello {
-            client: client_name.to_owned(),
-            version: PROTOCOL_VERSION,
-            ui,
-            capabilities: thurm_proto::CAPABILITIES
-                .iter()
-                .chain(extra_capabilities)
-                .map(|c| (*c).to_owned())
-                .collect(),
-        })?;
+        let hello = client
+            .request_timeout(
+                Request::Hello {
+                    client: client_name.to_owned(),
+                    version: PROTOCOL_VERSION,
+                    ui,
+                    capabilities: thurm_proto::CAPABILITIES
+                        .iter()
+                        .chain(extra_capabilities)
+                        .map(|c| (*c).to_owned())
+                        .collect(),
+                },
+                hello_timeout,
+            )
+            .inspect_err(|_| {
+                let _ = closer.shutdown(std::net::Shutdown::Both);
+            })?;
         if let Response::Hello { version, .. } = hello
             && !thurm_proto::protocol_compatible(version)
         {
+            let _ = closer.shutdown(std::net::Shutdown::Both);
             return Err(ClientError::Daemon(format!(
                 "protocol mismatch: daemon {version}, client {PROTOCOL_VERSION}"
             )));
