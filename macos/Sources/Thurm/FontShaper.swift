@@ -218,8 +218,14 @@ final class FontShaper {
         var byFamily = extra
         byFamily[kCTFontFamilyNameAttribute as String] = name
         let familyDesc = CTFontDescriptorCreateWithAttributes(byFamily as CFDictionary)
-        let familyFont = CTFontCreateWithFontDescriptor(familyDesc, size, nil)
-        if same(CTFontCopyFamilyName(familyFont) as String, name) { return (familyFont, familyDesc) }
+        // Upright and regular weight asked for outright: with a cascade list, iOS otherwise
+        // picks any face of the family (Bold, Italic). A family without an upright face gets its
+        // nearest one; the plain match is for when Core Text answers with another family.
+        let upright = CTFontDescriptorCreateCopyWithSymbolicTraits(familyDesc, [], styleTraits)
+        for desc in [upright, familyDesc].compactMap({ $0 }) {
+            let familyFont = CTFontCreateWithFontDescriptor(desc, size, nil)
+            if same(CTFontCopyFamilyName(familyFont) as String, name) { return (familyFont, desc) }
+        }
         var byName = extra
         byName[kCTFontNameAttribute as String] = name
         let nameDesc = CTFontDescriptorCreateWithAttributes(byName as CFDictionary)
@@ -257,9 +263,12 @@ final class FontShaper {
         return (system, CTFontCopyFontDescriptor(system))
     }
 
+    /// The traits that pick a style face: italic alone must not come out bold.
+    private static let styleTraits: CTFontSymbolicTraits = [.traitBold, .traitItalic]
+
     private static func variant(of base: CTFont, descriptor: CTFontDescriptor,
                                 traits: CTFontSymbolicTraits, size: CGFloat) -> CTFont {
-        if let desc = CTFontDescriptorCreateCopyWithSymbolicTraits(descriptor, traits, traits) {
+        if let desc = CTFontDescriptorCreateCopyWithSymbolicTraits(descriptor, traits, styleTraits) {
             let font = CTFontCreateWithFontDescriptor(desc, size, nil)
             if CTFontGetSymbolicTraits(font).contains(traits) { return font }
         }
