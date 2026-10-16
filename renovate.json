@@ -26,7 +26,8 @@
       "matchDepNames": [
         "rust"
       ],
-      "minimumReleaseAge": "3 days"
+      "minimumReleaseAge": "3 days",
+      "internalChecksFilter": "strict"
     }
   ]
 }
