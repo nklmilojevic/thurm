@@ -4,6 +4,15 @@
     "local>nklmilojevic/renovate-config",
     "helpers:pinGitHubActionDigests"
   ],
+  "nix": {
+    "enabled": true,
+    "lockFileMaintenance": {
+      "enabled": true,
+      "schedule": ["before 6am"],
+      "automerge": true,
+      "automergeType": "pr"
+    }
+  },
   "packageRules": [
     {
       "description": "Workflows hold the release signing keys: their updates are reviewed, never merged automatically.",
@@ -11,6 +20,13 @@
         ".github/workflows/**"
       ],
       "automerge": false
+    },
+    {
+      "description": "The flake takes Rust from rust-overlay at rust-toolchain.toml's version. Wait until the daily flake.lock maintenance has locked an overlay that knows the release.",
+      "matchDepNames": [
+        "rust"
+      ],
+      "minimumReleaseAge": "3 days"
     }
   ]
 }
