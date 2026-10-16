@@ -357,7 +357,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         if !other.tabs.isEmpty { order.append(other) }
         let names = order.map(\.name), tabs = order.map(\.tabs)
         let theme = SessionManager.shared.config.theme
-        if let s = shown, s.names == names, s.theme == theme, Self.sameRows(s.tabs, tabs) {
+        if let s = shown, s.names == names, s.theme == theme,
+           Self.sameRows(s.tabs.map(Self.identities), tabs.map(Self.identities)) {
             // The same tabs in the same places, so only a title, status or branch changed:
             // reconfigure those rows. reloadData would rebuild every row view, and a working
             // agent retitles its tab several times a second.
@@ -390,10 +391,15 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         }
     }
 
+    /// The identity of each tab in a group: the window it shows.
+    private static func identities(_ group: [SidebarTab]) -> [ObjectIdentifier?] {
+        group.map { $0.controller.map(ObjectIdentifier.init) }
+    }
+
     /// Whether two listings hold the same tabs in the same groups and order, whatever they show.
-    static func sameRows(_ a: [[SidebarTab]], _ b: [[SidebarTab]]) -> Bool {
+    static func sameRows<ID: Equatable>(_ a: [[ID]], _ b: [[ID]]) -> Bool {
         a.count == b.count && zip(a, b).allSatisfy { x, y in
-            x.count == y.count && zip(x, y).allSatisfy { $0.controller === $1.controller }
+            x.count == y.count && zip(x, y).allSatisfy { $0 == $1 }
         }
     }
 
@@ -661,7 +667,12 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
             // A click selects its row even when it changes nothing shown: put the selection back.
             let current = rows.firstIndex { $0.row.selected }
             if table.selectedRow != (current ?? -1) {
-                if let i = current { table.selectRowIndexes([i], byExtendingSelection: false) } else { table.deselectAll(nil) }
+                if let i = current {
+                table.selectRowIndexes([i], byExtendingSelection: false)
+                table.scrollRowToVisible(i)
+            } else {
+                table.deselectAll(nil)
+            }
             }
             return
         }
