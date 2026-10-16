@@ -1232,7 +1232,8 @@ final class SessionManager: NSObject, CoreDelegate {
             c.updateTitle()
             c.content.refreshHeaders()
             c.content.views[key]?.maybeShowRestoredToast()
-            if old?.progress != info.progress { c.content.views[key]?.setProgress(info.progress) }
+            let progress = TerminalView.shownProgress(info)
+            if TerminalView.shownProgress(old) != progress { c.content.views[key]?.setProgress(progress) }
         }
         // A handoff's agent finished or asks for something: bring its commits back.
         if let status = info.agent?.status, status == .done || status == .error || status == .needsInput,

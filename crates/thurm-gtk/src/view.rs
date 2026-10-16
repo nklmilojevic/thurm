@@ -93,7 +93,6 @@ pub struct TermView {
     focused: StdCell<bool>,
     progress: gtk::DrawingArea,
     progress_state: RefCell<Option<thurm_proto::Progress>>,
-    progress_started: StdCell<Option<Instant>>,
     toast: gtk::Revealer,
     toast_label: gtk::Label,
     toast_generation: StdCell<u64>,
@@ -198,7 +197,6 @@ impl TermView {
             focused: StdCell::new(false),
             progress,
             progress_state: RefCell::new(None),
-            progress_started: StdCell::new(None),
             toast,
             toast_label,
             toast_generation: StdCell::new(0),
@@ -414,15 +412,9 @@ impl TermView {
         if *self.progress_state.borrow() == progress {
             return;
         }
-        let indeterminate = progress
-            .as_ref()
-            .is_some_and(|p| p.state == ProgressState::Indeterminate);
         *self.progress_state.borrow_mut() = progress;
         self.progress.set_visible(self.progress_state.borrow().is_some());
-        self.progress_started
-            .set(indeterminate.then(Instant::now));
         self.progress.queue_draw();
-        self.ensure_tick();
     }
 
     pub fn set_offline(&self, message: Option<String>) {
@@ -660,8 +652,7 @@ impl TermView {
         *self.tick.borrow_mut() = Some(id);
     }
 
-    /// One frame of animation: smooth scroll, bell flash, progress. Returns whether to keep
-    /// ticking.
+    /// One frame of animation: smooth scroll, bell flash. Returns whether to keep ticking.
     fn on_tick(&self) -> bool {
         let mut more = false;
         if self.state.borrow().smooth_active {
@@ -674,10 +665,6 @@ impl TermView {
                 more = true;
             }
             self.area.queue_draw();
-        }
-        if self.progress_started.get().is_some() {
-            self.progress.queue_draw();
-            more = true;
         }
         more
     }
@@ -875,24 +862,16 @@ impl TermView {
             ProgressState::Paused => (1.0, 0.8, 0.0),
             _ => (0.21, 0.52, 0.89),
         };
-        cr.set_source_rgb(r, g, b);
-        let w = w as f64;
-        if p.state == ProgressState::Indeterminate {
-            let seg = (w * 0.25).max(40.0);
-            let t = self
-                .progress_started
-                .get()
-                .map_or(0.0, |s| s.elapsed().as_secs_f64());
-            // Back and forth over 1.2 s, eased.
-            let phase = (t / 1.2) % 2.0;
-            let u = if phase < 1.0 { phase } else { 2.0 - phase };
-            let eased = u * u * (3.0 - 2.0 * u);
-            let x = -seg + (w + seg) * eased;
-            cr.rectangle(x, 0.0, seg, h as f64);
+        // Indeterminate is a still, dimmed full bar: a moving segment would redraw the pane at
+        // the display's rate for as long as the program is busy.
+        let indeterminate = p.state == ProgressState::Indeterminate;
+        cr.set_source_rgba(r, g, b, if indeterminate { 0.4 } else { 1.0 });
+        let pct = if indeterminate {
+            1.0
         } else {
-            let pct = p.percent.unwrap_or(100).min(100) as f64 / 100.0;
-            cr.rectangle(0.0, 0.0, w * pct, h as f64);
-        }
+            p.percent.unwrap_or(100).min(100) as f64 / 100.0
+        };
+        cr.rectangle(0.0, 0.0, w as f64 * pct, h as f64);
         let _ = cr.fill();
     }
 
@@ -1646,9 +1625,15 @@ fn common_prefix<'a>(mut items: impl Iterator<Item = &'a str>) -> String {
     prefix.into_iter().collect()
 }
 
+/// The progress a pane shows. An agent's "busy" without a percentage is left out: its dot
+/// already says it is working.
+pub fn shown_progress(info: &PaneInfo) -> Option<thurm_proto::Progress> {
+    info.progress.filter(|p| info.agent.is_none() || p.state != ProgressState::Indeterminate)
+}
+
 /// Lets the app reach a view's info-driven overlays.
 pub fn info_updated(view: &Rc<TermView>, info: &PaneInfo, lock: bool) {
-    view.set_progress(info.progress);
+    view.set_progress(shown_progress(info));
     view.set_lock(lock);
     view.maybe_show_restored_toast();
 }

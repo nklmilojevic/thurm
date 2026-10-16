@@ -104,7 +104,7 @@ final class TerminalView: NSView, NSTextInputClient {
         clipsToBounds = true
         layerContentsPlacement = .topLeft
         registerForDraggedTypes([.fileURL, .URL, .png, .tiff, .string])
-        setProgress(SessionManager.shared.panes[pane]?.progress)
+        setProgress(Self.shownProgress(SessionManager.shared.panes[pane]))
         if pane.isRemote { setOffline(SessionManager.shared.offlineMessage(for: pane.host)) }
     }
 
@@ -704,6 +704,13 @@ final class TerminalView: NSView, NSTextInputClient {
         }
         lockBadge?.isHidden = !visible
         layoutOverlays()
+    }
+
+    /// The progress a pane shows. An agent's "busy" without a percentage is left out: its dot
+    /// already says it is working.
+    static func shownProgress(_ info: PaneInfo?) -> ProgressReport? {
+        guard let progress = info?.progress else { return nil }
+        return info?.agent != nil && progress.state == .indeterminate ? nil : progress
     }
 
     /// Progress bar along the top edge (OSC 9;4), like Ghostty's.
@@ -1727,8 +1734,8 @@ private final class OfflineOverlay: NSView {
     override func scrollWheel(with event: NSEvent) {}
 }
 
-/// Thin bar at the top of a pane: filled to the reported percentage, or a segment sliding
-/// back and forth while the program is busy without one.
+/// Thin bar at the top of a pane: filled to the reported percentage, or dimmed full width while
+/// the program is busy without one.
 private final class ProgressBarView: NSView {
     static let height: CGFloat = 2
 
@@ -1779,23 +1786,11 @@ private final class ProgressBarView: NSView {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             fill.backgroundColor = color.cgColor
         }
-        fill.removeAnimation(forKey: "slide")
-        if report.state == .indeterminate {
-            let segment = max(width * 0.25, 40)
-            fill.frame = CGRect(x: 0, y: 0, width: segment, height: bounds.height)
-            let slide = CABasicAnimation(keyPath: "position.x")
-            slide.fromValue = -segment
-            slide.toValue = width
-            slide.duration = 1.2
-            slide.autoreverses = true
-            slide.repeatCount = .infinity
-            slide.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            fill.add(slide, forKey: "slide")
-        } else {
-            // Error / paused without a percentage show a full bar, like Ghostty.
-            let fraction = CGFloat(report.percent ?? 100) / 100
-            fill.frame = CGRect(x: 0, y: 0, width: width * fraction, height: bounds.height)
-        }
+        // Indeterminate is a still, dimmed full bar: a sliding segment makes WindowServer
+        // recomposite the window at the display's rate for as long as the program is busy.
+        let fraction = report.state == .indeterminate ? 1 : CGFloat(report.percent ?? 100) / 100
+        fill.opacity = report.state == .indeterminate ? 0.4 : 1
+        fill.frame = CGRect(x: 0, y: 0, width: width * fraction, height: bounds.height)
         CATransaction.commit()
     }
 }

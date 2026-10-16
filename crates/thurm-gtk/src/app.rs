@@ -389,7 +389,7 @@ impl App {
             v.set_offline(self.remotes.offline_message(self, &key.host));
         }
         if let Some(info) = self.infos.borrow().get(key) {
-            v.set_progress(info.progress);
+            v.set_progress(crate::view::shown_progress(info));
         }
         self.views.borrow_mut().insert(key.clone(), v.clone());
         v
