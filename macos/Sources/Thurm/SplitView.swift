@@ -1088,17 +1088,9 @@ private final class CardChrome: NSView {
         // A card opening or closing can be flatter than its outline; it has nothing to show.
         let cards = cards.filter { $0.rect.width >= 1 && $0.rect.height >= 1 }
         let radii = cards.map { corners(of: $0.rect) }
-        // Cards are cut out of their union rather than with an even-odd path: during a zoom they
-        // overlap, and the overlap would flip back to gutter over the terminals.
-        var holes: CGPath?
-        for (card, r) in zip(cards, radii) {
-            let path = Self.path(card.rect, radii: r)
-            holes = holes.map { $0.union(path) } ?? path
-        }
-        let full = CGPath(rect: area, transform: nil)
         gutter.frame = bounds
         gutter.contentsScale = scale
-        gutter.path = holes.map { full.subtracting($0) } ?? full
+        gutter.path = CardPath.gutter(area, cards: zip(cards, radii).map { ($0.rect, $1) })
         gutter.fillColor = chrome.surface.withAlphaComponent(opacity).cgColor
         // A hairline around each card, a touch brighter around the focused pane. Light on dark
         // themes, so it reads as an edge. Each outline layer covers only its card, which bounds
@@ -1120,7 +1112,7 @@ private final class CardChrome: NSView {
             outline.frame = card.rect
             outline.contentsScale = scale
             let local = CGRect(origin: .zero, size: card.rect.size).insetBy(dx: 0.5, dy: 0.5)
-            outline.path = Self.path(local, radii: r.map { $0 - 0.5 })
+            outline.path = CardPath.rounded(local, radii: r.map { $0 - 0.5 })
             let color = card.focused ? chrome.strokeStrong : chrome.stroke
             outline.strokeColor = color.withAlphaComponent(color.alphaComponent * max(opacity, 0.6)).cgColor
             outline.lineWidth = ChromeStroke.width
@@ -1152,9 +1144,23 @@ private final class CardChrome: NSView {
             return inset < windowRadius ? max(base, windowRadius - inset) : base
         }
     }
+}
+
+/// The split cards' shapes, apart from `CardChrome` for tests.
+enum CardPath {
+    /// The pane area with the cards cut out. Cards are cut out of their union rather than with an
+    /// even-odd path: during a zoom they overlap, and the overlap would flip back to gutter over
+    /// the terminals.
+    static func gutter(_ area: CGRect, cards: [(rect: CGRect, radii: [CGFloat])]) -> CGPath {
+        let full = CGPath(rect: area, transform: nil)
+        let holes = cards.map { rounded($0.rect, radii: $0.radii) }.reduce(nil) { (union: CGPath?, card: CGPath) in
+            union.map { $0.union(card) } ?? card
+        }
+        return holes.map { full.subtracting($0) } ?? full
+    }
 
     /// A rounded rectangle with its own radius per corner, clockwise from the top left (flipped).
-    private static func path(_ r: NSRect, radii: [CGFloat]) -> CGPath {
+    static func rounded(_ r: NSRect, radii: [CGFloat]) -> CGPath {
         let limit = min(r.width, r.height) / 2
         let (tl, tr, br, bl) = (min(radii[0], limit), min(radii[1], limit), min(radii[2], limit), min(radii[3], limit))
         let p = CGMutablePath()
