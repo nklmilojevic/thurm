@@ -9,12 +9,16 @@ final class ProgressTests: XCTestCase {
         return PaneInfo(json: d)
     }
 
-    /// A program's progress shows; an agent's busy bar does not, its dot already says it is
-    /// working. An agent's percentage still shows.
-    func testAgentPanesHideTheBusyBar() {
+    /// A program's progress shows. A working agent's busy bar does not: its dot already says it
+    /// is working. An idle agent's dot is hidden, so its busy bar shows. A percentage always shows.
+    func testWorkingAgentHidesTheBusyBar() {
         XCTAssertEqual(TerminalView.shownProgress(pane(progress: "indeterminate", agent: nil))?.state,
                        .indeterminate)
         XCTAssertNil(TerminalView.shownProgress(pane(progress: "indeterminate", agent: "Working")))
+        XCTAssertEqual(TerminalView.shownProgress(pane(progress: "indeterminate", agent: "Idle"))?.state,
+                       .indeterminate)
+        XCTAssertEqual(TerminalView.shownProgress(pane(progress: "indeterminate", agent: "NeedsInput"))?.state,
+                       .indeterminate)
         let percent = pane(progress: "normal", percent: 40, agent: "Working")
         XCTAssertEqual(TerminalView.shownProgress(percent)?.percent, 40)
         XCTAssertNil(TerminalView.shownProgress(pane(progress: nil, agent: nil)))

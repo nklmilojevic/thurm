@@ -706,11 +706,12 @@ final class TerminalView: NSView, NSTextInputClient {
         layoutOverlays()
     }
 
-    /// The progress a pane shows. An agent's "busy" without a percentage is left out: its dot
-    /// already says it is working.
+    /// The progress a pane shows. A working agent's "busy" without a percentage is left out: its
+    /// dot already says it is working. An idle agent's dot is hidden, so its busy bar shows.
     static func shownProgress(_ info: PaneInfo?) -> ProgressReport? {
         guard let progress = info?.progress else { return nil }
-        return info?.agent != nil && progress.state == .indeterminate ? nil : progress
+        let working = info?.agent?.status == .working
+        return working && progress.state == .indeterminate ? nil : progress
     }
 
     /// Progress bar along the top edge (OSC 9;4), like Ghostty's.

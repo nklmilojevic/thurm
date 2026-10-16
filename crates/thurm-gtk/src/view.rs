@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use serde_json::{Value, json};
-use thurm_proto::{CompletionItem, Completions, PaneInfo, ProgressState};
+use thurm_proto::{AgentStatus, CompletionItem, Completions, PaneInfo, ProgressState};
 
 use crate::app;
 use crate::core::{Core, PaneKey};
@@ -1625,10 +1625,15 @@ fn common_prefix<'a>(mut items: impl Iterator<Item = &'a str>) -> String {
     prefix.into_iter().collect()
 }
 
-/// The progress a pane shows. An agent's "busy" without a percentage is left out: its dot
-/// already says it is working.
+/// The progress a pane shows. A working agent's "busy" without a percentage is left out: its
+/// dot already says it is working. An idle agent's dot is hidden, so its busy bar shows.
 pub fn shown_progress(info: &PaneInfo) -> Option<thurm_proto::Progress> {
-    info.progress.filter(|p| info.agent.is_none() || p.state != ProgressState::Indeterminate)
+    let working = info
+        .agent
+        .as_ref()
+        .is_some_and(|a| a.status == AgentStatus::Working);
+    info.progress
+        .filter(|p| !working || p.state != ProgressState::Indeterminate)
 }
 
 /// Lets the app reach a view's info-driven overlays.
@@ -1641,6 +1646,7 @@ pub fn info_updated(view: &Rc<TermView>, info: &PaneInfo, lock: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thurm_proto::{AgentState, Progress};
 
     #[test]
     fn prefix() {
@@ -1654,5 +1660,58 @@ mod tests {
         let new: Vec<String> = ["b", "c", "d"].iter().map(|s| s.to_string()).collect();
         assert_eq!(new_rows(&old, &new), vec!["d"]);
         assert!(new_rows(&old, &old).is_empty());
+    }
+
+    fn pane(agent: Option<AgentStatus>, progress: Option<Progress>) -> PaneInfo {
+        PaneInfo {
+            agent: agent.map(|status| AgentState {
+                name: "Claude Code".into(),
+                kind: "claude".into(),
+                status,
+                session_id: None,
+                message: None,
+                turn_ms: None,
+                turns: 0,
+                hooked: true,
+                topic: None,
+                permission: None,
+            }),
+            progress,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn busy_bar_hidden_only_while_agent_works() {
+        let busy = Progress {
+            state: ProgressState::Indeterminate,
+            percent: None,
+        };
+        let half = Progress {
+            state: ProgressState::Normal,
+            percent: Some(50),
+        };
+        let working = Some(AgentStatus::Working);
+
+        assert_eq!(shown_progress(&pane(None, Some(busy))), Some(busy));
+        assert_eq!(shown_progress(&pane(working, Some(busy))), None);
+        assert_eq!(shown_progress(&pane(working, Some(half))), Some(half));
+        assert_eq!(
+            shown_progress(&pane(Some(AgentStatus::Idle), Some(busy))),
+            Some(busy)
+        );
+        assert_eq!(shown_progress(&pane(None, None)), None);
+    }
+
+    #[test]
+    fn busy_bar_returns_when_agent_removed() {
+        let busy = Progress {
+            state: ProgressState::Indeterminate,
+            percent: None,
+        };
+        let mut info = pane(Some(AgentStatus::Working), Some(busy));
+        assert_eq!(shown_progress(&info), None);
+        info.agent = None;
+        assert_eq!(shown_progress(&info), Some(busy));
     }
 }
