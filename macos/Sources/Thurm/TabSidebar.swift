@@ -40,7 +40,7 @@ final class SidebarGroup {
 }
 
 final class TabBox {
-    let tab: SidebarTab
+    var tab: SidebarTab
     init(_ tab: SidebarTab) { self.tab = tab }
 }
 
@@ -357,7 +357,24 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         if !other.tabs.isEmpty { order.append(other) }
         let names = order.map(\.name), tabs = order.map(\.tabs)
         let theme = SessionManager.shared.config.theme
-        if shown.map({ $0.names == names && $0.tabs == tabs && $0.theme == theme }) != true {
+        if let s = shown, s.names == names, s.theme == theme,
+           Self.sameRows(s.tabs.map(Self.identities), tabs.map(Self.identities)) {
+            // The same tabs in the same places, so only a title, status or branch changed:
+            // reconfigure those rows. reloadData would rebuild every row view, and a working
+            // agent retitles its tab several times a second.
+            if s.tabs != tabs {
+                shown = (names, tabs, theme)
+                for (g, new) in zip(groups, tabs) {
+                    g.tabs = new
+                    for (box, tab) in zip(g.boxes, new) where box.tab != tab {
+                        box.tab = tab
+                        let row = outline.row(forItem: box)
+                        guard row >= 0 else { continue }
+                        (outline.view(atColumn: 0, row: row, makeIfNecessary: false) as? TabRowView)?.configure(tab)
+                    }
+                }
+            }
+        } else {
             shown = (names, tabs, theme)
             for g in order { g.boxes = g.tabs.map(TabBox.init) }
             groups = order
@@ -371,6 +388,18 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         let current = (0..<outline.numberOfRows).first { (outline.item(atRow: $0) as? TabBox)?.tab.selected == true }
         if let row = current, outline.selectedRow != row {
             outline.selectRowIndexes([row], byExtendingSelection: false)
+        }
+    }
+
+    /// The identity of each tab in a group: the window it shows.
+    private static func identities(_ group: [SidebarTab]) -> [ObjectIdentifier?] {
+        group.map { $0.controller.map(ObjectIdentifier.init) }
+    }
+
+    /// Whether two listings hold the same tabs in the same groups and order, whatever they show.
+    static func sameRows<ID: Equatable>(_ a: [[ID]], _ b: [[ID]]) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { x, y in
+            x.count == y.count && zip(x, y).allSatisfy { $0 == $1 }
         }
     }
 
@@ -626,20 +655,30 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         }
         let next = agentRows()
         if !repaint, next.count == rows.count, shownLimit == visibleRows,
-           zip(next, rows).allSatisfy({ $0.pane == $1.pane && $0.hiddenWorkspace == $1.hiddenWorkspace && $0.row == $1.row }) {
+           zip(next, rows).allSatisfy({ $0.pane == $1.pane && $0.hiddenWorkspace == $1.hiddenWorkspace }) {
+            // The same agents in the same places: reconfigure the rows that changed instead of
+            // rebuilding them all for every status or title change.
+            for (i, box) in next.enumerated() where box.row != rows[i].row {
+                rows[i] = box
+                (table.view(atColumn: 0, row: i, makeIfNecessary: false) as? TabRowView)?
+                    .configure(box.row, truncateTail: true)
+            }
+            updateSummary()
             // A click selects its row even when it changes nothing shown: put the selection back.
             let current = rows.firstIndex { $0.row.selected }
             if table.selectedRow != (current ?? -1) {
-                if let i = current { table.selectRowIndexes([i], byExtendingSelection: false) } else { table.deselectAll(nil) }
+                if let i = current {
+                table.selectRowIndexes([i], byExtendingSelection: false)
+                table.scrollRowToVisible(i)
+            } else {
+                table.deselectAll(nil)
+            }
             }
             return
         }
         rows = next
         isHidden = rows.isEmpty
-        let waiting = rows.filter { $0.row.status == .needsInput }.count
-        let working = rows.filter { $0.row.status == .working }.count
-        summary.stringValue = [waiting > 0 ? "\(waiting) waiting" : nil, working > 0 ? "\(working) working" : nil]
-            .compactMap { $0 }.joined(separator: " · ")
+        updateSummary()
         table.reloadData()
         updateHeight()
         if let i = rows.firstIndex(where: { $0.row.selected }) {
@@ -648,6 +687,14 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         } else {
             table.deselectAll(nil)
         }
+    }
+
+    private func updateSummary() {
+        let waiting = rows.filter { $0.row.status == .needsInput }.count
+        let working = rows.filter { $0.row.status == .working }.count
+        let text = [waiting > 0 ? "\(waiting) waiting" : nil, working > 0 ? "\(working) working" : nil]
+            .compactMap { $0 }.joined(separator: " · ")
+        if summary.stringValue != text { summary.stringValue = text }
     }
 
     private func updateHeight() {
