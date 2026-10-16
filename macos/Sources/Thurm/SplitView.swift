@@ -243,6 +243,7 @@ final class TabContentView: NSView {
     private(set) var root: SplitNode
     private(set) var views: [PaneKey: TerminalView] = [:]
     private var headers: [PaneKey: PaneHeader] = [:]
+    private let backdrop = SplitBackdrop()
     private let chrome = CardChrome()
     private(set) var focusedPane: PaneKey
     private(set) var zoomedPane: PaneKey?
@@ -350,6 +351,7 @@ final class TabContentView: NSView {
         if let z = zoomed, panes.contains(z) { self.zoomedPane = z } else { self.zoomedPane = nil }
         super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         autoresizingMask = [.width, .height]
+        addSubview(backdrop)
         addSubview(chrome)
         syncViews()
         setUpdateBadge(Updater.shared.badgeText)
@@ -394,13 +396,13 @@ final class TabContentView: NSView {
         for id in root.panes where views[id] == nil {
             let view = TerminalView(pane: id)
             view.onDimDrawn = { [weak self] in
-                if self?.showsHeaders == true { self?.needsDisplay = true }
+                if self?.showsHeaders == true || self?.isMoving == true { self?.updateBackdrop() }
             }
             views[id] = view
             addSubview(view, positioned: .below, relativeTo: chrome)
         }
         needsLayout = true
-        needsDisplay = true
+        updateBackdrop()
     }
 
     override func layout() {
@@ -473,6 +475,7 @@ final class TabContentView: NSView {
         }
         if cards {
             chrome.frame = bounds
+            chrome.scale = window?.backingScaleFactor ?? 2
             chrome.area = full
             chrome.cards = frames.map {
                 (rect: $0.1, focused: $0.0 == focusedPane && frames.count > 1)
@@ -486,7 +489,6 @@ final class TabContentView: NSView {
                 return [NSPoint(x: 0, y: 0), NSPoint(x: s.width, y: 0), NSPoint(x: 0, y: s.height),
                         NSPoint(x: s.width, y: s.height)].map { convert($0, from: nil) }
             } ?? []
-            chrome.needsDisplay = true
             syncDividerHighlight()
             for (id, header) in headers {
                 header.update(focused: id == focusedPane)
@@ -509,7 +511,7 @@ final class TabContentView: NSView {
             badge.frame = NSRect(x: full.maxX - size.width - 12, y: full.maxY - size.height - 10,
                                  width: size.width, height: size.height)
         }
-        needsDisplay = true
+        updateBackdrop()
     }
 
     /// A pane's terminal in its rectangle: all of it, or with cards inside the card's 1pt
@@ -557,7 +559,7 @@ final class TabContentView: NSView {
     private func syncDividerHighlight(at now: CFTimeInterval = CACurrentMediaTime()) {
         let divider = highlightedPath.flatMap { path in currentDividers.first { $0.path == path } }
         chrome.highlight = divider.map { ($0.rect, $0.axis, CGFloat(dividerEmphasis.value(at: now))) }
-        chrome.needsDisplay = true
+        chrome.refresh()
     }
 
     /// Highlights the divider at `path` (nil: none) and eases the highlight in or out.
@@ -658,13 +660,17 @@ final class TabContentView: NSView {
         views.values.forEach { $0.holdGridSize = false }
     }
 
-    override func draw(_ dirtyRect: NSRect) {
+    /// The fills under the terminals, as `backdrop` layers: a layout move then changes layer
+    /// frames and colors each frame instead of repainting a window-sized bitmap.
+    private func updateBackdrop() {
+        backdrop.frame = bounds
+        var fills: [(NSRect, NSColor)] = []
+        defer { backdrop.show(fills) }
         // Theme background under the titlebar and tab bar.
         let cfg = SessionManager.shared.config
         let area = paneArea
-        colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity).setFill()
-        NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: area.minY - bounds.minY).fill()
         let bg = colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity)
+        fills.append((NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: area.minY - bounds.minY), bg))
         func surface(_ id: PaneKey) -> NSColor {
             let scale = ChromePalette.dimmedBackgroundScale(drawn: (views[id] ?? leaving[id]?.view)?.dimDrawn ?? 0,
                                                             dim: cfg.unfocusedSplitDim,
@@ -674,26 +680,24 @@ final class TabContentView: NSView {
         }
         // During a layout move, each pane's surface under its terminal: what shows where a held
         // grid does not reach and where content fades in or out.
+        let frames = visibleFrames
         if isMoving {
-            for (id, rect) in visibleFrames {
-                surface(id).setFill()
-                rect.fill()
+            for (id, rect) in frames {
+                fills.append((rect, surface(id)))
             }
         }
         guard showsHeaders else {
             guard zoomedPane == nil, !isMoving else { return }
-            cfg.dividerColor.setFill()
             for d in currentDividers {
-                d.rect.fill()
+                fills.append((d.rect, cfg.dividerColor))
             }
             return
         }
         // Cards: the header strips in the terminal's color, under the headers, shaded with the
-        // pane's dim. The gutters and outlines are `CardChrome`'s, drawn over the terminals'
-        // square corners.
-        for (id, rect) in visibleFrames {
-            surface(id).setFill()
-            NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: 1 + PaneHeader.height).fill()
+        // pane's dim. The gutters and outlines are `CardChrome`'s, over the terminals' square
+        // corners.
+        for (id, rect) in frames {
+            fills.append((NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: 1 + PaneHeader.height), surface(id)))
         }
     }
 
@@ -977,7 +981,7 @@ final class TabContentView: NSView {
     /// Re-reads titles and focus into the headers (pane info changed, focus moved, theme).
     func refreshHeaders() {
         for (id, header) in headers { header.update(focused: id == focusedPane) }
-        if showsHeaders { needsDisplay = true }
+        if showsHeaders { updateBackdrop() }
     }
 
     /// After a config reload: headers turned on or off, or the theme changed.
@@ -999,9 +1003,51 @@ final class TabContentView: NSView {
     var host: HostId { root.panes.first?.host ?? localHost }
 }
 
+/// Flat fills under the terminals (see `TabContentView.updateBackdrop`), one layer each.
+/// Clicks pass through.
+private final class SplitBackdrop: NSView {
+    private var fills: [CALayer] = []
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func show(_ rects: [(NSRect, NSColor)]) {
+        guard let layer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        while fills.count < rects.count {
+            let fill = CALayer()
+            layer.addSublayer(fill)
+            fills.append(fill)
+        }
+        for (i, fill) in fills.enumerated() {
+            guard i < rects.count else {
+                fill.isHidden = true
+                continue
+            }
+            fill.isHidden = false
+            fill.frame = rects[i].0
+            fill.backgroundColor = rects[i].1.cgColor
+        }
+        CATransaction.commit()
+    }
+}
+
 /// Split cards' gutters (in the sidebar's color) and faint outlines, over the panes so the rounded
 /// corners cover the terminals' square ones. Clicks pass through. A card corner near a window
-/// corner follows the window's curve, so the two stay concentric.
+/// corner follows the window's curve, so the two stay concentric. Shape layers, not a drawn
+/// view: a layout move changes their paths each frame, which the render server rasterizes,
+/// instead of the app repainting and uploading a window-sized bitmap.
 private final class CardChrome: NSView {
     var area: NSRect = .zero
     var cards: [(rect: NSRect, focused: Bool)] = []
@@ -1011,48 +1057,86 @@ private final class CardChrome: NSView {
     var windowCorners: [NSPoint] = []
     /// The divider being hovered or dragged, and how far its highlight has eased in (0...1).
     var highlight: (rect: NSRect, axis: SplitAxis, amount: CGFloat)?
+    var scale: CGFloat = 2
+
+    private let gutter = CAShapeLayer()
+    private var outlines: [CAShapeLayer] = []
+    private let bar = CALayer()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.addSublayer(gutter)
+        layer?.addSublayer(bar)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
 
     override var isFlipped: Bool { true }
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-    override func draw(_ dirtyRect: NSRect) {
+    /// Applies the properties above to the layers.
+    func refresh() {
+        guard let layer else { return }
         let chrome = SessionManager.shared.config.chrome
-        // Cards are cut out one by one rather than with an even-odd path: during a zoom they
-        // overlap, and the overlap would flip back to gutter over the terminals.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         // A card opening or closing can be flatter than its outline; it has nothing to show.
         let cards = cards.filter { $0.rect.width >= 1 && $0.rect.height >= 1 }
         let radii = cards.map { corners(of: $0.rect) }
-        let context = NSGraphicsContext.current
-        chrome.surface.withAlphaComponent(opacity).setFill()
-        NSBezierPath(rect: area).fill()
-        context?.saveGraphicsState()
-        context?.compositingOperation = .clear
+        // Cards are cut out of their union rather than with an even-odd path: during a zoom they
+        // overlap, and the overlap would flip back to gutter over the terminals.
+        var holes: CGPath?
         for (card, r) in zip(cards, radii) {
-            Self.path(card.rect, radii: r).fill()
+            let path = Self.path(card.rect, radii: r)
+            holes = holes.map { $0.union(path) } ?? path
         }
-        context?.restoreGraphicsState()
+        let full = CGPath(rect: area, transform: nil)
+        gutter.frame = bounds
+        gutter.contentsScale = scale
+        gutter.path = holes.map { full.subtracting($0) } ?? full
+        gutter.fillColor = chrome.surface.withAlphaComponent(opacity).cgColor
         // A hairline around each card, a touch brighter around the focused pane. Light on dark
-        // themes, so it reads as an edge.
-        context?.saveGraphicsState()
-        if chrome.isDark { context?.compositingOperation = .plusLighter }
-        for (card, r) in zip(cards, radii) {
-            let outline = Self.path(card.rect.insetBy(dx: 0.5, dy: 0.5), radii: r.map { $0 - 0.5 })
-            let color = card.focused ? chrome.strokeStrong : chrome.stroke
-            color.withAlphaComponent(color.alphaComponent * max(opacity, 0.6)).setStroke()
-            outline.lineWidth = ChromeStroke.width
-            outline.stroke()
+        // themes, so it reads as an edge. Each outline layer covers only its card, which bounds
+        // the blend.
+        while outlines.count < cards.count {
+            let outline = CAShapeLayer()
+            outline.fillColor = nil
+            layer.insertSublayer(outline, below: bar)
+            outlines.append(outline)
         }
-        context?.restoreGraphicsState()
+        let blend = chrome.isDark ? CIFilter(name: "CIAdditionCompositing") : nil
+        for (i, outline) in outlines.enumerated() {
+            guard i < cards.count else {
+                outline.isHidden = true
+                continue
+            }
+            let (card, r) = (cards[i], radii[i])
+            outline.isHidden = false
+            outline.frame = card.rect
+            outline.contentsScale = scale
+            let local = CGRect(origin: .zero, size: card.rect.size).insetBy(dx: 0.5, dy: 0.5)
+            outline.path = Self.path(local, radii: r.map { $0 - 0.5 })
+            let color = card.focused ? chrome.strokeStrong : chrome.stroke
+            outline.strokeColor = color.withAlphaComponent(color.alphaComponent * max(opacity, 0.6)).cgColor
+            outline.lineWidth = ChromeStroke.width
+            if (outline.compositingFilter == nil) != (blend == nil) { outline.compositingFilter = blend }
+        }
         if let highlight, highlight.amount > 0 {
             let r = highlight.rect
             let width = 1 + 2 * highlight.amount
-            let bar = highlight.axis == .horizontal
+            bar.isHidden = false
+            bar.frame = highlight.axis == .horizontal
                 ? NSRect(x: r.midX - width / 2, y: r.minY, width: width, height: r.height)
                 : NSRect(x: r.minX, y: r.midY - width / 2, width: r.width, height: width)
-            (chrome.surface.blended(withFraction: 0.35 * highlight.amount, of: chrome.contentPrimary)
-                ?? chrome.contentPrimary).setFill()
-            NSBezierPath(rect: bar).fill()
+            bar.backgroundColor = (chrome.surface.blended(withFraction: 0.35 * highlight.amount, of: chrome.contentPrimary)
+                ?? chrome.contentPrimary).cgColor
+        } else {
+            bar.isHidden = true
         }
     }
 
@@ -1070,20 +1154,20 @@ private final class CardChrome: NSView {
     }
 
     /// A rounded rectangle with its own radius per corner, clockwise from the top left (flipped).
-    private static func path(_ r: NSRect, radii: [CGFloat]) -> NSBezierPath {
+    private static func path(_ r: NSRect, radii: [CGFloat]) -> CGPath {
         let limit = min(r.width, r.height) / 2
         let (tl, tr, br, bl) = (min(radii[0], limit), min(radii[1], limit), min(radii[2], limit), min(radii[3], limit))
-        let p = NSBezierPath()
-        p.move(to: NSPoint(x: r.minX + tl, y: r.minY))
-        p.line(to: NSPoint(x: r.maxX - tr, y: r.minY))
-        p.appendArc(from: NSPoint(x: r.maxX, y: r.minY), to: NSPoint(x: r.maxX, y: r.minY + tr), radius: tr)
-        p.line(to: NSPoint(x: r.maxX, y: r.maxY - br))
-        p.appendArc(from: NSPoint(x: r.maxX, y: r.maxY), to: NSPoint(x: r.maxX - br, y: r.maxY), radius: br)
-        p.line(to: NSPoint(x: r.minX + bl, y: r.maxY))
-        p.appendArc(from: NSPoint(x: r.minX, y: r.maxY), to: NSPoint(x: r.minX, y: r.maxY - bl), radius: bl)
-        p.line(to: NSPoint(x: r.minX, y: r.minY + tl))
-        p.appendArc(from: NSPoint(x: r.minX, y: r.minY), to: NSPoint(x: r.minX + tl, y: r.minY), radius: tl)
-        p.close()
+        let p = CGMutablePath()
+        p.move(to: CGPoint(x: r.minX + tl, y: r.minY))
+        p.addLine(to: CGPoint(x: r.maxX - tr, y: r.minY))
+        p.addArc(tangent1End: CGPoint(x: r.maxX, y: r.minY), tangent2End: CGPoint(x: r.maxX, y: r.minY + tr), radius: tr)
+        p.addLine(to: CGPoint(x: r.maxX, y: r.maxY - br))
+        p.addArc(tangent1End: CGPoint(x: r.maxX, y: r.maxY), tangent2End: CGPoint(x: r.maxX - br, y: r.maxY), radius: br)
+        p.addLine(to: CGPoint(x: r.minX + bl, y: r.maxY))
+        p.addArc(tangent1End: CGPoint(x: r.minX, y: r.maxY), tangent2End: CGPoint(x: r.minX, y: r.maxY - bl), radius: bl)
+        p.addLine(to: CGPoint(x: r.minX, y: r.minY + tl))
+        p.addArc(tangent1End: CGPoint(x: r.minX, y: r.minY), tangent2End: CGPoint(x: r.minX + tl, y: r.minY), radius: tl)
+        p.closeSubpath()
         return p
     }
 }
