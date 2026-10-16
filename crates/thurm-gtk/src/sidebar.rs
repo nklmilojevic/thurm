@@ -241,7 +241,13 @@ impl Sidebar {
             let shown = self.shown.borrow();
             shown.0 == groups && shown.1 == agents && shown.2 == collapsed
         };
-        if !unchanged {
+        if !unchanged && self.same_places(&groups, &tabs, collapsed, &agents) {
+            // The same tabs and agents in the same places, so only what a row shows changed:
+            // replace those rows. Rebuilding the lists would redo every row, and a working
+            // agent retitles its tab several times a second.
+            self.update_in_place(&groups, &tabs, collapsed, &agents);
+            *self.shown.borrow_mut() = (groups, agents, collapsed.to_vec());
+        } else if !unchanged {
             while let Some(r) = self.list.first_child() {
                 self.list.remove(&r);
             }
@@ -295,16 +301,7 @@ impl Sidebar {
                 }
             }
             *self.agent_keys.borrow_mut() = agents.iter().map(|a| a.key.clone()).collect();
-            let waiting = agents.iter().filter(|a| a.status == Some(AgentStatus::NeedsInput)).count();
-            let working = agents.iter().filter(|a| a.status == Some(AgentStatus::Working)).count();
-            let mut parts = Vec::new();
-            if waiting > 0 {
-                parts.push(format!("{waiting} waiting"));
-            }
-            if working > 0 {
-                parts.push(format!("{working} working"));
-            }
-            self.agents_summary.set_text(&parts.join(" · "));
+            self.set_agents_summary(&agents);
             self.agents_box.set_visible(!agents.is_empty());
             *self.shown.borrow_mut() = (groups, agents, collapsed.to_vec());
         }
@@ -320,6 +317,90 @@ impl Sidebar {
             None => self.agents_list.unselect_all(),
         }
         let _ = &self.agents_scroll;
+    }
+
+    /// Whether `update` lists the same tabs and agents as shown, in the same places.
+    fn same_places(
+        &self,
+        groups: &[Group],
+        tabs: &[Vec<Rc<Tab>>],
+        collapsed: &[String],
+        agents: &[AgentRow],
+    ) -> bool {
+        let shown = self.shown.borrow();
+        if shown.2 != collapsed
+            || shown.1.len() != agents.len()
+            || !shown.1.iter().zip(agents).all(|(a, b)| a.key == b.key)
+            || shown.0.len() != groups.len()
+            || !shown.0.iter().zip(groups).all(|(a, b)| a.name == b.name)
+            || listed_rows(&shown.0, collapsed).len() != listed_rows(groups, collapsed).len()
+        {
+            return false;
+        }
+        let listed = listed_tabs(groups, tabs, collapsed);
+        let row_tabs = self.row_tabs.borrow();
+        row_tabs.len() == listed.len()
+            && listed_rows(groups, collapsed).len() == listed.len()
+            && row_tabs.iter().zip(&listed).all(|(a, b)| match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::ptr::eq(a.as_ptr(), Rc::as_ptr(b)),
+                _ => false,
+            })
+    }
+
+    /// Replaces the rows whose content changed; `same_places` holds.
+    fn update_in_place(
+        self: &Rc<Self>,
+        groups: &[Group],
+        tabs: &[Vec<Rc<Tab>>],
+        collapsed: &[String],
+        agents: &[AgentRow],
+    ) {
+        let shown = self.shown.borrow();
+        let listed = listed_tabs(groups, tabs, collapsed);
+        let rows = listed_rows(groups, collapsed);
+        for (i, (old, (new, tab))) in listed_rows(&shown.0, collapsed)
+            .into_iter()
+            .zip(rows.into_iter().zip(&listed))
+            .enumerate()
+        {
+            let (Some(old), Some(new), Some(tab)) = (old, new, tab) else {
+                continue;
+            };
+            if old == new {
+                continue;
+            }
+            let row = tab_row(new);
+            self.install_row(&row, tab);
+            if let Some(stale) = self.list.row_at_index(i as i32) {
+                self.list.remove(&stale);
+            }
+            self.list.insert(&row, i as i32);
+        }
+        for (i, (old, new)) in shown.1.iter().zip(agents).enumerate() {
+            if old == new {
+                continue;
+            }
+            if let Some(stale) = self.agents_list.row_at_index(i as i32) {
+                self.agents_list.remove(&stale);
+            }
+            self.agents_list.insert(&agent_row(new), i as i32);
+        }
+        drop(shown);
+        self.set_agents_summary(agents);
+    }
+
+    fn set_agents_summary(&self, agents: &[AgentRow]) {
+        let waiting = agents.iter().filter(|a| a.status == Some(AgentStatus::NeedsInput)).count();
+        let working = agents.iter().filter(|a| a.status == Some(AgentStatus::Working)).count();
+        let mut parts = Vec::new();
+        if waiting > 0 {
+            parts.push(format!("{waiting} waiting"));
+        }
+        if working > 0 {
+            parts.push(format!("{working} working"));
+        }
+        self.agents_summary.set_text(&parts.join(" · "));
     }
 
     fn install_row(self: &Rc<Self>, row: &gtk::ListBoxRow, tab: &Rc<Tab>) {
@@ -423,6 +504,38 @@ fn tile(icon: PaneIcon, status: Option<AgentStatus>) -> gtk::DrawingArea {
         let _ = cr.fill();
     });
     art
+}
+
+/// The tab list's rows in order: `None` for a group header, collapsed groups' rows left out.
+fn listed_rows<'a>(groups: &'a [Group], collapsed: &[String]) -> Vec<Option<&'a TabRow>> {
+    let mut out = Vec::new();
+    for g in groups {
+        if g.name.is_some() {
+            out.push(None);
+        }
+        if !g.name.as_ref().is_some_and(|n| collapsed.contains(n)) {
+            out.extend(g.rows.iter().map(Some));
+        }
+    }
+    out
+}
+
+/// The tab behind each of `listed_rows`.
+fn listed_tabs(
+    groups: &[Group],
+    tabs: &[Vec<Rc<Tab>>],
+    collapsed: &[String],
+) -> Vec<Option<Rc<Tab>>> {
+    let mut out = Vec::new();
+    for (g, group_tabs) in groups.iter().zip(tabs) {
+        if g.name.is_some() {
+            out.push(None);
+        }
+        if !g.name.as_ref().is_some_and(|n| collapsed.contains(n)) {
+            out.extend(g.rows.iter().zip(group_tabs).map(|(_, t)| Some(t.clone())));
+        }
+    }
+    out
 }
 
 fn tab_row(r: &TabRow) -> gtk::ListBoxRow {
