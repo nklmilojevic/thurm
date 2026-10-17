@@ -3042,13 +3042,14 @@ impl Daemon {
     }
 
     /// Runs the `[[on]]` hooks for `event` in the pane `info` describes, with `{"event", "pane",
-    /// ...extra}` on their stdin. `secs` is how long a finished command ran, for `min_secs`.
+    /// ...extra}` on their stdin. `secs` is how long a finished command ran, for `min_secs`
+    /// (which other events ignore).
     fn run_hooks(&self, event: HookEvent, info: &PaneInfo, extra: serde_json::Value, secs: u64) {
         let hooks: Vec<EventHook> = self
             .config
             .read()
             .hooks(event)
-            .filter(|h| secs >= h.min_secs)
+            .filter(|h| event != HookEvent::CommandFinished || secs >= h.min_secs)
             .cloned()
             .collect();
         if hooks.is_empty() {

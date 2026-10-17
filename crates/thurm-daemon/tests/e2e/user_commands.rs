@@ -103,6 +103,8 @@ fn a_hook_gets_the_event_on_stdin() {
             [[on]]
             event = "pane_exited"
             exec = ["sh", "-c", "printf '%s ' \"$THURM_EVENT\" > \"$1\"; cat >> \"$1\"", "sh", {out:?}]
+            # Only for command_finished: it must not keep this hook from running.
+            min_secs = 60
             "#
         ),
     );

@@ -3835,6 +3835,27 @@ fn sort_value(v: Value) -> Value {
     }
 }
 
+/// The value `map` has for a key press. Shifted punctuation (Ctrl+Shift+= arrives as "plus") is
+/// also tried as the key's unshifted symbol.
+fn lookup_key<T: Clone>(
+    map: &HashMap<Combo, T>,
+    keyval: gdk::Key,
+    keycode: u32,
+    state: gdk::ModifierType,
+) -> Option<T> {
+    if let Some(v) = map.get(&actions::combo(keyval, state)) {
+        return Some(v.clone());
+    }
+    let display = gdk::Display::default()?;
+    let (base, ..) = gdk::prelude::DisplayExtManual::translate_key(
+        &display,
+        keycode,
+        gdk::ModifierType::empty(),
+        0,
+    )?;
+    map.get(&actions::combo(base, state)).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3885,25 +3906,4 @@ mod tests {
         assert!(s.starts_with("{\"windows\""), "{s}");
         assert!(s.find("\"windows\"") < s.find("\"workspaces\""));
     }
-}
-
-/// The value `map` has for a key press. Shifted punctuation (Ctrl+Shift+= arrives as "plus") is
-/// also tried as the key's unshifted symbol.
-fn lookup_key<T: Clone>(
-    map: &HashMap<Combo, T>,
-    keyval: gdk::Key,
-    keycode: u32,
-    state: gdk::ModifierType,
-) -> Option<T> {
-    if let Some(v) = map.get(&actions::combo(keyval, state)) {
-        return Some(v.clone());
-    }
-    let display = gdk::Display::default()?;
-    let (base, ..) = gdk::prelude::DisplayExtManual::translate_key(
-        &display,
-        keycode,
-        gdk::ModifierType::empty(),
-        0,
-    )?;
-    map.get(&actions::combo(base, state)).cloned()
 }

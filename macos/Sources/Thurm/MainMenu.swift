@@ -12,16 +12,46 @@ enum MainMenu {
     /// The Shell menu's Commands submenu: the config's `[[commands]]`, refilled on every load.
     private static let commandsMenu = NSMenu(title: "Commands")
     private static var commandsItem: NSMenuItem?
+    /// Built-in items whose key a command took, with the key they had.
+    private static var displaced: [(item: NSMenuItem, key: String, mods: NSEvent.ModifierFlags)] = []
 
-    static func updateCommands(_ commands: [UserCommand]) {
+    /// Refills the Commands submenu. A command's key comes before the built-in item's: the
+    /// first item with a key equivalent gets it, so the built-in one gives it up (and has it back
+    /// once no command claims it).
+    static func updateCommands(_ commands: [UserCommand], in main: NSMenu? = NSApp.mainMenu) {
+        for d in displaced {
+            d.item.keyEquivalent = d.key
+            d.item.keyEquivalentModifierMask = d.mods
+        }
+        displaced = []
         commandsMenu.removeAllItems()
         for command in commands {
             let (key, mods) = keyEquivalent(command.key) ?? ("", [])
+            if !key.isEmpty, let main { displace(chord(key, mods), in: main) }
             let entry = item(command.name, #selector(AppDelegate.runUserCommand(_:)), key, mods)
             entry.representedObject = command.name
             commandsMenu.addItem(entry)
         }
         commandsItem?.isHidden = commands.isEmpty
+    }
+
+    /// Takes the key equivalent `target` off every item under `menu` that has it.
+    private static func displace(_ target: String, in menu: NSMenu) {
+        for item in menu.items {
+            if let sub = item.submenu, sub !== commandsMenu { displace(target, in: sub) }
+            if !item.keyEquivalent.isEmpty,
+               chord(item.keyEquivalent, item.keyEquivalentModifierMask) == target {
+                displaced.append((item, item.keyEquivalent, item.keyEquivalentModifierMask))
+                item.keyEquivalent = ""
+            }
+        }
+    }
+
+    /// A key equivalent in one spelling: an uppercase letter is the lowercase one with Shift.
+    private static func chord(_ key: String, _ mods: NSEvent.ModifierFlags) -> String {
+        var m = mods.intersection([.command, .shift, .option, .control])
+        if key != key.lowercased() { m.insert(.shift) }
+        return "\(m.rawValue)+\(key.lowercased())"
     }
 
     /// A `[keybindings]` chord ("cmd+shift+l", "ctrl+alt+f5") as a menu key equivalent, with

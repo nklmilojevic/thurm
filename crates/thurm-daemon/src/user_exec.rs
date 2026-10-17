@@ -36,19 +36,22 @@ pub fn start(launch: Launch, on_failure: impl FnOnce(String) + Send + 'static) -
     std::thread::Builder::new()
         .name("user-command".into())
         .spawn(move || {
-            if let Some((mut pipe, data)) = stdin {
-                // A command that ignores its stdin closes the pipe: that is not a failure.
-                let _ = pipe.write_all(&data);
-            }
-            let mut err = Vec::new();
-            if let Some(s) = stderr.as_mut() {
-                let _ = s.read_to_end(&mut err);
+            // Its own thread: a command that logs before it reads its stdin would otherwise
+            // wait on a full stderr pipe while this one waits on a full stdin pipe.
+            let writer = stdin.map(|(mut pipe, data)| {
+                std::thread::spawn(move || {
+                    // A command that ignores its stdin closes the pipe: that is not a failure.
+                    let _ = pipe.write_all(&data);
+                })
+            });
+            let err = stderr.as_mut().map(tail).unwrap_or_default();
+            if let Some(w) = writer {
+                let _ = w.join();
             }
             match child.wait() {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
-                    let start = err.len().saturating_sub(STDERR_TAIL);
-                    let tail = String::from_utf8_lossy(&err[start..]).trim().to_owned();
+                    let tail = String::from_utf8_lossy(&err).trim().to_owned();
                     on_failure(match status.code() {
                         Some(c) if tail.is_empty() => format!("exit {c}"),
                         Some(c) => format!("exit {c}: {tail}"),
@@ -59,6 +62,26 @@ pub fn start(launch: Launch, on_failure: impl FnOnce(String) + Send + 'static) -
             }
         })?;
     Ok(())
+}
+
+/// The last [`STDERR_TAIL`] bytes `r` gives before its end: a command can log for as long as
+/// it runs, and only its last words go into the report.
+fn tail(r: &mut impl Read) -> Vec<u8> {
+    let mut kept = std::collections::VecDeque::with_capacity(STDERR_TAIL);
+    let mut buf = [0u8; 4096];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                kept.extend(&buf[..n]);
+                let over = kept.len().saturating_sub(STDERR_TAIL);
+                kept.drain(..over);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    kept.into()
 }
 
 fn command(launch: &Launch) -> Command {
@@ -125,6 +148,24 @@ mod tests {
         )
         .unwrap();
         rx.recv_timeout(Duration::from_secs(20)).ok().flatten()
+    }
+
+    #[test]
+    fn only_the_end_of_stderr_is_kept() {
+        let long: Vec<u8> = (0..20_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let kept = tail(&mut &long[..]);
+        assert_eq!(kept, long[long.len() - STDERR_TAIL..]);
+        assert_eq!(tail(&mut &b"short"[..]), b"short");
+    }
+
+    /// A command that fills its stderr before it reads its stdin still finishes.
+    #[test]
+    fn a_noisy_command_reading_a_large_stdin_does_not_hang() {
+        let script = "head -c 200000 /dev/zero | tr '\\0' x >&2; cat > /dev/null; exit 1";
+        let payload = "y".repeat(300_000);
+        let e = run(&["sh", "-c", script], vec![], Some(&payload)).unwrap();
+        assert!(e.starts_with("exit 1: xxx"), "{}", &e[..e.len().min(40)]);
+        assert!(e.len() <= STDERR_TAIL + 10);
     }
 
     #[test]

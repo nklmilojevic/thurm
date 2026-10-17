@@ -24,6 +24,33 @@ final class MainMenuTests: XCTestCase {
         XCTAssertEqual(parse("f5")!.0, String(UnicodeScalar(UInt32(NSF5FunctionKey))!))
     }
 
+    /// A command's key comes before a built-in item's, which has it back once no command does.
+    func testCommandKeysDisplaceBuiltInOnes() {
+        let main = NSMenu(title: "Main")
+        let shell = NSMenu(title: "Shell")
+        let split = NSMenuItem(title: "Split Down", action: nil, keyEquivalent: "d")
+        split.keyEquivalentModifierMask = [.command, .shift]
+        let tab = NSMenuItem(title: "New Tab", action: nil, keyEquivalent: "t")
+        tab.keyEquivalentModifierMask = [.command]
+        shell.addItem(split)
+        shell.addItem(tab)
+        let container = NSMenuItem(title: "Shell", action: nil, keyEquivalent: "")
+        container.submenu = shell
+        main.addItem(container)
+
+        MainMenu.updateCommands([UserCommand(name: "Layout", key: "cmd+shift+d")], in: main)
+        XCTAssertEqual(split.keyEquivalent, "")
+        XCTAssertEqual(tab.keyEquivalent, "t")
+
+        MainMenu.updateCommands([UserCommand(name: "Tab", key: "cmd+t")], in: main)
+        XCTAssertEqual(split.keyEquivalent, "d")
+        XCTAssertEqual(split.keyEquivalentModifierMask, [.command, .shift])
+        XCTAssertEqual(tab.keyEquivalent, "")
+
+        MainMenu.updateCommands([], in: main)
+        XCTAssertEqual(tab.keyEquivalent, "t")
+    }
+
     func testUnknownKeysAndModifiersAreRejected() {
         XCTAssertNil(parse(""))
         XCTAssertNil(parse("cmd+"))
