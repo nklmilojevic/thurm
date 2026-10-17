@@ -104,6 +104,11 @@ const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long ending the server waits for shells still starting (an ssh connection and a mosh
 /// bootstrap, each with its own timeout).
 const CREATING_TIMEOUT: Duration = Duration::from_secs(60);
+/// Tests widen the moment between a shell starting and its pane having it (its first output
+/// can come in it).
+#[cfg(test)]
+static SSH_START_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
 /// How long a new mosh session has to hear from its server over UDP (several startup probes)
 /// before the pane gives up on mosh: a firewall dropping UDP looks like nothing at all.
 const MOSH_ANSWER: Duration = if cfg!(test) {
@@ -266,6 +271,9 @@ struct Pane {
     subscribed: bool,
     alive: bool,
     exit_code: Option<i32>,
+    /// Terminal replies to an ssh shell's first output, which can come before the shell is
+    /// in `backend`: sent once it is.
+    held_replies: Vec<u8>,
 }
 
 impl Pane {
@@ -598,6 +606,7 @@ impl Inner {
             subscribed: false,
             alive: true,
             exit_code: None,
+            held_replies: Vec::new(),
         }));
         self.panes.lock().insert(id, pane.clone());
         let started = match self.target.mode {
@@ -652,7 +661,16 @@ impl Inner {
                 }
             })
             .map_err(|e| e.to_string())?;
-        pane.lock().backend = Backend::Ssh(shell);
+        #[cfg(test)]
+        std::thread::sleep(Duration::from_millis(
+            SSH_START_DELAY_MS.load(Ordering::Relaxed),
+        ));
+        let mut p = pane.lock();
+        let held = std::mem::take(&mut p.held_replies);
+        if !held.is_empty() {
+            shell.write(&held);
+        }
+        p.backend = Backend::Ssh(shell);
         Ok(())
     }
 
@@ -725,11 +743,12 @@ impl Inner {
         let mut info = false;
         for ev in p.term.drain_events() {
             match ev {
-                TermEvent::PtyWrite(bytes) => {
-                    if let Backend::Ssh(shell) = &p.backend {
-                        shell.write(&bytes);
-                    }
-                }
+                TermEvent::PtyWrite(bytes) => match &p.backend {
+                    Backend::Ssh(shell) => shell.write(&bytes),
+                    Backend::Starting => p.held_replies.extend(bytes),
+                    // mosh-server answers terminal queries itself.
+                    Backend::Mosh { .. } | Backend::Ended => {}
+                },
                 TermEvent::Title(_) => info = true,
                 TermEvent::Bell => self.event(Event::Bell { pane: p.id }),
                 TermEvent::ClipboardStore(text) => {

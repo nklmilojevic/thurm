@@ -59,6 +59,18 @@ struct Server {
     exits: Arc<Mutex<Vec<i32>>>,
     /// Refuse terminals (`PermitTTY no`).
     no_pty: bool,
+    /// A script each shell runs first, before reading commands.
+    shell_init: Option<String>,
+}
+
+/// How a [`serve_with`] server differs from [`serve`]'s.
+#[derive(Clone, Default)]
+pub struct Options {
+    /// Refuse terminals (sshd's `PermitTTY no`).
+    pub no_pty: bool,
+    /// A script each shell runs first (what a login shell's profile would print), then it
+    /// reads commands as usual.
+    pub shell_init: Option<String>,
 }
 
 impl server::Handler for Server {
@@ -143,7 +155,11 @@ impl server::Handler for Server {
         use std::io::Read as _;
         use std::process::{Command, Stdio};
         session.channel_success(channel)?;
-        let mut child = Command::new("/bin/sh")
+        let mut sh = Command::new("/bin/sh");
+        if let Some(init) = &self.shell_init {
+            sh.args(["-c", &format!("{init}\nexec /bin/sh")]);
+        }
+        let mut child = sh
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -237,11 +253,11 @@ pub struct TestServer {
 }
 
 pub fn serve(device: &TestKey) -> TestServer {
-    serve_with(device, false)
+    serve_with(device, Options::default())
 }
 
-/// Like [`serve`], refusing terminals when `no_pty` (sshd's `PermitTTY no`).
-pub fn serve_with(device: &TestKey, no_pty: bool) -> TestServer {
+/// Like [`serve`], as `opts` say.
+pub fn serve_with(device: &TestKey, opts: Options) -> TestServer {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let allowed = public_key(device).unwrap();
     let listener = rt
@@ -267,7 +283,8 @@ pub fn serve_with(device: &TestKey, no_pty: bool) -> TestServer {
                 shells: Default::default(),
                 sizes: seen.clone(),
                 exits: ended.clone(),
-                no_pty,
+                no_pty: opts.no_pty,
+                shell_init: opts.shell_init.clone(),
             };
             let config = config.clone();
             tokio::spawn(async move {

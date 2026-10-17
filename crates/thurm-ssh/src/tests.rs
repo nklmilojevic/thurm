@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use thurm_proto::{Envelope, Request, Response, ServerMessage, codec};
 
 use super::*;
-use crate::testing::{TestKey, serve, serve_with, target};
+use crate::testing::{Options, TestKey, serve, serve_with, target};
 
 fn temp_dir(name: &str) -> PathBuf {
     // Short: socket paths are limited to 104 bytes.
@@ -155,7 +155,13 @@ fn closing_a_shell_ends_it_and_keeps_the_session() {
 #[test]
 fn a_refused_terminal_fails_the_shell() {
     let key = TestKey::new(1);
-    let server = serve_with(&key, true);
+    let server = serve_with(
+        &key,
+        Options {
+            no_pty: true,
+            ..Default::default()
+        },
+    );
     let s = Session::connect(&target(&server), key, Duration::from_secs(5)).unwrap();
     let Err(SshError::Attention(e)) = s.open_shell((80, 24), "xterm-256color", &[], |_| {}) else {
         panic!("a shell without a terminal");

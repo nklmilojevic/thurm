@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use thurm_client::Client;
 use thurm_proto::{CreatePane, Event, PaneSize, Request, Response};
-use thurm_ssh::testing::{TestKey, TestServer, serve as ssh_server, target};
+use thurm_ssh::testing::{Options, TestKey, TestServer, serve as ssh_server, serve_with, target};
 
 use super::*;
 
@@ -489,4 +489,28 @@ fn mosh_only_without_udp_fails_the_pane() {
         Ok(Response::Panes(p)) if p.is_empty()
     ));
     let _ = std::fs::remove_file(fake);
+}
+
+/// A shell asking the terminal something as it starts (a prompt asking for the cursor, say)
+/// gets its answer, even when it asks before the pane has the shell.
+#[test]
+fn a_shell_starting_with_a_terminal_query_gets_the_answer() {
+    let key = TestKey::new(1);
+    let server = serve_with(
+        &key,
+        Options {
+            shell_init: Some(
+                r#"printf '\033[c'; reply=$(dd bs=1 count=3 2>/dev/null); printf 'got:%s\n' "$reply" | cat -v"#
+                    .into(),
+            ),
+            ..Default::default()
+        },
+    );
+    let app = open(&server, key, Mode::Ssh);
+    // The query comes before the pane has the shell.
+    super::SSH_START_DELAY_MS.store(500, Ordering::Relaxed);
+    let pane = app.create();
+    super::SSH_START_DELAY_MS.store(0, Ordering::Relaxed);
+    app.client.send(Request::Subscribe { pane }).unwrap();
+    app.wait_output(pane, "got:^[[?");
 }
