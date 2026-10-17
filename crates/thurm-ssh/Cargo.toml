@@ -13,6 +13,11 @@ log.workspace = true
 serde.workspace = true
 russh = { version = "0.64", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+p256 = { version = "0.14", features = ["ecdsa"], optional = true }
+
+[features]
+# An in-process ssh server and key for other crates' tests (`testing`).
+testing = ["dep:p256"]
 
 [dev-dependencies]
 p256 = { version = "0.14", features = ["ecdsa"] }

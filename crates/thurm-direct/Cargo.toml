@@ -1,0 +1,21 @@
+[package]
+name = "thurm-direct"
+description = "A host without Thurm, served to the iOS app as a daemon in the app: its panes are ssh shells and mosh sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thurm-proto.workspace = true
+thurm-config.workspace = true
+thurm-term.workspace = true
+thurm-ssh.workspace = true
+thurm-mosh.workspace = true
+log.workspace = true
+serde.workspace = true
+parking_lot.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+thurm-client.workspace = true
+thurm-ssh = { workspace = true, features = ["testing"] }

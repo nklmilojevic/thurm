@@ -6,7 +6,10 @@
 //! [`UnixStream::pair`], whose other end goes to [`thurm_client::Client::from_stream`].
 //!
 //! The only key is the device's ([`DeviceKey`], a P-256 key in the Secure Enclave): signing is
-//! done by the app, never here. Host keys are pinned (SHA-256 fingerprints from pairing).
+//! done by the app, never here. Host keys are pinned (SHA-256 fingerprints from pairing, or
+//! trusted by the user on first sight for a host added by hand: [`SessionError`]).
+//!
+//! A host without Thurm gets interactive shells on session channels ([`Session::open_shell`]).
 
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -19,6 +22,7 @@ use russh::{ChannelMsg, Disconnect};
 use thurm_client::{Client, ClientError};
 use thurm_proto::Event;
 use thurm_remote::{HostInfo, RemoteExec, SshError};
+use tokio::sync::mpsc;
 
 /// The device's ssh key. The private half never leaves the app's keystore.
 pub trait DeviceKey: Send + Sync + 'static {
@@ -166,12 +170,36 @@ impl Session {
         key: Arc<dyn DeviceKey>,
         timeout: Duration,
     ) -> Result<Session, SshError> {
+        Session::connect_checked(target, key, timeout).map_err(|e| match e {
+            SessionError::Ssh(e) => e,
+            SessionError::UnknownHostKey(seen) | SessionError::HostKeyChanged(seen) => {
+                SshError::Attention(format!(
+                    "the host's key ({seen}) is not the one paired with this device; \
+                     pair the host again if it was reinstalled"
+                ))
+            }
+            SessionError::KeyRejected => SshError::Attention(
+                "the host did not accept this device's key; add it from the Mac \
+                 (Settings › Remote › Pair iPhone)"
+                    .into(),
+            ),
+        })
+    }
+
+    /// [`Session::connect`], telling apart the failures a host added by hand needs the user for:
+    /// a host key not yet trusted, one that changed, and the device key not authorized there.
+    pub fn connect_checked(
+        target: &Target,
+        key: Arc<dyn DeviceKey>,
+        timeout: Duration,
+    ) -> Result<Session, SessionError> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("thurm-ssh")
             .enable_all()
             .build()
             .map_err(|e| SshError::Attention(format!("ssh runtime: {e}")))?;
+        let pinned_any = !target.host_keys.is_empty();
         let mismatch = Arc::new(std::sync::Mutex::new(None));
         let handler = Handler {
             pinned: target.host_keys.clone(),
@@ -188,15 +216,18 @@ impl Session {
         let result = rt.block_on(async move {
             let connect = client::connect(config, addr, handler);
             let mut handle = match tokio::time::timeout(timeout, connect).await {
-                Err(_) => return Err(SshError::Transient("ssh: connection timed out".into())),
+                Err(_) => {
+                    return Err(SshError::Transient("ssh: connection timed out".into()).into());
+                }
                 Ok(Err(e)) => {
                     if let Some(seen) = mismatch.lock().unwrap().take() {
-                        return Err(SshError::Attention(format!(
-                            "the host's key ({seen}) is not the one paired with this device; \
-                             pair the host again if it was reinstalled"
-                        )));
+                        return Err(if pinned_any {
+                            SessionError::HostKeyChanged(seen)
+                        } else {
+                            SessionError::UnknownHostKey(seen)
+                        });
                     }
-                    return Err(SshError::Transient(format!("ssh: {e}")));
+                    return Err(SshError::Transient(format!("ssh: {e}")).into());
                 }
                 Ok(Ok(h)) => h,
             };
@@ -206,7 +237,8 @@ impl Session {
                 Err(_) => {
                     return Err(SshError::Transient(
                         "ssh: the host or this device's key did not finish signing in".into(),
-                    ));
+                    )
+                    .into());
                 }
                 Ok(r) => {
                     r.map_err(|SignError(e)| SshError::Attention(format!("ssh: signing: {e}")))?
@@ -214,11 +246,7 @@ impl Session {
             };
             match auth {
                 AuthResult::Success => Ok(handle),
-                AuthResult::Failure { .. } => Err(SshError::Attention(
-                    "the host did not accept this device's key; add it from the Mac \
-                     (Settings › Remote › Pair iPhone)"
-                        .into(),
-                )),
+                AuthResult::Failure { .. } => Err(SessionError::KeyRejected),
             }
         });
         match result {
@@ -260,6 +288,103 @@ impl Session {
             let _ = tokio::io::copy_bidirectional(&mut theirs, &mut channel).await;
         });
         Ok(ours)
+    }
+
+    /// Runs `line` as given (no wrapping) on an exec channel and returns its exit code and
+    /// output, stdout and stderr together. For commands that must see the user's login shell,
+    /// such as starting `mosh-server`.
+    pub fn exec(&self, line: &str, timeout: Duration) -> Result<(Option<u32>, String), SshError> {
+        let run = async {
+            let mut ch = self.handle.channel_open_session().await?;
+            ch.exec(true, line).await?;
+            ch.eof().await?;
+            let (mut out, mut code) = (Vec::new(), None);
+            while let Some(msg) = ch.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                        out.extend_from_slice(&data)
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                    _ => {}
+                }
+            }
+            Ok::<_, russh::Error>((code, out))
+        };
+        let (code, out) = self
+            .rt
+            .block_on(async { tokio::time::timeout(timeout, run).await })
+            .map_err(|_| SshError::Transient("ssh: the remote command timed out".into()))?
+            .map_err(|e| SshError::Transient(format!("ssh: {e}")))?;
+        Ok((code, String::from_utf8_lossy(&out).into_owned()))
+    }
+
+    /// Starts the user's login shell on a pseudo-terminal of `size` (columns, rows), with
+    /// `env` set when the host allows it (sshd's `AcceptEnv`). `on_event` gets its output, then
+    /// one [`ShellEvent::Exit`], on the session's runtime.
+    pub fn open_shell(
+        &self,
+        size: (u16, u16),
+        term: &str,
+        env: &[(String, String)],
+        mut on_event: impl FnMut(ShellEvent) + Send + 'static,
+    ) -> Result<Shell, SshError> {
+        let open = async {
+            let mut ch = self.handle.channel_open_session().await?;
+            // Without a terminal, the shell would run but nothing full-screen would.
+            ch.request_pty(true, term, size.0.into(), size.1.into(), 0, 0, &[])
+                .await?;
+            if !replied(&mut ch).await? {
+                return Ok(Err(
+                    "the host refused a terminal (PermitTTY no, or no-pty for this key)",
+                ));
+            }
+            for (k, v) in env {
+                ch.set_env(false, k.as_str(), v.as_str()).await?;
+            }
+            ch.request_shell(true).await?;
+            if !replied(&mut ch).await? {
+                return Ok(Err("the host refused to start a shell"));
+            }
+            Ok::<_, russh::Error>(Ok(ch))
+        };
+        let ch = self
+            .rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(20), open).await })
+            .map_err(|_| SshError::Transient("ssh: the shell did not start".into()))?
+            .map_err(|e| SshError::Transient(format!("ssh: shell: {e}")))?
+            .map_err(|refused| SshError::Attention(format!("ssh: {refused}")))?;
+        let (mut read, write) = ch.split();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        self.rt.spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                let sent = match cmd {
+                    ShellCmd::Data(d) => write.data_bytes(d).await,
+                    ShellCmd::Resize(c, r) => write.window_change(c.into(), r.into(), 0, 0).await,
+                    ShellCmd::Close => {
+                        let _ = write.eof().await;
+                        write.close().await
+                    }
+                };
+                if sent.is_err() {
+                    return;
+                }
+            }
+        });
+        self.rt.spawn(async move {
+            let mut code = None;
+            while let Some(msg) = read.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                        on_event(ShellEvent::Data(data.to_vec()))
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            on_event(ShellEvent::Exit(code));
+        });
+        Ok(Shell { tx })
     }
 
     pub fn disconnect(&self) {
@@ -311,6 +436,91 @@ impl RemoteExec for Session {
                 "ssh: the remote command ended without an exit status".into(),
             )),
         }
+    }
+}
+
+/// The host's answer to the last request sent on `ch` with `want_reply`.
+async fn replied(ch: &mut russh::Channel<client::Msg>) -> Result<bool, russh::Error> {
+    while let Some(msg) = ch.wait().await {
+        match msg {
+            ChannelMsg::Success => return Ok(true),
+            ChannelMsg::Failure => return Ok(false),
+            _ => {}
+        }
+    }
+    Err(russh::Error::Disconnect)
+}
+
+/// Why [`Session::connect_checked`] failed.
+#[derive(Debug)]
+pub enum SessionError {
+    Ssh(SshError),
+    /// The host showed this key (`SHA256:` fingerprint) and none is trusted for it yet.
+    UnknownHostKey(String),
+    /// The host showed this key, not one of those trusted for it.
+    HostKeyChanged(String),
+    /// The host did not accept the device's key.
+    KeyRejected,
+}
+
+impl From<SshError> for SessionError {
+    fn from(e: SshError) -> Self {
+        SessionError::Ssh(e)
+    }
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::Ssh(e) => write!(f, "{e}"),
+            SessionError::UnknownHostKey(k) => write!(f, "the host's key {k} is not trusted yet"),
+            SessionError::HostKeyChanged(k) => {
+                write!(
+                    f,
+                    "the host's key changed to {k}; it may have been reinstalled"
+                )
+            }
+            SessionError::KeyRejected => f.write_str(
+                "the host did not accept this device's key; add it to ~/.ssh/authorized_keys there",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+/// What an interactive shell ([`Session::open_shell`]) does.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ShellEvent {
+    Data(Vec<u8>),
+    /// The shell ended (with its exit status, when the host sent one), or its channel did.
+    Exit(Option<u32>),
+}
+
+enum ShellCmd {
+    Data(Vec<u8>),
+    Resize(u16, u16),
+    Close,
+}
+
+/// An interactive shell on its own channel. Dropping it leaves the shell running until the
+/// session ends; [`Shell::close`] ends it.
+pub struct Shell {
+    tx: mpsc::UnboundedSender<ShellCmd>,
+}
+
+impl Shell {
+    pub fn write(&self, data: &[u8]) {
+        let _ = self.tx.send(ShellCmd::Data(data.to_vec()));
+    }
+
+    /// The terminal is now `cols` x `rows`.
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let _ = self.tx.send(ShellCmd::Resize(cols, rows));
+    }
+
+    pub fn close(&self) {
+        let _ = self.tx.send(ShellCmd::Close);
     }
 }
 
@@ -379,5 +589,7 @@ pub fn connect(
     })
 }
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 #[cfg(test)]
 mod tests;

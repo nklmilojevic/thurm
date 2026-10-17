@@ -1,12 +1,15 @@
 //! The iOS app's connections: a paired host's daemon over an in-process ssh session
 //! (`thurm-ssh`), with the device key held by the app (see `thurm_device_key`), or over
-//! Tailscale where the daemon serves there (`thurm-tailnet-client`).
+//! Tailscale where the daemon serves there (`thurm-tailnet-client`), and a host without Thurm,
+//! served by a daemon in the app (`thurm-direct`).
 
 use std::ffi::{c_char, c_int, c_void};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
-use crate::{Ctx, into_c, new_connection, opt_str, thurm_client, thurm_event_cb, thurm_frame_cb};
+use crate::{
+    Ctx, client_ref, into_c, new_connection, opt_str, thurm_client, thurm_event_cb, thurm_frame_cb,
+};
 
 /// The device's ssh key, held by the app (a Secure Enclave P-256 key). `sign` writes the
 /// 64-byte `r || s` ECDSA/SHA-256 signature of `data` to `sig` and returns true, or false when
@@ -197,6 +200,96 @@ pub unsafe extern "C" fn thurm_tailnet_connect_fd(
             set_err(err, e);
             std::ptr::null_mut()
         }
+    }
+}
+
+/// Connects to a host without Thurm, whose shells become this client's panes (`CreatePane`
+/// opens one). `target_json`: `{"host","port","user","host_keys":["SHA256:…"],"mode",
+/// "mosh_server"?,"mosh_ports"?}`, `mode` being `"mosh"` (falls back to ssh), `"mosh_only"` or
+/// `"ssh"`. Blocks while connecting (ssh), so call it off the main thread. NULL with `err` set
+/// on failure (free it): JSON `{"kind","message","fingerprint"?}`, `kind` being
+/// `"unknown_host_key"` (ask the user to trust `fingerprint`), `"host_key_changed"`,
+/// `"key_rejected"` or `"failed"`. Otherwise a client like `thurm_connect`'s, freed with
+/// `thurm_disconnect`, which also ends the host's shells.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_direct_connect(
+    target_json: *const c_char,
+    key: thurm_device_key,
+    client_name: *const c_char,
+    on_event: thurm_event_cb,
+    on_frame: thurm_frame_cb,
+    ctx: *mut c_void,
+    err: *mut *mut c_char,
+) -> *mut thurm_client {
+    let failed =
+        |message: String| serde_json::json!({"kind": "failed", "message": message}).to_string();
+    let target = match unsafe { opt_str(target_json) }
+        .ok_or_else(|| "no target".to_owned())
+        .and_then(|j| {
+            serde_json::from_str::<thurm_direct::DirectTarget>(j).map_err(|e| e.to_string())
+        }) {
+        Ok(t) => t,
+        Err(e) => {
+            set_err(err, failed(format!("bad target: {e}")));
+            return std::ptr::null_mut();
+        }
+    };
+    let key = match unsafe { app_key(&key) } {
+        Ok(k) => k,
+        Err(e) => {
+            set_err(err, failed(e));
+            return std::ptr::null_mut();
+        }
+    };
+    let name = unsafe { opt_str(client_name) }
+        .unwrap_or("Thurm iOS")
+        .to_owned();
+    let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
+        let (stream, direct) = thurm_direct::serve(target, key).map_err(|e| {
+            let (kind, fingerprint) = match &e {
+                thurm_direct::DirectError::UnknownHostKey(k) => ("unknown_host_key", Some(k)),
+                thurm_direct::DirectError::HostKeyChanged(k) => ("host_key_changed", Some(k)),
+                thurm_direct::DirectError::KeyRejected => ("key_rejected", None),
+                thurm_direct::DirectError::Failed(_) => ("failed", None),
+            };
+            serde_json::json!({"kind": kind, "message": e.to_string(), "fingerprint": fingerprint})
+                .to_string()
+        })?;
+        let client = ::thurm_client::Client::from_stream(
+            stream,
+            &name,
+            false,
+            &[thurm_proto::CAP_MOBILE],
+            on_ev,
+            on_disc,
+        )
+        .map_err(|e| failed(e.to_string()))?;
+        let transport: Box<dyn std::any::Any + Send> = Box::new(direct);
+        Ok((client, Some(transport)))
+    });
+    match connected {
+        Ok(c) => c,
+        Err(e) => {
+            set_err(err, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The network changed or the app came back to the foreground: a client of
+/// `thurm_direct_connect` moves its mosh sessions to new sockets now, instead of after
+/// seconds of silence. Does nothing for other clients.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_direct_wake(client: *mut thurm_client) {
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return;
+    };
+    if let Some(direct) = c
+        ._transport
+        .as_ref()
+        .and_then(|t| t.downcast_ref::<thurm_direct::Direct>())
+    {
+        direct.wake();
     }
 }
 

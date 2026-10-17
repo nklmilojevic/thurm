@@ -504,7 +504,8 @@ void thurm_remote_kick(const char *name, bool restart);
 char *thurm_remote_call(const char *json);
 
 /* ---------------------------------------------------------------------------------------
- * The iOS app (built with the `mobile` feature): paired hosts over an in-process ssh session.
+ * The iOS app (built with the `mobile` feature): paired hosts over an in-process ssh session,
+ * and hosts without Thurm.
  * ------------------------------------------------------------------------------------- */
 
 /* The device's ssh key, held by the app (a Secure Enclave P-256 key). `sign` writes the
@@ -549,6 +550,25 @@ thurm_client *thurm_tailnet_connect(const char *url, const char *client_name,
 thurm_client *thurm_tailnet_connect_fd(int fd, const char *url, const char *client_name,
                                        thurm_event_cb on_event, thurm_frame_cb on_frame, void *ctx,
                                        char **err);
+
+/* Connect to a host without Thurm: a daemon in the app serves it, whose panes are shells on
+ * the host (CreatePane opens one), over mosh or ssh. `target_json`:
+ *   {"host":"server.example.com","port":22,"user":"me","host_keys":["SHA256:..."],
+ *    "mode":"mosh","mosh_server":null,"mosh_ports":null}
+ * `mode`: "mosh" (falls back to ssh when mosh can't start), "mosh_only" or "ssh". Blocks while
+ * connecting: call it off the main thread. Returns NULL on failure with `err` set (free it), a
+ * JSON object {"kind","message","fingerprint"}: kind "unknown_host_key" (ask the user to trust
+ * `fingerprint`, then connect with it in host_keys), "host_key_changed", "key_rejected" or
+ * "failed". Otherwise a client used like thurm_connect's; thurm_disconnect also ends the
+ * host's shells. */
+thurm_client *thurm_direct_connect(const char *target_json, thurm_device_key key,
+                                   const char *client_name, thurm_event_cb on_event,
+                                   thurm_frame_cb on_frame, void *ctx, char **err);
+
+/* The network changed or the app came back to the foreground: a client of
+ * thurm_direct_connect moves its mosh sessions to new sockets at once. Does nothing for other
+ * clients. */
+void thurm_direct_wake(thurm_client *client);
 
 #ifdef __cplusplus
 }
