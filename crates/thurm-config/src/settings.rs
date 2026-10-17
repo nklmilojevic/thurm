@@ -218,6 +218,26 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
         Kind::Bool,
     ),
     (
+        "colors.improve_contrast",
+        "Improve text contrast",
+        Kind::Bool,
+    ),
+    (
+        "colors.theme_palette",
+        "Force theme palette for text",
+        Kind::Bool,
+    ),
+    (
+        "colors.blend_backgrounds",
+        "Blend program backgrounds",
+        Kind::Bool,
+    ),
+    (
+        "colors.display_p3",
+        "Use Display P3 color space",
+        Kind::Bool,
+    ),
+    (
         "terminal.scrollback",
         "Scrollback lines",
         Kind::Int(Some((0.0, 10_000_000.0))),

@@ -382,6 +382,175 @@ final class GridSnapshot {
     }
 }
 
+// MARK: - Color adjustments
+
+/// How cell colors are adjusted before drawing (`[colors]`: improve_contrast, theme_palette,
+/// blend_backgrounds, display_p3).
+struct ColorAdjustments: Equatable {
+    /// WCAG contrast ratio text is raised to against its background; 1 = off.
+    var minimumContrast: Double = 1
+    /// The theme's 16 colors.
+    var palette: [UInt32] = []
+    /// Text colors that aren't the theme's map to the nearest `palette` color.
+    var mapText = false
+    /// Backgrounds programs paint, other than the theme's colors, are tinted with the theme
+    /// background: screened over it in a dark theme, multiplied in a light one.
+    var blendBackgrounds = false
+    /// Colors are Display P3 values (the layer's color space), not sRGB.
+    var displayP3 = false
+
+    var isIdentity: Bool { minimumContrast <= 1 && !mapText && !blendBackgrounds }
+}
+
+/// Applies `ColorAdjustments`, caching results: a screen has few distinct color pairs.
+final class ColorAdjuster {
+    private(set) var adjustments = ColorAdjustments()
+    private var paletteLab: [SIMD3<Double>] = []
+    private var themeColors: Set<UInt32> = []
+    private var nearest: [UInt32: UInt32] = [:]
+    private var contrasted: [UInt64: UInt32] = [:]
+    private var blended: [UInt64: UInt32] = [:]
+
+    func set(_ a: ColorAdjustments) {
+        guard a != adjustments else { return }
+        adjustments = a
+        paletteLab = a.mapText ? a.palette.map { Self.oklab($0, p3: a.displayP3) } : []
+        themeColors = Set(a.palette)
+        nearest.removeAll()
+        contrasted.removeAll()
+        blended.removeAll()
+    }
+
+    /// The background to draw for a program's `bg` in a pane whose default is `themeBackground`.
+    func background(_ bg: UInt32, themeBackground: UInt32) -> UInt32 {
+        guard adjustments.blendBackgrounds, bg != themeBackground, !themeColors.contains(bg) else { return bg }
+        let key = UInt64(bg) << 32 | UInt64(themeBackground)
+        if let hit = blended[key] { return hit }
+        if blended.count > 4096 { blended.removeAll() }
+        let dark = Self.luminance(themeBackground, p3: adjustments.displayP3) < 0.5
+        let (r, g, b) = Self.channels(bg)
+        let (tr, tg, tb) = Self.channels(themeBackground)
+        func mix(_ a: Int, _ t: Int) -> UInt32 { UInt32(dark ? a + t - a * t / 255 : a * t / 255) }
+        let out = mix(r, tr) << 16 | mix(g, tg) << 8 | mix(b, tb)
+        blended[key] = out
+        return out
+    }
+
+    /// The color to draw text `fg` in over `bg`. `themed`: `fg` is the default foreground or a
+    /// theme color already, so only contrast applies.
+    func text(_ fg: UInt32, over bg: UInt32, themed: Bool) -> UInt32 {
+        var c = fg
+        if !themed && !paletteLab.isEmpty { c = nearestThemeColor(c) }
+        if adjustments.minimumContrast > 1 {
+            let key = UInt64(c) << 32 | UInt64(bg)
+            if let hit = contrasted[key] { return hit }
+            if contrasted.count > 4096 { contrasted.removeAll() }
+            let out = Self.contrasted(c, over: bg, minimum: adjustments.minimumContrast, p3: adjustments.displayP3)
+            contrasted[key] = out
+            c = out
+        }
+        return c
+    }
+
+    private func nearestThemeColor(_ c: UInt32) -> UInt32 {
+        if let hit = nearest[c] { return hit }
+        if nearest.count > 4096 { nearest.removeAll() }
+        let lab = Self.oklab(c, p3: adjustments.displayP3)
+        var best = c
+        var bestDistance = Double.infinity
+        for (i, p) in paletteLab.enumerated() {
+            let d = p - lab
+            let distance = (d * d).sum()
+            if distance < bestDistance {
+                bestDistance = distance
+                best = adjustments.palette[i]
+            }
+        }
+        nearest[c] = best
+        return best
+    }
+
+    // MARK: Color math (as Rex does it)
+
+    private static let linear: [Double] = (0..<256).map {
+        let v = Double($0) / 255
+        return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+    }
+
+    private static func channels(_ c: UInt32) -> (Int, Int, Int) {
+        (Int((c >> 16) & 0xFF), Int((c >> 8) & 0xFF), Int(c & 0xFF))
+    }
+
+    /// Relative luminance, with the weights of the color space's primaries.
+    static func luminance(_ c: UInt32, p3: Bool) -> Double {
+        let (r, g, b) = channels(c)
+        return p3 ? 0.2290 * linear[r] + 0.6917 * linear[g] + 0.0793 * linear[b]
+            : 0.2126 * linear[r] + 0.7152 * linear[g] + 0.0722 * linear[b]
+    }
+
+    private static func ratio(_ a: Double, _ b: Double) -> Double {
+        (max(a, b) + 0.05) / (min(a, b) + 0.05)
+    }
+
+    /// `fg`, or the color nearest it (moved toward black or white) with at least `minimum`
+    /// contrast over `bg`; black or white when neither direction gets there.
+    static func contrasted(_ fg: UInt32, over bg: UInt32, minimum: Double, p3: Bool) -> UInt32 {
+        guard minimum > 1 else { return fg }
+        let lb = luminance(bg, p3: p3)
+        if ratio(luminance(fg, p3: p3), lb) >= minimum { return fg }
+        let darkest = ratio(0, lb)
+        let lightest = ratio(1, lb)
+        if minimum > darkest && minimum > lightest { return darkest < lightest ? 0xFFFFFF : 0 }
+        let (r, g, b) = channels(fg)
+        // The smallest move toward `target` that reaches the contrast, by bisection.
+        func toward(_ target: Int) -> UInt32 {
+            var found = UInt32(target << 16 | target << 8 | target)
+            var lo = 0.0, hi = 1.0
+            for _ in 0..<12 {
+                let t = (lo + hi) / 2
+                func mix(_ v: Int) -> UInt32 { UInt32((Double(v) + Double(target - v) * t).rounded()) }
+                let c = mix(r) << 16 | mix(g) << 8 | mix(b)
+                if ratio(luminance(c, p3: p3), lb) < minimum {
+                    lo = t
+                } else {
+                    found = c
+                    hi = t
+                }
+            }
+            return found
+        }
+        func distance(_ c: UInt32) -> Int {
+            let (cr, cg, cb) = channels(c)
+            return (cr - r) * (cr - r) + (cg - g) * (cg - g) + (cb - b) * (cb - b)
+        }
+        let dark = minimum <= darkest ? toward(0) : nil
+        let light = minimum <= lightest ? toward(255) : nil
+        switch (dark, light) {
+        case let (d?, l?): return distance(l) < distance(d) ? l : d
+        case let (d?, nil): return d
+        case let (nil, l?): return l
+        default: return fg
+        }
+    }
+
+    /// Oklab of a color; Display P3 colors are taken to linear sRGB first.
+    static func oklab(_ c: UInt32, p3: Bool) -> SIMD3<Double> {
+        let (ri, gi, bi) = channels(c)
+        var (r, g, b) = (linear[ri], linear[gi], linear[bi])
+        if p3 {
+            (r, g, b) = (1.224940176 * r - 0.224940176 * g,
+                         -0.042056955 * r + 1.042056955 * g,
+                         -0.019637555 * r - 0.078636046 * g + 1.0982736 * b)
+        }
+        let l = cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+        let m = cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+        let s = cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+        return SIMD3(0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+                     1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+                     0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s)
+    }
+}
+
 // MARK: - Renderer
 
 /// Everything besides the grid that affects a frame.
@@ -413,6 +582,7 @@ struct RenderParams {
     /// Smooth scrolling: content moved down by this many pixels (0 ..< cell height), with the
     /// peek row drawn above row 0.
     var scrollY: Float = 0
+    var colors = ColorAdjustments()
 }
 
 private struct DrawSegment {
@@ -423,6 +593,7 @@ private struct DrawSegment {
 
 final class TerminalRenderer {
     let snapshot = GridSnapshot()
+    private let colors = ColorAdjuster()
 
     private var backgrounds: [QuadInstance] = []
     private var cursorUnder: [QuadInstance] = []
@@ -565,6 +736,7 @@ final class TerminalRenderer {
         let vh = Float(p.viewportHeight)
         let defaultBg = snapshot.valid ? snapshot.info.background : p.themeBackground
 
+        colors.set(p.colors)
         if snapshot.valid {
             buildGrid(p)
         }
@@ -590,14 +762,29 @@ final class TerminalRenderer {
         if f & CellFlag.searchMatch != 0 { return searchMatchBg }
         if f & CellFlag.selected != 0 { return info.selection_bg }
         if f & CellFlag.defaultBackground != 0 { return nil }
-        return cell.bg
+        // Inverse text has the default foreground behind it.
+        if cell.bg == info.foreground { return cell.bg }
+        return colors.background(cell.bg, themeBackground: info.background)
     }
 
     private func foregroundColor(_ cell: thurm_cell, _ info: thurm_grid_info) -> UInt32 {
         let f = cell.flags
         if f & (CellFlag.searchFocus | CellFlag.searchMatch) != 0 { return searchFg }
         if f & CellFlag.selected != 0 { return info.selection_fg }
-        return cell.fg
+        if colors.adjustments.isIdentity { return cell.fg }
+        // Box drawing, blocks and powerline separators join the backgrounds next to them, so
+        // they take the backgrounds' tint instead of text adjustments.
+        if Self.isShape(cell.ch) {
+            return cell.fg == info.foreground ? cell.fg : colors.background(cell.fg, themeBackground: info.background)
+        }
+        // Faint text is dimmed already, and default colors (inverse swaps them) are the theme's.
+        let themed = f & CellFlag.dim != 0 || cell.fg == info.foreground || cell.fg == info.background
+        return colors.text(cell.fg, over: backgroundColor(cell, info) ?? info.background, themed: themed)
+    }
+
+    /// Box drawing, block elements, legacy computing symbols and powerline separators.
+    private static func isShape(_ ch: UInt32) -> Bool {
+        (0x2500...0x259F).contains(ch) || (0x1FB00...0x1FBFF).contains(ch) || (0xE0B0...0xE0D7).contains(ch)
     }
 
     private func buildGrid(_ p: RenderParams) {

@@ -373,6 +373,14 @@ pub struct ColorConfig {
     pub palette: Vec<String>,
     /// Draw bold text with the bright palette variant.
     pub bold_is_bright: bool,
+    /// Adjust text too close to its background to read.
+    pub improve_contrast: bool,
+    /// Map RGB and 256-color text to the nearest theme color (and improve contrast).
+    pub theme_palette: bool,
+    /// Tint the backgrounds programs paint toward the theme background.
+    pub blend_backgrounds: bool,
+    /// Read theme and program colors as Display P3 instead of sRGB.
+    pub display_p3: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]

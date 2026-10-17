@@ -628,6 +628,8 @@ final class TerminalView: NSView, NSTextInputClient {
         }
         let opacity = Float((window?.windowController as? TerminalWindowController)?.opacity ?? config.opacity)
         if layer.isOpaque != (opacity >= 1) { layer.isOpaque = opacity >= 1 }
+        let space = config.displayP3 ? CGColorSpace.displayP3 : CGColorSpace.sRGB
+        if layer.colorspace?.name != space { layer.colorspace = CGColorSpace(name: space) }
         let params = RenderParams(pane: pane,
                                   shaper: s,
                                   padX: padXPixels,
@@ -646,7 +648,8 @@ final class TerminalView: NSView, NSTextInputClient {
                                   themeForeground: config.theme.foreground,
                                   hoverLink: hoverLink,
                                   hoverSpan: hoverSpan,
-                                  scrollY: smoothScrollY)
+                                  scrollY: smoothScrollY,
+                                  colors: config.colorAdjustments)
         renderer.draw(layer: layer, params: params)
         hasDrawn = true
         if Perf.enabled {
