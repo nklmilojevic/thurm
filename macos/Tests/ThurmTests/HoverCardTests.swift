@@ -116,6 +116,25 @@ final class HoverCardTests: XCTestCase {
         XCTAssertTrue(eightPanes().limited(to: 0).panes.isEmpty)
     }
 
+    /// A card of 200 pt with no panes listed, 100 pt more per pane.
+    private func height(_ n: Int) -> CGFloat { 200 + 100 * CGFloat(n) }
+
+    func testATallCardListsFewerPanes() {
+        let fit = TabHoverCard.fitting(listing: 6, room: 450, screen: 900, height: height)
+        XCTAssertEqual(fit.listed, 2)
+        XCTAssertEqual(fit.height, 400)
+        XCTAssertEqual(TabHoverCard.fitting(listing: 3, room: 900, screen: 900, height: height).listed, 3)
+    }
+
+    func testACardWithoutRoomUnderTheStripIsNeverCutOff() {
+        // Not even the header and map fit under the pill: the card takes the screen's height.
+        let fit = TabHoverCard.fitting(listing: 6, room: 120, screen: 900, height: height)
+        XCTAssertEqual(fit.listed, 6)
+        XCTAssertEqual(fit.height, height(6))
+        // Nor with no room at all.
+        XCTAssertEqual(TabHoverCard.fitting(listing: 2, room: -40, screen: 900, height: height).height, height(2))
+    }
+
     func testProgramsGitAndRemotes() {
         let remote: HostId = "devbox"
         let root = SplitNode.split(axis: .vertical, ratio: 0.5, first: .leaf(key(1, host: remote)),

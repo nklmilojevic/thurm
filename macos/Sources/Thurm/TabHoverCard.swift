@@ -477,17 +477,14 @@ final class TabHoverCard {
         let visible = screen.visibleFrame
         // Under a pill the card has the space below the strip; beside a row, the screen's height.
         let room = edge == .below ? rect.minY - Self.spacing - visible.minY - 4 : visible.height - 8
-        // The card takes no mouse, so it can't scroll: on a short screen it lists fewer panes
-        // (the rest are counted, and the map still shows them).
-        var listed = model.panes.count
-        card.show(model, aspect: aspect)
-        var fit = card.fittingSize
-        while fit.height > room, listed > 0 {
-            listed -= 1
-            card.show(model.limited(to: listed), aspect: aspect)
-            fit = card.fittingSize
+        var measured: Int?
+        let (listed, height) = Self.fitting(listing: model.panes.count, room: room, screen: visible.height - 8) { n in
+            card.show(model.limited(to: n), aspect: aspect)
+            measured = n
+            return card.fittingSize.height
         }
-        fit.height = min(fit.height, max(room, 0))
+        if measured != listed { card.show(model.limited(to: listed), aspect: aspect) }
+        let fit = NSSize(width: card.fittingSize.width, height: height)
         var origin: NSPoint
         switch edge {
         case .right:
@@ -510,6 +507,23 @@ final class TabHoverCard {
             ctx.duration = Motion.duration(Motion.fast)
             panel.animator().alphaValue = 1
         }
+    }
+
+    /// How many of `count` panes the card lists, and its height then, where `height(n)` is the
+    /// card's height listing `n`. The card takes no mouse, so it can't scroll: when it is taller
+    /// than `room` it lists fewer panes (the rest are counted, and the map still shows them).
+    /// It is never cut off: when even the header and map don't fit `room` (little space under a
+    /// pill), it gets the `screen`'s height and may cover the strip.
+    static func fitting(listing count: Int, room: CGFloat, screen: CGFloat,
+                        height: (Int) -> CGFloat) -> (listed: Int, height: CGFloat) {
+        let room = height(0) > room ? max(room, screen) : room
+        var listed = count
+        var h = height(listed)
+        while h > room, listed > 0 {
+            listed -= 1
+            h = height(listed)
+        }
+        return (listed, h)
     }
 
     private func hide() {
