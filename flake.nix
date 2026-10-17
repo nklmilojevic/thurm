@@ -53,6 +53,20 @@
             cargo = rust;
             rustc = rust;
           };
+          # thurm-tailnet, the Tailscale helper thurmd runs to serve over Tailscale ([tailscale]).
+          # Go from tailnet/go.mod's minor version, as macos/build.sh builds it.
+          tailnet = (pkgs.buildGoModule.override { go = pkgs.go_1_27; }) {
+            pname = "thurm-tailnet";
+            inherit version;
+            src = ./tailnet;
+            vendorHash = "sha256-6b5ZAdNGqAUXAiemNQLtasKW6fo8Ko4EvFO9Qr3NM5c=";
+            subPackages = [ "cmd/thurm-tailnet" ];
+            env.CGO_ENABLED = 0;
+            ldflags = [
+              "-s"
+              "-w"
+            ];
+          };
         in
         rustPlatform.buildRustPackage {
           pname = "thurm";
@@ -94,10 +108,15 @@
             export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
             mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
           '';
+          # thurmd looks for the helper beside its own executable.
+          postInstall = ''
+            install -Dm755 ${tailnet}/bin/thurm-tailnet $out/bin/thurm-tailnet
+          '';
+          passthru = { inherit tailnet; };
           # The suites need PTYs and sshd; CI runs them.
           doCheck = false;
           meta = {
-            description = "Thurm's CLI and session daemon (remote workspaces)";
+            description = "Thurm's CLI, session daemon (remote workspaces) and Tailscale helper";
             homepage = "https://github.com/nklmilojevic/thurm";
             license = lib.licenses.asl20;
             mainProgram = "thurm";
