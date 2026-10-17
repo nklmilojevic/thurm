@@ -3,7 +3,7 @@
 //!
 //! Scrollback is not saved: whatever programs printed (tokens, keys, customer data) stays in
 //! the daemon's memory. Older versions wrote it to `<state_dir>/scrollback/`, which
-//! [`Store::new`] removes.
+//! [`remove_old_scrollback`] removes at every start, whether or not sessions are saved.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,18 +70,21 @@ impl From<PaneSizeSnap> for PaneSize {
     }
 }
 
+/// Deletes the plain-text scrollback an older version saved in `state_dir`.
+pub fn remove_old_scrollback(state_dir: &Path) {
+    match std::fs::remove_dir_all(state_dir.join("scrollback")) {
+        Ok(()) => log::info!("removed the scrollback an older version saved"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("cannot remove saved scrollback: {e}"),
+    }
+}
+
 pub struct Store {
     dir: PathBuf,
 }
 
 impl Store {
     pub fn new(dir: PathBuf) -> Self {
-        // Plain-text scrollback left by an older version.
-        match std::fs::remove_dir_all(dir.join("scrollback")) {
-            Ok(()) => log::info!("removed the scrollback an older version saved"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => log::warn!("cannot remove saved scrollback: {e}"),
-        }
         Self { dir }
     }
 
@@ -246,8 +249,9 @@ mod tests {
         let old = dir.join("scrollback");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("3.ansi"), b"export TOKEN=secret\r\n").unwrap();
-        let store = Store::new(dir.clone());
+        remove_old_scrollback(&dir);
         assert!(!old.exists());
+        let store = Store::new(dir.clone());
         // Saving writes no scrollback either.
         store.save(&SessionSnapshot::default()).unwrap();
         let names: Vec<String> = std::fs::read_dir(&dir)

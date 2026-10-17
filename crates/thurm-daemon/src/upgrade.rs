@@ -11,7 +11,8 @@
 //!   touches the disk: the new image reads it from an inherited pipe (`--handoff-key-fd`).
 //!
 //! Before exec'ing, the old image asks the new binary (`--handoff-check`) which hand-off
-//! versions it reads; a binary that can't answer is never exec'd, and the daemon keeps running.
+//! versions it reads; a binary that can't answer, or reads only plain hand-offs (version 1), is
+//! never exec'd, and the daemon keeps running.
 
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
@@ -26,8 +27,12 @@ use crate::persist::PaneSizeSnap;
 use crate::pty;
 
 /// Bumped when [`Handoff`] changes incompatibly. A new daemon reads every version up to its own.
-/// 2: the file is sealed. An image that reads only 1 (a downgrade) is handed a plain file.
+/// 2: the file is sealed. An image that reads only 1 (a downgrade) is not exec'd: it would need
+/// the scrollback in a plain file. Plain files from older images are still read.
 pub const HANDOFF_VERSION: u32 = 2;
+
+/// The first version that is sealed, the oldest a target must read.
+const SEALED_VERSION: u32 = 2;
 
 /// What a sealed hand-off file starts with, followed by the nonce and the ciphertext.
 const SEALED_MAGIC: &[u8] = b"THURMSEAL1";
@@ -151,7 +156,8 @@ fn target(socket: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("thurmd"))
 }
 
-/// Asks `exe` which hand-off versions it reads: the newest, or an error when it can't take any.
+/// Asks `exe` which hand-off versions it reads: the newest, or an error when it can't take a
+/// sealed one.
 fn check(exe: &Path) -> Result<u32, String> {
     // A binary that hangs must not hold up the daemon (the upgrade runs on its main thread).
     let mut child = crate::pty::spawn_locked(
@@ -200,8 +206,12 @@ fn check(exe: &Path) -> Result<u32, String> {
         .and_then(|v| v.parse::<u32>().ok());
     match theirs {
         _ if !out.status.success() => Err(format!("{} --handoff-check failed", exe.display())),
-        Some(v) if v >= 1 => Ok(v),
-        Some(v) => Err(format!("{} reads hand-off version {v}", exe.display())),
+        Some(v) if v >= SEALED_VERSION => Ok(v),
+        Some(v) => Err(format!(
+            "{} reads hand-off version {v}, which would put the scrollback on disk unsealed; \
+             restart the daemon to switch to it",
+            exe.display()
+        )),
         None => Err(format!(
             "{} does not support in-place upgrades",
             exe.display()
@@ -243,7 +253,7 @@ pub fn perform(
         return;
     }
     // If the new image dies before adopting the panes, their shells are gone, but the session
-    // (layout, scrollback, cwd) comes back from this snapshot on the next start.
+    // (layout, cwd) comes back from this snapshot on the next start.
     if let Err(e) = daemon.save_session() {
         // The handoff carries the panes; the snapshot is only the fallback after a crash.
         log::warn!("upgrade: session snapshot not saved: {e}");
@@ -252,24 +262,16 @@ pub fn perform(
     handoff.version = version;
     handoff.lock_fd = lock_fd;
     let path = handoff_path(state_dir);
-    let key = if version >= 2 {
-        match random::<KEY_LEN>() {
-            Ok(k) => Some(k),
-            Err(e) => {
-                log::warn!("upgrade aborted: {e}");
-                return;
-            }
+    let key = match random::<KEY_LEN>() {
+        Ok(k) => k,
+        Err(e) => {
+            log::warn!("upgrade aborted: {e}");
+            return;
         }
-    } else {
-        log::warn!("upgrade: {} reads only plain hand-offs", exe.display());
-        None
     };
     let written = serde_json::to_vec(&handoff)
         .map_err(std::io::Error::other)
-        .and_then(|json| match &key {
-            Some(key) => seal(key, &json),
-            None => Ok(json),
-        })
+        .and_then(|json| seal(&key, &json))
         .and_then(|data| write_private(&path, &data));
     if let Err(e) = written {
         log::warn!("upgrade aborted: cannot write {}: {e}", path.display());
@@ -278,7 +280,7 @@ pub fn perform(
     // From here to the exec no process may start: it would inherit the fds made inheritable
     // below, the key's among them.
     let _spawning = pty::SPAWN_LOCK.lock();
-    let key_fd = match key.as_ref().map(key_pipe).transpose() {
+    let key_fd = match key_pipe(&key) {
         Ok(fd) => fd,
         Err(e) => {
             log::warn!("upgrade aborted: key pipe: {e}");
@@ -286,16 +288,14 @@ pub fn perform(
             return;
         }
     };
-    let close_key = || {
-        if let Some(fd) = key_fd {
-            unsafe { libc::close(fd) };
-        }
+    let close_key = || unsafe {
+        libc::close(key_fd);
     };
     let fds: Vec<RawFd> = std::iter::once(listener_fd)
         .chain(lock_fd)
         .chain(handoff.tailnet.map(|(_, fd)| fd))
         .chain(handoff.panes.iter().map(|p| p.fd))
-        .chain(key_fd)
+        .chain(std::iter::once(key_fd))
         .collect();
     for &fd in &fds {
         if let Err(e) = pty::set_cloexec(fd, false) {
@@ -320,10 +320,8 @@ pub fn perform(
     if !log_to_file {
         args.push("--foreground".to_owned());
     }
-    if let Some(fd) = key_fd {
-        args.push("--handoff-key-fd".to_owned());
-        args.push(fd.to_string());
-    }
+    args.push("--handoff-key-fd".to_owned());
+    args.push(key_fd.to_string());
     let err = exec(&exe, &args);
     log::warn!("upgrade failed: exec {}: {err}", exe.display());
     restore_cloexec(&fds);
@@ -476,15 +474,16 @@ mod tests {
     }
 
     #[test]
-    fn an_older_binary_is_handed_a_version_it_reads() {
+    fn an_older_binary_that_reads_only_plain_handoffs_is_refused() {
         let dir = std::env::temp_dir().join(format!("thurm-upgrade-old-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("thurmd");
         std::fs::write(&exe, "#!/bin/sh\necho 'handoff 1 protocol 17'\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // perform() writes min(theirs, ours): a plain file, which version 1 reads.
-        assert_eq!(check(&exe).unwrap().min(HANDOFF_VERSION), 1);
+        // It would need the scrollback in a plain file: the daemon keeps running instead.
+        let err = check(&exe).unwrap_err();
+        assert!(err.contains("restart"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -400,6 +400,7 @@ impl Daemon {
         let integration_dir = shell::install_integration(&state_dir)
             .map_err(|e| log::warn!("shell integration unavailable: {e}"))
             .ok();
+        persist::remove_old_scrollback(&state_dir);
         let store = config
             .session
             .persist
@@ -3582,6 +3583,28 @@ mod tests {
                 result: Ok(Response::Ok)
             })
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An older version's plain-text scrollback goes at start-up even when sessions are not
+    /// saved.
+    #[test]
+    fn old_scrollback_is_removed_without_persistence() {
+        let dir = std::env::temp_dir().join(format!("thurm-old-scrollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = dir.join("state").join("scrollback");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("3.ansi"), b"export TOKEN=secret\r\n").unwrap();
+        let mut config = Config::default();
+        config.session.persist = false;
+        let daemon = Daemon::new(
+            config,
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(daemon.store.is_none());
+        assert!(!old.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
