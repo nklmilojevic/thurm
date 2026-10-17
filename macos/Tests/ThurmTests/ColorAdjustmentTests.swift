@@ -1,3 +1,4 @@
+import Metal
 import XCTest
 @testable import Thurm
 
@@ -93,7 +94,13 @@ final class ColorAdjustmentTests: XCTestCase {
         XCTAssertEqual(adjuster.background(0x000000, themeBackground: 0x1E1E2E), 0x000000)
     }
 
-    func testIdentityByDefault() {
+    /// The shader (compiled at runtime) builds with the sRGB-to-P3 conversion.
+    func testShaderCompiles() throws {
+        try XCTSkipIf(MTLCreateSystemDefaultDevice() == nil, "no Metal device")
+        XCTAssertNotNil(MetalContext.shared)
+    }
+
+        func testIdentityByDefault() {
         XCTAssertTrue(ColorAdjustments().isIdentity)
         XCTAssertFalse(ColorAdjustments(blendBackgrounds: true).isIdentity)
         XCTAssertTrue(ColorAdjustments(palette: mocha, displayP3: true).isIdentity)

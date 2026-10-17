@@ -91,10 +91,21 @@ vertex VOut vs_main(uint vid [[vertex_id]],
     return o;
 }
 
+// sRGB-encoded color to Display P3-encoded, for pixels drawn into a P3 layer (both use the
+// sRGB transfer function).
+float3 srgb_to_p3(float3 c) {
+    float3 lin = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
+    float3 p3 = float3(dot(lin, float3(0.8224621, 0.1775380, 0.0)),
+                       dot(lin, float3(0.0331941, 0.9668058, 0.0)),
+                       dot(lin, float3(0.0170827, 0.0723974, 0.9105199)));
+    return select(1.055 * pow(p3, 1.0 / 2.4) - 0.055, p3 * 12.92, p3 <= 0.0031308);
+}
+
 fragment float4 fs_main(VOut in [[stage_in]],
                         texture2d<float> grayAtlas [[texture(0)]],
                         texture2d<float> colorAtlas [[texture(1)]],
-                        texture2d<float> image [[texture(2)]]) {
+                        texture2d<float> image [[texture(2)]],
+                        constant uint &displayP3 [[buffer(0)]]) {
     constexpr sampler nearestPx(coord::pixel, filter::nearest, address::clamp_to_edge);
     constexpr sampler linearPx(coord::pixel, filter::linear, address::clamp_to_edge);
     float4 c = in.color;
@@ -108,6 +119,8 @@ fragment float4 fs_main(VOut in [[stage_in]],
     }
     case 2u: {
         float4 s = colorAtlas.sample(nearestPx, in.uv);
+        // Emoji and images are sRGB pixels, whatever the layer's color space.
+        if (displayP3 != 0u && s.a > 0.0) s.rgb = srgb_to_p3(s.rgb / s.a) * s.a;
         return s * c.a;
     }
     case 3u: {
@@ -125,6 +138,7 @@ fragment float4 fs_main(VOut in [[stage_in]],
     }
     case 4u: {
         float4 s = image.sample(linearPx, in.uv);
+        if (displayP3 != 0u) s.rgb = srgb_to_p3(s.rgb);
         float a = s.a * c.a;
         return float4(s.rgb * a, a);
     }
@@ -669,6 +683,8 @@ final class TerminalRenderer {
         encoder.setRenderPipelineState(ctx.pipeline)
         var uniforms = SIMD2<Float>(Float(p.viewportWidth), Float(p.viewportHeight))
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
+        var displayP3: UInt32 = p.colors.displayP3 ? 1 : 0
+        encoder.setFragmentBytes(&displayP3, length: MemoryLayout<UInt32>.stride, index: 0)
         encoder.setFragmentTexture(p.shaper.glyphs.gray.texture, index: 0)
         encoder.setFragmentTexture(p.shaper.glyphs.color.texture, index: 1)
         encoder.setFragmentTexture(ctx.emptyTexture, index: 2)
