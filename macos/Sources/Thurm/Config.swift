@@ -87,11 +87,16 @@ struct UserCommand: Equatable {
     let key: String
 }
 
+/// `colors.display_p3` of the loaded config: theme colors are Display P3 values, as the
+/// terminal draws them, so the chrome around it matches.
+var themeColorsAreDisplayP3 = false
+
 /// Converts 0xRRGGBB to an NSColor.
 func colorFromRGB(_ rgb: UInt32, alpha: CGFloat = 1) -> NSColor {
     let r = CGFloat((rgb >> 16) & 0xFF) / 255
     let g = CGFloat((rgb >> 8) & 0xFF) / 255
     let b = CGFloat(rgb & 0xFF) / 255
+    if themeColorsAreDisplayP3 { return NSColor(displayP3Red: r, green: g, blue: b, alpha: alpha) }
     return NSColor(srgbRed: r, green: g, blue: b, alpha: alpha)
 }
 
@@ -198,6 +203,23 @@ final class AppConfig {
     var quickAnimationDuration: TimeInterval = 0.2
     /// nil: `opacity` (the window's).
     var quickOpacity: CGFloat?
+
+    // [colors]
+    var improveContrast = false
+    var themePalette = false
+    var blendBackgrounds = false
+    var displayP3 = false
+
+    /// What the renderer does to cell colors. The theme palette implies better contrast.
+    var colorAdjustments: ColorAdjustments {
+        ColorAdjustments(minimumContrast: improveContrast || themePalette ? Self.improvedContrast : 1,
+                         palette: Array(theme.palette.prefix(16)),
+                         mapText: themePalette,
+                         blendBackgrounds: blendBackgrounds,
+                         displayP3: displayP3)
+    }
+    /// The contrast ratio "Improve text contrast" raises text to (WCAG AA, as Rex).
+    static let improvedContrast = 4.5
 
     var theme = Theme.fallback
     /// `colors.theme`, split into its light and dark halves (equal for a single theme).
@@ -315,6 +337,13 @@ final class AppConfig {
             sidebarAgents = jsonBool(w["sidebar_agents"]) ?? sidebarAgents
             sidebarAgentRows = min(100, max(1, jsonInt(w["sidebar_agent_rows"]) ?? sidebarAgentRows))
         }
+        if let colors = c["colors"] as? [String: Any] {
+            improveContrast = jsonBool(colors["improve_contrast"]) ?? improveContrast
+            themePalette = jsonBool(colors["theme_palette"]) ?? themePalette
+            blendBackgrounds = jsonBool(colors["blend_backgrounds"]) ?? blendBackgrounds
+            displayP3 = jsonBool(colors["display_p3"]) ?? displayP3
+        }
+        themeColorsAreDisplayP3 = displayP3
         if let cur = c["cursor"] as? [String: Any] {
             cursorBlink = jsonBool(cur["blink"]) ?? cursorBlink
             cursorThickness = CGFloat(clamped(cur["thickness"], 0, 20) ?? Double(cursorThickness))

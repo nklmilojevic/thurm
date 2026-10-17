@@ -106,6 +106,14 @@ thickness = 2.0
 # palette = ["#1b2029", "#e06c75", ...]
 # Draw bold text with the bright palette variant.
 bold_is_bright = false
+# Adjust text too close to its background to read.
+improve_contrast = false
+# Map RGB and 256-color text to the nearest theme color, then improve contrast.
+theme_palette = false
+# Tint the backgrounds programs paint toward the theme background.
+blend_backgrounds = false
+# Read theme and program colors as wide-gamut Display P3 instead of sRGB (macOS).
+display_p3 = false
 
 [terminal]
 # Scrollback lines kept per pane.

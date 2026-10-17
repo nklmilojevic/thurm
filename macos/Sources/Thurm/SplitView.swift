@@ -675,8 +675,8 @@ final class TabContentView: NSView {
             let scale = ChromePalette.dimmedBackgroundScale(drawn: (views[id] ?? leaving[id]?.view)?.dimDrawn ?? 0,
                                                             dim: cfg.unfocusedSplitDim,
                                                             isDark: cfg.theme.isDark)
-            return NSColor(srgbRed: bg.redComponent * scale, green: bg.greenComponent * scale,
-                           blue: bg.blueComponent * scale, alpha: bg.alphaComponent)
+            let c = [bg.redComponent * scale, bg.greenComponent * scale, bg.blueComponent * scale, bg.alphaComponent]
+            return NSColor(colorSpace: bg.colorSpace, components: c, count: 4)
         }
         // During a layout move, each pane's surface under its terminal: what shows where a held
         // grid does not reach and where content fades in or out.
