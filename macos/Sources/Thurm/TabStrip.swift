@@ -78,7 +78,7 @@ final class TabStrip: NSView {
             return TabTrack.Tab(window: w,
                                 title: c.host == localHost ? base : "\(c.host) · \(base)",
                                 icon: PaneIcon(info),
-                                stacked: c.content.paneIds.count > 1,
+                                behind: PaneIcon.behind(c),
                                 status: status,
                                 selected: w === selected)
         }
@@ -170,7 +170,7 @@ private final class TabTrack: NSView {
         weak var window: NSWindow?
         var title: String
         var icon: PaneIcon
-        var stacked: Bool
+        var behind: [PaneIcon]
         var status: AgentStatus?
         var selected: Bool
     }
@@ -279,7 +279,7 @@ private final class TabTrack: NSView {
             let item = NSMenuItem(title: t.title, action: #selector(selectFromMenu(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = t.window
-            item.image = t.icon.tile(size: 16, stacked: t.stacked, badge: t.status == .idle ? nil : t.status)
+            item.image = t.icon.tile(size: 16, behind: t.behind, badge: t.status == .idle ? nil : t.status)
             overflowMenu.addItem(item)
         }
         overflowMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 6), in: sender)
@@ -359,8 +359,8 @@ private final class TabTrack: NSView {
     }
 }
 
-/// One tab: icon tile (stacked for a split tab, with the agent status as a badge), title, and a
-/// close button on hover. Click selects it, a middle click closes it.
+/// One tab: icon tile (a split tab's other panes stacked behind it, the agent status as a badge),
+/// title, and a close button on hover. Click selects it, a middle click closes it.
 private final class TabPill: NSView {
     var tab: TabTrack.Tab? {
         didSet { update() }
@@ -384,6 +384,8 @@ private final class TabPill: NSView {
 
     init() {
         super.init(frame: .zero)
+        icon.imageScaling = .scaleNone
+        icon.imageAlignment = .alignBottom
         title.font = .systemFont(ofSize: 13)
         title.lineBreakMode = .byTruncatingTail
         title.maximumNumberOfLines = 1
@@ -400,9 +402,10 @@ private final class TabPill: NSView {
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         NSLayoutConstraint.activate([
             iconLeading,
-            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            // The tile's bottom stays put; the panes stacked behind it rise above.
+            icon.bottomAnchor.constraint(equalTo: centerYAnchor, constant: 11),
             icon.widthAnchor.constraint(equalToConstant: 26),
-            icon.heightAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 26),
             title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
             title.centerYAnchor.constraint(equalTo: centerYAnchor),
             title.trailingAnchor.constraint(lessThanOrEqualTo: close.leadingAnchor, constant: -4),
@@ -437,7 +440,7 @@ private final class TabPill: NSView {
     private func update() {
         guard let tab else { return }
         let chrome = SessionManager.shared.config.chrome
-        icon.image = tab.icon.tile(size: 20, stacked: tab.stacked, badge: tab.status == .idle ? nil : tab.status)
+        icon.image = tab.icon.tile(size: 20, behind: tab.behind, badge: tab.status == .idle ? nil : tab.status)
         if title.stringValue != tab.title { title.stringValue = tab.title }
         title.textColor = tab.selected ? chrome.contentPrimary : chrome.contentSecondary
         close.contentTintColor = chrome.contentSecondary
