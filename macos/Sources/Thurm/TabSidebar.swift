@@ -20,6 +20,8 @@ struct SidebarTab {
     var shortcut: Int?
     var selected: Bool
     var icon: PaneIcon = .shell
+    /// The tab's other panes, stacked behind its icon.
+    var behind: [PaneIcon] = []
 }
 
 extension SidebarTab: Equatable {
@@ -27,6 +29,7 @@ extension SidebarTab: Equatable {
         a.controller === b.controller && a.title == b.title && a.subtitle == b.subtitle && a.branch == b.branch
             && a.added == b.added && a.removed == b.removed && a.status == b.status
             && a.shortcut == b.shortcut && a.selected == b.selected && a.icon == b.icon
+            && a.behind == b.behind
     }
 }
 
@@ -332,7 +335,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                                  status: status,
                                  shortcut: tabShortcut(index: index, count: windows.count),
                                  selected: w === window,
-                                 icon: PaneIcon(info))
+                                 icon: PaneIcon(info),
+                                 behind: PaneIcon.behind(c))
             if let g = git {
                 tab.branch = c.host == localHost ? g.branch : "\(c.host) · \(g.branch)"
                 tab.added = g.added
@@ -790,6 +794,8 @@ final class TabRowView: NSTableCellView {
     init() {
         super.init(frame: .zero)
         identifier = Self.identifier
+        icon.imageScaling = .scaleNone
+        icon.imageAlignment = .alignBottom
         dot.wantsLayer = true
         dot.layer?.cornerRadius = 4
         dot.layer?.borderWidth = 1.5
@@ -813,11 +819,12 @@ final class TabRowView: NSTableCellView {
             icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
             // Centered on the row, not the title: the status dot on its corner stays inside
             // the selection.
-            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            // The tile's bottom stays put; the panes stacked behind it rise above.
+            icon.bottomAnchor.constraint(equalTo: centerYAnchor, constant: 10),
             icon.widthAnchor.constraint(equalToConstant: 20),
-            icon.heightAnchor.constraint(equalToConstant: 20),
+            icon.heightAnchor.constraint(equalToConstant: 26),
             dot.centerXAnchor.constraint(equalTo: icon.trailingAnchor, constant: -1),
-            dot.centerYAnchor.constraint(equalTo: icon.topAnchor, constant: 1),
+            dot.centerYAnchor.constraint(equalTo: icon.bottomAnchor, constant: -19),
             dot.widthAnchor.constraint(equalToConstant: 8),
             dot.heightAnchor.constraint(equalToConstant: 8),
             title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
@@ -865,7 +872,7 @@ final class TabRowView: NSTableCellView {
             let dir = tab.subtitle ?? ""
             subtitle.stringValue = dir == tab.title || tab.title.hasSuffix(dir) ? "" : dir
         }
-        icon.image = tab.icon.tile(size: 20)
+        icon.image = tab.icon.tile(size: 20, behind: tab.behind, badge: nil)
         // A working agent shows the moving dots; the badge on the tile is for the states that
         // want attention. Idle agents show neither.
         working.isShown = tab.status == .working

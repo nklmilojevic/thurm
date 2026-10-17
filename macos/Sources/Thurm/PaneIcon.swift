@@ -86,28 +86,54 @@ enum PaneIcon: Equatable {
         return image
     }
 
-    /// The tile for a tab: `stacked` peeks a second tile out behind it (a split tab), and `badge`
-    /// puts the agent status on its corner.
-    func tile(size: CGFloat, stacked: Bool, badge: AgentStatus?) -> NSImage {
+    /// How many of a split tab's other panes show behind its tile.
+    static let maxBehind = 2
+
+    /// The icons of a tab's panes other than the focused one, in pane order, for `tile(behind:)`.
+    static func behind(_ c: TerminalWindowController) -> [PaneIcon] {
+        let panes = SessionManager.shared.panes
+        return c.content.paneIds.lazy.filter { $0 != c.focusedPane }.prefix(maxBehind).map { PaneIcon(panes[$0]) }
+    }
+
+    /// The tile for a tab: the tiles of its other panes (`behind`, nearest first) peek out above
+    /// it, each smaller and darker than the one in front, and `badge` puts the agent status on
+    /// its corner. The front tile sits at the bottom of the image, whatever is stacked above it.
+    func tile(size: CGFloat, behind: [PaneIcon], badge: AgentStatus?) -> NSImage {
         let front = tile(size: size)
-        let offset: CGFloat = stacked ? 4 : 0
-        let extra: CGFloat = 2
-        let ring = SessionManager.shared.config.sidebarColor
-        return NSImage(size: NSSize(width: size + offset + extra, height: size + extra), flipped: true) { _ in
-            if stacked {
-                front.draw(in: NSRect(x: offset, y: extra, width: size, height: size), from: .zero,
-                           operation: .sourceOver, fraction: 0.55)
+        let cards = behind.prefix(Self.maxBehind).enumerated().map { i, icon in
+            (icon.tile(size: size), Self.card(i + 1, size: size))
+        }
+        let peek = cards.map { -$0.1.minY }.max() ?? 0
+        let top = max(peek, badge == nil ? 0 : 2).rounded(.up)
+        let width = size + (badge == nil ? 0 : 2)
+        return NSImage(size: NSSize(width: width, height: size + top), flipped: true) { _ in
+            let cg = NSGraphicsContext.current?.cgContext
+            for (i, (image, rect)) in cards.enumerated().reversed() {
+                let r = rect.offsetBy(dx: 0, dy: top)
+                cg?.beginTransparencyLayer(auxiliaryInfo: nil)
+                image.draw(in: r)
+                NSColor(white: 0, alpha: 0.1 * CGFloat(i + 1)).setFill()
+                r.fill(using: .sourceAtop)
+                cg?.endTransparencyLayer()
             }
-            front.draw(in: NSRect(x: 0, y: extra, width: size, height: size))
+            front.draw(in: NSRect(x: 0, y: top, width: size, height: size))
             if let badge {
-                let c = NSPoint(x: size - 1.5, y: extra + 1.5)
-                ring.setFill()
+                let c = NSPoint(x: size - 1.5, y: top + 1.5)
+                SessionManager.shared.config.sidebarColor.setFill()
                 NSBezierPath(ovalIn: NSRect(x: c.x - 5, y: c.y - 5, width: 10, height: 10)).fill()
                 badge.color.setFill()
                 NSBezierPath(ovalIn: NSRect(x: c.x - 3.5, y: c.y - 3.5, width: 7, height: 7)).fill()
             }
             return true
         }
+    }
+
+    /// Where the `depth`th tile behind goes, relative to the front tile at the origin: raised by
+    /// a step of the tile's size and shrunk about its center.
+    static func card(_ depth: Int, size: CGFloat) -> NSRect {
+        let d = CGFloat(depth)
+        let side = size * (1 - 0.12 * d)
+        return NSRect(x: (size - side) / 2, y: (size - side) / 2 - size * 0.17 * d, width: side, height: side)
     }
 
     private static var cache: [String: NSImage] = [:]
