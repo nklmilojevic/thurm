@@ -256,9 +256,150 @@ fn serves_mosh_sessions_or_falls_back_to_ssh() {
         })
         .unwrap();
     app.wait_output(pane, "after-wake");
-    // Closing the pane ends the server on the host.
+    // The shell exits: mosh says so, and the pane closes.
+    app.client
+        .send(Request::Input {
+            pane,
+            data: b"exit\r".to_vec(),
+        })
+        .unwrap();
+    app.wait("close", |ev| {
+        matches!(ev, Event::PaneClosed { pane: p } if p == pane).then_some(())
+    });
+}
+
+/// A `mosh-server` that takes a second to start, so a close can come while it does; `None`
+/// without mosh-server here.
+fn slow_mosh_server(name: &str) -> Option<String> {
+    let out = std::process::Command::new("sh")
+        .args(["-c", "command -v mosh-server"])
+        .output()
+        .ok()?;
+    let real = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if real.is_empty() {
+        return None;
+    }
+    let path = format!("/tmp/thurm-direct-{name}-{}.sh", std::process::id());
+    std::fs::write(&path, format!("#!/bin/sh\nsleep 1\nexec {real} \"$@\"\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    Some(path)
+}
+
+/// Whether a mosh-server listening on `port` (as started here) runs.
+fn mosh_server_on(port: &str) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", &format!("mosh-server new .*-p {port}")])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn wait_gone(port: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while mosh_server_on(port) {
+        assert!(
+            Instant::now() < deadline,
+            "the mosh-server on {port} kept running"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Opens a mosh pane through the slow server on `port` in the background; returns the
+/// request's outcome and the pane's id once it shows (still starting).
+fn start_slowly(
+    server: &TestServer,
+    key: Arc<TestKey>,
+    port: &str,
+    slow: String,
+) -> (
+    App,
+    std::thread::JoinHandle<Result<Response, String>>,
+    PaneId,
+) {
+    let mut t = direct_target(server, Mode::MoshOnly);
+    t.mosh_server = Some(slow);
+    t.mosh_ports = Some(port.into());
+    let (stream, direct) = super::serve(t, key).unwrap();
+    let (tx, events) = mpsc::channel();
+    let client = Client::from_stream(
+        stream,
+        "ios-test",
+        false,
+        &[thurm_proto::CAP_MOBILE],
+        move |ev| {
+            let _ = tx.send(ev);
+        },
+        || {},
+    )
+    .unwrap();
+    let app = App {
+        client,
+        events,
+        _direct: direct,
+    };
+    let c = app.client.clone();
+    let creating = std::thread::spawn(move || {
+        let req = CreatePane {
+            command: None,
+            cwd: None,
+            env: vec![],
+            size: size(80, 24),
+            agent_preset: None,
+            inherit_cwd_from: None,
+            hold: false,
+            fork_from: None,
+        };
+        c.request(Request::CreatePane(req))
+            .map_err(|e| e.to_string())
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pane = loop {
+        if let Some(p) = app.panes().first() {
+            break p.id;
+        }
+        assert!(Instant::now() < deadline, "the pane never showed");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    (app, creating, pane)
+}
+
+#[test]
+fn closing_a_pane_while_it_starts_ends_its_server() {
+    let Some(slow) = slow_mosh_server("close") else {
+        eprintln!("no mosh-server here; skipped");
+        return;
+    };
+    let port = "60987";
+    let key = TestKey::new(1);
+    let server = ssh_server(&key);
+    let (app, creating, pane) = start_slowly(&server, key, port, slow.clone());
     assert!(matches!(
         app.client.request(Request::ClosePane { pane }),
         Ok(Response::Ok)
     ));
+    let outcome = creating.join().unwrap();
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert!(app.panes().is_empty());
+    wait_gone(port);
+    let _ = std::fs::remove_file(slow);
+}
+
+#[test]
+fn disconnecting_while_a_pane_starts_ends_its_server() {
+    let Some(slow) = slow_mosh_server("disconnect") else {
+        eprintln!("no mosh-server here; skipped");
+        return;
+    };
+    let port = "60988";
+    let key = TestKey::new(1);
+    let server = ssh_server(&key);
+    let (app, creating, _) = start_slowly(&server, key, port, slow.clone());
+    // The app goes away while the server is still starting.
+    drop(app);
+    let _ = creating.join();
+    // It starts after all, and is ended then.
+    std::thread::sleep(Duration::from_millis(1500));
+    wait_gone(port);
+    let _ = std::fs::remove_file(slow);
 }

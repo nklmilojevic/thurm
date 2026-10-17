@@ -13,10 +13,10 @@ use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use thurm_mosh::bootstrap::{self, BootstrapError};
 use thurm_mosh::{MoshEvent, MoshSession, Status};
 use thurm_proto::{
@@ -101,6 +101,9 @@ impl From<SessionError> for DirectError {
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long ending the server waits for shells still starting (an ssh connection and a mosh
+/// bootstrap, each with its own timeout).
+const CREATING_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A served host. Dropping it ends nothing by itself: the server ends when the app closes its
 /// end of the socket, and ends the host's shells with it.
@@ -144,6 +147,9 @@ pub fn serve(
         session: Mutex::new(Some(Arc::new(session))),
         panes: Mutex::new(HashMap::new()),
         next_pane: AtomicU64::new(1),
+        closed: AtomicBool::new(false),
+        creating: Mutex::new(0),
+        created: Condvar::new(),
         out: Mutex::new(theirs),
         mosh_rt: Some(mosh_rt),
     });
@@ -274,6 +280,30 @@ impl Pane {
     }
 }
 
+/// Ends what a pane runs; returns its mosh-server's pid, to end on the host.
+fn end_backend(backend: Backend) -> Option<u32> {
+    match backend {
+        Backend::Ssh(shell) => {
+            shell.close();
+            None
+        }
+        Backend::Mosh { session, pid, .. } => {
+            session.close();
+            pid
+        }
+        Backend::Starting | Backend::Ended => None,
+    }
+}
+
+/// Ends mosh-servers on the host over `session`, when it is still connected.
+fn kill(session: &Session, pids: &[u32]) {
+    if pids.is_empty() || session.is_closed() {
+        return;
+    }
+    let list: Vec<String> = pids.iter().map(u32::to_string).collect();
+    let _ = session.exec(&format!("kill {}", list.join(" ")), EXEC_TIMEOUT);
+}
+
 fn new_terminal(size: PaneSize) -> Terminal {
     let mut term = Terminal::new(
         size,
@@ -291,6 +321,11 @@ struct Inner {
     session: Mutex<Option<Arc<Session>>>,
     panes: Mutex<HashMap<PaneId, Arc<Mutex<Pane>>>>,
     next_pane: AtomicU64,
+    /// The app closed its end: shells that finish starting now end at once.
+    closed: AtomicBool,
+    /// Shells being started (`CreatePane` workers), and their end, signalled.
+    creating: Mutex<usize>,
+    created: Condvar,
     out: Mutex<UnixStream>,
     /// Always set; taken on drop.
     mosh_rt: Option<tokio::runtime::Runtime>,
@@ -360,10 +395,13 @@ impl Inner {
             };
             if let Request::CreatePane(req) = env.request {
                 // Starting mosh takes a few round trips: other requests go on meanwhile.
+                *self.creating.lock() += 1;
                 let server = self.clone();
                 std::thread::spawn(move || {
                     let result = server.create(req);
                     server.send(&ServerMessage::Response { id: env.id, result });
+                    *server.creating.lock() -= 1;
+                    server.created.notify_all();
                 });
                 continue;
             }
@@ -373,27 +411,27 @@ impl Inner {
         self.shutdown();
     }
 
-    /// The app is gone, and with it the only holder of the mosh keys: end the host's shells.
+    /// The app is gone, and with it the only holder of the mosh keys: end the host's shells,
+    /// those still starting included (they end themselves once started, seeing `closed`).
     fn shutdown(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        {
+            let deadline = Instant::now() + CREATING_TIMEOUT;
+            let mut creating = self.creating.lock();
+            while *creating > 0 {
+                if self.created.wait_until(&mut creating, deadline).timed_out() {
+                    break;
+                }
+            }
+        }
         let panes: Vec<_> = self.panes.lock().drain().map(|(_, p)| p).collect();
         let pids: Vec<u32> = panes
             .iter()
-            .filter_map(|p| match &p.lock().backend {
-                Backend::Mosh { pid, .. } => *pid,
-                _ => None,
-            })
+            .filter_map(|p| end_backend(std::mem::replace(&mut p.lock().backend, Backend::Ended)))
             .collect();
-        for p in &panes {
-            if let Backend::Ssh(shell) = &p.lock().backend {
-                shell.close();
-            }
-        }
         drop(panes);
         if let Some(session) = self.session.lock().take() {
-            if !pids.is_empty() && !session.is_closed() {
-                let list: Vec<String> = pids.iter().map(u32::to_string).collect();
-                let _ = session.exec(&format!("kill {}", list.join(" ")), EXEC_TIMEOUT);
-            }
+            kill(&session, &pids);
             session.disconnect();
         }
     }
@@ -527,26 +565,22 @@ impl Inner {
         let Some(pane) = self.panes.lock().remove(&id) else {
             return;
         };
+        // Still starting: its worker sees the pane gone and ends what it started.
         let backend = std::mem::replace(&mut pane.lock().backend, Backend::Ended);
-        match backend {
-            Backend::Ssh(shell) => shell.close(),
-            Backend::Mosh { session, pid, .. } => {
-                session.close();
-                // Over the session there is now: reconnecting would hold up this request (the
-                // server exits by itself after its timeout).
-                let live = self.session.lock().clone().filter(|s| !s.is_closed());
-                if let (Some(pid), Some(s)) = (pid, live) {
-                    std::thread::spawn(move || {
-                        let _ = s.exec(&format!("kill {pid}"), EXEC_TIMEOUT);
-                    });
-                }
+        if let Some(pid) = end_backend(backend) {
+            // Over the session there is now: reconnecting would hold up this request (the
+            // server exits by itself after its timeout).
+            if let Some(s) = self.session.lock().clone().filter(|s| !s.is_closed()) {
+                std::thread::spawn(move || kill(&s, &[pid]));
             }
-            Backend::Starting | Backend::Ended => {}
         }
         self.event(Event::PaneClosed { pane: id });
     }
 
     fn create(self: &Arc<Self>, req: CreatePane) -> Result<Response, String> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err("the connection is closing".into());
+        }
         let id = self.next_pane.fetch_add(1, Ordering::Relaxed);
         let size = req.size;
         let session = self.session()?;
@@ -576,6 +610,16 @@ impl Inner {
         if let Err(e) = started {
             self.panes.lock().remove(&id);
             return Err(e);
+        }
+        // Closed while it started (the pane, or the whole connection): end what it started.
+        // A close from here on finds the backend in the pane and ends it itself.
+        if self.closed.load(Ordering::SeqCst) || !self.panes.lock().contains_key(&id) {
+            self.panes.lock().remove(&id);
+            let backend = std::mem::replace(&mut pane.lock().backend, Backend::Ended);
+            if let Some(pid) = end_backend(backend) {
+                kill(&session, &[pid]);
+            }
+            return Err("the pane was closed while it started".into());
         }
         let info = pane.lock().info(&self.title());
         self.event(Event::PaneInfo(info));
@@ -621,7 +665,7 @@ impl Inner {
         let me = Arc::downgrade(self);
         let mut p = pane.lock();
         let initial = p.term.serialize_state();
-        let mosh = MoshSession::start(
+        let started = MoshSession::start(
             self.mosh_rt.as_ref().expect("the mosh runtime").handle(),
             SocketAddr::new(self.ip, connect.port),
             connect.key,
@@ -631,8 +675,16 @@ impl Inner {
                     me.on_mosh(id, ev);
                 }
             },
-        )
-        .map_err(|e| BootstrapError::Failed(format!("udp: {e}")))?;
+        );
+        let mosh = match started {
+            Ok(m) => m,
+            Err(e) => {
+                // The server started, detached, and would never hear from us.
+                drop(p);
+                kill(session, &connect.pid.into_iter().collect::<Vec<_>>());
+                return Err(BootstrapError::Failed(format!("udp: {e}")));
+            }
+        };
         p.backend = Backend::Mosh {
             session: mosh,
             pid: connect.pid,
@@ -784,6 +836,18 @@ impl Inner {
                     let state = p.term.serialize_state();
                     snapshots.insert(num, state);
                 }
+            }
+            MoshEvent::Ended => {
+                // The shell exited (mosh says no more): like an ssh shell's exit.
+                p.alive = false;
+                p.backend = Backend::Ended;
+                drop(guard);
+                self.event(Event::PaneExited {
+                    pane: id,
+                    code: None,
+                });
+                self.panes.lock().remove(&id);
+                self.event(Event::PaneClosed { pane: id });
             }
             MoshEvent::Status(s) => {
                 if *status != s {

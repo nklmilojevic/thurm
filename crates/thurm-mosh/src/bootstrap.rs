@@ -169,10 +169,7 @@ pub fn install_hint(uname: &str, os_release: &str) -> Option<String> {
 pub type ExecResult = Result<(Option<u32>, String), String>;
 
 /// Starts a session with `exec`, which runs a command line over ssh.
-pub fn start(
-    exec: &dyn Fn(&str) -> ExecResult,
-    opts: &Options,
-) -> Result<Connect, BootstrapError> {
+pub fn start(exec: &dyn Fn(&str) -> ExecResult, opts: &Options) -> Result<Connect, BootstrapError> {
     if let Some(p) = &opts.ports
         && !plain(p, ":")
     {

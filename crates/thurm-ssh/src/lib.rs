@@ -329,20 +329,30 @@ impl Session {
         mut on_event: impl FnMut(ShellEvent) + Send + 'static,
     ) -> Result<Shell, SshError> {
         let open = async {
-            let ch = self.handle.channel_open_session().await?;
-            ch.request_pty(false, term, size.0.into(), size.1.into(), 0, 0, &[])
+            let mut ch = self.handle.channel_open_session().await?;
+            // Without a terminal, the shell would run but nothing full-screen would.
+            ch.request_pty(true, term, size.0.into(), size.1.into(), 0, 0, &[])
                 .await?;
+            if !replied(&mut ch).await? {
+                return Ok(Err(
+                    "the host refused a terminal (PermitTTY no, or no-pty for this key)",
+                ));
+            }
             for (k, v) in env {
                 ch.set_env(false, k.as_str(), v.as_str()).await?;
             }
             ch.request_shell(true).await?;
-            Ok::<_, russh::Error>(ch)
+            if !replied(&mut ch).await? {
+                return Ok(Err("the host refused to start a shell"));
+            }
+            Ok::<_, russh::Error>(Ok(ch))
         };
         let ch = self
             .rt
             .block_on(async { tokio::time::timeout(Duration::from_secs(20), open).await })
             .map_err(|_| SshError::Transient("ssh: the shell did not start".into()))?
-            .map_err(|e| SshError::Transient(format!("ssh: shell: {e}")))?;
+            .map_err(|e| SshError::Transient(format!("ssh: shell: {e}")))?
+            .map_err(|refused| SshError::Attention(format!("ssh: {refused}")))?;
         let (mut read, write) = ch.split();
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.rt.spawn(async move {
@@ -368,7 +378,6 @@ impl Session {
                         on_event(ShellEvent::Data(data.to_vec()))
                     }
                     ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
-                    ChannelMsg::Failure => break,
                     ChannelMsg::Close => break,
                     _ => {}
                 }
@@ -428,6 +437,18 @@ impl RemoteExec for Session {
             )),
         }
     }
+}
+
+/// The host's answer to the last request sent on `ch` with `want_reply`.
+async fn replied(ch: &mut russh::Channel<client::Msg>) -> Result<bool, russh::Error> {
+    while let Some(msg) = ch.wait().await {
+        match msg {
+            ChannelMsg::Success => return Ok(true),
+            ChannelMsg::Failure => return Ok(false),
+            _ => {}
+        }
+    }
+    Err(russh::Error::Disconnect)
 }
 
 /// Why [`Session::connect_checked`] failed.

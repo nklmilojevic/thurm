@@ -55,6 +55,10 @@ struct Server {
     shells: Arc<Mutex<HashMap<ChannelId, std::process::ChildStdin>>>,
     /// What the client asked for: the terminal type and every size (pty, then window changes).
     sizes: Arc<Mutex<Vec<(String, u32, u32)>>>,
+    /// Each ended shell's exit code.
+    exits: Arc<Mutex<Vec<i32>>>,
+    /// Refuse terminals (`PermitTTY no`).
+    no_pty: bool,
 }
 
 impl server::Handler for Server {
@@ -109,6 +113,10 @@ impl server::Handler for Server {
         _: &[(russh::Pty, u32)],
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        if self.no_pty {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         self.sizes.lock().unwrap().push((term.into(), cols, rows));
         session.channel_success(channel)?;
         Ok(())
@@ -146,6 +154,7 @@ impl server::Handler for Server {
             .unwrap()
             .insert(channel, child.stdin.take().unwrap());
         let handle = session.handle();
+        let exits = self.exits.clone();
         let mut stdout = child.stdout.take().unwrap();
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 4096];
@@ -156,12 +165,32 @@ impl server::Handler for Server {
                     .block_on(async move { h.data(channel, data).await });
             }
             let code = child.wait().map(|s| s.code().unwrap_or(255)).unwrap_or(255);
+            exits.lock().unwrap().push(code);
             tokio::runtime::Handle::current().block_on(async move {
                 let _ = handle.exit_status_request(channel, code as u32).await;
                 let _ = handle.eof(channel).await;
                 let _ = handle.close(channel).await;
             });
         });
+        Ok(())
+    }
+
+    /// The client is done with the shell: its input ends, so it exits.
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        _: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        self.shells.lock().unwrap().remove(&channel);
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        self.shells.lock().unwrap().remove(&channel);
         Ok(())
     }
 
@@ -202,10 +231,17 @@ pub struct TestServer {
     pub port: u16,
     /// The terminal type and every size clients asked for (pty, then window changes).
     pub sizes: Arc<Mutex<Vec<(String, u32, u32)>>>,
+    /// Each ended shell's exit code.
+    pub exits: Arc<Mutex<Vec<i32>>>,
     _rt: tokio::runtime::Runtime,
 }
 
 pub fn serve(device: &TestKey) -> TestServer {
+    serve_with(device, false)
+}
+
+/// Like [`serve`], refusing terminals when `no_pty` (sshd's `PermitTTY no`).
+pub fn serve_with(device: &TestKey, no_pty: bool) -> TestServer {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let allowed = public_key(device).unwrap();
     let listener = rt
@@ -214,6 +250,8 @@ pub fn serve(device: &TestKey) -> TestServer {
     let port = listener.local_addr().unwrap().port();
     let sizes = Arc::new(Mutex::new(Vec::new()));
     let seen = sizes.clone();
+    let exits = Arc::new(Mutex::new(Vec::new()));
+    let ended = exits.clone();
     let config = Arc::new(server::Config {
         keys: vec![host_key()],
         auth_rejection_time: Duration::from_millis(10),
@@ -228,6 +266,8 @@ pub fn serve(device: &TestKey) -> TestServer {
                 allowed: allowed.clone(),
                 shells: Default::default(),
                 sizes: seen.clone(),
+                exits: ended.clone(),
+                no_pty,
             };
             let config = config.clone();
             tokio::spawn(async move {
@@ -240,6 +280,7 @@ pub fn serve(device: &TestKey) -> TestServer {
     TestServer {
         port,
         sizes,
+        exits,
         _rt: rt,
     }
 }

@@ -26,6 +26,8 @@ pub const MIN_RTO: Duration = Duration::from_millis(250);
 pub const MAX_RTO: Duration = Duration::from_secs(1);
 /// States sent and not yet acknowledged; beyond this the middle ones are forgotten.
 const MAX_SENT: usize = 64;
+/// The state number of a host ending the session.
+pub const SHUTDOWN: u64 = u64::MAX;
 /// Acknowledged host states kept as diff bases at most.
 const MAX_ACKED: usize = 32;
 
@@ -104,6 +106,12 @@ impl Engine {
     /// A host state just acknowledged: the caller snapshots its screen (the newest) now.
     pub fn take_snapshot_due(&mut self) -> Option<u64> {
         self.snapshot_due.take()
+    }
+
+    /// The host has ended the session (its shell exited): it sent the last state, which this
+    /// acknowledges at once.
+    pub fn shut_down(&self) -> bool {
+        self.current == SHUTDOWN
     }
 
     /// Whether the host has been heard from since the session started.
@@ -224,7 +232,10 @@ impl Engine {
         self.acked
             .retain(|&n| n >= inst.throwaway_num || n == inst.old_num);
         self.current = inst.new_num;
-        if !inst.diff.is_empty() {
+        if inst.new_num == SHUTDOWN {
+            // The host waits for this ack to exit.
+            self.ack_due = Some(now);
+        } else if !inst.diff.is_empty() {
             let due = now + ACK_DELAY;
             self.ack_due = Some(self.ack_due.map_or(due, |d| d.min(due)));
         }

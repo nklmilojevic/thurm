@@ -1,11 +1,15 @@
 //! A compressed instruction travels as fragments: `id (8, big endian) || num (2, big endian,
-//! top bit set on the last) || bytes`. Only the newest instruction is assembled; fragments of
-//! another one start over.
+//! top bit set on the last) || bytes`. Only the newest instruction is assembled: fragments of a
+//! newer one start over, those of an older one (reordered, late) are dropped.
 
 use crate::Error;
 
-/// Fragment payload size: datagrams stay well under common path MTUs, tunnels included.
-pub const MAX_FRAGMENT: usize = 1200;
+/// Fragment payload size. A datagram adds 38 bytes to it (fragment header, timestamps, nonce,
+/// tag) and IPv6 and UDP 48 more: 1086 bytes, under IPv6's minimum MTU of 1280 with room for
+/// extension headers and tunnels (VPNs, mobile networks), so nothing relies on fragmentation.
+pub const MAX_FRAGMENT: usize = 1000;
+/// What a datagram adds to a fragment's payload.
+pub const OVERHEAD: usize = HEADER + 4 + 8 + 16;
 const FINAL: u16 = 1 << 15;
 const HEADER: usize = 10;
 
@@ -49,6 +53,9 @@ impl Assembly {
         let id = u64::from_be_bytes(fragment[..8].try_into().unwrap());
         let raw = u16::from_be_bytes([fragment[8], fragment[9]]);
         let (num, last) = ((raw & !FINAL) as usize, raw & FINAL != 0);
+        if self.id.is_some_and(|current| id < current) {
+            return Ok(None);
+        }
         if self.id != Some(id) {
             *self = Assembly {
                 id: Some(id),

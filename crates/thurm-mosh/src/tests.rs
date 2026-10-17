@@ -4,8 +4,8 @@ use ocb3::aead::{Aead, KeyInit};
 
 use crate::bootstrap::{self, BootstrapError, Connect, Options};
 use crate::crypto::{Crypto, NO_TIMESTAMP, Packet, TO_CLIENT, parse_key};
-use crate::fragment::{Assembly, MAX_FRAGMENT, split};
-use crate::ssp::{ACK_DELAY, Apply, Engine, HEARTBEAT, MIN_RTO};
+use crate::fragment::{Assembly, MAX_FRAGMENT, OVERHEAD, split};
+use crate::ssp::{ACK_DELAY, Apply, Engine, HEARTBEAT, MIN_RTO, SHUTDOWN};
 use crate::wire::{self, HostEvent, Instruction, UserEvent};
 use crate::{Error, MoshEvent, MoshSession, Status};
 
@@ -77,6 +77,42 @@ fn fragments_reassemble_in_any_order() {
     assert_eq!(a.add(&older[0]).unwrap(), None);
     assert_eq!(a.add(&newer[0]).unwrap(), Some(b"x".to_vec()));
     assert_eq!(split(8, b"")[0], [0, 0, 0, 0, 0, 0, 0, 8, 0x80, 0]);
+}
+
+#[test]
+fn late_fragments_of_an_older_instruction_are_dropped() {
+    let older = split(6, &[1; MAX_FRAGMENT + 1]);
+    let newer: Vec<u8> = (0..MAX_FRAGMENT + 5).map(|i| i as u8).collect();
+    let parts = split(7, &newer);
+    let mut a = Assembly::default();
+    assert_eq!(a.add(&parts[0]).unwrap(), None);
+    // Reordered: a part of instruction 6 between the two of instruction 7.
+    assert_eq!(a.add(&older[1]).unwrap(), None);
+    assert_eq!(a.add(&parts[1]).unwrap(), Some(newer));
+}
+
+#[test]
+fn datagrams_fit_the_ipv6_minimum_mtu() {
+    let full = split(1, &[7; MAX_FRAGMENT]).remove(0);
+    let datagram = Crypto::new(&[1; 16]).seal(0, &packet(1, &full));
+    assert_eq!(datagram.len(), MAX_FRAGMENT + OVERHEAD);
+    // IPv6 and UDP headers, and room for extension headers and tunnels.
+    assert!(datagram.len() + 48 + 128 <= 1280, "{}", datagram.len());
+}
+
+#[test]
+fn a_host_ending_the_session_is_acknowledged_at_once() {
+    let t0 = Instant::now();
+    let mut e = Engine::new(t0);
+    e.poll(t0);
+    e.receive(t0, host(0, 1, 0, 0, b"screen")).unwrap();
+    assert!(!e.shut_down());
+    e.receive(t0, host(1, SHUTDOWN, 0, 0, b""))
+        .unwrap()
+        .unwrap();
+    assert!(e.shut_down());
+    assert_eq!(e.next_deadline(t0), t0);
+    assert_eq!(e.poll(t0).unwrap().ack_num, SHUTDOWN);
 }
 
 #[test]
@@ -433,6 +469,7 @@ fn talks_to_a_real_mosh_server() {
         match rx.recv_timeout(left) {
             Ok(MoshEvent::Status(Status::Connected)) => connected = true,
             Ok(MoshEvent::Status(_) | MoshEvent::Snapshot { .. }) => {}
+            Ok(MoshEvent::Ended) => panic!("ended early"),
             Ok(MoshEvent::Screen {
                 old_num,
                 new_num,
@@ -465,6 +502,59 @@ fn talks_to_a_real_mosh_server() {
             after.extend(bytes);
         }
     }
+    // The shell exits: the server says so, and goes once acknowledged.
     session.send_keys(b"exit\r");
-    std::thread::sleep(Duration::from_millis(300));
+    loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(MoshEvent::Ended) => break,
+            Ok(_) => {}
+            Err(_) => panic!("no end after exit"),
+        }
+    }
+}
+
+/// A fake server on a local socket: what the client shows for what it sends.
+#[test]
+fn only_a_valid_instruction_counts_as_connected() {
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let key = [3u8; 16];
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _session = MoshSession::start(
+        rt.handle(),
+        server.local_addr().unwrap(),
+        key,
+        (80, 24),
+        move |ev| {
+            let _ = tx.send(ev);
+        },
+    )
+    .unwrap();
+    let mut buf = [0u8; 2048];
+    let (_, client) = server.recv_from(&mut buf).unwrap();
+    let crypto = Crypto::new(&key);
+    let send = |seq: u64, payload: &[u8]| {
+        let frag = split(seq, payload).remove(0);
+        server
+            .send_to(&crypto.seal(TO_CLIENT, &packet(seq, &frag)), client)
+            .unwrap();
+    };
+    let connected = |within: Duration| {
+        let deadline = Instant::now() + within;
+        while let Ok(ev) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            if ev == MoshEvent::Status(Status::Connected) {
+                return true;
+            }
+        }
+        false
+    };
+    // Authenticated, but not zlib.
+    send(1, b"not an instruction");
+    assert!(!connected(Duration::from_millis(400)));
+    let inst = host(0, 1, 0, 0, b"");
+    send(2, &wire::compress(&inst.encode()));
+    assert!(connected(Duration::from_secs(5)));
 }

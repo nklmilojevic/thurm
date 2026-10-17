@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use thurm_proto::{Envelope, Request, Response, ServerMessage, codec};
 
 use super::*;
-use crate::testing::{TestKey, serve, target};
+use crate::testing::{TestKey, serve, serve_with, target};
 
 fn temp_dir(name: &str) -> PathBuf {
     // Short: socket paths are limited to 104 bytes.
@@ -116,6 +116,51 @@ fn runs_an_interactive_shell() {
         sizes,
         [("xterm-256color".into(), 80, 24), ("".into(), 100, 30)]
     );
+}
+
+#[test]
+fn closing_a_shell_ends_it_and_keeps_the_session() {
+    let key = TestKey::new(1);
+    let server = serve(&key);
+    let s = Session::connect(&target(&server), key, Duration::from_secs(5)).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let shell = s
+        .open_shell((80, 24), "xterm-256color", &[], move |ev| {
+            let _ = tx.send(ev);
+        })
+        .unwrap();
+    shell.write(b"echo ready\n");
+    let mut out = Vec::new();
+    while !String::from_utf8_lossy(&out).contains("ready") {
+        if let ShellEvent::Data(d) = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            out.extend(d);
+        }
+    }
+    shell.close();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while server.exits.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shell kept running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!s.is_closed());
+    assert_eq!(
+        s.exec("echo still", Duration::from_secs(5)).unwrap().1,
+        "still\n"
+    );
+}
+
+#[test]
+fn a_refused_terminal_fails_the_shell() {
+    let key = TestKey::new(1);
+    let server = serve_with(&key, true);
+    let s = Session::connect(&target(&server), key, Duration::from_secs(5)).unwrap();
+    let Err(SshError::Attention(e)) = s.open_shell((80, 24), "xterm-256color", &[], |_| {}) else {
+        panic!("a shell without a terminal");
+    };
+    assert!(e.contains("refused a terminal"), "{e}");
 }
 
 #[test]

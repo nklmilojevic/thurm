@@ -49,6 +49,8 @@ pub enum MoshEvent {
         num: u64,
     },
     Status(Status),
+    /// The host ended the session (the shell exited); nothing follows.
+    Ended,
 }
 
 enum Cmd {
@@ -185,6 +187,10 @@ impl Driver {
                 _ = tokio::time::sleep_until(deadline.min(check).into()) => {}
             }
             self.flush().await;
+            if self.engine.shut_down() {
+                (self.on_event)(MoshEvent::Ended);
+                return;
+            }
             self.watch();
         }
     }
@@ -292,10 +298,14 @@ impl Driver {
         let applied = wire::decompress(&whole)
             .and_then(|raw| wire::Instruction::decode(&raw))
             .and_then(|inst| self.engine.receive(now, inst));
-        self.set_status(Status::Connected);
         match applied {
-            Ok(Some(apply)) => self.screen(apply),
-            Ok(None) => {}
+            Ok(apply) => {
+                self.set_status(Status::Connected);
+                if let Some(apply) = apply {
+                    self.screen(apply);
+                }
+            }
+            // A broken or incompatible server: not connected for all that.
             Err(e) => log::warn!("{e}"),
         }
     }
