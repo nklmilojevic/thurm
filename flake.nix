@@ -139,6 +139,8 @@
           go_1_27
           python3
           uv
+          # thurm-mosh's and thurm-direct's tests talk to a real mosh-server when there is one.
+          mosh
           # Docs: cd docs && bun install && bun run dev
           bun
           gh

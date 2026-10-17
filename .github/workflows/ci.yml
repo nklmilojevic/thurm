@@ -80,6 +80,9 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
+      # thurm-mosh's and thurm-direct's tests talk to a real mosh-server (skipped without one).
+      - name: Install mosh
+        run: brew install mosh
       # --locked: a dependency change must come with its Cargo.lock.
       - name: Test
         run: cargo test --workspace --locked

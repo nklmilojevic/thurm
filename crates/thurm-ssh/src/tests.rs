@@ -1,169 +1,14 @@
-//! Against an in-process russh server that runs exec requests with the local `sh` and forwards
-//! streamlocal channels to local sockets.
+//! Against the in-process server of [`crate::testing`].
 
 use std::io::Write as _;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use p256::ecdsa::signature::Signer as _;
-use p256::ecdsa::{Signature, SigningKey};
-use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
-use russh::keys::{PrivateKey, PublicKey};
-use russh::server::{self, Auth, Msg, Session as ServerSession};
-use russh::{Channel, ChannelId};
 use thurm_proto::{Envelope, Request, Response, ServerMessage, codec};
 
 use super::*;
-
-struct TestKey(SigningKey);
-
-impl TestKey {
-    fn new(seed: u8) -> Arc<TestKey> {
-        Arc::new(TestKey(SigningKey::from_slice(&[seed; 32]).unwrap()))
-    }
-}
-
-impl DeviceKey for TestKey {
-    fn public_sec1(&self) -> Vec<u8> {
-        self.0
-            .verifying_key()
-            .to_sec1_point(false)
-            .as_bytes()
-            .to_vec()
-    }
-
-    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
-        let sig: Signature = self.0.sign(data);
-        Ok(sig.to_bytes().to_vec())
-    }
-}
-
-fn host_key() -> PrivateKey {
-    PrivateKey::new(
-        KeypairData::Ed25519(Ed25519Keypair::from_seed(&[7; 32])),
-        "test host",
-    )
-    .unwrap()
-}
-
-#[derive(Clone)]
-struct Server {
-    allowed: PublicKey,
-}
-
-impl server::Handler for Server {
-    type Error = russh::Error;
-
-    async fn auth_publickey(&mut self, _: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        Ok(if key.key_data() == self.allowed.key_data() {
-            Auth::Accept
-        } else {
-            Auth::reject()
-        })
-    }
-
-    async fn channel_open_session(
-        &mut self,
-        _: Channel<Msg>,
-        reply: server::ChannelOpenHandle,
-        _: &mut ServerSession,
-    ) -> Result<(), Self::Error> {
-        reply.accept().await;
-        Ok(())
-    }
-
-    async fn exec_request(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        session: &mut ServerSession,
-    ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(String::from_utf8_lossy(data).into_owned())
-            .output()
-            .unwrap();
-        session.data(channel, out.stdout)?;
-        session.extended_data(channel, 1, out.stderr)?;
-        session.exit_status_request(channel, out.status.code().unwrap_or(255) as u32)?;
-        session.eof(channel)?;
-        session.close(channel)?;
-        Ok(())
-    }
-
-    async fn channel_open_direct_streamlocal(
-        &mut self,
-        channel: Channel<Msg>,
-        socket_path: &str,
-        reply: server::ChannelOpenHandle,
-        _: &mut ServerSession,
-    ) -> Result<(), Self::Error> {
-        let Ok(mut local) = tokio::net::UnixStream::connect(socket_path).await else {
-            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
-            return Ok(());
-        };
-        reply.accept().await;
-        tokio::spawn(async move {
-            let mut channel = channel.into_stream();
-            let _ = tokio::io::copy_bidirectional(&mut local, &mut channel).await;
-        });
-        Ok(())
-    }
-}
-
-/// An ssh server on a local port accepting `device`; its runtime lives as long as the value.
-struct TestServer {
-    port: u16,
-    _rt: tokio::runtime::Runtime,
-}
-
-fn serve(device: &TestKey) -> TestServer {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let allowed = public_key(device).unwrap();
-    let listener = rt
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let config = Arc::new(server::Config {
-        keys: vec![host_key()],
-        auth_rejection_time: Duration::from_millis(10),
-        ..Default::default()
-    });
-    rt.spawn(async move {
-        loop {
-            let Ok((tcp, _)) = listener.accept().await else {
-                return;
-            };
-            let handler = Server {
-                allowed: allowed.clone(),
-            };
-            let config = config.clone();
-            tokio::spawn(async move {
-                if let Ok(running) = server::run_stream(config, tcp, handler).await {
-                    let _ = running.await;
-                }
-            });
-        }
-    });
-    TestServer { port, _rt: rt }
-}
-
-fn target(server: &TestServer) -> Target {
-    Target {
-        host: "127.0.0.1".into(),
-        port: server.port,
-        user: "me".into(),
-        host_keys: vec![
-            host_key()
-                .public_key()
-                .fingerprint(HashAlg::Sha256)
-                .to_string(),
-        ],
-        socket: None,
-    }
-}
+use crate::testing::{TestKey, serve, target};
 
 fn temp_dir(name: &str) -> PathBuf {
     // Short: socket paths are limited to 104 bytes.
@@ -209,6 +54,80 @@ fn refuses_a_host_key_other_than_the_paired_one() {
         panic!("connected to an unpaired host key");
     };
     assert!(e.contains("is not the one paired"), "{e}");
+}
+
+#[test]
+fn tells_an_untrusted_host_key_from_a_changed_one() {
+    let key = TestKey::new(1);
+    let server = serve(&key);
+    let expected = target(&server).host_keys[0].clone();
+    let mut t = target(&server);
+    t.host_keys.clear();
+    match Session::connect_checked(&t, key.clone(), Duration::from_secs(5)) {
+        Err(SessionError::UnknownHostKey(seen)) => assert_eq!(seen, expected),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("connected without a trusted host key"),
+    }
+    t.host_keys = vec!["SHA256:somethingElseEntirely".into()];
+    match Session::connect_checked(&t, key, Duration::from_secs(5)) {
+        Err(SessionError::HostKeyChanged(seen)) => assert_eq!(seen, expected),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("connected to a changed host key"),
+    }
+    match Session::connect_checked(&target(&server), TestKey::new(2), Duration::from_secs(5)) {
+        Err(SessionError::KeyRejected) => {}
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("an unknown key was accepted"),
+    }
+}
+
+#[test]
+fn runs_an_interactive_shell() {
+    let key = TestKey::new(1);
+    let server = serve(&key);
+    let s = Session::connect(&target(&server), key, Duration::from_secs(5)).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let shell = s
+        .open_shell((80, 24), "xterm-256color", &[], move |ev| {
+            let _ = tx.send(ev);
+        })
+        .unwrap();
+    shell.write(b"echo hello from the shell\n");
+    let mut out = Vec::new();
+    while !String::from_utf8_lossy(&out).contains("hello from the shell") {
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            ShellEvent::Data(d) => out.extend(d),
+            ShellEvent::Exit(c) => panic!("the shell ended ({c:?})"),
+        }
+    }
+    shell.resize(100, 30);
+    shell.write(b"exit 4\n");
+    loop {
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            ShellEvent::Data(_) => {}
+            ShellEvent::Exit(code) => {
+                assert_eq!(code, Some(4));
+                break;
+            }
+        }
+    }
+    let sizes = server.sizes.lock().unwrap().clone();
+    assert_eq!(
+        sizes,
+        [("xterm-256color".into(), 80, 24), ("".into(), 100, 30)]
+    );
+}
+
+#[test]
+fn execs_a_command_line_as_given() {
+    let key = TestKey::new(1);
+    let server = serve(&key);
+    let s = Session::connect(&target(&server), key, Duration::from_secs(5)).unwrap();
+    let (code, out) = s
+        .exec("echo out; echo err >&2; exit 2", Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(code, Some(2));
+    assert!(out.contains("out") && out.contains("err"), "{out}");
 }
 
 /// A key whose signing never returns (a Face ID prompt nobody answers).
