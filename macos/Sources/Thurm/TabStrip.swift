@@ -447,7 +447,8 @@ private final class TabPill: NSView {
         title.isHidden = compact
         close.isHidden = !hovering || compact
         iconLeading.constant = compact ? max(0, (bounds.width - 26) / 2) : 10
-        toolTip = tab.title
+        // The other tabs have their hover card instead.
+        toolTip = tab.selected ? tab.title : nil
         let target: Double = tab.selected ? 1 : 0
         if selection.to != target {
             let now = CACurrentMediaTime()
@@ -497,8 +498,21 @@ private final class TabPill: NSView {
         }
     }
 
-    override func mouseEntered(with event: NSEvent) { hovering = true }
-    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseEntered(with event: NSEvent) {
+        hovering = true
+        TabHoverCard.shared.enter(self, controller: tab?.window?.windowController as? TerminalWindowController,
+                                  edge: .below)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        TabHoverCard.shared.exit(self)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        TabHoverCard.shared.dismiss()
+        super.scrollWheel(with: event)
+    }
 
     /// Where the button went down, in the track: the start of a possible drag.
     private var downAt: NSPoint?
@@ -509,6 +523,7 @@ private final class TabPill: NSView {
     // Each tab is its own window with its own strip, so selecting one hides this strip: select
     // on release, after any drag, or the drag would lose its strip halfway.
     override func mouseDown(with event: NSEvent) {
+        TabHoverCard.shared.dismiss()
         downAt = superview?.convert(event.locationInWindow, from: nil)
     }
 
@@ -529,10 +544,12 @@ private final class TabPill: NSView {
     }
 
     override func otherMouseDown(with event: NSEvent) {
+        TabHoverCard.shared.dismiss()
         if event.buttonNumber == 2 { closeTab() }
     }
 
     @objc private func closeTab() {
+        TabHoverCard.shared.dismiss()
         tab?.window?.performClose(nil)
     }
 }

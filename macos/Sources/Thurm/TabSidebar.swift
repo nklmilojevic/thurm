@@ -506,6 +506,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         guard let box = item as? TabBox else { return nil }
         let cell = outlineView.makeView(withIdentifier: TabRowView.identifier, owner: nil) as? TabRowView
             ?? TabRowView()
+        cell.showsHoverCard = true
         cell.configure(box.tab)
         return cell
     }
@@ -513,6 +514,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     // MARK: Actions
 
     @objc private func rowClicked(_ sender: Any?) {
+        TabHoverCard.shared.dismiss()
         let row = outline.clickedRow >= 0 ? outline.clickedRow : outline.selectedRow
         guard row >= 0, let box = outline.item(atRow: row) as? TabBox,
               let w = box.tab.controller?.window else { return }
@@ -790,10 +792,15 @@ final class TabRowView: NSTableCellView {
     private let title = NSTextField(labelWithString: "")
     private let subtitle = NSTextField(labelWithString: "")
     private let shortcut = NSTextField(labelWithString: "")
+    /// Tab rows show the tab's hover card; agent rows (one pane each) don't.
+    var showsHoverCard = false
+    private weak var controller: TerminalWindowController?
 
     init() {
         super.init(frame: .zero)
         identifier = Self.identifier
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                                       owner: self))
         icon.imageScaling = .scaleNone
         icon.imageAlignment = .alignBottom
         dot.wantsLayer = true
@@ -845,6 +852,7 @@ final class TabRowView: NSTableCellView {
     }
 
     func configure(_ tab: SidebarTab, truncateTail: Bool = false) {
+        controller = tab.controller
         subtitle.lineBreakMode = truncateTail ? .byTruncatingTail : .byTruncatingMiddle
         title.stringValue = tab.title
         title.font = .systemFont(ofSize: 13, weight: tab.selected ? .medium : .regular)
@@ -880,7 +888,21 @@ final class TabRowView: NSTableCellView {
         dot.isHidden = tab.status == nil || tab.status == .idle || tab.status == .working
         dot.layer?.backgroundColor = tab.status?.color.cgColor
         dot.layer?.borderColor = SessionManager.shared.config.sidebarColor.cgColor
-        toolTip = [tab.title, tab.subtitle].compactMap { $0 }.joined(separator: "\n")
+        // The other tabs have their hover card instead.
+        toolTip = showsHoverCard && !tab.selected ? nil : [tab.title, tab.subtitle].compactMap { $0 }.joined(separator: "\n")
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if showsHoverCard { TabHoverCard.shared.enter(self, controller: controller, edge: .right) }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if showsHoverCard { TabHoverCard.shared.exit(self) }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        TabHoverCard.shared.dismiss()
+        super.scrollWheel(with: event)
     }
 }
 
