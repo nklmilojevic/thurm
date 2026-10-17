@@ -255,6 +255,22 @@ animation_duration = 0.2
 # "cmd+shift+d" = "split_down"
 # "cmd+d" = "split_right"
 
+# A command of your own, in the command palette and on an optional key. The daemon
+# runs it through your login shell in the focused pane's directory, with
+# THURM_PANE_ID and THURM_SOCKET set.
+# [[commands]]
+# name = "Dev layout"
+# exec = ["~/bin/dev-layout", "--branch", "main"]
+# key = "cmd+shift+l"
+
+# A command the daemon runs on an event, with the event as JSON on stdin.
+# Events: agent_working, agent_waiting, agent_blocked, agent_finished,
+# agent_failed, agent_idle, command_finished and pane_exited.
+# [[on]]
+# event = "agent_finished"
+# exec = ["~/bin/agent-done"]
+# min_secs = 0                 # command_finished only
+
 [tailscale]
 # Serve the daemon over Tailscale as a device of its own, so your phone and other
 # devices reach it at wss://HOSTNAME.YOUR-TAILNET.ts.net/v1/connect without ssh.

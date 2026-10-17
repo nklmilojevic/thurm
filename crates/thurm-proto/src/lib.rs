@@ -393,6 +393,12 @@ pub enum Request {
     },
     /// Who this connection is: a local peer or a tailnet caller.
     Whoami,
+    /// Run the config's `[[commands]]` entry `name`, with `pane` (the focused one) in its
+    /// environment and as its working directory. Answers once the command has started.
+    RunCommand {
+        name: String,
+        pane: Option<PaneId>,
+    },
 }
 
 /// A mobile client silent this long is taken for gone: iOS suspends apps without closing their

@@ -224,7 +224,7 @@ pub fn spawn_options(l: PaneLaunch<'_>) -> SpawnOptions {
 
 /// Directory holding the `thurm` CLI next to this daemon (`Thurm.app/Contents/Helpers`).
 /// The shell integration appends it to PATH so agents in panes can drive the terminal.
-fn cli_dir() -> Option<PathBuf> {
+pub fn cli_dir() -> Option<PathBuf> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     dir.join("thurm").is_file().then_some(dir)
 }

@@ -53,6 +53,7 @@ final class SessionManager: NSObject, CoreDelegate {
 
     func start() {
         config = AppConfig.load()
+        MainMenu.updateCommands(config.commands)
         if let err = config.loadError { tlog("config: \(err)") }
         Core.shared.delegate = self
         NotificationCenter.default.addObserver(self, selector: #selector(secureInputChanged(_:)),
@@ -903,6 +904,7 @@ final class SessionManager: NSObject, CoreDelegate {
             Core.shared.request("\"ReloadConfig\"")
         }
         config = AppConfig.load()
+        MainMenu.updateCommands(config.commands)
         if let o = sidebarTabsOverride { config.sidebarTabs = o }
         if let o = sidebarAgentsOverride { config.sidebarAgents = o }
         applyConfigToUI()
@@ -946,6 +948,20 @@ final class SessionManager: NSObject, CoreDelegate {
     func resetFontSize() {
         fontSizeOverride = nil
         applyConfigToUI()
+    }
+
+    /// Asks this Mac's daemon to run the `[[commands]]` entry `name`, for the focused pane when
+    /// it is one of this Mac's (a remote pane's id means nothing to it). A failure to start shows
+    /// in the pane; one later comes as a notification.
+    func runUserCommand(_ name: String) {
+        let view = currentController?.content.focusedView
+        var pane: Any = NSNull()
+        if let focused = currentController?.focusedPane, focused.host == localHost { pane = focused.id }
+        Core.shared.requestAsync(object: ["RunCommand": ["name": name, "pane": pane]], timeout: 10) { resp in
+            let error = (resp as? [String: Any]).flatMap { jsonString($0["error"]) }
+                ?? (resp == nil ? "Thurm's daemon is not connected" : nil)
+            if let error { view?.showToast("\(name): \(error)", duration: 5) }
+        }
     }
 
     func openConfigFile() {

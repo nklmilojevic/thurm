@@ -81,6 +81,12 @@ struct AgentPreset {
     let command: [String]
 }
 
+/// A `[[commands]]` entry: the daemon runs it by name; `key` is a `[keybindings]`-style chord.
+struct UserCommand: Equatable {
+    let name: String
+    let key: String
+}
+
 /// Converts 0xRRGGBB to an NSColor.
 func colorFromRGB(_ rgb: UInt32, alpha: CGFloat = 1) -> NSColor {
     let r = CGFloat((rgb >> 16) & 0xFF) / 255
@@ -200,6 +206,8 @@ final class AppConfig {
     var followsAppearance: Bool { themeLight != themeDark }
     var themes: [ThemeChoice] = []
     var agentPresets: [AgentPreset] = []
+    /// `[[commands]]`, in the Shell menu's Commands submenu (and so in the command palette).
+    var commands: [UserCommand] = []
     /// Programs with their own mark: 24x24 path data by icon id (`[programs]`).
     var programMarks: [String: String] = [:]
     /// `[[remote]]` hosts, by name (connected in the background; see Remote.swift).
@@ -266,6 +274,11 @@ final class AppConfig {
             }
         }
         guard let c = root["config"] as? [String: Any] else { return }
+
+        commands = (c["commands"] as? [[String: Any]] ?? []).compactMap { cmd in
+            guard let name = jsonString(cmd["name"]) else { return nil }
+            return UserCommand(name: name, key: jsonString(cmd["key"]) ?? "")
+        }
 
         if let font = c["font"] as? [String: Any] {
             fontFamily = jsonString(font["family"]) ?? fontFamily

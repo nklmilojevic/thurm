@@ -55,6 +55,8 @@ pub struct App {
     /// A theme chosen when config.toml cannot record it is in use (see `set_theme`).
     session_theme: Cell<bool>,
     keymap: RefCell<HashMap<Combo, &'static str>>,
+    /// The keys of `[[commands]]`, by the command's name.
+    command_keys: RefCell<HashMap<Combo, String>>,
     pub infos: RefCell<HashMap<PaneKey, PaneInfo>>,
     views: RefCell<HashMap<PaneKey, Rc<TermView>>>,
     pub window: RefCell<Option<Rc<MainWindow>>>,
@@ -284,6 +286,7 @@ impl App {
         ));
         let mut warnings = Vec::new();
         let bindings = actions::bindings(&ui.cfg.keybindings, &mut warnings);
+        let command_keys = actions::command_keymap(&ui.cfg.commands, &mut warnings);
         let app = Rc::new(App {
             gtk_app: gtk_app.clone(),
             cores: RefCell::new(HashMap::from([(LOCAL.to_string(), Rc::new(core))])),
@@ -295,6 +298,7 @@ impl App {
             sidebar_agents_override: Cell::new(None),
             session_theme: Cell::new(false),
             keymap: RefCell::new(actions::keymap(&bindings)),
+            command_keys: RefCell::new(command_keys),
             infos: RefCell::new(HashMap::new()),
             views: RefCell::new(HashMap::new()),
             window: RefCell::new(Some(window.clone())),
@@ -473,19 +477,37 @@ impl App {
         keycode: u32,
         state: gdk::ModifierType,
     ) -> Option<&'static str> {
-        let map = self.keymap.borrow();
-        if let Some(a) = map.get(&actions::combo(keyval, state)) {
-            return Some(a);
-        }
-        // Shifted punctuation (Ctrl+Shift+= arrives as "plus"): try the key's unshifted symbol.
-        let display = gdk::Display::default()?;
-        let (base, ..) = gdk::prelude::DisplayExtManual::translate_key(
-            &display,
-            keycode,
-            gdk::ModifierType::empty(),
-            0,
-        )?;
-        map.get(&actions::combo(base, state)).copied()
+        lookup_key(&self.keymap.borrow(), keyval, keycode, state)
+    }
+
+    /// The `[[commands]]` entry on this key, which comes before any action on it.
+    pub fn command_for_key(
+        &self,
+        keyval: gdk::Key,
+        keycode: u32,
+        state: gdk::ModifierType,
+    ) -> Option<String> {
+        lookup_key(&self.command_keys.borrow(), keyval, keycode, state)
+    }
+
+    /// Asks this machine's daemon to run the `[[commands]]` entry `name`, for the focused pane
+    /// when it is one of this machine's (a remote pane's id means nothing to it).
+    pub fn run_user_command(&self, name: &str) {
+        let Some(c) = self.core(LOCAL) else {
+            self.toast(&format!("{name}: the session daemon is not connected"), 5.0);
+            return;
+        };
+        let pane = self.focused_pane().filter(|k| !k.is_remote()).map(|k| k.id);
+        let name = name.to_owned();
+        c.request_async(
+            &json!({"RunCommand": {"name": name, "pane": pane}}),
+            10_000,
+            move |resp| {
+                if let Some(e) = resp.get("error").and_then(Value::as_str) {
+                    with_app(|a| a.toast(&format!("{name}: {e}"), 5.0));
+                }
+            },
+        );
     }
 
     pub fn activate(&self, name: &str) {
@@ -2293,6 +2315,22 @@ impl App {
                 with_app(|a| a.split_focused(Direction::Right, None, true));
             }));
         }
+        for command in &self.ui().cfg.commands {
+            let name = command.name.clone();
+            let shortcut = actions::parse_binding(&command.key)
+                .map(|a| actions::label(&a))
+                .unwrap_or_default();
+            items.push(
+                Item::new(
+                    format!("Commands: {}", command.name),
+                    command.exec.join(" "),
+                    move || {
+                        with_app(|a| a.run_user_command(&name));
+                    },
+                )
+                .shortcut(shortcut),
+            );
+        }
         items.extend(remote::palette_items(self));
         let host = self.current_host();
         for p in self.presets(&host) {
@@ -3359,6 +3397,7 @@ impl App {
         }
         let mut warnings = Vec::new();
         let bindings = actions::bindings(&ui.cfg.keybindings, &mut warnings);
+        *self.command_keys.borrow_mut() = actions::command_keymap(&ui.cfg.commands, &mut warnings);
         ui.warnings.extend(warnings);
         for (name, accels) in &bindings {
             let a: Vec<&str> = accels.iter().map(String::as_str).collect();
@@ -3846,4 +3885,25 @@ mod tests {
         assert!(s.starts_with("{\"windows\""), "{s}");
         assert!(s.find("\"windows\"") < s.find("\"workspaces\""));
     }
+}
+
+/// The value `map` has for a key press. Shifted punctuation (Ctrl+Shift+= arrives as "plus") is
+/// also tried as the key's unshifted symbol.
+fn lookup_key<T: Clone>(
+    map: &HashMap<Combo, T>,
+    keyval: gdk::Key,
+    keycode: u32,
+    state: gdk::ModifierType,
+) -> Option<T> {
+    if let Some(v) = map.get(&actions::combo(keyval, state)) {
+        return Some(v.clone());
+    }
+    let display = gdk::Display::default()?;
+    let (base, ..) = gdk::prelude::DisplayExtManual::translate_key(
+        &display,
+        keycode,
+        gdk::ModifierType::empty(),
+        0,
+    )?;
+    map.get(&actions::combo(base, state)).cloned()
 }

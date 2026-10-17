@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::{Mutex, RwLock};
 
-use thurm_config::{AgentDef, Config, NoticeState, ProgramDef};
+use thurm_config::{AgentDef, Config, EventHook, HookEvent, NoticeState, ProgramDef};
 use thurm_proto::{
     AgentState, AgentStatus, CreatePane, Event, Layout, PROTOCOL_VERSION, PaneId, PaneInfo,
     PaneSize, ProgramRecord, Request, Response, ServerMessage, WaitCondition, WaitOutcome,
@@ -32,6 +32,7 @@ use crate::procinfo;
 use crate::pty::{self, Pty};
 use crate::shell;
 use crate::upgrade;
+use crate::user_exec;
 
 /// Messages queued for a client before its subscriptions switch to re-sync (it stops getting
 /// output and gets a fresh `Attach` once it caught up).
@@ -1109,7 +1110,8 @@ impl Daemon {
                     TermEvent::CommandFinished(code) => {
                         st.info.last_exit_status = code;
                         info_changed = true;
-                        if let Some(start) = st.command_started.take() {
+                        let started = st.command_started.take();
+                        if let Some(start) = started {
                             let secs = cfg.command_finished_secs;
                             if cfg.enabled
                                 && secs > 0
@@ -1134,6 +1136,17 @@ impl Daemon {
                                 });
                             }
                         }
+                        let secs = started.map_or(0, |s| s.elapsed().as_secs());
+                        self.run_hooks(
+                            HookEvent::CommandFinished,
+                            &st.info,
+                            serde_json::json!({
+                                "exit_code": code,
+                                "duration_secs": secs,
+                                "command": st.command_line,
+                            }),
+                            secs,
+                        );
                         st.command_line = None;
                     }
                     TermEvent::Progress(p) => {
@@ -1176,7 +1189,7 @@ impl Daemon {
             log::info!("pane {} ended with the daemon", pane.id);
             return;
         }
-        let hold = {
+        let (hold, info) = {
             let mut st = pane.state.lock();
             st.info.alive = false;
             st.info.exit_code = code;
@@ -1195,13 +1208,19 @@ impl Daemon {
                 };
                 st.term.print(&msg);
             }
-            st.hold
+            (st.hold, st.info.clone())
         };
         if self.pane(pane.id).is_none() {
             // Closed explicitly; ClosePane already notified clients.
             return;
         }
         log::info!("pane {} exited ({code:?})", pane.id);
+        self.run_hooks(
+            HookEvent::PaneExited,
+            &info,
+            serde_json::json!({ "exit_code": code }),
+            0,
+        );
         {
             let mut recent = self.just_exited.lock();
             recent.retain(|(_, at)| at.elapsed() < TEARDOWN_GRACE);
@@ -2255,6 +2274,9 @@ impl Daemon {
             return Vec::new();
         }
         let state = NoticeState::of(a.status, a.permission.is_some());
+        let mut info = st.info.clone();
+        info.agent = Some(a.clone());
+        self.run_hooks(HookEvent::Agent(state), &info, serde_json::json!({}), 0);
         let notice = n.notice(state);
         if !n.enabled || !notice.notify {
             return Vec::new();
@@ -2974,7 +2996,113 @@ impl Daemon {
                     .map(|p| Response::Text(p.display().to_string()))
                     .map_err(|e| format!("cannot write {}: {e}", dir.display()))
             }
+            Request::RunCommand { name, pane } => self.run_command(&name, pane),
         }
+    }
+
+    /// Starts the `[[commands]]` entry `name` for `pane`. Its failure shows as a notification
+    /// in that pane, since nothing else would tell the user who picked it.
+    fn run_command(self: &Arc<Self>, name: &str, pane: Option<PaneId>) -> Result<Response, String> {
+        let command = self
+            .config
+            .read()
+            .command(name)
+            .cloned()
+            .ok_or_else(|| format!("no command named {name:?} in the config"))?;
+        let info = pane
+            .and_then(|id| self.pane(id))
+            .map(|p| p.state.lock().info.clone());
+        let daemon = Arc::downgrade(self);
+        let title = command.name.clone();
+        user_exec::start(
+            user_exec::Launch {
+                argv: &command.exec,
+                cwd: info.as_ref().and_then(|i| i.cwd.as_deref()),
+                env: self.user_exec_env(info.as_ref(), None),
+                stdin: None,
+            },
+            move |error| {
+                log::warn!("command {title:?} failed: {error}");
+                if let (Some(daemon), Some(pane)) = (daemon.upgrade(), pane) {
+                    daemon.broadcast(
+                        Event::Notify {
+                            pane,
+                            title: format!("{title} failed"),
+                            body: error,
+                            permission: None,
+                            sound: None,
+                        },
+                        true,
+                    );
+                }
+            },
+        )
+        .map_err(|e| format!("cannot run {:?}: {e}", command.exec[0]))?;
+        Ok(Response::Ok)
+    }
+
+    /// Runs the `[[on]]` hooks for `event` in the pane `info` describes, with `{"event", "pane",
+    /// ...extra}` on their stdin. `secs` is how long a finished command ran, for `min_secs`.
+    fn run_hooks(&self, event: HookEvent, info: &PaneInfo, extra: serde_json::Value, secs: u64) {
+        let hooks: Vec<EventHook> = self
+            .config
+            .read()
+            .hooks(event)
+            .filter(|h| secs >= h.min_secs)
+            .cloned()
+            .collect();
+        if hooks.is_empty() {
+            return;
+        }
+        let mut payload = serde_json::json!({ "event": event.name(), "pane": info });
+        if let (Some(p), serde_json::Value::Object(extra)) = (payload.as_object_mut(), extra) {
+            p.extend(extra);
+        }
+        let mut stdin = payload.to_string().into_bytes();
+        stdin.push(b'\n');
+        let env = self.user_exec_env(Some(info), Some(event));
+        let cwd = info.cwd.clone();
+        // Callers hold the pane's lock: starting a login shell is not for under it.
+        std::thread::spawn(move || {
+            for hook in hooks {
+                let label = format!("[[on]] {} {:?}", hook.event, hook.exec[0]);
+                let started = user_exec::start(
+                    user_exec::Launch {
+                        argv: &hook.exec,
+                        cwd: cwd.as_deref(),
+                        env: env.clone(),
+                        stdin: Some(stdin.clone()),
+                    },
+                    {
+                        let label = label.clone();
+                        move |error| log::warn!("{label} failed: {error}")
+                    },
+                );
+                if let Err(e) = started {
+                    log::warn!("{label} did not start: {e}");
+                }
+            }
+        });
+    }
+
+    /// What a user command learns from its environment: the pane, how to reach this daemon,
+    /// and for a hook its event.
+    fn user_exec_env(
+        &self,
+        info: Option<&PaneInfo>,
+        event: Option<HookEvent>,
+    ) -> Vec<(String, String)> {
+        let mut env = vec![(
+            thurm_proto::ENV_SOCKET.to_owned(),
+            self.socket.display().to_string(),
+        )];
+        if let Some(i) = info {
+            env.push((thurm_proto::ENV_PANE_ID.to_owned(), i.id.to_string()));
+        }
+        if let Some(e) = event {
+            env.push(("THURM_EVENT".to_owned(), e.name().to_owned()));
+        }
+        env
     }
 
     pub fn apply_config(&self, cfg: Config) {

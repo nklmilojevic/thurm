@@ -395,6 +395,8 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
         Kind::Float(Some((0.0, 1.0))),
     ),
     ("keybindings", "Key bindings", Kind::Table),
+    ("commands", "Commands", Kind::Table),
+    ("on", "Event hooks", Kind::Table),
     ("remote", "Remote hosts", Kind::Table),
 ];
 
@@ -669,7 +671,7 @@ fn within(x: f64, range: Option<(f64, f64)>) -> Result<(), String> {
 fn section_of(key: &str) -> &'static str {
     match key.split('.').next() {
         Some("colors" | "cursor") => "appearance",
-        Some("keybindings") => "keys",
+        Some("keybindings" | "commands" | "on") => "keys",
         Some("remote" | "push" | "tailscale") => "remotes",
         Some(top) => SECTIONS
             .iter()
