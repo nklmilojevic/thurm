@@ -83,6 +83,10 @@ thickness = 2.0
 # For example: palette = ["#1b2029", "#e06c75"].
 palette = []
 bold_is_bright = false
+improve_contrast = false
+theme_palette = false
+blend_backgrounds = false
+display_p3 = false
 
 [terminal]
 # Scrollback lines kept in memory per pane.
