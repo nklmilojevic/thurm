@@ -2838,6 +2838,7 @@ dependencies = [
 name = "thurm-daemon"
 version = "0.7.1"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "base64",
  "crossbeam-channel",

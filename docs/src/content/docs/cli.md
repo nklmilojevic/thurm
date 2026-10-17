@@ -107,7 +107,7 @@ Choose one condition and use `--timeout SECONDS` to bound a script's wait.
 
 Output silence does not prove that a task succeeded. Check the output and use
 a condition that matches the task. A screen match checks the visible screen,
-not all saved scrollback.
+not all scrollback.
 
 | Exit code | Meaning |
 | --- | --- |

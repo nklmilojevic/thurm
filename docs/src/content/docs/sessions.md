@@ -15,7 +15,8 @@ and the saved window, tab, and split layout.
 | Open the app again | The app connects to the existing session |
 | Close a pane | Its process stops |
 | Quit with `session.quit = "terminate"` | Shells stop |
-| Reboot or restart the daemon | Saved layout and scrollback can return; new processes start |
+| Upgrade the daemon (`thurm daemon upgrade`) | Shells and scrollback continue |
+| Reboot or restart the daemon | The saved layout returns with empty panes; new processes start |
 
 A disk snapshot cannot restore the memory of a stopped process.
 
@@ -23,9 +24,15 @@ A disk snapshot cannot restore the memory of a stopped process.
 
 With `session.persist = true`, the daemon saves state under
 `~/Library/Application Support/Thurm`. `THURM_STATE_DIR` overrides this directory.
-The default snapshot interval is 15 seconds. Up to 4,000 scrollback lines per
-pane are saved. This is separate from `terminal.scrollback`, which defaults to
-10,000 lines in memory.
+The default snapshot interval is 15 seconds. A snapshot holds the layout and each
+pane's working directory, command and agent session, never its scrollback:
+terminal output often holds tokens and keys, so it stays in the daemon's memory
+(`terminal.scrollback`, 10,000 lines by default). Older versions saved scrollback
+in a `scrollback` folder there; the daemon deletes it when it starts.
+
+An in-place upgrade passes every terminal to the new daemon in a file sealed with
+AES-256-GCM. Its key never touches the disk: the new daemon reads it from a pipe
+it inherits from the old one.
 
 ```sh
 thurm save

@@ -357,7 +357,7 @@ fn search_finds_and_highlights() {
 }
 
 #[test]
-fn capture_and_history_roundtrip() {
+fn capture_includes_scrollback() {
     let mut t = term(12, 4);
     t.advance(b"\x1b[32mgreen\x1b[0m plain\r\n");
     for i in 0..6 {
@@ -374,31 +374,6 @@ fn capture_and_history_roundtrip() {
 
     let screen = t.capture(&CaptureOpts::default());
     assert!(!screen.contains("green"));
-
-    let hist = t.serialize_history(100).unwrap();
-    let text = String::from_utf8_lossy(&hist);
-    assert!(text.contains("\x1b[38;5;2mgreen"), "{text:?}");
-
-    // Replaying into a fresh terminal reproduces the text, with soft wraps rejoined.
-    let mut u = term(40, 10);
-    u.replay(&hist);
-    let back = u.capture(&CaptureOpts {
-        lines: None,
-        scrollback: true,
-        ansi: false,
-    });
-    assert!(back.contains("green plain"));
-    assert!(back.contains("a very long line that wraps"), "{back:?}");
-    assert!(u.drain_events().is_empty());
-}
-
-#[test]
-fn alt_screen_blocks_history_serialization() {
-    let mut t = term(10, 3);
-    t.advance(b"shell\r\n\x1b[?1049hvim");
-    assert!(t.serialize_history(10).is_none());
-    t.advance(b"\x1b[?1049l");
-    assert!(String::from_utf8_lossy(&t.serialize_history(10).unwrap()).contains("shell"));
 }
 
 #[test]

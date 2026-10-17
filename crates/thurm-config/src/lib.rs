@@ -279,11 +279,6 @@ impl Config {
                 t.image_memory_mib as u64,
                 16_384,
             ),
-            (
-                "session.scrollback_lines",
-                self.session.scrollback_lines as u64,
-                1_000_000,
-            ),
         ] {
             if value > hi {
                 return Err(format!("{key} = {value} is out of range (at most {hi})"));
@@ -583,9 +578,12 @@ pub enum QuitBehavior {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct SessionConfig {
-    /// Save layout, cwd and scrollback to disk and restore them after a reboot.
+    /// Save layout, cwd and agents to disk and restore them after a reboot. Scrollback is not
+    /// saved.
     pub persist: bool,
-    /// Lines of scrollback per pane written to the snapshot.
+    /// Retired: scrollback is no longer written to disk. Kept so the many configs that still
+    /// set it load without a warning.
+    #[serde(skip_serializing)]
     pub scrollback_lines: usize,
     pub snapshot_interval_secs: u64,
     pub quit: QuitBehavior,
@@ -2026,6 +2024,13 @@ mod tests {
         std::fs::create_dir(&overlay).unwrap();
         assert!(!overlay_holds(&config, "font.size"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retired_scrollback_lines_loads_quietly() {
+        let (_, warnings) =
+            Config::parse_with_warnings("[session]\nscrollback_lines = 4000\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

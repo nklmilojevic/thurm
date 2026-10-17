@@ -377,8 +377,7 @@ impl Tailnet {
                 Ok(())
             });
         }
-        let child = cmd
-            .spawn()
+        let child = crate::pty::spawn_locked(&mut cmd)
             .map_err(|e| format!("starting {}: {e}", exe.display()))?;
         drop(theirs);
         let pid = child.id() as i32;

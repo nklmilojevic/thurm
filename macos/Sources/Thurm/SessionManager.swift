@@ -150,7 +150,7 @@ final class SessionManager: NSObject, CoreDelegate {
             if upgradeDaemonInPlace() { return connectAndHello() }
             helloRefusedForVersion = true
         }
-        Core.shared.lastError = "The running thurmd refused the connection: \(e). Quit Thurm and run `thurm daemon stop` (layout and scrollback are restored), then open Thurm again."
+        Core.shared.lastError = "The running thurmd refused the connection: \(e). Quit Thurm and run `thurm daemon stop` (the layout is restored), then open Thurm again."
         return false
     }
 

@@ -38,6 +38,8 @@ struct Args {
     no_restore: bool,
     /// Hand-off file from the image we replace (see `upgrade.rs`).
     adopt: Option<PathBuf>,
+    /// The pipe holding the key that hand-off is sealed with.
+    handoff_key_fd: Option<std::os::fd::RawFd>,
 }
 
 fn parse_args() -> Args {
@@ -47,6 +49,7 @@ fn parse_args() -> Args {
         socket: None,
         no_restore: false,
         adopt: None,
+        handoff_key_fd: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -57,6 +60,7 @@ fn parse_args() -> Args {
                 args.foreground = true;
             }
             "--adopt" => args.adopt = it.next().map(PathBuf::from),
+            "--handoff-key-fd" => args.handoff_key_fd = it.next().and_then(|n| n.parse().ok()),
             "--handoff-check" => {
                 upgrade::print_check();
                 std::process::exit(0);
@@ -108,7 +112,10 @@ fn main() {
     let _ = signal_hook::flag::register(signal_hook::consts::SIGUSR2, upgrade_requested.clone());
 
     let log_path = state_dir.join("thurmd.log");
-    let handoff = args.adopt.as_deref().map(upgrade::load);
+    let handoff = args
+        .adopt
+        .as_deref()
+        .map(|path| upgrade::load(path, args.handoff_key_fd));
     let lock_fd: Option<std::os::fd::RawFd>;
     let (listener, handoff, log_to_file) = match handoff {
         // Replacing ourselves: already daemonized, and the socket never stopped listening.

@@ -65,9 +65,6 @@ const PROGRAM_ALERT_WINDOW: Duration = Duration::from_secs(10);
 /// can see the shell go before the signal handler has run (and the main thread notices the
 /// signal up to 100ms after that).
 const TEARDOWN_GRACE: Duration = Duration::from_millis(500);
-/// Autosave serializes a busy pane's scrollback (under its lock) at most this often.
-/// Explicit saves (quit, upgrade, `thurm save`) always do.
-const HISTORY_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Work for the on-device model (`[ai]`), done one at a time by `ai_worker`.
 enum AiJob {
@@ -314,10 +311,6 @@ pub struct PaneState {
     osc_cwd: Option<String>,
     command_started: Option<Instant>,
     command_line: Option<String>,
-    last_history: Option<Arc<[u8]>>,
-    /// When `last_history` was serialized.
-    history_at: Option<Instant>,
-    saved_generation: u64,
     /// The unterminated end of what was parsed (an escape sequence cut by a read, or part of a
     /// UTF-8 character): an in-place upgrade replays it into the new terminal ahead of the
     /// rest, which is still in the kernel.
@@ -407,6 +400,7 @@ impl Daemon {
         let integration_dir = shell::install_integration(&state_dir)
             .map_err(|e| log::warn!("shell integration unavailable: {e}"))
             .ok();
+        persist::remove_old_scrollback(&state_dir);
         let store = config
             .session
             .persist
@@ -647,16 +641,16 @@ impl Daemon {
         req.command.clone()
     }
 
-    /// Create a pane. `restore` carries the id and saved scrollback when restoring a session.
+    /// Create a pane. `restore` carries the id when restoring a session.
     pub fn create_pane(
         self: &Arc<Self>,
         req: CreatePane,
-        restore: Option<(PaneId, Option<Vec<u8>>)>,
+        restore: Option<PaneId>,
     ) -> anyhow::Result<PaneId> {
-        let id = match &restore {
-            Some((id, _)) => {
+        let id = match restore {
+            Some(id) => {
                 self.next_pane.fetch_max(id + 1, Ordering::Relaxed);
-                *id
+                id
             }
             None => self.next_pane.fetch_add(1, Ordering::Relaxed),
         };
@@ -695,8 +689,7 @@ impl Daemon {
         let mut term = Terminal::new(size, self.engine.read().clone());
         term.set_shell_token(Some(token));
         let restored = restore.is_some();
-        if let Some((_, Some(history))) = &restore {
-            term.replay(history);
+        if restored {
             term.print(&format!(
                 "\r\n\x1b[2m── session restored · {} ──\x1b[0m\r\n",
                 cwd.as_deref().unwrap_or("~")
@@ -759,9 +752,6 @@ impl Daemon {
                 osc_cwd: p.osc_cwd,
                 command_started: None,
                 command_line: None,
-                last_history: None,
-                history_at: None,
-                saved_generation: 0,
                 carry: p.carry,
                 pending_input: None,
                 shell_integration_seen: p.shell_integration_seen,
@@ -1692,7 +1682,7 @@ impl Daemon {
                     && last_save.elapsed() > Duration::from_secs(1)
                     || last_save.elapsed() > interval)
             {
-                let _ = self.save_session_with(false);
+                let _ = self.save_session();
                 last_save = Instant::now();
             }
             let idle_exit = self.config.read().session.daemon_idle_exit_secs;
@@ -1720,24 +1710,16 @@ impl Daemon {
         serde_json::to_string(&layout).ok()
     }
 
+    /// Writes the layout and each pane's cwd, command and agent. Scrollback stays in memory:
+    /// it never reaches the disk, so a restart restores the panes without their history.
     pub fn save_session(&self) -> std::io::Result<()> {
-        self.save_session_with(true)
-    }
-
-    /// `full`: serialize every changed scrollback now. Autosave leaves panes whose history
-    /// was serialized less than `HISTORY_AUTOSAVE_INTERVAL` ago for a later round.
-    fn save_session_with(&self, full: bool) -> std::io::Result<()> {
         let Some(store) = &self.store else {
             return Ok(());
         };
         let _saving = self.save_lock.lock();
         // Changes from here on (a hook during the save) make the session dirty again.
         let was_dirty = self.session_dirty.swap(false, Ordering::Relaxed);
-        let lines = self.config.read().session.scrollback_lines;
         let mut panes = Vec::new();
-        let mut scrollbacks = Vec::new();
-        // Scrollbacks written by this save: marked saved only once it succeeded.
-        let mut written = Vec::new();
         let teardown = self.teardown_exits();
         let mut saving = self.all_panes();
         for p in &teardown {
@@ -1747,24 +1729,9 @@ impl Daemon {
         }
         saving.sort_by_key(|p| p.id);
         for pane in saving {
-            let mut st = pane.state.lock();
+            let st = pane.state.lock();
             if !st.info.alive && !teardown.iter().any(|p| p.id == pane.id) {
                 continue;
-            }
-            let generation = st.term.generation();
-            let recent = st
-                .history_at
-                .is_some_and(|at| at.elapsed() < HISTORY_AUTOSAVE_INTERVAL);
-            if (generation != st.saved_generation || st.last_history.is_none()) && (full || !recent)
-            {
-                if let Some(h) = st.term.serialize_history(lines) {
-                    st.last_history = Some(Arc::from(h));
-                    st.history_at = Some(Instant::now());
-                }
-                if let Some(h) = &st.last_history {
-                    scrollbacks.push((pane.id, Arc::clone(h)));
-                }
-                written.push((Arc::clone(&pane), generation));
             }
             panes.push(PaneSnapshot {
                 id: pane.id,
@@ -1788,25 +1755,12 @@ impl Daemon {
             panes,
             next_pane_id: self.next_pane.load(Ordering::Relaxed),
         };
-        match store.save(&snap, &scrollbacks) {
-            Ok(()) => {
-                for (pane, generation) in written {
-                    pane.state.lock().saved_generation = generation;
-                }
-                Ok(())
+        store.save(&snap).inspect_err(|e| {
+            log::warn!("failed to save session: {e}");
+            if was_dirty {
+                self.session_dirty.store(true, Ordering::Relaxed);
             }
-            Err(e) => {
-                log::warn!("failed to save session: {e}");
-                if was_dirty {
-                    self.session_dirty.store(true, Ordering::Relaxed);
-                }
-                // Retry these scrollbacks on the next save, not after the autosave interval.
-                for (pane, _) in written {
-                    pane.state.lock().history_at = None;
-                }
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Everything the next image needs to carry on (see `upgrade.rs`). The PTY fds stay owned
@@ -2005,7 +1959,6 @@ impl Daemon {
         let defs = cfg.agent_defs();
         let mut restored = 0;
         for p in &snap.panes {
-            let history = store.load_scrollback(p.id);
             let reported_resume = p.agent_resume.as_ref().filter(|argv| {
                 cfg.session.resume_agents
                     && p.agent_session.is_some()
@@ -2022,7 +1975,7 @@ impl Daemon {
                 size: p.size.into(),
                 ..Default::default()
             };
-            match self.create_pane(req, Some((p.id, history))) {
+            match self.create_pane(req, Some(p.id)) {
                 Ok(id) => {
                     restored += 1;
                     if let Some(argv) = reported_resume {
@@ -3630,6 +3583,28 @@ mod tests {
                 result: Ok(Response::Ok)
             })
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An older version's plain-text scrollback goes at start-up even when sessions are not
+    /// saved.
+    #[test]
+    fn old_scrollback_is_removed_without_persistence() {
+        let dir = std::env::temp_dir().join(format!("thurm-old-scrollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = dir.join("state").join("scrollback");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("3.ansi"), b"export TOKEN=secret\r\n").unwrap();
+        let mut config = Config::default();
+        config.session.persist = false;
+        let daemon = Daemon::new(
+            config,
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(daemon.store.is_none());
+        assert!(!old.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -275,16 +275,7 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
     ),
     ("terminal.smooth_scroll", "Smooth scrolling", Kind::Bool),
     ("terminal.tab_completion", "Tab completion", Kind::Bool),
-    (
-        "session.persist",
-        "Restore layout and scrollback",
-        Kind::Bool,
-    ),
-    (
-        "session.scrollback_lines",
-        "Scrollback saved per pane",
-        Kind::Int(Some((0.0, 1_000_000.0))),
-    ),
+    ("session.persist", "Restore layout and agents", Kind::Bool),
     (
         "session.snapshot_interval_secs",
         "Snapshot interval (seconds)",

@@ -1,9 +1,9 @@
-//! On-disk session snapshots: layout, per-pane metadata and scrollback.
+//! On-disk session snapshots: the layout and each pane's metadata, in
+//! `<state_dir>/session.json`.
 //!
-//! ```text
-//! <state_dir>/session.json          layout + pane list
-//! <state_dir>/scrollback/<id>.ansi  ANSI-escaped scrollback per pane
-//! ```
+//! Scrollback is not saved: whatever programs printed (tokens, keys, customer data) stays in
+//! the daemon's memory. Older versions wrote it to `<state_dir>/scrollback/`, which
+//! [`remove_old_scrollback`] removes at every start, whether or not sessions are saved.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +70,15 @@ impl From<PaneSizeSnap> for PaneSize {
     }
 }
 
+/// Deletes the plain-text scrollback an older version saved in `state_dir`.
+pub fn remove_old_scrollback(state_dir: &Path) {
+    match std::fs::remove_dir_all(state_dir.join("scrollback")) {
+        Ok(()) => log::info!("removed the scrollback an older version saved"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("cannot remove saved scrollback: {e}"),
+    }
+}
+
 pub struct Store {
     dir: PathBuf,
 }
@@ -83,14 +92,6 @@ impl Store {
         self.dir.join("session.json")
     }
 
-    fn scrollback_dir(&self) -> PathBuf {
-        self.dir.join("scrollback")
-    }
-
-    pub fn scrollback_path(&self, id: PaneId) -> PathBuf {
-        self.scrollback_dir().join(format!("{id}.ansi"))
-    }
-
     pub fn load(&self) -> Option<SessionSnapshot> {
         let text = std::fs::read_to_string(self.session_path()).ok()?;
         let snap: SessionSnapshot = serde_json::from_str(&text)
@@ -99,43 +100,16 @@ impl Store {
         (snap.version == SNAPSHOT_VERSION).then_some(snap)
     }
 
-    pub fn load_scrollback(&self, id: PaneId) -> Option<Vec<u8>> {
-        std::fs::read(self.scrollback_path(id)).ok()
-    }
-
-    /// Atomically write the snapshot plus changed scrollbacks, and delete scrollback files of
-    /// panes that no longer exist.
-    pub fn save(
-        &self,
-        snap: &SessionSnapshot,
-        scrollbacks: &[(PaneId, impl AsRef<[u8]>)],
-    ) -> std::io::Result<()> {
-        std::fs::create_dir_all(self.scrollback_dir())?;
-        for (id, data) in scrollbacks {
-            write_atomic(&self.scrollback_path(*id), data.as_ref())?;
-        }
+    /// Atomically write the snapshot.
+    pub fn save(&self, snap: &SessionSnapshot) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_vec_pretty(snap).map_err(std::io::Error::other)?;
-        write_atomic(&self.session_path(), &json)?;
-        let keep: Vec<String> = snap
-            .panes
-            .iter()
-            .map(|p| format!("{}.ansi", p.id))
-            .collect();
-        if let Ok(entries) = std::fs::read_dir(self.scrollback_dir()) {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".ansi") && !keep.contains(&name) {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-        }
-        Ok(())
+        write_atomic(&self.session_path(), &json)
     }
 
     #[cfg(test)]
     pub fn clear(&self) {
         let _ = std::fs::remove_file(self.session_path());
-        let _ = std::fs::remove_dir_all(self.scrollback_dir());
     }
 }
 
@@ -149,7 +123,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp{}-{seq}", std::process::id()));
     let result = (|| {
-        // Scrollback may contain secrets; the file is private from the start.
+        // Titles and working directories are private too; the file is private from the start.
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -206,8 +180,7 @@ mod tests {
                             }],
                             ..Default::default()
                         };
-                        let data = format!("thread {t} save {i}\r\n").repeat(200);
-                        if store.save(&snap, &[(1, data.into_bytes())]).is_err() {
+                        if store.save(&snap).is_err() {
                             failures += 1;
                         }
                     }
@@ -217,20 +190,16 @@ mod tests {
             .collect();
         let failures: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
         assert_eq!(failures, 0);
-        // Whatever won, both files are whole, private, and no temporary file is left.
+        // Whatever won, the file is whole, private, and no temporary file is left.
         assert!(store.load().is_some());
-        let scrollback = String::from_utf8(store.load_scrollback(1).unwrap()).unwrap();
-        let first = scrollback.lines().next().unwrap().to_owned();
-        assert!(scrollback.lines().all(|l| l == first));
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(store.scrollback_path(1))
+        let mode = std::fs::metadata(store.session_path())
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         let leftovers = std::fs::read_dir(&dir)
             .unwrap()
-            .chain(std::fs::read_dir(dir.join("scrollback")).unwrap())
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .count();
@@ -243,11 +212,7 @@ mod tests {
         let file = std::env::temp_dir().join(format!("thurm-persist-file-{}", std::process::id()));
         std::fs::write(&file, b"not a directory").unwrap();
         let store = Store::new(file.clone());
-        assert!(
-            store
-                .save(&SessionSnapshot::default(), &[(1, b"x".to_vec())])
-                .is_err()
-        );
+        assert!(store.save(&SessionSnapshot::default()).is_err());
         let _ = std::fs::remove_file(file);
     }
 
@@ -271,15 +236,30 @@ mod tests {
             }],
             next_pane_id: 4,
         };
-        store
-            .save(&snap, &[(3, b"hello\r\n".to_vec()), (9, b"stale".to_vec())])
-            .unwrap();
+        store.save(&snap).unwrap();
         assert_eq!(store.load().unwrap(), snap);
-        assert_eq!(store.load_scrollback(3).unwrap(), b"hello\r\n");
-        // Pane 9 is not in the snapshot, so its file is removed.
-        assert!(store.load_scrollback(9).is_none());
         store.clear();
         assert!(store.load().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scrollback_an_older_version_saved_is_removed() {
+        let dir = std::env::temp_dir().join(format!("thurm-persist-old-{}", std::process::id()));
+        let old = dir.join("scrollback");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("3.ansi"), b"export TOKEN=secret\r\n").unwrap();
+        remove_old_scrollback(&dir);
+        assert!(!old.exists());
+        let store = Store::new(dir.clone());
+        // Saving writes no scrollback either.
+        store.save(&SessionSnapshot::default()).unwrap();
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["session.json"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
