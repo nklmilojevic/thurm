@@ -779,12 +779,14 @@ func abbreviatePath(_ path: String) -> String {
     return parts.joined(separator: "/")
 }
 
-/// One sidebar row: icon tile with a status dot, title over branch/diff (or directory), Cmd+N hint.
+/// One sidebar row: icon tile with a status dot, title over branch/diff (or directory), working
+/// dots and the Cmd+N hint.
 final class TabRowView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("TabRow")
 
     private let icon = NSImageView()
     private let dot = NSView()
+    private let working = WorkingDots()
     private let title = NSTextField(labelWithString: "")
     private let subtitle = NSTextField(labelWithString: "")
     private let shortcut = NSTextField(labelWithString: "")
@@ -806,7 +808,7 @@ final class TabRowView: NSTableCellView {
         title.maximumNumberOfLines = 1
         shortcut.font = .systemFont(ofSize: 11)
         shortcut.textColor = SessionManager.shared.config.chrome.contentTertiary
-        for v in [icon, dot, title, subtitle, shortcut] {
+        for v in [icon, dot, title, subtitle, working, shortcut] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
         }
@@ -827,7 +829,9 @@ final class TabRowView: NSTableCellView {
             dot.heightAnchor.constraint(equalToConstant: 8),
             title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
             title.topAnchor.constraint(equalTo: topAnchor, constant: 4),
-            title.trailingAnchor.constraint(lessThanOrEqualTo: shortcut.leadingAnchor, constant: -6),
+            title.trailingAnchor.constraint(lessThanOrEqualTo: working.leadingAnchor, constant: -6),
+            working.trailingAnchor.constraint(equalTo: shortcut.leadingAnchor),
+            working.centerYAnchor.constraint(equalTo: title.centerYAnchor),
             subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
             subtitle.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
@@ -869,11 +873,143 @@ final class TabRowView: NSTableCellView {
             subtitle.stringValue = dir == tab.title || tab.title.hasSuffix(dir) ? "" : dir
         }
         icon.image = tab.icon.tile(size: 20, behind: tab.behind, badge: nil)
-        // A badge on the tile; idle agents show none.
-        dot.isHidden = tab.status == nil || tab.status == .idle
+        // A working agent shows the moving dots; the badge on the tile is for the states that
+        // want attention. Idle agents show neither.
+        working.isShown = tab.status == .working
+        working.color = SessionManager.shared.config.chrome.contentSecondary
+        dot.isHidden = tab.status == nil || tab.status == .idle || tab.status == .working
         dot.layer?.backgroundColor = tab.status?.color.cgColor
         dot.layer?.borderColor = SessionManager.shared.config.sidebarColor.cgColor
         toolTip = [tab.title, tab.subtitle].compactMap { $0 }.joined(separator: "\n")
+    }
+}
+
+/// Three dots that pulse in turn while an agent works. The pulse is a Core Animation keyframe on
+/// each dot's opacity, so the render server runs it: no timer, no redraw, nothing per frame on
+/// the main thread. It runs only while shown in a window, at a capped frame rate, and stands
+/// still under reduce motion. Hidden, it takes no width.
+final class WorkingDots: NSView {
+    static let size: CGFloat = 3.5
+    static let gap: CGFloat = 2.5
+    /// Space after the last dot, before whatever follows the view.
+    static let trailing: CGFloat = 6
+    static let period: CFTimeInterval = 1.2
+    static let key = "working"
+
+    let dots = (0..<3).map { _ in CALayer() }
+    /// Whether to stand still; tests swap in their own answer.
+    var reduced: () -> Bool = { Motion.reduced }
+
+    var isShown = false {
+        didSet {
+            guard isShown != oldValue else { return }
+            isHidden = !isShown
+            invalidateIntrinsicContentSize()
+            update()
+        }
+    }
+
+    var color: NSColor = .secondaryLabelColor {
+        didSet {
+            guard color != oldValue else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for d in dots { d.backgroundColor = color.cgColor }
+            CATransaction.commit()
+        }
+    }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        isHidden = true
+        for d in dots {
+            d.cornerRadius = Self.size / 2
+            d.backgroundColor = color.cgColor
+            layer?.addSublayer(d)
+        }
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        // Reduce motion switched on or off while a row stays up starts or stops its pulse.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(displayOptionsChanged),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+    }
+
+    deinit {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    @objc func displayOptionsChanged() {
+        update()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        guard isShown else { return NSSize(width: 0, height: Self.size) }
+        return NSSize(width: 3 * Self.size + 2 * Self.gap + Self.trailing, height: Self.size)
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let y = (bounds.height - Self.size) / 2
+        for (i, d) in dots.enumerated() {
+            d.frame = CGRect(x: CGFloat(i) * (Self.size + Self.gap), y: y, width: Self.size, height: Self.size)
+        }
+        CATransaction.commit()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        update()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        let scale = window?.backingScaleFactor ?? 2
+        for d in dots { d.contentsScale = scale }
+    }
+
+    /// Starts the pulse when it should run and isn't, stops it when it shouldn't. A row
+    /// reconfigured while its agent works (every retitle) leaves a running pulse alone.
+    private func update() {
+        let reduced = reduced()
+        let run = isShown && window != nil && !reduced
+        let running = dots[0].animation(forKey: Self.key) != nil
+        guard !(run && running) else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        guard run else {
+            // Still: plainly visible under reduce motion, dim otherwise (hidden or offscreen).
+            for d in dots {
+                d.removeAnimation(forKey: Self.key)
+                d.opacity = reduced ? 0.85 : 0.3
+            }
+            return
+        }
+        // One phase for every row, so two working tabs pulse together.
+        let now = CACurrentMediaTime()
+        let start = now - now.truncatingRemainder(dividingBy: Self.period)
+        for (i, d) in dots.enumerated() {
+            d.opacity = 0.3
+            let pulse = CAKeyframeAnimation(keyPath: "opacity")
+            pulse.values = [0.3, 0.85, 0.3, 0.3]
+            pulse.keyTimes = [0, 0.25, 0.5, 1]
+            pulse.timingFunctions = Array(repeating: CAMediaTimingFunction(name: .easeInEaseOut), count: 3)
+            pulse.duration = Self.period
+            pulse.repeatCount = .infinity
+            pulse.beginTime = d.convertTime(start + Double(i) * Self.period / 6, from: nil)
+            pulse.fillMode = .backwards
+            pulse.isRemovedOnCompletion = false
+            pulse.preferredFrameRateRange = CAFrameRateRange(minimum: 10, maximum: 30, preferred: 30)
+            d.add(pulse, forKey: Self.key)
+        }
     }
 }
 
