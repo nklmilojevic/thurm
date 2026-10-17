@@ -886,7 +886,11 @@ impl TermView {
     ) -> glib::Propagation {
         // An offline pane takes no input, but the app's shortcuts still work (to switch away).
         if self.is_offline() {
-            if let Some(action) = app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten() {
+            if let Some(name) = app::with_app(|a| a.command_for_key(keyval, keycode, state)).flatten() {
+                app::with_app(|a| a.run_user_command(&name));
+            } else if let Some(action) =
+                app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten()
+            {
                 app::with_app(|a| a.activate(action));
             }
             return glib::Propagation::Stop;
@@ -901,6 +905,12 @@ impl TermView {
             return glib::Propagation::Stop;
         }
         // The app's shortcuts, except while the input method composes (its keys pick candidates).
+        if !composing
+            && let Some(name) = app::with_app(|a| a.command_for_key(keyval, keycode, state)).flatten()
+        {
+            app::with_app(|a| a.run_user_command(&name));
+            return glib::Propagation::Stop;
+        }
         if !composing
             && let Some(action) = app::with_app(|a| a.action_for_key(keyval, keycode, state)).flatten()
         {

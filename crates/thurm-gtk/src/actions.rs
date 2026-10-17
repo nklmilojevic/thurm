@@ -326,6 +326,27 @@ pub fn keymap(bindings: &HashMap<&'static str, Vec<String>>) -> HashMap<Combo, &
     map
 }
 
+/// Combination → `[[commands]]` entry. A key that cannot be read becomes a warning; a command's
+/// key takes the combination from any action.
+pub fn command_keymap(
+    commands: &[thurm_config::CommandConfig],
+    warnings: &mut Vec<String>,
+) -> HashMap<Combo, String> {
+    let mut map = HashMap::new();
+    for c in commands.iter().filter(|c| !c.key.trim().is_empty()) {
+        match parse_binding(&c.key).and_then(|a| normalized(&a)) {
+            Some(combo) => {
+                map.entry(combo).or_insert_with(|| c.name.clone());
+            }
+            None => warnings.push(format!(
+                "command {:?}: cannot read key \"{}\"",
+                c.name, c.key
+            )),
+        }
+    }
+    map
+}
+
 /// "Ctrl+Shift+T" for the palette and tooltips.
 pub fn label(accel: &str) -> String {
     parse_accel(accel)
@@ -366,6 +387,28 @@ mod tests {
         assert!(b["new_tab"].is_empty());
         assert!(b.values().flatten().any(|a| a == "<Control><Shift>w"));
         assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn command_keys() {
+        let command = |name: &str, key: &str| thurm_config::CommandConfig {
+            name: name.into(),
+            exec: vec!["true".into()],
+            key: key.into(),
+        };
+        let mut warnings = Vec::new();
+        let map = command_keymap(
+            &[
+                command("Dev layout", "ctrl+alt+l"),
+                command("No key", ""),
+                command("Bad key", "ctrl+launchpad"),
+            ],
+            &mut warnings,
+        );
+        assert_eq!(map.len(), 1);
+        let combo = normalized("<Control><Alt>l").unwrap();
+        assert_eq!(map[&combo], "Dev layout");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]

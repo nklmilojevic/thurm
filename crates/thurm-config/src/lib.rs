@@ -44,8 +44,84 @@ pub struct Config {
     pub tailscale: TailscaleConfig,
     /// Extra key bindings: `"cmd+shift+d" = "split_down"`.
     pub keybindings: std::collections::BTreeMap<String, String>,
+    /// Commands of your own, in the command palette and on keys (`[[commands]]`).
+    pub commands: Vec<CommandConfig>,
+    /// Commands the daemon runs when something happens in a pane (`[[on]]`).
+    pub on: Vec<EventHook>,
     /// Other machines running `thurmd`, shown as remote workspaces (`[[remote]]`).
     pub remote: Vec<RemoteConfig>,
+}
+
+/// A command of your own (`[[commands]]`): the daemon runs `exec` when it is picked in the
+/// command palette or its `key` is pressed, with the focused pane in `THURM_PANE_ID`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct CommandConfig {
+    /// Shown in the command palette, and how the app asks the daemon to run it.
+    pub name: String,
+    /// The program and its arguments, run through the login shell like a pane's command.
+    pub exec: Vec<String>,
+    /// A key for it, written like a `[keybindings]` chord ("cmd+shift+l"); empty for none.
+    pub key: String,
+}
+
+/// What an `[[on]]` hook runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookEvent {
+    /// An agent entered a state of the notification matrix.
+    Agent(NoticeState),
+    /// A command at the shell prompt finished (needs shell integration).
+    CommandFinished,
+    /// A pane's process exited.
+    PaneExited,
+}
+
+impl HookEvent {
+    pub const ALL: [HookEvent; 8] = [
+        Self::Agent(NoticeState::Working),
+        Self::Agent(NoticeState::Waiting),
+        Self::Agent(NoticeState::Blocked),
+        Self::Agent(NoticeState::Finished),
+        Self::Agent(NoticeState::Failed),
+        Self::Agent(NoticeState::Idle),
+        Self::CommandFinished,
+        Self::PaneExited,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Agent(NoticeState::Working) => "agent_working",
+            Self::Agent(NoticeState::Waiting) => "agent_waiting",
+            Self::Agent(NoticeState::Blocked) => "agent_blocked",
+            Self::Agent(NoticeState::Finished) => "agent_finished",
+            Self::Agent(NoticeState::Failed) => "agent_failed",
+            Self::Agent(NoticeState::Idle) => "agent_idle",
+            Self::CommandFinished => "command_finished",
+            Self::PaneExited => "pane_exited",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.name() == name)
+    }
+}
+
+/// A command the daemon runs on an event (`[[on]]`), with the event as JSON on its stdin.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct EventHook {
+    /// One of [`HookEvent`]'s names, such as "agent_finished".
+    pub event: String,
+    /// The program and its arguments, run through the login shell like a pane's command.
+    pub exec: Vec<String>,
+    /// For `command_finished`: only commands that ran at least this many seconds.
+    pub min_secs: u64,
+}
+
+impl EventHook {
+    pub fn event(&self) -> Option<HookEvent> {
+        HookEvent::parse(&self.event)
+    }
 }
 
 /// A host whose `thurmd` the app attaches to over the system `ssh`.
@@ -103,6 +179,53 @@ pub fn validate_remote_name(name: &str) -> Result<(), String> {
 impl Config {
     pub fn remote(&self, name: &str) -> Option<&RemoteConfig> {
         self.remote.iter().find(|r| r.name == name)
+    }
+
+    pub fn command(&self, name: &str) -> Option<&CommandConfig> {
+        self.commands.iter().find(|c| c.name == name)
+    }
+
+    /// The `[[on]]` hooks for `event`.
+    pub fn hooks(&self, event: HookEvent) -> impl Iterator<Item = &EventHook> {
+        self.on.iter().filter(move |h| h.event() == Some(event))
+    }
+
+    /// Drops the `[[commands]]` and `[[on]]` entries that cannot run, with a warning each: one
+    /// mistake there (or an event of a newer Thurm) should not cost the rest of the file.
+    fn drop_unusable_entries(&mut self, warnings: &mut Vec<String>) {
+        let mut names = std::collections::HashSet::new();
+        self.commands.retain(|c| {
+            let problem = if c.name.trim().is_empty() {
+                Some("has no name")
+            } else if c.exec.is_empty() || c.exec[0].is_empty() {
+                Some("has no exec")
+            } else if !names.insert(c.name.clone()) {
+                Some("has the name of an earlier one")
+            } else {
+                None
+            };
+            if let Some(p) = problem {
+                warnings.push(format!("command {:?} {p}; ignored", c.name));
+            }
+            problem.is_none()
+        });
+        self.on.retain(|h| {
+            let problem = if h.event().is_none() {
+                Some(format!(
+                    "unknown event {:?} (known: {})",
+                    h.event,
+                    HookEvent::ALL.map(HookEvent::name).join(", ")
+                ))
+            } else if h.exec.is_empty() || h.exec[0].is_empty() {
+                Some(format!("{:?} has no exec", h.event))
+            } else {
+                None
+            };
+            if let Some(p) = &problem {
+                warnings.push(format!("[[on]] {p}; ignored"));
+            }
+            problem.is_none()
+        });
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -1220,6 +1343,7 @@ impl Config {
         cfg.notifications
             .apply_replaced_keys(&notification_keys(text));
         cfg.validate()?;
+        cfg.drop_unusable_entries(&mut unknown);
         Ok((cfg, unknown))
     }
 
@@ -2250,6 +2374,78 @@ clipboard_read = "always"
             "{warnings:?}"
         );
         assert!(Config::parse_with_warnings("").unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn commands_and_event_hooks() {
+        let c = Config::parse(
+            r#"
+            [[commands]]
+            name = "Dev layout"
+            exec = ["~/bin/dev-layout", "main"]
+            key = "cmd+shift+l"
+
+            [[on]]
+            event = "agent_finished"
+            exec = ["notify-done"]
+
+            [[on]]
+            event = "command_finished"
+            exec = ["log-command"]
+            min_secs = 30
+            "#,
+        )
+        .unwrap();
+        let dev = c.command("Dev layout").unwrap();
+        assert_eq!(dev.exec, ["~/bin/dev-layout", "main"]);
+        assert_eq!(dev.key, "cmd+shift+l");
+        assert!(c.command("Other").is_none());
+        let finished: Vec<_> = c.hooks(HookEvent::Agent(NoticeState::Finished)).collect();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].exec, ["notify-done"]);
+        let commands: Vec<_> = c.hooks(HookEvent::CommandFinished).collect();
+        assert_eq!(commands[0].min_secs, 30);
+        assert_eq!(c.hooks(HookEvent::PaneExited).count(), 0);
+        for e in HookEvent::ALL {
+            assert_eq!(HookEvent::parse(e.name()), Some(e));
+        }
+    }
+
+    #[test]
+    fn unusable_commands_and_hooks_are_dropped_with_a_warning() {
+        let (c, warnings) = Config::parse_with_warnings(
+            r#"
+            [[commands]]
+            name = "Good"
+            exec = ["true"]
+            [[commands]]
+            name = "Good"
+            exec = ["false"]
+            [[commands]]
+            name = "No exec"
+            [[on]]
+            event = "agent_teleported"
+            exec = ["true"]
+            [[on]]
+            event = "pane_exited"
+            exec = []
+            [[on]]
+            event = "pane_exited"
+            exec = ["true"]
+            [font]
+            size = 15.0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.font.size, 15.0);
+        assert_eq!(c.commands.len(), 1);
+        assert_eq!(c.command("Good").unwrap().exec, ["true"]);
+        assert_eq!(c.on.len(), 1);
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("agent_teleported")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

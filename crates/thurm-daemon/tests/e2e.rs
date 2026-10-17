@@ -18,6 +18,9 @@ mod mobile;
 #[path = "e2e/tailnet.rs"]
 mod tailnet;
 
+#[path = "e2e/user_commands.rs"]
+mod user_commands;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;

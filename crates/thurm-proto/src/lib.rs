@@ -393,6 +393,12 @@ pub enum Request {
     },
     /// Who this connection is: a local peer or a tailnet caller.
     Whoami,
+    /// Run the config's `[[commands]]` entry `name`, with `pane` (the focused one) in its
+    /// environment and as its working directory. Answers once the command has started.
+    RunCommand {
+        name: String,
+        pane: Option<PaneId>,
+    },
 }
 
 /// A mobile client silent this long is taken for gone: iOS suspends apps without closing their
@@ -561,7 +567,9 @@ pub enum Event {
         /// [`Request::AnswerPermission`].
         permission: Option<u64>,
         /// The sound to play (see `[notifications.<state>]`); unset is the default sound.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Always encoded: postcard has no field tags, so a skipped `None` left the message
+        /// one byte short and every client failed to decode it.
+        #[serde(default)]
         sound: Option<String>,
     },
     /// OSC 52 copy.

@@ -217,6 +217,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         SessionManager.shared.reloadConfig(notifyDaemon: true)
     }
 
+    /// A Commands menu item: the `[[commands]]` entry it names.
+    @objc func runUserCommand(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        SessionManager.shared.runUserCommand(name)
+    }
+
     @objc func showRemotes(_ sender: Any?) {
         RemoteHosts.shared.show()
     }

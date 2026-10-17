@@ -77,9 +77,76 @@ settings override theme colors.
 | `ai` | Optional on-device features |
 | `updates` | Update channel, background checks, and automatic downloads |
 | `keybindings` | Key combinations mapped to action names |
+| `commands` | Your own commands, in the command palette and on keys |
+| `on` | Commands the daemon runs when something happens in a pane |
 
 Shell and environment changes apply to new processes. They do not change the
 environment of shells that are already running.
+
+## Commands
+
+A `[[commands]]` entry adds a command of your own to the command palette, and
+optionally to a key. On macOS it is also in **Shell > Commands**.
+
+```toml
+[[commands]]
+name = "Dev layout"
+exec = ["~/bin/dev-layout", "--branch", "main"]
+key = "cmd+shift+l"
+```
+
+The daemon runs `exec` through your login shell, so your `PATH` applies, in the
+focused pane's directory. `THURM_PANE_ID` names that pane and `THURM_SOCKET` the
+daemon, so the command can drive Thurm with the CLI:
+
+```sh
+#!/bin/sh
+# ~/bin/dev-layout: an editor, a dev server beside it, and an agent below.
+thurm split --dir right -- npm run dev
+thurm split --dir down -- claude
+```
+
+`key` uses the same chord syntax as `[keybindings]`, and takes the combination
+from any built-in action. A command that fails shows as a notification with the
+end of its error output. Commands run on this machine's daemon; for a pane on a
+remote host, they run without `THURM_PANE_ID`.
+
+## Event hooks
+
+An `[[on]]` entry runs a command when something happens in a pane, even while
+no Thurm window is open:
+
+```toml
+[[on]]
+event = "agent_finished"
+exec = ["~/bin/agent-done"]
+
+[[on]]
+event = "command_finished"
+exec = ["~/bin/log-command"]
+min_secs = 60
+```
+
+| Event | When |
+|---|---|
+| `agent_working`, `agent_waiting`, `agent_blocked`, `agent_finished`, `agent_failed`, `agent_idle` | An agent enters that state, as in `[notifications]` |
+| `command_finished` | A command at the shell prompt finishes (needs shell integration). `min_secs` skips shorter ones |
+| `pane_exited` | A pane's process exits |
+
+The command gets the event as one line of JSON on standard input: `event`, the
+`pane` as `thurm info --json` shows it, and for `command_finished` the
+`exit_code`, `duration_secs` and `command`, for `pane_exited` the `exit_code`.
+`THURM_EVENT`, `THURM_PANE_ID` and `THURM_SOCKET` are set too.
+
+```sh
+#!/bin/sh
+# ~/bin/agent-done: tell a webhook which repository's agent finished.
+jq -c '{text: "\(.pane.agent.name) finished in \(.pane.cwd)"}' |
+  curl -s -H 'Content-Type: application/json' -d @- "$WEBHOOK_URL"
+```
+
+An entry with an unknown event or no `exec` is skipped with a warning, and the
+rest of the file still loads. Failures are written to the daemon's log.
 
 ## On-device AI
 

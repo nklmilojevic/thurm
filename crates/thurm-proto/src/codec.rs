@@ -131,6 +131,29 @@ mod tests {
         }
     }
 
+    /// A notification without a sound of its own (a finished command, a program's OSC 9)
+    /// decodes, as it does from an older daemon's `Some`.
+    #[test]
+    fn notify_roundtrips_with_and_without_a_sound() {
+        for sound in [None, Some("Glass".to_owned())] {
+            let out = ServerMessage::Event(Event::Notify {
+                pane: 2,
+                title: "make finished".into(),
+                body: "after 20s".into(),
+                permission: None,
+                sound: sound.clone(),
+            });
+            let bytes = encode(&out).unwrap();
+            let back: ServerMessage = read_message(&mut &bytes[..]).unwrap().unwrap();
+            match back {
+                ServerMessage::Event(Event::Notify {
+                    pane: 2, sound: s, ..
+                }) => assert_eq!(s, sound),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn eof_is_none() {
         let empty: &[u8] = &[];

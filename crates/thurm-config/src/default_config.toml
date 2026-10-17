@@ -310,6 +310,24 @@ animation_duration = 0.2
 # "cmd+shift+d" = "split_down"
 # "cmd+d" = "split_right"
 
+# Commands of your own, in the command palette and on an optional key. The daemon runs `exec`
+# (through your login shell, in the focused pane's directory) with THURM_PANE_ID and
+# THURM_SOCKET set, so it can drive Thurm with `thurm split`, `thurm send` and the like.
+# [[commands]]
+# name = "Dev layout"
+# exec = ["~/bin/dev-layout", "--branch", "main"]
+# key = "cmd+shift+l"          # optional, written like a [keybindings] chord
+
+# Commands the daemon runs when something happens in a pane, with the event as JSON on stdin
+# (`{"event": …, "pane": {…}}`, the pane as `thurm info --json` shows it) and THURM_EVENT,
+# THURM_PANE_ID and THURM_SOCKET set. Events: agent_working, agent_waiting, agent_blocked,
+# agent_finished, agent_failed, agent_idle, command_finished (with exit_code, duration_secs
+# and command; needs shell integration) and pane_exited (with exit_code).
+# [[on]]
+# event = "agent_finished"
+# exec = ["~/bin/agent-done"]
+# min_secs = 0                 # command_finished only: commands that ran at least this long
+
 # Remote workspaces: thurmd on another machine (a Linux devbox, another Mac), reached with
 # the system ssh and shown next to local panes. `thurm remote add devbox devbox` writes one.
 # [[remote]]

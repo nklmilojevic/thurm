@@ -9,6 +9,88 @@ enum MainMenu {
     private static let leftArrow = "\u{F702}"
     private static let rightArrow = "\u{F703}"
 
+    /// The Shell menu's Commands submenu: the config's `[[commands]]`, refilled on every load.
+    private static let commandsMenu = NSMenu(title: "Commands")
+    private static var commandsItem: NSMenuItem?
+    /// Built-in items whose key a command took, with the key they had.
+    private static var displaced: [(item: NSMenuItem, key: String, mods: NSEvent.ModifierFlags)] = []
+
+    /// Refills the Commands submenu. A command's key comes before the built-in item's: the
+    /// first item with a key equivalent gets it, so the built-in one gives it up (and has it back
+    /// once no command claims it).
+    static func updateCommands(_ commands: [UserCommand], in main: NSMenu? = NSApp.mainMenu) {
+        for d in displaced {
+            d.item.keyEquivalent = d.key
+            d.item.keyEquivalentModifierMask = d.mods
+        }
+        displaced = []
+        commandsMenu.removeAllItems()
+        for command in commands {
+            let (key, mods) = keyEquivalent(command.key) ?? ("", [])
+            if !key.isEmpty, let main { displace(chord(key, mods), in: main) }
+            let entry = item(command.name, #selector(AppDelegate.runUserCommand(_:)), key, mods)
+            entry.representedObject = command.name
+            commandsMenu.addItem(entry)
+        }
+        commandsItem?.isHidden = commands.isEmpty
+    }
+
+    /// Takes the key equivalent `target` off every item under `menu` that has it.
+    private static func displace(_ target: String, in menu: NSMenu) {
+        for item in menu.items {
+            if let sub = item.submenu, sub !== commandsMenu { displace(target, in: sub) }
+            if !item.keyEquivalent.isEmpty,
+               chord(item.keyEquivalent, item.keyEquivalentModifierMask) == target {
+                displaced.append((item, item.keyEquivalent, item.keyEquivalentModifierMask))
+                item.keyEquivalent = ""
+            }
+        }
+    }
+
+    /// A key equivalent in one spelling: an uppercase letter is the lowercase one with Shift.
+    private static func chord(_ key: String, _ mods: NSEvent.ModifierFlags) -> String {
+        var m = mods.intersection([.command, .shift, .option, .control])
+        if key != key.lowercased() { m.insert(.shift) }
+        return "\(m.rawValue)+\(key.lowercased())"
+    }
+
+    /// A `[keybindings]` chord ("cmd+shift+l", "ctrl+alt+f5") as a menu key equivalent, with
+    /// the key names Linux reads; nil for one a menu cannot show.
+    static func keyEquivalent(_ chord: String) -> (String, NSEvent.ModifierFlags)? {
+        let spec = chord.trimmingCharacters(in: .whitespaces).lowercased()
+        var parts = spec.split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
+        // "cmd++" is the plus key.
+        if spec.hasSuffix("++") { parts.append("plus") }
+        guard let key = parts.popLast(), !key.isEmpty else { return nil }
+        var mods: NSEvent.ModifierFlags = []
+        for m in parts {
+            switch m {
+            case "cmd", "command", "super": mods.insert(.command)
+            case "ctrl", "control": mods.insert(.control)
+            case "alt", "opt", "option": mods.insert(.option)
+            case "shift": mods.insert(.shift)
+            default: return nil
+            }
+        }
+        let function = { (code: Int) in String(UnicodeScalar(UInt32(code))!) }
+        let named: [String: String] = [
+            "plus": "+", "minus": "-", "equal": "=", "comma": ",", "period": ".", "slash": "/",
+            "backslash": "\\", "semicolon": ";", "quote": "'", "grave": "`", "backtick": "`",
+            "left_bracket": "[", "right_bracket": "]", "enter": "\r", "return": "\r",
+            "esc": "\u{1b}", "escape": "\u{1b}", "space": " ", "tab": "\t", "backspace": "\u{8}",
+            "delete": function(NSDeleteFunctionKey), "left": leftArrow, "right": rightArrow,
+            "up": upArrow, "down": downArrow, "pageup": function(NSPageUpFunctionKey),
+            "page_up": function(NSPageUpFunctionKey), "pagedown": function(NSPageDownFunctionKey),
+            "page_down": function(NSPageDownFunctionKey), "home": function(NSHomeFunctionKey),
+            "end": function(NSEndFunctionKey),
+        ]
+        if let k = named[key] { return (k, mods) }
+        if key.count > 1, key.hasPrefix("f"), let n = Int(key.dropFirst()), (1...35).contains(n) {
+            return (function(NSF1FunctionKey + n - 1), mods)
+        }
+        return key.count == 1 ? (key, mods) : nil
+    }
+
     static func build() -> NSMenu {
         let main = NSMenu(title: "Main Menu")
         main.addItem(container(appMenu()))
@@ -90,6 +172,11 @@ enum MainMenu {
         menu.addItem(.separator())
         menu.addItem(item("Command Palette…", #selector(AppDelegate.showCommandPalette(_:)), "p", [.command, .shift]))
         menu.addItem(item("Processes & Ports…", #selector(AppDelegate.showProcesses(_:))))
+        let commands = item("Commands", nil)
+        commands.submenu = commandsMenu
+        commands.isHidden = commandsMenu.items.isEmpty
+        commandsItem = commands
+        menu.addItem(commands)
         menu.addItem(.separator())
         menu.addItem(item("Close Pane", #selector(TerminalWindowController.closePane(_:)), "w"))
         menu.addItem(item("Close Tab", #selector(NSWindow.performClose(_:)), "w", [.command, .shift]))
