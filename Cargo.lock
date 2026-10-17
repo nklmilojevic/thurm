@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-cli"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "clap",
  "libc",
@@ -2810,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-client"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -2822,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-config"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "dirs",
  "libc",
@@ -2836,7 +2836,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-daemon"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2862,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-ffi"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "log",
  "parking_lot",
@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-gtk"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "env_logger",
  "gtk4",
@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-proto"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "postcard",
  "serde",
@@ -2904,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-remote"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "base64",
  "libc",
@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-ssh"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "log",
  "p256",
@@ -2934,7 +2934,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-tailnet-client"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "futures-util",
  "log",
@@ -2950,7 +2950,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-term"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "base64",
  "bitflags 2.13.2",
