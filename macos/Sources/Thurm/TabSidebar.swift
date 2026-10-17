@@ -897,6 +897,8 @@ final class WorkingDots: NSView {
     static let key = "working"
 
     let dots = (0..<3).map { _ in CALayer() }
+    /// Whether to stand still; tests swap in their own answer.
+    var reduced: () -> Bool = { Motion.reduced }
 
     var isShown = false {
         didSet {
@@ -928,6 +930,18 @@ final class WorkingDots: NSView {
         }
         setContentHuggingPriority(.required, for: .horizontal)
         setContentCompressionResistancePriority(.required, for: .horizontal)
+        // Reduce motion switched on or off while a row stays up starts or stops its pulse.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(displayOptionsChanged),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+    }
+
+    deinit {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    @objc func displayOptionsChanged() {
+        update()
     }
 
     required init?(coder: NSCoder) {
@@ -964,16 +978,18 @@ final class WorkingDots: NSView {
     /// Starts the pulse when it should run and isn't, stops it when it shouldn't. A row
     /// reconfigured while its agent works (every retitle) leaves a running pulse alone.
     private func update() {
-        let run = isShown && window != nil && !Motion.reduced
+        let reduced = reduced()
+        let run = isShown && window != nil && !reduced
         let running = dots[0].animation(forKey: Self.key) != nil
-        guard run != running else { return }
+        guard !(run && running) else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         guard run else {
+            // Still: plainly visible under reduce motion, dim otherwise (hidden or offscreen).
             for d in dots {
                 d.removeAnimation(forKey: Self.key)
-                d.opacity = Motion.reduced ? 0.85 : 0.3
+                d.opacity = reduced ? 0.85 : 0.3
             }
             return
         }
