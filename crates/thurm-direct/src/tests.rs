@@ -403,3 +403,90 @@ fn disconnecting_while_a_pane_starts_ends_its_server() {
     wait_gone(port);
     let _ = std::fs::remove_file(slow);
 }
+
+/// A `mosh-server` that starts but whose UDP never answers (a firewall dropping it): a socket
+/// that is bound and never read.
+fn silent_mosh_server(name: &str) -> (String, std::net::UdpSocket) {
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let path = format!("/tmp/thurm-direct-{name}-{}.sh", std::process::id());
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\necho 'MOSH CONNECT {port} AAAAAAAAAAAAAAAAAAAAAA'\n"),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (path, silent)
+}
+
+#[test]
+fn mosh_without_udp_falls_back_to_ssh() {
+    let (fake, _silent) = silent_mosh_server("silent-fallback");
+    let key = TestKey::new(1);
+    let server = ssh_server(&key);
+    let mut t = direct_target(&server, Mode::Mosh);
+    t.mosh_server = Some(fake.clone());
+    let (stream, direct) = super::serve(t, key).unwrap();
+    let (tx, events) = mpsc::channel();
+    let client = Client::from_stream(
+        stream,
+        "ios-test",
+        false,
+        &[thurm_proto::CAP_MOBILE],
+        move |ev| {
+            let _ = tx.send(ev);
+        },
+        || {},
+    )
+    .unwrap();
+    let app = App {
+        client,
+        events,
+        _direct: direct,
+    };
+    let pane = app.create();
+    let info = app.panes().into_iter().find(|p| p.id == pane).unwrap();
+    assert_eq!(info.program.unwrap().id, "ssh");
+    app.client.send(Request::Subscribe { pane }).unwrap();
+    app.wait_output(pane, "no answer from mosh-server over UDP");
+    let _ = std::fs::remove_file(fake);
+}
+
+#[test]
+fn mosh_only_without_udp_fails_the_pane() {
+    let (fake, _silent) = silent_mosh_server("silent-only");
+    let key = TestKey::new(1);
+    let server = ssh_server(&key);
+    let mut t = direct_target(&server, Mode::MoshOnly);
+    t.mosh_server = Some(fake.clone());
+    let (stream, _direct) = super::serve(t, key).unwrap();
+    let client = Client::from_stream(
+        stream,
+        "ios-test",
+        false,
+        &[thurm_proto::CAP_MOBILE],
+        |_| {},
+        || {},
+    )
+    .unwrap();
+    let req = CreatePane {
+        command: None,
+        cwd: None,
+        env: vec![],
+        size: size(80, 24),
+        agent_preset: None,
+        inherit_cwd_from: None,
+        hold: false,
+        fork_from: None,
+    };
+    match client.request(Request::CreatePane(req)) {
+        Err(e) => assert!(e.to_string().contains("no answer from mosh-server"), "{e}"),
+        Ok(r) => panic!("{r:?}"),
+    }
+    assert!(matches!(
+        client.request(Request::ListPanes),
+        Ok(Response::Panes(p)) if p.is_empty()
+    ));
+    let _ = std::fs::remove_file(fake);
+}

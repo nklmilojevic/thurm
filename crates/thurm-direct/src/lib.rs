@@ -104,6 +104,13 @@ const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long ending the server waits for shells still starting (an ssh connection and a mosh
 /// bootstrap, each with its own timeout).
 const CREATING_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a new mosh session has to hear from its server over UDP (several startup probes)
+/// before the pane gives up on mosh: a firewall dropping UDP looks like nothing at all.
+const MOSH_ANSWER: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(10)
+};
 
 /// A served host. Dropping it ends nothing by itself: the server ends when the app closes its
 /// end of the socket, and ends the host's shells with it.
@@ -663,6 +670,7 @@ impl Inner {
         let connect = bootstrap::start(&exec, &opts)?;
         let id = pane.lock().id;
         let me = Arc::downgrade(self);
+        let (answered, answer) = std::sync::mpsc::sync_channel(1);
         let mut p = pane.lock();
         let initial = p.term.serialize_state();
         let started = MoshSession::start(
@@ -671,6 +679,9 @@ impl Inner {
             connect.key,
             (size.cols, size.rows),
             move |ev| {
+                if ev == MoshEvent::Status(Status::Connected) {
+                    let _ = answered.try_send(());
+                }
                 if let Some(me) = me.upgrade() {
                     me.on_mosh(id, ev);
                 }
@@ -692,7 +703,20 @@ impl Inner {
             snapshots: BTreeMap::from([(0, initial)]),
             status: Status::Connecting,
         };
-        Ok(())
+        // The session's events need the pane while this waits.
+        drop(p);
+        if answer.recv_timeout(MOSH_ANSWER).is_ok() {
+            return Ok(());
+        }
+        let backend = std::mem::replace(&mut pane.lock().backend, Backend::Starting);
+        if let Some(pid) = end_backend(backend) {
+            kill(session, &[pid]);
+        }
+        Err(BootstrapError::Failed(format!(
+            "no answer from mosh-server over UDP (port {}) within {} s; a firewall may block it",
+            connect.port,
+            MOSH_ANSWER.as_secs()
+        )))
     }
 
     /// Takes care of what the pane's terminal wants done: its replies to the host (ssh only:
