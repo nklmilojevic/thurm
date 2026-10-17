@@ -666,6 +666,11 @@ impl Inner {
             SSH_START_DELAY_MS.load(Ordering::Relaxed),
         ));
         let mut p = pane.lock();
+        if matches!(p.backend, Backend::Ended) {
+            // It ended already, and the pane says so (on_shell): nothing to install.
+            shell.close();
+            return Ok(());
+        }
         let held = std::mem::take(&mut p.held_replies);
         if !held.is_empty() {
             shell.write(&held);

@@ -10,6 +10,9 @@ use thurm_ssh::testing::{Options, TestKey, TestServer, serve as ssh_server, serv
 
 use super::*;
 
+/// Held by the tests that widen `SSH_START_DELAY_MS`, which all servers here read.
+static DELAY: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 fn direct_target(server: &TestServer, mode: Mode) -> DirectTarget {
     let t = target(server);
     DirectTarget {
@@ -508,9 +511,65 @@ fn a_shell_starting_with_a_terminal_query_gets_the_answer() {
     );
     let app = open(&server, key, Mode::Ssh);
     // The query comes before the pane has the shell.
+    let _delay = DELAY.lock();
     super::SSH_START_DELAY_MS.store(500, Ordering::Relaxed);
     let pane = app.create();
     super::SSH_START_DELAY_MS.store(0, Ordering::Relaxed);
     app.client.send(Request::Subscribe { pane }).unwrap();
     app.wait_output(pane, "got:^[[?");
+}
+
+/// A shell whose channel ends (without an exit status: a dropped connection) before the pane
+/// has it leaves an ended pane, not one with a shell installed after the fact.
+#[test]
+fn a_shell_ending_before_its_pane_has_it_stays_ended() {
+    let key = TestKey::new(1);
+    let server = serve_with(
+        &key,
+        Options {
+            shell_init: Some("exit 0".into()),
+            no_exit_status: true,
+            ..Default::default()
+        },
+    );
+    let app = open(&server, key, Mode::Ssh);
+    let _delay = DELAY.lock();
+    super::SSH_START_DELAY_MS.store(500, Ordering::Relaxed);
+    let pane = app.create();
+    super::SSH_START_DELAY_MS.store(0, Ordering::Relaxed);
+    let info = app.panes().into_iter().find(|p| p.id == pane).unwrap();
+    assert!(!info.alive);
+    assert!(info.program.is_none(), "{:?}", info.program);
+    app.client.send(Request::Subscribe { pane }).unwrap();
+    app.wait_output(pane, "[connection lost]");
+}
+
+/// One exiting with its status before the pane has it closes the pane.
+#[test]
+fn a_shell_exiting_before_its_pane_has_it_closes_it() {
+    let key = TestKey::new(1);
+    let server = serve_with(
+        &key,
+        Options {
+            shell_init: Some("exit 3".into()),
+            ..Default::default()
+        },
+    );
+    let app = open(&server, key, Mode::Ssh);
+    let _delay = DELAY.lock();
+    super::SSH_START_DELAY_MS.store(500, Ordering::Relaxed);
+    let req = CreatePane {
+        command: None,
+        cwd: None,
+        env: vec![],
+        size: size(80, 24),
+        agent_preset: None,
+        inherit_cwd_from: None,
+        hold: false,
+        fork_from: None,
+    };
+    let created = app.client.request(Request::CreatePane(req));
+    super::SSH_START_DELAY_MS.store(0, Ordering::Relaxed);
+    assert!(created.is_err(), "{created:?}");
+    assert!(app.panes().is_empty());
 }

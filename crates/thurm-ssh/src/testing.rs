@@ -61,6 +61,8 @@ struct Server {
     no_pty: bool,
     /// A script each shell runs first, before reading commands.
     shell_init: Option<String>,
+    /// Close ended shells' channels without their exit status.
+    no_exit_status: bool,
 }
 
 /// How a [`serve_with`] server differs from [`serve`]'s.
@@ -71,6 +73,9 @@ pub struct Options {
     /// A script each shell runs first (what a login shell's profile would print), then it
     /// reads commands as usual.
     pub shell_init: Option<String>,
+    /// Close an ended shell's channel without its exit status (a dropped connection, to the
+    /// client).
+    pub no_exit_status: bool,
 }
 
 impl server::Handler for Server {
@@ -171,6 +176,7 @@ impl server::Handler for Server {
             .insert(channel, child.stdin.take().unwrap());
         let handle = session.handle();
         let exits = self.exits.clone();
+        let send_status = !self.no_exit_status;
         let mut stdout = child.stdout.take().unwrap();
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 4096];
@@ -183,7 +189,9 @@ impl server::Handler for Server {
             let code = child.wait().map(|s| s.code().unwrap_or(255)).unwrap_or(255);
             exits.lock().unwrap().push(code);
             tokio::runtime::Handle::current().block_on(async move {
-                let _ = handle.exit_status_request(channel, code as u32).await;
+                if send_status {
+                    let _ = handle.exit_status_request(channel, code as u32).await;
+                }
                 let _ = handle.eof(channel).await;
                 let _ = handle.close(channel).await;
             });
@@ -285,6 +293,7 @@ pub fn serve_with(device: &TestKey, opts: Options) -> TestServer {
                 exits: ended.clone(),
                 no_pty: opts.no_pty,
                 shell_init: opts.shell_init.clone(),
+                no_exit_status: opts.no_exit_status,
             };
             let config = config.clone();
             tokio::spawn(async move {
