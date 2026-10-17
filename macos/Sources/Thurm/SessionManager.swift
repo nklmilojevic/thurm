@@ -805,6 +805,7 @@ final class SessionManager: NSObject, CoreDelegate {
                 c.sidebar?.reload()
                 (c.window as? TerminalWindow)?.tabStrip?.reload()
             }
+            TabHoverCard.shared.refresh()
         }
     }
 

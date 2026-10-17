@@ -1,0 +1,497 @@
+import AppKit
+
+// A card about a tab, shown while the pointer rests on it in the sidebar or the tab strip: a
+// map of its splits, tinted by what each pane's agent is doing, and a line or three per pane
+// (what runs there, its status in words, its progress, where it is). It covers the tabs you
+// are not looking at; the selected tab is on screen already. The card never takes the mouse
+// or the keyboard, and updates while it is up.
+
+/// One pane as the card shows it.
+struct HoverCardPane: Equatable {
+    let key: PaneKey
+    var icon: PaneIcon
+    var title: String
+    var status: AgentStatus?
+    /// The agent's status in words, or the program running in the pane.
+    var detail: String?
+    var progress: ProgressReport?
+    /// The git branch, else the working directory.
+    var place: String?
+    var added: UInt32 = 0
+    var removed: UInt32 = 0
+    var focused: Bool
+}
+
+/// A pane's rectangle in the tab's layout, in the unit square (origin top left).
+struct HoverCardCell: Equatable {
+    let key: PaneKey
+    let rect: CGRect
+}
+
+/// What the card shows for one tab.
+struct HoverCardModel: Equatable {
+    var title: String
+    var subtitle: String?
+    /// The panes in layout order, as many as the card lists.
+    var panes: [HoverCardPane]
+    /// Panes in the tab the card leaves out.
+    var more: Int
+    /// The layout; empty for a tab with one pane.
+    var cells: [HoverCardCell]
+
+    static let maxPanes = 6
+
+    static func make(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, titleOverride: String?, host: HostId,
+                     panes: [PaneKey: PaneInfo]) -> HoverCardModel {
+        let keys = root.panes
+        let front = panes[focused]
+        var rows = keys.map { key -> HoverCardPane in
+            pane(key, info: panes[key], focused: key == focused, remote: host != localHost)
+        }
+        // More panes than fit: keep the most urgent (in layout order), so a waiting agent never
+        // falls off the end of the list.
+        let urgent = rows.enumerated().sorted {
+            let (a, b) = ($0.element.status?.urgency ?? -1, $1.element.status?.urgency ?? -1)
+            return a != b ? a > b : $0.offset < $1.offset
+        }.prefix(maxPanes).map(\.offset)
+        let more = rows.count - urgent.count
+        rows = rows.enumerated().filter { urgent.contains($0.offset) }.map(\.element)
+        var parts = [keys.count > 1 ? "\(keys.count) panes" : nil, host == localHost ? nil : host]
+        if let z = zoomed, keys.count > 1, let row = rows.first(where: { $0.key == z }) {
+            parts.append("\(row.title) zoomed")
+        }
+        let subtitle = parts.compactMap { $0 }.joined(separator: " · ")
+        return HoverCardModel(
+            title: titleOverride ?? front?.displayTitle ?? "Thurm",
+            subtitle: subtitle.isEmpty ? nil : subtitle,
+            panes: rows,
+            more: more,
+            cells: keys.count > 1 ? cells(root) : [])
+    }
+
+    /// The layout in the unit square. `SplitNode.frames` rounds to whole points, so it lays
+    /// out a large square that is then scaled down.
+    private static func cells(_ root: SplitNode) -> [HoverCardCell] {
+        let side: CGFloat = 1000
+        return root.frames(in: CGRect(x: 0, y: 0, width: side, height: side), gap: 0).map { key, r in
+            HoverCardCell(key: key, rect: CGRect(x: r.minX / side, y: r.minY / side,
+                                                 width: r.width / side, height: r.height / side))
+        }
+    }
+
+    private static func pane(_ key: PaneKey, info: PaneInfo?, focused: Bool, remote: Bool) -> HoverCardPane {
+        var row = HoverCardPane(key: key, icon: PaneIcon(info), title: info?.displayTitle ?? "Thurm", focused: focused)
+        guard let info else { return row }
+        if let agent = info.agent {
+            let a = AgentPane(pane: key, info: info, agent: agent, controller: nil, hidden: nil)
+            row.title = a.title
+            row.status = agent.status
+            row.detail = a.statusDetail
+        } else if !info.alive {
+            row.detail = "Exited"
+        } else if info.passwordInput {
+            row.detail = "Waiting for a password"
+        } else if info.hasRunningProcess, let name = info.foregroundName {
+            let program = info.program?.name ?? name
+            row.detail = row.title.localizedCaseInsensitiveContains(program) ? nil : "Running \(program)"
+        }
+        row.progress = info.progress
+        if let git = info.git {
+            row.place = git.branch
+            row.added = git.added
+            row.removed = git.removed
+        } else if let cwd = info.cwd {
+            let dir = remote ? cwd : abbreviatePath(cwd)
+            // The directory, unless the title already says the same.
+            row.place = dir == row.title || row.title.hasSuffix(dir) ? nil : dir
+        }
+        return row
+    }
+}
+
+/// The tab's splits in miniature: each pane a rounded cell with its icon, the cell tinted by
+/// its agent's status, the focused one outlined.
+final class HoverCardMinimap: NSView {
+    var model: HoverCardModel? {
+        didSet { if model != oldValue { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    }
+    /// The tab's content size, for the map's proportions.
+    var aspect: CGFloat = 0.6 {
+        didSet { if aspect != oldValue { invalidateIntrinsicContentSize() } }
+    }
+
+    static let width: CGFloat = 276
+    static let gap: CGFloat = 3
+
+    override var isFlipped: Bool { true }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: Self.width, height: (Self.width * aspect).rounded().clamped(to: 56...120))
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let model else { return }
+        let chrome = SessionManager.shared.config.chrome
+        let statuses = Dictionary(model.panes.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
+        let area = bounds
+        for cell in model.cells {
+            let r = CGRect(x: area.minX + cell.rect.minX * area.width, y: area.minY + cell.rect.minY * area.height,
+                           width: cell.rect.width * area.width, height: cell.rect.height * area.height)
+                .insetBy(dx: Self.gap / 2, dy: Self.gap / 2)
+            let path = NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4)
+            let pane = statuses[cell.key]
+            let tint = pane?.status.flatMap { $0 == .idle ? nil : $0.color }
+            (tint?.withAlphaComponent(0.2) ?? chrome.control).setFill()
+            path.fill()
+            if pane?.focused == true || tint != nil {
+                (tint ?? chrome.strokeStrong).withAlphaComponent(tint == nil ? 1 : 0.7).setStroke()
+                path.lineWidth = 1
+                path.stroke()
+            }
+            // The icon, when the cell has room for it.
+            let side: CGFloat = 13
+            guard let pane, r.width > side + 6, r.height > side + 6 else { continue }
+            let glyph = pane.icon.glyph(size: side)
+            let iconRect = CGRect(x: r.midX - side / 2, y: r.midY - side / 2, width: side, height: side)
+            let tinted = NSImage(size: glyph.size, flipped: false) { rect in
+                glyph.draw(in: rect)
+                (tint ?? chrome.contentSecondary).set()
+                rect.fill(using: .sourceAtop)
+                return true
+            }
+            tinted.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
+    }
+}
+
+/// The card's content: the header, the minimap, and a section per pane.
+final class HoverCardView: NSView {
+    private let stack = NSStackView()
+    let minimap = HoverCardMinimap()
+
+    static let width: CGFloat = 300
+    static let inset: CGFloat = 12
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.width, height: 100))
+        wantsLayer = true
+        layer?.cornerRadius = ChromeRadius.window
+        layer?.borderWidth = ChromeStroke.width
+        layer?.masksToBounds = true
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: Self.width),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: Self.inset),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.inset),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.inset),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -Self.inset),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override var isFlipped: Bool { true }
+
+    func show(_ model: HoverCardModel, aspect: CGFloat) {
+        let chrome = SessionManager.shared.config.chrome
+        layer?.backgroundColor = chrome.surfaceRaised.cgColor
+        layer?.borderColor = chrome.strokeStrong.cgColor
+        for v in stack.arrangedSubviews {
+            stack.removeArrangedSubview(v)
+            v.removeFromSuperview()
+        }
+        let contentWidth = Self.width - 2 * Self.inset
+
+        let header = NSStackView()
+        header.orientation = .vertical
+        header.alignment = .leading
+        header.spacing = 1
+        header.addArrangedSubview(label(model.title, size: 13, weight: .semibold, color: chrome.contentPrimary,
+                                        width: contentWidth))
+        if let subtitle = model.subtitle {
+            header.addArrangedSubview(label(subtitle, size: 11, color: chrome.contentSecondary, width: contentWidth))
+        }
+        stack.addArrangedSubview(header)
+
+        if !model.cells.isEmpty {
+            minimap.aspect = aspect
+            minimap.model = model
+            minimap.needsDisplay = true
+            stack.addArrangedSubview(minimap)
+        }
+
+        for pane in model.panes {
+            stack.addArrangedSubview(section(pane, chrome: chrome, width: contentWidth))
+        }
+        if model.more > 0 {
+            stack.addArrangedSubview(label("\(model.more) more \(model.more == 1 ? "pane" : "panes")", size: 11,
+                                           color: chrome.contentTertiary, width: contentWidth))
+        }
+        layoutSubtreeIfNeeded()
+    }
+
+    private func section(_ pane: HoverCardPane, chrome: ChromePalette, width: CGFloat) -> NSView {
+        let iconSide: CGFloat = 15
+        let textWidth = width - iconSide - 8
+        let icon = NSImageView(image: pane.icon.glyph(size: iconSide))
+        icon.contentTintColor = pane.status.flatMap { $0 == .idle ? nil : $0.color } ?? chrome.contentSecondary
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: iconSide),
+            icon.heightAnchor.constraint(equalToConstant: iconSide),
+        ])
+
+        let lines = NSStackView()
+        lines.orientation = .vertical
+        lines.alignment = .leading
+        lines.spacing = 2
+        lines.addArrangedSubview(label(pane.title, size: 13, weight: pane.focused ? .medium : .regular,
+                                       color: chrome.contentPrimary, width: textWidth))
+        if let detail = pane.detail {
+            let urgent = pane.status == .needsInput || pane.status == .error
+            lines.addArrangedSubview(label(detail, size: 12,
+                                           color: urgent ? pane.status!.color : chrome.contentSecondary,
+                                           width: textWidth, lines: 3))
+        }
+        if let progress = pane.progress {
+            lines.addArrangedSubview(ProgressLine(progress, width: textWidth))
+        }
+        if let place = pane.place {
+            let para = NSMutableParagraphStyle()
+            para.lineBreakMode = .byTruncatingMiddle
+            let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            let base: [NSAttributedString.Key: Any] = [.foregroundColor: chrome.contentSecondary, .font: font,
+                                                      .paragraphStyle: para]
+            let s = NSMutableAttributedString(string: place, attributes: base)
+            if pane.added > 0 {
+                s.append(NSAttributedString(string: "  +\(pane.added)",
+                                            attributes: base.merging([.foregroundColor: chrome.success]) { $1 }))
+            }
+            if pane.removed > 0 {
+                s.append(NSAttributedString(string: " −\(pane.removed)",
+                                            attributes: base.merging([.foregroundColor: chrome.danger]) { $1 }))
+            }
+            let field = NSTextField(labelWithAttributedString: s)
+            field.maximumNumberOfLines = 1
+            field.preferredMaxLayoutWidth = textWidth
+            field.widthAnchor.constraint(lessThanOrEqualToConstant: textWidth).isActive = true
+            lines.addArrangedSubview(field)
+        }
+
+        let row = NSStackView(views: [icon, lines])
+        row.orientation = .horizontal
+        row.alignment = .top
+        row.spacing = 8
+        return row
+    }
+
+    private func label(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor,
+                       width: CGFloat, lines: Int = 1) -> NSTextField {
+        let field = NSTextField(wrappingLabelWithString: text)
+        field.font = .systemFont(ofSize: size, weight: weight)
+        field.textColor = color
+        field.maximumNumberOfLines = lines
+        field.lineBreakMode = .byTruncatingTail
+        field.cell?.truncatesLastVisibleLine = true
+        field.preferredMaxLayoutWidth = width
+        field.widthAnchor.constraint(lessThanOrEqualToConstant: width).isActive = true
+        return field
+    }
+}
+
+/// A thin progress bar with its percentage (OSC 9;4), colored like the pane's own bar.
+private final class ProgressLine: NSView {
+    private let report: ProgressReport
+    private let width: CGFloat
+
+    init(_ report: ProgressReport, width: CGFloat) {
+        self.report = report
+        self.width = width
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: width, height: 9) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let chrome = SessionManager.shared.config.chrome
+        let track = CGRect(x: 0, y: (bounds.height - 3) / 2, width: bounds.width, height: 3)
+        chrome.control.setFill()
+        NSBezierPath(roundedRect: track, xRadius: 1.5, yRadius: 1.5).fill()
+        let color: NSColor
+        switch report.state {
+        case .error: color = chrome.danger
+        case .paused: color = chrome.warning
+        case .normal, .indeterminate: color = chrome.info
+        }
+        let fraction = report.state == .indeterminate ? 1 : CGFloat(report.percent ?? 100) / 100
+        color.withAlphaComponent(report.state == .indeterminate ? 0.4 : 1).setFill()
+        var fill = track
+        fill.size.width = max(3, track.width * min(1, max(0, fraction)))
+        NSBezierPath(roundedRect: fill, xRadius: 1.5, yRadius: 1.5).fill()
+    }
+}
+
+/// Shows, moves and hides the one card. Tab rows and pills report the pointer entering and
+/// leaving them; the card appears after the pointer rests, and while it is up (or just after)
+/// moving to another tab switches it at once.
+final class TabHoverCard {
+    static let shared = TabHoverCard()
+
+    enum Edge {
+        /// Beside a sidebar row.
+        case right
+        /// Under a tab strip pill.
+        case below
+    }
+
+    private let panel: NSPanel
+    private let card = HoverCardView()
+    private weak var anchor: NSView?
+    private weak var controller: TerminalWindowController?
+    private var edge = Edge.right
+    private var pending: DispatchWorkItem?
+    /// When the last card went away: a tab entered soon after shows its card without waiting.
+    private var hiddenAt: CFTimeInterval = 0
+    private var observers: [NSObjectProtocol] = []
+
+    static let delay: TimeInterval = 0.5
+    static let warm: TimeInterval = 0.4
+    static let grace: TimeInterval = 0.1
+    static let spacing: CGFloat = 6
+
+    private init() {
+        panel = NSPanel(contentRect: card.frame, styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: true)
+        panel.isFloatingPanel = true
+        panel.hasShadow = true
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.level = .popUpMenu
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = true
+        panel.contentView = card
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: NSApplication.didResignActiveNotification, object: nil,
+                                            queue: .main) { [weak self] _ in self?.dismiss() })
+        observers.append(center.addObserver(forName: NSWindow.didResignKeyNotification, object: nil,
+                                            queue: .main) { [weak self] note in
+            if (note.object as? NSWindow) === self?.anchor?.window { self?.dismiss() }
+        })
+    }
+
+    var isVisible: Bool { panel.isVisible }
+
+    /// The pointer entered `anchor`, a row or pill for `controller`'s tab.
+    func enter(_ anchor: NSView, controller: TerminalWindowController?, edge: Edge) {
+        pending?.cancel()
+        pending = nil
+        guard let controller, !controller.isClosed, NSApp.isActive,
+              // The selected tab is on screen already.
+              controller.window !== anchor.window else {
+            if self.anchor !== anchor { hide() }
+            return
+        }
+        self.anchor = anchor
+        self.controller = controller
+        self.edge = edge
+        if panel.isVisible || CACurrentMediaTime() - hiddenAt < Self.warm {
+            show()
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            self?.pending = nil
+            self?.show()
+        }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.delay, execute: work)
+    }
+
+    /// The pointer left `anchor`.
+    func exit(_ anchor: NSView) {
+        guard anchor === self.anchor else { return }
+        pending?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.anchor === anchor else { return }
+            self.pending = nil
+            self.hide()
+        }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.grace, execute: work)
+    }
+
+    /// Hides the card now (a click, a drag, a scroll), and doesn't bring it back until the
+    /// pointer enters a tab again.
+    func dismiss() {
+        pending?.cancel()
+        pending = nil
+        hide()
+        anchor = nil
+        hiddenAt = 0
+    }
+
+    /// Something in the tabs changed: redraw the card if it is up.
+    func refresh() {
+        guard panel.isVisible else { return }
+        show()
+    }
+
+    private func show() {
+        guard let anchor, let window = anchor.window, let controller, !controller.isClosed,
+              let screen = window.screen ?? NSScreen.main else {
+            hide()
+            return
+        }
+        let content = controller.content
+        let model = HoverCardModel.make(root: content.root, focused: content.focusedPane, zoomed: content.zoomedPane,
+                                        titleOverride: controller.titleOverride, host: controller.host,
+                                        panes: SessionManager.shared.panes)
+        let size = content.bounds.size
+        card.show(model, aspect: size.width > 0 ? size.height / size.width : 0.6)
+        panel.appearance = NSAppearance(named: SessionManager.shared.config.theme.isDark ? .darkAqua : .aqua)
+        let fit = card.fittingSize
+        let rect = window.convertToScreen(anchor.convert(anchor.bounds, to: nil))
+        var origin: NSPoint
+        switch edge {
+        case .right:
+            origin = NSPoint(x: rect.maxX + Self.spacing, y: rect.maxY - fit.height)
+        case .below:
+            origin = NSPoint(x: rect.minX, y: rect.minY - Self.spacing - fit.height)
+        }
+        let visible = screen.visibleFrame
+        origin.x = min(max(origin.x, visible.minX + 4), visible.maxX - fit.width - 4)
+        origin.y = min(max(origin.y, visible.minY + 4), visible.maxY - fit.height - 4)
+        panel.setFrame(NSRect(origin: origin, size: fit), display: true)
+        guard !panel.isVisible else { return }
+        if panel.parent !== window {
+            panel.parent?.removeChildWindow(panel)
+            window.addChildWindow(panel, ordered: .above)
+        }
+        panel.alphaValue = 0
+        panel.orderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = Motion.duration(Motion.fast)
+            panel.animator().alphaValue = 1
+        }
+    }
+
+    private func hide() {
+        guard panel.isVisible else { return }
+        hiddenAt = CACurrentMediaTime()
+        panel.parent?.removeChildWindow(panel)
+        panel.orderOut(nil)
+    }
+}
+
+private extension Comparable {
+    func clamped(to range: ClosedRange<Self>) -> Self { min(max(self, range.lowerBound), range.upperBound) }
+}
