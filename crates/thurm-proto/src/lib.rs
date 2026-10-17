@@ -561,7 +561,9 @@ pub enum Event {
         /// [`Request::AnswerPermission`].
         permission: Option<u64>,
         /// The sound to play (see `[notifications.<state>]`); unset is the default sound.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Always encoded: postcard has no field tags, so a skipped `None` left the message
+        /// one byte short and every client failed to decode it.
+        #[serde(default)]
         sound: Option<String>,
     },
     /// OSC 52 copy.
