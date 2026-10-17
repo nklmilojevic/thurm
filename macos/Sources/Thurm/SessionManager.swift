@@ -1281,6 +1281,8 @@ final class SessionManager: NSObject, CoreDelegate {
         // The sidebar's agent list covers every pane, including hidden workspaces'; its tiles
         // follow the program even when the title stays.
         if old?.agent != info.agent || PaneIcon(old) != PaneIcon(info) { refreshSidebars() }
+        // Progress, git, the directory or the program: only the card shows those.
+        TabHoverCard.shared.refresh()
         if old?.passwordInput != info.passwordInput {
             updateSecureInput()
         }

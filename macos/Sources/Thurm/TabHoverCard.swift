@@ -32,12 +32,16 @@ struct HoverCardCell: Equatable {
 struct HoverCardModel: Equatable {
     var title: String
     var subtitle: String?
-    /// The panes in layout order, as many as the card lists.
+    /// Every pane in layout order: the map shows them all.
+    var all: [HoverCardPane]
+    /// The panes listed, in layout order: at most `maxPanes`, and fewer when the card would not
+    /// fit the screen (see `limited(to:)`).
     var panes: [HoverCardPane]
-    /// Panes in the tab the card leaves out.
-    var more: Int
     /// The layout; empty for a tab with one pane.
     var cells: [HoverCardCell]
+
+    /// Panes in the tab the card doesn't list.
+    var more: Int { all.count - panes.count }
 
     static let maxPanes = 6
 
@@ -45,17 +49,9 @@ struct HoverCardModel: Equatable {
                      panes: [PaneKey: PaneInfo]) -> HoverCardModel {
         let keys = root.panes
         let front = panes[focused]
-        var rows = keys.map { key -> HoverCardPane in
+        let rows = keys.map { key -> HoverCardPane in
             pane(key, info: panes[key], focused: key == focused, remote: host != localHost)
         }
-        // More panes than fit: keep the most urgent (in layout order), so a waiting agent never
-        // falls off the end of the list.
-        let urgent = rows.enumerated().sorted {
-            let (a, b) = ($0.element.status?.urgency ?? -1, $1.element.status?.urgency ?? -1)
-            return a != b ? a > b : $0.offset < $1.offset
-        }.prefix(maxPanes).map(\.offset)
-        let more = rows.count - urgent.count
-        rows = rows.enumerated().filter { urgent.contains($0.offset) }.map(\.element)
         var parts = [keys.count > 1 ? "\(keys.count) panes" : nil, host == localHost ? nil : host]
         if let z = zoomed, keys.count > 1, let row = rows.first(where: { $0.key == z }) {
             parts.append("\(row.title) zoomed")
@@ -64,9 +60,22 @@ struct HoverCardModel: Equatable {
         return HoverCardModel(
             title: titleOverride ?? front?.displayTitle ?? "Thurm",
             subtitle: subtitle.isEmpty ? nil : subtitle,
+            all: rows,
             panes: rows,
-            more: more,
-            cells: keys.count > 1 ? cells(root) : [])
+            cells: keys.count > 1 ? cells(root) : []
+        ).limited(to: maxPanes)
+    }
+
+    /// The same card listing at most `count` panes: the most urgent, in layout order, so a
+    /// waiting agent never falls off the end of the list.
+    func limited(to count: Int) -> HoverCardModel {
+        let keep = all.enumerated().sorted {
+            let (a, b) = ($0.element.status?.urgency ?? -1, $1.element.status?.urgency ?? -1)
+            return a != b ? a > b : $0.offset < $1.offset
+        }.prefix(max(0, count)).map(\.offset)
+        var model = self
+        model.panes = all.enumerated().filter { keep.contains($0.offset) }.map(\.element)
+        return model
     }
 
     /// The layout in the unit square. `SplitNode.frames` rounds to whole points, so it lays
@@ -132,7 +141,7 @@ final class HoverCardMinimap: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let model else { return }
         let chrome = SessionManager.shared.config.chrome
-        let statuses = Dictionary(model.panes.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
+        let statuses = Dictionary(model.all.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
         let area = bounds
         for cell in model.cells {
             let r = CGRect(x: area.minX + cell.rect.minX * area.width, y: area.minY + cell.rect.minY * area.height,
@@ -363,6 +372,7 @@ final class TabHoverCard {
     /// When the last card went away: a tab entered soon after shows its card without waiting.
     private var hiddenAt: CFTimeInterval = 0
     private var observers: [NSObjectProtocol] = []
+    private var refreshPending = false
 
     static let delay: TimeInterval = 0.5
     static let warm: TimeInterval = 0.4
@@ -439,10 +449,15 @@ final class TabHoverCard {
         hiddenAt = 0
     }
 
-    /// Something in the tabs changed: redraw the card if it is up.
+    /// Something in the tabs or a pane changed: redraw the card on the next main-loop turn if
+    /// it is up (coalesced; nothing to do while it is hidden).
     func refresh() {
-        guard panel.isVisible else { return }
-        show()
+        guard panel.isVisible, !refreshPending else { return }
+        refreshPending = true
+        DispatchQueue.main.async {
+            self.refreshPending = false
+            if self.panel.isVisible { self.show() }
+        }
     }
 
     private func show() {
@@ -456,10 +471,23 @@ final class TabHoverCard {
                                         titleOverride: controller.titleOverride, host: controller.host,
                                         panes: SessionManager.shared.panes)
         let size = content.bounds.size
-        card.show(model, aspect: size.width > 0 ? size.height / size.width : 0.6)
+        let aspect = size.width > 0 ? size.height / size.width : 0.6
         panel.appearance = NSAppearance(named: SessionManager.shared.config.theme.isDark ? .darkAqua : .aqua)
-        let fit = card.fittingSize
         let rect = window.convertToScreen(anchor.convert(anchor.bounds, to: nil))
+        let visible = screen.visibleFrame
+        // Under a pill the card has the space below the strip; beside a row, the screen's height.
+        let room = edge == .below ? rect.minY - Self.spacing - visible.minY - 4 : visible.height - 8
+        // The card takes no mouse, so it can't scroll: on a short screen it lists fewer panes
+        // (the rest are counted, and the map still shows them).
+        var listed = model.panes.count
+        card.show(model, aspect: aspect)
+        var fit = card.fittingSize
+        while fit.height > room, listed > 0 {
+            listed -= 1
+            card.show(model.limited(to: listed), aspect: aspect)
+            fit = card.fittingSize
+        }
+        fit.height = min(fit.height, max(room, 0))
         var origin: NSPoint
         switch edge {
         case .right:
@@ -467,15 +495,15 @@ final class TabHoverCard {
         case .below:
             origin = NSPoint(x: rect.minX, y: rect.minY - Self.spacing - fit.height)
         }
-        let visible = screen.visibleFrame
         origin.x = min(max(origin.x, visible.minX + 4), visible.maxX - fit.width - 4)
         origin.y = min(max(origin.y, visible.minY + 4), visible.maxY - fit.height - 4)
         panel.setFrame(NSRect(origin: origin, size: fit), display: true)
-        guard !panel.isVisible else { return }
+        // A card that moved to a tab in another window follows that window.
         if panel.parent !== window {
             panel.parent?.removeChildWindow(panel)
             window.addChildWindow(panel, ordered: .above)
         }
+        guard !panel.isVisible else { return }
         panel.alphaValue = 0
         panel.orderFront(nil)
         NSAnimationContext.runAnimationGroup { ctx in

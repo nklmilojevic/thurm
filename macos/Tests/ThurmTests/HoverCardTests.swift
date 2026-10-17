@@ -80,6 +80,42 @@ final class HoverCardTests: XCTestCase {
         XCTAssertEqual(model.cells.count, 8)
     }
 
+    /// Eight panes side by side; pane 8's agent waits, pane 7's works and is zoomed.
+    private func eightPanes() -> HoverCardModel {
+        var root = SplitNode.leaf(key(1))
+        var panes = [key(1): info(1)]
+        for id in UInt64(2)...8 {
+            root = .split(axis: .horizontal, ratio: 0.5, first: root, second: .leaf(key(id)))
+            panes[key(id)] = info(id, ["title": "pane \(id)"])
+        }
+        panes[key(8)] = info(8, agent("NeedsInput"))
+        panes[key(7)] = info(7, agent("Working", topic: "Refactor"))
+        return HoverCardModel.make(root: root, focused: key(1), zoomed: key(6), titleOverride: nil,
+                                   host: localHost, panes: panes)
+    }
+
+    func testTheMapKeepsPanesTheListLeavesOut() {
+        let model = eightPanes()
+        XCTAssertEqual(model.panes.count, HoverCardModel.maxPanes)
+        XCTAssertFalse(model.panes.contains { $0.key == key(6) })
+        // Every cell has its pane's status, icon and focus.
+        XCTAssertEqual(model.all.map(\.key), (1...8).map { key(UInt64($0)) })
+        XCTAssertEqual(model.all.first { $0.key == key(7) }?.status, .working)
+        XCTAssertEqual(Set(model.cells.map(\.key)), Set(model.all.map(\.key)))
+    }
+
+    func testAZoomedPaneTheListLeavesOutIsStillNamed() {
+        XCTAssertEqual(eightPanes().subtitle, "8 panes · pane 6 zoomed")
+    }
+
+    func testFewerListedPanesKeepTheUrgentOnes() {
+        let model = eightPanes().limited(to: 2)
+        XCTAssertEqual(model.panes.map(\.key), [key(7), key(8)])
+        XCTAssertEqual(model.more, 6)
+        XCTAssertEqual(model.cells.count, 8)
+        XCTAssertTrue(eightPanes().limited(to: 0).panes.isEmpty)
+    }
+
     func testProgramsGitAndRemotes() {
         let remote: HostId = "devbox"
         let root = SplitNode.split(axis: .vertical, ratio: 0.5, first: .leaf(key(1, host: remote)),

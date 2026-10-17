@@ -509,6 +509,11 @@ private final class TabPill: NSView {
         TabHoverCard.shared.exit(self)
     }
 
+    override func scrollWheel(with event: NSEvent) {
+        TabHoverCard.shared.dismiss()
+        super.scrollWheel(with: event)
+    }
+
     /// Where the button went down, in the track: the start of a possible drag.
     private var downAt: NSPoint?
 
@@ -544,6 +549,7 @@ private final class TabPill: NSView {
     }
 
     @objc private func closeTab() {
+        TabHoverCard.shared.dismiss()
         tab?.window?.performClose(nil)
     }
 }
