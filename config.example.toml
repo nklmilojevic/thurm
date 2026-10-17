@@ -116,9 +116,8 @@ tab_completion = true
 # EDITOR = "nvim"
 
 [session]
-# Save the layout, working directories, and scrollback to disk.
+# Save the layout, working directories, and agents to disk. Scrollback stays in memory.
 persist = true
-scrollback_lines = 4000
 snapshot_interval_secs = 15
 # "detach" keeps shells running when the app quits.
 # "terminate" stops shells when the app quits.

@@ -241,7 +241,7 @@ fn connect_local(epoch: u64, upgraded: &Cell<bool>) -> Result<Core, ConnectError
                     }
                 }
                 return Err(ConnectError::OldDaemon(format!(
-                    "The running thurmd speaks another protocol: {e}. Run `thurm daemon stop` (layout and scrollback are restored), then open Thurm again."
+                    "The running thurmd speaks another protocol: {e}. Run `thurm daemon stop` (the layout is restored), then open Thurm again."
                 )));
             }
             Err(e) => return Err(ConnectError::Failed(e)),
@@ -249,7 +249,7 @@ fn connect_local(epoch: u64, upgraded: &Cell<bool>) -> Result<Core, ConnectError
         let resp = core.request(&hello);
         if let Some(e) = resp.get("error").and_then(Value::as_str) {
             return Err(ConnectError::Failed(format!(
-                "The running thurmd refused the connection: {e}. Quit Thurm and run `thurm daemon stop` (layout and scrollback are restored), then open Thurm again."
+                "The running thurmd refused the connection: {e}. Quit Thurm and run `thurm daemon stop` (the layout is restored), then open Thurm again."
             )));
         }
         let build = resp.pointer("/Hello/build").and_then(Value::as_str).unwrap_or("");

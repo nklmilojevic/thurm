@@ -318,7 +318,8 @@ fn panes_frames_persistence_and_restore() {
     drop(c);
     daemon.wait_exit();
 
-    // Restart: the pane comes back with the same id, cwd, scrollback and layout.
+    // Restart: the pane comes back with the same id, cwd and layout. Its scrollback never
+    // reached the disk, so it starts empty.
     let _daemon = env.start();
     let (c, _events) = env.connect();
     assert!(matches!(
@@ -333,8 +334,9 @@ fn panes_frames_persistence_and_restore() {
     assert_eq!(panes[0].id, pane);
     assert!(panes[0].restored);
     let text = capture(&c, pane);
-    assert!(text.contains("hello-42"), "{text}");
+    assert!(!text.contains("hello-42"), "{text}");
     assert!(text.contains("session restored"), "{text}");
+    assert!(!env.dir.join("state/scrollback").exists());
     match c.request(Request::GetLayout).unwrap() {
         Response::Layout(Some(l)) => assert!(l.contains(&format!("\"id\":{pane}"))),
         other => panic!("{other:?}"),
@@ -974,7 +976,8 @@ fn panes_killed_with_the_daemon_are_restored() {
         panes.iter().map(|p| p.id).collect::<Vec<_>>(),
         vec![pane, trapped]
     );
-    assert!(capture(&c, pane).contains("before-teardown"));
+    // Scrollback stays in memory: it went with the daemon.
+    assert!(!capture(&c, pane).contains("before-teardown"));
 }
 
 #[test]
@@ -1979,11 +1982,7 @@ fn agent_reporting_restores_exact_arguments_without_shell_expansion() {
         serde_json::from_slice(&std::fs::read(env.dir.join("state/session.json")).unwrap())
             .unwrap();
     assert_eq!(snapshot["panes"][0]["id"], pane);
-    assert!(
-        env.dir
-            .join(format!("state/scrollback/{pane}.ansi"))
-            .exists()
-    );
+    assert!(!env.dir.join("state/scrollback").exists());
 }
 
 #[test]
@@ -2248,7 +2247,7 @@ fn wait_for_reporting_shell(c: &Client, pane: PaneId) {
 }
 
 #[test]
-fn agent_reporting_missing_resume_keeps_pane_and_history() {
+fn agent_reporting_missing_resume_keeps_pane() {
     let env = Env::new("report-missing");
     let mut daemon = env.start();
     let (c, _) = env.connect();
@@ -2280,13 +2279,11 @@ fn agent_reporting_missing_resume_keeps_pane_and_history() {
     let (c, _) = env.connect();
     wait_match(&c, pane, "not found|No such file|no such file");
     wait_for_reporting_shell(&c, pane);
-    assert!(capture(&c, pane).contains("PRESERVE-THIS-HISTORY"));
+    assert!(!capture(&c, pane).contains("PRESERVE-THIS-HISTORY"));
     c.request(Request::SaveSnapshot).unwrap();
     let snapshot: serde_json::Value =
         serde_json::from_slice(&std::fs::read(env.dir.join("state/session.json")).unwrap())
             .unwrap();
     assert_eq!(snapshot["panes"][0]["id"], pane);
-    let history =
-        std::fs::read_to_string(env.dir.join(format!("state/scrollback/{pane}.ansi"))).unwrap();
-    assert!(history.contains("PRESERVE-THIS-HISTORY"));
+    assert!(!env.dir.join("state/scrollback").exists());
 }

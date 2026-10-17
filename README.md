@@ -43,8 +43,8 @@ The `thurmd` daemon owns the shell processes and terminal state. The app connect
 to it to display your session. With the default settings, quitting the app leaves
 those processes running. Reopen Thurm to connect to them again.
 
-Thurm also saves your layout, working directories, and scrollback to disk. This
-helps you return to your work after a reboot, with an important limit:
+Thurm also saves your layout and working directories to disk. This helps you
+return to your work after a reboot, with an important limit:
 
 | Action | What happens |
 | --- | --- |
@@ -55,8 +55,10 @@ helps you return to your work after a reboot, with an important limit:
 A saved session cannot restore the memory of a stopped process. Supported agents
 can use configured resume commands to continue a saved conversation.
 
-By default, Thurm saves a snapshot every 15 seconds and keeps up to 4,000
-scrollback lines per pane on disk. Use `thurm save` to save one now.
+Scrollback is never written to disk, because terminal output often holds tokens
+and keys. It survives app restarts and daemon upgrades, but after a reboot the
+restored panes start empty. By default, Thurm saves a snapshot every 15 seconds.
+Use `thurm save` to save one now.
 See the [session guide](https://docs.thurm.rs/sessions/) for storage
 paths, daemon controls, and restoration settings.
 

@@ -149,14 +149,13 @@ tab_completion = true
 # EDITOR = "nvim"
 
 [session]
-# Keep layout, working directories and scrollback across app restarts and reboots.
+# Keep layout, working directories and agents across app restarts and reboots.
+# Scrollback is never written to disk: after a reboot, panes start empty.
 persist = true
-# Lines of scrollback per pane written to the snapshot.
-scrollback_lines = 4000
 # Seconds between snapshots of the session.
 snapshot_interval_secs = 15
 # "detach": quitting the app leaves shells running and reattaches next launch.
-# "terminate": quitting kills the shells (layout and scrollback are still restored).
+# "terminate": quitting kills the shells (the layout is still restored).
 quit = "detach"
 # Re-run an agent's resume command (e.g. `claude --continue`) when restoring after a reboot.
 resume_agents = true

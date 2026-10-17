@@ -2326,23 +2326,6 @@ impl Terminal {
         out
     }
 
-    /// ANSI-escaped copy of the last `max_lines` lines of the primary screen, for persistence.
-    /// Returns `None` while the alternate screen is active.
-    pub fn serialize_history(&self, max_lines: usize) -> Option<Vec<u8>> {
-        if self.is_alt_screen() {
-            return None;
-        }
-        let screen = self.rows as i32;
-        let history = self.vt.history() as i32;
-        // Up to the cursor's line, so we don't persist a screen full of blank lines.
-        let cursor_line = self.cursor_point().line;
-        let top = (cursor_line - max_lines as i32 + 1).max(-history);
-        let bottom = cursor_line.min(screen - 1);
-        let mut out = self.format_lines(top, bottom, true, true);
-        out.push_str("\r\n\x1b[0m");
-        Some(out.into_bytes())
-    }
-
     /// Lines `top..=bottom` by libghostty-vt's formatter: VT sequences or plain text, soft
     /// wraps joined or not, trailing blanks trimmed.
     fn format_lines(&self, top: i32, bottom: i32, vt: bool, unwrap: bool) -> String {
