@@ -222,7 +222,9 @@ jobs:
       always()
       && ((github.event_name == 'release' && !github.event.release.prerelease)
         || (needs.plan.result == 'success' && needs.plan.outputs.build == 'true'))
-    runs-on: ubuntu-26.04
+    # The self-hosted runner (home-x64, container jobs only): this workflow never runs for a
+    # pull request.
+    runs-on: home-x64
     container: archlinux:base-devel
     permissions:
       contents: read

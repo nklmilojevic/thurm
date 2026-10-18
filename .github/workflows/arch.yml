@@ -35,7 +35,9 @@ permissions:
 jobs:
   makepkg:
     name: makepkg (x86_64)
-    runs-on: ubuntu-26.04
+    # Pushes to main build on the self-hosted runner (home-x64, container jobs only); pull
+    # requests never run there, so they stay on the hosted runner, in the same container.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-26.04' || 'home-x64' }}
     container: archlinux:base-devel
     timeout-minutes: 60
     steps:
