@@ -10,7 +10,6 @@ export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/thurm-target}"
 
 cd "$repo"
-"$repo/scripts/linux/zig-prefetch.sh"
 flags=()
 [ "$profile" = release ] && flags+=(--release)
 cargo build "${flags[@]}" -p thurm-gtk

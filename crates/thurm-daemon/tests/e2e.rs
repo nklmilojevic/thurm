@@ -182,6 +182,35 @@ fn wait_match(c: &Client, pane: PaneId, regex: &str) {
     );
 }
 
+/// Types `input` until `regex` matches: for input a shell may discard, as it does a line read
+/// while it handles an interrupt.
+fn send_until(c: &Client, pane: PaneId, input: &[u8], regex: &str) {
+    for _ in 0..5 {
+        c.request(Request::Input {
+            pane,
+            data: input.to_vec(),
+        })
+        .unwrap();
+        let r = c
+            .request(Request::Wait {
+                pane,
+                until: WaitCondition::Match {
+                    regex: regex.into(),
+                },
+                timeout_ms: Some(2_000),
+            })
+            .unwrap();
+        if matches!(r, Response::Wait(WaitOutcome::Satisfied)) {
+            return;
+        }
+    }
+    let info = c.request(Request::PaneInfo { pane });
+    panic!(
+        "waiting for {regex:?}\n{}\npane: {info:?}",
+        capture(c, pane)
+    );
+}
+
 fn capture(c: &Client, pane: PaneId) -> String {
     match c.request(Request::Capture {
         pane,
@@ -287,12 +316,9 @@ fn panes_frames_persistence_and_restore() {
         },
     })
     .unwrap();
-    c.request(Request::Input {
-        pane,
-        data: b"stty size\r".to_vec(),
-    })
-    .unwrap();
-    wait_match(&c, pane, "30 100");
+    // The Ctrl-C above may still be interrupting the shell: a line read meanwhile is discarded
+    // with the interrupt, so type the command again until it runs.
+    send_until(&c, pane, b"stty size\r", "30 100");
 
     // Layout round trip.
     let layout = Layout {

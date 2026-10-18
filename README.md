@@ -331,7 +331,7 @@ Make these changes in your Home Manager configuration.
 ## Build and contribute
 
 To build the macOS app, use an Apple silicon Mac with macOS 14 or later and Xcode 26 or
-later. The [Nix development shell](flake.nix) provides Rust, Zig, and the other
+later. The [Nix development shell](flake.nix) provides Rust and the other
 command-line build tools.
 
 ```sh
@@ -342,10 +342,11 @@ nix develop
 open macos/build/Thurm.app
 ```
 
-Without Nix, install Rust stable with the `aarch64-apple-darwin` target and
-Zig 0.16.0, then run the build script. The first build needs network access for
-the pinned Ghostty source and Swift dependencies. Local builds use an ad hoc
-signature by default.
+Without Nix, install Rust stable with the `aarch64-apple-darwin` target, then run
+the build script. The first build needs network access for the prebuilt
+libghostty-vt (Ghostty's terminal engine, from
+[ghostty-vt-rs](https://github.com/nklmilojevic/ghostty-vt-rs)) and the Swift
+dependencies. Local builds use an ad hoc signature by default.
 
 Use `./macos/build.sh --install` to build, install, and open the app. It replaces
 Thurm in `/Applications`, or in `~/Applications` if `/Applications` is not writable.
@@ -353,7 +354,7 @@ It also links `thurm` into `~/.local/bin` when that directory exists and the
 destination is not a regular file.
 
 To build the Linux app on Ubuntu 24.04 or newer, install the build dependencies
-(GTK 4, libadwaita, Rust, Zig 0.16.0) with `scripts/linux/provision.sh`, then
+(GTK 4, libadwaita, Rust) with `scripts/linux/provision.sh`, then
 `scripts/linux/install.sh` builds it and installs it in `~/.local`. On Arch,
 `scripts/linux/arch-package.sh` builds a package from the working tree. See
 [specs/linux.md](specs/linux.md) for the Linux app's design, packaging, and tests.
@@ -372,10 +373,9 @@ same Rust FFI. The main source areas are:
 | `crates/thurm-config/` | Settings, themes, and agent definitions |
 | `crates/thurm-client/`, `crates/thurm-proto/`, `crates/thurm-ffi/` | Client library, shared protocol, and Swift interface |
 | `shell-integration/`, `completions/` | Shell integration and completion definitions |
-| `vendor/libghostty-vt-sys/` | Bindings and build code for the pinned Ghostty source |
 | `docs/` | Documentation site |
 
-Run the Rust checks with Zig 0.16.0 on `PATH`, then the release script tests:
+Run the Rust checks, then the release script tests:
 
 ```sh
 cargo test --workspace --locked
