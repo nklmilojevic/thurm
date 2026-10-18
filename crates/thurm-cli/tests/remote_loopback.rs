@@ -359,8 +359,21 @@ fn remote_workspace_over_loopback_ssh() {
     assert!(!w.base.join("rhome/.local/share/thurm/bin/thurm").exists());
 
     // 2. Install this build the way the app does (copying on a Mac, the release archive
-    //    elsewhere), then connect.
-    let plan = install::plan(&w.ssh, None, Some(&w.bins)).unwrap();
+    //    elsewhere), then connect. Beside thurm and thurmd, a Tailscale helper that the install
+    //    must carry over too.
+    let staged = w.base.join("staged");
+    std::fs::create_dir_all(&staged).unwrap();
+    for bin in ["thurm", "thurmd"] {
+        std::os::unix::fs::symlink(w.bins.join(bin), staged.join(bin)).unwrap();
+    }
+    let helper = b"#!/bin/sh\nexit 0\n";
+    std::fs::write(staged.join("thurm-tailnet"), helper).unwrap();
+    std::fs::set_permissions(
+        staged.join("thurm-tailnet"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let plan = install::plan(&w.ssh, None, Some(&staged)).unwrap();
     assert!(!plan.installed);
     let method = if plan.methods.contains(&Method::Copy) {
         Method::Copy
@@ -373,8 +386,8 @@ fn remote_workspace_over_loopback_ssh() {
             .arg("-czf")
             .arg(&archive)
             .arg("-C")
-            .arg(&w.bins)
-            .args(["thurm", "thurmd"])
+            .arg(&staged)
+            .args(["-h", "thurm", "thurmd", "thurm-tailnet"])
             .status()
             .unwrap()
             .success();
@@ -382,8 +395,13 @@ fn remote_workspace_over_loopback_ssh() {
         unsafe { std::env::set_var("THURM_ARTIFACT_DIR", &dir) };
         Method::Download
     };
-    let info = install::install(&w.ssh, &plan.host, method, Some(&w.bins)).unwrap();
+    let info = install::install(&w.ssh, &plan.host, method, Some(&staged)).unwrap();
     assert_eq!(info.build, thurm_proto::BUILD);
+    assert_eq!(
+        std::fs::read(w.base.join("rhome/.local/share/thurm/bin/thurm-tailnet")).unwrap(),
+        helper,
+        "the helper lands beside thurmd"
+    );
     assert_eq!(info.socket, w.remote_socket);
     sup.kick(false);
     let s = watch.wait(&sup, Phase::Connected, 30);

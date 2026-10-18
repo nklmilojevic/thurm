@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Builds the .deb and .rpm of the Linux app (linux/nfpm.yaml) from built binaries, for this
-# machine's architecture. Needs nfpm, cargo and python3 on PATH.
+# machine's architecture. Needs nfpm, cargo, go and python3 on PATH.
 #   scripts/linux/package.sh VERSION THURM_GTK MUSL_DIR OUT_DIR
 # VERSION is the workspace version (0.3.0), or 0.3.0+tip.<commit count>.<sha> for a tip
 # build: it sorts after that release, before the next, and by commit among tips (dpkg, rpm
 # and pacman alike). THURM_GTK is the thurm-gtk binary, MUSL_DIR the
-# directory with the static thurm and thurmd; all three built with the same THURM_BUILD.
+# directory with the static thurm, thurmd and thurm-tailnet; all built with the same THURM_BUILD.
 # OUT_DIR gets the versioned packages, copies with fixed names (thurm-amd64.deb,
 # thurm-x86_64.rpm, ...) for releases/latest/download links, and a .sha256 for each.
 set -euo pipefail
@@ -23,8 +23,9 @@ case "$(uname -m)" in
 esac
 
 cd "$repo"
-# Generated, never reused: it follows the dependencies being packaged.
-python3 scripts/third-party-licenses.py
+# Generated, never reused: it follows the dependencies being packaged, thurm-tailnet's Go
+# modules included.
+python3 scripts/third-party-licenses.py --with-go
 export NFPM_ARCH="$deb_arch" THURM_PKG_VERSION="$version" THURM_GTK_BIN="$gtk" THURM_MUSL_DIR="$musl"
 
 work="$(mktemp -d)"
