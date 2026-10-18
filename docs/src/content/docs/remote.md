@@ -162,6 +162,11 @@ this Mac knows its host key. Such a host needs no host key, and no device key
 on it, when the phone reaches it over Tailscale alone. The Mac must be connected
 to the host when you open **Pair iPhone**, to ask it for the address.
 
+Without a Mac, pair the phone on the host itself: `thurm pair` prints a QR
+code to scan in the app (and the same link, to paste instead). The code
+carries only this host's Tailscale address, and the push relay when the host's
+config has one; the phone connects over Tailscale alone, with no ssh fallback.
+
 `thurm tailscale on` lasts until the daemon restarts. To keep it on, turn on
 **Serve over Tailscale** in Settings, or:
 
