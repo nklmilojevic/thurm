@@ -131,6 +131,10 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
+          # The container runs as root and the checkout belongs to the runner's user, so git
+          # (here, and Go's VCS stamping in Build) refuses it. actions/checkout trusts it only
+          # in a temporary HOME of its own.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           NUMBER="$(git rev-list --count HEAD)"
           # Same as macos/release/build-release.sh.
