@@ -161,6 +161,14 @@ jobs:
           # Static, like thurm and thurmd; each runner builds for its own architecture.
           (cd tailnet && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" \
             -o "../target/${{ matrix.target }}/release/thurm-tailnet" ./cmd/thurm-tailnet)
+      # Remote hosts run these as they are: no dynamic loader or libc to rely on there.
+      - name: Static
+        run: |
+          set -euo pipefail
+          for b in thurm thurmd thurm-tailnet; do
+            file "target/${{ matrix.target }}/release/$b"
+            file "target/${{ matrix.target }}/release/$b" | grep -Eq 'statically linked|static-pie linked'
+          done
       - name: Package
         run: |
           set -euo pipefail

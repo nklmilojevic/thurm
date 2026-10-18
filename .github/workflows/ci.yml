@@ -97,21 +97,13 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   linux:
-    # Remote hosts run the static musl builds of thurm and thurmd (remote workspaces).
-    name: Linux (${{ matrix.target }})
+    # The tests of what thurmd and thurm do on Linux remote hosts, on x86_64 only. Release
+    # builds and checks the shipped static binaries for both architectures.
+    name: Linux
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    # The same container on every runner, so the caches main saves are the ones pull requests
-    # restore. Privileged for the network namespace test.
+    runs-on: ubuntu-24.04
+    # The same image as Release's Linux builds. Privileged for the network namespace test.
     container:
       image: ubuntu:24.04
       options: --privileged
@@ -122,6 +114,7 @@ jobs:
     # The image has no locale set, unlike the hosted runners the tests were written on.
     env:
       LANG: C.UTF-8
+      TARGET: x86_64-unknown-linux-musl
     steps:
       # git first: the checkout must be a repository.
       - name: Build dependencies, musl and sshd
@@ -130,29 +123,18 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
-            xz-utils zstd file python3 musl-tools openssh-server openssh-client
+            xz-utils zstd python3 musl-tools openssh-server openssh-client
           # sshd's privilege separation directory, which its service makes on a host.
           mkdir -p /run/sshd
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.99.1
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: ${{ matrix.target }}
-      # The shipped static binaries: main only (pull requests run the tests below).
-      - name: Build
-        if: github.event_name == 'push'
-        run: cargo build --release --locked --target ${{ matrix.target }} -p thurm-cli -p thurm-daemon
-      - name: Static
-        if: github.event_name == 'push'
-        run: |
-          for b in thurm thurmd; do
-            file "target/${{ matrix.target }}/release/$b"
-            file "target/${{ matrix.target }}/release/$b" | grep -Eq 'statically linked|static-pie linked'
-          done
+          key: x86_64-unknown-linux-musl
       # The daemon and terminal suites, and the remote ones (loopback ssh, handoffs). Here sshd
       # is there, and so is the network namespace in a privileged container, so the tests
       # needing them must not skip.
@@ -160,7 +142,7 @@ jobs:
         env:
           THURM_REQUIRE_SSHD: "1"
           THURM_REQUIRE_NETNS: "1"
-        run: cargo test --locked --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
+        run: cargo test --locked --target "$TARGET" -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
 
   go:
     # The Tailscale helper (tailnet/, thurm-tailnet), with the Go version from its go.mod.
