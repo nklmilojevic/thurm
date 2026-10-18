@@ -3634,7 +3634,7 @@ mod tests {
                 }
                 let mut body = vec![0; len];
                 let _ = reader.read_exact(&mut body);
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
             }
         });
