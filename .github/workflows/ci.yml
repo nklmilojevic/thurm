@@ -123,6 +123,10 @@ jobs:
     container:
       image: ubuntu:24.04
       options: ${{ (github.event_name == 'pull_request' || !matrix.home) && '--privileged' || '' }}
+    defaults:
+      run:
+        # A container's default shell is sh.
+        shell: bash
     # The image has no locale set, unlike the hosted runners the tests were written on.
     env:
       LANG: C.UTF-8
@@ -218,6 +222,10 @@ jobs:
     # are the ones pull requests restore.
     runs-on: ${{ github.event_name != 'pull_request' && matrix.runner == 'ubuntu-24.04' && 'home-x64' || matrix.runner }}
     container: ubuntu:24.04
+    defaults:
+      run:
+        # A container's default shell is sh.
+        shell: bash
     # The image has no locale set; the smoke test types UTF-8 text (xdotool needs the locale).
     env:
       LANG: C.UTF-8
