@@ -82,6 +82,9 @@ impl Env {
             .env("THURM_CONFIG_DIR", self.dir.join("config"))
             .env("THURM_STATE_DIR", self.dir.join("state"))
             .env("SHELL", "/bin/sh")
+            // The prompt the tests wait for, `$ ` also as root (CI may run in a root container),
+            // where sh's own is `# `.
+            .env("PS1", "$ ")
             .env("THURM_LOG", "debug")
             // Agents' settings (hooks installed on launch) stay in the test directory.
             .env("CLAUDE_CONFIG_DIR", self.dir.join("claude"))

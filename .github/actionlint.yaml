@@ -1,0 +1,4 @@
+# The self-hosted runner's label (container jobs only; never pull requests).
+self-hosted-runner:
+  labels:
+    - home-x64
