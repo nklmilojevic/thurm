@@ -206,7 +206,9 @@ to (`thurm tailscale status` prints the command). Both admit only this Mac's
 owner unless `host_allow_identified = true`.
 
 The Tailscale part is a separate program, `thurm-tailnet`, next to `thurmd` in
-the app; the daemon starts it only while serving over Tailscale.
+the app, the Linux archives and packages, and the Nix package; the daemon starts
+it only while serving over Tailscale. Installing Thurm on a remote host copies it
+too, from builds that have it.
 
 ## What runs where
 

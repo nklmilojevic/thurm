@@ -154,6 +154,11 @@ jobs:
         with:
           path: ~/.cache/libghostty-vt
           key: libghostty-vt-release-linux-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
+      # thurm-tailnet, the Tailscale helper thurmd runs beside itself.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tailnet/go.mod
+          cache-dependency-path: tailnet/go.sum
       - name: musl, GTK and nfpm
         run: |
           set -euo pipefail
@@ -171,13 +176,16 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }} -p thurm-cli -p thurm-daemon
           cargo build --release -p thurm-gtk
+          # Static, like thurm and thurmd; each runner builds for its own architecture.
+          (cd tailnet && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" \
+            -o "../target/${{ matrix.target }}/release/thurm-tailnet" ./cmd/thurm-tailnet)
       - name: Package
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/linux"
           mkdir -p "$OUT"
-          python3 scripts/third-party-licenses.py
-          tar -czf "$OUT/${{ steps.meta.outputs.archive }}" -C "target/${{ matrix.target }}/release" thurm thurmd \
+          python3 scripts/third-party-licenses.py --with-go
+          tar -czf "$OUT/${{ steps.meta.outputs.archive }}" -C "target/${{ matrix.target }}/release" thurm thurmd thurm-tailnet \
             -C "$GITHUB_WORKSPACE" LICENSE THIRD_PARTY_LICENSES
           (cd "$OUT" && sha256sum "${{ steps.meta.outputs.archive }}" > "${{ steps.meta.outputs.archive }}.sha256")
           scripts/linux/package.sh "${{ steps.meta.outputs.package }}" target/release/thurm-gtk \

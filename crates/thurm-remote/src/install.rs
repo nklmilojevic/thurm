@@ -81,6 +81,10 @@ pub fn local_binaries(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     (t.is_file() && d.is_file()).then_some((t, d))
 }
 
+/// The Tailscale helper `thurmd` runs beside itself to serve over Tailscale. Builds that have it
+/// install it too; a host without it works, but cannot serve over Tailscale.
+const TAILNET_HELPER: &str = "thurm-tailnet";
+
 /// `thurm-<build>-<target>.tar.gz`, the asset name of a Linux build (`+` is not safe in
 /// release asset names).
 pub fn artifact_name(build: &str, target: &str) -> String {
@@ -297,6 +301,10 @@ pub fn install(
             let (thurm, thurmd) = local_bins.and_then(local_binaries).ok_or_else(|| {
                 InstallError::Failed("this Thurm's binaries were not found".into())
             })?;
+            let tailnet = thurmd.with_file_name(TAILNET_HELPER);
+            if tailnet.is_file() {
+                upload(ssh, TAILNET_HELPER, &read(&tailnet)?)?;
+            }
             upload(ssh, "thurmd", &read(&thurmd)?)?;
             upload(ssh, "thurm", &read(&thurm)?)?;
         }
@@ -304,7 +312,10 @@ pub fn install(
             let target = host.artifact_target().ok_or_else(|| {
                 InstallError::Failed(format!("no build for {} {}", host.os, host.arch))
             })?;
-            let (thurm, thurmd) = fetch_artifact(target)?;
+            let (thurm, thurmd, tailnet) = fetch_artifact(target)?;
+            if let Some(tailnet) = tailnet {
+                upload(ssh, TAILNET_HELPER, &tailnet)?;
+            }
             upload(ssh, "thurmd", &thurmd)?;
             upload(ssh, "thurm", &thurm)?;
         }
@@ -392,7 +403,7 @@ const UPLOAD: &str = concat!(
 
 /// The Linux build's `thurm` and `thurmd`, downloaded and checked, or taken from
 /// `THURM_ARTIFACT_DIR` (a directory of archives, for development).
-fn fetch_artifact(target: &str) -> Result<(Vec<u8>, Vec<u8>), InstallError> {
+fn fetch_artifact(target: &str) -> Result<Unpacked, InstallError> {
     let name = artifact_name(thurm_proto::BUILD, target);
     let archive = match std::env::var_os("THURM_ARTIFACT_DIR") {
         Some(dir) => read(&PathBuf::from(dir).join(&name))?,
@@ -439,8 +450,12 @@ fn download(url: &str) -> Result<Vec<u8>, InstallError> {
     Ok(out.stdout)
 }
 
-/// `thurm` and `thurmd` from a `.tar.gz` (with `tar`, which every Mac and Linux has).
-fn unpack(archive: &[u8]) -> Result<(Vec<u8>, Vec<u8>), InstallError> {
+/// `thurm`, `thurmd` and, from archives that have it, `thurm-tailnet`.
+type Unpacked = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
+/// `thurm` and `thurmd` from a `.tar.gz` (with `tar`, which every Mac and Linux has), and the
+/// Tailscale helper when the archive has one (older ones do not).
+fn unpack(archive: &[u8]) -> Result<Unpacked, InstallError> {
     let dir = std::env::temp_dir().join(format!(
         "thurm-artifact-{}-{}",
         std::process::id(),
@@ -475,7 +490,12 @@ fn unpack(archive: &[u8]) -> Result<(Vec<u8>, Vec<u8>), InstallError> {
                 .map_err(|_| InstallError::Failed(format!("the archive has no {n}")))?;
             Ok(v)
         };
-        Ok((pick("thurm")?, pick("thurmd")?))
+        let tailnet = dir
+            .join(TAILNET_HELPER)
+            .is_file()
+            .then(|| pick(TAILNET_HELPER))
+            .transpose()?;
+        Ok((pick("thurm")?, pick("thurmd")?, tailnet))
     })();
     let _ = std::fs::remove_dir_all(&dir);
     result
@@ -664,8 +684,18 @@ mod tests {
             .args(["thurm", "thurmd"])
             .output()
             .unwrap();
-        let (t, d) = unpack(&out.stdout).unwrap();
+        let (t, d, h) = unpack(&out.stdout).unwrap();
         assert_eq!((t.as_slice(), d.as_slice()), (&b"cli"[..], &b"daemon"[..]));
+        assert!(h.is_none(), "an archive from before the Tailscale helper");
+        std::fs::write(dir.join(TAILNET_HELPER), b"helper").unwrap();
+        let out = std::process::Command::new("tar")
+            .args(["-czf", "-", "-C"])
+            .arg(&dir)
+            .args(["thurm", "thurmd", TAILNET_HELPER])
+            .output()
+            .unwrap();
+        let (_, _, h) = unpack(&out.stdout).unwrap();
+        assert_eq!(h.as_deref(), Some(&b"helper"[..]));
         assert!(unpack(b"not an archive").is_err());
         let _ = std::fs::remove_dir_all(dir);
         assert_eq!(

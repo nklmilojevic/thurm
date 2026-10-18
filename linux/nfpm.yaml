@@ -54,6 +54,10 @@ contents:
     dst: /usr/bin/thurmd
     expand: true
     file_info: { mode: 0755 }
+  - src: ${THURM_MUSL_DIR}/thurm-tailnet
+    dst: /usr/bin/thurm-tailnet
+    expand: true
+    file_info: { mode: 0755 }
   - src: linux/rs.thurm.Thurm.desktop
     dst: /usr/share/applications/rs.thurm.Thurm.desktop
   - src: linux/rs.thurm.Thurm.png
