@@ -14,7 +14,7 @@ to it from your computer.
 The app requires **Apple silicon and macOS 14 or later**.
 Remote sessions can run on Linux x86_64, Linux aarch64, or another Apple silicon Mac.
 
-![Thurm with tabs grouped by repository in the sidebar, Claude Code working in the left pane, and lazygit and cargo test output on the right](docs/public/screenshots/hero.webp)
+![Thurm with tabs grouped by repository in the sidebar and three agents in its Agents list, one waiting for an answer; Claude Code works in the left pane, lazygit shows a diff and cargo test passes on the right](docs/public/screenshots/hero.webp)
 
 ## Why Thurm?
 
@@ -70,7 +70,7 @@ For a shell you can reach from another app, use **Window > Quick Terminal**.
 You can assign a global shortcut and choose its screen, position, and size.
 Its shell keeps running while the quick terminal is hidden.
 
-![The workspace switcher listing three workspaces with their tab counts](docs/public/screenshots/workspaces-crop.webp)
+![The workspace switcher listing two workspaces with their tab counts](docs/public/screenshots/workspace-switcher.webp)
 
 ### Coding agent controls
 
@@ -79,12 +79,14 @@ Use the agent switcher to return to an agent, or launch an installed agent from
 a preset. Built-in definitions include Claude Code, Codex, Gemini CLI, Aider,
 OpenCode, and others. You can add your own definitions and presets.
 
+![Claude Code stopped to ask which of three approaches to take, with a dev server in the split beside it; the sidebar marks its tab as waiting](docs/public/screenshots/needs-input.webp)
+
 Claude Code and Codex hooks report turn completion and session IDs. They support
 completion notifications, session titles, and commands that wait for a turn to
 finish. With a known session ID and a supported agent, you can fork a conversation
 into another tab or split.
 
-![The agent switcher listing a Codex session and a Claude Code session, with presets to launch either](docs/public/screenshots/agents-crop.webp)
+![The agent switcher listing a Claude Code session waiting for an answer, an idle Codex session and another Claude Code session, with presets to launch more](docs/public/screenshots/agent-switcher.webp)
 
 Agent notifications apply to panes without focus. Claude Code permission
 notifications also have **Approve** and **Deny** buttons for the active request.
@@ -134,7 +136,7 @@ libghostty-vt maintains terminal state.
 
 ![Pressing Tab after kubectl shows a completion menu of subcommands with descriptions](docs/public/screenshots/complete-kubectl.webp)
 
-![fastfetch drawing the Thurm icon inline with the kitty graphics protocol](docs/public/screenshots/graphics.webp)
+![fastfetch drawing the Thurm app icon inline with the kitty graphics protocol](docs/public/screenshots/graphics.webp)
 
 ### Optional on-device AI
 
@@ -198,7 +200,7 @@ thurm capture --pane "$pane" -n 20
 other pane IDs and `thurm --json list` for structured output. A wait timeout returns
 exit code 124. Waiting for a shell prompt requires shell integration.
 
-![A split tab where the left pane runs thurm split, send, wait, and capture to drive a build in the right pane](docs/public/screenshots/cli.webp)
+![A split tab where the left pane runs thurm split, send, wait, capture, and agents to drive a build in the right pane](docs/public/screenshots/cli.webp)
 
 ### Launch and inspect an agent
 
