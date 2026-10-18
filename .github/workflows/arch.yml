@@ -11,7 +11,6 @@ on:
       - scripts/linux/**
       - scripts/third-party-licenses.py
       - crates/**
-      - vendor/**
       - shell-integration/**
       - skills/**
       - macos/Resources/fonts/**
@@ -46,20 +45,21 @@ jobs:
             gtk4 libadwaita fontconfig hicolor-icon-theme
           useradd -m builder
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # The ghostty checkout and Zig's build cache, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR,
-      # see vendor/libghostty-vt-sys/build.rs). Shared with the other Arch job; saved from main only.
+      # The package builds libghostty-vt from source (AUR packages build from source): the ghostty
+      # checkout and Zig's caches, kept across runs (GHOSTTY_VT_RS_SYS_CACHE_DIR of ghostty-vt-rs-sys).
+      # Shared with the other Arch job; saved from main only.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: libghostty
         with:
           path: /var/cache/libghostty-vt
-          key: libghostty-vt-arch-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
+          key: libghostty-vt-arch-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: makepkg
         run: |
           mkdir -p /var/cache/libghostty-vt
           chown -R builder "$GITHUB_WORKSPACE" /var/cache/libghostty-vt
           # makepkg refuses to run as root.
           sudo -u builder git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          sudo -u builder env LIBGHOSTTY_VT_SYS_CACHE_DIR=/var/cache/libghostty-vt \
+          sudo -u builder env GHOSTTY_VT_RS_SYS_CACHE_DIR=/var/cache/libghostty-vt \
             ZIG_GLOBAL_CACHE_DIR=/var/cache/libghostty-vt/zig-global \
             scripts/linux/arch-package.sh /tmp/arch
       - name: Install

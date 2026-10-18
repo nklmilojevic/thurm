@@ -4,7 +4,7 @@
 
 use std::ptr;
 
-use libghostty_vt_sys as ffi;
+use ghostty_vt_rs_sys as ffi;
 use thurm_proto::{Key, KeyAction, KeyEvent, MouseButton, MouseEvent, MouseKind, NamedKey, mods};
 
 use crate::vt::Vt;

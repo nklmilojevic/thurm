@@ -17,7 +17,6 @@ sidebar:
 | `crates/thurm-ffi/` | C interface for the Swift app |
 | `crates/thurm-cli/` | Command-line interface |
 | `shell-integration/` | zsh, bash, and fish integration |
-| `vendor/libghostty-vt-sys/` | Bindings and build code for pinned Ghostty source |
 
 The app connects to the daemon over a Unix socket. The daemon owns terminal
 processes and state. The Swift app reads screen grids through the Rust FFI and
@@ -28,7 +27,7 @@ for app builds, rendering, signing, notarization, and release setup.
 
 ## Project checks
 
-With Zig 0.16.0 on `PATH`, run from the repository root:
+Run from the repository root:
 
 ```sh
 cargo test --workspace

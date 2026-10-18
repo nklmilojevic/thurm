@@ -138,22 +138,6 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: release-${{ matrix.target }}
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
-      # The ghostty checkout and Zig's caches, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR, see
-      # vendor/libghostty-vt-sys/build.rs): an unchanged libghostty-vt then builds in seconds.
-      # Saved from main only; pull requests and tagged releases restore main's.
-      - name: libghostty-vt cache directory
-        run: |
-          echo "LIBGHOSTTY_VT_SYS_CACHE_DIR=$HOME/.cache/libghostty-vt" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/libghostty-vt/zig-global" >> "$GITHUB_ENV"
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: libghostty
-        with:
-          path: ~/.cache/libghostty-vt
-          key: libghostty-vt-release-linux-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       # thurm-tailnet, the Tailscale helper thurmd runs beside itself.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -207,11 +191,6 @@ jobs:
           name: linux-${{ matrix.target }}
           path: ${{ runner.temp }}/linux/*
           retention-days: 3
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
-        with:
-          path: ~/.cache/libghostty-vt
-          key: ${{ steps.libghostty.outputs.cache-primary-key }}
 
   arch:
     # The Arch Linux package (linux/arch/PKGBUILD, as on the AUR), built from this commit in an
@@ -237,13 +216,14 @@ jobs:
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || needs.plan.outputs.sha }}
           fetch-depth: 0 # the tip version has the commit count
-      # The ghostty checkout and Zig's build cache, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR,
-      # see vendor/libghostty-vt-sys/build.rs). Shared with the other Arch job; saved from main only.
+      # The package builds libghostty-vt from source (AUR packages build from source): the ghostty
+      # checkout and Zig's caches, kept across runs (GHOSTTY_VT_RS_SYS_CACHE_DIR of ghostty-vt-rs-sys).
+      # Shared with the other Arch job; saved from main only.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: libghostty
         with:
           path: /var/cache/libghostty-vt
-          key: libghostty-vt-arch-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
+          key: libghostty-vt-arch-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: makepkg
         run: |
           set -euo pipefail
@@ -258,7 +238,7 @@ jobs:
           chown -R builder "$GITHUB_WORKSPACE" /var/cache/libghostty-vt
           # makepkg refuses to run as root.
           sudo -u builder git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          sudo -u builder env PKGVER="$PKGVER" LIBGHOSTTY_VT_SYS_CACHE_DIR=/var/cache/libghostty-vt \
+          sudo -u builder env PKGVER="$PKGVER" GHOSTTY_VT_RS_SYS_CACHE_DIR=/var/cache/libghostty-vt \
             ZIG_GLOBAL_CACHE_DIR=/var/cache/libghostty-vt/zig-global \
             scripts/linux/arch-package.sh /tmp/arch
       - name: Install
@@ -385,22 +365,6 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: release
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
-      # The ghostty checkout and Zig's caches, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR, see
-      # vendor/libghostty-vt-sys/build.rs): an unchanged libghostty-vt then builds in seconds.
-      # Saved from main only; pull requests and tagged releases restore main's.
-      - name: libghostty-vt cache directory
-        run: |
-          echo "LIBGHOSTTY_VT_SYS_CACHE_DIR=$HOME/.cache/libghostty-vt" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/libghostty-vt/zig-global" >> "$GITHUB_ENV"
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: libghostty
-        with:
-          path: ~/.cache/libghostty-vt
-          key: libghostty-vt-release-macos-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       # thurm-tailnet, the Tailscale helper bundled next to thurmd.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -558,8 +522,3 @@ jobs:
         run: |
           macos/release/ci-keychain.sh delete "$RUNNER_TEMP/thurm-signing.keychain-db"
           rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/sparkle-ed25519"
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
-        with:
-          path: ~/.cache/libghostty-vt
-          key: ${{ steps.libghostty.outputs.cache-primary-key }}

@@ -51,7 +51,7 @@ Replace `1` with the target ID from `thurm list`.
 
 ## Build fails
 
-Check `xcodebuild -version`, `rustc --version`, and `zig version` against the
+Check `xcodebuild -version` and `rustc --version` against the
 [requirements](/install/). Use `nix develop` for the repository toolchain.
 The initial build needs network access. Run `./macos/build.sh` from the repository
 root to build the Rust libraries, Swift app, and full app bundle together.

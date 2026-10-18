@@ -58,7 +58,7 @@ jobs:
             fi >> "$GITHUB_OUTPUT"
           }
           # Everything the crates build, embed or test with, and this workflow.
-          rust='crates/|vendor/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|shell-integration/|completions/|skills/|licenses/|config\.example\.toml$|macos/Resources/fonts/|scripts/third-party-licenses\.py$|scripts/linux/smoke|\.github/workflows/ci\.yml$'
+          rust='crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|shell-integration/|completions/|skills/|licenses/|config\.example\.toml$|macos/Resources/fonts/|scripts/third-party-licenses\.py$|scripts/linux/smoke|\.github/workflows/ci\.yml$'
           area rust "^($rust)"
           # The Linux app also reads the icons and data in linux/ when run from the checkout.
           area linux-app "^($rust|linux/(share|icons)/)"
@@ -84,23 +84,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # libghostty-vt (the terminal engine) is built from source with Zig.
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
-      # The ghostty checkout and Zig's caches, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR, see
-      # vendor/libghostty-vt-sys/build.rs): an unchanged libghostty-vt then builds in seconds.
-      # Saved from main only; pull requests and tagged releases restore main's.
-      - name: libghostty-vt cache directory
-        run: |
-          echo "LIBGHOSTTY_VT_SYS_CACHE_DIR=$HOME/.cache/libghostty-vt" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/libghostty-vt/zig-global" >> "$GITHUB_ENV"
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: libghostty
-        with:
-          path: ~/.cache/libghostty-vt
-          key: libghostty-vt-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       # thurm-mosh's and thurm-direct's tests talk to a real mosh-server (skipped without one).
       - name: Install mosh
         run: brew install mosh
@@ -115,11 +98,6 @@ jobs:
         run: python3 scripts/third-party-licenses.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
-        with:
-          path: ~/.cache/libghostty-vt
-          key: ${{ steps.libghostty.outputs.cache-primary-key }}
 
   linux:
     # Remote hosts run the static musl builds of thurm and thurmd (remote workspaces).
@@ -145,23 +123,6 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: ${{ matrix.target }}
-      # libghostty-vt is cross-built for musl with Zig.
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
-      # The ghostty checkout and Zig's caches, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR, see
-      # vendor/libghostty-vt-sys/build.rs): an unchanged libghostty-vt then builds in seconds.
-      # Saved from main only; pull requests and tagged releases restore main's.
-      - name: libghostty-vt cache directory
-        run: |
-          echo "LIBGHOSTTY_VT_SYS_CACHE_DIR=$HOME/.cache/libghostty-vt" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/libghostty-vt/zig-global" >> "$GITHUB_ENV"
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: libghostty
-        with:
-          path: ~/.cache/libghostty-vt
-          key: libghostty-vt-ci-linux-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       - name: musl and sshd
         run: sudo apt-get update && sudo apt-get install -y musl-tools openssh-server openssh-client
       # The shipped static binaries: main only (pull requests run the tests below).
@@ -186,11 +147,6 @@ jobs:
           THURM_REQUIRE_NETNS: "1"
           THURM_REQUIRE_SSHD: "1"
         run: cargo test --locked --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
-        with:
-          path: ~/.cache/libghostty-vt
-          key: ${{ steps.libghostty.outputs.cache-primary-key }}
 
   go:
     # The Tailscale helper (tailnet/, thurm-tailnet), with the Go version from its go.mod.
@@ -248,22 +204,6 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: linux-app
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
-      # The ghostty checkout and Zig's caches, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR, see
-      # vendor/libghostty-vt-sys/build.rs): an unchanged libghostty-vt then builds in seconds.
-      # Saved from main only; pull requests and tagged releases restore main's.
-      - name: libghostty-vt cache directory
-        run: |
-          echo "LIBGHOSTTY_VT_SYS_CACHE_DIR=$HOME/.cache/libghostty-vt" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/libghostty-vt/zig-global" >> "$GITHUB_ENV"
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: libghostty
-        with:
-          path: ~/.cache/libghostty-vt
-          key: libghostty-vt-ci-linux-app-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       - name: GTK and the headless display
         run: |
           sudo apt-get update
@@ -282,29 +222,36 @@ jobs:
         with:
           name: linux-app-smoke-${{ matrix.runner }}
           path: smoke
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
-        with:
-          path: ~/.cache/libghostty-vt
-          key: ${{ steps.libghostty.outputs.cache-primary-key }}
 
   checks:
     name: Consistency and advisories
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # The Ghostty commit is pinned twice: for cargo builds and for the Nix package.
+      # ghostty-vt-rs-sys pins the Ghostty commit (build.rs) and its prebuilt archives
+      # (prebuilt.rs). The Nix package repeats the archives it fetches (nix/ghostty-vt.nix), and
+      # the Arch package's source build fetches that commit's Zig packages (nix/ghostty-zig-deps.nix).
       - name: One Ghostty commit
         run: |
           set -euo pipefail
-          cargo_pin="$(sed -n 's/^const GHOSTTY_COMMIT: &str = "\([0-9a-f]*\)";/\1/p' vendor/libghostty-vt-sys/build.rs)"
-          nix_pin="$(sed -n 's/^ *rev = "\([0-9a-f]*\)";/\1/p' flake.nix | head -n 1)"
-          echo "build.rs: $cargo_pin"
-          echo "flake.nix: $nix_pin"
-          [[ -n "$cargo_pin" && "$cargo_pin" == "$nix_pin" ]] || {
-            echo "::error::vendor/libghostty-vt-sys/build.rs and flake.nix pin different Ghostty commits"
+          crate="$(dirname "$(cargo metadata --format-version 1 --locked |
+            jq -r '.packages[] | select(.name == "ghostty-vt-rs-sys") | .manifest_path')")"
+          commit="$(sed -n 's/^const GHOSTTY_COMMIT: &str = "\([0-9a-f]*\)";/\1/p' "$crate/build.rs")"
+          nix_commit="$(sed -n 's/^ *commit = "\([0-9a-f]*\)";/\1/p' nix/ghostty-vt.nix)"
+          zig_commit="$(sed -n '1s/.*build\.zig\.zon\.nix at \([0-9a-f]*\) .*/\1/p' nix/ghostty-zig-deps.nix)"
+          echo "ghostty-vt-rs-sys: $commit"
+          echo "nix/ghostty-vt.nix: $nix_commit"
+          echo "nix/ghostty-zig-deps.nix: $zig_commit"
+          [[ -n "$commit" && "$commit" == "$nix_commit" && "$commit" == "$zig_commit" ]] || {
+            echo "::error::nix/ghostty-vt.nix or nix/ghostty-zig-deps.nix is not at ghostty-vt-rs-sys's Ghostty commit"
             exit 1
           }
+          awk -F'"' '/triple = / { t = $2 } /sha256 = / { print t, $2 }' nix/ghostty-vt.nix | while read -r triple sum; do
+            grep -qF "(\"$triple\", \"$sum\")" "$crate/prebuilt.rs" || {
+              echo "::error::nix/ghostty-vt.nix: $triple's sha256 is not ghostty-vt-rs-sys's"
+              exit 1
+            }
+          done
       # The Rust version is pinned in rust-toolchain.toml and repeated in every workflow. A
       # dtolnay/rust-toolchain step without a toolchain input gets its ref's default, stable.
       - name: One Rust toolchain

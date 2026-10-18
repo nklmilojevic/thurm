@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-libghostty-vt-sys.workspace = true
+ghostty-vt-rs-sys.workspace = true
 bitflags.workspace = true
 memchr.workspace = true
 thurm-proto.workspace = true
