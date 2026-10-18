@@ -132,10 +132,30 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
+            home: true
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+            home: false
+    # Pushes to main run x86_64 on the self-hosted runner (home-x64, container jobs only); pull
+    # requests never run there.
+    runs-on: ${{ github.event_name != 'pull_request' && matrix.home && 'home-x64' || matrix.runner }}
+    # The same container on every runner, so the caches main saves are the ones pull requests
+    # restore. Privileged on the hosted runners for the network namespace test; the self-hosted
+    # runner can't be, and skips it.
+    container:
+      image: ubuntu:24.04
+      options: ${{ (github.event_name == 'pull_request' || !matrix.home) && '--privileged' || '' }}
     steps:
+      # git first: the checkout must be a repository.
+      - name: Build dependencies, musl and sshd
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
+            xz-utils zstd file python3 musl-tools openssh-server openssh-client
+          # sshd's privilege separation directory, which its service makes on a host.
+          mkdir -p /run/sshd
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -161,9 +181,7 @@ jobs:
         id: libghostty
         with:
           path: ~/.cache/libghostty-vt
-          key: libghostty-vt-ci-linux-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
-      - name: musl and sshd
-        run: sudo apt-get update && sudo apt-get install -y musl-tools openssh-server openssh-client
+          key: libghostty-vt-ci-linux-ubuntu-24.04-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       # The shipped static binaries: main only (pull requests run the tests below).
       - name: Build
         if: github.event_name == 'push'
@@ -175,17 +193,16 @@ jobs:
             file "target/${{ matrix.target }}/release/$b"
             file "target/${{ matrix.target }}/release/$b" | grep -Eq 'statically linked|static-pie linked'
           done
-      # Ubuntu's AppArmor blocks unprivileged user namespaces; the port lookup is tested with
-      # a listener in its own network namespace.
-      - name: Allow user namespaces
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      # The daemon and terminal suites, and the remote ones (loopback ssh, handoffs). Here the
-      # network namespace and sshd are there, so the tests needing them must not skip.
+      # The daemon and terminal suites, and the remote ones (loopback ssh, handoffs). Here sshd
+      # is there, and so is the network namespace in a privileged container, so the tests
+      # needing them must not skip.
       - name: Test
         env:
-          THURM_REQUIRE_NETNS: "1"
           THURM_REQUIRE_SSHD: "1"
-        run: cargo test --locked --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
+          REQUIRE_NETNS: ${{ (github.event_name == 'pull_request' || !matrix.home) && '1' || '' }}
+        run: |
+          if [[ -n "$REQUIRE_NETNS" ]]; then export THURM_REQUIRE_NETNS=1; fi
+          cargo test --locked --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
         with:
@@ -237,8 +254,21 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
+    # Pushes to main run x86_64 on the self-hosted runner (home-x64, container jobs only); pull
+    # requests never run there. The same container on every runner, so the caches main saves
+    # are the ones pull requests restore.
+    runs-on: ${{ github.event_name != 'pull_request' && matrix.runner == 'ubuntu-24.04' && 'home-x64' || matrix.runner }}
+    container: ubuntu:24.04
     steps:
+      # git first: the checkout must be a repository.
+      - name: GTK and the headless display
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
+            xz-utils zstd pkg-config libgtk-4-dev libadwaita-1-dev fonts-dejavu-core \
+            xvfb xdotool imagemagick dbus-x11
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -263,12 +293,7 @@ jobs:
         id: libghostty
         with:
           path: ~/.cache/libghostty-vt
-          key: libghostty-vt-ci-linux-app-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
-      - name: GTK and the headless display
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev fonts-dejavu-core \
-            xvfb xdotool imagemagick dbus-x11
+          key: libghostty-vt-ci-linux-app-ubuntu-24.04-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       - name: Test
         run: cargo test --locked -p thurm-gtk
       - name: Clippy
