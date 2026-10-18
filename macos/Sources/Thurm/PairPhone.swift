@@ -88,16 +88,20 @@ enum PhonePairing {
                       error: jsonString(d["error"]))
         }
 
-        /// Checked, and something the phone can connect to and trust.
+        /// The phone can use ssh to it: host keys, and an address to connect to.
+        var phoneSSH: Bool { hasSSH && !address.trimmingCharacters(in: .whitespaces).isEmpty }
+
+        /// Checked, and something the phone can connect to and trust: over Tailscale, the ssh
+        /// address may be empty.
         var inCode: Bool {
-            included && usable && !address.trimmingCharacters(in: .whitespaces).isEmpty
+            included && (phoneSSH || !(tailnet ?? "").isEmpty)
         }
 
         /// Its entry in the code (`PairedHost` in the iOS app). An app that knows `tailnet`
         /// connects there first, and over ssh when it has host keys.
         var payload: [String: Any] {
             var d: [String: Any] = ["name": name, "host": address.trimmingCharacters(in: .whitespaces),
-                                    "port": port, "user": user, "host_keys": hasSSH ? hostKeys : []]
+                                    "port": port, "user": user, "host_keys": phoneSSH ? hostKeys : []]
             if let socket { d["socket"] = socket }
             if let tailnet, !tailnet.isEmpty { d["tailnet"] = ["url": tailnet] }
             return d
@@ -112,7 +116,7 @@ enum PhonePairing {
     /// The ones Add Device Key authorizes the phone on: in the code, with ssh for the phone to use.
     /// A host left out of the code, or reached only over Tailscale, never gets its key.
     static func keyHosts(_ remotes: [RemoteHost]) -> [RemoteHost] {
-        inCode(remotes).filter(\.hasSSH)
+        inCode(remotes).filter(\.phoneSSH)
     }
 
     /// The Tailscale address in a daemon's answer to `TailscaleStatus`: nil for an error (a daemon

@@ -258,6 +258,21 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertNotNil(r["tailnet"])
         XCTAssertTrue(PhonePairing.keyHosts([bastion]).isEmpty, "no ssh there for the phone's key")
 
+        var noAddress = bastion
+        noAddress.address = "  "
+        XCTAssertTrue(noAddress.inCode, "the phone needs no ssh address over Tailscale")
+        var both = PhonePairing.RemoteHost(name: "devbox", address: "devbox", user: "me", hostKeys: ["SHA256:dev"])
+        both.setTailnet("wss://devbox.tail1234.ts.net/v1/connect")
+        both.address = ""
+        let blank = PhonePairing.payload(name: "studio", host: "studio", port: 22, user: "me",
+                                         hostKeys: ["SHA256:abc"], relay: nil, code: nil, remotes: [noAddress, both])
+        let entries = try XCTUnwrap(try decode(blank)["remotes"] as? [[String: Any]])
+        XCTAssertEqual(entries.compactMap { $0["name"] as? String }, ["bastion", "devbox"])
+        XCTAssertEqual(entries[1]["host"] as? String, "")
+        XCTAssertEqual(entries[1]["host_keys"] as? [String], [], "no ssh fallback without an address")
+        XCTAssertNotNil(entries[1]["tailnet"])
+        XCTAssertTrue(PhonePairing.keyHosts([noAddress, both]).isEmpty)
+
         var unchecked = bastion
         unchecked.included = false
         unchecked.setTailnet("wss://bastion.tail1234.ts.net/v1/connect")
