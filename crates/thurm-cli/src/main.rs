@@ -4,12 +4,13 @@
 //! (`$THURM_PANE_ID`), prints plain text, supports `--json`, and uses exit codes
 //! (0 ok, 1 error, 124 wait timeout).
 
-mod events;
-mod layouts;
-mod attach;
 mod agent;
 mod agent_prompt;
+mod attach;
+mod events;
 mod hook_pgrp;
+mod layouts;
+mod pair;
 mod remote;
 mod tailscale;
 
@@ -350,6 +351,17 @@ enum Cmd {
         #[command(subcommand)]
         action: tailscale::TailscaleCmd,
     },
+    /// Pair the phone with this host directly: a QR code (and link) for the Thurm app, with this
+    /// daemon's Tailscale address. Needs `thurm tailscale on`; the phone connects over Tailscale,
+    /// signed in to the same account.
+    Pair {
+        /// The name the phone shows (default: the daemon's name on the tailnet).
+        #[arg(long)]
+        name: Option<String>,
+        /// Print only the link, no QR code.
+        #[arg(long)]
+        link: bool,
+    },
     /// Show who the daemon sees on this connection.
     Whoami,
     /// Print the config file path.
@@ -565,6 +577,7 @@ fn run(cli: Cli) -> R {
                 | Cmd::AgentHook { .. }
                 | Cmd::Hooks { .. }
                 | Cmd::Remote { .. }
+                | Cmd::Pair { .. }
                 | Cmd::Theme { .. }
                 | Cmd::Set { .. }
                 | Cmd::Reload
@@ -936,7 +949,10 @@ fn systemd_unit_path() -> std::path::PathBuf {
 
 /// A user unit that starts `thurmd` at login, in the foreground. Not restarted, so
 /// `thurm daemon stop` stops it until the next login (like the macOS LaunchAgent).
-fn systemd_unit(daemon: &std::path::Path, socket: Option<&std::path::Path>) -> Result<String, String> {
+fn systemd_unit(
+    daemon: &std::path::Path,
+    socket: Option<&std::path::Path>,
+) -> Result<String, String> {
     let mut exec = format!("{} --foreground", systemd_quote(daemon)?);
     if let Some(s) = socket {
         exec.push_str(&format!(" --socket {}", systemd_quote(s)?));
@@ -955,7 +971,9 @@ fn systemd_quote(path: &std::path::Path) -> Result<String, String> {
         .to_str()
         .ok_or_else(|| format!("{path:?}: a systemd unit needs a UTF-8 path"))?;
     if s.chars().any(char::is_control) {
-        return Err(format!("{path:?}: control characters cannot go in a systemd unit"));
+        return Err(format!(
+            "{path:?}: control characters cannot go in a systemd unit"
+        ));
     }
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -1456,6 +1474,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
         Cmd::Layout { action } => return layouts::run(c, action),
         Cmd::Tailscale { action } => return tailscale::run(c, action, json),
         Cmd::Whoami => return tailscale::whoami(c, json),
+        Cmd::Pair { name, link } => return pair::run(c, name, link, json),
         Cmd::Reload => {
             c.request(Request::ReloadConfig)?;
             println!("configuration reloaded");
@@ -1510,7 +1529,8 @@ fn ui(c: &Client, cmd: UiCommand) {
         .status()
         .is_ok_and(|s| s.success());
     #[cfg(target_os = "linux")]
-    let launched = (std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some())
+    let launched = (std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("DISPLAY").is_some())
         && std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|d| d.join("thurm-gtk")))
@@ -1700,9 +1720,11 @@ mod tests {
             "ExecStart=\"/opt/My Apps/thurm \\\"x\\\"/thurmd\" --foreground \
              --socket \"/run/a b/100%%$$HOME\\\\.sock\"\n"
         ));
-        assert!(systemd_unit(std::path::Path::new("/usr/bin/thurmd"), None)
-            .unwrap()
-            .contains("ExecStart=\"/usr/bin/thurmd\" --foreground\n"));
+        assert!(
+            systemd_unit(std::path::Path::new("/usr/bin/thurmd"), None)
+                .unwrap()
+                .contains("ExecStart=\"/usr/bin/thurmd\" --foreground\n")
+        );
         let injected = std::path::Path::new("/tmp/x\nExecStartPre=/bin/evil");
         assert!(systemd_unit(daemon, Some(injected)).is_err());
         #[cfg(unix)]
@@ -1766,7 +1788,9 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["thurm", "wait", "--agent-free", "-t", "30"]).is_ok());
         assert!(matches!(
-            Cli::try_parse_from(["thurm", "equalize", "-p", "3"]).unwrap().cmd,
+            Cli::try_parse_from(["thurm", "equalize", "-p", "3"])
+                .unwrap()
+                .cmd,
             Cmd::Equalize { pane: Some(3) }
         ));
         let c = Cli::try_parse_from(["thurm", "--remote", "devbox", "agents"]).unwrap();
