@@ -1040,7 +1040,7 @@ mod tests {
                 }
                 let _ = posted.send(());
                 let _ = wait.recv();
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             }
         });
         let p = Pusher::new(&dir, true);
@@ -1094,7 +1094,7 @@ mod tests {
                 }
                 let _ = posted.send(());
                 let _ = wait.recv();
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             }
         });
         let p = Pusher::new(&dir, true);
@@ -1275,7 +1275,7 @@ mod tests {
                     line.clear();
                 }
                 let _ = stream.write_all(
-                    b"HTTP/1.1 404 Not Found\r\nX-Thurm-Device: unknown\r\nContent-Length: 0\r\n\r\n",
+                    b"HTTP/1.1 404 Not Found\r\nX-Thurm-Device: unknown\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
             }
         });
@@ -1332,7 +1332,7 @@ mod tests {
                 while reader.read_line(&mut line).unwrap_or(0) > 2 {
                     line.clear();
                 }
-                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 let _ = answered.send(());
             }
         });
@@ -1416,7 +1416,7 @@ mod tests {
                 }
                 let mut body = vec![0; len];
                 let _ = reader.read_exact(&mut body);
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
             }
         });

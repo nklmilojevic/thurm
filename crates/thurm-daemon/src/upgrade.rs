@@ -529,11 +529,22 @@ mod tests {
         let json = serde_json::to_vec(&sample()).unwrap();
         write_private(&path, &seal(&key, &json).unwrap()).unwrap();
         let fd = key_pipe(&key).unwrap();
+        let pipe = inode(fd).unwrap();
         let h = load(&path, Some(fd)).unwrap();
         assert_eq!(h.next_pane_id, 2);
-        // The file is gone and the pipe closed.
+        // The file is gone and the pipe closed: its fd is gone, or (tests running alongside
+        // may take the number at once) now names something else.
         assert!(!path.exists());
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_ne!(inode(fd), Some(pipe));
+    }
+
+    /// What `fd` refers to (device and inode), when it is open.
+    fn inode(fd: RawFd) -> Option<(u64, u64)> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return None;
+        }
+        Some((st.st_dev as u64, st.st_ino as u64))
     }
 
     #[test]
