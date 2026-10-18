@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Writes THIRD_PARTY_LICENSES: the license texts of everything compiled into or shipped with
-Thurm (the macOS and Linux apps, thurmd and thurm, and the Linux tarballs and packages). Not committed: macos/build.sh and
-the release workflow generate it at build time, so dependency updates never leave it stale.
+Thurm (the macOS app, thurmd and thurm, and the Linux tarballs). Not committed: macos/build.sh
+and the release workflow generate it at build time, so dependency updates never leave it stale.
 
 Crates come from `cargo metadata` (the normal dependencies of thurm-ffi, thurm-daemon and
 thurm-cli on the shipped targets) and their own license files. Identical texts are printed
@@ -27,7 +27,7 @@ TARGETS = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
 ]
-ROOTS = {"thurm-ffi", "thurm-daemon", "thurm-cli", "thurm-gtk"}
+ROOTS = {"thurm-ffi", "thurm-daemon", "thurm-cli"}
 LICENSE_FILE = re.compile(r"^(licen[cs]e|copying|notice|unlicense)([-_.].*)?$", re.IGNORECASE)
 
 # Not crates: (component, where it is used, license files relative to the repo).
@@ -35,14 +35,12 @@ EXTRA = [
     ("Ghostty (libghostty-vt)", "terminal emulation, linked into the app, thurmd and thurm",
      ["licenses/ghostty-MIT.txt"]),
     ("Sparkle", "software updates, macOS app", ["licenses/sparkle.txt"]),
-    ("LobeHub Icons", "OpenAI mark for Codex panes, macOS and Linux apps", ["licenses/lobehub-icons-MIT.txt"]),
+    ("LobeHub Icons", "OpenAI mark for Codex panes, macOS app", ["licenses/lobehub-icons-MIT.txt"]),
     ("iTerm2-Color-Schemes", "built-in color themes", ["crates/thurm-config/themes/LICENSE"]),
     ("tty7 and Fig autocomplete specs", "tab completion specs",
      ["completions/NOTICE", "completions/LICENSE-tty7-Apache-2.0"]),
-    ("JetBrains Mono", "bundled font, macOS and Linux apps", ["macos/Resources/fonts/JetBrainsMono-OFL.txt"]),
-    ("Symbols Nerd Font", "bundled font, macOS and Linux apps",
-     ["macos/Resources/fonts/SymbolsNerdFont-LICENSE"]),
-    ("Adwaita icon theme", "symbolic icons, Linux app", ["linux/icons/COPYING"]),
+    ("JetBrains Mono", "bundled font, macOS app", ["macos/Resources/fonts/JetBrainsMono-OFL.txt"]),
+    ("Symbols Nerd Font", "bundled font, macOS app", ["macos/Resources/fonts/SymbolsNerdFont-LICENSE"]),
 ]
 
 

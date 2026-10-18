@@ -13,7 +13,7 @@ thurm agents
 ```
 
 Use the preset name shown by `thurm presets`. Add `--split right` to launch in
-a split or `--cwd PATH` to select a working directory. Cmd+Shift+A (Linux: Ctrl+Alt+A) opens the
+a split or `--cwd PATH` to select a working directory. Cmd+Shift+A opens the
 agent switcher.
 
 Use [Agent prompts](/agent-prompts/) to submit text and wait for the same turn.

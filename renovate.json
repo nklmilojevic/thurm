@@ -30,7 +30,7 @@
       "internalChecksFilter": "strict"
     },
     {
-      "description": "The Linux builds' ubuntu container sets the oldest glibc the packages run on (Ubuntu 24.04, Debian 13). Moving it is a release decision, made by hand.",
+      "description": "The Linux builds' ubuntu container (static musl builds of thurm and thurmd) is the same image in CI and Release, so their caches match. Move both by hand, together.",
       "matchFileNames": [
         ".github/workflows/**"
       ],

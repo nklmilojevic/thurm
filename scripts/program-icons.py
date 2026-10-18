@@ -3,7 +3,7 @@
 
 Most programs show a category symbol; only a few get their own mark.
 
-The pane icon renderers (macOS and GTK) parse absolute M/L/C/Z path data only, so this
+The pane icon renderer (macOS) parses absolute M/L/C/Z path data only, so this
 rewrites Simple Icons (CC0) marks into that form: relative commands made absolute, H/V as
 lines, quadratics and arcs as cubics.
 
