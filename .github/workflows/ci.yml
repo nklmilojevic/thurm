@@ -121,7 +121,7 @@ jobs:
     # restore. Privileged on the hosted runners for the network namespace test; the self-hosted
     # runner can't be, and skips it.
     container:
-      image: ubuntu:24.04
+      image: ubuntu:26.04
       options: ${{ (github.event_name == 'pull_request' || !matrix.home) && '--privileged' || '' }}
     defaults:
       run:
@@ -221,7 +221,7 @@ jobs:
     # requests never run there. The same container on every runner, so the caches main saves
     # are the ones pull requests restore.
     runs-on: ${{ github.event_name != 'pull_request' && matrix.runner == 'ubuntu-24.04' && 'home-x64' || matrix.runner }}
-    container: ubuntu:24.04
+    container: ubuntu:26.04
     defaults:
       run:
         # A container's default shell is sh.

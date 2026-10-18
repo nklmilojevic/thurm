@@ -106,7 +106,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     # Ubuntu 24.04 on both: thurm-gtk, and so the packages, need its glibc or newer.
-    container: ubuntu:24.04
+    container: ubuntu:26.04
     defaults:
       run:
         # A container's default shell is sh.
