@@ -217,7 +217,7 @@ final class PairPhoneTests: XCTestCase {
         let remotes = try XCTUnwrap(d["remotes"] as? [[String: Any]])
         XCTAssertEqual(remotes.count, 1, "unchecked hosts, and hosts without keys or an address, are left out")
         // Add Device Key authorizes the phone on exactly the hosts in the code.
-        XCTAssertEqual(PhonePairing.inCode([devbox, unchecked, noKeys, noAddress]).map(\.name),
+        XCTAssertEqual(PhonePairing.keyHosts([devbox, unchecked, noKeys, noAddress]).map(\.name),
                        remotes.compactMap { $0["name"] as? String })
         let r = remotes[0]
         XCTAssertEqual(r["name"] as? String, "devbox")
@@ -228,6 +228,70 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertEqual(r["socket"] as? String, "/run/user/1000/thurm/thurmd.sock")
         XCTAssertEqual(Set(r.keys), ["name", "host", "port", "user", "host_keys", "socket"])
         XCTAssertEqual(d["host"] as? String, "studio.tail.ts.net", "the Mac stays the first host")
+    }
+
+    func testRemoteHostsCarryTheirTailnetAddress() throws {
+        var devbox = PhonePairing.RemoteHost(name: "devbox", address: "devbox", user: "me", hostKeys: ["SHA256:dev"])
+        devbox.setTailnet("wss://devbox.tail1234.ts.net/v1/connect")
+        let link = PhonePairing.payload(name: "studio", host: "studio", port: 22, user: "me",
+                                        hostKeys: ["SHA256:abc"], relay: nil, code: nil, remotes: [devbox])
+        let r = try XCTUnwrap((try decode(link)["remotes"] as? [[String: Any]])?.first)
+        let tailnet = try XCTUnwrap(r["tailnet"] as? [String: Any])
+        XCTAssertEqual(tailnet["url"] as? String, "wss://devbox.tail1234.ts.net/v1/connect")
+        XCTAssertEqual(r["host_keys"] as? [String], ["SHA256:dev"], "ssh stays the fallback")
+        XCTAssertEqual(PhonePairing.keyHosts([devbox]).map(\.name), ["devbox"])
+    }
+
+    func testRemoteHostsWithoutHostKeysPairOnlyOverTailscale() throws {
+        var bastion = PhonePairing.RemoteHost(name: "bastion", address: "bastion", user: "me", hostKeys: [],
+                                              error: "no known host key for bastion: connect to it from this Mac once")
+        XCTAssertFalse(bastion.inCode, "no way to trust it yet")
+        bastion.setTailnet(nil)
+        XCTAssertFalse(bastion.inCode, "an older daemon, or not serving over Tailscale")
+        bastion.setTailnet("wss://bastion.tail1234.ts.net/v1/connect")
+        XCTAssertTrue(bastion.included, "checked once it can be reached")
+        XCTAssertTrue(bastion.inCode)
+        let link = PhonePairing.payload(name: "studio", host: "studio", port: 22, user: "me",
+                                        hostKeys: ["SHA256:abc"], relay: nil, code: nil, remotes: [bastion])
+        let r = try XCTUnwrap((try decode(link)["remotes"] as? [[String: Any]])?.first)
+        XCTAssertEqual(r["host_keys"] as? [String], [])
+        XCTAssertNotNil(r["tailnet"])
+        XCTAssertTrue(PhonePairing.keyHosts([bastion]).isEmpty, "no ssh there for the phone's key")
+
+        var noAddress = bastion
+        noAddress.address = "  "
+        XCTAssertTrue(noAddress.inCode, "the phone needs no ssh address over Tailscale")
+        var both = PhonePairing.RemoteHost(name: "devbox", address: "devbox", user: "me", hostKeys: ["SHA256:dev"])
+        both.setTailnet("wss://devbox.tail1234.ts.net/v1/connect")
+        both.address = ""
+        let blank = PhonePairing.payload(name: "studio", host: "studio", port: 22, user: "me",
+                                         hostKeys: ["SHA256:abc"], relay: nil, code: nil, remotes: [noAddress, both])
+        let entries = try XCTUnwrap(try decode(blank)["remotes"] as? [[String: Any]])
+        XCTAssertEqual(entries.compactMap { $0["name"] as? String }, ["bastion", "devbox"])
+        XCTAssertEqual(entries[1]["host"] as? String, "")
+        XCTAssertEqual(entries[1]["host_keys"] as? [String], [], "no ssh fallback without an address")
+        XCTAssertNotNil(entries[1]["tailnet"])
+        XCTAssertTrue(PhonePairing.keyHosts([noAddress, both]).isEmpty)
+
+        var unchecked = bastion
+        unchecked.included = false
+        unchecked.setTailnet("wss://bastion.tail1234.ts.net/v1/connect")
+        XCTAssertFalse(unchecked.inCode, "an address arriving again keeps the user's choice")
+    }
+
+    func testRemoteTailscaleStatusGivesTheAddressOnlyWhenServing() {
+        let status: [String: Any] = [
+            "state": "running", "hostname": "bastion", "url": "wss://bastion.tail1234.ts.net/v1/connect",
+            "allow_tailnet_members": false, "tags": [] as [String], "host_urls": [] as [String],
+            "https": ["state": "ready"],
+        ]
+        XCTAssertEqual(PhonePairing.tailnetURL(statusResponse: ["TailscaleStatus": status]),
+                       "wss://bastion.tail1234.ts.net/v1/connect")
+        var off = status
+        off["state"] = "off"
+        XCTAssertNil(PhonePairing.tailnetURL(statusResponse: ["TailscaleStatus": off]))
+        XCTAssertNil(PhonePairing.tailnetURL(statusResponse: ["error": "the daemon does not know the request"]))
+        XCTAssertNil(PhonePairing.tailnetURL(statusResponse: nil))
     }
 
     func testQRCodeStaysScannableWithManyHosts() {

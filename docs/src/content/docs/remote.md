@@ -156,6 +156,12 @@ certificate. **Pair iPhone** then puts that address in the pairing code; the app
 connects there first, with ssh as the fallback. The phone needs the Tailscale
 app, signed in to the same tailnet.
 
+A remote host that serves over Tailscale goes into the code with its own
+address too: the phone connects to its daemon directly, and over ssh only when
+this Mac knows its host key. Such a host needs no host key, and no device key
+on it, when the phone reaches it over Tailscale alone. The Mac must be connected
+to the host when you open **Pair iPhone**, to ask it for the address.
+
 `thurm tailscale on` lasts until the daemon restarts. To keep it on, turn on
 **Serve over Tailscale** in Settings, or:
 

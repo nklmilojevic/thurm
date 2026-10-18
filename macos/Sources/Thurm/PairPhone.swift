@@ -31,7 +31,8 @@ enum PhonePairing {
     }
 
     /// A `[[remote]]` host for the code, as `pairing_hosts` describes it: its address, user and
-    /// port from `ssh -G`, its host keys from this Mac's known hosts.
+    /// port from `ssh -G`, its host keys from this Mac's known hosts, and its daemon's own
+    /// Tailscale address when it serves over Tailscale.
     struct RemoteHost: Identifiable, Equatable {
         var name: String
         /// Where the phone connects: `ssh -G`'s hostname until edited.
@@ -42,14 +43,16 @@ enum PhonePairing {
         var socket: String?
         /// The ProxyJump or ProxyCommand the Mac uses for it (the phone can't).
         var proxy: String?
-        /// Why it can't be in the code.
+        /// Why the phone can't use ssh to it.
         var error: String?
+        /// Its daemon over Tailscale (`wss://…/v1/connect`), from its `TailscaleStatus`.
+        var tailnet: String?
         /// Checked in the sheet.
         var included: Bool
         var id: String { name }
 
         init(name: String, address: String, port: Int = 22, user: String, hostKeys: [String],
-             socket: String? = nil, proxy: String? = nil, error: String? = nil) {
+             socket: String? = nil, proxy: String? = nil, error: String? = nil, tailnet: String? = nil) {
             self.name = name
             self.address = address
             self.port = port
@@ -58,7 +61,23 @@ enum PhonePairing {
             self.socket = socket
             self.proxy = proxy
             self.error = error
-            included = error == nil && !hostKeys.isEmpty
+            self.tailnet = tailnet
+            included = (error == nil && !hostKeys.isEmpty) || !(tailnet ?? "").isEmpty
+        }
+
+        /// The phone can trust it over ssh: the Mac knows its host keys.
+        var hasSSH: Bool { error == nil && !hostKeys.isEmpty }
+
+        /// Over ssh or Tailscale, which needs no host keys (as `PairingPayload` checks in the
+        /// iOS app).
+        var usable: Bool { hasSSH || !(tailnet ?? "").isEmpty }
+
+        /// Its daemon's Tailscale address arrived: a host the phone could not trust over ssh
+        /// becomes one it can reach, so it goes in the code.
+        mutating func setTailnet(_ url: String?) {
+            let was = usable
+            tailnet = url
+            if !was && usable { included = true }
         }
 
         init?(json: Any?) {
@@ -69,25 +88,42 @@ enum PhonePairing {
                       error: jsonString(d["error"]))
         }
 
-        /// Checked, and something the phone can connect to and trust.
+        /// The phone can use ssh to it: host keys, and an address to connect to.
+        var phoneSSH: Bool { hasSSH && !address.trimmingCharacters(in: .whitespaces).isEmpty }
+
+        /// Checked, and something the phone can connect to and trust: over Tailscale, the ssh
+        /// address may be empty.
         var inCode: Bool {
-            included && error == nil && !hostKeys.isEmpty
-                && !address.trimmingCharacters(in: .whitespaces).isEmpty
+            included && (phoneSSH || !(tailnet ?? "").isEmpty)
         }
 
-        /// Its entry in the code (`PairedHost` in the iOS app).
+        /// Its entry in the code (`PairedHost` in the iOS app). An app that knows `tailnet`
+        /// connects there first, and over ssh when it has host keys.
         var payload: [String: Any] {
             var d: [String: Any] = ["name": name, "host": address.trimmingCharacters(in: .whitespaces),
-                                    "port": port, "user": user, "host_keys": hostKeys]
+                                    "port": port, "user": user, "host_keys": phoneSSH ? hostKeys : []]
             if let socket { d["socket"] = socket }
+            if let tailnet, !tailnet.isEmpty { d["tailnet"] = ["url": tailnet] }
             return d
         }
     }
 
-    /// The remote hosts the code carries, and so the ones Add Device Key authorizes the phone on:
-    /// a host left out of the code never gets its key.
+    /// The remote hosts the code carries.
     static func inCode(_ remotes: [RemoteHost]) -> [RemoteHost] {
         remotes.filter(\.inCode)
+    }
+
+    /// The ones Add Device Key authorizes the phone on: in the code, with ssh for the phone to use.
+    /// A host left out of the code, or reached only over Tailscale, never gets its key.
+    static func keyHosts(_ remotes: [RemoteHost]) -> [RemoteHost] {
+        inCode(remotes).filter(\.phoneSSH)
+    }
+
+    /// The Tailscale address in a daemon's answer to `TailscaleStatus`: nil for an error (a daemon
+    /// from before Tailscale), no answer, or a node not yet serving HTTPS.
+    static func tailnetURL(statusResponse resp: Any?) -> String? {
+        guard let v = JSON.variant(resp), v.name == "TailscaleStatus" else { return nil }
+        return TailscaleStatus(json: v.payload)?.pairingURL
     }
 
     /// Whether there is a code to show: the phone needs this Mac's ssh address and host keys, or
@@ -251,7 +287,7 @@ enum PhonePairing {
         return local.hasSuffix(".local") ? local : local + ".local"
     }
 
-    /// Each remote host adds about 150 bytes: "M" keeps the code readable up to about six,
+    /// Each remote host adds about 150 bytes (60 more with a Tailscale address): "M" keeps the code readable up to about six,
     /// "L" beyond keeps it from getting too dense to scan.
     static func correctionLevel(remotes: Int) -> String {
         remotes > 6 ? "L" : "M"
@@ -417,22 +453,22 @@ struct PairPhoneSheet: View {
                                 Text(h.name).frame(width: 110, alignment: .leading).lineLimit(1)
                             }
                             .toggleStyle(.checkbox)
-                            .disabled(h.error != nil)
+                            .disabled(!h.usable)
                             TextField("Address", text: $h.address)
                                 .frame(width: 210)
-                                .disabled(!h.included || h.error != nil)
+                                .disabled(!h.included || !h.usable)
                             Text(h.port == 22 ? h.user : "\(h.user) · port \(h.port)")
                                 .foregroundStyle(.secondary).lineLimit(1)
                             Spacer()
                             Text(state(of: h)).font(.caption)
-                                .foregroundStyle(h.error == nil ? Color.secondary : Color.orange)
+                                .foregroundStyle(h.usable ? Color.secondary : Color.orange)
                                 .lineLimit(2)
                         }
-                        if h.included, h.error == nil, let proxy = h.proxy {
+                        if h.included, h.hasSSH, let proxy = h.proxy {
                             Text("This Mac reaches it through \(proxy), which the phone can't use: enter an address the phone reaches directly.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
-                        if h.included, h.error == nil, let hint = daemonHint(h.name) {
+                        if h.included, h.usable, let hint = daemonHint(h.name) {
                             Text(hint).font(.caption).foregroundStyle(.secondary)
                         }
                     }
@@ -442,6 +478,9 @@ struct PairPhoneSheet: View {
     }
 
     private func state(of h: PhonePairing.RemoteHost) -> String {
+        if h.tailnet != nil {
+            return h.hasSSH ? "Over Tailscale, ssh as the fallback" : "Over Tailscale"
+        }
         if let error = h.error {
             return error.hasPrefix("no known host key") ? "Connect to it from this Mac once" : error
         }
@@ -466,7 +505,20 @@ struct PairPhoneSheet: View {
                 remoteHosts = list
                 loadingHosts = false
                 for h in list where h.error == nil { loadDevices(on: h.name) }
+                for h in list where Remotes.shared.statuses[h.name]?.phase == "connected" {
+                    loadTailnet(on: h.name)
+                }
             }
+        }
+    }
+
+    /// Asks the host's daemon, through the Mac's tunnel to it, whether it serves over Tailscale.
+    private func loadTailnet(on name: String) {
+        Core.shared.requestAsync(object: "TailscaleStatus", host: name, timeout: 10) { resp in
+            guard let url = PhonePairing.tailnetURL(statusResponse: resp),
+                  let i = remoteHosts.firstIndex(where: { $0.name == name })
+            else { return }
+            remoteHosts[i].setTailnet(url)
         }
     }
 
@@ -551,7 +603,7 @@ struct PairPhoneSheet: View {
             return
         }
         devices = PhonePairing.devices()
-        for h in PhonePairing.inCode(remoteHosts) {
+        for h in PhonePairing.keyHosts(remoteHosts) {
             authorize(line, on: h.name)
         }
     }
