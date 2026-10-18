@@ -22,7 +22,7 @@ concurrency:
 # Every action is pinned to a commit (the tag it was taken from is in the comment).
 #
 # A pull request runs the tests of what it changes; main runs everything (Release builds from
-# commits that passed there, and builds the packages itself).
+# commits that passed there).
 jobs:
   changes:
     name: Changes
@@ -107,19 +107,14 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
-            home: true
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-            home: false
-    # Pushes to main run x86_64 on the self-hosted runner (home-x64, container jobs only); pull
-    # requests never run there.
-    runs-on: ${{ github.event_name != 'pull_request' && matrix.home && 'home-x64' || matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     # The same container on every runner, so the caches main saves are the ones pull requests
-    # restore. Privileged on the hosted runners for the network namespace test; the self-hosted
-    # runner can't be, and skips it.
+    # restore. Privileged for the network namespace test.
     container:
       image: ubuntu:24.04
-      options: ${{ (github.event_name == 'pull_request' || !matrix.home) && '--privileged' || '' }}
+      options: --privileged
     defaults:
       run:
         # A container's default shell is sh.
@@ -164,10 +159,8 @@ jobs:
       - name: Test
         env:
           THURM_REQUIRE_SSHD: "1"
-          REQUIRE_NETNS: ${{ (github.event_name == 'pull_request' || !matrix.home) && '1' || '' }}
-        run: |
-          if [[ -n "$REQUIRE_NETNS" ]]; then export THURM_REQUIRE_NETNS=1; fi
-          cargo test --locked --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
+          THURM_REQUIRE_NETNS: "1"
+        run: cargo test --locked --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
 
   go:
     # The Tailscale helper (tailnet/, thurm-tailnet), with the Go version from its go.mod.

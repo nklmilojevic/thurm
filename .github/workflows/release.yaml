@@ -97,10 +97,8 @@ jobs:
     strategy:
       matrix:
         include:
-          # The self-hosted runner (home-x64, container jobs only): this workflow never runs for
-          # a pull request.
           - target: x86_64-unknown-linux-musl
-            runner: home-x64
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
