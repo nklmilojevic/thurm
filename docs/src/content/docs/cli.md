@@ -79,6 +79,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `daemon ACTION` | Control the daemon; see [Sessions](/sessions/) |
 | `socket-path` | Print the daemon socket path |
 | `tailscale status\|on\|off\|login\|logout\|rename` | Serve the daemon over Tailscale; see [Serve over Tailscale](/remote/#serve-over-tailscale) |
+| `pair [--name NAME] [--link]` | A QR code and link that pair the phone with this host directly over Tailscale; see [Serve over Tailscale](/remote/#serve-over-tailscale) |
 | `whoami` | Show who the daemon sees on this connection |
 | `remote add\|list\|remove\|status\|install` | Manage remote hosts; see [Remote workspaces](/remote/) |
 | `remote doctor [NAME]` | Check what a host needs and offer fixes; `--fix`, `--yes` |
