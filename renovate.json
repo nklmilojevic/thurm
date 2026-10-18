@@ -28,6 +28,19 @@
       ],
       "minimumReleaseAge": "3 days",
       "internalChecksFilter": "strict"
+    },
+    {
+      "description": "The Linux builds' ubuntu container sets the oldest glibc the packages run on (Ubuntu 24.04, Debian 13). Moving it is a release decision, made by hand.",
+      "matchFileNames": [
+        ".github/workflows/**"
+      ],
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchDepNames": [
+        "ubuntu"
+      ],
+      "allowedVersions": "/^24\\.04$/"
     }
   ]
 }
