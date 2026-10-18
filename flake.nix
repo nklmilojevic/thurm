@@ -7,12 +7,21 @@
     url = "github:oxalica/rust-overlay";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  # The dependencies build in a derivation of their own (crane), which the thurm Cachix cache keeps.
+  inputs.crane.url = "github:ipetkov/crane";
+
+  # The package (and its dependencies) for every main commit, built by CI's Nix workflow.
+  nixConfig = {
+    extra-substituters = [ "https://thurm.cachix.org" ];
+    extra-trusted-public-keys = [ "thurm.cachix.org-1:WuDyAyzpnw27eEYA6LWBTKxRK7/uVuzzJk5RB6+ooKw=" ];
+  };
 
   outputs =
     {
       self,
       nixpkgs,
       rust-overlay,
+      crane,
       ...
     }:
     let
@@ -59,11 +68,7 @@
                 mkdir -p "$out"
                 tar -xzf "$src" -C "$out"
               '';
-          rust = pkgs.rust-bin.stable.${rustVersion}.minimal;
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = rust;
-            rustc = rust;
-          };
+          craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable.${rustVersion}.minimal);
           # thurm-tailnet, the Tailscale helper thurmd runs to serve over Tailscale ([tailscale]).
           # Go from tailnet/go.mod's minor version, as macos/build.sh builds it.
           tailnet = (pkgs.buildGoModule.override { go = pkgs.go_1_27; }) {
@@ -78,47 +83,53 @@
               "-w"
             ];
           };
+          common = {
+            pname = "thurm";
+            inherit version;
+            src = lib.fileset.toSource {
+              root = ./.;
+              fileset = lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./crates
+                ./shell-integration
+                ./completions
+              ];
+            };
+            strictDeps = true;
+            cargoExtraArgs = "--locked -p thurm-cli -p thurm-daemon";
+            # ghostty-vt-rs-sys is a dependency: its build script links the prebuilt archive.
+            env.GHOSTTY_VT_RS_SYS_PREBUILT_DIR = "${ghosttyVt}";
+            # The suites need PTYs and sshd; CI runs them.
+            doCheck = false;
+          };
+          # Only Cargo.toml and Cargo.lock reach it (crane replaces the sources with stubs), so it
+          # stays the same, and cached, until a dependency changes.
+          cargoArtifacts = craneLib.buildDepsOnly common;
         in
-        rustPlatform.buildRustPackage {
-          pname = "thurm";
-          inherit version;
-          src = lib.fileset.toSource {
-            root = ./.;
-            fileset = lib.fileset.unions [
-              ./Cargo.toml
-              ./Cargo.lock
-              ./crates
-              ./shell-integration
-              ./completions
-            ];
-          };
-          cargoLock.lockFile = ./Cargo.lock;
-          cargoBuildFlags = [
-            "-p"
-            "thurm-cli"
-            "-p"
-            "thurm-daemon"
-          ];
-          env = {
-            GHOSTTY_VT_RS_SYS_PREBUILT_DIR = "${ghosttyVt}";
-            # `<version>+nix.<commit>`: the app treats it as its own build of that commit.
-            THURM_BUILD = "${version}+nix.${self.shortRev or "dirty"}";
-          };
-          # thurmd looks for the helper beside its own executable.
-          postInstall = ''
-            install -Dm755 ${tailnet}/bin/thurm-tailnet $out/bin/thurm-tailnet
-          '';
-          passthru = { inherit tailnet ghosttyVt; };
-          # The suites need PTYs and sshd; CI runs them.
-          doCheck = false;
-          meta = {
-            description = "Thurm's CLI, session daemon (remote workspaces) and Tailscale helper";
-            homepage = "https://github.com/nklmilojevic/thurm";
-            license = lib.licenses.asl20;
-            mainProgram = "thurm";
-            platforms = packageSystems;
-          };
-        };
+        craneLib.buildPackage (
+          common
+          // {
+            inherit cargoArtifacts;
+            env = common.env // {
+              # `<version>+nix.<commit>`: the app treats it as its own build of that commit. Here
+              # and not in the dependencies, which would otherwise change with every commit.
+              THURM_BUILD = "${version}+nix.${self.shortRev or "dirty"}";
+            };
+            # thurmd looks for the helper beside its own executable.
+            postInstall = ''
+              install -Dm755 ${tailnet}/bin/thurm-tailnet $out/bin/thurm-tailnet
+            '';
+            passthru = { inherit tailnet ghosttyVt cargoArtifacts; };
+            meta = {
+              description = "Thurm's CLI, session daemon (remote workspaces) and Tailscale helper";
+              homepage = "https://github.com/nklmilojevic/thurm";
+              license = lib.licenses.asl20;
+              mainProgram = "thurm";
+              platforms = packageSystems;
+            };
+          }
+        );
       rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
         extensions = [
           "rust-src"

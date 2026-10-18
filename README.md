@@ -324,6 +324,16 @@ On macOS, use **Install Command-Line Tool** to get the CLI. A CLI from another
 build might not connect to the app's daemon. On a remote host, pin the flake
 input to the version of your app.
 
+Builds of `main` are in the `thurm` Cachix cache, so a Linux host can download the
+package instead of compiling it. Add the cache to your Nix configuration:
+
+```nix
+nix.settings = {
+  extra-substituters = [ "https://thurm.cachix.org" ];
+  extra-trusted-public-keys = [ "thurm.cachix.org-1:WuDyAyzpnw27eEYA6LWBTKxRK7/uVuzzJk5RB6+ooKw=" ];
+};
+```
+
 Home Manager makes the file read-only. Because of this, changes from the
 settings window, `thurm set`, `thurm theme NAME`, and `thurm remote add` fail.
 Make these changes in your Home Manager configuration.
