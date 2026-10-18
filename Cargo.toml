@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/libghostty-vt-sys"]
 
 [workspace.package]
 version = "0.7.2"
@@ -19,8 +18,8 @@ thurm-ssh = { path = "crates/thurm-ssh" }
 thurm-mosh = { path = "crates/thurm-mosh" }
 thurm-direct = { path = "crates/thurm-direct" }
 thurm-tailnet-client = { path = "crates/thurm-tailnet-client" }
-# Vendored (vendor/libghostty-vt-sys): upstream's crate, pinned to a newer Ghostty.
-libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
+# libghostty-vt (Ghostty's terminal engine): prebuilt for the shipped targets, no Zig needed.
+ghostty-vt-rs-sys = "0.1"
 bitflags = "2"
 memchr = "2"
 serde = { version = "1", features = ["derive"] }

@@ -39,15 +39,26 @@
         let
           inherit (pkgs) lib;
           version = (lib.importTOML ./Cargo.toml).workspace.package.version;
-          # libghostty-vt is built from this Ghostty commit (vendor/libghostty-vt-sys/build.rs).
-          ghostty = pkgs.fetchFromGitHub {
-            owner = "ghostty-org";
-            repo = "ghostty";
-            rev = "1e9e14af5df14211892f5fc15fd21a49c7d94868";
-            hash = "sha256-wP1vCVq/9k0fJba1t+T6fGYt4wU4qAJ6BxwUaiETWpk=";
-          };
-          # Its Zig packages, fetched ahead (the build has no network): Ghostty's own list.
-          ghosttyZigDeps = pkgs.callPackage ./nix/ghostty-zig-deps.nix { };
+          # libghostty-vt prebuilt by ghostty-vt-rs: the build has no network, so the archive is
+          # fetched (and checked) here and unpacked for its build script
+          # (GHOSTTY_VT_RS_SYS_PREBUILT_DIR). Zig is not needed.
+          ghosttyVt =
+            let
+              pin = import ./nix/ghostty-vt.nix;
+              archive = pin.targets.${pkgs.stdenv.hostPlatform.system};
+              short = builtins.substring 0 12 pin.commit;
+            in
+            pkgs.runCommandLocal "ghostty-vt-${short}"
+              {
+                src = pkgs.fetchurl {
+                  url = "https://github.com/nklmilojevic/ghostty-vt-rs/releases/download/ghostty-${short}/ghostty-vt-${short}-${archive.triple}.tar.gz";
+                  inherit (archive) sha256;
+                };
+              }
+              ''
+                mkdir -p "$out"
+                tar -xzf "$src" -C "$out"
+              '';
           rust = pkgs.rust-bin.stable.${rustVersion}.minimal;
           rustPlatform = pkgs.makeRustPlatform {
             cargo = rust;
@@ -77,7 +88,6 @@
               ./Cargo.toml
               ./Cargo.lock
               ./crates
-              ./vendor
               ./shell-integration
               ./completions
             ];
@@ -89,30 +99,16 @@
             "-p"
             "thurm-daemon"
           ];
-          # Zig for build.rs only: its setup hook would replace cargo's phases.
-          # (and Apple's libtool, which it uses to merge static libraries on macOS).
-          nativeBuildInputs = [
-            pkgs.zig_0_16
-          ]
-          ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.cctools ];
-          dontUseZigBuild = true;
-          dontUseZigCheck = true;
-          dontUseZigInstall = true;
           env = {
-            GHOSTTY_SOURCE_DIR = "${ghostty}";
-            GHOSTTY_ZIG_SYSTEM_DIR = "${ghosttyZigDeps}";
+            GHOSTTY_VT_RS_SYS_PREBUILT_DIR = "${ghosttyVt}";
             # `<version>+nix.<commit>`: the app treats it as its own build of that commit.
             THURM_BUILD = "${version}+nix.${self.shortRev or "dirty"}";
           };
-          preBuild = ''
-            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
-            mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
-          '';
           # thurmd looks for the helper beside its own executable.
           postInstall = ''
             install -Dm755 ${tailnet}/bin/thurm-tailnet $out/bin/thurm-tailnet
           '';
-          passthru = { inherit tailnet; };
+          passthru = { inherit tailnet ghosttyVt; };
           # The suites need PTYs and sshd; CI runs them.
           doCheck = false;
           meta = {
@@ -152,7 +148,8 @@
       devShells.${system}.default = pkgs.mkShellNoCC {
         packages = with pkgs; [
           rustToolchain
-          # libghostty-vt is built from source with Zig 0.16.
+          # libghostty-vt comes prebuilt; Zig 0.16 builds it from source instead
+          # (GHOSTTY_VT_RS_SYS_BUILD=source, as the Arch package does).
           zig_0_16
           # The Tailscale helper (tailnet/); the same minor version as tailnet/go.mod.
           go_1_27

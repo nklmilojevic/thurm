@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use libghostty_vt_sys as ffi;
+use ghostty_vt_rs_sys as ffi;
 
 pub use ffi::{ColorRgb, GridRef, Style, StyleColor};
 

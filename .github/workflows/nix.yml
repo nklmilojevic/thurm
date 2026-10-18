@@ -5,7 +5,7 @@ name: Nix
 on:
   push:
     branches: [main]
-    paths: [flake.nix, flake.lock, 'nix/**', 'tailnet/**', Cargo.toml, Cargo.lock, 'crates/**', 'vendor/**', 'shell-integration/**', 'completions/**', rust-toolchain.toml, .github/workflows/nix.yml]
+    paths: [flake.nix, flake.lock, 'nix/**', 'tailnet/**', Cargo.toml, Cargo.lock, 'crates/**', 'shell-integration/**', 'completions/**', rust-toolchain.toml, .github/workflows/nix.yml]
   pull_request:
     paths: [flake.nix, flake.lock, 'nix/**', 'tailnet/**', Cargo.lock, rust-toolchain.toml, .github/workflows/nix.yml]
 

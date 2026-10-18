@@ -24,6 +24,9 @@ _env() {
     export CARGO_TARGET_DIR="$srcdir/target"
     # Zig's package cache: one given from outside (CI keeps it across builds), else a fresh one.
     export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$srcdir/zig-cache}"
+    # libghostty-vt from Ghostty's source with Zig, not the prebuilt library ghostty-vt-rs-sys
+    # downloads by default.
+    export GHOSTTY_VT_RS_SYS_BUILD=source
     # The app and daemon must carry the same build id (an app that finds another build
     # replaces the running daemon in place).
     export THURM_BUILD="$pkgver+arch.$pkgrel"

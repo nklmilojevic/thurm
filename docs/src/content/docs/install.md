@@ -67,8 +67,8 @@ opened, run `thurm daemon install-systemd`.
 
 ## Build from source
 
-To build from source, install Xcode 26 or later, Rust stable with the
-`aarch64-apple-darwin` target, and Zig 0.16.0.
+To build from source, install Xcode 26 or later and Rust stable with the
+`aarch64-apple-darwin` target.
 
 Clone the repository and enter its directory:
 
@@ -77,7 +77,7 @@ git clone https://github.com/nklmilojevic/thurm.git
 cd thurm
 ```
 
-With Nix installed, the development shell provides Rust, Zig, Python, and `gh`:
+With Nix installed, the development shell provides Rust, Python, and `gh`:
 
 ```sh
 nix develop
@@ -85,9 +85,9 @@ nix develop
 open macos/build/Thurm.app
 ```
 
-Without Nix, put Rust and Zig on `PATH`, then run the last two commands.
-The first build needs network access to download the pinned Ghostty source and
-Swift dependencies. The script signs local builds with an ad hoc signature.
+Without Nix, put Rust on `PATH`, then run the last two commands.
+The first build needs network access to download the prebuilt libghostty-vt
+(Ghostty's terminal engine) and Swift dependencies. The script signs local builds with an ad hoc signature.
 
 To build, install, and open the app:
 

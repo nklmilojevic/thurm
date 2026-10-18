@@ -74,8 +74,6 @@ fi
 [[ "$(uname -m)" == "arm64" ]] || die "Thurm supports Apple silicon only; build on an arm64 Mac"
 command -v cargo >/dev/null || die "cargo not found (use the dev shell: nix develop)"
 command -v swift >/dev/null || die "swift not found (install Xcode 26 or later)"
-# libghostty-vt is built from source with Zig 0.16 (in the flake.nix dev shell).
-zig version 2>/dev/null | grep -q '^0\.16\.' || die "zig 0.16 not found (use the dev shell: nix develop, or direnv allow)"
 
 # ---------------------------------------------------------------------------------------
 # 0. Version: shared by Info.plist, the app and the daemon.
