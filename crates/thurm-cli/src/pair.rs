@@ -20,7 +20,9 @@ pub fn run(c: &Client, name: Option<String>, link_only: bool, json: bool) -> sup
     let host = host_of(&status, url);
     let name = name.unwrap_or_else(|| status.hostname.clone());
     let user = user_name().ok_or("could not tell this user's name")?;
-    let push = Config::load().map(|c| c.push).unwrap_or_default();
+    let push = Config::load()
+        .map_err(|e| format!("could not read the config, for the push relay: {e}"))?
+        .push;
     let payload = payload(&name, &host, &user, url, &push);
     let link = link(&payload);
     if json {
@@ -112,7 +114,7 @@ fn link(payload: &serde_json::Value) -> String {
 /// The link as a QR code of half blocks, two modules per line: black on white whatever the
 /// terminal's colors, with the quiet zone a camera needs around it.
 fn render(text: &str) -> Result<String, Box<dyn std::error::Error>> {
-    const QUIET: usize = 2;
+    const QUIET: usize = 4;
     let code = QrCode::new(text.as_bytes())?;
     let width = code.width();
     let colors = code.to_colors();
@@ -277,15 +279,25 @@ mod tests {
     fn renders_a_square_code_with_a_quiet_zone() {
         let out = render("thurm://pair?d=eyJ2IjoxfQ").unwrap();
         let rows: Vec<&str> = out.lines().collect();
-        let width = |r: &str| {
+        let cells = |r: &str| -> Vec<char> {
             r.trim_start_matches("\x1b[30;107m")
                 .trim_end_matches("\x1b[0m")
                 .chars()
-                .count()
+                .collect()
         };
-        let size = width(rows[0]);
-        assert!(rows.iter().all(|r| width(r) == size));
+        let size = cells(rows[0]).len();
+        assert!(rows.iter().all(|r| cells(r).len() == size));
         assert_eq!(rows.len(), size.div_ceil(2));
-        assert!(rows[0].contains("  "), "a blank quiet zone on top");
+        assert!(
+            rows[..2].iter().all(|r| cells(r).iter().all(|&c| c == ' ')),
+            "four blank modules on top"
+        );
+        assert!(
+            rows.iter().all(|r| {
+                let c = cells(r);
+                c[..4].iter().chain(&c[size - 4..]).all(|&c| c == ' ')
+            }),
+            "four blank modules on each side"
+        );
     }
 }
