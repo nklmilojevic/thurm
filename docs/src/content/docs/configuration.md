@@ -14,7 +14,7 @@ configuration directory. Otherwise, `XDG_CONFIG_HOME` changes the base directory
 to `$XDG_CONFIG_HOME/thurm`. Set these variables before you start the app and CLI.
 
 Create the parent directory if needed. Edit the file, then run `thurm reload`
-or press Cmd+Shift+, (Linux: Ctrl+Shift+R). Cmd+, (Linux: Ctrl+,) opens the
+or press Cmd+Shift+,. Cmd+, opens the
 configuration file.
 
 ## Example
@@ -161,9 +161,6 @@ explain the last finished command. Agent status inference applies to agents
 without hooks.
 
 ## Updates
-
-The `[updates]` settings are for the macOS app. On Linux, install a newer package
-(`.deb`, `.rpm` or the Arch package) to update.
 
 Release builds use these defaults:
 

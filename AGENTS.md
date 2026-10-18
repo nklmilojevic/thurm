@@ -10,7 +10,7 @@ it touches across all three.
 
 | Repository | What it is |
 |---|---|
-| `thurm` (public) | The daemon (`thurmd`), CLI, the macOS and Linux apps, and the Rust core the iOS app compiles. |
+| `thurm` (public) | The daemon (`thurmd`), CLI, the macOS app, and the Rust core the iOS app compiles. |
 | `thurm-ios` (private) | The iPhone and iPad app. Builds the core from `../thurm` (`build-core.sh`) and compiles the Mac renderer sources. |
 | `thurm-push-relay` (private) | The Go service between `thurmd` and APNs: device registration, agent notices and Live Activity updates. |
 

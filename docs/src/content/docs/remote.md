@@ -10,9 +10,7 @@ show as a workspace next to your local ones, with the same tabs, splits, agent
 sidebar, agent switcher (⌘⇧A) and notifications. Agents keep running there when
 your computer sleeps, changes networks, or quits.
 
-Shortcuts on this page are the macOS ones. On Linux, ⌘⇧P is Ctrl+Shift+P, ⌘⇧A is
-Ctrl+Alt+A, ⌘⇧O is Ctrl+Alt+O, and ⌘-click is Ctrl+click; **Thurm › Remotes…** is in
-the main menu (☰). See [Use Thurm](/usage/) for the full list.
+See [Use Thurm](/usage/) for the full list of shortcuts.
 
 The connection is the system `ssh`, one tunnel per host. Thurm has no relay or
 account of its own; Tailscale or any other network works underneath. Your phone
@@ -206,7 +204,7 @@ to (`thurm tailscale status` prints the command). Both admit only this Mac's
 owner unless `host_allow_identified = true`.
 
 The Tailscale part is a separate program, `thurm-tailnet`, next to `thurmd` in
-the app, the Linux archives and packages, and the Nix package; the daemon starts
+the app, the Linux archives, and the Nix package; the daemon starts
 it only while serving over Tailscale. Installing Thurm on a remote host copies it
 too, from builds that have it.
 

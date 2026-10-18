@@ -87,8 +87,7 @@ jobs:
   linux:
     # thurm and thurmd for Linux remote hosts, with the build id the app gets, so the app can
     # install exactly its own build there (remote workspaces). Published by the build job,
-    # which also compiles their SHA-256 into the app. Also the Linux app's .deb and .rpm
-    # (thurm-gtk with the same thurm and thurmd, one build id), checked by linux-install.
+    # which also compiles their SHA-256 into the app.
     name: Linux (${{ matrix.target }})
     needs: plan
     if: >-
@@ -98,14 +97,12 @@ jobs:
     strategy:
       matrix:
         include:
-          # The self-hosted runner (home-x64, container jobs only): this workflow never runs for
-          # a pull request.
           - target: x86_64-unknown-linux-musl
-            runner: home-x64
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    # Ubuntu 24.04 on both: thurm-gtk, and so the packages, need its glibc or newer.
+    # The same container on both runners; the binaries are static, so its glibc doesn't matter.
     container: ubuntu:24.04
     defaults:
       run:
@@ -119,13 +116,13 @@ jobs:
       LANG: C.UTF-8
     steps:
       # git first: the checkout must be a repository (the build number is its commit count).
-      - name: Build dependencies, musl and GTK
+      - name: Build dependencies and musl
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
-            xz-utils zstd file python3 pkg-config musl-tools libgtk-4-dev libadwaita-1-dev
+            xz-utils zstd file python3 musl-tools
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || needs.plan.outputs.sha }}
@@ -139,16 +136,12 @@ jobs:
           # Same as macos/release/build-release.sh.
           if [[ "${{ github.event_name }}" == release ]]; then
             SHORT="$VERSION"
-            PACKAGE="$VERSION"
           else
             SHORT="$VERSION-tip.$(git rev-parse --short=7 HEAD)"
-            # Package version: after the release it follows, before the next (dpkg, rpm, pacman).
-            PACKAGE="$VERSION+tip.$NUMBER.$(git rev-parse --short=7 HEAD)"
           fi
           BUILD="$SHORT+$NUMBER"
           echo "THURM_BUILD=$BUILD" >> "$GITHUB_ENV"
           echo "archive=thurm-${BUILD//+/-}-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.99.1
@@ -162,25 +155,20 @@ jobs:
         with:
           go-version-file: tailnet/go.mod
           cache-dependency-path: tailnet/go.sum
-      - name: nfpm
-        run: |
-          set -euo pipefail
-          case "$(uname -m)" in
-            x86_64) ASSET=nfpm_2.48.0_Linux_x86_64.tar.gz SUM=6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750 ;;
-            aarch64) ASSET=nfpm_2.48.0_Linux_arm64.tar.gz SUM=a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4 ;;
-          esac
-          curl -fsSL -o "$RUNNER_TEMP/$ASSET" "https://github.com/goreleaser/nfpm/releases/download/v2.48.0/$ASSET"
-          echo "$SUM  $RUNNER_TEMP/$ASSET" | sha256sum -c
-          mkdir -p "$RUNNER_TEMP/bin"
-          tar -xzf "$RUNNER_TEMP/$ASSET" -C "$RUNNER_TEMP/bin" nfpm
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Build
         run: |
           cargo build --release --target ${{ matrix.target }} -p thurm-cli -p thurm-daemon
-          cargo build --release -p thurm-gtk
           # Static, like thurm and thurmd; each runner builds for its own architecture.
           (cd tailnet && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" \
             -o "../target/${{ matrix.target }}/release/thurm-tailnet" ./cmd/thurm-tailnet)
+      # Remote hosts run these as they are: no dynamic loader or libc to rely on there.
+      - name: Static
+        run: |
+          set -euo pipefail
+          for b in thurm thurmd thurm-tailnet; do
+            file "target/${{ matrix.target }}/release/$b"
+            file "target/${{ matrix.target }}/release/$b" | grep -Eq 'statically linked|static-pie linked'
+          done
       - name: Package
         run: |
           set -euo pipefail
@@ -190,8 +178,6 @@ jobs:
           tar -czf "$OUT/${{ steps.meta.outputs.archive }}" -C "target/${{ matrix.target }}/release" thurm thurmd thurm-tailnet \
             -C "$GITHUB_WORKSPACE" LICENSE THIRD_PARTY_LICENSES
           (cd "$OUT" && sha256sum "${{ steps.meta.outputs.archive }}" > "${{ steps.meta.outputs.archive }}.sha256")
-          scripts/linux/package.sh "${{ steps.meta.outputs.package }}" target/release/thurm-gtk \
-            "target/${{ matrix.target }}/release" "$OUT"
           cat "$OUT"/*.sha256
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -199,132 +185,12 @@ jobs:
           path: ${{ runner.temp }}/linux/*
           retention-days: 3
 
-  linux-install:
-    # The .deb and .rpm, checked by installing them on the distributions they are for.
-    name: Install (${{ matrix.image }}, ${{ matrix.target }})
-    needs: linux
-    if: always() && needs.linux.result == 'success'
-    strategy:
-      matrix:
-        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
-        image: ['ubuntu:24.04', 'fedora:43']
-    # x86_64 on the self-hosted runner (home-x64, container jobs only).
-    runs-on: ${{ matrix.target == 'x86_64-unknown-linux-musl' && 'home-x64' || 'ubuntu-24.04-arm' }}
-    container: ${{ matrix.image }}
-    defaults:
-      run:
-        # A container's default shell is sh.
-        shell: bash
-    permissions: {}
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: linux-${{ matrix.target }}
-          path: pkgs
-      - name: Install
-        run: |
-          set -euo pipefail
-          if command -v apt-get >/dev/null; then
-            apt-get update -qq
-            apt-get install -y -qq "./pkgs/thurm-$(dpkg --print-architecture).deb" >/dev/null
-          else
-            dnf install -y -q "./pkgs/thurm-$(uname -m).rpm" >/dev/null
-          fi
-          if ldd /usr/bin/thurm-gtk | grep "not found"; then exit 1; fi
-          thurm --version
-          test -f /usr/share/thurm/icons/hicolor/scalable/actions/tab-new-symbolic.svg
-
-  arch:
-    # The Arch Linux package (linux/arch/PKGBUILD, as on the AUR), built from this commit in an
-    # Arch container and checked by installing it. Published by the build job.
-    name: Arch package
-    needs: plan
-    if: >-
-      always()
-      && ((github.event_name == 'release' && !github.event.release.prerelease)
-        || (needs.plan.result == 'success' && needs.plan.outputs.build == 'true'))
-    # The self-hosted runner (home-x64, container jobs only): this workflow never runs for a
-    # pull request.
-    runs-on: home-x64
-    container: archlinux:base-devel
-    permissions:
-      contents: read
-    steps:
-      # git first: the checkout must be a repository (arch-package.sh packs it with git ls-files).
-      - name: Build dependencies
-        run: |
-          pacman -Syu --noconfirm --needed git rustup zig musl pkgconf curl python \
-            gtk4 libadwaita fontconfig hicolor-icon-theme
-          useradd -m builder
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || needs.plan.outputs.sha }}
-          fetch-depth: 0 # the tip version has the commit count
-      # The package builds libghostty-vt from source (AUR packages build from source): the ghostty
-      # checkout and Zig's caches, kept across runs (GHOSTTY_VT_RS_SYS_CACHE_DIR of ghostty-vt-rs-sys).
-      # Shared with the other Arch job; saved from main only.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: libghostty
-        with:
-          path: /var/cache/libghostty-vt
-          key: libghostty-vt-arch-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - name: makepkg
-        run: |
-          set -euo pipefail
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          if [[ "${{ github.event_name }}" == release ]]; then
-            PKGVER="$VERSION"
-          else
-            PKGVER="$VERSION+tip.$(git rev-list --count HEAD).$(git rev-parse --short=7 HEAD)"
-          fi
-          mkdir -p /var/cache/libghostty-vt
-          chown -R builder "$GITHUB_WORKSPACE" /var/cache/libghostty-vt
-          # makepkg refuses to run as root.
-          sudo -u builder git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          sudo -u builder env PKGVER="$PKGVER" GHOSTTY_VT_RS_SYS_CACHE_DIR=/var/cache/libghostty-vt \
-            ZIG_GLOBAL_CACHE_DIR=/var/cache/libghostty-vt/zig-global \
-            scripts/linux/arch-package.sh /tmp/arch
-      - name: Install
-        run: |
-          set -euo pipefail
-          pacman -U --noconfirm /tmp/arch/thurm-*.pkg.tar.zst
-          if ldd /usr/bin/thurm-gtk | grep "not found"; then exit 1; fi
-          thurm --version
-          test -f /usr/share/thurm/icons/hicolor/scalable/actions/tab-new-symbolic.svg
-      - name: Package
-        run: |
-          set -euo pipefail
-          OUT="$RUNNER_TEMP/linux"
-          mkdir -p "$OUT"
-          cd /tmp/arch
-          for f in thurm-*.pkg.tar.zst; do
-            # `+` stays in the package version but not in file names (release asset names).
-            cp "$f" "$OUT/${f//+/-}"
-          done
-          cp thurm-*.pkg.tar.zst "$OUT/thurm-x86_64.pkg.tar.zst"
-          cd "$OUT"
-          for f in *.pkg.tar.zst; do sha256sum "$f" > "$f.sha256"; done
-          cat ./*.sha256
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: linux-arch-x86_64
-          path: ${{ runner.temp }}/linux/*
-          retention-days: 3
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
-        with:
-          path: /var/cache/libghostty-vt
-          key: ${{ steps.libghostty.outputs.cache-primary-key }}
-
   build:
     name: Build (${{ github.event_name == 'release' && github.event.release.tag_name || 'tip' }})
-    needs: [plan, linux, linux-install, arch]
+    needs: [plan, linux]
     if: >-
       always()
       && needs.linux.result == 'success'
-      && needs.linux-install.result == 'success'
-      && needs.arch.result == 'success'
       && ((github.event_name == 'release' && !github.event.release.prerelease)
         || (needs.plan.result == 'success' && needs.plan.outputs.build == 'true'))
     runs-on: macos-26
@@ -521,8 +387,6 @@ jobs:
             echo
             echo "Download **Thurm-tip.dmg**, or choose *Thurm › Update Channel › Tip* in any Thurm to get these builds automatically."
             echo
-            echo "Linux (Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch): **thurm-amd64.deb** / **thurm-arm64.deb**, **thurm-x86_64.rpm** / **thurm-aarch64.rpm**, or **thurm-x86_64.pkg.tar.zst** (\`sudo pacman -U\` its link)."
-            echo
             # The changes in this build (the appcast's notes, less their heading).
             tail -n +3 "$THURM_NOTES_FILE"
           } > "$NOTES"
@@ -533,10 +397,9 @@ jobs:
               --title "Tip" --notes-file "$NOTES"
           fi
           gh release upload tip --repo "$REPO" --clobber "$RUNNER_TEMP"/linux/thurm[-_]*
-          # Only this build's versioned Linux packages (the fixed names are replaced above).
+          # The Linux app's packages, left from builds before it was dropped.
           gh release view tip --repo "$REPO" --json assets -q '.assets[].name' \
-            | { grep -E '^(thurm_.*\.deb|thurm-[0-9].*\.(rpm|pkg\.tar\.zst))(\.sha256)?$' || true; } \
-            | { grep -vF -- ".${SHA:0:7}" || true; } \
+            | { grep -E '\.(deb|rpm|pkg\.tar\.zst)(\.sha256)?$' || true; } \
             | while read -r old; do gh release delete-asset tip "$old" --repo "$REPO" --yes; done
           cd macos/build/dist
           gh release upload tip --repo "$REPO" --clobber Thurm-tip-*.zip Thurm-tip.dmg

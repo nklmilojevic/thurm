@@ -1528,23 +1528,7 @@ fn ui(c: &Client, cmd: UiCommand) {
         .args(["-b", "com.thurm.terminal"])
         .status()
         .is_ok_and(|s| s.success());
-    #[cfg(target_os = "linux")]
-    let launched = (std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var_os("DISPLAY").is_some())
-        && std::env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(|d| d.join("thurm-gtk")))
-            .filter(|p| p.is_file())
-            .or_else(|| thurm_config::which("thurm-gtk"))
-            .is_some_and(|app| {
-                std::process::Command::new(app)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .is_ok()
-            });
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "macos"))]
     let launched = false;
     // The app adopts panes it doesn't know as a background workspace: send the command again
     // once it is up, so the pane goes where it says (its own workspace, a tab).

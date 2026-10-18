@@ -22,14 +22,13 @@ concurrency:
 # Every action is pinned to a commit (the tag it was taken from is in the comment).
 #
 # A pull request runs the tests of what it changes; main runs everything (Release builds from
-# commits that passed there, and builds the packages itself).
+# commits that passed there).
 jobs:
   changes:
     name: Changes
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.diff.outputs.rust }}
-      linux-app: ${{ steps.diff.outputs.linux-app }}
       release-scripts: ${{ steps.diff.outputs.release-scripts }}
       app-icon: ${{ steps.diff.outputs.app-icon }}
       docs: ${{ steps.diff.outputs.docs }}
@@ -58,10 +57,8 @@ jobs:
             fi >> "$GITHUB_OUTPUT"
           }
           # Everything the crates build, embed or test with, and this workflow.
-          rust='crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|shell-integration/|completions/|skills/|licenses/|config\.example\.toml$|macos/Resources/fonts/|scripts/third-party-licenses\.py$|scripts/linux/smoke|\.github/workflows/ci\.yml$'
+          rust='crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|shell-integration/|completions/|skills/|licenses/|config\.example\.toml$|macos/Resources/fonts/|scripts/third-party-licenses\.py$|\.github/workflows/ci\.yml$'
           area rust "^($rust)"
-          # The Linux app also reads the icons and data in linux/ when run from the checkout.
-          area linux-app "^($rust|linux/(share|icons)/)"
           area release-scripts '^(macos/build\.sh$|macos/compile-icon\.sh$|macos/package-dmg\.sh$|macos/release/|\.github/workflows/ci\.yml$)'
           area app-icon '^(macos/Resources/AppIcon\.icon/|macos/compile-icon\.sh$|macos/build\.sh$|\.github/workflows/ci\.yml$)'
           area docs '^(docs/|config\.example\.toml$|\.github/workflows/ci\.yml$)'
@@ -100,29 +97,16 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   linux:
-    # Remote hosts run the static musl builds of thurm and thurmd (remote workspaces).
-    name: Linux (${{ matrix.target }})
+    # The tests of what thurmd and thurm do on Linux remote hosts, on x86_64 only. Release
+    # builds and checks the shipped static binaries for both architectures.
+    name: Linux
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-            home: true
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-            home: false
-    # Pushes to main run x86_64 on the self-hosted runner (home-x64, container jobs only); pull
-    # requests never run there.
-    runs-on: ${{ github.event_name != 'pull_request' && matrix.home && 'home-x64' || matrix.runner }}
-    # The same container on every runner, so the caches main saves are the ones pull requests
-    # restore. Privileged on the hosted runners for the network namespace test; the self-hosted
-    # runner can't be, and skips it.
+    runs-on: ubuntu-24.04
+    # The same image as Release's Linux builds. Privileged for the network namespace test.
     container:
       image: ubuntu:24.04
-      options: ${{ (github.event_name == 'pull_request' || !matrix.home) && '--privileged' || '' }}
+      options: --privileged
     defaults:
       run:
         # A container's default shell is sh.
@@ -130,6 +114,7 @@ jobs:
     # The image has no locale set, unlike the hosted runners the tests were written on.
     env:
       LANG: C.UTF-8
+      TARGET: x86_64-unknown-linux-musl
     steps:
       # git first: the checkout must be a repository.
       - name: Build dependencies, musl and sshd
@@ -138,39 +123,26 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
-            xz-utils zstd file python3 musl-tools openssh-server openssh-client
+            xz-utils zstd python3 musl-tools openssh-server openssh-client
           # sshd's privilege separation directory, which its service makes on a host.
           mkdir -p /run/sshd
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.99.1
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: ${{ matrix.target }}
-      # The shipped static binaries: main only (pull requests run the tests below).
-      - name: Build
-        if: github.event_name == 'push'
-        run: cargo build --release --locked --target ${{ matrix.target }} -p thurm-cli -p thurm-daemon
-      - name: Static
-        if: github.event_name == 'push'
-        run: |
-          for b in thurm thurmd; do
-            file "target/${{ matrix.target }}/release/$b"
-            file "target/${{ matrix.target }}/release/$b" | grep -Eq 'statically linked|static-pie linked'
-          done
+          key: x86_64-unknown-linux-musl
       # The daemon and terminal suites, and the remote ones (loopback ssh, handoffs). Here sshd
       # is there, and so is the network namespace in a privileged container, so the tests
       # needing them must not skip.
       - name: Test
         env:
           THURM_REQUIRE_SSHD: "1"
-          REQUIRE_NETNS: ${{ (github.event_name == 'pull_request' || !matrix.home) && '1' || '' }}
-        run: |
-          if [[ -n "$REQUIRE_NETNS" ]]; then export THURM_REQUIRE_NETNS=1; fi
-          cargo test --locked --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
+          THURM_REQUIRE_NETNS: "1"
+        run: cargo test --locked --target "$TARGET" -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
 
   go:
     # The Tailscale helper (tailnet/, thurm-tailnet), with the Go version from its go.mod.
@@ -208,68 +180,13 @@ jobs:
         working-directory: .
         run: python3 scripts/third-party-licenses.py --with-go
 
-  linux-app:
-    # The Linux app (crates/thurm-gtk, GTK 4 + libadwaita), and a headless run of it.
-    name: Linux app (${{ matrix.runner }})
-    needs: changes
-    if: needs.changes.outputs.linux-app == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
-    # Pushes to main run x86_64 on the self-hosted runner (home-x64, container jobs only); pull
-    # requests never run there. The same container on every runner, so the caches main saves
-    # are the ones pull requests restore.
-    runs-on: ${{ github.event_name != 'pull_request' && matrix.runner == 'ubuntu-24.04' && 'home-x64' || matrix.runner }}
-    container: ubuntu:24.04
-    defaults:
-      run:
-        # A container's default shell is sh.
-        shell: bash
-    # The image has no locale set; the smoke test types UTF-8 text (xdotool needs the locale).
-    env:
-      LANG: C.UTF-8
-    steps:
-      # git first: the checkout must be a repository.
-      - name: GTK and the headless display
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
-            xz-utils zstd pkg-config libgtk-4-dev libadwaita-1-dev fonts-dejavu-core \
-            xvfb xdotool imagemagick dbus-x11
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: 1.99.1
-          components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: linux-app
-      - name: Test
-        run: cargo test --locked -p thurm-gtk
-      - name: Clippy
-        run: cargo clippy --locked -p thurm-gtk --all-targets -- -D warnings
-      - name: Smoke test
-        run: |
-          cargo build --locked -p thurm-gtk -p thurm-daemon -p thurm-cli
-          scripts/linux/smoke.sh target/debug smoke
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: always()
-        with:
-          name: linux-app-smoke-${{ matrix.runner }}
-          path: smoke
-
   checks:
     name: Consistency and advisories
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # ghostty-vt-rs-sys pins the Ghostty commit (build.rs) and its prebuilt archives
-      # (prebuilt.rs). The Nix package repeats the archives it fetches (nix/ghostty-vt.nix), and
-      # the Arch package's source build fetches that commit's Zig packages (nix/ghostty-zig-deps.nix).
+      # (prebuilt.rs). The Nix package repeats the archives it fetches (nix/ghostty-vt.nix).
       - name: One Ghostty commit
         run: |
           set -euo pipefail
@@ -278,13 +195,11 @@ jobs:
           commit="$(sed -n 's/^const GHOSTTY_COMMIT: &str = "\([0-9a-f]*\)";/\1/p' "$crate/build.rs")"
           prebuilt_commit="$(sed -n 's/^const PREBUILT_COMMIT: &str = "\([0-9a-f]*\)";/\1/p' "$crate/prebuilt.rs")"
           nix_commit="$(sed -n 's/^ *commit = "\([0-9a-f]*\)";/\1/p' nix/ghostty-vt.nix)"
-          zig_commit="$(sed -n '1s/.*build\.zig\.zon\.nix at \([0-9a-f]*\) .*/\1/p' nix/ghostty-zig-deps.nix)"
           echo "ghostty-vt-rs-sys: $commit (prebuilt archives: ${prebuilt_commit:-none})"
           echo "nix/ghostty-vt.nix: $nix_commit"
-          echo "nix/ghostty-zig-deps.nix: $zig_commit"
           # The sums below only mean something for archives built from the crate's commit.
-          [[ -n "$commit" && "$commit" == "$prebuilt_commit" && "$commit" == "$nix_commit" && "$commit" == "$zig_commit" ]] || {
-            echo "::error::ghostty-vt-rs-sys's prebuilt archives, nix/ghostty-vt.nix or nix/ghostty-zig-deps.nix are not at its Ghostty commit"
+          [[ -n "$commit" && "$commit" == "$prebuilt_commit" && "$commit" == "$nix_commit" ]] || {
+            echo "::error::ghostty-vt-rs-sys's prebuilt archives or nix/ghostty-vt.nix are not at its Ghostty commit"
             exit 1
           }
           awk -F'"' '/triple = / { t = $2 } /sha256 = / { print t, $2 }' nix/ghostty-vt.nix | while read -r triple sum; do

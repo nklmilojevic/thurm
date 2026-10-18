@@ -25,7 +25,7 @@ log.workspace = true
 
 [features]
 default = ["desktop"]
-# Remote workspaces over the system ssh (spawns processes; macOS and Linux front ends).
+# Remote workspaces over the system ssh (spawns processes; the macOS app).
 desktop = ["dep:thurm-remote"]
 # The iOS app: no process spawning, remote hosts over an in-process ssh transport, or over
 # Tailscale to a daemon serving there, and hosts without Thurm over ssh or mosh.
