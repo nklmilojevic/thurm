@@ -128,6 +128,8 @@ fn build_vendored(link_mode: LinkMode, target: &str) {
     let cache_dir = env::var_os("LIBGHOSTTY_VT_SYS_CACHE_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+        // Absolute: zig gets it as --cache-dir from inside the ghostty checkout.
+        .map(|dir| std::path::absolute(&dir).unwrap_or(dir))
         .unwrap_or_else(|| out_dir.clone());
 
     // Locate ghostty source: env override > fetch into OUT_DIR.
