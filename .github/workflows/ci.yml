@@ -13,6 +13,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# A new push to a pull request replaces its run; every commit on main runs to the end (Release
+# builds from commits that passed there).
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Every action is pinned to a commit (the tag it was taken from is in the comment).
 #
 # A pull request runs the tests of what it changes; main runs everything (Release builds from
@@ -76,10 +82,25 @@ jobs:
           components: clippy, rustfmt
           targets: aarch64-apple-ios
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # libghostty-vt (the terminal engine) is built from source with Zig.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
+          use-cache: false
+      # The ghostty checkout and Zig's caches, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR, see
+      # vendor/libghostty-vt-sys/build.rs): an unchanged libghostty-vt then builds in seconds.
+      # Saved from main only; pull requests and tagged releases restore main's.
+      - name: libghostty-vt cache directory
+        run: |
+          echo "LIBGHOSTTY_VT_SYS_CACHE_DIR=$HOME/.cache/libghostty-vt" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/libghostty-vt/zig-global" >> "$GITHUB_ENV"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: libghostty
+        with:
+          path: ~/.cache/libghostty-vt
+          key: libghostty-vt-ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       # thurm-mosh's and thurm-direct's tests talk to a real mosh-server (skipped without one).
       - name: Install mosh
         run: brew install mosh
@@ -94,6 +115,11 @@ jobs:
         run: python3 scripts/third-party-licenses.py
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/libghostty-vt
+          key: ${{ steps.libghostty.outputs.cache-primary-key }}
 
   linux:
     # Remote hosts run the static musl builds of thurm and thurmd (remote workspaces).
@@ -117,11 +143,25 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: ${{ matrix.target }}
       # libghostty-vt is cross-built for musl with Zig.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
+          use-cache: false
+      # The ghostty checkout and Zig's caches, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR, see
+      # vendor/libghostty-vt-sys/build.rs): an unchanged libghostty-vt then builds in seconds.
+      # Saved from main only; pull requests and tagged releases restore main's.
+      - name: libghostty-vt cache directory
+        run: |
+          echo "LIBGHOSTTY_VT_SYS_CACHE_DIR=$HOME/.cache/libghostty-vt" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/libghostty-vt/zig-global" >> "$GITHUB_ENV"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: libghostty
+        with:
+          path: ~/.cache/libghostty-vt
+          key: libghostty-vt-ci-linux-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       - name: musl and sshd
         run: sudo apt-get update && sudo apt-get install -y musl-tools openssh-server openssh-client
       # The shipped static binaries: main only (pull requests run the tests below).
@@ -146,6 +186,11 @@ jobs:
           THURM_REQUIRE_NETNS: "1"
           THURM_REQUIRE_SSHD: "1"
         run: cargo test --locked --target ${{ matrix.target }} -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/libghostty-vt
+          key: ${{ steps.libghostty.outputs.cache-primary-key }}
 
   go:
     # The Tailscale helper (tailnet/, thurm-tailnet), with the Go version from its go.mod.
@@ -201,10 +246,24 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: linux-app
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
+          use-cache: false
+      # The ghostty checkout and Zig's caches, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR, see
+      # vendor/libghostty-vt-sys/build.rs): an unchanged libghostty-vt then builds in seconds.
+      # Saved from main only; pull requests and tagged releases restore main's.
+      - name: libghostty-vt cache directory
+        run: |
+          echo "LIBGHOSTTY_VT_SYS_CACHE_DIR=$HOME/.cache/libghostty-vt" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$HOME/.cache/libghostty-vt/zig-global" >> "$GITHUB_ENV"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: libghostty
+        with:
+          path: ~/.cache/libghostty-vt
+          key: libghostty-vt-ci-linux-app-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       - name: GTK and the headless display
         run: |
           sudo apt-get update
@@ -223,6 +282,11 @@ jobs:
         with:
           name: linux-app-smoke-${{ matrix.runner }}
           path: smoke
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/libghostty-vt
+          key: ${{ steps.libghostty.outputs.cache-primary-key }}
 
   checks:
     name: Consistency and advisories
@@ -284,10 +348,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.99.1
+      # A release binary, checked by the action, rather than compiling cargo-audit every run.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-audit
       - name: Dependency advisories
-        run: |
-          cargo install --locked cargo-audit
-          cargo audit
+        run: cargo audit
 
   release-scripts:
     name: Release scripts
