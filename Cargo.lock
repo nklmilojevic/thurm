@@ -1153,7 +1153,8 @@ dependencies = [
 [[package]]
 name = "ghostty-vt-rs-sys"
 version = "0.1.0"
-source = "git+https://github.com/nklmilojevic/ghostty-vt-rs?rev=c59da7c8e50de069390988aca07ebe66102023dd#c59da7c8e50de069390988aca07ebe66102023dd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c56ef493e4f277afd1cd42f6a01767e341bbedee6e64bf2fcb71f185607acd5"
 dependencies = [
  "sha2 0.10.9",
 ]

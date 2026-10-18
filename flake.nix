@@ -92,10 +92,7 @@
               ./completions
             ];
           };
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            outputHashes."ghostty-vt-rs-sys-0.1.0" = "sha256-mL6C2i78TI0nQXi5VNKjggTh/5yZt9zsaET/I5jM83E=";
-          };
+          cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFlags = [
             "-p"
             "thurm-cli"
