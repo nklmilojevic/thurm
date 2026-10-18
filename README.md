@@ -14,8 +14,6 @@ to it from your computer.
 The app requires **Apple silicon and macOS 14 or later**.
 Remote sessions can run on Linux x86_64, Linux aarch64, or another Apple silicon Mac.
 
-![Thurm with tabs grouped by repository in the sidebar and three agents in its Agents list, one waiting for an answer; Claude Code works in the left pane, lazygit shows a diff and cargo test passes on the right](docs/public/screenshots/hero.webp)
-
 ## Why Thurm?
 
 Development often needs more than one shell: an editor, a server, test output,
