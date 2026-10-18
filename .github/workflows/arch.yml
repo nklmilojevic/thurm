@@ -25,7 +25,7 @@ on:
   # On pull requests only when the packaging itself changes; code is covered by CI's tests.
   pull_request:
     paths:
-      - linux/**
+      - linux/arch/**
       - scripts/linux/arch-package.sh
       - .github/workflows/arch.yml
 
@@ -46,15 +46,30 @@ jobs:
             gtk4 libadwaita fontconfig hicolor-icon-theme
           useradd -m builder
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The ghostty checkout and Zig's build cache, kept across runs (LIBGHOSTTY_VT_SYS_CACHE_DIR,
+      # see vendor/libghostty-vt-sys/build.rs). Shared with the other Arch job; saved from main only.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: libghostty
+        with:
+          path: /var/cache/libghostty-vt
+          key: libghostty-vt-arch-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/libghostty-vt-sys/build.rs', 'rust-toolchain.toml') }}
       - name: makepkg
         run: |
-          chown -R builder "$GITHUB_WORKSPACE"
+          mkdir -p /var/cache/libghostty-vt
+          chown -R builder "$GITHUB_WORKSPACE" /var/cache/libghostty-vt
           # makepkg refuses to run as root.
           sudo -u builder git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          sudo -u builder scripts/linux/arch-package.sh /tmp/arch
+          sudo -u builder env LIBGHOSTTY_VT_SYS_CACHE_DIR=/var/cache/libghostty-vt \
+            ZIG_GLOBAL_CACHE_DIR=/var/cache/libghostty-vt/zig-global \
+            scripts/linux/arch-package.sh /tmp/arch
       - name: Install
         run: |
           pacman -U --noconfirm /tmp/arch/thurm-*.pkg.tar.zst
           if ldd /usr/bin/thurm-gtk | grep "not found"; then exit 1; fi
           thurm --version
           test -f /usr/share/thurm/icons/hicolor/scalable/actions/tab-new-symbolic.svg
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.libghostty.outputs.cache-hit != 'true'
+        with:
+          path: /var/cache/libghostty-vt
+          key: ${{ steps.libghostty.outputs.cache-primary-key }}

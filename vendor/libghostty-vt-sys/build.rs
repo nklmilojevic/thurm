@@ -91,6 +91,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_SYS_OPTIMIZE");
     println!("cargo:rerun-if-env-changed=GHOSTTY_SOURCE_DIR");
     println!("cargo:rerun-if-env-changed=GHOSTTY_ZIG_SYSTEM_DIR");
+    println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_SYS_CACHE_DIR");
     println!("cargo:rerun-if-env-changed=TARGET");
     println!("cargo:rerun-if-env-changed=HOST");
     println!("cargo:rerun-if-env-changed=DEBUG");
@@ -121,6 +122,15 @@ fn main() {
 fn build_vendored(link_mode: LinkMode, target: &str) {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
     let host = env::var("HOST").expect("HOST must be set");
+    // Thurm: a directory kept across builds (CI caches it) for the ghostty checkout and zig's
+    // cache, so a fresh target directory rebuilds nothing zig built before. Zig's cache is
+    // content-addressed: targets and builds share it safely. Unset, both live in OUT_DIR.
+    let cache_dir = env::var_os("LIBGHOSTTY_VT_SYS_CACHE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        // Absolute: zig gets it as --cache-dir from inside the ghostty checkout.
+        .map(|dir| std::path::absolute(&dir).unwrap_or(dir))
+        .unwrap_or_else(|| out_dir.clone());
 
     // Locate ghostty source: env override > fetch into OUT_DIR.
     let ghostty_dir = match env::var("GHOSTTY_SOURCE_DIR") {
@@ -149,12 +159,12 @@ fn build_vendored(link_mode: LinkMode, target: &str) {
             }
             p
         }
-        Err(_) => fetch_ghostty(&out_dir),
+        Err(_) => fetch_ghostty(&cache_dir),
     };
 
     // Build libghostty-vt via zig.
     let install_prefix = out_dir.join("ghostty-install");
-    let zig_cache_dir = out_dir.join("zig-cache");
+    let zig_cache_dir = cache_dir.join("zig-cache");
     let zig_global_cache_dir = out_dir.join("zig-global-cache");
 
     let optimize = zig_optimize_mode();
