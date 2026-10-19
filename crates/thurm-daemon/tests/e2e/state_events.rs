@@ -45,10 +45,11 @@ fn state_events_clients_get_output_driven_pane_info_only() {
     // A clipboard copy (UI only, whoever asks) and then a progress report.
     c.request(Request::Input {
         pane,
-        data: b"printf '\\033]52;c;c2VjcmV0\\a\\033]9;4;1;40\\a'; echo done\r".to_vec(),
+        data: b"printf '\\033]52;c;c2VjcmV0\\a\\033]9;4;1;40\\a'; echo $((40 + 2))-done\r".to_vec(),
     })
     .unwrap();
-    wait_match(&c, pane, r"(?m)^done");
+    // Only the output has it, wherever the shell put it (typed before its prompt or after).
+    wait_match(&c, pane, "42-done");
     c.request(Request::ClosePane { pane }).unwrap();
 
     let progress = |events: &[Event]| {
