@@ -3,12 +3,12 @@
 import { Conn, type Hello, type Incoming } from "./conn";
 import { Input } from "./input";
 import { type Rect, type Tab, leaves, place, tabsOf } from "./layout";
+import { type Notice, addNotice } from "./notices";
 import { PaneView, measure, type DrawMeta, type Metrics } from "./render";
 
 declare const __CLOCK_URL__: string;
 
-type Notice = { pane: number; title: string; body: string; permission: number | null; error?: string };
-type PaneInfo = { id: number; title: string; agent?: { status: string; name: string } | null };
+type PaneInfo = { id: number; title: string; agent?: { status: string; name: string; permission?: number | null } | null };
 
 const $ = (id: string) => document.getElementById(id)!;
 const panesEl = $("panes");
@@ -354,8 +354,8 @@ function event(ev: Record<string, any> | string) {
     void loadLayout();
   } else if (ev.Notify) {
     const n = ev.Notify;
-    notices = notices.filter((x) => !(x.pane === n.pane && x.permission !== null && x.permission === n.permission));
-    notices.unshift({ pane: n.pane, title: n.title, body: n.body, permission: n.permission ?? null });
+    const pending = infos.get(n.pane)?.agent?.permission ?? null;
+    notices = addNotice(notices, { pane: n.pane, title: n.title, body: n.body, permission: n.permission ?? null }, pending);
     renderNotices();
     if (document.visibilityState !== "visible" && "Notification" in window && Notification.permission === "granted") {
       new Notification(n.title, { body: n.body, tag: `thurm-${n.pane}` });
