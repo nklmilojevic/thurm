@@ -15,6 +15,20 @@
   },
   "packageRules": [
     {
+      "description": "flake.nix keys tailnet's vendored modules on vendorHash, which Renovate cannot recompute. One weekly PR, merged by hand after `just tailnet-hash`.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "tailnet/go.mod"
+      ],
+      "groupName": "tailnet Go modules",
+      "schedule": [
+        "before 6am on monday"
+      ],
+      "automerge": false
+    },
+    {
       "description": "Workflows hold the release signing keys: their updates are reviewed, never merged automatically.",
       "matchFileNames": [
         ".github/workflows/**"
