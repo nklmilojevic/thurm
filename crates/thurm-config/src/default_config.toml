@@ -73,6 +73,12 @@ sidebar_width = 240.0
 sidebar_agents = true
 # Agents listed in the sidebar before its agents panel scrolls; drag the panel's header to change.
 sidebar_agent_rows = 5
+# Show what is left of a subscription's limits (the 5-hour and weekly windows) at the bottom of
+# the sidebar. View > Usage Limits in Sidebar.
+# Claude Code: read from Anthropic with Claude Code's sign-in.
+sidebar_usage_claude = false
+# Codex: read from its latest session log.
+sidebar_usage_codex = false
 
 [cursor]
 # Cursor shape: "block", "beam" or "underline".

@@ -14,6 +14,7 @@ final class SessionManager: NSObject, CoreDelegate {
     private var sidebarTabsOverride: Bool?
     /// View > Agents in Sidebar when config.toml cannot record it, as `sidebarTabsOverride`.
     private var sidebarAgentsOverride: Bool?
+    private var sidebarUsageOverride: [UsageProvider: Bool] = [:]
     /// A theme chosen when config.toml cannot record it is in use (see `setTheme`).
     private var sessionTheme = false
     var effectiveFontSize: CGFloat { fontSizeOverride ?? config.fontSize }
@@ -67,6 +68,7 @@ final class SessionManager: NSObject, CoreDelegate {
         if !sessionReady { restoreSession() }
         // Remote hosts connect in the background; their tabs show "reconnecting" until then.
         Remotes.shared.start()
+        UsageLimits.shared.configChanged()
         // Safety net only: tab changes save through the tab group's KVO.
         periodicTimer = Timer.scheduledTimer(timeInterval: 15, target: self, selector: #selector(periodicSave),
                                              userInfo: nil, repeats: true)
@@ -830,17 +832,31 @@ final class SessionManager: NSObject, CoreDelegate {
     /// the config when it can be written; otherwise it switches for this session only.
     func toggleSidebarAgents() {
         let agents = !config.sidebarAgents
-        let resp = Core.shared.request(object: ["SetSetting": ["key": "window.sidebar_agents",
-                                                               "value": agents ? "true" : "false"]])
-        // Saved, the daemon answers with the config's path; the reload that follows carries it.
-        // An error, no answer or anything else: switch for this session only.
-        if JSON.variant(resp)?.name == "Text" {
-            sidebarAgentsOverride = nil
-        } else {
-            sidebarAgentsOverride = agents
+        sidebarAgentsOverride = toggleSetting("window.sidebar_agents", to: agents)
+        if sidebarAgentsOverride != nil {
             config.sidebarAgents = agents
             applyConfigToUI()
         }
+    }
+
+    /// View > Usage Limits in Sidebar: switch `window.sidebar_usage_<provider>`, as
+    /// `toggleSidebarAgents`.
+    func toggleSidebarUsage(_ provider: UsageProvider) {
+        let on = !config.sidebarUsage.contains(provider)
+        sidebarUsageOverride[provider] = toggleSetting("window.sidebar_usage_\(provider.rawValue)", to: on)
+        if sidebarUsageOverride[provider] != nil {
+            if on { config.sidebarUsage.insert(provider) } else { config.sidebarUsage.remove(provider) }
+            applyConfigToUI()
+            UsageLimits.shared.configChanged()
+        }
+    }
+
+    /// Saves a switched setting. Saved, the daemon answers with the config's path and the reload
+    /// that follows carries it (nil). An error, no answer or anything else: the value to keep for
+    /// this session only.
+    private func toggleSetting(_ key: String, to value: Bool) -> Bool? {
+        let resp = Core.shared.request(object: ["SetSetting": ["key": key, "value": value ? "true" : "false"]])
+        return JSON.variant(resp)?.name == "Text" ? nil : value
     }
 
     func updateSecureInput() {
@@ -908,7 +924,11 @@ final class SessionManager: NSObject, CoreDelegate {
         config.loadWarnings += MainMenu.applyKeys(config.keybindings, commands: config.commands)
         if let o = sidebarTabsOverride { config.sidebarTabs = o }
         if let o = sidebarAgentsOverride { config.sidebarAgents = o }
+        for (p, on) in sidebarUsageOverride {
+            if on { config.sidebarUsage.insert(p) } else { config.sidebarUsage.remove(p) }
+        }
         applyConfigToUI()
+        UsageLimits.shared.configChanged()
         Core.shared.reloadRemoteEngines()
         Remotes.shared.configChanged()
         Updater.shared.configChanged()
