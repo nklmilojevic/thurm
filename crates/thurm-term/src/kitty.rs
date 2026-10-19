@@ -5,7 +5,12 @@
 //! reads it, and turns the command into a direct transmission of the bytes it read, which
 //! every copy then parses the same way.
 
+// Without unix (the browser client's wasm build) the readers below are stand-ins and their
+// helpers go unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::io::{Read, Seek};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
@@ -258,6 +263,7 @@ fn span(total: usize, offset: usize, size: Option<usize>, max: usize) -> Result<
 }
 
 /// Reads and unlinks a POSIX shared memory object (`t=s`), as the protocol requires.
+#[cfg(unix)]
 fn read_shm(name: &str, offset: usize, size: Option<usize>, max: usize) -> Result<Vec<u8>, Err> {
     let rest = name.strip_prefix('/').unwrap_or(name);
     if rest.is_empty() || name.len() > 255 || rest.contains('/') {
@@ -302,6 +308,12 @@ fn read_shm(name: &str, offset: usize, size: Option<usize>, max: usize) -> Resul
         libc::shm_unlink(cname.as_ptr());
     }
     result
+}
+
+/// No shared memory or files to read (the browser client's wasm build, which reads no media).
+#[cfg(not(unix))]
+fn read_shm(_: &str, _: usize, _: Option<usize>, _: usize) -> Result<Vec<u8>, Err> {
+    Err(err("EBADF", "cannot open the shared memory"))
 }
 
 fn is_temp_graphics_file(path: &str) -> bool {
@@ -392,6 +404,7 @@ fn resolve(path: &str, allow_dev_shm: bool) -> Result<std::path::PathBuf, Err> {
 }
 
 /// `allow_dev_shm`: temporary graphics files may be in /dev/shm.
+#[cfg(unix)]
 fn read_file(
     path: &str,
     offset: usize,
@@ -422,6 +435,11 @@ fn read_file(
         .read_to_end(&mut buf)
         .map_err(|_| err("EBADF", "cannot read the file"))?;
     Ok(buf)
+}
+
+#[cfg(not(unix))]
+fn read_file(_: &str, _: usize, _: Option<usize>, _: usize, _: bool) -> Result<Vec<u8>, Err> {
+    Err(err("EBADF", "cannot open the file"))
 }
 
 /// PNG to straight RGBA8 (libghostty-vt calls this for `f=100` images).

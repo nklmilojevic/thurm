@@ -1112,6 +1112,7 @@ pub fn state_dir() -> PathBuf {
 /// daemon), and elsewhere in `/tmp/thurm-<uid>` (checked by [`private_dir_ok`] before use). A
 /// daemon started by an earlier Thurm keeps answering on the old `/tmp` socket until it exits,
 /// and is used there meanwhile.
+#[cfg(unix)]
 pub fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("THURM_SOCKET") {
         return PathBuf::from(p);
@@ -1125,6 +1126,7 @@ pub fn socket_path() -> PathBuf {
 }
 
 /// `preferred`, unless only `legacy` (in a private directory) has a daemon of ours answering.
+#[cfg(unix)]
 fn live_socket(preferred: PathBuf, legacy: PathBuf) -> PathBuf {
     if legacy != preferred
         && !socket_answers(&preferred)
@@ -1138,12 +1140,14 @@ fn live_socket(preferred: PathBuf, legacy: PathBuf) -> PathBuf {
 }
 
 /// The directory of the default daemon socket (see [`socket_path`]).
+#[cfg(unix)]
 pub fn default_socket_dir() -> PathBuf {
     let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     socket_dir_for(xdg.as_deref(), &run_user_dir())
 }
 
 /// [`default_socket_dir`] for a session's `$XDG_RUNTIME_DIR` and the user's `/run/user/<uid>`.
+#[cfg(unix)]
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn socket_dir_for(xdg_runtime_dir: Option<&Path>, run_user: &Path) -> PathBuf {
     if let Some(dir) = xdg_runtime_dir {
@@ -1161,10 +1165,12 @@ fn socket_dir_for(xdg_runtime_dir: Option<&Path>, run_user: &Path) -> PathBuf {
 }
 
 /// Where systemd-logind keeps the user's runtime directory (`$XDG_RUNTIME_DIR` in its sessions).
+#[cfg(unix)]
 fn run_user_dir() -> PathBuf {
     PathBuf::from(format!("/run/user/{}", uid()))
 }
 
+#[cfg(unix)]
 fn legacy_socket_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/thurm-{}", uid()))
 }
@@ -1190,12 +1196,14 @@ fn darwin_user_temp_dir() -> Option<PathBuf> {
 }
 
 /// Whether a daemon of this user answers on `socket`.
+#[cfg(unix)]
 fn socket_answers(socket: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(socket).is_ok_and(|s| peer_is_same_user(&s))
 }
 
 /// Whether `dir` is a real directory (not a symlink) owned by this user that nobody else can
 /// enter: where the daemon socket may live.
+#[cfg(unix)]
 pub fn private_dir_ok(dir: &Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     std::fs::symlink_metadata(dir).is_ok_and(|m| {
@@ -1205,6 +1213,7 @@ pub fn private_dir_ok(dir: &Path) -> bool {
 
 /// Creates `dir` (mode 0700) if missing, and checks it with [`private_dir_ok`]: a directory
 /// another user created first (in `/tmp`) must not hold our socket.
+#[cfg(unix)]
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -1226,6 +1235,7 @@ pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Whether the process at the other end of `stream` runs as this user.
+#[cfg(unix)]
 pub fn peer_is_same_user(stream: &std::os::unix::net::UnixStream) -> bool {
     peer_uid(stream).is_some_and(|u| u == uid())
 }
@@ -1233,10 +1243,12 @@ pub fn peer_is_same_user(stream: &std::os::unix::net::UnixStream) -> bool {
 /// Whether the process at the other end of `stream` may use this user's daemon: this user, or
 /// root, which can act as this user anyway. Tailscale SSH dials a forwarded socket from
 /// `tailscaled`, which runs as root.
+#[cfg(unix)]
 pub fn peer_may_use_daemon(stream: &std::os::unix::net::UnixStream) -> bool {
     peer_uid(stream).is_some_and(|u| u == uid() || u == 0)
 }
 
+#[cfg(unix)]
 pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     let fd = stream.as_raw_fd();
@@ -1285,6 +1297,7 @@ pub fn remote_state_path(name: &str) -> PathBuf {
     remote_dir().join(format!("{name}.state"))
 }
 
+#[cfg(unix)]
 fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
@@ -1819,10 +1832,9 @@ pub fn edit_config(edit: impl FnOnce(&str) -> Result<String, String>) -> Result<
 
 /// Replaces the contents of `path` atomically, keeping what the user set up around it: a
 /// symlink (a Home Manager or dotfiles link) stays a link and its target gets the new
-/// contents, and the file keeps its permissions (a new file is private).
+/// contents, and the file keeps its permissions (a new file is private; modes on unix only).
 pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let target = match std::fs::canonicalize(path) {
         Ok(t) => t,
         // A link to a file that doesn't exist yet: create that file, keep the link.
@@ -1845,9 +1857,13 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         }
         Err(e) => return Err(e),
     };
-    let mode = std::fs::metadata(&target)
-        .map(|m| m.permissions().mode() & 0o7777)
-        .unwrap_or(0o600);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&target)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0o600)
+    };
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1856,14 +1872,18 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = target.with_file_name(format!(".{name}.tmp{}-{seq}", std::process::id()));
     // Only a file this call created is removed on failure.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut f = options.open(&tmp)?;
     let result = (|| {
         f.write_all(contents)?;
-        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         f.sync_all()?;
         std::fs::rename(&tmp, &target)
     })();
