@@ -230,6 +230,8 @@ final class AppConfig {
     var agentPresets: [AgentPreset] = []
     /// `[[commands]]`, in the Shell menu's Commands submenu (and so in the command palette).
     var commands: [UserCommand] = []
+    /// `[keybindings]`: chord → action name, or "none".
+    var keybindings: [String: String] = [:]
     /// Programs with their own mark: 24x24 path data by icon id (`[programs]`).
     var programMarks: [String: String] = [:]
     /// `[[remote]]` hosts, by name (connected in the background; see Remote.swift).
@@ -301,6 +303,7 @@ final class AppConfig {
             guard let name = jsonString(cmd["name"]) else { return nil }
             return UserCommand(name: name, key: jsonString(cmd["key"]) ?? "")
         }
+        keybindings = c["keybindings"] as? [String: String] ?? [:]
 
         if let font = c["font"] as? [String: Any] {
             fontFamily = jsonString(font["family"]) ?? fontFamily

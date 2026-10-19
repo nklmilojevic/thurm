@@ -83,6 +83,99 @@ settings override theme colors.
 Shell and environment changes apply to new processes. They do not change the
 environment of shells that are already running.
 
+## Key bindings
+
+`[keybindings]` maps a key combination to an action, the name of a menu item
+below. The action keeps its own shortcut, but the menu shows yours, and no other
+action has the combination any more. Map a combination to `none` to remove it.
+
+```toml
+[keybindings]
+"cmd+shift+d" = "split_right"
+"cmd+e" = "split_down"
+"cmd+k" = "none"
+```
+
+A combination is modifiers and a key joined by `+`. The modifiers are `cmd`,
+`ctrl`, `alt` (or `opt`) and `shift`. The key is a letter, digit or symbol, `f1`
+to `f35`, or one of `enter`, `tab`, `space`, `esc`, `backspace`, `delete`,
+`left`, `right`, `up`, `down`, `home`, `end`, `page_up`, `page_down`, `plus`,
+`minus`, `equal`, `comma`, `period`, `slash`, `backslash`, `semicolon`, `quote`,
+`grave`, `left_bracket` and `right_bracket`. A combination that cannot be read,
+or an unknown action, shows a warning when the configuration loads and leaves
+the defaults alone.
+
+| Action | Menu item |
+| --- | --- |
+| `about` | Thurm > About Thurm |
+| `open_config` | Thurm > Settings… |
+| `reload_config` | Thurm > Reload Configuration |
+| `remotes` | Thurm > Remotes… |
+| `secure_keyboard_entry` | Thurm > Secure Keyboard Entry |
+| `hide` | Thurm > Hide Thurm |
+| `hide_others` | Thurm > Hide Others |
+| `show_all` | Thurm > Show All |
+| `quit` | Thurm > Quit Thurm |
+| `new_tab` | Shell > New Tab |
+| `new_workspace` | Shell > New Workspace |
+| `switch_workspace` | Shell > Switch Workspace… |
+| `switch_agent` | Shell > Switch to Agent… |
+| `rename_workspace` | Shell > Rename Workspace… |
+| `close_workspace` | Shell > Close Workspace… |
+| `split_right` | Shell > Split Right |
+| `split_down` | Shell > Split Down |
+| `command_palette` | Shell > Command Palette… |
+| `processes` | Shell > Processes & Ports… |
+| `close_pane` | Shell > Close Pane |
+| `close_tab` | Shell > Close Tab |
+| `copy` | Edit > Copy |
+| `paste` | Edit > Paste |
+| `select_all` | Edit > Select All |
+| `clear_screen` | Edit > Clear Screen |
+| `clear_scrollback` | Edit > Clear Scrollback |
+| `explain` | Edit > Explain Last Command |
+| `find` | Edit > Find… |
+| `find_next` | Edit > Find Next |
+| `find_previous` | Edit > Find Previous |
+| `increase_font_size` | View > Increase Font Size |
+| `decrease_font_size` | View > Decrease Font Size |
+| `reset_font_size` | View > Reset Font Size |
+| `toggle_tab_style` | View > Tabs in Sidebar |
+| `toggle_sidebar_agents` | View > Agents in Sidebar |
+| `toggle_sidebar` | View > Hide Sidebar |
+| `zoom_split` | View > Zoom Split |
+| `equalize_splits` | View > Equalize Splits |
+| `focus_left` | View > Select Split Left |
+| `focus_right` | View > Select Split Right |
+| `focus_up` | View > Select Split Above |
+| `focus_down` | View > Select Split Below |
+| `resize_left` | View > Move Divider Left |
+| `resize_right` | View > Move Divider Right |
+| `resize_up` | View > Move Divider Up |
+| `resize_down` | View > Move Divider Down |
+| `move_pane_left` | View > Move Pane Left |
+| `move_pane_right` | View > Move Pane Right |
+| `move_pane_up` | View > Move Pane Up |
+| `move_pane_down` | View > Move Pane Down |
+| `toggle_fullscreen` | View > Toggle Full Screen |
+| `minimize` | Window > Minimize |
+| `maximize` | Window > Zoom |
+| `previous_tab` | Window > Show Previous Tab |
+| `next_tab` | Window > Show Next Tab |
+| `select_tab_1` | Window > Select Tab 1 |
+| `select_tab_2` | Window > Select Tab 2 |
+| `select_tab_3` | Window > Select Tab 3 |
+| `select_tab_4` | Window > Select Tab 4 |
+| `select_tab_5` | Window > Select Tab 5 |
+| `select_tab_6` | Window > Select Tab 6 |
+| `select_tab_7` | Window > Select Tab 7 |
+| `select_tab_8` | Window > Select Tab 8 |
+| `select_last_tab` | Window > Select Last Tab |
+| `move_tab_to_new_workspace` | Window > Move Tab to New Workspace |
+| `quick_terminal` | Window > Quick Terminal |
+| `bring_all_to_front` | Window > Bring All to Front |
+| `open_config_file` | Help > Open Configuration File |
+
 ## Commands
 
 A `[[commands]]` entry adds a command of your own to the command palette, and
