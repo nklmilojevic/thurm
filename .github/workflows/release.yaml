@@ -104,18 +104,11 @@ jobs:
         with:
           toolchain: 1.99.1
           targets: wasm32-unknown-unknown
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: wasm-bindgen@0.2.129
-      - name: wasm-opt
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends binaryen
+      # Zig, wasm-bindgen and wasm-opt from the flake's nixpkgs, as in CI and the dev shell.
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - name: Build
-        run: scripts/build-web.sh
+        run: nix shell --inputs-from . nixpkgs#zig_0_16 nixpkgs#wasm-bindgen-cli nixpkgs#binaryen -c scripts/build-web.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: web-dist

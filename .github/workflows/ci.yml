@@ -64,7 +64,7 @@ jobs:
           area app-icon '^(macos/Resources/AppIcon\.icon/|macos/compile-icon\.sh$|macos/build\.sh$|\.github/workflows/ci\.yml$)'
           area docs '^(docs/|config\.example\.toml$|\.github/workflows/ci\.yml$)'
           area go '^(tailnet/|scripts/third-party-licenses\.py$|\.github/workflows/ci\.yml$)'
-          area web '^(web/|crates/thurm-(web|term|proto|config)/|tailnet/internal/(web|gateway)/|tailnet/cmd/thurm-webtest/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/build-web\.sh$|\.github/workflows/ci\.yml$)'
+          area web '^(web/|crates/thurm-(web|term|proto|config)/|tailnet/internal/(web|gateway|node)/|tailnet/cmd/thurm-(webtest|tailnet)/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/build-web\.sh$|\.github/workflows/ci\.yml$)'
           cat "$GITHUB_OUTPUT"
 
   rust:
@@ -203,17 +203,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: web
-      # libghostty-vt for wasm32 is built from source until ghostty-vt-rs-sys ships it prebuilt.
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
-      # The wasm-bindgen version thurm-web pins.
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: wasm-bindgen@0.2.129
-      - name: wasm-opt
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends binaryen
+      # Zig (libghostty-vt for wasm32), wasm-bindgen and wasm-opt from the flake's nixpkgs: the
+      # dev shell's versions, the wasm-bindgen one being the version thurm-web pins.
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -221,13 +213,14 @@ jobs:
           cache-dependency-path: tailnet/go.sum
       - name: wasm core
         run: |
-          cargo clippy -p thurm-web -p thurm-term -p thurm-config -p thurm-proto --target wasm32-unknown-unknown --locked -- -D warnings
+          nix shell --inputs-from . nixpkgs#zig_0_16 -c \
+            cargo clippy -p thurm-web -p thurm-term -p thurm-config -p thurm-proto --target wasm32-unknown-unknown --locked -- -D warnings
           cargo test -p thurm-web --locked
       # Fails past the size budget (specs/web.md: under 1 MB compressed).
       - name: Bundle
         env:
           THURM_WEB_BUDGET_KIB: "700"
-        run: scripts/build-web.sh
+        run: nix shell --inputs-from . nixpkgs#zig_0_16 nixpkgs#wasm-bindgen-cli nixpkgs#binaryen -c scripts/build-web.sh
       - name: Types
         working-directory: web
         run: bunx tsc --noEmit
@@ -240,6 +233,12 @@ jobs:
           cd web
           bunx playwright install --with-deps chromium webkit
           bunx playwright test
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: failure()
+        with:
+          name: playwright-results
+          path: web/test-results/
+          retention-days: 7
 
   checks:
     name: Consistency and advisories
