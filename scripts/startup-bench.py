@@ -183,7 +183,9 @@ class Bench:
                 if os.path.exists(self.socket):
                     listed = self.cli("--json", "list", check=False)
                     if listed.returncode == 0:
-                        panes = [p["id"] for p in json.loads(listed.stdout) if p["alive"]]
+                        panes = [
+                            p["id"] for p in json.loads(listed.stdout) if p["alive"]
+                        ]
                 time.sleep(0.002)
             # The daemon answers each wait the moment the shell prints its prompt.
             waits = [
@@ -233,7 +235,14 @@ class Bench:
             if i == 0 and self.args.screenshot:
                 time.sleep(1)
                 subprocess.run(
-                    ["screencapture", "-x", "-o", "-l", self.window_id, self.args.screenshot]
+                    [
+                        "screencapture",
+                        "-x",
+                        "-o",
+                        "-l",
+                        self.window_id,
+                        self.args.screenshot,
+                    ]
                 )
             self.open_tabs(tabs)
             self.stop_app()
@@ -289,7 +298,9 @@ def main():
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--tabs", type=int, default=6)
     parser.add_argument("--shell", choices=["minimal", "login"], default="minimal")
-    parser.add_argument("--app", help="the Swift app binary (default: macos/.build release)")
+    parser.add_argument(
+        "--app", help="the Swift app binary (default: macos/.build release)"
+    )
     parser.add_argument("--screenshot", help="save the first cold window here (PNG)")
     args = parser.parse_args()
     if sys.platform != "darwin":
