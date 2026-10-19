@@ -66,7 +66,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `agent explain` | Show the process, status source, and detection evidence; `--pane ID` |
 | `agent report` / `agent release` | Report agent state and session details; see [Agent reporting](/agent-integration/) |
 | `attach --pane ID` | Open an interactive terminal connection; see [Terminal attachment](/attach/) |
-| `events` | Stream state changes as JSON Lines; `--pane ID`; see [Layouts and events](/workflows/) |
+| `events` | Stream state changes as JSON Lines; `--pane ID`, `--filter TYPE,...`; see [Layouts and events](/workflows/) |
 | `fork` | Fork an agent session; `--pane ID`, `--split DIRECTION` |
 | `hooks install\|uninstall\|status` | Manage hooks; `--agent claude\|codex` |
 | `explain` | Explain the last finished command; `--pane ID`; needs enabled AI |

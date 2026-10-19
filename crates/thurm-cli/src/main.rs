@@ -334,6 +334,9 @@ enum Cmd {
     Events {
         #[arg(long)]
         pane: Option<PaneId>,
+        /// Only these event types, comma-separated: `--filter PaneClosed,LayoutChanged`.
+        #[arg(long, value_delimiter = ',', ignore_case = true)]
+        filter: Vec<events::Kind>,
     },
     /// Reload ~/.config/thurm/config.toml.
     Reload,
@@ -598,7 +601,7 @@ fn run(cli: Cli) -> R {
         }
     }
     match cli.cmd {
-        Cmd::Events { pane } => events::run(remote.as_deref(), pane),
+        Cmd::Events { pane, filter } => events::run(remote.as_deref(), pane, &filter),
         // Through the dial socket, not the daemon's protocol.
         Cmd::Tailscale {
             action: tailscale::TailscaleCmd::Peers,

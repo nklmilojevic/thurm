@@ -1739,14 +1739,19 @@ private final class OfflineOverlay: NSView {
 }
 
 /// Thin bar at the top of a pane: filled to the reported percentage, or dimmed full width while
-/// the program is busy without one.
-private final class ProgressBarView: NSView {
+/// the program is busy without one. The sidebar's tab rows show one too, on a track.
+final class ProgressBarView: NSView {
     static let height: CGFloat = 2
 
     private let fill = CALayer()
 
     var report: ProgressReport? {
         didSet { if report != oldValue { update() } }
+    }
+
+    /// The unfilled part, rounded at the ends (none: clear and square, as on the pane).
+    var track: NSColor? {
+        didSet { if track != oldValue { update() } }
     }
 
     override init(frame: NSRect) {
@@ -1789,7 +1794,9 @@ private final class ProgressBarView: NSView {
         CATransaction.setDisableActions(true)
         effectiveAppearance.performAsCurrentDrawingAppearance {
             fill.backgroundColor = color.cgColor
+            layer?.backgroundColor = track?.cgColor
         }
+        layer?.cornerRadius = track == nil ? 0 : bounds.height / 2
         // Indeterminate is a still, dimmed full bar: a sliding segment makes WindowServer
         // recomposite the window at the display's rate for as long as the program is busy.
         let fraction = report.state == .indeterminate ? 1 : CGFloat(report.percent ?? 100) / 100
