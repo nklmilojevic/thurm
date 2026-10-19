@@ -326,6 +326,9 @@ enum Cmd {
     Events {
         #[arg(long)]
         pane: Option<PaneId>,
+        /// Only these event types, comma-separated: `--filter PaneClosed,LayoutChanged`.
+        #[arg(long, value_delimiter = ',', ignore_case = true)]
+        filter: Vec<events::Kind>,
     },
     /// Reload ~/.config/thurm/config.toml.
     Reload,
@@ -590,7 +593,7 @@ fn run(cli: Cli) -> R {
         }
     }
     match cli.cmd {
-        Cmd::Events { pane } => events::run(remote.as_deref(), pane),
+        Cmd::Events { pane, filter } => events::run(remote.as_deref(), pane, &filter),
         Cmd::Attach { pane } => attach::run(pane, remote.as_deref(), json),
         Cmd::SocketPath => {
             println!("{}", thurm_config::socket_path().display());
