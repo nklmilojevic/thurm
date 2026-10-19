@@ -310,6 +310,8 @@ enum MainMenu {
                           name: "toggle_tab_style"))
         menu.addItem(item("Agents in Sidebar", #selector(AppDelegate.toggleSidebarAgents(_:)),
                           name: "toggle_sidebar_agents"))
+        menu.addItem(item("Usage Limits in Sidebar", #selector(AppDelegate.toggleSidebarUsage(_:)),
+                          name: "toggle_sidebar_usage"))
         menu.addItem(item("Hide Sidebar", #selector(AppDelegate.toggleTabSidebar(_:)), "b", name: "toggle_sidebar"))
         let theme = NSMenu(title: "Theme")
         theme.delegate = ThemeMenu.shared

@@ -202,6 +202,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     private let workspaceButton = NSButton(title: "", target: nil, action: nil)
     private let workspaceMenu = NSMenu()
     private let agents = AgentsPanel()
+    private let usage = UsagePanel()
 
     /// Solid sidebar color from the theme (set by the window controller). The stock sidebar
     /// material is translucent, so its shade depended on whatever was behind the window.
@@ -255,7 +256,9 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         root.addSubview(workspaceButton)
         root.addSubview(scroll)
         root.addSubview(agents)
+        root.addSubview(usage)
         agents.translatesAutoresizingMaskIntoConstraints = false
+        usage.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             workspaceButton.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: 2),
             workspaceButton.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
@@ -266,7 +269,10 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             scroll.bottomAnchor.constraint(equalTo: agents.topAnchor),
             agents.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             agents.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            agents.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8),
+            agents.bottomAnchor.constraint(equalTo: usage.topAnchor),
+            usage.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            usage.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            usage.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8),
         ])
         view = root
     }
@@ -319,6 +325,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         if workspaceButton.title != workspace { workspaceButton.title = workspace }
         agents.controller = controller
         agents.reload()
+        usage.reload()
         let windows = controller?.orderedTabs ?? [window]
         let panes = SessionManager.shared.panes
         let config = SessionManager.shared.config

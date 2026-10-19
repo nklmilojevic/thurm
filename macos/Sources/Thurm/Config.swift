@@ -146,6 +146,8 @@ final class AppConfig {
     var sidebarAgents = true
     /// Agents the sidebar lists before its agents panel scrolls.
     var sidebarAgentRows = 5
+    /// `window.sidebar_usage`: what is left of the Claude Code and Codex limits, below the agents.
+    var sidebarUsage = false
 
     // [cursor]
     var cursorBlink = false
@@ -339,6 +341,7 @@ final class AppConfig {
             sidebarWidth = CGFloat(min(480, max(180, jsonDouble(w["sidebar_width"]) ?? Double(sidebarWidth))))
             sidebarAgents = jsonBool(w["sidebar_agents"]) ?? sidebarAgents
             sidebarAgentRows = min(100, max(1, jsonInt(w["sidebar_agent_rows"]) ?? sidebarAgentRows))
+            sidebarUsage = jsonBool(w["sidebar_usage"]) ?? sidebarUsage
         }
         if let colors = c["colors"] as? [String: Any] {
             improveContrast = jsonBool(colors["improve_contrast"]) ?? improveContrast

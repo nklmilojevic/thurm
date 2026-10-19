@@ -142,6 +142,7 @@ the defaults alone.
 | `reset_font_size` | View > Reset Font Size |
 | `toggle_tab_style` | View > Tabs in Sidebar |
 | `toggle_sidebar_agents` | View > Agents in Sidebar |
+| `toggle_sidebar_usage` | View > Usage Limits in Sidebar |
 | `toggle_sidebar` | View > Hide Sidebar |
 | `zoom_split` | View > Zoom Split |
 | `equalize_splits` | View > Equalize Splits |

@@ -239,6 +239,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         SessionManager.shared.toggleSidebarAgents()
     }
 
+    @objc func toggleSidebarUsage(_ sender: Any?) {
+        SessionManager.shared.toggleSidebarUsage()
+    }
+
     @objc func newWorkspace(_ sender: Any?) {
         SessionManager.shared.newWorkspace()
     }
@@ -309,6 +313,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         if menuItem.action == #selector(toggleSidebarAgents(_:)) {
             menuItem.state = SessionManager.shared.config.sidebarAgents ? .on : .off
+            return SessionManager.shared.config.sidebarTabs
+        }
+        if menuItem.action == #selector(toggleSidebarUsage(_:)) {
+            menuItem.state = SessionManager.shared.config.sidebarUsage ? .on : .off
             return SessionManager.shared.config.sidebarTabs
         }
         return true

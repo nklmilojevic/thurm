@@ -519,6 +519,9 @@ pub struct WindowConfig {
     pub sidebar_agents: bool,
     /// Rows the sidebar's agents panel shows before it scrolls (dragging its header sets it).
     pub sidebar_agent_rows: u32,
+    /// Show what is left of the Claude Code and Codex subscription limits at the bottom of the
+    /// sidebar.
+    pub sidebar_usage: bool,
 }
 
 impl Default for WindowConfig {
@@ -542,6 +545,7 @@ impl Default for WindowConfig {
             sidebar_width: 240.0,
             sidebar_agents: true,
             sidebar_agent_rows: 5,
+            sidebar_usage: false,
         }
     }
 }
@@ -2524,6 +2528,9 @@ clipboard_read = "always"
         assert!(Config::parse(&out).unwrap().window.sidebar_agents);
         let out = with_setting(&out, "window.sidebar_agents", "false").unwrap();
         assert!(!Config::parse(&out).unwrap().window.sidebar_agents);
+        assert!(!Config::parse(&out).unwrap().window.sidebar_usage);
+        let out = with_setting(&out, "window.sidebar_usage", "true").unwrap();
+        assert!(Config::parse(&out).unwrap().window.sidebar_usage);
         assert!(with_setting(&out, "window.tab_style", "\"diagonal\"").is_err());
         assert!(with_setting(&out, "window.nope", "1").is_err());
         assert!(with_setting(&out, "tab_style", "1").is_err());
