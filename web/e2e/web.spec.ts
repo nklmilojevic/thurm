@@ -76,9 +76,15 @@ test("ends a selection on release", async ({ page }) => {
   await page.mouse.down();
   await page.mouse.move(box.x + metrics.w * 5.6, y);
   await page.mouse.up();
+  const selection = () => page.evaluate(() => (window as any).__thurmTest.selection() as string);
+  // Where a drag ends inside a cell differs a little between engines; what it selected is
+  // "select" or one cell either side.
+  await expect.poll(selection).toMatch(/^sele/);
+  const selected = await selection();
   // Moving after the release leaves the selection as it was.
   await page.mouse.move(box.x + metrics.w * 3, y + metrics.h * 2);
-  await expect.poll(() => page.evaluate(() => (window as any).__thurmTest.selection())).toBe("select");
+  await page.mouse.move(box.x + metrics.w * 1, y + metrics.h * 3);
+  expect(await selection()).toBe(selected);
 });
 
 test("types through an input method", async ({ page, browserName }) => {
