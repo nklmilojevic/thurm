@@ -21,6 +21,20 @@ export type Incoming =
 
 export type ConnState = "connecting" | "connected" | "closed";
 
+/** What a connection is made of; tests swap in fakes. */
+export type ConnDeps = {
+  url: () => string;
+  socket: (url: string) => WebSocket;
+  client: () => Client;
+};
+
+const browserDeps: ConnDeps = {
+  url: () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/v1/connect`,
+  socket: (url) => new WebSocket(url),
+  // The terminal's default theme on the page's side of light and dark.
+  client: () => new Client(matchMedia("(prefers-color-scheme: dark)").matches),
+};
+
 export class Conn {
   client: Client | null = null;
   private ws: WebSocket | null = null;
@@ -33,29 +47,32 @@ export class Conn {
   constructor(
     private onIncoming: (msg: Incoming) => void,
     private onState: (state: ConnState, detail?: string) => void,
+    private deps: ConnDeps = browserDeps,
   ) {}
 
   static async load() {
     await init({ module_or_path: __WASM_URL__ });
   }
 
-  url(): string {
-    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-    return `${scheme}//${location.host}/v1/connect`;
-  }
-
+  /** Opens the connection, unless one is open or opening: one socket, one session. */
   connect() {
     this.stopped = false;
     clearTimeout(this.retry);
+    const state = this.ws?.readyState;
+    if (state === WebSocket.CONNECTING || state === WebSocket.OPEN) return;
     this.onState("connecting");
-    const ws = new WebSocket(this.url());
+    const ws = this.deps.socket(this.deps.url());
     ws.binaryType = "arraybuffer";
     this.ws = ws;
     ws.onopen = () => {
+      // A socket this connection gave up on (it was closing when connect ran again).
+      if (this.ws !== ws) {
+        ws.close();
+        return;
+      }
       this.backoff = 1000;
       this.client?.free();
-      // The terminal's default theme on the page's side of light and dark.
-      this.client = new Client(matchMedia("(prefers-color-scheme: dark)").matches);
+      this.client = this.deps.client();
       this.onState("connected");
       this.pump();
     };
@@ -73,6 +90,9 @@ export class Conn {
     ws.onclose = (ev) => {
       if (this.ws !== ws) return;
       this.ws = null;
+      // Its session ends with it; the next socket starts a new one.
+      this.client?.free();
+      this.client = null;
       for (const done of this.pending.values()) done(undefined, "disconnected");
       this.pending.clear();
       this.onState("closed", ev.reason || (ev.code === 1006 ? "the connection was refused or lost" : ""));

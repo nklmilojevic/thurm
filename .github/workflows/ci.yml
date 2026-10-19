@@ -220,9 +220,11 @@ jobs:
         env:
           THURM_WEB_BUDGET_KIB: "700"
         run: nix shell --inputs-from . nixpkgs#wasm-bindgen-cli nixpkgs#binaryen -c scripts/build-web.sh
-      - name: Types
+      - name: Types and unit tests
         working-directory: web
-        run: bunx tsc --noEmit
+        run: |
+          bunx tsc --noEmit
+          bun test src
       - name: Serving the bundle
         working-directory: tailnet
         run: go test ./internal/web/ ./internal/gateway/
