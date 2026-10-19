@@ -7,6 +7,10 @@
 //	← {"id":1,"error":null,"status":{...}}             the answer, with the status after it
 //	← {"status":{...}}                                  whenever the status changes
 //
+// Every message carries "build": the sha256 of this helper's executable as it was when it
+// started. A daemon that adopts a running helper after an in-place upgrade compares it with the
+// installed executable and replaces a helper that is out of date.
+//
 // With --dial-socket it also lets this machine's processes dial tailnet peers through the
 // embedded node (internal/dial).
 //
@@ -16,10 +20,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -61,6 +68,8 @@ type reply struct {
 	Status *status.Status `json:"status"`
 	// DialSocket is where this helper dials out, when it does (older helpers never say).
 	DialSocket string `json:"dial_socket,omitempty"`
+	// Build fingerprints this helper's executable (older helpers never say).
+	Build string `json:"build,omitempty"`
 }
 
 type helper struct {
@@ -72,6 +81,7 @@ type helper struct {
 	// hostname is kept for the status while the node is off.
 	hostname string
 	allow    bool
+	build    string
 }
 
 func main() {
@@ -95,7 +105,7 @@ func main() {
 		var d net.Dialer
 		return d.DialContext(ctx, "unix", *socket)
 	}
-	h := &helper{out: json.NewEncoder(ctl), hostname: "thurm"}
+	h := &helper{out: json.NewEncoder(ctl), hostname: "thurm", build: selfBuild()}
 	h.node = &node.Node{Dir: *state, Dial: dial, Logf: log.Printf, OnChange: h.publish}
 	h.host = &host.Host{ServePath: *serveSocket, Dial: dial, Logf: log.Printf}
 	if *dialSocket != "" {
@@ -223,10 +233,39 @@ func (h *helper) send(r reply) {
 	if h.dial != nil {
 		r.DialSocket = h.dial.Path
 	}
+	r.Build = h.build
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := h.out.Encode(r); err != nil {
 		// The daemon is gone; main notices the closed socket.
 		log.Printf("control: %v", err)
 	}
+}
+
+// selfBuild fingerprints this executable, read now: an update may replace the file later.
+func selfBuild() string {
+	exe, err := os.Executable()
+	if err != nil {
+		log.Printf("build: %v", err)
+		return ""
+	}
+	build, err := fileBuild(exe)
+	if err != nil {
+		log.Printf("build: %v", err)
+	}
+	return build
+}
+
+// fileBuild is the hex sha256 of a file, as thurmd computes it for the installed helper.
+func fileBuild(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
 }

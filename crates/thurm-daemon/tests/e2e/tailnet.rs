@@ -285,3 +285,180 @@ done
         std::thread::sleep(Duration::from_millis(200));
     }
 }
+
+/// A helper that writes its pid to `pids` and, with `says_build`, reports the sha256 of its own
+/// file as the real helper does. Written beside and renamed over, as an update replaces it.
+fn build_helper(env: &Env, says_build: bool, version: &str) -> PathBuf {
+    let path = env.dir.join("thurm-tailnet");
+    let pids = env.dir.join("pids");
+    let build = if says_build { r#","build":"%s""# } else { "" };
+    let script = format!(
+        r#"#!/bin/sh
+# {version}
+build=$(shasum -a 256 "$0" | cut -d' ' -f1)
+# Only once its build is read: the test may replace the file as soon as it sees the pid.
+echo $$ >> '{pids}'
+while IFS= read -r line <&3; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  printf '{{"id":%s,"error":null,"status":{{"state":"running","hostname":"stub","tags":[],"host_urls":[],"https":{{"state":"ready"}}}}{build}}}\n' "$id" "$build" >&3
+done
+"#,
+        pids = pids.display()
+    );
+    let next = env.dir.join("thurm-tailnet.next");
+    std::fs::write(&next, script).unwrap();
+    std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&next, &path).unwrap();
+    path
+}
+
+/// Serving from the config, as `tailscale.enabled` keeps it, so the new image serves too.
+fn serve_from_config(env: &Env) {
+    let mut cfg = std::fs::OpenOptions::new()
+        .append(true)
+        .open(env.dir.join("config/config.toml"))
+        .unwrap();
+    writeln!(cfg, "\n[tailscale]\nenabled = true\nhostname = \"stub\"").unwrap();
+}
+
+fn first_helper(env: &Env) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(&pid) = helper_pids(env).first() {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "no helper started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn helper_pids(env: &Env) -> Vec<i32> {
+    std::fs::read_to_string(env.dir.join("pids"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.parse().unwrap())
+        .collect()
+}
+
+fn alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// What an update does, then a connection to the new image.
+fn upgrade(env: &Env, daemon: &Daemon, c: Arc<Client>) -> Arc<Client> {
+    let mut req = env.socket.as_os_str().to_owned();
+    req.push(".upgrade");
+    std::fs::write(PathBuf::from(req), env!("CARGO_BIN_EXE_thurmd")).unwrap();
+    assert_eq!(
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGUSR2) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.is_alive() {
+        assert!(Instant::now() < deadline, "old image kept the connection");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(c);
+    env.connect().0
+}
+
+fn wait_for_replacement(env: &Env, c: &Client, old: i32) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let pids = helper_pids(env);
+        let running = matches!(
+            c.request(Request::TailscaleStatus).unwrap(),
+            Response::TailscaleStatus(s) if s.state == TailscaleState::Running
+        );
+        if pids.len() == 2 && alive(pids[1]) && !alive(old) && running {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "helper {old} was not replaced: {pids:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn an_upgrade_replaces_a_helper_whose_executable_changed() {
+    let env = Env::new("tailnet-upgrade-new");
+    let helper = build_helper(&env, true, "v1");
+    serve_from_config(&env);
+    let daemon = env.start_with(&[("THURM_TAILNET", &helper)]);
+    let (c, _rx) = env.connect();
+    let old = first_helper(&env);
+
+    build_helper(&env, true, "v2");
+    let c = upgrade(&env, &daemon, c);
+    wait_for_replacement(&env, &c, old);
+}
+
+#[test]
+fn an_upgrade_replaces_a_helper_too_old_to_say_its_build() {
+    let env = Env::new("tailnet-upgrade-old");
+    let helper = build_helper(&env, false, "v1");
+    serve_from_config(&env);
+    let daemon = env.start_with(&[("THURM_TAILNET", &helper)]);
+    let (c, _rx) = env.connect();
+    let old = first_helper(&env);
+
+    let c = upgrade(&env, &daemon, c);
+    wait_for_replacement(&env, &c, old);
+}
+
+#[test]
+fn an_upgrade_keeps_a_helper_that_is_current() {
+    let env = Env::new("tailnet-upgrade-same");
+    let helper = build_helper(&env, true, "v1");
+    serve_from_config(&env);
+    let daemon = env.start_with(&[("THURM_TAILNET", &helper)]);
+    let (c, _rx) = env.connect();
+    let old = first_helper(&env);
+
+    let c = upgrade(&env, &daemon, c);
+    match c.request(Request::TailscaleStatus).unwrap() {
+        Response::TailscaleStatus(s) => assert_eq!(s.state, TailscaleState::Running),
+        other => panic!("{other:?}"),
+    }
+    // Long enough for the new image to have compared builds.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(helper_pids(&env), vec![old]);
+    assert!(alive(old));
+}
+
+#[test]
+fn an_upgrade_replaces_a_helper_that_fails_the_status_probe() {
+    let env = Env::new("tailnet-upgrade-failing");
+    let path = env.dir.join("thurm-tailnet");
+    let pids = env.dir.join("pids");
+    // An old helper (no build) that answers `status` with an error.
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+echo $$ >> '{pids}'
+while IFS= read -r line <&3; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+  *'"cmd":"status"'*) printf '{{"id":%s,"error":"broken","status":null}}\n' "$id" >&3 ;;
+  *) printf '{{"id":%s,"error":null,"status":{{"state":"running","hostname":"stub","tags":[],"host_urls":[],"https":{{"state":"ready"}}}}}}\n' "$id" >&3 ;;
+  esac
+done
+"#,
+            pids = pids.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    serve_from_config(&env);
+    let daemon = env.start_with(&[("THURM_TAILNET", &path)]);
+    let (c, _rx) = env.connect();
+    let old = first_helper(&env);
+
+    // The installed helper is a working one.
+    build_helper(&env, true, "v2");
+    let c = upgrade(&env, &daemon, c);
+    wait_for_replacement(&env, &c, old);
+}
