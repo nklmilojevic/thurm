@@ -104,11 +104,11 @@ jobs:
         with:
           toolchain: 1.99.1
           targets: wasm32-unknown-unknown
-      # Zig, wasm-bindgen and wasm-opt from the flake's nixpkgs, as in CI and the dev shell.
+      # wasm-bindgen and wasm-opt from the flake's nixpkgs, as in CI and the dev shell.
       - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - name: Build
-        run: nix shell --inputs-from . nixpkgs#zig_0_16 nixpkgs#wasm-bindgen-cli nixpkgs#binaryen -c scripts/build-web.sh
+        run: nix shell --inputs-from . nixpkgs#wasm-bindgen-cli nixpkgs#binaryen -c scripts/build-web.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: web-dist

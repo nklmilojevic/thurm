@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the browser client (specs/web.md) into tailnet/internal/web/dist, which thurm-tailnet
 # embeds: the wasm session (thurm-web, size-optimized), its JS bindings, and the page.
-# Needs Zig 0.16, wasm-bindgen-cli (the version thurm-web pins), wasm-opt (binaryen) and bun:
+# Needs wasm-bindgen-cli (the version thurm-web pins), wasm-opt (binaryen) and bun:
 # the dev shell has them. THURM_WEB_BUDGET_KIB fails the build above that many KiB (brotli).
 set -euo pipefail
 cd "$(dirname "$0")/.."

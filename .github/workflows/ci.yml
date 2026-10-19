@@ -203,8 +203,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: web
-      # Zig (libghostty-vt for wasm32), wasm-bindgen and wasm-opt from the flake's nixpkgs: the
-      # dev shell's versions, the wasm-bindgen one being the version thurm-web pins.
+      # wasm-bindgen and wasm-opt from the flake's nixpkgs: the dev shell's versions, the
+      # wasm-bindgen one being the version thurm-web pins.
       - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -213,14 +213,13 @@ jobs:
           cache-dependency-path: tailnet/go.sum
       - name: wasm core
         run: |
-          nix shell --inputs-from . nixpkgs#zig_0_16 -c \
-            cargo clippy -p thurm-web -p thurm-term -p thurm-config -p thurm-proto --target wasm32-unknown-unknown --locked -- -D warnings
+          cargo clippy -p thurm-web -p thurm-term -p thurm-config -p thurm-proto --target wasm32-unknown-unknown --locked -- -D warnings
           cargo test -p thurm-web --locked
       # Fails past the size budget (specs/web.md: under 1 MB compressed).
       - name: Bundle
         env:
           THURM_WEB_BUDGET_KIB: "700"
-        run: nix shell --inputs-from . nixpkgs#zig_0_16 nixpkgs#wasm-bindgen-cli nixpkgs#binaryen -c scripts/build-web.sh
+        run: nix shell --inputs-from . nixpkgs#wasm-bindgen-cli nixpkgs#binaryen -c scripts/build-web.sh
       - name: Types
         working-directory: web
         run: bunx tsc --noEmit

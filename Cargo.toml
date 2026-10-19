@@ -19,7 +19,7 @@ thurm-mosh = { path = "crates/thurm-mosh" }
 thurm-direct = { path = "crates/thurm-direct" }
 thurm-tailnet-client = { path = "crates/thurm-tailnet-client" }
 # libghostty-vt (Ghostty's terminal engine): prebuilt for the shipped targets, no Zig needed.
-ghostty-vt-rs-sys = "0.1"
+ghostty-vt-rs-sys = "0.1.1"
 bitflags = "2"
 memchr = "2"
 serde = { version = "1", features = ["derive"] }
@@ -48,7 +48,3 @@ signal-hook = "0.4"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-# ghostty-vt-rs-sys with the wasm32 target, until 0.1.1 is on crates.io.
-[patch.crates-io]
-ghostty-vt-rs-sys = { git = "https://github.com/nklmilojevic/ghostty-vt-rs", rev = "5a0454d0f5b2294c7556fd4312b5c80d5f999fe2" }
