@@ -6,7 +6,28 @@ others. Inspired by Tern's `tern web serve` (a wasm client on WebGPU attached to
 session as its desktop and iPhone apps), without its `?token=` URL: the tailnet already says who
 is asking.
 
-Status: proposed. Nothing built. What was checked while writing this is in [Verified](#verified).
+Status: built, in review: nklmilojevic/ghostty-vt-rs#2 (merged; the wasm32 target), #167 (the
+core builds for wasm32), #169 (the client, serving, CI and release). Checked end to end in
+Chromium with Playwright, against a real `thurmd` behind a test gateway; not yet on a real
+tailnet node. What was checked while writing this is in [Verified](#verified).
+
+Where the build differs from the design below:
+
+- The worker is a clock only. The WebSocket and the wasm session stay on the main thread: a
+  keydown has to know at once whether the terminal took it (to prevent the browser's default),
+  and the worker's ticks still reach a hidden tab.
+- Events and requests cross into the page as serde JSON; only cells are a `Uint32Array`, and
+  only the rows that changed. A row shift repaints every row.
+- The reload rule compares the page's own script URL with the one the node's `index.html` names
+  now, rather than `Hello`'s `build`.
+- ghostty has no kitty graphics on freestanding targets (it needs a clock), so `thurm-term`
+  calls stand-ins there; images were a non-goal anyway.
+- The Host check applies to browser requests only (pages, and upgrades with an `Origin`): apps
+  keep connecting whatever name or port form they use.
+- Size: the wasm is 392 KiB brotli (505 KiB gzip), the whole first load 474 KiB brotli. Most of
+  the module is `thurm-term` and `thurm-config`'s embedded themes.
+- Option-as-Alt on a Mac and Thurm's own box drawing are not in v1; the nix package serves the
+  placeholder page (the bundle needs Zig and ghostty's sources in the sandbox).
 
 ## Goals
 
