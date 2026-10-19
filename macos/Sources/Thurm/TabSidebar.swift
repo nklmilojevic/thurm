@@ -22,6 +22,15 @@ struct SidebarTab {
     var icon: PaneIcon = .shell
     /// The tab's other panes, stacked behind its icon.
     var behind: [PaneIcon] = []
+    /// The bar under the title (OSC 9;4).
+    var progress: ProgressReport?
+
+    /// Whether the two differ in their progress only: the row then moves its bar and nothing else.
+    func differsInProgressOnly(from other: SidebarTab) -> Bool {
+        var same = other
+        same.progress = progress
+        return same == self && other.progress != progress
+    }
 }
 
 extension SidebarTab: Equatable {
@@ -29,7 +38,7 @@ extension SidebarTab: Equatable {
         a.controller === b.controller && a.title == b.title && a.subtitle == b.subtitle && a.branch == b.branch
             && a.added == b.added && a.removed == b.removed && a.status == b.status
             && a.shortcut == b.shortcut && a.selected == b.selected && a.icon == b.icon
-            && a.behind == b.behind
+            && a.behind == b.behind && a.progress == b.progress
     }
 }
 
@@ -337,6 +346,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                                  selected: w === window,
                                  icon: PaneIcon(info),
                                  behind: PaneIcon.behind(c))
+            tab.progress = Self.progress(focused: c.focusedPane, panes: c.content.paneIds, info: panes)
             if let g = git {
                 tab.branch = c.host == localHost ? g.branch : "\(c.host) · \(g.branch)"
                 tab.added = g.added
@@ -371,10 +381,14 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                 for (g, new) in zip(groups, tabs) {
                     g.tabs = new
                     for (box, tab) in zip(g.boxes, new) where box.tab != tab {
+                        // A program reports progress many times a second: move only the bar.
+                        let progressOnly = tab.differsInProgressOnly(from: box.tab)
                         box.tab = tab
                         let row = outline.row(forItem: box)
-                        guard row >= 0 else { continue }
-                        (outline.view(atColumn: 0, row: row, makeIfNecessary: false) as? TabRowView)?.configure(tab)
+                        guard row >= 0,
+                              let view = outline.view(atColumn: 0, row: row, makeIfNecessary: false) as? TabRowView
+                        else { continue }
+                        if progressOnly { view.setProgress(tab.progress) } else { view.configure(tab) }
                     }
                 }
             }
@@ -393,6 +407,14 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         if let row = current, outline.selectedRow != row {
             outline.selectRowIndexes([row], byExtendingSelection: false)
         }
+    }
+
+    /// The progress a tab's row shows. One bar for the whole tab: the focused pane's, as that is
+    /// the pane the tab is named after; else the first other pane (in split order) that reports
+    /// one, so a build left running in a split still shows.
+    static func progress(focused: PaneKey, panes: [PaneKey], info: [PaneKey: PaneInfo]) -> ProgressReport? {
+        TerminalView.shownProgress(info[focused])
+            ?? panes.lazy.compactMap { TerminalView.shownProgress(info[$0]) }.first
     }
 
     /// The identity of each tab in a group: the window it shows.
@@ -781,8 +803,8 @@ func abbreviatePath(_ path: String) -> String {
     return parts.joined(separator: "/")
 }
 
-/// One sidebar row: icon tile with a status dot, title over branch/diff (or directory), working
-/// dots and the Cmd+N hint.
+/// One sidebar row: icon tile with a status dot, title over branch/diff (or directory) and the
+/// progress bar, working dots and the Cmd+N hint.
 final class TabRowView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("TabRow")
 
@@ -792,6 +814,7 @@ final class TabRowView: NSTableCellView {
     private let title = NSTextField(labelWithString: "")
     private let subtitle = NSTextField(labelWithString: "")
     private let shortcut = NSTextField(labelWithString: "")
+    private let progress = ProgressBarView()
     /// Tab rows show the tab's hover card; agent rows (one pane each) don't.
     var showsHoverCard = false
     private weak var controller: TerminalWindowController?
@@ -815,7 +838,8 @@ final class TabRowView: NSTableCellView {
         title.maximumNumberOfLines = 1
         shortcut.font = .systemFont(ofSize: 11)
         shortcut.textColor = SessionManager.shared.config.chrome.contentTertiary
-        for v in [icon, dot, title, subtitle, working, shortcut] {
+        progress.isHidden = true
+        for v in [icon, dot, title, subtitle, working, shortcut, progress] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
         }
@@ -844,6 +868,11 @@ final class TabRowView: NSTableCellView {
             subtitle.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
             shortcut.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             shortcut.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            // Under the title and branch, in the row's bottom padding: the row keeps its height.
+            progress.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            progress.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            progress.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
+            progress.heightAnchor.constraint(equalToConstant: ProgressBarView.height),
         ])
     }
 
@@ -888,8 +917,17 @@ final class TabRowView: NSTableCellView {
         dot.isHidden = tab.status == nil || tab.status == .idle || tab.status == .working
         dot.layer?.backgroundColor = tab.status?.color.cgColor
         dot.layer?.borderColor = SessionManager.shared.config.sidebarColor.cgColor
+        progress.track = SessionManager.shared.config.chrome.control
+        setProgress(tab.progress)
         // The other tabs have their hover card instead.
         toolTip = showsHoverCard && !tab.selected ? nil : [tab.title, tab.subtitle].compactMap { $0 }.joined(separator: "\n")
+    }
+
+    /// Sets the bar alone: its fill layer moves, the rest of the row stays as it is. Like the
+    /// pane's bar, indeterminate is a still, dimmed full bar.
+    func setProgress(_ report: ProgressReport?) {
+        progress.report = report
+        if progress.isHidden != (report == nil) { progress.isHidden = report == nil }
     }
 
     override func mouseEntered(with event: NSEvent) {

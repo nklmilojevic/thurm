@@ -35,4 +35,67 @@ final class SidebarTests: XCTestCase {
         let shown = [[id(a), id(b)], [id(c)]]
         XCTAssertFalse(TabSidebarViewController.sameRows(shown, [[id(a)], [id(b), id(c)]]))
     }
+
+    private func pane(_ id: UInt64, progress: String?, percent: Int? = nil, agent: String? = nil) -> PaneInfo {
+        var d: [String: Any] = ["id": id]
+        if let progress { d["progress"] = ["state": progress, "percent": percent as Any] }
+        if let agent { d["agent"] = ["name": "Claude Code", "status": agent] }
+        return PaneInfo(json: d)!
+    }
+
+    /// The focused pane's progress wins; without one, the first other pane reporting shows.
+    func testTabProgressPrefersTheFocusedPane() {
+        let one = PaneKey.local(1), two = PaneKey.local(2), three = PaneKey.local(3)
+        let info = [one: pane(1, progress: nil),
+                    two: pane(2, progress: "normal", percent: 40),
+                    three: pane(3, progress: "error", percent: 90)]
+        let order = [one, two, three]
+        XCTAssertEqual(TabSidebarViewController.progress(focused: three, panes: order, info: info),
+                       ProgressReport(state: .error, percent: 90))
+        XCTAssertEqual(TabSidebarViewController.progress(focused: one, panes: order, info: info),
+                       ProgressReport(state: .normal, percent: 40))
+        XCTAssertNil(TabSidebarViewController.progress(focused: one, panes: [one], info: info))
+    }
+
+    /// A working agent's busy bar stays hidden here as on the pane, and does not hide another
+    /// pane's progress.
+    func testTabProgressSkipsAWorkingAgentsBusyBar() {
+        let agent = PaneKey.local(1), build = PaneKey.local(2)
+        var info = [agent: pane(1, progress: "indeterminate", agent: "Working")]
+        XCTAssertNil(TabSidebarViewController.progress(focused: agent, panes: [agent], info: info))
+        info[build] = pane(2, progress: "paused", percent: 10)
+        XCTAssertEqual(TabSidebarViewController.progress(focused: agent, panes: [agent, build], info: info),
+                       ProgressReport(state: .paused, percent: 10))
+        info[agent] = pane(1, progress: "indeterminate", agent: "Idle")
+        XCTAssertEqual(TabSidebarViewController.progress(focused: agent, panes: [agent, build], info: info)?.state,
+                       .indeterminate)
+    }
+
+    /// Only a progress change moves the bar alone; any other change reconfigures the row.
+    func testProgressOnlyChange() {
+        let tab = SidebarTab(controller: nil, title: "cargo", selected: false)
+        var moved = tab
+        moved.progress = ProgressReport(state: .normal, percent: 50)
+        XCTAssertTrue(moved.differsInProgressOnly(from: tab))
+        XCTAssertFalse(tab.differsInProgressOnly(from: tab))
+        var retitled = moved
+        retitled.title = "cargo build"
+        XCTAssertFalse(retitled.differsInProgressOnly(from: tab))
+        XCTAssertNotEqual(moved, tab)
+    }
+
+    /// The row's bar shows only while there is progress, and setting it leaves the rest alone.
+    func testRowBarFollowsProgress() {
+        let row = TabRowView()
+        var tab = SidebarTab(controller: nil, title: "cargo", selected: false)
+        row.configure(tab)
+        let bar = row.subviews.compactMap { $0 as? ProgressBarView }.first!
+        XCTAssertTrue(bar.isHidden)
+        tab.progress = ProgressReport(state: .normal, percent: 40)
+        row.setProgress(tab.progress)
+        XCTAssertFalse(bar.isHidden)
+        XCTAssertEqual(bar.report, tab.progress)
+        row.setProgress(nil)
+        XCTAssertTrue(bar.isHidden)
+    }
 }

@@ -191,6 +191,48 @@ fn events_filter_metadata_and_fail_on_disconnect() {
 }
 
 #[test]
+fn events_filter_by_type() {
+    let env = TestSocket::new("events-type");
+    let listener = env.listen();
+    let server = std::thread::spawn(move || {
+        let mut s = accept(listener);
+        for event in [
+            Event::PaneInfo(Default::default()),
+            Event::PaneClosed { pane: 4 },
+            Event::ConfigReloaded,
+            Event::LayoutChanged,
+        ] {
+            codec::write_message(&mut s, &ServerMessage::Event(event)).unwrap();
+        }
+    });
+    let output = env
+        .command()
+        .args(["events", "--filter", "PaneClosed,layout_changed"])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "{\"PaneClosed\":{\"pane\":4}}\n\"LayoutChanged\""
+    );
+}
+
+#[test]
+fn events_reject_unknown_type() {
+    let env = TestSocket::new("events-unknown");
+    let output = env
+        .command()
+        .args(["events", "--filter", "PaneClosed,Output"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("invalid value 'Output'"), "{error}");
+    assert!(error.contains("LayoutChanged"), "{error}");
+}
+
+#[test]
 fn remote_events_reject_unknown_and_disconnected_hosts_before_socket_access() {
     for configured in [false, true] {
         let env = TestSocket::new(if configured {
