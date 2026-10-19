@@ -13,9 +13,11 @@ Two numbers, each the median (and min/max) over --runs:
 plus `reattach`: the app relaunched while the daemon keeps running (window on screen; the
 shells never stopped).
 
-"At a prompt" is the daemon's `at_prompt` (OSC 133 from shell integration), which
-`thurm wait --prompt` returns on; "on screen" is the app's first window in CGWindowList.
-Neither is the first frame with the prompt drawn: that would need instrumenting the app.
+"At a prompt" is the daemon's `at_prompt` (OSC 133 from shell integration), polled with
+`thurm --json list` (not `thurm wait --prompt`, which settles for 300 ms first): a time is
+late by at most one poll, reported as `poll_ms`. "On screen" is the app's first window in
+CGWindowList. Neither is the first frame with the prompt drawn: that would need
+instrumenting the app.
 
 Build first (release, with /usr/bin first on PATH):
     cargo build --release -p thurm-ffi -p thurm-daemon -p thurm-cli --target aarch64-apple-darwin
@@ -87,6 +89,15 @@ class Bench:
         )
         # Short: a Unix socket path has to fit in 104 bytes.
         self.dir = tempfile.mkdtemp(prefix="tb", dir="/tmp")
+        self.app_proc = None
+        self.polls = []
+        try:
+            self.setup(args, thurm, sparkle)
+        except BaseException:
+            shutil.rmtree(self.dir, ignore_errors=True)
+            raise
+
+    def setup(self, args, thurm, sparkle):
         self.socket = os.path.join(self.dir, "s")
         self.state = os.path.join(self.dir, "state")
         config = os.path.join(self.dir, "config")
@@ -126,11 +137,14 @@ class Bench:
         with open(src, "w") as f:
             f.write(WINDOW_PROBE)
         subprocess.run(["/usr/bin/swiftc", "-O", "-o", self.probe, src], check=True)
-        self.app_proc = None
 
     def cli(self, *argv, check=True):
         out = subprocess.run(
-            [self.thurm, *argv], env=self.env, capture_output=True, text=True
+            [self.thurm, *argv],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if check and out.returncode != 0:
             die(f"thurm {' '.join(argv)}: {out.stderr.strip()}")
@@ -176,31 +190,22 @@ class Bench:
         prompt_at = t0
         if prompts:
             deadline = t0 + 20
-            panes = []
-            while len(panes) < prompts:
+            ready = 0
+            while ready < prompts:
                 if time.time() > deadline:
-                    die(f"only {len(panes)} of {prompts} panes appeared")
+                    die(f"only {ready} of {prompts} panes reached a prompt")
                 if os.path.exists(self.socket):
+                    before = time.time()
                     listed = self.cli("--json", "list", check=False)
+                    prompt_at = time.time()
+                    self.polls.append(prompt_at - before)
                     if listed.returncode == 0:
-                        panes = [
-                            p["id"] for p in json.loads(listed.stdout) if p["alive"]
-                        ]
-                time.sleep(0.002)
-            # The daemon answers each wait the moment the shell prints its prompt.
-            waits = [
-                subprocess.Popen(
-                    [self.thurm, "wait", "--prompt", "--pane", str(p), "-t", "20"],
-                    env=self.env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                for p in panes
-            ]
-            for w in waits:
-                if w.wait() != 0:
-                    die("a pane never reached a prompt")
-            prompt_at = time.time()
+                        ready = sum(
+                            1
+                            for p in json.loads(listed.stdout)
+                            if p["alive"] and p["at_prompt"]
+                        )
+                time.sleep(0.001)
         out, _ = probe.communicate()
         if probe.returncode != 0:
             die("the app's window never appeared")
@@ -242,7 +247,8 @@ class Bench:
                         "-l",
                         self.window_id,
                         self.args.screenshot,
-                    ]
+                    ],
+                    check=False,
                 )
             self.open_tabs(tabs)
             self.stop_app()
@@ -267,6 +273,7 @@ class Bench:
             "cold": summary(cold),
             "reattach": summary(reattach)["window"],
             "reopen": summary(reopen),
+            "poll_ms": round(statistics.median(self.polls) * 1e3, 1),
         }
         print(json.dumps(report, indent=2))
 
@@ -291,12 +298,19 @@ def summary(samples):
     }
 
 
+def positive(value):
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"{value} is not a positive number")
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--runs", type=int, default=10)
-    parser.add_argument("--tabs", type=int, default=6)
+    parser.add_argument("--runs", type=positive, default=10)
+    parser.add_argument("--tabs", type=positive, default=6)
     parser.add_argument("--shell", choices=["minimal", "login"], default="minimal")
     parser.add_argument(
         "--app", help="the Swift app binary (default: macos/.build release)"
