@@ -93,7 +93,11 @@ pub fn run(c: &Client, action: TailscaleCmd, json: bool) -> super::R {
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
-        print!("{}", describe(&status));
+        let browser = thurm_config::Config::load()
+            .unwrap_or_default()
+            .tailscale
+            .web;
+        print!("{}", describe(&status, browser));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -110,7 +114,8 @@ pub fn whoami(c: &Client, json: bool) -> super::R {
     Ok(ExitCode::SUCCESS)
 }
 
-fn describe(s: &TailscaleStatus) -> String {
+/// `browser`: the config serves the browser client, so the page's address is printed too.
+fn describe(s: &TailscaleStatus, browser: bool) -> String {
     let mut out = String::new();
     let state = match s.state {
         TailscaleState::Off => "not serving over Tailscale",
@@ -132,6 +137,13 @@ fn describe(s: &TailscaleStatus) -> String {
     }
     if let Some(url) = &s.url {
         out.push_str(&format!("connect: {url}\n"));
+    }
+    // Served once the node runs with HTTPS ready, which is when `url` is set.
+    if browser
+        && s.url.is_some()
+        && let Some(name) = &s.dns_name
+    {
+        out.push_str(&format!("browser: https://{name}/\n"));
     }
     for url in &s.host_urls {
         out.push_str(&format!("connect (this host's Tailscale): {url}\n"));
@@ -270,9 +282,25 @@ mod tests {
             auth_url: Some("https://login.tailscale.com/a/abc".into()),
             ..Default::default()
         };
-        let text = describe(&s);
+        let text = describe(&s, false);
         assert!(text.contains("needs you to sign in"), "{text}");
         assert!(text.contains("https://login.tailscale.com/a/abc"), "{text}");
+    }
+
+    #[test]
+    fn prints_the_browser_page_when_it_is_served() {
+        let s = TailscaleStatus {
+            state: TailscaleState::Running,
+            hostname: "thurm".into(),
+            dns_name: Some("thurm.tail1234.ts.net".into()),
+            url: Some("wss://thurm.tail1234.ts.net/v1/connect".into()),
+            ..Default::default()
+        };
+        assert!(describe(&s, true).contains("browser: https://thurm.tail1234.ts.net/\n"));
+        assert!(!describe(&s, false).contains("browser:"));
+        // Not before HTTPS is ready: the node doesn't serve the page yet.
+        let waiting = TailscaleStatus { url: None, ..s };
+        assert!(!describe(&waiting, true).contains("browser:"));
     }
 
     #[test]
@@ -288,7 +316,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let text = describe(&s);
+        let text = describe(&s, false);
         assert!(text.contains("serving over Tailscale"), "{text}");
         assert!(text.contains("only the account"), "{text}");
         assert!(text.contains("https: ready"), "{text}");

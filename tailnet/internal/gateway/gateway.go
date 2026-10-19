@@ -1,7 +1,8 @@
 // Package gateway serves the daemon's protocol to admitted tailnet callers over a WebSocket.
 //
 // A client opens GET /v1/connect and upgrades it; binary messages then carry the daemon's
-// byte stream (length-prefixed postcard frames) unchanged, in both directions.
+// byte stream (length-prefixed postcard frames) unchanged, in both directions. The browser
+// client, when served, is on every other path.
 package gateway
 
 import (
@@ -11,6 +12,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +40,12 @@ type Gateway struct {
 	Dial func(ctx context.Context) (net.Conn, error)
 	Logf func(format string, args ...any)
 
+	// Origin is the one browser origin allowed, such as https://thurm.tail1234.ts.net; empty
+	// allows none. Requests must be addressed to it too.
+	Origin string
+	// Web serves the browser client on every other path; nil serves none, which is 404.
+	Web http.Handler
+
 	mu    sync.Mutex
 	conns map[*websocket.Conn]struct{}
 	// epoch counts CloseAll calls: a caller admitted before one is not proxied after it.
@@ -51,24 +60,54 @@ func (g *Gateway) logf(format string, args ...any) {
 	}
 }
 
-// ServeHTTP answers /v1/connect, and 404 elsewhere so the endpoint is easy to tell apart.
-func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != ConnectPath {
-		http.NotFound(w, r)
-		return
-	}
-	caller, err := g.Identify(r)
-	if err != nil {
-		g.logf("%s: %s: not identified: %v", g.Via, r.RemoteAddr, err)
-		http.Error(w, "forbidden: the caller could not be identified", http.StatusForbidden)
-		return
-	}
+// SetBrowser sets the browser origin allowed and the client served to it (nil: none). It may
+// change while serving.
+func (g *Gateway) SetBrowser(origin string, web http.Handler) {
 	g.mu.Lock()
-	epoch := g.epoch
+	defer g.mu.Unlock()
+	g.Origin, g.Web = origin, web
+}
+
+// ServeHTTP answers /v1/connect, the browser client when Web is set, and 404 elsewhere so the
+// endpoint is easy to tell apart.
+func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	g.mu.Lock()
+	origin, web := g.Origin, g.Web
 	g.mu.Unlock()
-	if err := g.Policy().Check(caller); err != nil {
-		g.logf("%s: refused %s (%s): %v", g.Via, caller.LoginName, caller.Node, err)
-		http.Error(w, err.Error(), http.StatusForbidden)
+	// A browser reaches only the node's own address: a page on another name (a DNS rebinding
+	// one, say) gets nothing. Apps (no Origin) are not held to it, as before browsers came.
+	browser := r.URL.Path != ConnectPath || r.Header.Get("Origin") != ""
+	if origin != "" && browser && !sameHost(r.Host, origin) {
+		g.logf("%s: %s: refused host %q", g.Via, r.RemoteAddr, r.Host)
+		http.Error(w, "forbidden: this address is not the node's", http.StatusForbidden)
+		return
+	}
+	if r.URL.Path != ConnectPath {
+		if web == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if _, _, ok := g.authorize(w, r); !ok {
+			return
+		}
+		// The page's own origin decides where its WebSocket may connect: a page loaded as
+		// NAME., NAME:443 or in other letters goes to the canonical address first.
+		if u, err := url.Parse(origin); err == nil && origin != "" && r.Host != u.Host {
+			http.Redirect(w, r, origin+r.URL.RequestURI(), http.StatusPermanentRedirect)
+			return
+		}
+		web.ServeHTTP(w, r)
+		return
+	}
+	caller, epoch, ok := g.authorize(w, r)
+	if !ok {
+		return
+	}
+	// Apps send no Origin. A browser page sends its own, and only the node's page may connect;
+	// the daemon is not dialed for any other.
+	if o := r.Header.Get("Origin"); o != "" && o != origin {
+		g.logf("%s: refused %s: browser origin %q", g.Via, caller.LoginName, o)
+		http.Error(w, "forbidden: this page may not connect", http.StatusForbidden)
 		return
 	}
 	daemon, err := g.Dial(r.Context())
@@ -82,9 +121,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the Thurm daemon is not reachable", http.StatusServiceUnavailable)
 		return
 	}
-	// Clients are apps, not browsers: they send no Origin, and a browser page can't reach
-	// this without one.
-	ws, err := websocket.Accept(w, r, nil)
+	// The Origin check above is the only one, so the library's own is off.
+	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		daemon.Close()
 		return
@@ -104,6 +142,50 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn := websocket.NetConn(ctx, ws, websocket.MessageBinary)
 	pipe(conn, daemon)
 	ws.Close(websocket.StatusNormalClosure, "")
+}
+
+// sameHost reports whether a Host header names origin's host: case aside, with or without the
+// scheme's default port and a final dot.
+func sameHost(host, origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	def := "443"
+	if u.Scheme == "http" {
+		def = "80"
+	}
+	norm := func(h string) string {
+		name, port, err := net.SplitHostPort(h)
+		if err != nil {
+			name, port = h, ""
+		}
+		if port == "" {
+			port = def
+		}
+		return strings.ToLower(strings.TrimSuffix(name, ".")) + ":" + port
+	}
+	return norm(host) == norm(u.Host)
+}
+
+// authorize identifies the caller and checks it against the policy, answering 403 when either
+// refuses. It returns the epoch the caller is admitted at.
+func (g *Gateway) authorize(w http.ResponseWriter, r *http.Request) (admit.Caller, uint64, bool) {
+	caller, err := g.Identify(r)
+	if err != nil {
+		g.logf("%s: %s: not identified: %v", g.Via, r.RemoteAddr, err)
+		http.Error(w, "forbidden: the caller could not be identified", http.StatusForbidden)
+		return admit.Caller{}, 0, false
+	}
+	g.mu.Lock()
+	epoch := g.epoch
+	g.mu.Unlock()
+	if err := g.Policy().Check(caller); err != nil {
+		g.logf("%s: refused %s (%s): %v", g.Via, caller.LoginName, caller.Node, err)
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return admit.Caller{}, 0, false
+	}
+	return caller, epoch, true
 }
 
 // CloseAll drops every proxied connection (the listener was turned off, or the policy

@@ -114,6 +114,9 @@ TAILNET_BIN="$HERE/build/thurm-tailnet"
 GO_VERSION="$(sed -n 's/^go //p' "$ROOT/tailnet/go.mod")"
 command -v go >/dev/null || die "go not found: Go $GO_VERSION builds thurm-tailnet (nix develop has it)"
 log "go build thurm-tailnet (Go $GO_VERSION)"
+# The browser client it serves, when built (`just web`; the release workflow builds it).
+[[ -f "$ROOT/tailnet/internal/web/dist/index.html" ]] ||
+    log "no web client bundle: thurm-tailnet serves a placeholder page (run \`just web\` first)"
 mkdir -p "$HERE/build"
 (cd "$ROOT/tailnet" && GOOS=darwin GOARCH=arm64 GOTOOLCHAIN="go$GO_VERSION" \
     go build -trimpath -ldflags "-s -w" -o "$TAILNET_BIN" ./cmd/thurm-tailnet)

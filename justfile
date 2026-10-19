@@ -10,6 +10,11 @@ repo := "nklmilojevic/thurm"
 default:
     @just --list
 
+# Build the browser client into tailnet/internal/web/dist, which thurm-tailnet embeds
+# (scripts/build-web.sh; needs the dev shell).
+web:
+    scripts/build-web.sh
+
 # Print the current workspace version.
 version:
     @sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1

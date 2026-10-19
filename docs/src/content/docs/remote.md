@@ -186,6 +186,31 @@ Who may connect:
 HTTPS needs MagicDNS and HTTPS certificates turned on for your tailnet (the
 admin console's DNS page); `thurm tailscale status` says when one is off.
 
+### In a browser
+
+The same address can serve a web client: open
+`https://thurm.YOUR-TAILNET.ts.net/` in a browser on any device of your tailnet
+and you get your workspaces and tabs, the panes as they are on the Mac and the
+phone, typing, scrollback and agent notices with Approve and Deny. It is off by
+default:
+
+```sh
+thurm set tailscale.web true
+```
+
+`thurm tailscale status` then prints the page's address. Release builds
+include the web client; a Thurm built from source needs `just web` before
+building, or the page says the client was not built in. There is no password
+or token: the page is admitted exactly like the phone, by who Tailscale says
+the device belongs to, so a browser that can open it has a shell on the host.
+Only that page itself may talk to the daemon; a page from any other site,
+including another `ts.net` address, is refused. Layouts, settings and images
+stay on the desktop app.
+
+Browsers keep some shortcuts for themselves (Ctrl+W, Ctrl+T, Ctrl+N): the page
+asks before closing while it is connected, and in fullscreen Chromium hands
+them to the terminal. Copy is Cmd+C on a Mac and Ctrl+Shift+C elsewhere.
+
 | Command | What it does |
 | --- | --- |
 | `thurm tailscale status` | State, address, account, and the sign-in link while one is needed |

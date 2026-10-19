@@ -348,6 +348,7 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
     ("push.relay", "Push relay", Kind::Text),
     ("push.code", "Push relay code", Kind::Text),
     ("tailscale.enabled", "Serve over Tailscale", Kind::Bool),
+    ("tailscale.web", "Browser client", Kind::Bool),
     ("tailscale.hostname", "Tailnet hostname", Kind::Text),
     (
         "tailscale.allow_tailnet_members",
