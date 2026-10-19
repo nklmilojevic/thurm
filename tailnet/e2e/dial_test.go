@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +80,26 @@ func TestNodeDialsPeersThroughTheDialSocket(t *testing.T) {
 		}
 	}()
 
+	// And on :7298 it answers once its caller is done writing: the half-close must cross the
+	// tailnet (tsnet's connections must close their write half, not the whole connection).
+	lnDone, err := peer.Listen("tcp", ":7298")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			c, err := lnDone.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				got, _ := io.ReadAll(c)
+				_, _ = io.WriteString(c, strings.ToUpper(string(got)))
+				c.Close()
+			}()
+		}
+	}()
+
 	// Ours, as the helper runs it.
 	n := &node.Node{
 		Dir:        filepath.Join(t.TempDir(), "node"),
@@ -134,6 +155,47 @@ func TestNodeDialsPeersThroughTheDialSocket(t *testing.T) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+
+	// The peer is reachable now: one try is enough.
+	got, err := answerAfterDone(s.Path, "bastion")
+	if err != nil || got != "QUESTION" {
+		t.Fatalf("an answer after the caller is done: %q, %v", got, err)
+	}
+}
+
+func answerAfterDone(path, host string) (string, error) {
+	c, err := net.Dial("unix", path)
+	if err != nil {
+		return "", err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(15 * time.Second))
+	if err := json.NewEncoder(c).Encode(map[string]any{"host": host, "port": 7298}); err != nil {
+		return "", err
+	}
+	r := bufio.NewReader(c)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	var rep struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(line), &rep); err != nil {
+		return "", err
+	}
+	if !rep.OK {
+		return "", errString(rep.Error)
+	}
+	if _, err := io.WriteString(c, "question"); err != nil {
+		return "", err
+	}
+	if err := c.(*net.UnixConn).CloseWrite(); err != nil {
+		return "", err
+	}
+	got, err := io.ReadAll(r)
+	return string(got), err
 }
 
 func echoThrough(path, host string) (string, error) {
