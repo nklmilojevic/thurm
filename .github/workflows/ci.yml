@@ -33,6 +33,7 @@ jobs:
       app-icon: ${{ steps.diff.outputs.app-icon }}
       docs: ${{ steps.diff.outputs.docs }}
       go: ${{ steps.diff.outputs.go }}
+      web: ${{ steps.diff.outputs.web }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -63,6 +64,7 @@ jobs:
           area app-icon '^(macos/Resources/AppIcon\.icon/|macos/compile-icon\.sh$|macos/build\.sh$|\.github/workflows/ci\.yml$)'
           area docs '^(docs/|config\.example\.toml$|\.github/workflows/ci\.yml$)'
           area go '^(tailnet/|scripts/third-party-licenses\.py$|\.github/workflows/ci\.yml$)'
+          area web '^(web/|crates/thurm-(web|term|proto|config)/|tailnet/internal/(web|gateway)/|tailnet/cmd/thurm-webtest/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/build-web\.sh$|\.github/workflows/ci\.yml$)'
           cat "$GITHUB_OUTPUT"
 
   rust:
@@ -182,6 +184,62 @@ jobs:
       - name: Third-party licenses
         working-directory: .
         run: python3 scripts/third-party-licenses.py --with-go
+
+  web:
+    # The browser client: its wasm core, the bundle thurm-tailnet embeds, and the page against
+    # a real thurmd (Playwright, Chromium and WebKit).
+    name: Web
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.1
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: web
+      # libghostty-vt for wasm32 is built from source until ghostty-vt-rs-sys ships it prebuilt.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      # The wasm-bindgen version thurm-web pins.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: wasm-bindgen@0.2.129
+      - name: wasm-opt
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends binaryen
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tailnet/go.mod
+          cache-dependency-path: tailnet/go.sum
+      - name: wasm core
+        run: |
+          cargo clippy -p thurm-web -p thurm-term -p thurm-config -p thurm-proto --target wasm32-unknown-unknown --locked -- -D warnings
+          cargo test -p thurm-web --locked
+      # Fails past the size budget (specs/web.md: under 1 MB compressed).
+      - name: Bundle
+        env:
+          THURM_WEB_BUDGET_KIB: "700"
+        run: scripts/build-web.sh
+      - name: Types
+        working-directory: web
+        run: bunx tsc --noEmit
+      - name: Serving the bundle
+        working-directory: tailnet
+        run: go test ./internal/web/ ./internal/gateway/
+      - name: End to end
+        run: |
+          cargo build --locked -p thurm-daemon -p thurm-cli
+          cd web
+          bunx playwright install --with-deps chromium webkit
+          bunx playwright test
 
   checks:
     name: Consistency and advisories
