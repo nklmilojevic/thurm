@@ -229,6 +229,8 @@ fn remote_events_reject_unknown_and_disconnected_hosts_before_socket_access() {
                 linger: None,
                 owner_pid: std::process::id(),
                 tunnel_pid: None,
+                transport: Default::default(),
+                via: None,
             };
             std::fs::write(
                 env.dir.join("testbox.state"),

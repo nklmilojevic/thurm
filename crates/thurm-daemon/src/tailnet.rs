@@ -4,6 +4,10 @@
 //! The helper is a child process talking JSON lines over an inherited socket (fd 3). It never
 //! outlives the daemon (it stops when that socket closes) and survives an in-place upgrade: the
 //! socket and its pid ride along in the handoff.
+//!
+//! The helper also serves a dial socket (`thurm_config::tailnet_dial_socket_path`): this
+//! machine's processes reach other Thurm hosts through the embedded node there, without the
+//! node's key leaving the helper.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -90,6 +94,9 @@ struct Reply {
     id: Option<u64>,
     error: Option<String>,
     status: Option<TailscaleStatus>,
+    /// Where the helper dials out; a helper from before dialing out never says.
+    #[serde(default)]
+    dial_socket: Option<String>,
 }
 
 type Answer = Result<TailscaleStatus, String>;
@@ -110,6 +117,8 @@ struct Inner {
     config: Option<TailscaleConfig>,
     helper: Option<Helper>,
     pending: HashMap<u64, Sender<Answer>>,
+    /// The running helper's dial socket, as its last message said.
+    dial_socket: Option<String>,
     generation: u64,
     failures: u32,
 }
@@ -293,7 +302,13 @@ impl Tailnet {
         let _ = crate::pty::set_cloexec(fd, true);
         log::info!("tailscale: adopted helper {pid}");
         self.attach(ctl, pid);
-        let _ = self.request(serde_json::json!({"cmd": "status"}));
+        let answered = self.request(serde_json::json!({"cmd": "status"})).is_ok();
+        if answered && self.inner.lock().dial_socket.is_none() {
+            log::info!(
+                "tailscale: the adopted helper predates dialing out; tailnet remotes go through \
+                 the system Tailscale until Tailscale is turned off and on in Thurm"
+            );
+        }
     }
 
     /// Starts the helper when something is to be served, and sends it what to serve. Called
@@ -350,6 +365,9 @@ impl Tailnet {
         thurm_config::ensure_private_dir(&self.state_dir)
             .map_err(|e| format!("creating {}: {e}", self.state_dir.display()))?;
         let serve_socket = self.socket.with_file_name("tailnet-serve.sock");
+        let dial_socket = self
+            .socket
+            .with_file_name(thurm_config::TAILNET_DIAL_SOCKET);
         let (ours, theirs) = UnixStream::pair().map_err(|e| format!("control socket: {e}"))?;
         let fd = theirs.as_raw_fd();
         let mut cmd = Command::new(&exe);
@@ -361,6 +379,8 @@ impl Tailnet {
             .arg(&self.state_dir)
             .arg("--serve-socket")
             .arg(&serve_socket)
+            .arg("--dial-socket")
+            .arg(&dial_socket)
             .stdin(Stdio::null())
             .stdout(Stdio::null());
         // SAFETY: only async-signal-safe calls between fork and exec.
@@ -425,6 +445,7 @@ impl Tailnet {
                     continue;
                 }
             };
+            self.inner.lock().dial_socket = reply.dial_socket.clone();
             if let Some(status) = &reply.status {
                 self.set_status(status.clone());
             }

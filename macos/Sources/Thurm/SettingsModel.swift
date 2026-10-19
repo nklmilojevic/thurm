@@ -411,22 +411,25 @@ struct RemoteHostEntry: Equatable, Identifiable {
     let enabled: Bool
     /// `ask`, `always` or `never`.
     let clipboardRead: String
+    /// Its daemon's tailnet address, when it is reached over the tailnet instead of ssh.
+    let tailnet: String?
 
     var id: String { name }
 
     static let clipboardChoices = ["ask", "always", "never"]
 
-    init(name: String, target: String, enabled: Bool = true, clipboardRead: String = "ask") {
+    init(name: String, target: String, enabled: Bool = true, clipboardRead: String = "ask", tailnet: String? = nil) {
         self.name = name
         self.target = target
         self.enabled = enabled
         self.clipboardRead = clipboardRead
+        self.tailnet = tailnet
     }
 
     init?(json: [String: Any]) {
         guard let name = jsonString(json["name"]) else { return nil }
         self.init(name: name, target: jsonString(json["host"]) ?? "", enabled: jsonBool(json["enabled"]) ?? true,
-                  clipboardRead: jsonString(json["clipboard_read"]) ?? "ask")
+                  clipboardRead: jsonString(json["clipboard_read"]) ?? "ask", tailnet: jsonString(json["tailnet"]))
     }
 
     /// The hosts of the `remote` setting's value (none when it is unset).

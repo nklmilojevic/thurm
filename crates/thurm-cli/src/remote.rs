@@ -137,6 +137,8 @@ pub struct AddOptions {
     pub name: String,
     pub target: String,
     pub socket: Option<String>,
+    /// `--tailnet`: `Some("")` without a value (the target is the peer's name).
+    pub tailnet: Option<String>,
     /// Answer every question (`--yes` / `--no`), for scripts.
     pub assume: Option<bool>,
 }
@@ -146,6 +148,9 @@ pub fn add(o: AddOptions) -> R {
     let cfg = Config::load()?;
     if cfg.remote(&o.name).is_some() {
         return Err(format!("a remote named {:?} exists already", o.name).into());
+    }
+    if let Some(tailnet) = &o.tailnet {
+        return add_tailnet(&o, tailnet);
     }
     thurm_remote::ssh::prepare_dir()?;
     let ssh = Ssh::new(&o.target)?;
@@ -163,6 +168,7 @@ pub fn add(o: AddOptions) -> R {
         socket: o.socket.clone(),
         enabled: true,
         clipboard_read: ClipboardRead::Ask,
+        tailnet: None,
     };
     let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
     println!("Added [[remote]] {} to {}", o.name, file.display());
@@ -179,6 +185,61 @@ pub fn add(o: AddOptions) -> R {
         o.name
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// `thurm remote add NAME TARGET --tailnet [PEER|URL]`: checks the daemon answers over the
+/// tailnet and writes the entry. Installing and the doctor stay ssh's (`thurm remote install`).
+fn add_tailnet(o: &AddOptions, tailnet: &str) -> R {
+    let value = if tailnet.is_empty() {
+        o.target.as_str()
+    } else {
+        tailnet
+    };
+    Ssh::new(&o.target)?;
+    println!("Connecting to {value} over the tailnet …");
+    let checked = thurm_remote::tailnet::check(
+        value,
+        &thurm_config::tailnet_dial_socket_path(),
+        thurm_remote::tailnet::CONNECT_TIMEOUT,
+    )?;
+    println!("{}: {} ({})", o.name, checked.url, checked.via.label());
+    let entry = RemoteConfig {
+        name: o.name.clone(),
+        host: o.target.clone(),
+        socket: o.socket.clone(),
+        enabled: true,
+        clipboard_read: ClipboardRead::Ask,
+        tailnet: Some(checked.url.clone()),
+    };
+    let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
+    println!("Added [[remote]] {} to {}", o.name, file.display());
+    if checked.protocol != thurm_proto::PROTOCOL_VERSION || checked.build.is_empty() {
+        println!(
+            "note: its daemon speaks protocol {}, this Thurm {}: install this build there \
+             over ssh with `thurm remote install {}`",
+            checked.protocol,
+            thurm_proto::PROTOCOL_VERSION,
+            o.name
+        );
+    }
+    reload_app();
+    println!(
+        "Thurm connects to {} now; it shows as a workspace in the sidebar.",
+        o.name
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// How a host is reached, for lists.
+fn transport_label(r: &RemoteConfig, s: Option<&Status>) -> String {
+    if r.tailnet.is_none() {
+        return "ssh".into();
+    }
+    match s.and_then(|s| s.via) {
+        Some(thurm_remote::tailnet::Via::Node) => "tailnet (node)".into(),
+        Some(thurm_remote::tailnet::Via::System) => "tailnet (app)".into(),
+        None => "tailnet".into(),
+    }
 }
 
 /// Offers to install our build (and replace the daemon) when the host needs it.
@@ -501,7 +562,7 @@ pub fn list(json: bool) -> R {
             .iter()
             .map(|(r, s)| {
                 serde_json::json!({
-                    "name": r.name, "host": r.host, "enabled": r.enabled,
+                    "name": r.name, "host": r.host, "enabled": r.enabled, "tailnet": r.tailnet,
                     "state": s.as_ref().map(|s| s.phase.label()),
                     "status": s,
                 })
@@ -514,15 +575,22 @@ pub fn list(json: bool) -> R {
         println!("no remotes (add one with `thurm remote add <name> <ssh-target>`)");
         return Ok(ExitCode::SUCCESS);
     }
-    println!("{:<16} {:<32} {:<16} BUILD", "NAME", "HOST", "STATE");
+    println!(
+        "{:<16} {:<32} {:<15} {:<16} BUILD",
+        "NAME", "HOST", "VIA", "STATE"
+    );
     for (r, s) in rows {
         let state = match (&s, r.enabled) {
             (_, false) => "disabled".to_owned(),
             (Some(s), _) => s.phase.label().to_owned(),
             (None, _) => "app not running".to_owned(),
         };
+        let via = transport_label(&r, s.as_ref());
         let build = s.and_then(|s| s.remote_build).unwrap_or_default();
-        println!("{:<16} {:<32} {:<16} {build}", r.name, r.host, state);
+        println!(
+            "{:<16} {:<32} {:<15} {:<16} {build}",
+            r.name, r.host, via, state
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -536,11 +604,14 @@ pub fn status(name: Option<&str>, json: bool) -> R {
     if json {
         println!(
             "{}",
-            serde_json::json!({"name": r.name, "host": r.host, "status": s})
+            serde_json::json!({"name": r.name, "host": r.host, "tailnet": r.tailnet, "status": s})
         );
         return Ok(ExitCode::SUCCESS);
     }
     println!("{} ({})", r.name, r.host);
+    if let Some(url) = &r.tailnet {
+        println!("  via:      {} {url}", transport_label(&r, s.as_ref()));
+    }
     match s {
         None => println!("  not connected: Thurm is not running (or has not tried yet)"),
         Some(s) => {

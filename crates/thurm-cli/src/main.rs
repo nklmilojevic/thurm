@@ -68,13 +68,21 @@ enum WorkspaceCmd {
 #[derive(Subcommand)]
 enum RemoteCmd {
     /// Add a host: checks the connection, offers to install Thurm there, writes `[[remote]]`.
+    /// With --tailnet, connects over the tailnet instead of ssh (no install offer).
     Add {
         name: String,
-        /// ssh target: a Host alias, user@host, or ssh://user@host:port.
+        /// ssh target: a Host alias, user@host, or ssh://user@host:port. Still used over the
+        /// tailnet, to install, check and hand off; and the peer's name when --tailnet has
+        /// none.
         target: String,
         /// The daemon's socket there (default: what `thurm socket-path` prints there).
         #[arg(long)]
         socket: Option<String>,
+        /// Reach the daemon over the tailnet (it serves there with `thurm tailscale on`): a
+        /// peer's name, or its wss:// or ws://ADDR:PORT address. Through Thurm's own Tailscale
+        /// node when it runs here, else this Mac's Tailscale.
+        #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "PEER|URL")]
+        tailnet: Option<String>,
         /// Answer yes to every question.
         #[arg(long, short = 'y', conflicts_with = "no")]
         yes: bool,
@@ -371,7 +379,7 @@ enum Cmd {
     /// What this `thurm` is (build, protocol, socket) as JSON; read by the app over ssh.
     #[command(hide = true)]
     RemoteInfo,
-    /// Remote workspaces: thurmd on other machines, reached with ssh.
+    /// Remote workspaces: thurmd on other machines, reached with ssh or over the tailnet.
     Remote {
         #[command(subcommand)]
         action: RemoteCmd,
@@ -591,6 +599,13 @@ fn run(cli: Cli) -> R {
     }
     match cli.cmd {
         Cmd::Events { pane } => events::run(remote.as_deref(), pane),
+        // Through the dial socket, not the daemon's protocol.
+        Cmd::Tailscale {
+            action: tailscale::TailscaleCmd::Peers,
+        } => tailscale::peers(json),
+        Cmd::Tailscale {
+            action: tailscale::TailscaleCmd::Nc { host, port },
+        } => tailscale::nc(&host, port),
         Cmd::Attach { pane } => attach::run(pane, remote.as_deref(), json),
         Cmd::SocketPath => {
             println!("{}", thurm_config::socket_path().display());
@@ -602,12 +617,14 @@ fn run(cli: Cli) -> R {
                 name,
                 target,
                 socket,
+                tailnet,
                 yes,
                 no,
             } => remote::add(remote::AddOptions {
                 name,
                 target,
                 socket,
+                tailnet,
                 assume: if yes {
                     Some(true)
                 } else if no {

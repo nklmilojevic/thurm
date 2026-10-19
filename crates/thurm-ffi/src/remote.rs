@@ -175,6 +175,10 @@ enum Call {
     Add {
         name: String,
         target: String,
+        /// Reach it over the tailnet instead (a peer's name or address; empty: the target), after
+        /// checking the daemon answers there. ssh is not tried.
+        #[serde(default)]
+        tailnet: Option<String>,
     },
     /// Removes `[[remote]]` `name` (its daemon and panes keep running there).
     Remove {
@@ -336,7 +340,11 @@ fn call(c: Call) -> Result<Value, String> {
                 Err(e) => return Err(e.to_string()),
             }
         }
-        Call::Add { name, target } => {
+        Call::Add {
+            name,
+            target,
+            tailnet,
+        } => {
             thurm_config::validate_remote_name(&name)?;
             if Config::load()
                 .map_err(|e| e.to_string())?
@@ -344,6 +352,9 @@ fn call(c: Call) -> Result<Value, String> {
                 .is_some()
             {
                 return Err(format!("a remote named {name:?} exists already"));
+            }
+            if let Some(tailnet) = tailnet {
+                return add_tailnet(name, target, &tailnet);
             }
             thurm_remote::ssh::prepare_dir().map_err(|e| e.to_string())?;
             let ssh = Ssh::new(&target)?;
@@ -356,6 +367,7 @@ fn call(c: Call) -> Result<Value, String> {
                 socket: None,
                 enabled: true,
                 clipboard_read: thurm_config::ClipboardRead::Ask,
+                tailnet: None,
             };
             thurm_config::edit_remotes(|t| thurm_config::with_remote_added(t, &entry))?;
             if let Some(m) = MANAGER.lock().as_mut() {
@@ -528,6 +540,10 @@ fn remote_setting_literal(key: &str, value: &serde_json::Value) -> Result<String
             Ok(json!(s.trim()).to_string())
         }
         ("enabled", serde_json::Value::Bool(b)) => Ok(b.to_string()),
+        ("tailnet", serde_json::Value::String(s)) => {
+            thurm_config::parse_remote_tailnet(s)?;
+            Ok(json!(s.trim()).to_string())
+        }
         ("clipboard_read", serde_json::Value::String(s))
             if matches!(s.as_str(), "ask" | "always" | "never") =>
         {
@@ -535,6 +551,36 @@ fn remote_setting_literal(key: &str, value: &serde_json::Value) -> Result<String
         }
         _ => Err(format!("{key} can't be set to {value}")),
     }
+}
+
+/// Adds `name` reached over the tailnet at `tailnet` (empty: `target`, a peer's name), once its
+/// daemon answers there.
+fn add_tailnet(name: String, target: String, tailnet: &str) -> Result<Value, String> {
+    let target = target.trim().to_owned();
+    thurm_remote::ssh::validate_target(&target)?;
+    let value = if tailnet.trim().is_empty() {
+        target.as_str()
+    } else {
+        tailnet.trim()
+    };
+    let checked = thurm_remote::tailnet::check(
+        value,
+        &thurm_config::tailnet_dial_socket_path(),
+        thurm_remote::tailnet::CONNECT_TIMEOUT,
+    )?;
+    let entry = thurm_config::RemoteConfig {
+        name: name.clone(),
+        host: target,
+        socket: None,
+        enabled: true,
+        clipboard_read: thurm_config::ClipboardRead::Ask,
+        tailnet: Some(checked.url.clone()),
+    };
+    thurm_config::edit_remotes(|t| thurm_config::with_remote_added(t, &entry))?;
+    if let Some(m) = MANAGER.lock().as_mut() {
+        sync(m);
+    }
+    Ok(json!({ "name": name, "tailnet": checked }))
 }
 
 /// One remote operation: `json` is {"op": "...", ...} (see `Call`); answers the result as
@@ -622,5 +668,10 @@ mod tests {
         assert!(remote_setting_literal("clipboard_read", &json!("maybe")).is_err());
         assert!(remote_setting_literal("enabled", &json!("yes")).is_err());
         assert!(remote_setting_literal("name", &json!("x")).is_err());
+        assert_eq!(
+            remote_setting_literal("tailnet", &json!("wss://bastion.tail1234.ts.net")).unwrap(),
+            "\"wss://bastion.tail1234.ts.net\""
+        );
+        assert!(remote_setting_literal("tailnet", &json!("https://bastion")).is_err());
     }
 }

@@ -281,23 +281,45 @@ fn open_with(url: &str, limits: Limits) -> Result<(UnixStream, Session), Connect
     start(ws, session, limits)
 }
 
+/// Like [`open_fd`], but `ws://` is accepted too: the caller vouches that `fd` reaches `url`'s
+/// host through WireGuard (Thurm's embedded node dialed a peer from its netmap), so the tailnet
+/// ties the connection to the host where TLS otherwise would. `wss://` still does TLS.
+pub fn open_tailnet_fd(
+    fd: OwnedFd,
+    url: &str,
+    timeout: Duration,
+) -> Result<(UnixStream, Session), ConnectError> {
+    check_url(url)?;
+    open_fd_tls(
+        fd,
+        url,
+        Limits {
+            connect: timeout,
+            ..LIMITS
+        },
+        tls_config()?,
+        true,
+    )
+}
+
 fn open_fd_with(
     fd: OwnedFd,
     url: &str,
     limits: Limits,
 ) -> Result<(UnixStream, Session), ConnectError> {
-    open_fd_tls(fd, url, limits, tls_config()?)
+    open_fd_tls(fd, url, limits, tls_config()?, false)
 }
 
 /// Over a socket the caller dialed, TLS is what ties the connection to `url`'s host: only
-/// `wss://` is accepted.
+/// `wss://` is accepted, unless `plain_ok` says the dial itself did ([`open_tailnet_fd`]).
 fn open_fd_tls(
     fd: OwnedFd,
     url: &str,
     limits: Limits,
     tls: Arc<rustls::ClientConfig>,
+    plain_ok: bool,
 ) -> Result<(UnixStream, Session), ConnectError> {
-    if !url.starts_with("wss://") {
+    if !url.starts_with("wss://") && !plain_ok {
         return Err(ConnectError::BadUrl(format!(
             "{url}: a dialed socket needs a wss:// address"
         )));

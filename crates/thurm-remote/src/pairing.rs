@@ -537,6 +537,7 @@ mod tests {
             socket: Some("/run/x.sock".into()),
             enabled: true,
             clipboard_read: Default::default(),
+            tailnet: None,
         };
         for file in [&known, &hashed] {
             let e = host_entry(&remote, &ssh_for(22, file));

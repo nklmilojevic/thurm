@@ -20,6 +20,7 @@ import (
 	"tailscale.com/tsnet"
 
 	"github.com/nklmilojevic/thurm/tailnet/internal/admit"
+	"github.com/nklmilojevic/thurm/tailnet/internal/dial"
 	"github.com/nklmilojevic/thurm/tailnet/internal/gateway"
 	"github.com/nklmilojevic/thurm/tailnet/internal/status"
 )
@@ -42,6 +43,8 @@ type Node struct {
 	Dial     func(ctx context.Context) (net.Conn, error)
 	Logf     func(format string, args ...any)
 	OnChange func()
+	// ControlURL is the coordination server; empty is Tailscale's. Tests set their own.
+	ControlURL string
 
 	mu      sync.Mutex
 	cfg     Config
@@ -106,6 +109,7 @@ func (n *Node) Enable(cfg Config) error {
 	}
 	srv := &tsnet.Server{
 		Dir:           n.Dir,
+		ControlURL:    n.ControlURL,
 		Hostname:      cfg.Hostname,
 		AuthKey:       cfg.AuthKey,
 		AdvertiseTags: cfg.Tags,
@@ -242,6 +246,35 @@ func (n *Node) Enabled() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.srv != nil
+}
+
+// Peers lists the netmap's peers, for dialing out; dial.ErrNodeOff until the node runs.
+func (n *Node) Peers(ctx context.Context) ([]dial.Peer, error) {
+	n.mu.Lock()
+	lc, backend := n.lc, n.backend
+	n.mu.Unlock()
+	if lc == nil {
+		return nil, dial.ErrNodeOff
+	}
+	if backend != "Running" {
+		return nil, fmt.Errorf("%w (%s)", dial.ErrNodeOff, status.FromBackend(backend))
+	}
+	st, err := lc.Status(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading the tailnet's peers: %w", err)
+	}
+	return dial.FromStatus(st), nil
+}
+
+// DialPeer connects to addr ("ip:port") on the tailnet as this node.
+func (n *Node) DialPeer(ctx context.Context, addr string) (net.Conn, error) {
+	n.mu.Lock()
+	srv := n.srv
+	n.mu.Unlock()
+	if srv == nil {
+		return nil, dial.ErrNodeOff
+	}
+	return srv.Dial(ctx, "tcp", addr)
 }
 
 // Status fills the node's part of the status.

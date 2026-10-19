@@ -398,6 +398,7 @@ mod tests {
             socket: None,
             enabled: true,
             clipboard_read: crate::ClipboardRead::Ask,
+            tailnet: None,
         }
     }
 

@@ -317,4 +317,24 @@ final class RemoteHostEntryTests: XCTestCase {
         XCTAssertEqual(RemoteHostEntry.entries(NSNull()), [])
         XCTAssertEqual(RemoteHostEntry.entries(nil), [])
     }
+
+    func testATailnetHostKeepsItsAddress() {
+        let value = JSON.decode("""
+        [{"name": "bastion", "host": "bastion", "tailnet": "wss://bastion.tail1234.ts.net/v1/connect"}]
+        """)
+        XCTAssertEqual(RemoteHostEntry.entries(value), [
+            RemoteHostEntry(name: "bastion", target: "bastion", tailnet: "wss://bastion.tail1234.ts.net/v1/connect"),
+        ])
+    }
+}
+
+final class RemoteStatusTests: XCTestCase {
+    func testTransportReadWithItsDefault() {
+        let ssh = RemoteStatus(json: JSON.decode(#"{"name": "devbox", "phase": "connected"}"#))
+        XCTAssertEqual(ssh?.transport, "ssh")
+        XCTAssertEqual(ssh?.transportLabel, "SSH")
+        let tailnet = RemoteStatus(json: JSON.decode(#"{"name": "bastion", "transport": "tailnet", "via": "node"}"#))
+        XCTAssertEqual(tailnet?.via, "node")
+        XCTAssertEqual(tailnet?.transportLabel, "Tailscale, through Thurm's own node")
+    }
 }

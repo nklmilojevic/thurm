@@ -1,4 +1,5 @@
-//! One supervised tunnel per `[[remote]]` host: `ssh -N -L <local.sock>:<remote.sock>`,
+//! One supervised tunnel per `[[remote]]` host: `ssh -N -L <local.sock>:<remote.sock>`, or for
+//! a host with `tailnet` a relay from `<local.sock>` over the tailnet ([`crate::tailnet`]),
 //! reconnected with exponential backoff (capped at two minutes, reset after a minute of
 //! healthy connection) and on demand ([`Supervisor::kick`]: wake from sleep, network change,
 //! the app's connection dropping).
@@ -7,21 +8,24 @@
 //! local socket, where `thurm --remote` reads it. Background reconnects never install
 //! anything: a host without Thurm or with another protocol only reports that.
 
+use std::collections::HashMap;
 use std::io::{BufReader, Read};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
-use thurm_config::RemoteConfig;
+use thurm_config::{RemoteConfig, TailnetTarget};
 use thurm_proto::{Envelope, PROTOCOL_VERSION, Request, Response, ServerMessage, codec};
 
 use crate::ssh::{Ssh, SshError};
+use crate::tailnet::{self as tn, OpenError, Via};
 use crate::{HostInfo, probe, start_daemon};
+use thurm_tailnet_client::ConnectError;
 
 pub const MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// A connection that lasted this long resets the backoff.
@@ -61,6 +65,15 @@ impl Phase {
     }
 }
 
+/// How a host is reached.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    #[default]
+    Ssh,
+    Tailnet,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Status {
     pub name: String,
@@ -90,6 +103,11 @@ pub struct Status {
     /// The `ssh` process of a connected tunnel.
     #[serde(default)]
     pub tunnel_pid: Option<u32>,
+    #[serde(default)]
+    pub transport: Transport,
+    /// How a tailnet host's connection reached the tailnet, once connected.
+    #[serde(default)]
+    pub via: Option<Via>,
 }
 
 impl Status {
@@ -116,6 +134,8 @@ impl Status {
             linger: None,
             owner_pid: std::process::id(),
             tunnel_pid: None,
+            transport: transport_of(remote),
+            via: None,
         }
     }
 
@@ -125,6 +145,14 @@ impl Status {
         let s: Status = serde_json::from_str(&text).ok()?;
         let alive = unsafe { libc::kill(s.owner_pid as libc::pid_t, 0) } == 0;
         alive.then_some(s)
+    }
+}
+
+fn transport_of(remote: &RemoteConfig) -> Transport {
+    if remote.tailnet.is_some() {
+        Transport::Tailnet
+    } else {
+        Transport::Ssh
     }
 }
 
@@ -145,6 +173,11 @@ pub fn backoff(attempt: u32) -> Duration {
 /// (a tunnel whose network is gone accepts the connection and then never answers).
 pub fn ping(socket: &Path, timeout: Duration) -> Result<(u32, String), PingError> {
     let stream = UnixStream::connect(socket).map_err(|e| PingError::Unreachable(e.to_string()))?;
+    ping_stream(stream, timeout)
+}
+
+/// Like [`ping`], over a connection already open to the daemon.
+pub fn ping_stream(stream: UnixStream, timeout: Duration) -> Result<(u32, String), PingError> {
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     let mut w = stream
@@ -283,14 +316,21 @@ impl Supervisor {
         let (changed, moved) = {
             let mut cur = self.inner.remote.lock();
             let changed = *cur != remote;
-            let moved = cur.host != remote.host || cur.socket != remote.socket;
+            let moved = cur.host != remote.host
+                || cur.socket != remote.socket
+                || cur.tailnet != remote.tailnet;
             *cur = remote.clone();
             (changed, moved)
         };
         if moved {
             let extra = self.inner.ssh.lock().extra.clone();
             *self.inner.ssh.lock() = Ssh { extra, ..ssh };
-            self.inner.status.lock().host = remote.host;
+            {
+                let mut status = self.inner.status.lock();
+                status.transport = transport_of(&remote);
+                status.host = remote.host;
+                status.via = None;
+            }
             self.inner.reconfigured.store(true, Ordering::SeqCst);
         }
         if changed {
@@ -354,6 +394,136 @@ impl Drop for Tunnel {
     }
 }
 
+/// A connected host's tunnel.
+enum Link {
+    Ssh(Tunnel),
+    Tailnet(Relay),
+}
+
+/// A tailnet host's tunnel: each connection to the local socket gets its own connection over
+/// the tailnet, as `ssh -L` gives each its own channel. Dropping it closes them all.
+struct Relay {
+    stop: Arc<AtomicBool>,
+    /// Why the last connection couldn't be opened, until the supervisor looks.
+    failure: Arc<Mutex<Option<String>>>,
+    conns: Arc<Mutex<HashMap<u64, UnixStream>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Relay {
+    fn start(
+        listener: UnixListener,
+        target: TailnetTarget,
+        dial_socket: PathBuf,
+        name: &str,
+    ) -> std::io::Result<Relay> {
+        // Polled, so stopping doesn't wait for a connection.
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(Mutex::new(None));
+        let conns = Arc::new(Mutex::new(HashMap::new()));
+        let (stopped, failed, open) = (stop.clone(), failure.clone(), conns.clone());
+        let target = Arc::new(target);
+        let dial_socket = Arc::new(dial_socket);
+        let thread = std::thread::Builder::new()
+            .name(format!("relay-{name}"))
+            .spawn(move || {
+                let next = AtomicU64::new(0);
+                while !stopped.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((conn, _)) => {
+                            let id = next.fetch_add(1, Ordering::Relaxed);
+                            let (target, dial_socket) = (target.clone(), dial_socket.clone());
+                            let (failed, open) = (failed.clone(), open.clone());
+                            std::thread::spawn(move || {
+                                relay_one(conn, &target, &dial_socket, &failed, &open, id)
+                            });
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(e) => {
+                            *failed.lock() = Some(format!("the local socket: {e}"));
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                    }
+                }
+            })?;
+        Ok(Relay {
+            stop,
+            failure,
+            conns,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        for (_, conn) in self.conns.lock().drain() {
+            let _ = conn.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// Carries one local connection over its own tailnet connection until either side ends.
+fn relay_one(
+    conn: UnixStream,
+    target: &TailnetTarget,
+    dial_socket: &Path,
+    failure: &Mutex<Option<String>>,
+    conns: &Mutex<HashMap<u64, UnixStream>>,
+    id: u64,
+) {
+    // An accepted socket inherits the listener's non-blocking mode on macOS.
+    if conn.set_nonblocking(false).is_err() {
+        return;
+    }
+    let opened = match tn::open(target, dial_socket, thurm_tailnet_client::CONNECT_TIMEOUT) {
+        Ok(o) => o,
+        Err(e) => {
+            *failure.lock() = Some(e.to_string());
+            return;
+        }
+    };
+    if let Ok(c) = conn.try_clone() {
+        conns.lock().insert(id, c);
+    }
+    let tn::Opened {
+        stream, session, ..
+    } = opened;
+    splice(conn, stream);
+    drop(session);
+    conns.lock().remove(&id);
+}
+
+/// Copies both ways until either side ends, then closes both.
+fn splice(a: UnixStream, b: UnixStream) {
+    let (Ok(mut a_rd), Ok(mut b_rd)) = (a.try_clone(), b.try_clone()) else {
+        return;
+    };
+    let (Ok(a2), Ok(b2)) = (a.try_clone(), b.try_clone()) else {
+        return;
+    };
+    let close = move |x: &UnixStream, y: &UnixStream| {
+        let _ = x.shutdown(std::net::Shutdown::Both);
+        let _ = y.shutdown(std::net::Shutdown::Both);
+    };
+    let up = std::thread::spawn(move || {
+        let mut b_wr = &b2;
+        let _ = std::io::copy(&mut a_rd, &mut b_wr);
+        close(&a2, &b2);
+    });
+    let mut a_wr = &a;
+    let _ = std::io::copy(&mut b_rd, &mut a_wr);
+    close(&a, &b);
+    let _ = up.join();
+}
+
 impl Inner {
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
@@ -409,9 +579,12 @@ impl Inner {
                 s.retry_at = None;
             });
             match self.connect() {
-                Ok(tunnel) => {
+                Ok(link) => {
                     let connected = Instant::now();
-                    let reason = self.hold(tunnel);
+                    let reason = match link {
+                        Link::Ssh(tunnel) => self.hold(tunnel),
+                        Link::Tailnet(relay) => self.hold_relay(relay),
+                    };
                     if connected.elapsed() >= HEALTHY_AFTER {
                         attempt = 0;
                     }
@@ -422,6 +595,7 @@ impl Inner {
                         s.phase = Phase::Reconnecting;
                         s.message = Some(reason);
                         s.tunnel_pid = None;
+                        s.via = None;
                     });
                     // A settings edit requests a new destination now. Do not apply the
                     // retry delay left over from failures at the previous destination.
@@ -470,9 +644,97 @@ impl Inner {
         w.take().unwrap_or(false)
     }
 
-    fn connect(&self) -> Result<Tunnel, Failure> {
+    fn connect(&self) -> Result<Link, Failure> {
         // This attempt uses the current settings.
         self.reconfigured.store(false, Ordering::SeqCst);
+        let tailnet = self.remote.lock().tailnet.clone();
+        match tailnet {
+            Some(t) => self.connect_tailnet(&t).map(Link::Tailnet),
+            None => self.connect_ssh().map(Link::Ssh),
+        }
+    }
+
+    /// Opens one connection over the tailnet to check the daemon there, then relays the local
+    /// socket to it.
+    fn connect_tailnet(&self, tailnet: &str) -> Result<Relay, Failure> {
+        let name = self.remote.lock().name.clone();
+        let target = thurm_config::parse_remote_tailnet(tailnet).map_err(Failure::Attention)?;
+        crate::ssh::prepare_dir().map_err(|e| Failure::Attention(e.to_string()))?;
+        let dial_socket = thurm_config::tailnet_dial_socket_path();
+        let opened = match tn::open(&target, &dial_socket, thurm_tailnet_client::CONNECT_TIMEOUT) {
+            Ok(o) => o,
+            Err(OpenError::Connect(ConnectError::DaemonUnavailable)) => {
+                // A host listener answers for a daemon that isn't running; ssh can start it.
+                return Err(Failure::Transient(match self.start_daemon_over_ssh() {
+                    Ok(()) => format!("the daemon on {name} wasn't running; started it over ssh"),
+                    Err(e) => format!(
+                        "{name} answers over the tailnet, but its daemon doesn't, and starting it \
+                         over ssh failed: {e}"
+                    ),
+                }));
+            }
+            Err(e) => return Err(open_failure(&name, e)),
+        };
+        let tn::Opened {
+            stream,
+            session,
+            via,
+            ..
+        } = opened;
+        let pinged = ping_stream(stream, Duration::from_secs(10));
+        drop(session);
+        let (version, build) = match pinged {
+            Ok(v) => v,
+            Err(PingError::Protocol(v)) => (v, String::new()),
+            Err(PingError::Unreachable(e)) => {
+                return Err(Failure::Transient(format!(
+                    "the daemon on {name} does not answer over the tailnet: {e}"
+                )));
+            }
+        };
+        if version != PROTOCOL_VERSION || build.is_empty() {
+            return Err(Failure::Upgrade(format!(
+                "the daemon on {name} speaks protocol {version}, this app {PROTOCOL_VERSION}; \
+                 installing this build there needs ssh (`thurm remote install {name}`)"
+            )));
+        }
+        let local = self.local_socket();
+        let _ = std::fs::remove_file(&local);
+        let listener = UnixListener::bind(&local)
+            .map_err(|e| Failure::Attention(format!("{}: {e}", local.display())))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| Failure::Attention(format!("{}: {e}", local.display())))?;
+        }
+        let relay = Relay::start(listener, target, dial_socket, &name)
+            .map_err(|e| Failure::Attention(format!("starting the relay: {e}")))?;
+        let upgrade_available = !crate::install::same_build(thurm_proto::BUILD, &build);
+        self.set(|s| {
+            s.tunnel_pid = None;
+            s.phase = Phase::Connected;
+            s.message = None;
+            s.retry_at = None;
+            s.remote_build = Some(build);
+            s.remote_protocol = Some(version);
+            s.upgrade_available = upgrade_available;
+            s.via = Some(via);
+        });
+        Ok(relay)
+    }
+
+    /// Starts the host's daemon over ssh, for a tailnet host whose listener answers for it.
+    fn start_daemon_over_ssh(&self) -> Result<(), String> {
+        let ssh = self.ssh.lock().clone();
+        let configured = self.remote.lock().socket.clone();
+        let host = probe(&ssh).map_err(|e| e.to_string())?;
+        let socket = configured
+            .or(host.info.map(|i| i.socket))
+            .ok_or("the thurm there is too old to say where its daemon listens")?;
+        start_daemon(&ssh, &socket).map_err(|e| e.to_string())
+    }
+
+    fn connect_ssh(&self) -> Result<Tunnel, Failure> {
         let ssh = self.ssh.lock().clone();
         let configured_socket = self.remote.lock().socket.clone();
         crate::ssh::prepare_dir().map_err(|e| Failure::Attention(e.to_string()))?;
@@ -602,6 +864,53 @@ impl Inner {
         }
     }
 
+    /// Watches a connected tailnet relay until a restart or a failed connection finds the
+    /// host gone, or stop. Returns why it ended.
+    fn hold_relay(&self, relay: Relay) -> String {
+        let local = self.local_socket();
+        loop {
+            let restart = self.wait(Some(Duration::from_millis(500)));
+            if self.stopped() {
+                return "stopped".into();
+            }
+            if !self.remote.lock().enabled {
+                return "disabled".into();
+            }
+            if self.reconfigured.load(Ordering::SeqCst) {
+                return "the host's settings changed".into();
+            }
+            let failed = relay.failure.lock().take();
+            if !restart && failed.is_none() {
+                continue;
+            }
+            // One connection failing may be a blip: the host is gone once a fresh one fails.
+            match ping(&local, Duration::from_secs(10)) {
+                Ok((_, build)) => self.note_build(build),
+                Err(PingError::Protocol(_)) => {
+                    return "the daemon there now speaks another protocol".into();
+                }
+                Err(e) => {
+                    return relay
+                        .failure
+                        .lock()
+                        .take()
+                        .or(failed)
+                        .unwrap_or_else(|| format!("the connection stopped answering ({e:?})"));
+                }
+            }
+        }
+    }
+
+    /// Still up, though the daemon may have been replaced in place (an upgrade): say so again
+    /// with its build, so a client whose connection dropped with the old daemon connects again.
+    fn note_build(&self, build: String) {
+        let upgrade_available = !crate::install::same_build(thurm_proto::BUILD, &build);
+        self.set(|s| {
+            s.remote_build = Some(build);
+            s.upgrade_available = upgrade_available;
+        });
+    }
+
     /// Watches a connected tunnel until ssh exits, a restart finds it dead, or stop.
     /// Returns why it ended.
     fn hold(&self, mut tunnel: Tunnel) -> String {
@@ -627,17 +936,7 @@ impl Inner {
             }
             if restart {
                 match ping(&local, Duration::from_secs(4)) {
-                    Ok((_, build)) => {
-                        // Still up, though the daemon may have been replaced in place (an
-                        // upgrade): say so again with its build, so a client whose connection
-                        // dropped with the old daemon connects again.
-                        let upgrade_available =
-                            !crate::install::same_build(thurm_proto::BUILD, &build);
-                        self.set(|s| {
-                            s.remote_build = Some(build);
-                            s.upgrade_available = upgrade_available;
-                        });
-                    }
+                    Ok((_, build)) => self.note_build(build),
                     Err(PingError::Protocol(_)) => {
                         return "the daemon there now speaks another protocol".into();
                     }
@@ -645,6 +944,22 @@ impl Inner {
                 }
             }
         }
+    }
+}
+
+/// What a failed tailnet connection means for the host's phase.
+fn open_failure(name: &str, e: OpenError) -> Failure {
+    match e {
+        OpenError::Connect(ConnectError::Unreachable(m)) => {
+            Failure::Transient(format!("{name} does not answer over the tailnet: {m}"))
+        }
+        OpenError::Connect(ConnectError::Forbidden(m)) => Failure::Attention(format!(
+            "{name} does not let this Mac in over the tailnet: {m}"
+        )),
+        OpenError::Connect(ConnectError::DaemonUnavailable) => Failure::Transient(format!(
+            "{name} answers over the tailnet, but its daemon doesn't"
+        )),
+        e => Failure::Attention(e.to_string()),
     }
 }
 
@@ -728,6 +1043,7 @@ mod tests {
             socket: None,
             enabled: true,
             clipboard_read: Default::default(),
+            tailnet: None,
         };
         let s = Status::new(&r);
         let json = serde_json::to_string(&s).unwrap();

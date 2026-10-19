@@ -158,7 +158,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: tailnet/go.mod
-          cache-dependency-path: tailnet/go.sum
+          cache-dependency-path: |
+            tailnet/go.sum
+            tailnet/e2e/go.sum
       - name: Format
         run: |
           unformatted="$(gofmt -l .)"
@@ -167,6 +169,14 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -race ./...
+      # The node dialing a peer for this machine, against Tailscale's in-process coordination
+      # server: a module of its own, so tailscale.com/tstest's dependencies stay out of the
+      # helper's.
+      - name: End to end
+        working-directory: tailnet/e2e
+        run: |
+          go vet ./...
+          go test -race ./...
       # The helper ships as a static binary next to thurmd.
       - name: Build
         env:

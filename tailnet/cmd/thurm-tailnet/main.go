@@ -7,6 +7,9 @@
 //	← {"id":1,"error":null,"status":{...}}             the answer, with the status after it
 //	← {"status":{...}}                                  whenever the status changes
 //
+// With --dial-socket it also lets this machine's processes dial tailnet peers through the
+// embedded node (internal/dial).
+//
 // It exits when the control socket closes, so it never outlives the daemon.
 package main
 
@@ -23,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	dialer "github.com/nklmilojevic/thurm/tailnet/internal/dial"
 	"github.com/nklmilojevic/thurm/tailnet/internal/host"
 	"github.com/nklmilojevic/thurm/tailnet/internal/node"
 	"github.com/nklmilojevic/thurm/tailnet/internal/status"
@@ -54,11 +58,14 @@ type reply struct {
 	ID     *uint64        `json:"id,omitempty"`
 	Error  *string        `json:"error"`
 	Status *status.Status `json:"status"`
+	// DialSocket is where this helper dials out, when it does (older helpers never say).
+	DialSocket string `json:"dial_socket,omitempty"`
 }
 
 type helper struct {
 	node *node.Node
 	host *host.Host
+	dial *dialer.Server
 	out  *json.Encoder
 	mu   sync.Mutex
 	// hostname is kept for the status while the node is off.
@@ -71,6 +78,7 @@ func main() {
 	socket := flag.String("socket", "", "the daemon's socket")
 	state := flag.String("state", "", "the embedded node's state directory")
 	serveSocket := flag.String("serve-socket", "", "the socket offered to tailscale serve")
+	dialSocket := flag.String("dial-socket", "", "the socket this machine's processes dial tailnet peers through")
 	flag.Parse()
 	log.SetFlags(0)
 	log.SetPrefix("thurm-tailnet: ")
@@ -89,6 +97,13 @@ func main() {
 	h := &helper{out: json.NewEncoder(ctl), hostname: "thurm"}
 	h.node = &node.Node{Dir: *state, Dial: dial, Logf: log.Printf, OnChange: h.publish}
 	h.host = &host.Host{ServePath: *serveSocket, Dial: dial, Logf: log.Printf}
+	if *dialSocket != "" {
+		h.dial = &dialer.Server{Path: *dialSocket, Peers: h.node.Peers, Dial: h.node.DialPeer, PeerOK: dialer.SameUser, Logf: log.Printf}
+		if err := h.dial.Start(); err != nil {
+			log.Printf("dial socket: %v", err)
+			h.dial = nil
+		}
+	}
 
 	in := bufio.NewScanner(ctl)
 	in.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -103,6 +118,9 @@ func main() {
 		h.run(c)
 	}
 	// The daemon went away: stop serving, keeping the node signed in.
+	if h.dial != nil {
+		h.dial.Stop()
+	}
 	h.host.Stop()
 	h.node.Disable()
 }
@@ -200,6 +218,9 @@ func (h *helper) publish() {
 }
 
 func (h *helper) send(r reply) {
+	if h.dial != nil {
+		r.DialSocket = h.dial.Path
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := h.out.Encode(r); err != nil {
