@@ -26,6 +26,7 @@ export type ConnDeps = {
   url: () => string;
   socket: (url: string) => WebSocket;
   client: () => Client;
+  now: () => number;
 };
 
 const browserDeps: ConnDeps = {
@@ -33,6 +34,7 @@ const browserDeps: ConnDeps = {
   socket: (url) => new WebSocket(url),
   // The terminal's default theme on the page's side of light and dark.
   client: () => new Client(matchMedia("(prefers-color-scheme: dark)").matches),
+  now: () => Date.now(),
 };
 
 export class Conn {
@@ -42,6 +44,8 @@ export class Conn {
   private backoff = 1000;
   private stopped = false;
   private retry: ReturnType<typeof setTimeout> | undefined;
+  /** When the next attempt is due after a close (0: none): the worker clock's ticks retry too. */
+  private retryAt = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
@@ -58,6 +62,7 @@ export class Conn {
   connect() {
     this.stopped = false;
     clearTimeout(this.retry);
+    this.retryAt = 0;
     const state = this.ws?.readyState;
     if (state === WebSocket.CONNECTING || state === WebSocket.OPEN) return;
     this.onState("connecting");
@@ -97,6 +102,9 @@ export class Conn {
       this.pending.clear();
       this.onState("closed", ev.reason || (ev.code === 1006 ? "the connection was refused or lost" : ""));
       if (!this.stopped) {
+        // A hidden tab's timers may be held back for a minute or more; `tick`, which the
+        // worker clock drives, retries on time anyway.
+        this.retryAt = this.deps.now() + this.backoff;
         this.retry = setTimeout(() => this.connect(), this.backoff);
         this.backoff = Math.min(this.backoff * 2, 30_000);
       }
@@ -106,6 +114,7 @@ export class Conn {
   disconnect() {
     this.stopped = true;
     clearTimeout(this.retry);
+    this.retryAt = 0;
     this.ws?.close(1000, "disconnected");
   }
 
@@ -132,6 +141,7 @@ export class Conn {
 
   /** Pings and timed-out synchronized updates. */
   tick() {
+    if (!this.ws && !this.stopped && this.retryAt && this.deps.now() >= this.retryAt) this.connect();
     this.with((c) => c.tick());
   }
 

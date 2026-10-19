@@ -127,6 +127,25 @@ test("keeps its connection while the page's own timers are throttled", async ({ 
   expect(await sessions()).toBe(before);
 });
 
+test("reconnects from the worker clock while the page's own timers are stopped", async ({ page }) => {
+  // Whatever a browser does to a hidden tab's timers, a dropped page comes back: its retry is
+  // also driven by the worker clock's messages, not only by a page timer.
+  test.slow();
+  await open(page);
+  const sessions = () => page.evaluate(() => (window as any).__thurmTest.sessions() as number);
+  const before = await sessions();
+  await page.evaluate(() => {
+    const stopped = (() => 0) as any;
+    window.setTimeout = stopped;
+    window.setInterval = stopped;
+    window.requestAnimationFrame = stopped;
+  });
+  await h.restartDaemon();
+  pane = h.newPane();
+  await expect.poll(sessions, { timeout: 30_000 }).toBeGreaterThan(before);
+  await expect.poll(() => page.evaluate(() => (window as any).__thurmTest.connected()), { timeout: 30_000 }).toBe(true);
+});
+
 test("reconnects when the daemon comes back", async ({ page }) => {
   await open(page);
   await h.restartDaemon();

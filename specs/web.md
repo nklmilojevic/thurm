@@ -300,12 +300,17 @@ browser's same-origin rules are what keep other sites out.
   once it types; otherwise the pane is letterboxed at the active size, as on the other clients.
 - Focus: a pane gets `Focus { focused: true }` when it is the focused pane and the document is
   visible and focused. That marks it read, like on the Mac.
-- Keepalive: `Ping` every 15 s, from a dedicated worker. Main-thread timers in hidden tabs are
-  throttled hard enough (once a minute after a while, in Chromium) to pass the daemon's 45 s
-  limit. The WebSocket and the Rust session live in that worker; the main thread renders from a
-  cell buffer the worker posts. If a hidden tab is dropped anyway, `visibilitychange` reconnects
-  and `Attach` restores everything.
+- Keepalive: `Ping` every 15 s, ticked by a dedicated worker. Main-thread timers in hidden tabs
+  are throttled hard enough (once a minute after a while, in Chromium) to pass the daemon's 45 s
+  limit; a worker's messages still arrive. (As built, the worker is only that clock; see Status.)
+  Nothing guarantees it: a browser may freeze a background tab outright. So a drop has to be
+  cheap rather than prevented: `Attach` restores everything, retries are ticked by the same
+  worker clock (not only a page timer), and `visibilitychange` reconnects at once.
 - Reconnect with backoff (1 s up to 30 s) on close or error; resubscribe the visible panes.
+- Tested with the page's own timers stubbed out (the worker keeps it connected past the
+  daemon's limit, and brings it back after a drop). A real hidden tab can't be produced headless
+  (both of Chromium's headless modes keep background pages visible and unthrottled), so real
+  browsers' hidden tabs are checked by hand.
 - `Event::Attach` again on a live pane: drop and rebuild that pane's terminal, keep the scroll
   position if the pane was at the bottom.
 - Scrollback: the local terminal keeps what `Attach` replays, capped by `terminal.scrollback`

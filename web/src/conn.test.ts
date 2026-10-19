@@ -47,12 +47,18 @@ function setup() {
   FakeSocket.all = [];
   clients = 0;
   const states: ConnState[] = [];
+  const clock = { now: 0 };
   const conn = new Conn(
     () => {},
     (s) => states.push(s),
-    { url: () => "ws://test/v1/connect", socket: () => new FakeSocket() as unknown as WebSocket, client: fakeClient },
+    {
+      url: () => "ws://test/v1/connect",
+      socket: () => new FakeSocket() as unknown as WebSocket,
+      client: fakeClient,
+      now: () => clock.now,
+    },
   );
-  return { conn, states };
+  return { conn, states, clock };
 }
 
 test("a connect while the socket is opening opens no second one", () => {
@@ -105,4 +111,31 @@ test("the session ends with its socket, and the next socket starts a new one", (
   expect(FakeSocket.all.length).toBe(2);
   FakeSocket.all[1].open();
   expect(clients).toBe(2);
+});
+
+test("the clock's ticks retry a dropped connection when its timer is held back", () => {
+  const { conn, clock } = setup();
+  conn.connect();
+  FakeSocket.all[0].open();
+  // The daemon dropped it (a hidden tab's pings were late, say).
+  FakeSocket.all[0].readyState = WebSocket.CLOSED;
+  FakeSocket.all[0].onclose?.({ code: 1006, reason: "" });
+  conn.tick();
+  expect(FakeSocket.all.length).toBe(1);
+  // Past the 1 s backoff, though the page's retry timer never fired.
+  clock.now += 1_000;
+  conn.tick();
+  expect(FakeSocket.all.length).toBe(2);
+  conn.tick();
+  expect(FakeSocket.all.length).toBe(2);
+});
+
+test("no retry after Disconnect", () => {
+  const { conn, clock } = setup();
+  conn.connect();
+  FakeSocket.all[0].open();
+  conn.disconnect();
+  clock.now += 60_000;
+  conn.tick();
+  expect(FakeSocket.all.length).toBe(1);
 });
