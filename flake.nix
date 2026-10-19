@@ -135,10 +135,12 @@
           "rust-src"
           "rust-analyzer"
         ];
-        # The iOS app's core (thurm-ffi's `mobile` feature, built by the iOS app's repository).
+        # The iOS app's core (thurm-ffi's `mobile` feature, built by the iOS app's repository),
+        # and the browser client's (wasm32).
         targets = [
           "aarch64-apple-ios"
           "aarch64-apple-ios-sim"
+          "wasm32-unknown-unknown"
         ];
       };
     in

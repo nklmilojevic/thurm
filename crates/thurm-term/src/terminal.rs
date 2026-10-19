@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use thurm_config::{Config, Osc52Mode, Theme};
 use thurm_proto::{
@@ -10,6 +10,7 @@ use thurm_proto::{
     ImagePlacement, KeyEvent, MouseButton, MouseEvent, MouseKind, PaneSize, ScrollCmd,
     SearchDirection, SelectionKind, SelectionOp, cell_flags as cf, mods,
 };
+use web_time::Instant;
 
 use crate::filter::{Chunk, StreamFilter};
 use crate::keys;

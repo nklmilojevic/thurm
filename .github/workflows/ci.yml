@@ -77,7 +77,7 @@ jobs:
         with:
           toolchain: 1.99.1
           components: clippy, rustfmt
-          targets: aarch64-apple-ios
+          targets: aarch64-apple-ios, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -90,6 +90,9 @@ jobs:
       # The iOS app's core: catches desktop-only code (process spawning, Linux-only libc) leaking in.
       - name: iOS core
         run: cargo clippy -p thurm-ffi --target aarch64-apple-ios --no-default-features --features mobile --locked -- -D warnings
+      # The browser client's: the shared config and protocol crates build for wasm32 too.
+      - name: wasm core
+        run: cargo clippy -p thurm-config -p thurm-proto --target wasm32-unknown-unknown --locked -- -D warnings
       # Not committed (the builds generate it), but a broken generator should fail here, not at release.
       - name: Third-party licenses
         run: python3 scripts/third-party-licenses.py
