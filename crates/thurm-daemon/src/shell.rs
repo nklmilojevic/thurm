@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use thurm_config::Config;
+use thurm_config::{Config, Osc52Mode};
 use thurm_proto::{ENV_PANE_ID, ENV_SOCKET, PaneId, PaneSize};
 
 use crate::pty::SpawnOptions;
@@ -87,6 +87,33 @@ pub struct PaneLaunch<'a> {
 /// Ghostty release matching the pinned libghostty-vt (1.3.2-dev).
 const GHOSTTY_VERSION: &str = "1.3.2";
 
+/// iTerm2's feature reporting string (<https://iterm2.com/feature-reporting/>), which
+/// anstyle-progress (cargo) reads for OSC 9;4. Only what Thurm handles: no DECSLRM (attach
+/// snapshots don't restore the margins), title stacks (libghostty-vt ignores them), overline,
+/// sixel or iTerm2's inline files, and no Unicode width version (not pinned down).
+fn term_features(cfg: &Config) -> String {
+    let osc52_copy = matches!(cfg.terminal.osc52, Osc52Mode::Copy | Osc52Mode::CopyPaste);
+    let notify = cfg.notifications.enabled && cfg.notifications.program_notifications;
+    [
+        ("T3", true),
+        ("Cw", osc52_copy),
+        ("M", true),
+        ("Sc7", true),
+        ("U", true),
+        ("Ts2", true),
+        ("B", true),
+        ("F", true),
+        ("Gs", true),
+        ("Sy", true),
+        ("H", true),
+        ("No", notify),
+        ("P", true),
+    ]
+    .into_iter()
+    .filter_map(|(code, on)| on.then_some(code))
+    .collect()
+}
+
 pub fn spawn_options(l: PaneLaunch<'_>) -> SpawnOptions {
     let cfg = l.config;
     let mut env: Vec<(String, String)> = vec![
@@ -94,9 +121,10 @@ pub fn spawn_options(l: PaneLaunch<'_>) -> SpawnOptions {
         ("COLORTERM".into(), "truecolor".into()),
         // Thurm's terminal is libghostty-vt, so programs get told it is Ghostty: they gate
         // features on it (Claude Code only sends OSC 9;4 progress to Ghostty and iTerm2).
-        // `[terminal.env]` can override both. Thurm itself goes by the THURM_* variables.
+        // `[terminal.env]` can override them. Thurm itself goes by the THURM_* variables.
         ("TERM_PROGRAM".into(), "ghostty".into()),
         ("TERM_PROGRAM_VERSION".into(), GHOSTTY_VERSION.into()),
+        ("TERM_FEATURES".into(), term_features(cfg)),
         (ENV_PANE_ID.into(), l.id.to_string()),
         (ENV_SOCKET.into(), l.socket.display().to_string()),
     ];
@@ -283,5 +311,48 @@ mod tests {
                 .any(|(k, v)| k == "THURM_PANE_ID" && v == "7")
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn env_of(cfg: &Config) -> Vec<(String, String)> {
+        let sock = PathBuf::from("/tmp/x.sock");
+        spawn_options(PaneLaunch {
+            id: 1,
+            command: None,
+            cwd: None,
+            extra_env: vec![],
+            size: PaneSize::default(),
+            config: cfg,
+            socket: &sock,
+            integration_dir: None,
+            token: "",
+        })
+        .env
+    }
+
+    fn last<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        env.iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn term_features_env() {
+        let env = env_of(&Config::default());
+        assert_eq!(last(&env, "TERM_FEATURES"), Some("T3CwMSc7UTs2BFGsSyHNoP"));
+
+        let mut cfg = Config::default();
+        cfg.terminal.osc52 = Osc52Mode::Paste;
+        cfg.notifications.program_notifications = false;
+        assert_eq!(term_features(&cfg), "T3MSc7UTs2BFGsSyHP");
+        cfg.terminal.osc52 = Osc52Mode::CopyPaste;
+        cfg.notifications.program_notifications = true;
+        cfg.notifications.enabled = false;
+        assert_eq!(term_features(&cfg), "T3CwMSc7UTs2BFGsSyHP");
+
+        cfg.terminal
+            .env
+            .insert("TERM_FEATURES".into(), String::new());
+        assert_eq!(last(&env_of(&cfg), "TERM_FEATURES"), Some(""));
     }
 }
