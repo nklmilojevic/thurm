@@ -355,6 +355,8 @@ enum Failure {
     Transient(String),
     NotInstalled(String),
     Upgrade(String),
+    /// The host's daemon was down and has been started: try again right away.
+    Restarted(String),
 }
 
 impl From<SshError> for Failure {
@@ -407,12 +409,20 @@ struct Relay {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Why a relay couldn't carry a connection.
+enum RelayFailure {
+    /// Opening it over the tailnet: classified like the first connection's failure.
+    Open(OpenError),
+    /// Accepting it on the local socket.
+    Local(String),
+}
+
 /// What a relay's connections tell it, and the supervisor reads.
 #[derive(Default)]
 struct RelayShared {
     stop: AtomicBool,
     /// Why the last connection couldn't be opened, until the supervisor looks.
-    failure: Mutex<Option<String>>,
+    failure: Mutex<Option<RelayFailure>>,
     /// The route the last connection took, until the supervisor looks: the embedded node can
     /// go off (or come back) while the relay runs.
     route: Mutex<Option<Via>>,
@@ -457,7 +467,8 @@ impl Relay {
                             std::thread::sleep(Duration::from_millis(50));
                         }
                         Err(e) => {
-                            *ours.failure.lock() = Some(format!("the local socket: {e}"));
+                            *ours.failure.lock() =
+                                Some(RelayFailure::Local(format!("the local socket: {e}")));
                             std::thread::sleep(Duration::from_millis(500));
                         }
                     }
@@ -492,7 +503,7 @@ fn relay_one(conn: UnixStream, target: &TailnetTarget, dial_socket: &Path, share
     let opened = match tn::open(target, dial_socket, thurm_tailnet_client::CONNECT_TIMEOUT) {
         Ok(o) => o,
         Err(e) => {
-            *shared.failure.lock() = Some(e.to_string());
+            *shared.failure.lock() = Some(RelayFailure::Open(e));
             return;
         }
     };
@@ -591,8 +602,8 @@ impl Inner {
             match self.connect() {
                 Ok(link) => {
                     let connected = Instant::now();
-                    let reason = match link {
-                        Link::Ssh(tunnel) => self.hold(tunnel),
+                    let ended = match link {
+                        Link::Ssh(tunnel) => Ok(self.hold(tunnel)),
                         Link::Tailnet(relay) => self.hold_relay(relay),
                     };
                     if connected.elapsed() >= HEALTHY_AFTER {
@@ -601,6 +612,25 @@ impl Inner {
                     if self.stopped() {
                         break;
                     }
+                    let reason = match ended {
+                        Ok(reason) => reason,
+                        // The host refused, or its daemon went down: as on the first connection.
+                        Err(f) => {
+                            self.set(|s| {
+                                s.tunnel_pid = None;
+                                s.via = None;
+                            });
+                            if self.report(f) {
+                                attempt = 0;
+                            }
+                            let delay = backoff(attempt);
+                            attempt = attempt.saturating_add(1);
+                            let retry_at = now_secs() + delay.as_secs();
+                            self.set(|s| s.retry_at = Some(retry_at));
+                            self.wait(Some(delay));
+                            continue;
+                        }
+                    };
                     self.set(|s| {
                         s.phase = Phase::Reconnecting;
                         s.message = Some(reason);
@@ -615,16 +645,9 @@ impl Inner {
                     }
                 }
                 Err(f) => {
-                    let (phase, message) = match f {
-                        Failure::Attention(m) => (Phase::NeedsAttention, m),
-                        Failure::Transient(m) => (Phase::Reconnecting, m),
-                        Failure::NotInstalled(m) => (Phase::NotInstalled, m),
-                        Failure::Upgrade(m) => (Phase::UpgradeNeeded, m),
-                    };
-                    self.set(|s| {
-                        s.phase = phase;
-                        s.message = Some(message);
-                    });
+                    if self.report(f) {
+                        attempt = 0;
+                    }
                 }
             }
             let delay = backoff(attempt);
@@ -673,17 +696,7 @@ impl Inner {
         let dial_socket = thurm_config::tailnet_dial_socket_path();
         let opened = match tn::open(&target, &dial_socket, thurm_tailnet_client::CONNECT_TIMEOUT) {
             Ok(o) => o,
-            Err(OpenError::Connect(ConnectError::DaemonUnavailable)) => {
-                // A host listener answers for a daemon that isn't running; ssh can start it.
-                return Err(Failure::Transient(match self.start_daemon_over_ssh() {
-                    Ok(()) => format!("the daemon on {name} wasn't running; started it over ssh"),
-                    Err(e) => format!(
-                        "{name} answers over the tailnet, but its daemon doesn't, and starting it \
-                         over ssh failed: {e}"
-                    ),
-                }));
-            }
-            Err(e) => return Err(open_failure(&name, e)),
+            Err(e) => return Err(self.tailnet_failure(e)),
         };
         let tn::Opened {
             stream,
@@ -731,6 +744,42 @@ impl Inner {
             s.via = Some(via);
         });
         Ok(relay)
+    }
+
+    /// What a failed tailnet connection means for the host, the first one or a later one. A
+    /// host listener that answers for a daemon that is down gets the daemon started over ssh.
+    fn tailnet_failure(&self, e: OpenError) -> Failure {
+        let name = self.remote.lock().name.clone();
+        match e {
+            OpenError::Connect(ConnectError::DaemonUnavailable) => {
+                match self.start_daemon_over_ssh() {
+                    Ok(()) => Failure::Restarted(format!(
+                        "the daemon on {name} wasn't running; started it over ssh"
+                    )),
+                    Err(e) => Failure::Transient(format!(
+                        "{name} answers over the tailnet, but its daemon doesn't, and starting it \
+                         over ssh failed: {e}"
+                    )),
+                }
+            }
+            e => open_failure(&name, e),
+        }
+    }
+
+    /// Shows `f` in the host's status. Returns whether to try again right away.
+    fn report(&self, f: Failure) -> bool {
+        let restarted = matches!(f, Failure::Restarted(_));
+        let (phase, message) = match f {
+            Failure::Attention(m) => (Phase::NeedsAttention, m),
+            Failure::Transient(m) | Failure::Restarted(m) => (Phase::Reconnecting, m),
+            Failure::NotInstalled(m) => (Phase::NotInstalled, m),
+            Failure::Upgrade(m) => (Phase::UpgradeNeeded, m),
+        };
+        self.set(|s| {
+            s.phase = phase;
+            s.message = Some(message);
+        });
+        restarted
     }
 
     /// Starts the host's daemon over ssh, for a tailnet host whose listener answers for it.
@@ -875,19 +924,20 @@ impl Inner {
     }
 
     /// Watches a connected tailnet relay until a restart or a failed connection finds the
-    /// host gone, or stop. Returns why it ended.
-    fn hold_relay(&self, relay: Relay) -> String {
+    /// host gone, or stop. Returns why it ended, or a failure classified like a first
+    /// connection's (the host refused this Mac, its daemon went down).
+    fn hold_relay(&self, relay: Relay) -> Result<String, Failure> {
         let local = self.local_socket();
         loop {
             let restart = self.wait(Some(Duration::from_millis(500)));
             if self.stopped() {
-                return "stopped".into();
+                return Ok("stopped".into());
             }
             if !self.remote.lock().enabled {
-                return "disabled".into();
+                return Ok("disabled".into());
             }
             if self.reconfigured.load(Ordering::SeqCst) {
-                return "the host's settings changed".into();
+                return Ok("the host's settings changed".into());
             }
             if let Some(via) = relay.shared.route.lock().take()
                 && self.status.lock().via != Some(via)
@@ -902,16 +952,16 @@ impl Inner {
             match ping(&local, Duration::from_secs(10)) {
                 Ok((_, build)) => self.note_build(build),
                 Err(PingError::Protocol(_)) => {
-                    return "the daemon there now speaks another protocol".into();
+                    return Ok("the daemon there now speaks another protocol".into());
                 }
                 Err(e) => {
-                    return relay
-                        .shared
-                        .failure
-                        .lock()
-                        .take()
-                        .or(failed)
-                        .unwrap_or_else(|| format!("the connection stopped answering ({e:?})"));
+                    // The fresh connection's own failure says best what happened.
+                    let latest = relay.shared.failure.lock().take().or(failed);
+                    return match latest {
+                        Some(RelayFailure::Open(e)) => Err(self.tailnet_failure(e)),
+                        Some(RelayFailure::Local(m)) => Ok(m),
+                        None => Ok(format!("the connection stopped answering ({e:?})")),
+                    };
                 }
             }
         }

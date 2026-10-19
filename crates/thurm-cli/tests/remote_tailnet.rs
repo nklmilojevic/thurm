@@ -113,11 +113,38 @@ fn an_unreachable_peer_is_not_added() {
 #[test]
 fn peers_are_listed_through_the_dial_socket() {
     let w = World::new("c");
-    // The stand-in answers a dial, not a listing: an error that names the socket's answer.
     let out = w.thurm(&["tailscale", "peers"]);
-    assert!(!out.status.success());
-    // Without a dial socket at all, the hint says how to get one.
+    assert!(out.status.success(), "{}", text(&out));
+    let table = text(&out);
+    assert!(
+        table.contains("bastion.tail1234.ts.net") && table.contains("100.64.0.1"),
+        "{table}"
+    );
+    let out = w.thurm(&["--json", "tailscale", "peers"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let peers: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(peers[0]["dns_name"], "bastion.tail1234.ts.net");
+    assert_eq!(peers[0]["online"], true);
+}
+
+#[test]
+fn without_a_dial_socket_peers_says_how_to_get_one() {
+    let w = World::new("d");
     std::fs::remove_file(w.path(thurm_config::TAILNET_DIAL_SOCKET)).unwrap();
     let out = w.thurm(&["tailscale", "peers"]);
+    assert!(!out.status.success());
     assert!(text(&out).contains("thurm tailscale on"), "{}", text(&out));
+}
+
+#[test]
+fn the_dial_socket_commands_refuse_remote() {
+    let w = World::new("e");
+    for args in [
+        &["--remote", "devbox", "tailscale", "peers"][..],
+        &["--remote", "devbox", "tailscale", "nc", "bastion", "22"][..],
+    ] {
+        let out = w.thurm(args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(text(&out).contains("drop --remote"), "{}", text(&out));
+    }
 }

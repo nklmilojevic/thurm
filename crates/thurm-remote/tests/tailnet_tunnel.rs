@@ -12,7 +12,7 @@ use thurm_remote::tunnel::{Phase, Status, Supervisor, Transport, ping};
 
 #[path = "support/tailnet_fakes.rs"]
 mod fakes;
-use fakes::{daemon, gateway};
+use fakes::{daemon, gateway, switchable_gateway};
 
 /// The stand-in dial socket, once, where the environment points.
 fn dial_socket() {
@@ -46,7 +46,8 @@ fn base() -> &'static Path {
 fn remote(name: &str, tailnet: &str) -> RemoteConfig {
     RemoteConfig {
         name: name.into(),
-        host: "bastion".into(),
+        // Never a real host: a daemon that is down gets started over ssh.
+        host: "thurm-test.invalid".into(),
         socket: None,
         enabled: true,
         clipboard_read: Default::default(),
@@ -171,4 +172,41 @@ fn check_says_how_the_host_answers() {
         thurm_remote::tailnet::check("ws://nobody.ts.net:7297", &socket, Duration::from_secs(8))
             .unwrap_err();
     assert!(e.contains("nobody"), "{e}");
+}
+
+#[test]
+fn a_host_that_stops_letting_this_mac_in_needs_attention() {
+    let d = stand_in_daemon("revoke");
+    dial_socket();
+    let (port, _stop, answer) = switchable_gateway(d, None);
+    let sup = start(remote("revoke", &format!("ws://127.0.0.1:{port}")));
+    wait_for(&sup, |s| s.phase == Phase::Connected);
+    *answer.lock().unwrap() = Some((
+        403,
+        "forbidden: me@example.com is not this host's owner; turn on allow_tailnet_members",
+    ));
+    sup.kick(true);
+    let s = wait_for(&sup, |s| s.phase == Phase::NeedsAttention);
+    let msg = s.message.unwrap();
+    assert!(msg.contains("allow_tailnet_members"), "{msg}");
+    assert_eq!(s.via, None);
+}
+
+#[test]
+fn a_daemon_that_goes_down_is_started_over_ssh() {
+    let d = stand_in_daemon("down");
+    dial_socket();
+    let (port, _stop, answer) = switchable_gateway(d, None);
+    let sup = start(remote("down", &format!("ws://127.0.0.1:{port}")));
+    wait_for(&sup, |s| s.phase == Phase::Connected);
+    // The host listener answers, its daemon doesn't.
+    *answer.lock().unwrap() = Some((503, "the Thurm daemon is not reachable"));
+    sup.kick(true);
+    // The stand-in's ssh host doesn't exist: starting it is tried, and says why it failed.
+    let s = wait_for(&sup, |s| {
+        s.message
+            .as_deref()
+            .is_some_and(|m| m.contains("starting it over ssh failed"))
+    });
+    assert_eq!(s.phase, Phase::Reconnecting);
 }

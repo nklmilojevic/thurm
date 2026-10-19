@@ -227,10 +227,12 @@ the full address next to `host`. In the app, turn on **Over Tailscale** in
 **Add Host…**.
 
 The connection goes through this Mac's own Thurm device when it runs
-(`thurm tailscale on` here), so it works with the Tailscale app stopped, and
-through the Tailscale app otherwise. `thurm remote list` shows which:
-`tailnet (node)` or `tailnet (app)`. A `ws://` address is used through Thurm's
-device only.
+(`thurm tailscale on` here), so it works with the Tailscale app stopped. When
+that device is off, a full `wss://…/v1/connect` address goes through the
+Tailscale app instead; `thurm remote add --tailnet` saves that form. A bare peer
+name written into `tailnet` by hand, and a `ws://` address, work through Thurm's
+device only. `thurm remote list` shows which way a host is reached:
+`tailnet (node)` or `tailnet (app)`.
 
 The host decides who gets in, as for your phone: by default only its own
 account. If you sign this Mac's Thurm device in with the same account, it is let

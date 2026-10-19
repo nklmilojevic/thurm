@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use futures_util::{SinkExt, StreamExt};
 use thurm_proto::{Envelope, Request, Response, ServerMessage, codec};
@@ -56,15 +56,30 @@ pub fn daemon(path: &Path) {
     });
 }
 
+/// How the gateway answers: relays to the daemon, or refuses with an HTTP status and text (403
+/// as an admission refusal, 503 as a host listener whose daemon is down).
+pub type Answer = Arc<Mutex<Option<(u16, &'static str)>>>;
+
 /// The gateway: `/v1/connect` relayed to the daemon at `daemon`, or with `refuse` an HTTP 403
 /// with that text, as an admission refusal is. Returns its port and a switch that stops it.
 pub fn gateway(
     daemon: PathBuf,
     refuse: Option<&'static str>,
 ) -> (u16, tokio::sync::watch::Sender<bool>) {
+    let (port, stop, _) = switchable_gateway(daemon, refuse.map(|r| (403, r)));
+    (port, stop)
+}
+
+/// Like [`gateway`], with its answer changeable while it runs.
+pub fn switchable_gateway(
+    daemon: PathBuf,
+    refuse: Option<(u16, &'static str)>,
+) -> (u16, tokio::sync::watch::Sender<bool>, Answer) {
     let ln = rt().block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
     let port = ln.local_addr().unwrap().port();
     let (stop_tx, mut stop) = tokio::sync::watch::channel(false);
+    let answer: Answer = Arc::new(Mutex::new(refuse));
+    let theirs = answer.clone();
     rt().spawn(async move {
         loop {
             let (mut tcp, _) = tokio::select! {
@@ -73,12 +88,13 @@ pub fn gateway(
             };
             let daemon = daemon.clone();
             let mut stop = stop.clone();
+            let refuse = *theirs.lock().unwrap();
             tokio::spawn(async move {
-                if let Some(text) = refuse {
+                if let Some((code, text)) = refuse {
                     let mut buf = [0u8; 4096];
                     let _ = tcp.read(&mut buf).await;
                     let resp = format!(
-                        "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                        "HTTP/1.1 {code} Refused\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
                         text.len()
                     );
                     let _ = tcp.write_all(resp.as_bytes()).await;
@@ -122,11 +138,11 @@ pub fn gateway(
             });
         }
     });
-    (port, stop_tx)
+    (port, stop_tx, answer)
 }
 
 /// The stand-in dial socket on `path`: every peer is 127.0.0.1, and `bastion` is its name;
-/// others are refused the way the helper refuses them.
+/// others are refused the way the helper refuses them. A listing has `bastion` alone.
 pub fn dial_socket(path: &Path) {
     let ln = UnixListener::bind(path).unwrap();
     std::thread::spawn(move || {
@@ -143,6 +159,13 @@ fn serve_dial(mut conn: UnixStream) {
         return;
     }
     let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+    if req["peers"] == true {
+        let _ = writeln!(
+            conn,
+            r#"{{"ok":true,"peers":[{{"name":"bastion","dns_name":"bastion.tail1234.ts.net","addrs":["100.64.0.1"],"online":true}}]}}"#
+        );
+        return;
+    }
     let host = req["host"].as_str().unwrap_or_default().to_owned();
     if host != "127.0.0.1" && host != "bastion" {
         let refusal =

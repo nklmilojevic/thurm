@@ -599,6 +599,16 @@ fn run(cli: Cli) -> R {
                     .into(),
             );
         }
+        if matches!(
+            cli.cmd,
+            Cmd::Tailscale {
+                action: tailscale::TailscaleCmd::Peers | tailscale::TailscaleCmd::Nc { .. }
+            }
+        ) {
+            return Err("tailscale peers and nc dial through this machine's Tailscale device; \
+                        drop --remote"
+                .into());
+        }
     }
     match cli.cmd {
         Cmd::Events { pane, filter } => events::run(remote.as_deref(), pane, &filter),
