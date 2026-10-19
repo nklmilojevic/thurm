@@ -14,7 +14,7 @@ final class SessionManager: NSObject, CoreDelegate {
     private var sidebarTabsOverride: Bool?
     /// View > Agents in Sidebar when config.toml cannot record it, as `sidebarTabsOverride`.
     private var sidebarAgentsOverride: Bool?
-    private var sidebarUsageOverride: Bool?
+    private var sidebarUsageOverride: [UsageProvider: Bool] = [:]
     /// A theme chosen when config.toml cannot record it is in use (see `setTheme`).
     private var sessionTheme = false
     var effectiveFontSize: CGFloat { fontSizeOverride ?? config.fontSize }
@@ -839,12 +839,13 @@ final class SessionManager: NSObject, CoreDelegate {
         }
     }
 
-    /// View > Usage Limits in Sidebar: switch `window.sidebar_usage`, as `toggleSidebarAgents`.
-    func toggleSidebarUsage() {
-        let usage = !config.sidebarUsage
-        sidebarUsageOverride = toggleSetting("window.sidebar_usage", to: usage)
-        if sidebarUsageOverride != nil {
-            config.sidebarUsage = usage
+    /// View > Usage Limits in Sidebar: switch `window.sidebar_usage_<provider>`, as
+    /// `toggleSidebarAgents`.
+    func toggleSidebarUsage(_ provider: UsageProvider) {
+        let on = !config.sidebarUsage.contains(provider)
+        sidebarUsageOverride[provider] = toggleSetting("window.sidebar_usage_\(provider.rawValue)", to: on)
+        if sidebarUsageOverride[provider] != nil {
+            if on { config.sidebarUsage.insert(provider) } else { config.sidebarUsage.remove(provider) }
             applyConfigToUI()
             UsageLimits.shared.configChanged()
         }
@@ -923,7 +924,9 @@ final class SessionManager: NSObject, CoreDelegate {
         config.loadWarnings += MainMenu.applyKeys(config.keybindings, commands: config.commands)
         if let o = sidebarTabsOverride { config.sidebarTabs = o }
         if let o = sidebarAgentsOverride { config.sidebarAgents = o }
-        if let o = sidebarUsageOverride { config.sidebarUsage = o }
+        for (p, on) in sidebarUsageOverride {
+            if on { config.sidebarUsage.insert(p) } else { config.sidebarUsage.remove(p) }
+        }
         applyConfigToUI()
         UsageLimits.shared.configChanged()
         Core.shared.reloadRemoteEngines()

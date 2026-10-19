@@ -1,6 +1,6 @@
 import AppKit
 
-/// A subscription whose limits the sidebar shows (`window.sidebar_usage`).
+/// A subscription whose limits the sidebar can show (`window.sidebar_usage_<rawValue>`).
 enum UsageProvider: String, CaseIterable {
     case claude
     case codex
@@ -64,7 +64,7 @@ struct UsageReport: Equatable {
 /// Claude's come from Anthropic's usage endpoint (what Claude Code's `/usage` shows), with the
 /// sign-in Claude Code keeps in the keychain. It is only read: Claude Code renews it when it runs.
 /// Codex's come from the latest rate-limit snapshot Codex wrote to its session logs, so they
-/// cover what this Mac's Codex last saw.
+/// cover what this Mac's Codex last saw. Each is read only when chosen in the config.
 final class UsageLimits {
     static let shared = UsageLimits()
 
@@ -85,35 +85,40 @@ final class UsageLimits {
     /// After finding no sign-in: reading the keychain again may ask for it again.
     private static let claudeSignedOutInterval: TimeInterval = 30 * 60
 
-    private var enabled: Bool {
+    /// The providers chosen in the config; nothing is read for the others.
+    private var enabled: Set<UsageProvider> {
         let config = SessionManager.shared.config
-        return config.sidebarUsage && config.sidebarTabs
+        return config.sidebarTabs ? config.sidebarUsage : []
     }
 
     /// Starts or stops polling after the config changed.
     func configChanged() {
-        if enabled {
-            guard timer == nil else { return }
+        let on = enabled
+        if !on.contains(.claude) { claudeNext = .distantPast }
+        if !on.contains(.codex) { codexSeen = nil }
+        let dropped = reports.keys.filter { !on.contains($0) }
+        if !dropped.isEmpty {
+            dropped.forEach { reports[$0] = nil }
+            SessionManager.shared.refreshSidebars()
+        }
+        if on.isEmpty {
+            timer?.invalidate()
+            timer = nil
+        } else if timer == nil {
             let t = Timer(timeInterval: Self.tick, repeats: true) { [weak self] _ in self?.poll() }
             t.tolerance = 5
             RunLoop.main.add(t, forMode: .common)
             timer = t
             poll()
         } else {
-            timer?.invalidate()
-            timer = nil
-            claudeNext = .distantPast
-            codexSeen = nil
-            if !reports.isEmpty {
-                reports = [:]
-                SessionManager.shared.refreshSidebars()
-            }
+            // One just switched on: read it now rather than at the next tick.
+            poll()
         }
     }
 
-    /// Reads both again now (Claude at most once a minute).
+    /// Reads them again now (Claude at most once a minute).
     func refreshNow() {
-        guard enabled else { return }
+        guard !enabled.isEmpty else { return }
         claudeNext = min(claudeNext, claudeLast.addingTimeInterval(Self.claudeMinimum))
         codexSeen = nil
         poll()
@@ -127,14 +132,15 @@ final class UsageLimits {
         }
         lastTick = now
         if crossed { SessionManager.shared.refreshSidebars() }
-        if !codexInFlight {
+        let on = enabled
+        if on.contains(.codex), !codexInFlight {
             codexInFlight = true
             let seen = codexSeen
             queue.async {
                 let found = Self.latestCodexSnapshot(unchangedSince: seen)
                 DispatchQueue.main.async {
                     self.codexInFlight = false
-                    guard self.enabled else { return }
+                    guard self.enabled.contains(.codex) else { return }
                     switch found {
                     case .unchanged: break
                     case .none: self.set(.codex, nil)
@@ -145,7 +151,7 @@ final class UsageLimits {
                 }
             }
         }
-        if !claudeInFlight, now >= claudeNext {
+        if on.contains(.claude), !claudeInFlight, now >= claudeNext {
             claudeInFlight = true
             claudeLast = now
             claudeNext = now.addingTimeInterval(Self.claudeInterval)
@@ -153,7 +159,7 @@ final class UsageLimits {
                 Self.fetchClaude { result in
                     DispatchQueue.main.async {
                         self.claudeInFlight = false
-                        guard self.enabled else { return }
+                        guard self.enabled.contains(.claude) else { return }
                         self.applyClaude(result)
                     }
                 }
@@ -162,6 +168,7 @@ final class UsageLimits {
     }
 
     private func applyClaude(_ result: ClaudeResult) {
+        if case .failed(let problem, _) = result { tlog("usage: Claude limits: \(problem)") }
         switch result {
         case .signedOut:
             claudeNext = Date().addingTimeInterval(Self.claudeSignedOutInterval)
@@ -436,11 +443,9 @@ final class UsagePanel: NSView {
     func reload() {
         let config = SessionManager.shared.config
         let now = Date()
-        let models = config.sidebarUsage
-            ? UsageProvider.allCases.compactMap { p in
-                UsageLimits.shared.reports[p].map { UsageRowModel(provider: p, report: $0, now: now) }
-            }
-            : []
+        let models = UsageProvider.allCases.filter(config.sidebarUsage.contains).compactMap { p in
+            UsageLimits.shared.reports[p].map { UsageRowModel(provider: p, report: $0, now: now) }
+        }
         guard models != shown || config.theme != themed else { return }
         shown = models
         themed = config.theme

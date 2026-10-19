@@ -239,8 +239,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         SessionManager.shared.toggleSidebarAgents()
     }
 
-    @objc func toggleSidebarUsage(_ sender: Any?) {
-        SessionManager.shared.toggleSidebarUsage()
+    @objc func toggleSidebarUsageClaude(_ sender: Any?) {
+        SessionManager.shared.toggleSidebarUsage(.claude)
+    }
+
+    @objc func toggleSidebarUsageCodex(_ sender: Any?) {
+        SessionManager.shared.toggleSidebarUsage(.codex)
     }
 
     @objc func newWorkspace(_ sender: Any?) {
@@ -315,8 +319,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             menuItem.state = SessionManager.shared.config.sidebarAgents ? .on : .off
             return SessionManager.shared.config.sidebarTabs
         }
-        if menuItem.action == #selector(toggleSidebarUsage(_:)) {
-            menuItem.state = SessionManager.shared.config.sidebarUsage ? .on : .off
+        let usage: [Selector: UsageProvider] = [#selector(toggleSidebarUsageClaude(_:)): .claude,
+                                                #selector(toggleSidebarUsageCodex(_:)): .codex]
+        if let action = menuItem.action, let provider = usage[action] {
+            menuItem.state = SessionManager.shared.config.sidebarUsage.contains(provider) ? .on : .off
             return SessionManager.shared.config.sidebarTabs
         }
         return true

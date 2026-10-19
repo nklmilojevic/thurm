@@ -190,8 +190,13 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
         Kind::Int(Some((1.0, 100.0))),
     ),
     (
-        "window.sidebar_usage",
-        "Usage limits in sidebar",
+        "window.sidebar_usage_claude",
+        "Claude Code usage limits in sidebar",
+        Kind::Bool,
+    ),
+    (
+        "window.sidebar_usage_codex",
+        "Codex usage limits in sidebar",
         Kind::Bool,
     ),
     ("cursor.style", "Style", Kind::Enum(CURSOR_STYLE)),
