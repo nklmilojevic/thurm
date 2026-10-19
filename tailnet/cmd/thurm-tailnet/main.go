@@ -32,6 +32,7 @@ type nodeConfig struct {
 	Enabled             bool     `json:"enabled"`
 	Hostname            string   `json:"hostname"`
 	AllowTailnetMembers bool     `json:"allow_tailnet_members"`
+	Web                 bool     `json:"web"`
 	AdvertiseTags       []string `json:"advertise_tags"`
 	AuthKey             string   `json:"auth_key"`
 }
@@ -155,6 +156,7 @@ func (h *helper) apply(c command) error {
 			cfg := node.Config{
 				Hostname:     c.Node.Hostname,
 				AllowMembers: c.Node.AllowTailnetMembers,
+				Web:          c.Node.Web,
 				Tags:         c.Node.AdvertiseTags,
 				AuthKey:      c.Node.AuthKey,
 			}

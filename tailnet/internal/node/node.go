@@ -22,6 +22,7 @@ import (
 	"github.com/nklmilojevic/thurm/tailnet/internal/admit"
 	"github.com/nklmilojevic/thurm/tailnet/internal/gateway"
 	"github.com/nklmilojevic/thurm/tailnet/internal/status"
+	"github.com/nklmilojevic/thurm/tailnet/internal/web"
 )
 
 // AllowFlag names the setting that admits every tailnet member.
@@ -31,6 +32,8 @@ const AllowFlag = "Allow tailnet members (tailscale.allow_tailnet_members)"
 type Config struct {
 	Hostname     string
 	AllowMembers bool
+	// Web serves the browser client on the node's HTTPS address.
+	Web bool
 	// Tags and AuthKey only matter when the node enrolls.
 	Tags    []string
 	AuthKey string
@@ -91,6 +94,7 @@ func (n *Node) Enable(cfg Config) error {
 			// Narrowing who may connect drops everyone; the owner reconnects.
 			gw.CloseAll("access changed")
 		}
+		n.serveBrowser()
 		if cfg.Hostname != old.Hostname {
 			if err := n.Rename(cfg.Hostname); err != nil {
 				n.changed()
@@ -139,6 +143,30 @@ func (n *Node) Enable(cfg Config) error {
 	go n.watch(ctx, gen, lc)
 	n.changed()
 	return nil
+}
+
+// serveBrowser points the gateway at the browser client. Its origin is the node's own once the
+// DNS name is known, so a page from anywhere else is refused either way; the client itself is
+// served only with Web on and HTTPS ready.
+func (n *Node) serveBrowser() {
+	n.mu.Lock()
+	gw := n.gw
+	origin := ""
+	if n.st != nil && n.st.Self != nil {
+		if name := strings.TrimSuffix(n.st.Self.DNSName, "."); name != "" {
+			origin = "https://" + name
+		}
+	}
+	serve := n.cfg.Web && n.https.State == "ready" && origin != ""
+	n.mu.Unlock()
+	if gw == nil {
+		return
+	}
+	var client http.Handler
+	if serve {
+		client = web.Handler(web.Embedded(), origin)
+	}
+	gw.SetBrowser(origin, client)
 }
 
 // Disable stops serving: tailnet connections close, and the node stays signed in (its state
@@ -396,6 +424,7 @@ func (n *Node) apply(ctx context.Context, gen int, lc *local.Client, msg ipn.Not
 	if bind {
 		n.bindTLS(ctx, gen, st)
 	}
+	n.serveBrowser()
 	n.changed()
 }
 
@@ -489,6 +518,7 @@ func (n *Node) setHTTPS(gen int, h status.HTTPS) {
 	}
 	n.mu.Unlock()
 	if ok {
+		n.serveBrowser()
 		n.changed()
 	}
 }
