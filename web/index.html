@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Thurm</title>
+<link rel="stylesheet" href="__STYLE__">
+<script type="module" src="__APP__"></script>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <header>
+      <span class="brand">Thurm</span>
+      <span id="status" class="status">connecting</span>
+    </header>
+    <nav id="tabs" aria-label="Tabs"></nav>
+    <section id="notices" aria-label="Agent notices"></section>
+    <footer>
+      <span id="whoami"></span>
+      <button id="fullscreen" type="button" title="Fullscreen, with the browser's shortcuts going to the terminal where supported">Fullscreen</button>
+      <button id="disconnect" type="button">Disconnect</button>
+    </footer>
+  </aside>
+  <main id="panes" aria-label="Terminal"></main>
+</div>
+<div id="banner" hidden></div>
+<textarea id="input" aria-label="Terminal input" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+</body>
+</html>
