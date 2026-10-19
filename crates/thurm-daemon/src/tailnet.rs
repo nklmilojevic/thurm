@@ -10,19 +10,21 @@
 //! node's key leaving the helper.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Sender, bounded};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thurm_config::TailscaleConfig;
 use thurm_proto::TailscaleStatus;
 use thurm_proto::tailnet::{TailscaleState, valid_hostname, valid_tag};
@@ -31,6 +33,8 @@ use thurm_proto::tailnet::{TailscaleState, valid_hostname, valid_tag};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 /// The longest wait before restarting a helper that keeps exiting.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// How long a replaced helper gets to stop on its own before it is killed.
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the helper should serve.
 #[derive(Serialize, Clone, Debug, Default, PartialEq)]
@@ -100,6 +104,9 @@ struct Reply {
     /// Where the helper dials out; a helper from before dialing out never says.
     #[serde(default)]
     dial_socket: Option<String>,
+    /// The sha256 of the helper's executable when it started; older helpers never say.
+    #[serde(default)]
+    build: Option<String>,
 }
 
 type Answer = Result<TailscaleStatus, String>;
@@ -122,6 +129,8 @@ struct Inner {
     pending: HashMap<u64, Sender<Answer>>,
     /// The running helper's dial socket, as its last message said.
     dial_socket: Option<String>,
+    /// The running helper's build, as its last message said.
+    build: Option<String>,
     generation: u64,
     failures: u32,
 }
@@ -299,18 +308,73 @@ impl Tailnet {
         inner.helper.as_ref().map(|h| (h.pid, h.ctl.as_raw_fd()))
     }
 
-    /// Takes over the helper of the image we replaced, then re-applies the config.
+    /// Takes over the helper of the image we replaced. One older than the installed helper (the
+    /// update that replaced us replaced its executable too) is swapped for the installed one,
+    /// so an update reaches the helper as well.
     pub fn adopt(self: &Arc<Self>, pid: i32, fd: RawFd) {
         let ctl = unsafe { UnixStream::from_raw_fd(fd) };
         let _ = crate::pty::set_cloexec(fd, true);
         log::info!("tailscale: adopted helper {pid}");
         self.attach(ctl, pid);
-        let answered = self.request(serde_json::json!({"cmd": "status"})).is_ok();
-        if answered && self.inner.lock().dial_socket.is_none() {
-            log::info!(
-                "tailscale: the adopted helper predates dialing out; tailnet remotes go through \
-                 the system Tailscale until Tailscale is turned off and on in Thurm"
-            );
+        if self.request(serde_json::json!({"cmd": "status"})).is_err() {
+            return;
+        }
+        let this = self.clone();
+        // Off the caller's thread: hashing the helper and replacing it take a moment.
+        std::thread::spawn(move || {
+            let _ops = this.ops.lock();
+            let installed = match Self::helper_path()
+                .and_then(|p| file_build(&p).map_err(|e| format!("reading {}: {e}", p.display())))
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("tailscale: keeping helper {pid}: {e}");
+                    return;
+                }
+            };
+            if !outdated(this.inner.lock().build.as_deref(), &installed) {
+                return;
+            }
+            log::info!("tailscale: helper {pid} is older than the installed one; replacing it");
+            this.retire();
+            if let Err(e) = this.apply() {
+                log::warn!("tailscale: {e}");
+            }
+        });
+    }
+
+    /// Stops the running helper and waits until it has exited, without starting another: the
+    /// node's state must be free before a new helper opens it. Called with `ops` held.
+    fn retire(&self) {
+        let helper = {
+            let mut inner = self.inner.lock();
+            for (_, tx) in inner.pending.drain() {
+                let _ = tx.send(Err("the Tailscale helper was replaced".into()));
+            }
+            inner.dial_socket = None;
+            inner.build = None;
+            // Its reader sees another generation (or none) and leaves the restarting to us.
+            inner.helper.take()
+        };
+        let Some(helper) = helper else { return };
+        // A closed control socket stops it, keeping the node signed in.
+        let _ = helper.ctl.shutdown(Shutdown::Both);
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        loop {
+            // Gone once reaped, here or by its reader (-1).
+            let r = unsafe { libc::waitpid(helper.pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if r != 0 {
+                return;
+            }
+            if Instant::now() >= deadline {
+                log::warn!("tailscale: helper {} did not stop; killing it", helper.pid);
+                unsafe {
+                    libc::kill(helper.pid, libc::SIGKILL);
+                    libc::waitpid(helper.pid, std::ptr::null_mut(), 0);
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -448,8 +512,17 @@ impl Tailnet {
                     continue;
                 }
             };
-            self.inner.lock().dial_socket = reply.dial_socket.clone();
-            if let Some(status) = &reply.status {
+            let current = {
+                let mut inner = self.inner.lock();
+                // A replaced helper's last words don't describe the one that runs now.
+                let current = inner.helper.as_ref().map(|h| h.generation) == Some(generation);
+                if current {
+                    inner.dial_socket = reply.dial_socket.clone();
+                    inner.build = reply.build.clone();
+                }
+                current
+            };
+            if current && let Some(status) = &reply.status {
                 self.set_status(status.clone());
             }
             if let Some(id) = reply.id {
@@ -575,9 +648,51 @@ impl Tailnet {
     }
 }
 
+/// Whether a helper reporting `running` (`None`: too old to say) is older than the installed
+/// one.
+fn outdated(running: Option<&str>, installed: &str) -> bool {
+    running != Some(installed)
+}
+
+/// The hex sha256 of a file, as the helper computes it for its own executable.
+fn file_build(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut sum = Sha256::new();
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sum.update(&buf[..n]);
+    }
+    Ok(sum.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_helper_is_outdated_unless_it_reports_the_installed_build() {
+        assert!(!outdated(Some("abc"), "abc"));
+        assert!(outdated(Some("abc"), "def"));
+        // Too old to say.
+        assert!(outdated(None, "abc"));
+    }
+
+    #[test]
+    fn file_build_is_the_hex_sha256() {
+        let path = std::env::temp_dir().join(format!("thurm-build-{}", std::process::id()));
+        std::fs::write(&path, "abc").unwrap();
+        let build = file_build(&path);
+        let _ = std::fs::remove_file(&path);
+        // The same digest the helper's test expects of its fileBuild.
+        assert_eq!(
+            build.unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn want_from_config() {
