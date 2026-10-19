@@ -76,8 +76,10 @@ thurm --remote devbox events --json
 ```
 
 Each line is one JSON event. The stream contains `PaneInfo`, `PaneExited`,
-`PaneClosed`, `ConfigReloaded`, and `LayoutChanged` events. `PaneInfo` includes
-agent state when an agent is present. With `--pane`, only events for that pane
+`PaneClosed`, `ConfigReloaded`, and `LayoutChanged` events. A `PaneInfo` event
+comes whenever a pane's state changes: title, working directory, the shell
+returning to a prompt (with shell integration), progress reports, and agent
+state when an agent is present. With `--pane`, only events for that pane
 are included. `--filter` takes a comma-separated list of those event types and
 drops the others; `pane_closed` and other snake_case spellings also work. Both
 options can be combined. The stream does not contain terminal output or notifications.
@@ -88,6 +90,13 @@ Example:
 ```json
 {"PaneClosed":{"pane":42}}
 ```
+
+When panes change faster than the events are read, a pane's waiting `PaneInfo`
+is replaced by its newest one, so the stream may skip intermediate states but
+always ends on the current one.
+
+A daemon older than the CLI leaves out the `PaneInfo` changes that come from a
+pane's output, such as prompts, directories, titles, and progress.
 
 Events report changes after the connection starts. They are not a saved history
 or a complete initial snapshot. Use `thurm --json list` and `thurm layout` to

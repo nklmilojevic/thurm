@@ -85,6 +85,11 @@ pub const CAP_TAILSCALE: &str = "tailscale";
 /// and does not count as an open window.
 pub const CAP_MOBILE: &str = "mobile";
 
+/// Sent only by `thurm events`: besides the events every client gets, it gets the [`PaneInfo`]
+/// changes that come from a pane's output (prompt, cwd, progress), which otherwise go only to
+/// UI clients.
+pub const CAP_STATE_EVENTS: &str = "state-events";
+
 /// Environment variable exported into every pane with the pane's id.
 pub const ENV_PANE_ID: &str = "THURM_PANE_ID";
 /// Environment variable exported into every pane with the daemon socket path.

@@ -1,13 +1,11 @@
 //! JSON Lines for state changes. Terminal output is not part of this stream.
 
+use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, sync_channel};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
 
 use clap::ValueEnum;
-use thurm_client::{Client, ConnectOptions};
+use thurm_client::Client;
 use thurm_proto::{Event, PaneId};
 
 /// The event types the stream carries, named as in its JSON.
@@ -25,60 +23,96 @@ pub enum Kind {
     LayoutChanged,
 }
 
+/// Events not yet written: at most this many, besides one `PaneInfo` per pane.
+const BUFFER: usize = 256;
+
+#[derive(Default)]
+struct Queue {
+    events: VecDeque<Event>,
+    lost: bool,
+    closed: bool,
+}
+
+impl Queue {
+    /// A pane's newer `PaneInfo` replaces the one still waiting, at the end: a busy pane
+    /// (progress, prompts) shows its latest state instead of overflowing the buffer.
+    fn push(&mut self, event: Event) {
+        if let Event::PaneInfo(info) = &event {
+            self.events
+                .retain(|e| !matches!(e, Event::PaneInfo(old) if old.id == info.id));
+        }
+        if self.events.len() >= BUFFER {
+            self.lost = true;
+        } else {
+            self.events.push_back(event);
+        }
+    }
+}
+
 pub fn run(remote: Option<&str>, pane: Option<PaneId>, kinds: &[Kind]) -> super::R {
     if let Some(name) = remote {
         drop(super::remote::connect_remote(name)?);
     }
-    let (tx, rx) = sync_channel(256);
-    let lost = Arc::new(AtomicBool::new(false));
-    let disconnected = Arc::new(AtomicBool::new(false));
-    let overflow = lost.clone();
-    let closed = disconnected.clone();
+    let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
+    let incoming = queue.clone();
+    let closed = queue.clone();
     let kinds = kinds.to_vec();
     let socket = remote
         .map(thurm_config::remote_socket_path)
         .unwrap_or_else(thurm_config::socket_path);
-    let client = Client::connect(
-        ConnectOptions {
-            socket,
-            client_name: "thurm-events",
-            ..Default::default()
-        },
+    let stream = thurm_client::connect_daemon(&socket)
+        .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?;
+    // An older daemon ignores the capability and sends only the PaneInfo changes it sends
+    // every client.
+    let client = Client::from_stream(
+        stream,
+        "thurm-events",
+        false,
+        &[thurm_proto::CAP_STATE_EVENTS],
         move |event| {
-            if selected(&event, pane, &kinds) && tx.try_send(event).is_err() {
-                overflow.store(true, Ordering::Release);
+            if selected(&event, pane, &kinds) {
+                let (queue, ready) = &*incoming;
+                queue.lock().unwrap().push(event);
+                ready.notify_one();
             }
         },
         move || {
-            closed.store(true, Ordering::Release);
+            let (queue, ready) = &*closed;
+            queue.lock().unwrap().closed = true;
+            ready.notify_one();
         },
     )?;
     // The connection receives metadata events without a terminal subscription.
     let _client = client;
     let mut out = std::io::stdout().lock();
+    let (queue, ready) = &*queue;
     loop {
-        if lost.load(Ordering::Acquire) {
-            return Err("event buffer overflow; reconnect and read current state".into());
-        }
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(event) => {
-                let line = thurm_proto::to_json(&event);
-                if let Err(e) = writeln!(out, "{line}").and_then(|_| out.flush()) {
-                    if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        return Ok(std::process::ExitCode::SUCCESS);
-                    }
-                    return Err(e.into());
+        let event = {
+            let mut q = queue.lock().unwrap();
+            while q.events.is_empty() && !q.lost && !q.closed {
+                q = ready.wait(q).unwrap();
+            }
+            if q.lost {
+                return Err("event buffer overflow; reconnect and read current state".into());
+            }
+            match q.events.pop_front() {
+                Some(event) => event,
+                None => {
+                    return Err("event connection closed; reconnect and read current state".into());
                 }
             }
-            Err(RecvTimeoutError::Timeout) if !disconnected.load(Ordering::Acquire) => {}
-            Err(_) => {
-                return Err("event connection closed; reconnect and read current state".into());
+        };
+        let line = thurm_proto::to_json(&event);
+        if let Err(e) = writeln!(out, "{line}").and_then(|_| out.flush()) {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(std::process::ExitCode::SUCCESS);
             }
+            return Err(e.into());
         }
     }
 }
 
-/// Filtered here, not in the daemon: every connection already receives these events, and an
+/// Filtered here, not in the daemon: the daemon sends every event type to the connection, and an
 /// older daemon keeps working.
 fn selected(event: &Event, pane: Option<PaneId>, kinds: &[Kind]) -> bool {
     let (kind, id) = match event {
@@ -132,6 +166,44 @@ mod tests {
         ));
         assert!(!selected(&Event::PaneClosed { pane: 4 }, Some(5), &kinds));
         assert!(!selected(&Event::Bell { pane: 4 }, None, &[Kind::PaneInfo]));
+    }
+
+    fn info(id: PaneId, at_prompt: bool) -> Event {
+        Event::PaneInfo(thurm_proto::PaneInfo {
+            id,
+            at_prompt,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn queue_keeps_each_panes_latest_info_in_order() {
+        let mut q = Queue::default();
+        q.push(info(1, false));
+        q.push(info(2, false));
+        q.push(Event::PaneExited {
+            pane: 1,
+            code: None,
+        });
+        q.push(info(1, true));
+        let ids: Vec<_> = q
+            .events
+            .iter()
+            .map(|e| match e {
+                Event::PaneInfo(i) => format!("info {} {}", i.id, i.at_prompt),
+                Event::PaneExited { pane, .. } => format!("exited {pane}"),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, ["info 2 false", "exited 1", "info 1 true"]);
+        for _ in 0..10_000 {
+            q.push(info(3, true));
+        }
+        assert!(!q.lost);
+        for _ in 0..BUFFER {
+            q.push(Event::LayoutChanged);
+        }
+        assert!(q.lost);
     }
 
     #[test]
