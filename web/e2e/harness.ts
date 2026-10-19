@@ -38,6 +38,9 @@ export async function start(): Promise<Harness> {
     THURM_STATE_DIR: join(dir, "s"),
     THURM_REMOTE_DIR: join(dir, "r"),
     THURM_DAEMON: join(repo, "target/debug/thurmd"),
+    // The daemon drops a quiet mobile client after 45 s; shorter here, so the keepalive test
+    // need not wait that long. Still above the page's 15 s pings plus its 5 s clock.
+    THURM_MOBILE_SILENCE_MS: "25000",
   };
   const procs: ChildProcess[] = [];
   let daemon: ChildProcess;

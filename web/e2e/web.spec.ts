@@ -107,6 +107,26 @@ test("lists agent and program notices", async ({ page }) => {
   await expect(page.locator(".notice .title", { hasText: "Build done" })).toBeVisible();
 });
 
+test("keeps its connection while the page's own timers are throttled", async ({ page }) => {
+  // A hidden tab's timers can be held back past the daemon's limit for a quiet client; the
+  // worker clock's messages keep the pings going. Here the page's timers stop altogether.
+  test.slow();
+  await open(page);
+  const sessions = () => page.evaluate(() => (window as any).__thurmTest.sessions() as number);
+  const before = await sessions();
+  await page.evaluate(() => {
+    const stopped = (() => 0) as any;
+    window.setTimeout = stopped;
+    window.setInterval = stopped;
+    window.requestAnimationFrame = stopped;
+  });
+  // Past the 25 s limit the harness gives the daemon: a dropped page could not reconnect now
+  // (its retry is a timer), so it would show as disconnected.
+  await page.waitForTimeout(35_000);
+  expect(await page.evaluate(() => (window as any).__thurmTest.connected())).toBe(true);
+  expect(await sessions()).toBe(before);
+});
+
 test("reconnects when the daemon comes back", async ({ page }) => {
   await open(page);
   await h.restartDaemon();

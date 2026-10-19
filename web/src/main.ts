@@ -39,8 +39,10 @@ const dirty = new Set<number>();
 let frameQueued = false;
 let connectedOnce = false;
 let compatible = true;
+let sessions = 0;
 
 const conn = new Conn(incoming, (state, detail) => {
+  if (state === "connected") sessions++;
   const s = $("status");
   s.textContent = state === "connected" ? "connected" : state === "connecting" ? "connecting" : `offline${detail ? ` (${detail})` : ""}`;
   s.className = `status ${state === "connected" ? "ok" : state === "closed" ? "error" : ""}`;
@@ -534,6 +536,7 @@ async function main() {
   panes: () => [...views.keys()],
   notices: () => notices.map((n) => ({ ...n })),
   connected: () => conn.open,
+  sessions: () => sessions,
   selection: () => (focusedPane === null ? "" : (conn.client?.selection_text(focusedPane) ?? "")),
   cell: () => ({ w: metrics.cw / metrics.dpr, h: metrics.ch / metrics.dpr }),
 };
