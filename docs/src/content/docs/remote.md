@@ -15,7 +15,8 @@ See [Use Thurm](/usage/) for the full list of shortcuts.
 The connection is the system `ssh`, one tunnel per host. Thurm has no relay or
 account of its own; Tailscale or any other network works underneath. Your phone
 and other devices can also reach a daemon over Tailscale without ssh: see
-[Serve over Tailscale](#serve-over-tailscale).
+[Serve over Tailscale](#serve-over-tailscale). So can this Mac, for a host that
+serves there: see [Reach a host over Tailscale](#reach-a-host-over-tailscale).
 
 ## Add a host
 
@@ -39,6 +40,7 @@ host = "me@devbox.example.org"   # a Host alias, user@host, or ssh://user@host:p
 # socket = "/run/user/1000/thurm-1000/thurmd.sock"   # discovered when unset
 # enabled = true
 # clipboard_read = "ask"   # "ask", "always" or "never"
+# tailnet = "wss://devbox.YOUR-TAILNET.ts.net/v1/connect"   # over Tailscale instead of ssh
 ```
 
 The app connects to every enabled `[[remote]]` in the background. Other
@@ -208,6 +210,49 @@ the app, the Linux archives, and the Nix package; the daemon starts
 it only while serving over Tailscale. Installing Thurm on a remote host copies it
 too, from builds that have it.
 
+## Reach a host over Tailscale
+
+A host that serves over Tailscale (`thurm tailscale on` there) can be reached
+from this Mac the same way, without ssh:
+
+```sh
+thurm remote add bastion bastion --tailnet
+```
+
+`--tailnet` takes the host's name on the tailnet (default: the ssh target), or
+its address: `wss://bastion.YOUR-TAILNET.ts.net/v1/connect` for a device of its
+own, `ws://100.x.y.z:7297` for one that listens through its machine's Tailscale
+(`host_listen`). Thurm checks that the daemon answers, then writes `tailnet` with
+the full address next to `host`. In the app, turn on **Over Tailscale** in
+**Add Host…**.
+
+The connection goes through this Mac's own Thurm device when it runs
+(`thurm tailscale on` here), so it works with the Tailscale app stopped, and
+through the Tailscale app otherwise. `thurm remote list` shows which:
+`tailnet (node)` or `tailnet (app)`. A `ws://` address is used through Thurm's
+device only.
+
+The host decides who gets in, as for your phone: by default only its own
+account. If you sign this Mac's Thurm device in with the same account, it is let
+in. A host that is tagged, or signed in with another account, needs
+`allow_tailnet_members = true` (or `host_allow_identified = true` for
+`host_listen`), and then admits everyone your tailnet policy lets reach it:
+keep that policy tight. Your policy must also let this Mac reach the host's
+port 443 (or the `host_listen` port).
+
+ssh is still what installs, checks and hands off: `thurm remote install`,
+`thurm remote doctor` and `thurm handoff` use `host`, as do starting a daemon
+that isn't running and the ssh config's `LocalForward`s. With the Tailscale app
+stopped, ssh can go through Thurm's device too:
+
+```
+# ~/.ssh/config
+Host bastion
+  ProxyCommand thurm tailscale nc %h %p
+```
+
+`thurm tailscale peers` lists the devices Thurm's device sees.
+
 ## What runs where
 
 | Setting | Comes from |
@@ -319,12 +364,15 @@ reach the Mac's disk, clipboard, or credentials without you doing something:
 - **ssh.** Agent forwarding, X11 forwarding, and remote and dynamic forwards
   are always off. The only forward is the local socket for the daemon.
 - **Files.** Only what you paste or drop goes to the host.
+- **Over Tailscale.** The host admits this Mac by its Tailscale identity. On
+  this Mac, the tunnel's socket and Thurm's dial socket (next to the daemon's)
+  are yours alone, and the dial socket reaches tailnet devices only.
 
 ## Troubleshooting
 
 | State | What to do |
 | --- | --- |
-| needs attention | ssh needs you: read the message (host key, authentication, forwarding). Fix it, then **Retry** |
+| needs attention | ssh needs you: read the message (host key, authentication, forwarding). Fix it, then **Retry**. Over Tailscale: the host refused this Mac (the message names the setting), or neither Thurm's device nor the Tailscale app is on |
 | not installed | **Fix** next to Thurm in Thurm › Remotes…, or `thurm remote install NAME` |
 | upgrade needed | The host runs another protocol version. Install this build; its daemon is replaced in place and its panes keep running (daemons too old for that are restarted after you confirm) |
 | reconnecting | The host is unreachable; Thurm retries on its own |
