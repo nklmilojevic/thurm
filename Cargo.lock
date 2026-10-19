@@ -1052,9 +1052,8 @@ dependencies = [
 
 [[package]]
 name = "ghostty-vt-rs-sys"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c56ef493e4f277afd1cd42f6a01767e341bbedee6e64bf2fcb71f185607acd5"
+version = "0.1.1"
+source = "git+https://github.com/nklmilojevic/ghostty-vt-rs?rev=5a0454d0f5b2294c7556fd4312b5c80d5f999fe2#5a0454d0f5b2294c7556fd4312b5c80d5f999fe2"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -2641,6 +2640,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "thurm-web"
+version = "0.8.0"
+dependencies = [
+ "ghostty-vt-rs-sys",
+ "serde",
+ "serde_json",
+ "thurm-config",
+ "thurm-proto",
+ "thurm-term",
+ "wasm-bindgen",
+ "web-time",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3214,7 +3227,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "ghostty-vt-rs-sys"
-version = "0.1.1"

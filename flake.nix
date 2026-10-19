@@ -170,8 +170,11 @@
           uv
           # thurm-mosh's and thurm-direct's tests talk to a real mosh-server when there is one.
           mosh
-          # Docs: cd docs && bun install && bun run dev
+          # Docs: cd docs && bun install && bun run dev. The web client: `just web`.
           bun
+          # The web client's wasm: the same version as thurm-web's wasm-bindgen, and wasm-opt.
+          wasm-bindgen-cli
+          binaryen
           gh
         ];
 

@@ -48,3 +48,7 @@ signal-hook = "0.4"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# ghostty-vt-rs-sys with the wasm32 target, until 0.1.1 is on crates.io.
+[patch.crates-io]
+ghostty-vt-rs-sys = { git = "https://github.com/nklmilojevic/ghostty-vt-rs", rev = "5a0454d0f5b2294c7556fd4312b5c80d5f999fe2" }
