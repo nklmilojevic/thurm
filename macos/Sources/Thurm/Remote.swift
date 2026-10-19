@@ -970,7 +970,7 @@ final class RemoteHosts: ObservableObject {
         }
     }
 
-    /// Sets `key` (`host`, `enabled` or `clipboard_read`) of `host`.
+    /// Sets `key` (`host`, `enabled`, `clipboard_read` or `tailnet`) of `host`.
     func set(_ host: HostId, _ key: String, _ value: Any, done: @escaping (String?) -> Void = { _ in }) {
         edit(["op": "set", "name": host, "key": key, "value": value]) { error in
             if error == nil, key == "host" {

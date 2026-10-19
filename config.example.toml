@@ -295,7 +295,8 @@ host_allow_identified = false
 # A socket for `tailscale serve` to proxy to.
 serve_socket = false
 
-# Remote workspaces: thurmd on another machine, reached with the system ssh.
+# Remote workspaces: thurmd on another machine, reached with the system ssh, or over
+# Tailscale when `tailnet` is set (ssh still installs, checks and hands off).
 # `thurm remote add devbox devbox` checks the connection and writes an entry.
 # [[remote]]
 # name = "devbox"

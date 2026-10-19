@@ -72,8 +72,8 @@ enum RemoteCmd {
     Add {
         name: String,
         /// ssh target: a Host alias, user@host, or ssh://user@host:port. Still used over the
-        /// tailnet, to install, check and hand off; and the peer's name when --tailnet has
-        /// none.
+        /// tailnet, to install, check and hand off; its host is the peer's name when --tailnet
+        /// has none.
         target: String,
         /// The daemon's socket there (default: what `thurm socket-path` prints there).
         #[arg(long)]

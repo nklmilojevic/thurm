@@ -472,7 +472,7 @@ void thurm_remote_kick(const char *name, bool restart);
  *        writes [[remote]]; installing is doctor_fix "thurm")
  *   {"op":"add","name":"bastion","target":"bastion","tailnet":"<peer|url>"|""}
  *        {"name":...,"tailnet":{"url","via":"node"|"system","protocol","build"}} (checks the
- *        daemon over the tailnet, not ssh; "" reaches the target's name)
+ *        daemon over the tailnet, not ssh; "" reaches the target's host by name)
  *   {"op":"remove","name":"devbox"}                       "Ok" (removes the [[remote]])
  *   {"op":"set","name":"devbox","key":"enabled","value":false}   "Ok" (key: "host", "enabled",
  *        "clipboard_read" or "tailnet")

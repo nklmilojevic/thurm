@@ -403,11 +403,22 @@ enum Link {
 /// A tailnet host's tunnel: each connection to the local socket gets its own connection over
 /// the tailnet, as `ssh -L` gives each its own channel. Dropping it closes them all.
 struct Relay {
-    stop: Arc<AtomicBool>,
-    /// Why the last connection couldn't be opened, until the supervisor looks.
-    failure: Arc<Mutex<Option<String>>>,
-    conns: Arc<Mutex<HashMap<u64, UnixStream>>>,
+    shared: Arc<RelayShared>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What a relay's connections tell it, and the supervisor reads.
+#[derive(Default)]
+struct RelayShared {
+    stop: AtomicBool,
+    /// Why the last connection couldn't be opened, until the supervisor looks.
+    failure: Mutex<Option<String>>,
+    /// The route the last connection took, until the supervisor looks: the embedded node can
+    /// go off (or come back) while the relay runs.
+    route: Mutex<Option<Via>>,
+    /// Every accepted local connection, from accept on, so stopping closes each one, even one
+    /// still dialing.
+    conns: Mutex<HashMap<u64, UnixStream>>,
 }
 
 impl Relay {
@@ -419,40 +430,41 @@ impl Relay {
     ) -> std::io::Result<Relay> {
         // Polled, so stopping doesn't wait for a connection.
         listener.set_nonblocking(true)?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let failure = Arc::new(Mutex::new(None));
-        let conns = Arc::new(Mutex::new(HashMap::new()));
-        let (stopped, failed, open) = (stop.clone(), failure.clone(), conns.clone());
+        let shared = Arc::new(RelayShared::default());
+        let ours = shared.clone();
         let target = Arc::new(target);
         let dial_socket = Arc::new(dial_socket);
         let thread = std::thread::Builder::new()
             .name(format!("relay-{name}"))
             .spawn(move || {
                 let next = AtomicU64::new(0);
-                while !stopped.load(Ordering::Relaxed) {
+                while !ours.stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((conn, _)) => {
                             let id = next.fetch_add(1, Ordering::Relaxed);
+                            match conn.try_clone() {
+                                Ok(c) => ours.conns.lock().insert(id, c),
+                                Err(_) => continue,
+                            };
                             let (target, dial_socket) = (target.clone(), dial_socket.clone());
-                            let (failed, open) = (failed.clone(), open.clone());
+                            let shared = ours.clone();
                             std::thread::spawn(move || {
-                                relay_one(conn, &target, &dial_socket, &failed, &open, id)
+                                relay_one(conn, &target, &dial_socket, &shared);
+                                shared.conns.lock().remove(&id);
                             });
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(50));
                         }
                         Err(e) => {
-                            *failed.lock() = Some(format!("the local socket: {e}"));
+                            *ours.failure.lock() = Some(format!("the local socket: {e}"));
                             std::thread::sleep(Duration::from_millis(500));
                         }
                     }
                 }
             })?;
         Ok(Relay {
-            stop,
-            failure,
-            conns,
+            shared,
             thread: Some(thread),
         })
     }
@@ -460,25 +472,19 @@ impl Relay {
 
 impl Drop for Relay {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.shared.stop.store(true, Ordering::SeqCst);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        for (_, conn) in self.conns.lock().drain() {
+        for (_, conn) in self.shared.conns.lock().drain() {
             let _ = conn.shutdown(std::net::Shutdown::Both);
         }
     }
 }
 
-/// Carries one local connection over its own tailnet connection until either side ends.
-fn relay_one(
-    conn: UnixStream,
-    target: &TailnetTarget,
-    dial_socket: &Path,
-    failure: &Mutex<Option<String>>,
-    conns: &Mutex<HashMap<u64, UnixStream>>,
-    id: u64,
-) {
+/// Carries one local connection over its own tailnet connection until either side ends, unless
+/// the relay stopped meanwhile.
+fn relay_one(conn: UnixStream, target: &TailnetTarget, dial_socket: &Path, shared: &RelayShared) {
     // An accepted socket inherits the listener's non-blocking mode on macOS.
     if conn.set_nonblocking(false).is_err() {
         return;
@@ -486,19 +492,23 @@ fn relay_one(
     let opened = match tn::open(target, dial_socket, thurm_tailnet_client::CONNECT_TIMEOUT) {
         Ok(o) => o,
         Err(e) => {
-            *failure.lock() = Some(e.to_string());
+            *shared.failure.lock() = Some(e.to_string());
             return;
         }
     };
-    if let Ok(c) = conn.try_clone() {
-        conns.lock().insert(id, c);
+    // Stopped while dialing: the host was disabled, removed or moved; don't reach the old one.
+    if shared.stop.load(Ordering::SeqCst) {
+        return;
     }
     let tn::Opened {
-        stream, session, ..
+        stream,
+        session,
+        via,
+        ..
     } = opened;
+    *shared.route.lock() = Some(via);
     splice(conn, stream);
     drop(session);
-    conns.lock().remove(&id);
 }
 
 /// Copies both ways until either side ends, then closes both.
@@ -879,7 +889,12 @@ impl Inner {
             if self.reconfigured.load(Ordering::SeqCst) {
                 return "the host's settings changed".into();
             }
-            let failed = relay.failure.lock().take();
+            if let Some(via) = relay.shared.route.lock().take()
+                && self.status.lock().via != Some(via)
+            {
+                self.set(|s| s.via = Some(via));
+            }
+            let failed = relay.shared.failure.lock().take();
             if !restart && failed.is_none() {
                 continue;
             }
@@ -891,6 +906,7 @@ impl Inner {
                 }
                 Err(e) => {
                     return relay
+                        .shared
                         .failure
                         .lock()
                         .take()
@@ -1016,8 +1032,78 @@ fn write_state_file(s: &Status) {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/tailnet_fakes.rs"]
+#[allow(dead_code)]
+mod fakes;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch directory short enough for socket paths.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("thr{}{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn stopping_closes_a_client_still_dialing() {
+        let dir = scratch("stall");
+        // A dial socket that takes the request and never answers.
+        let dial = dir.join("d.sock");
+        let ln = UnixListener::bind(&dial).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for c in ln.incoming().flatten() {
+                held.push(c);
+            }
+        });
+        let local = dir.join("l.sock");
+        let target = thurm_config::parse_remote_tailnet("ws://127.0.0.1:1").unwrap();
+        let relay = Relay::start(UnixListener::bind(&local).unwrap(), target, dial, "t").unwrap();
+        let mut client = UnixStream::connect(&local).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // Accepted and registered before its dial finishes.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while relay.shared.conns.lock().is_empty() {
+            assert!(Instant::now() < deadline, "never accepted");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let started = Instant::now();
+        drop(relay);
+        let mut buf = [0u8; 1];
+        assert_eq!(client.read(&mut buf).unwrap(), 0);
+        // Closed by the stop, not by the dial's own timeout.
+        assert!(started.elapsed() < thurm_tailnet_client::CONNECT_TIMEOUT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_connection_reports_its_route() {
+        let dir = scratch("route");
+        fakes::daemon(&dir.join("daemon.sock"));
+        let (port, _stop) = fakes::gateway(dir.join("daemon.sock"), None);
+        fakes::dial_socket(&dir.join("d.sock"));
+        let local = dir.join("l.sock");
+        let target = thurm_config::parse_remote_tailnet(&format!("ws://127.0.0.1:{port}")).unwrap();
+        let relay = Relay::start(
+            UnixListener::bind(&local).unwrap(),
+            target,
+            dir.join("d.sock"),
+            "t",
+        )
+        .unwrap();
+        let (version, _) = ping(&local, Duration::from_secs(10)).unwrap();
+        assert_eq!(version, PROTOCOL_VERSION);
+        assert_eq!(*relay.shared.route.lock(), Some(Via::Node));
+        assert!(relay.shared.failure.lock().is_none());
+        drop(relay);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn backoff_doubles_up_to_two_minutes() {

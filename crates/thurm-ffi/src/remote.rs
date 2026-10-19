@@ -553,13 +553,13 @@ fn remote_setting_literal(key: &str, value: &serde_json::Value) -> Result<String
     }
 }
 
-/// Adds `name` reached over the tailnet at `tailnet` (empty: `target`, a peer's name), once its
-/// daemon answers there.
+/// Adds `name` reached over the tailnet at `tailnet` (empty: the host of the ssh `target`, as a
+/// peer's name), once its daemon answers there.
 fn add_tailnet(name: String, target: String, tailnet: &str) -> Result<Value, String> {
     let target = target.trim().to_owned();
     thurm_remote::ssh::validate_target(&target)?;
     let value = if tailnet.trim().is_empty() {
-        target.as_str()
+        thurm_remote::tailnet::peer_name(&target)
     } else {
         tailnet.trim()
     };

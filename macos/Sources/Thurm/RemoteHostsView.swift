@@ -138,9 +138,11 @@ private struct HostDetails: View {
     @ObservedObject var store: SettingsStore
     @ObservedObject var remotes: RemoteHosts
     @State private var target = ""
+    @State private var tailnet = ""
     @State private var failure: String?
     @State private var confirmingRemove = false
     @FocusState private var targetFocused: Bool
+    @FocusState private var tailnetFocused: Bool
 
     private var host: RemoteHostEntry? {
         RemoteHostEntry.entries(store.setting("remote")?.value).first { $0.name == name }
@@ -186,16 +188,18 @@ private struct HostDetails: View {
                                     if !focused { saveTarget() }
                                 }
                         }
-                        if let tailnet = host.tailnet {
-                            LabeledContent("Over") {
-                                VStack(alignment: .trailing, spacing: 2) {
-                                    Text(status?.transportLabel ?? "Tailscale")
-                                    Text(tailnet)
-                                        .font(.system(.caption, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                        .textSelection(.enabled)
-                                }
+                        if host.tailnet != nil {
+                            LabeledContent("Tailscale address") {
+                                TextField("", text: $tailnet, prompt: Text("wss://bastion.tail1234.ts.net"))
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 260)
+                                    .focused($tailnetFocused)
+                                    .onSubmit(saveTailnet)
+                                    .onChange(of: tailnetFocused) { _, focused in
+                                        if !focused { saveTailnet() }
+                                    }
                             }
+                            LabeledContent("Over", value: status?.transportLabel ?? "Tailscale")
                         }
                         Picker("Clipboard reads", selection: Binding(
                             get: { host.clipboardRead },
@@ -251,8 +255,12 @@ private struct HostDetails: View {
             .padding(16)
         }
         .frame(width: 620, height: 640)
-        .onAppear { target = host?.target ?? "" }
+        .onAppear {
+            target = host?.target ?? ""
+            tailnet = host?.tailnet ?? ""
+        }
         .onChange(of: host?.target) { _, new in target = new ?? "" }
+        .onChange(of: host?.tailnet) { _, new in tailnet = new ?? "" }
         .alert("Remove \(name)?", isPresented: $confirmingRemove) {
             Button("Remove", role: .destructive) {
                 remotes.remove(name) { failure = $0 }
@@ -299,6 +307,19 @@ private struct HostDetails: View {
             return
         }
         save("host", trimmed)
+    }
+
+    /// A tailnet host's address, changed (a new name, or where it serves). Removing it is
+    /// removing the host and adding it again over ssh.
+    private func saveTailnet() {
+        let trimmed = tailnet.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let host, let current = host.tailnet, trimmed != current else { return }
+        guard !trimmed.isEmpty else {
+            NSSound.beep()
+            tailnet = current
+            return
+        }
+        save("tailnet", trimmed)
     }
 }
 
@@ -406,7 +427,12 @@ private struct AddHostSheet: View {
                 Toggle("Over Tailscale", isOn: $overTailnet)
                 if overTailnet {
                     TextField("Tailscale address", text: $tailnet,
-                              prompt: Text("the SSH target's name, bastion, or wss://bastion.tail1234.ts.net"))
+                              prompt: Text("bastion, or wss://bastion.tail1234.ts.net"))
+                    Text("Blank: the SSH target's host (devbox in me@devbox) as its name on the tailnet. "
+                        + "An SSH Host alias may name another machine; give the address then.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .disabled(connecting)

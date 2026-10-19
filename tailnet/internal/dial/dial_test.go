@@ -218,3 +218,49 @@ func TestSameUserAcceptsThisProcess(t *testing.T) {
 		t.Fatal("this process's own connection was refused")
 	}
 }
+
+// A client that has said everything (its write half closed) still gets the peer's answer.
+func TestDialKeepsTheAnswerAfterTheClientIsDone(t *testing.T) {
+	// A peer that answers once its caller is done, after a pause.
+	peer, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	go func() {
+		c, err := peer.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		got, _ := io.ReadAll(c)
+		time.Sleep(200 * time.Millisecond)
+		_, _ = io.WriteString(c, strings.ToUpper(string(got)))
+	}()
+	dir, _ := os.MkdirTemp("", "dial")
+	defer os.RemoveAll(dir)
+	s := &Server{
+		Path:  filepath.Join(dir, "d.sock"),
+		Peers: func(context.Context) ([]Peer, error) { return peers, nil },
+		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", peer.Addr().String())
+		},
+		PeerOK: SameUser,
+		Logf:   t.Logf,
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	c, r, rep := ask(t, s.Path, "{\"host\":\"bastion\",\"port\":22}\nquestion")
+	if !rep.OK {
+		t.Fatalf("answer: %+v", rep)
+	}
+	if err := c.(*net.UnixConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil || string(got) != "QUESTION" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}

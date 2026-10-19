@@ -219,7 +219,7 @@ from this Mac the same way, without ssh:
 thurm remote add bastion bastion --tailnet
 ```
 
-`--tailnet` takes the host's name on the tailnet (default: the ssh target), or
+`--tailnet` takes the host's name on the tailnet (default: the ssh target's host), or
 its address: `wss://bastion.YOUR-TAILNET.ts.net/v1/connect` for a device of its
 own, `ws://100.x.y.z:7297` for one that listens through its machine's Tailscale
 (`host_listen`). Thurm checks that the daemon answers, then writes `tailnet` with

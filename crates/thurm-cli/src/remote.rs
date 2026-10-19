@@ -191,7 +191,7 @@ pub fn add(o: AddOptions) -> R {
 /// tailnet and writes the entry. Installing and the doctor stay ssh's (`thurm remote install`).
 fn add_tailnet(o: &AddOptions, tailnet: &str) -> R {
     let value = if tailnet.is_empty() {
-        o.target.as_str()
+        thurm_remote::tailnet::peer_name(&o.target)
     } else {
         tailnet
     };

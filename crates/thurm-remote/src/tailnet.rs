@@ -271,6 +271,22 @@ pub struct Checked {
     pub build: String,
 }
 
+/// The host part of an ssh target (`me@devbox`, `ssh://me@devbox:2222`), as the peer's name to
+/// try when no tailnet address is given. A `Host` alias stays as it is: it may name another
+/// machine than its tailnet name.
+pub fn peer_name(target: &str) -> &str {
+    let t = target.trim();
+    let t = t.strip_prefix("ssh://").unwrap_or(t);
+    let t = t.rsplit_once('@').map_or(t, |(_, host)| host);
+    let t = t.split('/').next().unwrap_or(t);
+    match t.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
+            host
+        }
+        _ => t,
+    }
+}
+
 /// Reaches the daemon at `value` (a `tailnet` setting, or a peer's name) and says Hello, for
 /// adding a host: resolves a name to its `wss://` address, and refuses what isn't a reachable
 /// Thurm daemon with the reason.
@@ -389,6 +405,19 @@ mod tests {
         );
         let e = dial(&path, "x", 443, Duration::from_secs(5)).unwrap_err();
         assert!(e.node_unavailable());
+    }
+
+    #[test]
+    fn peer_names_from_ssh_targets() {
+        for (target, want) in [
+            ("devbox", "devbox"),
+            ("me@devbox", "devbox"),
+            ("ssh://me@devbox:2222", "devbox"),
+            ("devbox.tail1234.ts.net", "devbox.tail1234.ts.net"),
+            (" me@bastion ", "bastion"),
+        ] {
+            assert_eq!(peer_name(target), want, "{target}");
+        }
     }
 
     #[test]

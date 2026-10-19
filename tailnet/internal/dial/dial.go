@@ -311,17 +311,25 @@ func (s *Server) refuse(c net.Conn, code string, err error) {
 	c.Close()
 }
 
-// pipe copies both ways until either side ends, then closes both.
+// pipe copies both ways until both sides are done, then closes both. One side finishing
+// (`thurm tailscale nc` at the end of its input) closes only the other side's write half, so the
+// answer still comes back; an error, or a connection that can't half-close, ends both.
 func pipe(a, b net.Conn) {
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
-		_, _ = io.Copy(dst, src)
+		_, err := io.Copy(dst, src)
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok && err == nil && cw.CloseWrite() == nil {
+			done <- struct{}{}
+			return
+		}
+		a.Close()
+		b.Close()
 		done <- struct{}{}
 	}
 	go cp(a, b)
 	go cp(b, a)
 	<-done
+	<-done
 	a.Close()
 	b.Close()
-	<-done
 }

@@ -194,7 +194,15 @@ pub fn parse_remote_tailnet(value: &str) -> Result<TailnetTarget, String> {
         let Some((addr, after)) = v6.split_once(']') else {
             return bad("unclosed [");
         };
-        (addr, after.strip_prefix(':'))
+        // Nothing after the bracket but its port.
+        let port = match after {
+            "" => None,
+            p => match p.strip_prefix(':') {
+                Some(p) => Some(p),
+                None => return bad("bad host"),
+            },
+        };
+        (addr, port)
     } else {
         match authority.rsplit_once(':') {
             Some((h, p)) => (h, Some(p)),
@@ -2289,6 +2297,8 @@ clipboard_read = "always"
             "wss://bastion.ts.net/other",
             "wss://:443",
             "wss://bastion.ts.net:0",
+            "wss://[bastion]oops/v1/connect",
+            "ws://[fd7a:115c:a1e0::1]x:7297",
             "wss://me@bastion.ts.net",
             "bad name",
             "-bastion",
