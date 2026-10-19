@@ -64,7 +64,8 @@ Use `thurm set window.tab_style sidebar` to return to the sidebar.
 | Quit | Cmd+Q |
 
 Change any shortcut in the `[keybindings]` table of the configuration: a key
-combination maps to an action name, or to `none` to remove it.
+combination maps to an action name, or to `none` to remove it. See
+[Key bindings](/configuration/#key-bindings) for the action names.
 
 Shell integration adds prompt marks and working directory tracking for zsh,
 bash, and fish. It also supports completion choices at a shell prompt. Use

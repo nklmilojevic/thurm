@@ -12,18 +12,47 @@ enum MainMenu {
     /// The Shell menu's Commands submenu: the config's `[[commands]]`, refilled on every load.
     private static let commandsMenu = NSMenu(title: "Commands")
     private static var commandsItem: NSMenuItem?
-    /// Built-in items whose key a command took, with the key they had.
-    private static var displaced: [(item: NSMenuItem, key: String, mods: NSEvent.ModifierFlags)] = []
+    /// Built-in items whose key `applyKeys` changed, with the key they had.
+    private static var changed: [(item: NSMenuItem, key: String, mods: NSEvent.ModifierFlags)] = []
+    /// Hidden items `applyKeys` added to keep a built-in key working next to a bound one.
+    private static var extraKeys: [NSMenuItem] = []
 
-    /// Refills the Commands submenu. A command's key comes before the built-in item's: the
-    /// first item with a key equivalent gets it, so the built-in one gives it up (and has it back
-    /// once no command claims it).
-    static func updateCommands(_ commands: [UserCommand], in main: NSMenu? = NSApp.mainMenu) {
-        for d in displaced {
-            d.item.keyEquivalent = d.key
-            d.item.keyEquivalentModifierMask = d.mods
+    /// Applies `[keybindings]` and `[[commands]]` keys to the menus, from the built-in keys up, and
+    /// returns warnings for what it cannot use. A binding gives its combination to one action
+    /// (shown on its item; the key the item had keeps working) or, bound to "none", to nothing.
+    /// A command's key comes before both: the first item with a key equivalent gets it, so the
+    /// built-in one gives it up (and has it back once no command claims it).
+    @discardableResult
+    static func applyKeys(_ bindings: [String: String], commands: [UserCommand],
+                          in main: NSMenu? = NSApp.mainMenu) -> [String] {
+        for c in changed {
+            c.item.keyEquivalent = c.key
+            c.item.keyEquivalentModifierMask = c.mods
         }
-        displaced = []
+        changed = []
+        for extra in extraKeys { extra.menu?.removeItem(extra) }
+        extraKeys = []
+        var warnings: [String] = []
+        if let main {
+            for (spec, action) in bindings.sorted(by: { $0.key < $1.key }) {
+                guard let (key, mods) = keyEquivalent(spec) else {
+                    warnings.append("keybindings: cannot read \"\(spec)\"")
+                    continue
+                }
+                let name = action.trimmingCharacters(in: .whitespaces)
+                var target: NSMenuItem?
+                if !name.isEmpty && name != "none" {
+                    // A typo leaves the combination's default alone.
+                    guard let found = actionItem(name, in: main) else {
+                        warnings.append("keybindings: unknown action \"\(name)\"")
+                        continue
+                    }
+                    target = found
+                }
+                displace(chord(key, mods), in: main)
+                if let target { bind(target, key, mods) }
+            }
+        }
         commandsMenu.removeAllItems()
         for command in commands {
             let (key, mods) = keyEquivalent(command.key) ?? ("", [])
@@ -33,6 +62,59 @@ enum MainMenu {
             commandsMenu.addItem(entry)
         }
         commandsItem?.isHidden = commands.isEmpty
+        return warnings
+    }
+
+    /// The identifier of a `[keybindings]` action's item. Namespaced: AppKit names an item
+    /// without one after its selector ("checkForUpdates:").
+    static func actionIdentifier(_ name: String) -> NSUserInterfaceItemIdentifier {
+        NSUserInterfaceItemIdentifier("thurm.action." + name)
+    }
+
+    /// The item of a `[keybindings]` action name, a visible one before a hidden alias.
+    private static func actionItem(_ name: String, in menu: NSMenu) -> NSMenuItem? {
+        actionItem(actionIdentifier(name), in: menu)
+    }
+
+    private static func actionItem(_ id: NSUserInterfaceItemIdentifier, in menu: NSMenu) -> NSMenuItem? {
+        var hidden: NSMenuItem?
+        for item in menu.items {
+            if let sub = item.submenu, sub !== commandsMenu, let found = actionItem(id, in: sub) {
+                if !found.isHidden { return found }
+                hidden = hidden ?? found
+            }
+            if item.identifier == id {
+                if !item.isHidden { return item }
+                hidden = hidden ?? item
+            }
+        }
+        return hidden
+    }
+
+    /// Shows `key` on `item`; a hidden copy right after it keeps the key it had.
+    private static func bind(_ item: NSMenuItem, _ key: String, _ mods: NSEvent.ModifierFlags) {
+        if !item.keyEquivalent.isEmpty, let menu = item.menu {
+            let extra = NSMenuItem(title: item.title, action: item.action, keyEquivalent: item.keyEquivalent)
+            extra.keyEquivalentModifierMask = item.keyEquivalentModifierMask
+            extra.target = item.target
+            extra.tag = item.tag
+            extra.representedObject = item.representedObject
+            extra.identifier = item.identifier
+            extra.isHidden = true
+            extra.allowsKeyEquivalentWhenHidden = true
+            menu.insertItem(extra, at: menu.index(of: item) + 1)
+            extraKeys.append(extra)
+        }
+        setKey(item, key, mods)
+    }
+
+    /// Changes an item's key, remembering the first one it had for the next `applyKeys`.
+    private static func setKey(_ item: NSMenuItem, _ key: String, _ mods: NSEvent.ModifierFlags) {
+        if !changed.contains(where: { $0.item === item }) {
+            changed.append((item, item.keyEquivalent, item.keyEquivalentModifierMask))
+        }
+        item.keyEquivalent = key
+        item.keyEquivalentModifierMask = key.isEmpty ? [] : mods
     }
 
     /// Takes the key equivalent `target` off every item under `menu` that has it.
@@ -41,8 +123,7 @@ enum MainMenu {
             if let sub = item.submenu, sub !== commandsMenu { displace(target, in: sub) }
             if !item.keyEquivalent.isEmpty,
                chord(item.keyEquivalent, item.keyEquivalentModifierMask) == target {
-                displaced.append((item, item.keyEquivalent, item.keyEquivalentModifierMask))
-                item.keyEquivalent = ""
+                setKey(item, "", [])
             }
         }
     }
@@ -54,8 +135,8 @@ enum MainMenu {
         return "\(m.rawValue)+\(key.lowercased())"
     }
 
-    /// A `[keybindings]` chord ("cmd+shift+l", "ctrl+alt+f5") as a menu key equivalent, with
-    /// the key names Linux reads; nil for one a menu cannot show.
+    /// A `[keybindings]` chord ("cmd+shift+l", "ctrl+alt+f5") as a menu key equivalent; nil for
+    /// one a menu cannot show.
     static func keyEquivalent(_ chord: String) -> (String, NSEvent.ModifierFlags)? {
         let spec = chord.trimmingCharacters(in: .whitespaces).lowercased()
         var parts = spec.split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -112,11 +193,14 @@ enum MainMenu {
         return item
     }
 
+    /// `name` is the item's `[keybindings]` action name.
     private static func item(_ title: String, _ action: Selector?, _ key: String = "",
-                             _ modifiers: NSEvent.ModifierFlags = [.command], tag: Int = 0) -> NSMenuItem {
+                             _ modifiers: NSEvent.ModifierFlags = [.command], tag: Int = 0,
+                             name: String? = nil) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.keyEquivalentModifierMask = key.isEmpty ? [] : modifiers
         item.tag = tag
+        item.identifier = name.map(actionIdentifier)
         return item
     }
 
@@ -124,12 +208,13 @@ enum MainMenu {
 
     private static func appMenu() -> NSMenu {
         let menu = NSMenu(title: "Thurm")
-        menu.addItem(item("About Thurm", #selector(NSApplication.orderFrontStandardAboutPanel(_:))))
+        menu.addItem(item("About Thurm", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), name: "about"))
         for updates in Updater.shared.menuItems() { menu.addItem(updates) }
         menu.addItem(.separator())
-        menu.addItem(item("Settings…", #selector(AppDelegate.showSettings(_:)), ","))
-        menu.addItem(item("Reload Configuration", #selector(AppDelegate.reloadConfig(_:)), ",", [.command, .shift]))
-        menu.addItem(item("Remotes…", #selector(AppDelegate.showRemotes(_:))))
+        menu.addItem(item("Settings…", #selector(AppDelegate.showSettings(_:)), ",", name: "open_config"))
+        menu.addItem(item("Reload Configuration", #selector(AppDelegate.reloadConfig(_:)), ",", [.command, .shift],
+                          name: "reload_config"))
+        menu.addItem(item("Remotes…", #selector(AppDelegate.showRemotes(_:)), name: "remotes"))
         let integrations = NSMenu(title: "Integrations")
         integrations.delegate = Integrations.shared
         let integrationsItem = item("Integrations", nil)
@@ -137,7 +222,7 @@ enum MainMenu {
         menu.addItem(integrationsItem)
         menu.addItem(.separator())
         menu.addItem(item("Secure Keyboard Entry", #selector(AppDelegate.toggleSecureInput(_:)), "i",
-                          [.command, .option]))
+                          [.command, .option], name: "secure_keyboard_entry"))
         menu.addItem(.separator())
         let services = NSMenu(title: "Services")
         let servicesItem = item("Services", nil)
@@ -145,125 +230,152 @@ enum MainMenu {
         NSApp.servicesMenu = services
         menu.addItem(servicesItem)
         menu.addItem(.separator())
-        menu.addItem(item("Hide Thurm", #selector(NSApplication.hide(_:)), "h"))
-        menu.addItem(item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]))
-        menu.addItem(item("Show All", #selector(NSApplication.unhideAllApplications(_:))))
+        menu.addItem(item("Hide Thurm", #selector(NSApplication.hide(_:)), "h", name: "hide"))
+        menu.addItem(item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option],
+                          name: "hide_others"))
+        menu.addItem(item("Show All", #selector(NSApplication.unhideAllApplications(_:)), name: "show_all"))
         menu.addItem(.separator())
-        menu.addItem(item("Quit Thurm", #selector(NSApplication.terminate(_:)), "q"))
+        menu.addItem(item("Quit Thurm", #selector(NSApplication.terminate(_:)), "q", name: "quit"))
         return menu
     }
 
     private static func shellMenu() -> NSMenu {
         let menu = NSMenu(title: "Shell")
-        menu.addItem(item("New Tab", #selector(AppDelegate.newTab(_:)), "t"))
-        menu.addItem(item("New Workspace", #selector(AppDelegate.newWorkspace(_:)), "n"))
+        menu.addItem(item("New Tab", #selector(AppDelegate.newTab(_:)), "t", name: "new_tab"))
+        menu.addItem(item("New Workspace", #selector(AppDelegate.newWorkspace(_:)), "n", name: "new_workspace"))
         // ⇧⌘N, its shortcut before Thurm had one window.
-        let alias = item("New Workspace", #selector(AppDelegate.newWorkspace(_:)), "n", [.command, .shift])
+        let alias = item("New Workspace", #selector(AppDelegate.newWorkspace(_:)), "n", [.command, .shift],
+                         name: "new_workspace")
         alias.isHidden = true
         alias.allowsKeyEquivalentWhenHidden = true
         menu.addItem(alias)
-        menu.addItem(item("Switch Workspace…", #selector(AppDelegate.switchWorkspace(_:)), "o", [.command, .shift]))
-        menu.addItem(item("Switch to Agent…", #selector(AppDelegate.switchAgent(_:)), "a", [.command, .shift]))
-        menu.addItem(item("Rename Workspace…", #selector(AppDelegate.renameWorkspace(_:))))
-        menu.addItem(item("Close Workspace…", #selector(AppDelegate.closeWorkspace(_:))))
+        menu.addItem(item("Switch Workspace…", #selector(AppDelegate.switchWorkspace(_:)), "o", [.command, .shift],
+                          name: "switch_workspace"))
+        menu.addItem(item("Switch to Agent…", #selector(AppDelegate.switchAgent(_:)), "a", [.command, .shift],
+                          name: "switch_agent"))
+        menu.addItem(item("Rename Workspace…", #selector(AppDelegate.renameWorkspace(_:)), name: "rename_workspace"))
+        menu.addItem(item("Close Workspace…", #selector(AppDelegate.closeWorkspace(_:)), name: "close_workspace"))
         menu.addItem(.separator())
-        menu.addItem(item("Split Right", #selector(TerminalWindowController.splitRight(_:)), "d"))
-        menu.addItem(item("Split Down", #selector(TerminalWindowController.splitDown(_:)), "d", [.command, .shift]))
+        menu.addItem(item("Split Right", #selector(TerminalWindowController.splitRight(_:)), "d", name: "split_right"))
+        menu.addItem(item("Split Down", #selector(TerminalWindowController.splitDown(_:)), "d", [.command, .shift],
+                          name: "split_down"))
         menu.addItem(.separator())
-        menu.addItem(item("Command Palette…", #selector(AppDelegate.showCommandPalette(_:)), "p", [.command, .shift]))
-        menu.addItem(item("Processes & Ports…", #selector(AppDelegate.showProcesses(_:))))
+        menu.addItem(item("Command Palette…", #selector(AppDelegate.showCommandPalette(_:)), "p", [.command, .shift],
+                          name: "command_palette"))
+        menu.addItem(item("Processes & Ports…", #selector(AppDelegate.showProcesses(_:)), name: "processes"))
         let commands = item("Commands", nil)
         commands.submenu = commandsMenu
         commands.isHidden = commandsMenu.items.isEmpty
         commandsItem = commands
         menu.addItem(commands)
         menu.addItem(.separator())
-        menu.addItem(item("Close Pane", #selector(TerminalWindowController.closePane(_:)), "w"))
-        menu.addItem(item("Close Tab", #selector(NSWindow.performClose(_:)), "w", [.command, .shift]))
+        menu.addItem(item("Close Pane", #selector(TerminalWindowController.closePane(_:)), "w", name: "close_pane"))
+        menu.addItem(item("Close Tab", #selector(NSWindow.performClose(_:)), "w", [.command, .shift],
+                          name: "close_tab"))
         return menu
     }
 
     private static func editMenu() -> NSMenu {
         let menu = NSMenu(title: "Edit")
-        menu.addItem(item("Copy", #selector(TerminalView.copy(_:)), "c"))
-        menu.addItem(item("Paste", #selector(TerminalView.paste(_:)), "v"))
-        menu.addItem(item("Select All", #selector(TerminalView.selectAll(_:)), "a"))
+        menu.addItem(item("Copy", #selector(TerminalView.copy(_:)), "c", name: "copy"))
+        menu.addItem(item("Paste", #selector(TerminalView.paste(_:)), "v", name: "paste"))
+        menu.addItem(item("Select All", #selector(TerminalView.selectAll(_:)), "a", name: "select_all"))
         menu.addItem(.separator())
-        menu.addItem(item("Clear Screen", #selector(TerminalView.clearScreen(_:)), "k"))
-        menu.addItem(item("Clear Scrollback", #selector(TerminalView.clearScrollback(_:)), "k", [.command, .option]))
-        menu.addItem(item("Explain Last Command", #selector(TerminalView.explainLastCommand(_:))))
+        menu.addItem(item("Clear Screen", #selector(TerminalView.clearScreen(_:)), "k", name: "clear_screen"))
+        menu.addItem(item("Clear Scrollback", #selector(TerminalView.clearScrollback(_:)), "k", [.command, .option],
+                          name: "clear_scrollback"))
+        menu.addItem(item("Explain Last Command", #selector(TerminalView.explainLastCommand(_:)), name: "explain"))
         menu.addItem(.separator())
-        menu.addItem(item("Find…", #selector(TerminalWindowController.showFind(_:)), "f"))
-        menu.addItem(item("Find Next", #selector(TerminalWindowController.findNext(_:)), "g"))
+        menu.addItem(item("Find…", #selector(TerminalWindowController.showFind(_:)), "f", name: "find"))
+        menu.addItem(item("Find Next", #selector(TerminalWindowController.findNext(_:)), "g", name: "find_next"))
         menu.addItem(item("Find Previous", #selector(TerminalWindowController.findPrevious(_:)), "g",
-                          [.command, .shift]))
+                          [.command, .shift], name: "find_previous"))
         return menu
     }
 
     private static func viewMenu() -> NSMenu {
         let menu = NSMenu(title: "View")
-        menu.addItem(item("Increase Font Size", #selector(AppDelegate.increaseFontSize(_:)), "="))
-        let plus = item("Increase Font Size", #selector(AppDelegate.increaseFontSize(_:)), "+")
+        menu.addItem(item("Increase Font Size", #selector(AppDelegate.increaseFontSize(_:)), "=",
+                          name: "increase_font_size"))
+        let plus = item("Increase Font Size", #selector(AppDelegate.increaseFontSize(_:)), "+",
+                        name: "increase_font_size")
         plus.isHidden = true
         plus.allowsKeyEquivalentWhenHidden = true
         menu.addItem(plus)
-        menu.addItem(item("Decrease Font Size", #selector(AppDelegate.decreaseFontSize(_:)), "-"))
-        menu.addItem(item("Reset Font Size", #selector(AppDelegate.resetFontSize(_:)), "0"))
+        menu.addItem(item("Decrease Font Size", #selector(AppDelegate.decreaseFontSize(_:)), "-",
+                          name: "decrease_font_size"))
+        menu.addItem(item("Reset Font Size", #selector(AppDelegate.resetFontSize(_:)), "0", name: "reset_font_size"))
         menu.addItem(.separator())
-        menu.addItem(item("Tabs in Sidebar", #selector(AppDelegate.toggleSidebarTabs(_:)), "s", [.command, .control]))
-        menu.addItem(item("Agents in Sidebar", #selector(AppDelegate.toggleSidebarAgents(_:))))
-        menu.addItem(item("Hide Sidebar", #selector(AppDelegate.toggleTabSidebar(_:)), "b"))
+        menu.addItem(item("Tabs in Sidebar", #selector(AppDelegate.toggleSidebarTabs(_:)), "s", [.command, .control],
+                          name: "toggle_tab_style"))
+        menu.addItem(item("Agents in Sidebar", #selector(AppDelegate.toggleSidebarAgents(_:)),
+                          name: "toggle_sidebar_agents"))
+        menu.addItem(item("Hide Sidebar", #selector(AppDelegate.toggleTabSidebar(_:)), "b", name: "toggle_sidebar"))
         let theme = NSMenu(title: "Theme")
         theme.delegate = ThemeMenu.shared
         let themeItem = item("Theme", nil)
         themeItem.submenu = theme
         menu.addItem(themeItem)
         menu.addItem(.separator())
-        menu.addItem(item("Zoom Split", #selector(TerminalWindowController.toggleZoom(_:)), "\r", [.command, .shift]))
+        menu.addItem(item("Zoom Split", #selector(TerminalWindowController.toggleZoom(_:)), "\r", [.command, .shift],
+                          name: "zoom_split"))
         menu.addItem(item("Equalize Splits", #selector(TerminalWindowController.equalizeSplits(_:)), "=",
-                          [.command, .control]))
+                          [.command, .control], name: "equalize_splits"))
         menu.addItem(.separator())
         let focusMods: NSEvent.ModifierFlags = [.command, .option]
-        menu.addItem(item("Select Split Left", #selector(TerminalWindowController.focusLeft(_:)), leftArrow, focusMods))
-        menu.addItem(item("Select Split Right", #selector(TerminalWindowController.focusRight(_:)), rightArrow, focusMods))
-        menu.addItem(item("Select Split Above", #selector(TerminalWindowController.focusUp(_:)), upArrow, focusMods))
-        menu.addItem(item("Select Split Below", #selector(TerminalWindowController.focusDown(_:)), downArrow, focusMods))
+        menu.addItem(item("Select Split Left", #selector(TerminalWindowController.focusLeft(_:)), leftArrow, focusMods,
+                          name: "focus_left"))
+        menu.addItem(item("Select Split Right", #selector(TerminalWindowController.focusRight(_:)), rightArrow,
+                          focusMods, name: "focus_right"))
+        menu.addItem(item("Select Split Above", #selector(TerminalWindowController.focusUp(_:)), upArrow, focusMods,
+                          name: "focus_up"))
+        menu.addItem(item("Select Split Below", #selector(TerminalWindowController.focusDown(_:)), downArrow, focusMods,
+                          name: "focus_down"))
         menu.addItem(.separator())
         let resizeMods: NSEvent.ModifierFlags = [.command, .control]
-        menu.addItem(item("Move Divider Left", #selector(TerminalWindowController.resizeLeft(_:)), leftArrow, resizeMods))
+        menu.addItem(item("Move Divider Left", #selector(TerminalWindowController.resizeLeft(_:)), leftArrow,
+                          resizeMods, name: "resize_left"))
         menu.addItem(item("Move Divider Right", #selector(TerminalWindowController.resizeRight(_:)), rightArrow,
-                          resizeMods))
-        menu.addItem(item("Move Divider Up", #selector(TerminalWindowController.resizeUp(_:)), upArrow, resizeMods))
+                          resizeMods, name: "resize_right"))
+        menu.addItem(item("Move Divider Up", #selector(TerminalWindowController.resizeUp(_:)), upArrow, resizeMods,
+                          name: "resize_up"))
         menu.addItem(item("Move Divider Down", #selector(TerminalWindowController.resizeDown(_:)), downArrow,
-                          resizeMods))
+                          resizeMods, name: "resize_down"))
         menu.addItem(.separator())
         let moveMods: NSEvent.ModifierFlags = [.command, .control, .shift]
-        menu.addItem(item("Move Pane Left", #selector(TerminalWindowController.movePaneLeft(_:)), leftArrow, moveMods))
+        menu.addItem(item("Move Pane Left", #selector(TerminalWindowController.movePaneLeft(_:)), leftArrow, moveMods,
+                          name: "move_pane_left"))
         menu.addItem(item("Move Pane Right", #selector(TerminalWindowController.movePaneRight(_:)), rightArrow,
-                          moveMods))
-        menu.addItem(item("Move Pane Up", #selector(TerminalWindowController.movePaneUp(_:)), upArrow, moveMods))
-        menu.addItem(item("Move Pane Down", #selector(TerminalWindowController.movePaneDown(_:)), downArrow, moveMods))
+                          moveMods, name: "move_pane_right"))
+        menu.addItem(item("Move Pane Up", #selector(TerminalWindowController.movePaneUp(_:)), upArrow, moveMods,
+                          name: "move_pane_up"))
+        menu.addItem(item("Move Pane Down", #selector(TerminalWindowController.movePaneDown(_:)), downArrow, moveMods,
+                          name: "move_pane_down"))
         menu.addItem(.separator())
-        menu.addItem(item("Toggle Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control]))
+        menu.addItem(item("Toggle Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control],
+                          name: "toggle_fullscreen"))
         return menu
     }
 
     private static func windowMenu() -> NSMenu {
         let menu = NSMenu(title: "Window")
-        menu.addItem(item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"))
-        menu.addItem(item("Zoom", #selector(NSWindow.performZoom(_:))))
+        menu.addItem(item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m", name: "minimize"))
+        menu.addItem(item("Zoom", #selector(NSWindow.performZoom(_:)), name: "maximize"))
         menu.addItem(.separator())
-        menu.addItem(item("Show Previous Tab", #selector(NSWindow.selectPreviousTab(_:)), "[", [.command, .shift]))
-        menu.addItem(item("Show Next Tab", #selector(NSWindow.selectNextTab(_:)), "]", [.command, .shift]))
+        menu.addItem(item("Show Previous Tab", #selector(NSWindow.selectPreviousTab(_:)), "[", [.command, .shift],
+                          name: "previous_tab"))
+        menu.addItem(item("Show Next Tab", #selector(NSWindow.selectNextTab(_:)), "]", [.command, .shift],
+                          name: "next_tab"))
         for n in 1...9 {
             let title = n == 9 ? "Select Last Tab" : "Select Tab \(n)"
             menu.addItem(item(title, #selector(TerminalWindowController.selectTabByNumber(_:)), "\(n)", [.command],
-                              tag: n))
+                              tag: n, name: n == 9 ? "select_last_tab" : "select_tab_\(n)"))
         }
         menu.addItem(.separator())
-        menu.addItem(item("Move Tab to New Workspace", #selector(NSWindow.moveTabToNewWindow(_:))))
+        menu.addItem(item("Move Tab to New Workspace", #selector(NSWindow.moveTabToNewWindow(_:)),
+                          name: "move_tab_to_new_workspace"))
         menu.addItem(.separator())
-        menu.addItem(item("Quick Terminal", #selector(AppDelegate.toggleQuickTerminal(_:))))
+        menu.addItem(item("Quick Terminal", #selector(AppDelegate.toggleQuickTerminal(_:)), name: "quick_terminal"))
         menu.addItem(.separator())
         let workspaces = NSMenu(title: "Workspaces")
         workspaces.delegate = WorkspaceMenuDelegate.shared
@@ -271,13 +383,14 @@ enum MainMenu {
         workspacesItem.submenu = workspaces
         menu.addItem(workspacesItem)
         menu.addItem(.separator())
-        menu.addItem(item("Bring All to Front", #selector(NSApplication.arrangeInFront(_:))))
+        menu.addItem(item("Bring All to Front", #selector(NSApplication.arrangeInFront(_:)),
+                          name: "bring_all_to_front"))
         return menu
     }
 
     private static func helpMenu() -> NSMenu {
         let menu = NSMenu(title: "Help")
-        menu.addItem(item("Open Configuration File", #selector(AppDelegate.openConfig(_:))))
+        menu.addItem(item("Open Configuration File", #selector(AppDelegate.openConfig(_:)), name: "open_config_file"))
         return menu
     }
 }

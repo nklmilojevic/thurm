@@ -53,7 +53,7 @@ final class SessionManager: NSObject, CoreDelegate {
 
     func start() {
         config = AppConfig.load()
-        MainMenu.updateCommands(config.commands)
+        config.loadWarnings += MainMenu.applyKeys(config.keybindings, commands: config.commands)
         if let err = config.loadError { tlog("config: \(err)") }
         Core.shared.delegate = self
         NotificationCenter.default.addObserver(self, selector: #selector(secureInputChanged(_:)),
@@ -905,7 +905,7 @@ final class SessionManager: NSObject, CoreDelegate {
             Core.shared.request("\"ReloadConfig\"")
         }
         config = AppConfig.load()
-        MainMenu.updateCommands(config.commands)
+        config.loadWarnings += MainMenu.applyKeys(config.keybindings, commands: config.commands)
         if let o = sidebarTabsOverride { config.sidebarTabs = o }
         if let o = sidebarAgentsOverride { config.sidebarAgents = o }
         applyConfigToUI()
