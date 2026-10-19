@@ -316,8 +316,10 @@ impl Tailnet {
         let _ = crate::pty::set_cloexec(fd, true);
         log::info!("tailscale: adopted helper {pid}");
         self.attach(ctl, pid);
-        if self.request(serde_json::json!({"cmd": "status"})).is_err() {
-            return;
+        // Its status before clients reconnect. A helper that fails to answer is replaced below
+        // all the same: it said no build.
+        if let Err(e) = self.request(serde_json::json!({"cmd": "status"})) {
+            log::warn!("tailscale: adopted helper {pid}: {e}");
         }
         let this = self.clone();
         // Off the caller's thread: hashing the helper and replacing it take a moment.
@@ -512,19 +514,7 @@ impl Tailnet {
                     continue;
                 }
             };
-            let current = {
-                let mut inner = self.inner.lock();
-                // A replaced helper's last words don't describe the one that runs now.
-                let current = inner.helper.as_ref().map(|h| h.generation) == Some(generation);
-                if current {
-                    inner.dial_socket = reply.dial_socket.clone();
-                    inner.build = reply.build.clone();
-                }
-                current
-            };
-            if current && let Some(status) = &reply.status {
-                self.set_status(status.clone());
-            }
+            self.take_reply(generation, &reply);
             if let Some(id) = reply.id {
                 let waiter = self.inner.lock().pending.remove(&id);
                 if let Some(tx) = waiter {
@@ -630,6 +620,23 @@ impl Tailnet {
         }
     }
 
+    /// Takes in what a message from helper `generation` says about it, unless that helper was
+    /// replaced: a replaced helper's last words don't describe the one that runs now. The check
+    /// and the status change happen under one lock, which `retire` takes to replace a helper, so
+    /// an old message can't land after the new helper's status. (Lock order: `inner`, then
+    /// `status`, as everywhere `set_status` runs with `inner` held.)
+    fn take_reply(&self, generation: u64, reply: &Reply) {
+        let mut inner = self.inner.lock();
+        if inner.helper.as_ref().map(|h| h.generation) != Some(generation) {
+            return;
+        }
+        inner.dial_socket = reply.dial_socket.clone();
+        inner.build = reply.build.clone();
+        if let Some(status) = &reply.status {
+            self.set_status(status.clone());
+        }
+    }
+
     fn set_status(&self, status: TailscaleStatus) {
         {
             let mut current = self.status.lock();
@@ -672,6 +679,54 @@ fn file_build(path: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A helper that holds `generation` without running anything (no reader, never waited).
+    fn with_helper(tailnet: &Tailnet, generation: u64) -> UnixStream {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let mut inner = tailnet.inner.lock();
+        inner.generation = generation;
+        inner.helper = Some(Helper {
+            ctl: ours,
+            pid: 0,
+            generation,
+        });
+        theirs
+    }
+
+    fn reply(state: TailscaleState, build: &str) -> Reply {
+        Reply {
+            id: None,
+            error: None,
+            status: Some(TailscaleStatus {
+                state,
+                ..Default::default()
+            }),
+            dial_socket: None,
+            build: Some(build.into()),
+        }
+    }
+
+    #[test]
+    fn a_replaced_helpers_message_changes_nothing() {
+        let tailnet = Tailnet::new("/nonexistent/d.sock".into(), "/nonexistent".into());
+        let _theirs = with_helper(&tailnet, 2);
+        tailnet.take_reply(2, &reply(TailscaleState::Running, "new"));
+        // Read by the replaced helper's reader before it was retired, taken in after.
+        tailnet.take_reply(1, &reply(TailscaleState::Stopped, "old"));
+        assert_eq!(tailnet.status().state, TailscaleState::Running);
+        assert_eq!(tailnet.inner.lock().build.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn a_retired_helpers_message_changes_nothing() {
+        let tailnet = Tailnet::new("/nonexistent/d.sock".into(), "/nonexistent".into());
+        let _theirs = with_helper(&tailnet, 1);
+        tailnet.take_reply(1, &reply(TailscaleState::Running, "old"));
+        // Retired, and nothing started yet: its reader's last message is dropped too.
+        tailnet.inner.lock().helper = None;
+        tailnet.take_reply(1, &reply(TailscaleState::Stopped, "old"));
+        assert_eq!(tailnet.status().state, TailscaleState::Running);
+    }
 
     #[test]
     fn a_helper_is_outdated_unless_it_reports_the_installed_build() {

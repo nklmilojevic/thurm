@@ -295,8 +295,9 @@ fn build_helper(env: &Env, says_build: bool, version: &str) -> PathBuf {
     let script = format!(
         r#"#!/bin/sh
 # {version}
-echo $$ >> '{pids}'
 build=$(shasum -a 256 "$0" | cut -d' ' -f1)
+# Only once its build is read: the test may replace the file as soon as it sees the pid.
+echo $$ >> '{pids}'
 while IFS= read -r line <&3; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   printf '{{"id":%s,"error":null,"status":{{"state":"running","hostname":"stub","tags":[],"host_urls":[],"https":{{"state":"ready"}}}}{build}}}\n' "$id" "$build" >&3
@@ -425,4 +426,39 @@ fn an_upgrade_keeps_a_helper_that_is_current() {
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(helper_pids(&env), vec![old]);
     assert!(alive(old));
+}
+
+#[test]
+fn an_upgrade_replaces_a_helper_that_fails_the_status_probe() {
+    let env = Env::new("tailnet-upgrade-failing");
+    let path = env.dir.join("thurm-tailnet");
+    let pids = env.dir.join("pids");
+    // An old helper (no build) that answers `status` with an error.
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+echo $$ >> '{pids}'
+while IFS= read -r line <&3; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+  *'"cmd":"status"'*) printf '{{"id":%s,"error":"broken","status":null}}\n' "$id" >&3 ;;
+  *) printf '{{"id":%s,"error":null,"status":{{"state":"running","hostname":"stub","tags":[],"host_urls":[],"https":{{"state":"ready"}}}}}}\n' "$id" >&3 ;;
+  esac
+done
+"#,
+            pids = pids.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    serve_from_config(&env);
+    let daemon = env.start_with(&[("THURM_TAILNET", &path)]);
+    let (c, _rx) = env.connect();
+    let old = first_helper(&env);
+
+    // The installed helper is a working one.
+    build_helper(&env, true, "v2");
+    let c = upgrade(&env, &daemon, c);
+    wait_for_replacement(&env, &c, old);
 }
