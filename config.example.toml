@@ -294,6 +294,9 @@ host_listen = ""
 host_allow_identified = false
 # A socket for `tailscale serve` to proxy to.
 serve_socket = false
+# Serve the browser client on the node's HTTPS address, at https://HOSTNAME.YOUR-TAILNET.ts.net/.
+# Needs enabled.
+web = false
 
 # Remote workspaces: thurmd on another machine, reached with the system ssh.
 # `thurm remote add devbox devbox` checks the connection and writes an entry.

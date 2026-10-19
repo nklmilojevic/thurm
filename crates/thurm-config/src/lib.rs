@@ -944,6 +944,9 @@ pub struct TailscaleConfig {
     /// Serve a Unix socket for `tailscale serve` to proxy to as HTTP (identity from its
     /// headers). Needs Tailscale 1.94 or newer; a raw `--tcp` forward to it is refused.
     pub serve_socket: bool,
+    /// Serve the browser client on the node's HTTPS address (`https://<node name>/`). Needs
+    /// `enabled`.
+    pub web: bool,
 }
 
 impl Default for TailscaleConfig {
@@ -957,6 +960,7 @@ impl Default for TailscaleConfig {
             host_listen: String::new(),
             host_allow_identified: false,
             serve_socket: false,
+            web: false,
         }
     }
 }

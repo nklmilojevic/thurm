@@ -36,6 +36,8 @@ struct NodeWant {
     allow_tailnet_members: bool,
     advertise_tags: Vec<String>,
     auth_key: String,
+    /// Serve the browser client on the node's HTTPS address.
+    web: bool,
 }
 
 #[derive(Serialize, Clone, Debug, Default, PartialEq)]
@@ -75,6 +77,7 @@ impl Want {
                 allow_tailnet_members: cfg.allow_tailnet_members,
                 advertise_tags: cfg.advertise_tags.clone(),
                 auth_key,
+                web: cfg.web,
             },
             host: HostWant {
                 listen: cfg.host_listen.clone(),
@@ -568,6 +571,20 @@ mod tests {
         assert_eq!(w.node.hostname, "mac");
         assert_eq!(w.host.listen, ":7297");
         assert!(!Want::from_config(&TailscaleConfig::default()).any());
+    }
+
+    #[test]
+    fn node_want_carries_the_browser_client_flag() {
+        let cfg = TailscaleConfig {
+            enabled: true,
+            web: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&Want::from_config(&cfg).node).unwrap();
+        assert_eq!(json["web"], true);
+        let off =
+            serde_json::to_value(&Want::from_config(&TailscaleConfig::default()).node).unwrap();
+        assert_eq!(off["web"], false);
     }
 
     #[test]
