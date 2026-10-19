@@ -114,12 +114,14 @@ final class MainMenuTests: XCTestCase {
     }
 
     func testBadBindingsWarnAndLeaveDefaults() {
-        let (main, _, right, _, _) = shellMenu()
-        let warnings = MainMenu.applyKeys(["cmd+d": "split_sideways", "hyper+d": "split_right"],
+        let (main, _, right, _, tab) = shellMenu()
+        let warnings = MainMenu.applyKeys(["cmd+d": "split_sideways", "hyper+d": "split_right", "cmd+t": " "],
                                           commands: [], in: main)
         XCTAssertEqual(warnings, ["keybindings: unknown action \"split_sideways\"",
+                                  "keybindings: unknown action \"\"",
                                   "keybindings: cannot read \"hyper+d\""])
         XCTAssertEqual(right.keyEquivalent, "d")
+        XCTAssertEqual(tab.keyEquivalent, "t")
     }
 
     /// The action names of the visible items under `menu`.

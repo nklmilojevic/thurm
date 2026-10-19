@@ -41,8 +41,8 @@ enum MainMenu {
                 }
                 let name = action.trimmingCharacters(in: .whitespaces)
                 var target: NSMenuItem?
-                if !name.isEmpty && name != "none" {
-                    // A typo leaves the combination's default alone.
+                if name != "none" {
+                    // A typo, or a blank, leaves the combination's default alone.
                     guard let found = actionItem(name, in: main) else {
                         warnings.append("keybindings: unknown action \"\(name)\"")
                         continue
