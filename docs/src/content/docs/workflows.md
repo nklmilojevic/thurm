@@ -71,13 +71,16 @@ connection open. Plain `thurm layout` still prints the saved session layout.
 ```sh
 thurm events --json
 thurm events --json --pane 42
+thurm events --filter PaneClosed,LayoutChanged
 thurm --remote devbox events --json
 ```
 
 Each line is one JSON event. The stream contains `PaneInfo`, `PaneExited`,
 `PaneClosed`, `ConfigReloaded`, and `LayoutChanged` events. `PaneInfo` includes
 agent state when an agent is present. With `--pane`, only events for that pane
-are included. The stream does not contain terminal output or notifications.
+are included. `--filter` takes a comma-separated list of those event types and
+drops the others; `pane_closed` and other snake_case spellings also work. Both
+options can be combined. The stream does not contain terminal output or notifications.
 Output is always JSON Lines, with or without `--json`.
 
 Example:
