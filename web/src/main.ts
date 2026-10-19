@@ -2,14 +2,11 @@
 // copies, typing, scrollback and agent notices.
 import { Conn, type Hello, type Incoming } from "./conn";
 import { Input } from "./input";
+import { type Rect, type Tab, leaves, place, tabsOf } from "./layout";
 import { PaneView, measure, type DrawMeta, type Metrics } from "./render";
 
 declare const __CLOCK_URL__: string;
 
-type LayoutNode =
-  | { type: "pane"; id: number; host?: string }
-  | { type: "split"; dir: "right" | "down" | "left" | "up"; ratio: number; first: LayoutNode; second: LayoutNode };
-type Tab = { workspace: string; title?: string; root: LayoutNode; focused: number };
 type Notice = { pane: number; title: string; body: string; permission: number | null; error?: string };
 type PaneInfo = { id: number; title: string; agent?: { status: string; name: string } | null };
 
@@ -155,29 +152,6 @@ async function loadLayout() {
   showTab();
 }
 
-function tabsOf(layout: any): Tab[] {
-  const names = new Map<number, string>();
-  for (const w of layout.workspaces ?? []) names.set(w.id, w.name || "Workspace");
-  const out: Tab[] = [];
-  const seen = new Set<string>();
-  const add = (workspace: string, t: any) => {
-    const key = JSON.stringify(t.root);
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push({ workspace, title: t.title ?? undefined, root: t.root, focused: t.focused });
-  };
-  for (const w of layout.windows ?? []) for (const t of w.tabs ?? []) add(names.get(w.workspace) ?? "Window", t);
-  for (const w of layout.workspaces ?? []) for (const t of w.tabs ?? []) add(w.name || "Workspace", t);
-  if (layout.quick) add("Quick Terminal", layout.quick);
-  return out.filter((t) => leaves(t.root).length > 0);
-}
-
-/** This daemon's panes in a split tree (a remote host's are someone else's). */
-function leaves(n: LayoutNode): number[] {
-  if (n.type === "pane") return n.host ? [] : [n.id];
-  return [...leaves(n.first), ...leaves(n.second)];
-}
-
 const STATUS_RANK: Record<string, number> = { NeedsInput: 4, Error: 3, Working: 2, Done: 1, Idle: 0 };
 const statusClass = (s: string) => s.replace(/[A-Z]/g, (c, i) => (i ? "-" : "") + c.toLowerCase());
 
@@ -223,29 +197,6 @@ function renderTabs() {
     };
     nav.append(b);
   });
-}
-
-type Rect = { x: number; y: number; w: number; h: number };
-
-function place(n: LayoutNode, r: Rect, out: Map<number, Rect>, remote: Rect[]) {
-  if (n.type === "pane") {
-    if (n.host) remote.push(r);
-    else out.set(n.id, r);
-    return;
-  }
-  const horizontal = n.dir === "right" || n.dir === "left";
-  const ratio = Math.min(Math.max(n.ratio, 0.05), 0.95);
-  const [a, b] = horizontal
-    ? [
-        { ...r, w: Math.round(r.w * ratio) },
-        { ...r, x: r.x + Math.round(r.w * ratio), w: r.w - Math.round(r.w * ratio) },
-      ]
-    : [
-        { ...r, h: Math.round(r.h * ratio) },
-        { ...r, y: r.y + Math.round(r.h * ratio), h: r.h - Math.round(r.h * ratio) },
-      ];
-  place(n.first, a, out, remote);
-  place(n.second, b, out, remote);
 }
 
 /** Lays the selected tab out, subscribing its panes and dropping the others'. */
