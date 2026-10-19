@@ -388,6 +388,11 @@ impl Session {
     /// synchronized update, a resize waiting for the shell's redraw).
     pub fn draw(&mut self, pane: PaneId) -> Option<Draw> {
         let p = self.panes.get_mut(&pane)?;
+        // A key or focus asks for a frame too; a synchronized update still shows nothing new
+        // until it ends or `tick` times it out.
+        if p.term.in_sync() {
+            return None;
+        }
         if let Some(snap) = p.term.snapshot(pane, &mut p.view) {
             p.grid.apply(snap.frame);
         }
@@ -734,6 +739,10 @@ mod tests {
                 .count()
         };
         assert_eq!(frames(&mut s), 1, "only the attach's");
+        // A key during the update asks for a frame, but nothing partial is drawn.
+        s.key(1, "KeyA", "a", 0, KeyAction::Press);
+        assert!(s.draw(1).is_none());
+        s.take_events();
         std::thread::sleep(Duration::from_millis(160));
         s.tick();
         assert_eq!(frames(&mut s), 1);

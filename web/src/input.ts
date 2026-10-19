@@ -27,6 +27,27 @@ export function mods(e: KeyboardEvent | MouseEvent): number {
 
 export type Target = { pane: number; view: PaneView } | null;
 
+// thurm_proto::MouseButton as the session takes it: left, middle, right, back, forward; 255 none.
+const NO_BUTTON = 255;
+
+/** The button a press or release is about (`PointerEvent.button`). */
+export function pressedButton(button: number): number {
+  return button >= 0 && button <= 4 ? button : NO_BUTTON;
+}
+
+/** The button held during a move (`PointerEvent.buttons` is a bitmask in another order). */
+export function heldButton(buttons: number): number {
+  const bits: [number, number][] = [
+    [1, 0],
+    [4, 1],
+    [2, 2],
+    [8, 3],
+    [16, 4],
+  ];
+  for (const [bit, button] of bits) if (buttons & bit) return button;
+  return NO_BUTTON;
+}
+
 export class Input {
   readonly area = document.getElementById("input") as HTMLTextAreaElement;
   private composing = false;
@@ -130,7 +151,7 @@ export class Input {
       const x = e.clientX - r.left;
       const y = e.clientY - r.top;
       const cell = view.cellAt(x, y);
-      const button = kind === 2 && e.buttons === 0 ? 255 : e.button === 0 ? 0 : e.button === 1 ? 1 : e.button === 2 ? 2 : e.button === 3 ? 3 : 4;
+      const button = kind === 2 ? heldButton(e.buttons) : pressedButton(e.button);
       this.conn.with((cl) =>
         cl.mouse(pane, kind, button, mods(e), Math.min(Math.max(e.detail, 1), 3), cell.col, cell.row, cell.rightHalf, Math.round(x), Math.round(y)),
       );

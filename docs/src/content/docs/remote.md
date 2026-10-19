@@ -196,7 +196,9 @@ default:
 thurm set tailscale.web true
 ```
 
-`thurm tailscale status` then prints the page's address. There is no password
+`thurm tailscale status` then prints the page's address. Release builds
+include the web client; a Thurm built from source needs `just web` before
+building, or the page says the client was not built in. There is no password
 or token: the page is admitted exactly like the phone, by who Tailscale says
 the device belongs to, so a browser that can open it has a shell on the host.
 Only that page itself may talk to the daemon; a page from any other site,

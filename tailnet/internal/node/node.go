@@ -147,9 +147,11 @@ func (n *Node) Enable(cfg Config) error {
 
 // serveBrowser points the gateway at the browser client. Its origin is the node's own once the
 // DNS name is known, so a page from anywhere else is refused either way; the client itself is
-// served only with Web on and HTTPS ready.
+// served only with Web on and HTTPS ready. n.mu is held through the gateway's update, so a
+// stale call can't put back what a newer one changed (lock order: n.mu, then the gateway's).
 func (n *Node) serveBrowser() {
 	n.mu.Lock()
+	defer n.mu.Unlock()
 	gw := n.gw
 	origin := ""
 	if n.st != nil && n.st.Self != nil {
@@ -158,7 +160,6 @@ func (n *Node) serveBrowser() {
 		}
 	}
 	serve := n.cfg.Web && n.https.State == "ready" && origin != ""
-	n.mu.Unlock()
 	if gw == nil {
 		return
 	}

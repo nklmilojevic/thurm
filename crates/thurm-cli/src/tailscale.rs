@@ -130,7 +130,11 @@ fn describe(s: &TailscaleStatus, browser: bool) -> String {
     if let Some(url) = &s.url {
         out.push_str(&format!("connect: {url}\n"));
     }
-    if browser && let Some(name) = &s.dns_name {
+    // Served once the node runs with HTTPS ready, which is when `url` is set.
+    if browser
+        && s.url.is_some()
+        && let Some(name) = &s.dns_name
+    {
         out.push_str(&format!("browser: https://{name}/\n"));
     }
     for url in &s.host_urls {
@@ -216,10 +220,14 @@ mod tests {
             state: TailscaleState::Running,
             hostname: "thurm".into(),
             dns_name: Some("thurm.tail1234.ts.net".into()),
+            url: Some("wss://thurm.tail1234.ts.net/v1/connect".into()),
             ..Default::default()
         };
         assert!(describe(&s, true).contains("browser: https://thurm.tail1234.ts.net/\n"));
         assert!(!describe(&s, false).contains("browser:"));
+        // Not before HTTPS is ready: the node doesn't serve the page yet.
+        let waiting = TailscaleStatus { url: None, ..s };
+        assert!(!describe(&waiting, true).contains("browser:"));
     }
 
     #[test]

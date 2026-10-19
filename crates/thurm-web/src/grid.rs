@@ -100,7 +100,11 @@ impl Grid {
         }
         // The cursor and selection colors live in rows the frame may not resend.
         let m = &self.meta;
-        if m.cursor != f.cursor || m.colors.selection_bg != f.colors.selection_bg {
+        if m.cursor != f.cursor
+            || m.colors.selection_bg != f.colors.selection_bg
+            || m.colors.cursor != f.colors.cursor
+            || m.colors.cursor_text != f.colors.cursor_text
+        {
             for row in [m.cursor.row as usize, f.cursor.row as usize] {
                 if let Some(d) = self.dirty.get_mut(row) {
                     *d = true;
@@ -233,6 +237,21 @@ mod tests {
             (text(&d, 0), text(&d, 1), text(&d, 2)),
             ("new".into(), "abc".into(), "def".into())
         );
+    }
+
+    #[test]
+    fn a_new_cursor_color_repaints_the_cursor_row() {
+        let mut g = Grid::default();
+        g.apply(frame(
+            true,
+            0,
+            vec![row(0, "abc"), row(1, "def"), row(2, "ghi")],
+        ));
+        g.take_draw();
+        let mut f = frame(false, 0, vec![]);
+        f.colors.cursor = 0xff0000;
+        g.apply(f);
+        assert_eq!(g.take_draw().dirty, [0]);
     }
 
     #[test]

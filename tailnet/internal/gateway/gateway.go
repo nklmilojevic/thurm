@@ -87,9 +87,16 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		if _, _, ok := g.authorize(w, r); ok {
-			web.ServeHTTP(w, r)
+		if _, _, ok := g.authorize(w, r); !ok {
+			return
 		}
+		// The page's own origin decides where its WebSocket may connect: a page loaded as
+		// NAME., NAME:443 or in other letters goes to the canonical address first.
+		if u, err := url.Parse(origin); err == nil && origin != "" && r.Host != u.Host {
+			http.Redirect(w, r, origin+r.URL.RequestURI(), http.StatusPermanentRedirect)
+			return
+		}
+		web.ServeHTTP(w, r)
 		return
 	}
 	caller, epoch, ok := g.authorize(w, r)

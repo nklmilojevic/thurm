@@ -178,6 +178,30 @@ func TestSameHost(t *testing.T) {
 	}
 }
 
+// A page loaded under another spelling of the node's name is sent to the canonical origin,
+// which is the one its WebSocket's Origin must match.
+func TestPagesRedirectToTheCanonicalOrigin(t *testing.T) {
+	f := newBrowserGateway(t, admit.Caller{UserID: 7}, nil, page())
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	host := f.srv.Listener.Addr().String()
+	name, port, _ := net.SplitHostPort(host)
+	req, err := http.NewRequest(http.MethodGet, f.origin+"/assets/app.js?x=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = name + ".:" + port
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusPermanentRedirect || resp.Header.Get("Location") != f.origin+"/assets/app.js?x=1" {
+		t.Fatalf("status %d, location %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+}
+
 // Apps send no Origin and are not held to the node's name (a client that writes the default
 // port, or reaches the node by another name it resolves to, keeps working).
 func TestAppsAreNotHeldToTheHost(t *testing.T) {

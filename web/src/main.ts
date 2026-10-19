@@ -45,11 +45,12 @@ const conn = new Conn(incoming, (state, detail) => {
   s.textContent = state === "connected" ? "connected" : state === "connecting" ? "connecting" : `offline${detail ? ` (${detail})` : ""}`;
   s.className = `status ${state === "connected" ? "ok" : state === "closed" ? "error" : ""}`;
   if (state === "closed") {
-    // A new session subscribes again.
+    // A new session subscribes again, and focuses again.
     for (const [pane, v] of views) {
       v.el.remove();
       views.delete(pane);
     }
+    focusedPane = null;
   }
 });
 
@@ -165,6 +166,7 @@ function tabsOf(layout: any): Tab[] {
   };
   for (const w of layout.windows ?? []) for (const t of w.tabs ?? []) add(names.get(w.workspace) ?? "Window", t);
   for (const w of layout.workspaces ?? []) for (const t of w.tabs ?? []) add(w.name || "Workspace", t);
+  if (layout.quick) add("Quick Terminal", layout.quick);
   return out.filter((t) => leaves(t.root).length > 0);
 }
 
@@ -532,6 +534,8 @@ async function main() {
   panes: () => [...views.keys()],
   notices: () => notices.map((n) => ({ ...n })),
   connected: () => conn.open,
+  selection: () => (focusedPane === null ? "" : (conn.client?.selection_text(focusedPane) ?? "")),
+  cell: () => ({ w: metrics.cw / metrics.dpr, h: metrics.ch / metrics.dpr }),
 };
 
 void main();

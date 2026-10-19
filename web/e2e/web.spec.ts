@@ -11,6 +11,14 @@ test.beforeAll(async () => {
 
 test.afterAll(() => h?.stop());
 
+// What the page says when it breaks, in the test's output.
+test.beforeEach(({ page }) => {
+  page.on("console", (m) => {
+    if (m.type() === "error" || m.type() === "warning") console.log(`[page ${m.type()}] ${m.text()}`);
+  });
+  page.on("pageerror", (e) => console.log(`[page error] ${e.message}`));
+});
+
 const text = (page: Page) => page.evaluate(() => (window as any).__thurmTest.text() as string);
 
 async function open(page: Page) {
@@ -53,6 +61,24 @@ test("scrolls back through history with the wheel", async ({ page }) => {
   await canvas.hover();
   for (let i = 0; i < 40; i++) await page.mouse.wheel(0, -400);
   await expect.poll(async () => (await text(page)).split("\n").includes("1")).toBe(true);
+});
+
+test("ends a selection on release", async ({ page }) => {
+  await open(page);
+  await page.keyboard.type("echo select-$((6*7))");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => text(page)).toContain("select-42");
+  const box = (await page.locator(".pane canvas").first().boundingBox())!;
+  const metrics = await page.evaluate(() => (window as any).__thurmTest.cell());
+  const row = (await text(page)).split("\n").indexOf("select-42");
+  const y = box.y + (row + 0.5) * metrics.h;
+  await page.mouse.move(box.x + 2, y);
+  await page.mouse.down();
+  await page.mouse.move(box.x + metrics.w * 5.6, y);
+  await page.mouse.up();
+  // Moving after the release leaves the selection as it was.
+  await page.mouse.move(box.x + metrics.w * 3, y + metrics.h * 2);
+  await expect.poll(() => page.evaluate(() => (window as any).__thurmTest.selection())).toBe("select");
 });
 
 test("types through an input method", async ({ page, browserName }) => {
