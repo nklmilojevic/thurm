@@ -143,7 +143,10 @@ final class UsageLimits {
                     guard self.enabled.contains(.codex) else { return }
                     switch found {
                     case .unchanged: break
-                    case .none: self.set(.codex, nil)
+                    case .none:
+                        self.codexSeen = nil
+                        self.set(.codex, UsageReport(windows: [], updated: nil, problem:
+                            "No Codex session with usage on this Mac yet; it shows after Codex's next answer"))
                     case .snapshot(let path, let modified, let report):
                         self.codexSeen = (path, modified)
                         self.set(.codex, report)
@@ -172,7 +175,8 @@ final class UsageLimits {
         switch result {
         case .signedOut:
             claudeNext = Date().addingTimeInterval(Self.claudeSignedOutInterval)
-            set(.claude, nil)
+            set(.claude, UsageReport(windows: [], updated: nil, problem:
+                "No Claude Code sign-in found on this Mac; sign in with `claude`, then click to check again"))
         case .windows(let windows):
             set(.claude, UsageReport(windows: windows, updated: Date(), problem: nil))
         case .failed(let problem, let backOff):
@@ -270,15 +274,17 @@ final class UsageLimits {
     }
 
     /// `/api/oauth/usage`: `five_hour` and `seven_day`, each `{utilization: 0…100, resets_at}`.
+    /// Neither window: an answer this does not understand, not one with nothing to show.
     static func parseClaudeUsage(_ data: Data) -> [UsageWindow]? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return [("five_hour", 5 * 60), ("seven_day", 7 * 24 * 60)].compactMap { key, minutes in
+        let windows = [("five_hour", 5 * 60), ("seven_day", 7 * 24 * 60)].compactMap { key, minutes -> UsageWindow? in
             guard let w = root[key] as? [String: Any],
                   let used = (w["utilization"] as? NSNumber)?.doubleValue
             else { return nil }
             return UsageWindow(minutes: minutes, usedPercent: used,
                                resetsAt: (w["resets_at"] as? String).flatMap(parseDate))
         }
+        return windows.isEmpty ? nil : windows
     }
 
     // MARK: Codex
@@ -443,9 +449,7 @@ final class UsagePanel: NSView {
     func reload() {
         let config = SessionManager.shared.config
         let now = Date()
-        let models = UsageProvider.allCases.filter(config.sidebarUsage.contains).compactMap { p in
-            UsageLimits.shared.reports[p].map { UsageRowModel(provider: p, report: $0, now: now) }
-        }
+        let models = Self.models(selected: config.sidebarUsage, reports: UsageLimits.shared.reports, now: now)
         guard models != shown || config.theme != themed else { return }
         shown = models
         themed = config.theme
@@ -455,6 +459,15 @@ final class UsagePanel: NSView {
         }
         isHidden = models.isEmpty
         collapsed.isActive = models.isEmpty
+    }
+
+    /// A row for every chosen provider, also before its first read and when it has nothing to
+    /// show, so there is a row to explain why and to click.
+    static func models(selected: Set<UsageProvider>, reports: [UsageProvider: UsageReport],
+                       now: Date) -> [UsageRowModel] {
+        UsageProvider.allCases.filter(selected.contains).map { p in
+            UsageRowModel(provider: p, report: reports[p] ?? UsageReport(windows: [], updated: nil), now: now)
+        }
     }
 }
 

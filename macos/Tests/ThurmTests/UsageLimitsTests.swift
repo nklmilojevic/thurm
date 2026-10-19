@@ -23,6 +23,14 @@ final class UsageLimitsTests: XCTestCase {
         XCTAssertNil(UsageLimits.parseClaudeUsage(Data("[]".utf8)))
     }
 
+    /// An answer without either window is a failed read, not an empty one.
+    func testClaudeUsageWithoutWindowsFails() {
+        XCTAssertNil(UsageLimits.parseClaudeUsage(Data("{}".utf8)))
+        XCTAssertNil(UsageLimits.parseClaudeUsage(Data(#"{"five_hour": null, "seven_day": {"resets_at": null}}"#.utf8)))
+        let one = #"{"five_hour": {"utilization": 9, "resets_at": null}}"#
+        XCTAssertEqual(UsageLimits.parseClaudeUsage(Data(one.utf8))?.map(\.label), ["5h"])
+    }
+
     func testClaudeCredentials() throws {
         let json = #"{"claudeAiOauth": {"accessToken": "t0k", "expiresAt": 1766505600000}}"#
         let c = try XCTUnwrap(UsageLimits.parseClaudeCredentials(Data(json.utf8)))
@@ -79,6 +87,23 @@ final class UsageLimitsTests: XCTestCase {
         XCTAssertEqual(w.leftPercent(at: now), 38)
         XCTAssertEqual(w.leftPercent(at: now.addingTimeInterval(61)), 100)
         XCTAssertEqual(UsageWindow(minutes: 300, usedPercent: 130).leftPercent(at: now), 0)
+    }
+
+    /// Every chosen provider gets a row, with or without a report; others none.
+    func testPanelRowsForChosenProviders() {
+        let now = Date()
+        let signedOut = UsageReport(windows: [], updated: nil, problem: "No Claude Code sign-in found")
+        let rows = UsagePanel.models(selected: [.claude, .codex], reports: [.claude: signedOut], now: now)
+        XCTAssertEqual(rows.map(\.provider), [.claude, .codex])
+        XCTAssertEqual(rows.map(\.gauges), [[], []])
+        XCTAssertTrue(rows[0].stale)
+        XCTAssertTrue(rows[0].tooltip.contains("No Claude Code sign-in found"))
+        XCTAssertTrue(rows[0].tooltip.hasSuffix("Click to refresh"))
+        XCTAssertFalse(rows[1].stale, "not read yet")
+        XCTAssertTrue(rows[1].tooltip.contains("No usage known yet"))
+        let codexOnly = UsagePanel.models(selected: [.codex], reports: [.claude: signedOut], now: now)
+        XCTAssertEqual(codexOnly.map(\.provider), [.codex])
+        XCTAssertTrue(UsagePanel.models(selected: [], reports: [.claude: signedOut], now: now).isEmpty)
     }
 
     func testRowModel() {
