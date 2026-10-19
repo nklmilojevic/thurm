@@ -1208,6 +1208,7 @@ pub const TAILNET_DIAL_SOCKET: &str = "tailnet-dial.sock";
 
 /// Where this machine's processes dial tailnet peers through the daemon's embedded node
 /// (served by its `thurm-tailnet` helper while the daemon runs one).
+#[cfg(unix)]
 pub fn tailnet_dial_socket_path() -> PathBuf {
     socket_path().with_file_name(TAILNET_DIAL_SOCKET)
 }
