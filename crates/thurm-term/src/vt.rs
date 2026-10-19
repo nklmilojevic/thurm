@@ -4,6 +4,10 @@ use std::ffi::c_void;
 use std::ptr;
 
 use ghostty_vt_rs_sys as ffi;
+// libghostty-vt has no kitty graphics where it can't read a clock (wasm32-freestanding): the
+// calls go to stand-ins that store nothing.
+#[cfg(not(target_arch = "wasm32"))]
+use ghostty_vt_rs_sys as kitty_ffi;
 
 pub use ffi::{ColorRgb, GridRef, Style, StyleColor};
 
@@ -372,7 +376,9 @@ impl Vt {
         }
         install_png_decoder();
         let mut placements: ffi::KittyGraphicsPlacementIterator = ptr::null_mut();
-        unsafe { ffi::ghostty_kitty_graphics_placement_iterator_new(ptr::null(), &mut placements) };
+        unsafe {
+            kitty_ffi::ghostty_kitty_graphics_placement_iterator_new(ptr::null(), &mut placements)
+        };
         let mut gesture: ffi::SelectionGesture = ptr::null_mut();
         let events = [
             ffi::SelectionGestureEventType::PRESS,
@@ -752,7 +758,7 @@ impl Vt {
         let Some(g) = self.kitty() else { return 0 };
         let mut out = 0u64;
         unsafe {
-            ffi::ghostty_kitty_graphics_get(
+            kitty_ffi::ghostty_kitty_graphics_get(
                 g,
                 ffi::KittyGraphicsData::GENERATION,
                 (&mut out as *mut u64).cast(),
@@ -767,7 +773,7 @@ impl Vt {
         let Some(g) = self.kitty() else { return out };
         let mut it = self.placements;
         unsafe {
-            if ffi::ghostty_kitty_graphics_get(
+            if kitty_ffi::ghostty_kitty_graphics_get(
                 g,
                 ffi::KittyGraphicsData::PLACEMENT_ITERATOR,
                 (&mut it as *mut ffi::KittyGraphicsPlacementIterator).cast(),
@@ -775,30 +781,38 @@ impl Vt {
             {
                 return out;
             }
-            while ffi::ghostty_kitty_graphics_placement_next(it) {
+            while kitty_ffi::ghostty_kitty_graphics_placement_next(it) {
                 use ffi::KittyGraphicsPlacementData as D;
                 let u32_of = |k| {
                     let mut v = 0u32;
-                    ffi::ghostty_kitty_graphics_placement_get(it, k, (&mut v as *mut u32).cast());
+                    kitty_ffi::ghostty_kitty_graphics_placement_get(
+                        it,
+                        k,
+                        (&mut v as *mut u32).cast(),
+                    );
                     v
                 };
                 let mut is_virtual = false;
-                ffi::ghostty_kitty_graphics_placement_get(
+                kitty_ffi::ghostty_kitty_graphics_placement_get(
                     it,
                     D::IS_VIRTUAL,
                     (&mut is_virtual as *mut bool).cast(),
                 );
                 let mut z = 0i32;
-                ffi::ghostty_kitty_graphics_placement_get(it, D::Z, (&mut z as *mut i32).cast());
+                kitty_ffi::ghostty_kitty_graphics_placement_get(
+                    it,
+                    D::Z,
+                    (&mut z as *mut i32).cast(),
+                );
                 let image = u32_of(D::IMAGE_ID);
-                let handle = ffi::ghostty_kitty_graphics_image(g, image);
+                let handle = kitty_ffi::ghostty_kitty_graphics_image(g, image);
                 let render = (!is_virtual && !handle.is_null())
                     .then(|| {
                         let mut info = ffi::KittyGraphicsPlacementRenderInfo {
                             size: std::mem::size_of::<ffi::KittyGraphicsPlacementRenderInfo>(),
                             ..Default::default()
                         };
-                        (ffi::ghostty_kitty_graphics_placement_render_info(
+                        (kitty_ffi::ghostty_kitty_graphics_placement_render_info(
                             it, handle, self.raw, &mut info,
                         ) == ffi::Result::SUCCESS
                             && info.viewport_visible)
@@ -829,7 +843,7 @@ impl Vt {
 
     fn kitty_image_handle(&self, id: u32) -> Option<ffi::KittyGraphicsImage> {
         let g = self.kitty()?;
-        let h = unsafe { ffi::ghostty_kitty_graphics_image(g, id) };
+        let h = unsafe { kitty_ffi::ghostty_kitty_graphics_image(g, id) };
         (!h.is_null()).then_some(h)
     }
 
@@ -838,7 +852,7 @@ impl Vt {
         let h = self.kitty_image_handle(id)?;
         let mut v = 0u64;
         let r = unsafe {
-            ffi::ghostty_kitty_graphics_image_get(
+            kitty_ffi::ghostty_kitty_graphics_image_get(
                 h,
                 ffi::KittyGraphicsImageData::GENERATION,
                 (&mut v as *mut u64).cast(),
@@ -853,8 +867,12 @@ impl Vt {
         let (mut w, mut hgt) = (0u32, 0u32);
         unsafe {
             use ffi::KittyGraphicsImageData as D;
-            ffi::ghostty_kitty_graphics_image_get(h, D::WIDTH, (&mut w as *mut u32).cast());
-            ffi::ghostty_kitty_graphics_image_get(h, D::HEIGHT, (&mut hgt as *mut u32).cast());
+            kitty_ffi::ghostty_kitty_graphics_image_get(h, D::WIDTH, (&mut w as *mut u32).cast());
+            kitty_ffi::ghostty_kitty_graphics_image_get(
+                h,
+                D::HEIGHT,
+                (&mut hgt as *mut u32).cast(),
+            );
         }
         Some((w, hgt))
     }
@@ -866,19 +884,27 @@ impl Vt {
         let (mut w, mut hgt, mut format) = (0u32, 0u32, ffi::KittyImageFormat::RGBA);
         let (mut data, mut len): (*const u8, usize) = (ptr::null(), 0);
         unsafe {
-            ffi::ghostty_kitty_graphics_image_get(h, D::WIDTH, (&mut w as *mut u32).cast());
-            ffi::ghostty_kitty_graphics_image_get(h, D::HEIGHT, (&mut hgt as *mut u32).cast());
-            ffi::ghostty_kitty_graphics_image_get(
+            kitty_ffi::ghostty_kitty_graphics_image_get(h, D::WIDTH, (&mut w as *mut u32).cast());
+            kitty_ffi::ghostty_kitty_graphics_image_get(
+                h,
+                D::HEIGHT,
+                (&mut hgt as *mut u32).cast(),
+            );
+            kitty_ffi::ghostty_kitty_graphics_image_get(
                 h,
                 D::FORMAT,
                 (&mut format as *mut ffi::KittyImageFormat::Type).cast(),
             );
-            ffi::ghostty_kitty_graphics_image_get(
+            kitty_ffi::ghostty_kitty_graphics_image_get(
                 h,
                 D::DATA_PTR,
                 (&mut data as *mut *const u8).cast(),
             );
-            ffi::ghostty_kitty_graphics_image_get(h, D::DATA_LEN, (&mut len as *mut usize).cast());
+            kitty_ffi::ghostty_kitty_graphics_image_get(
+                h,
+                D::DATA_LEN,
+                (&mut len as *mut usize).cast(),
+            );
         }
         if data.is_null() {
             return None;
@@ -1245,7 +1271,7 @@ impl Drop for Vt {
             for ev in [self.press, self.drag, self.release] {
                 ffi::ghostty_selection_gesture_event_free(ev);
             }
-            ffi::ghostty_kitty_graphics_placement_iterator_free(self.placements);
+            kitty_ffi::ghostty_kitty_graphics_placement_iterator_free(self.placements);
             ffi::ghostty_terminal_free(self.raw)
         }
     }
@@ -1670,4 +1696,69 @@ pub fn hyperlink(r: &GridRef) -> Option<String> {
         &big[..len]
     };
     Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::missing_safety_doc)]
+mod kitty_ffi {
+    use super::{c_void, ffi, ptr};
+
+    pub unsafe fn ghostty_kitty_graphics_get(
+        _: ffi::KittyGraphics,
+        _: ffi::KittyGraphicsData::Type,
+        _: *mut c_void,
+    ) -> ffi::Result::Type {
+        ffi::Result::NO_VALUE
+    }
+
+    pub unsafe fn ghostty_kitty_graphics_image(
+        _: ffi::KittyGraphics,
+        _: u32,
+    ) -> ffi::KittyGraphicsImage {
+        ptr::null_mut()
+    }
+
+    pub unsafe fn ghostty_kitty_graphics_image_get(
+        _: ffi::KittyGraphicsImage,
+        _: ffi::KittyGraphicsImageData::Type,
+        _: *mut c_void,
+    ) -> ffi::Result::Type {
+        ffi::Result::NO_VALUE
+    }
+
+    pub unsafe fn ghostty_kitty_graphics_placement_iterator_new(
+        _: *const ffi::Allocator,
+        out: *mut ffi::KittyGraphicsPlacementIterator,
+    ) -> ffi::Result::Type {
+        unsafe { *out = ptr::null_mut() };
+        ffi::Result::SUCCESS
+    }
+
+    pub unsafe fn ghostty_kitty_graphics_placement_iterator_free(
+        _: ffi::KittyGraphicsPlacementIterator,
+    ) {
+    }
+
+    pub unsafe fn ghostty_kitty_graphics_placement_next(
+        _: ffi::KittyGraphicsPlacementIterator,
+    ) -> bool {
+        false
+    }
+
+    pub unsafe fn ghostty_kitty_graphics_placement_get(
+        _: ffi::KittyGraphicsPlacementIterator,
+        _: ffi::KittyGraphicsPlacementData::Type,
+        _: *mut c_void,
+    ) -> ffi::Result::Type {
+        ffi::Result::NO_VALUE
+    }
+
+    pub unsafe fn ghostty_kitty_graphics_placement_render_info(
+        _: ffi::KittyGraphicsPlacementIterator,
+        _: ffi::KittyGraphicsImage,
+        _: ffi::Terminal,
+        _: *mut ffi::KittyGraphicsPlacementRenderInfo,
+    ) -> ffi::Result::Type {
+        ffi::Result::NO_VALUE
+    }
 }

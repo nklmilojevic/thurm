@@ -5,6 +5,10 @@
 //! reads it, and turns the command into a direct transmission of the bytes it read, which
 //! every copy then parses the same way.
 
+// Without unix (the browser client's wasm build) the readers below are stand-ins and their
+// helpers go unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::io::{Read, Seek};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
