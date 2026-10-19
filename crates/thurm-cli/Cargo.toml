@@ -24,3 +24,7 @@ qrcode.workspace = true
 
 [dev-dependencies]
 parking_lot.workspace = true
+# The tailnet stand-ins (thurm-remote's tests/support/tailnet_fakes.rs).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

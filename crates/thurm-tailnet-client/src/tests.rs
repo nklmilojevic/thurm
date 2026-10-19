@@ -350,6 +350,7 @@ fn relays_over_a_dialed_socket_with_tls_for_the_url_host() {
         "wss://thurm.test/v1/connect",
         LIMITS,
         trusting(&pki.ca),
+        false,
     )
     .unwrap();
     stream
@@ -372,6 +373,7 @@ fn a_dialed_socket_to_another_host_is_refused() {
         "wss://other.test/v1/connect",
         LIMITS,
         trusting(&pki.ca),
+        false,
     );
     assert!(
         matches!(r, Err(ConnectError::Protocol(ref e)) if e.starts_with("TLS")),
@@ -391,6 +393,7 @@ fn a_dialed_socket_with_an_untrusted_certificate_is_refused() {
         "wss://thurm.test/v1/connect",
         LIMITS,
         trusting(&stranger.ca),
+        false,
     );
     assert!(
         matches!(r, Err(ConnectError::Protocol(ref e)) if e.starts_with("TLS")),
@@ -416,4 +419,42 @@ fn a_dialed_socket_needs_wss() {
     // Taken over and closed.
     let mut buf = [0u8; 1];
     assert_eq!(theirs.read(&mut buf).unwrap(), 0);
+}
+
+#[test]
+fn a_tailnet_dialed_socket_may_be_plain_ws() {
+    let server = server_rt();
+    let url = echo_server(&server);
+    let addr = url
+        .trim_start_matches("ws://")
+        .trim_end_matches("/v1/connect")
+        .parse()
+        .unwrap();
+    let (mut stream, _session) = open_tailnet_fd(dialed(addr), &url, CONNECT_TIMEOUT).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(b"plain").unwrap();
+    let mut got = [0u8; 5];
+    stream.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"PLAIN");
+}
+
+#[test]
+fn a_tailnet_dialed_socket_still_checks_tls_for_wss() {
+    let server = server_rt();
+    let pki = test_pki();
+    let addr = tls_echo_server(&server, &pki);
+    // open_tailnet_fd trusts public roots only: the test CA's certificate is refused.
+    let r = open_tailnet_fd(dialed(addr), "wss://thurm.test/v1/connect", CONNECT_TIMEOUT);
+    assert!(
+        matches!(r, Err(ConnectError::Protocol(ref e)) if e.starts_with("TLS")),
+        "{:?}",
+        r.map(|_| ())
+    );
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    assert!(matches!(
+        open_tailnet_fd(OwnedFd::from(ours), "https://thurm.test/", CONNECT_TIMEOUT),
+        Err(ConnectError::BadUrl(_))
+    ));
 }

@@ -3,7 +3,8 @@ import Network
 import CThurm
 
 // Remote workspaces (specs/remote-workspaces.md): `thurmd` on other machines, reached through
-// a supervised `ssh -L` tunnel per `[[remote]]` host (Rust: crates/thurm-remote). Each host
+// a supervised `ssh -L` tunnel per `[[remote]]` host, or a relay over the tailnet for a host
+// with `tailnet` (Rust: crates/thurm-remote). Each host
 // connects as its own client; its panes live in remote workspaces next to local ones. While a
 // host is unreachable its tabs keep their last frame under a "reconnecting" overlay.
 
@@ -22,6 +23,10 @@ struct RemoteStatus {
     var os: String?
     var arch: String?
     var linger: String?
+    /// "ssh" or "tailnet".
+    var transport: String
+    /// For a tailnet host once connected: "node" (Thurm's own Tailscale) or "system".
+    var via: String?
 
     init?(json: Any?) {
         guard let d = json as? [String: Any], let name = jsonString(d["name"]) else { return nil }
@@ -36,6 +41,18 @@ struct RemoteStatus {
         os = jsonString(d["os"])
         arch = jsonString(d["arch"])
         linger = jsonString(d["linger"])
+        transport = jsonString(d["transport"]) ?? "ssh"
+        via = jsonString(d["via"])
+    }
+
+    /// How the host is reached, for its details.
+    var transportLabel: String {
+        guard transport == "tailnet" else { return "SSH" }
+        switch via {
+        case "node": return "Tailscale, through Thurm's own node"
+        case "system": return "Tailscale, through this Mac's Tailscale app"
+        default: return "Tailscale"
+        }
     }
 
     var label: String {
@@ -929,11 +946,15 @@ final class RemoteHosts: ObservableObject {
 
     // MARK: Hosts in the config
 
-    /// Adds `name` after checking that ssh reaches `target`, then checks what it needs.
+    /// Adds `name` after checking that ssh reaches `target`, then checks what it needs. With
+    /// `tailnet` (a peer's name or address; empty: the target), checks the daemon answers over
+    /// the tailnet instead, and leaves the ssh checks for Check Again.
     /// `done` gets the error, if it failed.
-    func add(name: String, target: String, done: @escaping (String?) -> Void) {
-        edit(["op": "add", "name": name, "target": target]) { error in
-            if error == nil { self.recheck(name) }
+    func add(name: String, target: String, tailnet: String? = nil, done: @escaping (String?) -> Void) {
+        var call: [String: Any] = ["op": "add", "name": name, "target": target]
+        if let tailnet { call["tailnet"] = tailnet }
+        edit(call) { error in
+            if error == nil, tailnet == nil { self.recheck(name) }
             done(error)
         }
     }
@@ -949,7 +970,7 @@ final class RemoteHosts: ObservableObject {
         }
     }
 
-    /// Sets `key` (`host`, `enabled` or `clipboard_read`) of `host`.
+    /// Sets `key` (`host`, `enabled`, `clipboard_read` or `tailnet`) of `host`.
     func set(_ host: HostId, _ key: String, _ value: Any, done: @escaping (String?) -> Void = { _ in }) {
         edit(["op": "set", "name": host, "key": key, "value": value]) { error in
             if error == nil, key == "host" {

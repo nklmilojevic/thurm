@@ -243,6 +243,7 @@ fn remote(name: &str, socket: Option<String>) -> RemoteConfig {
         socket,
         enabled: true,
         clipboard_read: Default::default(),
+        tailnet: None,
     }
 }
 

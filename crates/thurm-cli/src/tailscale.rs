@@ -44,6 +44,11 @@ pub enum TailscaleCmd {
     /// Rename the device without signing in again. NAME is one DNS label of 1 to 63 letters,
     /// digits or hyphens; the new DNS name may show a moment after this returns.
     Rename { name: String },
+    /// The tailnet's devices, as the device sees them (it must be on).
+    Peers,
+    /// Connect stdin and stdout to PORT on a tailnet peer through the device, for ssh with the
+    /// Tailscale app stopped: `ProxyCommand thurm tailscale nc %h %p`.
+    Nc { host: String, port: u16 },
 }
 
 pub fn run(c: &Client, action: TailscaleCmd, json: bool) -> super::R {
@@ -78,6 +83,9 @@ pub fn run(c: &Client, action: TailscaleCmd, json: bool) -> super::R {
         TailscaleCmd::Login => Request::TailscaleLogin,
         TailscaleCmd::Logout => Request::TailscaleLogout,
         TailscaleCmd::Rename { name } => Request::TailscaleRename { hostname: name },
+        TailscaleCmd::Peers | TailscaleCmd::Nc { .. } => {
+            unreachable!("run through the dial socket")
+        }
     };
     let Response::TailscaleStatus(status) = c.request_timeout(request, Some(TIMEOUT))? else {
         return Err("unexpected response".into());
@@ -182,6 +190,71 @@ fn describe_principal(p: &Principal) -> String {
             out.push('\n');
             out
         }
+    }
+}
+
+/// `thurm tailscale peers`.
+pub fn peers(json: bool) -> super::R {
+    let socket = thurm_config::tailnet_dial_socket_path();
+    let peers = thurm_remote::tailnet::peers(&socket, thurm_remote::tailnet::CONNECT_TIMEOUT)
+        .map_err(dial_hint)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&peers)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut peers = peers;
+    peers.sort_by(|a, b| a.dns_name.cmp(&b.dns_name));
+    println!("{:<44} {:<8} ADDRESSES", "NAME", "ONLINE");
+    for p in peers {
+        println!(
+            "{:<44} {:<8} {}",
+            p.dns_name,
+            if p.online { "yes" } else { "no" },
+            p.addrs.join(", ")
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `thurm tailscale nc HOST PORT`: stdin and stdout to the peer until either side ends.
+pub fn nc(host: &str, port: u16) -> super::R {
+    use std::io::{Read, Write};
+    let socket = thurm_config::tailnet_dial_socket_path();
+    let (stream, _) =
+        thurm_remote::tailnet::dial(&socket, host, port, thurm_remote::tailnet::CONNECT_TIMEOUT)
+            .map_err(dial_hint)?;
+    let mut up = stream.try_clone()?;
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 32 * 1024];
+        while let Ok(n) = stdin.read(&mut buf) {
+            if n == 0 || up.write_all(&buf[..n]).is_err() {
+                break;
+            }
+        }
+        let _ = up.shutdown(std::net::Shutdown::Write);
+    });
+    let mut down = stream;
+    let mut stdout = std::io::stdout().lock();
+    let mut buf = [0u8; 32 * 1024];
+    loop {
+        let n = down.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        stdout.write_all(&buf[..n])?;
+        stdout.flush()?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn dial_hint(e: thurm_remote::tailnet::DialError) -> String {
+    match e {
+        thurm_remote::tailnet::DialError::NoSocket(_) => format!(
+            "{e}: turn it on with `thurm tailscale on` (a daemon that was upgraded in place \
+             needs `thurm tailscale off` and `on` once)"
+        ),
+        e => e.to_string(),
     }
 }
 

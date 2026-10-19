@@ -124,7 +124,7 @@ impl EventHook {
     }
 }
 
-/// A host whose `thurmd` the app attaches to over the system `ssh`.
+/// A host whose `thurmd` the app attaches to over the system `ssh`, or over the tailnet.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RemoteConfig {
     /// Shown in the sidebar and used by `thurm --remote NAME`: letters, digits, `-`, `_`.
@@ -139,6 +139,105 @@ pub struct RemoteConfig {
     /// OSC 52 clipboard reads by this host's programs: ask every time, always allow, or never.
     #[serde(default)]
     pub clipboard_read: ClipboardRead,
+    /// Reach the daemon over the tailnet instead of an ssh tunnel: its
+    /// `wss://<node>.<tailnet>.ts.net/v1/connect`, a `ws://<address>:<port>/v1/connect` of its
+    /// host listener, or a peer's name (see [`parse_remote_tailnet`]). `host` stays ssh's, for
+    /// installing, the doctor and handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet: Option<String>,
+}
+
+/// Where a `[[remote]]`'s `tailnet` points.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TailnetTarget {
+    /// A daemon's WebSocket: `url` as the client opens it, `host` and `port` to dial.
+    Url {
+        url: String,
+        tls: bool,
+        host: String,
+        port: u16,
+    },
+    /// A peer's name, resolved through the embedded node to its `wss://` address.
+    Name(String),
+}
+
+/// Reads a `[[remote]]`'s `tailnet`: a `wss://` or `ws://` URL (path `/v1/connect` or none; a
+/// `ws://` one needs its port), or a peer's MagicDNS name.
+pub fn parse_remote_tailnet(value: &str) -> Result<TailnetTarget, String> {
+    let value = value.trim();
+    let bad = |why: &str| Err(format!("tailnet address {value:?}: {why}"));
+    let (tls, rest) = if let Some(r) = value.strip_prefix("wss://") {
+        (true, r)
+    } else if let Some(r) = value.strip_prefix("ws://") {
+        (false, r)
+    } else if value.contains("://") || value.contains('/') {
+        return bad("use wss://, ws:// or a peer's name");
+    } else {
+        let name = value.trim_end_matches('.');
+        let ok = !name.is_empty()
+            && name.len() <= 253
+            && name.split('.').all(thurm_proto::tailnet::valid_hostname);
+        return if ok {
+            Ok(TailnetTarget::Name(name.to_owned()))
+        } else {
+            bad("not a peer's name")
+        };
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    if !(path.is_empty() || path == thurm_proto::tailnet::CONNECT_PATH) {
+        return bad("the path must be /v1/connect");
+    }
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let Some((addr, after)) = v6.split_once(']') else {
+            return bad("unclosed [");
+        };
+        // Nothing after the bracket but its port.
+        let port = match after {
+            "" => None,
+            p => match p.strip_prefix(':') {
+                Some(p) => Some(p),
+                None => return bad("bad host"),
+            },
+        };
+        (addr, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() || host.contains(['@', '?', '#', ' ']) {
+        return bad("no host");
+    }
+    let port = match port {
+        Some(p) => match p.parse::<u16>() {
+            Ok(p) if p > 0 => p,
+            _ => return bad("bad port"),
+        },
+        None if tls => 443,
+        None => return bad("a ws:// address needs its port (the host listener's, like :7297)"),
+    };
+    let shown = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let scheme = if tls { "wss" } else { "ws" };
+    let path = thurm_proto::tailnet::CONNECT_PATH;
+    let url = if tls && port == 443 {
+        format!("{scheme}://{shown}{path}")
+    } else {
+        format!("{scheme}://{shown}:{port}{path}")
+    };
+    Ok(TailnetTarget::Url {
+        url,
+        tls,
+        host: host.trim_end_matches('.').to_owned(),
+        port,
+    })
 }
 
 fn default_true() -> bool {
@@ -1104,6 +1203,16 @@ pub fn state_dir() -> PathBuf {
     }
 }
 
+/// The dial socket's file name, beside the daemon's socket.
+pub const TAILNET_DIAL_SOCKET: &str = "tailnet-dial.sock";
+
+/// Where this machine's processes dial tailnet peers through the daemon's embedded node
+/// (served by its `thurm-tailnet` helper while the daemon runs one).
+#[cfg(unix)]
+pub fn tailnet_dial_socket_path() -> PathBuf {
+    socket_path().with_file_name(TAILNET_DIAL_SOCKET)
+}
+
 /// Unix socket of the daemon. Short enough for `sun_path` (104 bytes on macOS).
 ///
 /// In `$XDG_RUNTIME_DIR` when set; else on macOS in the per-user temporary directory, which no
@@ -1743,6 +1852,9 @@ pub fn with_remote_added(text: &str, remote: &RemoteConfig) -> Result<String, St
     if let Some(sock) = &remote.socket {
         t["socket"] = toml_edit::value(sock.as_str());
     }
+    if let Some(tailnet) = &remote.tailnet {
+        t["tailnet"] = toml_edit::value(tailnet.as_str());
+    }
     if !remote.enabled {
         t["enabled"] = toml_edit::value(false);
     }
@@ -2104,6 +2216,7 @@ clipboard_read = "always"
             socket: None,
             enabled: true,
             clipboard_read: ClipboardRead::Ask,
+            tailnet: None,
         };
         let added = with_remote_added(text, &r).unwrap();
         assert!(added.starts_with("# my config") && added.contains("# big"));
@@ -2119,6 +2232,101 @@ clipboard_read = "always"
         assert!(Config::parse(&removed).unwrap().remote.is_empty());
         assert!(!removed.contains("[[remote]]"));
         assert!(with_remote_removed(&removed, "devbox").is_err());
+    }
+
+    #[test]
+    fn tailnet_remotes_round_trip() {
+        let r = RemoteConfig {
+            name: "bastion".into(),
+            host: "bastion".into(),
+            socket: None,
+            enabled: true,
+            clipboard_read: ClipboardRead::Ask,
+            tailnet: Some("wss://bastion.tail1234.ts.net/v1/connect".into()),
+        };
+        let added = with_remote_added("", &r).unwrap();
+        assert!(added.contains("tailnet = \"wss://bastion.tail1234.ts.net/v1/connect\""));
+        let (cfg, warnings) = Config::parse_with_warnings(&added).unwrap();
+        assert_eq!(cfg.remote, vec![r]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Without it, an entry is the ssh remote it always was.
+        let ssh = Config::parse("[[remote]]\nname = \"a\"\nhost = \"a\"\n").unwrap();
+        assert_eq!(ssh.remote[0].tailnet, None);
+    }
+
+    #[test]
+    fn tailnet_addresses_parsed() {
+        let url = |u: &str, tls: bool, host: &str, port: u16| TailnetTarget::Url {
+            url: u.into(),
+            tls,
+            host: host.into(),
+            port,
+        };
+        for (input, want) in [
+            (
+                "wss://bastion.tail1234.ts.net/v1/connect",
+                url(
+                    "wss://bastion.tail1234.ts.net/v1/connect",
+                    true,
+                    "bastion.tail1234.ts.net",
+                    443,
+                ),
+            ),
+            (
+                "wss://bastion.tail1234.ts.net",
+                url(
+                    "wss://bastion.tail1234.ts.net/v1/connect",
+                    true,
+                    "bastion.tail1234.ts.net",
+                    443,
+                ),
+            ),
+            (
+                "wss://bastion.tail1234.ts.net:8443/v1/connect",
+                url(
+                    "wss://bastion.tail1234.ts.net:8443/v1/connect",
+                    true,
+                    "bastion.tail1234.ts.net",
+                    8443,
+                ),
+            ),
+            (
+                "ws://100.64.0.1:7297/v1/connect",
+                url("ws://100.64.0.1:7297/v1/connect", false, "100.64.0.1", 7297),
+            ),
+            (
+                "ws://[fd7a:115c:a1e0::1]:7297",
+                url(
+                    "ws://[fd7a:115c:a1e0::1]:7297/v1/connect",
+                    false,
+                    "fd7a:115c:a1e0::1",
+                    7297,
+                ),
+            ),
+            ("bastion", TailnetTarget::Name("bastion".into())),
+            (
+                "bastion.tail1234.ts.net.",
+                TailnetTarget::Name("bastion.tail1234.ts.net".into()),
+            ),
+        ] {
+            assert_eq!(parse_remote_tailnet(input), Ok(want), "{input}");
+        }
+        for bad in [
+            "",
+            "https://bastion.ts.net",
+            "ws://100.64.0.1/v1/connect",
+            "wss://bastion.ts.net/other",
+            "wss://:443",
+            "wss://bastion.ts.net:0",
+            "wss://[bastion]oops/v1/connect",
+            "ws://[fd7a:115c:a1e0::1]x:7297",
+            "wss://me@bastion.ts.net",
+            "bad name",
+            "-bastion",
+            "bastion/x",
+        ] {
+            assert!(parse_remote_tailnet(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

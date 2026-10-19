@@ -2457,6 +2457,7 @@ version = "0.8.0"
 dependencies = [
  "base64",
  "clap",
+ "futures-util",
  "libc",
  "parking_lot",
  "qrcode",
@@ -2467,6 +2468,8 @@ dependencies = [
  "thurm-proto",
  "thurm-remote",
  "thurm-term",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]
@@ -2581,6 +2584,7 @@ name = "thurm-remote"
 version = "0.8.0"
 dependencies = [
  "base64",
+ "futures-util",
  "libc",
  "log",
  "parking_lot",
@@ -2590,6 +2594,9 @@ dependencies = [
  "thurm-client",
  "thurm-config",
  "thurm-proto",
+ "thurm-tailnet-client",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

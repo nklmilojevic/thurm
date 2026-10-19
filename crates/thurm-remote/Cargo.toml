@@ -1,6 +1,6 @@
 [package]
 name = "thurm-remote"
-description = "Remote workspaces: ssh tunnels to thurmd on other machines, remote installs, git handoffs and the app-side policy for remote panes"
+description = "Remote workspaces: ssh and tailnet tunnels to thurmd on other machines, remote installs, git handoffs and the app-side policy for remote panes"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ license.workspace = true
 thurm-proto.workspace = true
 thurm-config.workspace = true
 thurm-client.workspace = true
+thurm-tailnet-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
@@ -16,3 +17,8 @@ log.workspace = true
 libc.workspace = true
 sha2 = "0.11"
 base64.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

@@ -79,6 +79,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `daemon ACTION` | Control the daemon; see [Sessions](/sessions/) |
 | `socket-path` | Print the daemon socket path |
 | `tailscale status\|on\|off\|login\|logout\|rename` | Serve the daemon over Tailscale; see [Serve over Tailscale](/remote/#serve-over-tailscale) |
+| `tailscale peers\|nc HOST PORT` | Tailnet devices, and a connection to one through Thurm's own device (an ssh `ProxyCommand`); see [Reach a host over Tailscale](/remote/#reach-a-host-over-tailscale) |
 | `pair [--name NAME] [--link]` | A QR code and link that pair the phone with this host directly over Tailscale; see [Serve over Tailscale](/remote/#serve-over-tailscale) |
 | `whoami` | Show who the daemon sees on this connection |
 | `remote add\|list\|remove\|status\|install` | Manage remote hosts; see [Remote workspaces](/remote/) |

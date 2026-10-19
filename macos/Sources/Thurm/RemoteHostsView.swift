@@ -138,9 +138,11 @@ private struct HostDetails: View {
     @ObservedObject var store: SettingsStore
     @ObservedObject var remotes: RemoteHosts
     @State private var target = ""
+    @State private var tailnet = ""
     @State private var failure: String?
     @State private var confirmingRemove = false
     @FocusState private var targetFocused: Bool
+    @FocusState private var tailnetFocused: Bool
 
     private var host: RemoteHostEntry? {
         RemoteHostEntry.entries(store.setting("remote")?.value).first { $0.name == name }
@@ -185,6 +187,19 @@ private struct HostDetails: View {
                                 .onChange(of: targetFocused) { _, focused in
                                     if !focused { saveTarget() }
                                 }
+                        }
+                        if host.tailnet != nil {
+                            LabeledContent("Tailscale address") {
+                                TextField("", text: $tailnet, prompt: Text("wss://bastion.tail1234.ts.net"))
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 260)
+                                    .focused($tailnetFocused)
+                                    .onSubmit(saveTailnet)
+                                    .onChange(of: tailnetFocused) { _, focused in
+                                        if !focused { saveTailnet() }
+                                    }
+                            }
+                            LabeledContent("Over", value: status?.transportLabel ?? "Tailscale")
                         }
                         Picker("Clipboard reads", selection: Binding(
                             get: { host.clipboardRead },
@@ -240,8 +255,12 @@ private struct HostDetails: View {
             .padding(16)
         }
         .frame(width: 620, height: 640)
-        .onAppear { target = host?.target ?? "" }
+        .onAppear {
+            target = host?.target ?? ""
+            tailnet = host?.tailnet ?? ""
+        }
         .onChange(of: host?.target) { _, new in target = new ?? "" }
+        .onChange(of: host?.tailnet) { _, new in tailnet = new ?? "" }
         .alert("Remove \(name)?", isPresented: $confirmingRemove) {
             Button("Remove", role: .destructive) {
                 remotes.remove(name) { failure = $0 }
@@ -288,6 +307,19 @@ private struct HostDetails: View {
             return
         }
         save("host", trimmed)
+    }
+
+    /// A tailnet host's address, changed (a new name, or where it serves). Removing it is
+    /// removing the host and adding it again over ssh.
+    private func saveTailnet() {
+        let trimmed = tailnet.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let host, let current = host.tailnet, trimmed != current else { return }
+        guard !trimmed.isEmpty else {
+            NSSound.beep()
+            tailnet = current
+            return
+        }
+        save("tailnet", trimmed)
     }
 }
 
@@ -362,11 +394,14 @@ private struct CheckRow: View {
     }
 }
 
-/// Add Host…: a name and an ssh target, checked over ssh before the host is added.
+/// Add Host…: a name and an ssh target, checked over ssh before the host is added; or, over
+/// Tailscale, checked by reaching its daemon on the tailnet.
 private struct AddHostSheet: View {
     @ObservedObject var remotes: RemoteHosts
     @State private var name = ""
     @State private var target = ""
+    @State private var overTailnet = false
+    @State private var tailnet = ""
     @State private var failure: String?
     @State private var connecting = false
 
@@ -377,14 +412,28 @@ private struct AddHostSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Add a Host")
                 .font(.headline)
-            Text("Thurm connects with the system ssh: the host needs a key that works without a prompt "
-                + "(an agent is fine). Connect once with ssh in a terminal to accept its host key.")
+            Text(overTailnet
+                ? "Thurm reaches the host's daemon over your tailnet, through its own Tailscale node "
+                    + "(Settings \u{203A} Tailscale) or the Tailscale app. The host serves there (thurm tailscale on there) "
+                    + "and must let your account in. Installing and checks still use ssh."
+                : "Thurm connects with the system ssh: the host needs a key that works without a prompt "
+                    + "(an agent is fine). Connect once with ssh in a terminal to accept its host key.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Form {
                 TextField("Name", text: $name, prompt: Text("devbox"))
                 TextField("SSH target", text: $target, prompt: Text("me@devbox, a Host alias, or ssh://me@devbox:2222"))
+                Toggle("Over Tailscale", isOn: $overTailnet)
+                if overTailnet {
+                    TextField("Tailscale address", text: $tailnet,
+                              prompt: Text("bastion, or wss://bastion.tail1234.ts.net"))
+                    Text("Blank: the SSH target's host (devbox in me@devbox) as its name on the tailnet. "
+                        + "An SSH Host alias may name another machine; give the address then.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .disabled(connecting)
             if let failure {
@@ -421,7 +470,8 @@ private struct AddHostSheet: View {
         let name = trimmedName
         connecting = true
         failure = nil
-        remotes.add(name: name, target: trimmedTarget) { error in
+        let address = overTailnet ? tailnet.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+        remotes.add(name: name, target: trimmedTarget, tailnet: address) { error in
             connecting = false
             if let error {
                 failure = error

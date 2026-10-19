@@ -1,9 +1,11 @@
 //! Remote workspaces: the app attaches to `thurmd` on other machines through the system
-//! `ssh` (see `specs/remote-workspaces.md`).
+//! `ssh`, or over the tailnet (see `specs/remote-workspaces.md`).
 //!
 //! - [`ssh`]: the hardened ssh invocations.
-//! - [`tunnel`]: one supervised `ssh -N -L` per host, reconnecting with backoff, and the
-//!   state file `thurm --remote` reads.
+//! - [`tailnet`]: reaching a host's daemon over the tailnet, through the embedded node's dial
+//!   socket or this machine's Tailscale.
+//! - [`tunnel`]: one supervised tunnel per host (`ssh -N -L`, or a relay over the tailnet),
+//!   reconnecting with backoff, and the state file `thurm --remote` reads.
 //! - [`install`]: putting the app's exact build on a host, and upgrading its daemon in place.
 //! - [`doctor`]: what a host needs (lingering, PATH, agents, hooks), and the fixes.
 //! - [`handoff`]: giving a local repository to a remote agent through git.
@@ -16,6 +18,7 @@ pub mod install;
 pub mod pairing;
 pub mod policy;
 pub mod ssh;
+pub mod tailnet;
 pub mod tunnel;
 
 use std::time::Duration;
