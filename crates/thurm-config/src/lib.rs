@@ -1832,11 +1832,9 @@ pub fn edit_config(edit: impl FnOnce(&str) -> Result<String, String>) -> Result<
 
 /// Replaces the contents of `path` atomically, keeping what the user set up around it: a
 /// symlink (a Home Manager or dotfiles link) stays a link and its target gets the new
-/// contents, and the file keeps its permissions (a new file is private).
-#[cfg(unix)]
+/// contents, and the file keeps its permissions (a new file is private; modes on unix only).
 pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let target = match std::fs::canonicalize(path) {
         Ok(t) => t,
         // A link to a file that doesn't exist yet: create that file, keep the link.
@@ -1859,9 +1857,13 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         }
         Err(e) => return Err(e),
     };
-    let mode = std::fs::metadata(&target)
-        .map(|m| m.permissions().mode() & 0o7777)
-        .unwrap_or(0o600);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&target)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0o600)
+    };
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1870,14 +1872,18 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = target.with_file_name(format!(".{name}.tmp{}-{seq}", std::process::id()));
     // Only a file this call created is removed on failure.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut f = options.open(&tmp)?;
     let result = (|| {
         f.write_all(contents)?;
-        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         f.sync_all()?;
         std::fs::rename(&tmp, &target)
     })();
@@ -1885,13 +1891,6 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result
-}
-
-/// Without unix file modes or links to keep (the browser client's wasm build, which writes no
-/// files): a plain write.
-#[cfg(not(unix))]
-pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, contents)
 }
 
 /// Validates `after`, an edit of the config text `before`: it must parse, and add no unknown
