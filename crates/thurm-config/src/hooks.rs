@@ -205,11 +205,11 @@ pub fn write_at(agent: &HookAgent, path: &Path, install: bool) -> Result<Written
         if !backup.exists() {
             // The settings may hold tokens: the backup is private.
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            options
                 .open(&backup)
                 .and_then(|mut f| f.write_all(current.as_bytes()))
                 .map_err(io)?;

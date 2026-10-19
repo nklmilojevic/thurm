@@ -38,6 +38,8 @@ libc = "0.2"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 log = "0.4"
+# std::time::Instant on native; the browser clock on wasm32, where std's panics.
+web-time = "1"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
