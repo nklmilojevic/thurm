@@ -70,6 +70,24 @@ watch:
     id="$(gh run list --repo {{ repo }} --workflow Release --limit 1 --json databaseId -q '.[0].databaseId')"
     gh run watch "$id" --repo {{ repo }} --exit-status
 
+# Renovate bumps tailnet/go.mod and go.sum but not this hash. On its PR:
+# `gh pr checkout N && just tailnet-hash && git commit -am "chore(nix): tailnet vendorHash" && git push`
+[doc("Recompute flake.nix's vendorHash for tailnet/ and check that it builds")]
+tailnet-hash:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    old="$(sed -nE 's/.*vendorHash = "(sha256-[^"]+)";.*/\1/p' flake.nix)"
+    [[ -n "$old" ]] || { echo "no vendorHash in flake.nix" >&2; exit 1; }
+    # Put the old hash back however this stops before the new one is written, Ctrl-C included.
+    trap 'sed -i.bak "s|vendorHash = pkgs.lib.fakeHash;|vendorHash = \"$old\";|" flake.nix; rm -f flake.nix.bak' EXIT
+    sed -i.bak "s|vendorHash = \"$old\";|vendorHash = pkgs.lib.fakeHash;|" flake.nix && rm flake.nix.bak
+    new="$(nix build .#thurm.tailnet.goModules --no-link 2>&1 | sed -nE 's/^ *got: *(sha256-[^ ]+)$/\1/p' || true)"
+    [[ -n "$new" ]] || { echo "nix gave no hash; flake.nix left as it was" >&2; exit 1; }
+    sed -i.bak "s|vendorHash = pkgs.lib.fakeHash;|vendorHash = \"$new\";|" flake.nix && rm flake.nix.bak
+    trap - EXIT
+    echo "==> vendorHash $old -> $new"
+    nix build .#thurm.tailnet --no-link
+
 # Write VERSION into Cargo.toml, Cargo.lock and Info.plist.
 _set-version version:
     #!/usr/bin/env bash
