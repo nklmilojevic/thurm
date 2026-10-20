@@ -16,14 +16,19 @@ pub fn run(c: &Client, name: Option<String>, link_only: bool, json: bool) -> sup
     let Response::TailscaleStatus(status) = c.request(Request::TailscaleStatus)? else {
         return Err("unexpected response".into());
     };
-    let url = tailnet_url(&status)?;
-    let host = host_of(&status, url);
+    let routes = routes(&status)?;
+    let first = routes
+        .wss
+        .as_deref()
+        .or(routes.plain.first().map(String::as_str))
+        .unwrap_or_default();
+    let host = host_of(&status, first);
     let name = name.unwrap_or_else(|| status.hostname.clone());
     let user = user_name().ok_or("could not tell this user's name")?;
     let push = Config::load()
         .map_err(|e| format!("could not read the config, for the push relay: {e}"))?
         .push;
-    let payload = payload(&name, &host, &user, url, &push);
+    let payload = payload(&name, &host, &user, &routes, &push);
     let link = link(&payload);
     if json {
         let out = serde_json::json!({ "link": link, "payload": payload });
@@ -34,8 +39,15 @@ pub fn run(c: &Client, name: Option<String>, link_only: bool, json: bool) -> sup
         print!("{}", render(&link)?);
         println!("Scan this with the Thurm app (+), or paste the link:");
         println!("{link}");
+        let reach: Vec<&str> = routes
+            .wss
+            .iter()
+            .chain(&routes.plain)
+            .map(String::as_str)
+            .collect();
         println!(
-            "The phone connects to {url} and needs Tailscale, signed in as {}.",
+            "The phone connects to {} and needs the tailnet's VPN (Tailscale, or your headscale client), signed in as {}.",
+            reach.join(", "),
             status
                 .account
                 .as_ref()
@@ -47,8 +59,16 @@ pub fn run(c: &Client, name: Option<String>, link_only: bool, json: bool) -> sup
     Ok(ExitCode::SUCCESS)
 }
 
-/// The address the phone connects to, or why there is none yet.
-fn tailnet_url(s: &TailscaleStatus) -> Result<&str, String> {
+/// The ways the phone can reach this host: `wss` once HTTPS is ready, and the plain tailnet
+/// endpoints (`ws://`), IP literals first.
+#[derive(Default)]
+struct Routes {
+    wss: Option<String>,
+    plain: Vec<String>,
+}
+
+/// The routes the phone connects by, or why there are none yet.
+fn routes(s: &TailscaleStatus) -> Result<Routes, String> {
     match s.state {
         TailscaleState::Running => {}
         TailscaleState::Off | TailscaleState::Stopped => {
@@ -64,36 +84,77 @@ fn tailnet_url(s: &TailscaleStatus) -> Result<&str, String> {
         }
         _ => return Err("Tailscale is not running yet: see `thurm tailscale status`".into()),
     }
-    match (&s.https.state, &s.url) {
-        (HttpsState::Ready, Some(url)) => Ok(url),
-        _ => Err("HTTPS is not ready on the tailnet yet: `thurm tailscale status` says why".into()),
+    let wss = match (&s.https.state, &s.url) {
+        (HttpsState::Ready, Some(url)) => Some(url.clone()),
+        _ => None,
+    };
+    let plain = plain_urls(s);
+    if wss.is_none() && plain.is_empty() {
+        return Err(
+            "no address for the phone yet: HTTPS is not ready on the tailnet (`thurm tailscale status` says why), \
+             and no plain endpoint is listening. Set `tailscale.plain_listen` (e.g. \":7297\") for a tailnet \
+             without HTTPS, such as a headscale, or `tailscale.host_listen` to use this machine's own Tailscale"
+                .into(),
+        );
     }
+    Ok(Routes { wss, plain })
+}
+
+/// The plain endpoints of the node and of this host's own Tailscale, each once, IP literals
+/// before names.
+fn plain_urls(s: &TailscaleStatus) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    for url in s.node_urls.iter().chain(&s.host_urls) {
+        if url.starts_with("ws://") && !urls.contains(url) {
+            urls.push(url.clone());
+        }
+    }
+    let (ips, names): (Vec<String>, Vec<String>) = urls
+        .into_iter()
+        .partition(|url| ws_host(url).parse::<std::net::IpAddr>().is_ok());
+    ips.into_iter().chain(names).collect()
+}
+
+/// The host of a `ws://` or `wss://` address, without its port or path (an IPv6 literal without
+/// its brackets).
+fn ws_host(url: &str) -> &str {
+    let rest = url.trim_start_matches("wss://").trim_start_matches("ws://");
+    if let Some(v6) = rest.strip_prefix('[') {
+        return v6.split(']').next().unwrap_or_default();
+    }
+    rest.split(['/', ':']).next().unwrap_or_default()
 }
 
 /// The host's tailnet name: the iOS app shows it, and needs a host in every entry.
-fn host_of(s: &TailscaleStatus, url: &str) -> String {
+fn host_of(s: &TailscaleStatus, route: &str) -> String {
     match &s.dns_name {
         Some(dns) if !dns.is_empty() => dns.trim_end_matches('.').to_owned(),
-        _ => url
-            .trim_start_matches("wss://")
-            .split(['/', ':'])
-            .next()
-            .unwrap_or_default()
-            .to_owned(),
+        _ => ws_host(route).to_owned(),
     }
 }
 
-/// What the code carries (`PairingPayload` in the iOS app): this host over Tailscale only, and
-/// the push relay when this host's config has one.
-fn payload(name: &str, host: &str, user: &str, url: &str, push: &PushConfig) -> serde_json::Value {
+/// What the code carries (`PairingPayload` in the iOS app): this host's routes, and the push
+/// relay when this host's config has one. `tailnet_plain` is only there with plain routes.
+fn payload(
+    name: &str,
+    host: &str,
+    user: &str,
+    routes: &Routes,
+    push: &PushConfig,
+) -> serde_json::Value {
     let mut d = serde_json::json!({
         "v": 1,
         "name": name,
         "host": host,
         "user": user,
         "host_keys": [],
-        "tailnet": { "url": url },
     });
+    if let Some(url) = &routes.wss {
+        d["tailnet"] = serde_json::json!({ "url": url });
+    }
+    if !routes.plain.is_empty() {
+        d["tailnet_plain"] = routes.plain.clone().into();
+    }
     if !push.relay.is_empty() {
         d["relay"] = push.relay.clone().into();
         if !push.code.is_empty() {
@@ -180,26 +241,104 @@ mod tests {
     }
 
     #[test]
-    fn pairs_only_once_serving_https() {
+    fn pairs_only_once_serving_https_or_plain() {
         let s = serving();
         assert_eq!(
-            tailnet_url(&s).unwrap(),
-            "wss://bastion.tail1234.ts.net/v1/connect"
+            routes(&s).unwrap().wss.as_deref(),
+            Some("wss://bastion.tail1234.ts.net/v1/connect")
         );
         let mut provisioning = serving();
         provisioning.https.state = HttpsState::Provisioning;
-        assert!(tailnet_url(&provisioning).unwrap_err().contains("HTTPS"));
+        let err = routes(&provisioning).err().unwrap();
+        assert!(err.contains("HTTPS"), "{err}");
+        assert!(err.contains("tailscale.plain_listen"), "{err}");
+        assert!(err.contains("tailscale.host_listen"), "{err}");
         let off = TailscaleStatus::default();
-        assert!(
-            tailnet_url(&off)
-                .unwrap_err()
-                .contains("thurm tailscale on")
-        );
+        assert!(routes(&off).err().unwrap().contains("thurm tailscale on"));
         let login = TailscaleStatus {
             state: TailscaleState::NeedsLogin,
             ..Default::default()
         };
-        assert!(tailnet_url(&login).unwrap_err().contains("sign"));
+        assert!(routes(&login).err().unwrap().contains("sign"));
+    }
+
+    #[test]
+    fn plain_routes_pair_without_https() {
+        let s = TailscaleStatus {
+            https: TailscaleHttps {
+                state: HttpsState::CertsOff,
+                error: None,
+            },
+            url: None,
+            dns_name: Some("bastion.hs.example.".into()),
+            host_urls: vec![
+                "ws://bastion.hs.example:7297/v1/connect".into(),
+                "ws://100.64.0.7:7297/v1/connect".into(),
+            ],
+            node_urls: vec![
+                "ws://100.64.0.9:7297/v1/connect".into(),
+                "ws://100.64.0.7:7297/v1/connect".into(),
+                "ws://thurm.hs.example:7297/v1/connect".into(),
+            ],
+            ..serving()
+        };
+        let r = routes(&s).unwrap();
+        assert!(r.wss.is_none());
+        assert_eq!(
+            r.plain,
+            [
+                "ws://100.64.0.9:7297/v1/connect",
+                "ws://100.64.0.7:7297/v1/connect",
+                "ws://thurm.hs.example:7297/v1/connect",
+                "ws://bastion.hs.example:7297/v1/connect",
+            ]
+        );
+        let p = payload(
+            "bastion",
+            "bastion.hs.example",
+            "me",
+            &r,
+            &PushConfig::default(),
+        );
+        assert!(p.get("tailnet").is_none());
+        assert_eq!(p["tailnet_plain"][0], "ws://100.64.0.9:7297/v1/connect");
+        assert_eq!(p["tailnet_plain"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn both_routes_are_carried() {
+        let mut s = serving();
+        s.host_urls = vec!["ws://100.64.0.7:7297/v1/connect".into()];
+        let r = routes(&s).unwrap();
+        let p = payload("bastion", "bastion", "me", &r, &PushConfig::default());
+        assert_eq!(
+            p["tailnet"]["url"],
+            "wss://bastion.tail1234.ts.net/v1/connect"
+        );
+        assert_eq!(
+            p["tailnet_plain"],
+            serde_json::json!(["ws://100.64.0.7:7297/v1/connect"])
+        );
+    }
+
+    #[test]
+    fn payload_without_plain_routes_has_no_plain_key() {
+        let r = routes(&serving()).unwrap();
+        let p = payload("bastion", "bastion", "me", &r, &PushConfig::default());
+        assert!(p.get("tailnet_plain").is_none());
+    }
+
+    #[test]
+    fn ws_host_is_the_bare_address() {
+        assert_eq!(
+            ws_host("ws://[fd7a:115c::1]:7297/v1/connect"),
+            "fd7a:115c::1"
+        );
+        assert_eq!(ws_host("ws://100.64.0.7:7297/v1/connect"), "100.64.0.7");
+        assert_eq!(
+            ws_host("wss://bastion.tail1234.ts.net/v1/connect"),
+            "bastion.tail1234.ts.net"
+        );
     }
 
     #[test]
@@ -217,6 +356,10 @@ mod tests {
             host_of(&no_dns, "wss://bastion.tail1234.ts.net/v1/connect"),
             "bastion.tail1234.ts.net"
         );
+        assert_eq!(
+            host_of(&no_dns, "ws://100.64.0.7:7297/v1/connect"),
+            "100.64.0.7"
+        );
     }
 
     /// What the iOS app's `PairingPayload.parse` reads: v 1, a host, a user, and a tailnet
@@ -224,11 +367,15 @@ mod tests {
     #[test]
     fn link_carries_the_tailnet_address() {
         let url = "wss://bastion.tail1234.ts.net/v1/connect";
+        let routes = Routes {
+            wss: Some(url.into()),
+            plain: Vec::new(),
+        };
         let p = payload(
             "bastion",
             "bastion.tail1234.ts.net",
             "me",
-            url,
+            &routes,
             &PushConfig::default(),
         );
         let l = link(&p);
@@ -255,13 +402,11 @@ mod tests {
             relay: "https://push.example".into(),
             code: "abc".into(),
         };
-        let p = payload(
-            "bastion",
-            "bastion",
-            "me",
-            "wss://bastion/v1/connect",
-            &push,
-        );
+        let routes = Routes {
+            wss: Some("wss://bastion/v1/connect".into()),
+            plain: Vec::new(),
+        };
+        let p = payload("bastion", "bastion", "me", &routes, &push);
         assert_eq!(p["relay"], "https://push.example");
         assert_eq!(p["code"], "abc");
         let no_code = PushConfig {
@@ -269,7 +414,7 @@ mod tests {
             ..push
         };
         assert!(
-            payload("b", "b", "me", "wss://b/v1/connect", &no_code)
+            payload("b", "b", "me", &routes, &no_code)
                 .get("code")
                 .is_none()
         );

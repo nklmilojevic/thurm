@@ -19,6 +19,10 @@ struct TailscaleStatus: Equatable {
     var https: String
     var httpsError: String?
     var hostURLs: [String]
+    /// Plain endpoints of the node, while its HTTPS is off (`ws://…/v1/connect`).
+    var nodeURLs: [String]
+    /// The coordination server the node signs in to; empty is Tailscale's.
+    var controlURL: String
     var serveSocket: String?
 
     init?(json: Any?) {
@@ -38,6 +42,8 @@ struct TailscaleStatus: Equatable {
         self.https = jsonString(https?["state"]) ?? "unavailable"
         httpsError = jsonString(https?["error"])
         hostURLs = d["host_urls"] as? [String] ?? []
+        nodeURLs = d["node_urls"] as? [String] ?? []
+        controlURL = jsonString(d["control_url"]) ?? ""
         serveSocket = jsonString(d["serve_socket"])
     }
 
@@ -71,6 +77,16 @@ struct TailscaleStatus: Equatable {
 
     /// The phone connects here: the node's own address, once it serves HTTPS.
     var pairingURL: String? { state == "running" && https == "ready" ? url : nil }
+
+    /// The plain endpoints the phone can connect to, while running.
+    var pairingPlain: [String] { state == "running" ? PhonePairing.plainRoutes(nodeURLs + hostURLs) : [] }
+
+    /// A coordination server other than Tailscale's, such as a headscale: its admin pages are not
+    /// Tailscale's.
+    var hasCustomControl: Bool { !controlURL.isEmpty }
+
+    /// What the admin pages are called in the copy.
+    var serverName: String { hasCustomControl ? "your coordination server" : "Tailscale" }
 
     /// The line under the label: who may connect once serving, or what is in the way.
     var detail: String? {
@@ -228,9 +244,9 @@ final class TailscaleService: ObservableObject {
                                       body: "Thurm needs you to sign in before your devices can reach \(s.hostname) over the tailnet.",
                                       url: s.authURL)
         case "needs_machine_auth":
-            Notifications.shared.post(id: "tailscale", title: "Approve \(s.hostname) in Tailscale",
+            Notifications.shared.post(id: "tailscale", title: "Approve \(s.hostname) in \(s.serverName)",
                                       body: "Your tailnet requires an admin to approve new devices.",
-                                      url: URL(string: "https://login.tailscale.com/admin/machines"))
+                                      url: s.hasCustomControl ? nil : URL(string: "https://login.tailscale.com/admin/machines"))
         default:
             Notifications.shared.post(id: "tailscale", title: "Tailscale stopped",
                                       body: s.error ?? "Thurm stopped serving over Tailscale.", url: nil)
@@ -325,18 +341,26 @@ struct TailscaleRows: View {
         if let account = s.account, s.state == "running" {
             LabeledContent("Account", value: account)
         }
+        if s.hasCustomControl {
+            LabeledContent("Coordination server", value: s.controlURL)
+        }
         if s.https == "magic_dns_off" || s.https == "certs_off" {
             LabeledContent {
-                Button("Open DNS Settings") {
-                    NSWorkspace.shared.open(URL(string: "https://login.tailscale.com/admin/dns")!)
+                if !s.hasCustomControl {
+                    Button("Open DNS Settings") {
+                        NSWorkspace.shared.open(URL(string: "https://login.tailscale.com/admin/dns")!)
+                    }
                 }
             } label: {
                 Text(s.https == "magic_dns_off"
-                     ? "Turn on MagicDNS for your tailnet so the phone can reach this Mac by name."
-                     : "Turn on HTTPS certificates for your tailnet so the phone can connect securely.")
+                     ? "Turn on MagicDNS on \(s.serverName) so the phone can reach this Mac by name."
+                     : "Turn on HTTPS certificates on \(s.serverName) so the phone can connect securely.")
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+        ForEach(s.nodeURLs, id: \.self) { url in
+            LabeledContent("Plain address", value: url)
         }
         ForEach(s.hostURLs, id: \.self) { url in
             LabeledContent("Through this Mac's Tailscale", value: url)
@@ -355,8 +379,10 @@ struct TailscaleRows: View {
         case "needs_login":
             Button(s.authURL == nil ? "Sign In\u{2026}" : "Open Sign-In Page") { service.signIn() }
         case "needs_machine_auth":
-            Button("Open Machines") {
-                NSWorkspace.shared.open(URL(string: "https://login.tailscale.com/admin/machines")!)
+            if !s.hasCustomControl {
+                Button("Open Machines") {
+                    NSWorkspace.shared.open(URL(string: "https://login.tailscale.com/admin/machines")!)
+                }
             }
         default:
             EmptyView()
