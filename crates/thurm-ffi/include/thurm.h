@@ -554,6 +554,16 @@ thurm_client *thurm_tailnet_connect_fd(int fd, const char *url, const char *clie
                                        thurm_event_cb on_event, thurm_frame_cb on_frame, void *ctx,
                                        char **err);
 
+/* Like thurm_tailnet_connect_fd, but `url` may be ws:// as well as wss://: for a daemon
+ * whose plain listener (tailscale.plain_listen) the tailnet's WireGuard reaches, such as a
+ * headscale node without HTTPS certificates. WireGuard encrypts that hop and the daemon
+ * admits the caller by its tailnet identity, so the socket and ownership are as for
+ * thurm_tailnet_connect_fd: `fd` is taken over, and closed when the connection ends or at
+ * once when connecting fails. Only pass a socket that the tailnet dialed to the URL's host. */
+thurm_client *thurm_tailnet_connect_plain_fd(int fd, const char *url, const char *client_name,
+                                             thurm_event_cb on_event, thurm_frame_cb on_frame,
+                                             void *ctx, char **err);
+
 /* Connect to a host without Thurm: a daemon in the app serves it, whose panes are shells on
  * the host (CreatePane opens one), over mosh or ssh. `target_json`:
  *   {"host":"server.example.com","port":22,"user":"me","host_keys":["SHA256:..."],

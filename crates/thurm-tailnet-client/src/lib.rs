@@ -147,6 +147,28 @@ pub fn connect_fd(
     )
 }
 
+/// Like [`connect_fd`], but `url` may be `ws://`: the caller vouches that `fd` reaches its host
+/// through WireGuard (see [`open_tailnet_fd`]).
+pub fn connect_tailnet_fd(
+    fd: OwnedFd,
+    url: &str,
+    client_name: &str,
+    capabilities: &[&str],
+    on_event: impl Fn(Event) + Send + 'static,
+    on_disconnect: impl FnOnce() + Send + 'static,
+) -> Result<Remote, ConnectError> {
+    let deadline = std::time::Instant::now() + LIMITS.connect;
+    let opened = open_tailnet_fd(fd, url, LIMITS.connect)?;
+    hello(
+        opened,
+        deadline,
+        client_name,
+        capabilities,
+        on_event,
+        on_disconnect,
+    )
+}
+
 fn connect_with(
     url: &str,
     client_name: &str,
