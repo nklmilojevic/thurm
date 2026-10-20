@@ -74,6 +74,11 @@ struct Agent {
     installer: Option<&'static str>,
 }
 
+/// What lingering off costs: the daemon ends with the last session (the fix is `loginctl
+/// enable-linger`).
+pub const LINGER_OFF: &str =
+    "the daemon's socket goes away when your last session on the host ends";
+
 const AGENTS: &[Agent] = &[
     Agent {
         kind: "claude",
@@ -392,8 +397,7 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
         Some("yes") => {}
         Some(_) => {
             c.state = State::Fail;
-            c.detail =
-                "off: the daemon's socket goes away when your last session on the host ends".into();
+            c.detail = format!("off: {LINGER_OFF}");
             c.fix = offer("Enable");
             c.terminal = Some(format!("sudo loginctl enable-linger {user}"));
         }

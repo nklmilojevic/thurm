@@ -457,6 +457,51 @@ fn mosh_without_udp_falls_back_to_ssh() {
 }
 
 #[test]
+fn mosh_and_ssh_both_failing_says_both() {
+    let (fake, _silent) = silent_mosh_server("silent-both");
+    let key = TestKey::new(1);
+    let server = serve_with(
+        &key,
+        Options {
+            no_pty: true,
+            ..Default::default()
+        },
+    );
+    let mut t = direct_target(&server, Mode::Mosh);
+    t.mosh_server = Some(fake.clone());
+    let (stream, _direct) = super::serve(t, key).unwrap();
+    let client = Client::from_stream(
+        stream,
+        "ios-test",
+        false,
+        &[thurm_proto::CAP_MOBILE],
+        |_| {},
+        || {},
+    )
+    .unwrap();
+    let req = CreatePane {
+        command: None,
+        cwd: None,
+        env: vec![],
+        size: size(80, 24),
+        agent_preset: None,
+        inherit_cwd_from: None,
+        hold: false,
+        fork_from: None,
+    };
+    match client.request(Request::CreatePane(req)) {
+        Err(e) => {
+            let e = e.to_string();
+            assert!(e.starts_with("mosh: "), "{e}");
+            assert!(e.contains("; then ssh: "), "{e}");
+            assert!(e.contains("refused a terminal"), "{e}");
+        }
+        Ok(r) => panic!("{r:?}"),
+    }
+    let _ = std::fs::remove_file(fake);
+}
+
+#[test]
 fn mosh_only_without_udp_fails_the_pane() {
     let (fake, _silent) = silent_mosh_server("silent-only");
     let key = TestKey::new(1);

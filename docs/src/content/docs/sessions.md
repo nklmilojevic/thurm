@@ -59,7 +59,11 @@ thurm daemon install-systemd     # Linux
 `install-launchd` installs a per-user LaunchAgent to start the daemon at login.
 Use `thurm daemon uninstall-launchd` to remove it. On Linux, `install-systemd`
 writes and enables a systemd user unit (`~/.config/systemd/user/thurmd.service`)
-instead; `thurm daemon uninstall-systemd` removes it.
+instead, and starts it when no daemon is running; `thurm daemon uninstall-systemd`
+removes it. The unit is not restarted when it stops, so `thurm daemon stop` holds
+until the next login. Lingering (`loginctl enable-linger`) keeps the daemon up
+after you log out; `install-systemd` warns when it is off. See
+[Linux server](/linux-server/).
 
 `upgrade` replaces an older daemon with the installed binary. Compatible
 versions transfer terminal state and open process handles so that programs
