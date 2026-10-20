@@ -80,6 +80,11 @@ pub struct TailscaleStatus {
     pub url: Option<String>,
     /// Endpoints served through this host's own Tailscale (`ws://100.x.y.z:7297/v1/connect`).
     pub host_urls: Vec<String>,
+    /// Plain endpoints of the embedded node while its HTTPS is off: `ws://100.x.y.z:7297/v1/connect`,
+    /// then `ws://<dns_name>:7297/v1/connect`.
+    pub node_urls: Vec<String>,
+    /// The coordination server the node signs in to; empty is Tailscale's.
+    pub control_url: String,
     /// The Unix socket served for `tailscale serve`, when on.
     pub serve_socket: Option<String>,
 }
@@ -285,6 +290,7 @@ mod tests {
             assert_eq!(s.state, TailscaleState::Running);
             assert_eq!(s.https.state, HttpsState::Unavailable);
             assert_eq!(s.host_urls.len(), 1);
+            assert!(s.node_urls.is_empty() && s.control_url.is_empty());
         }
     }
 

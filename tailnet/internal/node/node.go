@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,6 +39,11 @@ type Config struct {
 	// Tags and AuthKey only matter when the node enrolls.
 	Tags    []string
 	AuthKey string
+	// ControlURL is the coordination server; empty is Tailscale's.
+	ControlURL string
+	// PlainListen is ":port" or "addr:port" for a plain (unencrypted) listener, used while
+	// HTTPS is off. Empty is off.
+	PlainListen string
 }
 
 // Node holds the tsnet server while serving is on.
@@ -46,7 +52,7 @@ type Node struct {
 	Dial     func(ctx context.Context) (net.Conn, error)
 	Logf     func(format string, args ...any)
 	OnChange func()
-	// ControlURL is the coordination server; empty is Tailscale's. Tests set their own.
+	// ControlURL overrides the configured coordination server; tests set their own.
 	ControlURL string
 
 	mu      sync.Mutex
@@ -55,6 +61,7 @@ type Node struct {
 	lc      *local.Client
 	cancel  context.CancelFunc
 	ln      net.Listener
+	plainLn net.Listener
 	gw      *gateway.Gateway
 	gen     int
 	backend string
@@ -72,13 +79,28 @@ func (n *Node) changed() {
 	}
 }
 
-// Enable starts the node, or applies cfg to the running one (rename, who it admits).
+// coordination is the coordination server cfg signs in to; empty is Tailscale's.
+func (n *Node) coordination(cfg Config) string {
+	if n.ControlURL != "" {
+		return n.ControlURL
+	}
+	return cfg.ControlURL
+}
+
+// Enable starts the node, or applies cfg to the running one (rename, who it admits). A change of
+// coordination server or plain listener restarts the node, which stays signed in.
 func (n *Node) Enable(cfg Config) error {
 	if !status.ValidHostname(cfg.Hostname) {
 		return fmt.Errorf("invalid tailnet hostname %q: one DNS label of 1 to 63 letters, digits or hyphens", cfg.Hostname)
 	}
 	if len(cfg.Tags) > 0 && !cfg.AllowMembers {
 		return errors.New("tailscale: advertising tags gives this node a machine identity with no owner, so owner-only access would admit nobody. Allow tailnet members or drop the tags")
+	}
+	n.mu.Lock()
+	restart := n.srv != nil && (n.coordination(cfg) != n.coordination(n.cfg) || cfg.PlainListen != n.cfg.PlainListen)
+	n.mu.Unlock()
+	if restart {
+		n.Disable()
 	}
 	n.mu.Lock()
 	if n.srv != nil {
@@ -113,7 +135,7 @@ func (n *Node) Enable(cfg Config) error {
 	}
 	srv := &tsnet.Server{
 		Dir:           n.Dir,
-		ControlURL:    n.ControlURL,
+		ControlURL:    n.coordination(cfg),
 		Hostname:      cfg.Hostname,
 		AuthKey:       cfg.AuthKey,
 		AdvertiseTags: cfg.Tags,
@@ -178,8 +200,8 @@ func (n *Node) serveBrowser() {
 // is kept), so the next Enable needs no sign-in.
 func (n *Node) Disable() {
 	n.mu.Lock()
-	srv, ln, gw, cancel := n.srv, n.ln, n.gw, n.cancel
-	n.srv, n.lc, n.ln, n.gw, n.cancel, n.st = nil, nil, nil, nil, nil, nil
+	srv, ln, plain, gw, cancel := n.srv, n.ln, n.plainLn, n.gw, n.cancel
+	n.srv, n.lc, n.ln, n.plainLn, n.gw, n.cancel, n.st = nil, nil, nil, nil, nil, nil, nil
 	n.backend, n.authURL, n.errMsg = "", "", ""
 	n.https = status.HTTPS{State: "unavailable"}
 	n.gen++
@@ -190,6 +212,9 @@ func (n *Node) Disable() {
 	cancel()
 	if ln != nil {
 		ln.Close()
+	}
+	if plain != nil {
+		plain.Close()
 	}
 	gw.CloseAll("tailscale serving turned off")
 	srv.Close()
@@ -212,13 +237,13 @@ func (n *Node) Login(ctx context.Context) error {
 // that is off but signed in is started, without serving, to sign it out.
 func (n *Node) Logout(ctx context.Context) error {
 	n.mu.Lock()
-	lc, hostname := n.lc, n.cfg.Hostname
+	lc, cfg := n.lc, n.cfg
 	n.mu.Unlock()
 	if lc == nil {
 		if _, err := os.Stat(filepath.Join(n.Dir, "tailscaled.state")); errors.Is(err, os.ErrNotExist) {
 			return nil // never signed in
 		}
-		srv := &tsnet.Server{Dir: n.Dir, Hostname: hostname, UserLogf: n.userLogf, Logf: func(string, ...any) {}}
+		srv := &tsnet.Server{Dir: n.Dir, Hostname: cfg.Hostname, ControlURL: n.coordination(cfg), UserLogf: n.userLogf, Logf: func(string, ...any) {}}
 		if err := srv.Start(); err != nil {
 			return fmt.Errorf("signing out of Tailscale: starting the node: %w", err)
 		}
@@ -312,6 +337,7 @@ func (n *Node) Status(s *status.Status) {
 	defer n.mu.Unlock()
 	s.Hostname = n.cfg.Hostname
 	s.AllowTailnetMembers = n.cfg.AllowMembers
+	s.ControlURL = n.coordination(n.cfg)
 	if n.srv == nil {
 		// Never enabled leaves n.https empty, which the daemon can't read.
 		s.State = "off"
@@ -340,6 +366,9 @@ func (n *Node) Status(s *status.Status) {
 				url := "wss://" + name + gateway.ConnectPath
 				s.URL = &url
 			}
+		}
+		if n.plainLn != nil {
+			s.NodeURLs = plainURLs(n.cfg.PlainListen, st.Self.TailscaleIPs, strings.TrimSuffix(st.Self.DNSName, "."))
 		}
 		if st.Self.Tags != nil {
 			s.Tags = st.Self.Tags.AsSlice()
@@ -489,13 +518,14 @@ func (n *Node) askLogin(ctx context.Context, gen int, lc *local.Client) {
 // bindTLS serves the gateway over HTTPS once the tailnet allows it, reporting why not
 // otherwise; it's tried again on the next state change.
 func (n *Node) bindTLS(ctx context.Context, gen int, st *ipnstate.Status) {
+	where := n.adminWhere()
 	https := status.HTTPS{State: "provisioning"}
 	switch {
 	case st.CurrentTailnet == nil || !st.CurrentTailnet.MagicDNSEnabled:
-		msg := "MagicDNS is off for this tailnet. Turn it on under DNS in the Tailscale admin console."
+		msg := "MagicDNS is off for this tailnet. Turn it on " + where + "."
 		https = status.HTTPS{State: "magic_dns_off", Error: &msg}
 	case len(st.CertDomains) == 0:
-		msg := "HTTPS certificates are off for this tailnet. Turn them on under DNS in the Tailscale admin console."
+		msg := "HTTPS certificates are off for this tailnet. Turn them on " + where + "."
 		https = status.HTTPS{State: "certs_off", Error: &msg}
 	}
 	n.mu.Lock()
@@ -507,6 +537,7 @@ func (n *Node) bindTLS(ctx context.Context, gen int, st *ipnstate.Status) {
 	srv, gw, lc := n.srv, n.gw, n.lc
 	n.mu.Unlock()
 	if https.State != "provisioning" {
+		n.bindPlain(gen, srv, gw)
 		return
 	}
 	ln, err := srv.ListenTLS("tcp", ":443")
@@ -542,6 +573,82 @@ func (n *Node) bindTLS(ctx context.Context, gen int, st *ipnstate.Status) {
 		}
 		n.setHTTPS(gen, status.HTTPS{State: "ready"})
 	}()
+}
+
+// adminWhere names where a tailnet's settings are changed, for the status texts.
+func (n *Node) adminWhere() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.coordination(n.cfg) != "" {
+		return "on your coordination server"
+	}
+	return "under DNS in the Tailscale admin console"
+}
+
+// bindPlain serves the gateway on plain_listen while HTTPS is off. The tailnet's WireGuard
+// already encrypts the hop, and the gateway admits callers by WhoIs as it does on HTTPS.
+func (n *Node) bindPlain(gen int, srv *tsnet.Server, gw *gateway.Gateway) {
+	n.mu.Lock()
+	listen := n.cfg.PlainListen
+	skip := listen == "" || n.plainLn != nil || gen != n.gen
+	n.mu.Unlock()
+	if skip {
+		return
+	}
+	ln, err := srv.Listen("tcp", listen)
+	if err != nil {
+		n.fail(gen, fmt.Sprintf("listening on the tailnet at %s: %v", listen, err))
+		return
+	}
+	n.Logf("tailnet plain listener ready on %s", listen)
+	n.servePlain(gen, ln, gw)
+}
+
+// servePlain serves gw on ln until the node turns off or ln is closed; a listener from a node
+// that is already gone is closed at once.
+func (n *Node) servePlain(gen int, ln net.Listener, gw *gateway.Gateway) {
+	n.mu.Lock()
+	if gen != n.gen || n.plainLn != nil {
+		n.mu.Unlock()
+		ln.Close()
+		return
+	}
+	n.plainLn = ln
+	n.mu.Unlock()
+	n.changed()
+	go func() {
+		if err := gw.Serve(ln); err != nil {
+			n.Logf("tailscale: serving the plain listener: %v", err)
+		}
+	}()
+}
+
+// plainURLs are the addresses the plain listener answers on: the IP literals first, then the
+// MagicDNS name. listen is ":port" (every tailnet IPv4 address) or "addr:port".
+func plainURLs(listen string, ips []netip.Addr, dnsName string) []string {
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return nil
+	}
+	host, _, _ := net.SplitHostPort(listen)
+	var hosts []string
+	if host == "" {
+		for _, ip := range ips {
+			if ip.Is4() {
+				hosts = append(hosts, ip.String())
+			}
+		}
+	} else {
+		hosts = append(hosts, host)
+	}
+	if dnsName != "" {
+		hosts = append(hosts, dnsName)
+	}
+	urls := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		urls = append(urls, "ws://"+net.JoinHostPort(h, port)+gateway.ConnectPath)
+	}
+	return urls
 }
 
 func (n *Node) setHTTPS(gen int, h status.HTTPS) {

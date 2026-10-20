@@ -25,6 +25,8 @@ type Status struct {
 	HTTPS               HTTPS    `json:"https"`
 	URL                 *string  `json:"url"`
 	HostURLs            []string `json:"host_urls"`
+	NodeURLs            []string `json:"node_urls"`
+	ControlURL          string   `json:"control_url"`
 	ServeSocket         *string  `json:"serve_socket"`
 }
 

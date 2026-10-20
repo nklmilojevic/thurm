@@ -285,6 +285,13 @@ serve_socket = false
 # Serve the browser client on the node's HTTPS address, at https://HOSTNAME.YOUR-TAILNET.ts.net/.
 # Needs enabled.
 web = false
+# A coordination server to sign in to instead of Tailscale's, e.g. a headscale:
+# "https://headscale.example.com". Empty is Tailscale's. Changing it signs the node in again.
+control_url = ""
+# While the node has no HTTPS (MagicDNS or certificates off, as on headscale), listen on this
+# tailnet address without TLS, e.g. ":7297". The tailnet's WireGuard encrypts the hop, and the
+# same caller checks apply. Empty is off.
+plain_listen = ""
 
 [updates]
 # "release" (tagged releases), "tip" (a build of every commit to main), or "auto": the

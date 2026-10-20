@@ -293,6 +293,11 @@ auth_key_file = ""
 # Also listen on this machine's tailnet addresses through its own Tailscale.
 host_listen = ""
 # host_listen = ":7297"
+# A coordination server other than Tailscale's, such as a headscale.
+# control_url = "https://headscale.example.com"
+# Without HTTPS (no MagicDNS or certificates, as on headscale), listen on a tailnet address
+# without TLS.
+# plain_listen = ":7297"
 # With host_listen: admit every identified caller, not only this machine's owner.
 host_allow_identified = false
 # A socket for `tailscale serve` to proxy to.
