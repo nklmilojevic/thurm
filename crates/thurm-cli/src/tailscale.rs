@@ -148,6 +148,12 @@ fn describe(s: &TailscaleStatus, browser: bool) -> String {
     for url in &s.host_urls {
         out.push_str(&format!("connect (this host's Tailscale): {url}\n"));
     }
+    for url in &s.node_urls {
+        out.push_str(&format!("connect (plain, over the tailnet): {url}\n"));
+    }
+    if !s.control_url.is_empty() {
+        out.push_str(&format!("coordination server: {}\n", s.control_url));
+    }
     if let Some(sock) = &s.serve_socket {
         out.push_str(&format!(
             "tailscale serve: tailscale serve --bg unix:{sock}\n"
@@ -301,6 +307,43 @@ mod tests {
         // Not before HTTPS is ready: the node doesn't serve the page yet.
         let waiting = TailscaleStatus { url: None, ..s };
         assert!(!describe(&waiting, true).contains("browser:"));
+    }
+
+    #[test]
+    fn describes_a_plain_only_node() {
+        let s = TailscaleStatus {
+            state: TailscaleState::Running,
+            hostname: "thurm".into(),
+            https: thurm_proto::tailnet::TailscaleHttps {
+                state: HttpsState::CertsOff,
+                error: None,
+            },
+            node_urls: vec![
+                "ws://100.64.0.7:7297/v1/connect".into(),
+                "ws://thurm.hs.example:7297/v1/connect".into(),
+            ],
+            control_url: "https://headscale.example".into(),
+            ..Default::default()
+        };
+        let text = describe(&s, false);
+        assert!(
+            text.contains("connect (plain, over the tailnet): ws://100.64.0.7:7297/v1/connect\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "connect (plain, over the tailnet): ws://thurm.hs.example:7297/v1/connect\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("coordination server: https://headscale.example\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("connect: "),
+            "no wss address without HTTPS: {text}"
+        );
     }
 
     #[test]
