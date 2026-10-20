@@ -78,6 +78,9 @@ struct TailscaleStatus: Equatable {
     /// The phone connects here: the node's own address, once it serves HTTPS.
     var pairingURL: String? { state == "running" && https == "ready" ? url : nil }
 
+    /// The phone can reach this Mac over Tailscale, by HTTPS or a plain endpoint.
+    var hasTailnetRoute: Bool { pairingURL != nil || !pairingPlain.isEmpty }
+
     /// The plain endpoints the phone can connect to, while running.
     var pairingPlain: [String] { state == "running" ? PhonePairing.plainRoutes(nodeURLs + hostURLs) : [] }
 

@@ -337,6 +337,16 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertEqual(host.payload["tailnet_plain"] as? [String], ["ws://100.64.0.7:7297/v1/connect"])
     }
 
+    func testAPlainRouteCountsAsATailnetRoute() throws {
+        var json: [String: Any] = [
+            "state": "running", "hostname": "thurm", "https": ["state": "certs_off"], "url": NSNull(),
+            "host_urls": ["ws://100.64.0.7:7297/v1/connect"], "tags": [] as [String],
+        ]
+        XCTAssertTrue(try XCTUnwrap(TailscaleStatus(json: json)).hasTailnetRoute)
+        json["host_urls"] = [] as [String]
+        XCTAssertFalse(try XCTUnwrap(TailscaleStatus(json: json)).hasTailnetRoute)
+    }
+
     func testTailscaleStatusOnAnotherCoordinationServer() throws {
         var json: [String: Any] = [
             "state": "running", "hostname": "thurm", "https": ["state": "unavailable"],

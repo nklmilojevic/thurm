@@ -391,7 +391,7 @@ struct PairPhoneSheet: View {
                     .foregroundStyle(.secondary)
             }
             if remoteLogin == false {
-                Label(tailscale.status?.pairingURL == nil
+                Label(tailscale.status?.hasTailnetRoute != true
                       ? "Remote Login is off. Turn it on in System Settings › General › Sharing so the app can connect."
                       : "Remote Login is off: the app has no fallback when Tailscale is off on the phone.",
                       systemImage: "exclamationmark.triangle")
@@ -403,7 +403,7 @@ struct PairPhoneSheet: View {
                     .foregroundStyle(.secondary)
             }
             if hostKeys.isEmpty {
-                if tailscale.status?.pairingURL == nil {
+                if tailscale.status?.hasTailnetRoute != true {
                     Label("This Mac's ssh host keys could not be read (/etc/ssh).", systemImage: "xmark.octagon")
                         .foregroundStyle(.red)
                 } else {
