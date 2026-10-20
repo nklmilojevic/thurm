@@ -505,6 +505,46 @@ impl Vt {
         )
     }
 
+    /// Where leaving the alternate screen with DECSET 1049 would put the primary cursor (its
+    /// saved cursor, or the home position without one), as (column, row). Read on a snapshot
+    /// copy: switching screens carries or restores cursors.
+    pub fn saved_primary_cursor(&self) -> Option<(u16, u16)> {
+        let (mut buf, mut len) = (ptr::null_mut::<u8>(), 0usize);
+        let r = unsafe {
+            ffi::ghostty_snapshot_encode_alloc(self.raw, ptr::null(), &mut buf, &mut len)
+        };
+        if r != ffi::Result::SUCCESS {
+            return None;
+        }
+        let mut decoder: ffi::SnapshotDecoder = ptr::null_mut();
+        let mut copy: ffi::Terminal = ptr::null_mut();
+        let mut cursor = None;
+        unsafe {
+            if ffi::ghostty_snapshot_decoder_new_buf(ptr::null(), &mut decoder, buf, len)
+                == ffi::Result::SUCCESS
+            {
+                // Only the active screens: the history is not needed.
+                if ffi::ghostty_snapshot_decoder_ready(decoder, &mut copy) == ffi::Result::SUCCESS
+                    && !copy.is_null()
+                {
+                    let leave = b"\x1b[?1049l";
+                    ffi::ghostty_terminal_vt_write(copy, leave.as_ptr(), leave.len());
+                    let get = |data| {
+                        let mut v = 0u16;
+                        (ffi::ghostty_terminal_get(copy, data, (&mut v as *mut u16).cast())
+                            == ffi::Result::SUCCESS)
+                            .then_some(v)
+                    };
+                    cursor = get(ffi::TerminalData::CURSOR_X).zip(get(ffi::TerminalData::CURSOR_Y));
+                    ffi::ghostty_terminal_free(copy);
+                }
+                ffi::ghostty_snapshot_decoder_free(decoder);
+            }
+            ffi::ghostty_free(ptr::null(), buf, len);
+        }
+        cursor
+    }
+
     pub fn cursor_pending_wrap(&self) -> bool {
         self.get(ffi::TerminalData::CURSOR_PENDING_WRAP)
             .unwrap_or(false)

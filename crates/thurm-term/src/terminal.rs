@@ -2399,18 +2399,12 @@ impl Terminal {
         let alt = self.is_alt_screen();
         // The alternate screen: every row positioned explicitly.
         let alt_screen = alt.then(|| self.export_screen_exact());
-        // Mode 47 carries the cursor across each switch: keep the alternate screen's to put back.
-        let alt_cursor = alt.then(|| {
-            (
-                self.cursor_point(),
-                Pen::from_style(&self.vt.cursor_style()),
-                self.vt.mode(M_ORIGIN),
-            )
-        });
+        // Where leaving the alternate screen puts the cursor, for the copy to save on entering it.
+        let saved_cursor = alt.then(|| self.vt.saved_primary_cursor()).flatten();
         if alt {
-            // Look at the primary screen (mode 47 switches screens without clearing either),
-            // its cursor where entering the alternate screen saved it (where leaving restores it).
-            self.vt.write(b"\x1b[?47l\x1b8");
+            // Look at the primary screen (mode 47 switches screens without clearing either; it
+            // carries the cursor across, and back unchanged).
+            self.vt.write(b"\x1b[?47l");
         }
         let mut out = String::new();
         let history = self.vt.history() as i32;
@@ -2446,7 +2440,9 @@ impl Terminal {
                 out.push_str("\x1b]133;C\x07");
             }
         }
-        let primary_cursor = self.cursor_point();
+        let primary_cursor = saved_cursor
+            .map(|(col, row)| Point::new(row as i32, col as usize))
+            .unwrap_or_else(|| self.cursor_point());
         if let Some(alt_screen) = &alt_screen {
             // Back to the alternate screen, and have the copy switch to it (after saving the
             // primary cursor) and draw it.
@@ -2457,13 +2453,6 @@ impl Terminal {
             ));
             out.push_str("\x1b[?1049h");
             self.vt.write(b"\x1b[?47h");
-            if let Some((point, pen, origin)) = alt_cursor {
-                let mut seq = format!("\x1b[?6l\x1b[{};{}H", point.line + 1, point.col + 1);
-                SgrState::default().transition(&pen, &mut seq);
-                self.vt.write(seq.as_bytes());
-                // Directly: setting it with DECOM would home the cursor.
-                self.vt.set_mode(M_ORIGIN, origin);
-            }
             out.push_str(alt_screen);
         }
         self.collect_events();
