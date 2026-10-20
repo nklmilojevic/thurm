@@ -4,7 +4,7 @@ name: Release
 #   tip      nightly, or on demand (Actions › Release › Run workflow, or `gh workflow run Release`):
 #            the newest main commit that passed CI, as the rolling `tip` prerelease with
 #            <sparkle:channel>tip. Skipped when `tip` is already there or only docs/CI changed.
-#   release  a published GitHub release `vX.Y.Z` (gh release create vX.Y.Z): default channel
+#   release  a published GitHub release `vX.Y.Z` (`vesnik release --yes`): default channel
 # Both build Apple silicon only, sign with Developer ID, notarize, and upload to the GitHub
 # release. The build then starts pages.yml, which rebuilds the site (docs + appcast.xml from all releases, see
 # macos/release/appcast.py). One-time setup: macos/release/setup-github.sh.
@@ -272,12 +272,22 @@ jobs:
               echo "::error::Tag $TAG does not match the workspace version $VERSION in Cargo.toml. Bump it, merge, then tag v$VERSION."
               exit 1
             fi
-            # Only a commit that passed CI on main is released (like tip builds).
+            # Only a commit that passed CI on main is released (like tip builds). vesnik pushes
+            # the bump commit and publishes the release seconds later, so CI may still be running.
             SHA="$(git rev-parse HEAD)"
-            PASSED="$(gh run list --repo "$REPO" --workflow CI --commit "$SHA" --branch main --event push --status success \
-              --limit 1 --json headSha -q '.[0].headSha // empty')"
-            if [[ "$PASSED" != "$SHA" ]]; then
-              echo "::error::$TAG points at ${SHA:0:7}, which has not passed CI on main. Tag a green commit (gh release create $TAG --target <sha>)."
+            RUN=""
+            for _ in $(seq 1 30); do
+              RUN="$(gh run list --repo "$REPO" --workflow CI --commit "$SHA" --branch main --event push \
+                --limit 1 --json databaseId -q '.[0].databaseId // empty')"
+              [[ -n "$RUN" ]] && break
+              sleep 10
+            done
+            [[ -n "$RUN" ]] || { echo "::error::No CI run for ${SHA:0:7} on main after 5 minutes; $TAG was not built."; exit 1; }
+            # gh exits non-zero when the run fails; the conclusion below says why.
+            gh run watch "$RUN" --repo "$REPO" --exit-status --interval 30 >/dev/null 2>&1 || true
+            CONCLUSION="$(gh run view "$RUN" --repo "$REPO" --json conclusion -q .conclusion)"
+            if [[ "$CONCLUSION" != success ]]; then
+              echo "::error::CI ended with '${CONCLUSION:-no result}' on ${SHA:0:7}; $TAG was not built."
               exit 1
             fi
             CHANNEL=release
