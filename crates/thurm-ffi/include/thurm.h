@@ -526,8 +526,9 @@ typedef struct {
  *   {"host":"mac.tailnet.ts.net","port":22,"user":"me","host_keys":["SHA256:..."],
  *    "socket":null}
  * Blocks while connecting: call it off the main thread. Returns NULL on failure with `err`
- * set (free it); otherwise a client used like thurm_connect's. thurm_disconnect also closes
- * the ssh session. */
+ * set (free it): JSON {"kind","message"}, `kind` being "key_rejected" (the host does not have
+ * the device's key yet), "not_installed" (no thurm there) or "failed". Otherwise a client used
+ * like thurm_connect's. thurm_disconnect also closes the ssh session. */
 thurm_client *thurm_ssh_connect(const char *target_json, thurm_device_key key,
                                 const char *client_name, thurm_event_cb on_event,
                                 thurm_frame_cb on_frame, void *ctx, char **err);
@@ -553,6 +554,16 @@ thurm_client *thurm_tailnet_connect(const char *url, const char *client_name,
 thurm_client *thurm_tailnet_connect_fd(int fd, const char *url, const char *client_name,
                                        thurm_event_cb on_event, thurm_frame_cb on_frame, void *ctx,
                                        char **err);
+
+/* Like thurm_tailnet_connect_fd, but `url` may be ws:// as well as wss://: for a daemon
+ * whose plain listener (tailscale.plain_listen) the tailnet's WireGuard reaches, such as a
+ * headscale node without HTTPS certificates. WireGuard encrypts that hop and the daemon
+ * admits the caller by its tailnet identity, so the socket and ownership are as for
+ * thurm_tailnet_connect_fd: `fd` is taken over, and closed when the connection ends or at
+ * once when connecting fails. Only pass a socket that the tailnet dialed to the URL's host. */
+thurm_client *thurm_tailnet_connect_plain_fd(int fd, const char *url, const char *client_name,
+                                             thurm_event_cb on_event, thurm_frame_cb on_frame,
+                                             void *ctx, char **err);
 
 /* Connect to a host without Thurm: a daemon in the app serves it, whose panes are shells on
  * the host (CreatePane opens one), over mosh or ssh. `target_json`:

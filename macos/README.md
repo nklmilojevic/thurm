@@ -47,7 +47,7 @@ Pages, in two channels:
 
 | Channel | Gets | Published by |
 | --- | --- | --- |
-| **Release** (default) | tagged releases | `gh release create vX.Y.Z` (the tag must match `version` in `Cargo.toml`) |
+| **Release** (default) | tagged releases | `just release` (`vesnik release --yes`: bumps `Cargo.toml`, `Cargo.lock` and `Info.plist`, then publishes `vX.Y.Z`) |
 | **Tip** | the newest `main` commit that passed CI | nightly, or on demand (`gh workflow run Release`); rolling `tip` prerelease |
 
 The channel is `updates.channel` in the config: `auto` (the default) follows the installed

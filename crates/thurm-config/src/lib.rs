@@ -1052,6 +1052,11 @@ pub struct TailscaleConfig {
     /// Serve the browser client on the node's HTTPS address (`https://<node name>/`). Needs
     /// `enabled`.
     pub web: bool,
+    /// The coordination server to sign in to, such as a headscale's URL. Empty: Tailscale's.
+    pub control_url: String,
+    /// While the node has no HTTPS (MagicDNS or certificates off), listen on this tailnet
+    /// address without TLS, e.g. `:7297`; the tailnet's WireGuard encrypts it. Empty: off.
+    pub plain_listen: String,
 }
 
 impl Default for TailscaleConfig {
@@ -1066,6 +1071,8 @@ impl Default for TailscaleConfig {
             host_allow_identified: false,
             serve_socket: false,
             web: false,
+            control_url: String::new(),
+            plain_listen: String::new(),
         }
     }
 }
@@ -2173,6 +2180,20 @@ mod tests {
         let (_, warnings) =
             Config::parse_with_warnings("[session]\nscrollback_lines = 4000\n").unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn tailscale_control_and_plain_listen_parse() {
+        let cfg = Config::parse(
+            "[tailscale]\ncontrol_url = \"https://headscale.example.com\"\nplain_listen = \":7297\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tailscale.control_url, "https://headscale.example.com");
+        assert_eq!(cfg.tailscale.plain_listen, ":7297");
+        let default = Config::parse("").unwrap().tailscale;
+        assert!(default.control_url.is_empty() && default.plain_listen.is_empty());
+        let shipped = Config::parse(DEFAULT_CONFIG_TOML).unwrap().tailscale;
+        assert!(shipped.control_url.is_empty() && shipped.plain_listen.is_empty());
     }
 
     #[test]

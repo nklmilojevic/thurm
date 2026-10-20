@@ -1,0 +1,12 @@
+provider: claude
+model: claude-haiku-5-5
+style:
+  product: "a native macOS terminal for persistent sessions, coding agents, and remote work"
+breaking_bumps_minor: true
+github:
+  append_generated_notes: false
+packages:
+  - path: .
+    files:
+      - file: macos/Resources/Info.plist
+        regex: '<key>CFBundleShortVersionString</key>\s*<string>(?P<v>[^<]+)</string>'

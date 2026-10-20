@@ -166,6 +166,8 @@ Without a Mac, pair the phone on the host itself: `thurm pair` prints a QR
 code to scan in the app (and the same link, to paste instead). The code
 carries only this host's Tailscale address, and the push relay when the host's
 config has one; the phone connects over Tailscale alone, with no ssh fallback.
+When HTTPS is not ready, `thurm pair` carries the plain addresses of
+[Headscale](#headscale) instead, and fails only when there are neither.
 
 `thurm tailscale on` lasts until the daemon restarts. To keep it on, turn on
 **Serve over Tailscale** in Settings, or:
@@ -185,6 +187,40 @@ Who may connect:
 
 HTTPS needs MagicDNS and HTTPS certificates turned on for your tailnet (the
 admin console's DNS page); `thurm tailscale status` says when one is off.
+
+### Headscale
+
+To sign the node in to a [headscale](https://headscale.net) server instead of
+Tailscale's, set its address:
+
+```toml
+[tailscale]
+enabled = true
+control_url = "https://headscale.example.com"
+plain_listen = ":7297"
+```
+
+`control_url` (or `thurm set tailscale.control_url`) is the coordination server
+the node signs in to; empty is Tailscale's. Changing it restarts the node, which
+asks for a sign-in again on the new server. The admin pages in the Mac app and
+in the status then say "your coordination server" and link to nothing.
+
+A headscale tailnet without MagicDNS and HTTPS certificates has no `wss://`
+address. There, `plain_listen` (`thurm set tailscale.plain_listen :7297`) has the
+node serve the same gateway without TLS, at `ws://100.x.y.z:7297/v1/connect` for
+each of its tailnet addresses and at `ws://<name>:7297/v1/connect` once the name
+resolves. The tailnet's WireGuard encrypts that hop, and callers are admitted by
+their tailnet identity as they are over HTTPS. A browser always sends an
+`Origin` header, so browsers are refused there.
+
+The phone needs the same tailnet: a headscale client, or the Tailscale app
+signed in to the same server. **Pair iPhone** and `thurm pair` then put the
+plain addresses in the code, as `tailnet_plain`, and the app connects to them
+over the tailnet.
+
+To serve through a machine's own Tailscale instead, which is already on the
+headscale tailnet, use `host_listen` (`:7297`, see above). It needs no
+`control_url` of its own.
 
 ### In a browser
 

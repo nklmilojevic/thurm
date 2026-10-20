@@ -377,6 +377,8 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
         "Admit every identified caller",
         Kind::Bool,
     ),
+    ("tailscale.control_url", "Coordination server", Kind::Text),
+    ("tailscale.plain_listen", "Plain listener", Kind::Text),
     (
         "tailscale.serve_socket",
         "Socket for tailscale serve",

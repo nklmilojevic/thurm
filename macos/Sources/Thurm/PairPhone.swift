@@ -47,6 +47,8 @@ enum PhonePairing {
         var error: String?
         /// Its daemon over Tailscale (`wss://…/v1/connect`), from its `TailscaleStatus`.
         var tailnet: String?
+        /// Its plain tailnet endpoints (`ws://…/v1/connect`), for a tailnet without HTTPS.
+        var plain: [String] = []
         /// Checked in the sheet.
         var included: Bool
         var id: String { name }
@@ -70,13 +72,14 @@ enum PhonePairing {
 
         /// Over ssh or Tailscale, which needs no host keys (as `PairingPayload` checks in the
         /// iOS app).
-        var usable: Bool { hasSSH || !(tailnet ?? "").isEmpty }
+        var usable: Bool { hasSSH || !(tailnet ?? "").isEmpty || !plain.isEmpty }
 
-        /// Its daemon's Tailscale address arrived: a host the phone could not trust over ssh
+        /// Its daemon's Tailscale addresses arrived: a host the phone could not trust over ssh
         /// becomes one it can reach, so it goes in the code.
-        mutating func setTailnet(_ url: String?) {
+        mutating func setTailnet(_ url: String?, plain routes: [String] = []) {
             let was = usable
             tailnet = url
+            plain = routes
             if !was && usable { included = true }
         }
 
@@ -94,7 +97,7 @@ enum PhonePairing {
         /// Checked, and something the phone can connect to and trust: over Tailscale, the ssh
         /// address may be empty.
         var inCode: Bool {
-            included && (phoneSSH || !(tailnet ?? "").isEmpty)
+            included && (phoneSSH || !(tailnet ?? "").isEmpty || !plain.isEmpty)
         }
 
         /// Its entry in the code (`PairedHost` in the iOS app). An app that knows `tailnet`
@@ -104,6 +107,7 @@ enum PhonePairing {
                                     "port": port, "user": user, "host_keys": phoneSSH ? hostKeys : []]
             if let socket { d["socket"] = socket }
             if let tailnet, !tailnet.isEmpty { d["tailnet"] = ["url": tailnet] }
+            if !plain.isEmpty { d["tailnet_plain"] = plain }
             return d
         }
     }
@@ -119,28 +123,50 @@ enum PhonePairing {
         inCode(remotes).filter(\.phoneSSH)
     }
 
-    /// The Tailscale address in a daemon's answer to `TailscaleStatus`: nil for an error (a daemon
-    /// from before Tailscale), no answer, or a node not yet serving HTTPS.
-    static func tailnetURL(statusResponse resp: Any?) -> String? {
-        guard let v = JSON.variant(resp), v.name == "TailscaleStatus" else { return nil }
-        return TailscaleStatus(json: v.payload)?.pairingURL
+    /// The Tailscale addresses in a daemon's answer to `TailscaleStatus`: nil for an error (a
+    /// daemon from before Tailscale) or no answer; otherwise the HTTPS address once served (nil
+    /// before that) and the plain endpoints.
+    static func tailnetRoutes(statusResponse resp: Any?) -> (url: String?, plain: [String])? {
+        guard let v = JSON.variant(resp), v.name == "TailscaleStatus",
+              let status = TailscaleStatus(json: v.payload)
+        else { return nil }
+        return (status.pairingURL, status.pairingPlain)
+    }
+
+    /// The plain endpoints the phone can use: `ws://` addresses, each once, IPv4 literals first,
+    /// then IPv6, then names (a name may not resolve on the phone's tailnet, an address always does).
+    static func plainRoutes(_ urls: [String]) -> [String] {
+        var seen = Set<String>()
+        let unique = urls.filter { $0.hasPrefix("ws://") && seen.insert($0).inserted }
+        func rank(_ url: String) -> Int {
+            guard let host = URL(string: url)?.host else { return 2 }
+            if host.contains(":") { return 1 }
+            return host.allSatisfy { $0.isNumber || $0 == "." } ? 0 : 2
+        }
+        // A stable order: the sort alone does not keep equal ranks in place.
+        return unique.enumerated()
+            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+            .map(\.element)
     }
 
     /// Whether there is a code to show: the phone needs this Mac's ssh address and host keys, or
     /// its Tailscale address, which needs neither (as `PairingPayload` checks in the iOS app).
-    static func canPair(host: String, hostKeys: [String], tailnet: String?) -> Bool {
-        (!host.isEmpty && !hostKeys.isEmpty) || !(tailnet ?? "").isEmpty
+    static func canPair(host: String, hostKeys: [String], tailnet: String?, plain: [String] = []) -> Bool {
+        (!host.isEmpty && !hostKeys.isEmpty) || !(tailnet ?? "").isEmpty || !plain.isEmpty
     }
 
     /// What the QR code carries (see `PairingPayload` in the iOS app). Remote hosts not checked
     /// (or not usable) are left out. `tailnet` is this Mac's daemon over Tailscale
-    /// (`wss://…/v1/connect`): an app that knows it connects there first, and over ssh when it
-    /// can't; older apps read only the ssh fields.
+    /// (`wss://…/v1/connect`), and `plain` its plain endpoints (`ws://`, for a tailnet without
+    /// HTTPS): an app that knows them connects there first, and over ssh when it can't; older
+    /// apps read only the ssh fields.
     static func payload(name: String, host: String, port: Int, user: String, hostKeys: [String],
-                        relay: String?, code: String?, remotes: [RemoteHost] = [], tailnet: String? = nil) -> String {
+                        relay: String?, code: String?, remotes: [RemoteHost] = [], tailnet: String? = nil,
+                        plain: [String] = []) -> String {
         var d: [String: Any] = ["v": 1, "name": name, "host": host, "port": port, "user": user,
                                 "host_keys": hostKeys]
         if let tailnet, !tailnet.isEmpty { d["tailnet"] = ["url": tailnet] }
+        if !plain.isEmpty { d["tailnet_plain"] = plain }
         if let relay, !relay.isEmpty { d["relay"] = relay }
         if let code, !code.isEmpty { d["code"] = code }
         let remotes = inCode(remotes)
@@ -315,6 +341,8 @@ struct PairPhoneSheet: View {
     @State private var devices = PhonePairing.devices()
     @State private var message: String?
     @State private var remoteLogin: Bool?
+    /// Whether this Mac's `thurm` is found, and speaks our protocol, where sshd logins look.
+    @State private var cliReady: Bool?
     /// The `[[remote]]` hosts (`pairing_hosts`), with what the sheet changed.
     @State private var remoteHosts: [PhonePairing.RemoteHost] = []
     @State private var loadingHosts = true
@@ -343,11 +371,13 @@ struct PairPhoneSheet: View {
     private var link: String {
         PhonePairing.payload(name: Host.current().localizedName ?? host, host: host, port: port,
                              user: user, hostKeys: hostKeys, relay: push.relay, code: push.code,
-                             remotes: remoteHosts, tailnet: tailscale.status?.pairingURL)
+                             remotes: remoteHosts, tailnet: tailscale.status?.pairingURL,
+                             plain: tailscale.status?.pairingPlain ?? [])
     }
 
     private var canPair: Bool {
-        PhonePairing.canPair(host: host, hostKeys: hostKeys, tailnet: tailscale.status?.pairingURL)
+        PhonePairing.canPair(host: host, hostKeys: hostKeys, tailnet: tailscale.status?.pairingURL,
+                             plain: tailscale.status?.pairingPlain ?? [])
     }
 
     var body: some View {
@@ -357,16 +387,35 @@ struct PairPhoneSheet: View {
                 Label("The app connects over Tailscale (\(URL(string: url)?.host ?? url)), with ssh as the fallback.",
                       systemImage: "network")
                     .foregroundStyle(.secondary)
+            } else if let plain = tailscale.status?.pairingPlain.first {
+                Label("The app connects over the tailnet (\(URL(string: plain)?.host ?? plain)), with ssh as the fallback.",
+                      systemImage: "network")
+                    .foregroundStyle(.secondary)
             }
             if remoteLogin == false {
-                Label(tailscale.status?.pairingURL == nil
+                Label(tailscale.status?.hasTailnetRoute != true
                       ? "Remote Login is off. Turn it on in System Settings › General › Sharing so the app can connect."
                       : "Remote Login is off: the app has no fallback when Tailscale is off on the phone.",
                       systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             }
+            if !canPair {
+                Label("Pairing over Tailscale needs HTTPS or a plain endpoint: set tailscale.host_listen, or "
+                      + "tailscale.plain_listen for a tailnet without HTTPS, in the config.", systemImage: "info.circle")
+                    .foregroundStyle(.secondary)
+            }
+            if cliReady == false {
+                HStack {
+                    Label("The command-line tool is not on this Mac's login PATH, so a phone's ssh session "
+                          + "cannot find thurm.", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                    Button("Install Command-Line Tool") {
+                        Integrations.shared.installCLI { checkCLI() }
+                    }
+                }
+            }
             if hostKeys.isEmpty {
-                if tailscale.status?.pairingURL == nil {
+                if tailscale.status?.hasTailnetRoute != true {
                     Label("This Mac's ssh host keys could not be read (/etc/ssh).", systemImage: "xmark.octagon")
                         .foregroundStyle(.red)
                 } else {
@@ -430,6 +479,7 @@ struct PairPhoneSheet: View {
                 DispatchQueue.main.async { if host.isEmpty { host = name } }
             }
             checkRemoteLogin()
+            checkCLI()
             loadRemoteHosts()
             tailscale.refresh()
         }
@@ -515,10 +565,10 @@ struct PairPhoneSheet: View {
     /// Asks the host's daemon, through the Mac's tunnel to it, whether it serves over Tailscale.
     private func loadTailnet(on name: String) {
         Core.shared.requestAsync(object: "TailscaleStatus", host: name, timeout: 10) { resp in
-            guard let url = PhonePairing.tailnetURL(statusResponse: resp),
+            guard let routes = PhonePairing.tailnetRoutes(statusResponse: resp),
                   let i = remoteHosts.firstIndex(where: { $0.name == name })
             else { return }
-            remoteHosts[i].setTailnet(url)
+            remoteHosts[i].setTailnet(routes.url, plain: routes.plain)
         }
     }
 
@@ -671,6 +721,15 @@ struct PairPhoneSheet: View {
                 let why = ((resp as? [String: Any])?["error"] as? String) ?? "the daemon did not answer"
                 message = "Revoked \(label)'s key, but it may still get notifications: \(why)"
             }
+        }
+    }
+
+    /// Asks this Mac's `thurm` the way sshd's login environment would find it.
+    private func checkCLI() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let probe = Core.shared.remoteCall(["op": "local_probe"]) as? [String: Any]
+            let ready = probe?["found"] as? Bool == true && probe?["protocol_ok"] as? Bool == true
+            DispatchQueue.main.async { cliReady = ready }
         }
     }
 
