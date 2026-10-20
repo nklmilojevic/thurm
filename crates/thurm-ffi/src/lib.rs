@@ -770,7 +770,7 @@ pub unsafe extern "C" fn thurm_request_timeout(
         Ok(resp) => return into_c(serde_json::to_string(&resp).unwrap_or_else(error_json)),
         Err(req) => req,
     };
-    into_c(daemon_request(&c.client, req, timeout_ms))
+    into_c(daemon_request(&c.client, req, timeout_ms, direct_host(c)))
 }
 
 /// Callback of [`thurm_request_async`]: the response JSON (freed with `thurm_string_free` by
@@ -807,9 +807,10 @@ pub unsafe extern "C" fn thurm_request_async(
     };
     // The Arc keeps the connection alive for the request, whatever the caller does.
     let conn = c.client.clone();
+    let direct = direct_host(c);
     let spawned = std::thread::Builder::new()
         .name("thurm-request".into())
-        .spawn(move || reply(ctx, daemon_request(&conn, req, timeout_ms)));
+        .spawn(move || reply(ctx, daemon_request(&conn, req, timeout_ms, direct)));
     if let Err(e) = spawned {
         reply(
             ctx,
@@ -823,10 +824,26 @@ unsafe fn parse_request(json: *const c_char) -> Result<Request, String> {
     serde_json::from_str(json).map_err(|e| error_json(format!("bad request: {e}")))
 }
 
-fn daemon_request(client: &Client, req: Request, timeout_ms: u64) -> String {
+/// Whether `c` is a host without Thurm (`thurm_direct_connect`), whose daemon is in the app.
+#[cfg(feature = "mobile")]
+fn direct_host(c: &thurm_client) -> bool {
+    c._transport
+        .as_ref()
+        .is_some_and(|t| t.is::<thurm_direct::Direct>())
+}
+
+#[cfg(not(feature = "mobile"))]
+fn direct_host(_: &thurm_client) -> bool {
+    false
+}
+
+fn daemon_request(client: &Client, req: Request, timeout_ms: u64, direct: bool) -> String {
     let timeout = (timeout_ms > 0).then(|| std::time::Duration::from_millis(timeout_ms));
     match client.request_timeout(req, timeout) {
         Ok(resp) => serde_json::to_string(&resp).unwrap_or_else(error_json),
+        Err(::thurm_client::ClientError::Timeout) if direct => {
+            error_json("the host did not answer in time")
+        }
         Err(e) => error_json(e),
     }
 }
