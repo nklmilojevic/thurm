@@ -5,7 +5,8 @@ title: Install Thurm
 ## Requirements
 
 Thurm runs on Apple silicon with macOS 14 or later. Intel Macs are not supported.
-Remote sessions can also run on Linux hosts; see [Remote](/remote/).
+Remote sessions can also run on Linux hosts; see [Remote](/remote/). To run
+`thurmd` on a Linux server, see [Linux server](/linux-server/).
 
 ## Download
 

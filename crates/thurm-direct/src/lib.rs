@@ -620,6 +620,7 @@ impl Inner {
                     let note = format!("\x1b[2m[mosh: {e}; using ssh]\x1b[0m\r\n");
                     pane.lock().term.advance(note.as_bytes());
                     self.start_ssh(&session, &pane, size)
+                        .map_err(|s| format!("mosh: {e}; then ssh: {s}"))
                 }
             },
         };

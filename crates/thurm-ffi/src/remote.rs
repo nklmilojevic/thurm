@@ -13,7 +13,7 @@ use thurm_remote::doctor;
 use thurm_remote::handoff::{self, Registry, SshHost};
 use thurm_remote::install::{self, Method};
 use thurm_remote::tunnel::Supervisor;
-use thurm_remote::{Ssh, pairing, policy};
+use thurm_remote::{RemoteExec, Ssh, SshError, pairing, policy};
 
 use crate::{Ctx, into_c, opt_str};
 
@@ -262,6 +262,39 @@ enum Call {
     PairedDevices {
         name: String,
     },
+    /// Whether this Mac's `thurm` is found, and speaks our protocol, from the environment sshd
+    /// gives a login (Pair iPhone's check of the command-line tool).
+    LocalProbe,
+}
+
+/// Runs scripts with the local `/bin/sh` in the PATH sshd gives a login, so the probe sees what
+/// a host's would.
+struct LocalShell;
+
+impl RemoteExec for LocalShell {
+    fn run(
+        &self,
+        script: &str,
+        args: &[&str],
+        _input: Option<&[u8]>,
+        _timeout: std::time::Duration,
+    ) -> Result<String, SshError> {
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg("thurm")
+            .args(args)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .output()
+            .map_err(|e| SshError::Attention(format!("sh: {e}")))?;
+        match out.status.code() {
+            Some(0) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+            code => Err(SshError::Remote {
+                code: code.unwrap_or(-1),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }),
+        }
+    }
 }
 
 fn remote(name: &str) -> Result<thurm_config::RemoteConfig, String> {
@@ -528,6 +561,13 @@ fn call(c: Call) -> Result<Value, String> {
             let (_, ssh) = ssh_for(&name)?;
             json!(pairing::devices(&ssh).map_err(|e| e.to_string())?)
         }
+        Call::LocalProbe => {
+            let host = thurm_remote::probe(&LocalShell).map_err(|e| e.to_string())?;
+            json!({
+                "found": host.thurm.is_some(),
+                "protocol_ok": host.speaks_our_protocol(),
+            })
+        }
     })
 }
 
@@ -627,6 +667,7 @@ mod tests {
             r#"{"op":"authorize_device","name":"pi","key":"ecdsa-sha2-nistp256 AAAA thurm-ios:iPhone"}"#,
             r#"{"op":"revoke_device","name":"pi","device":"iPhone"}"#,
             r#"{"op":"paired_devices","name":"pi"}"#,
+            r#"{"op":"local_probe"}"#,
         ] {
             serde_json::from_str::<Call>(s).unwrap_or_else(|e| panic!("{s}: {e}"));
         }

@@ -57,7 +57,7 @@ final class Integrations: NSObject, NSMenuDelegate {
 
     // MARK: Command-line tool
 
-    private func installedCLILink() -> URL? {
+    func installedCLILink() -> URL? {
         let target = cli.resolvingSymlinksInPath().path
         return cliLinkCandidates.first { link in
             (try? fm.destinationOfSymbolicLink(atPath: link.path)).map {
@@ -66,7 +66,9 @@ final class Integrations: NSObject, NSMenuDelegate {
         }
     }
 
-    private func installCLI() {
+    /// `done` runs once the attempt has been reported, whether or not it linked the tool.
+    func installCLI(done: @escaping () -> Void = {}) {
+        defer { done() }
         let local = cliLinkCandidates[0]
         if fm.fileExists(atPath: local.deletingLastPathComponent().path) {
             if let existing = try? fm.attributesOfItem(atPath: local.path), existing[.type] as? FileAttributeType != .typeSymbolicLink {

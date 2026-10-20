@@ -526,8 +526,9 @@ typedef struct {
  *   {"host":"mac.tailnet.ts.net","port":22,"user":"me","host_keys":["SHA256:..."],
  *    "socket":null}
  * Blocks while connecting: call it off the main thread. Returns NULL on failure with `err`
- * set (free it); otherwise a client used like thurm_connect's. thurm_disconnect also closes
- * the ssh session. */
+ * set (free it): JSON {"kind","message"}, `kind` being "key_rejected" (the host does not have
+ * the device's key yet), "not_installed" (no thurm there) or "failed". Otherwise a client used
+ * like thurm_connect's. thurm_disconnect also closes the ssh session. */
 thurm_client *thurm_ssh_connect(const char *target_json, thurm_device_key key,
                                 const char *client_name, thurm_event_cb on_event,
                                 thurm_frame_cb on_frame, void *ctx, char **err);

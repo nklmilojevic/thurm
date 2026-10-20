@@ -66,11 +66,17 @@ fn set_err(err: *mut *mut c_char, e: String) {
     }
 }
 
+/// `thurm_ssh_connect`'s failure, as the JSON `thurm_direct_connect` uses.
+fn ssh_failure(kind: &str, message: impl std::fmt::Display) -> String {
+    serde_json::json!({"kind": kind, "message": message.to_string()}).to_string()
+}
+
 /// Connects to a paired host's daemon. `target_json`:
 /// `{"host","port","user","host_keys":["SHA256:…"],"socket"?}`. Blocks while connecting (ssh,
 /// probe, daemon start, Hello), so call it off the main thread. NULL with `err` set on failure
-/// (free it); otherwise a client like `thurm_connect`'s, freed with `thurm_disconnect`, which
-/// also closes the ssh session.
+/// (free it): JSON `{"kind","message"}`, `kind` being `"key_rejected"` (the host does not have
+/// the device's key yet), `"not_installed"` (no `thurm` there) or `"failed"`. Otherwise a client
+/// like `thurm_connect`'s, freed with `thurm_disconnect`, which also closes the ssh session.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_ssh_connect(
     target_json: *const c_char,
@@ -87,14 +93,14 @@ pub unsafe extern "C" fn thurm_ssh_connect(
     {
         Ok(t) => t,
         Err(e) => {
-            set_err(err, format!("bad target: {e}"));
+            set_err(err, ssh_failure("failed", format!("bad target: {e}")));
             return std::ptr::null_mut();
         }
     };
     let key = match unsafe { app_key(&key) } {
         Ok(k) => k,
         Err(e) => {
-            set_err(err, e);
+            set_err(err, ssh_failure("failed", e));
             return std::ptr::null_mut();
         }
     };
@@ -102,8 +108,14 @@ pub unsafe extern "C" fn thurm_ssh_connect(
         .unwrap_or("Thurm iOS")
         .to_owned();
     let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
-        let remote =
-            thurm_ssh::connect(&target, key, &name, on_ev, on_disc).map_err(|e| e.to_string())?;
+        let remote = thurm_ssh::connect(&target, key, &name, on_ev, on_disc).map_err(|e| {
+            let kind = match &e {
+                thurm_ssh::ConnectError::KeyRejected => "key_rejected",
+                thurm_ssh::ConnectError::NotInstalled => "not_installed",
+                _ => "failed",
+            };
+            ssh_failure(kind, e)
+        })?;
         let transport: Box<dyn std::any::Any + Send> = Box::new(remote.session);
         Ok((remote.client, Some(transport)))
     });

@@ -341,6 +341,8 @@ struct PairPhoneSheet: View {
     @State private var devices = PhonePairing.devices()
     @State private var message: String?
     @State private var remoteLogin: Bool?
+    /// Whether this Mac's `thurm` is found, and speaks our protocol, where sshd logins look.
+    @State private var cliReady: Bool?
     /// The `[[remote]]` hosts (`pairing_hosts`), with what the sheet changed.
     @State private var remoteHosts: [PhonePairing.RemoteHost] = []
     @State private var loadingHosts = true
@@ -401,6 +403,16 @@ struct PairPhoneSheet: View {
                 Label("Pairing over Tailscale needs HTTPS or a plain endpoint: set tailscale.host_listen, or "
                       + "tailscale.plain_listen for a tailnet without HTTPS, in the config.", systemImage: "info.circle")
                     .foregroundStyle(.secondary)
+            }
+            if cliReady == false {
+                HStack {
+                    Label("The command-line tool is not on this Mac's login PATH, so a phone's ssh session "
+                          + "cannot find thurm.", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                    Button("Install Command-Line Tool") {
+                        Integrations.shared.installCLI { checkCLI() }
+                    }
+                }
             }
             if hostKeys.isEmpty {
                 if tailscale.status?.hasTailnetRoute != true {
@@ -467,6 +479,7 @@ struct PairPhoneSheet: View {
                 DispatchQueue.main.async { if host.isEmpty { host = name } }
             }
             checkRemoteLogin()
+            checkCLI()
             loadRemoteHosts()
             tailscale.refresh()
         }
@@ -708,6 +721,15 @@ struct PairPhoneSheet: View {
                 let why = ((resp as? [String: Any])?["error"] as? String) ?? "the daemon did not answer"
                 message = "Revoked \(label)'s key, but it may still get notifications: \(why)"
             }
+        }
+    }
+
+    /// Asks this Mac's `thurm` the way sshd's login environment would find it.
+    private func checkCLI() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let probe = Core.shared.remoteCall(["op": "local_probe"]) as? [String: Any]
+            let ready = probe?["found"] as? Bool == true && probe?["protocol_ok"] as? Bool == true
+            DispatchQueue.main.async { cliReady = ready }
         }
     }
 
