@@ -932,6 +932,28 @@ fn daemon_cmd(action: &str, json: bool) -> R {
                 return Ok(ExitCode::FAILURE);
             }
             println!("{SYSTEMD_UNIT} installed and enabled ({})", path.display());
+            // Without a daemon answering, start it now: the unit is enabled for the next login only.
+            if thurm_client::daemon_pid(&thurm_config::socket_path()).is_none() {
+                if systemctl(&["start", SYSTEMD_UNIT]) {
+                    println!("{SYSTEMD_UNIT} started");
+                } else {
+                    eprintln!(
+                        "thurm: systemctl --user start {SYSTEMD_UNIT} failed; start it yourself"
+                    );
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+            // Without logind (or loginctl), there is nothing to say about lingering.
+            let user = std::env::var("USER").unwrap_or_default();
+            if let Ok(out) = std::process::Command::new("loginctl")
+                .args(["show-user", &user, "-p", "Linger", "--value"])
+                .output()
+                && out.status.success()
+                && !user.is_empty()
+                && let Some(warning) = linger_warning(&user, &String::from_utf8_lossy(&out.stdout))
+            {
+                eprintln!("thurm: {warning}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         "uninstall-systemd" => {
@@ -967,6 +989,17 @@ fn daemon_cmd(action: &str, json: bool) -> R {
 }
 
 const SYSTEMD_UNIT: &str = "thurmd.service";
+
+/// The warning for `user` when `loginctl show-user … -p Linger --value` printed `linger`, unless
+/// lingering is on.
+fn linger_warning(user: &str, linger: &str) -> Option<String> {
+    (linger.trim() != "yes").then(|| {
+        format!(
+            "lingering is off for {user}: {}; to keep it running, run: sudo loginctl enable-linger {user}",
+            thurm_remote::doctor::LINGER_OFF
+        )
+    })
+}
 
 fn systemd_unit_path() -> std::path::PathBuf {
     let config = std::env::var_os("XDG_CONFIG_HOME")
@@ -1747,6 +1780,15 @@ mod tests {
             let latin1 = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9/thurmd"));
             assert!(systemd_unit(latin1, None).is_err());
         }
+    }
+
+    #[test]
+    fn linger_warns_unless_it_is_on() {
+        assert_eq!(linger_warning("nkl", "yes\n"), None);
+        let off = linger_warning("nkl", "no\n").unwrap();
+        assert!(off.contains("sudo loginctl enable-linger nkl"), "{off}");
+        assert!(off.contains("socket goes away"), "{off}");
+        assert!(linger_warning("nkl", "").is_some());
     }
 
     #[test]
