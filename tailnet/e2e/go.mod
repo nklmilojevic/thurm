@@ -1,10 +1,10 @@
 module github.com/nklmilojevic/thurm/tailnet/e2e
 
-go 1.27.1
+go 1.27.3
 
 require (
 	github.com/nklmilojevic/thurm/tailnet v0.0.0
-	tailscale.com v1.104.1
+	tailscale.com v1.104.2
 )
 
 require (
