@@ -308,6 +308,16 @@ fn reaches_the_daemon_socket_as_a_mobile_client() {
 }
 
 #[test]
+fn connect_reports_a_device_key_the_host_does_not_know_as_key_rejected() {
+    let server = serve(&TestKey::new(1));
+    match connect(&target(&server), TestKey::new(2), "ios-test", |_| {}, || {}) {
+        Err(ConnectError::KeyRejected) => {}
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("connected with a key the host does not know"),
+    }
+}
+
+#[test]
 fn connect_reports_a_host_without_thurm() {
     let key = TestKey::new(1);
     let server = serve(&key);

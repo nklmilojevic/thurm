@@ -170,20 +170,7 @@ impl Session {
         key: Arc<dyn DeviceKey>,
         timeout: Duration,
     ) -> Result<Session, SshError> {
-        Session::connect_checked(target, key, timeout).map_err(|e| match e {
-            SessionError::Ssh(e) => e,
-            SessionError::UnknownHostKey(seen) | SessionError::HostKeyChanged(seen) => {
-                SshError::Attention(format!(
-                    "the host's key ({seen}) is not the one paired with this device; \
-                     pair the host again if it was reinstalled"
-                ))
-            }
-            SessionError::KeyRejected => SshError::Attention(
-                "the host did not accept this device's key; add it from the Mac \
-                 (Settings › Remote › Pair iPhone)"
-                    .into(),
-            ),
-        })
+        Session::connect_checked(target, key, timeout).map_err(SessionError::into_ssh)
     }
 
     /// [`Session::connect`], telling apart the failures a host added by hand needs the user for:
@@ -335,7 +322,8 @@ impl Session {
                 .await?;
             if !replied(&mut ch).await? {
                 return Ok(Err(
-                    "the host refused a terminal (PermitTTY no, or no-pty for this key)",
+                    "the host refused a terminal: a key line from Thurm's pairing (thurm-ios:…) \
+                     has restrict, which blocks terminals; otherwise PermitTTY no or no-pty",
                 ));
             }
             for (k, v) in env {
@@ -451,6 +439,10 @@ async fn replied(ch: &mut russh::Channel<client::Msg>) -> Result<bool, russh::Er
     Err(russh::Error::Disconnect)
 }
 
+/// The host did not accept the device's key, in the words the app shows.
+const KEY_REJECTED: &str = "the host did not accept this device's key; add it from the Mac \
+     (Thurm › Remotes… › Pair iPhone)";
+
 /// Why [`Session::connect_checked`] failed.
 #[derive(Debug)]
 pub enum SessionError {
@@ -461,6 +453,21 @@ pub enum SessionError {
     HostKeyChanged(String),
     /// The host did not accept the device's key.
     KeyRejected,
+}
+
+impl SessionError {
+    fn into_ssh(self) -> SshError {
+        match self {
+            SessionError::Ssh(e) => e,
+            SessionError::UnknownHostKey(seen) | SessionError::HostKeyChanged(seen) => {
+                SshError::Attention(format!(
+                    "the host's key ({seen}) is not the one paired with this device; \
+                     pair the host again if it was reinstalled"
+                ))
+            }
+            SessionError::KeyRejected => SshError::Attention(KEY_REJECTED.into()),
+        }
+    }
 }
 
 impl From<SshError> for SessionError {
@@ -528,6 +535,8 @@ impl Shell {
 #[derive(Debug)]
 pub enum ConnectError {
     Ssh(SshError),
+    /// The host does not accept the device's key yet: add it on the Mac, then try again.
+    KeyRejected,
     /// No `thurm` on the host: install it from the Mac.
     NotInstalled,
     Daemon(ClientError),
@@ -537,8 +546,10 @@ impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnectError::Ssh(e) => write!(f, "{e}"),
+            ConnectError::KeyRejected => f.write_str(KEY_REJECTED),
             ConnectError::NotInstalled => f.write_str(
-                "Thurm is not installed on this host; install it from the Mac (thurm remote add)",
+                "Thurm's command-line tool is not installed on this host; on a Mac, use Thurm › \
+                 Install Command-Line Tool, elsewhere `thurm remote add`",
             ),
             ConnectError::Daemon(e) => write!(f, "{e}"),
         }
@@ -564,7 +575,10 @@ pub fn connect(
     on_disconnect: impl FnOnce() + Send + 'static,
 ) -> Result<Remote, ConnectError> {
     let session =
-        Session::connect(target, key, Duration::from_secs(20)).map_err(ConnectError::Ssh)?;
+        Session::connect_checked(target, key, Duration::from_secs(20)).map_err(|e| match e {
+            SessionError::KeyRejected => ConnectError::KeyRejected,
+            e => ConnectError::Ssh(e.into_ssh()),
+        })?;
     let host = thurm_remote::probe(&session).map_err(ConnectError::Ssh)?;
     let socket = match (&target.socket, &host.info) {
         (Some(s), _) => s.clone(),
