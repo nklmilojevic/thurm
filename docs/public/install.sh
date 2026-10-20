@@ -55,6 +55,13 @@ for b in thurm thurmd thurm-tailnet; do
 done
 
 BIN="$HOME/.local/share/thurm/bin"
+LINK="$HOME/.local/bin/thurm"
+# Only a link this installer made (or a re-run of it) may be replaced: anything else at that
+# path belongs to the user or another package.
+if [ -e "$LINK" ] || [ -L "$LINK" ]; then
+  [ -L "$LINK" ] && [ "$(readlink "$LINK")" = "$BIN/thurm" ] ||
+    die "$LINK exists and is not a link to $BIN/thurm; move it aside and run this again"
+fi
 mkdir -p "$BIN" "$HOME/.local/bin"
 for b in thurm thurmd thurm-tailnet; do
   # Copied beside the old file and renamed over it: a running daemon keeps its binary.
@@ -62,7 +69,7 @@ for b in thurm thurmd thurm-tailnet; do
   chmod 755 "$BIN/.$b.new"
   mv -f "$BIN/.$b.new" "$BIN/$b"
 done
-ln -sfn "$BIN/thurm" "$HOME/.local/bin/thurm"
+ln -sfn "$BIN/thurm" "$LINK"
 
 echo "Installed Thurm to $BIN, with $HOME/.local/bin/thurm linked to it."
 case ":$PATH:" in

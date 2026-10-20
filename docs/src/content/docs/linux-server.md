@@ -23,6 +23,7 @@ directory on your `PATH`:
 ```sh
 curl -fsSL -O https://github.com/nklmilojevic/thurm/releases/latest/download/thurm-x86_64-unknown-linux-musl.tar.gz
 tar -xzf thurm-x86_64-unknown-linux-musl.tar.gz
+mkdir -p ~/.local/bin
 install -m 755 thurm thurmd thurm-tailnet ~/.local/bin/
 ```
 
