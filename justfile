@@ -4,7 +4,8 @@
 # version in Cargo.toml, Cargo.lock and macos/Resources/Info.plist, commits it to main, pushes,
 # and publishes the GitHub release vX.Y.Z. Publishing starts .github/workflows/release.yaml,
 # which waits for CI on that commit, then builds, signs, notarizes, uploads the assets and
-# refreshes the appcast.
+# refreshes the appcast. The recipe first drops the local rolling `tip` tag: CI force-moves it,
+# and a stale local copy makes vesnik's `git fetch --tags` fail.
 # Tip: `just tip` asks the Release workflow for a tip build of the newest green main.
 
 repo := "nklmilojevic/thurm"
@@ -23,6 +24,9 @@ version:
 
 [doc("Bump the version from the commits since the last tag, push it to main and publish vX.Y.Z")]
 release:
+    @test "$(git branch --show-current)" = main || { echo "release from main" >&2; exit 1; }
+    @test -z "$(git status --porcelain)" || { echo "release from a clean tree: vesnik commits untracked files it writes to, such as CHANGELOG.md" >&2; git status --short >&2; exit 1; }
+    @git tag -d tip >/dev/null 2>&1 || true
     vesnik release --yes
 
 # FORCE=true builds even when tip is current or only docs changed.
