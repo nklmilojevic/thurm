@@ -1906,3 +1906,56 @@ fn program_status_records() {
             .all(|e| !matches!(e, TermEvent::ProgramStatus(_)))
     );
 }
+
+#[test]
+fn replayed_alt_screen_restores_primary_cursor() {
+    // Leaving a full-screen app the copy rebuilt puts the cursor back where the shell left it,
+    // not where the app's was.
+    let mut a = term(20, 10);
+    a.advance(b"$ s\r\nConnecting\r\n\x1b[?1049h\x1b[2;9r\x1b[?6h\x1b[7;5H\x1b[1;31mk9s");
+    let pen = |t: &Terminal| Pen::from_style(&t.vt.cursor_style());
+    let before = (a.cursor_point(), pen(&a), a.mode());
+    let state = a.serialize_state();
+    assert_eq!(
+        (a.cursor_point(), pen(&a), a.mode()),
+        before,
+        "the daemon's own alternate screen cursor is intact"
+    );
+    let mut c = term(20, 10);
+    c.replay(&state);
+    assert_eq!(c.cursor_point(), a.cursor_point());
+    for t in [&mut a, &mut c] {
+        t.advance(b"\x1b[?1049l");
+    }
+    assert_eq!(a.cursor_point(), Point::new(2, 0));
+    assert_eq!(c.cursor_point(), a.cursor_point());
+}
+
+#[test]
+fn replayed_alt_screen_leaves_like_the_original_for_every_entry_mode() {
+    for (enter, leave) in [("?1049h", "?1049l"), ("?1047h", "?1047l"), ("?47h", "?47l")] {
+        let mut a = term(20, 10);
+        a.advance(format!("$ s\r\nConnecting\r\n\x1b[{enter}\x1b[7;5Hk9s").as_bytes());
+        let state = a.serialize_state();
+        let mut c = term(20, 10);
+        c.replay(&state);
+        for t in [&mut a, &mut c] {
+            t.advance(format!("\x1b[{leave}").as_bytes());
+        }
+        assert_eq!(c.cursor_point(), a.cursor_point(), "{enter}");
+    }
+}
+
+#[test]
+fn serializing_keeps_the_alt_screen_pending_wrap() {
+    let feed = b"\x1b[?1049h\x1b[3;1H0123456789abcdefghij";
+    let (mut a, mut control) = (term(20, 10), term(20, 10));
+    a.advance(feed);
+    control.advance(feed);
+    a.serialize_state();
+    for t in [&mut a, &mut control] {
+        t.advance(b"X");
+    }
+    assert_eq!(a.screen_text(), control.screen_text());
+    assert_eq!(a.cursor_point(), control.cursor_point());
+}

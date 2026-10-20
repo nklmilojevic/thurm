@@ -2399,8 +2399,11 @@ impl Terminal {
         let alt = self.is_alt_screen();
         // The alternate screen: every row positioned explicitly.
         let alt_screen = alt.then(|| self.export_screen_exact());
+        // Where leaving the alternate screen puts the cursor, for the copy to save on entering it.
+        let saved_cursor = alt.then(|| self.vt.saved_primary_cursor()).flatten();
         if alt {
-            // Look at the primary screen (mode 47 switches screens without clearing either).
+            // Look at the primary screen (mode 47 switches screens without clearing either; it
+            // carries the cursor across, and back unchanged).
             self.vt.write(b"\x1b[?47l");
         }
         let mut out = String::new();
@@ -2437,7 +2440,9 @@ impl Terminal {
                 out.push_str("\x1b]133;C\x07");
             }
         }
-        let primary_cursor = self.cursor_point();
+        let primary_cursor = saved_cursor
+            .map(|(col, row)| Point::new(row as i32, col as usize))
+            .unwrap_or_else(|| self.cursor_point());
         if let Some(alt_screen) = &alt_screen {
             // Back to the alternate screen, and have the copy switch to it (after saving the
             // primary cursor) and draw it.
