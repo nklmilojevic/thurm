@@ -46,6 +46,10 @@ struct NodeWant {
     auth_key: String,
     /// Serve the browser client on the node's HTTPS address.
     web: bool,
+    /// The coordination server to sign in to; empty is Tailscale's.
+    control_url: String,
+    /// The plain listener's address while HTTPS is off; empty is off.
+    plain_listen: String,
 }
 
 #[derive(Serialize, Clone, Debug, Default, PartialEq)]
@@ -86,6 +90,8 @@ impl Want {
                 advertise_tags: cfg.advertise_tags.clone(),
                 auth_key,
                 web: cfg.web,
+                control_url: cfg.control_url.clone(),
+                plain_listen: cfg.plain_listen.clone(),
             },
             host: HostWant {
                 listen: cfg.host_listen.clone(),

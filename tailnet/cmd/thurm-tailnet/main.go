@@ -46,6 +46,8 @@ type nodeConfig struct {
 	Web                 bool     `json:"web"`
 	AdvertiseTags       []string `json:"advertise_tags"`
 	AuthKey             string   `json:"auth_key"`
+	ControlURL          string   `json:"control_url"`
+	PlainListen         string   `json:"plain_listen"`
 }
 
 type hostConfig struct {
@@ -187,6 +189,8 @@ func (h *helper) apply(c command) error {
 				Web:          c.Node.Web,
 				Tags:         c.Node.AdvertiseTags,
 				AuthKey:      c.Node.AuthKey,
+				ControlURL:   c.Node.ControlURL,
+				PlainListen:  c.Node.PlainListen,
 			}
 			if err := h.node.Enable(cfg); err != nil {
 				errs = append(errs, err)
@@ -221,6 +225,9 @@ func (h *helper) status() *status.Status {
 	}
 	if s.HostURLs == nil {
 		s.HostURLs = []string{}
+	}
+	if s.NodeURLs == nil {
+		s.NodeURLs = []string{}
 	}
 	return s
 }

@@ -285,13 +285,84 @@ final class PairPhoneTests: XCTestCase {
             "allow_tailnet_members": false, "tags": [] as [String], "host_urls": [] as [String],
             "https": ["state": "ready"],
         ]
-        XCTAssertEqual(PhonePairing.tailnetURL(statusResponse: ["TailscaleStatus": status]),
+        XCTAssertEqual(PhonePairing.tailnetRoutes(statusResponse: ["TailscaleStatus": status])?.url,
                        "wss://bastion.tail1234.ts.net/v1/connect")
         var off = status
         off["state"] = "off"
-        XCTAssertNil(PhonePairing.tailnetURL(statusResponse: ["TailscaleStatus": off]))
-        XCTAssertNil(PhonePairing.tailnetURL(statusResponse: ["error": "the daemon does not know the request"]))
-        XCTAssertNil(PhonePairing.tailnetURL(statusResponse: nil))
+        XCTAssertNil(PhonePairing.tailnetRoutes(statusResponse: ["TailscaleStatus": off])?.url)
+        XCTAssertNil(PhonePairing.tailnetRoutes(statusResponse: ["error": "the daemon does not know the request"]))
+        XCTAssertNil(PhonePairing.tailnetRoutes(statusResponse: nil))
+    }
+
+    func testPairingLinkCarriesPlainTailnetRoutes() throws {
+        let plain = ["ws://100.64.0.7:7297/v1/connect", "ws://thurm.hs.example:7297/v1/connect"]
+        let link = PhonePairing.payload(name: "studio", host: "studio", port: 22, user: "me",
+                                        hostKeys: [], relay: nil, code: nil, plain: plain)
+        let d = try decode(link)
+        XCTAssertEqual(d["tailnet_plain"] as? [String], plain)
+        XCTAssertNil(d["tailnet"], "no HTTPS address, so no wss entry")
+        let withoutPlain = try decode(PhonePairing.payload(name: "studio", host: "studio", port: 22, user: "me",
+                                                           hostKeys: [], relay: nil, code: nil))
+        XCTAssertNil(withoutPlain["tailnet_plain"], "the key is left out when there are no plain routes")
+    }
+
+    func testPlainRoutesAreWsOnlyUniqueAndAddressesFirst() {
+        let routes = PhonePairing.plainRoutes([
+            "ws://bastion.hs.example:7297/v1/connect", "ws://100.64.0.7:7297/v1/connect",
+            "ws://100.64.0.7:7297/v1/connect", "wss://bastion.hs.example/v1/connect",
+        ])
+        XCTAssertEqual(routes, ["ws://100.64.0.7:7297/v1/connect", "ws://bastion.hs.example:7297/v1/connect"])
+        XCTAssertEqual(PhonePairing.plainRoutes([
+            "ws://bastion.hs.example:7297/v1/connect", "ws://[fd7a:115c:a1e0::1]:7297/v1/connect",
+            "ws://100.64.0.7:7297/v1/connect",
+        ]), [
+            "ws://100.64.0.7:7297/v1/connect", "ws://[fd7a:115c:a1e0::1]:7297/v1/connect",
+            "ws://bastion.hs.example:7297/v1/connect",
+        ])
+    }
+
+    func testPlainRoutesPairWithoutHTTPS() {
+        XCTAssertTrue(PhonePairing.canPair(host: "", hostKeys: [], tailnet: nil,
+                                           plain: ["ws://100.64.0.7:7297/v1/connect"]))
+        XCTAssertFalse(PhonePairing.canPair(host: "", hostKeys: [], tailnet: nil, plain: []))
+    }
+
+    func testRemoteHostTakesItsPlainRoutes() throws {
+        var host = try XCTUnwrap(PhonePairing.RemoteHost(json: [
+            "name": "bastion", "host": "", "user": "me", "host_keys": [] as [String],
+        ]))
+        XCTAssertFalse(host.inCode)
+        host.setTailnet(nil, plain: ["ws://100.64.0.7:7297/v1/connect"])
+        XCTAssertTrue(host.inCode)
+        XCTAssertEqual(host.payload["tailnet_plain"] as? [String], ["ws://100.64.0.7:7297/v1/connect"])
+    }
+
+    func testAPlainRouteCountsAsATailnetRoute() throws {
+        var json: [String: Any] = [
+            "state": "running", "hostname": "thurm", "https": ["state": "certs_off"], "url": NSNull(),
+            "host_urls": ["ws://100.64.0.7:7297/v1/connect"], "tags": [] as [String],
+        ]
+        XCTAssertTrue(try XCTUnwrap(TailscaleStatus(json: json)).hasTailnetRoute)
+        json["host_urls"] = [] as [String]
+        XCTAssertFalse(try XCTUnwrap(TailscaleStatus(json: json)).hasTailnetRoute)
+    }
+
+    func testTailscaleStatusOnAnotherCoordinationServer() throws {
+        var json: [String: Any] = [
+            "state": "running", "hostname": "thurm", "https": ["state": "unavailable"],
+            "url": NSNull(), "control_url": "https://headscale.example", "allow_tailnet_members": false,
+            "tags": [] as [String], "host_urls": ["ws://100.64.0.7:7297/v1/connect"],
+            "node_urls": ["ws://100.64.0.9:7297/v1/connect"],
+        ]
+        let status = try XCTUnwrap(TailscaleStatus(json: json))
+        XCTAssertTrue(status.hasCustomControl)
+        XCTAssertEqual(status.serverName, "your coordination server")
+        XCTAssertEqual(status.pairingPlain, ["ws://100.64.0.9:7297/v1/connect", "ws://100.64.0.7:7297/v1/connect"])
+        XCTAssertNil(status.pairingURL)
+        json["state"] = "off"
+        XCTAssertEqual(TailscaleStatus(json: json)?.pairingPlain, [], "plain routes only while running")
+        json["control_url"] = ""
+        XCTAssertEqual(TailscaleStatus(json: json)?.serverName, "Tailscale")
     }
 
     func testQRCodeStaysScannableWithManyHosts() {

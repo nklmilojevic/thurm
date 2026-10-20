@@ -441,6 +441,25 @@ fn a_tailnet_dialed_socket_may_be_plain_ws() {
 }
 
 #[test]
+fn connect_tailnet_fd_takes_plain_ws_where_connect_fd_refuses_it() {
+    let server = server_rt();
+    let url = echo_server(&server);
+    let addr = url
+        .trim_start_matches("ws://")
+        .trim_end_matches("/v1/connect")
+        .parse()
+        .unwrap();
+    let refused = connect_fd(dialed(addr), &url, "test", &[], |_| {}, || {});
+    assert!(matches!(refused, Err(ConnectError::BadUrl(_))));
+    let r = connect_tailnet_fd(dialed(addr), &url, "test", &[], |_| {}, || {});
+    assert!(
+        !matches!(r, Err(ConnectError::BadUrl(_))),
+        "{:?}",
+        r.map(|_| ())
+    );
+}
+
+#[test]
 fn a_tailnet_dialed_socket_still_checks_tls_for_wss() {
     let server = server_rt();
     let pki = test_pki();
