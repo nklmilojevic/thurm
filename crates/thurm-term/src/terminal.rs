@@ -2399,9 +2399,18 @@ impl Terminal {
         let alt = self.is_alt_screen();
         // The alternate screen: every row positioned explicitly.
         let alt_screen = alt.then(|| self.export_screen_exact());
+        // Mode 47 carries the cursor across each switch: keep the alternate screen's to put back.
+        let alt_cursor = alt.then(|| {
+            (
+                self.cursor_point(),
+                Pen::from_style(&self.vt.cursor_style()),
+                self.vt.mode(M_ORIGIN),
+            )
+        });
         if alt {
-            // Look at the primary screen (mode 47 switches screens without clearing either).
-            self.vt.write(b"\x1b[?47l");
+            // Look at the primary screen (mode 47 switches screens without clearing either),
+            // its cursor where entering the alternate screen saved it (where leaving restores it).
+            self.vt.write(b"\x1b[?47l\x1b8");
         }
         let mut out = String::new();
         let history = self.vt.history() as i32;
@@ -2448,6 +2457,13 @@ impl Terminal {
             ));
             out.push_str("\x1b[?1049h");
             self.vt.write(b"\x1b[?47h");
+            if let Some((point, pen, origin)) = alt_cursor {
+                let mut seq = format!("\x1b[?6l\x1b[{};{}H", point.line + 1, point.col + 1);
+                SgrState::default().transition(&pen, &mut seq);
+                self.vt.write(seq.as_bytes());
+                // Directly: setting it with DECOM would home the cursor.
+                self.vt.set_mode(M_ORIGIN, origin);
+            }
             out.push_str(alt_screen);
         }
         self.collect_events();
