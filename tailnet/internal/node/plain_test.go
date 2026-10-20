@@ -17,18 +17,27 @@ import (
 
 func TestPlainURLs(t *testing.T) {
 	ips := []netip.Addr{netip.MustParseAddr("fd7a:115c::1"), netip.MustParseAddr("100.64.0.7")}
+	v6Only := []netip.Addr{netip.MustParseAddr("fd7a:115c::1")}
 	cases := []struct {
 		name, listen, dns string
+		ips               []netip.Addr
 		want              []string
 	}{
-		{"every address", ":7297", "thurm.hs.example", []string{
-			"ws://100.64.0.7:7297/v1/connect", "ws://thurm.hs.example:7297/v1/connect"}},
-		{"one address", "100.64.0.9:7297", "", []string{"ws://100.64.0.9:7297/v1/connect"}},
-		{"no name yet", ":7297", "", []string{"ws://100.64.0.7:7297/v1/connect"}},
+		{"every address", ":7297", "thurm.hs.example", ips, []string{
+			"ws://100.64.0.7:7297/v1/connect", "ws://[fd7a:115c::1]:7297/v1/connect",
+			"ws://thurm.hs.example:7297/v1/connect"}},
+		{"no name yet", ":7297", "", ips, []string{
+			"ws://100.64.0.7:7297/v1/connect", "ws://[fd7a:115c::1]:7297/v1/connect"}},
+		{"ipv6 only, no name", ":7297", "", v6Only, []string{"ws://[fd7a:115c::1]:7297/v1/connect"}},
+		{"one address, no name advertised", "100.64.0.7:7297", "thurm.hs.example", ips, []string{
+			"ws://100.64.0.7:7297/v1/connect"}},
+		{"one ipv6 address", "[fd7a:115c::1]:7297", "thurm.hs.example", ips, []string{
+			"ws://[fd7a:115c::1]:7297/v1/connect"}},
+		{"address not the node's", "100.64.0.99:7297", "thurm.hs.example", ips, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := plainURLs(c.listen, ips, c.dns)
+			got := plainURLs(c.listen, c.ips, c.dns)
 			if len(got) != len(c.want) {
 				t.Fatalf("got %v, want %v", got, c.want)
 			}

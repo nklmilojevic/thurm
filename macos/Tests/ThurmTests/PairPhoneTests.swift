@@ -312,6 +312,13 @@ final class PairPhoneTests: XCTestCase {
             "ws://100.64.0.7:7297/v1/connect", "wss://bastion.hs.example/v1/connect",
         ])
         XCTAssertEqual(routes, ["ws://100.64.0.7:7297/v1/connect", "ws://bastion.hs.example:7297/v1/connect"])
+        XCTAssertEqual(PhonePairing.plainRoutes([
+            "ws://bastion.hs.example:7297/v1/connect", "ws://[fd7a:115c:a1e0::1]:7297/v1/connect",
+            "ws://100.64.0.7:7297/v1/connect",
+        ]), [
+            "ws://100.64.0.7:7297/v1/connect", "ws://[fd7a:115c:a1e0::1]:7297/v1/connect",
+            "ws://bastion.hs.example:7297/v1/connect",
+        ])
     }
 
     func testPlainRoutesPairWithoutHTTPS() {

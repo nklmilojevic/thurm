@@ -133,16 +133,20 @@ enum PhonePairing {
         return (status.pairingURL, status.pairingPlain)
     }
 
-    /// The plain endpoints the phone can use: `ws://` addresses, each once, IP literals first
-    /// (a name may not resolve on the phone's tailnet, an address always does).
+    /// The plain endpoints the phone can use: `ws://` addresses, each once, IPv4 literals first,
+    /// then IPv6, then names (a name may not resolve on the phone's tailnet, an address always does).
     static func plainRoutes(_ urls: [String]) -> [String] {
         var seen = Set<String>()
         let unique = urls.filter { $0.hasPrefix("ws://") && seen.insert($0).inserted }
-        func isAddress(_ url: String) -> Bool {
-            guard let host = URL(string: url)?.host else { return false }
-            return host.contains(":") || host.allSatisfy { $0.isNumber || $0 == "." }
+        func rank(_ url: String) -> Int {
+            guard let host = URL(string: url)?.host else { return 2 }
+            if host.contains(":") { return 1 }
+            return host.allSatisfy { $0.isNumber || $0 == "." } ? 0 : 2
         }
-        return unique.filter(isAddress) + unique.filter { !isAddress($0) }
+        // A stable order: the sort alone does not keep equal ranks in place.
+        return unique.enumerated()
+            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+            .map(\.element)
     }
 
     /// Whether there is a code to show: the phone needs this Mac's ssh address and host keys, or

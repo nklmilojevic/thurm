@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -537,7 +538,11 @@ func (n *Node) bindTLS(ctx context.Context, gen int, st *ipnstate.Status) {
 	srv, gw, lc := n.srv, n.gw, n.lc
 	n.mu.Unlock()
 	if https.State != "provisioning" {
-		n.bindPlain(gen, srv, gw)
+		var ips []netip.Addr
+		if st.Self != nil {
+			ips = st.Self.TailscaleIPs
+		}
+		n.bindPlain(gen, srv, gw, ips)
 		return
 	}
 	ln, err := srv.ListenTLS("tcp", ":443")
@@ -587,12 +592,16 @@ func (n *Node) adminWhere() string {
 
 // bindPlain serves the gateway on plain_listen while HTTPS is off. The tailnet's WireGuard
 // already encrypts the hop, and the gateway admits callers by WhoIs as it does on HTTPS.
-func (n *Node) bindPlain(gen int, srv *tsnet.Server, gw *gateway.Gateway) {
+func (n *Node) bindPlain(gen int, srv *tsnet.Server, gw *gateway.Gateway, ips []netip.Addr) {
 	n.mu.Lock()
 	listen := n.cfg.PlainListen
 	skip := listen == "" || n.plainLn != nil || gen != n.gen
 	n.mu.Unlock()
 	if skip {
+		return
+	}
+	if _, _, _, err := plainAddrs(listen, ips); err != nil {
+		n.fail(gen, err.Error())
 		return
 	}
 	ln, err := srv.Listen("tcp", listen)
@@ -623,25 +632,44 @@ func (n *Node) servePlain(gen int, ln net.Listener, gw *gateway.Gateway) {
 	}()
 }
 
-// plainURLs are the addresses the plain listener answers on: the IP literals first, then the
-// MagicDNS name. listen is ":port" (every tailnet IPv4 address) or "addr:port".
+// plainAddrs are the node's addresses a plain listener on listen serves, and its port: every
+// tailnet address for ":port", else the one named, which must be one of the node's own (tsnet
+// only checks that it is an IP literal). wildcard reports the ":port" form.
+func plainAddrs(listen string, ips []netip.Addr) (addrs []netip.Addr, port string, wildcard bool, err error) {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("invalid plain_listen %q: %w", listen, err)
+	}
+	if host == "" {
+		return ips, port, true, nil
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil || !slices.Contains(ips, ip) {
+		return nil, "", false, fmt.Errorf("plain_listen %q: %s is not one of this node's tailnet addresses %v", listen, host, ips)
+	}
+	return []netip.Addr{ip}, port, false, nil
+}
+
+// plainURLs are the addresses the plain listener answers on: IPv4 literals, then IPv6 ones, then
+// the MagicDNS name. The name is advertised only for the ":port" form, since a single address
+// need not be the one the name resolves to. Nil when the listen address is not usable.
 func plainURLs(listen string, ips []netip.Addr, dnsName string) []string {
-	_, port, err := net.SplitHostPort(listen)
+	addrs, port, wildcard, err := plainAddrs(listen, ips)
 	if err != nil {
 		return nil
 	}
-	host, _, _ := net.SplitHostPort(listen)
 	var hosts []string
-	if host == "" {
-		for _, ip := range ips {
-			if ip.Is4() {
-				hosts = append(hosts, ip.String())
-			}
+	for _, ip := range addrs {
+		if ip.Is4() {
+			hosts = append(hosts, ip.String())
 		}
-	} else {
-		hosts = append(hosts, host)
 	}
-	if dnsName != "" {
+	for _, ip := range addrs {
+		if ip.Is6() {
+			hosts = append(hosts, ip.String())
+		}
+	}
+	if wildcard && dnsName != "" {
 		hosts = append(hosts, dnsName)
 	}
 	urls := make([]string, 0, len(hosts))

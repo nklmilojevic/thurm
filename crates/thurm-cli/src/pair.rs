@@ -100,8 +100,8 @@ fn routes(s: &TailscaleStatus) -> Result<Routes, String> {
     Ok(Routes { wss, plain })
 }
 
-/// The plain endpoints of the node and of this host's own Tailscale, each once, IP literals
-/// before names.
+/// The plain endpoints of the node and of this host's own Tailscale, each once, IPv4 literals
+/// first, then IPv6, then names.
 fn plain_urls(s: &TailscaleStatus) -> Vec<String> {
     let mut urls: Vec<String> = Vec::new();
     for url in s.node_urls.iter().chain(&s.host_urls) {
@@ -109,10 +109,13 @@ fn plain_urls(s: &TailscaleStatus) -> Vec<String> {
             urls.push(url.clone());
         }
     }
-    let (ips, names): (Vec<String>, Vec<String>) = urls
-        .into_iter()
-        .partition(|url| ws_host(url).parse::<std::net::IpAddr>().is_ok());
-    ips.into_iter().chain(names).collect()
+    // IPv4 literals, then IPv6, then names; a stable sort keeps each group in its order.
+    urls.sort_by_key(|url| match ws_host(url).parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => 0,
+        Ok(std::net::IpAddr::V6(_)) => 1,
+        Err(_) => 2,
+    });
+    urls
 }
 
 /// The host of a `ws://` or `wss://` address, without its port or path (an IPv6 literal without
@@ -326,6 +329,26 @@ mod tests {
         let r = routes(&serving()).unwrap();
         let p = payload("bastion", "bastion", "me", &r, &PushConfig::default());
         assert!(p.get("tailnet_plain").is_none());
+    }
+
+    #[test]
+    fn plain_routes_put_ipv4_first_then_ipv6_then_names() {
+        let s = TailscaleStatus {
+            host_urls: vec![
+                "ws://bastion.hs.example:7297/v1/connect".into(),
+                "ws://[fd7a:115c:a1e0::1]:7297/v1/connect".into(),
+                "ws://100.64.0.7:7297/v1/connect".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            plain_urls(&s),
+            [
+                "ws://100.64.0.7:7297/v1/connect",
+                "ws://[fd7a:115c:a1e0::1]:7297/v1/connect",
+                "ws://bastion.hs.example:7297/v1/connect",
+            ]
+        );
     }
 
     #[test]
