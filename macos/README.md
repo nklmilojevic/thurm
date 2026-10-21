@@ -10,7 +10,7 @@ with Metal and CoreText. Quitting the app leaves your shells running (unless
 
 - An Apple silicon Mac with macOS 14 (Sonoma) or newer. Thurm is built for arm64 only.
 - Xcode 26 or newer
-- Rust (edition 2024, 1.88+): `nix develop` (or `direnv allow`) provides it, from the
+- Rust (edition 2024, 1.95+): `nix develop` (or `direnv allow`) provides it, from the
   repository's `flake.nix`. libghostty-vt comes prebuilt (ghostty-vt-rs-sys); Zig 0.16 is only
   needed to build it from source (`GHOSTTY_VT_RS_SYS_BUILD=source`).
 

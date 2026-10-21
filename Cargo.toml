@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.10.1"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.95"
 
 [workspace.dependencies]
 thurm-proto = { path = "crates/thurm-proto" }
