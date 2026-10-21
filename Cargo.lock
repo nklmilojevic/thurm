@@ -855,7 +855,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2043,9 +2043,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-cli"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "base64",
  "clap",
@@ -2474,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-client"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -2486,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-config"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "dirs",
  "libc",
@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-daemon"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2526,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-direct"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "log",
  "parking_lot",
@@ -2542,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-ffi"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "log",
  "parking_lot",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-mosh"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "aes",
  "base64",
@@ -2572,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-proto"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "postcard",
  "serde",
@@ -2581,7 +2581,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-remote"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "base64",
  "futures-util",
@@ -2601,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-ssh"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "log",
  "p256",
@@ -2615,7 +2615,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-tailnet-client"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "futures-util",
  "log",
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-term"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "base64",
  "bitflags 2.13.2",
@@ -2649,7 +2649,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-web"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "ghostty-vt-rs-sys",
  "serde",
@@ -2843,9 +2843,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "3.4.2"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
+checksum = "cde93ff05758a36a851a398a772b0b79a82fbe3c186a46f2696baaeaf84c966b"
 dependencies = [
  "base64",
  "log",
@@ -2859,9 +2859,9 @@ dependencies = [
 
 [[package]]
 name = "ureq-proto"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f86fd172ccca569e458f61b6bdd6220965a9ef36e672a6852953b51a0e1583be"
+checksum = "841583fc36089d7d59419568ae157f43a5a03a2e5a81ba87c77d1596ef46e922"
 dependencies = [
  "base64",
  "http",
