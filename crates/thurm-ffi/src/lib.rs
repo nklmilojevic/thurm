@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ::thurm_client::{Client, ConnectOptions};
-use parking_lot::Mutex;
+use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use thurm_proto::{
     Event, Frame, ImagePlacement, Key, KeyAction, KeyEvent, MouseButton, MouseEvent, MouseKind,
     NamedKey, PaneId, PaneSize, Request, Response,
@@ -327,7 +327,7 @@ impl Engine {
 
 struct Shared {
     grids: Mutex<HashMap<PaneId, Arc<Mutex<Grid>>>>,
-    locked: Mutex<HashMap<PaneId, Arc<Mutex<Grid>>>>,
+    locked: Mutex<HashMap<PaneId, ArcMutexGuard<RawMutex, Grid>>>,
     images: Mutex<HashMap<(PaneId, u32), Arc<ImageSlot>>>,
     locked_images: Mutex<HashMap<ImageKey, Vec<Arc<ImageSlot>>>>,
     locals: Mutex<HashMap<PaneId, Arc<Mutex<LocalPane>>>>,
@@ -1214,7 +1214,7 @@ pub unsafe extern "C" fn thurm_grid_lock(
         return false;
     };
     let slot = c.shared.grids.lock().entry(pane).or_default().clone();
-    let mut guard = slot.lock();
+    let mut guard = slot.lock_arc();
     if let Some(local) = c.shared.local(pane) {
         let snap = {
             let mut l = local.lock();
@@ -1250,11 +1250,8 @@ pub unsafe extern "C" fn thurm_grid_lock(
     // The caller now has a consistent view; the next lock reports rows changed after this.
     guard.info.dirty_rows = 0;
     guard.info.shift = 0;
-    std::mem::forget(guard);
-    if let Some(prev) = c.shared.locked.lock().insert(pane, slot) {
-        // Double lock without unlock: release the previous lock to avoid a deadlock.
-        unsafe { prev.force_unlock() };
-    }
+    // Double lock without unlock: dropping the previous guard releases it to avoid a deadlock.
+    c.shared.locked.lock().insert(pane, guard);
     true
 }
 
@@ -1263,8 +1260,8 @@ unsafe fn locked_grid<'a>(client: *mut thurm_client, pane: u64) -> Option<&'a Gr
     let locked = c.shared.locked.lock();
     let slot = locked.get(&pane)?;
     // Safety: the mutex is held by the caller (between grid_lock and grid_unlock) and the
-    // Arc is kept alive in `locked` until unlock.
-    Some(unsafe { &*slot.data_ptr() })
+    // guard is kept alive in `locked` until unlock.
+    Some(unsafe { &*ArcMutexGuard::mutex(slot).data_ptr() })
 }
 
 #[unsafe(no_mangle)]
@@ -1375,9 +1372,7 @@ pub unsafe extern "C" fn thurm_grid_unlock(client: *mut thurm_client, pane: u64)
     let Some(c) = (unsafe { client_ref(client) }) else {
         return;
     };
-    if let Some(slot) = c.shared.locked.lock().remove(&pane) {
-        unsafe { slot.force_unlock() };
-    }
+    c.shared.locked.lock().remove(&pane);
 }
 
 #[unsafe(no_mangle)]

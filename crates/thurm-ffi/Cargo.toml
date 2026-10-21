@@ -19,7 +19,8 @@ thurm-ssh = { workspace = true, optional = true }
 thurm-tailnet-client = { workspace = true, optional = true }
 thurm-direct = { workspace = true, optional = true }
 serde.workspace = true
-parking_lot.workspace = true
+# Grid locks are held across FFI calls as guards, possibly released on another thread.
+parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 serde_json.workspace = true
 log.workspace = true
 
