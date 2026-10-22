@@ -17,7 +17,7 @@ mod tailscale;
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use thurm_client::{Client, ClientError, ConnectOptions, find_daemon};
 use thurm_config::hooks;
 use thurm_proto::{
@@ -205,6 +205,8 @@ enum Cmd {
         #[arg(short, long)]
         pane: Option<PaneId>,
     },
+    /// Print the shell completion script for `thurm` itself (e.g. `thurm completion fish | source`).
+    Completion { shell: clap_complete::Shell },
     /// Processes running in panes and the TCP ports they listen on (dev servers, ...).
     Procs {
         #[arg(short, long)]
@@ -582,6 +584,7 @@ fn run(cli: Cli) -> R {
             Cmd::PaneId
                 | Cmd::ConfigPath
                 | Cmd::SocketPath
+                | Cmd::Completion { .. }
                 | Cmd::RemoteInfo
                 | Cmd::Notify { .. }
                 | Cmd::Daemon { .. }
@@ -622,6 +625,10 @@ fn run(cli: Cli) -> R {
         Cmd::Attach { pane } => attach::run(pane, remote.as_deref(), json),
         Cmd::SocketPath => {
             println!("{}", thurm_config::socket_path().display());
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Completion { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "thurm", &mut std::io::stdout());
             Ok(ExitCode::SUCCESS)
         }
         Cmd::RemoteInfo => remote::remote_info(),
@@ -1568,6 +1575,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
         | Cmd::PaneId
         | Cmd::ConfigPath
         | Cmd::SocketPath
+        | Cmd::Completion { .. }
         | Cmd::RemoteInfo
         | Cmd::Remote { .. }
         | Cmd::Handoff { .. }
