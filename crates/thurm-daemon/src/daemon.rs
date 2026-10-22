@@ -320,6 +320,10 @@ pub struct PaneState {
     /// UTF-8 character): an in-place upgrade replays it into the new terminal ahead of the
     /// rest, which is still in the kernel.
     carry: Vec<u8>,
+    /// The same for the stream forwarded to clients: an attaching client's copy gets it after
+    /// the state, so the output that follows finishes the sequence there instead of showing
+    /// its end as text.
+    forwarded_carry: Vec<u8>,
     pending_input: Option<(Instant, Vec<u8>)>,
     shell_integration_seen: bool,
     /// Last git probe: when, for which directory, and whether one is in flight.
@@ -337,6 +341,16 @@ pub struct PaneState {
     command_check: Option<((String, String), bool)>,
 }
 
+impl PaneState {
+    /// The state an attaching client rebuilds the terminal from, ending inside the sequence
+    /// the forwarded output is in the middle of.
+    fn attach_state(&mut self) -> Vec<u8> {
+        let mut state = self.term.serialize_state();
+        state.extend_from_slice(&self.forwarded_carry);
+        state
+    }
+}
+
 /// What [`Daemon::install_pane`] needs: a new pane, or one handed over by the previous daemon.
 struct InstallPane {
     term: Terminal,
@@ -348,6 +362,8 @@ struct InstallPane {
     shell_integration_seen: bool,
     /// Start of a sequence parsed by the image we replaced (see `PaneState::carry`).
     carry: Vec<u8>,
+    /// What forwarding `carry` gives clients (see `PaneState::forwarded_carry`).
+    forwarded_carry: Vec<u8>,
 }
 
 pub struct Daemon {
@@ -761,6 +777,7 @@ impl Daemon {
                 osc_cwd: None,
                 shell_integration_seen: false,
                 carry: Vec::new(),
+                forwarded_carry: Vec::new(),
             },
             true,
         )?;
@@ -794,6 +811,7 @@ impl Daemon {
                 command_started: None,
                 command_line: None,
                 carry: p.carry,
+                forwarded_carry: p.forwarded_carry,
                 pending_input: None,
                 shell_integration_seen: p.shell_integration_seen,
                 git_probe: None,
@@ -937,10 +955,10 @@ impl Daemon {
         for slice in bytes.chunks(PARSE_SLICE) {
             let events = {
                 let mut st = pane.state.lock();
-                if st.subscribers.is_empty() {
-                    st.term.advance(slice);
-                } else {
-                    let data = st.term.advance_forward(slice);
+                // Forwarded even without subscribers: one may attach inside a sequence.
+                let data = st.term.advance_forward(slice);
+                update_carry(&mut st.forwarded_carry, &data);
+                if !st.subscribers.is_empty() {
                     self.forward_output(pane.id, &mut st, data);
                 }
                 update_carry(&mut st.carry, slice);
@@ -973,7 +991,7 @@ impl Daemon {
             }
         }
         // The state already includes this chunk.
-        let state = need_state.then(|| st.term.serialize_state());
+        let state = need_state.then(|| st.attach_state());
         let size = st.term.size();
         // The last output event takes the buffer; only the others copy it.
         let last_output = plan.iter().rposition(|(_, attach)| !attach);
@@ -1018,7 +1036,7 @@ impl Daemon {
         if ready.is_empty() {
             return;
         }
-        let state = st.term.serialize_state();
+        let state = st.attach_state();
         let size = st.term.size();
         for c in ready {
             c.send(ServerMessage::Event(Event::Attach {
@@ -1046,7 +1064,7 @@ impl Daemon {
         if st.subscribers.is_empty() {
             return;
         }
-        let state = st.term.serialize_state();
+        let state = st.attach_state();
         let size = st.term.size();
         let clients = self.clients.lock();
         for cid in st.subscribers.keys() {
@@ -1920,8 +1938,9 @@ impl Daemon {
             term.replay(&p.state_bytes());
             // The start of a sequence the old image had parsed; the rest follows from the PTY.
             let pending = p.pending_bytes();
+            let mut forwarded_carry = Vec::new();
             if !pending.is_empty() {
-                term.advance(&pending);
+                update_carry(&mut forwarded_carry, &term.advance_forward(&pending));
                 let _ = term.drain_events();
             }
             if let Some(original) = p.terminal_size_after_detach {
@@ -1958,6 +1977,7 @@ impl Daemon {
                     shell_integration_seen: p.shell_integration_seen,
                     // Still the start of a sequence if the next upgrade comes before its end.
                     carry: pending,
+                    forwarded_carry,
                 },
                 alive,
             );
@@ -2596,7 +2616,7 @@ impl Daemon {
             Request::Subscribe { pane } => {
                 // Under the pane lock, so no output slips in between the state and the stream.
                 self.with_pane(pane, |_, st| {
-                    let state = st.term.serialize_state();
+                    let state = st.attach_state();
                     let size = st.term.size();
                     client.send(ServerMessage::Event(Event::Attach { pane, size, state }));
                     st.subscribers.insert(client.id, Subscriber::default());

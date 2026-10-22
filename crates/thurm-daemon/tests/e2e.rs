@@ -1468,6 +1468,55 @@ fn in_place_upgrade_loses_no_output() {
 }
 
 #[test]
+fn subscribing_inside_an_escape_sequence_shows_no_tail() {
+    let env = Env::new("attach-mid-sequence");
+    let _daemon = env.start();
+    let (c, events) = env.connect();
+    let pane = create(&c, &env.dir);
+    wait_match(&c, pane, r"\$");
+    // The output stops inside an SGR sequence (`\033[3`) and goes on (`1m`) a second later.
+    // (`\061` is `1`: the echoed command line has no `1mred`.)
+    c.request(Request::Input {
+        pane,
+        data: b"printf 'go\\033[3'; sleep 1; printf '\\061mred\\033[0m\\n'\r".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, "(?m)^go");
+    c.request(Request::Subscribe { pane }).unwrap();
+    let mut copy: Option<thurm_term::Terminal> = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match events.recv_timeout(Duration::from_millis(50)) {
+            Ok(Event::Attach { size, state, .. }) => {
+                assert!(
+                    state.ends_with(b"\x1b[3"),
+                    "attached outside the sequence: {:?}",
+                    String::from_utf8_lossy(&state[state.len().saturating_sub(40)..])
+                );
+                let mut t = thurm_term::Terminal::new(size, thurm_term::EngineConfig::default());
+                t.replay(&state);
+                copy = Some(t);
+            }
+            Ok(Event::Output { data, .. }) => copy.as_mut().unwrap().advance(&data),
+            _ => {}
+        }
+        if let Some(t) = &copy
+            && t.screen_text()
+                .lines()
+                .any(|l| l.starts_with("go") && l.ends_with("red"))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no output after the sequence");
+    }
+    let screen = copy.unwrap().screen_text();
+    assert!(
+        screen.lines().any(|l| l.trim_end() == "gored"),
+        "the copy printed the end of the sequence:\n{screen}"
+    );
+}
+
+#[test]
 fn upgrade_to_a_broken_binary_is_refused() {
     let env = Env::new("upgrade-refused");
     let daemon = env.start();

@@ -46,7 +46,7 @@ impl Daemon {
             st.term.resize(size);
             st.info.size = size;
             self.send_subscribers(st, Event::Resized { pane, size });
-            let state = st.term.serialize_state();
+            let state = st.attach_state();
             client.send(ServerMessage::Event(Event::Attach { pane, size, state }));
             st.subscribers.insert(client.id, Subscriber::default());
             Ok(Response::Ok)
