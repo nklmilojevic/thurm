@@ -632,7 +632,7 @@ final class SessionManager: NSObject, CoreDelegate {
     @discardableResult
     func newTab(from hostIn: TerminalWindowController?, pane existing: PaneKey? = nil, preset: String? = nil,
                 cwd: String? = nil, host daemonIn: HostId? = nil, handoff: String? = nil,
-                reveal: Bool = false) -> PaneKey? {
+                reveal: Bool = false, background: Bool = false) -> PaneKey? {
         // The quick terminal has one tab: new ones go to the last regular window.
         var host = hostIn ?? currentController
         if host?.isQuick ?? false { host = currentRegularController }
@@ -649,8 +649,15 @@ final class SessionManager: NSObject, CoreDelegate {
             if (workspace(host.workspaceID)?.host ?? host.host) == pane.host {
                 let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
                 c.handoffID = handoff
-                attachAsTab(c, to: host)
-                c.window?.makeKeyAndOrderFront(nil)
+                if background {
+                    // Behind the selected tab, which stays selected.
+                    let selected = host.window?.tabGroup?.selectedWindow
+                    attachAsTab(c, to: host)
+                    if let selected { selected.tabGroup?.selectedWindow = selected }
+                } else {
+                    attachAsTab(c, to: host)
+                    c.window?.makeKeyAndOrderFront(nil)
+                }
             } else {
                 let ws = workspacesByRecency.first { $0.host == pane.host && !isShown($0) }
                     ?? makeWorkspace(host: pane.host)
@@ -1434,6 +1441,75 @@ final class SessionManager: NSObject, CoreDelegate {
                 refreshSidebars()
                 scheduleLayoutSave()
             }
+        case "Open":
+            // `thurm new-tab` / `split` with options (`--background`, `--size`).
+            guard let pane = key("pane") else { return }
+            let background = jsonBool(d["background"]) ?? false
+            if controller(for: pane) != nil {
+                if !background { focusPane(pane, activate: true) }
+                return
+            }
+            if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
+            takeHiddenTab(pane)
+            let share = jsonUInt64(d["percent"]).map { CGFloat(min(99, max(1, $0))) / 100 }
+            if let dir = jsonString(d["split"]).flatMap(SplitDirName.init(rawValue:)) {
+                let target = key("target")
+                let host = target.flatMap { controller(for: $0) }
+                    ?? (currentController?.host == daemon ? currentController : nil)
+                if let host {
+                    host.content.split(target: target, newPane: pane, direction: dir, share: share,
+                                       takeFocus: !background)
+                    scheduleLayoutSave()
+                } else {
+                    newTab(from: currentController, pane: pane, background: background)
+                }
+            } else if jsonBool(d["new_window"]) ?? false {
+                newWindow(pane: pane, background: true)
+            } else {
+                newTab(from: currentController, pane: pane, background: background)
+            }
+            if !background { NSApp.activate() }
+        case "Zoom":
+            if let pane = key("pane") { controller(for: pane)?.content.zoom(pane, jsonBool(d["zoom"])) }
+        case "MovePane":
+            guard let pane = key("pane"), let target = key("target"), pane != target,
+                  let from = controller(for: pane), let to = controller(for: target),
+                  !from.isQuick, !to.isQuick,
+                  let dir = SplitDirName(rawValue: jsonString(d["dir"]) ?? "right") else { return }
+            let share = jsonUInt64(d["percent"]).map { CGFloat(min(99, max(1, $0))) / 100 }
+            if from === to {
+                to.content.move(pane, nextTo: target, direction: dir, share: share)
+            } else {
+                // Out of its tab first, so its view there lets go of the pane before the new one
+                // takes it; an emptied tab closes once the pane is in its new place.
+                let emptied = from.content.remove(pane: pane)
+                to.content.split(target: target, newPane: pane, direction: dir, share: share, takeFocus: false)
+                to.updateTitle()
+                if emptied {
+                    from.closingWithoutConfirmation = true
+                    from.window?.close()
+                } else {
+                    from.updateTitle()
+                }
+                focusChanged()
+            }
+            scheduleLayoutSave()
+        case "SwapPanes":
+            guard let a = key("a"), let b = key("b"), a != b,
+                  let ca = controller(for: a), let cb = controller(for: b) else { return }
+            if ca === cb {
+                ca.content.swap(a, b)
+            } else {
+                ca.content.replace(a, with: b)
+                cb.content.replace(b, with: a)
+                // Each pane's old view let go of it after its new one took it.
+                ca.content.views[b]?.resubscribe()
+                cb.content.views[a]?.resubscribe()
+                ca.updateTitle()
+                cb.updateTitle()
+                focusChanged()
+            }
+            scheduleLayoutSave()
         default:
             tlog("unknown UI command \(v.name)")
         }

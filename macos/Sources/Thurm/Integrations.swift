@@ -8,10 +8,6 @@ final class Integrations: NSObject, NSMenuDelegate {
     private let fm = FileManager.default
     private var home: URL { fm.homeDirectoryForCurrentUser }
     private var cli: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/thurm") }
-    private var bundledSkill: URL? {
-        Bundle.main.resourceURL?.appendingPathComponent("skills/thurm")
-    }
-    private var skillLink: URL { home.appendingPathComponent(".claude/skills/thurm") }
     private var launchAgent: URL { home.appendingPathComponent("Library/LaunchAgents/com.thurm.daemon.plist") }
     /// `~/.local/bin` when it exists (no password needed), else `/usr/local/bin`.
     private var cliLinkCandidates: [URL] {
@@ -34,11 +30,14 @@ final class Integrations: NSObject, NSMenuDelegate {
                 toggleHooks(agent, install: !complete)
             }
         }
-        if fm.fileExists(atPath: home.appendingPathComponent(".claude").path) {
-            let on = skillInstalled
-            add(menu, on ? "Uninstall thurm Skill for Claude Code" : "Install thurm Skill for Claude Code",
-                on: on, tip: "Lets Claude Code open panes and read other panes' output") { [self] in
-                on ? uninstallSkill() : installSkill()
+        // A skill of the user's own by that name is theirs to keep.
+        let skills = skillStatus().filter { $0.present && $0.state != "other" }
+        if !skills.isEmpty {
+            let on = skills.allSatisfy { $0.state == "current" }
+            let names = skills.map(\.name).joined(separator: ", ")
+            add(menu, on ? "Uninstall thurm Skill for Agents" : "Install thurm Skill for Agents",
+                on: on, tip: "Lets \(names) open panes and read other panes' output") { [self] in
+                run(["skill", on ? "remove" : "setup"], title: "thurm Skill")
             }
         }
         let agentOn = fm.fileExists(atPath: launchAgent.path)
@@ -134,38 +133,23 @@ final class Integrations: NSObject, NSMenuDelegate {
         run(["hooks", install ? "install" : "uninstall", "--agent", agent.kind], title: "\(agent.name) Hooks")
     }
 
-    // MARK: Claude Code skill
+    // MARK: Agent skill
 
-    private var skillInstalled: Bool {
-        guard let dest = try? fm.destinationOfSymbolicLink(atPath: skillLink.path) else { return false }
-        return URL(fileURLWithPath: dest).resolvingSymlinksInPath().path == bundledSkill?.resolvingSymlinksInPath().path
+    private struct SkillTarget {
+        let name: String
+        let present: Bool
+        let state: String
     }
 
-    private func installSkill() {
-        guard let source = bundledSkill, fm.fileExists(atPath: source.appendingPathComponent("SKILL.md").path) else {
-            report("thurm Skill", "This build has no bundled skill.", ok: false)
-            return
+    private func skillStatus() -> [SkillTarget] {
+        guard let out = capture(["--json", "skill", "status"]).output.data(using: .utf8),
+              let list = try? JSONSerialization.jsonObject(with: out) as? [[String: Any]]
+        else { return [] }
+        return list.compactMap { d in
+            guard let name = d["name"] as? String else { return nil }
+            return SkillTarget(name: name, present: d["present"] as? Bool ?? false,
+                               state: d["state"] as? String ?? "")
         }
-        if fm.fileExists(atPath: skillLink.path) || (try? fm.destinationOfSymbolicLink(atPath: skillLink.path)) != nil {
-            guard (try? fm.destinationOfSymbolicLink(atPath: skillLink.path)) != nil else {
-                report("thurm Skill", "\(skillLink.path) exists; not replacing it.", ok: false)
-                return
-            }
-            try? fm.removeItem(at: skillLink)
-        }
-        do {
-            try fm.createDirectory(at: skillLink.deletingLastPathComponent(), withIntermediateDirectories: true)
-            // A link into the app, so the skill updates with Thurm.
-            try fm.createSymbolicLink(at: skillLink, withDestinationURL: source)
-            report("thurm Skill", "Linked \(skillLink.path). New Claude Code sessions can use it.", ok: true)
-        } catch {
-            report("thurm Skill", error.localizedDescription, ok: false)
-        }
-    }
-
-    private func uninstallSkill() {
-        try? fm.removeItem(at: skillLink)
-        report("thurm Skill", "Removed \(skillLink.path).", ok: true)
     }
 
     // MARK: Running things

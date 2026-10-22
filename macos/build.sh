@@ -212,7 +212,8 @@ fi
 if [[ -d "$HERE/Resources/fonts" ]]; then
     cp -R "$HERE/Resources/fonts" "$APP/Contents/Resources/fonts"
 fi
-# The Claude Code skill (Thurm > Integrations links ~/.claude/skills/thurm to it).
+# The agent skill, a stub that runs `thurm skill show`. Thurm > Integrations used to link
+# ~/.claude/skills/thurm to it; `thurm skill setup` now writes a copy.
 if [[ -d "$ROOT/skills" ]]; then
     cp -R "$ROOT/skills" "$APP/Contents/Resources/skills"
 fi

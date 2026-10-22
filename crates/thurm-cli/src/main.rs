@@ -12,6 +12,7 @@ mod hook_pgrp;
 mod layouts;
 mod pair;
 mod remote;
+mod skill;
 mod tailscale;
 
 use std::io::{IsTerminal, Read, Write};
@@ -173,6 +174,15 @@ enum Cmd {
         /// Keep the pane open after the command exits.
         #[arg(long)]
         hold: bool,
+        /// Leave the focus, the selected tab and the app where they are.
+        #[arg(long)]
+        background: bool,
+        /// Tab title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Wait for COMMAND to exit, and exit with its status.
+        #[arg(long)]
+        wait: bool,
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -187,8 +197,55 @@ enum Cmd {
         cwd: Option<String>,
         #[arg(long)]
         hold: bool,
+        /// The new pane's share of the split, in percent (default: half).
+        #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(1..=99))]
+        size: Option<u8>,
+        /// Leave the focus and the app where they are.
+        #[arg(long)]
+        background: bool,
+        /// Wait for COMMAND to exit, and exit with its status.
+        #[arg(long)]
+        wait: bool,
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
+    },
+    /// Zoom a pane to fill its tab, or restore the splits (default: toggle).
+    Zoom {
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+        #[arg(long, conflicts_with = "off")]
+        on: bool,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Move a pane next to another one, in its tab or another tab; its program keeps running.
+    Move {
+        /// Pane to move (default: current pane).
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+        /// The pane to put it next to.
+        #[arg(long, value_name = "PANE")]
+        to: PaneId,
+        /// Which side of that pane.
+        #[arg(short, long, value_enum, default_value = "right")]
+        dir: Dir,
+        /// Its share of the new split, in percent (default: half).
+        #[arg(long, value_name = "PERCENT", value_parser = clap::value_parser!(u8).range(1..=99))]
+        size: Option<u8>,
+    },
+    /// Swap the places of two panes, in one tab or across tabs.
+    Swap {
+        /// Default: current pane.
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+        #[arg(long, value_name = "PANE")]
+        with: PaneId,
+    },
+    /// The pane with keyboard focus in the app (or the last one that had it).
+    Focused {
+        /// The panes that had focus, most recent first.
+        #[arg(long)]
+        history: bool,
     },
     /// Fork the agent session of a pane (Claude Code / Codex, needs hooks) into a new split or
     /// tab: `claude --resume <id> --fork-session`, `codex fork <id>`.
@@ -422,6 +479,12 @@ enum Cmd {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// The skill that teaches coding agents (Claude Code, Codex, ...) to drive Thurm: print its
+    /// guide, or install it.
+    Skill {
+        #[command(subcommand)]
+        action: skill::SkillCmd,
+    },
     /// Called by agent hooks: report an agent event for this pane. Reads the hook's JSON on
     /// stdin. Silent, and always succeeds, so it can never break the agent.
     #[command(hide = true)]
@@ -469,6 +532,14 @@ fn agent_hook(agent: Option<String>, event: Option<String>) {
     let payload: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
     let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).map(str::to_owned);
     let event = hooks::hook_event(&event, &payload);
+    if event == "session-start" {
+        // Claude Code and Codex add a SessionStart hook's output to the session's context.
+        print!(
+            "{}",
+            skill::session_context(pane, skill::cli_off_path().as_deref())
+        );
+        let _ = std::io::stdout().flush();
+    }
     let Ok(c) = connect(false) else { return };
     let _ = c.request(Request::AgentHook {
         pane,
@@ -587,6 +658,7 @@ fn run(cli: Cli) -> R {
                 | Cmd::Daemon { .. }
                 | Cmd::AgentHook { .. }
                 | Cmd::Hooks { .. }
+                | Cmd::Skill { .. }
                 | Cmd::Remote { .. }
                 | Cmd::Pair { .. }
                 | Cmd::Theme { .. }
@@ -705,6 +777,7 @@ fn run(cli: Cli) -> R {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Hooks { action, agent } => hooks_cmd(&action, agent.as_deref(), json),
+        Cmd::Skill { action } => skill::run(action, json),
         Cmd::Theme { spec: None } => {
             let cfg = thurm_config::Config::load()?;
             let current = cfg.theme_spec();
@@ -1157,7 +1230,18 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             let pane = current_pane(pane)?;
             match c.request(Request::PaneInfo { pane })? {
                 Response::PaneInfo(p) => {
-                    println!("{}", serde_json::to_string_pretty(&pane_json(&p))?)
+                    let mut info = pane_json(&p);
+                    // From a daemon that has them.
+                    if let Ok(Response::PaneModes(m)) = c.request(Request::PaneModes { pane }) {
+                        info["alt_screen"] = m.alt_screen.into();
+                        info["mouse"] = m.mouse.into();
+                        info["bracketed_paste"] = m.bracketed_paste.into();
+                        info["focus_reports"] = m.focus_reports.into();
+                    }
+                    if let Ok(Response::FocusHistory(h)) = c.request(Request::FocusHistory) {
+                        info["focused"] = h.iter().any(|r| r.pane == pane && r.focused).into();
+                    }
+                    println!("{}", serde_json::to_string_pretty(&info)?)
                 }
                 other => return Err(format!("unexpected response {other:?}").into()),
             }
@@ -1166,37 +1250,147 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             cwd,
             window,
             hold,
+            background,
+            title,
+            wait,
             command,
         } => {
             let inherit = current_pane(None).ok();
-            let pane = create(c, command, cwd, inherit, hold, None)?;
-            ui(
-                c,
-                UiCommand::NewTab {
-                    pane,
-                    new_window: window,
-                },
-            );
-            print_pane(pane, json);
+            // `--wait` reads the exit status from the held pane, then closes it.
+            let pane = create(c, command, cwd, inherit, hold || wait, None)?;
+            let plain = UiCommand::NewTab {
+                pane,
+                new_window: window,
+            };
+            if background && !window {
+                open(
+                    c,
+                    plain,
+                    UiCommand::Open {
+                        pane,
+                        split: None,
+                        target: None,
+                        new_window: false,
+                        percent: None,
+                        background,
+                    },
+                );
+            } else {
+                show(c, plain);
+            }
+            if let Some(title) = title {
+                let _ = ui(
+                    c,
+                    UiCommand::SetTabTitle {
+                        pane,
+                        title: (!title.is_empty()).then_some(title),
+                    },
+                );
+            }
+            return opened(c, pane, wait, hold, json);
         }
         Cmd::Split {
             dir,
             pane,
             cwd,
             hold,
+            size,
+            background,
+            wait,
             command,
         } => {
             let target = current_pane(pane).ok();
-            let new = create(c, command, cwd, target, hold, None)?;
-            ui(
+            let new = create(c, command, cwd, target, hold || wait, None)?;
+            let plain = UiCommand::Split {
+                target,
+                pane: new,
+                dir: dir.into(),
+            };
+            if background || size.is_some() {
+                open(
+                    c,
+                    plain,
+                    UiCommand::Open {
+                        pane: new,
+                        split: Some(dir.into()),
+                        target,
+                        new_window: false,
+                        percent: size,
+                        background,
+                    },
+                );
+            } else {
+                show(c, plain);
+            }
+            return opened(c, new, wait, hold, json);
+        }
+        Cmd::Zoom { pane, on, off } => {
+            let pane = current_pane(pane)?;
+            let zoom = if on {
+                Some(true)
+            } else if off {
+                Some(false)
+            } else {
+                None
+            };
+            layout_ui(c, UiCommand::Zoom { pane, zoom })?;
+        }
+        Cmd::Move {
+            pane,
+            to,
+            dir,
+            size,
+        } => {
+            let pane = current_pane(pane)?;
+            if pane == to {
+                return Err("a pane can't move next to itself".into());
+            }
+            layout_ui(
                 c,
-                UiCommand::Split {
-                    target,
-                    pane: new,
+                UiCommand::MovePane {
+                    pane,
+                    target: to,
                     dir: dir.into(),
+                    percent: size,
                 },
-            );
-            print_pane(new, json);
+            )?;
+        }
+        Cmd::Swap { pane, with } => {
+            let pane = current_pane(pane)?;
+            if pane != with {
+                layout_ui(c, UiCommand::SwapPanes { a: pane, b: with })?;
+            }
+        }
+        Cmd::Focused { history } => {
+            let Response::FocusHistory(records) = c.request(Request::FocusHistory)? else {
+                return Err("unexpected response".into());
+            };
+            let record = |r: &thurm_proto::FocusRecord| serde_json::json!({"pane": r.pane, "focused": r.focused, "since_ms": r.since_ms});
+            if history {
+                if json {
+                    let list: Vec<_> = records.iter().map(record).collect();
+                    println!("{}", serde_json::to_string_pretty(&list)?);
+                } else {
+                    println!("{:<6} {:<8} SINCE", "PANE", "FOCUSED");
+                    for r in &records {
+                        println!(
+                            "{:<6} {:<8} {}",
+                            r.pane,
+                            if r.focused { "yes" } else { "" },
+                            ago(r.since_ms)
+                        );
+                    }
+                }
+            } else {
+                let Some(r) = records.first() else {
+                    return Err("no pane has had focus in the app yet".into());
+                };
+                if json {
+                    println!("{}", record(r));
+                } else {
+                    println!("{}", r.pane);
+                }
+            }
         }
         Cmd::Complete { pane } => {
             let pane = current_pane(pane)?;
@@ -1272,7 +1466,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                 other => return Err(format!("unexpected response: {other:?}").into()),
             };
             match split {
-                Some(d) => ui(
+                Some(d) => show(
                     c,
                     UiCommand::Split {
                         target: Some(src),
@@ -1280,7 +1474,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                         dir: d.into(),
                     },
                 ),
-                None => ui(
+                None => show(
                     c,
                     UiCommand::NewTab {
                         pane: new,
@@ -1294,7 +1488,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             let target = current_pane(None).ok();
             let new = create(c, Vec::new(), cwd, target, false, Some(preset))?;
             match split {
-                Some(d) => ui(
+                Some(d) => show(
                     c,
                     UiCommand::Split {
                         target,
@@ -1302,7 +1496,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                         dir: d.into(),
                     },
                 ),
-                None => ui(
+                None => show(
                     c,
                     UiCommand::NewTab {
                         pane: new,
@@ -1576,14 +1770,20 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
         | Cmd::Events { .. }
         | Cmd::AgentHook { .. }
         | Cmd::Hooks { .. }
+        | Cmd::Skill { .. }
         | Cmd::Theme { spec: None } => unreachable!(),
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn ui(c: &Client, cmd: UiCommand) {
-    let Err(e) = c.request(Request::Ui(cmd.clone())) else {
-        return;
+/// Sends `cmd` to the app, starting the app when no window is open. The error is the daemon's
+/// last answer.
+fn ui(c: &Client, cmd: UiCommand) -> Result<(), String> {
+    let mut last = match c.request(Request::Ui(cmd.clone())) {
+        Ok(_) => return Ok(()),
+        Err(ClientError::Daemon(e)) if e != thurm_proto::LAYOUT_NO_WINDOW => return Err(e),
+        Err(ClientError::Daemon(e)) => e,
+        Err(e) => e.to_string(),
     };
     // No window is open: start the app.
     #[cfg(target_os = "macos")]
@@ -1599,12 +1799,84 @@ fn ui(c: &Client, cmd: UiCommand) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            if c.request(Request::Ui(cmd.clone())).is_ok() {
-                return;
+            match c.request(Request::Ui(cmd.clone())) {
+                Ok(_) => return Ok(()),
+                // Up, and refusing it (an app too old for the command).
+                Err(ClientError::Daemon(e)) if e != thurm_proto::LAYOUT_NO_WINDOW => {
+                    return Err(e);
+                }
+                Err(ClientError::Daemon(e)) => last = e,
+                Err(e) => last = e.to_string(),
             }
         }
     }
-    eprintln!("thurm: pane created but not shown: {e}");
+    Err(last)
+}
+
+/// [`ui`] for a new pane, saying so when it could not be shown.
+fn show(c: &Client, cmd: UiCommand) {
+    if let Err(e) = ui(c, cmd) {
+        eprintln!("thurm: pane created but not shown: {e}");
+    }
+}
+
+/// Shows a new pane with `cmd` (an `Open` with options), or with `plain` when the app or the
+/// daemon predates it.
+fn open(c: &Client, plain: UiCommand, cmd: UiCommand) {
+    match ui(c, cmd) {
+        Ok(()) => {}
+        // No app came up: `plain` would not be shown either.
+        Err(e) if e == thurm_proto::LAYOUT_NO_WINDOW => {
+            eprintln!("thurm: pane created but not shown: {e}");
+        }
+        Err(e) => {
+            eprintln!("thurm: {e}; opening it the usual way");
+            show(c, plain);
+        }
+    }
+}
+
+/// A UI command that only newer apps carry out ([`UiCommand::needs_ui_layout`]): an older app
+/// or daemon refuses it, and that is reported.
+fn layout_ui(c: &Client, cmd: UiCommand) -> Result<(), ClientError> {
+    c.request(Request::Ui(cmd)).map(|_| ())
+}
+
+/// After `new-tab` or `split`: prints the pane, and with `wait` waits for its command to exit
+/// and exits with its status. The pane was held for that, so it closes here unless `hold`.
+fn opened(c: &Client, pane: PaneId, wait: bool, hold: bool, json: bool) -> R {
+    if !wait {
+        print_pane(pane, json);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !json {
+        println!("{pane}");
+        let _ = std::io::stdout().flush();
+    }
+    let code = match c.request(Request::Wait {
+        pane,
+        until: WaitCondition::Exit,
+        timeout_ms: None,
+    })? {
+        Response::Wait(WaitOutcome::Exited { code }) => code,
+        other => return Err(format!("unexpected response {other:?}").into()),
+    };
+    if !hold {
+        let _ = c.request(Request::ClosePane { pane });
+    }
+    if json {
+        println!("{}", serde_json::json!({"pane": pane, "exit_code": code}));
+    }
+    // A signal leaves no code: a failure all the same.
+    Ok(ExitCode::from(code.map_or(1, |c| c.clamp(0, 255) as u8)))
+}
+
+fn ago(ms: u64) -> String {
+    match ms / 1000 {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s => format!("{}h ago", s / 3600),
+    }
 }
 
 fn pane_info(c: &Client, pane: PaneId) -> Option<PaneInfo> {

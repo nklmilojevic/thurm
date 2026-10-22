@@ -24,6 +24,9 @@ mod tailnet;
 #[path = "e2e/user_commands.rs"]
 mod user_commands;
 
+#[path = "e2e/ui_layout.rs"]
+mod ui_layout;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;

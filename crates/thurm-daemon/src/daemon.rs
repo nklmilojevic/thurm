@@ -3,6 +3,7 @@
 #[path = "active_size.rs"]
 mod active_size;
 mod agent_prompt;
+mod focus;
 mod layouts;
 #[path = "terminal_attach.rs"]
 mod terminal_attach;
@@ -238,6 +239,8 @@ pub struct Client {
     pub active_size: AtomicBool,
     /// `thurm events` ([`thurm_proto::CAP_STATE_EVENTS`]): gets every `PaneInfo`.
     pub state_events: AtomicBool,
+    /// A UI that carries out the newer UI commands ([`thurm_proto::CAP_UI_LAYOUT`]).
+    pub ui_layout: AtomicBool,
     /// Who connected: a local peer, or a tailnet caller the Tailscale helper admitted.
     pub principal: Mutex<Option<thurm_proto::Principal>>,
     pub name: Mutex<String>,
@@ -390,6 +393,8 @@ pub struct Daemon {
     /// When a save first saw `stopping`: the end of the teardown window.
     stopped_at: std::sync::OnceLock<Instant>,
     last_activity: Mutex<Instant>,
+    /// The panes UIs focused (`thurm focused`).
+    focus: Mutex<focus::FocusLog>,
 }
 
 impl Daemon {
@@ -444,6 +449,7 @@ impl Daemon {
             just_exited: Mutex::new(Vec::new()),
             stopped_at: std::sync::OnceLock::new(),
             last_activity: Mutex::new(Instant::now()),
+            focus: Mutex::new(focus::FocusLog::default()),
         })
     }
 
@@ -539,6 +545,35 @@ impl Daemon {
             .any(|c| c.ui.load(Ordering::Relaxed))
     }
 
+    /// A [`thurm_proto::CAP_UI_LAYOUT`] command, to the desktop UIs that carry it out. Refused
+    /// when none does, or when an older one shows a pane it changes: that UI would leave the
+    /// pane as it is.
+    fn layout_ui(&self, cmd: thurm_proto::UiCommand) -> Result<Response, String> {
+        let desktops: Vec<Arc<Client>> = self
+            .clients
+            .lock()
+            .values()
+            .filter(|c| c.ui.load(Ordering::Relaxed) && !c.mobile.load(Ordering::Relaxed))
+            .cloned()
+            .collect();
+        let (capable, older): (Vec<_>, Vec<_>) = desktops
+            .into_iter()
+            .partition(|c| c.ui_layout.load(Ordering::Relaxed));
+        let shown_by_older = cmd.layout_panes().into_iter().any(|p| {
+            self.pane(p).is_some_and(|p| {
+                let st = p.state.lock();
+                older.iter().any(|c| st.subscribers.contains_key(&c.id))
+            })
+        });
+        if capable.is_empty() || shown_by_older {
+            return Err(thurm_proto::UI_TOO_OLD.into());
+        }
+        for c in capable {
+            c.send(ServerMessage::Event(Event::Ui(cmd.clone())));
+        }
+        Ok(Response::Ok)
+    }
+
     // -----------------------------------------------------------------------------------------
     // Clients
     // -----------------------------------------------------------------------------------------
@@ -555,6 +590,7 @@ impl Daemon {
             socket: Mutex::new(None),
             active_size: AtomicBool::new(false),
             state_events: AtomicBool::new(false),
+            ui_layout: AtomicBool::new(false),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
@@ -585,6 +621,7 @@ impl Daemon {
     pub fn remove_client(&self, id: u64) {
         log::info!("client {id} gone");
         self.clients.lock().remove(&id);
+        self.focus.lock().client_gone(id);
         for p in self.all_panes() {
             let mut st = p.state.lock();
             st.subscribers.remove(&id);
@@ -2325,6 +2362,9 @@ impl Daemon {
                 if has(thurm_proto::CAP_STATE_EVENTS) {
                     client.state_events.store(true, Ordering::Relaxed);
                 }
+                if has(thurm_proto::CAP_UI_LAYOUT) {
+                    client.ui_layout.store(true, Ordering::Relaxed);
+                }
                 log::info!(
                     "client {} hello: {name} (protocol {version}{}{}{})",
                     client.id,
@@ -2537,6 +2577,9 @@ impl Daemon {
                         }
                         p.write(b);
                     }
+                    self.focus
+                        .lock()
+                        .focus(client.id, pane, focused, Instant::now());
                     // Looking at a finished agent acknowledges it (Done → Idle).
                     if focused {
                         self.pane_read(pane);
@@ -2700,6 +2743,9 @@ impl Daemon {
                 if matches!(cmd, thurm_proto::UiCommand::OpenLayout { .. }) {
                     return Err("use ApplyLayout to wait for desktop confirmation".into());
                 }
+                if cmd.needs_ui_layout() {
+                    return self.layout_ui(cmd);
+                }
                 self.broadcast(Event::Ui(cmd), true);
                 Ok(Response::Ok)
             }
@@ -2711,6 +2757,21 @@ impl Daemon {
                 let pane = self.pane(pane).ok_or("pane vanished")?;
                 self.handle_term_events(&pane, events);
                 Ok(Response::Ok)
+            }
+            Request::FocusHistory => {
+                let at = Instant::now();
+                let history = self.focus.lock().history(|p| self.pane(p).is_some(), at);
+                Ok(Response::FocusHistory(history))
+            }
+            Request::PaneModes { pane } => {
+                use thurm_term::mode::TermMode;
+                let m = self.with_pane(pane, |_, st| st.term.mode())?;
+                Ok(Response::PaneModes(thurm_proto::PaneModes {
+                    alt_screen: m.contains(TermMode::ALT_SCREEN),
+                    mouse: m.intersects(TermMode::MOUSE_MODE),
+                    bracketed_paste: m.contains(TermMode::BRACKETED_PASTE),
+                    focus_reports: m.contains(TermMode::FOCUS_IN_OUT),
+                }))
             }
             Request::ClearScrollback { pane } => {
                 self.with_pane(pane, |_, st| st.term.clear_scrollback())?;
@@ -3544,6 +3605,7 @@ mod tests {
             socket: Mutex::new(None),
             active_size: AtomicBool::new(false),
             state_events: AtomicBool::new(false),
+            ui_layout: AtomicBool::new(false),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),

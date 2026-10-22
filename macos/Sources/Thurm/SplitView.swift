@@ -47,21 +47,22 @@ indirect enum SplitNode {
         }
     }
 
-    /// Splits `target`, putting `newPane` on the given side.
-    func inserting(_ newPane: PaneKey, at target: PaneKey, direction: SplitDirName) -> SplitNode {
+    /// Splits `target`, putting `newPane` on the given side with `share` of the space.
+    func inserting(_ newPane: PaneKey, at target: PaneKey, direction: SplitDirName,
+                   share: CGFloat = 0.5) -> SplitNode {
         switch self {
         case .leaf(let id):
             guard id == target else { return self }
             switch direction {
-            case .right: return .split(axis: .horizontal, ratio: 0.5, first: self, second: .leaf(newPane))
-            case .left: return .split(axis: .horizontal, ratio: 0.5, first: .leaf(newPane), second: self)
-            case .down: return .split(axis: .vertical, ratio: 0.5, first: self, second: .leaf(newPane))
-            case .up: return .split(axis: .vertical, ratio: 0.5, first: .leaf(newPane), second: self)
+            case .right: return .split(axis: .horizontal, ratio: 1 - share, first: self, second: .leaf(newPane))
+            case .left: return .split(axis: .horizontal, ratio: share, first: .leaf(newPane), second: self)
+            case .down: return .split(axis: .vertical, ratio: 1 - share, first: self, second: .leaf(newPane))
+            case .up: return .split(axis: .vertical, ratio: share, first: .leaf(newPane), second: self)
             }
         case .split(let axis, let ratio, let first, let second):
             return .split(axis: axis, ratio: ratio,
-                          first: first.inserting(newPane, at: target, direction: direction),
-                          second: second.inserting(newPane, at: target, direction: direction))
+                          first: first.inserting(newPane, at: target, direction: direction, share: share),
+                          second: second.inserting(newPane, at: target, direction: direction, share: share))
         }
     }
 
@@ -781,15 +782,54 @@ final class TabContentView: NSView {
 
     // MARK: Tree operations
 
-    /// Inserts `newPane` next to `target` (default: focused pane) and focuses it.
-    func split(target: PaneKey? = nil, newPane: PaneKey, direction: SplitDirName) {
+    /// Inserts `newPane` next to `target` (default: focused pane) and focuses it. `share` is its
+    /// part of the split (default: half, or even with auto-balance).
+    func split(target: PaneKey? = nil, newPane: PaneKey, direction: SplitDirName, share: CGFloat? = nil,
+               takeFocus: Bool = true) {
         let t = target.flatMap { root.contains($0) ? $0 : nil } ?? focusedPane
         transitionLayout(curve: Motion.paneCurve) {
             zoomedPane = nil
-            root = root.inserting(newPane, at: t, direction: direction)
-            if SessionManager.shared.config.autoBalance { root = root.equalized() }
+            root = root.inserting(newPane, at: t, direction: direction, share: share ?? 0.5)
+            if share == nil && SessionManager.shared.config.autoBalance { root = root.equalized() }
         }
-        focus(newPane)
+        if takeFocus { focus(newPane) }
+        window?.invalidateCursorRects(for: self)
+    }
+
+    /// Moves `pane` of this tab next to `target`, keeping its view.
+    func move(_ pane: PaneKey, nextTo target: PaneKey, direction: SplitDirName, share: CGFloat?) {
+        guard pane != target, root.contains(target), let rest = root.removing(pane), rest.contains(target) else {
+            return
+        }
+        transitionLayout(curve: Motion.paneCurve) {
+            zoomedPane = nil
+            root = rest.inserting(pane, at: target, direction: direction, share: share ?? 0.5)
+            if share == nil && SessionManager.shared.config.autoBalance { root = root.equalized() }
+        }
+        window?.invalidateCursorRects(for: self)
+    }
+
+    /// Exchanges the places of two panes of this tab.
+    func swap(_ a: PaneKey, _ b: PaneKey) {
+        guard root.contains(a), root.contains(b) else { return }
+        root = root.swapping(a, b)
+        layoutPanes()
+        window?.invalidateCursorRects(for: self)
+    }
+
+    /// Puts `new`, a pane of another tab, where `old` is; `old` leaves this tab.
+    func replace(_ old: PaneKey, with new: PaneKey) {
+        guard root.contains(old), !root.contains(new) else { return }
+        let wasFocused = focusedPane == old
+        if zoomedPane == old { zoomedPane = new }
+        root = root.swapping(old, new)
+        syncViews()
+        if wasFocused {
+            focusedPane = new
+            if window?.isKeyWindow == true, let view = views[new] { window?.makeFirstResponder(view) }
+            refreshHeaders()
+        }
+        layoutPanes()
         window?.invalidateCursorRects(for: self)
     }
 
@@ -895,6 +935,21 @@ final class TabContentView: NSView {
         guard zoomedPane == nil, let target = neighbor(of: focusedPane, direction) else { return }
         root = root.swapping(focusedPane, target)
         layoutPanes()
+        window?.invalidateCursorRects(for: self)
+        SessionManager.shared.scheduleLayoutSave()
+    }
+
+    /// Zooms `pane` (true), restores the splits (false), or toggles (nil).
+    func zoom(_ pane: PaneKey, _ on: Bool?) {
+        guard root.contains(pane) else { return }
+        if on ?? (zoomedPane != pane) {
+            guard root.panes.count > 1 else { return }
+            if focusedPane != pane { focus(pane) }
+            transitionZoom { zoomedPane = pane }
+        } else {
+            guard zoomedPane != nil else { return }
+            transitionZoom { zoomedPane = nil }
+        }
         window?.invalidateCursorRects(for: self)
         SessionManager.shared.scheduleLayoutSave()
     }
