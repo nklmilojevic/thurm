@@ -92,7 +92,7 @@ const AGENTS: &[Agent] = &[
     },
 ];
 
-/// Everything besides the install plan: PATH link, agents, sign-in and hooks. Agents are also
+/// Everything besides the install plan: PATH link, agents, sign-in, hooks and the skill. Agents are also
 /// looked up through the login shell (npm and bun install into places a plain ssh command
 /// does not have on PATH), except under `THURM_BASE_PATH` (the loopback tests).
 const PROBE: &str = concat!(
@@ -107,6 +107,7 @@ const PROBE: &str = concat!(
     "echo \"agent_$a=$p\"; done; ",
     "{ [ -f \"${CLAUDE_CONFIG_DIR:-$TH/.claude}/.credentials.json\" ] || [ -n \"$ANTHROPIC_API_KEY\" ]; } && echo claude_login=1; ",
     "command -v thurm >/dev/null 2>&1 && echo \"hooks=$(HOME=\"$TH\" thurm hooks status --json 2>/dev/null | head -n 1)\"; ",
+    "command -v thurm >/dev/null 2>&1 && echo \"skill=$(HOME=\"$TH\" thurm skill status --json 2>/dev/null | head -n 1)\"; ",
     "true"
 );
 
@@ -121,6 +122,8 @@ struct Probe {
     claude_login: bool,
     /// `thurm hooks status --json` there.
     hooks: Vec<Value>,
+    /// `thurm skill status --json` there (empty from a Thurm without `thurm skill`).
+    skill: Vec<Value>,
 }
 
 fn parse(out: &str) -> Probe {
@@ -138,6 +141,9 @@ fn parse(out: &str) -> Probe {
             "claude_login" => p.claude_login = true,
             "hooks" => {
                 p.hooks = serde_json::from_str::<Vec<Value>>(v).unwrap_or_default();
+            }
+            "skill" => {
+                p.skill = serde_json::from_str::<Vec<Value>>(v).unwrap_or_default();
             }
             _ => {
                 if let Some(kind) = k.strip_prefix("agent_")
@@ -524,6 +530,34 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
         }
         out.push(c);
     }
+
+    // The skill that teaches those agents to drive Thurm there.
+    if !probe.agents.is_empty() {
+        let field = |s: &Value, k: &str| s.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+        let missing: Vec<String> = probe
+            .skill
+            .iter()
+            .filter(|s| s.get("present").and_then(Value::as_bool) == Some(true))
+            .filter(|s| !matches!(field(s, "state").as_str(), "current" | "other"))
+            .map(|s| field(s, "name"))
+            .collect();
+        let mut c = check("skill", "Agent skill", State::Ok, "installed");
+        if !thurm_there {
+            c.state = State::Skip;
+            c.detail = "needs Thurm".into();
+        } else if probe.skill.is_empty() {
+            c.state = State::Skip;
+            c.detail = "needs a newer Thurm".into();
+        } else if !missing.is_empty() {
+            c.state = State::Warn;
+            c.detail = format!(
+                "not installed for {}: agents there don't know the thurm CLI",
+                missing.join("; ")
+            );
+            c.fix = offer("Install");
+        }
+        out.push(c);
+    }
     out
 }
 
@@ -579,6 +613,12 @@ const HOOKS: &str = concat!(
     "TH=\"${THURM_HOME:-$HOME}\"; ",
     "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
     "HOME=\"$TH\" thurm hooks install --agent \"$1\""
+);
+
+const SKILL: &str = concat!(
+    "TH=\"${THURM_HOME:-$HOME}\"; ",
+    "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
+    "HOME=\"$TH\" thurm skill setup"
 );
 
 /// Downloaded first, so a failed download fails the fix (`curl | bash` would report the
@@ -638,6 +678,10 @@ pub fn fix(
         "path" => {
             ssh.run(LINK, &[], None, Duration::from_secs(30))?;
             Ok("linked ~/.local/bin/thurm".into())
+        }
+        "skill" => {
+            let out = ssh.run(SKILL, &[], None, Duration::from_secs(30))?;
+            Ok(out.trim().to_owned())
         }
         _ => {
             if let Some(kind) = id.strip_prefix("hooks.") {
@@ -735,10 +779,11 @@ mod tests {
         assert_eq!(state(&c, "path"), State::Skip);
         assert_eq!(state(&c, "agent.claude"), State::Warn);
         assert_eq!(state(&c, "agent.codex"), State::Skip);
-        // No agent, so nothing about its sign-in or hooks.
+        // No agent, so nothing about its sign-in, hooks or skill.
         assert!(
-            !c.iter()
-                .any(|c| c.id.starts_with("hooks.") || c.id.starts_with("login."))
+            !c.iter().any(|c| c.id.starts_with("hooks.")
+                || c.id.starts_with("login.")
+                || c.id == "skill")
         );
     }
 
@@ -759,6 +804,8 @@ mod tests {
         assert_eq!(state(&c, "login.claude"), State::Warn);
         assert_eq!(state(&c, "hooks.claude"), State::Fail);
         assert!(!c.iter().any(|c| c.id == "hooks.codex"));
+        // Its Thurm predates `thurm skill`.
+        assert_eq!(state(&c, "skill"), State::Skip);
         let report = Report {
             plan: plan(true),
             checks: c,
@@ -780,6 +827,29 @@ mod tests {
         };
         assert!(r.healthy(), "{:#?}", r.checks);
         assert!(r.checks.iter().all(|c| c.fix.is_none()));
+    }
+
+    #[test]
+    fn a_host_without_the_skill() {
+        let out = concat!(
+            "user=me\nlocalbin=1\nlink=1\nagent_claude=/usr/bin/claude\nclaude_login=1\n",
+            "hooks=[{\"agent\":\"claude\",\"installed\":6,\"total\":6}]\n",
+            "skill=[{\"agent\":\"claude\",\"name\":\"Claude Code\",\"state\":\"missing\",\"present\":true},",
+            "{\"agent\":\"agents\",\"name\":\"Codex, OpenCode, Pi\",\"state\":\"missing\",\"present\":false}]\n"
+        );
+        let c = checks("pi", &plan(true), &parse(out));
+        let s = c.iter().find(|c| c.id == "skill").unwrap();
+        assert_eq!(s.state, State::Warn);
+        assert!(s.detail.contains("Claude Code") && !s.detail.contains("Codex"));
+        assert!(s.fix.is_some());
+
+        // A skill of the user's own by that name is left alone.
+        let out = out.replace(
+            "\"state\":\"missing\",\"present\":true",
+            "\"state\":\"other\",\"present\":true",
+        );
+        let c = checks("pi", &plan(true), &parse(&out));
+        assert_eq!(state(&c, "skill"), State::Ok);
     }
 
     #[test]

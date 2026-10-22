@@ -71,6 +71,7 @@ pub const CAPABILITIES: &[&str] = &[
     "push",
     "pane-read",
     CAP_TAILSCALE,
+    CAP_UI_LAYOUT,
 ];
 
 /// The pane takes the size of the client that used it last (see the daemon's `active_size`)
@@ -80,6 +81,13 @@ pub const CAP_ACTIVE_SIZE: &str = "active-size";
 /// The daemon serves over Tailscale (see [`tailnet`]): it answers the `Tailscale*` requests and
 /// `Whoami`, and reports `TailscaleStatusChanged`.
 pub const CAP_TAILSCALE: &str = "tailscale";
+
+/// The UI carries out [`UiCommand::Open`], [`UiCommand::Zoom`], [`UiCommand::MovePane`] and
+/// [`UiCommand::SwapPanes`]; the daemon refuses them with [`UI_TOO_OLD`] when no open UI does.
+pub const CAP_UI_LAYOUT: &str = "ui-layout";
+
+/// The daemon's answer to a [`UiCommand`] that no open UI understands.
+pub const UI_TOO_OLD: &str = "the Thurm app is too old for this; update it";
 
 /// Sent only by the iOS app: it gets notifications like a desktop UI, but takes no UI commands
 /// and does not count as an open window.
@@ -404,6 +412,13 @@ pub enum Request {
         name: String,
         pane: Option<PaneId>,
     },
+    /// The panes that had keyboard focus in a UI, most recent first. Answers
+    /// [`Response::FocusHistory`].
+    FocusHistory,
+    /// Terminal modes of a pane that [`PaneInfo`] leaves out. Answers [`Response::PaneModes`].
+    PaneModes {
+        pane: PaneId,
+    },
 }
 
 /// A mobile client silent this long is taken for gone: iOS suspends apps without closing their
@@ -491,6 +506,29 @@ pub enum Response {
     LayoutResult(LayoutResult),
     TailscaleStatus(TailscaleStatus),
     Whoami(Principal),
+    FocusHistory(Vec<FocusRecord>),
+    PaneModes(PaneModes),
+}
+
+/// A pane that had keyboard focus in a UI (the Mac app, the iOS app).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FocusRecord {
+    pub pane: PaneId,
+    /// It has focus now (in the active window of a UI that is in front).
+    pub focused: bool,
+    /// Milliseconds since it last gained focus.
+    pub since_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct PaneModes {
+    /// A full-screen program (an editor, a pager, `top`) runs on the alternate screen.
+    pub alt_screen: bool,
+    /// The program asked for mouse reports.
+    pub mouse: bool,
+    pub bracketed_paste: bool,
+    /// The program asked for focus in/out reports.
+    pub focus_reports: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1240,6 +1278,52 @@ pub enum UiCommand {
         json: String,
         request_id: u64,
     },
+    /// Show an existing pane: split off `target` (or the focused pane) when `split` is set,
+    /// else in a new tab, or a new workspace with `new_window`. Needs [`CAP_UI_LAYOUT`].
+    Open {
+        pane: PaneId,
+        split: Option<SplitDir>,
+        target: Option<PaneId>,
+        new_window: bool,
+        /// The new pane's share of the split in percent, 1-99 (default: half, or even with
+        /// auto-balance).
+        percent: Option<u8>,
+        /// Keep the focus, the selected tab and the app where they are.
+        background: bool,
+    },
+    /// Zoom `pane` to fill its tab (`Some(true)`), restore the splits (`Some(false)`), or
+    /// toggle. Needs [`CAP_UI_LAYOUT`].
+    Zoom {
+        pane: PaneId,
+        zoom: Option<bool>,
+    },
+    /// Move `pane` next to `target`, on its `dir` side, keeping its program running; `percent`
+    /// is its share of the new split. Works across the tabs of the open window. Needs
+    /// [`CAP_UI_LAYOUT`].
+    MovePane {
+        pane: PaneId,
+        target: PaneId,
+        dir: SplitDir,
+        percent: Option<u8>,
+    },
+    /// Exchange the places of two panes, in one tab or across tabs. Needs [`CAP_UI_LAYOUT`].
+    SwapPanes {
+        a: PaneId,
+        b: PaneId,
+    },
+}
+
+impl UiCommand {
+    /// Only UIs with [`CAP_UI_LAYOUT`] carry it out.
+    pub fn needs_ui_layout(&self) -> bool {
+        matches!(
+            self,
+            UiCommand::Open { .. }
+                | UiCommand::Zoom { .. }
+                | UiCommand::MovePane { .. }
+                | UiCommand::SwapPanes { .. }
+        )
+    }
 }
 
 impl Frame {

@@ -42,6 +42,9 @@ file (`settings.json.thurm-backup`). This includes agents installed after
 Thurm, on this Mac or on a remote host. Set `agents.install_hooks = false` to
 turn it off.
 
+When a session starts, the hook also tells the agent which pane it runs in and
+that the `thurm` CLI can drive Thurm.
+
 Hooks support `thurm wait --agent-done --timeout 120`, session titles, and
 notifications when turns finish. Without hooks, detection uses process and
 screen information, which cannot provide the same completion signal.
@@ -85,6 +88,18 @@ answers only the prompt the notification is about: once you answer in the
 terminal, press a key in the pane, or the agent moves on, the notification is
 withdrawn, and a button pressed in the meantime opens the pane instead.
 
-For agent authors, the repository includes a
-[Thurm skill](https://github.com/nklmilojevic/thurm/blob/main/skills/thurm/SKILL.md)
-with CLI procedures.
+## Agent skill
+
+The thurm skill teaches agents to drive Thurm: open panes, run commands in them,
+read their output, and wait for commands and other agents. Install it with:
+
+```sh
+thurm skill setup
+```
+
+It goes to `~/.claude/skills/thurm` for Claude Code, and to
+`~/.agents/skills/thurm` for Codex, OpenCode and Pi. The skill only tells the
+agent to run `thurm skill show`, which prints the guide for the installed
+version, so upgrading Thurm updates it. `thurm skill status` shows where it is
+installed, `thurm skill remove` removes it, and **Thurm > Integrations** does
+the same. On remote hosts, `thurm remote doctor --fix` offers to install it.

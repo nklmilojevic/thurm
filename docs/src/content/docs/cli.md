@@ -43,10 +43,14 @@ Use `thurm COMMAND --help` for the full argument list.
 | --- | --- |
 | `list` (alias `ls`) | List panes |
 | `pane-id` | Print the current pane ID |
-| `info --pane ID` | Show pane details |
-| `new-tab [COMMAND...]` | Open a tab; `--window` (in a new workspace, in the background), `--cwd PATH`, `--hold` |
-| `split [COMMAND...]` | Split a pane; `--dir right\|down\|left\|up`, `--pane ID`, `--cwd PATH`, `--hold` |
+| `info --pane ID` | Show pane details, including `alt_screen` (a full-screen program has the screen) and `focused` |
+| `new-tab [COMMAND...]` | Open a tab; `--window` (in a new workspace, in the background), `--cwd PATH`, `--hold`, `--title NAME`, `--background` (keep the focus and the selected tab), `--wait` (exit with the command's status) |
+| `split [COMMAND...]` | Split a pane; `--dir right\|down\|left\|up`, `--pane ID`, `--cwd PATH`, `--hold`, `--size PERCENT` (the new pane's share), `--background`, `--wait` |
 | `focus ID` | Focus a pane in the app |
+| `focused` | Print the pane with keyboard focus in the app, or the last one that had it; `--history` lists them, most recent first |
+| `zoom` | Zoom a pane to fill its tab; `--pane ID`, `--on`, `--off` (default: toggle) |
+| `move --to PANE` | Move a pane next to another, in any tab of the window; `--pane ID`, `--dir right\|down\|left\|up`, `--size PERCENT` |
+| `swap --with PANE` | Exchange the places of two panes, in one tab or across tabs; `--pane ID` |
 | `close [ID]` | Stop and close a pane; ID is positional |
 | `title [TEXT...]` | Set the tab title; `--pane ID`; empty text resets it |
 | `workspace rename NAME...` | Rename the workspace a pane is in; `--pane ID` (`new-tab --window` prints the new pane's ID) |
@@ -69,6 +73,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `events` | Stream state changes as JSON Lines; `--pane ID`, `--filter TYPE,...`; see [Layouts and events](/workflows/) |
 | `fork` | Fork an agent session; `--pane ID`, `--split DIRECTION` |
 | `hooks install\|uninstall\|status` | Manage hooks; `--agent claude\|codex` |
+| `skill show\|setup\|remove\|status` | Print the agent guide, or install the skill that points agents at it; `--agent claude\|agents` |
 | `explain` | Explain the last finished command; `--pane ID`; needs enabled AI |
 | `config-path` | Print the configuration path |
 | `reload` | Reload configuration |
