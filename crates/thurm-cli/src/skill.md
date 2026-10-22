@@ -49,7 +49,8 @@ thurm procs --pane "$id" --ports
 - A pane closes when its command exits. Pass `--hold` to keep it open with the output (for
   test runs and anything the user should read); `thurm info --pane "$id"` then has `exit_code`.
 - `--wait` on `new-tab` or `split` waits for the command to exit and exits with its status
-  (after printing the pane id). Leave it off for servers, editors and watchers.
+  (after printing the pane id). The pane then closes, output and all: add `--hold` to read it
+  afterwards with `thurm capture`. Leave `--wait` off for servers, editors and watchers.
 - Save the id each command prints. If a command times out or errors, check `thurm list`
   before running it again: it may have worked, and a retry opens a second pane.
 

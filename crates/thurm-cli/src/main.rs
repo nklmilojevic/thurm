@@ -1276,7 +1276,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                     },
                 );
             } else {
-                let _ = ui(c, plain);
+                show(c, plain);
             }
             if let Some(title) = title {
                 let _ = ui(
@@ -1320,7 +1320,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                     },
                 );
             } else {
-                let _ = ui(c, plain);
+                show(c, plain);
             }
             return opened(c, new, wait, hold, json);
         }
@@ -1465,8 +1465,8 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                 Response::PaneCreated { pane } => pane,
                 other => return Err(format!("unexpected response: {other:?}").into()),
             };
-            let _ = match split {
-                Some(d) => ui(
+            match split {
+                Some(d) => show(
                     c,
                     UiCommand::Split {
                         target: Some(src),
@@ -1474,21 +1474,21 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                         dir: d.into(),
                     },
                 ),
-                None => ui(
+                None => show(
                     c,
                     UiCommand::NewTab {
                         pane: new,
                         new_window: false,
                     },
                 ),
-            };
+            }
             print_pane(new, json);
         }
         Cmd::Launch { preset, split, cwd } => {
             let target = current_pane(None).ok();
             let new = create(c, Vec::new(), cwd, target, false, Some(preset))?;
-            let _ = match split {
-                Some(d) => ui(
+            match split {
+                Some(d) => show(
                     c,
                     UiCommand::Split {
                         target,
@@ -1496,14 +1496,14 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                         dir: d.into(),
                     },
                 ),
-                None => ui(
+                None => show(
                     c,
                     UiCommand::NewTab {
                         pane: new,
                         new_window: false,
                     },
                 ),
-            };
+            }
             print_pane(new, json);
         }
         Cmd::Presets => {
@@ -1776,12 +1776,14 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Sends `cmd` to the app, starting the app when no window is open.
+/// Sends `cmd` to the app, starting the app when no window is open. The error is the daemon's
+/// last answer.
 fn ui(c: &Client, cmd: UiCommand) -> Result<(), String> {
-    let e = match c.request(Request::Ui(cmd.clone())) {
+    let mut last = match c.request(Request::Ui(cmd.clone())) {
         Ok(_) => return Ok(()),
         Err(ClientError::Daemon(e)) if e != thurm_proto::LAYOUT_NO_WINDOW => return Err(e),
-        Err(e) => e,
+        Err(ClientError::Daemon(e)) => e,
+        Err(e) => e.to_string(),
     };
     // No window is open: start the app.
     #[cfg(target_os = "macos")]
@@ -1797,22 +1799,39 @@ fn ui(c: &Client, cmd: UiCommand) -> Result<(), String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            if c.request(Request::Ui(cmd.clone())).is_ok() {
-                return Ok(());
+            match c.request(Request::Ui(cmd.clone())) {
+                Ok(_) => return Ok(()),
+                // Up, and refusing it (an app too old for the command).
+                Err(ClientError::Daemon(e)) if e != thurm_proto::LAYOUT_NO_WINDOW => {
+                    return Err(e);
+                }
+                Err(ClientError::Daemon(e)) => last = e,
+                Err(e) => last = e.to_string(),
             }
         }
     }
-    eprintln!("thurm: pane created but not shown: {e}");
-    Ok(())
+    Err(last)
+}
+
+/// [`ui`] for a new pane, saying so when it could not be shown.
+fn show(c: &Client, cmd: UiCommand) {
+    if let Err(e) = ui(c, cmd) {
+        eprintln!("thurm: pane created but not shown: {e}");
+    }
 }
 
 /// Shows a new pane with `cmd` (an `Open` with options), or with `plain` when the app or the
 /// daemon predates it.
 fn open(c: &Client, plain: UiCommand, cmd: UiCommand) {
-    if let Err(e) = ui(c, cmd) {
-        eprintln!("thurm: {e}; opening it the usual way");
-        if let Err(e) = ui(c, plain) {
+    match ui(c, cmd) {
+        Ok(()) => {}
+        // No app came up: `plain` would not be shown either.
+        Err(e) if e == thurm_proto::LAYOUT_NO_WINDOW => {
             eprintln!("thurm: pane created but not shown: {e}");
+        }
+        Err(e) => {
+            eprintln!("thurm: {e}; opening it the usual way");
+            show(c, plain);
         }
     }
 }

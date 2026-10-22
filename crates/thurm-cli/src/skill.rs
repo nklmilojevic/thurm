@@ -173,7 +173,11 @@ pub fn run(cmd: SkillCmd, json: bool) -> crate::R {
     let all = targets(&home(), claude_dir);
     let chosen: Vec<&Target> = match only.as_deref() {
         Some(k) => all.iter().filter(|t| t.kind == k).collect(),
-        None => all.iter().filter(|t| t.present || json).collect(),
+        // `status --json` reports every target; the others touch installed agents only.
+        None => all
+            .iter()
+            .filter(|t| t.present || (json && action == "status"))
+            .collect(),
     };
     if only.is_some() && chosen.is_empty() {
         return Err(format!(

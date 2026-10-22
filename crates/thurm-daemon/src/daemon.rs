@@ -545,13 +545,33 @@ impl Daemon {
             .any(|c| c.ui.load(Ordering::Relaxed))
     }
 
-    /// An open UI carries out the newer UI commands ([`thurm_proto::CAP_UI_LAYOUT`]).
-    fn has_layout_ui(&self) -> bool {
-        self.clients.lock().values().any(|c| {
-            c.ui.load(Ordering::Relaxed)
-                && c.ui_layout.load(Ordering::Relaxed)
-                && !c.mobile.load(Ordering::Relaxed)
-        })
+    /// A [`thurm_proto::CAP_UI_LAYOUT`] command, to the desktop UIs that carry it out. Refused
+    /// when none does, or when an older one shows a pane it changes: that UI would leave the
+    /// pane as it is.
+    fn layout_ui(&self, cmd: thurm_proto::UiCommand) -> Result<Response, String> {
+        let desktops: Vec<Arc<Client>> = self
+            .clients
+            .lock()
+            .values()
+            .filter(|c| c.ui.load(Ordering::Relaxed) && !c.mobile.load(Ordering::Relaxed))
+            .cloned()
+            .collect();
+        let (capable, older): (Vec<_>, Vec<_>) = desktops
+            .into_iter()
+            .partition(|c| c.ui_layout.load(Ordering::Relaxed));
+        let shown_by_older = cmd.layout_panes().into_iter().any(|p| {
+            self.pane(p).is_some_and(|p| {
+                let st = p.state.lock();
+                older.iter().any(|c| st.subscribers.contains_key(&c.id))
+            })
+        });
+        if capable.is_empty() || shown_by_older {
+            return Err(thurm_proto::UI_TOO_OLD.into());
+        }
+        for c in capable {
+            c.send(ServerMessage::Event(Event::Ui(cmd.clone())));
+        }
+        Ok(Response::Ok)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2723,8 +2743,8 @@ impl Daemon {
                 if matches!(cmd, thurm_proto::UiCommand::OpenLayout { .. }) {
                     return Err("use ApplyLayout to wait for desktop confirmation".into());
                 }
-                if cmd.needs_ui_layout() && !self.has_layout_ui() {
-                    return Err(thurm_proto::UI_TOO_OLD.into());
+                if cmd.needs_ui_layout() {
+                    return self.layout_ui(cmd);
                 }
                 self.broadcast(Event::Ui(cmd), true);
                 Ok(Response::Ok)

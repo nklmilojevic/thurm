@@ -1314,6 +1314,18 @@ pub enum UiCommand {
 }
 
 impl UiCommand {
+    /// The existing panes a [`CAP_UI_LAYOUT`] command changes: a UI showing one of them must
+    /// know the command.
+    pub fn layout_panes(&self) -> Vec<PaneId> {
+        match self {
+            UiCommand::Open { target, .. } => target.iter().copied().collect(),
+            UiCommand::Zoom { pane, .. } => vec![*pane],
+            UiCommand::MovePane { pane, target, .. } => vec![*pane, *target],
+            UiCommand::SwapPanes { a, b } => vec![*a, *b],
+            _ => Vec::new(),
+        }
+    }
+
     /// Only UIs with [`CAP_UI_LAYOUT`] carry it out.
     pub fn needs_ui_layout(&self) -> bool {
         matches!(

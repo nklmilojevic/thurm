@@ -531,8 +531,13 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
         out.push(c);
     }
 
-    // The skill that teaches those agents to drive Thurm there.
-    if !probe.agents.is_empty() {
+    // The skill that teaches agents to drive Thurm there: for the agents found above, or ones
+    // `thurm skill status` found (OpenCode and Pi are not probed for).
+    let skill_target = probe
+        .skill
+        .iter()
+        .any(|s| s.get("present").and_then(Value::as_bool) == Some(true));
+    if !probe.agents.is_empty() || skill_target {
         let field = |s: &Value, k: &str| s.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
         let missing: Vec<String> = probe
             .skill
@@ -850,6 +855,20 @@ mod tests {
         );
         let c = checks("pi", &plan(true), &parse(&out));
         assert_eq!(state(&c, "skill"), State::Ok);
+    }
+
+    #[test]
+    fn a_host_with_only_opencode_or_pi_gets_the_skill_check() {
+        let out = concat!(
+            "user=me\nlocalbin=1\nlink=1\nagent_claude=\nagent_codex=\n",
+            "skill=[{\"agent\":\"claude\",\"name\":\"Claude Code\",\"state\":\"missing\",\"present\":false},",
+            "{\"agent\":\"agents\",\"name\":\"Codex, OpenCode, Pi\",\"state\":\"missing\",\"present\":true}]\n"
+        );
+        let c = checks("pi", &plan(true), &parse(out));
+        let s = c.iter().find(|c| c.id == "skill").unwrap();
+        assert_eq!(s.state, State::Warn);
+        assert!(s.detail.contains("OpenCode") && !s.detail.contains("Claude"));
+        assert!(s.fix.is_some());
     }
 
     #[test]

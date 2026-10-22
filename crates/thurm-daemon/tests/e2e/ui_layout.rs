@@ -73,6 +73,40 @@ fn layout_commands_need_a_ui_that_knows_them() {
 }
 
 #[test]
+fn an_older_ui_showing_the_pane_refuses_it() {
+    let env = Env::new("ui-mixed");
+    let _d = env.start();
+    let (new, _new_rx) = env.connect();
+    let shown = create(&new, &env.dir);
+    let other = create(&new, &env.dir);
+    // An older Mac shows `shown` (subscribed to it), next to a current one.
+    let mut old = old_ui(&env);
+    send(&mut old, 2, Request::Subscribe { pane: shown }).unwrap();
+
+    let zoom = |pane| UiCommand::Zoom {
+        pane,
+        zoom: Some(true),
+    };
+    let err = new.request(Request::Ui(zoom(shown))).unwrap_err();
+    assert!(err.to_string().contains(UI_TOO_OLD), "{err}");
+    let swap = UiCommand::SwapPanes { a: other, b: shown };
+    assert!(new.request(Request::Ui(swap)).is_err());
+
+    // A pane only the current UI shows: done, and the older UI is not sent what it can't read.
+    new.request(Request::Ui(zoom(other))).unwrap();
+    send(&mut old, 3, Request::Unsubscribe { pane: shown }).unwrap();
+    old.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    while let Ok(Some(frame)) = codec::read_frame(&mut old) {
+        let msg: ServerMessage = codec::decode(&frame).unwrap();
+        assert!(
+            !matches!(msg, ServerMessage::Event(Event::Ui(_))),
+            "{msg:?}"
+        );
+    }
+}
+
+#[test]
 fn focus_history_and_pane_modes() {
     let env = Env::new("focus-modes");
     let _d = env.start();
