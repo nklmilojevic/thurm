@@ -2353,23 +2353,8 @@ impl Terminal {
         for line in top..=bottom {
             let row = self.read_row(line);
             let wrapped = row.wrapped;
-            // Trim trailing blank default cells.
-            let mut end = row.cells.len();
-            if !wrapped {
-                while end > 0 {
-                    let c = &row.cells[end - 1];
-                    let blank = c.ch == ' '
-                        && c.pen.bg == Color::Default
-                        && c.pen.attrs & A_INVERSE == 0
-                        && c.pen.underline == UL_NONE;
-                    if !blank {
-                        break;
-                    }
-                    end -= 1;
-                }
-            }
             let mut text = String::new();
-            for c in &row.cells[..end] {
+            for c in &row.cells[..exported_cells(&row)] {
                 if c.is_spacer() {
                     continue;
                 }
@@ -2595,6 +2580,9 @@ impl Terminal {
         use vt::Semantic;
         let mut out = self.export_lines(top, bottom, true);
         let clustered = self.vt.mode(vt::mode(2027, false));
+        // What the copy has: a change in the trimmed blank cells at the end of a row is not
+        // marked there (it would land at the end of the text, columns early), but where the
+        // next row starts.
         let mut current = Semantic::OUTPUT;
         for (i, line) in (top..=bottom).enumerate() {
             let Some(r0) = self.row_ref(line) else {
@@ -2604,8 +2592,9 @@ impl Terminal {
             if row_prompt == vt::RowPrompt::NONE && current == Semantic::OUTPUT {
                 continue;
             }
+            let end = exported_cells(&self.read_row_at(&r0));
             let mut marks = Vec::new();
-            for x in 0..self.cols {
+            for x in 0..self.cols.min(end + 1) {
                 let s = vt::cell_semantic(&GridRef { x: x as u16, ..r0 });
                 let starts_prompt =
                     x == 0 && row_prompt == vt::RowPrompt::PROMPT && s == Semantic::PROMPT;
@@ -2658,6 +2647,24 @@ impl Terminal {
         self.after_write();
         self.generation += 1;
     }
+}
+
+/// How many of `row`'s cells an export writes: all of a soft-wrapped row, else up to the
+/// trailing blank default cells.
+fn exported_cells(row: &Row) -> usize {
+    if row.wrapped {
+        return row.cells.len();
+    }
+    let blank = |c: &GCell| {
+        c.ch == ' '
+            && c.pen.bg == Color::Default
+            && c.pen.attrs & A_INVERSE == 0
+            && c.pen.underline == UL_NONE
+    };
+    row.cells
+        .iter()
+        .rposition(|c| !blank(c))
+        .map_or(0, |i| i + 1)
 }
 
 /// Text of the cells from `start` up to (not including) `end`.

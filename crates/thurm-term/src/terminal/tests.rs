@@ -774,6 +774,27 @@ fn all_text(t: &Terminal) -> String {
 }
 
 #[test]
+fn replayed_prompt_marks_stay_inside_the_text() {
+    // zsh's prompt ends in a space, trimmed from the state: a mark where the input starts
+    // would land right after the `%`.
+    let mut a = term(40, 4);
+    for _ in 0..3 {
+        a.advance(b"\x1b]133;A\x07me qa % \x1b]133;B\x07\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+    }
+    a.advance(b"\x1b]133;A\x07me qa % \x1b]133;B\x07");
+    let state = a.serialize_state();
+    assert!(
+        !String::from_utf8_lossy(&state).contains("%\x1b]133;"),
+        "{:?}",
+        String::from_utf8_lossy(&state)
+    );
+    let mut b = term(40, 4);
+    b.replay(&state);
+    assert_eq!(all_text(&b), all_text(&a));
+    assert_eq!(b.prompt_lines(), a.prompt_lines());
+}
+
+#[test]
 fn attach_state_round_trips() {
     let mut a = term(20, 5);
     for i in 0..12 {
