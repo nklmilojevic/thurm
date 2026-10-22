@@ -1,0 +1,7 @@
+{
+  "name": "sefko",
+  "description": "Keeps allowlisted 1Password secrets in memory and serves them to CLIs",
+  "dynamic": {
+    "protocol": "cobra"
+  }
+}

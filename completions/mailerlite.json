@@ -1,0 +1,8 @@
+{
+  "name": "mailerlite",
+  "description": "Command-line interface for the MailerLite API",
+  "dynamic": {
+    "protocol": "clap",
+    "env": "MAILERLITE_COMPLETE"
+  }
+}
