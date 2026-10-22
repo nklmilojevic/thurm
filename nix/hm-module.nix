@@ -140,6 +140,11 @@ in
     home.packages = lib.optional (cfg.package != null) cfg.package;
 
     xdg.configFile = {
+      # The package installs completions; the app's CLI (macOS) prints its own, so they match
+      # its version.
+      "fish/completions/thurm.fish" = lib.mkIf (cfg.package == null && config.programs.fish.enable) {
+        text = "command -q thurm; and thurm completion fish 2>/dev/null | source\n";
+      };
       "thurm/config.toml" = lib.mkIf (cfg.settings != { } || cfg.extraConfig != "") {
         source = configFile;
         onChange = reloadScript;

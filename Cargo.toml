@@ -42,6 +42,7 @@ log = "0.4"
 web-time = "1"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 anyhow = "1"
 signal-hook = "0.4"
 

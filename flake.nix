@@ -117,8 +117,15 @@
               THURM_BUILD = "${version}+nix.${self.shortRev or "dirty"}";
             };
             # thurmd looks for the helper beside its own executable.
+            nativeBuildInputs = [ pkgs.installShellFiles ];
             postInstall = ''
               install -Dm755 ${tailnet}/bin/thurm-tailnet $out/bin/thurm-tailnet
+            ''
+            + lib.optionalString (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
+              installShellCompletion --cmd thurm \
+                --bash <($out/bin/thurm completion bash) \
+                --fish <($out/bin/thurm completion fish) \
+                --zsh <($out/bin/thurm completion zsh)
             '';
             passthru = { inherit tailnet ghosttyVt cargoArtifacts; };
             meta = {
