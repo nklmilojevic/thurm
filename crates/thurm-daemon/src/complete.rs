@@ -3,7 +3,8 @@
 //! (MIT), values from the specs' generator scripts, and paths.
 //!
 //! Specs are JSON files named `<command>.json`, looked up in `$THURM_COMPLETIONS_DIR`,
-//! `~/.config/thurm/completions` and the app bundle's `Resources/completions`.
+//! `~/.config/thurm/completions` and the app bundle's `Resources/completions`. A spec with
+//! `dynamic` asks the program itself instead (cobra's `__complete`, clap's `CompleteEnv`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,18 @@ struct Spec {
     options: Vec<Opt>,
     subcommands: Vec<Sub>,
     args: Vec<Arg>,
+    dynamic: Option<Dynamic>,
+}
+
+/// How a program completes its own command line. Asked at each Tab, so it stays current with
+/// the installed version and can offer live values (branches, contexts, resources).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "protocol", rename_all = "lowercase")]
+enum Dynamic {
+    /// Cobra's hidden `__complete` command (Go CLIs: gh, helm, kubectl, ...).
+    Cobra,
+    /// clap_complete's `CompleteEnv`: `<env>=fish prog -- prog <words>`.
+    Clap { env: String },
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
@@ -86,7 +99,11 @@ pub fn complete(line: &str, cwd: &Path, path: Option<&str>) -> Completions {
     } else {
         let command = basename(&words[0]);
         match load_spec(command) {
-            Some(spec) => from_spec(&spec, &words[1..], &current, cwd, &path),
+            Some(spec) => spec
+                .dynamic
+                .as_ref()
+                .and_then(|d| dynamic(d, &words, &current, cwd, &path))
+                .unwrap_or_else(|| from_spec(&spec, &words[1..], &current, cwd, &path)),
             None => paths(&current, cwd, dirs_only(command)),
         }
     };
@@ -337,6 +354,91 @@ fn from_spec(
     out
 }
 
+/// Cobra's `ShellCompDirective` bits.
+const COBRA_ERROR: u32 = 1;
+const COBRA_NO_FILE_COMP: u32 = 4;
+const COBRA_FILTER_FILE_EXT: u32 = 8;
+const COBRA_FILTER_DIRS: u32 = 16;
+
+/// Candidates from the program itself. `None` when it can't answer (not installed, a version
+/// without the protocol, an error, too slow), to fall back to the rest of the spec.
+fn dynamic(
+    d: &Dynamic,
+    words: &[String],
+    current: &str,
+    cwd: &Path,
+    path: &str,
+) -> Option<Vec<CompletionItem>> {
+    let program = words[0].clone();
+    let (mut script, env) = match d {
+        Dynamic::Cobra => (vec![program, "__complete".to_owned()], None),
+        Dynamic::Clap { env } => (
+            vec![program.clone(), "--".to_owned(), program],
+            Some((env.as_str(), "fish")),
+        ),
+    };
+    script.extend(words[1..].iter().cloned());
+    script.push(current.to_owned());
+    let lines = run_program(&script, cwd, path, env, DYNAMIC_TIMEOUT, true)?;
+    let mut directive = 0;
+    let mut answers = Vec::new();
+    for line in &lines {
+        if *d == Dynamic::Cobra
+            && let Some(bits) = line.strip_prefix(':')
+        {
+            directive = bits.trim().parse().unwrap_or(COBRA_ERROR);
+            continue;
+        }
+        let (value, description) = match line.split_once('\t') {
+            Some((v, desc)) => (v, Some(desc.to_owned())),
+            None => (line.as_str(), None),
+        };
+        if !value.is_empty() {
+            answers.push((value, description));
+        }
+    }
+    if directive & COBRA_ERROR != 0 {
+        return None;
+    }
+    // With these two, the answers say what to list rather than being candidates: the
+    // directory to list subdirectories of (none: here), or the file extensions to offer.
+    if directive & COBRA_FILTER_DIRS != 0 {
+        let base = answers
+            .first()
+            .map_or(cwd.to_path_buf(), |(dir, _)| cwd.join(dir));
+        return Some(paths(current, &base, true));
+    }
+    if directive & COBRA_FILTER_FILE_EXT != 0 {
+        let exts: Vec<String> = answers
+            .iter()
+            .map(|(e, _)| format!(".{}", e.trim_start_matches('.')))
+            .collect();
+        let mut out = paths(current, cwd, false);
+        out.retain(|i| {
+            i.kind == CompletionKind::Directory || exts.iter().any(|e| i.text.ends_with(e))
+        });
+        return Some(out);
+    }
+    if *d == Dynamic::Cobra && answers.is_empty() && directive & COBRA_NO_FILE_COMP == 0 {
+        return Some(paths(current, cwd, false));
+    }
+    // Cobra's NoSpace (bit 2) has no field to travel in (the protocol can't add one); the app
+    // already types no space after a candidate ending in `/` or `=`, the cases it is sent for.
+    let out = answers
+        .into_iter()
+        .filter(|(value, _)| value.starts_with(current))
+        .map(|(value, description)| {
+            let kind = if value.starts_with('-') {
+                CompletionKind::Flag
+            } else {
+                CompletionKind::Value
+            };
+            item(value, kind, description)
+        })
+        .collect();
+    Some(out)
+}
+
 /// Suggestions, generator output and path templates of one argument.
 fn arg_values(arg: &Arg, current: &str, cwd: &Path, path: &str) -> Vec<CompletionItem> {
     let mut out = Vec::new();
@@ -375,19 +477,41 @@ fn arg_values(arg: &Arg, current: &str, cwd: &Path, path: &str) -> Vec<Completio
     out
 }
 
+const GENERATOR_TIMEOUT: Duration = Duration::from_millis(600);
+/// Programs answering for themselves may reach a cluster or an API (sofka gives itself 2 s).
+const DYNAMIC_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Output lines of a generator script, run in `cwd` with a 600 ms timeout, cached for 5 s.
 fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
-    type Cache = Mutex<HashMap<(Vec<String>, PathBuf), (Instant, Vec<String>)>>;
+    run_program(script, cwd, path, None, GENERATOR_TIMEOUT, false).unwrap_or_default()
+}
+
+/// Output lines of `script` run in `cwd` with `env` set, cached for 5 s. `None` when it can't
+/// be started, runs past `timeout`, prints too much, or (with `require_success`) fails.
+fn run_program(
+    script: &[String],
+    cwd: &Path,
+    path: &str,
+    env: Option<(&str, &str)>,
+    timeout: Duration,
+    require_success: bool,
+) -> Option<Vec<String>> {
+    // The shell's PATH too: panes with different PATHs may run different programs.
+    type Key = (Vec<String>, PathBuf, String, Option<(String, String)>);
+    type Cache = Mutex<HashMap<Key, (Instant, Vec<String>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
-    let Some((program, args)) = script.split_first() else {
-        return Vec::new();
-    };
-    let key = (script.to_vec(), cwd.to_path_buf());
+    let (program, args) = script.split_first()?;
+    let key = (
+        script.to_vec(),
+        cwd.to_path_buf(),
+        path.to_owned(),
+        env.map(|(k, v)| (k.to_owned(), v.to_owned())),
+    );
     let cache = CACHE.get_or_init(Default::default);
     if let Some((at, lines)) = cache.lock().unwrap().get(&key)
         && at.elapsed() < Duration::from_secs(5)
     {
-        return lines.clone();
+        return Some(lines.clone());
     }
     // Command::new looks the program up in *our* PATH; use the shell's.
     let program = std::env::split_paths(path)
@@ -395,18 +519,19 @@ fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
         .map(|d| d.join(program))
         .find(|p| p.is_file())
         .unwrap_or_else(|| PathBuf::from(program));
-    let Ok(mut child) = crate::pty::spawn_locked(
-        std::process::Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .env("PATH", path)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null()),
-    ) else {
-        return Vec::new();
-    };
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("PATH", path)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    if let Some((k, v)) = env {
+        command.env(k, v);
+    }
+    let mut child = crate::pty::spawn_locked(&mut command).ok()?;
     // Read while the child runs (output beyond the 64 KiB pipe buffer would otherwise block
     // it until the deadline), without blocking: a background process the generator leaves
     // behind may hold the pipe open after it exits.
@@ -423,7 +548,8 @@ fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
         };
     }
     let mut out = Vec::new();
-    let deadline = Instant::now() + Duration::from_millis(600);
+    let mut status = None;
+    let deadline = Instant::now() + timeout;
     loop {
         if let Some(s) = &mut stdout {
             match drain(s, &mut out) {
@@ -433,7 +559,8 @@ fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
             }
         }
         match child.try_wait() {
-            Ok(Some(_)) => {
+            Ok(Some(s)) => {
+                status = Some(s);
                 if let Some(s) = &mut stdout {
                     drain(s, &mut out);
                 }
@@ -443,10 +570,13 @@ fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
             _ => break,
         }
     }
-    if !matches!(child.try_wait(), Ok(Some(_))) || out.len() > GENERATOR_MAX_OUTPUT {
+    if status.is_none() || out.len() > GENERATOR_MAX_OUTPUT {
         let _ = child.kill();
         let _ = child.wait();
-        return Vec::new();
+        return None;
+    }
+    if require_success && !status.is_some_and(|s| s.success()) {
+        return None;
     }
     let out = String::from_utf8_lossy(&out);
     let lines: Vec<String> = out.lines().map(str::to_owned).collect();
@@ -454,7 +584,7 @@ fn run_generator(script: &[String], cwd: &Path, path: &str) -> Vec<String> {
         .lock()
         .unwrap()
         .insert(key, (Instant::now(), lines.clone()));
-    lines
+    Some(lines)
 }
 
 const GENERATOR_MAX_OUTPUT: usize = 4 << 20;
@@ -668,6 +798,182 @@ mod tests {
                 .iter()
                 .any(|i| i.text == "--amend" && i.description.is_some())
         );
+        // Thurm's own: programs that answer for themselves, and codex's generated snapshot.
+        let load = |name: &str| -> Spec {
+            serde_json::from_str(
+                &std::fs::read_to_string(dir.join(format!("{name}.json"))).unwrap(),
+            )
+            .unwrap()
+        };
+        for name in ["vesnik", "enklava", "sefko"] {
+            assert_eq!(load(name).dynamic, Some(Dynamic::Cobra), "{name}");
+        }
+        for name in ["sofka", "thurm", "mailerlite", "mailersend"] {
+            let env = format!("{}_COMPLETE", name.to_uppercase());
+            assert_eq!(load(name).dynamic, Some(Dynamic::Clap { env }), "{name}");
+        }
+        let codex = load("codex");
+        assert!(codex.dynamic.is_none());
+        let sandbox = from_spec(&codex, &["exec".into(), "--sandbox".into()], "", &cwd, "");
+        assert!(
+            sandbox.iter().any(|i| i.text == "workspace-write"),
+            "{sandbox:?}"
+        );
+    }
+
+    /// A directory holding one executable `sh` script, for a `$PATH`.
+    fn fake_program(name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("thurm-dyn-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cwd/sub")).unwrap();
+        std::fs::write(dir.join("cwd/file.txt"), "").unwrap();
+        let program = dir.join(name);
+        std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn dynamic_cobra() {
+        let dir = fake_program(
+            "cobratool",
+            r#"[ "$1" = __complete ] || exit 1
+shift
+case "$*" in
+  "pl") printf 'plan\tShow the plan\nplay\n:4\n' ;;
+  "plan --m") printf -- '--model\tModel name\n:4\n' ;;
+  "plan ") printf ':0\n' ;;
+  "dir ") printf 'sub\n:16\n' ;;
+  "here ") printf ':16\n' ;;
+  "conf ") printf 'yaml\n.json\n:8\n' ;;
+  "set --out") printf -- '--output=\n:2\n' ;;
+  *) printf ':1\n' ;;
+esac"#,
+        );
+        let path = format!("{}:/bin:/usr/bin", dir.display());
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(cwd.join("sub/inner")).unwrap();
+        for f in ["a.yaml", "b.json", "c.toml"] {
+            std::fs::write(cwd.join(f), "").unwrap();
+        }
+        let run = |words: &[&str], current: &str| {
+            let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            dynamic(&Dynamic::Cobra, &words, current, &cwd, &path)
+        };
+        let texts = |v: Vec<CompletionItem>| v.into_iter().map(|i| i.text).collect::<Vec<_>>();
+
+        let subs = run(&["cobratool"], "pl").unwrap();
+        assert_eq!(subs[0].description.as_deref(), Some("Show the plan"));
+        assert_eq!(subs[0].kind, CompletionKind::Value);
+        assert_eq!(texts(subs), vec!["plan", "play"]);
+        let flags = run(&["cobratool", "plan"], "--m").unwrap();
+        assert_eq!(flags[0].kind, CompletionKind::Flag);
+        assert_eq!(texts(flags), vec!["--model"]);
+        // No candidates and file completion allowed: paths.
+        let mut files = texts(run(&["cobratool", "plan"], "").unwrap());
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["a.yaml", "b.json", "c.toml", "file.txt", "sub/"]
+        );
+        // ShellCompDirectiveFilterDirs: subdirectories of the directory it names, else here.
+        assert_eq!(
+            texts(run(&["cobratool", "dir"], "").unwrap()),
+            vec!["inner/"]
+        );
+        assert_eq!(
+            texts(run(&["cobratool", "here"], "").unwrap()),
+            vec!["sub/"]
+        );
+        // ShellCompDirectiveFilterFileExt: files with those extensions, and directories.
+        let mut filtered = texts(run(&["cobratool", "conf"], "").unwrap());
+        filtered.sort();
+        assert_eq!(filtered, vec!["a.yaml", "b.json", "sub/"]);
+        // NoSpace comes with `--flag=`, which the app completes without a space.
+        assert_eq!(
+            texts(run(&["cobratool", "set"], "--out").unwrap()),
+            vec!["--output="]
+        );
+        // ShellCompDirectiveError: fall back to the spec.
+        assert!(run(&["cobratool", "nope"], "").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_clap() {
+        let dir = fake_program(
+            "claptool",
+            r#"[ "$CLAPTOOL_COMPLETE" = fish ] && [ "$1" = -- ] && [ "$2" = claptool ] || exit 2
+shift 2
+case "$*" in
+  "comp") printf 'completion\tPrint a completion script\ncomplete\n' ;;
+  "completion ") printf 'bash\nfish\nzsh\n' ;;
+esac"#,
+        );
+        let path = format!("{}:/bin:/usr/bin", dir.display());
+        let cwd = dir.join("cwd");
+        let run = |env: &str, words: &[&str], current: &str| {
+            let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+            let d = Dynamic::Clap {
+                env: env.to_owned(),
+            };
+            dynamic(&d, &words, current, &cwd, &path)
+                .map(|v| v.into_iter().map(|i| i.text).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            run("CLAPTOOL_COMPLETE", &["claptool"], "comp").unwrap(),
+            vec!["completion", "complete"]
+        );
+        assert_eq!(
+            run("CLAPTOOL_COMPLETE", &["claptool", "completion"], "").unwrap(),
+            vec!["bash", "fish", "zsh"]
+        );
+        // A version without the protocol fails: fall back to the spec.
+        assert!(run("OTHER_COMPLETE", &["claptool"], "comp").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_answers_are_cached_per_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("thurm-dyn-{}-paths", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let words = vec!["pathtool".to_owned()];
+        let mut answers = Vec::new();
+        for which in ["a", "b"] {
+            let dir = root.join(which);
+            std::fs::create_dir_all(&dir).unwrap();
+            let program = dir.join("pathtool");
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf 'from-{which}\\n:4\\n'\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Same command, word and directory: only the shell's PATH differs.
+            let path = format!("{}:/bin:/usr/bin", dir.display());
+            let items = dynamic(&Dynamic::Cobra, &words, "", &root, &path).unwrap();
+            answers.push(items.into_iter().map(|i| i.text).collect::<Vec<_>>());
+        }
+        assert_eq!(answers, vec![vec!["from-a"], vec!["from-b"]]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dynamic_spec_falls_back_when_the_program_is_missing() {
+        let spec: Spec = serde_json::from_str(
+            r#"{"dynamic":{"protocol":"cobra"},"subcommands":[{"names":["plan"]}]}"#,
+        )
+        .unwrap();
+        let words = vec!["thurm-no-such-program".to_owned()];
+        let cwd = std::env::temp_dir();
+        assert!(dynamic(spec.dynamic.as_ref().unwrap(), &words, "", &cwd, "/bin").is_none());
+        let texts: Vec<String> = from_spec(&spec, &[], "pl", &cwd, "")
+            .into_iter()
+            .map(|i| i.text)
+            .collect();
+        assert_eq!(texts, vec!["plan"]);
     }
 
     #[test]

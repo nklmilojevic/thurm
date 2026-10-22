@@ -497,6 +497,11 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    // Thurm's own Tab completion asks `THURM_COMPLETE=fish thurm -- thurm <words>` (see
+    // completions/thurm.json); answers and exits when that is set.
+    clap_complete::CompleteEnv::with_factory(Cli::command)
+        .var("THURM_COMPLETE")
+        .complete();
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => code,

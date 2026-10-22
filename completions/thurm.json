@@ -1,0 +1,8 @@
+{
+  "name": "thurm",
+  "description": "Control Thurm terminal panes",
+  "dynamic": {
+    "protocol": "clap",
+    "env": "THURM_COMPLETE"
+  }
+}

@@ -917,7 +917,7 @@ final class TerminalView: NSView, NSTextInputClient {
     private func acceptCompletion(_ item: CompletionCandidate) {
         let word = completion.word
         completion.close()
-        insertCompletion(item.text, replacing: word, final: !item.isDirectory)
+        insertCompletion(item.text, replacing: word, final: !item.continuesWord)
     }
 
     /// Types the completion into the shell: only the missing part when `text` extends `word`,

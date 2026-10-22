@@ -71,6 +71,20 @@ Shell integration adds prompt marks and working directory tracking for zsh,
 bash, and fish. It also supports completion choices at a shell prompt. Use
 `thurm scroll prev-prompt` or `thurm scroll next-prompt` to move between marks.
 
+Completion choices for a command come from a spec named `<command>.json`. Thurm
+reads it from `~/.config/thurm/completions` first, then from the specs bundled with
+the app. A spec can list subcommands, options and values, or tell Thurm to ask the
+program itself at each Tab, so the choices match the installed version:
+
+```json
+{ "dynamic": { "protocol": "cobra" } }
+```
+
+Use `cobra` for Go programs built with Cobra (they answer `__complete`). Use
+`{ "protocol": "clap", "env": "PROG_COMPLETE" }` for Rust programs that support
+clap's dynamic completion through that environment variable. If the program can't
+answer, Thurm uses the rest of the spec.
+
 ## Input and notifications
 
 The Option key is not Alt by default. Set `window.option_as_alt` to `left`,

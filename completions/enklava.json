@@ -1,0 +1,7 @@
+{
+  "name": "enklava",
+  "description": "Secure Enclave SSH keys and Git signing for macOS",
+  "dynamic": {
+    "protocol": "cobra"
+  }
+}

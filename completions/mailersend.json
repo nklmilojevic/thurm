@@ -1,0 +1,8 @@
+{
+  "name": "mailersend",
+  "description": "Command-line interface for the MailerSend API",
+  "dynamic": {
+    "protocol": "clap",
+    "env": "MAILERSEND_COMPLETE"
+  }
+}

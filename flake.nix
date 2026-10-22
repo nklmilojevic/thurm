@@ -94,6 +94,8 @@
                 ./crates
                 ./shell-integration
                 ./completions
+                # crates/thurm-cli/src/skill.rs includes skills/thurm/SKILL.md.
+                ./skills
               ];
             };
             strictDeps = true;

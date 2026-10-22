@@ -30,3 +30,19 @@ fn prints_scripts_without_a_daemon() {
     assert!(!socket.exists(), "a daemon was started");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Thurm's own Tab completion (completions/thurm.json) asks through clap's CompleteEnv.
+#[test]
+fn answers_dynamic_completion_requests() {
+    let out = Command::new(env!("CARGO_BIN_EXE_thurm"))
+        .env("THURM_COMPLETE", "fish")
+        .args(["--", "thurm", "comp"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let lines = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        lines.lines().any(|l| l.starts_with("completion\t")),
+        "{lines}"
+    );
+}

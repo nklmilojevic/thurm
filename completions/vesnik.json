@@ -1,0 +1,7 @@
+{
+  "name": "vesnik",
+  "description": "AI-written release notes and version bumps, reviewed before anything ships",
+  "dynamic": {
+    "protocol": "cobra"
+  }
+}

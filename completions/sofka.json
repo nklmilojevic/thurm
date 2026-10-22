@@ -1,0 +1,8 @@
+{
+  "name": "sofka",
+  "description": "A Kubernetes TUI",
+  "dynamic": {
+    "protocol": "clap",
+    "env": "SOFKA_COMPLETE"
+  }
+}
