@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.11.0 - 2026-10-22
+
+Thurm now gives agents and scripts more control over panes. It also adds shell completions and fixes stray text in attached copies.
+
+### New features
+
+- Agents get the guide from the `thurm` they run, and `thurm skill setup` installs it for Claude Code, Codex, OpenCode and Pi. The CLI also gains layout commands for background panes, split sizes and cross-tab moves.
+- Thurm now prints shell completion scripts for bash, elvish, fish, powershell and zsh with `thurm completion <shell>`. Your shell then completes `thurm` commands and options.
+- Tab asks supported programs for their own completions, so they stay current. Bundled specs now cover sofka, vesnik, enklava, sefko, thurm, codex, mailerlite and mailersend.
+
+### Fixes
+
+- Attached copies no longer show stray text, such as `1m`, after you switch back to a window.
+- Prompt marks in replayed zsh output now appear at the correct column.
+
+### Other changes
+
+- Thurm now uses a newer lock library. Locks that many threads share perform better under contention.
+- To build Thurm from source, you now need Rust 1.95 or later.
+
 ## v0.10.1 - 2026-10-21
 
 This release fixes a security advisory in a certificate library and restores the CI build.
