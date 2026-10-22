@@ -1488,6 +1488,11 @@ fn subscribing_inside_an_escape_sequence_shows_no_tail() {
     loop {
         match events.recv_timeout(Duration::from_millis(50)) {
             Ok(Event::Attach { size, state, .. }) => {
+                assert!(
+                    state.ends_with(b"\x1b[3"),
+                    "attached outside the sequence: {:?}",
+                    String::from_utf8_lossy(&state[state.len().saturating_sub(40)..])
+                );
                 let mut t = thurm_term::Terminal::new(size, thurm_term::EngineConfig::default());
                 t.replay(&state);
                 copy = Some(t);
