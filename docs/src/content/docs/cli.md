@@ -57,6 +57,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `scroll up\|down\|top\|bottom\|prev-prompt\|next-prompt` | Move the viewport; `--pane ID` |
 | `clear` | Clear scrollback; `--pane ID` |
 | `complete` | Show completion choices for prompt input; `--pane ID` |
+| `completion SHELL` | Print the shell completion script for `thurm` itself: `bash`, `elvish`, `fish`, `powershell` or `zsh`, e.g. `thurm completion fish \| source`. The Nix package installs the bash, fish and zsh scripts; on macOS, the Home Manager module sets up fish for the app's CLI |
 | `procs` | List processes and ports; `--pane ID`, `--ports` |
 | `notify TITLE [BODY...]` | Send a desktop notification through the current terminal |
 | `presets` | List agent launch presets |

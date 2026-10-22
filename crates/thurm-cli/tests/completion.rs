@@ -11,6 +11,8 @@ fn prints_scripts_without_a_daemon() {
         ("fish", "complete -c thurm"),
         ("zsh", "#compdef thurm"),
         ("bash", "complete -F _thurm"),
+        ("elvish", "arg-completer[thurm]"),
+        ("powershell", "-CommandName 'thurm'"),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_thurm"))
             .env("THURM_SOCKET", &socket)
