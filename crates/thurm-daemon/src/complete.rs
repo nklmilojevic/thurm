@@ -381,7 +381,7 @@ fn dynamic(
     script.push(current.to_owned());
     let lines = run_program(&script, cwd, path, env, DYNAMIC_TIMEOUT, true)?;
     let mut directive = 0;
-    let mut out = Vec::new();
+    let mut answers = Vec::new();
     for line in &lines {
         if *d == Dynamic::Cobra
             && let Some(bits) = line.strip_prefix(':')
@@ -393,29 +393,49 @@ fn dynamic(
             Some((v, desc)) => (v, Some(desc.to_owned())),
             None => (line.as_str(), None),
         };
-        if value.is_empty() || !value.starts_with(current) {
-            continue;
+        if !value.is_empty() {
+            answers.push((value, description));
         }
-        let kind = if value.starts_with('-') {
-            CompletionKind::Flag
-        } else {
-            CompletionKind::Value
-        };
-        out.push(item(value, kind, description));
     }
     if directive & COBRA_ERROR != 0 {
         return None;
     }
-    // Extension filters and "a directory in here" name what to list, not candidates.
+    // With these two, the answers say what to list rather than being candidates: the
+    // directory to list subdirectories of (none: here), or the file extensions to offer.
     if directive & COBRA_FILTER_DIRS != 0 {
-        return Some(paths(current, cwd, true));
+        let base = answers
+            .first()
+            .map_or(cwd.to_path_buf(), |(dir, _)| cwd.join(dir));
+        return Some(paths(current, &base, true));
     }
     if directive & COBRA_FILTER_FILE_EXT != 0 {
+        let exts: Vec<String> = answers
+            .iter()
+            .map(|(e, _)| format!(".{}", e.trim_start_matches('.')))
+            .collect();
+        let mut out = paths(current, cwd, false);
+        out.retain(|i| {
+            i.kind == CompletionKind::Directory || exts.iter().any(|e| i.text.ends_with(e))
+        });
+        return Some(out);
+    }
+    if *d == Dynamic::Cobra && answers.is_empty() && directive & COBRA_NO_FILE_COMP == 0 {
         return Some(paths(current, cwd, false));
     }
-    if *d == Dynamic::Cobra && out.is_empty() && directive & COBRA_NO_FILE_COMP == 0 {
-        return Some(paths(current, cwd, false));
-    }
+    // Cobra's NoSpace (bit 2) has no field to travel in (the protocol can't add one); the app
+    // already types no space after a candidate ending in `/` or `=`, the cases it is sent for.
+    let out = answers
+        .into_iter()
+        .filter(|(value, _)| value.starts_with(current))
+        .map(|(value, description)| {
+            let kind = if value.starts_with('-') {
+                CompletionKind::Flag
+            } else {
+                CompletionKind::Value
+            };
+            item(value, kind, description)
+        })
+        .collect();
     Some(out)
 }
 
@@ -476,13 +496,15 @@ fn run_program(
     timeout: Duration,
     require_success: bool,
 ) -> Option<Vec<String>> {
-    type Key = (Vec<String>, PathBuf, Option<(String, String)>);
+    // The shell's PATH too: panes with different PATHs may run different programs.
+    type Key = (Vec<String>, PathBuf, String, Option<(String, String)>);
     type Cache = Mutex<HashMap<Key, (Instant, Vec<String>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     let (program, args) = script.split_first()?;
     let key = (
         script.to_vec(),
         cwd.to_path_buf(),
+        path.to_owned(),
         env.map(|(k, v)| (k.to_owned(), v.to_owned())),
     );
     let cache = CACHE.get_or_init(Default::default);
@@ -823,11 +845,18 @@ case "$*" in
   "plan --m") printf -- '--model\tModel name\n:4\n' ;;
   "plan ") printf ':0\n' ;;
   "dir ") printf 'sub\n:16\n' ;;
+  "here ") printf ':16\n' ;;
+  "conf ") printf 'yaml\n.json\n:8\n' ;;
+  "set --out") printf -- '--output=\n:2\n' ;;
   *) printf ':1\n' ;;
 esac"#,
         );
         let path = format!("{}:/bin:/usr/bin", dir.display());
         let cwd = dir.join("cwd");
+        std::fs::create_dir_all(cwd.join("sub/inner")).unwrap();
+        for f in ["a.yaml", "b.json", "c.toml"] {
+            std::fs::write(cwd.join(f), "").unwrap();
+        }
         let run = |words: &[&str], current: &str| {
             let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
             dynamic(&Dynamic::Cobra, &words, current, &cwd, &path)
@@ -844,9 +873,28 @@ esac"#,
         // No candidates and file completion allowed: paths.
         let mut files = texts(run(&["cobratool", "plan"], "").unwrap());
         files.sort();
-        assert_eq!(files, vec!["file.txt", "sub/"]);
-        // ShellCompDirectiveFilterDirs: directories only.
-        assert_eq!(texts(run(&["cobratool", "dir"], "").unwrap()), vec!["sub/"]);
+        assert_eq!(
+            files,
+            vec!["a.yaml", "b.json", "c.toml", "file.txt", "sub/"]
+        );
+        // ShellCompDirectiveFilterDirs: subdirectories of the directory it names, else here.
+        assert_eq!(
+            texts(run(&["cobratool", "dir"], "").unwrap()),
+            vec!["inner/"]
+        );
+        assert_eq!(
+            texts(run(&["cobratool", "here"], "").unwrap()),
+            vec!["sub/"]
+        );
+        // ShellCompDirectiveFilterFileExt: files with those extensions, and directories.
+        let mut filtered = texts(run(&["cobratool", "conf"], "").unwrap());
+        filtered.sort();
+        assert_eq!(filtered, vec!["a.yaml", "b.json", "sub/"]);
+        // NoSpace comes with `--flag=`, which the app completes without a space.
+        assert_eq!(
+            texts(run(&["cobratool", "set"], "--out").unwrap()),
+            vec!["--output="]
+        );
         // ShellCompDirectiveError: fall back to the spec.
         assert!(run(&["cobratool", "nope"], "").is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -884,6 +932,32 @@ esac"#,
         // A version without the protocol fails: fall back to the spec.
         assert!(run("OTHER_COMPLETE", &["claptool"], "comp").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_answers_are_cached_per_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("thurm-dyn-{}-paths", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let words = vec!["pathtool".to_owned()];
+        let mut answers = Vec::new();
+        for which in ["a", "b"] {
+            let dir = root.join(which);
+            std::fs::create_dir_all(&dir).unwrap();
+            let program = dir.join("pathtool");
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf 'from-{which}\\n:4\\n'\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Same command, word and directory: only the shell's PATH differs.
+            let path = format!("{}:/bin:/usr/bin", dir.display());
+            let items = dynamic(&Dynamic::Cobra, &words, "", &root, &path).unwrap();
+            answers.push(items.into_iter().map(|i| i.text).collect::<Vec<_>>());
+        }
+        assert_eq!(answers, vec![vec!["from-a"], vec!["from-b"]]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

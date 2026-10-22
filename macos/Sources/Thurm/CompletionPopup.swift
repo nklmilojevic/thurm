@@ -8,6 +8,10 @@ struct CompletionCandidate {
 
     var isDirectory: Bool { kind == "Directory" || text.hasSuffix("/") }
 
+    /// Typing goes on after it, so no space follows: a directory, or an option's `--name=`
+    /// (what Cobra programs answer with their NoSpace directive).
+    var continuesWord: Bool { isDirectory || text.hasSuffix("=") }
+
     var symbol: String {
         switch kind {
         case "Command": return "terminal"

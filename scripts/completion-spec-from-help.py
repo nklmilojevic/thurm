@@ -5,10 +5,14 @@ For CLIs that can't answer completion requests themselves (no cobra `__complete`
 `CompleteEnv`): walks `<command> [subcommand...] -h`, reading clap's Commands, Options and
 possible values. Only help is ever run. Regenerate after the CLI changes:
 
-    python3 scripts/completion-spec-from-help.py codex "OpenAI's coding agent" > completions/codex.json
+    python3 scripts/completion-spec-from-help.py -o completions/codex.json codex "OpenAI's coding agent"
+
+With -o the file is replaced only when every help request succeeded.
 """
 
+import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -19,6 +23,8 @@ BRACKETS = re.compile(r"\s*\[(aliases|possible values|default|env): ([^\]]*)\]")
 
 
 def help_text(argv):
+    """`argv -h`; exits when it fails, so a partial spec is never printed."""
+    cmd = " ".join([*argv, "-h"])
     try:
         out = subprocess.run(
             [*argv, "-h"],
@@ -28,9 +34,11 @@ def help_text(argv):
             stdin=subprocess.DEVNULL,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return out.stdout if out.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired) as e:
+        sys.exit(f"{cmd}: {e}")
+    if out.returncode != 0:
+        sys.exit(f"{cmd}: exit {out.returncode}\n{out.stderr.strip()}")
+    return out.stdout
 
 
 def sections(text):
@@ -91,17 +99,25 @@ def command(argv, depth):
 
 
 def main():
-    if len(sys.argv) not in (2, 3):
-        sys.exit(__doc__)
-    name = sys.argv[1]
-    spec = {"name": name}
-    if len(sys.argv) == 3:
-        spec["description"] = sys.argv[2]
-    spec.update(command([name], 1))
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("-o", "--output", help="write here instead of stdout")
+    parser.add_argument("command")
+    parser.add_argument("description", nargs="?")
+    args = parser.parse_args()
+    spec = {"name": args.command}
+    if args.description:
+        spec["description"] = args.description
+    spec.update(command([args.command], 1))
     if not spec["options"] and not spec["subcommands"]:
-        sys.exit(f"{name} -h printed no clap options or commands")
-    json.dump(spec, sys.stdout, separators=(",", ":"))
-    print()
+        sys.exit(f"{args.command} -h printed no clap options or commands")
+    text = json.dumps(spec, separators=(",", ":")) + "\n"
+    if not args.output:
+        sys.stdout.write(text)
+        return
+    tmp = f"{args.output}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, args.output)
 
 
 if __name__ == "__main__":
