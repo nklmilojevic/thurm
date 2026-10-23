@@ -75,7 +75,7 @@
             pname = "thurm-tailnet";
             inherit version;
             src = ./tailnet;
-            vendorHash = "sha256-EkFanR5bVhb0S8FQEVFJ6ghZSdqzvJv3bmjLlZC9b+Y=";
+            vendorHash = "sha256-OE3BPHw4H1HJYQmcsdksrKyvi+RYGi89mKZrDa6K4yg=";
             subPackages = [ "cmd/thurm-tailnet" ];
             env.CGO_ENABLED = 0;
             ldflags = [
