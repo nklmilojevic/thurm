@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.12.0 - 2026-10-24
+
+This release lets you go to a pane from the tab hover card on macOS. This release also fixes the pane header buttons and the mouse reports.
+
+### New features
+
+- The tab hover card on macOS now takes mouse clicks. A click on a pane in the map or the list selects its tab and focuses that pane.
+
+### Fixes
+
+- The split, zoom and close buttons in a pane header have a larger click area. A click near a button no longer focuses the pane by mistake.
+- Mouse reports keep the correct format after a re-attach. Programs such as Textual no longer get every click at the top-left cell.
+
 ## v0.11.0 - 2026-10-22
 
 Thurm now gives agents and scripts more control over panes. It also adds shell completions and fixes stray text in attached copies.
