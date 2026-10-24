@@ -368,6 +368,19 @@ extension SessionManager {
         scheduleLayoutSave()
     }
 
+    /// `c`, the last tab of its workspace, is closing: its window moves on to the most recent
+    /// hidden workspace instead of closing (which would quit the app), and the emptied workspace
+    /// goes. False when there is no other workspace to show.
+    func showNextWorkspace(closing c: TerminalWindowController) -> Bool {
+        guard !isTerminating, !c.isQuick, !c.isClosed, group(of: c).count == 1,
+              let next = workspacesByRecency.first(where: { $0.id != c.workspaceID && !isShown($0) })
+        else { return false }
+        workspaces.removeAll { $0.id == c.workspaceID }
+        c.workspaceID = 0
+        switchWorkspace(in: c, to: next)
+        return c.isClosed
+    }
+
     /// ⌘⇧O: pick a workspace by name.
     func showWorkspaceSwitcher() {
         let current = currentController?.workspaceID
