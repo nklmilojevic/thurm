@@ -83,8 +83,42 @@ enum State {
 const MAX_APC_CTL: usize = 1024;
 /// Longest OSC number we look at (the intercepted ones have at most 4 digits).
 const MAX_OSC_NUM: usize = 6;
-/// Longest CSI parameter string we remember (DECSTBM needs a handful).
-const MAX_CSI_PARAMS: usize = 16;
+/// Longest CSI parameter string we remember (DECSTBM needs a handful, a list of DEC private
+/// modes more).
+const MAX_CSI_PARAMS: usize = 64;
+
+/// A mouse report format: DEC private mode 1005, 1006, 1015 or 1016, or none of them (X10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseFormat {
+    #[default]
+    X10,
+    Utf8,
+    Sgr,
+    Urxvt,
+    SgrPixels,
+}
+
+impl MouseFormat {
+    fn from_mode(mode: u16) -> Option<Self> {
+        Some(match mode {
+            1005 => Self::Utf8,
+            1006 => Self::Sgr,
+            1015 => Self::Urxvt,
+            1016 => Self::SgrPixels,
+            _ => return None,
+        })
+    }
+}
+
+/// A change of the mouse report format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatChange {
+    /// This format is selected: its mode set, or (X10) a format mode reset, or RIS.
+    To(MouseFormat),
+    /// This format's mode was restored (XTRESTORE): the format if the mode is now set, X10
+    /// otherwise.
+    Restored(MouseFormat),
+}
 
 #[derive(Debug)]
 pub struct StreamFilter {
@@ -92,11 +126,14 @@ pub struct StreamFilter {
     buf: Vec<u8>,
     /// Terminator used by the OSC being buffered (BEL vs ST) to replay it verbatim.
     osc_bel: bool,
-    /// Parameters of the CSI being passed through.
+    /// Parameters of the CSI being passed through, and whether it is a DEC private one (`?`).
     csi_params: Vec<u8>,
+    csi_private: bool,
     /// The scroll region the stream set since the last [`StreamFilter::take_scroll_region`]
     /// (`Some(None)`: reset to the full screen).
     scroll_region: Option<Option<(u16, u16)>>,
+    /// The last mouse format change since the last [`StreamFilter::take_mouse_format`].
+    mouse_format: Option<FormatChange>,
     /// Take every APC out of the stream (kitty graphics turned off), not only transmissions
     /// libghostty-vt can't read itself.
     pub all_apc: bool,
@@ -118,7 +155,9 @@ impl StreamFilter {
             buf: Vec::new(),
             osc_bel: false,
             csi_params: Vec::new(),
+            csi_private: false,
             scroll_region: None,
+            mouse_format: None,
             all_apc: false,
             media_more: false,
         }
@@ -128,6 +167,12 @@ impl StreamFilter {
     /// `Some(None)` when it went back to the full screen.
     pub fn take_scroll_region(&mut self) -> Option<Option<(u16, u16)>> {
         self.scroll_region.take()
+    }
+
+    /// The last change of the mouse report format in what was fed since the last call:
+    /// libghostty-vt selects a format as its mode is set or reset, and doesn't say which.
+    pub fn take_mouse_format(&mut self) -> Option<FormatChange> {
+        self.mouse_format.take()
     }
 
     /// Split `input` into chunks, appending them to `out`.
@@ -207,10 +252,12 @@ impl StreamFilter {
                                 b'[' => {
                                     self.state = State::Csi;
                                     self.csi_params.clear();
+                                    self.csi_private = false;
                                 }
                                 b'c' => {
                                     // RIS resets everything.
                                     self.scroll_region = Some(None);
+                                    self.mouse_format = Some(FormatChange::To(MouseFormat::X10));
                                     self.media_more = false;
                                 }
                                 _ => {}
@@ -220,7 +267,10 @@ impl StreamFilter {
                     i += 1;
                 }
                 State::Csi => {
-                    if b.is_ascii_digit() || b == b';' {
+                    if b == b'?' && self.csi_params.is_empty() && !self.csi_private {
+                        self.csi_private = true;
+                        i += 1;
+                    } else if b.is_ascii_digit() || b == b';' {
                         let rest = &input[i..];
                         let n = rest
                             .iter()
@@ -230,7 +280,11 @@ impl StreamFilter {
                         self.csi_params.extend_from_slice(&rest[..n.min(room)]);
                         i += n;
                     } else {
-                        if b == b'r' {
+                        if self.csi_private {
+                            if let Some(c) = mouse_format_change(&self.csi_params, b) {
+                                self.mouse_format = Some(c);
+                            }
+                        } else if b == b'r' {
                             self.scroll_region = Some(parse_decstbm(&self.csi_params));
                         }
                         self.end_csi(b);
@@ -502,8 +556,8 @@ impl StreamFilter {
     }
 
     /// Fast path for a complete, well-formed CSI at the start of `bytes` (which starts with
-    /// ESC): its length, after noting DECSTBM. `None` leaves it to the state
-    /// machine (split across chunks, or bytes the state machine treats specially).
+    /// ESC): its length, after noting DECSTBM and mouse format modes. `None` leaves it to the
+    /// state machine (split across chunks, or bytes the state machine treats specially).
     fn whole_csi(&mut self, bytes: &[u8]) -> Option<usize> {
         if bytes.get(1) != Some(&b'[') {
             return None;
@@ -532,6 +586,12 @@ impl StreamFilter {
         if numeric && fin == b'r' && params_end == j {
             let params = &bytes[2..params_end.min(2 + MAX_CSI_PARAMS)];
             self.scroll_region = Some(parse_decstbm(params));
+        }
+        if bytes[2] == b'?'
+            && params_end == j
+            && let Some(c) = mouse_format_change(&bytes[3..params_end], fin)
+        {
+            self.mouse_format = Some(c);
         }
         Some(j + 1)
     }
@@ -641,6 +701,22 @@ fn parse_decstbm(params: &[u8]) -> Option<(u16, u16)> {
         return None;
     }
     bottom.map(|b| (top, b)).filter(|&(t, b)| b > t)
+}
+
+/// The mouse format change a DEC private mode set (`h`), reset (`l`) or restore (`r`,
+/// XTRESTORE) makes: libghostty-vt applies the modes in order, so the last format mode counts.
+fn mouse_format_change(params: &[u8], fin: u8) -> Option<FormatChange> {
+    let format = params
+        .split(|&b| b == b';')
+        .filter_map(|p| std::str::from_utf8(p).ok()?.parse().ok())
+        .filter_map(MouseFormat::from_mode)
+        .next_back()?;
+    match fin {
+        b'h' => Some(FormatChange::To(format)),
+        b'l' => Some(FormatChange::To(MouseFormat::X10)),
+        b'r' => Some(FormatChange::Restored(format)),
+        _ => None,
+    }
 }
 
 fn osc_number(body: &[u8]) -> Option<u32> {
@@ -964,6 +1040,33 @@ mod tests {
         assert_eq!(feed(b"\x1b[3;9r\x1bc"), Some(None));
         // Other sequences leave it alone.
         assert_eq!(feed(b"\x1b[1;31mred\x1b[0m\x1b[2J\x1b[?25l"), None);
+    }
+
+    #[test]
+    fn tracks_mouse_format_across_chunks() {
+        use FormatChange::*;
+        use MouseFormat::*;
+        let mut f = StreamFilter::new();
+        let mut feed = |b: &[u8]| {
+            f.feed(b, &mut Vec::new());
+            f.take_mouse_format()
+        };
+        assert_eq!(feed(b"\x1b[?1000h\x1b[?25l\x1b[1006h"), None);
+        assert_eq!(feed(b"\x1b[?1006h\x1b[?1016h"), Some(To(SgrPixels)));
+        assert_eq!(feed(b"\x1b[?1000;1015;1006;1003h"), Some(To(Sgr)));
+        assert_eq!(feed(b"\x1b[?1016l"), Some(To(X10)));
+        assert_eq!(feed(b"\x1b[?1006r"), Some(Restored(Sgr)));
+        assert_eq!(feed(b"\x1b[?1006s\x1b[?1000l"), None);
+        // Split mid-sequence, including right after the ESC and the `?`.
+        assert_eq!(feed(b"xyz\x1b"), None);
+        assert_eq!(feed(b"[?"), None);
+        assert_eq!(feed(b"10"), None);
+        assert_eq!(feed(b"05h tail"), Some(To(Utf8)));
+        assert_eq!(feed(b"\x1b[?1006h\x1bc"), Some(To(X10)));
+        // DECSTBM is not a mode restore, nor the other way round.
+        assert_eq!(feed(b"\x1b[1006r"), None);
+        assert_eq!(feed(b"\x1b[?1;10r"), None);
+        assert_eq!(f.take_scroll_region(), Some(None));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use thurm_proto::{
 };
 use web_time::Instant;
 
-use crate::filter::{Chunk, StreamFilter};
+use crate::filter::{Chunk, FormatChange, MouseFormat, StreamFilter};
 use crate::keys;
 use crate::kitty::{Image, Media, MediaReader};
 pub use crate::mode::TermMode;
@@ -35,6 +35,13 @@ const M_UTF8_MOUSE: u16 = vt::mode(1005, false);
 const M_SGR_MOUSE: u16 = vt::mode(1006, false);
 const M_URXVT_MOUSE: u16 = vt::mode(1015, false);
 const M_SGR_PIXELS_MOUSE: u16 = vt::mode(1016, false);
+/// The mouse report format modes, with the format each selects.
+const MOUSE_FORMATS: [(MouseFormat, u16, &str); 4] = [
+    (MouseFormat::Utf8, M_UTF8_MOUSE, "1005"),
+    (MouseFormat::Sgr, M_SGR_MOUSE, "1006"),
+    (MouseFormat::Urxvt, M_URXVT_MOUSE, "1015"),
+    (MouseFormat::SgrPixels, M_SGR_PIXELS_MOUSE, "1016"),
+];
 const M_ALT_SCROLL: u16 = vt::mode(1007, false);
 const M_BRACKETED_PASTE: u16 = vt::mode(2004, false);
 const M_SYNC: u16 = vt::mode(2026, false);
@@ -473,6 +480,9 @@ pub struct Terminal {
     /// DECSTBM scroll region (1-based top, bottom) when not the whole screen, so attach
     /// snapshots can restore it.
     scroll_region: Option<(u16, u16)>,
+    /// The mouse report format libghostty-vt uses, so attach snapshots can restore it: the
+    /// format modes don't say which one was set last, nor that one was reset since.
+    mouse_format: MouseFormat,
     /// `$PATH` as the shell last reported it (shell integration).
     shell_path: Option<String>,
     /// The token the pane's shell integration puts in front of its `$PATH` report.
@@ -539,6 +549,7 @@ impl Terminal {
             kitty_generation: 0,
             forward: None,
             scroll_region: None,
+            mouse_format: MouseFormat::X10,
             shell_path: None,
             shell_token: None,
             input_start: None,
@@ -742,6 +753,16 @@ impl Terminal {
                     }
                 }
             }
+        }
+        // Resolved once the whole feed is written: a restored mode's value is known then.
+        if let Some(change) = self.filter.take_mouse_format() {
+            self.mouse_format = match change {
+                FormatChange::To(f) => f,
+                FormatChange::Restored(f) => MOUSE_FORMATS
+                    .iter()
+                    .find(|&&(m, mode, _)| m == f && self.vt.mode(mode))
+                    .map_or(MouseFormat::X10, |&(m, ..)| m),
+            };
         }
         self.after_write();
         self.check_images();
@@ -2289,6 +2310,8 @@ impl Terminal {
         self.collect_events();
         self.filter.take_scroll_region();
         self.scroll_region = None;
+        self.filter.take_mouse_format();
+        self.mouse_format = MouseFormat::X10;
         self.vt.set_selection(None);
         self.prompt_start = None;
         self.input_start = None;
@@ -2476,16 +2499,25 @@ impl Terminal {
         set(&mut out, mode.contains(TermMode::MOUSE_DRAG), "1002");
         set(&mut out, mode.contains(TermMode::MOUSE_MOTION), "1003");
         set(&mut out, mode.contains(TermMode::FOCUS_IN_OUT), "1004");
-        // The report format is whichever of these was set last, which the modes don't say:
-        // the most specific goes last (a program that asks for pixels sets 1006 first, for
-        // terminals without 1016).
-        for (m, code) in [
-            (M_UTF8_MOUSE, "1005"),
-            (M_URXVT_MOUSE, "1015"),
-            (M_SGR_MOUSE, "1006"),
-            (M_SGR_PIXELS_MOUSE, "1016"),
-        ] {
-            set(&mut out, self.vt.mode(m), code);
+        // The report format is the last format mode set, or X10 after one was reset: the
+        // format in use goes last, and X10 with a format mode still set ends on a reset of
+        // one that isn't.
+        for &(f, m, code) in &MOUSE_FORMATS {
+            set(&mut out, f != self.mouse_format && self.vt.mode(m), code);
+        }
+        match MOUSE_FORMATS
+            .iter()
+            .find(|&&(f, ..)| f == self.mouse_format)
+        {
+            Some(&(_, m, code)) => set(&mut out, self.vt.mode(m), code),
+            None => {
+                if MOUSE_FORMATS.iter().any(|&(_, m, _)| self.vt.mode(m))
+                    && let Some(&(.., code)) =
+                        MOUSE_FORMATS.iter().find(|&&(_, m, _)| !self.vt.mode(m))
+                {
+                    out.push_str(&format!("\x1b[?{code}l"));
+                }
+            }
         }
         set(&mut out, mode.contains(TermMode::BRACKETED_PASTE), "2004");
         if !mode.contains(TermMode::ALTERNATE_SCROLL) {

@@ -1596,14 +1596,37 @@ mod encoding {
         let mut px = mouse(MouseKind::Press, MouseButton::Left, 70, 3, 0);
         px.x = 705;
         px.y = 65;
+        let sgr = &b"\x1b[<0;71;4M"[..];
+        let pixels = &b"\x1b[<0;705;65M"[..];
+        let x10 = &b"\x1b[M g$"[..];
         // Textual's order: SGR first, pixels once the terminal reports pixel sizes.
         for (setup, want) in [
             (
                 "\x1b[?1000h\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?1016h",
-                &b"\x1b[<0;705;65M"[..],
+                pixels,
             ),
-            ("\x1b[?1000h\x1b[?1015h\x1b[?1006h", b"\x1b[<0;71;4M"),
+            ("\x1b[?1000h\x1b[?1015h\x1b[?1006h", sgr),
             ("\x1b[?1000h\x1b[?1015h", b"\x1b[32;71;4M"),
+            // The last format set counts, whatever it is.
+            ("\x1b[?1000h\x1b[?1016h\x1b[?1006h", sgr),
+            ("\x1b[?1000h\x1b[?1006;1015h", b"\x1b[32;71;4M"),
+            // Resetting a format mode selects X10, though another stays set.
+            ("\x1b[?1000h\x1b[?1006h\x1b[?1016h\x1b[?1016l", x10),
+            ("\x1b[?1000h\x1b[?1015h\x1b[?1006h\x1b[?1006l", x10),
+            (
+                "\x1b[?1000h\x1b[?1006h\x1b[?1005l\x1b[?1015h\x1b[?1016h\x1b[?1005h\x1b[?1015l",
+                x10,
+            ),
+            // Restoring a mode selects its format, or X10.
+            (
+                "\x1b[?1000h\x1b[?1006h\x1b[?1006s\x1b[?1016h\x1b[?1006r",
+                sgr,
+            ),
+            (
+                "\x1b[?1000h\x1b[?1006s\x1b[?1006h\x1b[?1016h\x1b[?1006r",
+                x10,
+            ),
+            ("\x1b[?1000h\x1b[?1006h\x1bc\x1b[?1000h", x10),
         ] {
             let mut a = with(setup);
             let mut copy = term(80, 24);
