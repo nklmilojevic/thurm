@@ -250,7 +250,7 @@ final class TabContentView: NSView {
     private(set) var zoomedPane: PaneKey?
 
     private(set) var findBar: FindBar?
-    private var updateBadge: UpdateBadge?
+    private var noticeBadges: [NoticeBadge] = []
     private var dragging: SplitDivider?
     /// Pane rectangles where a layout move (zoom, a pane opening or closing) started;
     /// `layoutProgress` eases them to the layout.
@@ -355,7 +355,7 @@ final class TabContentView: NSView {
         addSubview(backdrop)
         addSubview(chrome)
         syncViews()
-        setUpdateBadge(Updater.shared.badgeText)
+        setNotices(Notices.shared.current)
     }
 
     required init?(coder: NSCoder) {
@@ -507,10 +507,12 @@ final class TabContentView: NSView {
             bar.frame = NSRect(x: full.maxX - width - 12, y: full.minY + 8, width: width,
                                height: max(size.height, 34))
         }
-        if let badge = updateBadge {
+        var bottom = full.maxY - 10
+        for badge in noticeBadges {
             let size = badge.fittingSize
-            badge.frame = NSRect(x: full.maxX - size.width - 12, y: full.maxY - size.height - 10,
+            badge.frame = NSRect(x: full.maxX - size.width - 12, y: bottom - size.height,
                                  width: size.width, height: size.height)
+            bottom -= size.height + 6
         }
         updateBackdrop()
     }
@@ -1008,27 +1010,17 @@ final class TabContentView: NSView {
         }
     }
 
-    // MARK: Update badge
+    // MARK: Notices
 
-    /// Shows `text` in the bottom right (see `Updater`), or removes the badge when nil.
-    func setUpdateBadge(_ text: String?) {
-        guard let text else {
-            updateBadge?.removeFromSuperview()
-            updateBadge = nil
-            return
-        }
-        let badge = updateBadge ?? UpdateBadge()
-        badge.text = text
-        if badge.superview !== self {
+    /// Shows `notices` stacked in the bottom right (see `Notices`).
+    func setNotices(_ notices: [Notice]) {
+        for badge in noticeBadges { badge.removeFromSuperview() }
+        noticeBadges = notices.map { NoticeBadge($0) }
+        for badge in noticeBadges {
             addSubview(badge, positioned: .above, relativeTo: nil)
         }
-        updateBadge = badge
         layoutPanes()
-        window?.invalidateCursorRects(for: badge)
-    }
-
-    func applyUpdateBadgeTheme() {
-        updateBadge?.applyTheme()
+        for badge in noticeBadges { window?.invalidateCursorRects(for: badge) }
     }
 
     // MARK: Pane headers
@@ -1041,7 +1033,7 @@ final class TabContentView: NSView {
 
     /// After a config reload: headers turned on or off, or the theme changed.
     func applyConfig() {
-        applyUpdateBadgeTheme()
+        for badge in noticeBadges { badge.applyTheme() }
         findBar?.applyTheme()
         layoutPanes()
         window?.invalidateCursorRects(for: self)
