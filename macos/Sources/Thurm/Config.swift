@@ -130,6 +130,8 @@ final class AppConfig {
     var rows = 32
     var confirmClose = true
     var unfocusedSplitDim: CGFloat = 0.25
+    /// `window.active_pane_border`: outline the focused split pane in the accent color.
+    var activePaneBorder = false
     /// `window.auto_balance`: even out a tab's splits when a pane opens or closes.
     var autoBalance = true
     var paneHeaders = true
@@ -331,6 +333,7 @@ final class AppConfig {
             confirmClose = jsonBool(w["confirm_close"]) ?? confirmClose
             unfocusedSplitDim = CGFloat(min(1, max(0, jsonDouble(w["unfocused_split_dim"])
                 ?? Double(unfocusedSplitDim))))
+            activePaneBorder = jsonBool(w["active_pane_border"]) ?? activePaneBorder
             autoBalance = jsonBool(w["auto_balance"]) ?? autoBalance
             paneHeaders = jsonBool(w["pane_headers"]) ?? paneHeaders
             paneGap = CGFloat(clamped(w["pane_gap"], 0, 64) ?? Double(paneGap))

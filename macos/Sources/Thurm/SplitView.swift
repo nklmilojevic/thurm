@@ -246,6 +246,9 @@ final class TabContentView: NSView {
     private var headers: [PaneKey: PaneHeader] = [:]
     private let backdrop = SplitBackdrop()
     private let chrome = CardChrome()
+    /// `window.active_pane_border` without pane headers: the ring around the focused pane (the
+    /// cards draw their own).
+    private let focusRing = FocusRing()
     private(set) var focusedPane: PaneKey
     private(set) var zoomedPane: PaneKey?
 
@@ -354,6 +357,7 @@ final class TabContentView: NSView {
         autoresizingMask = [.width, .height]
         addSubview(backdrop)
         addSubview(chrome)
+        addSubview(focusRing)
         syncViews()
         setUpdateBadge(Updater.shared.badgeText)
     }
@@ -481,6 +485,7 @@ final class TabContentView: NSView {
             chrome.cards = frames.map {
                 (rect: $0.1, focused: $0.0 == focusedPane && frames.count > 1)
             }
+            chrome.accentsFocused = SessionManager.shared.config.activePaneBorder
             chrome.opacity = controller?.opacity ?? SessionManager.shared.config.opacity
             chrome.windowRadius = (window as? TerminalWindow)?.cornerRadius ?? 0
             // The window's own corners (above the titlebar with native tabs, where this view
@@ -498,6 +503,7 @@ final class TabContentView: NSView {
             for header in headers.values { header.removeFromSuperview() }
             headers.removeAll()
         }
+        updateFocusRing(frames: frames, cards: cards)
         for view in views.values {
             view.visibilityChanged()
         }
@@ -546,6 +552,16 @@ final class TabContentView: NSView {
     private var currentDividers: [SplitDivider] {
         if zoomedPane != nil { return [] }
         return root.dividers(in: splitArea, gap: splitGap)
+    }
+
+    /// Places the ring around the focused pane, shown with `window.active_pane_border` while the
+    /// tab shows several panes and no cards (which outline the focused one themselves).
+    private func updateFocusRing(frames: [(PaneKey, CGRect)], cards: Bool) {
+        let rect = frames.first { $0.0 == focusedPane }?.1
+        let on = SessionManager.shared.config.activePaneBorder && !cards && frames.count > 1
+        focusRing.frame = bounds
+        focusRing.ring = on ? rect : nil
+        focusRing.refresh()
     }
 
     /// Dims every pane but the focused one while the tab shows several.
@@ -883,6 +899,7 @@ final class TabContentView: NSView {
         if changed { refreshHeaders() }
         if changed { updateDimming() }
         if changed && showsHeaders { layoutPanes() }
+        if changed && !showsHeaders { updateFocusRing(frames: visibleFrames, cards: false) }
         if changed {
             controller?.focusedPaneChanged()
         }
@@ -1098,6 +1115,51 @@ private final class SplitBackdrop: NSView {
     }
 }
 
+/// The accent ring around the focused pane in splits without cards (`window.active_pane_border`),
+/// over the terminals, inside the pane's rectangle. Clicks pass through.
+private final class FocusRing: NSView {
+    static let width: CGFloat = 1.5
+
+    var ring: NSRect?
+
+    private let shape = CAShapeLayer()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        shape.fillColor = nil
+        layer?.addSublayer(shape)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        shape.contentsScale = window?.backingScaleFactor ?? 2
+    }
+
+    func refresh() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        guard let ring, ring.width > Self.width, ring.height > Self.width else {
+            shape.isHidden = true
+            return
+        }
+        shape.isHidden = false
+        shape.frame = bounds
+        shape.path = CGPath(rect: ring.insetBy(dx: Self.width / 2, dy: Self.width / 2), transform: nil)
+        shape.strokeColor = SessionManager.shared.config.chrome.accent.cgColor
+        shape.lineWidth = Self.width
+    }
+}
+
 /// Split cards' gutters (in the sidebar's color) and faint outlines, over the panes so the rounded
 /// corners cover the terminals' square ones. Clicks pass through. A card corner near a window
 /// corner follows the window's curve, so the two stay concentric. Shape layers, not a drawn
@@ -1106,6 +1168,8 @@ private final class SplitBackdrop: NSView {
 private final class CardChrome: NSView {
     var area: NSRect = .zero
     var cards: [(rect: NSRect, focused: Bool)] = []
+    /// `window.active_pane_border`: the focused card's outline in the accent color.
+    var accentsFocused = false
     var opacity: CGFloat = 1
     var windowRadius: CGFloat = 0
     /// The window's corners, in this view.
@@ -1166,12 +1230,16 @@ private final class CardChrome: NSView {
             outline.isHidden = false
             outline.frame = card.rect
             outline.contentsScale = scale
-            let local = CGRect(origin: .zero, size: card.rect.size).insetBy(dx: 0.5, dy: 0.5)
-            outline.path = CardPath.rounded(local, radii: r.map { $0 - 0.5 })
+            let accent = card.focused && accentsFocused
+            let inset = accent ? FocusRing.width / 2 : 0.5
+            let local = CGRect(origin: .zero, size: card.rect.size).insetBy(dx: inset, dy: inset)
+            outline.path = CardPath.rounded(local, radii: r.map { $0 - inset })
             let color = card.focused ? chrome.strokeStrong : chrome.stroke
-            outline.strokeColor = color.withAlphaComponent(color.alphaComponent * max(opacity, 0.6)).cgColor
-            outline.lineWidth = ChromeStroke.width
-            if (outline.compositingFilter == nil) != (blend == nil) { outline.compositingFilter = blend }
+            outline.strokeColor = accent ? chrome.accent.cgColor
+                : color.withAlphaComponent(color.alphaComponent * max(opacity, 0.6)).cgColor
+            outline.lineWidth = accent ? FocusRing.width : ChromeStroke.width
+            let filter = accent ? nil : blend
+            if (outline.compositingFilter == nil) != (filter == nil) { outline.compositingFilter = filter }
         }
         if let highlight, highlight.amount > 0 {
             let r = highlight.rect

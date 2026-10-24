@@ -325,6 +325,8 @@ enum MainMenu {
         themeItem.submenu = theme
         menu.addItem(themeItem)
         menu.addItem(.separator())
+        menu.addItem(item("Show Active Pane Border", #selector(AppDelegate.toggleActivePaneBorder(_:)),
+                          name: "toggle_active_pane_border"))
         menu.addItem(item("Zoom Split", #selector(TerminalWindowController.toggleZoom(_:)), "\r", [.command, .shift],
                           name: "zoom_split"))
         menu.addItem(item("Equalize Splits", #selector(TerminalWindowController.equalizeSplits(_:)), "=",
