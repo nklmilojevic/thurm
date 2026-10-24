@@ -9,19 +9,21 @@ enum AgentWall {
     static let cellAspect: CGFloat = 1.6
 
     /// Panes per row for `count` panes in `size`: rows of near-equal length, the longer ones on
-    /// top, as many as make the cells closest to `cellAspect` (fewer rows on a tie).
+    /// top, as many as make the cells closest to `cellAspect` on average (fewer rows on a tie).
     static func rows(count: Int, in size: CGSize) -> [Int] {
         guard count > 0 else { return [] }
         let area = size.width > 0 && size.height > 0 ? size : CGSize(width: 1600, height: 1000)
         var best = [count]
         var bestScore = CGFloat.infinity
         for r in 1...count {
-            let cols = (count + r - 1) / r
-            let aspect = (area.width / CGFloat(cols)) / (area.height / CGFloat(r))
-            let score = abs(log(aspect / cellAspect))
+            let rows = (0..<r).map { count / r + ($0 < count % r ? 1 : 0) }
+            let height = area.height / CGFloat(r)
+            let score = rows.reduce(0) { sum, n in
+                sum + CGFloat(n) * abs(log(area.width / CGFloat(n) / height / cellAspect))
+            } / CGFloat(count)
             if score < bestScore - 0.001 {
                 bestScore = score
-                best = (0..<r).map { count / r + ($0 < count % r ? 1 : 0) }
+                best = rows
             }
         }
         return best
@@ -61,10 +63,12 @@ enum AgentWall {
 
     /// Putting the wall back, for each origin by its old place: the panes still on the wall go
     /// back to their spots in the tab's layout. A tab that kept some of its panes takes them, with
-    /// the panes it got meanwhile on its right; the others come back as new tabs. Agents that
+    /// the panes it got meanwhile on its right (a later return to it has the earlier one's); the
+    /// others come back as new tabs. Agents that
     /// ended, or have nowhere to go, stay on the wall.
     static func returns(origins: [WallOrigin], onWall: [PaneKey], tabs: [[PaneKey]]) -> [Return] {
         var left = Set(onWall)
+        var tabs = tabs
         var out: [Return] = []
         for origin in origins.sorted(by: { $0.index < $1.index }) {
             let panes = origin.tab.root.panes
@@ -78,6 +82,9 @@ enum AgentWall {
             for pane in kept where !root.contains(pane) {
                 if let last = root.panes.last { root = root.inserting(pane, at: last, direction: .right) }
             }
+            // Two origins can go back to one tab (their shells moved together): the next one
+            // keeps what this one put back.
+            if let into { tabs[into] = root.panes }
             out.append(Return(origin: origin, panes: back, root: root, into: into))
         }
         return out

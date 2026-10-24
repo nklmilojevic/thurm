@@ -539,6 +539,11 @@ func retainTabs(_ tabs: [TabLayout], _ keep: (PaneKey) -> Bool) -> [TabLayout] {
         if !ids.contains(tab.focused), let first = ids.first { tab.focused = first }
         if let z = tab.zoomed, !ids.contains(z) { tab.zoomed = nil }
         tab.root = root
+        tab.wall = tab.wall.map { origins in
+            origins.compactMap { o in
+                retainTabs([o.tab], keep).first.map { WallOrigin(index: o.index, after: o.after, tab: $0) }
+            }
+        }
         return tab
     }
 }
