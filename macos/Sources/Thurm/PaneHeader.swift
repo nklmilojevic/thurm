@@ -49,19 +49,21 @@ final class PaneHeader: NSView {
         title.maximumNumberOfLines = 1
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         buttons.orientation = .horizontal
-        buttons.spacing = 2
+        buttons.spacing = 0
         for (symbol, label, action) in [
             ("rectangle.split.2x1", "Split Right", #selector(splitRight)),
             ("rectangle.split.1x2", "Split Down", #selector(splitDown)),
             ("arrow.up.left.and.arrow.down.right", "Zoom", #selector(zoom)),
             ("xmark", "Close Pane", #selector(close)),
         ] {
-            let b = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: label)!,
-                             target: self, action: action)
+            let b = HeaderButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: label)!,
+                                 target: self, action: action)
             b.isBordered = false
             b.symbolConfiguration = .init(pointSize: 12, weight: .regular)
             b.toolTip = label
-            b.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            // The whole header-high cell takes the click, not just the glyph.
+            b.widthAnchor.constraint(equalToConstant: 26).isActive = true
+            b.heightAnchor.constraint(equalToConstant: Self.height).isActive = true
             buttons.addArrangedSubview(b)
         }
         for v in [icon, dot, title, buttons] as [NSView] {
@@ -80,7 +82,7 @@ final class PaneHeader: NSView {
             title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
             title.centerYAnchor.constraint(equalTo: centerYAnchor),
             title.trailingAnchor.constraint(lessThanOrEqualTo: buttons.leadingAnchor, constant: -8),
-            buttons.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            buttons.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             buttons.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
         update(focused: false)
@@ -111,8 +113,10 @@ final class PaneHeader: NSView {
         let fg = colorFromRGB(cfg.theme.foreground)
         title.textColor = focused ? cfg.chrome.contentPrimary : cfg.chrome.contentSecondary
         icon.contentTintColor = fg.withAlphaComponent(focused ? 0.9 : 0.55)
-        for case let b as NSButton in buttons.arrangedSubviews {
-            b.contentTintColor = fg.withAlphaComponent(focused ? 0.45 : 0.3)
+        for case let b as HeaderButton in buttons.arrangedSubviews {
+            b.tint = fg.withAlphaComponent(focused ? 0.45 : 0.3)
+            b.hoverTint = fg.withAlphaComponent(0.9)
+            b.hoverFill = fg.withAlphaComponent(0.1)
         }
         let status = info?.agent?.status
         dot.isHidden = status == nil || status == .idle
@@ -140,4 +144,56 @@ final class PaneHeader: NSView {
     @objc private func splitDown() { act { $0.splitDown(nil) } }
     @objc private func zoom() { act { $0.toggleZoom(nil) } }
     @objc private func close() { act { $0.closePane(nil) } }
+}
+
+/// A pane header button: brightens and shows a rounded backdrop while the pointer is over it, so
+/// its (header-high) click target is visible.
+private final class HeaderButton: NSButton {
+    var tint: NSColor = .secondaryLabelColor { didSet { refresh() } }
+    var hoverTint: NSColor = .labelColor { didSet { refresh() } }
+    var hoverFill: NSColor = .clear { didSet { refresh() } }
+    private var hovering = false {
+        didSet { if hovering != oldValue { refresh() } }
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                                       owner: self))
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { hovering = false }
+    }
+
+    override func layout() {
+        super.layout()
+        // The backdrop is a square around the glyph, not the full header-high cell.
+        let side = min(bounds.width, 22)
+        backdrop.frame = NSRect(x: (bounds.width - side) / 2, y: (bounds.height - side) / 2, width: side, height: side)
+    }
+
+    private lazy var backdrop: CALayer = {
+        let l = CALayer()
+        l.cornerRadius = 5
+        layer?.insertSublayer(l, at: 0)
+        return l
+    }()
+
+    private func refresh() {
+        contentTintColor = hovering ? hoverTint : tint
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        backdrop.backgroundColor = hovering ? hoverFill.cgColor : nil
+        CATransaction.commit()
+    }
 }
