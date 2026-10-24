@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.13.0 - 2026-10-24
+
+This release adds an Agent Wall and an active pane border. It also fixes a bug that quit the app when a workspace lost its last tab.
+
+### New features
+
+- Thurm now shows a notice when the session daemon is an older build, locally or on a remote host. The notice offers a restart or an in-place upgrade, so new features work.
+- Agent Wall moves every agent in a window into one grid tab, without a restart. Agents keep running and return to their tabs when you turn the wall off.
+- A new option, `window.active_pane_border`, outlines the focused pane in the accent color. The option is off by default. It shows which pane has focus in a split tab.
+
+### Fixes
+
+- When a workspace loses its last tab, Thurm shows the most recently used workspace. Before, the app quit while other workspaces still had tabs.
+- The sidebar tab shortcut, `⌘N`, now appears on the branch row only while Command is held. Long branch names use the full row width when the shortcut is hidden.
+- `thurm send` now sends Enter as a separate write after the text. Claude Code no longer reads the Enter as a new line, so messages submit.
+
 ## v0.12.1 - 2026-10-24
 
 This release fixes a macOS problem where clicks in the tab hover card did nothing.
