@@ -27,8 +27,8 @@ struct Notice: Equatable {
 final class Notices {
     static let shared = Notices()
 
-    /// The local daemon's build while it is older than this app's (its in-place upgrade did not
-    /// happen), else nil.
+    /// The local daemon's build while it is known to be older than this app's (its in-place
+    /// upgrade did not happen), else nil.
     var localDaemonBuild: String? {
         didSet { if localDaemonBuild != oldValue { refresh() } }
     }
@@ -93,8 +93,9 @@ final class Notices {
         }
         let stale = remotes.filter { s in
             guard s.upgradeAvailable || s.phase == "upgrade_needed" else { return false }
-            // A host ahead of this Mac is not downgraded; this app's own update catches up.
-            if let b = s.remoteBuild, isNewer(b, than: ours) { return false }
+            // Only a build known to be older: a host ahead of this Mac, or one that can't be
+            // ordered (a nix build of the same version), is not offered this one.
+            if let b = s.remoteBuild, !isNewer(ours, than: b) { return false }
             return !dismissed.contains(remoteKey(s))
         }
         if let first = stale.first {
@@ -155,6 +156,7 @@ final class NoticeBadge: NSView {
         dot.wantsLayer = true
         dot.layer?.cornerRadius = 3
         label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.lineBreakMode = .byTruncatingTail
         label.stringValue = notice.text
         toolTip = notice.tooltip
         addSubview(dot)
@@ -184,16 +186,21 @@ final class NoticeBadge: NSView {
         close?.contentTintColor = chrome.contentSecondary
     }
 
+    /// Besides the label: the dot and padding, and the cross.
+    private var chromeWidth: CGFloat { 32 + (close == nil ? 0 : 16) }
+
     override var fittingSize: NSSize {
-        let l = label.fittingSize
-        return NSSize(width: ceil(l.width) + 32 + (close == nil ? 0 : 16), height: 22)
+        NSSize(width: ceil(label.fittingSize.width) + chromeWidth, height: 22)
     }
 
+    /// A window narrower than the text gets a narrower pill: the label is cut short (the tooltip
+    /// keeps all of it), the cross stays.
     override func layout() {
         super.layout()
         let l = label.fittingSize
+        let width = max(0, min(ceil(l.width), bounds.width - chromeWidth))
         dot.frame = NSRect(x: 11, y: (bounds.height - 6) / 2, width: 6, height: 6)
-        label.frame = NSRect(x: 22, y: (bounds.height - l.height) / 2, width: ceil(l.width), height: l.height)
+        label.frame = NSRect(x: 22, y: (bounds.height - l.height) / 2, width: width, height: l.height)
         close?.frame = NSRect(x: label.frame.maxX + 4, y: (bounds.height - 16) / 2, width: 16, height: 16)
     }
 

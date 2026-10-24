@@ -77,4 +77,27 @@ final class NoticesTests: XCTestCase {
         XCTAssertEqual(Notices.notices(update: nil, localDaemon: nil, remotes: after, ours: ours,
                                        dismissed: dismissed).count, 1)
     }
+
+    func testRemotesThatCannotBeOrderedAreLeftAlone() {
+        let remotes = [
+            remote("nix", build: "0.12.1+nix.3fa1c2e", upgrade: true),
+            remote("fork", build: "0.12.1+412.bbbbbbb", upgrade: true),
+        ]
+        XCTAssertEqual(Notices.notices(update: nil, localDaemon: nil, remotes: remotes, ours: ours, dismissed: []), [])
+        // Nor is a local daemon of either kind known to be older.
+        XCTAssertFalse(Notices.isNewer(ours, than: "0.12.1+nix.3fa1c2e"))
+        XCTAssertFalse(Notices.isNewer(ours, than: "0.12.1+412.bbbbbbb"))
+    }
+
+    func testANarrowPillKeepsItsCross() {
+        let notice = Notice(kind: .localDaemon, text: "Restart the session daemon to use new features",
+                            tooltip: "", keys: ["local:x"])
+        let badge = NoticeBadge(notice)
+        XCTAssertGreaterThan(badge.fittingSize.width, 200)
+        badge.frame = NSRect(x: 0, y: 0, width: 200, height: 22)
+        badge.layout()
+        let close = badge.subviews.compactMap { $0 as? NSButton }.first
+        XCTAssertNotNil(close)
+        XCTAssertLessThanOrEqual(close!.frame.maxX, 200)
+    }
 }

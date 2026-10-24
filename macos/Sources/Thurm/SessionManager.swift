@@ -136,10 +136,10 @@ final class SessionManager: NSObject, CoreDelegate {
             tlog("thurmd runs build \(build), this app \(Core.buildId)")
             Core.shared.disconnect()
             if upgradeDaemonInPlace() { return connectAndHello() }
-            // Compatible, just older: carry on with it, and say so (a newer one is left alone).
+            // Compatible: carry on with it, and say so when it is known to be older.
             guard Core.shared.connect() else { return false }
             Core.shared.request(object: ["Hello": ["client": "Thurm.app", "version": thurm_protocol_version(), "ui": true]])
-            Notices.shared.localDaemonBuild = Notices.isNewer(build, than: Core.buildId) ? nil : build
+            Notices.shared.localDaemonBuild = Notices.isNewer(Core.buildId, than: build) ? build : nil
         } else {
             Notices.shared.localDaemonBuild = nil
         }
@@ -1203,7 +1203,8 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     @objc private func attemptReconnect() {
-        guard !isTerminating, !Core.shared.isConnected else { return }
+        // `offerDaemonRestart` reconnects once the daemon is replaced.
+        guard !isTerminating, !replacingDaemon, !Core.shared.isConnected else { return }
         if connectAndHello() {
             resync()
             return

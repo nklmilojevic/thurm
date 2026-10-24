@@ -510,8 +510,9 @@ final class TabContentView: NSView {
         var bottom = full.maxY - 10
         for badge in noticeBadges {
             let size = badge.fittingSize
-            badge.frame = NSRect(x: full.maxX - size.width - 12, y: bottom - size.height,
-                                 width: size.width, height: size.height)
+            let width = min(size.width, max(0, full.width - 24))
+            badge.frame = NSRect(x: full.maxX - width - 12, y: bottom - size.height,
+                                 width: width, height: size.height)
             bottom -= size.height + 6
         }
         updateBackdrop()
