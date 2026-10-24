@@ -79,11 +79,6 @@ struct HoverCardModel: Equatable {
         return model
     }
 
-    /// The pane whose cell holds `point`, in the unit square.
-    func pane(at point: CGPoint) -> PaneKey? {
-        cells.first { $0.rect.contains(point) }?.key
-    }
-
     /// The layout in the unit square. `SplitNode.frames` rounds to whole points, so it lays
     /// out a large square that is then scaled down.
     private static func cells(_ root: SplitNode) -> [HoverCardCell] {
@@ -152,11 +147,8 @@ final class HoverCardMinimap: NSView {
         guard let model else { return }
         let chrome = SessionManager.shared.config.chrome
         let statuses = Dictionary(model.all.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
-        let area = bounds
         for cell in model.cells {
-            let r = CGRect(x: area.minX + cell.rect.minX * area.width, y: area.minY + cell.rect.minY * area.height,
-                           width: cell.rect.width * area.width, height: cell.rect.height * area.height)
-                .insetBy(dx: Self.gap / 2, dy: Self.gap / 2)
+            let r = rect(of: cell)
             let path = NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4)
             let pane = statuses[cell.key]
             let tint = pane?.status.flatMap { $0 == .idle ? nil : $0.color }
@@ -183,10 +175,16 @@ final class HoverCardMinimap: NSView {
         }
     }
 
-    /// The pane under `point`, in the map's coordinates.
+    /// The cell as drawn: its share of the map, less half the gap on each side.
+    private func rect(of cell: HoverCardCell) -> CGRect {
+        CGRect(x: bounds.minX + cell.rect.minX * bounds.width, y: bounds.minY + cell.rect.minY * bounds.height,
+               width: cell.rect.width * bounds.width, height: cell.rect.height * bounds.height)
+            .insetBy(dx: Self.gap / 2, dy: Self.gap / 2)
+    }
+
+    /// The pane whose drawn cell holds `point`, in the map's coordinates; none in the gaps.
     func pane(at point: NSPoint) -> PaneKey? {
-        guard let model, bounds.width > 0, bounds.height > 0, bounds.contains(point) else { return nil }
-        return model.pane(at: CGPoint(x: point.x / bounds.width, y: point.y / bounds.height))
+        model?.cells.first { rect(of: $0).contains(point) }?.key
     }
 }
 
@@ -368,6 +366,8 @@ final class HoverCardView: NSView {
         row.orientation = .horizontal
         row.alignment = .top
         row.spacing = 8
+        // The whole width, so a click beside a short title still lands on the pane.
+        row.widthAnchor.constraint(equalToConstant: width).isActive = true
         return row
     }
 
