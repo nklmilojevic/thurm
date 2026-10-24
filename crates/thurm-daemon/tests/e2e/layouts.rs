@@ -30,6 +30,7 @@ fn apply(
             focused: pane,
             zoomed: None,
             handoff: None,
+            wall: None,
         };
         tx.send(client.request(Request::ApplyLayout {
             json: serde_json::to_string(&tab).unwrap(),

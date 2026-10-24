@@ -415,6 +415,8 @@ struct TabLayout: Codable, Equatable {
     var zoomed: UInt64?
     /// A handoff tab: the handoff's id (see `thurm handoff`).
     var handoff: String? = nil
+    /// The agent wall: the tabs its agents came from (see AgentWall.swift).
+    var wall: [WallOrigin]? = nil
 
     /// The panes of `root` that `focused` and `zoomed` name.
     var focusedKey: PaneKey {
@@ -425,6 +427,16 @@ struct TabLayout: Codable, Equatable {
     var zoomedKey: PaneKey? {
         zoomed.flatMap { z in root.panes.first { $0.id == z } }
     }
+}
+
+/// `thurm_proto::WallOrigin`: a tab the agent wall took agents from, its place among the
+/// window's tabs and how it looked.
+struct WallOrigin: Codable, Equatable {
+    var index: Int
+    /// A pane of the tab before it (nil: it was the first), which places it among tabs opened
+    /// since; `index` when that pane is gone.
+    var after: UInt64? = nil
+    var tab: TabLayout
 }
 
 struct WindowLayout: Codable, Equatable {
@@ -527,6 +539,11 @@ func retainTabs(_ tabs: [TabLayout], _ keep: (PaneKey) -> Bool) -> [TabLayout] {
         if !ids.contains(tab.focused), let first = ids.first { tab.focused = first }
         if let z = tab.zoomed, !ids.contains(z) { tab.zoomed = nil }
         tab.root = root
+        tab.wall = tab.wall.map { origins in
+            origins.compactMap { o in
+                retainTabs([o.tab], keep).first.map { WallOrigin(index: o.index, after: o.after, tab: $0) }
+            }
+        }
         return tab
     }
 }

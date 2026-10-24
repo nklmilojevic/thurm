@@ -9,6 +9,11 @@ use super::*;
 
 /// A UI from before [`CAP_UI_LAYOUT`]: the client library would announce it.
 fn old_ui(env: &Env) -> UnixStream {
+    ui_with(env, &[CAP_ACTIVE_SIZE])
+}
+
+/// A UI that announces only `capabilities`.
+fn ui_with(env: &Env, capabilities: &[&str]) -> UnixStream {
     let mut s = UnixStream::connect(&env.socket).unwrap();
     let r = send(
         &mut s,
@@ -17,7 +22,7 @@ fn old_ui(env: &Env) -> UnixStream {
             client: "e2e-old-app".into(),
             version: PROTOCOL_VERSION,
             ui: true,
-            capabilities: vec![CAP_ACTIVE_SIZE.into()],
+            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
         },
     );
     assert!(matches!(r, Ok(Response::Hello { .. })), "{r:?}");
@@ -68,6 +73,42 @@ fn layout_commands_need_a_ui_that_knows_them() {
     let mut got = false;
     while Instant::now() < deadline && !got {
         got = matches!(new_rx.recv_timeout(Duration::from_millis(200)), Ok(Event::Ui(ref c)) if *c == zoom);
+    }
+    assert!(got);
+}
+
+#[test]
+fn the_agent_wall_needs_a_ui_that_knows_it() {
+    let env = Env::new("ui-wall");
+    let _d = env.start();
+    // A UI with the other layout commands, from before the agent wall.
+    let mut old = ui_with(&env, &[CAP_ACTIVE_SIZE, CAP_UI_LAYOUT]);
+    let Ok(Response::PaneCreated { pane }) = send(
+        &mut old,
+        2,
+        Request::CreatePane(CreatePane {
+            cwd: Some(env.dir.display().to_string()),
+            ..Default::default()
+        }),
+    ) else {
+        panic!("no pane");
+    };
+    let wall = UiCommand::AgentWall { pane, on: None };
+    let err = send(&mut old, 3, Request::Ui(wall.clone())).unwrap_err();
+    assert_eq!(err, UI_TOO_OLD);
+    let zoom = UiCommand::Zoom { pane, zoom: None };
+    assert!(matches!(
+        send(&mut old, 4, Request::Ui(zoom)),
+        Ok(Response::Ok)
+    ));
+    drop(old);
+
+    let (new, new_rx) = env.connect();
+    new.request(Request::Ui(wall.clone())).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut got = false;
+    while Instant::now() < deadline && !got {
+        got = matches!(new_rx.recv_timeout(Duration::from_millis(200)), Ok(Event::Ui(ref c)) if *c == wall);
     }
     assert!(got);
 }

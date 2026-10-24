@@ -171,6 +171,7 @@ mod tests {
             focused: 7,
             zoomed: None,
             handoff: None,
+            wall: None,
         };
         assert_eq!(validate_tab(&tab).unwrap(), vec![7]);
         tab.focused = 8;

@@ -336,6 +336,7 @@ fn panes_frames_persistence_and_restore() {
                 focused: pane,
                 zoomed: None,
                 handoff: None,
+                wall: None,
             }],
             selected_tab: 0,
             fullscreen: false,

@@ -49,6 +49,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `focus ID` | Focus a pane in the app |
 | `focused` | Print the pane with keyboard focus in the app, or the last one that had it; `--history` lists them, most recent first |
 | `zoom` | Zoom a pane to fill its tab; `--pane ID`, `--on`, `--off` (default: toggle) |
+| `wall` | Gather the agents of the window's tabs into one grid tab, or put them back in their tabs; `--pane ID`, `--on`, `--off` (default: toggle) |
 | `move --to PANE` | Move a pane next to another, in any tab of the window; `--pane ID`, `--dir right\|down\|left\|up`, `--size PERCENT` |
 | `swap --with PANE` | Exchange the places of two panes, in one tab or across tabs; `--pane ID` |
 | `close [ID]` | Stop and close a pane; ID is positional |

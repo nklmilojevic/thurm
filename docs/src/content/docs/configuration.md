@@ -120,6 +120,7 @@ the defaults alone.
 | `new_workspace` | Shell > New Workspace |
 | `switch_workspace` | Shell > Switch Workspace… |
 | `switch_agent` | Shell > Switch to Agent… |
+| `agent_wall` | Shell > Agent Wall |
 | `rename_workspace` | Shell > Rename Workspace… |
 | `close_workspace` | Shell > Close Workspace… |
 | `split_right` | Shell > Split Right |

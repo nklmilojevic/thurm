@@ -14,7 +14,7 @@ pub mod template;
 
 use serde::{Deserialize, Serialize};
 
-pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WindowLayout};
+pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WallOrigin, WindowLayout};
 pub use tailnet::{Principal, PrincipalKind, TailscaleStatus};
 
 /// Bumped whenever the wire format changes incompatibly.
@@ -72,6 +72,7 @@ pub const CAPABILITIES: &[&str] = &[
     "pane-read",
     CAP_TAILSCALE,
     CAP_UI_LAYOUT,
+    CAP_AGENT_WALL,
 ];
 
 /// The pane takes the size of the client that used it last (see the daemon's `active_size`)
@@ -85,6 +86,9 @@ pub const CAP_TAILSCALE: &str = "tailscale";
 /// The UI carries out [`UiCommand::Open`], [`UiCommand::Zoom`], [`UiCommand::MovePane`] and
 /// [`UiCommand::SwapPanes`]; the daemon refuses them with [`UI_TOO_OLD`] when no open UI does.
 pub const CAP_UI_LAYOUT: &str = "ui-layout";
+
+/// The UI carries out [`UiCommand::AgentWall`].
+pub const CAP_AGENT_WALL: &str = "agent-wall";
 
 /// The daemon's answer to a [`UiCommand`] that no open UI understands.
 pub const UI_TOO_OLD: &str = "the Thurm app is too old for this; update it";
@@ -1311,6 +1315,12 @@ pub enum UiCommand {
         a: PaneId,
         b: PaneId,
     },
+    /// Gather the agents of the tabs of `pane`'s window into one grid tab (`Some(true)`), put
+    /// them back in their tabs (`Some(false)`), or toggle. Needs [`CAP_AGENT_WALL`].
+    AgentWall {
+        pane: PaneId,
+        on: Option<bool>,
+    },
 }
 
 impl UiCommand {
@@ -1322,6 +1332,7 @@ impl UiCommand {
             UiCommand::Zoom { pane, .. } => vec![*pane],
             UiCommand::MovePane { pane, target, .. } => vec![*pane, *target],
             UiCommand::SwapPanes { a, b } => vec![*a, *b],
+            UiCommand::AgentWall { pane, .. } => vec![*pane],
             _ => Vec::new(),
         }
     }
@@ -1334,7 +1345,13 @@ impl UiCommand {
                 | UiCommand::Zoom { .. }
                 | UiCommand::MovePane { .. }
                 | UiCommand::SwapPanes { .. }
+                | UiCommand::AgentWall { .. }
         )
+    }
+
+    /// Only UIs with [`CAP_AGENT_WALL`] carry it out.
+    pub fn needs_agent_wall(&self) -> bool {
+        matches!(self, UiCommand::AgentWall { .. })
     }
 }
 

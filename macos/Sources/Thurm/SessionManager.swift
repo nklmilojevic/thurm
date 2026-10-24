@@ -542,6 +542,7 @@ final class SessionManager: NSObject, CoreDelegate {
                                    title: tab.title, frame: frame)
             c.workspaceID = ws?.id ?? 0
             c.handoffID = tab.handoff
+            c.wall = tab.wall
             if let prev = created.last {
                 attachAsTab(c, to: prev)
             } else {
@@ -720,6 +721,7 @@ final class SessionManager: NSObject, CoreDelegate {
                     let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey,
                                            zoomed: tab.zoomedKey, title: tab.title, frame: nil)
                     t.handoffID = tab.handoff
+                    t.wall = tab.wall
                     attachAsTab(t, to: c)
                 }
                 ws.hiddenTabs = []
@@ -1374,6 +1376,8 @@ final class SessionManager: NSObject, CoreDelegate {
         if old?.passwordInput != info.passwordInput {
             updateSecureInput()
         }
+        // Not at launch (no `old`): those agents were where they are when the app quit.
+        if old != nil, old?.agent == nil, info.agent != nil { agentStarted(key) }
     }
 
     /// Commands sent by the `thurm` CLI through a daemon (`host`'s: its pane ids).
@@ -1555,6 +1559,8 @@ final class SessionManager: NSObject, CoreDelegate {
                 focusChanged()
             }
             scheduleLayoutSave()
+        case "AgentWall":
+            if let pane = key("pane"), let c = controller(for: pane) { toggleAgentWall(in: c, on: jsonBool(d["on"])) }
         case "SwapPanes":
             guard let a = key("a"), let b = key("b"), a != b,
                   let ca = controller(for: a), let cb = controller(for: b) else { return }

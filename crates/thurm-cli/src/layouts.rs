@@ -85,6 +85,7 @@ pub fn run(c: &Client, action: Option<LayoutCmd>) -> super::R {
                     focused: created[0],
                     zoomed: None,
                     handoff: None,
+                    wall: None,
                 };
                 // Once sent, only a confirmed pre-commit failure permits cleanup.
                 rollback = false;

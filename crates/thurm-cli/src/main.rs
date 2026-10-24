@@ -218,6 +218,17 @@ enum Cmd {
         #[arg(long)]
         off: bool,
     },
+    /// Gather the agents of this window's tabs into one grid tab, or put them back (default:
+    /// toggle). Their programs keep running.
+    Wall {
+        /// A pane of the window (default: current pane).
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+        #[arg(long, conflicts_with = "off")]
+        on: bool,
+        #[arg(long)]
+        off: bool,
+    },
     /// Move a pane next to another one, in its tab or another tab; its program keeps running.
     Move {
         /// Pane to move (default: current pane).
@@ -1346,6 +1357,17 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                 None
             };
             layout_ui(c, UiCommand::Zoom { pane, zoom })?;
+        }
+        Cmd::Wall { pane, on, off } => {
+            let pane = current_pane(pane)?;
+            let on = if on {
+                Some(true)
+            } else if off {
+                Some(false)
+            } else {
+                None
+            };
+            layout_ui(c, UiCommand::AgentWall { pane, on })?;
         }
         Cmd::Move {
             pane,
