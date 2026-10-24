@@ -99,3 +99,76 @@ final class SidebarTests: XCTestCase {
         XCTAssertTrue(bar.isHidden)
     }
 }
+
+final class CommandHoldTests: XCTestCase {
+    private var scheduled: [DispatchWorkItem] = []
+    private lazy var hold = CommandHold { [unowned self] in scheduled.append($0) }
+
+    /// Runs the reveals still due, as the main queue would after the delay.
+    private func elapse() {
+        for work in scheduled where !work.isCancelled { work.perform() }
+        scheduled = []
+    }
+
+    func testHeldCommandShowsAfterTheDelay() {
+        hold.update(.flagsChanged, .command)
+        XCTAssertFalse(hold.held)
+        elapse()
+        XCTAssertTrue(hold.held)
+        hold.update(.flagsChanged, [])
+        XCTAssertFalse(hold.held)
+    }
+
+    func testReleaseBeforeTheDelayShowsNothing() {
+        hold.update(.flagsChanged, .command)
+        hold.update(.flagsChanged, [])
+        elapse()
+        XCTAssertFalse(hold.held)
+    }
+
+    func testKeyPressCancelsAndHides() {
+        hold.update(.flagsChanged, .command)
+        hold.update(.keyDown, .command)
+        elapse()
+        XCTAssertFalse(hold.held)
+        hold.update(.flagsChanged, .command)
+        elapse()
+        XCTAssertTrue(hold.held)
+        hold.update(.keyDown, .command)
+        XCTAssertFalse(hold.held)
+    }
+
+    func testOtherModifiersCancel() {
+        for other: NSEvent.ModifierFlags in [.shift, .option, .control, .function] {
+            hold.update(.flagsChanged, [.command, other])
+            elapse()
+            XCTAssertFalse(hold.held, "\(other)")
+            hold.update(.flagsChanged, .command)
+            elapse()
+            XCTAssertTrue(hold.held)
+            hold.update(.flagsChanged, [.command, other])
+            XCTAssertFalse(hold.held, "\(other)")
+        }
+    }
+
+    func testLosingFocusHides() {
+        hold.update(.flagsChanged, .command)
+        elapse()
+        NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil)
+        XCTAssertFalse(hold.held)
+    }
+
+    /// A row shows its hint while Command is held, and a row configured during the hold shows it too.
+    func testRowFollowsTheHold() {
+        let row = TabRowView(hold: hold)
+        row.configure(SidebarTab(controller: nil, title: "zsh", shortcut: 4, selected: false))
+        XCTAssertEqual(row.shownShortcut, "")
+        hold.update(.flagsChanged, .command)
+        elapse()
+        XCTAssertEqual(row.shownShortcut, "⌘4")
+        row.configure(SidebarTab(controller: nil, title: "zsh", shortcut: 2, selected: false))
+        XCTAssertEqual(row.shownShortcut, "⌘2")
+        hold.update(.flagsChanged, [])
+        XCTAssertEqual(row.shownShortcut, "")
+    }
+}
