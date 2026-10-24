@@ -50,6 +50,9 @@ struct Cli {
 /// this machine) is not a default.
 static REMOTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How long `thurm send` waits between the text and its Enter.
+const SEND_ENTER_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
 fn remote_mode() -> bool {
     REMOTE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -1566,28 +1569,31 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             text,
         } => {
             let pane = current_pane(pane)?;
-            let mut s = if text.len() == 1 && text[0] == "-" {
+            let s = if text.len() == 1 && text[0] == "-" {
                 let mut buf = String::new();
                 std::io::stdin().read_to_string(&mut buf)?;
                 buf
             } else {
                 text.join(" ")
             };
+            let typed = !s.is_empty();
             if paste {
                 c.request(Request::Paste { pane, text: s })?;
-                if !no_enter {
-                    c.request(Request::Input {
-                        pane,
-                        data: b"\r".to_vec(),
-                    })?;
-                }
-            } else {
-                if !no_enter {
-                    s.push('\r');
-                }
+            } else if typed {
                 c.request(Request::Input {
                     pane,
                     data: s.into_bytes(),
+                })?;
+            }
+            if !no_enter {
+                // Agent TUIs (Claude Code) take a burst of input as a paste, and an Enter
+                // inside it as a newline: send it on its own, once the text has landed.
+                if typed {
+                    std::thread::sleep(SEND_ENTER_DELAY);
+                }
+                c.request(Request::Input {
+                    pane,
+                    data: b"\r".to_vec(),
                 })?;
             }
         }
