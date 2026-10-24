@@ -3,8 +3,9 @@ import AppKit
 // A card about a tab, shown while the pointer rests on it in the sidebar or the tab strip: a
 // map of its splits, tinted by what each pane's agent is doing, and a line or three per pane
 // (what runs there, its status in words, its progress, where it is). It covers the tabs you
-// are not looking at; the selected tab is on screen already. The card never takes the mouse
-// or the keyboard, and updates while it is up.
+// are not looking at; the selected tab is on screen already. The card never takes the
+// keyboard, and updates while it is up. The pointer can move onto it, and a click on a pane in
+// the map or the list goes to that pane.
 
 /// One pane as the card shows it.
 struct HoverCardPane: Equatable {
@@ -78,6 +79,11 @@ struct HoverCardModel: Equatable {
         return model
     }
 
+    /// The pane whose cell holds `point`, in the unit square.
+    func pane(at point: CGPoint) -> PaneKey? {
+        cells.first { $0.rect.contains(point) }?.key
+    }
+
     /// The layout in the unit square. `SplitNode.frames` rounds to whole points, so it lays
     /// out a large square that is then scaled down.
     private static func cells(_ root: SplitNode) -> [HoverCardCell] {
@@ -128,6 +134,10 @@ final class HoverCardMinimap: NSView {
     var aspect: CGFloat = 0.6 {
         didSet { if aspect != oldValue { invalidateIntrinsicContentSize() } }
     }
+    /// The pane under the pointer, in the map or the list: its cell is lit.
+    var hovered: PaneKey? {
+        didSet { if hovered != oldValue { needsDisplay = true } }
+    }
 
     static let width: CGFloat = 276
     static let gap: CGFloat = 3
@@ -150,7 +160,8 @@ final class HoverCardMinimap: NSView {
             let path = NSBezierPath(roundedRect: r, xRadius: 4, yRadius: 4)
             let pane = statuses[cell.key]
             let tint = pane?.status.flatMap { $0 == .idle ? nil : $0.color }
-            (tint?.withAlphaComponent(0.2) ?? chrome.control).setFill()
+            let lit = cell.key == hovered
+            (tint?.withAlphaComponent(lit ? 0.35 : 0.2) ?? (lit ? chrome.strokeStrong : chrome.control)).setFill()
             path.fill()
             if pane?.focused == true || tint != nil {
                 (tint ?? chrome.strokeStrong).withAlphaComponent(tint == nil ? 1 : 0.7).setStroke()
@@ -171,12 +182,26 @@ final class HoverCardMinimap: NSView {
             tinted.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
         }
     }
+
+    /// The pane under `point`, in the map's coordinates.
+    func pane(at point: NSPoint) -> PaneKey? {
+        guard let model, bounds.width > 0, bounds.height > 0, bounds.contains(point) else { return nil }
+        return model.pane(at: CGPoint(x: point.x / bounds.width, y: point.y / bounds.height))
+    }
 }
 
 /// The card's content: the header, the minimap, and a section per pane.
 final class HoverCardView: NSView {
     private let stack = NSStackView()
     let minimap = HoverCardMinimap()
+    /// Each listed pane's section.
+    private var sections: [(key: PaneKey, view: NSView)] = []
+    /// The pane under the button when it went down.
+    private var pressed: PaneKey?
+    /// A pane was clicked.
+    var onSelect: ((PaneKey) -> Void)?
+    /// The pointer entered or left the card.
+    var onHover: ((Bool) -> Void)?
 
     static let width: CGFloat = 300
     static let inset: CGFloat = 12
@@ -199,6 +224,9 @@ final class HoverCardView: NSView {
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.inset),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -Self.inset),
         ])
+        // The card's window is never key: track the pointer always.
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited,
+                                                              .mouseMoved], owner: self))
     }
 
     required init?(coder: NSCoder) {
@@ -206,6 +234,45 @@ final class HoverCardView: NSView {
     }
 
     override var isFlipped: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// The pane under `point`, in the card's coordinates: a cell in the map or a section in the list.
+    func pane(at point: NSPoint) -> PaneKey? {
+        if minimap.superview != nil, let key = minimap.pane(at: minimap.convert(point, from: self)) { return key }
+        return sections.first { $0.view.convert($0.view.bounds, to: self).contains(point) }?.key
+    }
+
+    private func track(_ event: NSEvent) {
+        let key = pane(at: convert(event.locationInWindow, from: nil))
+        minimap.hovered = key
+        (key == nil ? NSCursor.arrow : NSCursor.pointingHand).set()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        track(event)
+        onHover?(true)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        track(event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        minimap.hovered = nil
+        NSCursor.arrow.set()
+        onHover?(false)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        pressed = pane(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer { pressed = nil }
+        guard let pressed, pane(at: convert(event.locationInWindow, from: nil)) == pressed else { return }
+        onSelect?(pressed)
+    }
 
     func show(_ model: HoverCardModel, aspect: CGFloat) {
         let chrome = SessionManager.shared.config.chrome
@@ -215,6 +282,7 @@ final class HoverCardView: NSView {
             stack.removeArrangedSubview(v)
             v.removeFromSuperview()
         }
+        sections = []
         let contentWidth = Self.width - 2 * Self.inset
 
         let header = NSStackView()
@@ -231,12 +299,15 @@ final class HoverCardView: NSView {
         if !model.cells.isEmpty {
             minimap.aspect = aspect
             minimap.model = model
+            if let key = minimap.hovered, !model.all.contains(where: { $0.key == key }) { minimap.hovered = nil }
             minimap.needsDisplay = true
             stack.addArrangedSubview(minimap)
         }
 
         for pane in model.panes {
-            stack.addArrangedSubview(section(pane, chrome: chrome, width: contentWidth))
+            let view = section(pane, chrome: chrome, width: contentWidth)
+            sections.append((pane.key, view))
+            stack.addArrangedSubview(view)
         }
         if model.more > 0 {
             stack.addArrangedSubview(label("\(model.more) more \(model.more == 1 ? "pane" : "panes")", size: 11,
@@ -387,9 +458,19 @@ final class TabHoverCard {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.level = .popUpMenu
-        panel.ignoresMouseEvents = true
+        panel.acceptsMouseMovedEvents = true
         panel.hidesOnDeactivate = true
         panel.contentView = card
+        card.onSelect = { [weak self] key in self?.select(key) }
+        card.onHover = { [weak self] inside in
+            guard let self, let anchor = self.anchor else { return }
+            if inside {
+                self.pending?.cancel()
+                self.pending = nil
+            } else {
+                self.exit(anchor)
+            }
+        }
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: NSApplication.didResignActiveNotification, object: nil,
                                             queue: .main) { [weak self] _ in self?.dismiss() })
@@ -426,17 +507,31 @@ final class TabHoverCard {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.delay, execute: work)
     }
 
-    /// The pointer left `anchor`.
+    /// The pointer left `anchor`, or the card. The card stays while the pointer is on either.
     func exit(_ anchor: NSView) {
         guard anchor === self.anchor else { return }
         pending?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.anchor === anchor else { return }
+            guard let self, self.anchor === anchor, !self.pointerInside(anchor) else { return }
             self.pending = nil
             self.hide()
         }
         pending = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.grace, execute: work)
+    }
+
+    private func pointerInside(_ anchor: NSView) -> Bool {
+        let mouse = NSEvent.mouseLocation
+        if panel.isVisible, panel.frame.contains(mouse) { return true }
+        guard let window = anchor.window else { return false }
+        let local = anchor.convert(window.convertPoint(fromScreen: mouse), from: nil)
+        return anchor.bounds.contains(local)
+    }
+
+    /// A pane in the card was clicked: go to it.
+    private func select(_ key: PaneKey) {
+        dismiss()
+        SessionManager.shared.focusPane(key, activate: false)
     }
 
     /// Hides the card now (a click, a drag, a scroll), and doesn't bring it back until the
@@ -510,7 +605,7 @@ final class TabHoverCard {
     }
 
     /// How many of `count` panes the card lists, and its height then, where `height(n)` is the
-    /// card's height listing `n`. The card takes no mouse, so it can't scroll: when it is taller
+    /// card's height listing `n`. The card doesn't scroll: when it is taller
     /// than `room` it lists fewer panes (the rest are counted, and the map still shows them).
     /// It is never cut off: when even the header and map don't fit `room` (little space under a
     /// pill), it gets the `screen`'s height and may cover the strip.
