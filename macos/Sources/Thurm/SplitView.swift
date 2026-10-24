@@ -828,6 +828,17 @@ final class TabContentView: NSView {
         window?.invalidateCursorRects(for: self)
     }
 
+    /// Lays the tab out as `newRoot`, keeping the views of the panes it already shows. Panes of
+    /// other tabs must have left them first.
+    func setRoot(_ newRoot: SplitNode) {
+        transitionLayout(curve: Motion.paneCurve) {
+            zoomedPane = nil
+            root = newRoot
+        }
+        if !root.contains(focusedPane), let first = root.panes.first { setFocusedPane(first) }
+        window?.invalidateCursorRects(for: self)
+    }
+
     /// Exchanges the places of two panes of this tab.
     func swap(_ a: PaneKey, _ b: PaneKey) {
         guard root.contains(a), root.contains(b) else { return }
@@ -1061,7 +1072,7 @@ final class TabContentView: NSView {
 
     func tabLayout(title: String?) -> TabLayout {
         TabLayout(title: title, root: root.layoutNode, focused: focusedPane.id, zoomed: zoomedPane?.id,
-                  handoff: controller?.handoffID)
+                  handoff: controller?.handoffID, wall: controller?.wall)
     }
 
     /// The host of this tab's panes.

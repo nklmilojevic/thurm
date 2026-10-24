@@ -89,6 +89,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     var handoffID: String? {
         didSet { SessionManager.shared.refreshSidebars() }
     }
+    /// The agent wall (see AgentWall.swift): the tabs its agents came from.
+    var wall: [WallOrigin]? {
+        didSet { SessionManager.shared.refreshSidebars() }
+    }
     /// The daemon of this tab's panes.
     var host: HostId { content.host }
     /// Set once the window closed; the controller is about to be released.
@@ -432,6 +436,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func toggleZoom(_ sender: Any?) {
         content.toggleZoom()
+    }
+
+    @objc func toggleAgentWall(_ sender: Any?) {
+        SessionManager.shared.toggleAgentWall(in: self)
     }
 
     @objc func equalizeSplits(_ sender: Any?) {

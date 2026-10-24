@@ -253,6 +253,8 @@ enum MainMenu {
                           name: "switch_workspace"))
         menu.addItem(item("Switch to Agent…", #selector(AppDelegate.switchAgent(_:)), "a", [.command, .shift],
                           name: "switch_agent"))
+        menu.addItem(item("Agent Wall", #selector(TerminalWindowController.toggleAgentWall(_:)), "a",
+                          [.command, .control], name: "agent_wall"))
         menu.addItem(item("Rename Workspace…", #selector(AppDelegate.renameWorkspace(_:)), name: "rename_workspace"))
         menu.addItem(item("Close Workspace…", #selector(AppDelegate.closeWorkspace(_:)), name: "close_workspace"))
         menu.addItem(.separator())

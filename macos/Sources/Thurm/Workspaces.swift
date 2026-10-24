@@ -177,6 +177,7 @@ extension SessionManager {
             let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
                                    title: tab.title, frame: nil)
             t.handoffID = tab.handoff
+            t.wall = tab.wall
             add(t)
         }
         if created.isEmpty {
@@ -275,6 +276,7 @@ extension SessionManager {
                                    title: tab.title, frame: frame)
             c.workspaceID = ws.id
             c.handoffID = tab.handoff
+            c.wall = tab.wall
             if let prev = previous { attachAsTab(c, to: prev) } else { showAsNewWindow(c, frame: frame) }
             previous = c
             created.append(c)

@@ -241,6 +241,8 @@ pub struct Client {
     pub state_events: AtomicBool,
     /// A UI that carries out the newer UI commands ([`thurm_proto::CAP_UI_LAYOUT`]).
     pub ui_layout: AtomicBool,
+    /// A UI that gathers agents into a wall ([`thurm_proto::CAP_AGENT_WALL`]).
+    pub agent_wall: AtomicBool,
     /// Who connected: a local peer, or a tailnet caller the Tailscale helper admitted.
     pub principal: Mutex<Option<thurm_proto::Principal>>,
     pub name: Mutex<String>,
@@ -572,9 +574,10 @@ impl Daemon {
             .filter(|c| c.ui.load(Ordering::Relaxed) && !c.mobile.load(Ordering::Relaxed))
             .cloned()
             .collect();
-        let (capable, older): (Vec<_>, Vec<_>) = desktops
-            .into_iter()
-            .partition(|c| c.ui_layout.load(Ordering::Relaxed));
+        let wall = cmd.needs_agent_wall();
+        let (capable, older): (Vec<_>, Vec<_>) = desktops.into_iter().partition(|c| {
+            c.ui_layout.load(Ordering::Relaxed) && (!wall || c.agent_wall.load(Ordering::Relaxed))
+        });
         let shown_by_older = cmd.layout_panes().into_iter().any(|p| {
             self.pane(p).is_some_and(|p| {
                 let st = p.state.lock();
@@ -607,6 +610,7 @@ impl Daemon {
             active_size: AtomicBool::new(false),
             state_events: AtomicBool::new(false),
             ui_layout: AtomicBool::new(false),
+            agent_wall: AtomicBool::new(false),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
@@ -2385,6 +2389,9 @@ impl Daemon {
                 if has(thurm_proto::CAP_UI_LAYOUT) {
                     client.ui_layout.store(true, Ordering::Relaxed);
                 }
+                if has(thurm_proto::CAP_AGENT_WALL) {
+                    client.agent_wall.store(true, Ordering::Relaxed);
+                }
                 log::info!(
                     "client {} hello: {name} (protocol {version}{}{}{})",
                     client.id,
@@ -3626,6 +3633,7 @@ mod tests {
             active_size: AtomicBool::new(false),
             state_events: AtomicBool::new(false),
             ui_layout: AtomicBool::new(false),
+            agent_wall: AtomicBool::new(false),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),

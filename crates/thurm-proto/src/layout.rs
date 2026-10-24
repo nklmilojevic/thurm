@@ -74,6 +74,20 @@ pub struct TabLayout {
     /// A handoff tab: a remote agent working on a local repository (see `thurm handoff`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<String>,
+    /// The agent wall: the app gathered the agents of these tabs here, and puts them back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall: Option<Vec<WallOrigin>>,
+}
+
+/// A tab the agent wall took agents from: its place among the window's tabs and how it looked.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct WallOrigin {
+    pub index: usize,
+    /// A pane of the tab before it (`None`: it was the first), which places it among tabs
+    /// opened since; `index` when that pane is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<PaneId>,
+    pub tab: TabLayout,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -209,6 +223,15 @@ fn retain_tabs(tabs: Vec<TabLayout>, keep: &dyn Fn(PaneId) -> bool) -> Vec<TabLa
                 t.zoomed = None;
             }
             t.root = root;
+            t.wall = t.wall.take().map(|origins| {
+                origins
+                    .into_iter()
+                    .filter_map(|o| {
+                        let tab = retain_tabs(vec![o.tab], keep).pop()?;
+                        Some(WallOrigin { tab, ..o })
+                    })
+                    .collect()
+            });
             Some(t)
         })
         .collect()
@@ -234,6 +257,7 @@ mod tests {
                         focused: 2,
                         zoomed: None,
                         handoff: None,
+                        wall: None,
                     },
                     TabLayout {
                         title: Some("logs".into()),
@@ -241,6 +265,7 @@ mod tests {
                         focused: 3,
                         zoomed: None,
                         handoff: None,
+                        wall: None,
                     },
                 ],
                 selected_tab: 1,
@@ -263,6 +288,7 @@ mod tests {
                         focused: 4,
                         zoomed: None,
                         handoff: None,
+                        wall: None,
                     }],
                     selected_tab: 0,
                     host: None,
@@ -274,6 +300,7 @@ mod tests {
                 focused: 5,
                 zoomed: None,
                 handoff: None,
+                wall: None,
             }),
         }
     }
@@ -345,6 +372,7 @@ mod tests {
             focused: 7,
             zoomed: None,
             handoff: Some("agent/quiet-otter".into()),
+            wall: None,
         });
         l.workspaces[0].host = Some("devbox".into());
         let json = serde_json::to_string(&l).unwrap();
@@ -365,5 +393,51 @@ mod tests {
         assert_eq!(tab.focused, 7);
         assert_eq!(tab.handoff.as_deref(), Some("agent/quiet-otter"));
         assert_eq!(l.workspaces[0].host.as_deref(), Some("devbox"));
+    }
+
+    #[test]
+    fn wall_keeps_its_origins() {
+        let tab = |root: LayoutNode, focused| TabLayout {
+            title: None,
+            root,
+            focused,
+            zoomed: None,
+            handoff: None,
+            wall: None,
+        };
+        let split = |a, b| LayoutNode::Split {
+            dir: SplitDir::Down,
+            ratio: 0.3,
+            first: Box::new(LayoutNode::local(a)),
+            second: Box::new(LayoutNode::local(b)),
+        };
+        let mut l = sample();
+        // Agents 6 and 8 left a tab of their own and a tab where shell 7 stayed.
+        let mut wall = tab(split(6, 8), 6);
+        wall.title = Some("Agents".into());
+        wall.wall = Some(vec![
+            WallOrigin {
+                index: 2,
+                after: Some(3),
+                tab: tab(LayoutNode::local(6), 6),
+            },
+            WallOrigin {
+                index: 3,
+                after: Some(6),
+                tab: tab(split(7, 8), 8),
+            },
+        ]);
+        l.windows[0].tabs.push(wall);
+        l.windows[0].tabs.push(tab(LayoutNode::local(7), 7));
+        let json = serde_json::to_string(&l).unwrap();
+        assert_eq!(serde_json::from_str::<Layout>(&json).unwrap(), l);
+        // A tab without a wall says nothing of one, and older layouts have none.
+        assert_eq!(json.matches(r#""wall""#).count(), 1);
+        // Agent 6 ended: its tab has nothing to come back to; 8 still goes back next to 7.
+        l.retain_panes(&|id| id != 6);
+        let origins = l.windows[0].tabs[2].wall.as_ref().unwrap();
+        assert_eq!(origins.len(), 1);
+        assert_eq!((origins[0].index, origins[0].after), (3, Some(6)));
+        assert_eq!(origins[0].tab.root, split(7, 8));
     }
 }
