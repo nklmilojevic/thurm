@@ -64,8 +64,7 @@ enum AgentWall {
     /// Putting the wall back, for each origin by its old place: the panes still on the wall go
     /// back to their spots in the tab's layout. A tab that kept some of its panes takes them, with
     /// the panes it got meanwhile on its right (a later return to it has the earlier one's); the
-    /// others come back as new tabs. Agents that
-    /// ended, or have nowhere to go, stay on the wall.
+    /// others come back as new tabs. Agents that ended, or have nowhere to go, stay on the wall.
     static func returns(origins: [WallOrigin], onWall: [PaneKey], tabs: [[PaneKey]]) -> [Return] {
         var left = Set(onWall)
         var tabs = tabs
