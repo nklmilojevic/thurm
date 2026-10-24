@@ -166,6 +166,11 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
         "Dim unfocused splits",
         Kind::Float(Some((0.0, 1.0))),
     ),
+    (
+        "window.active_pane_border",
+        "Active pane border",
+        Kind::Bool,
+    ),
     ("window.auto_balance", "Balance splits", Kind::Bool),
     ("window.pane_headers", "Pane headers", Kind::Bool),
     (

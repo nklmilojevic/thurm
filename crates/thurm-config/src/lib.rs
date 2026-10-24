@@ -506,6 +506,8 @@ pub struct WindowConfig {
     pub quit_after_last_window: bool,
     /// Dim unfocused split panes (0 = off, 1 = fully).
     pub unfocused_split_dim: f64,
+    /// Outline the focused split pane in the theme's accent color.
+    pub active_pane_border: bool,
     /// Rebalance a tab's splits (as View > Equalize Splits does) when a pane opens or closes.
     pub auto_balance: bool,
     /// Show the per-pane header strip with agent status in splits.
@@ -539,6 +541,7 @@ impl Default for WindowConfig {
             confirm_close: true,
             quit_after_last_window: false,
             unfocused_split_dim: 0.25,
+            active_pane_border: false,
             auto_balance: true,
             pane_headers: true,
             pane_gap: 6.0,

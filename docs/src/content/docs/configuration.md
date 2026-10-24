@@ -145,6 +145,7 @@ the defaults alone.
 | `toggle_sidebar_usage_claude` | View > Usage Limits in Sidebar > Claude Code |
 | `toggle_sidebar_usage_codex` | View > Usage Limits in Sidebar > Codex |
 | `toggle_sidebar` | View > Hide Sidebar |
+| `toggle_active_pane_border` | View > Show Active Pane Border |
 | `zoom_split` | View > Zoom Split |
 | `equalize_splits` | View > Equalize Splits |
 | `focus_left` | View > Select Split Left |

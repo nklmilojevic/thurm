@@ -58,6 +58,8 @@ confirm_close = true
 quit_after_last_window = false
 # Dim unfocused split panes (0 = off, 1 = fully).
 unfocused_split_dim = 0.25
+# Outline the focused split pane in the theme's accent color. View > Show Active Pane Border.
+active_pane_border = false
 # Give the panes of a tab the same space again whenever one opens or closes (dragged dividers
 # stay until then). View > Equalize Splits does it on demand.
 auto_balance = true

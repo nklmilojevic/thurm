@@ -239,6 +239,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         SessionManager.shared.toggleSidebarAgents()
     }
 
+    @objc func toggleActivePaneBorder(_ sender: Any?) {
+        SessionManager.shared.toggleActivePaneBorder()
+    }
+
     @objc func toggleSidebarUsageClaude(_ sender: Any?) {
         SessionManager.shared.toggleSidebarUsage(.claude)
     }
@@ -314,6 +318,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         if menuItem.action == #selector(toggleSidebarTabs(_:)) {
             menuItem.state = SessionManager.shared.config.sidebarTabs ? .on : .off
+        }
+        if menuItem.action == #selector(toggleActivePaneBorder(_:)) {
+            menuItem.state = SessionManager.shared.config.activePaneBorder ? .on : .off
         }
         if menuItem.action == #selector(toggleSidebarAgents(_:)) {
             menuItem.state = SessionManager.shared.config.sidebarAgents ? .on : .off

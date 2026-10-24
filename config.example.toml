@@ -50,6 +50,8 @@ confirm_close = true
 quit_after_last_window = false
 # Dim panes without focus: 0.0 disables dimming; 1.0 gives full dimming.
 unfocused_split_dim = 0.25
+# Draw an accent-colored border around the focused pane while a tab shows several.
+active_pane_border = false
 # Even out a tab's splits when a pane opens or closes. A dragged divider holds until then.
 auto_balance = true
 pane_headers = true

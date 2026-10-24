@@ -14,6 +14,7 @@ final class SessionManager: NSObject, CoreDelegate {
     private var sidebarTabsOverride: Bool?
     /// View > Agents in Sidebar when config.toml cannot record it, as `sidebarTabsOverride`.
     private var sidebarAgentsOverride: Bool?
+    private var activePaneBorderOverride: Bool?
     private var sidebarUsageOverride: [UsageProvider: Bool] = [:]
     /// A theme chosen when config.toml cannot record it is in use (see `setTheme`).
     private var sessionTheme = false
@@ -846,6 +847,17 @@ final class SessionManager: NSObject, CoreDelegate {
         }
     }
 
+    /// View > Show Active Pane Border: switch `window.active_pane_border`, as
+    /// `toggleSidebarAgents`.
+    func toggleActivePaneBorder() {
+        let on = !config.activePaneBorder
+        activePaneBorderOverride = toggleSetting("window.active_pane_border", to: on)
+        if activePaneBorderOverride != nil {
+            config.activePaneBorder = on
+            applyConfigToUI()
+        }
+    }
+
     /// View > Usage Limits in Sidebar: switch `window.sidebar_usage_<provider>`, as
     /// `toggleSidebarAgents`.
     func toggleSidebarUsage(_ provider: UsageProvider) {
@@ -931,6 +943,7 @@ final class SessionManager: NSObject, CoreDelegate {
         config.loadWarnings += MainMenu.applyKeys(config.keybindings, commands: config.commands)
         if let o = sidebarTabsOverride { config.sidebarTabs = o }
         if let o = sidebarAgentsOverride { config.sidebarAgents = o }
+        if let o = activePaneBorderOverride { config.activePaneBorder = o }
         for (p, on) in sidebarUsageOverride {
             if on { config.sidebarUsage.insert(p) } else { config.sidebarUsage.remove(p) }
         }
