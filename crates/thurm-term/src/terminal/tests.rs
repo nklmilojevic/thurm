@@ -1592,6 +1592,28 @@ mod encoding {
     }
 
     #[test]
+    fn attach_keeps_mouse_format() {
+        let mut px = mouse(MouseKind::Press, MouseButton::Left, 70, 3, 0);
+        px.x = 705;
+        px.y = 65;
+        // Textual's order: SGR first, pixels once the terminal reports pixel sizes.
+        for (setup, want) in [
+            (
+                "\x1b[?1000h\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?1016h",
+                &b"\x1b[<0;705;65M"[..],
+            ),
+            ("\x1b[?1000h\x1b[?1015h\x1b[?1006h", b"\x1b[<0;71;4M"),
+            ("\x1b[?1000h\x1b[?1015h", b"\x1b[32;71;4M"),
+        ] {
+            let mut a = with(setup);
+            let mut copy = term(80, 24);
+            copy.replay(&a.serialize_state());
+            assert_eq!(a.mouse(&px).1, want, "{setup:?}");
+            assert_eq!(copy.mouse(&px).1, want, "copy of {setup:?}");
+        }
+    }
+
+    #[test]
     fn mouse_legacy_and_utf8() {
         let mode = "\x1b[?1000h";
         assert_eq!(

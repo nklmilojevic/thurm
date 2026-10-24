@@ -33,6 +33,8 @@ const M_MOUSE_MOTION: u16 = vt::mode(1003, false);
 const M_FOCUS: u16 = vt::mode(1004, false);
 const M_UTF8_MOUSE: u16 = vt::mode(1005, false);
 const M_SGR_MOUSE: u16 = vt::mode(1006, false);
+const M_URXVT_MOUSE: u16 = vt::mode(1015, false);
+const M_SGR_PIXELS_MOUSE: u16 = vt::mode(1016, false);
 const M_ALT_SCROLL: u16 = vt::mode(1007, false);
 const M_BRACKETED_PASTE: u16 = vt::mode(2004, false);
 const M_SYNC: u16 = vt::mode(2026, false);
@@ -2474,8 +2476,17 @@ impl Terminal {
         set(&mut out, mode.contains(TermMode::MOUSE_DRAG), "1002");
         set(&mut out, mode.contains(TermMode::MOUSE_MOTION), "1003");
         set(&mut out, mode.contains(TermMode::FOCUS_IN_OUT), "1004");
-        set(&mut out, mode.contains(TermMode::UTF8_MOUSE), "1005");
-        set(&mut out, mode.contains(TermMode::SGR_MOUSE), "1006");
+        // The report format is whichever of these was set last, which the modes don't say:
+        // the most specific goes last (a program that asks for pixels sets 1006 first, for
+        // terminals without 1016).
+        for (m, code) in [
+            (M_UTF8_MOUSE, "1005"),
+            (M_URXVT_MOUSE, "1015"),
+            (M_SGR_MOUSE, "1006"),
+            (M_SGR_PIXELS_MOUSE, "1016"),
+        ] {
+            set(&mut out, self.vt.mode(m), code);
+        }
         set(&mut out, mode.contains(TermMode::BRACKETED_PASTE), "2004");
         if !mode.contains(TermMode::ALTERNATE_SCROLL) {
             out.push_str("\x1b[?1007l");
