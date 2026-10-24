@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.12.1 - 2026-10-24
+
+This release fixes a macOS problem where clicks in the tab hover card did nothing.
+
+### Fixes
+- The tab hover card now takes clicks on its map and labels. Before this release, a click on a pane did nothing. Now, a click on a pane picks that pane.
+
 ## v0.12.0 - 2026-10-24
 
 This release lets you go to a pane from the tab hover card on macOS. This release also fixes the pane header buttons and the mouse reports.

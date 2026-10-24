@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-cli"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "base64",
  "clap",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-client"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-config"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "dirs",
  "libc",
@@ -2467,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-daemon"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2493,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-direct"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "log",
  "parking_lot",
@@ -2509,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-ffi"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "log",
  "parking_lot",
@@ -2527,7 +2527,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-mosh"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "aes",
  "base64",
@@ -2539,7 +2539,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-proto"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "postcard",
  "serde",
@@ -2548,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-remote"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "base64",
  "futures-util",
@@ -2568,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-ssh"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "log",
  "p256",
@@ -2582,7 +2582,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-tailnet-client"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "futures-util",
  "log",
@@ -2598,7 +2598,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-term"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "base64",
  "bitflags 2.13.2",
@@ -2616,7 +2616,7 @@ dependencies = [
 
 [[package]]
 name = "thurm-web"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "ghostty-vt-rs-sys",
  "serde",
