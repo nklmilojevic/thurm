@@ -64,6 +64,24 @@ final class HoverCardTests: XCTestCase {
         XCTAssertNil(map.pane(at: NSPoint(x: 300, y: 50)))
     }
 
+    func testTheCardTakesClicksOnItsMapAndLabels() {
+        let root = SplitNode.split(axis: .horizontal, ratio: 0.5, first: .leaf(key(1)), second: .leaf(key(2)))
+        let card = HoverCardView()
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 400), styleMask: [.borderless],
+                              backing: .buffered, defer: true)
+        window.contentView = card
+        card.show(HoverCardModel.make(root: root, focused: key(1), zoomed: nil, titleOverride: "work",
+                                      host: localHost, panes: [:]), aspect: 0.5)
+        let map = card.minimap.convert(card.minimap.bounds, to: card)
+        let inMap = NSPoint(x: map.minX + map.width / 4, y: map.midY)
+        let inTitle = NSPoint(x: HoverCardView.inset + 4, y: HoverCardView.inset + 4)
+        let hit = { (p: NSPoint) in card.hitTest(card.convert(p, to: card.superview)) }
+        XCTAssertTrue(hit(inMap) === card)
+        XCTAssertEqual(card.pane(at: inMap), key(1))
+        XCTAssertTrue(hit(inTitle) === card)
+        XCTAssertNil(hit(NSPoint(x: card.bounds.maxX + 10, y: 10)))
+    }
+
     func testAgentPanesSayWhatTheyWaitFor() {
         let model = HoverCardModel.make(
             root: .leaf(key(1)), focused: key(1), zoomed: nil, titleOverride: nil, host: localHost,
