@@ -235,6 +235,13 @@ final class HoverCardView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    /// Every click in the card is the card's: its map, labels and icons would otherwise take
+    /// the click, and in a window that is never key they refuse it or keep it.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = superview.map { convert(point, from: $0) } ?? point
+        return bounds.contains(local) ? self : nil
+    }
+
     /// The pane under `point`, in the card's coordinates: a cell in the map or a section in the list.
     func pane(at point: NSPoint) -> PaneKey? {
         if minimap.superview != nil, let key = minimap.pane(at: minimap.convert(point, from: self)) { return key }
