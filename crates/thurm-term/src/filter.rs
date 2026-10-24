@@ -83,9 +83,8 @@ enum State {
 const MAX_APC_CTL: usize = 1024;
 /// Longest OSC number we look at (the intercepted ones have at most 4 digits).
 const MAX_OSC_NUM: usize = 6;
-/// Longest CSI parameter string we remember (DECSTBM needs a handful, a list of DEC private
-/// modes more).
-const MAX_CSI_PARAMS: usize = 64;
+/// Longest CSI parameter string we remember (DECSTBM needs a handful).
+const MAX_CSI_PARAMS: usize = 16;
 
 /// A mouse report format: DEC private mode 1005, 1006, 1015 or 1016, or none of them (X10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -120,15 +119,44 @@ pub enum FormatChange {
     Restored(MouseFormat),
 }
 
+/// The parameters of a DEC private mode CSI (`?`) as they arrive, however long the list.
+#[derive(Debug, Default)]
+struct ModeParams {
+    /// The parameter being read.
+    num: u16,
+    /// The last mouse format mode in the list so far.
+    format: Option<MouseFormat>,
+}
+
+impl ModeParams {
+    fn feed(&mut self, b: u8) {
+        if b == b';' {
+            self.end();
+        } else {
+            self.num = self
+                .num
+                .saturating_mul(10)
+                .saturating_add((b - b'0') as u16);
+        }
+    }
+
+    fn end(&mut self) {
+        if let Some(f) = MouseFormat::from_mode(self.num) {
+            self.format = Some(f);
+        }
+        self.num = 0;
+    }
+}
+
 #[derive(Debug)]
 pub struct StreamFilter {
     state: State,
     buf: Vec<u8>,
     /// Terminator used by the OSC being buffered (BEL vs ST) to replay it verbatim.
     osc_bel: bool,
-    /// Parameters of the CSI being passed through, and whether it is a DEC private one (`?`).
+    /// Parameters of the CSI being passed through, or of a DEC private one (`?`).
     csi_params: Vec<u8>,
-    csi_private: bool,
+    csi_private: Option<ModeParams>,
     /// The scroll region the stream set since the last [`StreamFilter::take_scroll_region`]
     /// (`Some(None)`: reset to the full screen).
     scroll_region: Option<Option<(u16, u16)>>,
@@ -155,7 +183,7 @@ impl StreamFilter {
             buf: Vec::new(),
             osc_bel: false,
             csi_params: Vec::new(),
-            csi_private: false,
+            csi_private: None,
             scroll_region: None,
             mouse_format: None,
             all_apc: false,
@@ -252,7 +280,7 @@ impl StreamFilter {
                                 b'[' => {
                                     self.state = State::Csi;
                                     self.csi_params.clear();
-                                    self.csi_private = false;
+                                    self.csi_private = None;
                                 }
                                 b'c' => {
                                     // RIS resets everything.
@@ -267,8 +295,8 @@ impl StreamFilter {
                     i += 1;
                 }
                 State::Csi => {
-                    if b == b'?' && self.csi_params.is_empty() && !self.csi_private {
-                        self.csi_private = true;
+                    if b == b'?' && self.csi_params.is_empty() && self.csi_private.is_none() {
+                        self.csi_private = Some(ModeParams::default());
                         i += 1;
                     } else if b.is_ascii_digit() || b == b';' {
                         let rest = &input[i..];
@@ -276,12 +304,17 @@ impl StreamFilter {
                             .iter()
                             .position(|c| !(c.is_ascii_digit() || *c == b';'))
                             .unwrap_or(rest.len());
-                        let room = MAX_CSI_PARAMS.saturating_sub(self.csi_params.len());
-                        self.csi_params.extend_from_slice(&rest[..n.min(room)]);
+                        if let Some(p) = &mut self.csi_private {
+                            rest[..n].iter().for_each(|&c| p.feed(c));
+                        } else {
+                            let room = MAX_CSI_PARAMS.saturating_sub(self.csi_params.len());
+                            self.csi_params.extend_from_slice(&rest[..n.min(room)]);
+                        }
                         i += n;
                     } else {
-                        if self.csi_private {
-                            if let Some(c) = mouse_format_change(&self.csi_params, b) {
+                        if let Some(mut p) = self.csi_private.take() {
+                            p.end();
+                            if let Some(c) = p.format.and_then(|f| format_change(f, b)) {
                                 self.mouse_format = Some(c);
                             }
                         } else if b == b'r' {
@@ -589,7 +622,7 @@ impl StreamFilter {
         }
         if bytes[2] == b'?'
             && params_end == j
-            && let Some(c) = mouse_format_change(&bytes[3..params_end], fin)
+            && let Some(c) = mode_params(&bytes[3..params_end]).and_then(|f| format_change(f, fin))
         {
             self.mouse_format = Some(c);
         }
@@ -703,14 +736,18 @@ fn parse_decstbm(params: &[u8]) -> Option<(u16, u16)> {
     bottom.map(|b| (top, b)).filter(|&(t, b)| b > t)
 }
 
+/// The last mouse format mode in a DEC private mode CSI's parameters: libghostty-vt applies
+/// the modes in order, so it is the one that counts.
+fn mode_params(params: &[u8]) -> Option<MouseFormat> {
+    let mut p = ModeParams::default();
+    params.iter().for_each(|&c| p.feed(c));
+    p.end();
+    p.format
+}
+
 /// The mouse format change a DEC private mode set (`h`), reset (`l`) or restore (`r`,
-/// XTRESTORE) makes: libghostty-vt applies the modes in order, so the last format mode counts.
-fn mouse_format_change(params: &[u8], fin: u8) -> Option<FormatChange> {
-    let format = params
-        .split(|&b| b == b';')
-        .filter_map(|p| std::str::from_utf8(p).ok()?.parse().ok())
-        .filter_map(MouseFormat::from_mode)
-        .next_back()?;
+/// XTRESTORE) of `format`'s mode makes.
+fn format_change(format: MouseFormat, fin: u8) -> Option<FormatChange> {
     match fin {
         b'h' => Some(FormatChange::To(format)),
         b'l' => Some(FormatChange::To(MouseFormat::X10)),
@@ -1062,6 +1099,10 @@ mod tests {
         assert_eq!(feed(b"[?"), None);
         assert_eq!(feed(b"10"), None);
         assert_eq!(feed(b"05h tail"), Some(To(Utf8)));
+        // A long list split mid-way: the format mode after the first chunk counts.
+        let modes = (1..40).map(|m| m.to_string()).collect::<Vec<_>>().join(";");
+        assert_eq!(feed(format!("\x1b[?{modes}").as_bytes()), None);
+        assert_eq!(feed(b";1016;25h"), Some(To(SgrPixels)));
         assert_eq!(feed(b"\x1b[?1006h\x1bc"), Some(To(X10)));
         // DECSTBM is not a mode restore, nor the other way round.
         assert_eq!(feed(b"\x1b[1006r"), None);
