@@ -260,10 +260,15 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     container:
-      image: mcr.microsoft.com/playwright:v1.64.1-resolute
+      # Pinned to the tag's digest: a moved tag must not change what runs here.
+      image: mcr.microsoft.com/playwright:v1.64.1-resolute@sha256:d89d0e4a7058330a8334306a5aef1e00807863d31af27cf11348eed696d6e0ba
       options: --ipc=host
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The checkout belongs to the runner's user, not the container's root, so Git (and with
+      # it the Go VCS stamping in the harness's gateway build) refuses it. actions/checkout trusts
+      # it only in a temporary HOME of its own.
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       # setup-bun unpacks with unzip, which the image lacks.
       - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends unzip
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
