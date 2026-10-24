@@ -811,7 +811,7 @@ func abbreviatePath(_ path: String) -> String {
 }
 
 /// One sidebar row: icon tile with a status dot, title over branch/diff (or directory) and the
-/// progress bar, working dots and the Cmd+N hint.
+/// progress bar, working dots and the Cmd+N hint (shown while Command is held).
 final class TabRowView: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("TabRow")
 
@@ -821,6 +821,7 @@ final class TabRowView: NSTableCellView {
     private let title = NSTextField(labelWithString: "")
     private let subtitle = NSTextField(labelWithString: "")
     private let shortcut = NSTextField(labelWithString: "")
+    private var shortcutHint = ""
     private let progress = ProgressBarView()
     /// Tab rows show the tab's hover card; agent rows (one pane each) don't.
     var showsHoverCard = false
@@ -868,19 +869,26 @@ final class TabRowView: NSTableCellView {
             title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
             title.topAnchor.constraint(equalTo: topAnchor, constant: 4),
             title.trailingAnchor.constraint(lessThanOrEqualTo: working.leadingAnchor, constant: -6),
-            working.trailingAnchor.constraint(equalTo: shortcut.leadingAnchor),
+            working.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             working.centerYAnchor.constraint(equalTo: title.centerYAnchor),
             subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
-            subtitle.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            // An empty hint has no width, so the branch gets the row back when it hides.
+            subtitle.trailingAnchor.constraint(lessThanOrEqualTo: shortcut.leadingAnchor, constant: -4),
             shortcut.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            shortcut.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            shortcut.firstBaselineAnchor.constraint(equalTo: subtitle.firstBaselineAnchor),
             // Under the title and branch, in the row's bottom padding: the row keeps its height.
             progress.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             progress.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             progress.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
             progress.heightAnchor.constraint(equalToConstant: ProgressBarView.height),
         ])
+        NotificationCenter.default.addObserver(self, selector: #selector(commandHeldChanged),
+                                               name: CommandHold.changed, object: nil)
+    }
+
+    @objc private func commandHeldChanged() {
+        shortcut.stringValue = CommandHold.shared.held ? shortcutHint : ""
     }
 
     required init?(coder: NSCoder) {
@@ -892,7 +900,8 @@ final class TabRowView: NSTableCellView {
         subtitle.lineBreakMode = truncateTail ? .byTruncatingTail : .byTruncatingMiddle
         title.stringValue = tab.title
         title.font = .systemFont(ofSize: 13, weight: tab.selected ? .medium : .regular)
-        shortcut.stringValue = tab.shortcut.map { "⌘\($0)" } ?? ""
+        shortcutHint = tab.shortcut.map { "⌘\($0)" } ?? ""
+        commandHeldChanged()
         if let branch = tab.branch {
             // Attributed strings don't inherit the field's line break mode: keep one line, and
             // shorten the branch rather than the diff counts.
@@ -948,6 +957,44 @@ final class TabRowView: NSTableCellView {
     override func scrollWheel(with event: NSEvent) {
         TabHoverCard.shared.dismiss()
         super.scrollWheel(with: event)
+    }
+}
+
+/// Whether Command alone has been held a moment, for the sidebar's Cmd+N hints. The delay keeps
+/// them from flashing on every Command shortcut.
+final class CommandHold {
+    static let shared = CommandHold()
+    static let changed = Notification.Name("ThurmCommandHoldChanged")
+    private(set) var held = false {
+        didSet { if held != oldValue { NotificationCenter.default.post(name: Self.changed, object: nil) } }
+    }
+    private var pending: DispatchWorkItem?
+
+    private init() {
+        NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { [weak self] event in
+            self?.update(event)
+            return event
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in self?.reset() }
+    }
+
+    private func update(_ event: NSEvent) {
+        let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard event.type == .flagsChanged, mods == .command else { return reset() }
+        guard pending == nil, !held else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.pending = nil
+            self?.held = true
+        }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func reset() {
+        pending?.cancel()
+        pending = nil
+        held = false
     }
 }
 
