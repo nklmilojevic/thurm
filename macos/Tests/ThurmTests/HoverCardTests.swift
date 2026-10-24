@@ -49,6 +49,21 @@ final class HoverCardTests: XCTestCase {
         XCTAssertEqual(model.cells[1].rect.height, 0.5, accuracy: 0.01)
     }
 
+    func testTheMapFindsTheCellUnderThePointerButNotTheGaps() {
+        // a | (b over c)
+        let root = SplitNode.split(axis: .horizontal, ratio: 0.5, first: .leaf(key(1)),
+                                   second: .split(axis: .vertical, ratio: 0.5, first: .leaf(key(2)), second: .leaf(key(3))))
+        let map = HoverCardMinimap(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        map.model = HoverCardModel.make(root: root, focused: key(1), zoomed: nil, titleOverride: nil,
+                                        host: localHost, panes: [:])
+        XCTAssertEqual(map.pane(at: NSPoint(x: 40, y: 90)), key(1))
+        XCTAssertEqual(map.pane(at: NSPoint(x: 160, y: 20)), key(2))
+        XCTAssertEqual(map.pane(at: NSPoint(x: 160, y: 80)), key(3))
+        XCTAssertNil(map.pane(at: NSPoint(x: 100, y: 50)))
+        XCTAssertNil(map.pane(at: NSPoint(x: 160, y: 50)))
+        XCTAssertNil(map.pane(at: NSPoint(x: 300, y: 50)))
+    }
+
     func testAgentPanesSayWhatTheyWaitFor() {
         let model = HoverCardModel.make(
             root: .leaf(key(1)), focused: key(1), zoomed: nil, titleOverride: nil, host: localHost,
