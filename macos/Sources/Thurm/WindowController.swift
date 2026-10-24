@@ -372,7 +372,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         if let handoff = handoffID, handoffChoice == .removeWorktree {
             DispatchQueue.main.async { manager.removeHandoffWorktree(handoff) }
         }
-        return true
+        // The window shows another workspace now, and this tab is gone with it.
+        return !manager.showNextWorkspace(closing: self)
     }
 
     func windowDidEndLiveResize(_ notification: Notification) {

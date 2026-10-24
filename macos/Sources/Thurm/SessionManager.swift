@@ -783,6 +783,7 @@ final class SessionManager: NSObject, CoreDelegate {
         guard let c = controller(for: id) else { return }
         let empty = c.content.remove(pane: id)
         if empty {
+            guard !showNextWorkspace(closing: c) else { return }
             c.closingWithoutConfirmation = true
             c.window?.close()
         } else {
