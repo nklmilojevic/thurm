@@ -9,8 +9,8 @@ import Sparkle
 /// marks tip builds with `<sparkle:channel>tip</sparkle:channel>`, so the channel only changes
 /// which items Sparkle may pick. Development builds carry no feed or key, and never update.
 ///
-/// Scheduled checks don't open Sparkle's window over the terminal: an `UpdateBadge` in the bottom
-/// right of each window says an update is waiting, and clicking it opens the window. Checks
+/// Scheduled checks don't open Sparkle's window over the terminal: a notice (`Notices`) in the
+/// bottom right of each window says an update is waiting, and clicking it opens the window. Checks
 /// from the menu open the window right away.
 ///
 /// After an update the new app finds the daemon still running the old build and replaces it
@@ -169,71 +169,6 @@ final class Updater: NSObject, SPUUpdaterDelegate, SPUStandardUserDriverDelegate
     private func setBadge(_ text: String?) {
         badgeText = text
         if let text { tlog("update badge: \(text)") }
-        for c in SessionManager.shared.liveControllers {
-            c.content.setUpdateBadge(text)
-        }
-    }
-}
-
-/// "Update available: 1.2.0" pill in the bottom right of a window; a click opens Sparkle's
-/// update window. Colors follow the terminal theme.
-final class UpdateBadge: NSView {
-    private let dot = NSView()
-    private let label = NSTextField(labelWithString: "")
-
-    var text: String {
-        get { label.stringValue }
-        set {
-            label.stringValue = newValue
-            toolTip = "\(newValue). Click to see what's new and install."
-            needsLayout = true
-        }
-    }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.cornerRadius = 11
-        layer?.borderWidth = ChromeStroke.width
-        dot.wantsLayer = true
-        dot.layer?.cornerRadius = 3
-        label.font = .systemFont(ofSize: 11, weight: .medium)
-        addSubview(dot)
-        addSubview(label)
-        applyTheme()
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) is not supported")
-    }
-
-    func applyTheme() {
-        let chrome = SessionManager.shared.config.chrome
-        layer?.backgroundColor = chrome.surfaceRaised.cgColor
-        layer?.borderColor = chrome.strokeStrong.cgColor
-        label.textColor = chrome.contentPrimary
-        dot.layer?.backgroundColor = chrome.success.cgColor
-    }
-
-    override var fittingSize: NSSize {
-        let l = label.fittingSize
-        return NSSize(width: ceil(l.width) + 32, height: 22)
-    }
-
-    override func layout() {
-        super.layout()
-        let l = label.fittingSize
-        dot.frame = NSRect(x: 11, y: (bounds.height - 6) / 2, width: 6, height: 6)
-        label.frame = NSRect(x: 22, y: (bounds.height - l.height) / 2, width: ceil(l.width), height: l.height)
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        Updater.shared.checkForUpdates(self)
+        Notices.shared.refresh()
     }
 }

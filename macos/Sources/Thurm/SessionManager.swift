@@ -137,9 +137,12 @@ final class SessionManager: NSObject, CoreDelegate {
             tlog("thurmd runs build \(build), this app \(Core.buildId)")
             Core.shared.disconnect()
             if upgradeDaemonInPlace() { return connectAndHello() }
-            // Compatible, just older: carry on with it.
+            // Compatible: carry on with it, and say so when it is known to be older.
             guard Core.shared.connect() else { return false }
             Core.shared.request(object: ["Hello": ["client": "Thurm.app", "version": thurm_protocol_version(), "ui": true]])
+            Notices.shared.localDaemonBuild = Notices.isNewer(Core.buildId, than: build) ? build : nil
+        } else {
+            Notices.shared.localDaemonBuild = nil
         }
         sendAppearance()
         return true
@@ -168,6 +171,45 @@ final class SessionManager: NSObject, CoreDelegate {
         let rc = path.withCString { thurm_upgrade_daemon($0) }
         tlog(rc == 0 ? "thurmd upgraded in place" : "in-place daemon upgrade not possible (\(rc))")
         return rc == 0
+    }
+
+    /// Set while the daemon is replaced from `offerDaemonRestart`: the connection it drops is
+    /// taken up again once that is done, not raced against the old daemon.
+    private var replacingDaemon = false
+
+    /// The daemon stayed on an older build (see `Notices`): restart it, or try the in-place
+    /// upgrade again.
+    func offerDaemonRestart() {
+        guard let build = Notices.shared.localDaemonBuild, !replacingDaemon, let path = Core.daemonPath else { return }
+        let alert = NSAlert()
+        alert.messageText = "Restart the session daemon?"
+        alert.informativeText = "It still runs Thurm \(build) and could not be replaced in place, so features of "
+            + "\(Core.buildId) that need it don't work yet. Restarting it closes the programs running in your "
+            + "tabs; tabs, splits, scrollback and working directories come back."
+        alert.addButton(withTitle: "Restart Daemon")
+        alert.addButton(withTitle: "Try in Place Again")
+        alert.addButton(withTitle: "Cancel")
+        let choice = alert.runModal()
+        guard choice == .alertFirstButtonReturn || choice == .alertSecondButtonReturn else { return }
+        let restart = choice == .alertFirstButtonReturn
+        replacingDaemon = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = restart ? thurm_terminate_daemon() : path.withCString { thurm_upgrade_daemon($0) } == 0
+            DispatchQueue.main.async {
+                tlog(restart ? "restarting thurmd: \(ok ? "stopped" : "could not stop it")"
+                             : "thurmd upgrade retried: \(ok ? "upgraded" : "not possible")")
+                self.replacingDaemon = false
+                if !ok {
+                    let what = restart ? "The daemon could not be stopped" : "The daemon could not be replaced in place"
+                    self.currentController?.content.focusedView?.showToast("\(what) (see thurmd.log)", duration: 6)
+                }
+                // A replaced daemon dropped the connection; a new one starts if none runs.
+                if !Core.shared.isConnected {
+                    self.reconnectAttempt = 0
+                    self.attemptReconnect()
+                }
+            }
+        }
     }
 
     // MARK: - Appearance and themes
@@ -1162,15 +1204,20 @@ final class SessionManager: NSObject, CoreDelegate {
             Remotes.shared.connectionLost(host)
             return
         }
-        tlog("lost connection to thurmd; reconnecting")
         Core.shared.disconnect()
+        if replacingDaemon {
+            tlog("lost connection to thurmd while replacing it")
+            return
+        }
+        tlog("lost connection to thurmd; reconnecting")
         reconnectAttempt = 0
         currentController?.content.focusedView?.showToast("Daemon connection lost, reconnecting…", duration: 3)
         attemptReconnect()
     }
 
     @objc private func attemptReconnect() {
-        guard !isTerminating, !Core.shared.isConnected else { return }
+        // `offerDaemonRestart` reconnects once the daemon is replaced.
+        guard !isTerminating, !replacingDaemon, !Core.shared.isConnected else { return }
         if connectAndHello() {
             resync()
             return

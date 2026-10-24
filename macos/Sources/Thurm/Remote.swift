@@ -185,6 +185,7 @@ final class Remotes {
         }
         syncCountdown()
         RemoteHosts.shared.reload()
+        Notices.shared.refresh()
     }
 
     func phaseLabel(_ host: HostId) -> String {
@@ -222,6 +223,7 @@ final class Remotes {
         syncCountdown()
         RemoteHosts.shared.reload()
         SessionManager.shared.refreshSidebars()
+        Notices.shared.refresh()
     }
 
     /// `host`'s connection dropped (the daemon went away or the tunnel did).
