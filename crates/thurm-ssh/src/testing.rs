@@ -81,8 +81,12 @@ pub struct Options {
 impl server::Handler for Server {
     type Error = russh::Error;
 
-    async fn auth_publickey(&mut self, _: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        Ok(if key.key_data() == self.allowed.key_data() {
+    async fn auth_publickey(
+        &mut self,
+        _: &str,
+        key: server::VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        Ok(if key.public_key.key_data() == self.allowed.key_data() {
             Auth::Accept
         } else {
             Auth::reject()
