@@ -9,20 +9,20 @@ enum Motion {
     static var speed = AnimationSpeed.normal
 
     /// Small state changes: selection, focus dimming, toasts, divider highlight.
-    static var fast: TimeInterval { 0.12 * speed.scale }
+    static var fast: TimeInterval { 0.048 * speed.scale }
     /// Layout moves: sidebar, zoom and tab drag.
-    static var standard: TimeInterval { 0.18 * speed.scale }
+    static var standard: TimeInterval { 0.072 * speed.scale }
     /// The one-shot attention ring on a tab.
     static let pulse: TimeInterval = 0.6
 
     /// cubic-bezier(0.4, -0.4, 0.2, 1.2): a quick start that settles with a 1.7% overshoot.
     static let curve = CubicBezier(x1: 0.4, y1: -0.4, x2: 0.2, y2: 1.2)
     static let timingFunction = CAMediaTimingFunction(controlPoints: 0.4, -0.4, 0.2, 1.2)
-    /// Split panes opening, closing, moving and zooming: Rex's "Snappy" spring (stiffness 520,
-    /// mass 1, critically damped), which settles without overshoot, so a growing pane never pokes
-    /// past its place. Half the way in 74 ms, 90% in 171 ms, settled at `paneSettle`. A faster
-    /// `speed` plays the same curve in less time: a stiffer spring, still critically damped.
-    static let paneSpring = CriticalSpring(stiffness: 520)
+    /// Split panes opening, closing, moving and zooming: a critically damped spring (stiffness
+    /// 3250, mass 1), which settles without overshoot, so a growing pane never pokes past its
+    /// place. Half the way in 30 ms, 90% in 68 ms, settled at `paneSettle`. A slower `speed`
+    /// plays the same curve over more time: a softer spring, still critically damped.
+    static let paneSpring = CriticalSpring(stiffness: 3250)
     static var paneSettle: TimeInterval { paneSpring.settlingDuration * speed.scale }
 
     /// Whether the user asked for less motion (Accessibility > Display > Reduce motion).
@@ -45,14 +45,14 @@ enum Motion {
 
 /// `window.animation_speed`.
 enum AnimationSpeed: String {
-    case normal, fast, faster
+    case normal, slow, slower
 
-    /// The share of the normal duration an animation takes.
+    /// How many times the normal duration an animation takes.
     var scale: Double {
         switch self {
         case .normal: return 1
-        case .fast: return 0.65
-        case .faster: return 0.4
+        case .slow: return 1.6
+        case .slower: return 2.5
         }
     }
 }

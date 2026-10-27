@@ -68,7 +68,7 @@ pane_headers = true
 # Space between split panes when pane headers show, in points.
 pane_gap = 6.0
 # How fast panes open, close, move and zoom, and the sidebar, tab strip and toasts ease:
-# "normal", "fast" or "faster". macOS's Reduce motion turns them off whatever this says.
+# "normal", "slow" or "slower". macOS's Reduce motion turns them off whatever this says.
 animation_speed = "normal"
 # Tabs: "native" (in the titlebar) or "sidebar" (vertical, grouped by repository). View > Tabs.
 tab_style = "sidebar"
