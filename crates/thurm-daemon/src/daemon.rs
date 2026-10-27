@@ -237,6 +237,9 @@ pub struct Client {
     pub socket: Mutex<Option<std::os::unix::net::UnixStream>>,
     /// Its panes follow the active client's size ([`thurm_proto::CAP_ACTIVE_SIZE`]).
     pub active_size: AtomicBool,
+    /// Shows one pane at a time and holds the size of the one it shows
+    /// ([`thurm_proto::CAP_PANE_PAGER`]).
+    pub pane_pager: AtomicBool,
     /// `thurm events` ([`thurm_proto::CAP_STATE_EVENTS`]): gets every `PaneInfo`.
     pub state_events: AtomicBool,
     /// A UI that carries out the newer UI commands ([`thurm_proto::CAP_UI_LAYOUT`]).
@@ -314,6 +317,8 @@ pub struct PaneState {
     pub wanted: HashMap<u64, active_size::Wanted>,
     /// The client whose size the pane has now.
     pub size_owner: Option<u64>,
+    /// The phone showing the pane: other clients' `Resize` waits until it lets go.
+    pub size_held_by: Option<u64>,
     pub agent: AgentTracker,
     osc_cwd: Option<String>,
     command_started: Option<Instant>,
@@ -608,6 +613,7 @@ impl Daemon {
             push_device: Mutex::new(None),
             socket: Mutex::new(None),
             active_size: AtomicBool::new(false),
+            pane_pager: AtomicBool::new(false),
             state_events: AtomicBool::new(false),
             ui_layout: AtomicBool::new(false),
             agent_wall: AtomicBool::new(false),
@@ -810,6 +816,7 @@ impl Daemon {
                 terminal_attachment: None,
                 wanted: HashMap::new(),
                 size_owner: None,
+                size_held_by: None,
                 agent: AgentTracker::default(),
                 osc_cwd: p.osc_cwd,
                 command_started: None,
@@ -2383,6 +2390,9 @@ impl Daemon {
                 if has(thurm_proto::CAP_ACTIVE_SIZE) {
                     client.active_size.store(true, Ordering::Relaxed);
                 }
+                if has(thurm_proto::CAP_PANE_PAGER) {
+                    client.pane_pager.store(true, Ordering::Relaxed);
+                }
                 if has(thurm_proto::CAP_STATE_EVENTS) {
                     client.state_events.store(true, Ordering::Relaxed);
                 }
@@ -2393,7 +2403,7 @@ impl Daemon {
                     client.agent_wall.store(true, Ordering::Relaxed);
                 }
                 log::info!(
-                    "client {} hello: {name} (protocol {version}{}{}{})",
+                    "client {} hello: {name} (protocol {version}{}{}{}{})",
                     client.id,
                     if has(thurm_proto::CAP_MOBILE) {
                         ", mobile"
@@ -2402,6 +2412,11 @@ impl Daemon {
                     },
                     if has(thurm_proto::CAP_ACTIVE_SIZE) {
                         ", active size"
+                    } else {
+                        ""
+                    },
+                    if has(thurm_proto::CAP_PANE_PAGER) {
+                        ", pane pager"
                     } else {
                         ""
                     },
@@ -2633,6 +2648,8 @@ impl Daemon {
             Request::Unsubscribe { pane } => {
                 self.with_pane(pane, |_, st| {
                     st.subscribers.remove(&client.id);
+                    // Not shown here any more: its size goes to a client still showing it.
+                    self.forget_size(st, client.id);
                 })?;
                 Ok(Response::Ok)
             }
@@ -3631,6 +3648,7 @@ mod tests {
             push_device: Mutex::new(None),
             socket: Mutex::new(None),
             active_size: AtomicBool::new(false),
+            pane_pager: AtomicBool::new(false),
             state_events: AtomicBool::new(false),
             ui_layout: AtomicBool::new(false),
             agent_wall: AtomicBool::new(false),

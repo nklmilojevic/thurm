@@ -3,14 +3,19 @@ use std::os::unix::net::UnixStream;
 
 use super::*;
 
+/// The iOS app.
 fn mobile(env: &Env) -> (Arc<Client>, Receiver<Event>) {
+    mobile_with(env, &[CAP_MOBILE, CAP_PANE_PAGER])
+}
+
+fn mobile_with(env: &Env, capabilities: &[&str]) -> (Arc<Client>, Receiver<Event>) {
     let (tx, rx) = unbounded();
     let stream = thurm_client::connect_daemon(&env.socket).unwrap();
     let c = Client::from_stream(
         stream,
         "e2e-ios",
         false,
-        &[CAP_MOBILE],
+        capabilities,
         move |ev| {
             let _ = tx.send(ev);
         },
@@ -129,6 +134,187 @@ fn pane_takes_the_size_of_the_client_that_used_it_last() {
         assert!(Instant::now() < deadline, "the Mac's size did not return");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The phone splits a pane, and the Mac lays its window out again and resizes every pane: the
+/// pane the phone shows keeps the phone's size, and the Mac's new size is kept for later.
+#[test]
+fn a_mac_relayout_does_not_take_the_phones_pane() {
+    let env = Env::new("held-relayout");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (phone, _) = mobile(&env);
+    let pane = create(&mac, &env.dir);
+    mac.request(Request::Resize {
+        pane,
+        size: size(120, 40),
+    })
+    .unwrap();
+    phone
+        .request(Request::Resize {
+            pane,
+            size: size(50, 30),
+        })
+        .unwrap();
+
+    mac.request(Request::Resize {
+        pane,
+        size: size(60, 40),
+    })
+    .unwrap();
+    assert_eq!(pane_size(&mac, pane), (50, 30));
+
+    // The phone lets go: the Mac's latest size applies.
+    phone.request(Request::Unsubscribe { pane }).unwrap();
+    assert_eq!(pane_size(&mac, pane), (60, 40));
+}
+
+/// A mobile client that doesn't page panes (the web client showing a split, an app from before
+/// [`CAP_PANE_PAGER`]) holds nothing: the Mac's relayout resizes the pane as before.
+#[test]
+fn a_mobile_client_showing_splits_does_not_hold() {
+    let env = Env::new("unheld-relayout");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (web, _) = mobile_with(&env, &[CAP_MOBILE]);
+    let pane = create(&mac, &env.dir);
+    mac.request(Request::Resize {
+        pane,
+        size: size(120, 40),
+    })
+    .unwrap();
+    web.request(Request::Resize {
+        pane,
+        size: size(50, 30),
+    })
+    .unwrap();
+    assert_eq!(pane_size(&mac, pane), (50, 30));
+
+    mac.request(Request::Resize {
+        pane,
+        size: size(60, 40),
+    })
+    .unwrap();
+    assert_eq!(pane_size(&mac, pane), (60, 40));
+}
+
+/// Holding stops a `Resize` only: typing on the Mac takes the pane back.
+#[test]
+fn typing_on_the_mac_takes_a_held_pane_back() {
+    let env = Env::new("held-typing");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (phone, _) = mobile(&env);
+    let pane = create(&mac, &env.dir);
+    mac.request(Request::Resize {
+        pane,
+        size: size(120, 40),
+    })
+    .unwrap();
+    phone
+        .request(Request::Resize {
+            pane,
+            size: size(50, 30),
+        })
+        .unwrap();
+
+    mac.request(Request::Input {
+        pane,
+        data: b" ".to_vec(),
+    })
+    .unwrap();
+    assert_eq!(pane_size(&mac, pane), (120, 40));
+
+    // No longer held: a Mac resize applies again.
+    mac.request(Request::Resize {
+        pane,
+        size: size(100, 40),
+    })
+    .unwrap();
+    assert_eq!(pane_size(&mac, pane), (100, 40));
+}
+
+/// A client that stops showing a pane (the phone swiping on, the Mac hiding its tab) gives the
+/// size to the client still showing it.
+#[test]
+fn unsubscribing_gives_the_size_back() {
+    let env = Env::new("unsubscribe-size");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (phone, _) = mobile(&env);
+    let pane = create(&mac, &env.dir);
+    mac.request(Request::Resize {
+        pane,
+        size: size(120, 40),
+    })
+    .unwrap();
+    phone
+        .request(Request::Resize {
+            pane,
+            size: size(50, 30),
+        })
+        .unwrap();
+    phone.request(Request::Unsubscribe { pane }).unwrap();
+    assert_eq!(pane_size(&mac, pane), (120, 40));
+
+    // The other way round: the phone shows it again, then the Mac hides it.
+    phone
+        .request(Request::Resize {
+            pane,
+            size: size(50, 30),
+        })
+        .unwrap();
+    assert_eq!(pane_size(&mac, pane), (50, 30));
+    mac.request(Request::Unsubscribe { pane }).unwrap();
+    assert_eq!(pane_size(&mac, pane), (50, 30));
+}
+
+/// A phone that goes quiet while holding a pane lets go: the size the Mac asked for meanwhile
+/// applies.
+#[test]
+fn a_silent_phone_releases_its_hold() {
+    let env = Env::new("silent-hold");
+    let _daemon = env.start_with(&[("THURM_MOBILE_SILENCE_MS", Path::new("800"))]);
+    let (mac, _) = env.connect();
+    let pane = create(&mac, &env.dir);
+    mac.request(Request::Resize {
+        pane,
+        size: size(120, 40),
+    })
+    .unwrap();
+
+    let caps = [
+        thurm_proto::CAP_MOBILE,
+        thurm_proto::CAP_PANE_PAGER,
+        thurm_proto::CAP_ACTIVE_SIZE,
+    ];
+    let (mut phone, hello) = raw_hello(&env, PROTOCOL_VERSION, &caps);
+    assert!(hello.is_ok(), "{hello:?}");
+    let r = raw_request(
+        &mut phone,
+        2,
+        Request::Resize {
+            pane,
+            size: size(50, 30),
+        },
+    );
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+    mac.request(Request::Resize {
+        pane,
+        size: size(90, 40),
+    })
+    .unwrap();
+    assert_eq!(pane_size(&mac, pane), (50, 30));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pane_size(&mac, pane) != (90, 40) {
+        assert!(
+            Instant::now() < deadline,
+            "the silent phone kept holding the pane"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(phone);
 }
 
 /// A client leaving gives the size back only if the pane had its size: another one that wants

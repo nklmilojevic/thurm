@@ -591,7 +591,7 @@ pub fn connect(
         stream,
         client_name,
         false,
-        &[thurm_proto::CAP_MOBILE],
+        &[thurm_proto::CAP_MOBILE, thurm_proto::CAP_PANE_PAGER],
         on_event,
         on_disconnect,
     )
