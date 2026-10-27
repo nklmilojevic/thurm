@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.14.0 - 2026-10-27
+
+Thurm now moves panes with a smoother, faster motion and a new `window.animation_speed` setting. A phone keeps the size of the pane it shows.
+
+### New features
+
+- Pane moves now use a critically damped spring. The default motion is faster than before, and zoom uses the same curve.
+- The `window.animation_speed` setting adds `normal`, `slow` and `slower`. Use `slow` or `slower` for a longer motion.
+- A pane shown on the phone keeps the phone's size. A layout change on the Mac no longer resizes it. A key press on the Mac takes the size back.
+- The focus ring uses the theme's cursor color when the theme sets a distinct one. Themes without one keep blue.
+
+### Fixes
+
+- Pane moves no longer drop frames when the Mac is busy. The render server now plays each move, so the app does less work.
+
 ## v0.13.0 - 2026-10-24
 
 This release adds an Agent Wall and an active pane border. It also fixes a bug that quit the app when a workspace lost its last tab.
