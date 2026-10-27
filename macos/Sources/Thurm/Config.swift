@@ -273,7 +273,7 @@ final class AppConfig {
         return cfg
     }
 
-    private func apply(_ root: [String: Any]) {
+    func apply(_ root: [String: Any]) {
         loadError = jsonString(root["error"])
         loadWarnings = root["warnings"] as? [String] ?? []
         configPath = jsonString(root["config_path"]) ?? ""

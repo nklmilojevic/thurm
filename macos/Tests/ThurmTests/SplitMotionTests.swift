@@ -74,6 +74,31 @@ final class SplitMotionTests: XCTestCase {
         }
     }
 
+    /// `window.animation_speed` reaches the motion when the config loads and again on a reload.
+    func testConfigSpeedReachesMotion() {
+        let manager = SessionManager.shared
+        let saved = manager.config
+        defer { manager.config = saved }
+        func loaded(_ speed: String) -> AppConfig {
+            let config = AppConfig()
+            config.apply(["config": ["window": ["animation_speed": speed]]])
+            return config
+        }
+
+        manager.config = loaded("faster")
+        XCTAssertEqual(Motion.speed, .faster)
+        XCTAssertEqual(Motion.paneSettle, Motion.paneSpring.settlingDuration * 0.4, accuracy: 1e-9)
+        XCTAssertEqual(Motion.standard, 0.18 * 0.4, accuracy: 1e-9)
+
+        manager.config = loaded("normal")
+        XCTAssertEqual(Motion.speed, .normal)
+        XCTAssertEqual(Motion.paneSettle, Motion.paneSpring.settlingDuration, accuracy: 1e-9)
+
+        // A value the app does not know keeps the default.
+        manager.config = loaded("glacial")
+        XCTAssertEqual(Motion.speed, .normal)
+    }
+
     func testTweenUsesItsCurve() {
         var tween = Tween(0, curve: Motion.paneSpring)
         tween.move(to: 1, duration: 1, at: 0)
