@@ -170,9 +170,9 @@
       devShells.${system}.default = pkgs.mkShellNoCC {
         packages = with pkgs; [
           rustToolchain
-          # libghostty-vt comes prebuilt; Zig 0.16 builds it from source instead
+          # libghostty-vt comes prebuilt; Zig 0.17 builds it from source instead
           # (GHOSTTY_VT_RS_SYS_BUILD=source, as the Arch package does).
-          zig_0_16
+          zig_0_17
           # The Tailscale helper (tailnet/); the same minor version as tailnet/go.mod.
           go_1_27
           python3
