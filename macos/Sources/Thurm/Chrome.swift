@@ -35,39 +35,35 @@ struct ChromePalette {
     let strokeStrong: NSColor
 
     init(theme: Theme) {
-        let bg = colorFromRGB(theme.background)
-        let fg = colorFromRGB(theme.foreground)
-        func mix(_ fraction: CGFloat) -> NSColor { bg.blended(withFraction: fraction, of: fg) ?? fg }
-        func ink(_ alpha: CGFloat) -> NSColor { fg.withAlphaComponent(alpha) }
-        func ansi(_ index: Int, _ fallback: NSColor) -> NSColor {
-            theme.palette.count > index ? colorFromRGB(theme.palette[index]) : fallback
-        }
-        isDark = theme.isDark
-        canvas = bg
-        surface = bg.shadow(withLevel: Self.surfaceShade(isDark: isDark)) ?? bg
-        surfaceRaised = mix(0.05)
-        divider = mix(0.25)
-        control = ink(0.035)
-        controlHover = ink(0.07)
-        controlPressed = ink(0.11)
-        controlSelected = ink(0.07)
-        contentPrimary = fg
-        contentSecondary = ink(0.6)
-        contentTertiary = ink(0.42)
-        contentDisabled = ink(0.3)
-        accent = ansi(4, .systemBlue)
+        let c = ChromeColors(background: theme.background, foreground: theme.foreground,
+                             cursor: theme.cursor, palette: theme.palette, isDark: theme.isDark,
+                             p3: themeColorsAreDisplayP3)
+        isDark = c.isDark
+        canvas = NSColor(chrome: c.canvas)
+        surface = NSColor(chrome: c.surface)
+        surfaceRaised = NSColor(chrome: c.surfaceRaised)
+        divider = NSColor(chrome: c.divider)
+        control = NSColor(chrome: c.control)
+        controlHover = NSColor(chrome: c.controlHover)
+        controlPressed = NSColor(chrome: c.controlPressed)
+        controlSelected = NSColor(chrome: c.controlSelected)
+        contentPrimary = NSColor(chrome: c.contentPrimary)
+        contentSecondary = NSColor(chrome: c.contentSecondary)
+        contentTertiary = NSColor(chrome: c.contentTertiary)
+        contentDisabled = NSColor(chrome: c.contentDisabled)
+        accent = c.accent.map(NSColor.init(chrome:)) ?? .systemBlue
         accentContainer = accent.withAlphaComponent(0.18)
         accentRing = accent.withAlphaComponent(0.6)
-        danger = ansi(1, .systemRed)
-        warning = ansi(3, .systemOrange)
-        success = ansi(2, .systemGreen)
-        info = accent
-        stroke = ink(0.09)
-        strokeStrong = ink(0.14)
+        danger = c.danger.map(NSColor.init(chrome:)) ?? .systemRed
+        warning = c.warning.map(NSColor.init(chrome:)) ?? .systemOrange
+        success = c.success.map(NSColor.init(chrome:)) ?? .systemGreen
+        info = c.info.map(NSColor.init(chrome:)) ?? .systemBlue
+        stroke = NSColor(chrome: c.stroke)
+        strokeStrong = NSColor(chrome: c.strokeStrong)
     }
 
     /// How far `surface` is shaded toward black from the canvas.
-    static func surfaceShade(isDark: Bool) -> CGFloat { isDark ? 0.18 : 0.05 }
+    static func surfaceShade(isDark: Bool) -> CGFloat { CGFloat(ChromeColors.surfaceShade(isDark: isDark)) }
 
     /// The unfocused-split dim lays the background scaled by this over the pane, so at the full
     /// `dim` the pane's background lands on `surface` and the pane sinks into the gutters, in
@@ -86,6 +82,17 @@ struct ChromePalette {
 
 extension AppConfig {
     var chrome: ChromePalette { ChromePalette(theme: theme) }
+}
+
+extension NSColor {
+    /// A chrome color, in the space the theme's colors are read in (see `colorFromRGB`).
+    convenience init(chrome c: ChromeRGBA) {
+        if themeColorsAreDisplayP3 {
+            self.init(displayP3Red: c.red, green: c.green, blue: c.blue, alpha: c.alpha)
+        } else {
+            self.init(srgbRed: c.red, green: c.green, blue: c.blue, alpha: c.alpha)
+        }
+    }
 }
 
 /// Corner radii of the chrome, on one scale.

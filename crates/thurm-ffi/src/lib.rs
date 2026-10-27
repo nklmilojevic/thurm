@@ -359,6 +359,15 @@ impl Shared {
         self.locals.lock().get(&pane).cloned()
     }
 
+    /// Show the panes in the light or dark variant of the theme; whether it changed.
+    fn set_dark(&self, dark: bool) -> bool {
+        let changed = std::mem::replace(&mut self.engine.lock().dark, dark) != dark;
+        if changed {
+            self.reload_engine(false);
+        }
+        changed
+    }
+
     fn reload_engine(&self, reload_file: bool) {
         let cfg = {
             let mut e = self.engine.lock();
@@ -583,6 +592,16 @@ pub unsafe extern "C" fn thurm_write_temp_file(
 pub unsafe extern "C" fn thurm_reload_engine(client: *mut thurm_client) {
     if let Some(c) = unsafe { client_ref(client) } {
         c.shared.reload_engine(true);
+    }
+}
+
+/// Show the connection's panes in the light or dark variant of this device's theme, without
+/// telling the daemon: unlike a `SetAppearance` request, the host (and the other devices showing
+/// its panes) keep their appearance. The iPhone follows its own.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_set_local_appearance(client: *mut thurm_client, dark: bool) {
+    if let Some(c) = unsafe { client_ref(client) } {
+        c.shared.set_dark(dark);
     }
 }
 
@@ -877,13 +896,7 @@ impl thurm_client {
             | Request::Search { pane, .. }
             | Request::Scroll { pane, .. } => *pane,
             Request::SetAppearance { dark } => {
-                let changed = {
-                    let mut e = self.shared.engine.lock();
-                    std::mem::replace(&mut e.dark, *dark) != *dark
-                };
-                if changed {
-                    self.shared.reload_engine(false);
-                }
+                self.shared.set_dark(*dark);
                 return Err(req);
             }
             _ => return Err(req),
@@ -1490,6 +1503,19 @@ pub unsafe extern "C" fn thurm_set_session_theme(spec: *const c_char) -> *mut c_
     }
 }
 
+/// Theme `name` (a theme name or file) as JSON, like `theme` in `thurm_config_json`, or null
+/// when there is no such theme: the theme picker draws its previews with it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_theme_json(name: *const c_char) -> *mut c_char {
+    let Some(name) = (unsafe { opt_str(name) }) else {
+        return std::ptr::null_mut();
+    };
+    match thurm_config::load_theme(name).map(|t| serde_json::to_string(&t)) {
+        Ok(Ok(json)) => into_c(json),
+        _ => std::ptr::null_mut(),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn thurm_config_json(dark: bool) -> *mut c_char {
     let _ = thurm_config::ensure_default_config();
@@ -1620,6 +1646,153 @@ mod tests {
             let text = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
             assert!(text.contains("error"), "{text}");
         }
+    }
+
+    #[test]
+    fn local_appearance_changes_only_this_devices_engine() {
+        let shared = Shared::default();
+        assert!(shared.engine.lock().dark);
+        assert!(shared.set_dark(false));
+        assert!(!shared.engine.lock().dark);
+        assert!(!shared.set_dark(false), "no change, no reload");
+        // Without a connection there is nothing to change.
+        unsafe { thurm_set_local_appearance(std::ptr::null_mut(), true) };
+    }
+
+    /// Through a connection to a daemon that records what it is sent: the local call turns
+    /// the attached pane light and sends nothing; `SetAppearance` turns it dark and reaches
+    /// the daemon.
+    #[test]
+    fn local_appearance_stays_off_the_daemon() {
+        use std::io::BufReader;
+        use std::os::unix::net::UnixListener;
+        use thurm_proto::{Envelope, ServerMessage, codec};
+
+        let dir = std::env::temp_dir().join(format!("thurm-ffi-look-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let received = Arc::new(Mutex::new(Vec::<Request>::new()));
+        let log = received.clone();
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut w = s;
+            while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut r) {
+                let result = match &env.request {
+                    Request::Hello { .. } => Response::Hello {
+                        version: thurm_proto::PROTOCOL_VERSION,
+                        daemon_pid: 1,
+                        restored: false,
+                        build: String::new(),
+                        capabilities: thurm_proto::CAPABILITIES
+                            .iter()
+                            .map(|c| (*c).to_owned())
+                            .collect(),
+                    },
+                    // The pane arrives before the answer, so it is attached when that returns.
+                    Request::ListPanes => {
+                        let attach = Event::Attach {
+                            pane: 1,
+                            size: PaneSize {
+                                cols: 20,
+                                rows: 5,
+                                cell_width: 8,
+                                cell_height: 16,
+                            },
+                            state: Vec::new(),
+                        };
+                        codec::write_message(&mut w, &ServerMessage::Event(attach)).unwrap();
+                        Response::Ok
+                    }
+                    _ => Response::Ok,
+                };
+                log.lock().push(env.request);
+                let resp = ServerMessage::Response {
+                    id: env.id,
+                    result: Ok(result),
+                };
+                codec::write_message(&mut w, &resp).unwrap();
+            }
+        });
+
+        let socket = CString::new(sock.to_str().unwrap()).unwrap();
+        let mut err = std::ptr::null_mut();
+        let client = unsafe {
+            thurm_connect_socket(
+                socket.as_ptr(),
+                std::ptr::null(),
+                c"test".as_ptr(),
+                None,
+                None,
+                std::ptr::null_mut(),
+                &mut err,
+            )
+        };
+        assert!(!client.is_null());
+        // This device's theme, not the config of whoever runs the tests.
+        let c = unsafe { client_ref(client) }.unwrap();
+        c.shared.engine.lock().cfg =
+            thurm_config::Config::parse("[colors]\ntheme = \"light:thurm-light,dark:thurm\"\n")
+                .unwrap();
+        let request = |json: &CStr| {
+            let out = unsafe { thurm_request(client, json.as_ptr()) };
+            let text = unsafe { CStr::from_ptr(out) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { thurm_string_free(out) };
+            text
+        };
+        assert_eq!(request(c"\"ListPanes\""), "\"Ok\"");
+        let background = || {
+            let mut info = thurm_grid_info::default();
+            assert!(unsafe { thurm_grid_lock(client, 1, &mut info, std::ptr::null_mut()) });
+            unsafe { thurm_grid_unlock(client, 1) };
+            info.background
+        };
+        let light = thurm_config::builtin_theme("thurm-light")
+            .unwrap()
+            .background;
+        let dark = thurm_config::builtin_theme("thurm").unwrap().background;
+        assert_ne!(light, dark);
+        assert_eq!(background(), dark);
+
+        unsafe { thurm_set_local_appearance(client, false) };
+        assert_eq!(background(), light);
+        // A round trip: anything sent before it has reached the daemon.
+        assert_eq!(request(c"\"ListPanes\""), "\"Ok\"");
+        let seen = |r: &[Request]| r.iter().any(|r| matches!(r, Request::SetAppearance { .. }));
+        assert!(!seen(&received.lock()), "{:?}", received.lock());
+
+        assert_eq!(request(c"{\"SetAppearance\":{\"dark\":true}}"), "\"Ok\"");
+        assert_eq!(background(), dark);
+        assert!(
+            received
+                .lock()
+                .iter()
+                .any(|r| matches!(r, Request::SetAppearance { dark: true })),
+            "{:?}",
+            received.lock()
+        );
+
+        unsafe { thurm_disconnect(client) };
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn theme_json_has_the_colors() {
+        let json = unsafe { thurm_theme_json(c"thurm-light".as_ptr()) };
+        assert!(!json.is_null());
+        let text = unsafe { CStr::from_ptr(json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { thurm_string_free(json) };
+        let t: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(t["background"], 0xfafbfc);
+        assert_eq!(t["palette"].as_array().unwrap().len(), 16);
+        assert!(unsafe { thurm_theme_json(c"no such theme".as_ptr()) }.is_null());
+        assert!(unsafe { thurm_theme_json(std::ptr::null()) }.is_null());
     }
 
     #[test]
