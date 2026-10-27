@@ -61,6 +61,44 @@ final class SplitMotionTests: XCTestCase {
         XCTAssertEqual(Motion.paneSpring.value(at: 0.171 / settle), 0.9, accuracy: 0.01)
     }
 
+    /// A faster speed plays the curve of a stiffer spring, still critically damped, in its time.
+    func testFasterSpeedPlaysAStifferSpring() {
+        defer { Motion.speed = .normal }
+        Motion.speed = .faster
+        let scale = AnimationSpeed.faster.scale
+        let stiffer = CriticalSpring(stiffness: 520 / (scale * scale))
+        XCTAssertEqual(stiffer.settlingDuration, Motion.paneSettle, accuracy: 0.01)
+        XCTAssertEqual(Motion.fast, 0.12 * scale, accuracy: 1e-9)
+        for x in stride(from: 0.0, through: 1.0, by: 0.05) {
+            XCTAssertEqual(stiffer.value(at: x), Motion.paneSpring.value(at: x), accuracy: 1e-3)
+        }
+    }
+
+    /// `window.animation_speed` reaches the motion when the config loads and again on a reload.
+    func testConfigSpeedReachesMotion() {
+        let manager = SessionManager.shared
+        let saved = manager.config
+        defer { manager.config = saved }
+        func loaded(_ speed: String) -> AppConfig {
+            let config = AppConfig()
+            config.apply(["config": ["window": ["animation_speed": speed]]])
+            return config
+        }
+
+        manager.config = loaded("faster")
+        XCTAssertEqual(Motion.speed, .faster)
+        XCTAssertEqual(Motion.paneSettle, Motion.paneSpring.settlingDuration * 0.4, accuracy: 1e-9)
+        XCTAssertEqual(Motion.standard, 0.18 * 0.4, accuracy: 1e-9)
+
+        manager.config = loaded("normal")
+        XCTAssertEqual(Motion.speed, .normal)
+        XCTAssertEqual(Motion.paneSettle, Motion.paneSpring.settlingDuration, accuracy: 1e-9)
+
+        // A value the app does not know keeps the default.
+        manager.config = loaded("glacial")
+        XCTAssertEqual(Motion.speed, .normal)
+    }
+
     func testTweenUsesItsCurve() {
         var tween = Tween(0, curve: Motion.paneSpring)
         tween.move(to: 1, duration: 1, at: 0)

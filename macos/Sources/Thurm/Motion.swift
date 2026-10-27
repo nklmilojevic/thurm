@@ -4,10 +4,14 @@ import QuartzCore
 /// The motion the chrome shares: one easing curve, a few duration tokens and the reduce-motion
 /// switch. Nothing here runs a free timer: a `MotionDriver` lives only as long as its animation.
 enum Motion {
+    /// `window.animation_speed`, kept in step with the config: it scales `fast`, `standard` and
+    /// `paneSettle`. The attention pulse keeps its time, so it still catches the eye.
+    static var speed = AnimationSpeed.normal
+
     /// Small state changes: selection, focus dimming, toasts, divider highlight.
-    static let fast: TimeInterval = 0.12
-    /// Layout moves: sidebar, zoom, tab drag and the quick terminal.
-    static let standard: TimeInterval = 0.18
+    static var fast: TimeInterval { 0.12 * speed.scale }
+    /// Layout moves: sidebar, zoom and tab drag.
+    static var standard: TimeInterval { 0.18 * speed.scale }
     /// The one-shot attention ring on a tab.
     static let pulse: TimeInterval = 0.6
 
@@ -16,9 +20,10 @@ enum Motion {
     static let timingFunction = CAMediaTimingFunction(controlPoints: 0.4, -0.4, 0.2, 1.2)
     /// Split panes opening, closing, moving and zooming: Rex's "Snappy" spring (stiffness 520,
     /// mass 1, critically damped), which settles without overshoot, so a growing pane never pokes
-    /// past its place. Half the way in 74 ms, 90% in 171 ms, settled at `paneSettle`.
+    /// past its place. Half the way in 74 ms, 90% in 171 ms, settled at `paneSettle`. A faster
+    /// `speed` plays the same curve in less time: a stiffer spring, still critically damped.
     static let paneSpring = CriticalSpring(stiffness: 520)
-    static var paneSettle: TimeInterval { paneSpring.settlingDuration }
+    static var paneSettle: TimeInterval { paneSpring.settlingDuration * speed.scale }
 
     /// Whether the user asked for less motion (Accessibility > Display > Reduce motion).
     static var reduced: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
@@ -35,6 +40,20 @@ enum Motion {
             return u * u * (3 - 2 * u)
         }
         return appearing ? smoothstep(2 * t - 1) : 1 - smoothstep(2 * t)
+    }
+}
+
+/// `window.animation_speed`.
+enum AnimationSpeed: String {
+    case normal, fast, faster
+
+    /// The share of the normal duration an animation takes.
+    var scale: Double {
+        switch self {
+        case .normal: return 1
+        case .fast: return 0.65
+        case .faster: return 0.4
+        }
     }
 }
 

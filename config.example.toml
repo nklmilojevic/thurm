@@ -57,6 +57,8 @@ auto_balance = true
 pane_headers = true
 # Space between split panes (and around them) when pane headers show, in points.
 pane_gap = 6.0
+# Animation speed for panes and the chrome: "normal", "fast" or "faster".
+animation_speed = "normal"
 # Tab location: "native" or "sidebar".
 tab_style = "sidebar"
 sidebar_width = 240.0
