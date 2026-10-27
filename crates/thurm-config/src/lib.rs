@@ -466,10 +466,10 @@ pub enum TabStyle {
 pub enum AnimationSpeed {
     #[default]
     Normal,
-    /// About two thirds of the normal time.
-    Fast,
-    /// About two fifths of the normal time.
-    Faster,
+    /// 1.6 times the normal time.
+    Slow,
+    /// 2.5 times the normal time.
+    Slower,
 }
 
 /// What the window chrome sits on when `window.opacity` is below 1 (see `window.blur`).
