@@ -97,6 +97,11 @@ pub const UI_TOO_OLD: &str = "the Thurm app is too old for this; update it";
 /// and does not count as an open window.
 pub const CAP_MOBILE: &str = "mobile";
 
+/// Sent only by the iOS app, besides [`CAP_MOBILE`]: it shows a pane full-screen and pages
+/// between panes, so a pane it sizes keeps that size against other clients' `Resize` until it
+/// lets go (see the daemon's `active_size`). The web client, showing splits, does not send it.
+pub const CAP_PANE_PAGER: &str = "pane-pager";
+
 /// Sent only by `thurm events`: besides the events every client gets, it gets the [`PaneInfo`]
 /// changes that come from a pane's output (prompt, cwd, progress), which otherwise go only to
 /// UI clients.

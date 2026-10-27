@@ -2,9 +2,10 @@
 //! showing it, the client that used it last wins, and gets its size back after the other one
 //! had it. Clients without [`thurm_proto::CAP_ACTIVE_SIZE`] keep the last `Resize` winning.
 //!
-//! The phone shows one pane at a time and holds the one it shows: a `Resize` from another
-//! client (the Mac laying its window out again) waits until the phone lets go, by leaving the
-//! pane or the host, or until that client really uses the pane.
+//! The phone shows one pane at a time and holds the one it shows
+//! ([`thurm_proto::CAP_PANE_PAGER`]): a `Resize` from another client (the Mac laying its window
+//! out again) waits until the phone lets go, by leaving the pane or the host, or until that
+//! client really uses the pane. Other mobile clients (the web client, showing splits) don't hold.
 
 use std::sync::atomic::AtomicU64;
 
@@ -115,7 +116,7 @@ impl Daemon {
 
 /// Whether the pane `client` sizes stays its size until it lets go (the phone).
 fn holds(client: &Client) -> bool {
-    client.mobile.load(Ordering::Relaxed)
+    client.pane_pager.load(Ordering::Relaxed)
 }
 
 impl Daemon {

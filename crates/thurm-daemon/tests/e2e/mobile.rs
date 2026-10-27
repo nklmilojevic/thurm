@@ -3,14 +3,19 @@ use std::os::unix::net::UnixStream;
 
 use super::*;
 
+/// The iOS app.
 fn mobile(env: &Env) -> (Arc<Client>, Receiver<Event>) {
+    mobile_with(env, &[CAP_MOBILE, CAP_PANE_PAGER])
+}
+
+fn mobile_with(env: &Env, capabilities: &[&str]) -> (Arc<Client>, Receiver<Event>) {
     let (tx, rx) = unbounded();
     let stream = thurm_client::connect_daemon(&env.socket).unwrap();
     let c = Client::from_stream(
         stream,
         "e2e-ios",
         false,
-        &[CAP_MOBILE],
+        capabilities,
         move |ev| {
             let _ = tx.send(ev);
         },
@@ -164,6 +169,35 @@ fn a_mac_relayout_does_not_take_the_phones_pane() {
     assert_eq!(pane_size(&mac, pane), (60, 40));
 }
 
+/// A mobile client that doesn't page panes (the web client showing a split, an app from before
+/// [`CAP_PANE_PAGER`]) holds nothing: the Mac's relayout resizes the pane as before.
+#[test]
+fn a_mobile_client_showing_splits_does_not_hold() {
+    let env = Env::new("unheld-relayout");
+    let _daemon = env.start();
+    let (mac, _) = env.connect();
+    let (web, _) = mobile_with(&env, &[CAP_MOBILE]);
+    let pane = create(&mac, &env.dir);
+    mac.request(Request::Resize {
+        pane,
+        size: size(120, 40),
+    })
+    .unwrap();
+    web.request(Request::Resize {
+        pane,
+        size: size(50, 30),
+    })
+    .unwrap();
+    assert_eq!(pane_size(&mac, pane), (50, 30));
+
+    mac.request(Request::Resize {
+        pane,
+        size: size(60, 40),
+    })
+    .unwrap();
+    assert_eq!(pane_size(&mac, pane), (60, 40));
+}
+
 /// Holding stops a `Resize` only: typing on the Mac takes the pane back.
 #[test]
 fn typing_on_the_mac_takes_a_held_pane_back() {
@@ -249,7 +283,11 @@ fn a_silent_phone_releases_its_hold() {
     })
     .unwrap();
 
-    let caps = [thurm_proto::CAP_MOBILE, thurm_proto::CAP_ACTIVE_SIZE];
+    let caps = [
+        thurm_proto::CAP_MOBILE,
+        thurm_proto::CAP_PANE_PAGER,
+        thurm_proto::CAP_ACTIVE_SIZE,
+    ];
     let (mut phone, hello) = raw_hello(&env, PROTOCOL_VERSION, &caps);
     assert!(hello.is_ok(), "{hello:?}");
     let r = raw_request(
