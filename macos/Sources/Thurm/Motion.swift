@@ -14,10 +14,11 @@ enum Motion {
     /// cubic-bezier(0.4, -0.4, 0.2, 1.2): a quick start that settles with a 1.7% overshoot.
     static let curve = CubicBezier(x1: 0.4, y1: -0.4, x2: 0.2, y2: 1.2)
     static let timingFunction = CAMediaTimingFunction(controlPoints: 0.4, -0.4, 0.2, 1.2)
-    /// cubic-bezier(0.2, 0.9, 0.3, 1.0): split panes opening and closing. Most of the way in the
-    /// first moments, then a long settle with no overshoot, so a growing pane never pokes past
-    /// its place.
-    static let paneCurve = CubicBezier(x1: 0.2, y1: 0.9, x2: 0.3, y2: 1.0)
+    /// Split panes opening, closing, moving and zooming: Rex's "Snappy" spring (stiffness 520,
+    /// mass 1, critically damped), which settles without overshoot, so a growing pane never pokes
+    /// past its place. Half the way in 74 ms, 90% in 171 ms, settled at `paneSettle`.
+    static let paneSpring = CriticalSpring(stiffness: 520)
+    static var paneSettle: TimeInterval { paneSpring.settlingDuration }
 
     /// Whether the user asked for less motion (Accessibility > Display > Reduce motion).
     static var reduced: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
@@ -37,10 +38,39 @@ enum Motion {
     }
 }
 
+/// Maps a time fraction (0...1) to eased progress, 0 at the start and 1 at the end.
+protocol Easing {
+    func value(at x: Double) -> Double
+}
+
+/// A critically damped spring with mass 1 over the time Core Animation takes to settle it:
+/// `1 - (1 + ωt)·e^(-ωt)` with ω = √stiffness, ending at exactly 1.
+struct CriticalSpring: Easing {
+    let stiffness: Double
+    /// `CASpringAnimation.settlingDuration` for this spring.
+    let settlingDuration: TimeInterval
+
+    init(stiffness: Double) {
+        self.stiffness = stiffness
+        let spring = CASpringAnimation()
+        spring.mass = 1
+        spring.stiffness = stiffness
+        spring.damping = 2 * stiffness.squareRoot()
+        settlingDuration = spring.settlingDuration
+    }
+
+    func value(at x: Double) -> Double {
+        if x <= 0 { return 0 }
+        if x >= 1 { return 1 }
+        let wt = stiffness.squareRoot() * x * settlingDuration
+        return 1 - (1 + wt) * exp(-wt)
+    }
+}
+
 /// A CSS-style cubic-bezier timing curve. `value(at:)` maps a time fraction to eased progress: it
 /// solves the x curve for the curve parameter (Newton's method, bisection as a fallback), then
 /// reads the y curve at that parameter.
-struct CubicBezier {
+struct CubicBezier: Easing {
     let x1: Double
     let y1: Double
     let x2: Double
@@ -88,9 +118,9 @@ struct Tween {
     private(set) var to: Double
     private var start: CFTimeInterval = 0
     private var duration: TimeInterval = 0
-    private let curve: CubicBezier
+    private let curve: any Easing
 
-    init(_ value: Double, curve: CubicBezier = Motion.curve) {
+    init(_ value: Double, curve: any Easing = Motion.curve) {
         from = value
         to = value
         self.curve = curve
@@ -104,6 +134,14 @@ struct Tween {
 
     func isFinished(at now: CFTimeInterval) -> Bool {
         now - start >= duration
+    }
+
+    /// When the move in progress ends.
+    var end: CFTimeInterval { start + duration }
+
+    /// Runs the move in progress from `start` instead, keeping where it goes and how long it takes.
+    mutating func restart(at start: CFTimeInterval) {
+        self.start = start
     }
 
     /// Eases toward `target` over `duration` seconds from the value at `now`. A zero duration
