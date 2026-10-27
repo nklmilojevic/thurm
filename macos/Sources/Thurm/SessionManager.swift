@@ -6,7 +6,9 @@ import CThurm
 final class SessionManager: NSObject, CoreDelegate {
     static let shared = SessionManager()
 
-    var config = AppConfig()
+    var config = AppConfig() {
+        didSet { Motion.speed = config.animationSpeed }
+    }
     /// Cmd+Plus / Cmd+Minus override of `config.fontSize` (not persisted).
     private(set) var fontSizeOverride: CGFloat?
     /// View > Tabs in Sidebar when config.toml cannot record it (read-only, e.g. managed by Nix

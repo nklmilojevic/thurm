@@ -96,6 +96,7 @@ const NOTICE_FIELDS: &[(&str, &str, Kind)] = &[
 const WINDOW_MATERIAL: &[&str] = &["theme", "system", "blend", "modern"];
 const OPTION_AS_ALT: &[&str] = &["none", "left", "right", "both"];
 const TAB_STYLE: &[&str] = &["native", "sidebar"];
+const ANIMATION_SPEED: &[&str] = &["normal", "fast", "faster"];
 const CURSOR_STYLE: &[&str] = &["block", "beam", "underline"];
 const OSC52: &[&str] = &["disabled", "copy", "paste", "copy-paste"];
 const QUIT: &[&str] = &["detach", "terminate"];
@@ -177,6 +178,11 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
         "window.pane_gap",
         "Gap between splits",
         Kind::Float(Some((0.0, 64.0))),
+    ),
+    (
+        "window.animation_speed",
+        "Animation speed",
+        Kind::Enum(ANIMATION_SPEED),
     ),
     ("window.tab_style", "Tabs", Kind::Enum(TAB_STYLE)),
     (

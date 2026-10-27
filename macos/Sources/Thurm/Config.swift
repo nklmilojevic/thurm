@@ -136,6 +136,7 @@ final class AppConfig {
     var autoBalance = true
     var paneHeaders = true
     var paneGap: CGFloat = 6
+    var animationSpeed = AnimationSpeed.normal
     /// `window.tab_style == "sidebar"`: vertical tabs instead of the native tab bar.
     var sidebarTabs = true
     var quitAfterLastWindow = false
@@ -337,6 +338,7 @@ final class AppConfig {
             autoBalance = jsonBool(w["auto_balance"]) ?? autoBalance
             paneHeaders = jsonBool(w["pane_headers"]) ?? paneHeaders
             paneGap = CGFloat(clamped(w["pane_gap"], 0, 64) ?? Double(paneGap))
+            if let a = jsonString(w["animation_speed"]).flatMap(AnimationSpeed.init(rawValue:)) { animationSpeed = a }
             if let style = jsonString(w["tab_style"]) { sidebarTabs = style == "sidebar" }
             blur = min(100, max(0, jsonInt(w["blur"]) ?? blur))
             if let m = jsonString(w["material"]).flatMap(WindowMaterial.init(rawValue:)) { material = m }

@@ -460,6 +460,18 @@ pub enum TabStyle {
     Sidebar,
 }
 
+/// How fast pane moves and the chrome animate.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AnimationSpeed {
+    #[default]
+    Normal,
+    /// About two thirds of the normal time.
+    Fast,
+    /// About two fifths of the normal time.
+    Faster,
+}
+
 /// What the window chrome sits on when `window.opacity` is below 1 (see `window.blur`).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -514,6 +526,8 @@ pub struct WindowConfig {
     pub pane_headers: bool,
     /// Space between split panes (and around them) when pane headers show, in points.
     pub pane_gap: f64,
+    /// How fast panes open, close, move and zoom, and the chrome eases.
+    pub animation_speed: AnimationSpeed,
     pub tab_style: TabStyle,
     /// Width of the tab sidebar in points.
     pub sidebar_width: f64,
@@ -545,6 +559,7 @@ impl Default for WindowConfig {
             auto_balance: true,
             pane_headers: true,
             pane_gap: 6.0,
+            animation_speed: AnimationSpeed::Normal,
             tab_style: TabStyle::Sidebar,
             sidebar_width: 240.0,
             sidebar_agents: true,
