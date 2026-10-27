@@ -464,9 +464,12 @@ pub enum TabStyle {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AnimationSpeed {
+    /// `faster` was this speed's name before it became the default.
     #[default]
+    #[serde(alias = "faster")]
     Normal,
-    /// 1.6 times the normal time.
+    /// 1.6 times the normal time (once `fast`).
+    #[serde(alias = "fast")]
     Slow,
     /// 2.5 times the normal time.
     Slower,
@@ -2515,6 +2518,18 @@ clipboard_read = "always"
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(Config::parse(&text).unwrap().window.pane_headers);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn animation_speed_reads_its_earlier_names() {
+        for (value, speed) in [
+            ("\"slower\"", AnimationSpeed::Slower),
+            ("\"fast\"", AnimationSpeed::Slow),
+            ("\"faster\"", AnimationSpeed::Normal),
+        ] {
+            let out = with_setting(DEFAULT_CONFIG_TOML, "window.animation_speed", value).unwrap();
+            assert_eq!(Config::parse(&out).unwrap().window.animation_speed, speed);
+        }
     }
 
     #[test]
