@@ -314,6 +314,8 @@ pub struct PaneState {
     pub wanted: HashMap<u64, active_size::Wanted>,
     /// The client whose size the pane has now.
     pub size_owner: Option<u64>,
+    /// The phone showing the pane: other clients' `Resize` waits until it lets go.
+    pub size_held_by: Option<u64>,
     pub agent: AgentTracker,
     osc_cwd: Option<String>,
     command_started: Option<Instant>,
@@ -810,6 +812,7 @@ impl Daemon {
                 terminal_attachment: None,
                 wanted: HashMap::new(),
                 size_owner: None,
+                size_held_by: None,
                 agent: AgentTracker::default(),
                 osc_cwd: p.osc_cwd,
                 command_started: None,
@@ -2633,6 +2636,8 @@ impl Daemon {
             Request::Unsubscribe { pane } => {
                 self.with_pane(pane, |_, st| {
                     st.subscribers.remove(&client.id);
+                    // Not shown here any more: its size goes to a client still showing it.
+                    self.forget_size(st, client.id);
                 })?;
                 Ok(Response::Ok)
             }

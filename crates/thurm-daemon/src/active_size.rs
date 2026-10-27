@@ -1,6 +1,10 @@
 //! Which client's size a pane takes. A pane has one PTY size; with the phone and the Mac
 //! showing it, the client that used it last wins, and gets its size back after the other one
 //! had it. Clients without [`thurm_proto::CAP_ACTIVE_SIZE`] keep the last `Resize` winning.
+//!
+//! The phone shows one pane at a time and holds the one it shows: a `Resize` from another
+//! client (the Mac laying its window out again) waits until the phone lets go, by leaving the
+//! pane or the host, or until that client really uses the pane.
 
 use std::sync::atomic::AtomicU64;
 
@@ -29,8 +33,21 @@ impl Daemon {
             if client.active_size.load(Ordering::Relaxed) {
                 let used = TICK.fetch_add(1, Ordering::Relaxed);
                 st.wanted.insert(client.id, Wanted { size, used });
+                if let Some(holder) = st.size_held_by
+                    && holder != client.id
+                    && st.wanted.contains_key(&holder)
+                {
+                    log::info!(
+                        "pane {pane}: client {} wants {}x{}; client {holder} holds it",
+                        client.id,
+                        size.cols,
+                        size.rows
+                    );
+                    return;
+                }
             }
             st.size_owner = Some(client.id);
+            st.size_held_by = holds(client).then_some(client.id);
             log::info!(
                 "pane {pane}: client {} wants {}x{}",
                 client.id,
@@ -52,11 +69,16 @@ impl Daemon {
         w.used = TICK.fetch_add(1, Ordering::Relaxed);
         let size = w.size;
         st.size_owner = Some(client.id);
+        st.size_held_by = holds(client).then_some(client.id);
         self.set_size(st, size);
     }
 
-    /// `client` is gone: when the pane had its size, the last user left takes over.
+    /// `client` is gone, or no longer shows the pane: when the pane had its size, the last user
+    /// left takes over.
     pub(super) fn forget_size(&self, st: &mut PaneState, client: u64) {
+        if st.size_held_by == Some(client) {
+            st.size_held_by = None;
+        }
         if st.wanted.remove(&client).is_none() {
             return;
         }
@@ -89,7 +111,14 @@ impl Daemon {
             self.set_size(st, next.size);
         }
     }
+}
 
+/// Whether the pane `client` sizes stays its size until it lets go (the phone).
+fn holds(client: &Client) -> bool {
+    client.mobile.load(Ordering::Relaxed)
+}
+
+impl Daemon {
     pub(super) fn set_size(&self, st: &mut PaneState, size: PaneSize) {
         if st.info.size == size {
             return;
