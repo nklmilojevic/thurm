@@ -53,24 +53,24 @@ final class SplitMotionTests: XCTestCase {
         XCTAssertEqual(Motion.paneSpring.value(at: 1), 1)
     }
 
-    /// Rex's "Snappy": half the way at 74 ms, 90% at 171 ms, settled by Core Animation at 0.5 s.
+    /// Half the way at 30 ms, 90% at 68 ms, settled by Core Animation at 0.2 s.
     func testPaneSpringMatchesCoreAnimation() {
         let settle = Motion.paneSettle
-        XCTAssertEqual(settle, 0.5, accuracy: 0.01)
-        XCTAssertEqual(Motion.paneSpring.value(at: 0.074 / settle), 0.5, accuracy: 0.01)
-        XCTAssertEqual(Motion.paneSpring.value(at: 0.171 / settle), 0.9, accuracy: 0.01)
+        XCTAssertEqual(settle, 0.2, accuracy: 0.01)
+        XCTAssertEqual(Motion.paneSpring.value(at: 0.030 / settle), 0.5, accuracy: 0.01)
+        XCTAssertEqual(Motion.paneSpring.value(at: 0.068 / settle), 0.9, accuracy: 0.01)
     }
 
-    /// A faster speed plays the curve of a stiffer spring, still critically damped, in its time.
-    func testFasterSpeedPlaysAStifferSpring() {
+    /// A slower speed plays the curve of a softer spring, still critically damped, in its time.
+    func testSlowerSpeedPlaysASofterSpring() {
         defer { Motion.speed = .normal }
-        Motion.speed = .faster
-        let scale = AnimationSpeed.faster.scale
-        let stiffer = CriticalSpring(stiffness: 520 / (scale * scale))
-        XCTAssertEqual(stiffer.settlingDuration, Motion.paneSettle, accuracy: 0.01)
-        XCTAssertEqual(Motion.fast, 0.12 * scale, accuracy: 1e-9)
+        Motion.speed = .slower
+        let scale = AnimationSpeed.slower.scale
+        let softer = CriticalSpring(stiffness: 3250 / (scale * scale))
+        XCTAssertEqual(softer.settlingDuration, Motion.paneSettle, accuracy: 0.01)
+        XCTAssertEqual(Motion.fast, 0.048 * scale, accuracy: 1e-9)
         for x in stride(from: 0.0, through: 1.0, by: 0.05) {
-            XCTAssertEqual(stiffer.value(at: x), Motion.paneSpring.value(at: x), accuracy: 1e-3)
+            XCTAssertEqual(softer.value(at: x), Motion.paneSpring.value(at: x), accuracy: 1e-3)
         }
     }
 
@@ -85,10 +85,10 @@ final class SplitMotionTests: XCTestCase {
             return config
         }
 
-        manager.config = loaded("faster")
-        XCTAssertEqual(Motion.speed, .faster)
-        XCTAssertEqual(Motion.paneSettle, Motion.paneSpring.settlingDuration * 0.4, accuracy: 1e-9)
-        XCTAssertEqual(Motion.standard, 0.18 * 0.4, accuracy: 1e-9)
+        manager.config = loaded("slower")
+        XCTAssertEqual(Motion.speed, .slower)
+        XCTAssertEqual(Motion.paneSettle, Motion.paneSpring.settlingDuration * 2.5, accuracy: 1e-9)
+        XCTAssertEqual(Motion.standard, 0.072 * 2.5, accuracy: 1e-9)
 
         manager.config = loaded("normal")
         XCTAssertEqual(Motion.speed, .normal)
