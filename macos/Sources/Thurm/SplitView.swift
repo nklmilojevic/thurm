@@ -259,7 +259,11 @@ final class TabContentView: NSView {
     /// `layoutProgress` eases them to the layout.
     private var motionFrom: [PaneKey: CGRect] = [:]
     private var layoutProgress = Tween(1)
-    private let layoutMotion = MotionDriver()
+    /// The time `layoutPanes` lays out for while a move is recorded (see `playMove`).
+    private var layoutClock: CFTimeInterval?
+    /// Layers playing the move's frames, and which move that is.
+    private var movingLayers: [CALayer] = []
+    private var moveGeneration = 0
     /// Panes opening in the current move, from the split edge they grow out of.
     private var entering: [PaneKey: CGRect] = [:]
     /// Panes closing in the current move: their views (detached, showing their last frame) and
@@ -308,11 +312,21 @@ final class TabContentView: NSView {
 
     private var isMoving: Bool { !layoutProgress.isFinished(at: CACurrentMediaTime()) }
 
-    /// Each visible pane's rectangle: its card with headers, else its whole view. During a layout
-    /// move, the rectangles on the way from where the panes were.
-    private var visibleFrames: [(PaneKey, CGRect)] {
-        let targets = targetFrames
+    /// The moment the layout is for: a frame of a move being recorded, else the end of the move
+    /// in progress (Core Animation shows the frames on the way, and the layers hold where they
+    /// end up), else now.
+    private var layoutTime: CFTimeInterval {
+        if let layoutClock { return layoutClock }
         let now = CACurrentMediaTime()
+        return layoutProgress.isFinished(at: now) ? now : layoutProgress.end
+    }
+
+    private var visibleFrames: [(PaneKey, CGRect)] { frames(at: layoutTime) }
+
+    /// Each visible pane's rectangle at `now`: its card with headers, else its whole view. During
+    /// a layout move, the rectangles on the way from where the panes were.
+    private func frames(at now: CFTimeInterval) -> [(PaneKey, CGRect)] {
+        let targets = targetFrames
         guard !layoutProgress.isFinished(at: now) else { return targets }
         let t = CGFloat(layoutProgress.value(at: now))
         let moving = targets.map { id, rect in
@@ -416,7 +430,10 @@ final class TabContentView: NSView {
     }
 
     override func setFrameSize(_ newSize: NSSize) {
+        let resized = newSize != frame.size
         super.setFrameSize(newSize)
+        // A move's frames were laid out for the old size: settle it at the new one.
+        if resized && isMoving { finishLayoutMove() }
         layoutPanes()
     }
 
@@ -440,7 +457,7 @@ final class TabContentView: NSView {
             headers[id]?.isHidden = !visible.contains(id)
         }
         updateDimming()
-        let now = CACurrentMediaTime()
+        let now = layoutTime
         for (id, rect) in frames {
             guard let view = views[id] ?? leaving[id]?.view else { continue }
             let opacity = contentOpacity(id, at: now)
@@ -534,8 +551,13 @@ final class TabContentView: NSView {
                       height: max(0, inner.height - PaneHeader.height))
     }
 
+    /// `titlebarControlsMaxX` while a move is recorded: the titlebar holds still, and finding its
+    /// buttons walks the window's views, too slow for every frame.
+    private var recordingControls: CGFloat?
+
     /// `TerminalWindow.leadingControlsMaxX` in this view, when the panes run under the titlebar.
     private var titlebarControlsMaxX: CGFloat? {
+        if layoutClock != nil { return recordingControls }
         guard fullHeight, let window = window as? TerminalWindow else { return nil }
         let maxX = window.leadingControlsMaxX
         return maxX > 0 ? convert(NSPoint(x: maxX, y: 0), from: nil).x : nil
@@ -603,7 +625,7 @@ final class TabContentView: NSView {
 
     /// Runs a zoom change as a move: the panes glide from where they were to the new layout.
     private func transitionZoom(_ change: () -> Void) {
-        transitionLayout(curve: Motion.curve) {
+        transitionLayout {
             change()
             if let z = zoomedPane, let view = views[z] {
                 addSubview(view, positioned: .below, relativeTo: chrome)
@@ -615,9 +637,9 @@ final class TabContentView: NSView {
     /// new panes grow out of their split edge and fade in, and closed ones shrink into theirs
     /// and fade out. Terminals hold their grid until it settles, so the text does not reflow
     /// per frame; a new pane sizes its grid for its place first, so it opens at its final size.
-    private func transitionLayout(curve: CubicBezier, _ change: () -> Void) {
-        let duration = Motion.duration(Motion.standard)
-        let from = Dictionary(visibleFrames, uniquingKeysWith: { first, _ in first })
+    private func transitionLayout(_ change: () -> Void) {
+        let duration = Motion.duration(Motion.paneSettle)
+        let from = Dictionary(frames(at: CACurrentMediaTime()), uniquingKeysWith: { first, _ in first })
         let oldRoot = root
         let before = Set(views.keys)
         finishLayoutMove()
@@ -647,25 +669,59 @@ final class TabContentView: NSView {
         }
         motionFrom = from
         views.values.forEach { $0.holdGridSize = true }
-        layoutProgress = Tween(0, curve: curve)
-        layoutProgress.move(to: 1, duration: duration, at: CACurrentMediaTime())
-        layoutMotion.run(on: self, for: duration) { [weak self] time in
-            self?.layoutTick(time)
-        }
-        layoutPanes()
+        layoutProgress = Tween(0, curve: Motion.paneSpring)
+        playMove(duration: duration)
     }
 
-    private func layoutTick(_ now: CFTimeInterval) {
-        guard layoutProgress.isFinished(at: now) else {
-            needsLayout = true
-            return
+    /// Lays the move out once per display frame and hands the frames to Core Animation (see
+    /// `BakedMotion`), which plays them with no work from the app; the layers themselves take
+    /// where the move ends. It settles when the frames run out.
+    private func playMove(duration: TimeInterval) {
+        let fps = Double(window?.screen?.maximumFramesPerSecond ?? 60)
+        let count = max(1, Int((duration * fps).rounded(.up)))
+        let base = CACurrentMediaTime()
+        layoutProgress.move(to: 1, duration: duration, at: base)
+        var motion = BakedMotion()
+        recordingControls = titlebarControlsMaxX
+        // Views made for this move (a new pane's header) get their layers from AppKit at the
+        // next display, and a layer that does not exist yet records nothing: lay out the first
+        // frame and display it.
+        layoutClock = base
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        window?.displayIfNeeded()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let layer {
+            for frame in 0..<count {
+                layoutClock = base + duration * Double(frame) / Double(count)
+                // `layout()` lays the panes out, then the headers' contents.
+                needsLayout = true
+                layoutSubtreeIfNeeded()
+                motion.record(layer)
+            }
         }
-        finishLayoutMove()
+        layoutClock = nil
+        // Laying the frames out took a moment: the move starts now, from its first frame.
+        let start = CACurrentMediaTime()
+        layoutProgress.restart(at: start)
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        movingLayers = motion.play(begin: start, duration: duration, fps: Float(fps))
+        CATransaction.commit()
+        moveGeneration += 1
+        let generation = moveGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            guard let self, self.moveGeneration == generation else { return }
+            self.finishLayoutMove()
+        }
     }
 
     /// Settles the layout move in progress, if any: closed panes go, terminals take their size.
     private func finishLayoutMove() {
-        layoutMotion.stop()
+        moveGeneration += 1
+        BakedMotion.stop(movingLayers)
+        movingLayers = []
         layoutProgress = Tween(1)
         let moved = !motionFrom.isEmpty || !leaving.isEmpty
         motionFrom = [:]
@@ -806,7 +862,7 @@ final class TabContentView: NSView {
     func split(target: PaneKey? = nil, newPane: PaneKey, direction: SplitDirName, share: CGFloat? = nil,
                takeFocus: Bool = true) {
         let t = target.flatMap { root.contains($0) ? $0 : nil } ?? focusedPane
-        transitionLayout(curve: Motion.paneCurve) {
+        transitionLayout {
             zoomedPane = nil
             root = root.inserting(newPane, at: t, direction: direction, share: share ?? 0.5)
             if share == nil && SessionManager.shared.config.autoBalance { root = root.equalized() }
@@ -820,7 +876,7 @@ final class TabContentView: NSView {
         guard pane != target, root.contains(target), let rest = root.removing(pane), rest.contains(target) else {
             return
         }
-        transitionLayout(curve: Motion.paneCurve) {
+        transitionLayout {
             zoomedPane = nil
             root = rest.inserting(pane, at: target, direction: direction, share: share ?? 0.5)
             if share == nil && SessionManager.shared.config.autoBalance { root = root.equalized() }
@@ -831,7 +887,7 @@ final class TabContentView: NSView {
     /// Lays the tab out as `newRoot`, keeping the views of the panes it already shows. Panes of
     /// other tabs must have left them first.
     func setRoot(_ newRoot: SplitNode) {
-        transitionLayout(curve: Motion.paneCurve) {
+        transitionLayout {
             zoomedPane = nil
             root = newRoot
         }
@@ -887,7 +943,7 @@ final class TabContentView: NSView {
                 hypot(a.1.midX - center.x, a.1.midY - center.y) < hypot(b.1.midX - center.x, b.1.midY - center.y)
             })?.0 ?? (newRoot.panes.first ?? pane)
         }
-        transitionLayout(curve: Motion.paneCurve) { root = newRoot }
+        transitionLayout { root = newRoot }
         window?.invalidateCursorRects(for: self)
         if wasFocused { focus(nextFocus) }
         return false
