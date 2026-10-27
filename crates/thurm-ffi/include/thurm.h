@@ -70,6 +70,11 @@ char *thurm_write_temp_file(thurm_client *client, const char *name, const uint8_
  * "ConfigReloaded" does this for its own connection; call it for remote connections. */
 void thurm_reload_engine(thurm_client *client);
 
+/* Show the connection's panes in the light or dark variant of this device's theme, without
+ * telling the daemon (unlike a "SetAppearance" request, which changes the host's). For the
+ * iPhone, which follows its own appearance. */
+void thurm_set_local_appearance(thurm_client *client, bool dark);
+
 void thurm_string_free(char *s);
 
 /* ---------------------------------------------------------------------------------------
@@ -393,6 +398,11 @@ uint64_t thurm_image_serial(thurm_client *client, thurm_pane_id pane, uint32_t i
  * "config_path":"...","program_icons":{"neovim":"M...",...}} or {"error":"...","config":{defaults...},...}. `theme` is resolved for
  * the `dark` system appearance. Free the result. */
 char *thurm_config_json(bool dark);
+
+/* Theme `name` (a theme name or file) as JSON, like "theme" in thurm_config_json, or NULL when
+ * there is no such theme. For drawing theme previews without showing the theme. Free the
+ * result. */
+char *thurm_theme_json(const char *name);
 
 /* Show every pane in theme `name` (a theme name or file) without saving it; NULL goes back to
  * the configured theme. Returns the theme shown as JSON (like "theme" in thurm_config_json), or

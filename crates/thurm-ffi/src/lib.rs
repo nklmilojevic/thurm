@@ -359,6 +359,15 @@ impl Shared {
         self.locals.lock().get(&pane).cloned()
     }
 
+    /// Show the panes in the light or dark variant of the theme; whether it changed.
+    fn set_dark(&self, dark: bool) -> bool {
+        let changed = std::mem::replace(&mut self.engine.lock().dark, dark) != dark;
+        if changed {
+            self.reload_engine(false);
+        }
+        changed
+    }
+
     fn reload_engine(&self, reload_file: bool) {
         let cfg = {
             let mut e = self.engine.lock();
@@ -583,6 +592,16 @@ pub unsafe extern "C" fn thurm_write_temp_file(
 pub unsafe extern "C" fn thurm_reload_engine(client: *mut thurm_client) {
     if let Some(c) = unsafe { client_ref(client) } {
         c.shared.reload_engine(true);
+    }
+}
+
+/// Show the connection's panes in the light or dark variant of this device's theme, without
+/// telling the daemon: unlike a `SetAppearance` request, the host (and the other devices showing
+/// its panes) keep their appearance. The iPhone follows its own.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_set_local_appearance(client: *mut thurm_client, dark: bool) {
+    if let Some(c) = unsafe { client_ref(client) } {
+        c.shared.set_dark(dark);
     }
 }
 
@@ -877,13 +896,7 @@ impl thurm_client {
             | Request::Search { pane, .. }
             | Request::Scroll { pane, .. } => *pane,
             Request::SetAppearance { dark } => {
-                let changed = {
-                    let mut e = self.shared.engine.lock();
-                    std::mem::replace(&mut e.dark, *dark) != *dark
-                };
-                if changed {
-                    self.shared.reload_engine(false);
-                }
+                self.shared.set_dark(*dark);
                 return Err(req);
             }
             _ => return Err(req),
@@ -1490,6 +1503,19 @@ pub unsafe extern "C" fn thurm_set_session_theme(spec: *const c_char) -> *mut c_
     }
 }
 
+/// Theme `name` (a theme name or file) as JSON, like `theme` in `thurm_config_json`, or null
+/// when there is no such theme: the theme picker draws its previews with it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_theme_json(name: *const c_char) -> *mut c_char {
+    let Some(name) = (unsafe { opt_str(name) }) else {
+        return std::ptr::null_mut();
+    };
+    match thurm_config::load_theme(name).map(|t| serde_json::to_string(&t)) {
+        Ok(Ok(json)) => into_c(json),
+        _ => std::ptr::null_mut(),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn thurm_config_json(dark: bool) -> *mut c_char {
     let _ = thurm_config::ensure_default_config();
@@ -1620,6 +1646,32 @@ mod tests {
             let text = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
             assert!(text.contains("error"), "{text}");
         }
+    }
+
+    #[test]
+    fn local_appearance_changes_only_this_devices_engine() {
+        let shared = Shared::default();
+        assert!(shared.engine.lock().dark);
+        assert!(shared.set_dark(false));
+        assert!(!shared.engine.lock().dark);
+        assert!(!shared.set_dark(false), "no change, no reload");
+        // Without a connection there is nothing to change.
+        unsafe { thurm_set_local_appearance(std::ptr::null_mut(), true) };
+    }
+
+    #[test]
+    fn theme_json_has_the_colors() {
+        let json = unsafe { thurm_theme_json(c"thurm-light".as_ptr()) };
+        assert!(!json.is_null());
+        let text = unsafe { CStr::from_ptr(json) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { thurm_string_free(json) };
+        let t: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(t["background"], 0xfafbfc);
+        assert_eq!(t["palette"].as_array().unwrap().len(), 16);
+        assert!(unsafe { thurm_theme_json(c"no such theme".as_ptr()) }.is_null());
+        assert!(unsafe { thurm_theme_json(std::ptr::null()) }.is_null());
     }
 
     #[test]
