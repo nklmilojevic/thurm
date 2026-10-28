@@ -3,7 +3,7 @@
 use std::io::{BufWriter, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -203,6 +203,7 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
     // Weak: the client owns `rx`'s sender, and the writer only stops once every sender is gone.
     let counter = Arc::downgrade(&client);
     let last_written = client.last_written.clone();
+    let deflate = client.deflate.clone();
     let writer = std::thread::Builder::new()
         .name(format!("client-{}-writer", client.id))
         .spawn(move || {
@@ -221,14 +222,14 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
                 );
             };
             'write: while let Ok(msg) = rx.recv() {
-                if write_msg(&mut w, &msg).is_err() {
+                if write_msg(&mut w, &msg, &deflate).is_err() {
                     break;
                 }
                 written(&msg);
                 let mut batch = 1;
                 // Drain whatever else is queued before flushing.
                 while let Ok(msg) = rx.try_recv() {
-                    if write_msg(&mut w, &msg).is_err() {
+                    if write_msg(&mut w, &msg, &deflate).is_err() {
                         break 'write;
                     }
                     written(&msg);
@@ -320,8 +321,12 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
     }
 }
 
-fn write_msg<W: std::io::Write>(w: &mut W, msg: &ServerMessage) -> std::io::Result<()> {
-    let buf = codec::encode(msg)?;
+fn write_msg<W: std::io::Write>(
+    w: &mut W,
+    msg: &ServerMessage,
+    deflate: &AtomicBool,
+) -> std::io::Result<()> {
+    let buf = codec::encode_frame(msg, deflate.load(Ordering::Relaxed))?;
     w.write_all(&buf)
 }
 

@@ -11,7 +11,7 @@ thurm-client.workspace = true
 thurm-remote.workspace = true
 log.workspace = true
 serde.workspace = true
-russh = { version = "0.65", default-features = false, features = ["ring"] }
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
 p256 = { version = "0.14", features = ["ecdsa"], optional = true }
 
