@@ -200,24 +200,6 @@ fn ctrl_c_ends_what_a_program_reported_without_shell_integration() {
 }
 
 #[test]
-fn a_job_that_ends_right_after_reporting_leaves_no_status() {
-    let env = Env::new("program-status-quick-job");
-    let _d = env.start();
-    let (c, _) = env.connect();
-    let pane = create(&c, &env.dir);
-    run(
-        &c,
-        pane,
-        r#"sh -c "printf '\\033]7501;state=working:app=x\\033\\\\'""#,
-    );
-    // The shell has the prompt back; a job that started and ended between two ticks is not
-    // seen, so only the records that were parsed while it ran (or just after) matter here.
-    std::thread::sleep(Duration::from_millis(1500));
-    let i = info(&c, pane);
-    assert!(i.programs.is_empty() && i.agent.is_none(), "{i:?}");
-}
-
-#[test]
 fn a_job_status_survives_an_upgrade_and_ends_with_the_job() {
     let env = Env::new("program-status-upgrade-job");
     let daemon = env.start();

@@ -349,9 +349,6 @@ pub struct PaneState {
     /// The process group that was in the foreground when the program records last changed:
     /// when the shell has the terminal back from it, the records are over (see `monitor`).
     programs_pgrp: Option<u32>,
-    /// The last foreground process group the monitor saw that was not the pane's shell, and
-    /// when (see `report_pgrp`).
-    last_job: Option<(u32, Instant)>,
 }
 
 impl PaneState {
@@ -361,27 +358,6 @@ impl PaneState {
         let mut state = self.term.serialize_state();
         state.extend_from_slice(&self.forwarded_carry);
         state
-    }
-}
-
-/// How long a job the monitor saw in the foreground still gets the program reports the shell
-/// has the terminal back for (see `report_pgrp`).
-const JOB_REPORT_WINDOW: Duration = Duration::from_secs(1);
-
-/// The process group a program report belongs to. A job that reports and exits at once can be
-/// parsed after the shell has the terminal back, so a report that arrives with the shell in the
-/// foreground belongs to the job the monitor saw there just before. A job that starts and ends
-/// between two monitor ticks is never seen, so its reports cannot be attributed.
-fn report_pgrp(
-    fg: Option<u32>,
-    shell: Option<u32>,
-    last_job: Option<(u32, Instant)>,
-) -> Option<u32> {
-    match last_job {
-        Some((job, seen)) if fg.is_some() && fg == shell && seen.elapsed() < JOB_REPORT_WINDOW => {
-            Some(job)
-        }
-        _ => fg,
     }
 }
 
@@ -863,7 +839,6 @@ impl Daemon {
                 program_command: None,
                 command_check: None,
                 programs_pgrp: p.programs_pgrp,
-                last_job: None,
             }),
         });
         self.panes.lock().insert(id, pane.clone());
@@ -1250,8 +1225,9 @@ impl Daemon {
                     // Each report in turn: a request answered within the same read still
                     // notifies.
                     TermEvent::ProgramStatus(records) => {
-                        st.programs_pgrp =
-                            report_pgrp(st.pty.foreground_pgrp(), st.info.pid, st.last_job);
+                        // A report parsed after its program gave the terminal back counts as the
+                        // shell's, and so stays: the reader can't tell when the bytes were written.
+                        st.programs_pgrp = st.pty.foreground_pgrp();
                         outgoing.extend(self.sync_programs(pane.id, &mut st, records));
                         info_changed = true;
                     }
@@ -1643,14 +1619,10 @@ impl Daemon {
                     // ends (Ctrl+C), so the terminal coming back to the shell ends what the program
                     // reported. Not for a program that is the pane's process itself, nor for
                     // records the shell reported itself.
-                    let fg_pgrp = st.pty.foreground_pgrp();
-                    if fg_pgrp.is_some() && fg_pgrp != st.info.pid {
-                        st.last_job = fg_pgrp.map(|job| (job, Instant::now()));
-                    }
                     let mut programs_changed = false;
                     if st.programs_pgrp.is_some()
                         && st.programs_pgrp != st.info.pid
-                        && fg_pgrp == st.info.pid
+                        && st.pty.foreground_pgrp() == st.info.pid
                         && st
                             .info
                             .pid
@@ -3608,21 +3580,6 @@ mod tests {
             topic: None,
             permission,
         }
-    }
-
-    #[test]
-    fn a_report_just_after_a_job_belongs_to_the_job() {
-        let now = Instant::now();
-        let job = Some((7, now));
-        // The job is still in the foreground.
-        assert_eq!(report_pgrp(Some(7), Some(100), job), Some(7));
-        // The job reported and exited before the shell was parsed.
-        assert_eq!(report_pgrp(Some(100), Some(100), job), Some(7));
-        // The job was seen long ago: the shell's own report.
-        let old = Some((7, now - Duration::from_secs(5)));
-        assert_eq!(report_pgrp(Some(100), Some(100), old), Some(100));
-        // No job was seen.
-        assert_eq!(report_pgrp(Some(100), Some(100), None), Some(100));
     }
 
     #[test]
