@@ -214,3 +214,21 @@ fn a_job_status_survives_an_upgrade_and_ends_with_the_job() {
         i.programs.is_empty() && i.agent.is_none()
     });
 }
+
+/// A job that reports and exits at once: its report is parsed after the shell has the terminal
+/// back, but it was read while the job still had it.
+#[test]
+fn a_quick_job_reports_and_exits_leaves_no_status() {
+    let env = Env::new("program-status-quick-job");
+    let _d = env.start();
+    let (c, _) = env.connect();
+    let pane = create(&c, &env.dir);
+    run(
+        &c,
+        pane,
+        r#"sh -c "printf '\\033]7501;state=working:app=x\\033\\\\'""#,
+    );
+    wait_info(&c, pane, "the quick job's status ended", |i| {
+        i.programs.is_empty() && i.agent.is_none()
+    });
+}

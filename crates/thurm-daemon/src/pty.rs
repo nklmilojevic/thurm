@@ -240,8 +240,7 @@ impl Pty {
 
     /// Foreground process group of the terminal (the running job, or the shell itself).
     pub fn foreground_pgrp(&self) -> Option<u32> {
-        let pg = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
-        (pg > 0).then_some(pg as u32)
+        foreground_of(&self.master)
     }
 
     /// Echo disabled with canonical mode on: a password prompt (sudo, ssh, gpg...).
@@ -309,6 +308,12 @@ pub fn set_cloexec(fd: RawFd, on: bool) -> io::Result<()> {
 /// microseconds catches the next chunk instead, which drains a busy PTY about 1.7x faster
 /// (11 MB: 72 ms blocking, 42 ms spinning on an M3 Max). An idle pane spins once per burst.
 const READ_SPINS: u32 = 32;
+
+/// Foreground process group of the terminal `fd` is a master of (see `Pty::foreground_pgrp`).
+pub fn foreground_of(fd: &impl AsRawFd) -> Option<u32> {
+    let pg = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
+    (pg > 0).then_some(pg as u32)
+}
 
 /// Make the PTY master non-blocking, for [`read_pty`]. The flag belongs to the open file, so
 /// the writer's handle is non-blocking too: [`write_all`] waits in `poll` when it's full.

@@ -212,9 +212,32 @@ struct ReadAhead {
 #[derive(Default)]
 struct ReadAheadState {
     data: Vec<u8>,
+    /// The terminal's foreground process group when each part of `data` was read: from each
+    /// offset on, until the next.
+    groups: Vec<(usize, Option<u32>)>,
     eof: bool,
     /// The parser is working through a batch it took.
     parsing: bool,
+}
+
+/// `len` bytes read in parts, each with the foreground process group when it was read (from
+/// its offset on), as `(start, end, group)`. Bytes before the first part have no group.
+fn read_groups(len: usize, groups: &[(usize, Option<u32>)]) -> Vec<(usize, usize, Option<u32>)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut group = None;
+    for &(at, g) in groups {
+        let at = at.min(len);
+        if at > start {
+            out.push((start, at, group));
+        }
+        start = start.max(at);
+        group = g;
+    }
+    if len > start || out.is_empty() {
+        out.push((start, len, group));
+    }
+    out
 }
 
 /// A client subscribed to a pane's output.
@@ -349,6 +372,8 @@ pub struct PaneState {
     /// The process group that was in the foreground when the program records last changed:
     /// when the shell has the terminal back from it, the records are over (see `monitor`).
     programs_pgrp: Option<u32>,
+    /// The foreground process group when the output being parsed was read (see `reader_loop`).
+    output_pgrp: Option<u32>,
 }
 
 impl PaneState {
@@ -839,6 +864,7 @@ impl Daemon {
                 program_command: None,
                 command_check: None,
                 programs_pgrp: p.programs_pgrp,
+                output_pgrp: None,
             }),
         });
         self.panes.lock().insert(id, pane.clone());
@@ -894,6 +920,10 @@ impl Daemon {
                     break;
                 }
             };
+            // Who wrote it, as near the write as the daemon gets: a program that reports and
+            // exits at once has usually not given the terminal back yet, while the parser may
+            // only reach its bytes after the shell has.
+            let group = pty::foreground_of(&reader);
             let quiet = last_read.elapsed() >= QUIET;
             last_read = Instant::now();
             let mut st = pipe.state.lock();
@@ -902,7 +932,7 @@ impl Daemon {
                 // waking the parser, which is idle and has nothing queued. Nothing else can be
                 // appended meanwhile, so the order holds.
                 drop(st);
-                self.parse_guarded(&pane, &buf[..n]);
+                self.parse_guarded(&pane, &buf[..n], &[(0, group)]);
                 continue;
             }
             while st.data.len() >= READ_AHEAD {
@@ -915,6 +945,10 @@ impl Daemon {
                 let len = st.data.len();
                 st.data.reserve_exact(READ_AHEAD + buf.len() - len);
             }
+            if st.groups.last().is_none_or(|&(_, g)| g != group) {
+                let at = st.data.len();
+                st.groups.push((at, group));
+            }
             st.data.extend_from_slice(&buf[..n]);
             pipe.ready.notify_one();
         }
@@ -926,6 +960,7 @@ impl Daemon {
     fn parser_loop(self: Arc<Self>, pane: Arc<Pane>, pipe: Arc<ReadAhead>) {
         interactive_qos();
         let mut batch = Vec::new();
+        let mut groups = Vec::new();
         loop {
             {
                 let mut st = pipe.state.lock();
@@ -938,11 +973,13 @@ impl Daemon {
                 }
                 // Swap buffers: the reader keeps appending into the (emptied) previous batch.
                 std::mem::swap(&mut st.data, &mut batch);
+                std::mem::swap(&mut st.groups, &mut groups);
                 st.parsing = true;
                 pipe.room.notify_one();
             }
-            self.parse_guarded(&pane, &batch);
+            self.parse_guarded(&pane, &batch, &groups);
             batch.clear();
+            groups.clear();
             // After a burst, give the memory back rather than keep megabytes per pane (the
             // reader's buffer is this one after the next swap).
             if batch.capacity() > KEEP_BUFFER {
@@ -954,9 +991,11 @@ impl Daemon {
 
     /// [`Daemon::parse_output`], surviving a panic in the terminal code: the pane goes on with
     /// the next output instead of freezing with a dead parser thread.
-    fn parse_guarded(&self, pane: &Arc<Pane>, bytes: &[u8]) {
+    fn parse_guarded(&self, pane: &Arc<Pane>, bytes: &[u8], groups: &[(usize, Option<u32>)]) {
         let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.parse_output(pane, bytes)
+            for (start, end, group) in read_groups(bytes.len(), groups) {
+                self.parse_output(pane, &bytes[start..end], group);
+            }
         }));
         if parsed.is_err() {
             log::error!(
@@ -969,10 +1008,12 @@ impl Daemon {
 
     /// Feeds PTY output to the pane's terminal and forwards it to subscribers, a slice per
     /// lock so that requests for the pane are not held up by a long batch.
-    fn parse_output(&self, pane: &Arc<Pane>, bytes: &[u8]) {
+    /// `group` is the foreground process group when `bytes` were read.
+    fn parse_output(&self, pane: &Arc<Pane>, bytes: &[u8], group: Option<u32>) {
         for slice in bytes.chunks(PARSE_SLICE) {
             let events = {
                 let mut st = pane.state.lock();
+                st.output_pgrp = group;
                 // Forwarded even without subscribers: one may attach inside a sequence.
                 let data = st.term.advance_forward(slice);
                 update_carry(&mut st.forwarded_carry, &data);
@@ -1225,9 +1266,8 @@ impl Daemon {
                     // Each report in turn: a request answered within the same read still
                     // notifies.
                     TermEvent::ProgramStatus(records) => {
-                        // A report parsed after its program gave the terminal back counts as the
-                        // shell's, and so stays: the reader can't tell when the bytes were written.
-                        st.programs_pgrp = st.pty.foreground_pgrp();
+                        // Whose report: the group in the foreground when its bytes were read.
+                        st.programs_pgrp = st.output_pgrp.or_else(|| st.pty.foreground_pgrp());
                         outgoing.extend(self.sync_programs(pane.id, &mut st, records));
                         info_changed = true;
                     }
@@ -3580,6 +3620,19 @@ mod tests {
             topic: None,
             permission,
         }
+    }
+
+    #[test]
+    fn output_keeps_the_group_it_was_read_under() {
+        // A job's report, then the shell's prompt, read in one batch.
+        assert_eq!(
+            read_groups(10, &[(0, Some(7)), (6, Some(100))]),
+            vec![(0, 6, Some(7)), (6, 10, Some(100))]
+        );
+        assert_eq!(read_groups(4, &[(0, Some(7))]), vec![(0, 4, Some(7))]);
+        // Nothing recorded: no group, and the report falls back to the terminal's now.
+        assert_eq!(read_groups(4, &[]), vec![(0, 4, None)]);
+        assert_eq!(read_groups(0, &[]), vec![(0, 0, None)]);
     }
 
     #[test]
