@@ -90,6 +90,7 @@ pub fn run(c: &Client, action: Option<LayoutCmd>) -> super::R {
                     handoff: None,
                     wall: None,
                     floating: Vec::new(),
+                    floating_hidden: false,
                 };
                 // Once sent, only a confirmed pre-commit failure permits cleanup.
                 rollback = false;

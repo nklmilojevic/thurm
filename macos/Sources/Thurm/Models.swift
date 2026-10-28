@@ -425,6 +425,13 @@ struct TabLayout: Codable, Equatable {
     /// Panes floating above `root`, back to front (see FloatingPanes.swift). Nil rather than
     /// empty, so a tab without them is stored as before.
     var floating: [FloatingPane]? = nil
+    /// The floating panes are hidden (their programs keep running); nil when shown.
+    var floatingHidden: Bool? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case title, root, focused, zoomed, handoff, wall, floating
+        case floatingHidden = "floating_hidden"
+    }
 
     /// The tab's panes: those of `root`, then the floating ones.
     var panes: [PaneKey] {
@@ -593,6 +600,7 @@ func retainTabs(_ tabs: [TabLayout], _ keep: (PaneKey) -> Bool) -> [TabLayout] {
         if let z = tab.zoomed, !ids.contains(z) { tab.zoomed = nil }
         tab.root = root
         tab.floating = floating.isEmpty ? nil : floating
+        if floating.isEmpty { tab.floatingHidden = nil }
         tab.wall = tab.wall.map { origins in
             origins.compactMap { o in
                 retainTabs([o.tab], keep).first.map { WallOrigin(index: o.index, after: o.after, tab: $0) }

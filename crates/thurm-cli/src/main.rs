@@ -249,6 +249,24 @@ enum Cmd {
         #[arg(short, long)]
         pane: Option<PaneId>,
     },
+    /// Run COMMAND (default: shell) in a new pane floating above a tab's splits.
+    NewFloat {
+        /// A pane of the tab (default: current pane).
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        hold: bool,
+        /// Leave the focus and the app where they are.
+        #[arg(long)]
+        background: bool,
+        /// Wait for COMMAND to exit, and exit with its status.
+        #[arg(long)]
+        wait: bool,
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
     /// Move a pane next to another one, in its tab or another tab; its program keeps running.
     Move {
         /// Pane to move (default: current pane).
@@ -1401,6 +1419,37 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                 None
             };
             layout_ui(c, UiCommand::Float { pane, on })?;
+        }
+        Cmd::NewFloat {
+            pane,
+            cwd,
+            hold,
+            background,
+            wait,
+            command,
+        } => {
+            // The app floats it in the frontmost tab when `--pane` names none: refuse that first.
+            if let Some(p) = pane
+                && pane_info(c, p).is_none()
+            {
+                return Err(format!("no pane {p}").into());
+            }
+            let target = current_pane(pane).ok();
+            let new = create(c, command, cwd, target, hold || wait, None)?;
+            open(
+                c,
+                UiCommand::Split {
+                    target,
+                    pane: new,
+                    dir: SplitDir::Right,
+                },
+                UiCommand::OpenFloating {
+                    pane: new,
+                    target,
+                    background,
+                },
+            );
+            return opened(c, new, wait, hold, json);
         }
         Cmd::Dock { pane } => {
             let pane = current_pane(pane)?;

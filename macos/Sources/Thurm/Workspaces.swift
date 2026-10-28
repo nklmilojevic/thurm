@@ -175,7 +175,8 @@ extension SessionManager {
         }
         for tab in target.hiddenTabs {
             let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
-                                   title: tab.title, frame: nil, floating: tab.floating)
+                                   title: tab.title, frame: nil, floating: tab.floating,
+                                   floatingHidden: tab.floatingHidden)
             t.handoffID = tab.handoff
             t.wall = tab.wall
             add(t)
@@ -273,7 +274,8 @@ extension SessionManager {
         var created: [TerminalWindowController] = []
         for tab in ws.hiddenTabs {
             let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
-                                   title: tab.title, frame: frame, floating: tab.floating)
+                                   title: tab.title, frame: frame, floating: tab.floating,
+                                   floatingHidden: tab.floatingHidden)
             c.workspaceID = ws.id
             c.handoffID = tab.handoff
             c.wall = tab.wall

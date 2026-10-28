@@ -206,8 +206,11 @@ extension SessionManager {
             if let i = r.into {
                 let t = existing[i]
                 t.content.setRoot(r.root)
-                t.content.addFloating(r.floating)
-                if t.content.contains(r.origin.tab.focusedKey) { t.content.setFocusedPane(r.origin.tab.focusedKey) }
+                t.content.addFloating(r.floating, hidden: r.origin.tab.floatingHidden ?? false)
+                let key = r.origin.tab.focusedKey
+                if t.content.contains(key) && !(t.content.floatingHidden && t.content.isFloating(key)) {
+                    t.content.setFocusedPane(key)
+                }
                 if let z = r.origin.tab.zoomedKey, r.root.contains(z) { t.content.zoom(z, true) }
                 t.updateTitle()
                 continue
@@ -217,7 +220,7 @@ extension SessionManager {
                 ? tab.focusedKey : r.root.panes[0]
             let zoomed = tab.zoomedKey.flatMap { r.root.contains($0) ? $0 : nil }
             let t = makeController(root: r.root, focused: pane, zoomed: zoomed, title: tab.title, frame: nil,
-                                   floating: r.floating)
+                                   floating: r.floating, floatingHidden: tab.floatingHidden)
             t.workspaceID = wall.workspaceID
             // Back after the tab it followed.
             let at = AgentWall.position(after: r.origin.after, index: r.origin.index,

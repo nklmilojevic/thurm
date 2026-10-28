@@ -74,6 +74,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_UI_LAYOUT,
     CAP_AGENT_WALL,
     CAP_FLOATING,
+    CAP_FLOATING_NEW,
 ];
 
 /// The pane takes the size of the client that used it last (see the daemon's `active_size`)
@@ -93,6 +94,9 @@ pub const CAP_AGENT_WALL: &str = "agent-wall";
 
 /// The UI carries out [`UiCommand::Float`].
 pub const CAP_FLOATING: &str = "floating-panes";
+
+/// The UI carries out [`UiCommand::OpenFloating`].
+pub const CAP_FLOATING_NEW: &str = "floating-new";
 
 /// The daemon's answer to a [`UiCommand`] that no open UI understands.
 pub const UI_TOO_OLD: &str = "the Thurm app is too old for this; update it";
@@ -1347,6 +1351,14 @@ pub enum UiCommand {
         pane: PaneId,
         on: Option<bool>,
     },
+    /// Show an existing pane floating above the splits of `target`'s tab (or the focused
+    /// one's). Needs [`CAP_FLOATING_NEW`].
+    OpenFloating {
+        pane: PaneId,
+        target: Option<PaneId>,
+        /// Keep the focus, the selected tab and the app where they are.
+        background: bool,
+    },
 }
 
 impl UiCommand {
@@ -1354,7 +1366,9 @@ impl UiCommand {
     /// know the command.
     pub fn layout_panes(&self) -> Vec<PaneId> {
         match self {
-            UiCommand::Open { target, .. } => target.iter().copied().collect(),
+            UiCommand::Open { target, .. } | UiCommand::OpenFloating { target, .. } => {
+                target.iter().copied().collect()
+            }
             UiCommand::Zoom { pane, .. } => vec![*pane],
             UiCommand::MovePane { pane, target, .. } => vec![*pane, *target],
             UiCommand::SwapPanes { a, b } => vec![*a, *b],
@@ -1374,6 +1388,7 @@ impl UiCommand {
                 | UiCommand::SwapPanes { .. }
                 | UiCommand::AgentWall { .. }
                 | UiCommand::Float { .. }
+                | UiCommand::OpenFloating { .. }
         )
     }
 
@@ -1385,6 +1400,11 @@ impl UiCommand {
     /// Only UIs with [`CAP_FLOATING`] carry it out.
     pub fn needs_floating(&self) -> bool {
         matches!(self, UiCommand::Float { .. })
+    }
+
+    /// Only UIs with [`CAP_FLOATING_NEW`] carry it out.
+    pub fn needs_floating_new(&self) -> bool {
+        matches!(self, UiCommand::OpenFloating { .. })
     }
 }
 

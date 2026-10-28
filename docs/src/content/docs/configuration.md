@@ -149,6 +149,8 @@ the defaults alone.
 | `toggle_sidebar` | View > Hide Sidebar |
 | `toggle_active_pane_border` | View > Show Active Pane Border |
 | `zoom_split` | View > Zoom Split |
+| `toggle_floating_panes` | View > Show Floating Panes |
+| `new_floating_pane` | View > New Floating Pane |
 | `float_pane` | View > Float Pane |
 | `equalize_splits` | View > Equalize Splits |
 | `focus_left` | View > Select Split Left |

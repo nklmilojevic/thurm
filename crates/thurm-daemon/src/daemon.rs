@@ -271,6 +271,8 @@ pub struct Client {
     pub agent_wall: AtomicBool,
     /// A UI that floats panes ([`thurm_proto::CAP_FLOATING`]).
     pub floating: AtomicBool,
+    /// A UI that opens new floating panes ([`thurm_proto::CAP_FLOATING_NEW`]).
+    pub floating_new: AtomicBool,
     /// A remote client that takes deflated events ([`thurm_proto::CAP_DEFLATE`]). Shared with the
     /// client's writer thread, which encodes what it sends.
     pub deflate: Arc<AtomicBool>,
@@ -619,10 +621,12 @@ impl Daemon {
             .collect();
         let wall = cmd.needs_agent_wall();
         let floating = cmd.needs_floating();
+        let floating_new = cmd.needs_floating_new();
         let (capable, older): (Vec<_>, Vec<_>) = desktops.into_iter().partition(|c| {
             c.ui_layout.load(Ordering::Relaxed)
                 && (!wall || c.agent_wall.load(Ordering::Relaxed))
                 && (!floating || c.floating.load(Ordering::Relaxed))
+                && (!floating_new || c.floating_new.load(Ordering::Relaxed))
         });
         let shown_by_older = cmd.layout_panes().into_iter().any(|p| {
             self.pane(p).is_some_and(|p| {
@@ -659,6 +663,7 @@ impl Daemon {
             ui_layout: AtomicBool::new(false),
             agent_wall: AtomicBool::new(false),
             floating: AtomicBool::new(false),
+            floating_new: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
@@ -2492,6 +2497,9 @@ impl Daemon {
                 if has(thurm_proto::CAP_FLOATING) {
                     client.floating.store(true, Ordering::Relaxed);
                 }
+                if has(thurm_proto::CAP_FLOATING_NEW) {
+                    client.floating_new.store(true, Ordering::Relaxed);
+                }
                 if has(thurm_proto::CAP_DEFLATE) {
                     client.deflate.store(true, Ordering::Relaxed);
                 }
@@ -3796,6 +3804,7 @@ mod tests {
             ui_layout: AtomicBool::new(false),
             agent_wall: AtomicBool::new(false),
             floating: AtomicBool::new(false),
+            floating_new: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),

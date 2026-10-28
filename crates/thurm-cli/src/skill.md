@@ -163,6 +163,7 @@ thurm swap --pane ID --with OTHER                      # exchange places, in any
 thurm equalize --pane ID         # give the splits of its tab equal space
 thurm wall --on                  # gather the window's agents into one grid tab (--off: put back)
 thurm float --pane ID --on       # lift it above its tab's splits as a card (--off or `thurm dock`: back in)
+thurm new-float -- lazygit       # run it in a new card above this tab's splits (--pane ID: that tab)
 thurm title "backend"            # tab title (empty to reset)
 thurm workspace rename "api"     # name the current pane's workspace (--pane ID for another)
 thurm scroll --pane ID prev-prompt   # up, down, top, bottom, prev-prompt, next-prompt
@@ -177,8 +178,8 @@ reloads), `thurm theme [NAME]`, `thurm reload`.
 ## Finish
 
 Verify the result before reporting it: capture the pane, check `thurm info`, or look at the
-layout. `zoom`, `move`, `swap`, `wall`, `float`, `--background` and `--size` need a current Thurm app; an older
-one refuses them (`--background` and `--size` then fall back to a plain split or tab, with a
-warning). Report it in the user's terms ("opened a split below with the dev server on port
+layout. `zoom`, `move`, `swap`, `wall`, `float`, `new-float`, `--background` and `--size` need a current Thurm app; an older
+one refuses them (`new-float` then falls back to a split, and `--background` and `--size` to a
+plain split or tab, with a warning). Report it in the user's terms ("opened a split below with the dev server on port
 5173"), with anything that failed. Close the panes you created with `thurm close` when you no
 longer need them, and leave the user's panes alone.
