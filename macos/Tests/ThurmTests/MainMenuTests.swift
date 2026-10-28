@@ -188,4 +188,56 @@ final class MainMenuTests: XCTestCase {
         MainMenu.applyKeys(["cmd+1": "none"], commands: [], in: main)
         XCTAssertNil(MainMenu.keyedItem("1", [.command], in: main))
     }
+
+    private final class Receiver: NSObject, NSMenuItemValidation {
+        var enabled = true
+        var calls = 0
+        @objc func fire(_ sender: Any?) { calls += 1 }
+        func validateMenuItem(_ menuItem: NSMenuItem) -> Bool { enabled }
+    }
+
+    private func digitEvent(_ code: UInt16, _ typed: String, _ mods: NSEvent.ModifierFlags) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: mods, timestamp: 0,
+                         windowNumber: 0, context: nil, characters: typed,
+                         charactersIgnoringModifiers: typed, isARepeat: false, keyCode: code)!
+    }
+
+    /// AZERTY ⌘1 types "&": the fallback fires the item bound to ⌘1 once, unless its validation
+    /// disables it, the key is unbound or other modifiers are held.
+    func testPhysicalFallbackDispatchesValidatedItem() {
+        let app = NSApplication.shared
+        let saved = app.mainMenu
+        defer { app.mainMenu = saved }
+        let receiver = Receiver()
+        let item = NSMenuItem(title: "Select Tab 1", action: #selector(Receiver.fire(_:)), keyEquivalent: "1")
+        item.keyEquivalentModifierMask = [.command]
+        item.target = receiver
+        let sub = NSMenu(title: "Window")
+        sub.addItem(item)
+        let main = NSMenu()
+        main.addItem(NSMenuItem(title: "Window", action: nil, keyEquivalent: ""))
+        main.items[0].submenu = sub
+        app.mainMenu = main
+
+        XCTAssertTrue(MainMenu.physicalFallback(digitEvent(0x12, "&", [.command])))
+        XCTAssertEqual(receiver.calls, 1)
+        XCTAssertTrue(MainMenu.physicalFallback(digitEvent(0x53, "1", [.command])))
+        XCTAssertEqual(receiver.calls, 2)
+
+        XCTAssertFalse(MainMenu.physicalFallback(digitEvent(0x12, "1", [.command, .shift])))
+        XCTAssertFalse(MainMenu.physicalFallback(digitEvent(0x13, "é", [.command])))
+
+        receiver.enabled = false
+        XCTAssertFalse(MainMenu.physicalFallback(digitEvent(0x12, "&", [.command])))
+        sub.autoenablesItems = false
+        receiver.enabled = true
+        item.isEnabled = false
+        XCTAssertFalse(MainMenu.physicalFallback(digitEvent(0x12, "&", [.command])))
+        XCTAssertEqual(receiver.calls, 2)
+
+        item.isEnabled = true
+        item.keyEquivalent = ""
+        XCTAssertFalse(MainMenu.physicalFallback(digitEvent(0x12, "&", [.command])))
+        XCTAssertEqual(receiver.calls, 2)
+    }
 }

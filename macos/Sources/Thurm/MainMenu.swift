@@ -151,9 +151,19 @@ enum MainMenu {
               let digit = digitKeys[event.keyCode],
               let item = keyedItem(digit, [.command], in: NSApp.mainMenu),
               let action = item.action,
-              NSApp.target(forAction: action, to: item.target, from: item) != nil
+              let target = NSApp.target(forAction: action, to: item.target, from: item),
+              enabled(item, target: target)
         else { return false }
-        NSApp.sendAction(action, to: item.target, from: item)
+        NSApp.sendAction(action, to: target, from: item)
+        return true
+    }
+
+    /// Whether the menu would enable `item` with this target: its validation decides, as when the
+    /// menu matches the key itself, so a disabled action stays disabled.
+    static func enabled(_ item: NSMenuItem, target: Any) -> Bool {
+        guard item.menu?.autoenablesItems ?? true else { return item.isEnabled }
+        if let validator = target as? NSMenuItemValidation { return validator.validateMenuItem(item) }
+        if let validator = target as? NSUserInterfaceValidations { return validator.validateUserInterfaceItem(item) }
         return true
     }
 
