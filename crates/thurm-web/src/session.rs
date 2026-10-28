@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use serde_json::json;
 use thurm_proto::{
-    CAP_MOBILE, Envelope, Event, KeyAction, MouseButton, MouseEvent, MouseKind, PROTOCOL_VERSION,
-    PaneId, PaneSize, Request, Response, ScrollCmd, ServerMessage, codec, hello_compatible,
+    CAP_DEFLATE, CAP_MOBILE, Envelope, Event, KeyAction, MouseButton, MouseEvent, MouseKind,
+    PROTOCOL_VERSION, PaneId, PaneSize, Request, Response, ScrollCmd, ServerMessage, codec,
+    hello_compatible,
 };
 use thurm_term::{ClientView, EngineConfig, MouseOutcome, Terminal};
 use web_time::Instant;
@@ -72,8 +73,8 @@ impl Session {
             client: CLIENT.into(),
             version: PROTOCOL_VERSION,
             ui: false,
-            // Notices and pane info like the phone, no desktop UI commands.
-            capabilities: vec![CAP_MOBILE.into()],
+            // Notices and pane info like the phone, no desktop UI commands. Deflated events.
+            capabilities: vec![CAP_MOBILE.into(), CAP_DEFLATE.into()],
         });
         s
     }
@@ -135,7 +136,7 @@ impl Session {
     }
 
     fn message(&mut self, frame: &[u8]) {
-        let msg = match codec::decode::<ServerMessage>(frame) {
+        let msg = match codec::decode_message(frame) {
             Ok(m) => m,
             // A newer daemon's response: fail the request waiting for it. A newer event: skip.
             Err(_) => {
@@ -524,7 +525,10 @@ mod tests {
                     (client.as_str(), *version, *ui),
                     (CLIENT, PROTOCOL_VERSION, false)
                 );
-                assert_eq!(capabilities, &[CAP_MOBILE.to_owned()]);
+                assert_eq!(
+                    capabilities,
+                    &[CAP_MOBILE.to_owned(), CAP_DEFLATE.to_owned()]
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -634,6 +638,27 @@ mod tests {
         // A second Attach (the daemon resynced a client that fell behind) starts over.
         attach(&mut s, 4, b"again");
         assert_eq!(screen(&mut s, 4), ["again", "", "", ""]);
+    }
+
+    #[test]
+    fn deflated_output_is_unwrapped() {
+        let mut s = Session::new(true);
+        hello_ok(&mut s);
+        attach(&mut s, 4, b"hello\r\n");
+        let output = ServerMessage::Event(Event::Output {
+            pane: 4,
+            data: b"world\r\n".repeat(2048),
+        });
+        s.receive(&codec::encode_frame(&output, true).unwrap())
+            .unwrap();
+        let kinds: Vec<_> = s
+            .take_events()
+            .into_iter()
+            .map(|e| e["kind"].clone())
+            .collect();
+        assert_eq!(kinds, ["hello", "frame", "frame"]);
+        // The output scrolled the attach's line off the top: what's left is the output.
+        assert_eq!(screen(&mut s, 4)[0], "world");
     }
 
     #[test]

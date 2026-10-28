@@ -111,6 +111,10 @@ pub const CAP_PANE_PAGER: &str = "pane-pager";
 /// UI clients.
 pub const CAP_STATE_EVENTS: &str = "state-events";
 
+/// Sent only by remote clients (the iOS app over ssh or the tailnet, the web client): the daemon
+/// deflates the events it sends them, as [`Event::Compressed`] (see [`codec::encode_frame`]).
+pub const CAP_DEFLATE: &str = "deflate";
+
 /// Environment variable exported into every pane with the pane's id.
 pub const ENV_PANE_ID: &str = "THURM_PANE_ID";
 /// Environment variable exported into every pane with the daemon socket path.
@@ -648,6 +652,13 @@ pub enum Event {
     },
     /// Serving over Tailscale changed state (sign-in link, running, error...).
     TailscaleStatusChanged(TailscaleStatus),
+    /// An event sent deflated to a client that asked for it ([`CAP_DEFLATE`]): the raw deflate of
+    /// the postcard encoding of the `ServerMessage::Event` it stands for. Clients unwrap it with
+    /// [`codec::decode_message`], which never yields another `Compressed`.
+    Compressed {
+        #[serde(with = "bytes")]
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]

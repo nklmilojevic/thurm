@@ -189,6 +189,10 @@ impl Ssh {
                 "StreamLocalBindUnlink=yes",
                 "-o",
                 "StreamLocalBindMask=0177",
+                // Behind the extra options (`THURM_SSH_OPTIONS`), which ssh reads first: a
+                // `Compression=no` there wins.
+                "-o",
+                "Compression=yes",
                 "-L",
             ])
             .arg(format!("{}:{remote}", local.display()))
@@ -509,6 +513,32 @@ mod tests {
         assert!(!args.iter().any(|a| a.starts_with("ExitOnForwardFailure")));
         // First value wins in ssh: the hardening comes before the destination.
         assert!(args.iter().position(|a| a == "BatchMode=yes").unwrap() < args.len() - 1);
+    }
+
+    #[test]
+    fn tunnel_compresses_unless_the_extra_options_say_otherwise() {
+        let args = |extra: Vec<String>| -> Vec<String> {
+            let ssh = Ssh {
+                target: "me@box".into(),
+                config: "/c".into(),
+                program: "ssh".into(),
+                extra,
+            };
+            ssh.tunnel_command(Path::new("/l.sock"), "/r.sock")
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert!(
+            args(vec![])
+                .windows(2)
+                .any(|w| w == ["-o", "Compression=yes"])
+        );
+        // ssh takes the first value: the user's option, placed before this one, wins.
+        let user = args(vec!["-o".into(), "Compression=no".into()]);
+        let first = user.iter().position(|a| a == "Compression=no").unwrap();
+        let ours = user.iter().position(|a| a == "Compression=yes").unwrap();
+        assert!(first < ours);
     }
 
     #[test]

@@ -11,14 +11,16 @@
 //!
 //! A host without Thurm gets interactive shells on session channels ([`Session::open_shell`]).
 
+use std::borrow::Cow;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
 use russh::client::{self, AuthResult, Handle};
+use russh::compression;
 use russh::keys::ssh_key::public::{EcdsaPublicKey, KeyData};
 use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
-use russh::{ChannelMsg, Disconnect};
+use russh::{ChannelMsg, Disconnect, Preferred};
 use thurm_client::{Client, ClientError};
 use thurm_proto::Event;
 use thurm_remote::{HostInfo, RemoteExec, SshError};
@@ -195,6 +197,15 @@ impl Session {
         let config = Arc::new(client::Config {
             keepalive_interval: Some(Duration::from_secs(15)),
             keepalive_max: 3,
+            // Our order wins negotiation: zlib where the server has it, else none.
+            preferred: Preferred {
+                compression: Cow::Borrowed(&[
+                    compression::ZLIB_LEGACY,
+                    compression::ZLIB,
+                    compression::NONE,
+                ]),
+                ..Preferred::DEFAULT
+            },
             ..Default::default()
         });
         let public = public_key(key.as_ref())?;
@@ -591,7 +602,11 @@ pub fn connect(
         stream,
         client_name,
         false,
-        &[thurm_proto::CAP_MOBILE, thurm_proto::CAP_PANE_PAGER],
+        &[
+            thurm_proto::CAP_MOBILE,
+            thurm_proto::CAP_PANE_PAGER,
+            thurm_proto::CAP_DEFLATE,
+        ],
         on_event,
         on_disconnect,
     )
