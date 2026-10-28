@@ -114,6 +114,40 @@ fn the_agent_wall_needs_a_ui_that_knows_it() {
 }
 
 #[test]
+fn floating_needs_a_ui_that_knows_it() {
+    let env = Env::new("ui-float");
+    let _d = env.start();
+    // A UI with the other layout commands, from before floating panes.
+    let mut old = ui_with(&env, &[CAP_ACTIVE_SIZE, CAP_UI_LAYOUT, CAP_AGENT_WALL]);
+    let Ok(Response::PaneCreated { pane }) = send(
+        &mut old,
+        2,
+        Request::CreatePane(CreatePane {
+            cwd: Some(env.dir.display().to_string()),
+            ..Default::default()
+        }),
+    ) else {
+        panic!("no pane");
+    };
+    let float = UiCommand::Float {
+        pane,
+        on: Some(true),
+    };
+    let err = send(&mut old, 3, Request::Ui(float.clone())).unwrap_err();
+    assert_eq!(err, UI_TOO_OLD);
+    drop(old);
+
+    let (new, new_rx) = env.connect();
+    new.request(Request::Ui(float.clone())).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut got = false;
+    while Instant::now() < deadline && !got {
+        got = matches!(new_rx.recv_timeout(Duration::from_millis(200)), Ok(Event::Ui(ref c)) if *c == float);
+    }
+    assert!(got);
+}
+
+#[test]
 fn an_older_ui_showing_the_pane_refuses_it() {
     let env = Env::new("ui-mixed");
     let _d = env.start();

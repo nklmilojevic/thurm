@@ -331,6 +331,8 @@ enum MainMenu {
                           name: "toggle_active_pane_border"))
         menu.addItem(item("Zoom Split", #selector(TerminalWindowController.toggleZoom(_:)), "\r", [.command, .shift],
                           name: "zoom_split"))
+        menu.addItem(item("Float Pane", #selector(TerminalWindowController.toggleFloat(_:)), "\r", [.command, .option],
+                          name: "float_pane"))
         menu.addItem(item("Equalize Splits", #selector(TerminalWindowController.equalizeSplits(_:)), "=",
                           [.command, .control], name: "equalize_splits"))
         menu.addItem(.separator())

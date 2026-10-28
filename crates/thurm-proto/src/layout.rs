@@ -66,9 +66,10 @@ pub struct TabLayout {
     #[serde(default)]
     pub title: Option<String>,
     pub root: LayoutNode,
-    /// A pane of `root` (ids are unique per host, and a tab's panes share one host).
+    /// A pane of `root` or a floating one (ids are unique per host, and a tab's panes share
+    /// one host).
     pub focused: PaneId,
-    /// Pane shown zoomed (maximized within the tab).
+    /// Pane of `root` shown zoomed (maximized within the tab).
     #[serde(default)]
     pub zoomed: Option<PaneId>,
     /// A handoff tab: a remote agent working on a local repository (see `thurm handoff`).
@@ -77,6 +78,36 @@ pub struct TabLayout {
     /// The agent wall: the app gathered the agents of these tabs here, and puts them back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall: Option<Vec<WallOrigin>>,
+    /// Panes floating above `root`, back to front.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub floating: Vec<FloatingPane>,
+}
+
+/// A pane lifted out of a tab's splits, shown as a card above them.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct FloatingPane {
+    pub id: PaneId,
+    /// The `[[remote]]` host whose daemon runs the pane; `None` for this daemon's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// `[x, y, width, height]` as fractions of the tab's area, from its top left corner.
+    pub frame: [f64; 4],
+    /// Shown over the whole tab.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub zoomed: bool,
+}
+
+impl TabLayout {
+    /// This daemon's panes: the leaves of `root`, then the floating ones.
+    pub fn panes(&self, out: &mut Vec<PaneId>) {
+        self.root.panes(out);
+        out.extend(
+            self.floating
+                .iter()
+                .filter(|f| f.host.is_none())
+                .map(|f| f.id),
+        );
+    }
 }
 
 /// A tab the agent wall took agents from: its place among the window's tabs and how it looked.
@@ -180,7 +211,7 @@ impl Layout {
         let tabs = self.windows.iter().flat_map(|w| &w.tabs);
         let tabs = tabs.chain(self.workspaces.iter().flat_map(|w| &w.tabs));
         for t in tabs.chain(&self.quick) {
-            t.root.panes(&mut out);
+            t.panes(&mut out);
         }
         out
     }
@@ -212,14 +243,25 @@ impl Layout {
 fn retain_tabs(tabs: Vec<TabLayout>, keep: &dyn Fn(PaneId) -> bool) -> Vec<TabLayout> {
     tabs.into_iter()
         .filter_map(|mut t| {
-            let root = t.root.remap(&|id| keep(id).then_some(id))?;
+            t.floating.retain(|f| f.host.is_some() || keep(f.id));
+            let root = match t.root.remap(&|id| keep(id).then_some(id)) {
+                Some(root) => root,
+                // The splits are gone: the frontmost floating pane takes their place.
+                None => {
+                    let f = t.floating.pop()?;
+                    LayoutNode::Pane {
+                        id: f.id,
+                        host: f.host,
+                    }
+                }
+            };
             let mut leaves = Vec::new();
             root.leaves(&mut leaves);
-            let ids: Vec<PaneId> = leaves.iter().map(|(_, id)| *id).collect();
-            if !ids.contains(&t.focused) {
-                t.focused = ids[0];
+            let tiled: Vec<PaneId> = leaves.iter().map(|(_, id)| *id).collect();
+            if !tiled.contains(&t.focused) && !t.floating.iter().any(|f| f.id == t.focused) {
+                t.focused = tiled[0];
             }
-            if t.zoomed.is_some_and(|z| !ids.contains(&z)) {
+            if t.zoomed.is_some_and(|z| !tiled.contains(&z)) {
                 t.zoomed = None;
             }
             t.root = root;
@@ -258,6 +300,7 @@ mod tests {
                         zoomed: None,
                         handoff: None,
                         wall: None,
+                        floating: Vec::new(),
                     },
                     TabLayout {
                         title: Some("logs".into()),
@@ -266,6 +309,7 @@ mod tests {
                         zoomed: None,
                         handoff: None,
                         wall: None,
+                        floating: Vec::new(),
                     },
                 ],
                 selected_tab: 1,
@@ -289,6 +333,7 @@ mod tests {
                         zoomed: None,
                         handoff: None,
                         wall: None,
+                        floating: Vec::new(),
                     }],
                     selected_tab: 0,
                     host: None,
@@ -301,6 +346,7 @@ mod tests {
                 zoomed: None,
                 handoff: None,
                 wall: None,
+                floating: Vec::new(),
             }),
         }
     }
@@ -373,6 +419,7 @@ mod tests {
             zoomed: None,
             handoff: Some("agent/quiet-otter".into()),
             wall: None,
+            floating: Vec::new(),
         });
         l.workspaces[0].host = Some("devbox".into());
         let json = serde_json::to_string(&l).unwrap();
@@ -404,6 +451,7 @@ mod tests {
             zoomed: None,
             handoff: None,
             wall: None,
+            floating: Vec::new(),
         };
         let split = |a, b| LayoutNode::Split {
             dir: SplitDir::Down,
@@ -439,5 +487,57 @@ mod tests {
         assert_eq!(origins.len(), 1);
         assert_eq!((origins[0].index, origins[0].after), (3, Some(6)));
         assert_eq!(origins[0].tab.root, split(7, 8));
+    }
+
+    #[test]
+    fn floating_panes_belong_to_their_tab() {
+        let card = |id, host: Option<&str>| FloatingPane {
+            id,
+            host: host.map(Into::into),
+            frame: [0.2, 0.2, 0.5, 0.5],
+            zoomed: false,
+        };
+        let mut l = sample();
+        // A tab without floating panes says nothing of them, and older layouts have none.
+        let json = serde_json::to_string(&l).unwrap();
+        assert!(!json.contains("floating"));
+        let tab = &mut l.windows[0].tabs[1];
+        tab.floating = vec![card(6, None), card(9, Some("devbox"))];
+        tab.focused = 6;
+        let json = serde_json::to_string(&l).unwrap();
+        assert!(json.contains(r#""floating":[{"id":6,"frame":[0.2,0.2,0.5,0.5]}"#));
+        assert_eq!(serde_json::from_str::<Layout>(&json).unwrap(), l);
+        // Only local floating panes count, after the tab's splits.
+        assert_eq!(l.panes(), vec![1, 2, 3, 6, 4, 5]);
+        // A focused floating pane stays focused while it lives.
+        l.retain_panes(&|id| id != 1);
+        assert_eq!(l.windows[0].tabs[1].focused, 6);
+        l.retain_panes(&|id| id != 6);
+        let tab = &l.windows[0].tabs[1];
+        assert_eq!(tab.focused, 3);
+        assert_eq!(tab.floating, vec![card(9, Some("devbox"))]);
+    }
+
+    #[test]
+    fn a_floating_pane_takes_over_the_splits() {
+        let card = |id| FloatingPane {
+            id,
+            host: None,
+            frame: [0.1, 0.1, 0.4, 0.4],
+            zoomed: true,
+        };
+        let mut l = sample();
+        let tab = &mut l.windows[0].tabs[1];
+        tab.floating = vec![card(6), card(7)];
+        tab.zoomed = Some(3);
+        // Pane 3 ended: the frontmost floating pane fills the tab, and nothing is zoomed.
+        l.retain_panes(&|id| id != 3);
+        let tab = &l.windows[0].tabs[1];
+        assert_eq!(tab.root, LayoutNode::local(7));
+        assert_eq!(tab.floating, vec![card(6)]);
+        assert_eq!((tab.focused, tab.zoomed), (7, None));
+        // The tab goes with its last pane.
+        l.retain_panes(&|id| id != 6 && id != 7);
+        assert_eq!(l.windows[0].tabs.len(), 1);
     }
 }

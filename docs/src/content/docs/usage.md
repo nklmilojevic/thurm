@@ -18,6 +18,7 @@ of tabs.
 | Move focus between panes | Cmd+Option+Arrow |
 | Move a divider | Cmd+Control+Arrow |
 | Zoom the current pane | Cmd+Shift+Return |
+| Float / dock the current pane | Cmd+Option+Return |
 | Equalize split sizes | Cmd+Control+= |
 | Command palette | Cmd+Shift+P |
 | Workspace switcher | Cmd+Shift+O |
@@ -25,6 +26,12 @@ of tabs.
 
 Menu items named here (such as **Thurm › Remotes…**) are in the menu bar and in the
 command palette.
+
+A floating pane is a card above the tab's splits. Drag its header to move it, drag
+its edges to resize it, and double-click the header to zoom it. To put it back, use
+**View › Dock Pane**, or hold Cmd while dragging its header over a pane and drop
+it on the side where it should go (Esc cancels the drag). The last pane of the
+splits can't float.
 
 Closing a pane stops its process. Quitting the app keeps processes running by
 default. See [Sessions](/sessions/).

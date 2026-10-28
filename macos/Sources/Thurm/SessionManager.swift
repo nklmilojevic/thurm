@@ -476,16 +476,16 @@ final class SessionManager: NSObject, CoreDelegate {
         workspaces = layout.workspaces.map { Workspace(layout: $0) }
         if let quick = layout.quick {
             QuickTerminal.shared.restore(quick)
-            placed.formUnion(quick.root.panes)
+            placed.formUnion(quick.panes)
         }
 
         // Hidden workspaces' panes are in use too (they run until a window shows them), and
         // the quick terminal's.
-        var used = Set(layout.workspaces.flatMap { $0.tabs.flatMap { $0.root.panes } })
-        used.formUnion(layout.quick?.root.panes ?? [])
+        var used = Set(layout.workspaces.flatMap { $0.tabs.flatMap { $0.panes } })
+        used.formUnion(layout.quick?.panes ?? [])
         for var w in layout.windows {
-            w.tabs = w.tabs.filter { tab in tab.root.panes.allSatisfy { !placed.contains($0) } }
-            placed.formUnion(w.tabs.flatMap { $0.root.panes })
+            w.tabs = w.tabs.filter { tab in tab.panes.allSatisfy { !placed.contains($0) } }
+            placed.formUnion(w.tabs.flatMap { $0.panes })
             // Thurm has one window: the front one of the layout. Older layouts' other windows
             // come back as workspaces in the background.
             if regularControllers.isEmpty {
@@ -493,7 +493,7 @@ final class SessionManager: NSObject, CoreDelegate {
             } else {
                 hideWindowLayout(w)
             }
-            used.formUnion(w.tabs.flatMap { $0.root.panes })
+            used.formUnion(w.tabs.flatMap { $0.panes })
         }
 
         // Panes that exist but are not in the layout: tabs of a workspace in the background.
@@ -541,7 +541,7 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         for tab in w.tabs {
             let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
-                                   title: tab.title, frame: frame)
+                                   title: tab.title, frame: frame, floating: tab.floating)
             c.workspaceID = ws?.id ?? 0
             c.handoffID = tab.handoff
             c.wall = tab.wall
@@ -602,7 +602,7 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     func controller(for pane: PaneKey) -> TerminalWindowController? {
-        liveControllers.first { $0.content.root.contains(pane) }
+        liveControllers.first { $0.content.contains(pane) }
     }
 
     func view(for pane: PaneKey) -> TerminalView? {
@@ -615,9 +615,9 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     func makeController(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, title: String?,
-                        frame: NSRect?, quick: Bool = false) -> TerminalWindowController {
-        let c = TerminalWindowController(root: root, focused: focused, zoomed: zoomed, title: title,
-                                         contentSize: defaultContentSize(), quick: quick)
+                        frame: NSRect?, quick: Bool = false, floating: [FloatingPane]? = nil) -> TerminalWindowController {
+        let c = TerminalWindowController(root: root, focused: focused, zoomed: zoomed, floating: floating ?? [],
+                                         title: title, contentSize: defaultContentSize(), quick: quick)
         if let frame = frame {
             c.window?.setFrame(frame, display: false)
         }
@@ -721,7 +721,7 @@ final class SessionManager: NSObject, CoreDelegate {
                 showAsNewWindow(c, frame: frame)
                 for tab in ws.hiddenTabs {
                     let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey,
-                                           zoomed: tab.zoomedKey, title: tab.title, frame: nil)
+                                           zoomed: tab.zoomedKey, title: tab.title, frame: nil, floating: tab.floating)
                     t.handoffID = tab.handoff
                     t.wall = tab.wall
                     attachAsTab(t, to: c)
@@ -1563,6 +1563,9 @@ final class SessionManager: NSObject, CoreDelegate {
             scheduleLayoutSave()
         case "AgentWall":
             if let pane = key("pane"), let c = controller(for: pane) { toggleAgentWall(in: c, on: jsonBool(d["on"])) }
+        case "Float":
+            guard let pane = key("pane"), let c = controller(for: pane), !c.isQuick || c.content.isFloating(pane) else { return }
+            c.content.setFloating(pane, jsonBool(d["on"]))
         case "SwapPanes":
             guard let a = key("a"), let b = key("b"), a != b,
                   let ca = controller(for: a), let cb = controller(for: b) else { return }

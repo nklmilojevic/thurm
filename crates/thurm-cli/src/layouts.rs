@@ -44,10 +44,13 @@ pub fn run(c: &Client, action: Option<LayoutCmd>) -> super::R {
                 .chain(&layout.quick)
                 .find(|t| {
                     let mut ids = Vec::new();
-                    t.root.panes(&mut ids);
+                    t.panes(&mut ids);
                     ids.contains(&pane)
                 })
                 .ok_or("pane is not in the saved layout")?;
+            if !tab.floating.is_empty() {
+                eprintln!("note: floating panes are not part of layout templates");
+            }
             let Response::Panes(panes) = c.request(Request::ListPanes)? else {
                 return Err("unexpected pane list response".into());
             };
@@ -86,6 +89,7 @@ pub fn run(c: &Client, action: Option<LayoutCmd>) -> super::R {
                     zoomed: None,
                     handoff: None,
                     wall: None,
+                    floating: Vec::new(),
                 };
                 // Once sent, only a confirmed pre-commit failure permits cleanup.
                 rollback = false;

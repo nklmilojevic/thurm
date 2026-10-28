@@ -197,7 +197,7 @@ final class QuickTerminal {
         guard controller == nil else { return }
         controller = SessionManager.shared.makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey,
                                                           zoomed: tab.zoomedKey, title: tab.title, frame: nil,
-                                                          quick: true)
+                                                          quick: true, floating: tab.floating)
     }
 
     /// Its last pane ended (or it was closed): the next show starts a new shell.
