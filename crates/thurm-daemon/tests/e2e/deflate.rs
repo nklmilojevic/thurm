@@ -14,13 +14,12 @@ struct Raw {
     events: std::collections::VecDeque<(bool, Event)>,
 }
 
-/// What a connection was sent: the output bytes, and how many of its output events were deflated
-/// and how many were small plain ones.
-#[derive(Default)]
+/// How a subscriber's replay came: deflated, small and plain, or big and plain.
+#[derive(Default, Debug)]
 struct Seen {
-    output: usize,
     deflated: usize,
     small_plain: usize,
+    big_plain: usize,
 }
 
 impl Raw {
@@ -64,10 +63,11 @@ impl Raw {
         }
     }
 
-    /// Reads the connection's events until its output reaches `bytes`.
-    fn output_until(&mut self, bytes: usize) -> Seen {
-        let mut seen = Seen::default();
-        while seen.output < bytes {
+    /// Subscribes to `pane` and says how the replay (`Attach`) it was sent came: the one big
+    /// event a screen gives.
+    fn subscribe(&mut self, pane: PaneId) -> Seen {
+        self.request(Request::Subscribe { pane }).unwrap();
+        loop {
             let (deflated, ev) = match self.events.pop_front() {
                 Some(queued) => queued,
                 None => {
@@ -80,17 +80,19 @@ impl Raw {
                     (is_compressed(&frame), ev)
                 }
             };
-            let Event::Output { data, .. } = ev else {
+            let Event::Attach { state, .. } = ev else {
                 continue;
             };
-            seen.output += data.len();
+            let mut seen = Seen::default();
             if deflated {
                 seen.deflated += 1;
-            } else if data.len() < codec::DEFLATE_MIN {
+            } else if state.len() < codec::DEFLATE_MIN {
                 seen.small_plain += 1;
+            } else {
+                seen.big_plain += 1;
             }
+            return seen;
         }
-        seen
     }
 }
 
@@ -102,56 +104,38 @@ fn is_compressed(frame: &[u8]) -> bool {
     )
 }
 
+/// A pane whose screen holds more than a kilobyte of output, so a subscriber's replay is big.
+fn filled_pane(env: &Env) -> (Arc<Client>, PaneId) {
+    let (c, _rx) = env.connect();
+    let pane = create(&c, &env.dir);
+    wait_match(&c, pane, r"\$");
+    c.request(Request::Input {
+        pane,
+        data: b"yes 'line of terminal output' | head -c 8192; echo marker-$((40+2))\n".to_vec(),
+    })
+    .unwrap();
+    wait_match(&c, pane, "marker-42");
+    (c, pane)
+}
+
 #[test]
 fn only_clients_that_ask_get_deflated_events() {
     let env = Env::new("deflate");
     let _daemon = env.start();
-    let (c, _rx) = env.connect();
-    let pane = create(&c, &env.dir);
-    wait_match(&c, pane, r"\$");
-
-    let mut asks = Raw::hello(&env, &[CAP_DEFLATE]);
-    let mut plain = Raw::hello(&env, &[]);
-    for raw in [&mut asks, &mut plain] {
-        raw.request(Request::Subscribe { pane }).unwrap();
-    }
-
-    // Small output first: plain for both.
-    c.request(Request::Input {
-        pane,
-        data: b"echo small\n".to_vec(),
-    })
-    .unwrap();
-    let small = asks.output_until(1);
-    assert!(small.small_plain >= 1, "{}", small.output);
-    assert_eq!(small.deflated, 0);
-
-    // Then a big one, repetitive so it deflates.
-    let big = 64 * 1024;
-    c.request(Request::Input {
-        pane,
-        data: format!("yes 'line of terminal output' | head -c {big}\n").into_bytes(),
-    })
-    .unwrap();
-    let asked = asks.output_until(big);
-    assert!(
-        asked.deflated >= 1,
-        "no deflated output for a client that asked"
-    );
-    let not_asked = plain.output_until(big);
-    assert_eq!(
-        not_asked.deflated, 0,
-        "a client that did not ask got deflated output"
-    );
+    let (c, pane) = filled_pane(&env);
+    let asks = Raw::hello(&env, &[CAP_DEFLATE]).subscribe(pane);
+    let plain = Raw::hello(&env, &[]).subscribe(pane);
+    assert_eq!(asks.deflated, 1, "{asks:?}");
+    assert_eq!(plain.deflated, 0, "{plain:?}");
+    assert_eq!(plain.big_plain, 1, "{plain:?}");
+    drop(c);
 }
 
 #[test]
 fn a_later_hello_keeps_the_capability() {
     let env = Env::new("deflate-hello");
     let _daemon = env.start();
-    let (c, _rx) = env.connect();
-    let pane = create(&c, &env.dir);
-    wait_match(&c, pane, r"\$");
+    let (_c, pane) = filled_pane(&env);
     // A second Hello on the connection, without the capability (a client asking for the daemon's
     // version), must not drop the first one's.
     let mut raw = Raw::hello(&env, &[CAP_DEFLATE]);
@@ -162,11 +146,5 @@ fn a_later_hello_keeps_the_capability() {
         capabilities: vec![],
     })
     .unwrap();
-    raw.request(Request::Subscribe { pane }).unwrap();
-    c.request(Request::Input {
-        pane,
-        data: format!("yes 'line of terminal output' | head -c {}\n", 64 * 1024).into_bytes(),
-    })
-    .unwrap();
-    assert!(raw.output_until(64 * 1024).deflated >= 1);
+    assert_eq!(raw.subscribe(pane).deflated, 1);
 }

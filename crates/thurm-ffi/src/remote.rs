@@ -12,7 +12,7 @@ use thurm_config::Config;
 use thurm_remote::doctor;
 use thurm_remote::handoff::{self, Registry, SshHost};
 use thurm_remote::install::{self, Method};
-use thurm_remote::tunnel::Supervisor;
+use thurm_remote::tunnel::{Supervisor, Transport};
 use thurm_remote::{RemoteExec, Ssh, SshError, pairing, policy};
 
 use crate::{Ctx, into_c, opt_str};
@@ -27,6 +27,18 @@ struct Manager {
 }
 
 static MANAGER: Mutex<Option<Manager>> = Mutex::new(None);
+
+/// Whether `socket` is the local end of a tailnet host's tunnel, a relay (see
+/// `thurm_remote::tunnel`) rather than an ssh forward.
+pub fn is_tailnet_socket(socket: &std::path::Path) -> bool {
+    let guard = MANAGER.lock();
+    guard.as_ref().is_some_and(|m| {
+        m.supervisors.values().any(|s| {
+            let status = s.status();
+            status.transport == Transport::Tailnet && std::path::Path::new(&status.socket) == socket
+        })
+    })
+}
 
 fn emit(cb: thurm_remote_status_cb, ctx: Ctx, json: &str) {
     if let (Some(cb), Ok(s)) = (cb, std::ffi::CString::new(json)) {

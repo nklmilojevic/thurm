@@ -323,12 +323,22 @@ impl Client {
         on_event: impl Fn(Event) + Send + 'static,
         on_disconnect: impl FnOnce() + Send + 'static,
     ) -> Result<Arc<Client>, ClientError> {
+        Self::connect_with(opts, &[], on_event, on_disconnect)
+    }
+
+    /// Like [`Client::connect`], with `extra_capabilities` in the Hello besides the build's.
+    pub fn connect_with(
+        opts: ConnectOptions<'_>,
+        extra_capabilities: &[&str],
+        on_event: impl Fn(Event) + Send + 'static,
+        on_disconnect: impl FnOnce() + Send + 'static,
+    ) -> Result<Arc<Client>, ClientError> {
         let stream = connect_socket(&opts)?;
         Self::from_stream(
             stream,
             opts.client_name,
             opts.ui,
-            &[],
+            extra_capabilities,
             on_event,
             on_disconnect,
         )
@@ -651,6 +661,64 @@ mod tests {
         assert!(e.contains("older build"), "{e}");
         assert_eq!(mismatched_protocol(&e), Some(PROTOCOL_VERSION));
         assert_eq!(probe_daemon(&sock).unwrap(), (PROTOCOL_VERSION, None));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn connect_with_says_the_extra_capabilities() {
+        let dir = std::env::temp_dir().join(format!("thurm-client-caps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = stream.unwrap();
+                let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut s) else {
+                    continue;
+                };
+                let Request::Hello { capabilities, .. } = env.request else {
+                    continue;
+                };
+                seen_tx.send(capabilities).unwrap();
+                codec::write_message(
+                    &mut s,
+                    &ServerMessage::Response {
+                        id: env.id,
+                        result: Ok(Response::Hello {
+                            version: PROTOCOL_VERSION,
+                            daemon_pid: 1,
+                            restored: false,
+                            build: "test".into(),
+                            capabilities: thurm_proto::CAPABILITIES
+                                .iter()
+                                .map(|c| (*c).to_owned())
+                                .collect(),
+                        }),
+                    },
+                )
+                .unwrap();
+            }
+        });
+        let opts = || ConnectOptions {
+            socket: sock.clone(),
+            spawn_daemon: None,
+            client_name: "test",
+            ui: false,
+        };
+        let _plain = Client::connect(opts(), |_| {}, || {}).unwrap();
+        let plain = seen_rx.recv().unwrap();
+        assert!(!plain.iter().any(|c| c == thurm_proto::CAP_DEFLATE));
+        let _deflate =
+            Client::connect_with(opts(), &[thurm_proto::CAP_DEFLATE], |_| {}, || {}).unwrap();
+        let asked = seen_rx.recv().unwrap();
+        assert!(asked.iter().any(|c| c == thurm_proto::CAP_DEFLATE));
+        assert!(
+            thurm_proto::CAPABILITIES
+                .iter()
+                .all(|c| asked.iter().any(|a| a == c))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
