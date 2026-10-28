@@ -31,6 +31,7 @@ fn apply(
             zoomed: None,
             handoff: None,
             wall: None,
+            floating: Vec::new(),
         };
         tx.send(client.request(Request::ApplyLayout {
             json: serde_json::to_string(&tab).unwrap(),

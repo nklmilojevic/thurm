@@ -414,22 +414,66 @@ indirect enum LayoutNode: Codable, Equatable {
 struct TabLayout: Codable, Equatable {
     var title: String?
     var root: LayoutNode
-    /// A pane id of `root` (a tab's panes share one host).
+    /// A pane id of `root` or of a floating pane (a tab's panes share one host).
     var focused: UInt64
+    /// A pane id of `root`.
     var zoomed: UInt64?
     /// A handoff tab: the handoff's id (see `thurm handoff`).
     var handoff: String? = nil
     /// The agent wall: the tabs its agents came from (see AgentWall.swift).
     var wall: [WallOrigin]? = nil
+    /// Panes floating above `root`, back to front (see FloatingPanes.swift). Nil rather than
+    /// empty, so a tab without them is stored as before.
+    var floating: [FloatingPane]? = nil
 
-    /// The panes of `root` that `focused` and `zoomed` name.
+    /// The tab's panes: those of `root`, then the floating ones.
+    var panes: [PaneKey] {
+        root.panes + (floating ?? []).map(\.pane)
+    }
+
+    /// The panes that `focused` and `zoomed` name.
     var focusedKey: PaneKey {
-        let panes = root.panes
+        let panes = panes
         return panes.first { $0.id == focused } ?? panes.first ?? .local(focused)
     }
 
     var zoomedKey: PaneKey? {
         zoomed.flatMap { z in root.panes.first { $0.id == z } }
+    }
+}
+
+/// `thurm_proto::FloatingPane`: a pane lifted out of a tab's splits, shown as a card above them.
+struct FloatingPane: Codable, Equatable {
+    var pane: PaneKey
+    /// `[x, y, width, height]` as fractions of the tab's area, from its top left corner.
+    var frame: [Double]
+    /// Shown over the whole tab.
+    var zoomed = false
+
+    private enum CodingKeys: String, CodingKey {
+        case id, host, frame, zoomed
+    }
+
+    init(pane: PaneKey, frame: [Double], zoomed: Bool = false) {
+        self.pane = pane
+        self.frame = frame
+        self.zoomed = zoomed
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let host = try c.decodeIfPresent(String.self, forKey: .host) ?? localHost
+        pane = PaneKey(host, try c.decode(UInt64.self, forKey: .id))
+        frame = try c.decode([Double].self, forKey: .frame)
+        zoomed = try c.decodeIfPresent(Bool.self, forKey: .zoomed) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(pane.id, forKey: .id)
+        if pane.isRemote { try c.encode(pane.host, forKey: .host) }
+        try c.encode(frame, forKey: .frame)
+        if zoomed { try c.encode(true, forKey: .zoomed) }
     }
 }
 
@@ -538,11 +582,17 @@ struct WorkspaceLayout: Codable, Equatable {
 func retainTabs(_ tabs: [TabLayout], _ keep: (PaneKey) -> Bool) -> [TabLayout] {
     tabs.compactMap { tab in
         var tab = tab
-        guard let root = tab.root.retaining(keep) else { return nil }
+        var floating = (tab.floating ?? []).filter { keep($0.pane) }
+        // The splits gone, the frontmost floating pane takes their place.
+        guard let root = tab.root.retaining(keep) ?? floating.popLast().map({ .pane($0.pane) }) else { return nil }
         let ids = root.panes.map(\.id)
-        if !ids.contains(tab.focused), let first = ids.first { tab.focused = first }
+        if !ids.contains(tab.focused), !floating.contains(where: { $0.pane.id == tab.focused }),
+           let first = ids.first {
+            tab.focused = first
+        }
         if let z = tab.zoomed, !ids.contains(z) { tab.zoomed = nil }
         tab.root = root
+        tab.floating = floating.isEmpty ? nil : floating
         tab.wall = tab.wall.map { origins in
             origins.compactMap { o in
                 retainTabs([o.tab], keep).first.map { WallOrigin(index: o.index, after: o.after, tab: $0) }
@@ -584,7 +634,7 @@ struct Layout: Codable, Equatable {
 
     var panes: [PaneKey] {
         (windows.flatMap { $0.tabs } + workspaces.flatMap { $0.tabs } + (quick.map { [$0] } ?? []))
-            .flatMap { $0.root.panes }
+            .flatMap { $0.panes }
     }
 
     /// Same semantics as `Layout::retain_panes` on the Rust side (which only sees its own).

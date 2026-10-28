@@ -101,9 +101,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     /// the tab groups, workspaces and saved windows.
     let isQuick: Bool
 
-    init(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, title: String?, contentSize: NSSize,
-         quick: Bool = false) {
-        content = TabContentView(root: root, focused: focused, zoomed: zoomed)
+    init(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, floating: [FloatingPane] = [], title: String?,
+         contentSize: NSSize, quick: Bool = false) {
+        content = TabContentView(root: root, focused: focused, zoomed: zoomed, floating: floating)
         isQuick = quick
         let rect = NSRect(origin: .zero, size: contentSize)
         // Tabs live in the titlebar, which is tinted with the theme (see TerminalWindow).
@@ -443,6 +443,14 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         content.toggleZoom()
     }
 
+    /// Floats the focused pane above the splits, or docks it back.
+    @objc func toggleFloat(_ sender: Any?) {
+        let pane = content.focusedPane
+        if !content.setFloating(pane, nil) {
+            content.focusedView?.showToast("The only pane of the splits can't float")
+        }
+    }
+
     @objc func toggleAgentWall(_ sender: Any?) {
         SessionManager.shared.toggleAgentWall(in: self)
     }
@@ -507,5 +515,15 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     /// The "+" button of the native tab bar.
     @objc override func newWindowForTab(_ sender: Any?) {
         SessionManager.shared.newTab(from: self)
+    }
+}
+
+extension TerminalWindowController: NSMenuItemValidation {
+    /// Float Pane reads Dock Pane while the focused pane floats.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard menuItem.action == #selector(toggleFloat(_:)) else { return true }
+        let floats = content.isFloating(content.focusedPane)
+        menuItem.title = floats ? "Dock Pane" : "Float Pane"
+        return floats || content.canFloat(content.focusedPane)
     }
 }

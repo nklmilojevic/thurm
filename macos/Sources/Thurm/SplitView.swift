@@ -251,6 +251,20 @@ final class TabContentView: NSView {
     private let focusRing = FocusRing()
     private(set) var focusedPane: PaneKey
     private(set) var zoomedPane: PaneKey?
+    /// Panes floating above the splits, back to front (see FloatingPanes.swift).
+    private(set) var floating: [FloatingCard] = []
+    /// Each card's fill and outline, by pane.
+    private var cardParts: [PaneKey: (back: FloatingCardBack, rim: FloatingCardRim)] = [:]
+    /// The pane of the splits focused last: where they split while a card has the focus.
+    private var lastTiledFocus: PaneKey?
+    /// Where docked panes floated, for when they float again.
+    private var floatedFrames: [PaneKey: CGRect] = [:]
+    /// Closing panes that were cards: they shrink in place instead of into a split edge.
+    private var leavingCards: Set<PaneKey> = []
+    private let dockIndicator = DockIndicator()
+    /// A card whose edges a drag is moving: the edges, and its rectangle and the pointer at the
+    /// start.
+    private var resizing: (pane: PaneKey, edges: FloatingEdges, start: CGRect, from: NSPoint)?
 
     private(set) var findBar: FindBar?
     private var noticeBadges: [NoticeBadge] = []
@@ -292,7 +306,8 @@ final class TabContentView: NSView {
     /// always in `fullHeight` mode or under the horizontal tab strip.
     var showsHeaders: Bool {
         SessionManager.shared.config.paneHeaders
-            && (hasMultipleVisiblePanes || fullHeight || (window as? TerminalWindow)?.tabStrip != nil)
+            && ((zoomedPane == nil && root.panes.count > 1) || fullHeight
+                || (window as? TerminalWindow)?.tabStrip != nil)
     }
 
     /// Where the split tree lays out, and the space between its panes.
@@ -352,8 +367,28 @@ final class TabContentView: NSView {
     }
 
     private var targetFrames: [(PaneKey, CGRect)] {
-        if let z = zoomedPane { return [(z, showsHeaders ? splitArea : paneArea)] }
-        return root.frames(in: splitArea, gap: splitGap)
+        let tiled = zoomedPane.map { [($0, showsHeaders ? splitArea : paneArea)] }
+            ?? root.frames(in: splitArea, gap: splitGap)
+        return tiled + floating.map { ($0.pane, cardRect($0)) }
+    }
+
+    /// Where cards go: the tab below the titlebar, clear of its edges.
+    private var floatArea: NSRect {
+        let inset = safeAreaInsets
+        return NSRect(x: bounds.minX + inset.left, y: bounds.minY + inset.top,
+                      width: max(0, bounds.width - inset.left - inset.right),
+                      height: max(0, bounds.height - inset.top - inset.bottom)).insetBy(dx: 8, dy: 8)
+    }
+
+    /// A card's rectangle; zoomed, the space a zoomed pane of the splits takes.
+    private func cardRect(_ card: FloatingCard) -> CGRect {
+        card.zoomed ? (showsHeaders ? splitArea : paneArea) : FloatingGeometry.rect(card.frame, in: floatArea)
+    }
+
+    /// The cards' rectangles as laid out now, back to front.
+    private var cardFrames: [(PaneKey, CGRect)] {
+        let frames = Dictionary(visibleFrames, uniquingKeysWith: { first, _ in first })
+        return floating.compactMap { card in frames[card.pane].map { (card.pane, $0) } }
     }
 
     private static func blend(_ a: CGRect, _ b: CGRect, _ t: CGFloat) -> CGRect {
@@ -362,16 +397,20 @@ final class TabContentView: NSView {
                height: max(0, a.height + (b.height - a.height) * t))
     }
 
-    init(root: SplitNode, focused: PaneKey, zoomed: PaneKey?) {
+    init(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, floating: [FloatingPane] = []) {
         self.root = root
         let panes = root.panes
-        self.focusedPane = panes.contains(focused) ? focused : (panes.first ?? focused)
+        var seen = Set(panes)
+        self.floating = floating.filter { seen.insert($0.pane).inserted }.map(FloatingCard.init)
+        self.focusedPane = seen.contains(focused) ? focused : (panes.first ?? focused)
+        self.lastTiledFocus = panes.contains(focused) ? focused : panes.first
         if let z = zoomed, panes.contains(z) { self.zoomedPane = z } else { self.zoomedPane = nil }
         super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         autoresizingMask = [.width, .height]
         addSubview(backdrop)
         addSubview(chrome)
         addSubview(focusRing)
+        addSubview(dockIndicator)
         syncViews()
         setNotices(Notices.shared.current)
     }
@@ -382,14 +421,19 @@ final class TabContentView: NSView {
 
     override var isFlipped: Bool { true }
 
-    var paneIds: [PaneKey] { root.panes }
+    /// The tab's panes: those of the splits, then the floating ones.
+    var paneIds: [PaneKey] { root.panes + floating.map(\.pane) }
     var isEmpty: Bool { views.isEmpty }
     var focusedView: TerminalView? { views[focusedPane] }
 
-    /// Panes currently on screen (all panes, or only the zoomed one).
+    func isFloating(_ pane: PaneKey) -> Bool { floating.contains { $0.pane == pane } }
+    func contains(_ pane: PaneKey) -> Bool { root.contains(pane) || isFloating(pane) }
+    /// Whether `pane` can float: a pane of the splits, which keep another.
+    func canFloat(_ pane: PaneKey) -> Bool { root.contains(pane) && root.panes.count > 1 }
+
+    /// Panes currently on screen (all panes, or only the zoomed one and the floating ones).
     var visiblePaneIds: [PaneKey] {
-        if let z = zoomedPane { return [z] }
-        return root.panes
+        (zoomedPane.map { [$0] } ?? root.panes) + floating.map(\.pane)
     }
 
     var hasMultipleVisiblePanes: Bool { visiblePaneIds.count > 1 }
@@ -400,7 +444,7 @@ final class TabContentView: NSView {
     /// `keepingClosed`, the views of removed panes stay on screen in `leaving` for a layout move
     /// to close (the move fills in where they shrink to).
     private func syncViews(keepingClosed: Bool = false) {
-        let ids = Set(root.panes)
+        let ids = Set(paneIds)
         for (id, view) in views where !ids.contains(id) {
             view.detach()
             views.removeValue(forKey: id)
@@ -412,16 +456,60 @@ final class TabContentView: NSView {
                 header?.removeFromSuperview()
             }
         }
-        for id in root.panes where views[id] == nil {
+        for id in paneIds where views[id] == nil {
             let view = TerminalView(pane: id)
             view.onDimDrawn = { [weak self] in
-                if self?.showsHeaders == true || self?.isMoving == true { self?.updateBackdrop() }
+                guard let self else { return }
+                if self.showsHeaders || self.isMoving || !self.floating.isEmpty { self.updateBackdrop() }
             }
             views[id] = view
             addSubview(view, positioned: .below, relativeTo: chrome)
         }
+        for (id, parts) in cardParts where !isFloating(id) && !(keepingClosed && leaving[id] != nil) {
+            parts.back.removeFromSuperview()
+            parts.rim.removeFromSuperview()
+            cardParts.removeValue(forKey: id)
+        }
+        for card in floating where cardParts[card.pane] == nil {
+            let parts = (back: FloatingCardBack(), rim: FloatingCardRim())
+            addSubview(parts.back)
+            addSubview(parts.rim)
+            cardParts[card.pane] = parts
+        }
+        restack()
         needsLayout = true
         updateBackdrop()
+    }
+
+    /// Orders the subviews: the splits under their chrome, then the cards back to front (each
+    /// its fill, terminal, header and outline), the dock indicator, and overlays (find bar,
+    /// notices) on top. Sorted in place: a view being clicked is never taken out of the window.
+    private func restack() {
+        var rank: [ObjectIdentifier: Int] = [:]
+        func set(_ view: NSView?, _ r: Int) { if let view { rank[ObjectIdentifier(view)] = r } }
+        for (i, view) in subviews.enumerated() { rank[ObjectIdentifier(view)] = 100_000 + i }
+        set(backdrop, 0)
+        for (i, view) in subviews.enumerated() where view is TerminalView || view is PaneHeader {
+            set(view, 100 + i)
+        }
+        set(chrome, 10_000)
+        set(focusRing, 10_001)
+        let cards = floating.map(\.pane) + leavingCards.sorted { $0.id < $1.id }
+        for (i, id) in cards.enumerated() {
+            let base = 20_000 + i * 4
+            set(cardParts[id]?.back, base)
+            set(views[id] ?? leaving[id]?.view, base + 1)
+            set(headers[id] ?? leaving[id]?.header, base + 2)
+            set(cardParts[id]?.rim, base + 3)
+        }
+        set(dockIndicator, 50_000)
+        withUnsafeMutablePointer(to: &rank) { ranks in
+            sortSubviews({ a, b, context in
+                let ranks = context!.assumingMemoryBound(to: [ObjectIdentifier: Int].self).pointee
+                let (x, y) = (ranks[ObjectIdentifier(a)] ?? 0, ranks[ObjectIdentifier(b)] ?? 0)
+                return x < y ? .orderedAscending : x > y ? .orderedDescending : .orderedSame
+            }, context: ranks)
+        }
     }
 
     override func layout() {
@@ -462,6 +550,11 @@ final class TabContentView: NSView {
             guard let view = views[id] ?? leaving[id]?.view else { continue }
             let opacity = contentOpacity(id, at: now)
             view.alphaValue = opacity
+            view.layer?.cornerRadius = cardParts[id] == nil ? 0 : Self.cardRadius - 1
+            if let parts = cardParts[id] {
+                layoutCard(id, rect: rect, view: view, parts: parts, opacity: opacity)
+                continue
+            }
             guard cards else {
                 leaving[id]?.header?.isHidden = true
                 view.frame = rect
@@ -471,23 +564,11 @@ final class TabContentView: NSView {
             // card opening or closing gets thinner than its border, and that inset is null.
             let inner = CGRect(x: rect.minX + 1, y: rect.minY + 1, width: max(0, rect.width - 2),
                                height: max(0, rect.height - 2))
-            let header = headers[id] ?? leaving[id]?.header ?? {
-                let h = PaneHeader(pane: id)
-                h.content = self
-                headers[id] = h
-                addSubview(h, positioned: .below, relativeTo: chrome)
-                return h
-            }()
+            let header = header(for: id)
             header.isHidden = false
             header.alphaValue = opacity
             header.frame = NSRect(x: inner.minX, y: inner.minY, width: inner.width, height: PaneHeader.height)
-            // A top pane at the window's leading edge (sidebar collapsed) keeps its icon and
-            // title clear of the traffic lights and toolbar buttons.
-            if let controls, inner.minX < controls, rect.minY <= splitArea.minY + 1 {
-                header.leadingInset = controls - inner.minX + 10
-            } else {
-                header.leadingInset = PaneHeader.leading
-            }
+            header.leadingInset = headerInset(inner: inner, rect: rect, controls: controls)
             view.frame = terminalFrame(in: rect, cards: true)
         }
         chrome.isHidden = !cards
@@ -495,12 +576,13 @@ final class TabContentView: NSView {
             settledControls = controls
             recheckTitlebarControls()
         }
+        let tiled = frames.filter { cardParts[$0.0] == nil }
         if cards {
             chrome.frame = bounds
             chrome.scale = window?.backingScaleFactor ?? 2
             chrome.area = full
-            chrome.cards = frames.map {
-                (rect: $0.1, focused: $0.0 == focusedPane && frames.count > 1)
+            chrome.cards = tiled.map {
+                (rect: $0.1, focused: $0.0 == focusedPane && tiled.count > 1)
             }
             chrome.accentsFocused = SessionManager.shared.config.activePaneBorder
             chrome.opacity = controller?.opacity ?? SessionManager.shared.config.opacity
@@ -517,10 +599,12 @@ final class TabContentView: NSView {
                 header.update(focused: id == focusedPane)
             }
         } else {
-            for header in headers.values { header.removeFromSuperview() }
-            headers.removeAll()
+            for (id, header) in headers where cardParts[id] == nil {
+                header.removeFromSuperview()
+                headers.removeValue(forKey: id)
+            }
         }
-        updateFocusRing(frames: frames, cards: cards)
+        updateFocusRing(frames: tiled, cards: cards)
         for view in views.values {
             view.visibilityChanged()
         }
@@ -539,6 +623,46 @@ final class TabContentView: NSView {
             bottom -= size.height + 6
         }
         updateBackdrop()
+    }
+
+    /// A top pane at the window's leading edge (sidebar collapsed) keeps its header's icon and
+    /// title clear of the traffic lights and toolbar buttons.
+    private func headerInset(inner: CGRect, rect: CGRect, controls: CGFloat?) -> CGFloat {
+        if let controls, inner.minX < controls, rect.minY <= splitArea.minY + 1 {
+            return controls - inner.minX + 10
+        }
+        return PaneHeader.leading
+    }
+
+    /// The header of `id`, made on first use.
+    private func header(for id: PaneKey) -> PaneHeader {
+        if let header = headers[id] ?? leaving[id]?.header { return header }
+        let h = PaneHeader(pane: id)
+        h.content = self
+        headers[id] = h
+        addSubview(h, positioned: .below, relativeTo: chrome)
+        if cardParts[id] != nil { restack() }
+        return h
+    }
+
+    /// A card in `rect`: its fill and shadow, the header across the top, the terminal below,
+    /// and the outline over both.
+    private func layoutCard(_ id: PaneKey, rect: CGRect, view: TerminalView,
+                            parts: (back: FloatingCardBack, rim: FloatingCardRim), opacity: CGFloat) {
+        parts.back.frame = rect
+        parts.back.alphaValue = opacity
+        parts.rim.frame = rect
+        parts.rim.alphaValue = opacity
+        parts.rim.update(focused: id == focusedPane)
+        let header = header(for: id)
+        header.isHidden = false
+        header.alphaValue = opacity
+        let inner = CGRect(x: rect.minX + 1, y: rect.minY + 1, width: max(0, rect.width - 2),
+                           height: max(0, rect.height - 2))
+        header.leadingInset = headerInset(inner: inner, rect: rect, controls: titlebarControlsMaxX)
+        header.frame = NSRect(x: inner.minX, y: inner.minY, width: inner.width, height: PaneHeader.height)
+        header.update(focused: id == focusedPane)
+        view.frame = terminalFrame(in: rect, cards: true)
     }
 
     /// A pane's terminal in its rectangle: all of it, or with cards inside the card's 1pt
@@ -641,6 +765,7 @@ final class TabContentView: NSView {
         let duration = Motion.duration(Motion.paneSettle)
         let from = Dictionary(frames(at: CACurrentMediaTime()), uniquingKeysWith: { first, _ in first })
         let oldRoot = root
+        let oldCards = Set(floating.map(\.pane))
         let before = Set(views.keys)
         finishLayoutMove()
         guard duration > 0 else {
@@ -655,18 +780,31 @@ final class TabContentView: NSView {
         let targets = Dictionary(targetFrames, uniquingKeysWith: { first, _ in first })
         let cards = showsHeaders
         for id in Set(views.keys).subtracting(before) {
-            guard let side = root.side(of: id), let rect = targets[id] else { continue }
-            entering[id] = SplitNode.collapsed(rect, axis: side.axis, second: side.second)
+            guard let rect = targets[id] else { continue }
+            if isFloating(id) {
+                // A new card grows a little where it lands as it fades in.
+                entering[id] = rect.insetBy(dx: rect.width * 0.06, dy: rect.height * 0.06)
+            } else {
+                guard let side = root.side(of: id) else { continue }
+                entering[id] = SplitNode.collapsed(rect, axis: side.axis, second: side.second)
+            }
             // The new terminal takes its final grid size, unseen, before the move starts.
             if let view = views[id] {
                 view.alphaValue = 0
-                view.frame = terminalFrame(in: rect, cards: cards)
+                view.frame = terminalFrame(in: rect, cards: cards || isFloating(id))
             }
         }
+        leavingCards = Set(leaving.keys).intersection(oldCards)
         for id in leaving.keys {
+            // A card shrinks a little where it is as it fades.
+            if leavingCards.contains(id), let rect = from[id] {
+                leaving[id]?.to = rect.insetBy(dx: rect.width * 0.06, dy: rect.height * 0.06)
+                continue
+            }
             guard let side = oldRoot.side(of: id), let rect = from[id] else { continue }
             leaving[id]?.to = SplitNode.collapsed(rect, axis: side.axis, second: side.second)
         }
+        if !leavingCards.isEmpty { restack() }
         motionFrom = from
         views.values.forEach { $0.holdGridSize = true }
         layoutProgress = Tween(0, curve: Motion.paneSpring)
@@ -731,6 +869,12 @@ final class TabContentView: NSView {
             pane.header?.removeFromSuperview()
         }
         leaving = [:]
+        leavingCards = []
+        for (id, parts) in cardParts where !isFloating(id) {
+            parts.back.removeFromSuperview()
+            parts.rim.removeFromSuperview()
+            cardParts.removeValue(forKey: id)
+        }
         guard moved else { return }
         layoutPanes()
         views.values.forEach { $0.holdGridSize = false }
@@ -754,9 +898,11 @@ final class TabContentView: NSView {
             let c = [bg.redComponent * scale, bg.greenComponent * scale, bg.blueComponent * scale, bg.alphaComponent]
             return NSColor(colorSpace: bg.colorSpace, components: c, count: 4)
         }
+        // Cards are filled by their own back, which hides the splits under them.
+        for (id, parts) in cardParts { parts.back.fill = surface(id) }
         // During a layout move, each pane's surface under its terminal: what shows where a held
         // grid does not reach and where content fades in or out.
-        let frames = visibleFrames
+        let frames = visibleFrames.filter { cardParts[$0.0] == nil }
         if isMoving {
             for (id, rect) in frames {
                 fills.append((rect, surface(id)))
@@ -778,7 +924,22 @@ final class TabContentView: NSView {
     }
 
     func dividerAt(_ point: NSPoint) -> SplitDivider? {
-        currentDividers.first { $0.hitRect.contains(point) }
+        let band = FloatingGeometry.band
+        guard !cardFrames.contains(where: { $0.1.insetBy(dx: -band, dy: -band).contains(point) }) else { return nil }
+        return currentDividers.first { $0.hitRect.contains(point) }
+    }
+
+    /// The card whose edge is at `point`, and which edges: the frontmost card there, as a
+    /// card covers the edges of those behind it.
+    private func cardEdges(at point: NSPoint) -> (pane: PaneKey, edges: FloatingEdges, rect: CGRect)? {
+        for (id, rect) in cardFrames.reversed() {
+            let edges = FloatingGeometry.edges(at: point, of: rect)
+            if !edges.isEmpty {
+                return floating.first { $0.pane == id }?.zoomed == true ? nil : (id, edges, rect)
+            }
+            if rect.contains(point) { return nil }
+        }
+        return nil
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -786,7 +947,7 @@ final class TabContentView: NSView {
         if let bar = findBar, !bar.isHidden, bar.frame.contains(local) {
             return super.hitTest(point)
         }
-        if dividerAt(local) != nil {
+        if cardEdges(at: local) != nil || dividerAt(local) != nil {
             return self
         }
         return super.hitTest(point)
@@ -796,6 +957,11 @@ final class TabContentView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        if let hit = cardEdges(at: p) {
+            focus(hit.pane)
+            resizing = (hit.pane, hit.edges, hit.rect, p)
+            return
+        }
         dragging = dividerAt(p)
         if let path = dragging?.path {
             setDividerHighlight(path)
@@ -805,6 +971,15 @@ final class TabContentView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if let r = resizing, let i = floating.firstIndex(where: { $0.pane == r.pane }) {
+            let p = convert(event.locationInWindow, from: nil)
+            let area = floatArea
+            let rect = FloatingGeometry.resized(r.start, edges: r.edges,
+                                                by: CGVector(dx: p.x - r.from.x, dy: p.y - r.from.y), in: area)
+            floating[i].frame = FloatingGeometry.fraction(of: rect, in: area)
+            needsLayout = true
+            return
+        }
         guard let d = dragging else {
             super.mouseDragged(with: event)
             return
@@ -824,6 +999,12 @@ final class TabContentView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if resizing != nil {
+            resizing = nil
+            window?.invalidateCursorRects(for: self)
+            SessionManager.shared.scheduleLayoutSave()
+            return
+        }
         if dragging != nil {
             dragging = nil
             setDividerHighlight(dividerAt(convert(event.locationInWindow, from: nil))?.path)
@@ -850,8 +1031,37 @@ final class TabContentView: NSView {
     }
 
     override func resetCursorRects() {
+        let band = FloatingGeometry.band
+        let cards = cardFrames
+        let holes = cards.map { $0.1.insetBy(dx: -band, dy: -band) }
         for d in currentDividers {
-            addCursorRect(d.hitRect, cursor: d.axis == .horizontal ? .resizeLeftRight : .resizeUpDown)
+            for rect in FloatingGeometry.uncovered(d.hitRect, axis: d.axis, by: holes) {
+                addCursorRect(rect, cursor: d.axis == .horizontal ? .resizeLeftRight : .resizeUpDown)
+            }
+        }
+        for (i, (id, r)) in cards.enumerated() where floating.first(where: { $0.pane == id })?.zoomed == false {
+            // A card's edges under the cards in front of it don't resize it (see `cardEdges`).
+            let above = holes[(i + 1)...]
+            let b2 = band * 2
+            let parts: [(CGRect, FloatingEdges)] = [
+                (CGRect(x: r.minX - band, y: r.minY + band, width: b2, height: r.height - b2), .left),
+                (CGRect(x: r.maxX - band, y: r.minY + band, width: b2, height: r.height - b2), .right),
+                (CGRect(x: r.minX + band, y: r.minY - band, width: r.width - b2, height: b2), .top),
+                (CGRect(x: r.minX + band, y: r.maxY - band, width: r.width - b2, height: b2), .bottom),
+                (CGRect(x: r.minX - band, y: r.minY - band, width: b2, height: b2), [.top, .left]),
+                (CGRect(x: r.maxX - band, y: r.minY - band, width: b2, height: b2), [.top, .right]),
+                (CGRect(x: r.minX - band, y: r.maxY - band, width: b2, height: b2), [.bottom, .left]),
+                (CGRect(x: r.maxX - band, y: r.maxY - band, width: b2, height: b2), [.bottom, .right]),
+            ]
+            for (rect, edges) in parts {
+                let pieces: [CGRect]
+                switch edges {
+                case .left, .right: pieces = FloatingGeometry.uncovered(rect, axis: .horizontal, by: Array(above))
+                case .top, .bottom: pieces = FloatingGeometry.uncovered(rect, axis: .vertical, by: Array(above))
+                default: pieces = above.contains { $0.intersects(rect) } ? [] : [rect]
+                }
+                for piece in pieces { addCursorRect(piece, cursor: FloatingGeometry.cursor(for: edges)) }
+            }
         }
     }
 
@@ -861,7 +1071,7 @@ final class TabContentView: NSView {
     /// part of the split (default: half, or even with auto-balance).
     func split(target: PaneKey? = nil, newPane: PaneKey, direction: SplitDirName, share: CGFloat? = nil,
                takeFocus: Bool = true) {
-        let t = target.flatMap { root.contains($0) ? $0 : nil } ?? focusedPane
+        let t = target.flatMap { root.contains($0) ? $0 : nil } ?? tiledFocus
         transitionLayout {
             zoomedPane = nil
             root = root.inserting(newPane, at: t, direction: direction, share: share ?? 0.5)
@@ -871,8 +1081,19 @@ final class TabContentView: NSView {
         window?.invalidateCursorRects(for: self)
     }
 
+    /// The pane of the splits the splits act on: the focused one, or while a card has the focus,
+    /// the one focused before it.
+    private var tiledFocus: PaneKey {
+        if root.contains(focusedPane) { return focusedPane }
+        return lastTiledFocus.flatMap { root.contains($0) ? $0 : nil } ?? root.panes[0]
+    }
+
     /// Moves `pane` of this tab next to `target`, keeping its view.
     func move(_ pane: PaneKey, nextTo target: PaneKey, direction: SplitDirName, share: CGFloat?) {
+        if isFloating(pane) {
+            dock(pane, nextTo: target, direction: direction, share: share)
+            return
+        }
         guard pane != target, root.contains(target), let rest = root.removing(pane), rest.contains(target) else {
             return
         }
@@ -890,25 +1111,32 @@ final class TabContentView: NSView {
         transitionLayout {
             zoomedPane = nil
             root = newRoot
+            floating.removeAll { newRoot.contains($0.pane) }
         }
-        if !root.contains(focusedPane), let first = root.panes.first { setFocusedPane(first) }
+        if !contains(focusedPane), let first = root.panes.first { setFocusedPane(first) }
         window?.invalidateCursorRects(for: self)
     }
 
     /// Exchanges the places of two panes of this tab.
     func swap(_ a: PaneKey, _ b: PaneKey) {
-        guard root.contains(a), root.contains(b) else { return }
+        guard contains(a), contains(b) else { return }
         root = root.swapping(a, b)
+        // A card trades places too: with the pane of the splits, or with the other card.
+        for i in floating.indices {
+            if floating[i].pane == a { floating[i].pane = b } else if floating[i].pane == b { floating[i].pane = a }
+        }
+        syncViews()
         layoutPanes()
         window?.invalidateCursorRects(for: self)
     }
 
     /// Puts `new`, a pane of another tab, where `old` is; `old` leaves this tab.
     func replace(_ old: PaneKey, with new: PaneKey) {
-        guard root.contains(old), !root.contains(new) else { return }
+        guard contains(old), !contains(new) else { return }
         let wasFocused = focusedPane == old
         if zoomedPane == old { zoomedPane = new }
         root = root.swapping(old, new)
+        for i in floating.indices where floating[i].pane == old { floating[i].pane = new }
         syncViews()
         if wasFocused {
             focusedPane = new
@@ -922,10 +1150,19 @@ final class TabContentView: NSView {
     /// Removes a pane's view. Returns true when the tab became empty.
     @discardableResult
     func remove(pane: PaneKey) -> Bool {
-        guard root.contains(pane) else { return views.isEmpty }
+        guard contains(pane) else { return views.isEmpty }
         let wasFocused = pane == focusedPane
+        if let i = floating.firstIndex(where: { $0.pane == pane }) {
+            floatedFrames[pane] = nil
+            transitionLayout { floating.remove(at: i) }
+            window?.invalidateCursorRects(for: self)
+            if wasFocused { focus(floating.last?.pane ?? tiledFocus) }
+            return false
+        }
         if zoomedPane == pane { zoomedPane = nil }
-        guard var newRoot = root.removing(pane) else {
+        // The splits' last pane closing: the frontmost card takes their place.
+        let promoted = root.panes == [pane] ? floating.last : nil
+        guard var newRoot = root.removing(pane) ?? promoted.map({ .leaf($0.pane) }) else {
             finishLayoutMove()
             views[pane]?.detach()
             views[pane]?.removeFromSuperview()
@@ -943,7 +1180,10 @@ final class TabContentView: NSView {
                 hypot(a.1.midX - center.x, a.1.midY - center.y) < hypot(b.1.midX - center.x, b.1.midY - center.y)
             })?.0 ?? (newRoot.panes.first ?? pane)
         }
-        transitionLayout { root = newRoot }
+        transitionLayout {
+            root = newRoot
+            if promoted != nil { floating.removeLast() }
+        }
         window?.invalidateCursorRects(for: self)
         if wasFocused { focus(nextFocus) }
         return false
@@ -952,7 +1192,7 @@ final class TabContentView: NSView {
     /// Makes `pane` the focused pane (and first responder when the window is visible).
     func focus(_ pane: PaneKey) {
         guard let view = views[pane] else { return }
-        if let z = zoomedPane, z != pane {
+        if let z = zoomedPane, z != pane, root.contains(pane) {
             transitionZoom { zoomedPane = nil }
         }
         setFocusedPane(pane)
@@ -965,10 +1205,20 @@ final class TabContentView: NSView {
         guard views[pane] != nil else { return }
         let changed = pane != focusedPane
         focusedPane = pane
+        if root.contains(pane) {
+            lastTiledFocus = pane
+        } else if let i = floating.firstIndex(where: { $0.pane == pane }), i != floating.count - 1 {
+            // A card with the focus comes to the front.
+            floating.append(floating.remove(at: i))
+            restack()
+            window?.invalidateCursorRects(for: self)
+            SessionManager.shared.scheduleLayoutSave()
+        }
         for view in views.values { view.needsRender = true }
         if changed { refreshHeaders() }
         if changed { updateDimming() }
-        if changed && showsHeaders { layoutPanes() }
+        // Cards draw their focus in their outline, with or without the splits' headers.
+        if changed && (showsHeaders || !floating.isEmpty) { layoutPanes() }
         if changed && !showsHeaders { updateFocusRing(frames: visibleFrames, cards: false) }
         if changed {
             controller?.focusedPaneChanged()
@@ -976,36 +1226,54 @@ final class TabContentView: NSView {
     }
 
     func moveFocus(_ direction: FocusDirection) {
-        guard zoomedPane == nil, let target = neighbor(of: focusedPane, direction) else { return }
+        guard zoomedPane == nil, let target = neighbor(of: focusedPane, direction, cards: true) else { return }
         focus(target)
     }
 
-    /// The pane next to `pane` in `direction`: overlapping ones first, then the closest.
-    private func neighbor(of pane: PaneKey, _ direction: FocusDirection) -> PaneKey? {
+    /// The pane next to `pane` in `direction`, among the splits and, with `cards`, the cards.
+    private func neighbor(of pane: PaneKey, _ direction: FocusDirection, cards: Bool = false) -> PaneKey? {
         guard let current = views[pane] else { return nil }
-        let cur = current.frame
+        let candidates = views.filter { id, _ in id != pane && (cards || root.contains(id)) }
+        return Self.neighbor(of: current.frame, among: candidates.map { ($0.key, $0.value.frame) }, direction)
+    }
+
+    /// The frame next to `cur` in `direction`: overlapping ones first, then the closest. A card
+    /// and a pane it lies over go by their centers.
+    static func neighbor(of cur: CGRect, among frames: [(PaneKey, CGRect)], _ direction: FocusDirection) -> PaneKey? {
         var best: (PaneKey, CGFloat)?
-        for (id, view) in views where id != pane {
-            let f = view.frame
+        for (id, f) in frames {
             let overlap: Bool
             let distance: CGFloat
-            switch direction {
-            case .left:
-                guard f.maxX <= cur.minX + 2 else { continue }
-                overlap = f.maxY > cur.minY && f.minY < cur.maxY
-                distance = cur.minX - f.maxX
-            case .right:
-                guard f.minX >= cur.maxX - 2 else { continue }
-                overlap = f.maxY > cur.minY && f.minY < cur.maxY
-                distance = f.minX - cur.maxX
-            case .up:
-                guard f.maxY <= cur.minY + 2 else { continue }
-                overlap = f.maxX > cur.minX && f.minX < cur.maxX
-                distance = cur.minY - f.maxY
-            case .down:
-                guard f.minY >= cur.maxY - 2 else { continue }
-                overlap = f.maxX > cur.minX && f.minX < cur.maxX
-                distance = f.minY - cur.maxY
+            if f.intersects(cur.insetBy(dx: 2, dy: 2)) {
+                let ahead: CGFloat
+                switch direction {
+                case .left: ahead = cur.midX - f.midX
+                case .right: ahead = f.midX - cur.midX
+                case .up: ahead = cur.midY - f.midY
+                case .down: ahead = f.midY - cur.midY
+                }
+                guard ahead > 0 else { continue }
+                overlap = true
+                distance = 0
+            } else {
+                switch direction {
+                case .left:
+                    guard f.maxX <= cur.minX + 2 else { continue }
+                    overlap = f.maxY > cur.minY && f.minY < cur.maxY
+                    distance = cur.minX - f.maxX
+                case .right:
+                    guard f.minX >= cur.maxX - 2 else { continue }
+                    overlap = f.maxY > cur.minY && f.minY < cur.maxY
+                    distance = f.minX - cur.maxX
+                case .up:
+                    guard f.maxY <= cur.minY + 2 else { continue }
+                    overlap = f.maxX > cur.minX && f.minX < cur.maxX
+                    distance = cur.minY - f.maxY
+                case .down:
+                    guard f.minY >= cur.maxY - 2 else { continue }
+                    overlap = f.maxX > cur.minX && f.minX < cur.maxX
+                    distance = f.minY - cur.maxY
+                }
             }
             // Prefer overlapping neighbours, then the closest center.
             let centerDistance = hypot(f.midX - cur.midX, f.midY - cur.midY)
@@ -1019,7 +1287,9 @@ final class TabContentView: NSView {
 
     /// Swaps the focused pane with its neighbour in `direction`; the focus stays on it.
     func movePane(_ direction: FocusDirection) {
-        guard zoomedPane == nil, let target = neighbor(of: focusedPane, direction) else { return }
+        guard zoomedPane == nil, root.contains(focusedPane), let target = neighbor(of: focusedPane, direction) else {
+            return
+        }
         root = root.swapping(focusedPane, target)
         layoutPanes()
         window?.invalidateCursorRects(for: self)
@@ -1028,6 +1298,10 @@ final class TabContentView: NSView {
 
     /// Zooms `pane` (true), restores the splits (false), or toggles (nil).
     func zoom(_ pane: PaneKey, _ on: Bool?) {
+        if isFloating(pane) {
+            zoomCard(pane, on)
+            return
+        }
         guard root.contains(pane) else { return }
         if on ?? (zoomedPane != pane) {
             guard root.panes.count > 1 else { return }
@@ -1042,11 +1316,147 @@ final class TabContentView: NSView {
     }
 
     func toggleZoom() {
+        if isFloating(focusedPane) {
+            zoomCard(focusedPane, nil)
+            return
+        }
         guard root.panes.count > 1 || zoomedPane != nil else { return }
         transitionZoom { zoomedPane = zoomedPane == nil ? focusedPane : nil }
         window?.invalidateCursorRects(for: self)
         if let view = views[focusedPane] { window?.makeFirstResponder(view) }
         SessionManager.shared.scheduleLayoutSave()
+    }
+
+    // MARK: Floating panes
+
+    /// Floats `pane` above the splits (true), docks it back into them (false), or toggles
+    /// (nil). False when it cannot float: the splits keep at least one pane.
+    @discardableResult
+    func setFloating(_ pane: PaneKey, _ on: Bool?) -> Bool {
+        let floats = isFloating(pane)
+        guard on ?? !floats else {
+            if floats {
+                let anchor = dockAnchor(for: pane)
+                dock(pane, nextTo: anchor.pane, direction: anchor.side, share: nil)
+                focus(pane)
+            }
+            return true
+        }
+        guard !floats else { return true }
+        guard canFloat(pane), let rest = root.removing(pane) else { return false }
+        let frame = floatedFrames[pane] ?? FloatingGeometry.defaultFraction(index: floating.count)
+        transitionLayout {
+            if zoomedPane == pane { zoomedPane = nil }
+            root = SessionManager.shared.config.autoBalance ? rest.equalized() : rest
+            floating.append(FloatingCard(pane: pane, frame: frame))
+        }
+        focus(pane)
+        window?.invalidateCursorRects(for: self)
+        SessionManager.shared.scheduleLayoutSave()
+        return true
+    }
+
+    /// Floats `cards`, panes of other tabs that left them first, above the splits.
+    func addFloating(_ cards: [FloatingPane]) {
+        let new = cards.filter { !contains($0.pane) }
+        guard !new.isEmpty else { return }
+        transitionLayout { floating += new.map(FloatingCard.init) }
+        window?.invalidateCursorRects(for: self)
+    }
+
+    /// Puts floating `pane` back into the splits, on `direction`'s side of `target`.
+    func dock(_ pane: PaneKey, nextTo target: PaneKey, direction: SplitDirName, share: CGFloat?) {
+        guard let i = floating.firstIndex(where: { $0.pane == pane }), root.contains(target) else { return }
+        floatedFrames[pane] = floating[i].frame
+        transitionLayout {
+            zoomedPane = nil
+            floating.remove(at: i)
+            root = root.inserting(pane, at: target, direction: direction, share: share ?? 0.5)
+            if share == nil && SessionManager.shared.config.autoBalance { root = root.equalized() }
+        }
+        window?.invalidateCursorRects(for: self)
+        SessionManager.shared.scheduleLayoutSave()
+    }
+
+    /// Where Dock Pane puts a card: next to the pane of the splits focused last (else the one
+    /// nearest the card), on the side the card is over.
+    private func dockAnchor(for pane: PaneKey) -> (pane: PaneKey, side: SplitDirName) {
+        let card = cardFrames.first { $0.0 == pane }?.1 ?? floatArea
+        let center = CGPoint(x: card.midX, y: card.midY)
+        let tiles = root.frames(in: splitArea, gap: splitGap)
+        let anchor = tiles.first { $0.0 == tiledFocus }
+            ?? tiles.min { hypot($0.1.midX - center.x, $0.1.midY - center.y) < hypot($1.1.midX - center.x, $1.1.midY - center.y) }
+        guard let anchor else { return (root.panes[0], .right) }
+        return (anchor.0, FloatingGeometry.dockSide(center, in: anchor.1))
+    }
+
+    /// Zooms a card over the whole tab (true), back to its place (false), or toggles (nil).
+    private func zoomCard(_ pane: PaneKey, _ on: Bool?) {
+        guard let i = floating.firstIndex(where: { $0.pane == pane }) else { return }
+        let zoomed = on ?? !floating[i].zoomed
+        guard zoomed != floating[i].zoomed else { return }
+        transitionLayout { floating[i].zoomed = zoomed }
+        if focusedPane != pane { focus(pane) }
+        window?.invalidateCursorRects(for: self)
+        SessionManager.shared.scheduleLayoutSave()
+    }
+
+    /// The pane of the splits under `point` a card dropped there docks next to, its side, and
+    /// the part of it the card would take.
+    private func dockTarget(at point: NSPoint, excluding pane: PaneKey) -> (pane: PaneKey, side: SplitDirName, rect: CGRect)? {
+        let tiles = visibleFrames.filter { root.contains($0.0) && $0.0 != pane }
+        guard let (id, rect) = tiles.first(where: { $0.1.contains(point) }) else { return nil }
+        let side = FloatingGeometry.dockSide(point, in: rect)
+        return (id, side, FloatingGeometry.dockRect(rect, side: side, gap: splitGap))
+    }
+
+    /// Moves a card by its header, from a mouse down until the button comes up. Dropped with ⌘
+    /// held over a pane of the splits, it docks there (where the indicator shows); Esc puts it
+    /// back where it was.
+    func trackCardDrag(_ pane: PaneKey, from event: NSEvent) {
+        guard let window, let start = floating.first(where: { $0.pane == pane }), !start.zoomed,
+              let startRect = cardFrames.first(where: { $0.0 == pane })?.1 else { return }
+        let origin = convert(event.locationInWindow, from: nil)
+        var moved = false
+        var cancelled = false
+        var target: (pane: PaneKey, side: SplitDirName, rect: CGRect)?
+        window.trackEvents(matching: [.leftMouseDragged, .leftMouseUp, .keyDown, .flagsChanged],
+                           timeout: NSEvent.foreverDuration, mode: .eventTracking) { [weak self] e, stop in
+            guard let self, let e, let i = self.floating.firstIndex(where: { $0.pane == pane }) else {
+                stop.pointee = true
+                return
+            }
+            switch e.type {
+            case .leftMouseUp:
+                stop.pointee = true
+            case .keyDown:
+                guard e.keyCode == 53 else { return }
+                cancelled = true
+                self.floating[i].frame = start.frame
+                stop.pointee = true
+            default:
+                let p = self.convert(e.type == .flagsChanged ? window.mouseLocationOutsideOfEventStream
+                                     : e.locationInWindow, from: nil)
+                if !moved && hypot(p.x - origin.x, p.y - origin.y) < 3 { return }
+                moved = true
+                let area = self.floatArea
+                let rect = startRect.offsetBy(dx: p.x - origin.x, dy: p.y - origin.y)
+                self.floating[i].frame = FloatingGeometry.fraction(of: FloatingGeometry.rect(
+                    FloatingGeometry.fraction(of: rect, in: area), in: area), in: area)
+                target = e.modifierFlags.contains(.command) ? self.dockTarget(at: p, excluding: pane) : nil
+                self.dockIndicator.show(target?.rect)
+                self.needsLayout = true
+            }
+        }
+        dockIndicator.show(nil)
+        if let target, !cancelled {
+            dock(pane, nextTo: target.pane, direction: target.side, share: nil)
+            focus(pane)
+            return
+        }
+        needsLayout = true
+        window.invalidateCursorRects(for: self)
+        if moved && !cancelled { SessionManager.shared.scheduleLayoutSave() }
     }
 
     func equalize() {
@@ -1128,7 +1538,8 @@ final class TabContentView: NSView {
 
     func tabLayout(title: String?) -> TabLayout {
         TabLayout(title: title, root: root.layoutNode, focused: focusedPane.id, zoomed: zoomedPane?.id,
-                  handoff: controller?.handoffID, wall: controller?.wall)
+                  handoff: controller?.handoffID, wall: controller?.wall,
+                  floating: floating.isEmpty ? nil : floating.map(\.saved))
     }
 
     /// The host of this tab's panes.

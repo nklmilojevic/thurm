@@ -14,7 +14,7 @@ pub mod template;
 
 use serde::{Deserialize, Serialize};
 
-pub use layout::{Layout, LayoutNode, SplitDir, TabLayout, WallOrigin, WindowLayout};
+pub use layout::{FloatingPane, Layout, LayoutNode, SplitDir, TabLayout, WallOrigin, WindowLayout};
 pub use tailnet::{Principal, PrincipalKind, TailscaleStatus};
 
 /// Bumped whenever the wire format changes incompatibly.
@@ -73,6 +73,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_TAILSCALE,
     CAP_UI_LAYOUT,
     CAP_AGENT_WALL,
+    CAP_FLOATING,
 ];
 
 /// The pane takes the size of the client that used it last (see the daemon's `active_size`)
@@ -89,6 +90,9 @@ pub const CAP_UI_LAYOUT: &str = "ui-layout";
 
 /// The UI carries out [`UiCommand::AgentWall`].
 pub const CAP_AGENT_WALL: &str = "agent-wall";
+
+/// The UI carries out [`UiCommand::Float`].
+pub const CAP_FLOATING: &str = "floating-panes";
 
 /// The daemon's answer to a [`UiCommand`] that no open UI understands.
 pub const UI_TOO_OLD: &str = "the Thurm app is too old for this; update it";
@@ -1337,6 +1341,12 @@ pub enum UiCommand {
         pane: PaneId,
         on: Option<bool>,
     },
+    /// Float `pane` above its tab's splits (`Some(true)`), dock it back into them
+    /// (`Some(false)`), or toggle. Needs [`CAP_FLOATING`].
+    Float {
+        pane: PaneId,
+        on: Option<bool>,
+    },
 }
 
 impl UiCommand {
@@ -1349,6 +1359,7 @@ impl UiCommand {
             UiCommand::MovePane { pane, target, .. } => vec![*pane, *target],
             UiCommand::SwapPanes { a, b } => vec![*a, *b],
             UiCommand::AgentWall { pane, .. } => vec![*pane],
+            UiCommand::Float { pane, .. } => vec![*pane],
             _ => Vec::new(),
         }
     }
@@ -1362,12 +1373,18 @@ impl UiCommand {
                 | UiCommand::MovePane { .. }
                 | UiCommand::SwapPanes { .. }
                 | UiCommand::AgentWall { .. }
+                | UiCommand::Float { .. }
         )
     }
 
     /// Only UIs with [`CAP_AGENT_WALL`] carry it out.
     pub fn needs_agent_wall(&self) -> bool {
         matches!(self, UiCommand::AgentWall { .. })
+    }
+
+    /// Only UIs with [`CAP_FLOATING`] carry it out.
+    pub fn needs_floating(&self) -> bool {
+        matches!(self, UiCommand::Float { .. })
     }
 }
 

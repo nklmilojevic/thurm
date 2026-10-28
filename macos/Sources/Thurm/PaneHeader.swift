@@ -15,7 +15,8 @@ extension AgentStatus {
 }
 
 /// The strip above a split pane (`window.pane_headers`): what runs in it, and buttons to split,
-/// zoom or close it. Clicking it focuses the pane; double-clicking zooms it.
+/// float, zoom or close it. Clicking it focuses the pane; double-clicking zooms it. On a floating
+/// pane it is always shown, and dragging it moves the pane.
 final class PaneHeader: NSView {
     static let height: CGFloat = 30
 
@@ -26,6 +27,8 @@ final class PaneHeader: NSView {
     private let dot = NSView()
     private let title = NSTextField(labelWithString: "")
     private let buttons = NSStackView()
+    private var splitButtons: [NSButton] = []
+    private var floatButton: NSButton?
     private var focused = false
     private var iconKind: PaneIcon?
     private lazy var iconLeading = icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.leading)
@@ -53,6 +56,7 @@ final class PaneHeader: NSView {
         for (symbol, label, action) in [
             ("rectangle.split.2x1", "Split Right", #selector(splitRight)),
             ("rectangle.split.1x2", "Split Down", #selector(splitDown)),
+            ("pip.exit", "Float Pane", #selector(toggleFloat)),
             ("arrow.up.left.and.arrow.down.right", "Zoom", #selector(zoom)),
             ("xmark", "Close Pane", #selector(close)),
         ] {
@@ -65,6 +69,8 @@ final class PaneHeader: NSView {
             b.widthAnchor.constraint(equalToConstant: 26).isActive = true
             b.heightAnchor.constraint(equalToConstant: Self.height).isActive = true
             buttons.addArrangedSubview(b)
+            if action == #selector(splitRight) || action == #selector(splitDown) { splitButtons.append(b) }
+            if action == #selector(toggleFloat) { floatButton = b }
         }
         for v in [icon, dot, title, buttons] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
@@ -121,6 +127,18 @@ final class PaneHeader: NSView {
         let status = info?.agent?.status
         dot.isHidden = status == nil || status == .idle
         dot.layer?.backgroundColor = status?.color.cgColor
+        // A floating pane docks rather than splits; the splits' only pane cannot float.
+        let floats = content?.isFloating(pane) ?? false
+        for b in splitButtons where b.isHidden != floats { b.isHidden = floats }
+        if let b = floatButton {
+            let symbol = floats ? "pip.enter" : "pip.exit"
+            if b.toolTip != (floats ? "Dock Pane" : "Float Pane") {
+                b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: floats ? "Dock Pane" : "Float Pane")
+                b.toolTip = floats ? "Dock Pane" : "Float Pane"
+            }
+            let hidden = !floats && !(content?.canFloat(pane) ?? false)
+            if b.isHidden != hidden { b.isHidden = hidden }
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -130,6 +148,7 @@ final class PaneHeader: NSView {
             content.toggleZoom()
         } else {
             content.focus(pane)
+            if content.isFloating(pane) { content.trackCardDrag(pane, from: event) }
         }
     }
 
@@ -142,6 +161,7 @@ final class PaneHeader: NSView {
 
     @objc private func splitRight() { act { $0.splitRight(nil) } }
     @objc private func splitDown() { act { $0.splitDown(nil) } }
+    @objc private func toggleFloat() { act { $0.toggleFloat(nil) } }
     @objc private func zoom() { act { $0.toggleZoom(nil) } }
     @objc private func close() { act { $0.closePane(nil) } }
 }

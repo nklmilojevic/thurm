@@ -126,7 +126,18 @@ pub fn validate_tab(tab: &crate::TabLayout) -> Result<Vec<crate::PaneId>, String
     }
     let mut ids = Vec::new();
     walk(&tab.root, 0, &mut ids)?;
-    if !ids.contains(&tab.focused) || tab.zoomed.is_some_and(|id| !ids.contains(&id)) {
+    let tiled = ids.len();
+    for f in &tab.floating {
+        if f.host.is_some() || ids.contains(&f.id) || ids.len() >= 64 {
+            return Err("layout must contain up to 64 unique local panes".into());
+        }
+        let [_, _, w, h] = f.frame;
+        if !f.frame.iter().all(|v| v.is_finite()) || w <= 0.0 || h <= 0.0 {
+            return Err("floating panes need a finite, non-empty frame".into());
+        }
+        ids.push(f.id);
+    }
+    if !ids.contains(&tab.focused) || tab.zoomed.is_some_and(|id| !ids[..tiled].contains(&id)) {
         return Err("focused and zoomed panes must belong to the layout".into());
     }
     Ok(ids)
@@ -172,6 +183,7 @@ mod tests {
             zoomed: None,
             handoff: None,
             wall: None,
+            floating: Vec::new(),
         };
         assert_eq!(validate_tab(&tab).unwrap(), vec![7]);
         tab.focused = 8;
@@ -184,5 +196,38 @@ mod tests {
             second: Box::new(crate::LayoutNode::local(7)),
         };
         assert!(validate_tab(&tab).is_err());
+    }
+
+    #[test]
+    fn ui_layout_checks_floating_panes() {
+        let card = |id, frame| crate::FloatingPane {
+            id,
+            host: None,
+            frame,
+            zoomed: false,
+        };
+        let mut tab = crate::TabLayout {
+            title: None,
+            root: crate::LayoutNode::local(7),
+            focused: 8,
+            zoomed: None,
+            handoff: None,
+            wall: None,
+            floating: vec![card(8, [0.1, 0.1, 0.5, 0.5])],
+        };
+        assert_eq!(validate_tab(&tab).unwrap(), vec![7, 8]);
+        // Only a pane of the splits can be zoomed.
+        tab.zoomed = Some(8);
+        assert!(validate_tab(&tab).is_err());
+        tab.zoomed = None;
+        for bad in [
+            card(7, [0.1, 0.1, 0.5, 0.5]),
+            card(9, [0.1, 0.1, 0.0, 0.5]),
+            card(9, [f64::NAN, 0.1, 0.5, 0.5]),
+        ] {
+            tab.floating.push(bad);
+            assert!(validate_tab(&tab).is_err());
+            tab.floating.pop();
+        }
     }
 }

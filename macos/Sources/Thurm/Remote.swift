@@ -440,9 +440,9 @@ extension SessionManager {
             }
         }
         for ws in workspaces where !isShown(ws) {
-            let before = ws.hiddenTabs.flatMap { $0.root.panes }.count
+            let before = ws.hiddenTabs.flatMap { $0.panes }.count
             ws.hiddenTabs = retainTabs(ws.hiddenTabs) { $0.host != host || alive.contains($0) }
-            gone += before - ws.hiddenTabs.flatMap { $0.root.panes }.count
+            gone += before - ws.hiddenTabs.flatMap { $0.panes }.count
             ws.hiddenSelectedTab = min(ws.hiddenSelectedTab, max(0, ws.hiddenTabs.count - 1))
         }
         for info in infos where info.alive { paneInfoUpdated(info) }
@@ -452,7 +452,7 @@ extension SessionManager {
         }
         // Panes the layout doesn't know about: new tabs in the host's workspace.
         var known = Set(liveControllers.flatMap { $0.content.paneIds })
-        known.formUnion(workspaces.flatMap { $0.hiddenTabs.flatMap { $0.root.panes } })
+        known.formUnion(workspaces.flatMap { $0.hiddenTabs.flatMap { $0.panes } })
         let unknown = infos.filter { $0.alive && !known.contains($0.key) }.map(\.key).sorted { $0.id < $1.id }
         if !unknown.isEmpty { adoptRemotePanes(unknown, host: host) }
 

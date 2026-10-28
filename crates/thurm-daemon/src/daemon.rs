@@ -246,6 +246,8 @@ pub struct Client {
     pub ui_layout: AtomicBool,
     /// A UI that gathers agents into a wall ([`thurm_proto::CAP_AGENT_WALL`]).
     pub agent_wall: AtomicBool,
+    /// A UI that floats panes ([`thurm_proto::CAP_FLOATING`]).
+    pub floating: AtomicBool,
     /// A remote client that takes deflated events ([`thurm_proto::CAP_DEFLATE`]). Shared with the
     /// client's writer thread, which encodes what it sends.
     pub deflate: Arc<AtomicBool>,
@@ -586,8 +588,11 @@ impl Daemon {
             .cloned()
             .collect();
         let wall = cmd.needs_agent_wall();
+        let floating = cmd.needs_floating();
         let (capable, older): (Vec<_>, Vec<_>) = desktops.into_iter().partition(|c| {
-            c.ui_layout.load(Ordering::Relaxed) && (!wall || c.agent_wall.load(Ordering::Relaxed))
+            c.ui_layout.load(Ordering::Relaxed)
+                && (!wall || c.agent_wall.load(Ordering::Relaxed))
+                && (!floating || c.floating.load(Ordering::Relaxed))
         });
         let shown_by_older = cmd.layout_panes().into_iter().any(|p| {
             self.pane(p).is_some_and(|p| {
@@ -623,6 +628,7 @@ impl Daemon {
             state_events: AtomicBool::new(false),
             ui_layout: AtomicBool::new(false),
             agent_wall: AtomicBool::new(false),
+            floating: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
@@ -2410,6 +2416,9 @@ impl Daemon {
                 if has(thurm_proto::CAP_AGENT_WALL) {
                     client.agent_wall.store(true, Ordering::Relaxed);
                 }
+                if has(thurm_proto::CAP_FLOATING) {
+                    client.floating.store(true, Ordering::Relaxed);
+                }
                 if has(thurm_proto::CAP_DEFLATE) {
                     client.deflate.store(true, Ordering::Relaxed);
                 }
@@ -3663,6 +3672,7 @@ mod tests {
             state_events: AtomicBool::new(false),
             ui_layout: AtomicBool::new(false),
             agent_wall: AtomicBool::new(false),
+            floating: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
@@ -3768,7 +3778,9 @@ mod tests {
                 }
                 let mut body = vec![0; len];
                 let _ = reader.read_exact(&mut body);
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
                 let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
             }
         });

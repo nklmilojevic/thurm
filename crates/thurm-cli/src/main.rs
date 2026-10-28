@@ -232,6 +232,23 @@ enum Cmd {
         #[arg(long)]
         off: bool,
     },
+    /// Float a pane above its tab's splits, as a card you can move and resize, or dock it back
+    /// (default: toggle). Its program keeps running.
+    Float {
+        /// Pane to float (default: current pane).
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+        #[arg(long, conflicts_with = "off")]
+        on: bool,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Dock a floating pane back into its tab's splits.
+    Dock {
+        /// Pane to dock (default: current pane).
+        #[arg(short, long)]
+        pane: Option<PaneId>,
+    },
     /// Move a pane next to another one, in its tab or another tab; its program keeps running.
     Move {
         /// Pane to move (default: current pane).
@@ -699,9 +716,11 @@ fn run(cli: Cli) -> R {
                 action: tailscale::TailscaleCmd::Peers | tailscale::TailscaleCmd::Nc { .. }
             }
         ) {
-            return Err("tailscale peers and nc dial through this machine's Tailscale device; \
+            return Err(
+                "tailscale peers and nc dial through this machine's Tailscale device; \
                         drop --remote"
-                .into());
+                    .into(),
+            );
         }
     }
     match cli.cmd {
@@ -1371,6 +1390,27 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                 None
             };
             layout_ui(c, UiCommand::AgentWall { pane, on })?;
+        }
+        Cmd::Float { pane, on, off } => {
+            let pane = current_pane(pane)?;
+            let on = if on {
+                Some(true)
+            } else if off {
+                Some(false)
+            } else {
+                None
+            };
+            layout_ui(c, UiCommand::Float { pane, on })?;
+        }
+        Cmd::Dock { pane } => {
+            let pane = current_pane(pane)?;
+            layout_ui(
+                c,
+                UiCommand::Float {
+                    pane,
+                    on: Some(false),
+                },
+            )?;
         }
         Cmd::Move {
             pane,

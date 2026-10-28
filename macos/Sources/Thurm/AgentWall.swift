@@ -53,11 +53,14 @@ enum AgentWall {
         var panes: [PaneKey]
         /// The tab's layout once they are back.
         var root: SplitNode
+        /// Those that floated in the tab, floating again.
+        var floating: [FloatingPane] = []
         /// The open tab (of `tabs`) that kept the rest of the origin's panes; nil for a new tab.
         var into: Int?
 
         static func == (a: Return, b: Return) -> Bool {
-            a.origin == b.origin && a.panes == b.panes && a.root.layoutNode == b.root.layoutNode && a.into == b.into
+            a.origin == b.origin && a.panes == b.panes && a.root.layoutNode == b.root.layoutNode
+                && a.floating == b.floating && a.into == b.into
         }
     }
 
@@ -65,26 +68,39 @@ enum AgentWall {
     /// back to their spots in the tab's layout. A tab that kept some of its panes takes them, with
     /// the panes it got meanwhile on its right (a later return to it has the earlier one's); the
     /// others come back as new tabs. Agents that ended, or have nowhere to go, stay on the wall.
-    static func returns(origins: [WallOrigin], onWall: [PaneKey], tabs: [[PaneKey]]) -> [Return] {
+    /// Panes that floated in their tab float again; `floating` holds the open tabs' own floating
+    /// panes, which stay as they are.
+    static func returns(origins: [WallOrigin], onWall: [PaneKey], tabs: [[PaneKey]],
+                        floating: [Set<PaneKey>] = []) -> [Return] {
         var left = Set(onWall)
         var tabs = tabs
+        var floating = floating
         var out: [Return] = []
         for origin in origins.sorted(by: { $0.index < $1.index }) {
-            let panes = origin.tab.root.panes
+            let panes = origin.tab.panes
             let back = panes.filter { left.contains($0) }
             guard !back.isEmpty else { continue }
             left.subtract(back)
             let into = tabs.firstIndex { tab in panes.contains { !back.contains($0) && tab.contains($0) } }
-            let kept = into.map { tabs[$0] } ?? []
-            guard let layout = origin.tab.root.retaining({ back.contains($0) || kept.contains($0) }) else { continue }
+            let cards = into.flatMap { $0 < floating.count ? floating[$0] : nil } ?? []
+            let kept = into.map { tabs[$0].filter { !cards.contains($0) } } ?? []
+            var floats = (origin.tab.floating ?? []).filter { back.contains($0.pane) }
+            // Only floating panes come back to a new tab: the frontmost one takes the splits.
+            guard let layout = origin.tab.root.retaining({ back.contains($0) || kept.contains($0) })
+                ?? (kept.isEmpty ? floats.popLast().map({ .pane($0.pane) }) : nil) else { continue }
             var root = SplitNode(layout: layout)
             for pane in kept where !root.contains(pane) {
                 if let last = root.panes.last { root = root.inserting(pane, at: last, direction: .right) }
             }
             // Two origins can go back to one tab (their shells moved together): the next one
             // keeps what this one put back.
-            if let into { tabs[into] = root.panes }
-            out.append(Return(origin: origin, panes: back, root: root, into: into))
+            if let into {
+                tabs[into] = root.panes + cards + floats.map(\.pane)
+                // The panes put back as cards stay cards for a later return to the same tab.
+                while floating.count <= into { floating.append([]) }
+                floating[into].formUnion(floats.map(\.pane))
+            }
+            out.append(Return(origin: origin, panes: back, root: root, floating: floats, into: into))
         }
         return out
     }
@@ -177,7 +193,8 @@ extension SessionManager {
         guard let origins = wall.wall else { return }
         var tabs = group(of: wall).filter { $0 !== wall && !$0.isQuick }
         let plan = AgentWall.returns(origins: origins, onWall: wall.content.paneIds,
-                                     tabs: tabs.map(\.content.paneIds))
+                                     tabs: tabs.map(\.content.paneIds),
+                                     floating: tabs.map { Set($0.content.floating.map(\.pane)) })
         let existing = tabs
         let focused = wall.content.focusedPane
         wall.wall = nil
@@ -189,15 +206,18 @@ extension SessionManager {
             if let i = r.into {
                 let t = existing[i]
                 t.content.setRoot(r.root)
-                if r.root.contains(r.origin.tab.focusedKey) { t.content.setFocusedPane(r.origin.tab.focusedKey) }
+                t.content.addFloating(r.floating)
+                if t.content.contains(r.origin.tab.focusedKey) { t.content.setFocusedPane(r.origin.tab.focusedKey) }
                 if let z = r.origin.tab.zoomedKey, r.root.contains(z) { t.content.zoom(z, true) }
                 t.updateTitle()
                 continue
             }
             let tab = r.origin.tab
-            let pane = r.root.contains(tab.focusedKey) ? tab.focusedKey : r.root.panes[0]
+            let pane = r.root.contains(tab.focusedKey) || r.floating.contains(where: { $0.pane == tab.focusedKey })
+                ? tab.focusedKey : r.root.panes[0]
             let zoomed = tab.zoomedKey.flatMap { r.root.contains($0) ? $0 : nil }
-            let t = makeController(root: r.root, focused: pane, zoomed: zoomed, title: tab.title, frame: nil)
+            let t = makeController(root: r.root, focused: pane, zoomed: zoomed, title: tab.title, frame: nil,
+                                   floating: r.floating)
             t.workspaceID = wall.workspaceID
             // Back after the tab it followed.
             let at = AgentWall.position(after: r.origin.after, index: r.origin.index,
@@ -228,7 +248,7 @@ extension SessionManager {
         guard let c = controller(for: pane), !c.isQuick, c.wall == nil, c.handoffID == nil,
               let wall = agentWall(near: c), var origins = wall.wall else { return }
         let here = Set(c.content.paneIds)
-        guard !origins.contains(where: { $0.tab.root.panes.contains(where: here.contains) }) else { return }
+        guard !origins.contains(where: { $0.tab.panes.contains(where: here.contains) }) else { return }
         let tabs = group(of: wall).filter { $0 !== wall && !$0.isQuick }
         let i = tabs.firstIndex { $0 === c } ?? tabs.count
         origins.append(WallOrigin(index: i, after: AgentWall.anchor(before: i, in: tabs),

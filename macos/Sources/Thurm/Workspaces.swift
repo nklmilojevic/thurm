@@ -83,7 +83,7 @@ extension SessionManager {
     func takeHiddenTab(_ pane: PaneKey) {
         for ws in workspaces where !isShown(ws) {
             let before = ws.hiddenTabs.count
-            ws.hiddenTabs.removeAll { $0.root.panes == [pane] }
+            ws.hiddenTabs.removeAll { $0.panes == [pane] }
             ws.hiddenSelectedTab = min(ws.hiddenSelectedTab, max(0, ws.hiddenTabs.count - 1))
             if before > 0 && ws.hiddenTabs.isEmpty { workspaces.removeAll { $0 === ws } }
         }
@@ -92,7 +92,7 @@ extension SessionManager {
     /// The workspace showing `pane`, or holding it in a hidden tab.
     func workspace(containing pane: PaneKey) -> Workspace? {
         if let c = controller(for: pane) { return workspace(c.workspaceID) }
-        return workspaces.first { $0.hiddenTabs.contains { $0.root.panes.contains(pane) } }
+        return workspaces.first { $0.hiddenTabs.contains { $0.panes.contains(pane) } }
     }
 
     var currentWorkspace: Workspace? {
@@ -175,7 +175,7 @@ extension SessionManager {
         }
         for tab in target.hiddenTabs {
             let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
-                                   title: tab.title, frame: nil)
+                                   title: tab.title, frame: nil, floating: tab.floating)
             t.handoffID = tab.handoff
             t.wall = tab.wall
             add(t)
@@ -273,7 +273,7 @@ extension SessionManager {
         var created: [TerminalWindowController] = []
         for tab in ws.hiddenTabs {
             let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
-                                   title: tab.title, frame: frame)
+                                   title: tab.title, frame: frame, floating: tab.floating)
             c.workspaceID = ws.id
             c.handoffID = tab.handoff
             c.wall = tab.wall
@@ -351,7 +351,7 @@ extension SessionManager {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         let ids = shownIn.map { group(of: $0).flatMap { $0.content.paneIds } }
-            ?? ws.hiddenTabs.flatMap { $0.root.panes }
+            ?? ws.hiddenTabs.flatMap { $0.panes }
         for id in ids { sendClosePane(id) }
         workspaces.removeAll { $0 === ws }
         if let c = shownIn {

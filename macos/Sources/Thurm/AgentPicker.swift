@@ -71,7 +71,7 @@ extension SessionManager {
         }
         for ws in workspaces where !isShown(ws) {
             for tab in ws.hiddenTabs {
-                for id in tab.root.panes { add(id, in: nil, hidden: ws) }
+                for id in tab.panes { add(id, in: nil, hidden: ws) }
             }
         }
         return out
