@@ -8,6 +8,11 @@ final class PaneKeyTests: XCTestCase {
 
     /// `--remote` takes the configured host name, which is the pane's host id.
     func testRemotePaneCopiesTheRemoteFlags() {
-        XCTAssertEqual(PaneKey("devbox", 7).copyText, "--remote devbox --pane 7")
+        XCTAssertEqual(PaneKey("devbox", 7).copyText, "--remote=devbox --pane 7")
+    }
+
+    /// Remote names may start with `-`; a separate token would read as another option.
+    func testLeadingHyphenRemoteStaysTheRemoteValue() {
+        XCTAssertEqual(PaneKey("-dev", 7).copyText, "--remote=-dev --pane 7")
     }
 }

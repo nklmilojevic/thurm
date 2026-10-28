@@ -17,6 +17,8 @@ private struct CellPosition {
     var rightHalf: Bool
     var x: Int
     var y: Int
+    /// False in the padding or past the last column or row, where col and row are clamped.
+    var inGrid: Bool
 }
 
 /// One terminal pane: a CAMetalLayer backed view that renders the daemon's grid and forwards
@@ -1427,18 +1429,26 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     private func cellPosition(_ point: NSPoint) -> CellPosition {
-        guard let s = shaper else { return CellPosition(col: 0, row: 0, rightHalf: false, x: 0, y: 0) }
+        guard let s = shaper else {
+            return CellPosition(col: 0, row: 0, rightHalf: false, x: 0, y: 0, inGrid: false)
+        }
         let scale = backingScale
         let x = point.x * scale - CGFloat(padXPixels)
         let y = point.y * scale - CGFloat(padYPixels) - CGFloat(smoothScrollY)
         let fcol = x / CGFloat(s.cellWidth)
         let frow = y / CGFloat(s.cellHeight)
-        let maxCol = max(0, (renderer.snapshot.valid ? renderer.snapshot.cols : cols) - 1)
-        let maxRow = max(0, (renderer.snapshot.valid ? renderer.snapshot.rows : rows) - 1)
-        let col = min(maxCol, max(0, Int(floor(fcol))))
-        let row = min(maxRow, max(0, Int(floor(frow))))
+        let gridCols = renderer.snapshot.valid ? renderer.snapshot.cols : cols
+        let gridRows = renderer.snapshot.valid ? renderer.snapshot.rows : rows
+        let col = min(max(0, gridCols - 1), max(0, Int(floor(fcol))))
+        let row = min(max(0, gridRows - 1), max(0, Int(floor(frow))))
         let rightHalf = fcol - floor(fcol) >= 0.5
-        return CellPosition(col: col, row: row, rightHalf: rightHalf, x: max(0, Int(x)), y: max(0, Int(y)))
+        return CellPosition(col: col, row: row, rightHalf: rightHalf, x: max(0, Int(x)), y: max(0, Int(y)),
+                            inGrid: TerminalView.isInGrid(col: fcol, row: frow, cols: gridCols, rows: gridRows))
+    }
+
+    /// Whether a fractional grid position falls on one of the cols × rows cells.
+    static func isInGrid(col: CGFloat, row: CGFloat, cols: Int, rows: Int) -> Bool {
+        col >= 0 && row >= 0 && col < CGFloat(cols) && row < CGFloat(rows)
     }
 
     private func mouseMods(_ flags: NSEvent.ModifierFlags) -> UInt8 {
@@ -1499,7 +1509,8 @@ final class TerminalView: NSView, NSTextInputClient {
             window?.makeFirstResponder(self)
         }
         let p = cellPosition(convert(event.locationInWindow, from: nil))
-        NSMenu.popUpContextMenu(contextMenu(link: linkURL(col: p.col, row: p.row)), with: event, for: self)
+        let link = p.inGrid ? linkURL(col: p.col, row: p.row) : nil
+        NSMenu.popUpContextMenu(contextMenu(link: link), with: event, for: self)
     }
 
     override func rightMouseUp(with event: NSEvent) {
