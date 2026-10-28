@@ -221,13 +221,23 @@ fn a_job_status_survives_an_upgrade_and_ends_with_the_job() {
 fn a_quick_job_reports_and_exits_leaves_no_status() {
     let env = Env::new("program-status-quick-job");
     let _d = env.start();
-    let (c, _) = env.connect();
+    let (c, rx) = env.connect();
     let pane = create(&c, &env.dir);
     run(
         &c,
         pane,
         r#"sh -c "printf '\\033]7501;state=working:app=x\\033\\\\'""#,
     );
+    // The report was parsed: an empty pane at the start proves nothing.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Event::PaneInfo(i)) if i.id == pane && working(&i) => break,
+            Ok(_) => {}
+            Err(e) => panic!("the quick job's report was not seen: {e}"),
+        }
+    }
     wait_info(&c, pane, "the quick job's status ended", |i| {
         i.programs.is_empty() && i.agent.is_none()
     });

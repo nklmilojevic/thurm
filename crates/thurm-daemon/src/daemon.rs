@@ -3635,6 +3635,43 @@ mod tests {
         assert_eq!(read_groups(0, &[]), vec![(0, 0, None)]);
     }
 
+    /// A job that reports and exits at once can have given the terminal back by the time its
+    /// bytes are parsed: the report is the group's that had it when they were read.
+    #[test]
+    fn a_report_belongs_to_the_group_it_was_read_under() {
+        let dir = std::env::temp_dir().join(format!("thurm-report-group-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // A pane that prints nothing, so its own parser doesn't run meanwhile.
+        let id = daemon
+            .create_pane(
+                CreatePane {
+                    command: Some(vec!["sleep".into(), "30".into()]),
+                    size: PaneSize {
+                        cols: 80,
+                        rows: 24,
+                        cell_width: 8,
+                        cell_height: 16,
+                    },
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let pane = daemon.pane(id).unwrap();
+        let job = 1_000_000;
+        assert_ne!(pane.state.lock().pty.foreground_pgrp(), Some(job));
+        daemon.parse_output(&pane, b"\x1b]7501;state=working:app=x\x1b\\", Some(job));
+        assert_eq!(pane.state.lock().programs_pgrp, Some(job));
+        daemon.close_pane(id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_prompt_going_away_while_still_waiting_is_news() {
         let blocked = agent(AgentStatus::NeedsInput, Some(7));
