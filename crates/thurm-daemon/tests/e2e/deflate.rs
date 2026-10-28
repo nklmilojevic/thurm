@@ -208,6 +208,18 @@ fn both_floods(asks: &mut Raw, plain: &mut Raw, marker: &[u8]) -> (Flood, Flood)
     })
 }
 
+/// A flood's text up to and including its first `marker`, with the PTY's doubled CRs collapsed.
+/// macOS's PTY turns some `\n` into `\r\r\n` in a long output, with or without the daemon
+/// (a plain `pty.fork` of `seq 1 20000` shows the same), so both sides are normalized alike.
+fn through_marker(text: &[u8], marker: &[u8]) -> Vec<u8> {
+    let end = text
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .map_or(text.len(), |at| at + marker.len());
+    let text = String::from_utf8_lossy(&text[..end]);
+    text.replace("\r\r\n", "\r\n").into_bytes()
+}
+
 #[test]
 fn a_flood_reads_the_same_merged_as_plain() {
     let env = Env::new("deflate-flood");
@@ -219,13 +231,16 @@ fn a_flood_reads_the_same_merged_as_plain() {
     plain.subscribe(pane);
     seq_flood(&c, pane, 20_000);
     let (asks_flood, plain_flood) = both_floods(&mut asks, &mut plain, b"done-42");
-    // The same bytes in the same order; the deflate client may have fewer, bigger events.
-    let (short, long) = if asks_flood.text.len() < plain_flood.text.len() {
-        (&asks_flood.text, &plain_flood.text)
-    } else {
-        (&plain_flood.text, &asks_flood.text)
-    };
-    assert!(long.starts_with(short), "the two floods differ");
+    let asks_text = through_marker(&asks_flood.text, b"done-42");
+    let plain_text = through_marker(&plain_flood.text, b"done-42");
+    assert_eq!(
+        asks_text, plain_text,
+        "the deflate client's bytes differ from the plain client's"
+    );
+    // The echo of the command, the numbers, then the marker.
+    let seq: String = (1..=20_000).map(|i| format!("{i}\r\n")).collect();
+    let expected = format!("seq 1 20000; echo done-$((40+2))\r\n{seq}done-42");
+    assert_eq!(String::from_utf8_lossy(&asks_text), expected);
     assert!(asks_flood.compressed >= 1, "{}", asks_flood.events);
     assert_eq!(plain_flood.compressed, 0);
 }
