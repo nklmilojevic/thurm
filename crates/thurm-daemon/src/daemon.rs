@@ -246,6 +246,9 @@ pub struct Client {
     pub ui_layout: AtomicBool,
     /// A UI that gathers agents into a wall ([`thurm_proto::CAP_AGENT_WALL`]).
     pub agent_wall: AtomicBool,
+    /// A remote client that takes deflated events ([`thurm_proto::CAP_DEFLATE`]). Shared with the
+    /// client's writer thread, which encodes what it sends.
+    pub deflate: Arc<AtomicBool>,
     /// Who connected: a local peer, or a tailnet caller the Tailscale helper admitted.
     pub principal: Mutex<Option<thurm_proto::Principal>>,
     pub name: Mutex<String>,
@@ -617,6 +620,7 @@ impl Daemon {
             state_events: AtomicBool::new(false),
             ui_layout: AtomicBool::new(false),
             agent_wall: AtomicBool::new(false),
+            deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
@@ -2402,6 +2406,9 @@ impl Daemon {
                 if has(thurm_proto::CAP_AGENT_WALL) {
                     client.agent_wall.store(true, Ordering::Relaxed);
                 }
+                if has(thurm_proto::CAP_DEFLATE) {
+                    client.deflate.store(true, Ordering::Relaxed);
+                }
                 log::info!(
                     "client {} hello: {name} (protocol {version}{}{}{}{})",
                     client.id,
@@ -3652,6 +3659,7 @@ mod tests {
             state_events: AtomicBool::new(false),
             ui_layout: AtomicBool::new(false),
             agent_wall: AtomicBool::new(false),
+            deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),

@@ -438,6 +438,7 @@ pub unsafe extern "C" fn thurm_connect(
     let socket = thurm_config::socket_path();
     unsafe {
         connect_to(
+            &[],
             socket,
             daemon_path,
             client_name,
@@ -469,6 +470,7 @@ pub unsafe extern "C" fn thurm_connect_socket(
     let socket = std::path::PathBuf::from(socket);
     unsafe {
         connect_to(
+            remote_capabilities(&socket),
             socket,
             daemon_path,
             client_name,
@@ -480,7 +482,24 @@ pub unsafe extern "C" fn thurm_connect_socket(
     }
 }
 
+/// What a connection to `socket` says in `Hello` besides the build's capabilities. A tailnet
+/// relay splices the bytes unchanged, so the daemon gets this Mac's capabilities as they are, and
+/// it asks for deflated events there. An ssh tunnel compresses on its own (`Compression=yes`), so
+/// it isn't asked twice.
+fn remote_capabilities(socket: &Path) -> &'static [&'static str] {
+    #[cfg(feature = "desktop")]
+    {
+        if remote::is_tailnet_socket(socket) {
+            return &[thurm_proto::CAP_DEFLATE];
+        }
+    }
+    let _ = socket;
+    &[]
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe fn connect_to(
+    capabilities: &[&str],
     socket: std::path::PathBuf,
     daemon_path: *const c_char,
     client_name: *const c_char,
@@ -494,13 +513,14 @@ unsafe fn connect_to(
         .unwrap_or("Thurm.app")
         .to_owned();
     let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
-        Client::connect(
+        Client::connect_with(
             ConnectOptions {
                 socket,
                 spawn_daemon: daemon,
                 client_name: &name,
                 ui: true,
             },
+            capabilities,
             on_ev,
             on_disc,
         )

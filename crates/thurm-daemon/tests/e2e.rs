@@ -18,6 +18,9 @@ mod mobile;
 #[path = "e2e/state_events.rs"]
 mod state_events;
 
+#[path = "e2e/deflate.rs"]
+mod deflate;
+
 #[path = "e2e/tailnet.rs"]
 mod tailnet;
 
