@@ -1,11 +1,12 @@
 //! Unix socket server: one reader and one writer thread per client connection.
 
-use std::io::{BufWriter, Read};
+use std::io::{BufWriter, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use thurm_proto::codec;
 use thurm_proto::{Envelope, ServerMessage};
 
@@ -37,10 +38,95 @@ fn mobile_silence() -> Duration {
         .unwrap_or(thurm_proto::MOBILE_SILENCE)
 }
 
-/// Whether a client the writer put a message out to within `silence` of `now` is still there.
-/// A phone whose session loop is busy with output can't ping, but its connection is alive.
+/// Whether a client whose socket took bytes within `silence` of `now` is still there. A phone
+/// whose session loop is busy with output can't ping, but its connection is alive.
 fn written_within(last_written: Instant, now: Instant, silence: Duration) -> bool {
     now.saturating_duration_since(last_written) < silence
+}
+
+/// The socket under the writer's buffer: stamps the time on every write that takes bytes, so a
+/// large write that is still moving counts as progress.
+struct Progress<W> {
+    inner: W,
+    at: Arc<Mutex<Instant>>,
+}
+
+impl<W: Write> Write for Progress<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if n > 0 {
+            *self.at.lock() = Instant::now();
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Reads length-prefixed frames that may arrive in pieces. A partial frame is kept across read
+/// timeouts: a `read_exact` that times out has already taken some of the frame.
+#[derive(Default)]
+struct Frames {
+    len: [u8; 4],
+    len_read: usize,
+    body: Vec<u8>,
+    body_read: usize,
+}
+
+impl Frames {
+    /// The next whole frame, or `Ok(None)` when the connection ends between frames. A timeout is
+    /// an error; what was read of the frame stays for the next call.
+    fn read<R: Read>(&mut self, r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+        loop {
+            if self.len_read < self.len.len() {
+                let n = read_some(r, &mut self.len[self.len_read..])?;
+                if n == 0 {
+                    return if self.len_read == 0 {
+                        Ok(None)
+                    } else {
+                        Err(ended_mid_frame())
+                    };
+                }
+                self.len_read += n;
+                if self.len_read == self.len.len() {
+                    let len = u32::from_le_bytes(self.len) as usize;
+                    if len > codec::MAX_MESSAGE {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "message too large",
+                        ));
+                    }
+                    self.body = vec![0; len];
+                }
+            } else if self.body_read < self.body.len() {
+                let n = read_some(r, &mut self.body[self.body_read..])?;
+                if n == 0 {
+                    return Err(ended_mid_frame());
+                }
+                self.body_read += n;
+            } else {
+                return Ok(Some(std::mem::take(self).body));
+            }
+        }
+    }
+}
+
+fn read_some<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match r.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
+fn ended_mid_frame() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "the connection ended in a frame",
+    )
 }
 
 /// Reads how a connection starts: an ingress preamble (`thurm_proto::tailnet`), or the first
@@ -116,10 +202,15 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
     };
     // Weak: the client owns `rx`'s sender, and the writer only stops once every sender is gone.
     let counter = Arc::downgrade(&client);
+    let last_written = client.last_written.clone();
     let writer = std::thread::Builder::new()
         .name(format!("client-{}-writer", client.id))
         .spawn(move || {
-            let mut w = BufWriter::with_capacity(256 * 1024, write_stream);
+            let socket = Progress {
+                inner: write_stream,
+                at: last_written,
+            };
+            let mut w = BufWriter::with_capacity(256 * 1024, socket);
             let written = |msg: &ServerMessage| {
                 let Some(counter) = counter.upgrade() else {
                     return;
@@ -128,7 +219,6 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
                     crate::daemon::message_weight(msg).min(counter.queued.load(Ordering::Relaxed)),
                     Ordering::Relaxed,
                 );
-                *counter.last_written.lock() = Instant::now();
             };
             'write: while let Ok(msg) = rx.recv() {
                 if write_msg(&mut w, &msg).is_err() {
@@ -162,6 +252,7 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
         });
 
     let mut first_frame = first_frame;
+    let mut frames = Frames::default();
     let mut silence_limited = false;
     loop {
         // A phone that stopped talking (suspended, out of range) is gone: it pings while open.
@@ -169,8 +260,10 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
             silence_limited = true;
             let _ = reader.get_ref().set_read_timeout(Some(mobile_silence()));
         }
+        // A silence-limited read may time out mid-frame and go on, so it keeps its place.
         let frame = match first_frame.take() {
             Some(frame) => Ok(Some(frame)),
+            None if silence_limited => frames.read(&mut reader),
             None => codec::read_frame(&mut reader),
         };
         match frame {
@@ -230,4 +323,107 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
 fn write_msg<W: std::io::Write>(w: &mut W, msg: &ServerMessage) -> std::io::Result<()> {
     let buf = codec::encode(msg)?;
     w.write_all(&buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::io::{self, ErrorKind};
+
+    use super::*;
+
+    /// What a scripted connection does next.
+    enum Step {
+        Bytes(Vec<u8>),
+        Timeout,
+    }
+
+    /// A connection that yields its steps in order, then ends.
+    struct Script(VecDeque<Step>);
+
+    impl Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(Step::Timeout) => Err(ErrorKind::TimedOut.into()),
+                Some(Step::Bytes(mut bytes)) => {
+                    let n = bytes.len().min(buf.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        self.0.push_front(Step::Bytes(bytes.split_off(n)));
+                    }
+                    Ok(n)
+                }
+            }
+        }
+    }
+
+    fn wire(body: &[u8]) -> Vec<u8> {
+        let mut wire = (body.len() as u32).to_le_bytes().to_vec();
+        wire.extend_from_slice(body);
+        wire
+    }
+
+    fn timed_out(r: &io::Result<Option<Vec<u8>>>) -> bool {
+        matches!(r, Err(e) if e.kind() == ErrorKind::TimedOut)
+    }
+
+    #[test]
+    fn a_frame_split_across_timeouts_resumes_where_it_stopped() {
+        let (one, two) = (wire(b"hello"), wire(b"hi"));
+        let mut all = one.clone();
+        all.extend_from_slice(&two);
+        // The first timeout splits the length, the second the body of the first frame.
+        let mut r = Script(VecDeque::from([
+            Step::Bytes(all[..2].to_vec()),
+            Step::Timeout,
+            Step::Bytes(all[2..6].to_vec()),
+            Step::Timeout,
+            Step::Bytes(all[6..].to_vec()),
+        ]));
+        let mut frames = Frames::default();
+        assert!(timed_out(&frames.read(&mut r)));
+        assert!(timed_out(&frames.read(&mut r)));
+        assert_eq!(frames.read(&mut r).unwrap(), Some(b"hello".to_vec()));
+        assert_eq!(frames.read(&mut r).unwrap(), Some(b"hi".to_vec()));
+        assert_eq!(frames.read(&mut r).unwrap(), None);
+    }
+
+    #[test]
+    fn a_frame_split_right_after_its_length_resumes() {
+        let w = wire(b"hello");
+        let mut r = Script(VecDeque::from([
+            Step::Bytes(w[..4].to_vec()),
+            Step::Timeout,
+            Step::Bytes(w[4..].to_vec()),
+        ]));
+        let mut frames = Frames::default();
+        assert!(timed_out(&frames.read(&mut r)));
+        assert_eq!(frames.read(&mut r).unwrap(), Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn a_connection_ending_inside_a_frame_is_an_error() {
+        let w = wire(b"hello");
+        let mut r = Script(VecDeque::from([Step::Bytes(w[..7].to_vec())]));
+        let mut frames = Frames::default();
+        let e = frames.read(&mut r).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn writes_that_take_bytes_stamp_the_socket() {
+        let at = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60)));
+        let mut socket = Progress {
+            inner: Vec::new(),
+            at: at.clone(),
+        };
+        socket.write_all(b"partial and whole").unwrap();
+        assert!(written_within(
+            *at.lock(),
+            Instant::now(),
+            Duration::from_secs(1)
+        ));
+        assert_eq!(socket.inner, b"partial and whole");
+    }
 }

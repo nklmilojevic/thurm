@@ -555,3 +555,46 @@ fn a_send_gets_only_the_silence_left() {
         Duration::ZERO
     );
 }
+
+#[test]
+fn a_local_write_is_stalled_once_it_takes_nothing_for_the_bound() {
+    let now = tokio::time::Instant::now();
+    let idle = Duration::from_secs(45);
+    assert!(!stalled(now, now + Duration::from_secs(44), idle));
+    assert!(stalled(now, now + idle, idle));
+}
+
+#[test]
+fn a_local_app_that_takes_nothing_fails_the_write_at_the_bound() {
+    let rt = server_rt();
+    // Nothing reads the other end, so the write can't go on; the peer stays open.
+    let (mut ours, _theirs) = tokio::io::duplex(8);
+    let started = Instant::now();
+    let wrote = rt.block_on(write_progressing(
+        &mut ours,
+        &[0u8; 64],
+        Duration::from_millis(300),
+    ));
+    assert!(!wrote);
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn a_slow_local_app_that_keeps_reading_is_not_stalled() {
+    let rt = server_rt();
+    let (mut ours, mut theirs) = tokio::io::duplex(8);
+    // 25 reads of 8 bytes, 60 ms apart: longer than the bound, but never idle for it.
+    rt.spawn(async move {
+        let mut buf = [0u8; 8];
+        for _ in 0..25 {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            theirs.read_exact(&mut buf).await.unwrap();
+        }
+    });
+    let wrote = rt.block_on(write_progressing(
+        &mut ours,
+        &[7u8; 200],
+        Duration::from_millis(300),
+    ));
+    assert!(wrote);
+}

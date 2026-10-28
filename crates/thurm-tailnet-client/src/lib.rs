@@ -507,6 +507,38 @@ fn quiet(
     Quiet::Ping
 }
 
+/// Whether a write whose last bytes went out at `last` has stalled: no bytes for `idle`.
+fn stalled(last: tokio::time::Instant, now: tokio::time::Instant, idle: Duration) -> bool {
+    now.saturating_duration_since(last) >= idle
+}
+
+/// Writes `data` to the local app, giving up once it takes no bytes for `idle`. An app that
+/// keeps reading is not stalled, however long the whole write takes.
+async fn write_progressing<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    mut data: &[u8],
+    idle: Duration,
+) -> bool {
+    let mut last = tokio::time::Instant::now();
+    while !data.is_empty() {
+        tokio::select! {
+            written = wr.write(data) => match written {
+                Ok(n) if n > 0 => {
+                    data = &data[n..];
+                    last = tokio::time::Instant::now();
+                }
+                _ => return false,
+            },
+            _ = tokio::time::sleep_until(last + idle) => {
+                if stalled(last, tokio::time::Instant::now(), idle) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Copies the daemon's bytes both ways until either side ends, pinging while it's quiet.
 async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
     ws: tokio_tungstenite::WebSocketStream<S>,
@@ -531,9 +563,10 @@ async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
             match msg {
                 Ok(Message::Binary(b)) => {
                     let _ = heard_tx.send(Heard::Writing);
-                    let wrote = wr.write_all(&b).await;
+                    let wrote = write_progressing(&mut wr, &b, limits.silent).await;
                     let _ = heard_tx.send(Heard::At(tokio::time::Instant::now()));
-                    if wrote.is_err() {
+                    if !wrote {
+                        log::info!("tailnet: the local app takes no bytes; closing");
                         break;
                     }
                 }
