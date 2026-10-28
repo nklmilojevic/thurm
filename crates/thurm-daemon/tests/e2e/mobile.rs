@@ -790,9 +790,15 @@ fn a_phone_receiving_output_stays_connected_while_it_says_nothing() {
     assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
     let phone = listen(phone);
 
+    // Stopped by a file rather than ^C, which bash can miss between `echo` and `sleep`.
+    let stop = env.dir.join("stop-ticking");
     mac.request(Request::Input {
         pane,
-        data: b"while :; do echo tick; sleep 0.2; done\r".to_vec(),
+        data: format!(
+            "while [ ! -e '{}' ]; do echo tick; sleep 0.2; done\r",
+            stop.display()
+        )
+        .into_bytes(),
     })
     .unwrap();
     // Several silence limits of output, none of it answered.
@@ -803,11 +809,7 @@ fn a_phone_receiving_output_stays_connected_while_it_says_nothing() {
     );
     assert!(phone.outputs.load(Ordering::Relaxed) > 5);
 
-    mac.request(Request::Input {
-        pane,
-        data: b"\x03".to_vec(),
-    })
-    .unwrap();
+    std::fs::write(&stop, "").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !phone.closed.load(Ordering::Relaxed) {
         assert!(
