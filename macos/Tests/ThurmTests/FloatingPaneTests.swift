@@ -65,6 +65,28 @@ final class FloatingPaneTests: XCTestCase {
                        [divider])
     }
 
+    func testDirectionalFocusReachesCards() {
+        // One pane filling the tab, a card over its right half.
+        let pane = CGRect(x: 0, y: 0, width: 1000, height: 600)
+        let card = CGRect(x: 600, y: 100, width: 300, height: 300)
+        XCTAssertEqual(TabContentView.neighbor(of: pane, among: [(key(2), card)], .right), key(2))
+        XCTAssertEqual(TabContentView.neighbor(of: pane, among: [(key(2), card)], .up), key(2))
+        XCTAssertNil(TabContentView.neighbor(of: pane, among: [(key(2), card)], .left))
+        // And back from the card.
+        XCTAssertEqual(TabContentView.neighbor(of: card, among: [(key(1), pane)], .left), key(1))
+        XCTAssertNil(TabContentView.neighbor(of: card, among: [(key(1), pane)], .right))
+        // Splits that share an edge (within the 2pt slack) still go by their edges.
+        let left = CGRect(x: 0, y: 0, width: 501, height: 600)
+        let topRight = CGRect(x: 500, y: 0, width: 500, height: 300)
+        let bottomRight = CGRect(x: 500, y: 300, width: 500, height: 300)
+        XCTAssertEqual(TabContentView.neighbor(of: topRight, among: [(key(1), left), (key(3), bottomRight)], .left), key(1))
+        XCTAssertEqual(TabContentView.neighbor(of: topRight, among: [(key(1), left), (key(3), bottomRight)], .down), key(3))
+        XCTAssertNil(TabContentView.neighbor(of: left, among: [(key(2), topRight), (key(3), bottomRight)], .up))
+        // A card beside the splits goes by its edges too.
+        let beside = CGRect(x: 1100, y: 0, width: 300, height: 300)
+        XCTAssertEqual(TabContentView.neighbor(of: topRight, among: [(key(1), left), (key(4), beside)], .right), key(4))
+    }
+
     func testNewCardsCascade() {
         let first = FloatingGeometry.defaultFraction(index: 0)
         let second = FloatingGeometry.defaultFraction(index: 1)

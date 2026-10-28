@@ -1226,36 +1226,54 @@ final class TabContentView: NSView {
     }
 
     func moveFocus(_ direction: FocusDirection) {
-        guard zoomedPane == nil, let target = neighbor(of: focusedPane, direction) else { return }
+        guard zoomedPane == nil, let target = neighbor(of: focusedPane, direction, cards: true) else { return }
         focus(target)
     }
 
-    /// The pane next to `pane` in `direction`: overlapping ones first, then the closest.
-    private func neighbor(of pane: PaneKey, _ direction: FocusDirection) -> PaneKey? {
+    /// The pane next to `pane` in `direction`, among the splits and, with `cards`, the cards.
+    private func neighbor(of pane: PaneKey, _ direction: FocusDirection, cards: Bool = false) -> PaneKey? {
         guard let current = views[pane] else { return nil }
-        let cur = current.frame
+        let candidates = views.filter { id, _ in id != pane && (cards || root.contains(id)) }
+        return Self.neighbor(of: current.frame, among: candidates.map { ($0.key, $0.value.frame) }, direction)
+    }
+
+    /// The frame next to `cur` in `direction`: overlapping ones first, then the closest. A card
+    /// and a pane it lies over go by their centers.
+    static func neighbor(of cur: CGRect, among frames: [(PaneKey, CGRect)], _ direction: FocusDirection) -> PaneKey? {
         var best: (PaneKey, CGFloat)?
-        for (id, view) in views where id != pane && root.contains(id) {
-            let f = view.frame
+        for (id, f) in frames {
             let overlap: Bool
             let distance: CGFloat
-            switch direction {
-            case .left:
-                guard f.maxX <= cur.minX + 2 else { continue }
-                overlap = f.maxY > cur.minY && f.minY < cur.maxY
-                distance = cur.minX - f.maxX
-            case .right:
-                guard f.minX >= cur.maxX - 2 else { continue }
-                overlap = f.maxY > cur.minY && f.minY < cur.maxY
-                distance = f.minX - cur.maxX
-            case .up:
-                guard f.maxY <= cur.minY + 2 else { continue }
-                overlap = f.maxX > cur.minX && f.minX < cur.maxX
-                distance = cur.minY - f.maxY
-            case .down:
-                guard f.minY >= cur.maxY - 2 else { continue }
-                overlap = f.maxX > cur.minX && f.minX < cur.maxX
-                distance = f.minY - cur.maxY
+            if f.intersects(cur.insetBy(dx: 2, dy: 2)) {
+                let ahead: CGFloat
+                switch direction {
+                case .left: ahead = cur.midX - f.midX
+                case .right: ahead = f.midX - cur.midX
+                case .up: ahead = cur.midY - f.midY
+                case .down: ahead = f.midY - cur.midY
+                }
+                guard ahead > 0 else { continue }
+                overlap = true
+                distance = 0
+            } else {
+                switch direction {
+                case .left:
+                    guard f.maxX <= cur.minX + 2 else { continue }
+                    overlap = f.maxY > cur.minY && f.minY < cur.maxY
+                    distance = cur.minX - f.maxX
+                case .right:
+                    guard f.minX >= cur.maxX - 2 else { continue }
+                    overlap = f.maxY > cur.minY && f.minY < cur.maxY
+                    distance = f.minX - cur.maxX
+                case .up:
+                    guard f.maxY <= cur.minY + 2 else { continue }
+                    overlap = f.maxX > cur.minX && f.minX < cur.maxX
+                    distance = cur.minY - f.maxY
+                case .down:
+                    guard f.minY >= cur.maxY - 2 else { continue }
+                    overlap = f.maxX > cur.minX && f.minX < cur.maxX
+                    distance = f.minY - cur.maxY
+                }
             }
             // Prefer overlapping neighbours, then the closest center.
             let centerDistance = hypot(f.midX - cur.midX, f.midY - cur.midY)
