@@ -1374,13 +1374,14 @@ final class TabContentView: NSView {
         return true
     }
 
-    /// Floats `cards`, panes of other tabs that left them first, above the splits.
-    func addFloating(_ cards: [FloatingPane]) {
+    /// Floats `cards`, panes of other tabs that left them first, above the splits: shown or
+    /// hidden like the tab's other cards, or with none, as `hidden` says.
+    func addFloating(_ cards: [FloatingPane], hidden: Bool) {
         let new = cards.filter { !contains($0.pane) }
         guard !new.isEmpty else { return }
         transitionLayout {
+            if floating.isEmpty { floatingHidden = hidden }
             floating += new.map(FloatingCard.init)
-            floatingHidden = false
         }
         window?.invalidateCursorRects(for: self)
     }
@@ -1428,6 +1429,7 @@ final class TabContentView: NSView {
         transitionLayout {
             zoomedPane = nil
             floating.remove(at: i)
+            if floating.isEmpty { floatingHidden = false }
             root = root.inserting(pane, at: target, direction: direction, share: share ?? 0.5)
             if share == nil && SessionManager.shared.config.autoBalance { root = root.equalized() }
         }
