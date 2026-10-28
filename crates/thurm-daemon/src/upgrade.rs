@@ -104,6 +104,9 @@ pub struct PaneHandoff {
     /// What programs reported about themselves (OSC 7501).
     #[serde(default)]
     pub programs: Vec<thurm_proto::ProgramRecord>,
+    /// The process group the program records were reported in (see `PaneState::programs_pgrp`).
+    #[serde(default)]
+    pub programs_pgrp: Option<u32>,
 }
 
 impl PaneHandoff {

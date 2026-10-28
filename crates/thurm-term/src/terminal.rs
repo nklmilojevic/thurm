@@ -1141,6 +1141,13 @@ impl Terminal {
         self.programs.process_exited()
     }
 
+    /// The shell has the terminal back from a program it started, and no prompt mark said so
+    /// (a shell without integration): what the program reported is over. Returns whether the
+    /// records changed.
+    pub fn foreground_returned(&mut self) -> bool {
+        self.programs.prompt_started()
+    }
+
     /// The user came back to the terminal: reported results are no longer news. Returns
     /// whether the records changed.
     pub fn acknowledge_program_status(&mut self) -> bool {

@@ -1907,6 +1907,18 @@ fn osc52_is_forwarded_once() {
 }
 
 #[test]
+fn program_status_ends_when_the_foreground_returns() {
+    let mut t = term(20, 5);
+    t.advance(b"\x1b]7501;state=working:id=w\x07\x1b]7501;state=done:id=d\x07");
+    t.advance(b"\x1b]7501;state=error:id=e\x07\x1b]7501;state=blocked:id=b\x07");
+    assert!(t.foreground_returned());
+    let ids: Vec<String> = t.program_status().into_iter().map(|r| r.id).collect();
+    assert_eq!(ids, ["d", "e"]);
+    // Nothing left to drop.
+    assert!(!t.foreground_returned());
+}
+
+#[test]
 fn program_status_records() {
     let mut t = term(20, 5);
     // The support query is answered with what this terminal accepts, in the query's terminator.

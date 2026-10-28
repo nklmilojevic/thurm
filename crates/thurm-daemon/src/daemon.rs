@@ -212,9 +212,32 @@ struct ReadAhead {
 #[derive(Default)]
 struct ReadAheadState {
     data: Vec<u8>,
+    /// The terminal's foreground process group when each part of `data` was read: from each
+    /// offset on, until the next.
+    groups: Vec<(usize, Option<u32>)>,
     eof: bool,
     /// The parser is working through a batch it took.
     parsing: bool,
+}
+
+/// `len` bytes read in parts, each with the foreground process group when it was read (from
+/// its offset on), as `(start, end, group)`. Bytes before the first part have no group.
+fn read_groups(len: usize, groups: &[(usize, Option<u32>)]) -> Vec<(usize, usize, Option<u32>)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut group = None;
+    for &(at, g) in groups {
+        let at = at.min(len);
+        if at > start {
+            out.push((start, at, group));
+        }
+        start = start.max(at);
+        group = g;
+    }
+    if len > start || out.is_empty() {
+        out.push((start, len, group));
+    }
+    out
 }
 
 /// A client subscribed to a pane's output.
@@ -354,6 +377,11 @@ pub struct PaneState {
     program_command: Option<String>,
     /// The last `names_program` answer: for which word and program.
     command_check: Option<((String, String), bool)>,
+    /// The process group that was in the foreground when the program records last changed:
+    /// when the shell has the terminal back from it, the records are over (see `monitor`).
+    programs_pgrp: Option<u32>,
+    /// The foreground process group when the output being parsed was read (see `reader_loop`).
+    output_pgrp: Option<u32>,
 }
 
 impl PaneState {
@@ -379,6 +407,8 @@ struct InstallPane {
     carry: Vec<u8>,
     /// What forwarding `carry` gives clients (see `PaneState::forwarded_carry`).
     forwarded_carry: Vec<u8>,
+    /// The program records' group (see `PaneState::programs_pgrp`).
+    programs_pgrp: Option<u32>,
 }
 
 pub struct Daemon {
@@ -802,6 +832,7 @@ impl Daemon {
                 shell_integration_seen: false,
                 carry: Vec::new(),
                 forwarded_carry: Vec::new(),
+                programs_pgrp: None,
             },
             true,
         )?;
@@ -846,6 +877,8 @@ impl Daemon {
                 program_name: None,
                 program_command: None,
                 command_check: None,
+                programs_pgrp: p.programs_pgrp,
+                output_pgrp: None,
             }),
         });
         self.panes.lock().insert(id, pane.clone());
@@ -901,6 +934,10 @@ impl Daemon {
                     break;
                 }
             };
+            // Who wrote it, as near the write as the daemon gets: a program that reports and
+            // exits at once has usually not given the terminal back yet, while the parser may
+            // only reach its bytes after the shell has.
+            let group = pty::foreground_of(&reader);
             let quiet = last_read.elapsed() >= QUIET;
             last_read = Instant::now();
             let mut st = pipe.state.lock();
@@ -909,7 +946,7 @@ impl Daemon {
                 // waking the parser, which is idle and has nothing queued. Nothing else can be
                 // appended meanwhile, so the order holds.
                 drop(st);
-                self.parse_guarded(&pane, &buf[..n]);
+                self.parse_guarded(&pane, &buf[..n], &[(0, group)]);
                 continue;
             }
             while st.data.len() >= READ_AHEAD {
@@ -922,6 +959,10 @@ impl Daemon {
                 let len = st.data.len();
                 st.data.reserve_exact(READ_AHEAD + buf.len() - len);
             }
+            if st.groups.last().is_none_or(|&(_, g)| g != group) {
+                let at = st.data.len();
+                st.groups.push((at, group));
+            }
             st.data.extend_from_slice(&buf[..n]);
             pipe.ready.notify_one();
         }
@@ -933,6 +974,7 @@ impl Daemon {
     fn parser_loop(self: Arc<Self>, pane: Arc<Pane>, pipe: Arc<ReadAhead>) {
         interactive_qos();
         let mut batch = Vec::new();
+        let mut groups = Vec::new();
         loop {
             {
                 let mut st = pipe.state.lock();
@@ -945,11 +987,13 @@ impl Daemon {
                 }
                 // Swap buffers: the reader keeps appending into the (emptied) previous batch.
                 std::mem::swap(&mut st.data, &mut batch);
+                std::mem::swap(&mut st.groups, &mut groups);
                 st.parsing = true;
                 pipe.room.notify_one();
             }
-            self.parse_guarded(&pane, &batch);
+            self.parse_guarded(&pane, &batch, &groups);
             batch.clear();
+            groups.clear();
             // After a burst, give the memory back rather than keep megabytes per pane (the
             // reader's buffer is this one after the next swap).
             if batch.capacity() > KEEP_BUFFER {
@@ -961,9 +1005,11 @@ impl Daemon {
 
     /// [`Daemon::parse_output`], surviving a panic in the terminal code: the pane goes on with
     /// the next output instead of freezing with a dead parser thread.
-    fn parse_guarded(&self, pane: &Arc<Pane>, bytes: &[u8]) {
+    fn parse_guarded(&self, pane: &Arc<Pane>, bytes: &[u8], groups: &[(usize, Option<u32>)]) {
         let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.parse_output(pane, bytes)
+            for (start, end, group) in read_groups(bytes.len(), groups) {
+                self.parse_output(pane, &bytes[start..end], group);
+            }
         }));
         if parsed.is_err() {
             log::error!(
@@ -976,10 +1022,12 @@ impl Daemon {
 
     /// Feeds PTY output to the pane's terminal and forwards it to subscribers, a slice per
     /// lock so that requests for the pane are not held up by a long batch.
-    fn parse_output(&self, pane: &Arc<Pane>, bytes: &[u8]) {
+    /// `group` is the foreground process group when `bytes` were read.
+    fn parse_output(&self, pane: &Arc<Pane>, bytes: &[u8], group: Option<u32>) {
         for slice in bytes.chunks(PARSE_SLICE) {
             let events = {
                 let mut st = pane.state.lock();
+                st.output_pgrp = group;
                 // Forwarded even without subscribers: one may attach inside a sequence.
                 let data = st.term.advance_forward(slice);
                 update_carry(&mut st.forwarded_carry, &data);
@@ -1232,6 +1280,8 @@ impl Daemon {
                     // Each report in turn: a request answered within the same read still
                     // notifies.
                     TermEvent::ProgramStatus(records) => {
+                        // Whose report: the group in the foreground when its bytes were read.
+                        st.programs_pgrp = st.output_pgrp.or_else(|| st.pty.foreground_pgrp());
                         outgoing.extend(self.sync_programs(pane.id, &mut st, records));
                         info_changed = true;
                     }
@@ -1619,6 +1669,27 @@ impl Daemon {
                     if st.term.sync_deadline().is_some_and(|d| d <= Instant::now()) {
                         st.term.flush_sync();
                     }
+                    // A shell without integration sends no prompt mark when a program it started
+                    // ends (Ctrl+C), so the terminal coming back to the shell ends what the program
+                    // reported. Not for a program that is the pane's process itself, nor for
+                    // records the shell reported itself.
+                    let mut programs_changed = false;
+                    if st.programs_pgrp.is_some()
+                        && st.programs_pgrp != st.info.pid
+                        && st.pty.foreground_pgrp() == st.info.pid
+                        && st
+                            .info
+                            .pid
+                            .and_then(procinfo::process_info)
+                            .is_some_and(|p| procinfo::is_shell(&p.name))
+                    {
+                        st.programs_pgrp = None;
+                        if st.term.foreground_returned() {
+                            let records = st.term.program_status();
+                            events.extend(self.sync_programs(pane.id, &mut st, records));
+                            programs_changed = true;
+                        }
+                    }
                     let before = st.info.clone();
                     if st.agent.invalidate_dead_report_owner() {
                         st.info.agent = st.agent.state().cloned();
@@ -1751,7 +1822,7 @@ impl Daemon {
                     // every 2 s for clients that display it.
                     let mut cmp = st.info.clone();
                     cmp.idle_ms = before.idle_ms;
-                    if cmp != before || tick.is_multiple_of(4) {
+                    if cmp != before || programs_changed || tick.is_multiple_of(4) {
                         events.push(Event::PaneInfo(st.info.clone()));
                     }
                     // Under the pane's lock, as everywhere: a state taken before a hook's must
@@ -1916,6 +1987,7 @@ impl Daemon {
                 agent_hook: st.agent.hook_handoff(),
                 terminal_size_after_detach: st.terminal_attachment.map(|(_, size)| size.into()),
                 programs: st.term.program_status_handoff(),
+                programs_pgrp: st.programs_pgrp,
             });
         }
         upgrade::Handoff {
@@ -2003,6 +2075,7 @@ impl Daemon {
                     // Still the start of a sequence if the next upgrade comes before its end.
                     carry: pending,
                     forwarded_carry,
+                    programs_pgrp: p.programs_pgrp,
                 },
                 alive,
             );
@@ -3567,6 +3640,56 @@ mod tests {
             topic: None,
             permission,
         }
+    }
+
+    #[test]
+    fn output_keeps_the_group_it_was_read_under() {
+        // A job's report, then the shell's prompt, read in one batch.
+        assert_eq!(
+            read_groups(10, &[(0, Some(7)), (6, Some(100))]),
+            vec![(0, 6, Some(7)), (6, 10, Some(100))]
+        );
+        assert_eq!(read_groups(4, &[(0, Some(7))]), vec![(0, 4, Some(7))]);
+        // Nothing recorded: no group, and the report falls back to the terminal's now.
+        assert_eq!(read_groups(4, &[]), vec![(0, 4, None)]);
+        assert_eq!(read_groups(0, &[]), vec![(0, 0, None)]);
+    }
+
+    /// A job that reports and exits at once can have given the terminal back by the time its
+    /// bytes are parsed: the report is the group's that had it when they were read.
+    #[test]
+    fn a_report_belongs_to_the_group_it_was_read_under() {
+        let dir = std::env::temp_dir().join(format!("thurm-report-group-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // A pane that prints nothing, so its own parser doesn't run meanwhile.
+        let id = daemon
+            .create_pane(
+                CreatePane {
+                    command: Some(vec!["sleep".into(), "30".into()]),
+                    size: PaneSize {
+                        cols: 80,
+                        rows: 24,
+                        cell_width: 8,
+                        cell_height: 16,
+                    },
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let pane = daemon.pane(id).unwrap();
+        let job = 1_000_000;
+        assert_ne!(pane.state.lock().pty.foreground_pgrp(), Some(job));
+        daemon.parse_output(&pane, b"\x1b]7501;state=working:app=x\x1b\\", Some(job));
+        assert_eq!(pane.state.lock().programs_pgrp, Some(job));
+        daemon.close_pane(id);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -29,6 +29,23 @@ fn run(c: &Client, pane: PaneId, line: &str) {
     .unwrap();
 }
 
+/// A job that reports working, then sleeps: stopped with Ctrl+C, it ends without a prompt mark.
+const WORKING_JOB: &str = r#"sh -c "printf '\\033]7501;state=working:app=x\\033\\\\'; sleep 30""#;
+
+fn working(i: &PaneInfo) -> bool {
+    i.agent
+        .as_ref()
+        .is_some_and(|a| a.status == AgentStatus::Working)
+}
+
+fn interrupt(c: &Client, pane: PaneId) {
+    c.request(Request::Input {
+        pane,
+        data: vec![3],
+    })
+    .unwrap();
+}
+
 #[test]
 fn programs_report_their_status() {
     let env = Env::new("program-status");
@@ -166,4 +183,62 @@ fn records_survive_an_upgrade_without_notifying_again() {
         "notified again"
     );
     drop(c2);
+}
+
+#[test]
+fn ctrl_c_ends_what_a_program_reported_without_shell_integration() {
+    let env = Env::new("program-status-interrupt");
+    let _d = env.start();
+    let (c, _) = env.connect();
+    let pane = create(&c, &env.dir);
+    run(&c, pane, WORKING_JOB);
+    wait_info(&c, pane, "working", working);
+    interrupt(&c, pane);
+    wait_info(&c, pane, "interrupted", |i| {
+        i.programs.is_empty() && i.agent.is_none()
+    });
+}
+
+#[test]
+fn a_job_status_survives_an_upgrade_and_ends_with_the_job() {
+    let env = Env::new("program-status-upgrade-job");
+    let daemon = env.start();
+    let (c, _) = env.connect();
+    let pane = create(&c, &env.dir);
+    run(&c, pane, WORKING_JOB);
+    wait_info(&c, pane, "working", working);
+    let c = super::workflows_upgrade::upgrade(&env, &daemon, &c);
+    assert!(working(&info(&c, pane)), "working lost in the upgrade");
+    interrupt(&c, pane);
+    wait_info(&c, pane, "interrupted after the upgrade", |i| {
+        i.programs.is_empty() && i.agent.is_none()
+    });
+}
+
+/// A job that reports and exits at once: its report is parsed after the shell has the terminal
+/// back, but it was read while the job still had it.
+#[test]
+fn a_quick_job_reports_and_exits_leaves_no_status() {
+    let env = Env::new("program-status-quick-job");
+    let _d = env.start();
+    let (c, rx) = env.connect();
+    let pane = create(&c, &env.dir);
+    run(
+        &c,
+        pane,
+        r#"sh -c "printf '\\033]7501;state=working:app=x\\033\\\\'""#,
+    );
+    // The report was parsed: an empty pane at the start proves nothing.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Event::PaneInfo(i)) if i.id == pane && working(&i) => break,
+            Ok(_) => {}
+            Err(e) => panic!("the quick job's report was not seen: {e}"),
+        }
+    }
+    wait_info(&c, pane, "the quick job's status ended", |i| {
+        i.programs.is_empty() && i.agent.is_none()
+    });
 }
