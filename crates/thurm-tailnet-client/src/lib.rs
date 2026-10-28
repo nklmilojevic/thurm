@@ -23,7 +23,8 @@ use tokio_tungstenite::tungstenite::{self, Message};
 /// How long reaching the daemon may take: TCP, TLS and the upgrade. Short, so a device whose
 /// Tailscale is off falls back to ssh quickly (a node that is off doesn't refuse; it's silent).
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
-/// A ping this often keeps the connection checked while nothing else is said.
+/// A ping once the daemon has been quiet this long. Never while it talks: the gateway answers a
+/// ping only once its own writes let go of the socket, within a few seconds.
 const PING_EVERY: Duration = Duration::from_secs(15);
 /// Nothing heard for this long (not even a pong): the connection is gone.
 const SILENT_LIMIT: Duration = Duration::from_secs(45);
@@ -451,6 +452,93 @@ async fn send_within<S: AsyncRead + AsyncWrite + Unpin>(
     )
 }
 
+/// What the relay knows about the daemon's side of the connection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Heard {
+    /// Last heard at this instant.
+    At(tokio::time::Instant),
+    /// Its bytes are being written to the local app now. Nothing is heard meanwhile, and that
+    /// wait is the app's, not the daemon's silence.
+    Writing,
+}
+
+/// The silence left before the connection is closed: a send may use no more than this, so a
+/// stalled send can't stretch the limit.
+fn silence_left(heard: Heard, now: tokio::time::Instant, silent: Duration) -> Duration {
+    match heard {
+        Heard::At(at) => silent.saturating_sub(now.saturating_duration_since(at)),
+        Heard::Writing => silent,
+    }
+}
+
+/// What the relay does about a quiet daemon.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Quiet {
+    /// Look again in this long.
+    Wait(Duration),
+    /// Quiet for `ping_every`, and not pinged since it was last heard.
+    Ping,
+    /// Silent for the whole limit: gone.
+    Close,
+}
+
+/// What to do at `now`, given when the daemon was last heard and when it was last pinged.
+fn quiet(
+    heard: Heard,
+    pinged: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    ping_every: Duration,
+    silent: Duration,
+) -> Quiet {
+    let Heard::At(at) = heard else {
+        return Quiet::Wait(ping_every);
+    };
+    let silence = now.saturating_duration_since(at);
+    if silence >= silent {
+        return Quiet::Close;
+    }
+    if silence < ping_every {
+        return Quiet::Wait(ping_every - silence);
+    }
+    // Pinged since it was last heard: wait for the pong, or for the limit.
+    if pinged.is_some_and(|p| p > at) {
+        return Quiet::Wait(silent - silence);
+    }
+    Quiet::Ping
+}
+
+/// Whether a write whose last bytes went out at `last` has stalled: no bytes for `idle`.
+fn stalled(last: tokio::time::Instant, now: tokio::time::Instant, idle: Duration) -> bool {
+    now.saturating_duration_since(last) >= idle
+}
+
+/// Writes `data` to the local app, giving up once it takes no bytes for `idle`. An app that
+/// keeps reading is not stalled, however long the whole write takes.
+async fn write_progressing<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    mut data: &[u8],
+    idle: Duration,
+) -> bool {
+    let mut last = tokio::time::Instant::now();
+    while !data.is_empty() {
+        tokio::select! {
+            written = wr.write(data) => match written {
+                Ok(n) if n > 0 => {
+                    data = &data[n..];
+                    last = tokio::time::Instant::now();
+                }
+                _ => return false,
+            },
+            _ = tokio::time::sleep_until(last + idle) => {
+                if stalled(last, tokio::time::Instant::now(), idle) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Copies the daemon's bytes both ways until either side ends, pinging while it's quiet.
 async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
     ws: tokio_tungstenite::WebSocketStream<S>,
@@ -459,18 +547,26 @@ async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
 ) {
     let (mut sink, mut stream) = ws.split();
     let (mut rd, mut wr) = local.into_split();
-    // When the daemon was last heard from; the down side keeps it current.
-    let (heard_tx, heard_rx) = tokio::sync::watch::channel(tokio::time::Instant::now());
-    // What's left of the silence limit: a send may wait that long and no longer, so a stalled
-    // send can't stretch the limit.
-    let budget = || limits.silent.saturating_sub(heard_rx.borrow().elapsed());
+    // The daemon's side, as the down side keeps it current.
+    let (heard_tx, heard_rx) = tokio::sync::watch::channel(Heard::At(tokio::time::Instant::now()));
+    let budget = || {
+        silence_left(
+            *heard_rx.borrow(),
+            tokio::time::Instant::now(),
+            limits.silent,
+        )
+    };
 
     let down = async {
         while let Some(msg) = stream.next().await {
-            let _ = heard_tx.send(tokio::time::Instant::now());
+            let _ = heard_tx.send(Heard::At(tokio::time::Instant::now()));
             match msg {
                 Ok(Message::Binary(b)) => {
-                    if wr.write_all(&b).await.is_err() {
+                    let _ = heard_tx.send(Heard::Writing);
+                    let wrote = write_progressing(&mut wr, &b, limits.silent).await;
+                    let _ = heard_tx.send(Heard::At(tokio::time::Instant::now()));
+                    if !wrote {
+                        log::info!("tailnet: the local app takes no bytes; closing");
                         break;
                     }
                 }
@@ -482,9 +578,20 @@ async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let up = async {
         let mut buf = vec![0u8; 64 * 1024];
-        let mut ping = tokio::time::interval(limits.ping_every);
-        ping.tick().await;
+        let mut pinged = None;
         loop {
+            let heard = *heard_rx.borrow();
+            let state = quiet(
+                heard,
+                pinged,
+                tokio::time::Instant::now(),
+                limits.ping_every,
+                limits.silent,
+            );
+            let check = tokio::time::sleep(match state {
+                Quiet::Wait(d) => d,
+                Quiet::Ping | Quiet::Close => Duration::ZERO,
+            });
             tokio::select! {
                 n = rd.read(&mut buf) => match n {
                     Ok(0) | Err(_) => {
@@ -499,15 +606,19 @@ async fn relay<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                 },
-                _ = ping.tick() => {
-                    if budget().is_zero() {
+                _ = check => match state {
+                    Quiet::Wait(_) => {}
+                    Quiet::Close => {
                         log::info!("tailnet: no answer for {}s; closing", limits.silent.as_secs());
                         break;
                     }
-                    if !send_within(&mut sink, Message::Ping(Vec::new().into()), budget()).await {
-                        break;
+                    Quiet::Ping => {
+                        pinged = Some(tokio::time::Instant::now());
+                        if !send_within(&mut sink, Message::Ping(Vec::new().into()), budget()).await {
+                            break;
+                        }
                     }
-                }
+                },
             }
         }
     };

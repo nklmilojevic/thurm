@@ -1,5 +1,6 @@
 use std::io::Write as _;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::*;
 
@@ -748,6 +749,91 @@ fn a_silent_phone_is_dropped_and_gives_the_pane_back() {
         std::thread::sleep(Duration::from_millis(100));
     }
     drop(phone);
+}
+
+/// Reads what the daemon sends a raw phone, on a thread: the output events so far, and whether
+/// the daemon closed the connection.
+struct Listening {
+    outputs: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+}
+
+fn listen(mut phone: UnixStream) -> Listening {
+    phone.set_read_timeout(None).unwrap();
+    let outputs = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicBool::new(false));
+    let (o, c) = (outputs.clone(), closed.clone());
+    std::thread::spawn(move || {
+        while let Ok(Some(frame)) = codec::read_frame(&mut phone) {
+            if let Ok(ServerMessage::Event(Event::Output { .. })) = codec::decode(&frame) {
+                o.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        c.store(true, Ordering::Relaxed);
+    });
+    Listening { outputs, closed }
+}
+
+/// A phone busy with output that it doesn't answer (its session loop is blocked behind it) is
+/// not gone: it stays connected past the silence limit while output keeps coming, and goes
+/// once the output stops and it says nothing.
+#[test]
+fn a_phone_receiving_output_stays_connected_while_it_says_nothing() {
+    let env = Env::new("busy-phone");
+    let _daemon = env.start_with(&[("THURM_MOBILE_SILENCE_MS", Path::new("800"))]);
+    let (mac, _) = env.connect();
+    let pane = create(&mac, &env.dir);
+
+    let (mut phone, hello) = raw_hello(&env, PROTOCOL_VERSION, &[CAP_MOBILE]);
+    assert!(hello.is_ok(), "{hello:?}");
+    let r = raw_request(&mut phone, 2, Request::Subscribe { pane });
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+    let phone = listen(phone);
+
+    // Stopped by a file rather than ^C, which bash can miss between `echo` and `sleep`.
+    let stop = env.dir.join("stop-ticking");
+    mac.request(Request::Input {
+        pane,
+        data: format!(
+            "while [ ! -e '{}' ]; do echo tick; sleep 0.2; done\r",
+            stop.display()
+        )
+        .into_bytes(),
+    })
+    .unwrap();
+    // Several silence limits of output, none of it answered.
+    std::thread::sleep(Duration::from_millis(3000));
+    assert!(
+        !phone.closed.load(Ordering::Relaxed),
+        "the busy phone was dropped"
+    );
+    assert!(phone.outputs.load(Ordering::Relaxed) > 5);
+
+    std::fs::write(&stop, "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !phone.closed.load(Ordering::Relaxed) {
+        assert!(
+            Instant::now() < deadline,
+            "the phone that went quiet was kept"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A phone that neither sends nor receives anything is dropped after the silence limit.
+#[test]
+fn a_phone_that_neither_sends_nor_hears_is_dropped() {
+    let env = Env::new("deaf-phone");
+    let _daemon = env.start_with(&[("THURM_MOBILE_SILENCE_MS", Path::new("800"))]);
+    let (phone, hello) = raw_hello(&env, PROTOCOL_VERSION, &[CAP_MOBILE]);
+    assert!(hello.is_ok(), "{hello:?}");
+    let phone = listen(phone);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !phone.closed.load(Ordering::Relaxed) {
+        assert!(Instant::now() < deadline, "the silent phone was kept");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The Mac app says Hello again on its connection (to read the daemon's version) without
