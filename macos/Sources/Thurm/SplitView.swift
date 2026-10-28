@@ -1039,7 +1039,9 @@ final class TabContentView: NSView {
                 addCursorRect(rect, cursor: d.axis == .horizontal ? .resizeLeftRight : .resizeUpDown)
             }
         }
-        for (id, r) in cards where floating.first(where: { $0.pane == id })?.zoomed == false {
+        for (i, (id, r)) in cards.enumerated() where floating.first(where: { $0.pane == id })?.zoomed == false {
+            // A card's edges under the cards in front of it don't resize it (see `cardEdges`).
+            let above = holes[(i + 1)...]
             let b2 = band * 2
             let parts: [(CGRect, FloatingEdges)] = [
                 (CGRect(x: r.minX - band, y: r.minY + band, width: b2, height: r.height - b2), .left),
@@ -1051,7 +1053,15 @@ final class TabContentView: NSView {
                 (CGRect(x: r.minX - band, y: r.maxY - band, width: b2, height: b2), [.bottom, .left]),
                 (CGRect(x: r.maxX - band, y: r.maxY - band, width: b2, height: b2), [.bottom, .right]),
             ]
-            for (rect, edges) in parts { addCursorRect(rect, cursor: FloatingGeometry.cursor(for: edges)) }
+            for (rect, edges) in parts {
+                let pieces: [CGRect]
+                switch edges {
+                case .left, .right: pieces = FloatingGeometry.uncovered(rect, axis: .horizontal, by: Array(above))
+                case .top, .bottom: pieces = FloatingGeometry.uncovered(rect, axis: .vertical, by: Array(above))
+                default: pieces = above.contains { $0.intersects(rect) } ? [] : [rect]
+                }
+                for piece in pieces { addCursorRect(piece, cursor: FloatingGeometry.cursor(for: edges)) }
+            }
         }
     }
 
@@ -1207,7 +1217,8 @@ final class TabContentView: NSView {
         for view in views.values { view.needsRender = true }
         if changed { refreshHeaders() }
         if changed { updateDimming() }
-        if changed && showsHeaders { layoutPanes() }
+        // Cards draw their focus in their outline, with or without the splits' headers.
+        if changed && (showsHeaders || !floating.isEmpty) { layoutPanes() }
         if changed && !showsHeaders { updateFocusRing(frames: visibleFrames, cards: false) }
         if changed {
             controller?.focusedPaneChanged()

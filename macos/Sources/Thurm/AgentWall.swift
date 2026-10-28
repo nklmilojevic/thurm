@@ -74,6 +74,7 @@ enum AgentWall {
                         floating: [Set<PaneKey>] = []) -> [Return] {
         var left = Set(onWall)
         var tabs = tabs
+        var floating = floating
         var out: [Return] = []
         for origin in origins.sorted(by: { $0.index < $1.index }) {
             let panes = origin.tab.panes
@@ -93,7 +94,12 @@ enum AgentWall {
             }
             // Two origins can go back to one tab (their shells moved together): the next one
             // keeps what this one put back.
-            if let into { tabs[into] = root.panes + cards + floats.map(\.pane) }
+            if let into {
+                tabs[into] = root.panes + cards + floats.map(\.pane)
+                // The panes put back as cards stay cards for a later return to the same tab.
+                while floating.count <= into { floating.append([]) }
+                floating[into].formUnion(floats.map(\.pane))
+            }
             out.append(Return(origin: origin, panes: back, root: root, floating: floats, into: into))
         }
         return out

@@ -145,4 +145,20 @@ final class FloatingPaneTests: XCTestCase {
         XCTAssertEqual(plan[0].root.panes, [key(3)])
         XCTAssertEqual(plan[0].floating, [])
     }
+
+    /// Two origins going back to one tab: the first one's card stays a card for the second.
+    func testACardPutBackStaysACardForTheNextReturn() {
+        let card = FloatingPane(pane: key(3), frame: [0.2, 0.2, 0.5, 0.5])
+        let first = WallOrigin(index: 0, tab: TabLayout(title: nil, root: .pane(key(2)), focused: 2, zoomed: nil,
+                                                        floating: [card]))
+        let second = WallOrigin(index: 1, tab: TabLayout(title: nil, root: .split(dir: .right, ratio: 0.5,
+                                                                                  first: .pane(key(2)),
+                                                                                  second: .pane(key(4))),
+                                                         focused: 4, zoomed: nil))
+        let plan = AgentWall.returns(origins: [first, second], onWall: [key(3), key(4)], tabs: [[key(2)]],
+                                     floating: [[]])
+        XCTAssertEqual(plan.map(\.into), [0, 0])
+        XCTAssertEqual(plan[0].floating, [card])
+        XCTAssertEqual(Set(plan[1].root.panes), [key(2), key(4)])
+    }
 }
