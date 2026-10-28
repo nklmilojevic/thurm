@@ -1498,7 +1498,8 @@ final class TerminalView: NSView, NSTextInputClient {
         if window?.firstResponder !== self {
             window?.makeFirstResponder(self)
         }
-        NSMenu.popUpContextMenu(contextMenu(), with: event, for: self)
+        let p = cellPosition(convert(event.locationInWindow, from: nil))
+        NSMenu.popUpContextMenu(contextMenu(link: linkURL(col: p.col, row: p.row)), with: event, for: self)
     }
 
     override func rightMouseUp(with event: NSEvent) {
@@ -1669,8 +1670,19 @@ final class TerminalView: NSView, NSTextInputClient {
 
     // MARK: Context menu
 
-    private func contextMenu() -> NSMenu {
+    private func contextMenu(link: URL?) -> NSMenu {
         let menu = NSMenu(title: "Terminal")
+        if let link {
+            let openItem = menu.addItem(withTitle: "Open Link", action: #selector(openLinkFromMenu(_:)),
+                                        keyEquivalent: "")
+            openItem.target = self
+            openItem.representedObject = link
+            let copyLinkItem = menu.addItem(withTitle: "Copy Link", action: #selector(copyLinkFromMenu(_:)),
+                                            keyEquivalent: "")
+            copyLinkItem.target = self
+            copyLinkItem.representedObject = link
+            menu.addItem(NSMenuItem.separator())
+        }
         let copyItem = menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
         copyItem.target = self
         let pasteItem = menu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "")
@@ -1680,10 +1692,28 @@ final class TerminalView: NSView, NSTextInputClient {
                      keyEquivalent: "")
         menu.addItem(withTitle: "Split Down", action: #selector(TerminalWindowController.splitDown(_:)),
                      keyEquivalent: "")
+        let copyIDItem = menu.addItem(withTitle: "Copy Pane ID", action: #selector(copyPaneID(_:)), keyEquivalent: "")
+        copyIDItem.target = self
         menu.addItem(NSMenuItem.separator())
         let clearItem = menu.addItem(withTitle: "Clear", action: #selector(clearScreen(_:)), keyEquivalent: "")
         clearItem.target = self
         return menu
+    }
+
+    @objc private func openLinkFromMenu(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        SessionManager.shared.openLink(url, from: pane, in: window)
+    }
+
+    @objc private func copyLinkFromMenu(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+    }
+
+    @objc private func copyPaneID(_ sender: Any?) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(pane.copyText, forType: .string)
     }
 }
 

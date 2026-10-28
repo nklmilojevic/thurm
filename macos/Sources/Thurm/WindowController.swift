@@ -434,6 +434,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         SessionManager.shared.userClosePane(content.focusedPane)
     }
 
+    @objc func copyPaneID(_ sender: Any?) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(focusedPane.copyText, forType: .string)
+    }
+
     @objc func toggleZoom(_ sender: Any?) {
         content.toggleZoom()
     }

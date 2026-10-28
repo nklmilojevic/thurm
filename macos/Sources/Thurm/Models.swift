@@ -32,6 +32,9 @@ struct PaneKey: Hashable, CustomStringConvertible {
     /// The id as request payloads carry it.
     var number: NSNumber { NSNumber(value: id) }
     var description: String { isRemote ? "\(host):\(id)" : "\(id)" }
+    /// What "Copy Pane ID" copies: the bare id on this Mac, or the `thurm` arguments that name a
+    /// remote pane (`--remote` takes the `[[remote]]` name, which is the host id).
+    var copyText: String { isRemote ? "--remote \(host) --pane \(id)" : "\(id)" }
 }
 
 // MARK: - Constants mirrored from thurm.h
