@@ -167,3 +167,29 @@ fn records_survive_an_upgrade_without_notifying_again() {
     );
     drop(c2);
 }
+
+#[test]
+fn ctrl_c_ends_what_a_program_reported_without_shell_integration() {
+    let env = Env::new("program-status-interrupt");
+    let _d = env.start();
+    let (c, _) = env.connect();
+    let pane = create(&c, &env.dir);
+    run(
+        &c,
+        pane,
+        r#"sh -c "printf '\\033]7501;state=working:app=x\\033\\\\'; sleep 30""#,
+    );
+    wait_info(&c, pane, "working", |i| {
+        i.agent
+            .as_ref()
+            .is_some_and(|a| a.status == AgentStatus::Working)
+    });
+    c.request(Request::Input {
+        pane,
+        data: vec![3],
+    })
+    .unwrap();
+    wait_info(&c, pane, "interrupted", |i| {
+        i.programs.is_empty() && i.agent.is_none()
+    });
+}

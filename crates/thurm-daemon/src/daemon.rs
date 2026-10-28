@@ -346,6 +346,9 @@ pub struct PaneState {
     program_command: Option<String>,
     /// The last `names_program` answer: for which word and program.
     command_check: Option<((String, String), bool)>,
+    /// The process group that was in the foreground when the program records last changed:
+    /// when the shell has the terminal back from it, the records are over (see `monitor`).
+    programs_pgrp: Option<u32>,
 }
 
 impl PaneState {
@@ -832,6 +835,7 @@ impl Daemon {
                 program_name: None,
                 program_command: None,
                 command_check: None,
+                programs_pgrp: None,
             }),
         });
         self.panes.lock().insert(id, pane.clone());
@@ -1218,6 +1222,7 @@ impl Daemon {
                     // Each report in turn: a request answered within the same read still
                     // notifies.
                     TermEvent::ProgramStatus(records) => {
+                        st.programs_pgrp = st.pty.foreground_pgrp();
                         outgoing.extend(self.sync_programs(pane.id, &mut st, records));
                         info_changed = true;
                     }
@@ -1605,6 +1610,27 @@ impl Daemon {
                     if st.term.sync_deadline().is_some_and(|d| d <= Instant::now()) {
                         st.term.flush_sync();
                     }
+                    // A shell without integration sends no prompt mark when a program it started
+                    // ends (Ctrl+C), so the terminal coming back to the shell ends what the program
+                    // reported. Not for a program that is the pane's process itself, nor for
+                    // records the shell reported itself.
+                    let mut programs_changed = false;
+                    if st.programs_pgrp.is_some()
+                        && st.programs_pgrp != st.info.pid
+                        && st.pty.foreground_pgrp() == st.info.pid
+                        && st
+                            .info
+                            .pid
+                            .and_then(procinfo::process_info)
+                            .is_some_and(|p| procinfo::is_shell(&p.name))
+                    {
+                        st.programs_pgrp = None;
+                        if st.term.foreground_returned() {
+                            let records = st.term.program_status();
+                            events.extend(self.sync_programs(pane.id, &mut st, records));
+                            programs_changed = true;
+                        }
+                    }
                     let before = st.info.clone();
                     if st.agent.invalidate_dead_report_owner() {
                         st.info.agent = st.agent.state().cloned();
@@ -1737,7 +1763,7 @@ impl Daemon {
                     // every 2 s for clients that display it.
                     let mut cmp = st.info.clone();
                     cmp.idle_ms = before.idle_ms;
-                    if cmp != before || tick.is_multiple_of(4) {
+                    if cmp != before || programs_changed || tick.is_multiple_of(4) {
                         events.push(Event::PaneInfo(st.info.clone()));
                     }
                     // Under the pane's lock, as everywhere: a state taken before a hook's must
