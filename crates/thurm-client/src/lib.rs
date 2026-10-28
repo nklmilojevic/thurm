@@ -397,7 +397,7 @@ impl Client {
                 while let Ok(Some(frame)) = codec::read_frame(&mut reader) {
                     // A message of a newer daemon this client can't decode is skipped (the frames
                     // after it are intact); a response still ends its request, with an error.
-                    let Ok(msg) = codec::decode::<ServerMessage>(&frame) else {
+                    let Ok(msg) = codec::decode_message(&frame) else {
                         if let Some(id) = codec::response_id(&frame)
                             && let Some(tx) = pending.lock().remove(&id)
                         {

@@ -15,6 +15,14 @@ use crate::{
 /// panes (the iPad too, holding the panes it shows).
 const APP_CAPABILITIES: &[&str] = &[thurm_proto::CAP_MOBILE, thurm_proto::CAP_PANE_PAGER];
 
+/// [`APP_CAPABILITIES`] for a daemon across the network (the tailnet), which deflates its events
+/// for the app. The in-app daemon of `thurm_direct_connect` is no such connection.
+const REMOTE_CAPABILITIES: &[&str] = &[
+    thurm_proto::CAP_MOBILE,
+    thurm_proto::CAP_PANE_PAGER,
+    thurm_proto::CAP_DEFLATE,
+];
+
 /// The device's ssh key, held by the app (a Secure Enclave P-256 key). `sign` writes the
 /// 64-byte `r || s` ECDSA/SHA-256 signature of `data` to `sig` and returns true, or false when
 /// the user declined; it is called on a background thread and may block (Face ID).
@@ -155,8 +163,9 @@ pub unsafe extern "C" fn thurm_tailnet_connect(
         .unwrap_or("Thurm iOS")
         .to_owned();
     let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
-        let remote = thurm_tailnet_client::connect(&url, &name, APP_CAPABILITIES, on_ev, on_disc)
-            .map_err(|e| e.to_string())?;
+        let remote =
+            thurm_tailnet_client::connect(&url, &name, REMOTE_CAPABILITIES, on_ev, on_disc)
+                .map_err(|e| e.to_string())?;
         let transport: Box<dyn std::any::Any + Send> = Box::new(remote.session);
         Ok((remote.client, Some(transport)))
     });
@@ -235,12 +244,12 @@ unsafe fn tailnet_connect_fd(
                 fd,
                 &url,
                 &name,
-                APP_CAPABILITIES,
+                REMOTE_CAPABILITIES,
                 on_ev,
                 on_disc,
             )
         } else {
-            thurm_tailnet_client::connect_fd(fd, &url, &name, APP_CAPABILITIES, on_ev, on_disc)
+            thurm_tailnet_client::connect_fd(fd, &url, &name, REMOTE_CAPABILITIES, on_ev, on_disc)
         }
         .map_err(|e| e.to_string())?;
         let transport: Box<dyn std::any::Any + Send> = Box::new(remote.session);
