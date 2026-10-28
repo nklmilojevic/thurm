@@ -156,4 +156,88 @@ final class MainMenuTests: XCTestCase {
         XCTAssertNil(parse("hyper+k"))
         XCTAssertNil(parse("cmd+launchpad"))
     }
+
+    /// Digits follow key positions: the digit row whatever it types, and the keypad, but not F20.
+    func testDigitKeysByPosition() {
+        XCTAssertEqual(MainMenu.digitKeys[0x12], "1")
+        XCTAssertEqual(MainMenu.digitKeys[0x17], "5")
+        XCTAssertEqual(MainMenu.digitKeys[0x1C], "8")
+        XCTAssertEqual(MainMenu.digitKeys[0x19], "9")
+        XCTAssertEqual(MainMenu.digitKeys[0x1D], "0")
+        XCTAssertEqual(MainMenu.digitKeys[0x53], "1")
+        XCTAssertEqual(MainMenu.digitKeys[0x59], "7")
+        XCTAssertEqual(MainMenu.digitKeys[0x5B], "8")
+        XCTAssertEqual(MainMenu.digitKeys[0x5C], "9")
+        XCTAssertNil(MainMenu.digitKeys[0x5A])
+        XCTAssertNil(MainMenu.digitKeys[0x0C])
+    }
+
+    /// ⌘1 finds Select Tab 1, the item a binding moved the combination to, or nothing for "none".
+    func testDigitLookupFollowsBindings() {
+        _ = NSApplication.shared
+        let main = MainMenu.build()
+        let select = MainMenu.actionIdentifier("select_tab_1")
+
+        MainMenu.applyKeys([:], commands: [], in: main)
+        XCTAssertEqual(MainMenu.keyedItem("1", [.command], in: main)?.identifier, select)
+        XCTAssertNil(MainMenu.keyedItem("1", [.command, .shift], in: main))
+
+        MainMenu.applyKeys(["cmd+1": "new_tab"], commands: [], in: main)
+        XCTAssertEqual(MainMenu.keyedItem("1", [.command], in: main)?.identifier, MainMenu.actionIdentifier("new_tab"))
+
+        MainMenu.applyKeys(["cmd+1": "none"], commands: [], in: main)
+        XCTAssertNil(MainMenu.keyedItem("1", [.command], in: main))
+    }
+
+    private final class Receiver: NSObject, NSMenuItemValidation {
+        var enabled = true
+        var calls = 0
+        @objc func fire(_ sender: Any?) { calls += 1 }
+        func validateMenuItem(_ menuItem: NSMenuItem) -> Bool { enabled }
+    }
+
+    private func digitEvent(_ code: UInt16, _ typed: String, _ mods: NSEvent.ModifierFlags) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: mods, timestamp: 0,
+                         windowNumber: 0, context: nil, characters: typed,
+                         charactersIgnoringModifiers: typed, isARepeat: false, keyCode: code)!
+    }
+
+    /// AZERTY ⌘1 types "&": the fallback fires the item bound to ⌘1 once, unless its validation
+    /// disables it, the key is unbound or other modifiers are held.
+    func testPhysicalFallbackDispatchesValidatedItem() {
+        let app = NSApplication.shared
+        let saved = app.mainMenu
+        defer { app.mainMenu = saved }
+        let receiver = Receiver()
+        let item = NSMenuItem(title: "Select Tab 1", action: #selector(Receiver.fire(_:)), keyEquivalent: "1")
+        item.keyEquivalentModifierMask = [.command]
+        item.target = receiver
+        let sub = NSMenu(title: "Window")
+        sub.addItem(item)
+        let main = NSMenu()
+        main.addItem(NSMenuItem(title: "Window", action: nil, keyEquivalent: ""))
+        main.items[0].submenu = sub
+        app.mainMenu = main
+
+        XCTAssertTrue(MainMenu.physicalFallback(digitEvent(0x12, "&", [.command])))
+        XCTAssertEqual(receiver.calls, 1)
+        XCTAssertTrue(MainMenu.physicalFallback(digitEvent(0x53, "1", [.command])))
+        XCTAssertEqual(receiver.calls, 2)
+
+        XCTAssertFalse(MainMenu.physicalFallback(digitEvent(0x12, "1", [.command, .shift])))
+        XCTAssertFalse(MainMenu.physicalFallback(digitEvent(0x13, "é", [.command])))
+
+        receiver.enabled = false
+        XCTAssertFalse(MainMenu.physicalFallback(digitEvent(0x12, "&", [.command])))
+        sub.autoenablesItems = false
+        receiver.enabled = true
+        item.isEnabled = false
+        XCTAssertFalse(MainMenu.physicalFallback(digitEvent(0x12, "&", [.command])))
+        XCTAssertEqual(receiver.calls, 2)
+
+        item.isEnabled = true
+        item.keyEquivalent = ""
+        XCTAssertFalse(MainMenu.physicalFallback(digitEvent(0x12, "&", [.command])))
+        XCTAssertEqual(receiver.calls, 2)
+    }
 }
