@@ -1428,6 +1428,12 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             wait,
             command,
         } => {
+            // The app floats it in the frontmost tab when `--pane` names none: refuse that first.
+            if let Some(p) = pane
+                && pane_info(c, p).is_none()
+            {
+                return Err(format!("no pane {p}").into());
+            }
             let target = current_pane(pane).ok();
             let new = create(c, command, cwd, target, hold || wait, None)?;
             open(
