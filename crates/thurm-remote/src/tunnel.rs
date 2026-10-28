@@ -30,6 +30,9 @@ use thurm_tailnet_client::ConnectError;
 pub const MAX_BACKOFF: Duration = Duration::from_secs(120);
 /// A connection that lasted this long resets the backoff.
 pub const HEALTHY_AFTER: Duration = Duration::from_secs(60);
+/// How long a probe of the daemon behind a connected tunnel may take. A saturated link queues
+/// the answer behind the output it carries, so this is as long as the relay's own probe.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -949,7 +952,7 @@ impl Inner {
                 continue;
             }
             // One connection failing may be a blip: the host is gone once a fresh one fails.
-            match ping(&local, Duration::from_secs(10)) {
+            match ping(&local, PROBE_TIMEOUT) {
                 Ok((_, build)) => self.note_build(build),
                 Err(PingError::Protocol(_)) => {
                     return Ok("the daemon there now speaks another protocol".into());
@@ -1001,7 +1004,7 @@ impl Inner {
                 return "the host's settings changed".into();
             }
             if restart {
-                match ping(&local, Duration::from_secs(4)) {
+                match ping(&local, PROBE_TIMEOUT) {
                     Ok((_, build)) => self.note_build(build),
                     Err(PingError::Protocol(_)) => {
                         return "the daemon there now speaks another protocol".into();

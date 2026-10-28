@@ -477,3 +477,81 @@ fn a_tailnet_dialed_socket_still_checks_tls_for_wss() {
         Err(ConnectError::BadUrl(_))
     ));
 }
+
+/// The relay's decision at a time: the daemon last heard `ago` before, with `pinged` set.
+fn decide(ago: Option<Duration>, pinged: Option<Duration>) -> Quiet {
+    let now = tokio::time::Instant::now() + Duration::from_secs(100);
+    let heard = match ago {
+        Some(ago) => Heard::At(now - ago),
+        None => Heard::Writing,
+    };
+    quiet(
+        heard,
+        pinged.map(|ago| now - ago),
+        now,
+        Duration::from_secs(15),
+        Duration::from_secs(45),
+    )
+}
+
+#[test]
+fn a_daemon_that_talks_is_never_pinged() {
+    assert_eq!(
+        decide(Some(Duration::from_secs(1)), None),
+        Quiet::Wait(Duration::from_secs(14))
+    );
+    assert_eq!(
+        decide(Some(Duration::from_secs(14)), None),
+        Quiet::Wait(Duration::from_secs(1))
+    );
+}
+
+#[test]
+fn a_quiet_daemon_is_pinged_once_per_silence() {
+    assert_eq!(decide(Some(Duration::from_secs(15)), None), Quiet::Ping);
+    assert_eq!(decide(Some(Duration::from_secs(40)), None), Quiet::Ping);
+    // Pinged after it was last heard: wait for the answer, until the limit.
+    assert_eq!(
+        decide(Some(Duration::from_secs(16)), Some(Duration::from_secs(1))),
+        Quiet::Wait(Duration::from_secs(29))
+    );
+    // A pong (or anything else) since the ping makes it a new silence.
+    assert_eq!(
+        decide(Some(Duration::from_secs(1)), Some(Duration::from_secs(2))),
+        Quiet::Wait(Duration::from_secs(14))
+    );
+}
+
+#[test]
+fn a_daemon_silent_for_the_limit_is_gone() {
+    assert_eq!(decide(Some(Duration::from_secs(45)), None), Quiet::Close);
+    assert_eq!(
+        decide(Some(Duration::from_secs(46)), Some(Duration::from_secs(20))),
+        Quiet::Close
+    );
+}
+
+#[test]
+fn time_spent_writing_to_the_local_app_is_not_silence() {
+    // However long the write has taken, the daemon is not quiet while it goes on.
+    assert_eq!(decide(None, None), Quiet::Wait(Duration::from_secs(15)));
+    let now = tokio::time::Instant::now();
+    assert_eq!(
+        silence_left(Heard::Writing, now, Duration::from_secs(45)),
+        Duration::from_secs(45)
+    );
+}
+
+#[test]
+fn a_send_gets_only_the_silence_left() {
+    let now = tokio::time::Instant::now();
+    let heard = Heard::At(now - Duration::from_secs(10));
+    assert_eq!(
+        silence_left(heard, now, Duration::from_secs(45)),
+        Duration::from_secs(35)
+    );
+    assert_eq!(
+        silence_left(heard, now, Duration::from_secs(5)),
+        Duration::ZERO
+    );
+}

@@ -4,6 +4,7 @@ use std::io::{BufWriter, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use thurm_proto::codec;
 use thurm_proto::{Envelope, ServerMessage};
@@ -28,12 +29,18 @@ pub fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
 }
 
 /// `MOBILE_SILENCE`, or `THURM_MOBILE_SILENCE_MS` (tests).
-fn mobile_silence() -> std::time::Duration {
+fn mobile_silence() -> Duration {
     std::env::var("THURM_MOBILE_SILENCE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .map(std::time::Duration::from_millis)
+        .map(Duration::from_millis)
         .unwrap_or(thurm_proto::MOBILE_SILENCE)
+}
+
+/// Whether a client the writer put a message out to within `silence` of `now` is still there.
+/// A phone whose session loop is busy with output can't ping, but its connection is alive.
+fn written_within(last_written: Instant, now: Instant, silence: Duration) -> bool {
+    now.saturating_duration_since(last_written) < silence
 }
 
 /// Reads how a connection starts: an ingress preamble (`thurm_proto::tailnet`), or the first
@@ -121,6 +128,7 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
                     crate::daemon::message_weight(msg).min(counter.queued.load(Ordering::Relaxed)),
                     Ordering::Relaxed,
                 );
+                *counter.last_written.lock() = Instant::now();
             };
             'write: while let Ok(msg) = rx.recv() {
                 if write_msg(&mut w, &msg).is_err() {
@@ -196,6 +204,13 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
+                if written_within(
+                    *client.last_written.lock(),
+                    Instant::now(),
+                    mobile_silence(),
+                ) {
+                    continue;
+                }
                 log::info!("client {} (mobile) went quiet; dropping it", client.id);
                 break;
             }

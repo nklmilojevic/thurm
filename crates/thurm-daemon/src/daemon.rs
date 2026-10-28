@@ -254,6 +254,9 @@ pub struct Client {
     pub queued: std::sync::atomic::AtomicUsize,
     /// Messages sent but not yet flushed to the socket; the writer subtracts them after a flush.
     pub unflushed: std::sync::atomic::AtomicUsize,
+    /// When the writer last put a message out: a client it still sends to is not gone, though
+    /// it says nothing (see `mobile_silence`).
+    pub last_written: Mutex<Instant>,
 }
 
 impl Client {
@@ -621,6 +624,7 @@ impl Daemon {
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
+            last_written: Mutex::new(Instant::now()),
         });
         self.clients.lock().insert(id, client.clone());
         *self.last_activity.lock() = Instant::now();
@@ -3656,6 +3660,7 @@ mod tests {
             name: Mutex::new(String::new()),
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
+            last_written: Mutex::new(Instant::now()),
         };
         // A few big outputs are a backlog, not only thousands of messages.
         for _ in 0..70 {
