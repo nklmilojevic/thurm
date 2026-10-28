@@ -81,6 +81,9 @@ pub struct TabLayout {
     /// Panes floating above `root`, back to front.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub floating: Vec<FloatingPane>,
+    /// The floating panes are hidden (their programs keep running) until shown again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub floating_hidden: bool,
 }
 
 /// A pane lifted out of a tab's splits, shown as a card above them.
@@ -265,6 +268,7 @@ fn retain_tabs(tabs: Vec<TabLayout>, keep: &dyn Fn(PaneId) -> bool) -> Vec<TabLa
                 t.zoomed = None;
             }
             t.root = root;
+            t.floating_hidden &= !t.floating.is_empty();
             t.wall = t.wall.take().map(|origins| {
                 origins
                     .into_iter()
@@ -301,6 +305,7 @@ mod tests {
                         handoff: None,
                         wall: None,
                         floating: Vec::new(),
+                        floating_hidden: false,
                     },
                     TabLayout {
                         title: Some("logs".into()),
@@ -310,6 +315,7 @@ mod tests {
                         handoff: None,
                         wall: None,
                         floating: Vec::new(),
+                        floating_hidden: false,
                     },
                 ],
                 selected_tab: 1,
@@ -334,6 +340,7 @@ mod tests {
                         handoff: None,
                         wall: None,
                         floating: Vec::new(),
+                        floating_hidden: false,
                     }],
                     selected_tab: 0,
                     host: None,
@@ -347,6 +354,7 @@ mod tests {
                 handoff: None,
                 wall: None,
                 floating: Vec::new(),
+                floating_hidden: false,
             }),
         }
     }
@@ -420,6 +428,7 @@ mod tests {
             handoff: Some("agent/quiet-otter".into()),
             wall: None,
             floating: Vec::new(),
+            floating_hidden: false,
         });
         l.workspaces[0].host = Some("devbox".into());
         let json = serde_json::to_string(&l).unwrap();
@@ -452,6 +461,7 @@ mod tests {
             handoff: None,
             wall: None,
             floating: Vec::new(),
+            floating_hidden: false,
         };
         let split = |a, b| LayoutNode::Split {
             dir: SplitDir::Down,
@@ -516,6 +526,29 @@ mod tests {
         let tab = &l.windows[0].tabs[1];
         assert_eq!(tab.focused, 3);
         assert_eq!(tab.floating, vec![card(9, Some("devbox"))]);
+    }
+
+    #[test]
+    fn hidden_floating_panes_stay_hidden_while_there_are_any() {
+        let card = |id| FloatingPane {
+            id,
+            host: None,
+            frame: [0.2, 0.2, 0.5, 0.5],
+            zoomed: false,
+        };
+        let mut l = sample();
+        let tab = &mut l.windows[0].tabs[1];
+        tab.floating = vec![card(6), card(7)];
+        tab.floating_hidden = true;
+        let json = serde_json::to_string(&l).unwrap();
+        assert!(json.contains(r#""floating_hidden":true"#));
+        assert_eq!(serde_json::from_str::<Layout>(&json).unwrap(), l);
+        l.retain_panes(&|id| id != 6);
+        assert!(l.windows[0].tabs[1].floating_hidden);
+        // The last one gone: a new floating pane shows.
+        l.retain_panes(&|id| id != 7);
+        assert!(!l.windows[0].tabs[1].floating_hidden);
+        assert!(!serde_json::to_string(&l).unwrap().contains("floating"));
     }
 
     #[test]

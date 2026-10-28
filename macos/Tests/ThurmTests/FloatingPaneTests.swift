@@ -142,6 +142,26 @@ final class FloatingPaneTests: XCTestCase {
                        [key(1), key(2), key(3), key(4)])
     }
 
+    /// Hidden floating panes (`floating_hidden`), as the daemon stores them.
+    func testTabLayoutCodesHiddenFloatingPanes() throws {
+        let json = """
+        {"root":{"type":"pane","id":1},"focused":1,"zoomed":null,
+         "floating":[{"id":2,"frame":[0.1,0.2,0.5,0.5]},{"id":3,"frame":[0.2,0.2,0.5,0.5]}],"floating_hidden":true}
+        """
+        let tab = try JSONDecoder().decode(TabLayout.self, from: Data(json.utf8))
+        XCTAssertEqual(tab.floatingHidden, true)
+        let encoded = String(decoding: try JSONEncoder().encode(tab), as: UTF8.self)
+        XCTAssertTrue(encoded.contains("\"floating_hidden\":true"))
+        XCTAssertEqual(try JSONDecoder().decode(TabLayout.self, from: Data(encoded.utf8)), tab)
+        // Shown, as before: nothing stored.
+        var shown = tab
+        shown.floatingHidden = nil
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(shown), as: UTF8.self).contains("floating_hidden"))
+        // They stay hidden while there are any.
+        XCTAssertEqual(retainTabs([tab]) { $0 != key(2) }[0].floatingHidden, true)
+        XCTAssertNil(retainTabs([tab]) { $0 == key(1) }[0].floatingHidden)
+    }
+
     func testFloatingCardsRoundTripTheirSavedFrame() {
         let card = FloatingCard(FloatingPane(pane: key(3), frame: [0.25, 0.5, 0.5, 0.25], zoomed: true))
         XCTAssertEqual(card.frame, CGRect(x: 0.25, y: 0.5, width: 0.5, height: 0.25))

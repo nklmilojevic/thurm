@@ -101,9 +101,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     /// the tab groups, workspaces and saved windows.
     let isQuick: Bool
 
-    init(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, floating: [FloatingPane] = [], title: String?,
-         contentSize: NSSize, quick: Bool = false) {
-        content = TabContentView(root: root, focused: focused, zoomed: zoomed, floating: floating)
+    init(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, floating: [FloatingPane] = [],
+         floatingHidden: Bool = false, title: String?, contentSize: NSSize, quick: Bool = false) {
+        content = TabContentView(root: root, focused: focused, zoomed: zoomed, floating: floating,
+                                 floatingHidden: floatingHidden)
         isQuick = quick
         let rect = NSRect(origin: .zero, size: contentSize)
         // Tabs live in the titlebar, which is tinted with the theme (see TerminalWindow).
@@ -451,6 +452,20 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    /// Opens a shell floating above the splits when the tab has none, else hides the floating
+    /// panes or shows them again.
+    @objc func toggleFloatingPanes(_ sender: Any?) {
+        if content.floating.isEmpty {
+            SessionManager.shared.newFloatingPane(in: self)
+        } else {
+            content.setFloatingHidden(!content.floatingHidden)
+        }
+    }
+
+    @objc func newFloatingPane(_ sender: Any?) {
+        SessionManager.shared.newFloatingPane(in: self)
+    }
+
     @objc func toggleAgentWall(_ sender: Any?) {
         SessionManager.shared.toggleAgentWall(in: self)
     }
@@ -519,11 +534,22 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
 }
 
 extension TerminalWindowController: NSMenuItemValidation {
-    /// Float Pane reads Dock Pane while the focused pane floats.
+    /// Float Pane reads Dock Pane while the focused pane floats, and Show Floating Panes reads
+    /// Hide Floating Panes while they show. The quick terminal floats none.
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        guard menuItem.action == #selector(toggleFloat(_:)) else { return true }
-        let floats = content.isFloating(content.focusedPane)
-        menuItem.title = floats ? "Dock Pane" : "Float Pane"
-        return floats || content.canFloat(content.focusedPane)
+        switch menuItem.action {
+        case #selector(toggleFloat(_:)):
+            let floats = content.isFloating(content.focusedPane)
+            menuItem.title = floats ? "Dock Pane" : "Float Pane"
+            return floats || !isQuick
+        case #selector(toggleFloatingPanes(_:)):
+            let shown = !content.floating.isEmpty && !content.floatingHidden
+            menuItem.title = shown ? "Hide Floating Panes" : "Show Floating Panes"
+            return !isQuick
+        case #selector(newFloatingPane(_:)):
+            return !isQuick
+        default:
+            return true
+        }
     }
 }

@@ -52,6 +52,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `wall` | Gather the agents of the window's tabs into one grid tab, or put them back in their tabs; `--pane ID`, `--on`, `--off` (default: toggle) |
 | `float` | Float a pane above its tab's splits as a card you can move and resize, or dock it back; `--pane ID`, `--on`, `--off` (default: toggle) |
 | `dock` | Dock a floating pane back into its tab's splits; `--pane ID` |
+| `new-float [COMMAND...]` | Run a command (default: shell) in a new pane floating above a tab's splits; `--pane ID` (a pane of the tab), `--cwd PATH`, `--hold`, `--background`, `--wait` |
 | `move --to PANE` | Move a pane next to another, in any tab of the window; `--pane ID`, `--dir right\|down\|left\|up`, `--size PERCENT` |
 | `swap --with PANE` | Exchange the places of two panes, in one tab or across tabs; `--pane ID` |
 | `close [ID]` | Stop and close a pane; ID is positional |

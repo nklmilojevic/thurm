@@ -541,7 +541,8 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         for tab in w.tabs {
             let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
-                                   title: tab.title, frame: frame, floating: tab.floating)
+                                   title: tab.title, frame: frame, floating: tab.floating,
+                                   floatingHidden: tab.floatingHidden)
             c.workspaceID = ws?.id ?? 0
             c.handoffID = tab.handoff
             c.wall = tab.wall
@@ -615,9 +616,11 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     func makeController(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, title: String?,
-                        frame: NSRect?, quick: Bool = false, floating: [FloatingPane]? = nil) -> TerminalWindowController {
+                        frame: NSRect?, quick: Bool = false, floating: [FloatingPane]? = nil,
+                        floatingHidden: Bool? = nil) -> TerminalWindowController {
         let c = TerminalWindowController(root: root, focused: focused, zoomed: zoomed, floating: floating ?? [],
-                                         title: title, contentSize: defaultContentSize(), quick: quick)
+                                         floatingHidden: floatingHidden ?? false, title: title,
+                                         contentSize: defaultContentSize(), quick: quick)
         if let frame = frame {
             c.window?.setFrame(frame, display: false)
         }
@@ -750,6 +753,14 @@ final class SessionManager: NSObject, CoreDelegate {
                                   forkFrom: fork ? target : nil, cwd: cwd) else { return }
         c.content.split(target: target, newPane: id, direction: direction)
         scheduleLayoutSave()
+    }
+
+    /// A new shell floating above the splits of `c`'s tab, where its focused pane is.
+    func newFloatingPane(in c: TerminalWindowController) {
+        guard !c.isQuick else { return }
+        let size = gridSize(forPoints: c.content.newCardRect.size)
+        guard let id = createPane(cols: size.cols, rows: size.rows, inheritFrom: c.focusedPane) else { return }
+        c.content.addNewFloating(id)
     }
 
     /// Cmd+W: close the focused pane (confirming when a program is running).
@@ -1566,6 +1577,26 @@ final class SessionManager: NSObject, CoreDelegate {
         case "Float":
             guard let pane = key("pane"), let c = controller(for: pane), !c.isQuick || c.content.isFloating(pane) else { return }
             c.content.setFloating(pane, jsonBool(d["on"]))
+        case "OpenFloating":
+            // `thurm new-float`.
+            guard let pane = key("pane") else { return }
+            let background = jsonBool(d["background"]) ?? false
+            if controller(for: pane) != nil {
+                if !background { focusPane(pane, activate: true) }
+                return
+            }
+            if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
+            takeHiddenTab(pane)
+            let host = key("target").flatMap { controller(for: $0) }
+                ?? (currentController?.host == daemon ? currentController : nil)
+            if let host, !host.isQuick {
+                host.content.addNewFloating(pane, takeFocus: !background)
+                host.updateTitle()
+                if !background { host.window?.makeKeyAndOrderFront(nil) }
+            } else {
+                newTab(from: currentController, pane: pane, background: background)
+            }
+            if !background { NSApp.activate() }
         case "SwapPanes":
             guard let a = key("a"), let b = key("b"), a != b,
                   let ca = controller(for: a), let cb = controller(for: b) else { return }
