@@ -17,6 +17,8 @@ private struct CellPosition {
     var rightHalf: Bool
     var x: Int
     var y: Int
+    /// False in the padding or past the last column or row, where col and row are clamped.
+    var inGrid: Bool
 }
 
 /// One terminal pane: a CAMetalLayer backed view that renders the daemon's grid and forwards
@@ -1427,18 +1429,26 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     private func cellPosition(_ point: NSPoint) -> CellPosition {
-        guard let s = shaper else { return CellPosition(col: 0, row: 0, rightHalf: false, x: 0, y: 0) }
+        guard let s = shaper else {
+            return CellPosition(col: 0, row: 0, rightHalf: false, x: 0, y: 0, inGrid: false)
+        }
         let scale = backingScale
         let x = point.x * scale - CGFloat(padXPixels)
         let y = point.y * scale - CGFloat(padYPixels) - CGFloat(smoothScrollY)
         let fcol = x / CGFloat(s.cellWidth)
         let frow = y / CGFloat(s.cellHeight)
-        let maxCol = max(0, (renderer.snapshot.valid ? renderer.snapshot.cols : cols) - 1)
-        let maxRow = max(0, (renderer.snapshot.valid ? renderer.snapshot.rows : rows) - 1)
-        let col = min(maxCol, max(0, Int(floor(fcol))))
-        let row = min(maxRow, max(0, Int(floor(frow))))
+        let gridCols = renderer.snapshot.valid ? renderer.snapshot.cols : cols
+        let gridRows = renderer.snapshot.valid ? renderer.snapshot.rows : rows
+        let col = min(max(0, gridCols - 1), max(0, Int(floor(fcol))))
+        let row = min(max(0, gridRows - 1), max(0, Int(floor(frow))))
         let rightHalf = fcol - floor(fcol) >= 0.5
-        return CellPosition(col: col, row: row, rightHalf: rightHalf, x: max(0, Int(x)), y: max(0, Int(y)))
+        return CellPosition(col: col, row: row, rightHalf: rightHalf, x: max(0, Int(x)), y: max(0, Int(y)),
+                            inGrid: TerminalView.isInGrid(col: fcol, row: frow, cols: gridCols, rows: gridRows))
+    }
+
+    /// Whether a fractional grid position falls on one of the cols × rows cells.
+    static func isInGrid(col: CGFloat, row: CGFloat, cols: Int, rows: Int) -> Bool {
+        col >= 0 && row >= 0 && col < CGFloat(cols) && row < CGFloat(rows)
     }
 
     private func mouseMods(_ flags: NSEvent.ModifierFlags) -> UInt8 {
@@ -1498,7 +1508,9 @@ final class TerminalView: NSView, NSTextInputClient {
         if window?.firstResponder !== self {
             window?.makeFirstResponder(self)
         }
-        NSMenu.popUpContextMenu(contextMenu(), with: event, for: self)
+        let p = cellPosition(convert(event.locationInWindow, from: nil))
+        let link = p.inGrid ? linkURL(col: p.col, row: p.row) : nil
+        NSMenu.popUpContextMenu(contextMenu(link: link), with: event, for: self)
     }
 
     override func rightMouseUp(with event: NSEvent) {
@@ -1669,8 +1681,19 @@ final class TerminalView: NSView, NSTextInputClient {
 
     // MARK: Context menu
 
-    private func contextMenu() -> NSMenu {
+    private func contextMenu(link: URL?) -> NSMenu {
         let menu = NSMenu(title: "Terminal")
+        if let link {
+            let openItem = menu.addItem(withTitle: "Open Link", action: #selector(openLinkFromMenu(_:)),
+                                        keyEquivalent: "")
+            openItem.target = self
+            openItem.representedObject = link
+            let copyLinkItem = menu.addItem(withTitle: "Copy Link", action: #selector(copyLinkFromMenu(_:)),
+                                            keyEquivalent: "")
+            copyLinkItem.target = self
+            copyLinkItem.representedObject = link
+            menu.addItem(NSMenuItem.separator())
+        }
         let copyItem = menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
         copyItem.target = self
         let pasteItem = menu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "")
@@ -1680,10 +1703,28 @@ final class TerminalView: NSView, NSTextInputClient {
                      keyEquivalent: "")
         menu.addItem(withTitle: "Split Down", action: #selector(TerminalWindowController.splitDown(_:)),
                      keyEquivalent: "")
+        let copyIDItem = menu.addItem(withTitle: "Copy Pane ID", action: #selector(copyPaneID(_:)), keyEquivalent: "")
+        copyIDItem.target = self
         menu.addItem(NSMenuItem.separator())
         let clearItem = menu.addItem(withTitle: "Clear", action: #selector(clearScreen(_:)), keyEquivalent: "")
         clearItem.target = self
         return menu
+    }
+
+    @objc private func openLinkFromMenu(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        SessionManager.shared.openLink(url, from: pane, in: window)
+    }
+
+    @objc private func copyLinkFromMenu(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+    }
+
+    @objc private func copyPaneID(_ sender: Any?) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(pane.copyText, forType: .string)
     }
 }
 

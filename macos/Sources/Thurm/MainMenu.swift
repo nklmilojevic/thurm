@@ -261,6 +261,7 @@ enum MainMenu {
         menu.addItem(item("Split Right", #selector(TerminalWindowController.splitRight(_:)), "d", name: "split_right"))
         menu.addItem(item("Split Down", #selector(TerminalWindowController.splitDown(_:)), "d", [.command, .shift],
                           name: "split_down"))
+        menu.addItem(item("Copy Pane ID", #selector(TerminalWindowController.copyPaneID(_:)), name: "copy_pane_id"))
         menu.addItem(.separator())
         menu.addItem(item("Command Palette…", #selector(AppDelegate.showCommandPalette(_:)), "p", [.command, .shift],
                           name: "command_palette"))

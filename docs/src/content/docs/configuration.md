@@ -125,6 +125,7 @@ the defaults alone.
 | `close_workspace` | Shell > Close Workspace… |
 | `split_right` | Shell > Split Right |
 | `split_down` | Shell > Split Down |
+| `copy_pane_id` | Shell > Copy Pane ID |
 | `command_palette` | Shell > Command Palette… |
 | `processes` | Shell > Processes & Ports… |
 | `close_pane` | Shell > Close Pane |
