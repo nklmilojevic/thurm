@@ -140,6 +140,15 @@ final class CommandPalette: NSObject, NSTableViewDataSource, NSTableViewDelegate
         panel?.orderOut(nil)
     }
 
+    /// A click in another window closes the palette, and the click goes no further: it must not
+    /// also move focus or select text there. True when the click was taken.
+    func dismissOnClick(_ event: NSEvent) -> Bool {
+        guard isVisible, [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type) else { return false }
+        close()
+        cancelIfOpen()
+        return true
+    }
+
     /// Closed without choosing: let the caller undo its previews.
     private func cancelIfOpen() {
         let cancel = onCancel

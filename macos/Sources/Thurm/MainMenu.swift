@@ -128,6 +128,48 @@ enum MainMenu {
         }
     }
 
+    /// The digit each key types by position, on the digit row and the keypad (0x5A is F20, not a
+    /// digit). Layouts that need Shift for digits, like AZERTY, still send these keys' codes.
+    static let digitKeys: [UInt16: String] = {
+        var digits: [UInt16: String] = [:]
+        for (code, char) in KeyMapping.usLayout where ("0"..."9").contains(char) {
+            digits[code] = String(char)
+        }
+        let keypad: [UInt16: String] = [
+            0x52: "0", 0x53: "1", 0x54: "2", 0x55: "3", 0x56: "4", 0x57: "5", 0x58: "6", 0x59: "7",
+            0x5B: "8", 0x5C: "9",
+        ]
+        return digits.merging(keypad) { digit, _ in digit }
+    }()
+
+    /// A ⌘+digit the menu did not match, by key position: on AZERTY ⌘1 types "&", so the menu
+    /// finds nothing. Fires the item that holds ⌘+that digit, the way the menu would, and returns
+    /// true; false when no enabled item has it (a `[keybindings]` "none" leaves it unbound).
+    static func physicalFallback(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown,
+              event.modifierFlags.intersection([.command, .shift, .control, .option]) == [.command],
+              let digit = digitKeys[event.keyCode],
+              let item = keyedItem(digit, [.command], in: NSApp.mainMenu),
+              let action = item.action,
+              NSApp.target(forAction: action, to: item.target, from: item) != nil
+        else { return false }
+        NSApp.sendAction(action, to: item.target, from: item)
+        return true
+    }
+
+    /// The first item under `menu` with this key equivalent, hidden copies included.
+    static func keyedItem(_ key: String, _ mods: NSEvent.ModifierFlags, in menu: NSMenu?) -> NSMenuItem? {
+        guard let menu else { return nil }
+        let wanted = chord(key, mods)
+        for item in menu.items {
+            if let found = item.submenu.flatMap({ keyedItem(key, mods, in: $0) }) { return found }
+            if !item.keyEquivalent.isEmpty, chord(item.keyEquivalent, item.keyEquivalentModifierMask) == wanted {
+                return item
+            }
+        }
+        return nil
+    }
+
     /// A key equivalent in one spelling: an uppercase letter is the lowercase one with Shift.
     private static func chord(_ key: String, _ mods: NSEvent.ModifierFlags) -> String {
         var m = mods.intersection([.command, .shift, .option, .control])

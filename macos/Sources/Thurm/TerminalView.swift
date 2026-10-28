@@ -1129,6 +1129,7 @@ final class TerminalView: NSView, NSTextInputClient {
 
     /// Command shortcuts that the menu may not match on every layout.
     private func handleCommandFallback(_ event: NSEvent) -> Bool {
+        if MainMenu.physicalFallback(event) { return true }
         let flags = event.modifierFlags
         if flags.isDisjoint(with: [.shift, .control, .option]) {
             // Line editing as in other macOS terminals: Cmd+Backspace deletes to its start (Ctrl+U),
@@ -1459,6 +1460,7 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     override func mouseDown(with event: NSEvent) {
+        completion.close()
         if window?.firstResponder !== self {
             window?.makeFirstResponder(self)
         }
@@ -1489,6 +1491,7 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        completion.close()
         let reporting = (snapshotModes & TermMode.mouseAny) != 0
         if reporting && !event.modifierFlags.contains(.shift) {
             rightPressReported = true

@@ -24,6 +24,18 @@ final class QuickTerminalWindow: NSPanel {
     /// ends. QuickTerminal places it on the screen itself.
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 
+    override func sendEvent(_ event: NSEvent) {
+        if CommandPalette.shared.dismissOnClick(event) {
+            makeKeyAndOrderFront(nil)
+            return
+        }
+        super.sendEvent(event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        super.performKeyEquivalent(with: event) || MainMenu.physicalFallback(event)
+    }
+
     /// There is no close button, which makes AppKit's performClose beep: Close Tab (⌘⇧W).
     override func performClose(_ sender: Any?) {
         if delegate?.windowShouldClose?(self) ?? true { close() }

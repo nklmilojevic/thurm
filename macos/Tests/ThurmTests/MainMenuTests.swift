@@ -156,4 +156,36 @@ final class MainMenuTests: XCTestCase {
         XCTAssertNil(parse("hyper+k"))
         XCTAssertNil(parse("cmd+launchpad"))
     }
+
+    /// Digits follow key positions: the digit row whatever it types, and the keypad, but not F20.
+    func testDigitKeysByPosition() {
+        XCTAssertEqual(MainMenu.digitKeys[0x12], "1")
+        XCTAssertEqual(MainMenu.digitKeys[0x17], "5")
+        XCTAssertEqual(MainMenu.digitKeys[0x1C], "8")
+        XCTAssertEqual(MainMenu.digitKeys[0x19], "9")
+        XCTAssertEqual(MainMenu.digitKeys[0x1D], "0")
+        XCTAssertEqual(MainMenu.digitKeys[0x53], "1")
+        XCTAssertEqual(MainMenu.digitKeys[0x59], "7")
+        XCTAssertEqual(MainMenu.digitKeys[0x5B], "8")
+        XCTAssertEqual(MainMenu.digitKeys[0x5C], "9")
+        XCTAssertNil(MainMenu.digitKeys[0x5A])
+        XCTAssertNil(MainMenu.digitKeys[0x0C])
+    }
+
+    /// ⌘1 finds Select Tab 1, the item a binding moved the combination to, or nothing for "none".
+    func testDigitLookupFollowsBindings() {
+        _ = NSApplication.shared
+        let main = MainMenu.build()
+        let select = MainMenu.actionIdentifier("select_tab_1")
+
+        MainMenu.applyKeys([:], commands: [], in: main)
+        XCTAssertEqual(MainMenu.keyedItem("1", [.command], in: main)?.identifier, select)
+        XCTAssertNil(MainMenu.keyedItem("1", [.command, .shift], in: main))
+
+        MainMenu.applyKeys(["cmd+1": "new_tab"], commands: [], in: main)
+        XCTAssertEqual(MainMenu.keyedItem("1", [.command], in: main)?.identifier, MainMenu.actionIdentifier("new_tab"))
+
+        MainMenu.applyKeys(["cmd+1": "none"], commands: [], in: main)
+        XCTAssertNil(MainMenu.keyedItem("1", [.command], in: main))
+    }
 }

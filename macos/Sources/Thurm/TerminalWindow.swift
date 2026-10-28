@@ -227,6 +227,19 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         titleLabel.textColor = isMainWindow ? chrome.contentPrimary : chrome.contentSecondary
     }
 
+    override func sendEvent(_ event: NSEvent) {
+        // Before super: the click must not make this window key first.
+        if CommandPalette.shared.dismissOnClick(event) {
+            makeKeyAndOrderFront(nil)
+            return
+        }
+        super.sendEvent(event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        super.performKeyEquivalent(with: event) || MainMenu.physicalFallback(event)
+    }
+
     override func becomeMain() {
         super.becomeMain()
         applyTitleColor()
