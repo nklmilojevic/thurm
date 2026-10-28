@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.15.0 - 2026-10-28
+
+This release adds floating panes, which show a pane above the splits of a tab. It also compresses remote output and fixes input and connection problems.
+
+### New features
+
+- Floating panes: a pane can float above the splits of a tab as a card. Use View › Float Pane, the pane header button, or `thurm float`. Dock Pane puts the card back into the splits.
+- Cmd+Option+Return opens a shell as a card on any tab, or shows and hides the cards.
+- The `thurm new-float` command opens a pane as a card.
+- The focus shortcuts now move to floating cards too.
+- Right-click a link to choose Open Link or Copy Link. Open Link uses the same policy as Cmd-click.
+- Copy Pane ID in the Shell menu copies a pane ID for use with `thurm --pane`.
+- Remote clients, such as the iOS app and the web client, now receive compressed terminal output. This sends less data over the network.
+
+### Fixes
+
+- A click that closes the command palette no longer reaches the window below it.
+- A click in a pane closes the tab-completion popup.
+- ⌘1–⌘9 now work on keyboard layouts that need Shift for digits, such as AZERTY. Custom `[keybindings]` still apply.
+- A program stopped with Ctrl+C no longer shows as working in the sidebar, even without shell integration.
+- Busy remote connections, such as phones, no longer close while output flows. Only connections that send and receive nothing are closed.
+
+### Other changes
+
+- Building from source now needs Zig 0.17.
+- The terminal engine, libghostty-vt, now uses a newer Ghostty version.
+
 ## v0.14.0 - 2026-10-27
 
 Thurm now moves panes with a smoother, faster motion and a new `window.animation_speed` setting. A phone keeps the size of the pane it shows.
