@@ -19,6 +19,7 @@ libc.workspace = true
 parking_lot.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
+memchr.workspace = true
 env_logger.workspace = true
 regex.workspace = true
 signal-hook.workspace = true

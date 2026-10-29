@@ -238,8 +238,14 @@ impl Pty {
         None
     }
 
-    /// Foreground process group of the terminal (the running job, or the shell itself).
+    /// Foreground process group of the terminal (the running job, or the shell itself), or of
+    /// the terminal a PTY proxy runs the shell on (see `procinfo::behind_proxy`).
     pub fn foreground_pgrp(&self) -> Option<u32> {
+        self.terminal_pgrp().map(crate::procinfo::behind_proxy)
+    }
+
+    /// Foreground process group of the pane's own terminal, a proxy's included.
+    pub fn terminal_pgrp(&self) -> Option<u32> {
         foreground_of(&self.master)
     }
 
