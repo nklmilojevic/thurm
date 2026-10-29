@@ -363,6 +363,12 @@ enum MainMenu {
         menu.addItem(.separator())
         menu.addItem(item("Tabs in Sidebar", #selector(AppDelegate.toggleSidebarTabs(_:)), "s", [.command, .control],
                           name: "toggle_tab_style"))
+        menu.addItem(item("Group Tabs by Repository", #selector(AppDelegate.toggleSidebarGroupByRepo(_:)),
+                          name: "toggle_sidebar_group_by_repo"))
+        menu.addItem(item("Tabs from All Workspaces", #selector(AppDelegate.toggleSidebarAllWorkspaces(_:)),
+                          name: "toggle_sidebar_all_workspaces"))
+        menu.addItem(item("Only Active Tabs", #selector(AppDelegate.toggleSidebarActiveOnly(_:)),
+                          name: "toggle_sidebar_active_only"))
         menu.addItem(item("Agents in Sidebar", #selector(AppDelegate.toggleSidebarAgents(_:)),
                           name: "toggle_sidebar_agents"))
         let usage = NSMenu(title: "Usage Limits in Sidebar")

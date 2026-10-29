@@ -17,6 +17,9 @@ final class SessionManager: NSObject, CoreDelegate {
     /// View > Agents in Sidebar when config.toml cannot record it, as `sidebarTabsOverride`.
     private var sidebarAgentsOverride: Bool?
     private var activePaneBorderOverride: Bool?
+    /// View > Group Tabs by Repository, Tabs from All Workspaces and Only Active Tabs, as
+    /// `sidebarTabsOverride`.
+    private var sidebarListingOverride: [WritableKeyPath<AppConfig, Bool>: Bool] = [:]
     private var sidebarUsageOverride: [UsageProvider: Bool] = [:]
     /// A theme chosen when config.toml cannot record it is in use (see `setTheme`).
     private var sessionTheme = false
@@ -905,6 +908,18 @@ final class SessionManager: NSObject, CoreDelegate {
         }
     }
 
+    /// How the sidebar lists tabs (View > Group Tabs by Repository, Tabs from All Workspaces,
+    /// Only Active Tabs, and the filter button next to the sidebar button): switch the setting `key` that `path`
+    /// reads, as `toggleSidebarAgents`.
+    func toggleSidebarListing(_ key: String, _ path: WritableKeyPath<AppConfig, Bool>) {
+        let on = !config[keyPath: path]
+        sidebarListingOverride[path] = toggleSetting(key, to: on)
+        if sidebarListingOverride[path] != nil {
+            config[keyPath: path] = on
+            applyConfigToUI()
+        }
+    }
+
     /// View > Show Active Pane Border: switch `window.active_pane_border`, as
     /// `toggleSidebarAgents`.
     func toggleActivePaneBorder() {
@@ -1002,6 +1017,7 @@ final class SessionManager: NSObject, CoreDelegate {
         if let o = sidebarTabsOverride { config.sidebarTabs = o }
         if let o = sidebarAgentsOverride { config.sidebarAgents = o }
         if let o = activePaneBorderOverride { config.activePaneBorder = o }
+        for (path, on) in sidebarListingOverride { config[keyPath: path] = on }
         for (p, on) in sidebarUsageOverride {
             if on { config.sidebarUsage.insert(p) } else { config.sidebarUsage.remove(p) }
         }

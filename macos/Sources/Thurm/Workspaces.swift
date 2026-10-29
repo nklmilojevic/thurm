@@ -192,6 +192,11 @@ extension SessionManager {
         target.hiddenTabs = []
         target.hiddenSelectedTab = 0
         target.lastActive = Date()
+        // The old tabs leave every listing now, and the new tabs' sidebars are laid out as the
+        // shown one: the first frame of the switch is already the last, with nothing redrawn.
+        for o in old { o.isClosed = true }
+        let shownSplit = (selectedWindow.windowController as? TerminalWindowController)?.tabSplit
+        for n in created { n.tabSplit?.match(shownSplit) }
         selected.window?.makeKeyAndOrderFront(nil)
         for o in old {
             o.closingWithoutConfirmation = true
@@ -200,6 +205,18 @@ extension SessionManager {
         refreshSidebars()
         focusChanged()
         scheduleLayoutSave()
+    }
+
+    /// A hidden workspace's tab clicked in the sidebar: `c`'s window switches to the workspace,
+    /// on that tab.
+    func showHiddenTab(_ tab: HiddenTab, from c: TerminalWindowController?) {
+        guard let ws = workspace(tab.workspace), tab.index < ws.hiddenTabs.count else { return }
+        ws.hiddenSelectedTab = tab.index
+        if let c = c ?? currentController {
+            switchWorkspace(in: c, to: ws)
+        } else {
+            openWorkspaceInNewWindow(ws)
+        }
     }
 
     /// Adds `pane` as a tab of `ws` (not shown). With `reveal`, `c`'s window switches to `ws` on

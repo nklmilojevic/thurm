@@ -74,6 +74,16 @@ animation_speed = "normal"
 tab_style = "sidebar"
 # Width of the tab sidebar in points.
 sidebar_width = 240.0
+# List the sidebar's tabs under their git repository; off, one list in tab order.
+# View > Group Tabs by Repository.
+sidebar_group_by_repo = true
+# List the tabs of every workspace in the sidebar, under a header each (instead of grouping by
+# repository); click a hidden workspace's tab to switch to it. View > Tabs from All Workspaces.
+sidebar_all_workspaces = false
+# List only the tabs where something is going on: an agent that isn't idle, or a program
+# reporting progress (the selected tab always shows). The filter button next to the sidebar
+# button, View > Only Active Tabs.
+sidebar_active_only = false
 # List every pane running an agent below the sidebar's tabs. View > Agents in Sidebar.
 sidebar_agents = true
 # Agents listed in the sidebar before its agents panel scrolls; drag the panel's header to change.

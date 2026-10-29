@@ -17,6 +17,17 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
     private static let titleItem = NSToolbarItem.Identifier("thurmTitle")
     private static let sidebarItem = NSToolbarItem.Identifier("thurmSidebar")
     private static let newTabItem = NSToolbarItem.Identifier("thurmNewTab")
+    private static let activeOnlyItem = NSToolbarItem.Identifier("thurmActiveOnly")
+
+    /// `window.sidebar_active_only`, which the button next to the sidebar button shows.
+    var sidebarActiveOnly = false {
+        didSet {
+            guard sidebarActiveOnly != oldValue else { return }
+            for item in toolbar?.items ?? [] where item.itemIdentifier == Self.activeOnlyItem {
+                styleActiveOnlyItem(item)
+            }
+        }
+    }
 
     /// Vertical tabs are on: AppKit's tab bar stays installed (so switching back is instant and
     /// AppKit's own bookkeeping is untouched) but hidden. The sidebar then runs up under a clear
@@ -69,13 +80,14 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
     }
 
     /// With vertical tabs, the sidebar's part of the titlebar holds the sidebar button (next to
-    /// the traffic lights) and New Tab (at its right edge); the tracking separator keeps both
+    /// the traffic lights), Only Active Tabs beside it, and New Tab (at its right edge); the tracking separator keeps both
     /// there. Windows share the toolbar configuration (same identifier), so this is idempotent.
     private func syncSidebarItem() {
         guard let toolbar else { return }
         let separator = toolbar.items.firstIndex { $0.itemIdentifier == .sidebarTrackingSeparator }
         if suppressTabBar, separator == nil {
-            for (i, id) in [Self.sidebarItem, .flexibleSpace, Self.newTabItem, .sidebarTrackingSeparator].enumerated() {
+            for (i, id) in [Self.sidebarItem, Self.activeOnlyItem, .flexibleSpace, Self.newTabItem,
+                            .sidebarTrackingSeparator].enumerated() {
                 toolbar.insertItem(withItemIdentifier: id, at: i)
             }
         } else if !suppressTabBar, let separator {
@@ -567,7 +579,8 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
     // MARK: NSToolbarDelegate
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Self.titleItem, Self.sidebarItem, Self.newTabItem, .sidebarTrackingSeparator, .flexibleSpace]
+        [Self.titleItem, Self.sidebarItem, Self.activeOnlyItem, Self.newTabItem, .sidebarTrackingSeparator,
+         .flexibleSpace]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -584,6 +597,12 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
             item.action = #selector(AppDelegate.toggleTabSidebar(_:))
             item.visibilityPriority = .high
         }
+        if id == Self.activeOnlyItem {
+            item.label = "Only Active Tabs"
+            item.action = #selector(AppDelegate.toggleSidebarActiveOnly(_:))
+            item.visibilityPriority = .high
+            styleActiveOnlyItem(item)
+        }
         if id == Self.newTabItem {
             item.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "New Tab")
             item.label = "New Tab"
@@ -599,6 +618,13 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
             item.isBordered = false
         }
         return item
+    }
+
+    /// The filter symbol, filled while only active tabs show.
+    private func styleActiveOnlyItem(_ item: NSToolbarItem) {
+        let name = sidebarActiveOnly ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle"
+        item.image = NSImage(systemSymbolName: name, accessibilityDescription: "Only Active Tabs")
+        item.toolTip = sidebarActiveOnly ? "Show All Tabs" : "Show Only Active Tabs"
     }
 }
 
