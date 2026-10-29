@@ -145,6 +145,12 @@ final class AppConfig {
     /// `window.material`: the chrome's backdrop when the window is translucent.
     var material = WindowMaterial.theme
     var sidebarWidth: CGFloat = 240
+    /// `window.sidebar_group_by_repo`: the sidebar's tabs under their repository.
+    var sidebarGroupByRepo = true
+    /// `window.sidebar_all_workspaces`: every workspace's tabs in the sidebar.
+    var sidebarAllWorkspaces = false
+    /// `window.sidebar_active_only`: only the tabs where something is going on.
+    var sidebarActiveOnly = false
     /// `window.sidebar_agents`: the agents panel below the sidebar's tabs.
     var sidebarAgents = true
     /// Agents the sidebar lists before its agents panel scrolls.
@@ -344,6 +350,9 @@ final class AppConfig {
             if let m = jsonString(w["material"]).flatMap(WindowMaterial.init(rawValue:)) { material = m }
             quitAfterLastWindow = jsonBool(w["quit_after_last_window"]) ?? quitAfterLastWindow
             sidebarWidth = CGFloat(min(480, max(180, jsonDouble(w["sidebar_width"]) ?? Double(sidebarWidth))))
+            sidebarGroupByRepo = jsonBool(w["sidebar_group_by_repo"]) ?? sidebarGroupByRepo
+            sidebarAllWorkspaces = jsonBool(w["sidebar_all_workspaces"]) ?? sidebarAllWorkspaces
+            sidebarActiveOnly = jsonBool(w["sidebar_active_only"]) ?? sidebarActiveOnly
             sidebarAgents = jsonBool(w["sidebar_agents"]) ?? sidebarAgents
             sidebarAgentRows = min(100, max(1, jsonInt(w["sidebar_agent_rows"]) ?? sidebarAgentRows))
             for p in UsageProvider.allCases {

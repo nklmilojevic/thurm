@@ -98,6 +98,39 @@ final class SidebarTests: XCTestCase {
         row.setProgress(nil)
         XCTAssertTrue(bar.isHidden)
     }
+
+    /// Grouped, each repository's tabs follow its first tab, and tabs outside one come last.
+    func testListingOrderGroupsByFirstAppearance() {
+        let tabs = ["a1", "x1", "b1", "a2", "x2", "b2"]
+        let repo: (String) -> String? = { $0.hasPrefix("x") ? nil : String($0.prefix(1)) }
+        XCTAssertEqual(TabSidebarViewController.listingOrder(tabs, key: repo), ["a1", "a2", "b1", "b2", "x1", "x2"])
+        XCTAssertEqual(TabSidebarViewController.listingOrder(tabs) { _ in nil }, tabs)
+    }
+
+    /// Off, or with every workspace listed (under the workspace), tabs keep their tab order.
+    func testGroupingByRepositoryFollowsTheSettings() {
+        let config = AppConfig()
+        XCTAssertTrue(TabSidebarViewController.groupsByRepo(config))
+        config.sidebarGroupByRepo = false
+        XCTAssertFalse(TabSidebarViewController.groupsByRepo(config))
+        config.sidebarGroupByRepo = true
+        config.sidebarAllWorkspaces = true
+        XCTAssertFalse(TabSidebarViewController.groupsByRepo(config))
+    }
+
+    /// A tab is active while an agent in any of its panes isn't idle, or it shows progress.
+    func testActiveTabs() {
+        let shell = PaneKey.local(1), agent = PaneKey.local(2)
+        var info = [shell: pane(1, progress: nil), agent: pane(2, progress: nil, agent: "Idle")]
+        XCTAssertFalse(TabSidebarViewController.isActive([shell, agent], info: info, progress: nil))
+        XCTAssertTrue(TabSidebarViewController.isActive([shell], info: info,
+                                                        progress: ProgressReport(state: .normal, percent: 10)))
+        for status in ["Working", "NeedsInput", "Done", "Error"] {
+            info[agent] = pane(2, progress: nil, agent: status)
+            XCTAssertTrue(TabSidebarViewController.isActive([shell, agent], info: info, progress: nil), status)
+            XCTAssertFalse(TabSidebarViewController.isActive([shell], info: info, progress: nil), status)
+        }
+    }
 }
 
 final class CommandHoldTests: XCTestCase {

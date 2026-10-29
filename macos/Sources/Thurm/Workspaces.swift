@@ -202,6 +202,18 @@ extension SessionManager {
         scheduleLayoutSave()
     }
 
+    /// A hidden workspace's tab clicked in the sidebar: `c`'s window switches to the workspace,
+    /// on that tab.
+    func showHiddenTab(_ tab: HiddenTab, from c: TerminalWindowController?) {
+        guard let ws = workspace(tab.workspace), tab.index < ws.hiddenTabs.count else { return }
+        ws.hiddenSelectedTab = tab.index
+        if let c = c ?? currentController {
+            switchWorkspace(in: c, to: ws)
+        } else {
+            openWorkspaceInNewWindow(ws)
+        }
+    }
+
     /// Adds `pane` as a tab of `ws` (not shown). With `reveal`, `c`'s window switches to `ws` on
     /// that tab; else the window says where it went.
     func addHiddenTab(_ pane: PaneKey, handoff: String?, to ws: Workspace, in c: TerminalWindowController,

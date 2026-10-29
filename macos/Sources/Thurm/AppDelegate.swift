@@ -239,6 +239,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         SessionManager.shared.toggleSidebarAgents()
     }
 
+    @objc func toggleSidebarGroupByRepo(_ sender: Any?) {
+        SessionManager.shared.toggleSidebarListing("window.sidebar_group_by_repo", \.sidebarGroupByRepo)
+    }
+
+    @objc func toggleSidebarAllWorkspaces(_ sender: Any?) {
+        SessionManager.shared.toggleSidebarListing("window.sidebar_all_workspaces", \.sidebarAllWorkspaces)
+    }
+
+    @objc func toggleSidebarActiveOnly(_ sender: Any?) {
+        SessionManager.shared.toggleSidebarListing("window.sidebar_active_only", \.sidebarActiveOnly)
+    }
+
     @objc func toggleActivePaneBorder(_ sender: Any?) {
         SessionManager.shared.toggleActivePaneBorder()
     }
@@ -325,6 +337,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if menuItem.action == #selector(toggleSidebarAgents(_:)) {
             menuItem.state = SessionManager.shared.config.sidebarAgents ? .on : .off
             return SessionManager.shared.config.sidebarTabs
+        }
+        let listing: [Selector: KeyPath<AppConfig, Bool>] = [
+            #selector(toggleSidebarGroupByRepo(_:)): \.sidebarGroupByRepo,
+            #selector(toggleSidebarAllWorkspaces(_:)): \.sidebarAllWorkspaces,
+            #selector(toggleSidebarActiveOnly(_:)): \.sidebarActiveOnly,
+        ]
+        if let action = menuItem.action, let path = listing[action] {
+            let config = SessionManager.shared.config
+            menuItem.state = config[keyPath: path] ? .on : .off
+            // Every workspace's tabs are listed under the workspace, not the repository.
+            return config.sidebarTabs && !(action == #selector(toggleSidebarGroupByRepo(_:)) && config.sidebarAllWorkspaces)
         }
         let usage: [Selector: UsageProvider] = [#selector(toggleSidebarUsageClaude(_:)): .claude,
                                                 #selector(toggleSidebarUsageCodex(_:)): .codex]

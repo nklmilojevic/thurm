@@ -534,6 +534,12 @@ pub struct WindowConfig {
     pub tab_style: TabStyle,
     /// Width of the tab sidebar in points.
     pub sidebar_width: f64,
+    /// List the sidebar's tabs under their git repository.
+    pub sidebar_group_by_repo: bool,
+    /// List every workspace's tabs in the sidebar, under a header each.
+    pub sidebar_all_workspaces: bool,
+    /// List only the tabs where something is going on: an agent that isn't idle, or progress.
+    pub sidebar_active_only: bool,
     /// Show the agents panel below the sidebar's tabs.
     pub sidebar_agents: bool,
     /// Rows the sidebar's agents panel shows before it scrolls (dragging its header sets it).
@@ -565,6 +571,9 @@ impl Default for WindowConfig {
             animation_speed: AnimationSpeed::Normal,
             tab_style: TabStyle::Sidebar,
             sidebar_width: 240.0,
+            sidebar_group_by_repo: true,
+            sidebar_all_workspaces: false,
+            sidebar_active_only: false,
             sidebar_agents: true,
             sidebar_agent_rows: 5,
             sidebar_usage_claude: false,
@@ -2581,6 +2590,15 @@ clipboard_read = "always"
         assert!(out.contains("# Tabs:"), "comments kept");
         let out = with_setting(&out, "window.sidebar_width", "300.0").unwrap();
         assert_eq!(Config::parse(&out).unwrap().window.sidebar_width, 300.0);
+        let window = Config::parse(&out).unwrap().window;
+        assert!(window.sidebar_group_by_repo, "grouped by default");
+        assert!(!window.sidebar_all_workspaces && !window.sidebar_active_only, "opt-in");
+        let out = with_setting(&out, "window.sidebar_group_by_repo", "false").unwrap();
+        let out = with_setting(&out, "window.sidebar_all_workspaces", "true").unwrap();
+        let out = with_setting(&out, "window.sidebar_active_only", "true").unwrap();
+        let window = Config::parse(&out).unwrap().window;
+        assert!(!window.sidebar_group_by_repo);
+        assert!(window.sidebar_all_workspaces && window.sidebar_active_only);
         assert!(Config::parse(&out).unwrap().window.sidebar_agents);
         let out = with_setting(&out, "window.sidebar_agents", "false").unwrap();
         assert!(!Config::parse(&out).unwrap().window.sidebar_agents);

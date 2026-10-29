@@ -1,10 +1,10 @@
 import AppKit
 
 // Vertical tabs (config `window.tab_style = "sidebar"`), after tty7's sidebar: tabs grouped by
-// git repository, each row showing the agent status, the title and the branch with its diff
-// size. Tabs are still native window tabs underneath (one NSWindow per tab, with the native tab
-// bar suppressed), so restore, Cmd+1…9 and "Move Tab to New Workspace" keep working;
-// every window of a tab group shows the same list. Below the tabs, an agents panel lists every
+// git repository (or by workspace, listing every workspace's tabs), each row showing the agent
+// status, the title and the branch with its diff size. Tabs are still native window tabs
+// underneath (one NSWindow per tab, with the native tab bar suppressed), so restore, Cmd+1…9
+// and "Move Tab to New Workspace" keep working; every window of a tab group shows the same list. Below the tabs, an agents panel lists every
 // pane running a coding agent (in any window or workspace), so an agent in an unfocused split
 // is one click away; it has its own selection: the focused agent pane.
 
@@ -24,6 +24,10 @@ struct SidebarTab {
     var behind: [PaneIcon] = []
     /// The bar under the title (OSC 9;4).
     var progress: ProgressReport?
+    /// A tab of a workspace no window shows, which a click switches to.
+    var hidden: HiddenTab?
+    /// Something is going on in it (see `TabSidebarViewController.isActive`).
+    var active = false
 
     /// Whether the two differ in their progress only: the row then moves its bar and nothing else.
     func differsInProgressOnly(from other: SidebarTab) -> Bool {
@@ -38,17 +42,31 @@ extension SidebarTab: Equatable {
         a.controller === b.controller && a.title == b.title && a.subtitle == b.subtitle && a.branch == b.branch
             && a.added == b.added && a.removed == b.removed && a.status == b.status
             && a.shortcut == b.shortcut && a.selected == b.selected && a.icon == b.icon
-            && a.behind == b.behind && a.progress == b.progress
+            && a.behind == b.behind && a.progress == b.progress && a.hidden == b.hidden && a.active == b.active
     }
 }
 
-/// Tabs sharing a repository (or "Terminals" for the rest).
+/// A tab of a workspace no window shows: its `hiddenTabs[index]`.
+struct HiddenTab: Equatable {
+    let workspace: UInt64
+    let index: Int
+}
+
+/// Tabs sharing a repository (or "Terminals" for the rest), or a workspace's tabs.
 final class SidebarGroup {
     let name: String
+    /// What its collapsed state is kept under: the name, or for a workspace its id.
+    let key: String
+    /// Another workspace's tabs: listed, but this window's tabs can't be dropped among them.
+    let elsewhere: Bool
     var tabs: [SidebarTab] = []
     /// Row objects, built once per reload (NSOutlineView tracks items by identity).
     var boxes: [TabBox] = []
-    init(name: String) { self.name = name }
+    init(name: String, key: String? = nil, elsewhere: Bool = false) {
+        self.name = name
+        self.key = key ?? name
+        self.elsewhere = elsewhere
+    }
 }
 
 final class TabBox {
@@ -186,12 +204,12 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     private var reloadHeld = false
     /// The rows as last shown: agents retitle their panes several times a second, which
     /// mostly changes nothing the sidebar shows.
-    private var shown: (names: [String], tabs: [[SidebarTab]], theme: Theme)?
+    private var shown: (names: [[String]], tabs: [[SidebarTab]], theme: Theme)?
 
     private let outline = NSOutlineView()
     private var groups: [SidebarGroup] = []
     private static let dragType = NSPasteboard.PasteboardType("com.thurm.sidebar-tab")
-    /// Group names the user collapsed (kept across reloads and launches).
+    /// Keys of the groups the user collapsed (kept across reloads and launches).
     private static var collapsed: Set<String> {
         get { Set(UserDefaults.standard.stringArray(forKey: "SidebarCollapsedGroups") ?? []) }
         set { UserDefaults.standard.set(Array(newValue), forKey: "SidebarCollapsedGroups") }
@@ -201,6 +219,9 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     /// The window's workspace; click for the workspace menu.
     private let workspaceButton = NSButton(title: "", target: nil, action: nil)
     private let workspaceMenu = NSMenu()
+    /// Only active tabs (`window.sidebar_active_only`), as it was last drawn.
+    private let filterButton = NSButton(title: "", target: nil, action: nil)
+    private var filterShown: (on: Bool, theme: Theme)?
     private let agents = AgentsPanel()
     private let usage = UsagePanel()
 
@@ -249,11 +270,19 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         workspaceButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         workspaceButton.translatesAutoresizingMaskIntoConstraints = false
 
+        filterButton.target = self
+        filterButton.action = #selector(filterClicked(_:))
+        filterButton.isBordered = false
+        filterButton.imagePosition = .imageOnly
+        filterButton.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+        filterButton.translatesAutoresizingMaskIntoConstraints = false
+
         let root = NSView()
         root.wantsLayer = true
         root.layer?.backgroundColor = backgroundColor?.cgColor
         scroll.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(workspaceButton)
+        root.addSubview(filterButton)
         root.addSubview(scroll)
         root.addSubview(agents)
         root.addSubview(usage)
@@ -262,7 +291,9 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         NSLayoutConstraint.activate([
             workspaceButton.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: 2),
             workspaceButton.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            workspaceButton.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -12),
+            workspaceButton.trailingAnchor.constraint(lessThanOrEqualTo: filterButton.leadingAnchor, constant: -6),
+            filterButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            filterButton.centerYAnchor.constraint(equalTo: workspaceButton.centerYAnchor),
             scroll.topAnchor.constraint(equalTo: workspaceButton.bottomAnchor, constant: 4),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -286,23 +317,112 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     }
 
     /// Tabs in the order the sidebar lists them: grouped by repository, the groups in the order
-    /// of their first tab, then the rest ("Terminals"). Numbers follow it, so they can change
-    /// when a tab closes or moves to another repository.
+    /// of their first tab, then the rest ("Terminals"); ungrouped, in tab order. Numbers follow
+    /// it, so they can change when a tab closes or moves to another repository.
     static func displayOrder(_ windows: [NSWindow]) -> [NSWindow] {
-        var roots: [String] = []
-        var byRoot: [String: [NSWindow]] = [:]
-        var other: [NSWindow] = []
-        for w in windows {
-            guard let c = w.windowController as? TerminalWindowController, !c.isClosed else { continue }
-            if let root = group(for: c)?.key {
-                if byRoot[root] == nil { roots.append(root) }
-                byRoot[root, default: []].append(w)
+        let live = windows.filter { ($0.windowController as? TerminalWindowController)?.isClosed == false }
+        guard groupsByRepo(SessionManager.shared.config) else { return live }
+        return listingOrder(live) { group(for: $0.windowController as! TerminalWindowController)?.key }
+    }
+
+    /// Whether the window's tabs are listed under their repository: every workspace's tabs are
+    /// listed under the workspace instead.
+    static func groupsByRepo(_ config: AppConfig) -> Bool {
+        config.sidebarGroupByRepo && !config.sidebarAllWorkspaces
+    }
+
+    /// `items` grouped by `key`: the groups in the order of their first item, then the items
+    /// without one.
+    static func listingOrder<T>(_ items: [T], key: (T) -> String?) -> [T] {
+        var keys: [String] = []
+        var byKey: [String: [T]] = [:]
+        var other: [T] = []
+        for item in items {
+            if let k = key(item) {
+                if byKey[k] == nil { keys.append(k) }
+                byKey[k, default: []].append(item)
             } else {
-                other.append(w)
+                other.append(item)
             }
         }
-        return roots.flatMap { byRoot[$0] ?? [] } + other
+        return keys.flatMap { byKey[$0] ?? [] } + other
     }
+
+    /// Whether a tab with these panes has something going on: an agent that isn't idle, or a
+    /// program reporting progress. `window.sidebar_active_only` lists only these (and the
+    /// selected tab).
+    static func isActive(_ panes: [PaneKey], info: [PaneKey: PaneInfo], progress: ProgressReport?) -> Bool {
+        progress != nil || panes.contains { info[$0]?.agent.map { $0.status != .idle } ?? false }
+    }
+
+    /// The status a tab shows: the most urgent of its panes' agents, among the states that
+    /// mark tabs.
+    private static func status(_ panes: [PaneKey], info: [PaneKey: PaneInfo], config: AppConfig) -> AgentStatus? {
+        var status: AgentStatus?
+        for id in panes {
+            if let a = info[id]?.agent, config.notice(for: a).tabIndicator,
+               status == nil || a.status.urgency > status!.urgency {
+                status = a.status
+            }
+        }
+        return status
+    }
+
+    /// The row of a window's tab.
+    private static func row(_ c: TerminalWindowController, shortcut: Int?, selected: Bool,
+                            info panes: [PaneKey: PaneInfo], config: AppConfig) -> SidebarTab {
+        let info = panes[c.focusedPane]
+        let git = info?.git
+        // Remote paths are the host's, not abbreviated against this Mac's home.
+        let dir = info?.cwd.map { c.host == localHost ? abbreviatePath($0) : "\(c.host):\($0)" }
+        var tab = SidebarTab(controller: c,
+                             title: c.titleOverride ?? info?.displayTitle ?? "Thurm",
+                             subtitle: dir,
+                             status: status(c.content.paneIds, info: panes, config: config),
+                             shortcut: shortcut,
+                             selected: selected,
+                             icon: PaneIcon(info),
+                             behind: PaneIcon.behind(c))
+        tab.progress = progress(focused: c.focusedPane, panes: c.content.paneIds, info: panes)
+        tab.active = isActive(c.content.paneIds, info: panes, progress: tab.progress)
+        if let g = git {
+            tab.branch = c.host == localHost ? g.branch : "\(c.host) · \(g.branch)"
+            tab.added = g.added
+            tab.removed = g.removed
+        }
+        if let h = c.handoffID.flatMap({ Remotes.shared.handoffs[$0] }) {
+            // A handoff: where it runs, and whether its work came back.
+            tab.branch = "\(h.host) · \(h.branch)" + (Remotes.shared.handoffErrors[h.id] != nil ? " · fetch failed" : "")
+        }
+        return tab
+    }
+
+    /// The row of `ws`'s `index`th tab, which no window shows.
+    private static func hiddenRow(_ t: TabLayout, index: Int, of ws: Workspace,
+                                  info panes: [PaneKey: PaneInfo], config: AppConfig) -> SidebarTab {
+        let focused = t.focusedKey
+        let info = panes[focused]
+        let dir = info?.cwd.map { ws.host == localHost ? abbreviatePath($0) : "\(ws.host):\($0)" }
+        var tab = SidebarTab(controller: nil,
+                             title: t.title ?? info?.displayTitle ?? "Thurm",
+                             subtitle: dir,
+                             status: status(t.panes, info: panes, config: config),
+                             shortcut: nil,
+                             selected: false,
+                             icon: PaneIcon(info))
+        tab.progress = progress(focused: focused, panes: t.panes, info: panes)
+        tab.active = isActive(t.panes, info: panes, progress: tab.progress)
+        if let g = info?.git {
+            tab.branch = ws.host == localHost ? g.branch : "\(ws.host) · \(g.branch)"
+            tab.added = g.added
+            tab.removed = g.removed
+        }
+        tab.hidden = HiddenTab(workspace: ws.id, index: index)
+        return tab
+    }
+
+    /// What a workspace's group keeps its collapsed state under.
+    private static func collapseKey(_ ws: Workspace) -> String { "workspace:\(ws.id)" }
 
     /// The group a tab is listed under: its repository ("devbox · repo" on a remote host), or
     /// for a handoff tab the local repository it came from.
@@ -321,49 +441,29 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             reloadHeld = true
             return
         }
-        let workspace = controller.flatMap { SessionManager.shared.workspace($0.workspaceID)?.name } ?? ""
+        let sm = SessionManager.shared
+        let shownWorkspace = controller.flatMap { sm.workspace($0.workspaceID) }
+        let workspace = shownWorkspace?.name ?? ""
         if workspaceButton.title != workspace { workspaceButton.title = workspace }
+        let config = sm.config
+        updateFilterButton(on: config.sidebarActiveOnly, theme: config.theme)
         agents.controller = controller
         agents.reload()
         usage.reload()
         let windows = controller?.orderedTabs ?? [window]
-        let panes = SessionManager.shared.panes
-        let config = SessionManager.shared.config
+        let panes = sm.panes
+        let byRepo = Self.groupsByRepo(config)
         var byRoot: [String: SidebarGroup] = [:]
         var order: [SidebarGroup] = []
-        let other = SidebarGroup(name: "Terminals")
+        // Every workspace listed: this window's tabs under its workspace, first.
+        let other = config.sidebarAllWorkspaces
+            ? SidebarGroup(name: shownWorkspace?.name ?? "Tabs", key: shownWorkspace.map(Self.collapseKey))
+            : SidebarGroup(name: "Terminals")
         for (index, w) in windows.enumerated() {
             guard let c = w.windowController as? TerminalWindowController, !c.isClosed else { continue }
-            let info = panes[c.focusedPane]
-            var status: AgentStatus?
-            for id in c.content.paneIds {
-                if let a = panes[id]?.agent, config.notice(for: a).tabIndicator,
-                   status == nil || a.status.urgency > status!.urgency {
-                    status = a.status
-                }
-            }
-            let git = info?.git
-            // Remote paths are the host's, not abbreviated against this Mac's home.
-            let dir = info?.cwd.map { c.host == localHost ? abbreviatePath($0) : "\(c.host):\($0)" }
-            var tab = SidebarTab(controller: c,
-                                 title: c.titleOverride ?? info?.displayTitle ?? "Thurm",
-                                 subtitle: dir,
-                                 status: status,
-                                 shortcut: tabShortcut(index: index, count: windows.count),
-                                 selected: w === window,
-                                 icon: PaneIcon(info),
-                                 behind: PaneIcon.behind(c))
-            tab.progress = Self.progress(focused: c.focusedPane, panes: c.content.paneIds, info: panes)
-            if let g = git {
-                tab.branch = c.host == localHost ? g.branch : "\(c.host) · \(g.branch)"
-                tab.added = g.added
-                tab.removed = g.removed
-            }
-            if let h = c.handoffID.flatMap({ Remotes.shared.handoffs[$0] }) {
-                // A handoff: where it runs, and whether its work came back.
-                tab.branch = "\(h.host) · \(h.branch)" + (Remotes.shared.handoffErrors[h.id] != nil ? " · fetch failed" : "")
-            }
-            if let (key, name) = Self.group(for: c) {
+            let tab = Self.row(c, shortcut: tabShortcut(index: index, count: windows.count), selected: w === window,
+                               info: panes, config: config)
+            if byRepo, let (key, name) = Self.group(for: c) {
                 let group = byRoot[key] ?? {
                     let n = SidebarGroup(name: name)
                     byRoot[key] = n
@@ -375,8 +475,30 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                 other.tabs.append(tab)
             }
         }
-        if !other.tabs.isEmpty { order.append(other) }
-        let names = order.map(\.name), tabs = order.map(\.tabs)
+        if config.sidebarAllWorkspaces {
+            order.append(other)
+            for ws in sm.workspacesByRecency where ws.id != shownWorkspace?.id {
+                let g = SidebarGroup(name: ws.isRemote ? "\(ws.name) (\(ws.host))" : ws.name,
+                                     key: Self.collapseKey(ws), elsewhere: true)
+                if let shownIn = sm.controllerShowing(ws) {
+                    g.tabs = sm.group(of: shownIn).map {
+                        Self.row($0, shortcut: nil, selected: false, info: panes, config: config)
+                    }
+                } else {
+                    g.tabs = ws.hiddenTabs.enumerated().map {
+                        Self.hiddenRow($0.element, index: $0.offset, of: ws, info: panes, config: config)
+                    }
+                }
+                order.append(g)
+            }
+        } else if !other.tabs.isEmpty {
+            order.append(other)
+        }
+        if config.sidebarActiveOnly {
+            for g in order { g.tabs.removeAll { !$0.selected && !$0.active } }
+        }
+        order.removeAll { $0.tabs.isEmpty }
+        let names = order.map { [$0.key, $0.name] }, tabs = order.map(\.tabs)
         let theme = SessionManager.shared.config.theme
         if let s = shown, s.names == names, s.theme == theme,
            Self.sameRows(s.tabs.map(Self.identities), tabs.map(Self.identities)) {
@@ -406,7 +528,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             showHeaders = groups.count > 1
             outline.reloadData()
             let collapsed = Self.collapsed
-            for g in groups where !collapsed.contains(g.name) { outline.expandItem(g) }
+            for g in groups where !collapsed.contains(g.key) { outline.expandItem(g) }
         }
         // Select the row of this window's tab, also when the rows are unchanged: a click on
         // another tab's row selected that row here, and this window's tab is the one shown again.
@@ -460,11 +582,11 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
 
     // Collapsing a repository group sticks.
     func outlineViewItemDidCollapse(_ notification: Notification) {
-        if let g = notification.userInfo?["NSObject"] as? SidebarGroup { Self.collapsed.insert(g.name) }
+        if let g = notification.userInfo?["NSObject"] as? SidebarGroup { Self.collapsed.insert(g.key) }
     }
 
     func outlineViewItemDidExpand(_ notification: Notification) {
-        if let g = notification.userInfo?["NSObject"] as? SidebarGroup { Self.collapsed.remove(g.name) }
+        if let g = notification.userInfo?["NSObject"] as? SidebarGroup { Self.collapsed.remove(g.key) }
     }
 
     // MARK: Drag to reorder (moves the native tab)
@@ -478,8 +600,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
 
     func outlineView(_ outlineView: NSOutlineView, validateDrop info: NSDraggingInfo, proposedItem item: Any?,
                      proposedChildIndex index: Int) -> NSDragOperation {
-        // Drop between rows (not onto one).
-        index == NSOutlineViewDropOnItemIndex ? [] : .move
+        // Drop between rows (not onto one), among this window's tabs.
+        index == NSOutlineViewDropOnItemIndex || (item as? SidebarGroup)?.elsewhere == true ? [] : .move
     }
 
     func outlineView(_ outlineView: NSOutlineView, acceptDrop info: NSDraggingInfo, item: Any?,
@@ -519,6 +641,10 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         item is TabBox
     }
 
+    func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
+        item is TabBox ? SidebarRowView() : nil
+    }
+
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
         if item is SidebarGroup { return 24 }
         return 40
@@ -535,7 +661,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         guard let box = item as? TabBox else { return nil }
         let cell = outlineView.makeView(withIdentifier: TabRowView.identifier, owner: nil) as? TabRowView
             ?? TabRowView()
-        cell.showsHoverCard = true
+        cell.showsHoverCard = box.tab.hidden == nil
         cell.configure(box.tab)
         return cell
     }
@@ -545,8 +671,12 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     @objc private func rowClicked(_ sender: Any?) {
         TabHoverCard.shared.dismiss()
         let row = outline.clickedRow >= 0 ? outline.clickedRow : outline.selectedRow
-        guard row >= 0, let box = outline.item(atRow: row) as? TabBox,
-              let w = box.tab.controller?.window else { return }
+        guard row >= 0, let box = outline.item(atRow: row) as? TabBox else { return }
+        if let hidden = box.tab.hidden {
+            SessionManager.shared.showHiddenTab(hidden, from: controller)
+            return
+        }
+        guard let w = box.tab.controller?.window else { return }
         w.makeKeyAndOrderFront(nil)
         if let view = box.tab.controller?.content.focusedView {
             w.makeFirstResponder(view)
@@ -578,6 +708,45 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         guard let c = clickedTab() else { return }
         SessionManager.shared.moveTabToNewWorkspace(c)
     }
+
+    @objc private func filterClicked(_ sender: Any?) {
+        SessionManager.shared.toggleSidebarListing("window.sidebar_active_only", \.sidebarActiveOnly)
+    }
+
+    private func updateFilterButton(on: Bool, theme: Theme) {
+        guard filterShown?.on != on || filterShown?.theme != theme else { return }
+        filterShown = (on, theme)
+        let name = on ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle"
+        filterButton.image = NSImage(systemSymbolName: name, accessibilityDescription: "Only Active Tabs")
+        let chrome = SessionManager.shared.config.chrome
+        filterButton.contentTintColor = on ? chrome.accent : chrome.contentSecondary
+        filterButton.toolTip = on ? "Showing only active tabs: click to show all" : "Show only active tabs"
+    }
+}
+
+extension TabSidebarViewController: NSMenuItemValidation {
+    /// The row menu acts on a window's tab: not on a header or a hidden workspace's tab.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        clickedTab() != nil
+    }
+}
+
+/// A sidebar row whose selection is a capsule in the theme's selection color, like the tab
+/// strip's tabs.
+final class SidebarRowView: NSTableRowView {
+    override func drawSelection(in dirtyRect: NSRect) {
+        let color = colorFromRGB(SessionManager.shared.config.theme.selectionBackground)
+        let rect = bounds.insetBy(dx: 6, dy: 1)
+        let r = rect.height / 2
+        let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: r - 0.5, yRadius: r - 0.5)
+        color.withAlphaComponent(0.6).setFill()
+        path.fill()
+        color.setStroke()
+        path.lineWidth = ChromeStroke.width
+        path.stroke()
+    }
+
+    override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
 }
 
 /// The agents panel at the bottom of the sidebar: every pane running an agent, wherever it is.
@@ -767,6 +936,10 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     // MARK: NSTableViewDataSource / Delegate
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        SidebarRowView()
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let cell = tableView.makeView(withIdentifier: TabRowView.identifier, owner: nil) as? TabRowView

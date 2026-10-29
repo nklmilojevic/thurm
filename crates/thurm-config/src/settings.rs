@@ -191,6 +191,17 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
         Kind::Float(Some((180.0, 480.0))),
     ),
     (
+        "window.sidebar_group_by_repo",
+        "Group tabs by repository",
+        Kind::Bool,
+    ),
+    (
+        "window.sidebar_all_workspaces",
+        "Tabs from all workspaces",
+        Kind::Bool,
+    ),
+    ("window.sidebar_active_only", "Only active tabs", Kind::Bool),
+    (
         "window.sidebar_agents",
         "Agents panel in sidebar",
         Kind::Bool,
