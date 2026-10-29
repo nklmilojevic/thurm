@@ -219,9 +219,6 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     /// The window's workspace; click for the workspace menu.
     private let workspaceButton = NSButton(title: "", target: nil, action: nil)
     private let workspaceMenu = NSMenu()
-    /// Only active tabs (`window.sidebar_active_only`), as it was last drawn.
-    private let filterButton = NSButton(title: "", target: nil, action: nil)
-    private var filterShown: (on: Bool, theme: Theme)?
     private let agents = AgentsPanel()
     private let usage = UsagePanel()
 
@@ -242,6 +239,9 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         outline.outlineTableColumn = column
         outline.headerView = nil
         outline.style = .sourceList
+        // The row view draws the selection (see `SidebarRowView`): the source list draws its own
+        // over any other.
+        outline.selectionHighlightStyle = .none
         outline.rowSizeStyle = .custom
         outline.floatsGroupRows = false
         outline.indentationPerLevel = 0
@@ -270,19 +270,11 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         workspaceButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         workspaceButton.translatesAutoresizingMaskIntoConstraints = false
 
-        filterButton.target = self
-        filterButton.action = #selector(filterClicked(_:))
-        filterButton.isBordered = false
-        filterButton.imagePosition = .imageOnly
-        filterButton.symbolConfiguration = .init(pointSize: 12, weight: .regular)
-        filterButton.translatesAutoresizingMaskIntoConstraints = false
-
         let root = NSView()
         root.wantsLayer = true
         root.layer?.backgroundColor = backgroundColor?.cgColor
         scroll.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(workspaceButton)
-        root.addSubview(filterButton)
         root.addSubview(scroll)
         root.addSubview(agents)
         root.addSubview(usage)
@@ -291,9 +283,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         NSLayoutConstraint.activate([
             workspaceButton.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: 2),
             workspaceButton.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            workspaceButton.trailingAnchor.constraint(lessThanOrEqualTo: filterButton.leadingAnchor, constant: -6),
-            filterButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
-            filterButton.centerYAnchor.constraint(equalTo: workspaceButton.centerYAnchor),
+            workspaceButton.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -12),
             scroll.topAnchor.constraint(equalTo: workspaceButton.bottomAnchor, constant: 4),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -446,7 +436,6 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         let workspace = shownWorkspace?.name ?? ""
         if workspaceButton.title != workspace { workspaceButton.title = workspace }
         let config = sm.config
-        updateFilterButton(on: config.sidebarActiveOnly, theme: config.theme)
         agents.controller = controller
         agents.reload()
         usage.reload()
@@ -525,7 +514,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             shown = (names, tabs, theme)
             for g in order { g.boxes = g.tabs.map(TabBox.init) }
             groups = order
-            showHeaders = groups.count > 1
+            // Every workspace listed: each under its name, also when the others have no tabs to show.
+            showHeaders = config.sidebarAllWorkspaces || groups.count > 1
             outline.reloadData()
             let collapsed = Self.collapsed
             for g in groups where !collapsed.contains(g.key) { outline.expandItem(g) }
@@ -591,8 +581,22 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
 
     // MARK: Drag to reorder (moves the native tab)
 
+    /// Whether `w` is one of this window's tabs: the only ones a drag reorders. Another
+    /// workspace's (listed with every workspace) would join this window's tab group.
+    private func ownsTab(_ w: NSWindow) -> Bool {
+        guard let own = controller?.window else { return false }
+        return (own.tabGroup?.windows ?? [own]).contains { $0 === w }
+    }
+
+    /// The tab a drag carries, when it is one of this window's.
+    private func draggedTab(_ info: NSDraggingInfo) -> NSWindow? {
+        guard let s = info.draggingPasteboard.string(forType: Self.dragType), let number = Int(s),
+              let w = NSApp.window(withWindowNumber: number), ownsTab(w) else { return nil }
+        return w
+    }
+
     func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
-        guard let box = item as? TabBox, let w = box.tab.controller?.window else { return nil }
+        guard let box = item as? TabBox, let w = box.tab.controller?.window, ownsTab(w) else { return nil }
         let pb = NSPasteboardItem()
         pb.setString(String(w.windowNumber), forType: Self.dragType)
         return pb
@@ -600,14 +604,15 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
 
     func outlineView(_ outlineView: NSOutlineView, validateDrop info: NSDraggingInfo, proposedItem item: Any?,
                      proposedChildIndex index: Int) -> NSDragOperation {
-        // Drop between rows (not onto one), among this window's tabs.
-        index == NSOutlineViewDropOnItemIndex || (item as? SidebarGroup)?.elsewhere == true ? [] : .move
+        // One of this window's tabs, dropped between rows (not onto one) among them.
+        guard draggedTab(info) != nil, index != NSOutlineViewDropOnItemIndex,
+              (item as? SidebarGroup)?.elsewhere != true else { return [] }
+        return .move
     }
 
     func outlineView(_ outlineView: NSOutlineView, acceptDrop info: NSDraggingInfo, item: Any?,
                      childIndex index: Int) -> Bool {
-        guard let s = info.draggingPasteboard.string(forType: Self.dragType), let number = Int(s),
-              let moving = NSApp.window(withWindowNumber: number),
+        guard let moving = draggedTab(info), (item as? SidebarGroup)?.elsewhere != true,
               let group = controller?.window?.tabGroup else { return false }
         // Rows of the drop's group in order, and the tab that ends up right after the dropped one.
         let rows: [TabBox] = (item as? SidebarGroup)?.boxes ?? (showHeaders ? [] : groups.first?.boxes ?? [])
@@ -708,20 +713,6 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         guard let c = clickedTab() else { return }
         SessionManager.shared.moveTabToNewWorkspace(c)
     }
-
-    @objc private func filterClicked(_ sender: Any?) {
-        SessionManager.shared.toggleSidebarListing("window.sidebar_active_only", \.sidebarActiveOnly)
-    }
-
-    private func updateFilterButton(on: Bool, theme: Theme) {
-        guard filterShown?.on != on || filterShown?.theme != theme else { return }
-        filterShown = (on, theme)
-        let name = on ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle"
-        filterButton.image = NSImage(systemSymbolName: name, accessibilityDescription: "Only Active Tabs")
-        let chrome = SessionManager.shared.config.chrome
-        filterButton.contentTintColor = on ? chrome.accent : chrome.contentSecondary
-        filterButton.toolTip = on ? "Showing only active tabs: click to show all" : "Show only active tabs"
-    }
 }
 
 extension TabSidebarViewController: NSMenuItemValidation {
@@ -731,17 +722,23 @@ extension TabSidebarViewController: NSMenuItemValidation {
     }
 }
 
-/// A sidebar row whose selection is a capsule in the theme's selection color, like the tab
-/// strip's tabs.
+/// A sidebar row whose selection is a capsule in the chrome's colors, like the tab strip's
+/// selected tab. Its table highlights nothing itself (`selectionHighlightStyle = .none`).
 final class SidebarRowView: NSTableRowView {
-    override func drawSelection(in dirtyRect: NSRect) {
-        let color = colorFromRGB(SessionManager.shared.config.theme.selectionBackground)
-        let rect = bounds.insetBy(dx: 6, dy: 1)
+    override var isSelected: Bool {
+        didSet { if isSelected != oldValue { needsDisplay = true } }
+    }
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        super.drawBackground(in: dirtyRect)
+        guard isSelected else { return }
+        let chrome = SessionManager.shared.config.chrome
+        let rect = bounds.insetBy(dx: 10, dy: 1)
         let r = rect.height / 2
         let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: r - 0.5, yRadius: r - 0.5)
-        color.withAlphaComponent(0.6).setFill()
+        chrome.controlSelected.setFill()
         path.fill()
-        color.setStroke()
+        chrome.stroke.setStroke()
         path.lineWidth = ChromeStroke.width
         path.stroke()
     }
@@ -785,6 +782,7 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         table.addTableColumn(column)
         table.headerView = nil
         table.style = .sourceList
+        table.selectionHighlightStyle = .none
         table.rowSizeStyle = .custom
         table.rowHeight = Self.rowHeight
         table.intercellSpacing = NSSize(width: 0, height: 0)

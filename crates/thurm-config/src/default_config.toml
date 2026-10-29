@@ -81,8 +81,8 @@ sidebar_group_by_repo = true
 # repository); click a hidden workspace's tab to switch to it. View > Tabs from All Workspaces.
 sidebar_all_workspaces = false
 # List only the tabs where something is going on: an agent that isn't idle, or a program
-# reporting progress (the selected tab always shows). The sidebar's filter button,
-# View > Only Active Tabs.
+# reporting progress (the selected tab always shows). The filter button next to the sidebar
+# button, View > Only Active Tabs.
 sidebar_active_only = false
 # List every pane running an agent below the sidebar's tabs. View > Agents in Sidebar.
 sidebar_agents = true

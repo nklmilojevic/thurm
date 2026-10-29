@@ -65,7 +65,7 @@ The View menu changes what the sidebar lists, as do the settings below:
   tabs show under a header for the workspace. Click a tab of another workspace to
   switch to it.
 - **Only Active Tabs** (`window.sidebar_active_only`, or the filter button next to
-  the workspace name). The sidebar lists only the tabs with an agent that isn't
+  the sidebar button in the titlebar). The sidebar lists only the tabs with an agent that isn't
   idle or a program reporting progress, plus the selected tab.
 
 ## Text, search, and navigation

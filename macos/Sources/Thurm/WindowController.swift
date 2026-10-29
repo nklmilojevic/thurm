@@ -215,6 +215,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         dot.applyTheme()
         applyTabStyle()
         (window as? TerminalWindow)?.hidesTitle = cfg.sidebarTabs && cfg.paneHeaders
+        (window as? TerminalWindow)?.sidebarActiveOnly = cfg.sidebarActiveOnly
         sidebar?.backgroundColor = cfg.sidebarColor
         // The quick terminal's rounded corners need a transparent window.
         if opacity < 1 || isQuick {
