@@ -230,6 +230,23 @@ mod tests {
         assert_eq!(parent(me), Some(unsafe { libc::getppid() } as u32));
         assert!(parent(u32::MAX).is_none());
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn children_and_job() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let kids = children(std::process::id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(kids.contains(&child.id()), "{kids:?}");
+        assert!(!kids.contains(&0), "{kids:?}");
+        let me = job(std::process::id()).expect("own job");
+        assert_eq!(me.pgrp, unsafe { libc::getpgrp() } as u32);
+        assert!(job(u32::MAX).is_none());
+    }
 }
 
 /// (pid, ppid, command line).
@@ -544,6 +561,153 @@ pub fn process_birth(pid: u32) -> Option<u64> {
             .saturating_mul(1_000_000)
             .saturating_add(info.pbi_start_tvusec)
     })
+}
+
+/// Programs that run the shell on a terminal of their own and relay it to the pane's
+/// (`atuin pty-proxy`, `script`).
+const PTY_PROXIES: &[&str] = &["atuin", "script"];
+
+/// The foreground group of the pane's terminal (`pgrp`), seen through PTY proxies. While a
+/// proxy runs, its shell and everything that shell starts are on the proxy's terminal, and
+/// the pane's shows the proxy's group in front (login(1) and `atuin pty-proxy` under it). So
+/// follow the shells and proxies of that group to the first process on another terminal and
+/// take that terminal's foreground group (again, for a proxy behind a proxy). Anything else in
+/// front (Neovim with a `:terminal` open) is what runs.
+pub fn behind_proxy(pgrp: u32) -> u32 {
+    let mut fg = pgrp;
+    for _ in 0..4 {
+        match inner_foreground(fg) {
+            Some(inner) if inner != fg => fg = inner,
+            _ => break,
+        }
+    }
+    fg
+}
+
+fn inner_foreground(pgrp: u32) -> Option<u32> {
+    // The pane's terminal. login(1) runs as root and tells us nothing: the next process of its
+    // group does.
+    let mut tty = job(pgrp).map(|j| j.tty);
+    let relays =
+        |pid: u32| name(pid).is_some_and(|n| is_shell(&n) || PTY_PROXIES.contains(&n.as_str()));
+    let mut queue = vec![pgrp];
+    let mut visited = 0;
+    while let Some(pid) = queue.pop() {
+        visited += 1;
+        if visited > 16 || !relays(pid) {
+            continue;
+        }
+        // The group's own processes first: the shell's jobs are not what it relays, and a
+        // process of the group tells the terminal when the leader didn't.
+        let (own, others): (Vec<_>, Vec<_>) = children(pid)
+            .into_iter()
+            .filter_map(|c| Some((c, job(c)?)))
+            .partition(|(_, j)| j.pgrp == pgrp);
+        for (child, j) in own {
+            if *tty.get_or_insert(j.tty) == j.tty {
+                queue.push(child);
+            }
+        }
+        for (_, j) in others {
+            if j.tty.is_some()
+                && tty.is_some_and(|t| t != j.tty)
+                && let Some(inner) = j.tpgid
+            {
+                return Some(inner);
+            }
+        }
+    }
+    None
+}
+
+/// A process's group, its controlling terminal and that terminal's foreground group.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Job {
+    pgrp: u32,
+    tty: Option<u64>,
+    tpgid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+fn job(pid: u32) -> Option<Job> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // After the name: state ppid pgrp session tty_nr tpgid.
+    let f: Vec<&str> = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .take(6)
+        .collect();
+    let num = |i: usize| f.get(i)?.parse::<i64>().ok();
+    Some(Job {
+        pgrp: num(2)? as u32,
+        tty: num(4).filter(|&t| t != 0).map(|t| t as u64),
+        tpgid: num(5).filter(|&t| t > 0).map(|t| t as u32),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn children(pid: u32) -> Vec<u32> {
+    // Each thread lists the children it started.
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter_map(|t| std::fs::read_to_string(t.path().join("children")).ok())
+        .flat_map(|s| {
+            s.split_whitespace()
+                .filter_map(|p| p.parse().ok())
+                .collect::<Vec<u32>>()
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn job(pid: u32) -> Option<Job> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    // No terminal: e_tdev is NODEV and e_tpgid 0.
+    (n == size).then_some(Job {
+        pgrp: info.pbi_pgid,
+        tty: (info.e_tdev != u32::MAX).then_some(info.e_tdev as u64),
+        tpgid: (info.e_tpgid != 0).then_some(info.e_tpgid),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn children(pid: u32) -> Vec<u32> {
+    let mut pids = [0 as libc::pid_t; 64];
+    let n = unsafe {
+        libc::proc_listchildpids(
+            pid as i32,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as i32,
+        )
+    };
+    pids[..n.clamp(0, pids.len() as i32) as usize]
+        .iter()
+        .map(|&p| p as u32)
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn job(_pid: u32) -> Option<Job> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn children(_pid: u32) -> Vec<u32> {
+    Vec::new()
 }
 
 /// Read the agent's identity and confirm that it belongs to the pane's foreground.

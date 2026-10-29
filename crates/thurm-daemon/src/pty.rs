@@ -238,9 +238,10 @@ impl Pty {
         None
     }
 
-    /// Foreground process group of the terminal (the running job, or the shell itself).
+    /// Foreground process group of the terminal (the running job, or the shell itself), or of
+    /// the terminal a PTY proxy runs the shell on (see `procinfo::behind_proxy`).
     pub fn foreground_pgrp(&self) -> Option<u32> {
-        foreground_of(&self.master)
+        foreground_of(&self.master).map(crate::procinfo::behind_proxy)
     }
 
     /// Echo disabled with canonical mode on: a password prompt (sudo, ssh, gpg...).

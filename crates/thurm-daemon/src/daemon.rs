@@ -3700,6 +3700,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The program in front of a pane whose shell runs behind a PTY proxy (`atuin pty-proxy`,
+    /// here `script`) is the one on the proxy's terminal, not the proxy.
+    #[test]
+    fn the_foreground_is_seen_through_a_pty_proxy() {
+        let dir = std::env::temp_dir().join(format!("thurm-pty-proxy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let foreground = |script: &str| {
+            let id = daemon
+                .create_pane(
+                    CreatePane {
+                        command: Some(vec!["sh".into(), "-c".into(), script.into()]),
+                        size: PaneSize {
+                            cols: 80,
+                            rows: 24,
+                            cell_width: 8,
+                            cell_height: 16,
+                        },
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let pane = daemon.pane(id).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut name = None;
+            while Instant::now() < deadline {
+                name = pane
+                    .state
+                    .lock()
+                    .pty
+                    .foreground_pgrp()
+                    .and_then(procinfo::process_info)
+                    .map(|p| p.name);
+                if name.as_deref() == Some("sleep") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            daemon.close_pane(id);
+            name
+        };
+        #[cfg(target_os = "macos")]
+        let proxied = "script -q /dev/null /bin/sleep 30";
+        #[cfg(not(target_os = "macos"))]
+        let proxied = "script -qc 'exec /bin/sleep 30' /dev/null";
+        assert_eq!(foreground(proxied).as_deref(), Some("sleep"));
+        // Without job control the shell's job is in the shell's group: no proxy, the shell.
+        let plain = foreground("/bin/sleep 30; :");
+        assert!(
+            plain.as_deref().is_some_and(procinfo::is_shell),
+            "{plain:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_prompt_going_away_while_still_waiting_is_news() {
         let blocked = agent(AgentStatus::NeedsInput, Some(7));
