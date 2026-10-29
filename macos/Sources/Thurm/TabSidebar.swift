@@ -144,6 +144,23 @@ final class TabSplitViewController: NSSplitViewController {
         splitViewItems.first?.isCollapsed ?? false
     }
 
+    /// Before this window is shown in place of `other`'s (a workspace switch): the sidebar as
+    /// open, as wide and as far scrolled as there, its rows built, so the swap changes nothing
+    /// in it but the selection.
+    func match(_ other: TabSplitViewController?) {
+        if let other {
+            splitViewItems.first?.isCollapsed = other.sidebarCollapsed
+            view.layoutSubtreeIfNeeded()
+            if !other.sidebarCollapsed {
+                splitView.setPosition(other.sidebar.view.frame.width, ofDividerAt: 0)
+                sidebar.preferredWidth = nil
+            }
+        }
+        sidebar.reload()
+        view.layoutSubtreeIfNeeded()
+        if let other { sidebar.scrollOffset = other.sidebar.scrollOffset }
+    }
+
     func toggleSidebarAnimated() {
         guard !togglingSidebar, let side = splitViewItems.first else { return }
         let collapse = !side.isCollapsed
@@ -306,6 +323,16 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         workspaceMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
     }
 
+    /// How far the tab list is scrolled.
+    var scrollOffset: NSPoint {
+        get { outline.enclosingScrollView?.contentView.bounds.origin ?? .zero }
+        set {
+            guard let scroll = outline.enclosingScrollView else { return }
+            scroll.contentView.scroll(to: newValue)
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+    }
+
     /// Tabs in the order the sidebar lists them: grouped by repository, the groups in the order
     /// of their first tab, then the rest ("Terminals"); ungrouped, in tab order. Numbers follow
     /// it, so they can change when a tab closes or moves to another repository.
@@ -380,14 +407,18 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             tab.added = g.added
             tab.removed = g.removed
         }
-        if let h = c.handoffID.flatMap({ Remotes.shared.handoffs[$0] }) {
-            // A handoff: where it runs, and whether its work came back.
-            tab.branch = "\(h.host) · \(h.branch)" + (Remotes.shared.handoffErrors[h.id] != nil ? " · fetch failed" : "")
-        }
+        if let branch = handoffBranch(c.handoffID) { tab.branch = branch }
         return tab
     }
 
-    /// The row of `ws`'s `index`th tab, which no window shows.
+    /// A handoff tab's branch line: where it runs, and whether its work came back.
+    private static func handoffBranch(_ id: String?) -> String? {
+        guard let h = id.flatMap({ Remotes.shared.handoffs[$0] }) else { return nil }
+        return "\(h.host) · \(h.branch)" + (Remotes.shared.handoffErrors[h.id] != nil ? " · fetch failed" : "")
+    }
+
+    /// The row of `ws`'s `index`th tab, which no window shows: as its window would show it, so
+    /// switching to the workspace changes nothing in it.
     private static func hiddenRow(_ t: TabLayout, index: Int, of ws: Workspace,
                                   info panes: [PaneKey: PaneInfo], config: AppConfig) -> SidebarTab {
         let focused = t.focusedKey
@@ -399,7 +430,9 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                              status: status(t.panes, info: panes, config: config),
                              shortcut: nil,
                              selected: false,
-                             icon: PaneIcon(info))
+                             icon: PaneIcon(info),
+                             behind: t.panes.lazy.filter { $0 != focused }.prefix(PaneIcon.maxBehind)
+                                 .map { PaneIcon(panes[$0]) })
         tab.progress = progress(focused: focused, panes: t.panes, info: panes)
         tab.active = isActive(t.panes, info: panes, progress: tab.progress)
         if let g = info?.git {
@@ -407,6 +440,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             tab.added = g.added
             tab.removed = g.removed
         }
+        if let branch = handoffBranch(t.handoff) { tab.branch = branch }
         tab.hidden = HiddenTab(workspace: ws.id, index: index)
         return tab
     }
@@ -917,10 +951,23 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     /// Every agent pane: this window's tabs first, then other windows, then hidden workspaces.
+    /// With every workspace's tabs listed, by workspace in the tab list's order instead, so a
+    /// switch moves none.
     private func agentRows() -> [AgentBox] {
-        guard SessionManager.shared.config.sidebarAgents else { return [] }
+        let sm = SessionManager.shared
+        guard sm.config.sidebarAgents else { return [] }
         let key = NSApp.keyWindow?.windowController as? TerminalWindowController
-        return SessionManager.shared.agentPanes(first: controller).map { a in
+        var agents = sm.agentPanes(first: controller)
+        if sm.config.sidebarAllWorkspaces {
+            let rank = { (a: AgentPane) -> Int in
+                let ws = a.hidden?.id ?? a.controller?.workspaceID
+                return sm.workspaces.firstIndex { $0.id == ws } ?? sm.workspaces.count
+            }
+            agents = agents.enumerated()
+                .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+                .map(\.element)
+        }
+        return agents.map { a in
             // Where it runs first (the repository or directory, and the workspace when hidden),
             // so a long status is what gets cut.
             let row = SidebarTab(controller: a.controller,

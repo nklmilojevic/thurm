@@ -192,6 +192,11 @@ extension SessionManager {
         target.hiddenTabs = []
         target.hiddenSelectedTab = 0
         target.lastActive = Date()
+        // The old tabs leave every listing now, and the new tabs' sidebars are laid out as the
+        // shown one: the first frame of the switch is already the last, with nothing redrawn.
+        for o in old { o.isClosed = true }
+        let shownSplit = (selectedWindow.windowController as? TerminalWindowController)?.tabSplit
+        for n in created { n.tabSplit?.match(shownSplit) }
         selected.window?.makeKeyAndOrderFront(nil)
         for o in old {
             o.closingWithoutConfirmation = true
