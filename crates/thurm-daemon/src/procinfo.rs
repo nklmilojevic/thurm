@@ -251,17 +251,42 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn stdin_device() {
+        use std::os::fd::{FromRawFd, OwnedFd};
         use std::os::unix::fs::MetadataExt;
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .stdin(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let device = stdin_tty(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
+        let device = |stdin: std::process::Stdio| {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(stdin)
+                .spawn()
+                .unwrap();
+            let device = stdin_tty(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            device
+        };
         let null = std::fs::metadata("/dev/null").unwrap().rdev();
-        assert_eq!(device, Some(null));
+        assert_eq!(device(std::process::Stdio::null()), Some(null));
+        // A terminal's, as its own `stat` gives it.
+        let (mut master, mut slave) = (0, 0);
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0);
+        let (master, slave) = unsafe {
+            (
+                OwnedFd::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+            )
+        };
+        let terminal = slave.metadata().unwrap().rdev();
+        assert_eq!(device(slave.into()), Some(terminal));
+        drop(master);
     }
 
     /// pid, ppid, name, job, stdin.
@@ -874,6 +899,15 @@ struct VnodeFdInfo {
     guardflags: u32,
     vnode: libc::vnode_info_path,
 }
+
+// As <sys/proc_info.h> lays it out (`sizeof`, then `offsetof` `pvip` and the fields read).
+#[cfg(target_os = "macos")]
+const _: () = {
+    assert!(std::mem::size_of::<VnodeFdInfo>() == 1200);
+    assert!(std::mem::offset_of!(VnodeFdInfo, vnode) == 24);
+    assert!(std::mem::offset_of!(VnodeFdInfo, vnode.vip_vi.vi_stat.vst_mode) == 28);
+    assert!(std::mem::offset_of!(VnodeFdInfo, vnode.vip_vi.vi_stat.vst_rdev) == 140);
+};
 
 #[cfg(target_os = "macos")]
 const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
