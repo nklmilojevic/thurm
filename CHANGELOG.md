@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.16.0 - 2026-10-29
+
+This release adds three sidebar settings to the macOS app. It also fixes agent icons behind PTY proxies, sidebar drawing for new tabs, and keyboard focus after a tab closes.
+
+### New features
+
+- Adds the `window.sidebar_group_by_repo`, `window.sidebar_all_workspaces` and `window.sidebar_active_only` settings. They change which tabs the sidebar lists. The selected row now uses a capsule in the theme's selection color.
+
+### Fixes
+
+- The sidebar shows the agent icon when `atuin pty-proxy` runs the shell. Before, it showed the shell icon.
+- New tabs draw their sidebar at once. Before, the first frames listed only the new tab.
+- Typing goes to the next tab after you close a tab. Before, keys went nowhere until you clicked the terminal.
+
 ## v0.15.0 - 2026-10-28
 
 This release adds floating panes, which show a pane above the splits of a tab. It also compresses remote output and fixes input and connection problems.
