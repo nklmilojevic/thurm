@@ -144,15 +144,17 @@ final class TabSplitViewController: NSSplitViewController {
         splitViewItems.first?.isCollapsed ?? false
     }
 
-    /// Before this window is shown in place of `other`'s (a workspace switch): the sidebar as
-    /// open, as wide and as far scrolled as there, its rows built, so the swap changes nothing
-    /// in it but the selection.
+    /// Before this window is shown in place of `other`'s (a new tab, a workspace switch): the
+    /// sidebar as open, as wide and as far scrolled as there, its rows built, so the swap changes
+    /// nothing in it but the selection.
     func match(_ other: TabSplitViewController?) {
         if let other {
             splitViewItems.first?.isCollapsed = other.sidebarCollapsed
             view.layoutSubtreeIfNeeded()
-            if !other.sidebarCollapsed {
-                splitView.setPosition(other.sidebar.view.frame.width, ofDividerAt: 0)
+            // A sidebar not laid out yet (a window restored a moment ago) has no width to copy.
+            let width = other.sidebar.view.frame.width
+            if !other.sidebarCollapsed, width >= splitViewItems[0].minimumThickness {
+                splitView.setPosition(width, ofDividerAt: 0)
                 sidebar.preferredWidth = nil
             }
         }
@@ -961,7 +963,10 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private func agentRows() -> [AgentBox] {
         let sm = SessionManager.shared
         guard sm.config.sidebarAgents else { return [] }
-        let key = NSApp.keyWindow?.windowController as? TerminalWindowController
+        var key = NSApp.keyWindow?.windowController as? TerminalWindowController
+        // The other tabs of the key window answer as if shown, so a tab's panel already has its
+        // selection when the tab comes forward.
+        if let group = key?.window?.tabGroup, group === controller?.window?.tabGroup { key = controller }
         var agents = sm.agentPanes(first: controller)
         if sm.config.sidebarAllWorkspaces {
             let rank = { (a: AgentPane) -> Int in
@@ -1014,6 +1019,9 @@ final class AgentsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let sm = SessionManager.shared
         guard let a = sm.agentPanes(first: controller).first(where: { $0.pane == agent.pane }) else { return }
         sm.focusAgent(a, from: controller)
+        // Its tab came forward with another split focused: the panel there selects this agent
+        // before it is drawn, not a refresh later.
+        sm.controller(for: a.pane)?.sidebar?.reload()
     }
 
 }

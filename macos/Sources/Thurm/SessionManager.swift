@@ -636,6 +636,9 @@ final class SessionManager: NSObject, CoreDelegate {
         guard let hostWindow = host.window, let w = c.window else { return }
         w.setFrame(hostWindow.frame, display: false)
         hostWindow.addTabbedWindow(w, ordered: .above)
+        // Its sidebar lists the whole tab group from its first frame, not just itself until the
+        // next refresh.
+        c.tabSplit?.match(host.tabSplit)
     }
 
     /// Shows a window as its own window (never auto-tabbed into another one).
