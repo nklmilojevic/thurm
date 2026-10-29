@@ -445,6 +445,12 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         return tab
     }
 
+    /// A workspace's header, the same whether this window shows it or not: its name, and a
+    /// remote workspace's host.
+    static func heading(_ ws: Workspace) -> String {
+        ws.isRemote ? "\(ws.name) (\(ws.host))" : ws.name
+    }
+
     /// What a workspace's group keeps its collapsed state under.
     private static func collapseKey(_ ws: Workspace) -> String { "workspace:\(ws.id)" }
 
@@ -480,7 +486,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         var order: [SidebarGroup] = []
         // Every workspace listed: this window's tabs under its workspace.
         let other = config.sidebarAllWorkspaces
-            ? SidebarGroup(name: shownWorkspace?.name ?? "Tabs", key: shownWorkspace.map(Self.collapseKey))
+            ? SidebarGroup(name: shownWorkspace.map(Self.heading) ?? "Tabs", key: shownWorkspace.map(Self.collapseKey))
             : SidebarGroup(name: "Terminals")
         for (index, w) in windows.enumerated() {
             guard let c = w.windowController as? TerminalWindowController, !c.isClosed else { continue }
@@ -506,8 +512,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                     order.append(other)
                     continue
                 }
-                let g = SidebarGroup(name: ws.isRemote ? "\(ws.name) (\(ws.host))" : ws.name,
-                                     key: Self.collapseKey(ws), elsewhere: true)
+                let g = SidebarGroup(name: Self.heading(ws), key: Self.collapseKey(ws), elsewhere: true)
                 if let shownIn = sm.controllerShowing(ws) {
                     g.tabs = sm.group(of: shownIn).map {
                         Self.row($0, shortcut: nil, selected: false, info: panes, config: config)

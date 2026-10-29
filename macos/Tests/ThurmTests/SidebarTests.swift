@@ -118,6 +118,13 @@ final class SidebarTests: XCTestCase {
         XCTAssertFalse(TabSidebarViewController.groupsByRepo(config))
     }
 
+    /// A remote workspace's header names its host, so the header doesn't change when a window
+    /// switches to it.
+    func testWorkspaceHeading() {
+        XCTAssertEqual(TabSidebarViewController.heading(Workspace(id: 1, name: "api")), "api")
+        XCTAssertEqual(TabSidebarViewController.heading(Workspace(id: 2, name: "api", host: "devbox")), "api (devbox)")
+    }
+
     /// A tab is active while an agent in any of its panes isn't idle, or it shows progress.
     func testActiveTabs() {
         let shell = PaneKey.local(1), agent = PaneKey.local(2)
