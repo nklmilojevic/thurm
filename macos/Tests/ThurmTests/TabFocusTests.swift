@@ -44,9 +44,13 @@ final class TabFocusTests: XCTestCase {
     func testFieldInsideTheTabKeepsFocus() throws {
         let (c, window) = try controller()
         c.content.showFindBar()
-        let responder = try XCTUnwrap(window.firstResponder as? NSView)
-        XCTAssertTrue(responder.isDescendant(of: try XCTUnwrap(c.content.findBar)))
+        // Editing the search field: its field editor, not the field, holds the keyboard.
+        let editor = try XCTUnwrap(window.firstResponder as? NSTextView)
+        XCTAssertTrue(editor.isFieldEditor)
+        XCTAssertTrue(editor.delegate is NSSearchField)
         becomeKey(c)
-        XCTAssertTrue(window.firstResponder === responder)
+        XCTAssertTrue(window.firstResponder === editor)
+        editor.insertText("needle", replacementRange: editor.selectedRange())
+        XCTAssertEqual((editor.delegate as? NSSearchField)?.stringValue, "needle")
     }
 }
