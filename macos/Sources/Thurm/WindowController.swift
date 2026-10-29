@@ -392,6 +392,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        // A tab AppKit brings forward (the neighbour of one that closed) keeps the responder
+        // it was left with: its sidebar, clicked to switch away, or none if never shown.
+        // The terminal takes it back; the find bar's field, inside `content`, keeps it.
+        if let window, let view = content.focusedView,
+           !((window.firstResponder as? NSView)?.isDescendant(of: content) ?? false) {
+            window.makeFirstResponder(view)
+        }
         SessionManager.shared.controllerBecameKey(self)
         content.focusedView?.reportFocus()
     }
