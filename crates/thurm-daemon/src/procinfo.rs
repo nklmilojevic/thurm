@@ -247,6 +247,111 @@ mod tests {
         assert_eq!(me.pgrp, unsafe { libc::getpgrp() } as u32);
         assert!(job(u32::MAX).is_none());
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn stdin_device() {
+        use std::os::unix::fs::MetadataExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let device = stdin_tty(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let null = std::fs::metadata("/dev/null").unwrap().rdev();
+        assert_eq!(device, Some(null));
+    }
+
+    /// pid, ppid, name, job, stdin.
+    type Row = (u32, u32, &'static str, Option<Job>, Option<u64>);
+
+    /// A process table.
+    struct Table(Vec<Row>);
+
+    impl Procs for Table {
+        fn name(&self, pid: u32) -> Option<String> {
+            self.0.iter().find(|p| p.0 == pid).map(|p| p.2.to_owned())
+        }
+        fn job(&self, pid: u32) -> Option<Job> {
+            self.0.iter().find(|p| p.0 == pid)?.3
+        }
+        fn children(&self, pid: u32) -> Vec<u32> {
+            self.0.iter().filter(|p| p.1 == pid).map(|p| p.0).collect()
+        }
+        fn stdin(&self, pid: u32) -> Option<u64> {
+            self.0.iter().find(|p| p.0 == pid)?.4
+        }
+        fn dev_tty(&self) -> Option<u64> {
+            Some(DEV_TTY)
+        }
+    }
+
+    /// The pane's terminal, one a proxy (or anything else) opened, and /dev/tty.
+    const PANE: u64 = 6;
+    const INNER: u64 = 7;
+    const DEV_TTY: u64 = 2;
+
+    fn on(pgrp: u32, tty: u64, tpgid: u32) -> Option<Job> {
+        Some(Job {
+            pgrp,
+            tty: Some(tty),
+            tpgid: Some(tpgid),
+        })
+    }
+
+    #[test]
+    fn atuin_behind_login_relays_its_terminal() {
+        let table = |front: u32| {
+            Table(vec![
+                // login(1) runs as root: nothing to read but its name.
+                (100, 1, "login", None, None),
+                // `exec atuin pty-proxy … </dev/tty`.
+                (101, 100, "atuin", on(100, PANE, 100), Some(DEV_TTY)),
+                (102, 101, "fish", on(102, INNER, front), Some(INNER)),
+                (103, 102, "claude", on(103, INNER, front), Some(INNER)),
+            ])
+        };
+        assert_eq!(behind_proxy_in(100, &table(103)), 103);
+        assert_eq!(behind_proxy_in(100, &table(102)), 102);
+    }
+
+    #[test]
+    fn a_shell_child_on_its_own_terminal_is_not_in_front() {
+        let table = Table(vec![
+            (200, 1, "fish", on(200, PANE, 200), Some(PANE)),
+            // Started in a session of its own, with a terminal of its own (no proxy).
+            (201, 200, "server", on(201, INNER, 201), None),
+        ]);
+        assert_eq!(behind_proxy_in(200, &table), 200);
+    }
+
+    #[test]
+    fn a_proxy_without_the_panes_input_is_not_in_front() {
+        // A shell without job control, at its prompt, with `script` running in its group.
+        let table = |input: Option<u64>| {
+            Table(vec![
+                (300, 1, "sh", on(300, PANE, 300), Some(PANE)),
+                (301, 300, "script", on(300, PANE, 300), input),
+                (302, 301, "claude", on(302, INNER, 302), Some(INNER)),
+            ])
+        };
+        // In the background, its input elsewhere (a pipe, /dev/null).
+        assert_eq!(behind_proxy_in(300, &table(None)), 300);
+        assert_eq!(behind_proxy_in(300, &table(Some(INNER + 1))), 300);
+        // Relaying the pane.
+        assert_eq!(behind_proxy_in(300, &table(Some(PANE))), 302);
+    }
+
+    #[test]
+    fn a_program_with_a_terminal_inside_is_in_front() {
+        let table = Table(vec![
+            (400, 1, "nvim", on(400, PANE, 400), Some(PANE)),
+            (401, 400, "fish", on(401, INNER, 401), Some(INNER)),
+        ]);
+        assert_eq!(behind_proxy_in(400, &table), 400);
+    }
 }
 
 /// (pid, ppid, command line).
@@ -570,13 +675,17 @@ const PTY_PROXIES: &[&str] = &["atuin", "script"];
 /// The foreground group of the pane's terminal (`pgrp`), seen through PTY proxies. While a
 /// proxy runs, its shell and everything that shell starts are on the proxy's terminal, and
 /// the pane's shows the proxy's group in front (login(1) and `atuin pty-proxy` under it). So
-/// follow the shells and proxies of that group to the first process on another terminal and
-/// take that terminal's foreground group (again, for a proxy behind a proxy). Anything else in
-/// front (Neovim with a `:terminal` open) is what runs.
+/// follow the shells and proxies of that group to a proxy that reads the pane's terminal, and
+/// take the foreground group of the terminal it runs its child on (again, for a proxy behind
+/// a proxy). Anything else in front (Neovim with a `:terminal` open) is what runs.
 pub fn behind_proxy(pgrp: u32) -> u32 {
+    behind_proxy_in(pgrp, &System)
+}
+
+fn behind_proxy_in(pgrp: u32, procs: &impl Procs) -> u32 {
     let mut fg = pgrp;
     for _ in 0..4 {
-        match inner_foreground(fg) {
+        match inner_foreground(fg, procs) {
             Some(inner) if inner != fg => fg = inner,
             _ => break,
         }
@@ -584,33 +693,46 @@ pub fn behind_proxy(pgrp: u32) -> u32 {
     fg
 }
 
-fn inner_foreground(pgrp: u32) -> Option<u32> {
+fn inner_foreground(pgrp: u32, procs: &impl Procs) -> Option<u32> {
     // The pane's terminal. login(1) runs as root and tells us nothing: the next process of its
     // group does.
-    let mut tty = job(pgrp).map(|j| j.tty);
-    let relays =
-        |pid: u32| name(pid).is_some_and(|n| is_shell(&n) || PTY_PROXIES.contains(&n.as_str()));
+    let mut tty = procs.job(pgrp).and_then(|j| j.tty);
     let mut queue = vec![pgrp];
     let mut visited = 0;
     while let Some(pid) = queue.pop() {
         visited += 1;
-        if visited > 16 || !relays(pid) {
+        let Some(name) = procs.name(pid).filter(|_| visited <= 16) else {
+            continue;
+        };
+        let proxy = PTY_PROXIES.contains(&name.as_str());
+        if !proxy && !is_shell(&name) {
             continue;
         }
         // The group's own processes first: the shell's jobs are not what it relays, and a
         // process of the group tells the terminal when the leader didn't.
-        let (own, others): (Vec<_>, Vec<_>) = children(pid)
+        let (own, others): (Vec<_>, Vec<_>) = procs
+            .children(pid)
             .into_iter()
-            .filter_map(|c| Some((c, job(c)?)))
+            .filter_map(|c| Some((c, procs.job(c)?)))
             .partition(|(_, j)| j.pgrp == pgrp);
         for (child, j) in own {
-            if *tty.get_or_insert(j.tty) == j.tty {
+            if let Some(t) = j.tty
+                && *tty.get_or_insert(t) == t
+            {
                 queue.push(child);
             }
         }
+        // Only a proxy relays another terminal, and only one that reads the pane's: a shell's
+        // own children on other terminals, or a proxy left running in the background without
+        // its input, are not what is in front. Its input may be /dev/tty, its controlling
+        // terminal, which is the pane's (`atuin init` runs it so when its input isn't one).
+        let input = procs.stdin(pid);
+        if !proxy || tty.is_none() || (input != tty && input != procs.dev_tty()) {
+            continue;
+        }
         for (_, j) in others {
             if j.tty.is_some()
-                && tty.is_some_and(|t| t != j.tty)
+                && j.tty != tty
                 && let Some(inner) = j.tpgid
             {
                 return Some(inner);
@@ -618,6 +740,40 @@ fn inner_foreground(pgrp: u32) -> Option<u32> {
         }
     }
     None
+}
+
+/// What [`behind_proxy`] asks about processes.
+trait Procs {
+    fn name(&self, pid: u32) -> Option<String>;
+    fn job(&self, pid: u32) -> Option<Job>;
+    fn children(&self, pid: u32) -> Vec<u32>;
+    /// The device `pid`'s standard input is (a terminal's, `/dev/null`'s), if it is one.
+    fn stdin(&self, pid: u32) -> Option<u64>;
+    /// The device of `/dev/tty`.
+    fn dev_tty(&self) -> Option<u64>;
+}
+
+/// This machine's processes.
+struct System;
+
+impl Procs for System {
+    fn name(&self, pid: u32) -> Option<String> {
+        name(pid)
+    }
+    fn job(&self, pid: u32) -> Option<Job> {
+        job(pid)
+    }
+    fn children(&self, pid: u32) -> Vec<u32> {
+        children(pid)
+    }
+    fn stdin(&self, pid: u32) -> Option<u64> {
+        stdin_tty(pid)
+    }
+    fn dev_tty(&self) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        static DEV_TTY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *DEV_TTY.get_or_init(|| std::fs::metadata("/dev/tty").ok().map(|m| m.rdev()))
+    }
 }
 
 /// A process's group, its controlling terminal and that terminal's foreground group.
@@ -700,8 +856,52 @@ fn children(pid: u32) -> Vec<u32> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn stdin_tty(pid: u32) -> Option<u64> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let m = std::fs::metadata(format!("/proc/{pid}/fd/0")).ok()?;
+    m.file_type().is_char_device().then_some(m.rdev())
+}
+
+/// `struct vnode_fdinfowithpath` (`proc_fileinfo`, then the vnode), which libc lacks.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VnodeFdInfo {
+    openflags: u32,
+    status: u32,
+    offset: libc::off_t,
+    kind: i32,
+    guardflags: u32,
+    vnode: libc::vnode_info_path,
+}
+
+#[cfg(target_os = "macos")]
+const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+#[cfg(target_os = "macos")]
+fn stdin_tty(pid: u32) -> Option<u64> {
+    let mut info: VnodeFdInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let n = unsafe {
+        libc::proc_pidfdinfo(
+            pid as i32,
+            0,
+            PROC_PIDFDVNODEPATHINFO,
+            (&mut info as *mut VnodeFdInfo).cast(),
+            size,
+        )
+    };
+    let stat = &info.vnode.vip_vi.vi_stat;
+    (n == size && stat.vst_mode & libc::S_IFMT == libc::S_IFCHR).then_some(stat.vst_rdev as u64)
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn job(_pid: u32) -> Option<Job> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn stdin_tty(_pid: u32) -> Option<u64> {
     None
 }
 

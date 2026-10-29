@@ -240,6 +240,24 @@ fn read_groups(len: usize, groups: &[(usize, Option<u32>)]) -> Vec<(usize, usize
     out
 }
 
+/// A shell without integration sends no prompt mark when a program it started ends (Ctrl+C),
+/// so the terminal coming back to the shell (the pane's, or the one behind its PTY proxy) ends
+/// what the program reported. Not for a program that is the pane's process itself, nor for
+/// records the shell reported itself.
+fn shell_took_the_terminal_back(st: &PaneState) -> bool {
+    let is_shell = |pgrp: Option<u32>| {
+        pgrp.and_then(procinfo::process_info)
+            .is_some_and(|p| procinfo::is_shell(&p.name))
+    };
+    let shell = st.pty.foreground_pgrp();
+    st.programs_pgrp.is_some()
+        && st.programs_pgrp != st.info.pid
+        && st.programs_pgrp != shell
+        && st.pty.terminal_pgrp() == st.info.pid
+        && is_shell(shell)
+        && is_shell(st.info.pid)
+}
+
 /// A client subscribed to a pane's output.
 #[derive(Default)]
 pub struct Subscriber {
@@ -927,6 +945,8 @@ impl Daemon {
         }
         let mut buf = vec![0u8; 64 * 1024];
         let mut last_read = Instant::now();
+        // The last read had a program report, which may end in this one.
+        let mut reported = false;
         loop {
             self.readers.park_if_paused();
             let n = match pty::read_pty(&mut reader, &mut buf, self.readers.wake_fd()) {
@@ -942,7 +962,14 @@ impl Daemon {
             // Who wrote it, as near the write as the daemon gets: a program that reports and
             // exits at once has usually not given the terminal back yet, while the parser may
             // only reach its bytes after the shell has.
-            let group = pty::foreground_of(&reader);
+            let mut group = pty::foreground_of(&reader);
+            // Behind a PTY proxy, the reporting program is on the proxy's terminal. Looking
+            // there takes a few more calls, so only for reads with a report in them.
+            let report = memchr::memmem::find(&buf[..n], b"]7501;").is_some();
+            if report || reported {
+                group = group.map(procinfo::behind_proxy);
+            }
+            reported = report;
             let quiet = last_read.elapsed() >= QUIET;
             last_read = Instant::now();
             let mut st = pipe.state.lock();
@@ -1674,20 +1701,8 @@ impl Daemon {
                     if st.term.sync_deadline().is_some_and(|d| d <= Instant::now()) {
                         st.term.flush_sync();
                     }
-                    // A shell without integration sends no prompt mark when a program it started
-                    // ends (Ctrl+C), so the terminal coming back to the shell ends what the program
-                    // reported. Not for a program that is the pane's process itself, nor for
-                    // records the shell reported itself.
                     let mut programs_changed = false;
-                    if st.programs_pgrp.is_some()
-                        && st.programs_pgrp != st.info.pid
-                        && st.pty.foreground_pgrp() == st.info.pid
-                        && st
-                            .info
-                            .pid
-                            .and_then(procinfo::process_info)
-                            .is_some_and(|p| procinfo::is_shell(&p.name))
-                    {
+                    if shell_took_the_terminal_back(&st) {
                         st.programs_pgrp = None;
                         if st.term.foreground_returned() {
                             let records = st.term.program_status();
@@ -3729,7 +3744,7 @@ mod tests {
                 )
                 .unwrap();
             let pane = daemon.pane(id).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(3);
             let mut name = None;
             while Instant::now() < deadline {
                 name = pane
@@ -3758,6 +3773,85 @@ mod tests {
             plain.as_deref().is_some_and(procinfo::is_shell),
             "{plain:?}"
         );
+        // A proxy in the shell's group but in the background, its input a pipe: the shell
+        // still reads the pane, and is what is in front.
+        #[cfg(target_os = "macos")]
+        let background = "/bin/sleep 30 | script -q /dev/null /bin/sleep 30 & wait";
+        #[cfg(not(target_os = "macos"))]
+        let background = "/bin/sleep 30 | script -qc 'exec /bin/sleep 30' /dev/null & wait";
+        let behind = foreground(background);
+        assert!(
+            behind.as_deref().is_some_and(procinfo::is_shell),
+            "{behind:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A program behind a PTY proxy reports, then ends without a prompt mark: its report is
+    /// over once the shell behind the proxy has the terminal back.
+    #[test]
+    fn a_report_behind_a_pty_proxy_ends_with_its_program() {
+        let dir = std::env::temp_dir().join(format!("thurm-proxy-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("report.sh");
+        std::fs::write(
+            &report,
+            "printf '\\033]7501;state=working:app=x\\033\\\\'\nsleep 1\n",
+        )
+        .unwrap();
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // An interactive shell (job control) behind `script`.
+        #[cfg(target_os = "macos")]
+        let proxied = "script -q /dev/null /bin/sh -i; :";
+        #[cfg(not(target_os = "macos"))]
+        let proxied = "script -qc '/bin/sh -i' /dev/null; :";
+        let id = daemon
+            .create_pane(
+                CreatePane {
+                    command: Some(vec!["sh".into(), "-c".into(), proxied.into()]),
+                    size: PaneSize {
+                        cols: 80,
+                        rows: 24,
+                        cell_width: 8,
+                        cell_height: 16,
+                    },
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let pane = daemon.pane(id).unwrap();
+        let wait_for = |what: &str, done: &dyn Fn(&PaneState) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(&pane.state.lock()) {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let pane_pid = pane.state.lock().info.pid;
+        let inner_shell = |st: &PaneState| {
+            let fg = st.pty.foreground_pgrp();
+            fg != pane_pid
+                && fg
+                    .and_then(procinfo::process_info)
+                    .is_some_and(|p| procinfo::is_shell(&p.name))
+        };
+        wait_for("the shell behind the proxy", &inner_shell);
+        pane.write(format!("sh {}\n", report.display()).into_bytes());
+        wait_for("the report", &|st| {
+            st.programs_pgrp.is_some() && st.programs_pgrp != pane_pid
+        });
+        assert!(!shell_took_the_terminal_back(&pane.state.lock()));
+        wait_for("the shell to have the terminal back", &|st| {
+            shell_took_the_terminal_back(st)
+        });
+        daemon.close_pane(id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

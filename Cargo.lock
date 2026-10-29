@@ -2429,6 +2429,7 @@ dependencies = [
  "hmac",
  "libc",
  "log",
+ "memchr",
  "parking_lot",
  "regex",
  "serde",
