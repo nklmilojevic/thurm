@@ -444,7 +444,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         let byRepo = Self.groupsByRepo(config)
         var byRoot: [String: SidebarGroup] = [:]
         var order: [SidebarGroup] = []
-        // Every workspace listed: this window's tabs under its workspace, first.
+        // Every workspace listed: this window's tabs under its workspace.
         let other = config.sidebarAllWorkspaces
             ? SidebarGroup(name: shownWorkspace?.name ?? "Tabs", key: shownWorkspace.map(Self.collapseKey))
             : SidebarGroup(name: "Terminals")
@@ -465,8 +465,13 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             }
         }
         if config.sidebarAllWorkspaces {
-            order.append(other)
-            for ws in sm.workspacesByRecency where ws.id != shownWorkspace?.id {
+            // The workspaces in the order they were made, so switching to one moves nothing.
+            if !sm.workspaces.contains(where: { $0.id == shownWorkspace?.id }) { order.append(other) }
+            for ws in sm.workspaces {
+                guard ws.id != shownWorkspace?.id else {
+                    order.append(other)
+                    continue
+                }
                 let g = SidebarGroup(name: ws.isRemote ? "\(ws.name) (\(ws.host))" : ws.name,
                                      key: Self.collapseKey(ws), elsewhere: true)
                 if let shownIn = sm.controllerShowing(ws) {
