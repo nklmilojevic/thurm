@@ -240,6 +240,57 @@ fn read_groups(len: usize, groups: &[(usize, Option<u32>)]) -> Vec<(usize, usize
     out
 }
 
+/// Follows program reports (OSC 7501) through PTY reads, which split them anywhere.
+#[derive(Default)]
+struct ReportScan {
+    /// The last read's last bytes: the start of a marker the next read may finish.
+    tail: Vec<u8>,
+    /// Inside a report: its end is still to come.
+    open: bool,
+}
+
+impl ReportScan {
+    const MARKER: &[u8] = b"]7501;";
+
+    /// Whether this read has a part of a report from its marker on.
+    fn read(&mut self, data: &[u8]) -> bool {
+        let mut touched = self.open;
+        let mut at = 0;
+        let mut joined = std::mem::take(&mut self.tail);
+        let kept = joined.len();
+        joined.extend_from_slice(&data[..data.len().min(Self::MARKER.len() - 1)]);
+        if let Some(i) = memchr::memmem::find(&joined, Self::MARKER) {
+            // Too short to hold a marker on either side: it spans the two reads.
+            touched = true;
+            self.open = true;
+            at = i + Self::MARKER.len() - kept;
+        }
+        loop {
+            if self.open {
+                // A report has neither ESC nor BEL: the first one ends it.
+                let Some(i) = memchr::memchr2(0x1b, 0x07, &data[at..]) else {
+                    break;
+                };
+                self.open = false;
+                at += i + 1;
+            }
+            let Some(i) = memchr::memmem::find(&data[at..], Self::MARKER) else {
+                break;
+            };
+            touched = true;
+            self.open = true;
+            at += i + Self::MARKER.len();
+        }
+        let keep = Self::MARKER.len() - 1;
+        self.tail = if data.len() >= keep {
+            data[data.len() - keep..].to_vec()
+        } else {
+            joined[joined.len().saturating_sub(keep)..].to_vec()
+        };
+        touched
+    }
+}
+
 /// A shell without integration sends no prompt mark when a program it started ends (Ctrl+C),
 /// so the terminal coming back to the shell (the pane's, or the one behind its PTY proxy) ends
 /// what the program reported. Not for a program that is the pane's process itself, nor for
@@ -945,8 +996,7 @@ impl Daemon {
         }
         let mut buf = vec![0u8; 64 * 1024];
         let mut last_read = Instant::now();
-        // The last read had a program report, which may end in this one.
-        let mut reported = false;
+        let mut reports = ReportScan::default();
         loop {
             self.readers.park_if_paused();
             let n = match pty::read_pty(&mut reader, &mut buf, self.readers.wake_fd()) {
@@ -965,11 +1015,9 @@ impl Daemon {
             let mut group = pty::foreground_of(&reader);
             // Behind a PTY proxy, the reporting program is on the proxy's terminal. Looking
             // there takes a few more calls, so only for reads with a report in them.
-            let report = memchr::memmem::find(&buf[..n], b"]7501;").is_some();
-            if report || reported {
+            if reports.read(&buf[..n]) {
                 group = group.map(procinfo::behind_proxy);
             }
-            reported = report;
             let quiet = last_read.elapsed() >= QUIET;
             last_read = Instant::now();
             let mut st = pipe.state.lock();
@@ -3785,6 +3833,49 @@ mod tests {
             "{behind:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// However the reads split a report, the read its end is in (where the terminal sees it)
+    /// is looked at; output without reports never is.
+    #[test]
+    fn reports_are_found_across_reads() {
+        let stream = b"ab\x1b]7501;state=working:app=x\x1b\\cd\x1b]7501;app=y\x07ef";
+        // Where each report ends: the first ESC or BEL after its marker.
+        let ends: Vec<usize> = memchr::memmem::find_iter(stream, ReportScan::MARKER)
+            .map(|m| {
+                m + stream[m..]
+                    .iter()
+                    .position(|&b| b == 0x1b || b == 0x07)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ends.len(), 2);
+        let check = |cuts: &[usize]| {
+            let mut scan = ReportScan::default();
+            let mut start = 0;
+            for &end in cuts.iter().chain([&stream.len()]) {
+                let touched = scan.read(&stream[start..end]);
+                for &e in &ends {
+                    if (start..end).contains(&e) {
+                        assert!(
+                            touched,
+                            "report end {e} missed in {start}..{end} ({cuts:?})"
+                        );
+                    }
+                }
+                start = end;
+            }
+        };
+        for a in 0..=stream.len() {
+            check(&[a]);
+            for b in a..=stream.len() {
+                check(&[a, b]);
+            }
+        }
+        let mut scan = ReportScan::default();
+        for chunk in b"plain ]750 output\x1b]0;title\x07 and 1;7501;".chunks(3) {
+            assert!(!scan.read(chunk), "{chunk:?}");
+        }
     }
 
     /// A program behind a PTY proxy reports, then ends without a prompt mark: its report is
