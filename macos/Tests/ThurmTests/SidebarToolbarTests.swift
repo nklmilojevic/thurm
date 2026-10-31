@@ -82,15 +82,31 @@ final class SidebarToolbarTests: XCTestCase {
         }
     }
 
-    /// Leaving sidebar mode removes its whole toolbar section; re-entering rebuilds it once.
+    /// Leaving sidebar mode removes its section; re-entering restores the last toggled state.
     func testNativeTabsRemoveSidebarSection() throws {
         manager.config.sidebarActiveOnly = true
-        let (c, window, _) = try controller()
+        let (c, window, initialSplit) = try controller()
         let toolbar = try XCTUnwrap(window.toolbar)
         let trailingSpace = try XCTUnwrap(toolbar.items.last)
+        let initiallyCollapsed = initialSplit.sidebarCollapsed
+
+        func toggle(_ split: TabSplitViewController) {
+            split.toggleSidebarAnimated()
+            let settled = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !split.sidebar.holdReloads },
+                                                    object: nil)
+            wait(for: [settled], timeout: 3)
+        }
+        defer {
+            if let split = c.tabSplit, split.sidebarCollapsed != initiallyCollapsed {
+                toggle(split)
+            }
+        }
 
         for collapsed in [false, true] {
-            try XCTUnwrap(c.tabSplit).splitViewItems[0].isCollapsed = collapsed
+            let split = try XCTUnwrap(c.tabSplit)
+            // Only the user toggle updates the default used when sidebar mode is recreated.
+            if split.sidebarCollapsed != collapsed { toggle(split) }
+            XCTAssertEqual(split.sidebarCollapsed, collapsed)
             manager.config.sidebarTabs = false
             c.applyTabStyle()
             XCTAssertEqual(toolbar.items.map(\.itemIdentifier), [.flexibleSpace])
@@ -98,8 +114,18 @@ final class SidebarToolbarTests: XCTestCase {
 
             manager.config.sidebarTabs = true
             c.applyTabStyle()
+            XCTAssertEqual(try XCTUnwrap(c.tabSplit).sidebarCollapsed, collapsed)
+            XCTAssertEqual(window.sidebarCollapsed, collapsed)
             XCTAssertEqual(toolbar.items.filter { $0.itemIdentifier == .sidebarTrackingSeparator }.count, 1)
-            XCTAssertEqual(filter(window)?.toolTip, "Show All Tabs")
+            XCTAssertEqual(toolbar.items.filter { $0.action == #selector(AppDelegate.newTab(_:)) }.count, 1)
+            if collapsed {
+                XCTAssertNil(filter(window))
+                XCTAssertEqual(toolbar.items[1].action, #selector(AppDelegate.newTab(_:)))
+                XCTAssertEqual(toolbar.items[1].toolTip, "New Tab (⌘T)")
+            } else {
+                XCTAssertEqual(filter(window)?.toolTip, "Show All Tabs")
+            }
+            XCTAssertTrue(manager.config.sidebarActiveOnly)
             XCTAssertTrue(toolbar.items.last === trailingSpace)
         }
     }
