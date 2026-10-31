@@ -96,6 +96,7 @@ final class TabSplitViewController: NSSplitViewController {
     private let host = NSViewController()
     /// `window.sidebar_width` as last applied, so a reload moves the divider only when it changed.
     private var configuredWidth: CGFloat
+    private var collapseObservation: NSKeyValueObservation?
 
     init(content: TabContentView, width: CGFloat) {
         configuredWidth = width
@@ -111,6 +112,10 @@ final class TabSplitViewController: NSSplitViewController {
         let main = NSSplitViewItem(viewController: host)
         addSplitViewItem(side)
         addSplitViewItem(main)
+        // Also follows divider gestures and the state copied when switching tabs/workspaces.
+        collapseObservation = side.observe(\.isCollapsed) { [weak self] _, _ in
+            self?.syncSidebarToolbar()
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -119,6 +124,7 @@ final class TabSplitViewController: NSSplitViewController {
 
     override func viewDidAppear() {
         super.viewDidAppear()
+        syncSidebarToolbar()
         // NSSplitViewItem has no initial-thickness API; place the divider once.
         if !sidebarCollapsed { placeDivider() }
     }
@@ -142,6 +148,11 @@ final class TabSplitViewController: NSSplitViewController {
 
     var sidebarCollapsed: Bool {
         splitViewItems.first?.isCollapsed ?? false
+    }
+
+    private func syncSidebarToolbar() {
+        guard !togglingSidebar else { return }
+        (view.window as? TerminalWindow)?.sidebarCollapsed = sidebarCollapsed
     }
 
     /// Before this window is shown in place of `other`'s (a new tab, a workspace switch): the
@@ -172,14 +183,18 @@ final class TabSplitViewController: NSSplitViewController {
         sidebar.holdReloads = true
         togglingSidebar = true
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(saveWidth), object: nil)
+        // Remove the far-edge button before closing. When opening, restore it only once the
+        // sidebar has room for it, so it never flashes into the overflow menu mid-animation.
+        if collapse { (view.window as? TerminalWindow)?.sidebarCollapsed = true }
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = Motion.duration(Motion.standard)
             ctx.timingFunction = Motion.timingFunction
             side.animator().isCollapsed = collapse
         }, completionHandler: { [weak self] in
             if !collapse { self?.placeDivider() }
-            self?.view.layoutSubtreeIfNeeded()
             self?.togglingSidebar = false
+            self?.syncSidebarToolbar()
+            self?.view.layoutSubtreeIfNeeded()
             self?.sidebar.holdReloads = false
             panes.forEach { $0.holdGridSize = false }
         })
