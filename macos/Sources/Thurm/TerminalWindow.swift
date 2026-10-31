@@ -19,13 +19,19 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
     private static let newTabItem = NSToolbarItem.Identifier("thurmNewTab")
     private static let activeOnlyItem = NSToolbarItem.Identifier("thurmActiveOnly")
 
+    /// A collapsed sidebar leaves just its toggle and New Tab beside the traffic lights.
+    var sidebarCollapsed = false {
+        didSet {
+            guard sidebarCollapsed != oldValue else { return }
+            syncSidebarItem()
+        }
+    }
+
     /// `window.sidebar_active_only`, which the button next to the sidebar button shows.
     var sidebarActiveOnly = false {
         didSet {
             guard sidebarActiveOnly != oldValue else { return }
-            for item in toolbar?.items ?? [] where item.itemIdentifier == Self.activeOnlyItem {
-                styleActiveOnlyItem(item)
-            }
+            syncSidebarItem()
         }
     }
 
@@ -79,21 +85,49 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         strip.reload()
     }
 
-    /// With vertical tabs, the sidebar's part of the titlebar holds the sidebar button (next to
-    /// the traffic lights), Only Active Tabs beside it, and New Tab (at its right edge); the tracking separator keeps both
-    /// there. Windows share the toolbar configuration (same identifier), so this is idempotent.
+    /// Keep the leading pair in place. Its second button becomes New Tab when collapsed, and
+    /// the separate New Tab at the sidebar's far edge is then unnecessary.
     private func syncSidebarItem() {
         guard let toolbar else { return }
+        // These controls change once per toggle; they must not inherit the split view's
+        // animation and briefly fade or move through an intermediate toolbar layout.
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.current.duration = 0
+        NSAnimationContext.current.allowsImplicitAnimation = false
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer {
+            CATransaction.commit()
+            NSAnimationContext.endGrouping()
+        }
+        for item in toolbar.items where item.itemIdentifier == Self.activeOnlyItem {
+            styleActiveOnlyItem(item)
+        }
         let separator = toolbar.items.firstIndex { $0.itemIdentifier == .sidebarTrackingSeparator }
-        if suppressTabBar, separator == nil {
-            for (i, id) in [Self.sidebarItem, Self.activeOnlyItem, .flexibleSpace, Self.newTabItem,
-                            .sidebarTrackingSeparator].enumerated() {
+        let leading = [Self.sidebarItem, Self.activeOnlyItem]
+        let expanded: [NSToolbarItem.Identifier] = [.flexibleSpace, Self.newTabItem]
+        if !suppressTabBar {
+            // Switching to native tabs removes the entire sidebar section.
+            if let separator {
+                for i in (0...separator).reversed() { toolbar.removeItem(at: i) }
+            }
+        } else if let separator {
+            // The separator anchors this section throughout a toggle. Change only the
+            // flexible space and far-edge New Tab between the leading pair and that anchor.
+            if sidebarCollapsed {
+                for i in (leading.count..<separator).reversed() { toolbar.removeItem(at: i) }
+            } else if separator == leading.count {
+                for (offset, id) in expanded.enumerated() {
+                    toolbar.insertItem(withItemIdentifier: id, at: separator + offset)
+                }
+            }
+        } else {
+            let items = leading + (sidebarCollapsed ? [] : expanded) + [.sidebarTrackingSeparator]
+            for (i, id) in items.enumerated() {
                 toolbar.insertItem(withItemIdentifier: id, at: i)
             }
-        } else if !suppressTabBar, let separator {
-            // Everything up to the separator is ours.
-            for i in (0...separator).reversed() { toolbar.removeItem(at: i) }
         }
+        titlebarView?.layoutSubtreeIfNeeded()
     }
 
     /// The tab bar lives in the toolbar row (see `setupTabBar`), outside the accessory's
@@ -192,7 +226,9 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
                   backing backingStoreType: NSWindow.BackingStoreType, defer flag: Bool) {
         super.init(contentRect: contentRect, styleMask: style, backing: backingStoreType, defer: flag)
         titleVisibility = .hidden
-        let toolbar = NSToolbar(identifier: "Thurm")
+        // AppKit synchronizes toolbars with the same identifier, but tabs can have different
+        // sidebar states (including a hidden tab or workspace that has yet to be shown).
+        let toolbar = NSToolbar(identifier: "Thurm-\(UUID().uuidString)")
         toolbar.delegate = self
         self.toolbar = toolbar
         toolbarStyle = .unifiedCompact
@@ -598,8 +634,6 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
             item.visibilityPriority = .high
         }
         if id == Self.activeOnlyItem {
-            item.label = "Only Active Tabs"
-            item.action = #selector(AppDelegate.toggleSidebarActiveOnly(_:))
             item.visibilityPriority = .high
             styleActiveOnlyItem(item)
         }
@@ -620,8 +654,17 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         return item
     }
 
-    /// The filter symbol, filled while only active tabs show.
+    /// The second button keeps its place, swapping the filter for New Tab while collapsed.
     private func styleActiveOnlyItem(_ item: NSToolbarItem) {
+        if sidebarCollapsed {
+            item.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "New Tab")
+            item.label = "New Tab"
+            item.toolTip = "New Tab (⌘T)"
+            item.action = #selector(AppDelegate.newTab(_:))
+            return
+        }
+        item.label = "Only Active Tabs"
+        item.action = #selector(AppDelegate.toggleSidebarActiveOnly(_:))
         let name = sidebarActiveOnly ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle"
         item.image = NSImage(systemSymbolName: name, accessibilityDescription: "Only Active Tabs")
         item.toolTip = sidebarActiveOnly ? "Show All Tabs" : "Show Only Active Tabs"
