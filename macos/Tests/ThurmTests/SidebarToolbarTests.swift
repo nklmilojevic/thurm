@@ -58,6 +58,52 @@ final class SidebarToolbarTests: XCTestCase {
         XCTAssertEqual(filter(window)?.toolTip, "Show All Tabs")
     }
 
+    /// Animated transitions retain the same toolbar section, including its trailing space.
+    func testAnimatedTogglesKeepToolbarSection() throws {
+        let (_, window, split) = try controller()
+        let toolbar = try XCTUnwrap(window.toolbar)
+        let leading = Array(toolbar.items.prefix(2))
+        let separator = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier == .sidebarTrackingSeparator })
+        let trailingSpace = try XCTUnwrap(toolbar.items.last)
+
+        for _ in 0..<2 {
+            for collapsed in [true, false] {
+                split.toggleSidebarAnimated()
+                let settled = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !split.sidebar.holdReloads },
+                                                        object: nil)
+                wait(for: [settled], timeout: 3)
+                XCTAssertEqual(split.sidebarCollapsed, collapsed)
+                XCTAssertEqual(toolbar.items.prefix(2).map(ObjectIdentifier.init), leading.map(ObjectIdentifier.init))
+                XCTAssertTrue(toolbar.items.first { $0.itemIdentifier == .sidebarTrackingSeparator } === separator)
+                XCTAssertTrue(toolbar.items.last === trailingSpace)
+                XCTAssertEqual(toolbar.items.filter { $0.action == #selector(AppDelegate.newTab(_:)) }.count, 1)
+                XCTAssertEqual(filter(window) == nil, collapsed)
+            }
+        }
+    }
+
+    /// Leaving sidebar mode removes its whole toolbar section; re-entering rebuilds it once.
+    func testNativeTabsRemoveSidebarSection() throws {
+        manager.config.sidebarActiveOnly = true
+        let (c, window, _) = try controller()
+        let toolbar = try XCTUnwrap(window.toolbar)
+        let trailingSpace = try XCTUnwrap(toolbar.items.last)
+
+        for collapsed in [false, true] {
+            try XCTUnwrap(c.tabSplit).splitViewItems[0].isCollapsed = collapsed
+            manager.config.sidebarTabs = false
+            c.applyTabStyle()
+            XCTAssertEqual(toolbar.items.map(\.itemIdentifier), [.flexibleSpace])
+            XCTAssertTrue(toolbar.items.last === trailingSpace)
+
+            manager.config.sidebarTabs = true
+            c.applyTabStyle()
+            XCTAssertEqual(toolbar.items.filter { $0.itemIdentifier == .sidebarTrackingSeparator }.count, 1)
+            XCTAssertEqual(filter(window)?.toolTip, "Show All Tabs")
+            XCTAssertTrue(toolbar.items.last === trailingSpace)
+        }
+    }
+
     /// Both controls fit directly in the toolbar even at the window's minimum width.
     func testCollapsedControlsStayOutOfOverflow() throws {
         let (_, window, split) = try controller()

@@ -103,26 +103,29 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         for item in toolbar.items where item.itemIdentifier == Self.activeOnlyItem {
             styleActiveOnlyItem(item)
         }
-        let items: [NSToolbarItem.Identifier]
+        let separator = toolbar.items.firstIndex { $0.itemIdentifier == .sidebarTrackingSeparator }
+        let leading = [Self.sidebarItem, Self.activeOnlyItem]
+        let expanded: [NSToolbarItem.Identifier] = [.flexibleSpace, Self.newTabItem]
         if !suppressTabBar {
-            items = [.flexibleSpace]
-        } else if sidebarCollapsed {
-            items = [Self.sidebarItem, Self.activeOnlyItem, .sidebarTrackingSeparator, .flexibleSpace]
+            // Switching to native tabs removes the entire sidebar section.
+            if let separator {
+                for i in (0...separator).reversed() { toolbar.removeItem(at: i) }
+            }
+        } else if let separator {
+            // The separator anchors this section throughout a toggle. Change only the
+            // flexible space and far-edge New Tab between the leading pair and that anchor.
+            if sidebarCollapsed {
+                for i in (leading.count..<separator).reversed() { toolbar.removeItem(at: i) }
+            } else if separator == leading.count {
+                for (offset, id) in expanded.enumerated() {
+                    toolbar.insertItem(withItemIdentifier: id, at: separator + offset)
+                }
+            }
         } else {
-            items = [Self.sidebarItem, Self.activeOnlyItem, .flexibleSpace, Self.newTabItem,
-                     .sidebarTrackingSeparator, .flexibleSpace]
-        }
-        let current = toolbar.items.map(\.itemIdentifier)
-        guard current != items else { return }
-        let common = zip(current, items).prefix { $0 == $1 }.count
-        // Keep the tracking separator and trailing space too. Removing the separator makes
-        // AppKit tear down the sidebar's toolbar section, flashing its glass during a toggle.
-        let suffix = zip(current.dropFirst(common).reversed(), items.dropFirst(common).reversed())
-            .prefix { $0 == $1 }.count
-        for i in (common..<(current.count - suffix)).reversed() { toolbar.removeItem(at: i) }
-        for i in common..<(items.count - suffix) {
-            let id = items[i]
-            toolbar.insertItem(withItemIdentifier: id, at: i)
+            let items = leading + (sidebarCollapsed ? [] : expanded) + [.sidebarTrackingSeparator]
+            for (i, id) in items.enumerated() {
+                toolbar.insertItem(withItemIdentifier: id, at: i)
+            }
         }
         titlebarView?.layoutSubtreeIfNeeded()
     }
