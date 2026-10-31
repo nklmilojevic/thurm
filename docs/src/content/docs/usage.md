@@ -68,6 +68,9 @@ The View menu changes what the sidebar lists, as do the settings below:
   the sidebar button in the titlebar). The sidebar lists only the tabs with an agent that isn't
   idle or a program reporting progress, plus the selected tab.
 
+When the sidebar is hidden, the filter button beside its toggle becomes **+** (New Tab).
+Showing the sidebar restores the filter button, with its setting preserved.
+
 ## Text, search, and navigation
 
 | Action | Shortcut |

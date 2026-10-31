@@ -166,6 +166,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
             window.contentViewController = split
             window.setFrame(frame, display: true)
             tabSplit = split
+            window.sidebarCollapsed = split.sidebarCollapsed
             split.sidebar.reload()
         } else {
             let hadSplit = tabSplit != nil
