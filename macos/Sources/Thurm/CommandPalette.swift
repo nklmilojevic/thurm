@@ -427,10 +427,24 @@ private final class PaletteCell: NSView {
     func apply(_ style: PopupStyle, selected: Bool) {
         title.font = style.font
         detail.font = style.detailFont
-        shortcut.font = style.detailFont
+        shortcut.font = .systemFont(ofSize: style.detailFont.pointSize)
         title.textColor = selected ? style.selectionText : style.text
         let dim = selected ? style.selectionText.withAlphaComponent(0.7) : style.secondary
         detail.textColor = dim
-        shortcut.textColor = dim
+
+        // Native shortcut glyphs, with room between modifiers but not inside named keys.
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .right
+        paragraph.lineBreakMode = .byTruncatingTail
+        let hint = NSMutableAttributedString(string: shortcut.stringValue, attributes: [
+            .font: NSFont.systemFont(ofSize: style.detailFont.pointSize),
+            .foregroundColor: dim,
+            .paragraphStyle: paragraph,
+        ])
+        let modifiers = hint.string.prefix { "⌃⌥⇧⌘".contains($0) }
+        if !modifiers.isEmpty && modifiers.count < hint.string.count {
+            hint.addAttribute(.kern, value: 2, range: NSRange(location: 0, length: modifiers.utf16.count))
+        }
+        shortcut.attributedStringValue = hint
     }
 }
