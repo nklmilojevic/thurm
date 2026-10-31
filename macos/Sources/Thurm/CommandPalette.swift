@@ -442,7 +442,7 @@ private final class PaletteCell: NSView {
             .paragraphStyle: paragraph,
         ])
         let modifiers = hint.string.prefix { "⌃⌥⇧⌘".contains($0) }
-        if !modifiers.isEmpty {
+        if !modifiers.isEmpty && modifiers.count < hint.string.count {
             hint.addAttribute(.kern, value: 2, range: NSRange(location: 0, length: modifiers.utf16.count))
         }
         shortcut.attributedStringValue = hint
