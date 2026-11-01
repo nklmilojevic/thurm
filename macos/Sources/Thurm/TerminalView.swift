@@ -42,6 +42,18 @@ final class TerminalView: NSView, NSTextInputClient {
     /// A frame is on screen. Until then there is no last image to keep while a resize is
     /// waited for, so the drawable follows the bounds at once.
     private var hasDrawn = false
+    /// A sidebar slide reveals a surface large enough for both endpoints. Keep its drawable
+    /// fixed while the view's bounds animate, avoiding new Metal surfaces on every step.
+    private var sidebarViewportSize: CGSize?
+    private enum SidebarReflow {
+        case capture, waiting
+        case blending(CFTimeInterval)
+    }
+    private var sidebarReflow: SidebarReflow?
+    private var blendingSidebarContent: Bool {
+        if case .blending? = sidebarReflow { return true }
+        return false
+    }
     /// The daemon didn't answer a resize in time: draw the frame we have at the new size.
     private var resizeTimedOut = false
     private var resizeFrameTimeout: DispatchWorkItem?
@@ -245,7 +257,6 @@ final class TerminalView: NSView, NSTextInputClient {
         }
         super.setFrameSize(newSize)
         if holdGridSize {
-            // Keep the current frame until the sidebar layout reaches its final size.
             layoutOverlays()
             return
         }
@@ -259,6 +270,8 @@ final class TerminalView: NSView, NSTextInputClient {
 
     /// Stops rendering and unsubscribes (pane closed or tab closing).
     func detach() {
+        sidebarReflow = nil
+        renderer.clearContentTransition()
         if subscribed {
             subscribed = false
             Core.shared.unsubscribe(pane)
@@ -303,20 +316,46 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     private func updateDrawableSize() {
-        // A held grid keeps its drawable: a pane opening in a split took its final size before
-        // the move, and must not take the in-between bounds of the move.
-        guard !holdGridSize, !waitingForResizeFrame || !hasDrawn else { return }
+        // Baked split moves keep their drawable. A sidebar prepares its larger endpoint
+        // once, then clips that surface as AppKit changes the view's bounds.
+        guard sidebarViewportSize != nil || (!holdGridSize && (!waitingForResizeFrame || !hasDrawn)) else { return }
         guard let layer = metalLayer else { return }
         let scale = backingScale
-        let size = CGSize(width: max(1, (bounds.width * scale).rounded()),
-                          height: max(1, (bounds.height * scale).rounded()))
+        let viewport = sidebarViewportSize ?? bounds.size
+        let size = CGSize(width: max(1, (viewport.width * scale).rounded()),
+                          height: max(1, (viewport.height * scale).rounded()))
         if layer.drawableSize != size {
             layer.drawableSize = size
         }
     }
 
+    func beginSidebarResize(to size: CGSize? = nil) {
+        let destination = size ?? bounds.size
+        sidebarViewportSize = CGSize(width: max(bounds.width, destination.width),
+                                     height: max(bounds.height, destination.height))
+        holdGridSize = true
+        if destination != bounds.size, renderer.snapshot.valid, Motion.duration(Motion.sidebarReflow) > 0 {
+            sidebarReflow = .capture
+        } else {
+            sidebarReflow = nil
+        }
+        updateDrawableSize()
+        // Save the visible layout before asking the program to wrap at its new width.
+        renderNow()
+        // Give the program the destination size before the slide starts. Its redraw can
+        // finish during the animation, instead of starting a second resize after it ends.
+        if let size { reportGridSize(for: size) }
+    }
+
+    func endSidebarResize() {
+        holdGridSize = false
+        renderNow()
+        if waitingForResizeFrame { scheduleResizeFrameTimeout() }
+    }
+
     /// Computes cols/rows from the view size and tells the daemon when they change.
-    /// Hold the grid size during a sidebar toggle. Resize once after layout is complete.
+    /// Keep intermediate animation sizes away from the PTY. A sidebar can report its
+    /// destination up front; layout completion checks the actual size once more.
     var holdGridSize = false {
         didSet {
             if holdGridSize {
@@ -334,10 +373,14 @@ final class TerminalView: NSView, NSTextInputClient {
 
     private func updateGridSize() {
         guard !holdGridSize else { return }
-        guard let s = shaper, bounds.width > 1, bounds.height > 1, window != nil, !isHidden else { return }
+        reportGridSize(for: bounds.size)
+    }
+
+    private func reportGridSize(for size: CGSize) {
+        guard let s = shaper, size.width > 1, size.height > 1, window != nil, !isHidden else { return }
         let scale = backingScale
-        let availW = bounds.width * scale - CGFloat(2 * padXPixels)
-        let availH = bounds.height * scale - CGFloat(2 * padYPixels)
+        let availW = size.width * scale - CGFloat(2 * padXPixels)
+        let availH = size.height * scale - CGFloat(2 * padYPixels)
         let newCols = max(2, Int(availW / CGFloat(s.cellWidth)))
         let newRows = max(1, Int(availH / CGFloat(s.cellHeight)))
         cols = newCols
@@ -447,8 +490,13 @@ final class TerminalView: NSView, NSTextInputClient {
     private func updateFrameRate() {
         guard let link = frameLink else { return }
         let maxFPS = Float(window?.screen?.maximumFramesPerSecond ?? 60)
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: min(10, maxFPS), maximum: maxFPS,
-                                                        preferred: maxFPS)
+        // Keep the short text handoff at a steady cadence even when the terminal is quiet.
+        let minimum = min(blendingSidebarContent ? 60 : 10, maxFPS)
+        let current = link.preferredFrameRateRange
+        if current.minimum != minimum || current.maximum != maxFPS || current.preferred != maxFPS {
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: minimum, maximum: maxFPS,
+                                                          preferred: maxFPS)
+        }
     }
 
     /// Resumes the display link for at least one tick.
@@ -460,7 +508,7 @@ final class TerminalView: NSView, NSTextInputClient {
     /// True while the next refresh has work: a pending draw, scroll or animation.
     private var wantsTick: Bool {
         needsRender || pendingScroll != nil || smoothActive || flashStart > 0 || renderer.wantsAnotherFrame
-            || !dimTween.isFinished(at: CACurrentMediaTime())
+            || !dimTween.isFinished(at: CACurrentMediaTime()) || blendingSidebarContent
     }
 
     /// Pauses the display link when nothing animates, so an idle pane costs no wakeups. New
@@ -468,6 +516,7 @@ final class TerminalView: NSView, NSTextInputClient {
     /// a one-shot timer wakes it for the next cursor blink.
     private func updateLinkState() {
         guard let link = frameLink else { return }
+        updateFrameRate()
         if Perf.tickRendering || wantsTick {
             link.isPaused = false
             blinkTimer?.invalidate()
@@ -507,7 +556,7 @@ final class TerminalView: NSView, NSTextInputClient {
             Core.shared.wheel(pane, lines: s.lines, col: s.col, row: s.row, mods: s.mods)
             if Perf.enabled { Perf.shared.wheelSent(pane: pane) }
         }
-        var render = needsRender
+        var render = needsRender || blendingSidebarContent
         if smoothActive {
             advanceSmoothScroll(CACurrentMediaTime())
             render = true
@@ -604,19 +653,20 @@ final class TerminalView: NSView, NSTextInputClient {
         let perfGrid = Perf.enabled ? CACurrentMediaTime() : 0
         if renderer.snapshot.update(pane: pane) { accessibilityGridChanged() }
         // A previous resize can still be in flight when another layout change occurs. A held
-        // grid draws whatever snapshot it has: its drawable keeps the size that snapshot had.
+        // grid draws its last complete snapshot while the program prepares the destination.
         let sized = renderer.snapshot.cols == cols && renderer.snapshot.rows == rows
         if sized { resizeTimedOut = false }
         // Only our own resize is waited for. A size another client set (the phone, while it is
         // the one in use) is drawn as it is, pinned top left, until this view is used again.
-        guard sized || resizeTimedOut || holdGridSize || !waitingForResizeFrame else {
+        guard sized || resizeTimedOut || holdGridSize || sidebarViewportSize != nil || !waitingForResizeFrame else {
             needsRender = true
             return
         }
-        // A held grid keeps its drawable too: frames still draw (new output, the dim easing
-        // in or out during a layout move) at the held size, pinned to the top left.
-        if waitingForResizeFrame && !holdGridSize {
+        // Release the prepared surface after layout settles and the matching frame arrives.
+        // Output can still update it during the slide without reallocating its drawable.
+        if !holdGridSize && (sized || resizeTimedOut) {
             waitingForResizeFrame = false
+            sidebarViewportSize = nil
             updateDrawableSize()
         }
         let perfDraw = Perf.enabled ? CACurrentMediaTime() : 0
@@ -654,8 +704,10 @@ final class TerminalView: NSView, NSTextInputClient {
                                   hoverSpan: hoverSpan,
                                   scrollY: smoothScrollY,
                                   colors: config.colorAdjustments,
-                                  backgroundInLayer: true)
+                                  backgroundInLayer: true,
+                                  contentTransition: sidebarContentTransition(at: CACurrentMediaTime(), sized: sized))
         if renderer.draw(layer: layer, params: params) {
+            if case .capture? = sidebarReflow { sidebarReflow = .waiting }
             let color = renderer.surfaceColor(params: params)
             let components = [CGFloat(color.x), CGFloat(color.y), CGFloat(color.z), CGFloat(color.w)]
             let background = NSColor(colorSpace: config.displayP3 ? .displayP3 : .sRGB,
@@ -682,6 +734,32 @@ final class TerminalView: NSView, NSTextInputClient {
         let newCursor = (renderer.snapshot.info.cursor_col, renderer.snapshot.info.cursor_row)
         if hasMarkedText() && (oldCursor.0 != newCursor.0 || oldCursor.1 != newCursor.1) {
             updateMarkedTextOverlay()
+        }
+    }
+
+    /// Reflow arrives independently of the geometry animation. Blend only once the new
+    /// grid is ready, so long lines changing rows do not jump in a single presented frame.
+    private func sidebarContentTransition(at now: CFTimeInterval, sized: Bool) -> ContentTransition {
+        let duration = Motion.duration(Motion.sidebarReflow)
+        guard duration > 0 else {
+            sidebarReflow = nil
+            return .none
+        }
+        switch sidebarReflow {
+        case .capture:
+            return .capture
+        case .waiting:
+            if sized || resizeTimedOut { sidebarReflow = .blending(now) }
+            return .blend(0)
+        case .blending(let start):
+            let t = min(1, max(0, (now - start) / duration))
+            if t >= 1 {
+                sidebarReflow = nil
+                return .none
+            }
+            return .blend(Float(t * t * (3 - 2 * t)))
+        case nil:
+            return .none
         }
     }
 

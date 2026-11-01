@@ -145,6 +145,55 @@ final class TerminalBackdropTests: XCTestCase {
         XCTAssertEqual(drawable.transactionValue, "resized")
     }
 
+    /// A sidebar reveals the prepared image without redrawing idle panes at every width.
+    /// Check both endpoints' pixels, including dimming and transparency.
+    func testSidebarViewportKeepsBackgroundPixelsUniform() throws {
+        try requireMetal()
+        let config = SessionManager.shared.config
+        for background: UInt32 in [0x1E1E2E, 0xEFF1F5] {
+            config.theme.background = background
+            for opacity: CGFloat in [1, 0.6] {
+                config.opacity = opacity
+                let a = PaneKey.local(1), b = PaneKey.local(2)
+                let content = TabContentView(root: .split(axis: .horizontal, ratio: 0.5,
+                                                        first: .leaf(a), second: .leaf(b)),
+                                             focused: a, zoomed: nil)
+                defer { content.detachAll() }
+                content.frame = CGRect(x: 0, y: 0, width: 600, height: 400)
+                let panes = try [a, b].map { try pane(in: content, key: $0) }
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: Motion.fast + 0.02))
+                var original: [[UInt8]] = []
+                for (view, layer) in panes {
+                    view.renderNow()
+                    original.append(try pixel(in: layer, x: 10))
+                }
+                for widths: [CGFloat] in [[640, 720, 840], [800, 700, 600]] {
+                    content.beginSidebarResize(contentWidth: try XCTUnwrap(widths.last))
+                    let prepared = try panes.map { try XCTUnwrap($0.1.lastDrawable) }
+                    for width in widths {
+                        content.setFrameSize(CGSize(width: width, height: 400))
+                        for (i, pair) in panes.enumerated() {
+                            let (view, layer) = pair
+                            XCTAssertTrue(view.holdGridSize)
+                            XCTAssertTrue(layer.lastDrawable === prepared[i], "layout alone must not redraw an idle pane")
+                            XCTAssertEqual(Int(layer.drawableSize.width), prepared[i].texture.width)
+                            XCTAssertGreaterThanOrEqual(layer.drawableSize.width, (view.bounds.width * 2).rounded())
+                            XCTAssertNotNil(layer.backgroundColor)
+                            let right = Int((view.bounds.width * 2).rounded()) - 10
+                            XCTAssertEqual(try pixel(in: layer, x: 10), original[i])
+                            XCTAssertEqual(try pixel(in: layer, x: right), original[i],
+                                           "exposed background differs: \(background), opacity \(opacity), width \(width)")
+                        }
+                    }
+                    for (view, layer) in panes {
+                        view.endSidebarResize()
+                        XCTAssertEqual(layer.drawableSize.width, (view.bounds.width * 2).rounded())
+                    }
+                }
+            }
+        }
+    }
+
     /// The layer-backed path must match the existing Metal composition, including the
     /// alpha-preserving dim/bell covers. Check real GPU output to catch double opacity.
     func testLayerSurfaceMatchesMetalClearAndCovers() throws {
@@ -192,6 +241,49 @@ final class TerminalBackdropTests: XCTestCase {
         return pixel
     }
 
+    func testContentReflowBlendsPixelsWithoutStretchingOrDoublingAlpha() throws {
+        try requireMetal()
+        let renderer = TerminalRenderer()
+        let layer = BackdropMetalLayer()
+        layer.device = try XCTUnwrap(MetalContext.shared?.device)
+        layer.presentsWithTransaction = true
+        layer.drawableSize = CGSize(width: 100, height: 200)
+        var params = RenderParams(pane: .local(1), shaper: try XCTUnwrap(FontShaper.shared(scale: 2)),
+            padX: 0, padY: 0, viewportWidth: 100, viewportHeight: 200, focused: false, cursorOn: false,
+            cursorThickness: 1, dim: 0, dimFill: 0.3, flash: 0, opacity: 0.6,
+            themeBackground: 0xFF0000, themeForeground: 0xFFFFFF, hoverLink: 0, hoverSpan: nil,
+            contentTransition: .capture)
+        XCTAssertTrue(renderer.draw(layer: layer, params: params))
+        XCTAssertEqual(try rawPixel(in: layer, x: 10), [0, 0, 153, 153])
+        params.themeBackground = 0x0000FF
+        params.contentTransition = .blend(0)
+        XCTAssertTrue(renderer.draw(layer: layer, params: params))
+        XCTAssertEqual(try rawPixel(in: layer, x: 10), [0, 0, 153, 153], "the new layout starts at the old image")
+
+        params.contentTransition = .blend(0.5)
+        params.viewportWidth = 120
+        layer.drawableSize.width = 120
+        XCTAssertTrue(renderer.draw(layer: layer, params: params))
+        let middle = try rawPixel(in: layer, x: 10)
+        for (actual, expected) in zip(middle, [76.5, 0, 76.5, 153]) {
+            XCTAssertEqual(Double(actual), expected, accuracy: 1)
+        }
+        let exposed = try rawPixel(in: layer, x: 110)
+        XCTAssertEqual(exposed[2], 0, "the old red image must not stretch into the new width")
+        XCTAssertEqual(Double(exposed[3]), 76.5, accuracy: 1)
+
+        params.viewportWidth = 80
+        layer.drawableSize.width = 80
+        XCTAssertTrue(renderer.draw(layer: layer, params: params))
+        XCTAssertEqual(try rawPixel(in: layer, x: 70), middle, "shrinking crops the old image")
+        params.contentTransition = .none
+        XCTAssertTrue(renderer.draw(layer: layer, params: params))
+        XCTAssertEqual(try rawPixel(in: layer, x: 10), [153, 0, 0, 153])
+        params.contentTransition = .blend(0)
+        XCTAssertTrue(renderer.draw(layer: layer, params: params))
+        XCTAssertEqual(try rawPixel(in: layer, x: 10), [153, 0, 0, 153], "a finished transition releases its old image")
+    }
+
     private func pixel(in layer: BackdropMetalLayer, x: Int) throws -> [UInt8] {
         let pixel = try rawPixel(in: layer, x: x)
         let bg = try XCTUnwrap(NSColor(cgColor: try XCTUnwrap(layer.backgroundColor))?.usingColorSpace(.sRGB))
@@ -199,6 +291,33 @@ final class TerminalBackdropTests: XCTestCase {
         let base = [bg.blueComponent, bg.greenComponent, bg.redComponent, CGFloat(1)]
         return (0..<4).map { i in
             UInt8(clamping: Int((Double(pixel[i]) + Double(base[i] * bg.alphaComponent) * 255 * (1 - alpha)).rounded()))
+        }
+    }
+
+    func testSidebarDestinationSizesMatchSettledLayout() throws {
+        let a = PaneKey.local(1), b = PaneKey.local(2), c = PaneKey.local(3), d = PaneKey.local(4)
+        let root = SplitNode.split(axis: .horizontal, ratio: 0.37, first: .leaf(a),
+                                  second: .split(axis: .vertical, ratio: 0.6, first: .leaf(b), second: .leaf(c)))
+        for headers in [false, true] {
+            SessionManager.shared.config.paneHeaders = headers
+            for zoom: PaneKey? in [nil, b] {
+                for floatingZoom in [false, true] {
+                    let floating = FloatingPane(pane: d, frame: [0.2, 0.1, 0.5, 0.6], zoomed: floatingZoom)
+                    let content = TabContentView(root: root, focused: a, zoomed: zoom, floating: [floating])
+                    defer { content.detachAll() }
+                    content.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
+                    for width: CGFloat in [1040, 600, 800] {
+                        let before = content.views.mapValues(\.frame)
+                        let expected = content.sidebarTerminalSizes(contentWidth: width)
+                        XCTAssertEqual(content.views.mapValues(\.frame), before, "projection must not move views")
+                        content.setFrameSize(CGSize(width: width, height: 600))
+                        for (id, size) in expected {
+                            XCTAssertEqual(content.views[id]?.frame.size, size,
+                                           "destination mismatch: headers \(headers), zoom \(String(describing: zoom)), width \(width)")
+                        }
+                    }
+                }
+            }
         }
     }
 
