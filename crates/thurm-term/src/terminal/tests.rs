@@ -387,9 +387,105 @@ fn resize_forces_full_frame() {
         cell_width: 10,
         cell_height: 20,
     });
+    let deadline = t.sync_deadline().expect("resize redraw deadline");
+    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
     let s = t.snapshot(1, &mut view).unwrap();
     assert!(s.frame.full);
     assert_eq!((s.frame.cols, s.frame.rows), (20, 5));
+}
+
+#[test]
+fn resize_waits_for_redraw_on_both_screens() {
+    for alternate in [false, true] {
+        let mut t = term(40, 5);
+        if alternate {
+            t.advance(b"\x1b[?1049h");
+        }
+        t.advance(b"old 40-column layout");
+        let mut view = ClientView::new();
+        t.snapshot(1, &mut view).unwrap();
+        let mut size = t.size();
+        size.cols = 30;
+        t.resize(size);
+        assert!(t.snapshot(1, &mut view).is_none(), "old layout at new size");
+
+        // SIGWINCH redraw, split across reads: neither the erase nor the partial line
+        // should become a frame, including when the UI polls without a frame callback.
+        t.advance(b"\x1b[H\x1b[2Jnew 30-");
+        assert!(t.snapshot(1, &mut view).is_none(), "partial redraw");
+        t.advance(b"column layout");
+        assert!(t.snapshot(1, &mut view).is_none(), "still settling");
+        let deadline = t.sync_deadline().unwrap();
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        let frame = t.snapshot(1, &mut view).unwrap().frame;
+        assert_eq!(frame.cols, 30);
+        assert_eq!(row_text(&frame, 0), "new 30-column layout");
+        assert!(!t.in_sync());
+    }
+}
+
+#[test]
+fn resize_of_a_silent_program_expires_and_same_size_does_not_restart_it() {
+    let mut t = term(40, 5);
+    t.advance(b"unchanged output");
+    let mut view = ClientView::new();
+    t.snapshot(1, &mut view).unwrap();
+    let mut size = t.size();
+    size.cols = 50;
+    t.resize(size);
+    let deadline = t.sync_deadline().unwrap();
+    assert!(deadline <= Instant::now() + RESIZE_HOLD);
+    t.resize(size);
+    assert_eq!(t.sync_deadline(), Some(deadline));
+    assert!(t.snapshot(1, &mut view).is_none());
+    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    let frame = t.snapshot(1, &mut view).unwrap().frame;
+    assert_eq!(frame.cols, 50);
+    assert_eq!(row_text(&frame, 0), "unchanged output");
+}
+
+#[test]
+fn polling_during_synchronized_redraw_never_exposes_a_partial_frame() {
+    let mut t = term(40, 5);
+    let mut view = ClientView::new();
+    t.advance(b"old frame");
+    t.snapshot(1, &mut view).unwrap();
+    t.advance(b"\x1b[?2026h\x1b[H\x1b[2Jpartial");
+    assert!(t.snapshot(1, &mut view).is_none());
+    t.advance(b" frame\x1b[?2026l");
+    assert_eq!(
+        row_text(&t.snapshot(1, &mut view).unwrap().frame, 0),
+        "partial frame"
+    );
+}
+
+#[test]
+fn synchronized_redraw_can_outlast_resize_settling() {
+    let mut t = term(40, 5);
+    let mut view = ClientView::new();
+    t.snapshot(1, &mut view).unwrap();
+    let mut size = t.size();
+    size.cols = 30;
+    t.resize(size);
+    t.advance(b"\x1b[?2026h\x1b[H\x1b[2Jpartial");
+    let settle = t.sync_deadline().unwrap();
+    std::thread::sleep(settle.saturating_duration_since(Instant::now()));
+    assert!(
+        t.snapshot(1, &mut view).is_none(),
+        "sync update is still open"
+    );
+    let sync = t
+        .sync_deadline()
+        .expect("sync timeout must remain scheduled");
+    assert!(sync > settle);
+    std::thread::sleep(sync.saturating_duration_since(Instant::now()));
+    let frame = t
+        .snapshot(1, &mut view)
+        .expect("bounded wait if program stops responding")
+        .frame;
+    assert_eq!(frame.cols, 30);
+    assert_eq!(row_text(&frame, 0), "partial");
+    assert!(!t.in_sync());
 }
 
 #[test]
@@ -921,6 +1017,8 @@ fn resize_at_a_redrawing_prompt_clears_it_in_every_copy() {
             t.snapshot(1, &mut ClientView::new()).is_none(),
             "held for the redraw"
         );
+    }
+    for t in [&mut a, &mut b] {
         let deadline = t.sync_deadline().expect("a deadline to flush at");
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
         t.flush_sync();
