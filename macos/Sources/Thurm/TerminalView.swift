@@ -50,6 +50,8 @@ final class TerminalView: NSView, NSTextInputClient {
         case blending(CFTimeInterval)
     }
     private var sidebarReflow: SidebarReflow?
+    /// Keep the old grid until its image has been submitted, even if the slide finishes first.
+    private var pendingSidebarSize: CGSize?
     private var blendingSidebarContent: Bool {
         if case .blending? = sidebarReflow { return true }
         return false
@@ -271,6 +273,7 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Stops rendering and unsubscribes (pane closed or tab closing).
     func detach() {
         sidebarReflow = nil
+        pendingSidebarSize = nil
         renderer.clearContentTransition()
         if subscribed {
             subscribed = false
@@ -330,11 +333,13 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     func beginSidebarResize(to size: CGSize? = nil) {
+        pendingSidebarSize = nil
         let destination = size ?? bounds.size
         sidebarViewportSize = CGSize(width: max(bounds.width, destination.width),
                                      height: max(bounds.height, destination.height))
         holdGridSize = true
-        if destination != bounds.size, renderer.snapshot.valid, Motion.duration(Motion.sidebarReflow) > 0 {
+        // The visible surface can still be empty while the first daemon frame is pending.
+        if destination != bounds.size, hasDrawn, Motion.duration(Motion.sidebarReflow) > 0 {
             sidebarReflow = .capture
         } else {
             sidebarReflow = nil
@@ -377,6 +382,11 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     private func reportGridSize(for size: CGSize) {
+        if case .capture? = sidebarReflow {
+            pendingSidebarSize = size
+            return
+        }
+        pendingSidebarSize = nil
         guard let s = shaper, size.width > 1, size.height > 1, window != nil, !isHidden else { return }
         let scale = backingScale
         let availW = size.width * scale - CGFloat(2 * padXPixels)
@@ -708,6 +718,7 @@ final class TerminalView: NSView, NSTextInputClient {
                                   contentTransition: sidebarContentTransition(at: CACurrentMediaTime(), sized: sized))
         if renderer.draw(layer: layer, params: params) {
             if case .capture? = sidebarReflow { sidebarReflow = .waiting }
+            if let size = pendingSidebarSize { reportGridSize(for: size) }
             let color = renderer.surfaceColor(params: params)
             let components = [CGFloat(color.x), CGFloat(color.y), CGFloat(color.z), CGFloat(color.w)]
             let background = NSColor(colorSpace: config.displayP3 ? .displayP3 : .sRGB,

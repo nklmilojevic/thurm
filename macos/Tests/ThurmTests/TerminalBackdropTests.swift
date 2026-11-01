@@ -145,6 +145,66 @@ final class TerminalBackdropTests: XCTestCase {
         XCTAssertEqual(drawable.transactionValue, "resized")
     }
 
+    func testSidebarResizeWaitsForCaptureWhenDrawablesAreUnavailable() throws {
+        try requireMetal()
+        try XCTSkipIf(Motion.reduced, "sidebar reflow is disabled by Reduce Motion")
+        for finishBeforeCapture in [false, true] {
+            let key = PaneKey.local(1)
+            let content = TabContentView(root: .leaf(key), focused: key, zoomed: nil)
+            let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 600, height: 400),
+                                  styleMask: .borderless, backing: .buffered, defer: false)
+            window.contentView = content
+            defer {
+                content.detachAll()
+                window.contentView = nil
+            }
+            let (view, layer) = try pane(in: content)
+            let oldCols = view.cols
+            let oldRows = view.rows
+            let oldDrawable = try XCTUnwrap(layer.lastDrawable)
+            XCTAssertGreaterThan(oldCols, 0)
+
+            layer.available = false
+            let destination = CGSize(width: view.bounds.width + 240, height: view.bounds.height)
+            view.beginSidebarResize(to: destination)
+            XCTAssertEqual(view.cols, oldCols, "a failed capture must not request the new grid")
+            XCTAssertEqual(view.rows, oldRows)
+            view.renderNow()
+            XCTAssertEqual(view.cols, oldCols, "retries must keep the old grid until submission succeeds")
+            XCTAssertTrue(layer.lastDrawable === oldDrawable)
+            XCTAssertTrue(view.needsRender)
+
+            // Layout completion also reports a size. It must defer that report and keep the
+            // latest bounds, which may differ from the original projection.
+            let settled = CGSize(width: destination.width + 40, height: destination.height + 40)
+            if finishBeforeCapture {
+                view.setFrameSize(settled)
+                view.endSidebarResize()
+                XCTAssertEqual(view.cols, oldCols, "ending the slide must not bypass capture")
+                XCTAssertEqual(view.rows, oldRows)
+                XCTAssertTrue(view.needsRender)
+            }
+
+            layer.available = true
+            view.renderNow()
+            XCTAssertFalse(layer.lastDrawable === oldDrawable)
+            XCTAssertTrue(try XCTUnwrap(layer.lastDrawable).presentedOnMain)
+            XCTAssertGreaterThan(view.cols, oldCols, "a successful capture must release the pending resize")
+            if finishBeforeCapture {
+                XCTAssertGreaterThan(view.rows, oldRows, "use the settled size instead of the stale projection")
+            } else {
+                XCTAssertEqual(view.rows, oldRows)
+                view.setFrameSize(destination)
+                view.endSidebarResize()
+            }
+            let resizedCols = view.cols
+            let resizedRows = view.rows
+            view.renderNow()
+            XCTAssertEqual(view.cols, resizedCols)
+            XCTAssertEqual(view.rows, resizedRows)
+        }
+    }
+
     /// A sidebar reveals the prepared image without redrawing idle panes at every width.
     /// Check both endpoints' pixels, including dimming and transparency.
     func testSidebarViewportKeepsBackgroundPixelsUniform() throws {

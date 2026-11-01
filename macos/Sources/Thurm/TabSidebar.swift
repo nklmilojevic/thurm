@@ -204,7 +204,8 @@ final class TabSplitViewController: NSSplitViewController {
             finish()
             return
         }
-        // NSSplitViewItem's default collapse animation has its own duration and curve;
+        // NSSplitViewItem.h documents "collapsed" as the animations dictionary key.
+        // Its default collapse animation has its own duration and curve;
         // setting only NSAnimationContext does not override them.
         let animation = CABasicAnimation()
         animation.duration = duration
