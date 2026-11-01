@@ -166,9 +166,14 @@ final class TerminalView: NSView, NSTextInputClient {
         CGPoint(x: CGFloat(padXPixels) / backingScale, y: CGFloat(padYPixels) / backingScale)
     }
 
-    /// A cell, and the padding from the view's top left corner to its first cell, in points.
-    var gridCellSize: CGSize { cellSizePoints }
-    var gridPadding: CGPoint { accessibilityPadding }
+    /// A cell, and the padding from a view's top left corner to its first cell, in points, of
+    /// every terminal at `scale`: they share one font (`FontShaper.shared`) and one padding.
+    static func gridMetrics(scale: CGFloat) -> (cell: CGSize, padding: CGPoint)? {
+        guard let s = FontShaper.shared(scale: scale) else { return nil }
+        let config = SessionManager.shared.config
+        return (CGSize(width: CGFloat(s.cellWidth) / scale, height: CGFloat(s.cellHeight) / scale),
+                CGPoint(x: (config.paddingX * scale).rounded() / scale, y: (config.paddingY * scale).rounded() / scale))
+    }
 
     private var cellSizePoints: CGSize {
         guard let s = shaper else { return CGSize(width: 8, height: 16) }
