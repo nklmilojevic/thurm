@@ -83,8 +83,10 @@ final class TerminalView: NSView, NSTextInputClient {
     /// The unfocused-split dim, eased in and out as focus moves between the panes of a tab.
     private var dimTween = Tween(0)
     private(set) var dimDrawn: Float = 0
-    /// Called when a frame drew a different dim, so the pane's header can follow it.
-    var onDimDrawn: (() -> Void)?
+    /// Called when a frame changes the surface color, so the backdrop and header
+    /// change in the same Core Animation transaction as the Metal image.
+    var onSurfaceDrawn: (() -> Void)?
+    private(set) var surfaceColorDrawn: NSColor?
 
     // Overlays.
     private var lockBadge: NSImageView?
@@ -130,8 +132,13 @@ final class TerminalView: NSView, NSTextInputClient {
         // Present as soon as a frame is drawn instead of on the next vsync (Alacritty's
         // `SwapInterval::DontWait`); pacing comes from `scheduleRender`.
         layer.displaySyncEnabled = !Perf.tickRendering
-        // Opaque (no WindowServer blending) whenever the window's opacity is 1; see `renderNow`.
+        // The image, its base fill and the pane header must change together.
+        layer.presentsWithTransaction = true
+        // Transparent Metal contents sit over the layer's background. Even an opaque window
+        // must composite these two: marking the drawable opaque would discard its alpha.
         layer.isOpaque = false
+        let cfg = SessionManager.shared.config
+        layer.backgroundColor = colorFromRGB(cfg.theme.background, alpha: cfg.opacity).cgColor
         layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         layer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
         // On a size change (splits, window resize) keep the last frame unscaled at the top
@@ -583,7 +590,7 @@ final class TerminalView: NSView, NSTextInputClient {
         }
     }
 
-    private func renderNow() {
+    func renderNow() {
         lastRenderTime = CACurrentMediaTime()
         let perfStart = Perf.enabled ? CACurrentMediaTime() : 0
         defer { if Perf.enabled { Perf.shared.rendered(pane: pane, start: perfStart, generation: renderer.snapshot.info.generation) } }
@@ -624,12 +631,7 @@ final class TerminalView: NSView, NSTextInputClient {
             }
         }
         let dim = dimValue(at: CACurrentMediaTime())
-        if dim != dimDrawn {
-            dimDrawn = dim
-            onDimDrawn?()
-        }
         let opacity = Float((window?.windowController as? TerminalWindowController)?.opacity ?? config.opacity)
-        if layer.isOpaque != (opacity >= 1) { layer.isOpaque = opacity >= 1 }
         let space = config.displayP3 ? CGColorSpace.displayP3 : CGColorSpace.sRGB
         if layer.colorspace?.name != space { layer.colorspace = CGColorSpace(name: space) }
         let params = RenderParams(pane: pane,
@@ -651,9 +653,28 @@ final class TerminalView: NSView, NSTextInputClient {
                                   hoverLink: hoverLink,
                                   hoverSpan: hoverSpan,
                                   scrollY: smoothScrollY,
-                                  colors: config.colorAdjustments)
-        renderer.draw(layer: layer, params: params)
-        hasDrawn = true
+                                  colors: config.colorAdjustments,
+                                  backgroundInLayer: true)
+        if renderer.draw(layer: layer, params: params) {
+            let color = renderer.surfaceColor(params: params)
+            let components = [CGFloat(color.x), CGFloat(color.y), CGFloat(color.z), CGFloat(color.w)]
+            let background = NSColor(colorSpace: config.displayP3 ? .displayP3 : .sRGB,
+                                     components: components, count: 4)
+            let changed = surfaceColorDrawn != background
+            // A submitted image can reach the compositor after its new bounds. This fill
+            // always covers those bounds, so an expanding pane never exposes the window's
+            // different background. The transparent Metal clear avoids double opacity.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.backgroundColor = background.cgColor
+            CATransaction.commit()
+            hasDrawn = true
+            dimDrawn = dim
+            surfaceColorDrawn = background
+            if changed { onSurfaceDrawn?() }
+        } else {
+            needsRender = true
+        }
         if Perf.enabled {
             Perf.shared.split(pane: pane, update: perfDraw - perfGrid, draw: CACurrentMediaTime() - perfDraw)
         }

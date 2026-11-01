@@ -597,6 +597,9 @@ struct RenderParams {
     /// peek row drawn above row 0.
     var scrollY: Float = 0
     var colors = ColorAdjustments()
+    /// The macOS layer supplies the base background, including outside a resizing drawable.
+    /// Leave the Metal clear transparent there; iOS keeps drawing its background in Metal.
+    var backgroundInLayer = false
 }
 
 private struct DrawSegment {
@@ -634,9 +637,30 @@ final class TerminalRenderer {
     private let searchFocusBg: UInt32 = 0xF0883E
     private let searchFg: UInt32 = 0x1B1B1B
 
-    func draw(layer: CAMetalLayer, params p: RenderParams) {
-        guard let ctx = MetalContext.shared else { return }
-        guard p.viewportWidth > 0, p.viewportHeight > 0 else { return }
+    /// The base surface after the same dim and bell covers used by `buildQuads`.
+    func surfaceColor(params p: RenderParams) -> SIMD4<Float> {
+        let background = snapshot.valid ? snapshot.info.background : p.themeBackground
+        var color = rgba(background, p.opacity)
+        if p.dim > 0.001 {
+            let scale = 1 - p.dim * (1 - p.dimFill)
+            color.x *= scale
+            color.y *= scale
+            color.z *= scale
+        }
+        if p.flash > 0.001 {
+            let foreground = rgba(snapshot.valid ? snapshot.info.foreground : p.themeForeground)
+            let amount = 0.22 * p.flash
+            color.x = color.x * (1 - amount) + foreground.x * amount
+            color.y = color.y * (1 - amount) + foreground.y * amount
+            color.z = color.z * (1 - amount) + foreground.z * amount
+        }
+        return color
+    }
+
+    @discardableResult
+    func draw(layer: CAMetalLayer, params p: RenderParams) -> Bool {
+        guard let ctx = MetalContext.shared else { return false }
+        guard p.viewportWidth > 0, p.viewportHeight > 0 else { return false }
         wantsAnotherFrame = false
         // Rasterizing a glyph can wipe a full atlas; quads built before that point to stale
         // texels, so build again against the fresh atlas.
@@ -646,9 +670,9 @@ final class TerminalRenderer {
             buildQuads(p, device: ctx.device)
         }
 
-        guard let drawable = layer.nextDrawable() else { return }
+        guard let drawable = layer.nextDrawable() else { return false }
         let bgColor = snapshot.valid ? snapshot.info.background : p.themeBackground
-        let clear = rgba(bgColor, p.opacity)
+        let clear = p.backgroundInLayer ? SIMD4<Float>.zero : rgba(bgColor, p.opacity)
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = drawable.texture
         pass.colorAttachments[0].loadAction = .clear
@@ -659,7 +683,7 @@ final class TerminalRenderer {
                                                             alpha: Double(clear.w))
         guard let commands = ctx.queue.makeCommandBuffer(),
               let encoder = commands.makeRenderCommandEncoder(descriptor: pass)
-        else { return }
+        else { return false }
 
         // Assemble all quads into one buffer, in paint order.
         allQuads.removeAll(keepingCapacity: true)
@@ -717,9 +741,19 @@ final class TerminalRenderer {
             }
         }
         encoder.endEncoding()
-        commands.present(drawable)
-        commands.commit()
+        if layer.presentsWithTransaction {
+            // AppKit's layout and backdrop updates must land with this image. Apple's
+            // transaction presentation contract requires presenting the drawable directly
+            // after scheduling the commands, rather than via MTLCommandBuffer.present.
+            commands.commit()
+            commands.waitUntilScheduled()
+            drawable.present()
+        } else {
+            commands.present(drawable)
+            commands.commit()
+        }
         ctx.lastCommitted = commands
+        return true
     }
 
     /// The next quad buffer, at least `length` bytes. Waits while the GPU still reads every

@@ -466,10 +466,7 @@ final class TabContentView: NSView {
         }
         for id in paneIds where views[id] == nil {
             let view = TerminalView(pane: id)
-            view.onDimDrawn = { [weak self] in
-                guard let self else { return }
-                if self.showsHeaders || self.isMoving || !self.floating.isEmpty { self.updateBackdrop() }
-            }
+            view.onSurfaceDrawn = { [weak self] in self?.updateBackdrop() }
             views[id] = view
             addSubview(view, positioned: .below, relativeTo: chrome)
         }
@@ -904,11 +901,7 @@ final class TabContentView: NSView {
         let bg = colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity)
         fills.append((NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: area.minY - bounds.minY), bg))
         func surface(_ id: PaneKey) -> NSColor {
-            let scale = ChromePalette.dimmedBackgroundScale(drawn: (views[id] ?? leaving[id]?.view)?.dimDrawn ?? 0,
-                                                            dim: cfg.unfocusedSplitDim,
-                                                            isDark: cfg.theme.isDark)
-            let c = [bg.redComponent * scale, bg.greenComponent * scale, bg.blueComponent * scale, bg.alphaComponent]
-            return NSColor(colorSpace: bg.colorSpace, components: c, count: 4)
+            (views[id] ?? leaving[id]?.view)?.surfaceColorDrawn ?? bg
         }
         // Cards are filled by their own back, which hides the splits under them.
         for (id, parts) in cardParts { parts.back.fill = surface(id) }
