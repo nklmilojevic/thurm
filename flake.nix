@@ -99,7 +99,7 @@
               ];
             };
             strictDeps = true;
-            cargoExtraArgs = "--locked -p thurm-cli -p thurm-daemon";
+            cargoExtraArgs = "--locked -p thurm-cli -p thurm-daemon -p thurm-nvim";
             # ghostty-vt-rs-sys is a dependency: its build script links the prebuilt archive.
             env.GHOSTTY_VT_RS_SYS_PREBUILT_DIR = "${ghosttyVt}";
             # The suites need PTYs and sshd; CI runs them.

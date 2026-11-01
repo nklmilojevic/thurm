@@ -23,12 +23,13 @@ open macos/build/Thurm.app
 
 `build.sh`:
 
-1. runs `cargo build --release -p thurm-ffi -p thurm-daemon -p thurm-cli --target
-   aarch64-apple-darwin` (`libthurm_ffi.a`, `thurmd`, `thurm`). `SKIP_RUST=1` reuses existing
-   artifacts;
+1. runs `cargo build --release -p thurm-ffi -p thurm-daemon -p thurm-cli -p thurm-nvim
+   --target aarch64-apple-darwin` (`libthurm_ffi.a`, `thurmd`, `thurm`, `thurm-nvim`).
+   `SKIP_RUST=1` reuses existing artifacts;
 2. copies `thurm.h` into `Sources/CThurm/include/` (a copy, not a symlink, so SwiftPM sees it);
 3. runs `swift build -c release --arch arm64` (SwiftPM fetches Sparkle);
-4. assembles `macos/build/Thurm.app`: `Contents/MacOS/Thurm`, `Contents/Helpers/{thurmd,thurm}`,
+4. assembles `macos/build/Thurm.app`: `Contents/MacOS/Thurm`,
+   `Contents/Helpers/{thurmd,thurm,thurm-nvim}`,
    `Contents/Frameworks/Sparkle.framework`, resources, and `Info.plist` with the version,
    build number and (release builds only) the update feed;
 5. signs the bundle: ad hoc, or with `THURM_SIGN_IDENTITY` (inside out, hardened runtime).

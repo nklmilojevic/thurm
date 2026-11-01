@@ -45,6 +45,8 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4", features = ["unstable-dynamic"] }
 anyhow = "1"
 signal-hook = "0.4"
+# msgpack values, for Neovim's RPC (thurm-nvim).
+rmpv = "1.3"
 
 [profile.release]
 lto = "thin"
