@@ -1,0 +1,24 @@
+[package]
+name = "thurm-nvim"
+description = "thurm-nvim: Neovim with each of its windows in a Thurm pane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "thurm-nvim"
+path = "src/main.rs"
+
+[dependencies]
+thurm-proto.workspace = true
+thurm-config.workspace = true
+thurm-client.workspace = true
+rmpv.workspace = true
+libc.workspace = true
+signal-hook.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+[dev-dependencies]
+thurm-term.workspace = true
