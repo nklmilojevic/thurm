@@ -766,6 +766,22 @@ fn parse_cells(s: &str) -> Result<(i32, i32, u16, u16), String> {
     Ok((col, row, cols, rows))
 }
 
+/// Where `float` puts `pane`: with `--cells`, counting from another pane than the card itself
+/// (default: `current`), since the app can't place a card by its own cells.
+fn float_place(
+    args: &PlaceArgs,
+    pane: PaneId,
+    current: Option<PaneId>,
+) -> Result<Option<FloatPlace>, String> {
+    const SELF: &str =
+        "a card can't count from its own cells: pass another pane of the tab with --anchor";
+    let place = args.place(|| current.ok_or_else(|| SELF.to_string()))?;
+    if place.as_ref().and_then(FloatPlace::anchor) == Some(pane) {
+        return Err(SELF.into());
+    }
+    Ok(place)
+}
+
 /// Refuses a `--cells` anchor that doesn't exist, or isn't in the tab of `pane` (when given),
 /// before anything changes: the app would have nowhere to count from.
 fn check_anchor(
@@ -1532,14 +1548,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             place,
         } => {
             let pane = current_pane(pane)?;
-            let place = place.place(|| {
-                current_pane(None)
-                    .ok()
-                    .filter(|&a| a != pane)
-                    .ok_or_else(|| {
-                        "--cells counts from another pane of the tab: pass --anchor".to_string()
-                    })
-            })?;
+            let place = float_place(&place, pane, current_pane(None).ok())?;
             check_anchor(c, place.as_ref(), Some(pane))?;
             if let Some(place) = place {
                 layout_ui(c, UiCommand::PlaceFloating { pane, place })?;
@@ -2499,5 +2508,35 @@ mod tests {
             PlaceArgs::default().place(|| Err("unused".into())),
             Ok(None)
         );
+
+        // `float` never counts a card from itself, named or by default.
+        let cells = |anchor| PlaceArgs {
+            cells: Some((0, 0, 10, 2)),
+            anchor,
+            ..Default::default()
+        };
+        assert!(float_place(&cells(Some(4)), 4, Some(1)).is_err());
+        assert!(float_place(&cells(None), 4, Some(4)).is_err());
+        assert!(float_place(&cells(None), 4, None).is_err());
+        assert_eq!(
+            float_place(&cells(None), 4, Some(1))
+                .unwrap()
+                .and_then(|p| p.anchor()),
+            Some(1)
+        );
+        assert_eq!(
+            float_place(&cells(Some(2)), 4, Some(4))
+                .unwrap()
+                .and_then(|p| p.anchor()),
+            Some(2)
+        );
+        let frame = PlaceArgs {
+            frame: Some([0.1, 0.1, 0.5, 0.5]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            float_place(&frame, 4, Some(4)),
+            Ok(Some(FloatPlace::Fraction(_)))
+        ));
     }
 }
