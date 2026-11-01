@@ -366,3 +366,120 @@ fn statusline_cells_keep_combining_characters_together() {
     assert_eq!(&texts[..2], ["e\u{301}", "x"]);
     assert_eq!(cells[0].as_array().unwrap()[1].as_u64(), Some(1));
 }
+
+/// Ending a session Neovim didn't end itself (its last pane closed) keeps unsaved changes
+/// recoverable: a hang-up, as when a terminal closes, never `:qa!`. A `:qa` of its own leaves
+/// no swap file behind.
+#[test]
+fn ending_a_session_keeps_unsaved_changes_recoverable() {
+    use crate::daemon::NvimProcess;
+
+    let dir = std::env::temp_dir().join(format!("tn-swap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = TempDir(dir.clone());
+    let start = |name: &str| -> Option<(NvimProcess, Nvim, Receiver<Message>)> {
+        let sock = dir.join(format!("{name}.sock"));
+        let child = Command::new("nvim")
+            .args(["--clean", "--headless", "--cmd"])
+            .arg(format!("set directory={}//", dir.display()))
+            .arg("--listen")
+            .arg(&sock)
+            .arg(dir.join(format!("{name}.txt")))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match UnixStream::connect(&sock) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => panic!("nvim socket: {e}"),
+            }
+        };
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let (tx, rx) = unbounded();
+        std::thread::spawn(move || {
+            while let Ok(Some(m)) = nvim::read_message(&mut reader) {
+                if tx.send(m).is_err() {
+                    return;
+                }
+            }
+        });
+        Some((
+            NvimProcess {
+                child,
+                exiting: false,
+            },
+            Nvim::new(stream),
+            rx,
+        ))
+    };
+    let call = |nvim: &mut Nvim, rx: &Receiver<Message>, method: &str, params: Vec<Value>| {
+        let id = nvim.request(method, params).unwrap();
+        nvim.flush().unwrap();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).expect("an answer") {
+                Message::Response { id: got, result } if got == id => return result,
+                _ => {}
+            }
+        }
+    };
+    let swaps = |name: &str| {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(&format!("{name}.txt.sw"))
+            })
+            .count()
+    };
+
+    // The last pane closed with unsaved changes: the swap file stays.
+    let Some((process, mut nvim, rx)) = start("hup") else {
+        eprintln!("no nvim on PATH: skipped");
+        return;
+    };
+    call(
+        &mut nvim,
+        &rx,
+        "nvim_buf_set_lines",
+        vec![
+            0.into(),
+            0.into(),
+            (-1).into(),
+            false.into(),
+            Value::Array(vec!["unsaved".into()]),
+        ],
+    )
+    .unwrap();
+    drop(process);
+    assert_eq!(swaps("hup"), 1, "the changes must stay recoverable");
+
+    // `:qa!` of its own: no swap file left.
+    let (mut process, mut nvim, rx) = start("quit").unwrap();
+    call(
+        &mut nvim,
+        &rx,
+        "nvim_buf_set_lines",
+        vec![
+            0.into(),
+            0.into(),
+            (-1).into(),
+            false.into(),
+            Value::Array(vec!["discarded".into()]),
+        ],
+    )
+    .unwrap();
+    nvim.request("nvim_input", vec![":qa!<CR>".into()]).unwrap();
+    nvim.flush().unwrap();
+    process.exiting = true;
+    drop(process);
+    assert_eq!(swaps("quit"), 0);
+}

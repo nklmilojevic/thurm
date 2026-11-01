@@ -190,6 +190,8 @@ pub struct Daemon {
     /// A Thurm focus change of ours, and when: until it lands, focus reports are stale.
     own_focus: Option<(PaneId, Instant)>,
     thurm_ops: Option<Sender<ThurmOp>>,
+    /// Neovim closed our connection: it is exiting on its own.
+    nvim_exiting: bool,
     exe: PathBuf,
     socket: PathBuf,
 }
@@ -210,22 +212,30 @@ pub fn run(dir: &Path, nvim_args: &[String]) -> io::Result<()> {
     result
 }
 
-/// Neovim, waited for however the daemon ends. It closes our connection while still exiting
-/// (`:qa`), so it gets a moment to finish: a hang-up then would make it keep its swap files as
-/// after a crash. Still running after that, it is hung up on (and saves them).
-struct NvimProcess(Child);
+/// Neovim, ended however the daemon ends.
+///
+/// Unless it is exiting on its own (`:qa`, which closes our connection while it still writes
+/// files), it is hung up on, as when the terminal it runs in closes: it keeps the swap files of
+/// changed buffers, for `:recover`, rather than lose the changes. One exiting on its own gets a
+/// moment first: a hang-up then would keep swap files of a clean exit.
+pub(crate) struct NvimProcess {
+    pub(crate) child: Child,
+    pub(crate) exiting: bool,
+}
 
 impl Drop for NvimProcess {
     fn drop(&mut self) {
-        let deadline = Instant::now() + NVIM_EXIT_GRACE;
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.0.try_wait() {
-                return;
+        if self.exiting {
+            let deadline = Instant::now() + NVIM_EXIT_GRACE;
+            while Instant::now() < deadline {
+                if let Ok(Some(_)) = self.child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
-        unsafe { libc::kill(self.0.id() as i32, libc::SIGHUP) };
-        let _ = self.0.wait();
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGHUP) };
+        let _ = self.child.wait();
     }
 }
 
@@ -275,7 +285,10 @@ fn serve(dir: &Path, nvim_args: &[String]) -> io::Result<()> {
     };
 
     let nvim_sock = nvim_socket(dir);
-    let _nvim_process = NvimProcess(spawn_nvim(&nvim_sock, nvim_args)?);
+    let mut nvim_process = NvimProcess {
+        child: spawn_nvim(&nvim_sock, nvim_args)?,
+        exiting: false,
+    };
     let (nvim, reader) = connect_retry(&nvim_sock, Duration::from_secs(10))?;
     {
         let tx = tx.clone();
@@ -302,6 +315,7 @@ fn serve(dir: &Path, nvim_args: &[String]) -> io::Result<()> {
         focus_gen: 0,
         own_focus: None,
         thurm_ops: None,
+        nvim_exiting: false,
         exe: std::env::current_exe()?,
         socket,
     };
@@ -314,11 +328,12 @@ fn serve(dir: &Path, nvim_args: &[String]) -> io::Result<()> {
     d.panes.push(launcher);
     d.attach_tty(0, first.0, first.1);
 
-    // However it ends, every terminal goes back as it was (Neovim goes with `_nvim_process`).
+    // However it ends, every terminal goes back as it was (Neovim goes with `nvim_process`).
     let result = d.start().and_then(|()| d.run_loop(&rx));
     for p in &mut d.panes {
         p.release();
     }
+    nvim_process.exiting = d.nvim_exiting;
     result
 }
 
@@ -548,7 +563,11 @@ impl Daemon {
     fn handle(&mut self, msg: Msg) -> io::Result<bool> {
         match msg {
             Msg::Nvim(m) => self.on_nvim(m)?,
-            Msg::NvimGone | Msg::Signal => return Ok(false),
+            Msg::NvimGone => {
+                self.nvim_exiting = true;
+                return Ok(false);
+            }
+            Msg::Signal => return Ok(false),
             Msg::Helper { id, stream, tty } => {
                 let id = id.unwrap_or(0);
                 if self.panes.iter().any(|p| p.id == id && p.tty.is_none()) {
@@ -572,7 +591,7 @@ impl Daemon {
                 self.size_editor()?;
                 self.draw_all();
             }
-            Msg::HelperGone(id) => self.pane_gone(id)?,
+            Msg::HelperGone(id) => return self.pane_gone(id),
             Msg::Input(id, bytes) => self.on_input(id, &bytes)?,
             Msg::Created { id, pane } => match pane {
                 Some(t) => {
@@ -1210,25 +1229,26 @@ impl Daemon {
         Ok(())
     }
 
-    fn pane_gone(&mut self, id: u32) -> io::Result<()> {
+    /// A pane's helper hung up (the pane closed): its window closes. The last one ends the
+    /// session (false), as closing the terminal Neovim runs in would: Neovim is hung up on and
+    /// keeps the swap files of unsaved changes. Never `:qa!`, which would throw them away.
+    fn pane_gone(&mut self, id: u32) -> io::Result<bool> {
         let Some(i) = self.panes.iter().position(|p| p.id == id) else {
-            return Ok(());
+            return Ok(true);
         };
         let mut p = self.panes.remove(i);
         p.release();
-        if let Some(w) = p.win {
-            self.lua("thurm_nvim.close(...)", vec![w.into()], Pending::Ignore)?;
-        }
         if self
             .panes
             .iter()
             .all(|p| p.tty.is_none() && p.win.is_none())
-            || self.panes.is_empty()
         {
-            // The last pane went: Neovim goes with it, as when its terminal closes.
-            self.request("nvim_command", vec!["qa!".into()], Pending::Ignore)?;
+            return Ok(false);
         }
-        Ok(())
+        if let Some(w) = p.win {
+            self.lua("thurm_nvim.close(...)", vec![w.into()], Pending::Ignore)?;
+        }
+        Ok(true)
     }
 
     fn draw_all(&mut self) {
