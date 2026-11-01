@@ -197,7 +197,16 @@ jobs:
           path: tailnet/internal/web/dist
       - name: Build
         run: |
-          cargo build --release --target ${{ matrix.target }} -p thurm-cli -p thurm-daemon -p thurm-nvim
+          # This workflow comes from main's newest commit, but the commit built is the newest
+          # with green CI, which may be older: build only the binaries it has.
+          BINS="thurm thurmd"
+          PACKAGES=(-p thurm-cli -p thurm-daemon)
+          if [[ -d crates/thurm-nvim ]]; then
+            BINS="$BINS thurm-nvim"
+            PACKAGES+=(-p thurm-nvim)
+          fi
+          echo "BINS=$BINS" >> "$GITHUB_ENV"
+          cargo build --release --target ${{ matrix.target }} "${PACKAGES[@]}"
           # Static, like thurm and thurmd; each runner builds for its own architecture.
           (cd tailnet && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" \
             -o "../target/${{ matrix.target }}/release/thurm-tailnet" ./cmd/thurm-tailnet)
@@ -205,7 +214,8 @@ jobs:
       - name: Static
         run: |
           set -euo pipefail
-          for b in thurm thurmd thurm-nvim thurm-tailnet; do
+          read -ra bins <<< "$BINS"
+          for b in "${bins[@]}" thurm-tailnet; do
             file "target/${{ matrix.target }}/release/$b"
             file "target/${{ matrix.target }}/release/$b" | grep -Eq 'statically linked|static-pie linked'
           done
@@ -215,7 +225,8 @@ jobs:
           OUT="$RUNNER_TEMP/linux"
           mkdir -p "$OUT"
           python3 scripts/third-party-licenses.py --with-go
-          tar -czf "$OUT/${{ steps.meta.outputs.archive }}" -C "target/${{ matrix.target }}/release" thurm thurmd thurm-nvim thurm-tailnet \
+          read -ra bins <<< "$BINS"
+          tar -czf "$OUT/${{ steps.meta.outputs.archive }}" -C "target/${{ matrix.target }}/release" "${bins[@]}" thurm-tailnet \
             -C "$GITHUB_WORKSPACE" LICENSE THIRD_PARTY_LICENSES
           (cd "$OUT" && sha256sum "${{ steps.meta.outputs.archive }}" > "${{ steps.meta.outputs.archive }}.sha256")
           cat "$OUT"/*.sha256
