@@ -86,6 +86,9 @@ pub struct FloatPos {
     pub focusable: bool,
     pub zindex: i64,
     pub compindex: i64,
+    /// Where Neovim draws it on the editor, kept inside it (`screen_row`, `screen_col`; Neovim
+    /// 0.10 and later). Only meaningful for a float on the editor.
+    pub screen: Option<(i64, i64)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -195,6 +198,10 @@ impl Model {
                     focusable: a.get(6).and_then(Value::as_bool).unwrap_or(true),
                     zindex: i(7),
                     compindex: i(8),
+                    screen: a
+                        .get(9)
+                        .and_then(Value::as_i64)
+                        .zip(a.get(10).and_then(Value::as_i64)),
                 };
                 self.set_win(u(0), a.get(1), WinKind::Float(pos));
             }
@@ -301,6 +308,28 @@ impl Model {
     /// Where float grid `grid` lands: following anchors (at most 8 deep) down to a window's
     /// grid or the editor. Floats on the message grid land on the editor at its row.
     pub fn place(&self, grid: u64) -> Option<Placed> {
+        let placed = self.place_by_anchor(grid)?;
+        // On the editor, Neovim knows better: it keeps the float inside.
+        if placed.root == EDITOR
+            && let Some(Win {
+                kind:
+                    WinKind::Float(FloatPos {
+                        screen: Some((row, col)),
+                        ..
+                    }),
+                ..
+            }) = self.wins.get(&grid)
+        {
+            return Some(Placed {
+                root: EDITOR,
+                row: *row as i32,
+                col: *col as i32,
+            });
+        }
+        Some(placed)
+    }
+
+    fn place_by_anchor(&self, grid: u64) -> Option<Placed> {
         let mut g = grid;
         let (mut row, mut col) = (0i32, 0i32);
         for _ in 0..8 {
@@ -588,6 +617,32 @@ mod tests {
             vec![4, 5]
         );
         assert_eq!(m.grid_of_win(1000), Some(2));
+
+        // On the editor, Neovim's screen position wins over the anchor's (kept inside).
+        m.apply_redraw(&[ev(
+            "win_float_pos",
+            vec![
+                8.into(),
+                1004.into(),
+                "NW".into(),
+                1.into(),
+                5.0.into(),
+                (-9.0).into(),
+                true.into(),
+                40.into(),
+                0.into(),
+                5.into(),
+                0.into(),
+            ],
+        )]);
+        assert_eq!(
+            m.place(8),
+            Some(Placed {
+                root: EDITOR,
+                row: 5,
+                col: 0
+            })
+        );
     }
 
     #[test]

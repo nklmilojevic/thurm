@@ -66,7 +66,7 @@ export default defineConfig({
         },
         {
           label: 'Guides',
-          items: ['cli', 'agents', 'agent-prompts', 'agent-integration', 'sessions', 'remote', 'linux-server', 'attach', 'workflows'],
+          items: ['cli', 'agents', 'agent-prompts', 'agent-integration', 'sessions', 'remote', 'linux-server', 'attach', 'neovim', 'workflows'],
         },
         {
           label: 'Help',

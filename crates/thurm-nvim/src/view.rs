@@ -323,6 +323,7 @@ mod tests {
                     focusable: true,
                     zindex: 50,
                     compindex: 0,
+                    screen: None,
                 }),
             },
         );
@@ -395,6 +396,7 @@ mod tests {
                     focusable: false,
                     zindex: 50,
                     compindex: 0,
+                    screen: None,
                 }),
             },
         );
