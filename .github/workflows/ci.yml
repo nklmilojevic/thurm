@@ -147,7 +147,7 @@ jobs:
         env:
           THURM_REQUIRE_SSHD: "1"
           THURM_REQUIRE_NETNS: "1"
-        run: cargo test --locked --target "$TARGET" -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli
+        run: cargo test --locked --target "$TARGET" -p thurm-daemon -p thurm-term -p thurm-remote -p thurm-cli -p thurm-nvim
 
   go:
     # The Tailscale helper (tailnet/, thurm-tailnet), with the Go version from its go.mod.

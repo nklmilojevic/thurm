@@ -49,7 +49,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 RUST_TARGET=aarch64-apple-darwin
 RUST_OUT="$ROOT/target/$RUST_TARGET/release"
 APP="$HERE/build/Thurm.app"
-BINARIES=(thurmd thurm)
+BINARIES=(thurmd thurm thurm-nvim)
 STATICLIB=libthurm_ffi.a
 
 # Deliberately not exporting MACOSX_DEPLOYMENT_TARGET: cargo applies it to host proc-macro
@@ -100,7 +100,7 @@ if [[ -z "${SKIP_RUST:-}" ]]; then
         die "Rust target $RUST_TARGET not installed (rustup target add $RUST_TARGET)"
     fi
     log "cargo build --release ($RUST_TARGET)"
-    (cd "$ROOT" && cargo build --release -p thurm-ffi -p thurm-daemon -p thurm-cli --target "$RUST_TARGET")
+    (cd "$ROOT" && cargo build --release -p thurm-ffi -p thurm-daemon -p thurm-cli -p thurm-nvim --target "$RUST_TARGET")
 else
     log "SKIP_RUST set; using existing artifacts in $RUST_OUT"
 fi

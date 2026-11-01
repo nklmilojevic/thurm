@@ -39,7 +39,7 @@ if [[ "$PREVIEW" == 0 ]]; then
         || die "A valid Developer ID Application identity is required"
     SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
     for binary in "$APP" "$APP/Contents/Helpers/thurm" "$APP/Contents/Helpers/thurmd" \
-        "$APP/Contents/Helpers/thurm-intelligence" "$SPARKLE" "$SPARKLE/Versions/B/Autoupdate" \
+        "$APP/Contents/Helpers/thurm-nvim" "$APP/Contents/Helpers/thurm-intelligence" "$SPARKLE" "$SPARKLE/Versions/B/Autoupdate" \
         "$SPARKLE/Versions/B/Updater.app" "$SPARKLE/Versions/B/XPCServices/Installer.xpc" \
         "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"; do
         codesign --verify --strict --verbose=2 "$binary" || die "Signature is invalid: $binary"
@@ -56,7 +56,8 @@ if [[ "$NOTARIZE" == 1 ]]; then
 fi
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")"
-for binary in "$APP/Contents/MacOS/Thurm" "$APP/Contents/Helpers/thurm" "$APP/Contents/Helpers/thurmd"; do
+for binary in "$APP/Contents/MacOS/Thurm" "$APP/Contents/Helpers/thurm" "$APP/Contents/Helpers/thurmd" \
+    "$APP/Contents/Helpers/thurm-nvim"; do
     lipo "$binary" -verify_arch arm64 || die "$binary is not built for arm64"
 done
 SUFFIX=""

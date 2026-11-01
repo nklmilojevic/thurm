@@ -128,7 +128,11 @@ impl Styles {
     /// Highlight `hl` with Neovim's default colors filled in where it has none. Colors still
     /// `None` are the terminal's own.
     pub fn resolve(&self, hl: u32) -> Style {
-        let mut s = self.attrs.get(&hl).copied().unwrap_or_default();
+        self.resolve_style(self.attrs.get(&hl).copied().unwrap_or_default())
+    }
+
+    /// `s` with Neovim's default colors filled in where it has none.
+    pub fn resolve_style(&self, mut s: Style) -> Style {
         s.fg = s.fg.or(self.default_fg);
         s.bg = s.bg.or(self.default_bg);
         s.sp = s.sp.or(self.default_sp);
@@ -177,12 +181,23 @@ impl Frame {
         Frame {
             cols,
             rows,
-            lines: vec![vec![FrameCell { text: Text::SPACE, width: 1, style: Style::default() }; cols as usize]; rows as usize],
+            lines: vec![
+                vec![
+                    FrameCell {
+                        text: Text::SPACE,
+                        width: 1,
+                        style: Style::default()
+                    };
+                    cols as usize
+                ];
+                rows as usize
+            ],
             cursor: None,
         }
     }
 
     /// Writes `s` at `row`, `col` in `style`, one cell per char (tests and simple text).
+    #[cfg(test)]
     pub fn put_str(&mut self, row: u16, col: u16, s: &str, style: Style) {
         let Some(line) = self.lines.get_mut(row as usize) else {
             return;
