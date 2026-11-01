@@ -798,18 +798,31 @@ fn check_anchor(
     let Some(pane) = pane.filter(|&p| p != anchor) else {
         return Ok(());
     };
-    // No layout saved yet (or an unreadable one): nothing to check against.
-    let Ok(Response::Layout(Some(json))) = c.request(Request::GetLayout) else {
-        return Ok(());
+    let layout = match c.request(Request::GetLayout) {
+        Ok(Response::Layout(Some(json))) => serde_json::from_str::<thurm_proto::Layout>(&json).ok(),
+        _ => None,
     };
-    let Ok(layout) = serde_json::from_str::<thurm_proto::Layout>(&json) else {
-        return Ok(());
-    };
-    match (layout.tab_of(pane), layout.tab_of(anchor)) {
-        (Some(a), Some(b)) if !std::ptr::eq(a, b) => Err(format!(
+    same_tab(layout.as_ref(), pane, anchor)
+}
+
+/// `anchor` and `pane` are in one tab of `layout`. Anything short of that is refused: the app
+/// puts a card placed in cells on its anchor's tab, wherever `pane` is.
+fn same_tab(
+    layout: Option<&thurm_proto::Layout>,
+    pane: PaneId,
+    anchor: PaneId,
+) -> Result<(), String> {
+    match layout.map(|l| (l.tab_of(pane), l.tab_of(anchor))) {
+        Some((Some(a), Some(b))) if std::ptr::eq(a, b) => Ok(()),
+        Some((Some(_), Some(_))) => Err(format!(
             "pane {anchor} (--anchor) is not in the tab of pane {pane}"
         )),
-        _ => Ok(()),
+        // No layout from the app yet, an unreadable one, or one saved before a pane opened (it
+        // saves half a second after a change).
+        _ => Err(format!(
+            "can't tell yet whether pane {anchor} (--anchor) is in the tab of pane {pane}: try \
+             again, or leave out --pane (the card goes on the anchor's tab)"
+        )),
     }
 }
 
@@ -2538,5 +2551,58 @@ mod tests {
             float_place(&frame, 4, Some(4)),
             Ok(Some(FloatPlace::Fraction(_)))
         ));
+
+        // The anchor and the pane must be seen in one tab; anything less is refused.
+        let tab = |root, floating: Vec<PaneId>| thurm_proto::TabLayout {
+            title: None,
+            root,
+            focused: 1,
+            zoomed: None,
+            handoff: None,
+            wall: None,
+            floating: floating
+                .into_iter()
+                .map(|id| thurm_proto::FloatingPane {
+                    id,
+                    host: None,
+                    frame: [0.1, 0.1, 0.4, 0.4],
+                    zoomed: false,
+                    cells: None,
+                })
+                .collect(),
+            floating_hidden: false,
+        };
+        let layout = thurm_proto::Layout {
+            windows: vec![thurm_proto::WindowLayout {
+                tabs: vec![
+                    tab(
+                        thurm_proto::LayoutNode::Split {
+                            dir: SplitDir::Right,
+                            ratio: 0.5,
+                            first: Box::new(thurm_proto::LayoutNode::local(1)),
+                            second: Box::new(thurm_proto::LayoutNode::local(2)),
+                        },
+                        vec![3],
+                    ),
+                    tab(thurm_proto::LayoutNode::local(4), Vec::new()),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(same_tab(Some(&layout), 1, 2), Ok(()));
+        assert_eq!(same_tab(Some(&layout), 3, 1), Ok(()));
+        assert!(
+            same_tab(Some(&layout), 1, 4)
+                .unwrap_err()
+                .contains("not in the tab")
+        );
+        // Not saved yet: a pane the layout doesn't list, or no layout at all.
+        assert!(
+            same_tab(Some(&layout), 1, 9)
+                .unwrap_err()
+                .contains("can't tell yet")
+        );
+        assert!(same_tab(None, 1, 2).unwrap_err().contains("can't tell yet"));
     }
 }
