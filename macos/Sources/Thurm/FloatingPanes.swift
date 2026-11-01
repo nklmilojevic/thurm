@@ -47,8 +47,14 @@ struct FloatingEdges: OptionSet, Hashable {
 enum FloatingGeometry {
     /// A card is never smaller than this, nor larger than its area.
     static let minSize = CGSize(width: 280, height: 160)
-    /// The least a card placed in cells keeps to: its header and a row of a few cells.
+    /// The least a card placed in cells keeps to before its terminal's metrics are known: its
+    /// header and a row of a few cells. Once known, see `cellMinSize`.
     static let exactMinSize = CGSize(width: 32, height: PaneHeader.height + 20)
+
+    /// The least a card placed in cells keeps to: a terminal of 2 columns by 1 row.
+    static func cellMinSize(cell: CGSize, padding: CGPoint) -> CGSize {
+        cardSize(CardCells(cols: 2, rows: 1)!, cell: cell, padding: padding)
+    }
     /// How far either side of a card's edge a drag resizes it.
     static let band: CGFloat = 5
 
@@ -99,7 +105,8 @@ enum FloatingGeometry {
         let size = cardSize(cells, cell: cell, padding: padding)
         let sized = CGRect(x: fraction.minX, y: fraction.minY,
                            width: size.width / area.width, height: size.height / area.height)
-        return rect(sized, in: area, minSize: exactMinSize)
+        // Its size comes from its cells (at least 2x1): no minimum on top of that.
+        return rect(sized, in: area, minSize: .zero)
     }
 
     /// The fraction of a new card: centered, cascading by `index` so several stay apart.

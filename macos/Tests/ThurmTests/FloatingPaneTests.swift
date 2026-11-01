@@ -126,6 +126,14 @@ final class FloatingPaneTests: XCTestCase {
         XCTAssertEqual(saved.saved.cells, CardCells(cols: 2, rows: 1))
         // The terminal is at least 2 columns.
         XCTAssertNil(CardCells(cols: 1, rows: 5))
+        // With a small font, the smallest card is smaller than the one for unknown metrics, and
+        // keeps its 2x1 cells: no minimum widens it.
+        let tiny = CGSize(width: 6, height: 12), tight = CGPoint(x: 2, y: 0)
+        let least = CardCells(cols: 2, rows: 1)!
+        let leastRect = FloatingGeometry.rect(fraction, cells: least, cell: tiny, padding: tight, in: area)
+        XCTAssertLessThan(leastRect.width, FloatingGeometry.exactMinSize.width)
+        XCTAssertEqual(FloatingGeometry.cells(of: leastRect.size, cell: tiny, padding: tight), least)
+        XCTAssertEqual(FloatingGeometry.cellMinSize(cell: tiny, padding: tight), leastRect.size)
     }
 
     /// `thurm_proto::FloatPlace` as serde writes it.

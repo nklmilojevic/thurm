@@ -696,8 +696,9 @@ struct PlaceArgs {
     /// is resized.
     #[arg(long, value_name = "COL,ROW,COLSxROWS", value_parser = parse_cells)]
     cells: Option<(i32, i32, u16, u16)>,
-    /// The pane `--cells` counts from, in the same tab (default: the current pane). A card
-    /// can't count from itself: placing the current pane needs another pane here.
+    /// The pane `--cells` counts from, in the same tab (default: the current pane); without
+    /// `--pane`, the card goes on its tab. A card can't count from itself: placing the current
+    /// pane needs another pane here.
     #[arg(long, value_name = "PANE", requires = "cells")]
     anchor: Option<PaneId>,
 }
@@ -1568,20 +1569,24 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             {
                 return Err(format!("no pane {p}").into());
             }
-            let target = current_pane(pane).ok();
             let place = place.place(|| {
-                target
-                    .ok_or_else(|| "--cells needs a pane to count from: pass --anchor".to_string())
+                current_pane(pane)
+                    .map_err(|_| "--cells needs a pane to count from: pass --anchor".to_string())
             })?;
             check_anchor(c, place.as_ref(), pane)?;
+            // Placed in cells without `--pane`: on the anchor's tab, so the pane starts like its
+            // other panes (cwd, size) rather than like the current one.
+            let target = match place.as_ref().and_then(FloatPlace::anchor) {
+                Some(anchor) if pane.is_none() => Some(anchor),
+                _ => current_pane(pane).ok(),
+            };
             let new = create(c, command, cwd, target, hold || wait, None)?;
             if let Some(place) = place {
                 match ui(
                     c,
                     UiCommand::OpenFloatingAt {
                         pane: new,
-                        // With cells, the card goes where it counts from.
-                        target: place.anchor().or(target),
+                        target,
                         place,
                         background,
                     },

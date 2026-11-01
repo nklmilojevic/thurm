@@ -384,6 +384,13 @@ final class TabContentView: NSView {
                       height: max(0, bounds.height - inset.top - inset.bottom)).insetBy(dx: 8, dy: 8)
     }
 
+    /// The least `card` keeps to while dragged or resized: a card placed in cells, 2 columns by 1
+    /// row of its terminal; others, `FloatingGeometry.minSize`.
+    private func minCardSize(_ card: FloatingCard) -> CGSize {
+        guard card.cells != nil, let view = views[card.pane] else { return card.minSize }
+        return FloatingGeometry.cellMinSize(cell: view.gridCellSize, padding: view.gridPadding)
+    }
+
     /// A card's rectangle; zoomed, the space a zoomed pane of the splits takes. A card placed in
     /// cells keeps its terminal's size in cells, whatever the tab's size.
     private func cardRect(_ card: FloatingCard) -> CGRect {
@@ -994,7 +1001,7 @@ final class TabContentView: NSView {
             let area = floatArea
             let rect = FloatingGeometry.resized(r.start, edges: r.edges,
                                                 by: CGVector(dx: p.x - r.from.x, dy: p.y - r.from.y), in: area,
-                                                minSize: floating[i].minSize)
+                                                minSize: minCardSize(floating[i]))
             floating[i].frame = FloatingGeometry.fraction(of: rect, in: area)
             // A card placed in cells stays one, in whole cells of its new size.
             if floating[i].cells != nil, let view = views[r.pane],
@@ -1559,7 +1566,7 @@ final class TabContentView: NSView {
                 let area = self.floatArea
                 let rect = startRect.offsetBy(dx: p.x - origin.x, dy: p.y - origin.y)
                 self.floating[i].frame = FloatingGeometry.fraction(of: FloatingGeometry.rect(
-                    FloatingGeometry.fraction(of: rect, in: area), in: area, minSize: self.floating[i].minSize),
+                    FloatingGeometry.fraction(of: rect, in: area), in: area, minSize: self.minCardSize(self.floating[i])),
                                                                    in: area)
                 target = e.modifierFlags.contains(.command) ? self.dockTarget(at: p, excluding: pane) : nil
                 self.dockIndicator.show(target?.rect)
