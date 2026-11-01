@@ -179,25 +179,45 @@ final class TabSplitViewController: NSSplitViewController {
         let collapse = !side.isCollapsed
         Self.collapsedByDefault = collapse
         let panes = (host.view as? TabContentView)?.views.values.map { $0 } ?? []
-        panes.forEach { $0.holdGridSize = true }
+        let rememberedWidth = sidebar.view.frame.width >= side.minimumThickness
+            ? sidebar.view.frame.width : configuredWidth
+        let sidebarWidth = min(side.maximumThickness, max(side.minimumThickness, sidebar.preferredWidth ?? rememberedWidth))
+        let contentWidth = splitView.bounds.width - (collapse ? 0 : sidebarWidth + splitView.dividerThickness)
+        (host.view as? TabContentView)?.beginSidebarResize(contentWidth: max(0, contentWidth))
         sidebar.holdReloads = true
         togglingSidebar = true
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(saveWidth), object: nil)
         // Remove the far-edge button before closing. When opening, restore it only once the
         // sidebar has room for it, so it never flashes into the overflow menu mid-animation.
         if collapse { (view.window as? TerminalWindow)?.sidebarCollapsed = true }
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = Motion.duration(Motion.standard)
-            ctx.timingFunction = Motion.timingFunction
-            side.animator().isCollapsed = collapse
-        }, completionHandler: { [weak self] in
+        let duration = Motion.duration(Motion.sidebar)
+        let finish = { [weak self] in
             if !collapse { self?.placeDivider() }
             self?.togglingSidebar = false
             self?.syncSidebarToolbar()
             self?.view.layoutSubtreeIfNeeded()
             self?.sidebar.holdReloads = false
-            panes.forEach { $0.holdGridSize = false }
-        })
+            panes.forEach { $0.endSidebarResize() }
+        }
+        guard duration > 0 else {
+            side.isCollapsed = collapse
+            finish()
+            return
+        }
+        // NSSplitViewItem.h documents "collapsed" as the animations dictionary key.
+        // Its default collapse animation has its own duration and curve;
+        // setting only NSAnimationContext does not override them.
+        let animation = CABasicAnimation()
+        animation.duration = duration
+        animation.timingFunction = Motion.sidebarTimingFunction
+        let fps = Float(view.window?.screen?.maximumFramesPerSecond ?? 60)
+        animation.preferredFrameRateRange = CAFrameRateRange(minimum: min(60, fps), maximum: fps, preferred: fps)
+        side.animations[NSAnimatablePropertyKey("collapsed")] = animation
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = duration
+            ctx.timingFunction = Motion.sidebarTimingFunction
+            side.animator().isCollapsed = collapse
+        }, completionHandler: finish)
     }
 
     /// Do not save intermediate widths while the sidebar changes state.

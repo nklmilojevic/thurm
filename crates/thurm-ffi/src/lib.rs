@@ -660,7 +660,7 @@ fn schedule_sync_flush(
                     Some(_) => {
                         l.term.flush_sync();
                         l.drain(pane, &shared.images);
-                        None
+                        l.term.sync_deadline()
                     }
                     None => None,
                 }
@@ -723,7 +723,7 @@ fn handle_event(
                     l.term.resize(size);
                     l.term.sync_deadline()
                 };
-                // At a prompt the frame waits for the shell's redraw (see `Terminal::resize`).
+                // The resized grid waits for the program's redraw (see `Terminal::resize`).
                 match held {
                     Some(deadline) => schedule_sync_flush(shared, pane, deadline, on_frame, ctx),
                     None => fire_frame(on_frame, ctx, pane),
@@ -1645,6 +1645,43 @@ pub extern "C" fn thurm_settings_overlay_path() -> *mut c_char {
 mod tests {
     use super::*;
     use thurm_proto::{Cell, FrameRow};
+
+    #[test]
+    fn resize_flush_keeps_the_synchronized_update_timeout() {
+        let shared = Arc::new(Shared::default());
+        let size = PaneSize {
+            cols: 40,
+            rows: 5,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let mut term = Terminal::new(size, EngineConfig::default());
+        term.resize(PaneSize { cols: 30, ..size });
+        term.advance(b"\x1b[?2026h\x1b[H\x1b[2Jpartial");
+        let deadline = term.sync_deadline().unwrap();
+        let local = Arc::new(Mutex::new(LocalPane {
+            term,
+            view: ClientView::new(),
+        }));
+        shared.locals.lock().insert(1, local.clone());
+        // No output follows: the timer must flush both the short resize hold and the
+        // longer synchronized update before announcing a drawable frame.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        unsafe extern "C" fn frame(ctx: *mut c_void, _pane: u64) {
+            let tx = unsafe { Box::from_raw(ctx.cast::<std::sync::mpsc::Sender<()>>()) };
+            let _ = tx.send(());
+        }
+        let ctx = Ctx(Box::into_raw(Box::new(tx)).cast());
+        schedule_sync_flush(&shared, 1, deadline, Some(frame), ctx);
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let mut l = local.lock();
+        assert!(
+            !l.term.in_sync(),
+            "callback fired before the second hold expired"
+        );
+        let l = &mut *l;
+        assert_eq!(l.term.snapshot(1, &mut l.view).unwrap().frame.cols, 30);
+    }
 
     #[test]
     fn async_requests_always_answer() {

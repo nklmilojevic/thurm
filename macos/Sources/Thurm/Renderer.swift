@@ -166,6 +166,23 @@ fragment float4 fs_main(VOut in [[stage_in]],
         return float4(0.0);
     }
 }
+
+vertex float4 vs_reflow(uint vid [[vertex_id]]) {
+    const float2 corners[] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    return float4(corners[vid], 0, 1);
+}
+
+fragment float4 fs_reflow(float4 position [[position]],
+                         texture2d<float, access::read> before [[texture(0)]],
+                         texture2d<float, access::read> after [[texture(1)]],
+                         constant float &progress [[buffer(0)]]) {
+    // Read device pixels directly: reflow changes line wrapping, never the glyph scale.
+    uint2 pixel = uint2(position.xy);
+    float4 a = all(pixel < uint2(before.get_width(), before.get_height())) ? before.read(pixel) : float4(0);
+    float4 b = all(pixel < uint2(after.get_width(), after.get_height())) ? after.read(pixel) : float4(0);
+    // Both images are premultiplied. Interpolation preserves the pane's transparency.
+    return mix(a, b, progress);
+}
 """
 
 // MARK: - Shared Metal state
@@ -179,6 +196,7 @@ final class MetalContext {
     /// For the dim and flash covers: shades the color under them in proportion to its alpha
     /// and keeps that alpha, so a translucent pane stays as translucent as its gutters.
     let coverPipeline: MTLRenderPipelineState
+    let reflowPipeline: MTLRenderPipelineState
     /// 1×1 transparent texture bound when a slot has nothing to show.
     let emptyTexture: MTLTexture
     /// The most recently committed frame (all panes share this serial queue).
@@ -227,6 +245,11 @@ final class MetalContext {
             att.sourceAlphaBlendFactor = .zero
             att.destinationAlphaBlendFactor = .one
             coverPipeline = try device.makeRenderPipelineState(descriptor: desc)
+            desc.label = "Thurm reflow"
+            desc.vertexFunction = library.makeFunction(name: "vs_reflow")
+            desc.fragmentFunction = library.makeFunction(name: "fs_reflow")
+            att.isBlendingEnabled = false
+            reflowPipeline = try device.makeRenderPipelineState(descriptor: desc)
         } catch {
             tlog("could not build the Metal pipeline: \(error)")
             return nil
@@ -568,6 +591,12 @@ final class ColorAdjuster {
 // MARK: - Renderer
 
 /// Everything besides the grid that affects a frame.
+enum ContentTransition {
+    case none
+    case capture
+    case blend(Float)
+}
+
 struct RenderParams {
     var pane: PaneKey
     var shaper: FontShaper
@@ -597,6 +626,11 @@ struct RenderParams {
     /// peek row drawn above row 0.
     var scrollY: Float = 0
     var colors = ColorAdjustments()
+    /// The macOS layer supplies the base background, including outside a resizing drawable.
+    /// Leave the Metal clear transparent there; iOS keeps drawing its background in Metal.
+    var backgroundInLayer = false
+    /// An optional handoff between layouts. The default keeps the direct rendering path.
+    var contentTransition = ContentTransition.none
 }
 
 private struct DrawSegment {
@@ -629,14 +663,50 @@ final class TerminalRenderer {
     private var segments: [DrawSegment] = []
     /// Set when an image was referenced but its pixels were not available yet.
     private(set) var wantsAnotherFrame = false
+    private var beforeReflow: MTLTexture?
+    private var afterReflow: MTLTexture?
+
+    func clearContentTransition() {
+        beforeReflow = nil
+        afterReflow = nil
+    }
+
+    private func reflowTexture(device: MTLDevice, width: Int, height: Int) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+            width: width, height: height, mipmapped: false)
+        desc.storageMode = .private
+        desc.usage = [.renderTarget, .shaderRead]
+        return device.makeTexture(descriptor: desc)
+    }
 
     private let searchMatchBg: UInt32 = 0xD7BA5A
     private let searchFocusBg: UInt32 = 0xF0883E
     private let searchFg: UInt32 = 0x1B1B1B
 
-    func draw(layer: CAMetalLayer, params p: RenderParams) {
-        guard let ctx = MetalContext.shared else { return }
-        guard p.viewportWidth > 0, p.viewportHeight > 0 else { return }
+    /// The base surface after the same dim and bell covers used by `buildQuads`.
+    func surfaceColor(params p: RenderParams) -> SIMD4<Float> {
+        let background = snapshot.valid ? snapshot.info.background : p.themeBackground
+        var color = rgba(background, p.opacity)
+        if p.dim > 0.001 {
+            let scale = 1 - p.dim * (1 - p.dimFill)
+            color.x *= scale
+            color.y *= scale
+            color.z *= scale
+        }
+        if p.flash > 0.001 {
+            let foreground = rgba(snapshot.valid ? snapshot.info.foreground : p.themeForeground)
+            let amount = 0.22 * p.flash
+            color.x = color.x * (1 - amount) + foreground.x * amount
+            color.y = color.y * (1 - amount) + foreground.y * amount
+            color.z = color.z * (1 - amount) + foreground.z * amount
+        }
+        return color
+    }
+
+    @discardableResult
+    func draw(layer: CAMetalLayer, params p: RenderParams) -> Bool {
+        guard let ctx = MetalContext.shared else { return false }
+        guard p.viewportWidth > 0, p.viewportHeight > 0 else { return false }
         wantsAnotherFrame = false
         // Rasterizing a glyph can wipe a full atlas; quads built before that point to stale
         // texels, so build again against the fresh atlas.
@@ -646,11 +716,34 @@ final class TerminalRenderer {
             buildQuads(p, device: ctx.device)
         }
 
-        guard let drawable = layer.nextDrawable() else { return }
+        guard let drawable = layer.nextDrawable() else { return false }
+        var target = drawable.texture
+        var transition: (before: MTLTexture, after: MTLTexture, progress: Float)?
+        switch p.contentTransition {
+        case .none:
+            clearContentTransition()
+        case .capture:
+            clearContentTransition()
+            beforeReflow = reflowTexture(device: ctx.device, width: p.viewportWidth, height: p.viewportHeight)
+            if let beforeReflow {
+                target = beforeReflow
+                transition = (beforeReflow, beforeReflow, 0)
+            }
+        case .blend(let progress):
+            if let beforeReflow {
+                if afterReflow?.width != p.viewportWidth || afterReflow?.height != p.viewportHeight {
+                    afterReflow = reflowTexture(device: ctx.device, width: p.viewportWidth, height: p.viewportHeight)
+                }
+                if let afterReflow {
+                    target = afterReflow
+                    transition = (beforeReflow, afterReflow, min(1, max(0, progress)))
+                }
+            }
+        }
         let bgColor = snapshot.valid ? snapshot.info.background : p.themeBackground
-        let clear = rgba(bgColor, p.opacity)
+        let clear = p.backgroundInLayer ? SIMD4<Float>.zero : rgba(bgColor, p.opacity)
         let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = drawable.texture
+        pass.colorAttachments[0].texture = target
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].storeAction = .store
         pass.colorAttachments[0].clearColor = MTLClearColor(red: Double(clear.x * clear.w),
@@ -659,7 +752,7 @@ final class TerminalRenderer {
                                                             alpha: Double(clear.w))
         guard let commands = ctx.queue.makeCommandBuffer(),
               let encoder = commands.makeRenderCommandEncoder(descriptor: pass)
-        else { return }
+        else { return false }
 
         // Assemble all quads into one buffer, in paint order.
         allQuads.removeAll(keepingCapacity: true)
@@ -717,9 +810,38 @@ final class TerminalRenderer {
             }
         }
         encoder.endEncoding()
-        commands.present(drawable)
-        commands.commit()
+        if let transition {
+            let composite = MTLRenderPassDescriptor()
+            composite.colorAttachments[0].texture = drawable.texture
+            composite.colorAttachments[0].loadAction = .dontCare
+            composite.colorAttachments[0].storeAction = .store
+            guard let encoder = commands.makeRenderCommandEncoder(descriptor: composite) else {
+                // Complete any encoded work so its in-flight quad buffer is released.
+                commands.commit()
+                ctx.lastCommitted = commands
+                return false
+            }
+            encoder.setRenderPipelineState(ctx.reflowPipeline)
+            encoder.setFragmentTexture(transition.before, index: 0)
+            encoder.setFragmentTexture(transition.after, index: 1)
+            var progress = transition.progress
+            encoder.setFragmentBytes(&progress, length: MemoryLayout<Float>.stride, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            encoder.endEncoding()
+        }
+        if layer.presentsWithTransaction {
+            // AppKit's layout and backdrop updates must land with this image. Apple's
+            // transaction presentation contract requires presenting the drawable directly
+            // after scheduling the commands, rather than via MTLCommandBuffer.present.
+            commands.commit()
+            commands.waitUntilScheduled()
+            drawable.present()
+        } else {
+            commands.present(drawable)
+            commands.commit()
+        }
         ctx.lastCommitted = commands
+        return true
     }
 
     /// The next quad buffer, at least `length` bytes. Waits while the GPU still reads every

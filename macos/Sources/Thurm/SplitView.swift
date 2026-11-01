@@ -371,9 +371,34 @@ final class TabContentView: NSView {
     }
 
     private var targetFrames: [(PaneKey, CGRect)] {
-        let tiled = zoomedPane.map { [($0, showsHeaders ? splitArea : paneArea)] }
-            ?? root.frames(in: splitArea, gap: splitGap)
-        return tiled + shownCards.map { ($0.pane, cardRect($0)) }
+        targetFrames(contentWidth: bounds.width)
+    }
+
+    /// A sidebar changes only the available width. Project the same split/card layout at
+    /// its destination without moving the views or disturbing AppKit's split constraints.
+    private func targetFrames(contentWidth: CGFloat) -> [(PaneKey, CGRect)] {
+        let delta = contentWidth - bounds.width
+        func widened(_ rect: CGRect) -> CGRect {
+            CGRect(x: rect.minX, y: rect.minY, width: max(0, rect.width + delta), height: rect.height)
+        }
+        let area = widened(paneArea), splits = widened(splitArea), floats = widened(floatArea)
+        let zoom = showsHeaders ? splits : area
+        let tiled = zoomedPane.map { [($0, zoom)] } ?? root.frames(in: splits, gap: splitGap)
+        return tiled + shownCards.map {
+            ($0.pane, $0.zoomed ? zoom : FloatingGeometry.rect($0.frame, in: floats))
+        }
+    }
+
+    func sidebarTerminalSizes(contentWidth: CGFloat) -> [PaneKey: CGSize] {
+        Dictionary(targetFrames(contentWidth: contentWidth).map { id, rect in
+            (id, terminalFrame(in: rect, cards: showsHeaders || isFloating(id)).size)
+        }, uniquingKeysWith: { first, _ in first })
+    }
+
+    func beginSidebarResize(contentWidth: CGFloat) {
+        finishLayoutMove()
+        let sizes = sidebarTerminalSizes(contentWidth: contentWidth)
+        for (id, view) in views { view.beginSidebarResize(to: sizes[id]) }
     }
 
     /// Where cards go: the tab below the titlebar, clear of its edges.
@@ -466,10 +491,7 @@ final class TabContentView: NSView {
         }
         for id in paneIds where views[id] == nil {
             let view = TerminalView(pane: id)
-            view.onDimDrawn = { [weak self] in
-                guard let self else { return }
-                if self.showsHeaders || self.isMoving || !self.floating.isEmpty { self.updateBackdrop() }
-            }
+            view.onSurfaceDrawn = { [weak self] in self?.updateBackdrop() }
             views[id] = view
             addSubview(view, positioned: .below, relativeTo: chrome)
         }
@@ -904,11 +926,7 @@ final class TabContentView: NSView {
         let bg = colorFromRGB(cfg.theme.background, alpha: controller?.opacity ?? cfg.opacity)
         fills.append((NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: area.minY - bounds.minY), bg))
         func surface(_ id: PaneKey) -> NSColor {
-            let scale = ChromePalette.dimmedBackgroundScale(drawn: (views[id] ?? leaving[id]?.view)?.dimDrawn ?? 0,
-                                                            dim: cfg.unfocusedSplitDim,
-                                                            isDark: cfg.theme.isDark)
-            let c = [bg.redComponent * scale, bg.greenComponent * scale, bg.blueComponent * scale, bg.alphaComponent]
-            return NSColor(colorSpace: bg.colorSpace, components: c, count: 4)
+            (views[id] ?? leaving[id]?.view)?.surfaceColorDrawn ?? bg
         }
         // Cards are filled by their own back, which hides the splits under them.
         for (id, parts) in cardParts { parts.back.fill = surface(id) }

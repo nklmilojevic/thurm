@@ -48,11 +48,10 @@ const M_SYNC: u16 = vt::mode(2026, false);
 const M_INSERT: u16 = vt::mode(4, true);
 const M_LINE_FEED: u16 = vt::mode(20, true);
 
-/// After a resize erased the prompt: show the next frame once the shell's redraw has been quiet
-/// this long...
-const PROMPT_SETTLE: Duration = Duration::from_millis(10);
-/// ...and at most this long after the resize (a shell that doesn't redraw).
-const PROMPT_HOLD: Duration = Duration::from_millis(100);
+/// After a resize: show the next frame once the program's redraw has been quiet this long...
+const RESIZE_SETTLE: Duration = Duration::from_millis(10);
+/// ...and at most this long after the resize (a program that doesn't redraw).
+const RESIZE_HOLD: Duration = Duration::from_millis(100);
 /// Longest a synchronized update (DEC mode 2026) may hold frames back.
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 
@@ -496,11 +495,12 @@ pub struct Terminal {
     /// Whether the shell redraws its prompt on resize. Default to true, as Ghostty does.
     /// An explicit OSC 133 redraw option stays in effect until the shell changes it.
     shell_redraws: bool,
-    /// Frames held after a resize erased the prompt, until the shell has redrawn it:
-    /// (latest end, current end). Otherwise one frame shows the prompt line empty.
-    prompt_hold: Option<(Instant, Instant)>,
-    /// The shell has sent the input-start mark after a resize.
-    prompt_redraw_ready: bool,
+    /// Frames held after a resize until the program redraws: (latest end, current end).
+    /// A new grid size alone still contains the old layout or an erased prompt.
+    resize_hold: Option<(Instant, Instant)>,
+    /// For a marked prompt, wait for the shell's input-start mark before settling. Other
+    /// programs can settle after any output; shells without integration work this way too.
+    resize_redraw_ready: bool,
     /// When the current synchronized update (DEC mode 2026) began.
     sync_since: Option<Instant>,
     alt_screen: bool,
@@ -556,8 +556,8 @@ impl Terminal {
             prompt_start: None,
             at_prompt: false,
             shell_redraws: true,
-            prompt_hold: None,
-            prompt_redraw_ready: false,
+            resize_hold: None,
+            resize_redraw_ready: false,
             sync_since: None,
             alt_screen: false,
             events: Vec::new(),
@@ -766,13 +766,13 @@ impl Terminal {
         }
         self.after_write();
         self.check_images();
-        // Settings and title updates can arrive before the prompt is drawn.
-        // Start the short timer only after the shell marks the end of its prompt.
-        if self.prompt_redraw_ready
+        // Debounce redraws split across PTY reads. At a marked prompt, settings and title
+        // updates can arrive first: wait for the input-start mark before starting this timer.
+        if self.resize_redraw_ready
             && !bytes.is_empty()
-            && let Some((latest, end)) = &mut self.prompt_hold
+            && let Some((latest, end)) = &mut self.resize_hold
         {
-            *end = (self.last_output + PROMPT_SETTLE).min(*latest);
+            *end = (self.last_output + RESIZE_SETTLE).min(*latest);
         }
     }
 
@@ -804,12 +804,12 @@ impl Terminal {
         self.forward.take().unwrap_or_default()
     }
 
-    /// When frames held back end: a synchronized update (DEC mode 2026) timing out, or the
-    /// prompt redraw after a resize settling. `None` when nothing is held.
+    /// When frames held back end: a synchronized update (DEC mode 2026) timing out, or
+    /// a redraw after a resize settling. `None` when nothing is held.
     pub fn sync_deadline(&self) -> Option<Instant> {
         let sync = self.sync_since.map(|s| s + SYNC_TIMEOUT);
-        let prompt = self.prompt_hold.map(|(_, end)| end);
-        match (sync, prompt) {
+        let resize = self.resize_hold.map(|(_, end)| end);
+        match (sync, resize) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -818,8 +818,8 @@ impl Terminal {
     /// Finish whatever held frames and whose deadline expired.
     pub fn flush_sync(&mut self) {
         let now = Instant::now();
-        if self.prompt_hold.is_some_and(|(_, end)| end <= now) {
-            self.prompt_hold = None;
+        if self.resize_hold.is_some_and(|(_, end)| end <= now) {
+            self.resize_hold = None;
         }
         if self.sync_since.is_some_and(|s| s + SYNC_TIMEOUT <= now) {
             self.vt.set_mode(M_SYNC, false);
@@ -829,9 +829,9 @@ impl Terminal {
         self.collect_events();
     }
 
-    /// Whether frames should be held back (a synchronized update, or a prompt redraw).
+    /// Whether frames should be held back (a synchronized update, or a resize redraw).
     pub fn in_sync(&self) -> bool {
-        self.sync_since.is_some() || self.prompt_hold.is_some()
+        self.sync_since.is_some() || self.resize_hold.is_some()
     }
 
     pub fn drain_events(&mut self) -> Vec<TermEvent> {
@@ -905,14 +905,17 @@ impl Terminal {
         self.size = size;
         let cols = size.cols.max(2);
         let rows = size.rows.max(1);
-        // libghostty-vt clears a prompt the shell redraws (OSC 133;A;redraw=1); keep showing
-        // the old frame until the shell has drawn the new one.
-        if self.at_prompt && self.shell_redraws && !self.is_alt_screen() {
+        // libghostty-vt clears a prompt the shell redraws (OSC 133;A;redraw=1).
+        let prompt = self.at_prompt && self.shell_redraws && !self.is_alt_screen();
+        if prompt {
             self.clear_prompt_before_resize();
-            let latest = Instant::now() + PROMPT_HOLD;
-            self.prompt_hold = Some((latest, latest));
-            self.prompt_redraw_ready = false;
         }
+        // Resizing the grid precedes the program's SIGWINCH redraw. Keep the previous
+        // image until that redraw settles, rather than publishing old-width content in a
+        // new-width frame first. The deadline also releases silent programs and dead peers.
+        let latest = Instant::now() + RESIZE_HOLD;
+        self.resize_hold = Some((latest, latest));
+        self.resize_redraw_ready = !prompt;
         self.vt
             .resize(cols, rows, size.cell_width as u32, size.cell_height as u32);
         self.cols = cols as usize;
@@ -1094,7 +1097,7 @@ impl Terminal {
             }
             OscEvent::InputStart => {
                 self.mark_prompt();
-                self.prompt_redraw_ready = true;
+                self.resize_redraw_ready = true;
             }
             OscEvent::ShellPath(p) => {
                 // Only the pane's own shell knows the token: program output (`cat`, a remote
@@ -1362,7 +1365,12 @@ impl Terminal {
     /// Build a frame for a client, containing only what changed since the last frame that
     /// client received. Returns `None` when nothing changed.
     pub fn snapshot(&mut self, pane: proto::PaneId, view: &mut ClientView) -> Option<Snapshot> {
-        if self.prompt_hold.is_some() {
+        // The renderer can poll for a frame independently of output notifications (a
+        // resize or cursor blink). It must not expose a partially redrawn screen then.
+        if self.sync_deadline().is_some_and(|d| d <= Instant::now()) {
+            self.flush_sync();
+        }
+        if self.in_sync() {
             return None;
         }
         // Hyperlink ids are handed out as rows are drawn, and every new one grew the table

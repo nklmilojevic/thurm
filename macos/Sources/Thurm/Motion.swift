@@ -10,8 +10,13 @@ enum Motion {
 
     /// Small state changes: selection, focus dimming, toasts, divider highlight.
     static var fast: TimeInterval { 0.048 * speed.scale }
-    /// Layout moves: sidebar, zoom and tab drag.
+    /// Short layout moves, such as tab drag.
     static var standard: TimeInterval { 0.072 * speed.scale }
+    /// A sidebar moves a whole window of text; accelerate and settle gently at both ends.
+    static var sidebar: TimeInterval { 0.34 * speed.scale }
+    static let sidebarTimingFunction = CAMediaTimingFunction(controlPoints: 0.42, 0, 0.58, 1)
+    /// Blend a program's old and new line wrapping while the sidebar is moving.
+    static var sidebarReflow: TimeInterval { 0.20 * speed.scale }
     /// The one-shot attention ring on a tab.
     static let pulse: TimeInterval = 0.6
 
