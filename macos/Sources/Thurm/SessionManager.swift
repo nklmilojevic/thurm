@@ -1608,10 +1608,11 @@ final class SessionManager: NSObject, CoreDelegate {
             }
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
             takeHiddenTab(pane)
+            // Placed in cells, it goes on the tab of the pane it counts from.
             var anchor: UInt64? = nil
-            if case let .cells(a, _, _, _, _) = place { anchor = a }
-            let host = key("target").flatMap { controller(for: $0) }
-                ?? anchor.flatMap { controller(for: PaneKey(daemon, $0)) }
+            if case let .cells(a, _, _, _) = place { anchor = a }
+            let host = anchor.flatMap { controller(for: PaneKey(daemon, $0)) }
+                ?? key("target").flatMap { controller(for: $0) }
                 ?? (currentController?.host == daemon ? currentController : nil)
             if let host, !host.isQuick {
                 host.content.addNewFloating(pane, place: place, takeFocus: !background)

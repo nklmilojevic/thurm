@@ -1365,8 +1365,8 @@ pub enum UiCommand {
     },
     // Postcard encodes a variant by its index: new variants go last, so older peers still
     // decode the ones before them.
-    /// [`UiCommand::OpenFloating`] at `place`. With [`FloatPlace::Cells`], `target` defaults to
-    /// the anchor. Needs [`CAP_FLOATING_PLACE`].
+    /// [`UiCommand::OpenFloating`] at `place`. With [`FloatPlace::Cells`], on the anchor's tab
+    /// (`target` is then the anchor or a pane of its tab). Needs [`CAP_FLOATING_PLACE`].
     OpenFloatingAt {
         pane: PaneId,
         target: Option<PaneId>,
@@ -1388,9 +1388,10 @@ pub enum FloatPlace {
     /// `[x, y, width, height]` as fractions of the tab's area, from its top left corner (as
     /// [`FloatingPane::frame`]).
     Fraction([f64; 4]),
-    /// The card whose terminal is `cols` by `rows` cells, its first cell `col` cells right of
-    /// and `row` cells below the first cell of `anchor`, a pane of the same tab. Either may be
-    /// negative or past the anchor's edge; the app keeps the card inside the tab.
+    /// The card whose terminal is `cols` (at least 2) by `rows` cells, its first cell `col`
+    /// cells right of and `row` cells below the first cell of `anchor`; the card goes on
+    /// `anchor`'s tab. Either may be negative or past the anchor's edge; the app keeps the card
+    /// inside the tab, and keeps its size in cells when the tab is resized.
     Cells {
         anchor: PaneId,
         col: i32,

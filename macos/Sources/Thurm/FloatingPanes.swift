@@ -7,17 +7,17 @@ struct FloatingCard: Equatable {
     var frame: CGRect
     /// Shown over the whole tab.
     var zoomed = false
-    /// Placed at a size in cells: kept below the size of a card made by hand.
-    var exact = false
+    /// Placed in cells: its terminal keeps this size, below the size of a card made by hand.
+    var cells: CardCells?
 
-    init(pane: PaneKey, frame: CGRect, zoomed: Bool = false, exact: Bool = false) {
+    init(pane: PaneKey, frame: CGRect, zoomed: Bool = false, cells: CardCells? = nil) {
         self.pane = pane
         self.frame = frame
         self.zoomed = zoomed
-        self.exact = exact
+        self.cells = cells
     }
 
-    var minSize: CGSize { exact ? FloatingGeometry.exactMinSize : FloatingGeometry.minSize }
+    var minSize: CGSize { cells == nil ? FloatingGeometry.minSize : FloatingGeometry.exactMinSize }
 
     init(_ saved: FloatingPane) {
         let f = saved.frame.count == 4 ? saved.frame.map { CGFloat($0) } : {
@@ -25,12 +25,12 @@ struct FloatingCard: Equatable {
             return [d.minX, d.minY, d.width, d.height]
         }()
         self.init(pane: saved.pane, frame: CGRect(x: f[0], y: f[1], width: f[2], height: f[3]), zoomed: saved.zoomed,
-                  exact: saved.exact)
+                  cells: saved.cells)
     }
 
     var saved: FloatingPane {
         FloatingPane(pane: pane, frame: [frame.minX, frame.minY, frame.width, frame.height].map(Double.init),
-                     zoomed: zoomed, exact: exact)
+                     zoomed: zoomed, cells: cells)
     }
 }
 
@@ -68,16 +68,38 @@ enum FloatingGeometry {
                       width: rect.width / area.width, height: rect.height / area.height)
     }
 
-    /// The card whose terminal is `cols`×`rows` cells, its first cell (`col`, `row`) cells from
-    /// the first cell of a terminal view at `anchor` (both with `cell` and `padding`). The
-    /// inverse of `TabContentView.terminalFrame(in:cards:)`: a 1pt border, and the header on top.
+    /// The size of a card whose terminal is `cells` (with `cell` and `padding`). The inverse of
+    /// `TabContentView.terminalFrame(in:cards:)`: a 1pt border, and the header on top.
+    static func cardSize(_ cells: CardCells, cell: CGSize, padding: CGPoint) -> CGSize {
+        CGSize(width: CGFloat(cells.cols) * cell.width + 2 * padding.x + 2,
+               height: CGFloat(cells.rows) * cell.height + 2 * padding.y + PaneHeader.height + 2)
+    }
+
+    /// The cells of a card's terminal `size` (its rectangle with `cardSize`'s border and header).
+    static func cells(of size: CGSize, cell: CGSize, padding: CGPoint) -> CardCells? {
+        guard cell.width > 0, cell.height > 0 else { return nil }
+        return CardCells(cols: max(2, Int(((size.width - 2 - 2 * padding.x) / cell.width).rounded())),
+                         rows: max(1, Int(((size.height - 2 - PaneHeader.height - 2 * padding.y) / cell.height).rounded())))
+    }
+
+    /// The card whose terminal is `cells`, its first cell (`col`, `row`) cells from the first
+    /// cell of a terminal view at `anchor` (both with `cell` and `padding`).
     static func cardRect(anchor: CGPoint, cell: CGSize, padding: CGPoint,
-                         col: Int, row: Int, cols: Int, rows: Int) -> CGRect {
-        let terminal = CGRect(x: anchor.x + CGFloat(col) * cell.width, y: anchor.y + CGFloat(row) * cell.height,
-                              width: CGFloat(cols) * cell.width + 2 * padding.x,
-                              height: CGFloat(rows) * cell.height + 2 * padding.y)
-        return CGRect(x: terminal.minX - 1, y: terminal.minY - PaneHeader.height - 1,
-                      width: terminal.width + 2, height: terminal.height + PaneHeader.height + 2)
+                         col: Int, row: Int, cells: CardCells) -> CGRect {
+        let size = cardSize(cells, cell: cell, padding: padding)
+        return CGRect(x: anchor.x + CGFloat(col) * cell.width - 1,
+                      y: anchor.y + CGFloat(row) * cell.height - PaneHeader.height - 1,
+                      width: size.width, height: size.height)
+    }
+
+    /// A card placed in cells, in `area`: at `fraction`'s position, sized to `cells` whatever the
+    /// area's size, and wholly inside the area.
+    static func rect(_ fraction: CGRect, cells: CardCells, cell: CGSize, padding: CGPoint, in area: CGRect) -> CGRect {
+        guard area.width > 0, area.height > 0 else { return rect(fraction, in: area, minSize: exactMinSize) }
+        let size = cardSize(cells, cell: cell, padding: padding)
+        let sized = CGRect(x: fraction.minX, y: fraction.minY,
+                           width: size.width / area.width, height: size.height / area.height)
+        return rect(sized, in: area, minSize: exactMinSize)
     }
 
     /// The fraction of a new card: centered, cascading by `index` so several stay apart.

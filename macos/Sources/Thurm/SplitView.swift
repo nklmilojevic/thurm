@@ -384,10 +384,15 @@ final class TabContentView: NSView {
                       height: max(0, bounds.height - inset.top - inset.bottom)).insetBy(dx: 8, dy: 8)
     }
 
-    /// A card's rectangle; zoomed, the space a zoomed pane of the splits takes.
+    /// A card's rectangle; zoomed, the space a zoomed pane of the splits takes. A card placed in
+    /// cells keeps its terminal's size in cells, whatever the tab's size.
     private func cardRect(_ card: FloatingCard) -> CGRect {
-        card.zoomed ? (showsHeaders ? splitArea : paneArea)
-            : FloatingGeometry.rect(card.frame, in: floatArea, minSize: card.minSize)
+        if card.zoomed { return showsHeaders ? splitArea : paneArea }
+        if let cells = card.cells, let view = views[card.pane] {
+            return FloatingGeometry.rect(card.frame, cells: cells, cell: view.gridCellSize,
+                                         padding: view.gridPadding, in: floatArea)
+        }
+        return FloatingGeometry.rect(card.frame, in: floatArea, minSize: card.minSize)
     }
 
     /// The cards' rectangles as laid out now, back to front.
@@ -991,6 +996,11 @@ final class TabContentView: NSView {
                                                 by: CGVector(dx: p.x - r.from.x, dy: p.y - r.from.y), in: area,
                                                 minSize: floating[i].minSize)
             floating[i].frame = FloatingGeometry.fraction(of: rect, in: area)
+            // A card placed in cells stays one, in whole cells of its new size.
+            if floating[i].cells != nil, let view = views[r.pane],
+               let cells = FloatingGeometry.cells(of: rect.size, cell: view.gridCellSize, padding: view.gridPadding) {
+                floating[i].cells = cells
+            }
             needsLayout = true
             return
         }
@@ -1393,9 +1403,10 @@ final class TabContentView: NSView {
     func addNewFloating(_ pane: PaneKey, place: FloatPlace? = nil, takeFocus: Bool = true) {
         guard !contains(pane) else { return }
         let placed = place.flatMap { cardFrame(for: $0) }
+        if place != nil && placed == nil { tlog("new floating pane \(pane): its place's anchor is not shown here") }
         let frame = placed?.frame ?? FloatingGeometry.defaultFraction(index: floating.count)
         transitionLayout {
-            floating.append(FloatingCard(pane: pane, frame: frame, exact: placed?.exact ?? false))
+            floating.append(FloatingCard(pane: pane, frame: frame, cells: placed?.cells))
             floatingHidden = false
         }
         if takeFocus { focus(pane) }
@@ -1417,7 +1428,7 @@ final class TabContentView: NSView {
               let i = floating.firstIndex(where: { $0.pane == pane }) else { return false }
         transitionLayout {
             floating[i].frame = placed.frame
-            floating[i].exact = placed.exact
+            floating[i].cells = placed.cells
             floating[i].zoomed = false
             floatingHidden = false
         }
@@ -1426,15 +1437,15 @@ final class TabContentView: NSView {
         return true
     }
 
-    /// A card's frame for `place`, as fractions of the cards' area, and whether it was placed in
-    /// cells. With cells, the card's terminal is `cols`×`rows` cells of the anchor's font, its
+    /// A card's frame for `place`, as fractions of the cards' area, and its terminal's size in
+    /// cells when placed in cells: then its terminal is that many cells of the anchor's font, its
     /// first cell over the anchor's (`col`, `row`) cell; nil when the anchor is not shown in this
     /// tab (or is `excluding`, the card being placed).
-    func cardFrame(for place: FloatPlace, excluding: PaneKey? = nil) -> (frame: CGRect, exact: Bool)? {
+    func cardFrame(for place: FloatPlace, excluding: PaneKey? = nil) -> (frame: CGRect, cells: CardCells?)? {
         switch place {
         case .fraction(let frame):
-            return (frame, false)
-        case let .cells(anchorID, col, row, cols, rows):
+            return (frame, nil)
+        case let .cells(anchorID, col, row, size):
             // Where layout puts the anchor's terminal, not where it is mid-move.
             guard let anchor = paneIds.first(where: { $0.id == anchorID }), anchor != excluding,
                   let view = views[anchor],
@@ -1442,8 +1453,8 @@ final class TabContentView: NSView {
             let terminal = showsHeaders || isFloating(anchor) ? terminalFrame(in: rect, cards: true) : rect
             let card = FloatingGeometry.cardRect(anchor: terminal.origin,
                                                  cell: view.gridCellSize, padding: view.gridPadding,
-                                                 col: col, row: row, cols: cols, rows: rows)
-            return (FloatingGeometry.fraction(of: card, in: floatArea), true)
+                                                 col: col, row: row, cells: size)
+            return (FloatingGeometry.fraction(of: card, in: floatArea), size)
         }
     }
 

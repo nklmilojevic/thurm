@@ -98,10 +98,11 @@ pub struct FloatingPane {
     /// Shown over the whole tab.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub zoomed: bool,
-    /// Placed at a size in cells ([`crate::FloatPlace::Cells`]): kept as small as it was made,
-    /// below the size a card dragged by hand keeps to.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub exact: bool,
+    /// `[cols, rows]`: its terminal's size in cells, for a card placed in cells
+    /// ([`crate::FloatPlace::Cells`]). The app sizes the card to it whatever the tab's size (only
+    /// its position follows `frame`), and lets it be smaller than a card made by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cells: Option<[u16; 2]>,
 }
 
 impl TabLayout {
@@ -212,6 +213,19 @@ impl LayoutNode {
 }
 
 impl Layout {
+    /// The tab showing this daemon's `pane`, in a window, a workspace or the quick terminal.
+    pub fn tab_of(&self, pane: PaneId) -> Option<&TabLayout> {
+        let tabs = self.windows.iter().flat_map(|w| &w.tabs);
+        let mut tabs = tabs
+            .chain(self.workspaces.iter().flat_map(|w| &w.tabs))
+            .chain(&self.quick);
+        tabs.find(|t| {
+            let mut panes = Vec::new();
+            t.panes(&mut panes);
+            panes.contains(&pane)
+        })
+    }
+
     /// This daemon's panes (remote leaves are left out).
     pub fn panes(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
@@ -510,7 +524,7 @@ mod tests {
             host: host.map(Into::into),
             frame: [0.2, 0.2, 0.5, 0.5],
             zoomed: false,
-            exact: false,
+            cells: None,
         };
         let mut l = sample();
         // A tab without floating panes says nothing of them, and older layouts have none.
@@ -540,7 +554,7 @@ mod tests {
             host: None,
             frame: [0.2, 0.2, 0.5, 0.5],
             zoomed: false,
-            exact: false,
+            cells: None,
         };
         let mut l = sample();
         let tab = &mut l.windows[0].tabs[1];
@@ -564,7 +578,7 @@ mod tests {
             host: None,
             frame: [0.1, 0.1, 0.4, 0.4],
             zoomed: true,
-            exact: false,
+            cells: None,
         };
         let mut l = sample();
         let tab = &mut l.windows[0].tabs[1];
@@ -579,5 +593,30 @@ mod tests {
         // The tab goes with its last pane.
         l.retain_panes(&|id| id != 6 && id != 7);
         assert_eq!(l.windows[0].tabs.len(), 1);
+    }
+
+    #[test]
+    fn the_tab_of_a_pane() {
+        let mut l = sample();
+        l.windows[0].tabs[1].floating = vec![FloatingPane {
+            id: 6,
+            host: None,
+            frame: [0.1, 0.1, 0.4, 0.4],
+            zoomed: false,
+            cells: Some([40, 10]),
+        }];
+        let tab = |pane| l.tab_of(pane).map(|t| t.focused);
+        assert_eq!(tab(1), Some(2));
+        assert_eq!(tab(2), Some(2));
+        // A floating pane, a hidden workspace's and the quick terminal's.
+        assert_eq!(tab(6), Some(3));
+        assert_eq!(tab(4), Some(4));
+        assert_eq!(tab(5), Some(5));
+        assert_eq!(tab(9), None);
+        assert!(
+            serde_json::to_string(&l)
+                .unwrap()
+                .contains(r#""cells":[40,10]"#)
+        );
     }
 }

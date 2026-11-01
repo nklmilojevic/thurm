@@ -691,11 +691,13 @@ struct PlaceArgs {
     /// Its card as fractions of the tab's area, from the top left: `0.1,0.1,0.5,0.4`.
     #[arg(long, value_name = "X,Y,W,H", value_parser = parse_frame, conflicts_with = "cells")]
     frame: Option<[f64; 4]>,
-    /// Its terminal COLSxROWS cells, its first cell COL, ROW cells from the anchor's first cell
-    /// (may be negative): `2,1,40x10`.
+    /// Its terminal COLSxROWS cells (at least 2 columns), its first cell COL, ROW cells from the
+    /// anchor's first cell (may be negative): `2,1,40x10`. It keeps that size when the window
+    /// is resized.
     #[arg(long, value_name = "COL,ROW,COLSxROWS", value_parser = parse_cells)]
     cells: Option<(i32, i32, u16, u16)>,
-    /// The pane `--cells` counts from, in the same tab (default: the current pane).
+    /// The pane `--cells` counts from, in the same tab (default: the current pane). A card
+    /// can't count from itself: placing the current pane needs another pane here.
     #[arg(long, value_name = "PANE", requires = "cells")]
     anchor: Option<PaneId>,
 }
@@ -757,10 +759,41 @@ fn parse_cells(s: &str) -> Result<(i32, i32, u16, u16), String> {
     let row = row.trim().parse().map_err(|_| bad())?;
     let cols: u16 = cols.trim().parse().map_err(|_| bad())?;
     let rows: u16 = rows.trim().parse().map_err(|_| bad())?;
-    if cols == 0 || rows == 0 {
-        return Err("the size can't be 0".into());
+    if cols < 2 || rows == 0 {
+        return Err("the size is at least 2 columns by 1 row".into());
     }
     Ok((col, row, cols, rows))
+}
+
+/// Refuses a `--cells` anchor that doesn't exist, or isn't in the tab of `pane` (when given),
+/// before anything changes: the app would have nowhere to count from.
+fn check_anchor(
+    c: &Client,
+    place: Option<&FloatPlace>,
+    pane: Option<PaneId>,
+) -> Result<(), String> {
+    let Some(anchor) = place.and_then(FloatPlace::anchor) else {
+        return Ok(());
+    };
+    if pane_info(c, anchor).is_none() {
+        return Err(format!("no pane {anchor}"));
+    }
+    let Some(pane) = pane.filter(|&p| p != anchor) else {
+        return Ok(());
+    };
+    // No layout saved yet (or an unreadable one): nothing to check against.
+    let Ok(Response::Layout(Some(json))) = c.request(Request::GetLayout) else {
+        return Ok(());
+    };
+    let Ok(layout) = serde_json::from_str::<thurm_proto::Layout>(&json) else {
+        return Ok(());
+    };
+    match (layout.tab_of(pane), layout.tab_of(anchor)) {
+        (Some(a), Some(b)) if !std::ptr::eq(a, b) => Err(format!(
+            "pane {anchor} (--anchor) is not in the tab of pane {pane}"
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn current_pane(p: Option<PaneId>) -> Result<PaneId, String> {
@@ -1506,6 +1539,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                         "--cells counts from another pane of the tab: pass --anchor".to_string()
                     })
             })?;
+            check_anchor(c, place.as_ref(), Some(pane))?;
             if let Some(place) = place {
                 layout_ui(c, UiCommand::PlaceFloating { pane, place })?;
                 return Ok(ExitCode::SUCCESS);
@@ -1539,13 +1573,15 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                 target
                     .ok_or_else(|| "--cells needs a pane to count from: pass --anchor".to_string())
             })?;
+            check_anchor(c, place.as_ref(), pane)?;
             let new = create(c, command, cwd, target, hold || wait, None)?;
             if let Some(place) = place {
                 match ui(
                     c,
                     UiCommand::OpenFloatingAt {
                         pane: new,
-                        target,
+                        // With cells, the card goes where it counts from.
+                        target: place.anchor().or(target),
                         place,
                         background,
                     },
@@ -2420,6 +2456,10 @@ mod tests {
         assert!(parse_cells("2,1").is_err());
         assert!(parse_cells("2,1,40").is_err());
         assert!(parse_cells("2,1,0x10").is_err());
+        // The terminal is at least 2 columns wide.
+        assert!(parse_cells("2,1,1x10").is_err());
+        assert!(parse_cells("2,1,2x0").is_err());
+        assert_eq!(parse_cells("2,1,2x1"), Ok((2, 1, 2, 1)));
         assert!(parse_cells("2,1,40x10,9").is_err());
         assert_eq!(parse_frame("0.1,0.2,0.5,0.4"), Ok([0.1, 0.2, 0.5, 0.4]));
         assert!(parse_frame("0.1,0.2,0.5").is_err());

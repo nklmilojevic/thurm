@@ -89,8 +89,9 @@ final class FloatingPaneTests: XCTestCase {
 
     func testCardsPlacedInCellsFitTheirTerminal() {
         let cell = CGSize(width: 8, height: 17), pad = CGPoint(x: 4, y: 2)
+        let size = CardCells(cols: 40, rows: 10)!
         let card = FloatingGeometry.cardRect(anchor: CGPoint(x: 100, y: 200), cell: cell, padding: pad,
-                                             col: 2, row: -1, cols: 40, rows: 10)
+                                             col: 2, row: -1, cells: size)
         // Its terminal: the 1pt border and the header off, then the padding off: 40x10 cells
         // whose first cell is over the anchor's cell (2, -1).
         let terminal = CGRect(x: card.minX + 1, y: card.minY + 1 + PaneHeader.height,
@@ -99,14 +100,32 @@ final class FloatingPaneTests: XCTestCase {
         XCTAssertEqual(terminal.minY + pad.y, 200 + pad.y - cell.height)
         XCTAssertEqual((terminal.width - 2 * pad.x) / cell.width, 40)
         XCTAssertEqual((terminal.height - 2 * pad.y) / cell.height, 10)
+        XCTAssertEqual(FloatingGeometry.cells(of: card.size, cell: cell, padding: pad), size)
+    }
+
+    func testCardsPlacedInCellsKeepTheirSizeWhenTheTabResizes() {
+        let cell = CGSize(width: 8, height: 17), pad = CGPoint(x: 4, y: 2)
+        let size = CardCells(cols: 40, rows: 10)!
+        let expected = FloatingGeometry.cardSize(size, cell: cell, padding: pad)
+        let fraction = CGRect(x: 0.2, y: 0.3, width: 0.1, height: 0.1)
+        for area in [CGRect(x: 0, y: 40, width: 1000, height: 600), CGRect(x: 0, y: 40, width: 1600, height: 900),
+                     CGRect(x: 0, y: 40, width: 700, height: 500)] {
+            let rect = FloatingGeometry.rect(fraction, cells: size, cell: cell, padding: pad, in: area)
+            XCTAssertEqual(rect.size, expected, "\(area)")
+            XCTAssertEqual(FloatingGeometry.cells(of: rect.size, cell: cell, padding: pad), size)
+            // Its position still follows the tab.
+            XCTAssertEqual(rect.minX, area.minX + 0.2 * area.width, accuracy: 1)
+        }
         // Small cards placed in cells keep their size; ones made by hand grow to the minimum.
         let small = FloatingGeometry.fraction(of: CGRect(x: 300, y: 300, width: 100, height: 60), in: area)
         XCTAssertEqual(FloatingGeometry.rect(small, in: area, minSize: FloatingGeometry.exactMinSize).size,
                        CGSize(width: 100, height: 60))
         XCTAssertEqual(FloatingGeometry.rect(small, in: area).size, FloatingGeometry.minSize)
-        let card2 = FloatingCard(FloatingPane(pane: key(3), frame: [0.1, 0.1, 0.1, 0.1], exact: true))
-        XCTAssertEqual(card2.minSize, FloatingGeometry.exactMinSize)
-        XCTAssertTrue(card2.saved.exact)
+        let saved = FloatingCard(FloatingPane(pane: key(3), frame: [0.1, 0.1, 0.1, 0.1], cells: CardCells(cols: 2, rows: 1)))
+        XCTAssertEqual(saved.minSize, FloatingGeometry.exactMinSize)
+        XCTAssertEqual(saved.saved.cells, CardCells(cols: 2, rows: 1))
+        // The terminal is at least 2 columns.
+        XCTAssertNil(CardCells(cols: 1, rows: 5))
     }
 
     /// `thurm_proto::FloatPlace` as serde writes it.
@@ -116,7 +135,8 @@ final class FloatingPaneTests: XCTestCase {
         }
         XCTAssertEqual(try place(#"{"Fraction":[0.1,0.2,0.5,0.4]}"#), .fraction(CGRect(x: 0.1, y: 0.2, width: 0.5, height: 0.4)))
         XCTAssertEqual(try place(#"{"Cells":{"anchor":7,"col":-2,"row":3,"cols":40,"rows":10}}"#),
-                       .cells(anchor: 7, col: -2, row: 3, cols: 40, rows: 10))
+                       .cells(anchor: 7, col: -2, row: 3, size: CardCells(cols: 40, rows: 10)!))
+        XCTAssertNil(try place(#"{"Cells":{"anchor":7,"col":0,"row":0,"cols":1,"rows":10}}"#))
         XCTAssertNil(try place(#"{"Fraction":[0.1,0.2,0,0.4]}"#))
         XCTAssertNil(try place(#"{"Cells":{"anchor":7,"col":0,"row":0,"cols":0,"rows":10}}"#))
         XCTAssertNil(try place(#"{"Somewhere":[1]}"#))
@@ -148,11 +168,11 @@ final class FloatingPaneTests: XCTestCase {
         let encoded = String(decoding: try JSONEncoder().encode(plain), as: UTF8.self)
         XCTAssertFalse(encoded.contains("floating"))
         XCTAssertFalse(encoded.contains("zoomed\":true"))
-        // A card placed in cells says so; others leave it out.
-        let exact = try JSONDecoder().decode(FloatingPane.self, from: Data(#"{"id":4,"frame":[0,0,0.1,0.1],"exact":true}"#.utf8))
-        XCTAssertTrue(exact.exact)
-        XCTAssertTrue(String(decoding: try JSONEncoder().encode(exact), as: UTF8.self).contains("\"exact\":true"))
-        XCTAssertFalse(String(decoding: try JSONEncoder().encode(tab), as: UTF8.self).contains("exact"))
+        // A card placed in cells keeps its size in cells; others leave it out.
+        let cells = try JSONDecoder().decode(FloatingPane.self, from: Data(#"{"id":4,"frame":[0,0,0.1,0.1],"cells":[40,10]}"#.utf8))
+        XCTAssertEqual(cells.cells, CardCells(cols: 40, rows: 10))
+        XCTAssertTrue(String(decoding: try JSONEncoder().encode(cells), as: UTF8.self).contains("\"cells\":[40,10]"))
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(tab), as: UTF8.self).contains("cells"))
     }
 
     /// Same as `retain_tabs` on the Rust side: cards go with their panes, and the frontmost one
