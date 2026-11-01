@@ -7,24 +7,30 @@ struct FloatingCard: Equatable {
     var frame: CGRect
     /// Shown over the whole tab.
     var zoomed = false
+    /// Placed at a size in cells: kept below the size of a card made by hand.
+    var exact = false
 
-    init(pane: PaneKey, frame: CGRect, zoomed: Bool = false) {
+    init(pane: PaneKey, frame: CGRect, zoomed: Bool = false, exact: Bool = false) {
         self.pane = pane
         self.frame = frame
         self.zoomed = zoomed
+        self.exact = exact
     }
+
+    var minSize: CGSize { exact ? FloatingGeometry.exactMinSize : FloatingGeometry.minSize }
 
     init(_ saved: FloatingPane) {
         let f = saved.frame.count == 4 ? saved.frame.map { CGFloat($0) } : {
             let d = FloatingGeometry.defaultFraction(index: 0)
             return [d.minX, d.minY, d.width, d.height]
         }()
-        self.init(pane: saved.pane, frame: CGRect(x: f[0], y: f[1], width: f[2], height: f[3]), zoomed: saved.zoomed)
+        self.init(pane: saved.pane, frame: CGRect(x: f[0], y: f[1], width: f[2], height: f[3]), zoomed: saved.zoomed,
+                  exact: saved.exact)
     }
 
     var saved: FloatingPane {
         FloatingPane(pane: pane, frame: [frame.minX, frame.minY, frame.width, frame.height].map(Double.init),
-                     zoomed: zoomed)
+                     zoomed: zoomed, exact: exact)
     }
 }
 
@@ -41,11 +47,13 @@ struct FloatingEdges: OptionSet, Hashable {
 enum FloatingGeometry {
     /// A card is never smaller than this, nor larger than its area.
     static let minSize = CGSize(width: 280, height: 160)
+    /// The least a card placed in cells keeps to: its header and a row of a few cells.
+    static let exactMinSize = CGSize(width: 32, height: PaneHeader.height + 20)
     /// How far either side of a card's edge a drag resizes it.
     static let band: CGFloat = 5
 
     /// The card for `fraction` of `area`, at least `minSize` and wholly inside the area.
-    static func rect(_ fraction: CGRect, in area: CGRect) -> CGRect {
+    static func rect(_ fraction: CGRect, in area: CGRect, minSize: CGSize = FloatingGeometry.minSize) -> CGRect {
         let w = min(max(fraction.width * area.width, minSize.width), area.width)
         let h = min(max(fraction.height * area.height, minSize.height), area.height)
         let x = min(max(area.minX + fraction.minX * area.width, area.minX), area.maxX - w)
@@ -58,6 +66,18 @@ enum FloatingGeometry {
         guard area.width > 0, area.height > 0 else { return rect }
         return CGRect(x: (rect.minX - area.minX) / area.width, y: (rect.minY - area.minY) / area.height,
                       width: rect.width / area.width, height: rect.height / area.height)
+    }
+
+    /// The card whose terminal is `cols`×`rows` cells, its first cell (`col`, `row`) cells from
+    /// the first cell of a terminal view at `anchor` (both with `cell` and `padding`). The
+    /// inverse of `TabContentView.terminalFrame(in:cards:)`: a 1pt border, and the header on top.
+    static func cardRect(anchor: CGPoint, cell: CGSize, padding: CGPoint,
+                         col: Int, row: Int, cols: Int, rows: Int) -> CGRect {
+        let terminal = CGRect(x: anchor.x + CGFloat(col) * cell.width, y: anchor.y + CGFloat(row) * cell.height,
+                              width: CGFloat(cols) * cell.width + 2 * padding.x,
+                              height: CGFloat(rows) * cell.height + 2 * padding.y)
+        return CGRect(x: terminal.minX - 1, y: terminal.minY - PaneHeader.height - 1,
+                      width: terminal.width + 2, height: terminal.height + PaneHeader.height + 2)
     }
 
     /// The fraction of a new card: centered, cascading by `index` so several stay apart.
@@ -78,7 +98,8 @@ enum FloatingGeometry {
 
     /// `rect` with `edges` moved by `delta`, kept at least `minSize` and inside `area`; the
     /// opposite edges hold still.
-    static func resized(_ rect: CGRect, edges: FloatingEdges, by delta: CGVector, in area: CGRect) -> CGRect {
+    static func resized(_ rect: CGRect, edges: FloatingEdges, by delta: CGVector, in area: CGRect,
+                        minSize: CGSize = FloatingGeometry.minSize) -> CGRect {
         var (minX, minY, maxX, maxY) = (rect.minX, rect.minY, rect.maxX, rect.maxY)
         let minW = min(minSize.width, area.width), minH = min(minSize.height, area.height)
         if edges.contains(.left) { minX = min(max(area.minX, minX + delta.dx), maxX - minW) }

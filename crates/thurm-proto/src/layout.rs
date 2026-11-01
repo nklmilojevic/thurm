@@ -98,6 +98,10 @@ pub struct FloatingPane {
     /// Shown over the whole tab.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub zoomed: bool,
+    /// Placed at a size in cells ([`crate::FloatPlace::Cells`]): kept as small as it was made,
+    /// below the size a card dragged by hand keeps to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exact: bool,
 }
 
 impl TabLayout {
@@ -506,6 +510,7 @@ mod tests {
             host: host.map(Into::into),
             frame: [0.2, 0.2, 0.5, 0.5],
             zoomed: false,
+            exact: false,
         };
         let mut l = sample();
         // A tab without floating panes says nothing of them, and older layouts have none.
@@ -535,6 +540,7 @@ mod tests {
             host: None,
             frame: [0.2, 0.2, 0.5, 0.5],
             zoomed: false,
+            exact: false,
         };
         let mut l = sample();
         let tab = &mut l.windows[0].tabs[1];
@@ -558,6 +564,7 @@ mod tests {
             host: None,
             frame: [0.1, 0.1, 0.4, 0.4],
             zoomed: true,
+            exact: false,
         };
         let mut l = sample();
         let tab = &mut l.windows[0].tabs[1];

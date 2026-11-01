@@ -456,15 +456,18 @@ struct FloatingPane: Codable, Equatable {
     var frame: [Double]
     /// Shown over the whole tab.
     var zoomed = false
+    /// Placed at a size in cells, kept below the size a card made by hand keeps to.
+    var exact = false
 
     private enum CodingKeys: String, CodingKey {
-        case id, host, frame, zoomed
+        case id, host, frame, zoomed, exact
     }
 
-    init(pane: PaneKey, frame: [Double], zoomed: Bool = false) {
+    init(pane: PaneKey, frame: [Double], zoomed: Bool = false, exact: Bool = false) {
         self.pane = pane
         self.frame = frame
         self.zoomed = zoomed
+        self.exact = exact
     }
 
     init(from decoder: Decoder) throws {
@@ -473,6 +476,7 @@ struct FloatingPane: Codable, Equatable {
         pane = PaneKey(host, try c.decode(UInt64.self, forKey: .id))
         frame = try c.decode([Double].self, forKey: .frame)
         zoomed = try c.decodeIfPresent(Bool.self, forKey: .zoomed) ?? false
+        exact = try c.decodeIfPresent(Bool.self, forKey: .exact) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -481,6 +485,34 @@ struct FloatingPane: Codable, Equatable {
         if pane.isRemote { try c.encode(pane.host, forKey: .host) }
         try c.encode(frame, forKey: .frame)
         if zoomed { try c.encode(true, forKey: .zoomed) }
+        if exact { try c.encode(true, forKey: .exact) }
+    }
+}
+
+/// `thurm_proto::FloatPlace`: where a floating pane goes.
+enum FloatPlace: Equatable {
+    /// Fractions of the tab's area, from its top left corner.
+    case fraction(CGRect)
+    /// A terminal of `cols`×`rows` cells, its first cell (`col`, `row`) cells from `anchor`'s.
+    case cells(anchor: UInt64, col: Int, row: Int, cols: Int, rows: Int)
+
+    /// From serde's JSON: `{"Fraction":[x,y,w,h]}` or `{"Cells":{"anchor":…}}`.
+    init?(json: Any?) {
+        guard let v = JSON.variant(json) else { return nil }
+        switch v.name {
+        case "Fraction":
+            guard let a = v.payload as? [Any], a.count == 4 else { return nil }
+            let f = a.compactMap { clamped($0, 0, 1) }
+            guard f.count == 4, f[2] > 0, f[3] > 0 else { return nil }
+            self = .fraction(CGRect(x: f[0], y: f[1], width: f[2], height: f[3]))
+        case "Cells":
+            guard let d = v.payload as? [String: Any], let anchor = jsonUInt64(d["anchor"]),
+                  let col = jsonInt(d["col"]), let row = jsonInt(d["row"]),
+                  let cols = jsonInt(d["cols"]), let rows = jsonInt(d["rows"]), cols > 0, rows > 0 else { return nil }
+            self = .cells(anchor: anchor, col: col, row: row, cols: cols, rows: rows)
+        default:
+            return nil
+        }
     }
 }
 

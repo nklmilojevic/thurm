@@ -408,4 +408,34 @@ mod tests {
         let frame = encode_frame(&attach, true).unwrap();
         assert_eq!(frame, encode(&attach).unwrap());
     }
+
+    #[test]
+    fn placed_floats_leave_older_ui_commands_as_they_were() {
+        // An older app decodes `OpenFloating` by its variant index: the new commands come after it.
+        let open = UiCommand::OpenFloating {
+            pane: 5,
+            target: None,
+            background: false,
+        };
+        assert_eq!(postcard::to_allocvec(&open).unwrap(), [14, 5, 0, 0]);
+
+        let place = UiCommand::PlaceFloating {
+            pane: 5,
+            place: FloatPlace::Cells {
+                anchor: 2,
+                col: -1,
+                row: 3,
+                cols: 40,
+                rows: 10,
+            },
+        };
+        let bytes = postcard::to_allocvec(&place).unwrap();
+        assert_eq!(bytes[0], 16);
+        assert_eq!(postcard::from_bytes::<UiCommand>(&bytes).unwrap(), place);
+        // The app reads UI commands as JSON.
+        assert_eq!(
+            serde_json::to_string(&place).unwrap(),
+            r#"{"PlaceFloating":{"pane":5,"place":{"Cells":{"anchor":2,"col":-1,"row":3,"cols":40,"rows":10}}}}"#
+        );
+    }
 }

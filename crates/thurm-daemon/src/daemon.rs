@@ -342,6 +342,8 @@ pub struct Client {
     pub floating: AtomicBool,
     /// A UI that opens new floating panes ([`thurm_proto::CAP_FLOATING_NEW`]).
     pub floating_new: AtomicBool,
+    /// A UI that places floating panes ([`thurm_proto::CAP_FLOATING_PLACE`]).
+    pub floating_place: AtomicBool,
     /// A remote client that takes deflated events ([`thurm_proto::CAP_DEFLATE`]). Shared with the
     /// client's writer thread, which encodes what it sends.
     pub deflate: Arc<AtomicBool>,
@@ -691,11 +693,13 @@ impl Daemon {
         let wall = cmd.needs_agent_wall();
         let floating = cmd.needs_floating();
         let floating_new = cmd.needs_floating_new();
+        let floating_place = cmd.needs_floating_place();
         let (capable, older): (Vec<_>, Vec<_>) = desktops.into_iter().partition(|c| {
             c.ui_layout.load(Ordering::Relaxed)
                 && (!wall || c.agent_wall.load(Ordering::Relaxed))
                 && (!floating || c.floating.load(Ordering::Relaxed))
                 && (!floating_new || c.floating_new.load(Ordering::Relaxed))
+                && (!floating_place || c.floating_place.load(Ordering::Relaxed))
         });
         let shown_by_older = cmd.layout_panes().into_iter().any(|p| {
             self.pane(p).is_some_and(|p| {
@@ -733,6 +737,7 @@ impl Daemon {
             agent_wall: AtomicBool::new(false),
             floating: AtomicBool::new(false),
             floating_new: AtomicBool::new(false),
+            floating_place: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
@@ -2563,6 +2568,9 @@ impl Daemon {
                 if has(thurm_proto::CAP_FLOATING_NEW) {
                     client.floating_new.store(true, Ordering::Relaxed);
                 }
+                if has(thurm_proto::CAP_FLOATING_PLACE) {
+                    client.floating_place.store(true, Ordering::Relaxed);
+                }
                 if has(thurm_proto::CAP_DEFLATE) {
                     client.deflate.store(true, Ordering::Relaxed);
                 }
@@ -4051,6 +4059,7 @@ mod tests {
             agent_wall: AtomicBool::new(false),
             floating: AtomicBool::new(false),
             floating_new: AtomicBool::new(false),
+            floating_place: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),

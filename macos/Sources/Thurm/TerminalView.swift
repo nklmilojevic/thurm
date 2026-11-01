@@ -166,6 +166,10 @@ final class TerminalView: NSView, NSTextInputClient {
         CGPoint(x: CGFloat(padXPixels) / backingScale, y: CGFloat(padYPixels) / backingScale)
     }
 
+    /// A cell, and the padding from the view's top left corner to its first cell, in points.
+    var gridCellSize: CGSize { cellSizePoints }
+    var gridPadding: CGPoint { accessibilityPadding }
+
     private var cellSizePoints: CGSize {
         guard let s = shaper else { return CGSize(width: 8, height: 16) }
         return CGSize(width: CGFloat(s.cellWidth) / backingScale, height: CGFloat(s.cellHeight) / backingScale)

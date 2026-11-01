@@ -186,6 +186,71 @@ fn new_floating_panes_need_a_ui_that_knows_them() {
 }
 
 #[test]
+fn placed_floating_panes_need_a_ui_that_knows_them() {
+    let env = Env::new("ui-float-place");
+    let _d = env.start();
+    // A UI that opens new floating panes, from before placing them.
+    let mut old = ui_with(
+        &env,
+        &[
+            CAP_ACTIVE_SIZE,
+            CAP_UI_LAYOUT,
+            CAP_AGENT_WALL,
+            CAP_FLOATING,
+            CAP_FLOATING_NEW,
+        ],
+    );
+    let mut pane = || {
+        let Ok(Response::PaneCreated { pane }) = send(
+            &mut old,
+            2,
+            Request::CreatePane(CreatePane {
+                cwd: Some(env.dir.display().to_string()),
+                ..Default::default()
+            }),
+        ) else {
+            panic!("no pane");
+        };
+        pane
+    };
+    let (anchor, new_pane) = (pane(), pane());
+    let commands = [
+        UiCommand::OpenFloatingAt {
+            pane: new_pane,
+            target: None,
+            place: FloatPlace::Cells {
+                anchor,
+                col: 2,
+                row: -1,
+                cols: 40,
+                rows: 10,
+            },
+            background: true,
+        },
+        UiCommand::PlaceFloating {
+            pane: new_pane,
+            place: FloatPlace::Fraction([0.1, 0.1, 0.3, 0.3]),
+        },
+    ];
+    for (i, cmd) in commands.iter().enumerate() {
+        let err = send(&mut old, 3 + i as u64, Request::Ui(cmd.clone())).unwrap_err();
+        assert_eq!(err, UI_TOO_OLD, "{cmd:?}");
+    }
+    drop(old);
+
+    let (new, new_rx) = env.connect();
+    for cmd in commands {
+        new.request(Request::Ui(cmd.clone())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = false;
+        while Instant::now() < deadline && !got {
+            got = matches!(new_rx.recv_timeout(Duration::from_millis(200)), Ok(Event::Ui(ref c)) if *c == cmd);
+        }
+        assert!(got, "{cmd:?}");
+    }
+}
+
+#[test]
 fn an_older_ui_showing_the_pane_refuses_it() {
     let env = Env::new("ui-mixed");
     let _d = env.start();

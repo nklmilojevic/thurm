@@ -22,8 +22,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use thurm_client::{Client, ClientError, ConnectOptions, find_daemon};
 use thurm_config::hooks;
 use thurm_proto::{
-    CaptureOpts, CreatePane, ENV_PANE_ID, PaneId, PaneInfo, PaneSize, Request, Response, ScrollCmd,
-    SplitDir, UiCommand, WaitCondition, WaitOutcome,
+    CaptureOpts, CreatePane, ENV_PANE_ID, FloatPlace, PaneId, PaneInfo, PaneSize, Request,
+    Response, ScrollCmd, SplitDir, UiCommand, WaitCondition, WaitOutcome,
 };
 
 #[derive(Parser)]
@@ -240,8 +240,10 @@ enum Cmd {
         pane: Option<PaneId>,
         #[arg(long, conflicts_with = "off")]
         on: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["frame", "cells"])]
         off: bool,
+        #[command(flatten)]
+        place: PlaceArgs,
     },
     /// Dock a floating pane back into its tab's splits.
     Dock {
@@ -264,6 +266,8 @@ enum Cmd {
         /// Wait for COMMAND to exit, and exit with its status.
         #[arg(long)]
         wait: bool,
+        #[command(flatten)]
+        place: PlaceArgs,
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -679,6 +683,84 @@ fn hooks_cmd(action: &str, only: Option<&str>, json: bool) -> R {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// Where `new-float` and `float` put a floating pane (default: where new floating panes go).
+#[derive(clap::Args, Debug, Default)]
+struct PlaceArgs {
+    /// Its card as fractions of the tab's area, from the top left: `0.1,0.1,0.5,0.4`.
+    #[arg(long, value_name = "X,Y,W,H", value_parser = parse_frame, conflicts_with = "cells")]
+    frame: Option<[f64; 4]>,
+    /// Its terminal COLSxROWS cells, its first cell COL, ROW cells from the anchor's first cell
+    /// (may be negative): `2,1,40x10`.
+    #[arg(long, value_name = "COL,ROW,COLSxROWS", value_parser = parse_cells)]
+    cells: Option<(i32, i32, u16, u16)>,
+    /// The pane `--cells` counts from, in the same tab (default: the current pane).
+    #[arg(long, value_name = "PANE", requires = "cells")]
+    anchor: Option<PaneId>,
+}
+
+impl PlaceArgs {
+    /// The place asked for, with the anchor defaulting to `anchor`.
+    fn place(
+        &self,
+        anchor: impl FnOnce() -> Result<PaneId, String>,
+    ) -> Result<Option<FloatPlace>, String> {
+        if let Some(frame) = self.frame {
+            return Ok(Some(FloatPlace::Fraction(frame)));
+        }
+        let Some((col, row, cols, rows)) = self.cells else {
+            return Ok(None);
+        };
+        let anchor = match self.anchor {
+            Some(a) => a,
+            None => anchor()?,
+        };
+        Ok(Some(FloatPlace::Cells {
+            anchor,
+            col,
+            row,
+            cols,
+            rows,
+        }))
+    }
+}
+
+fn parse_frame(s: &str) -> Result<[f64; 4], String> {
+    let v: Vec<f64> = s
+        .split(',')
+        .map(|n| {
+            n.trim()
+                .parse::<f64>()
+                .map_err(|_| format!("not a number: {n}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let [x, y, w, h] = v[..] else {
+        return Err("expected X,Y,W,H".into());
+    };
+    if [x, y, w, h].iter().any(|f| !(0.0..=1.0).contains(f)) || w == 0.0 || h == 0.0 {
+        return Err("fractions go from 0 to 1, and the width and height can't be 0".into());
+    }
+    Ok([x, y, w, h])
+}
+
+fn parse_cells(s: &str) -> Result<(i32, i32, u16, u16), String> {
+    let bad = || "expected COL,ROW,COLSxROWS, e.g. 2,1,40x10".to_string();
+    let mut parts = s.split(',');
+    let (Some(col), Some(row), Some(size), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad());
+    };
+    let (cols, rows) = size.split_once(['x', 'X']).ok_or_else(bad)?;
+    let col = col.trim().parse().map_err(|_| bad())?;
+    let row = row.trim().parse().map_err(|_| bad())?;
+    let cols: u16 = cols.trim().parse().map_err(|_| bad())?;
+    let rows: u16 = rows.trim().parse().map_err(|_| bad())?;
+    if cols == 0 || rows == 0 {
+        return Err("the size can't be 0".into());
+    }
+    Ok((col, row, cols, rows))
 }
 
 fn current_pane(p: Option<PaneId>) -> Result<PaneId, String> {
@@ -1409,8 +1491,25 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             };
             layout_ui(c, UiCommand::AgentWall { pane, on })?;
         }
-        Cmd::Float { pane, on, off } => {
+        Cmd::Float {
+            pane,
+            on,
+            off,
+            place,
+        } => {
             let pane = current_pane(pane)?;
+            let place = place.place(|| {
+                current_pane(None)
+                    .ok()
+                    .filter(|&a| a != pane)
+                    .ok_or_else(|| {
+                        "--cells counts from another pane of the tab: pass --anchor".to_string()
+                    })
+            })?;
+            if let Some(place) = place {
+                layout_ui(c, UiCommand::PlaceFloating { pane, place })?;
+                return Ok(ExitCode::SUCCESS);
+            }
             let on = if on {
                 Some(true)
             } else if off {
@@ -1426,6 +1525,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
             hold,
             background,
             wait,
+            place,
             command,
         } => {
             // The app floats it in the frontmost tab when `--pane` names none: refuse that first.
@@ -1435,7 +1535,29 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
                 return Err(format!("no pane {p}").into());
             }
             let target = current_pane(pane).ok();
+            let place = place.place(|| {
+                target
+                    .ok_or_else(|| "--cells needs a pane to count from: pass --anchor".to_string())
+            })?;
             let new = create(c, command, cwd, target, hold || wait, None)?;
+            if let Some(place) = place {
+                match ui(
+                    c,
+                    UiCommand::OpenFloatingAt {
+                        pane: new,
+                        target,
+                        place,
+                        background,
+                    },
+                ) {
+                    Ok(()) => return opened(c, new, wait, hold, json),
+                    Err(e) if e == thurm_proto::LAYOUT_NO_WINDOW => {
+                        eprintln!("thurm: pane created but not shown: {e}");
+                        return opened(c, new, wait, hold, json);
+                    }
+                    Err(e) => eprintln!("thurm: {e}; floating it where new floating panes go"),
+                }
+            }
             open(
                 c,
                 UiCommand::Split {
@@ -2289,5 +2411,48 @@ mod tests {
         assert!(parse(&["handoff", "--cleanup", "x", "--force"]).is_ok());
         assert!(parse(&["remote", "install", "box", "--no"]).is_ok());
         assert!(parse(&["remote", "install", "box", "--yes", "--no"]).is_err());
+    }
+
+    #[test]
+    fn floating_places() {
+        assert_eq!(parse_cells("2,-1,40x10"), Ok((2, -1, 40, 10)));
+        assert_eq!(parse_cells(" 0, 0, 8X3"), Ok((0, 0, 8, 3)));
+        assert!(parse_cells("2,1").is_err());
+        assert!(parse_cells("2,1,40").is_err());
+        assert!(parse_cells("2,1,0x10").is_err());
+        assert!(parse_cells("2,1,40x10,9").is_err());
+        assert_eq!(parse_frame("0.1,0.2,0.5,0.4"), Ok([0.1, 0.2, 0.5, 0.4]));
+        assert!(parse_frame("0.1,0.2,0.5").is_err());
+        assert!(parse_frame("0.1,0.2,1.5,0.4").is_err());
+        assert!(parse_frame("0.1,0.2,0,0.4").is_err());
+
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("thurm").chain(args.iter().copied()))
+        };
+        assert!(parse(&["new-float", "--cells", "2,1,40x10", "--anchor", "3", "nvim"]).is_ok());
+        assert!(parse(&["new-float", "--anchor", "3"]).is_err());
+        assert!(parse(&["new-float", "--frame", "0,0,1,1", "--cells", "0,0,1x1"]).is_err());
+        assert!(parse(&["float", "--off", "--frame", "0,0,1,1"]).is_err());
+        assert!(parse(&["float", "-p", "4", "--cells", "0,0,10x2", "--anchor", "3"]).is_ok());
+
+        let args = PlaceArgs {
+            cells: Some((1, 2, 3, 4)),
+            ..Default::default()
+        };
+        assert_eq!(
+            args.place(|| Ok(9)),
+            Ok(Some(FloatPlace::Cells {
+                anchor: 9,
+                col: 1,
+                row: 2,
+                cols: 3,
+                rows: 4
+            }))
+        );
+        assert_eq!(
+            PlaceArgs::default().place(|| Err("unused".into())),
+            Ok(None)
+        );
     }
 }

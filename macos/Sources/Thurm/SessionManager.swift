@@ -1596,26 +1596,36 @@ final class SessionManager: NSObject, CoreDelegate {
         case "Float":
             guard let pane = key("pane"), let c = controller(for: pane), !c.isQuick || c.content.isFloating(pane) else { return }
             c.content.setFloating(pane, jsonBool(d["on"]))
-        case "OpenFloating":
-            // `thurm new-float`.
+        case "OpenFloating", "OpenFloatingAt":
+            // `thurm new-float`, with `--frame` or `--cells` for `OpenFloatingAt`.
             guard let pane = key("pane") else { return }
             let background = jsonBool(d["background"]) ?? false
-            if controller(for: pane) != nil {
+            let place = FloatPlace(json: d["place"])
+            if let c = controller(for: pane) {
+                if let place, !c.isQuick { c.content.placeFloating(pane, at: place) }
                 if !background { focusPane(pane, activate: true) }
                 return
             }
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
             takeHiddenTab(pane)
+            var anchor: UInt64? = nil
+            if case let .cells(a, _, _, _, _) = place { anchor = a }
             let host = key("target").flatMap { controller(for: $0) }
+                ?? anchor.flatMap { controller(for: PaneKey(daemon, $0)) }
                 ?? (currentController?.host == daemon ? currentController : nil)
             if let host, !host.isQuick {
-                host.content.addNewFloating(pane, takeFocus: !background)
+                host.content.addNewFloating(pane, place: place, takeFocus: !background)
                 host.updateTitle()
                 if !background { host.window?.makeKeyAndOrderFront(nil) }
             } else {
                 newTab(from: currentController, pane: pane, background: background)
             }
             if !background { NSApp.activate() }
+        case "PlaceFloating":
+            // `thurm float --frame/--cells`.
+            guard let pane = key("pane"), let place = FloatPlace(json: d["place"]),
+                  let c = controller(for: pane), !c.isQuick else { return }
+            c.content.placeFloating(pane, at: place)
         case "SwapPanes":
             guard let a = key("a"), let b = key("b"), a != b,
                   let ca = controller(for: a), let cb = controller(for: b) else { return }
