@@ -456,15 +456,19 @@ struct FloatingPane: Codable, Equatable {
     var frame: [Double]
     /// Shown over the whole tab.
     var zoomed = false
+    /// Its terminal's size, for a card placed in cells: the card keeps it whatever the tab's size
+    /// (only its position follows `frame`), stored as `[cols, rows]`.
+    var cells: CardCells? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case id, host, frame, zoomed
+        case id, host, frame, zoomed, cells
     }
 
-    init(pane: PaneKey, frame: [Double], zoomed: Bool = false) {
+    init(pane: PaneKey, frame: [Double], zoomed: Bool = false, cells: CardCells? = nil) {
         self.pane = pane
         self.frame = frame
         self.zoomed = zoomed
+        self.cells = cells
     }
 
     init(from decoder: Decoder) throws {
@@ -473,6 +477,7 @@ struct FloatingPane: Codable, Equatable {
         pane = PaneKey(host, try c.decode(UInt64.self, forKey: .id))
         frame = try c.decode([Double].self, forKey: .frame)
         zoomed = try c.decodeIfPresent(Bool.self, forKey: .zoomed) ?? false
+        cells = try c.decodeIfPresent([Int].self, forKey: .cells).flatMap(CardCells.init(array:))
     }
 
     func encode(to encoder: Encoder) throws {
@@ -481,6 +486,52 @@ struct FloatingPane: Codable, Equatable {
         if pane.isRemote { try c.encode(pane.host, forKey: .host) }
         try c.encode(frame, forKey: .frame)
         if zoomed { try c.encode(true, forKey: .zoomed) }
+        if let cells { try c.encode([cells.cols, cells.rows], forKey: .cells) }
+    }
+}
+
+/// A card's terminal size in cells: at least 2 columns (the terminal's least) by 1 row.
+struct CardCells: Equatable {
+    var cols: Int
+    var rows: Int
+
+    init?(cols: Int, rows: Int) {
+        guard cols >= 2, rows >= 1 else { return nil }
+        self.cols = cols
+        self.rows = rows
+    }
+
+    init?(array: [Int]) {
+        guard array.count == 2 else { return nil }
+        self.init(cols: array[0], rows: array[1])
+    }
+}
+
+/// `thurm_proto::FloatPlace`: where a floating pane goes.
+enum FloatPlace: Equatable {
+    /// Fractions of the tab's area, from its top left corner.
+    case fraction(CGRect)
+    /// A terminal of `size`, its first cell (`col`, `row`) cells from `anchor`'s.
+    case cells(anchor: UInt64, col: Int, row: Int, size: CardCells)
+
+    /// From serde's JSON: `{"Fraction":[x,y,w,h]}` or `{"Cells":{"anchor":…}}`.
+    init?(json: Any?) {
+        guard let v = JSON.variant(json) else { return nil }
+        switch v.name {
+        case "Fraction":
+            guard let a = v.payload as? [Any], a.count == 4 else { return nil }
+            let f = a.compactMap { clamped($0, 0, 1) }
+            guard f.count == 4, f[2] > 0, f[3] > 0 else { return nil }
+            self = .fraction(CGRect(x: f[0], y: f[1], width: f[2], height: f[3]))
+        case "Cells":
+            guard let d = v.payload as? [String: Any], let anchor = jsonUInt64(d["anchor"]),
+                  let col = jsonInt(d["col"]), let row = jsonInt(d["row"]),
+                  let cols = jsonInt(d["cols"]), let rows = jsonInt(d["rows"]),
+                  let size = CardCells(cols: cols, rows: rows) else { return nil }
+            self = .cells(anchor: anchor, col: col, row: row, size: size)
+        default:
+            return nil
+        }
     }
 }
 

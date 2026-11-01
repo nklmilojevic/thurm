@@ -164,6 +164,8 @@ thurm equalize --pane ID         # give the splits of its tab equal space
 thurm wall --on                  # gather the window's agents into one grid tab (--off: put back)
 thurm float --pane ID --on       # lift it above its tab's splits as a card (--off or `thurm dock`: back in)
 thurm new-float -- lazygit       # run it in a new card above this tab's splits (--pane ID: that tab)
+thurm new-float --cells 2,1,40x10 -- htop   # a card whose terminal is 40x10 cells, over cell (2, 1) of this pane
+thurm float --pane ID --frame 0.1,0.1,0.5,0.4   # move/resize a card (fractions of the tab); --cells C,R,WxH --anchor PANE
 thurm title "backend"            # tab title (empty to reset)
 thurm workspace rename "api"     # name the current pane's workspace (--pane ID for another)
 thurm scroll --pane ID prev-prompt   # up, down, top, bottom, prev-prompt, next-prompt
