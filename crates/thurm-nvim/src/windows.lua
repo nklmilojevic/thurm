@@ -93,7 +93,13 @@ local function cells_of(str, highlights)
       hl = hl_attrs(highlights[next_hl].group)
       next_hl = next_hl + 1
     end
-    table.insert(out, { ch, vim.fn.strdisplaywidth(ch), hl or vim.empty_dict() })
+    local width = vim.fn.strdisplaywidth(ch)
+    if width == 0 and #out > 0 then
+      -- A combining character: it belongs to the cell before.
+      out[#out][1] = out[#out][1] .. ch
+    else
+      table.insert(out, { ch, width, hl or vim.empty_dict() })
+    end
     byte = byte + #ch
   end
   return out
@@ -136,6 +142,14 @@ local function placement(win)
   return find(vim.fn.winlayout(api.nvim_tabpage_get_number(api.nvim_win_get_tabpage(win))))
 end
 
+-- The window being left: when a window is new, the one that was split. (The alternate window,
+-- `winnr('#')`, is the one before that.)
+local left
+api.nvim_create_autocmd('WinLeave', {
+  group = group,
+  callback = function() left = api.nvim_get_current_win() end,
+})
+
 -- Before the new window is adopted, so its pane opens where Neovim put the window.
 api.nvim_create_autocmd('WinNew', {
   group = group,
@@ -144,7 +158,7 @@ api.nvim_create_autocmd('WinNew', {
     local win = api.nvim_get_current_win()
     local dir, first = placement(win)
     if not dir then return end
-    local from = vim.fn.win_getid(vim.fn.winnr('#'))
+    local from = (left and left ~= win and api.nvim_win_is_valid(left)) and left or vim.fn.win_getid(vim.fn.winnr('#'))
     -- Splitting an external window loses its scroll: carry it over.
     if shown(from) and api.nvim_win_get_buf(from) == api.nvim_win_get_buf(win) then
       local view = api.nvim_win_call(from, vim.fn.winsaveview)
@@ -198,9 +212,14 @@ api.nvim_create_autocmd('QuitPre', {
     local tab = api.nvim_get_current_tabpage()
     local anchor = anchor_of(tab)
     if not anchor or not shown(cur) or others_shown(cur) then return end
+    local w, h = api.nvim_win_get_width(cur), api.nvim_win_get_height(cur)
     api.nvim_win_set_config(cur, { split = 'left', win = anchor })
     anchors[tab] = nil
     api.nvim_win_close(anchor, true)
+    -- Still here afterwards: Neovim refused to quit (unsaved changes). Back to external.
+    vim.schedule(function()
+      if api.nvim_win_is_valid(cur) and not api.nvim_win_get_config(cur).external then M.adopt(cur, w, h) end
+    end)
   end,
 })
 

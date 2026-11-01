@@ -8,6 +8,8 @@ final class Integrations: NSObject, NSMenuDelegate {
     private let fm = FileManager.default
     private var home: URL { fm.homeDirectoryForCurrentUser }
     private var cli: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/thurm") }
+    /// `thurm-nvim`, linked next to the CLI.
+    private var nvim: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/thurm-nvim") }
     private var launchAgent: URL { home.appendingPathComponent("Library/LaunchAgents/com.thurm.daemon.plist") }
     /// `~/.local/bin` when it exists (no password needed), else `/usr/local/bin`.
     private var cliLinkCandidates: [URL] {
@@ -77,6 +79,7 @@ final class Integrations: NSObject, NSMenuDelegate {
             try? fm.removeItem(at: local)
             do {
                 try fm.createSymbolicLink(at: local, withDestinationURL: cli)
+                linkNvim(beside: local)
                 report("Command-Line Tool", "Linked \(local.path) → \(cli.path).", ok: true)
             } catch {
                 report("Command-Line Tool", error.localizedDescription, ok: false)
@@ -84,16 +87,39 @@ final class Integrations: NSObject, NSMenuDelegate {
             return
         }
         let global = cliLinkCandidates[1]
-        admin("mkdir -p /usr/local/bin && ln -sf \(quoted(cli.path)) \(quoted(global.path))",
+        let globalNvim = global.deletingLastPathComponent().appendingPathComponent("thurm-nvim")
+        admin("mkdir -p /usr/local/bin && ln -sf \(quoted(cli.path)) \(quoted(global.path))"
+              + " && { [ ! -e \(quoted(globalNvim.path)) ] || [ -L \(quoted(globalNvim.path)) ]; }"
+              + " && ln -sf \(quoted(nvim.path)) \(quoted(globalNvim.path))",
               done: "Linked \(global.path) → \(cli.path).")
     }
 
+    /// `thurm-nvim` next to the CLI's link `link`, unless a file of the user's own is there.
+    private func linkNvim(beside link: URL) {
+        let target = link.deletingLastPathComponent().appendingPathComponent("thurm-nvim")
+        if let existing = try? fm.attributesOfItem(atPath: target.path),
+           existing[.type] as? FileAttributeType != .typeSymbolicLink { return }
+        try? fm.removeItem(at: target)
+        try? fm.createSymbolicLink(at: target, withDestinationURL: nvim)
+    }
+
+    /// The `thurm-nvim` link next to the CLI's link `link`, if it points into an app.
+    private func nvimLink(beside link: URL) -> URL? {
+        let target = link.deletingLastPathComponent().appendingPathComponent("thurm-nvim")
+        guard let dest = try? fm.destinationOfSymbolicLink(atPath: target.path),
+              dest.hasSuffix("Contents/Helpers/thurm-nvim") else { return nil }
+        return target
+    }
+
     private func uninstallCLI(_ link: URL) {
+        let nvimLink = nvimLink(beside: link)
         if fm.isWritableFile(atPath: link.deletingLastPathComponent().path) {
             try? fm.removeItem(at: link)
+            if let nvimLink { try? fm.removeItem(at: nvimLink) }
             report("Command-Line Tool", "Removed \(link.path).", ok: true)
         } else {
-            admin("rm -f \(quoted(link.path))", done: "Removed \(link.path).")
+            let both = [link] + (nvimLink.map { [$0] } ?? [])
+            admin("rm -f " + both.map { quoted($0.path) }.joined(separator: " "), done: "Removed \(link.path).")
         }
     }
 

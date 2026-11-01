@@ -83,7 +83,19 @@ fn draw_row(row: usize, line: &[FrameCell], emitted: &mut Option<Style>, out: &m
             cell.width == 1
         };
         if fits && !text.is_empty() {
-            out.extend_from_slice(text.as_bytes());
+            // Never a control character to the terminal, whatever produced the cell.
+            if text.chars().any(crate::cell::is_control) {
+                for ch in text.chars() {
+                    let ch = if crate::cell::is_control(ch) {
+                        '\u{fffd}'
+                    } else {
+                        ch
+                    };
+                    out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+            } else {
+                out.extend_from_slice(text.as_bytes());
+            }
         } else {
             out.push(b' ');
         }
@@ -630,6 +642,19 @@ mod tests {
         t.advance(&draw(&mut PaneRenderer::new(), &want));
         assert_screen(&mut t, &want);
         assert_eq!(screen(&mut t).lines[0].cells[0].ch, 't');
+    }
+
+    #[test]
+    fn control_characters_in_a_cell_never_reach_the_terminal() {
+        let mut frame = Frame::blank(12, 1);
+        frame.lines[0][0].text = Text::new("\x1b]0;pwned\x07");
+        let out = draw(&mut PaneRenderer::new(), &frame);
+        assert!(!contains(&out, b"\x1b]0;"));
+        assert!(!contains(&out, b"\x07"));
+        let mut t = emulator(12, 1);
+        t.advance(&out);
+        assert_eq!(t.title(), None);
+        assert!(t.screen_text().starts_with('\u{fffd}'));
     }
 
     #[test]

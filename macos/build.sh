@@ -3,7 +3,7 @@
 #
 #   ./macos/build.sh            release build into macos/build/Thurm.app
 #   ./macos/build.sh --install  build, then install into /Applications (or ~/Applications),
-#                               link the `thurm` CLI into ~/.local/bin, and open it
+#                               link the `thurm` CLI (and `thurm-nvim`) into ~/.local/bin, and open it
 #   SKIP_RUST=1 ./macos/build.sh  reuse the Rust artifacts already in target/aarch64-apple-darwin/release
 #   THURM_SWIFT_BUILD_SYSTEM=native ./macos/build.sh
 #                               use Swift's native build system
@@ -290,6 +290,11 @@ LINK="$HOME/.local/bin/thurm"
 if [[ -d "$HOME/.local/bin" ]] && { [[ ! -e "$LINK" ]] || [[ -L "$LINK" ]]; }; then
     ln -sfn "$DEST/Contents/Helpers/thurm" "$LINK"
     log "Linked $LINK"
+    NVIM_LINK="$HOME/.local/bin/thurm-nvim"
+    if [[ ! -e "$NVIM_LINK" ]] || [[ -L "$NVIM_LINK" ]]; then
+        ln -sfn "$DEST/Contents/Helpers/thurm-nvim" "$NVIM_LINK"
+        log "Linked $NVIM_LINK"
+    fi
 else
     log "note: link the CLI yourself, or use Thurm > Integrations > Install Command-Line Tool"
 fi

@@ -270,3 +270,99 @@ fn close_of_the_last_window_reopens_it_and_quit_quits() {
     }
     panic!("nvim didn't quit");
 }
+
+#[test]
+fn a_split_comes_from_the_window_split_not_the_one_before() {
+    let Some(mut live) = Live::start() else {
+        eprintln!("no nvim on PATH: skipped");
+        return;
+    };
+    let (a, _) = setup(&mut live);
+    live.call("nvim_command", vec!["vsplit".into()]).unwrap();
+    live.settle();
+    let b = nvim::handle(&live.note("thurm_split").unwrap()[0]).unwrap();
+    live.lua(
+        "thurm_nvim.adopt(...)",
+        vec![b.into(), 20.into(), 10.into()],
+    )
+    .unwrap();
+    live.settle();
+    // To A and back to B: A is now the alternate window, B the current one.
+    live.call("nvim_set_current_win", vec![a.into()]).unwrap();
+    live.call("nvim_set_current_win", vec![b.into()]).unwrap();
+    live.settle();
+    live.call("nvim_command", vec!["vsplit".into()]).unwrap();
+    live.settle();
+    let note = live.note("thurm_split").unwrap().clone();
+    assert_ne!(nvim::handle(&note[0]), Some(b));
+    assert_eq!(nvim::handle(&note[3]), Some(b));
+}
+
+#[test]
+fn a_refused_quit_leaves_the_window_external() {
+    let Some(mut live) = Live::start() else {
+        eprintln!("no nvim on PATH: skipped");
+        return;
+    };
+    let (first, _) = setup(&mut live);
+    live.call(
+        "nvim_buf_set_lines",
+        vec![
+            0.into(),
+            0.into(),
+            (-1).into(),
+            false.into(),
+            Value::Array(vec!["unsaved".into()]),
+        ],
+    )
+    .unwrap();
+    // E37: no write since last change.
+    assert!(live.call("nvim_command", vec!["q".into()]).is_err());
+    live.settle();
+    assert_eq!(live.kind(first), Some(WinKind::External));
+    let g = live.model.grid_of_win(first).unwrap();
+    assert_eq!(
+        (live.model.grids[&g].cols, live.model.grids[&g].rows),
+        (40, 10)
+    );
+    // And :q! then really quits.
+    live.call("nvim_input", vec![":q!<CR>".into()]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = live.child.try_wait() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("nvim didn't quit");
+}
+
+#[test]
+fn statusline_cells_keep_combining_characters_together() {
+    let Some(mut live) = Live::start() else {
+        eprintln!("no nvim on PATH: skipped");
+        return;
+    };
+    let (first, _) = setup(&mut live);
+    live.call(
+        "nvim_set_option_value",
+        vec!["statusline".into(), "e\u{301}x".into(), Value::Map(vec![])],
+    )
+    .unwrap();
+    let st = live
+        .lua(
+            "return thurm_nvim.statuslines(...)",
+            vec![
+                Value::Array(vec![first.into()]),
+                Value::Array(vec![10.into()]),
+            ],
+        )
+        .unwrap();
+    let cells = st.as_array().unwrap()[0].as_array().unwrap().clone();
+    let texts: Vec<String> = cells
+        .iter()
+        .map(|c| c.as_array().unwrap()[0].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(&texts[..2], ["e\u{301}", "x"]);
+    assert_eq!(cells[0].as_array().unwrap()[1].as_u64(), Some(1));
+}

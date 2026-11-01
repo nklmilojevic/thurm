@@ -24,16 +24,20 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        Some("daemon") if args.len() >= 2 => {
+        // Internal, behind flags no Neovim invocation starts with: a file named `daemon` or
+        // `pane` is still a file to open.
+        Some(launch::DAEMON) if args.len() >= 2 => {
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
                 .init();
             daemon::run(Path::new(&args[1]), &args[2..])
         }
-        Some("pane") if args.len() >= 2 => {
-            let id = args.get(2).and_then(|s| s.parse().ok());
-            helper::run(Path::new(&args[1]), id)
+        Some(launch::PANE) if (2..=3).contains(&args.len()) => {
+            match args.get(2).map(|s| s.parse::<u32>()) {
+                Some(Err(_)) => Err(std::io::Error::other("not a pane id")),
+                id => helper::run(Path::new(&args[1]), id.map(Result::unwrap)),
+            }
         }
-        Some("--help" | "-h") => {
+        Some("--help" | "-h") if args.len() == 1 => {
             println!(
                 "usage: thurm-nvim [nvim arguments]\n\nRuns Neovim with each of its windows in a Thurm pane."
             );

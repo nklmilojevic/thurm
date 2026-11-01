@@ -305,64 +305,59 @@ impl Model {
             .map(|(g, _)| *g)
     }
 
-    /// Where float grid `grid` lands: following anchors (at most 8 deep) down to a window's
-    /// grid or the editor. Floats on the message grid land on the editor at its row.
+    /// Where float grid `grid` lands: on the grid of the window it hangs from, or on the
+    /// editor (floats on the message grid land on the editor at its row). A float on the
+    /// editor is where Neovim draws it, kept inside (its `screen` position); one hanging from
+    /// it builds on that, not on its parent's raw anchor.
     pub fn place(&self, grid: u64) -> Option<Placed> {
-        let placed = self.place_by_anchor(grid)?;
-        // On the editor, Neovim knows better: it keeps the float inside.
-        if placed.root == EDITOR
-            && let Some(Win {
-                kind:
-                    WinKind::Float(FloatPos {
-                        screen: Some((row, col)),
-                        ..
-                    }),
-                ..
-            }) = self.wins.get(&grid)
+        self.place_within(grid, 8)
+    }
+
+    fn place_within(&self, g: u64, depth: u8) -> Option<Placed> {
+        let Some(Win {
+            kind: WinKind::Float(pos),
+            ..
+        }) = self.wins.get(&g)
+        else {
+            if Some(g) == self.msg_grid {
+                return Some(Placed {
+                    root: EDITOR,
+                    row: self.msg_row as i32,
+                    col: 0,
+                });
+            }
+            return Some(Placed {
+                root: g,
+                row: 0,
+                col: 0,
+            });
+        };
+        let parent = self.place_within(pos.anchor_grid, depth.checked_sub(1)?)?;
+        if parent.root == EDITOR
+            && let Some((row, col)) = pos.screen
         {
             return Some(Placed {
                 root: EDITOR,
-                row: *row as i32,
-                col: *col as i32,
+                row: row as i32,
+                col: col as i32,
             });
         }
-        Some(placed)
-    }
-
-    fn place_by_anchor(&self, grid: u64) -> Option<Placed> {
-        let mut g = grid;
-        let (mut row, mut col) = (0i32, 0i32);
-        for _ in 0..8 {
-            let Some(Win {
-                kind: WinKind::Float(pos),
-                ..
-            }) = self.wins.get(&g)
-            else {
-                if Some(g) == self.msg_grid {
-                    return Some(Placed {
-                        root: EDITOR,
-                        row: row + self.msg_row as i32,
-                        col,
-                    });
-                }
-                return Some(Placed { root: g, row, col });
-            };
-            let size = self
-                .grids
-                .get(&g)
-                .map(|x| (x.rows as f64, x.cols as f64))
-                .unwrap_or((0.0, 0.0));
-            let (dr, dc) = match pos.anchor.as_str() {
-                "NE" => (0.0, size.1),
-                "SW" => (size.0, 0.0),
-                "SE" => (size.0, size.1),
-                _ => (0.0, 0.0),
-            };
-            row += (pos.row - dr).round() as i32;
-            col += (pos.col - dc).round() as i32;
-            g = pos.anchor_grid;
-        }
-        None
+        let size = self
+            .grids
+            .get(&g)
+            .map(|x| (x.rows as f64, x.cols as f64))
+            .unwrap_or((0.0, 0.0));
+        let (dr, dc) = match pos.anchor.as_str() {
+            "NE" => (0.0, size.1),
+            "SW" => (size.0, 0.0),
+            "SE" => (size.0, size.1),
+            _ => (0.0, 0.0),
+        };
+        Some(Placed {
+            root: parent.root,
+            row: parent.row + (pos.row - dr).round() as i32,
+            col: parent.col + (pos.col - dc).round() as i32,
+        })
     }
 
     /// The floats (grid ids) that land on root grid `root`, bottom to top.
@@ -641,6 +636,28 @@ mod tests {
                 root: EDITOR,
                 row: 5,
                 col: 0
+            })
+        );
+        // A float hanging from it (no screen position of its own) builds on where it is drawn.
+        m.apply_redraw(&[ev(
+            "win_float_pos",
+            vec![
+                9.into(),
+                1005.into(),
+                "NW".into(),
+                8.into(),
+                1.0.into(),
+                2.0.into(),
+                true.into(),
+                41.into(),
+            ],
+        )]);
+        assert_eq!(
+            m.place(9),
+            Some(Placed {
+                root: EDITOR,
+                row: 6,
+                col: 2
             })
         );
     }

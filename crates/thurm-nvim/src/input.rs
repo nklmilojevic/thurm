@@ -80,12 +80,25 @@ impl InputParser {
         for &b in bytes {
             self.byte(b);
         }
-        if self.state == State::Esc {
-            self.state = State::Ground;
-            self.key(0, Key::Named("Esc"));
-        }
+        // A trailing ESC may start a sequence the next read finishes: it waits, for
+        // [`InputParser::flush_escape`] after a moment.
         self.flush_paste();
         self.flush_keys();
+        std::mem::take(&mut self.out)
+    }
+
+    /// The last read ended in an ESC that may still start a sequence.
+    pub fn pending_escape(&self) -> bool {
+        self.state == State::Esc && !self.paste
+    }
+
+    /// Nothing followed the ESC in time: it was the Escape key.
+    pub fn flush_escape(&mut self) -> Vec<InputEvent> {
+        if self.pending_escape() {
+            self.state = State::Ground;
+            self.key(0, Key::Named("Esc"));
+            self.flush_keys();
+        }
         std::mem::take(&mut self.out)
     }
 
@@ -692,9 +705,34 @@ mod tests {
 
     #[test]
     fn lone_escape_at_end_of_feed() {
+        // It may start a sequence the next read finishes: it waits until flushed.
         let mut parser = InputParser::new();
-        assert_eq!(parser.feed(b"\x1b"), vec![keys("<Esc>")]);
+        assert_eq!(parser.feed(b"\x1b"), Vec::new());
+        assert!(parser.pending_escape());
+        assert_eq!(parser.flush_escape(), vec![keys("<Esc>")]);
+        assert!(!parser.pending_escape());
+        assert_eq!(parser.flush_escape(), Vec::new());
         assert_eq!(parser.feed(b"x"), vec![keys("x")]);
+    }
+
+    #[test]
+    fn escape_sequences_split_after_the_escape() {
+        let mut parser = InputParser::new();
+        assert_eq!(parser.feed(b"\x1b"), Vec::new());
+        assert_eq!(parser.feed(b"[A"), vec![keys("<Up>")]);
+        assert_eq!(parser.feed(b"\x1b"), Vec::new());
+        assert_eq!(parser.feed(b"[I"), vec![InputEvent::FocusIn]);
+        assert_eq!(parser.feed(b"\x1b"), Vec::new());
+        assert_eq!(
+            parser.feed(b"[200~hi\x1b[201~"),
+            vec![
+                InputEvent::PasteStart,
+                InputEvent::Paste("hi".into()),
+                InputEvent::PasteEnd
+            ]
+        );
+        assert_eq!(parser.feed(b"\x1b"), Vec::new());
+        assert_eq!(parser.feed(b"x"), vec![keys("<M-x>")]);
     }
 
     #[test]
@@ -943,7 +981,8 @@ mod tests {
         let mut parser = InputParser::new();
         assert_eq!(parser.feed(b"\x1b[1;"), Vec::new());
         assert_eq!(parser.feed(b"5A"), vec![keys("<C-Up>")]);
-        assert_eq!(parser.feed(b"\x1b"), vec![keys("<Esc>")]);
+        assert_eq!(parser.feed(b"\x1b"), Vec::new());
+        assert_eq!(parser.flush_escape(), vec![keys("<Esc>")]);
     }
 
     #[test]

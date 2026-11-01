@@ -44,6 +44,31 @@ impl Text {
     }
 }
 
+/// A control character as Neovim shows it (`^[` for ESC, `<9b>` for a C1 control), or `None`
+/// for text without one.
+pub fn visible_control(s: &str) -> Option<String> {
+    if !s.chars().any(is_control) {
+        return None;
+    }
+    let mut out = String::new();
+    for ch in s.chars() {
+        match ch as u32 {
+            c @ (0..=0x1f | 0x7f) => {
+                out.push('^');
+                out.push(char::from_u32(c ^ 0x40).unwrap_or('?'));
+            }
+            c @ 0x80..=0x9f => out.push_str(&format!("<{c:02x}>")),
+            _ => out.push(ch),
+        }
+    }
+    Some(out)
+}
+
+/// C0, DEL and C1 controls: what a terminal acts on rather than shows.
+pub fn is_control(ch: char) -> bool {
+    matches!(ch as u32, 0..=0x1f | 0x7f..=0x9f)
+}
+
 impl std::fmt::Debug for Text {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.as_str())
@@ -225,6 +250,15 @@ mod tests {
         assert_eq!(Text::new("👩‍👩‍👧").as_str(), "👩‍👩‍👧");
         assert_eq!(Text::new(&"a\u{301}".repeat(12)).as_str(), "\u{fffd}");
         assert!(Text::SPACE.is_blank() && Text::EMPTY.is_blank() && !Text::new("x").is_blank());
+    }
+
+    #[test]
+    fn control_characters_become_visible() {
+        assert_eq!(visible_control("abc"), None);
+        assert_eq!(visible_control("\x1b").as_deref(), Some("^["));
+        assert_eq!(visible_control("a\x07").as_deref(), Some("a^G"));
+        assert_eq!(visible_control("\u{9b}").as_deref(), Some("<9b>"));
+        assert_eq!(visible_control("\x7f").as_deref(), Some("^?"));
     }
 
     #[test]

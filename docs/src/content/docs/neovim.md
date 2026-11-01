@@ -24,9 +24,16 @@ Neovim configuration and plugins.
   at the bottom of the current window's pane, or in your plugin's popup if you
   use one.
 
-`thurm-nvim` is installed with the app (`Thurm.app/Contents/Helpers/thurm-nvim`)
-and is included in the Linux release archives. Set `THURM_NVIM` to run a
-different `nvim` binary.
+`thurm-nvim` ships with the app. **Thurm › Integrations › Install Command-Line
+Tool** links it into `~/.local/bin` next to `thurm`. Without that link, run it by
+its full path; inside a Thurm pane `$THURM_BIN_DIR` holds that directory:
+
+```sh
+"$THURM_BIN_DIR/thurm-nvim" src/main.rs
+```
+
+On Linux it is in the release archive next to `thurm` and `thurmd`. Set
+`THURM_NVIM` to run a different `nvim` binary.
 
 ## Limitations
 

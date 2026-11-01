@@ -20,7 +20,7 @@ use thurm_proto::{CreatePane, PaneId, PaneSize, Request, Response, SplitDir, UiC
 use crate::cell::{FrameCell, Text};
 use crate::grid::{Model, WinKind, style_from_get_hl};
 use crate::input::{InputEvent, InputParser};
-use crate::launch::with_ext;
+use crate::launch::{self, helper_socket, log_path, nvim_socket};
 use crate::nvim::{self, Message, Nvim};
 use crate::render::{PaneRenderer, enter_modes, leave_modes};
 use crate::view::{PaneView, compose};
@@ -33,6 +33,13 @@ const WINDOWS_LUA: &str = include_str!("windows.lua");
 const FOCUS_OUT_DELAY: Duration = Duration::from_millis(80);
 
 /// How long a focus change of ours keeps the panes' own focus reports from moving Neovim.
+/// How long a lone ESC waits for the rest of a sequence split across reads before it counts as
+/// the Escape key (with the kitty keyboard protocol, Escape comes as `CSI 27 u` anyway).
+const ESCAPE_DELAY: Duration = Duration::from_millis(25);
+
+/// How long Neovim may take to exit on its own before it is hung up on.
+const NVIM_EXIT_GRACE: Duration = Duration::from_secs(2);
+
 const OWN_FOCUS_GRACE: Duration = Duration::from_millis(600);
 
 enum Msg {
@@ -53,6 +60,9 @@ enum Msg {
         pane: Option<PaneId>,
     },
     FocusOutTimer(u64),
+    /// A pane's read ended in a lone ESC, this many reads in: if no read came since, it was
+    /// the Escape key.
+    EscapeTimer(u32, u64),
     Signal,
 }
 
@@ -88,6 +98,10 @@ struct Pane {
     status: Option<Vec<FrameCell>>,
     /// The window size last asked of Neovim.
     asked_size: Option<(u16, u16)>,
+    /// A bracketed paste is under way and Neovim has its first part (`nvim_paste` phase 1).
+    pasting: bool,
+    /// Reads from its terminal so far, to tell whether one came after a lone ESC.
+    reads: u64,
 }
 
 struct Tty {
@@ -111,6 +125,8 @@ impl Pane {
             focused: false,
             status: None,
             asked_size: None,
+            pasting: false,
+            reads: 0,
         }
     }
 
@@ -142,6 +158,7 @@ impl Pane {
 
 /// What a pending Neovim request was for.
 enum Pending {
+    UiAttach,
     ApiInfo,
     Setup,
     Statuslines(Vec<u32>),
@@ -177,10 +194,50 @@ pub struct Daemon {
     socket: PathBuf,
 }
 
-pub fn run(base: &Path, nvim_args: &[String]) -> io::Result<()> {
+pub fn run(dir: &Path, nvim_args: &[String]) -> io::Result<()> {
     unsafe { libc::setsid() };
-    let socket = with_ext(base, ".sock");
-    let _ = std::fs::remove_file(&socket);
+    let result = serve(dir, nvim_args);
+    if let Err(e) = &result {
+        log::error!("{e}");
+    }
+    let _ = std::fs::remove_file(helper_socket(dir));
+    let _ = std::fs::remove_file(nvim_socket(dir));
+    // The log stays when something went wrong, for the user to read.
+    if result.is_ok() {
+        let _ = std::fs::remove_file(log_path(dir));
+        let _ = std::fs::remove_dir(dir);
+    }
+    result
+}
+
+/// Neovim, waited for however the daemon ends. It closes our connection while still exiting
+/// (`:qa`), so it gets a moment to finish: a hang-up then would make it keep its swap files as
+/// after a crash. Still running after that, it is hung up on (and saves them).
+struct NvimProcess(Child);
+
+impl Drop for NvimProcess {
+    fn drop(&mut self) {
+        let deadline = Instant::now() + NVIM_EXIT_GRACE;
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = self.0.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe { libc::kill(self.0.id() as i32, libc::SIGHUP) };
+        let _ = self.0.wait();
+    }
+}
+
+fn serve(dir: &Path, nvim_args: &[String]) -> io::Result<()> {
+    // `dir` is the launcher's fresh private directory; refuse anything else.
+    if !thurm_config::private_dir_ok(dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not private", dir.display()),
+        ));
+    }
+    let socket = helper_socket(dir);
     let listener = UnixListener::bind(&socket)?;
     // Ready: the launcher becomes our first helper.
     io::stdout().write_all(b"r")?;
@@ -189,7 +246,6 @@ pub fn run(base: &Path, nvim_args: &[String]) -> io::Result<()> {
     unsafe { libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO) };
 
     let (tx, rx) = unbounded();
-    listener.set_nonblocking(false)?;
     {
         let tx = tx.clone();
         std::thread::spawn(move || accept_helpers(listener, tx));
@@ -218,9 +274,9 @@ pub fn run(base: &Path, nvim_args: &[String]) -> io::Result<()> {
         _ => return Err(io::Error::other("the launcher's pane never connected")),
     };
 
-    let nvim_socket = with_ext(base, ".nvim.sock");
-    let mut child = spawn_nvim(&nvim_socket, nvim_args)?;
-    let (nvim, reader) = connect_retry(&nvim_socket, Duration::from_secs(3))?;
+    let nvim_sock = nvim_socket(dir);
+    let _nvim_process = NvimProcess(spawn_nvim(&nvim_sock, nvim_args)?);
+    let (nvim, reader) = connect_retry(&nvim_sock, Duration::from_secs(10))?;
     {
         let tx = tx.clone();
         std::thread::spawn(move || read_nvim(reader, tx));
@@ -247,7 +303,7 @@ pub fn run(base: &Path, nvim_args: &[String]) -> io::Result<()> {
         own_focus: None,
         thurm_ops: None,
         exe: std::env::current_exe()?,
-        socket: socket.clone(),
+        socket,
     };
     d.thurm_ops = start_thurm(tx.clone());
     let mut launcher = Pane::new(0, None);
@@ -257,18 +313,11 @@ pub fn run(base: &Path, nvim_args: &[String]) -> io::Result<()> {
     launcher.focused = true;
     d.panes.push(launcher);
     d.attach_tty(0, first.0, first.1);
-    d.start()?;
 
-    let result = d.run_loop(&rx);
+    // However it ends, every terminal goes back as it was (Neovim goes with `_nvim_process`).
+    let result = d.start().and_then(|()| d.run_loop(&rx));
     for p in &mut d.panes {
         p.release();
-    }
-    unsafe { libc::kill(child.id() as i32, libc::SIGHUP) };
-    let _ = child.wait();
-    let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_file(&nvim_socket);
-    if result.is_ok() {
-        let _ = std::fs::remove_file(with_ext(base, ".log"));
     }
     result
 }
@@ -316,6 +365,11 @@ fn read_nvim(mut reader: BufReader<UnixStream>, tx: Sender<Msg>) {
 fn accept_helpers(listener: UnixListener, tx: Sender<Msg>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // Only this user's helpers: the socket is in a private directory, but be sure.
+        if !thurm_config::peer_is_same_user(&stream) {
+            log::warn!("a helper of another user");
+            continue;
+        }
         let mut buf = [0u8; 32];
         let Ok((n, Some(fd))) = fdpass::recv(&stream, &mut buf) else {
             continue;
@@ -417,7 +471,11 @@ fn split(
             pane,
             dir,
         })) {
+            // Shown nowhere (no app window, say): it would only hold the window unseen. The
+            // caller closes the window when it hears there is no pane.
             log::warn!("showing pane {pane}: {e}");
+            let _ = client.request(Request::ClosePane { pane });
+            return None;
         }
     }
     Some(pane)
@@ -440,7 +498,7 @@ impl Daemon {
         self.request(
             "nvim_ui_attach",
             vec![cols.into(), rows.into(), opts],
-            Pending::Ignore,
+            Pending::UiAttach,
         )?;
         self.request("nvim_get_api_info", vec![], Pending::ApiInfo)?;
         self.nvim.flush()
@@ -474,7 +532,7 @@ impl Daemon {
                     return Ok(());
                 }
             }
-            let _ = self.nvim.flush();
+            self.nvim.flush()?;
             if self
                 .panes
                 .iter()
@@ -542,6 +600,15 @@ impl Daemon {
                     }
                 }
             },
+            Msg::EscapeTimer(id, reads) => {
+                let Some(p) = self.pane_mut(id) else {
+                    return Ok(true);
+                };
+                if p.reads == reads {
+                    let events = p.parser.flush_escape();
+                    self.input_events(id, events)?;
+                }
+            }
             Msg::FocusOutTimer(generation) => {
                 if generation == self.focus_gen
                     && !self.panes.iter().any(|p| p.focused)
@@ -649,6 +716,19 @@ impl Daemon {
                 };
                 let result = match result {
                     Ok(v) => v,
+                    // Without the UI or windows.lua there is nothing to show: give up, and the
+                    // terminals go back as they were.
+                    Err(e)
+                        if matches!(
+                            what,
+                            Pending::UiAttach | Pending::ApiInfo | Pending::Setup
+                        ) =>
+                    {
+                        return Err(io::Error::other(format!(
+                            "setting up Neovim: {}",
+                            nvim::error_text(&e)
+                        )));
+                    }
                     Err(e) => {
                         log::warn!("Neovim: {}", nvim::error_text(&e));
                         if matches!(what, Pending::Statuslines(_)) {
@@ -692,7 +772,7 @@ impl Daemon {
                             self.ask_statuslines()?;
                         }
                     }
-                    Pending::Ignore => {}
+                    Pending::UiAttach | Pending::Ignore => {}
                 }
             }
             Message::Request { id, method } => {
@@ -820,7 +900,7 @@ impl Daemon {
         self.panes.push(Pane::new(id, Some(win)));
         let command = vec![
             self.exe.display().to_string(),
-            "pane".into(),
+            launch::PANE.into(),
             self.socket.display().to_string(),
             id.to_string(),
         ];
@@ -941,6 +1021,18 @@ impl Daemon {
                         _ => Default::default(),
                     };
                     let style = self.model.styles.resolve_style(attrs);
+                    // Text from a file can hold control characters: shown as Neovim shows
+                    // them, never sent to the terminal.
+                    if let Some(shown) = crate::cell::visible_control(text) {
+                        for ch in shown.chars() {
+                            out.push(FrameCell {
+                                text: Text::new(ch.encode_utf8(&mut [0; 4])),
+                                width: 1,
+                                style,
+                            });
+                        }
+                        continue;
+                    }
                     out.push(FrameCell {
                         text: Text::new(text),
                         width,
@@ -972,10 +1064,27 @@ impl Daemon {
     }
 
     fn on_input(&mut self, id: u32, bytes: &[u8]) -> io::Result<()> {
+        let tx = self.tx.clone();
         let Some(p) = self.pane_mut(id) else {
             return Ok(());
         };
+        p.reads += 1;
         let events = p.parser.feed(bytes);
+        if p.parser.pending_escape() {
+            // Wait a moment for the rest of a sequence; nothing more and it was Escape.
+            let reads = p.reads;
+            std::thread::spawn(move || {
+                std::thread::sleep(ESCAPE_DELAY);
+                let _ = tx.send(Msg::EscapeTimer(id, reads));
+            });
+        }
+        self.input_events(id, events)
+    }
+
+    fn input_events(&mut self, id: u32, events: Vec<InputEvent>) -> io::Result<()> {
+        let Some(p) = self.pane_mut(id) else {
+            return Ok(());
+        };
         let (win, rows) = (p.win, p.view(false).text_rows());
         let grid = win.and_then(|w| self.model.grid_of_win(w));
         for ev in events {
@@ -986,16 +1095,36 @@ impl Daemon {
                     self.make_current(win)?;
                     self.request("nvim_input", vec![keys.into()], Pending::Ignore)?;
                 }
-                InputEvent::PasteStart => {}
+                InputEvent::PasteStart => {
+                    if let Some(p) = self.pane_mut(id) {
+                        p.pasting = false;
+                    }
+                }
+                // One paste, however many reads it took: phase 1, then 2s, then 3.
                 InputEvent::Paste(text) => {
                     self.make_current(win)?;
+                    let Some(p) = self.pane_mut(id) else { continue };
+                    let phase = if std::mem::replace(&mut p.pasting, true) {
+                        2
+                    } else {
+                        1
+                    };
                     self.request(
                         "nvim_paste",
-                        vec![text.into(), true.into(), (-1).into()],
+                        vec![text.into(), true.into(), phase.into()],
                         Pending::Ignore,
                     )?;
                 }
-                InputEvent::PasteEnd => {}
+                InputEvent::PasteEnd => {
+                    let Some(p) = self.pane_mut(id) else { continue };
+                    if std::mem::take(&mut p.pasting) {
+                        self.request(
+                            "nvim_paste",
+                            vec!["".into(), true.into(), 3.into()],
+                            Pending::Ignore,
+                        )?;
+                    }
+                }
                 InputEvent::Mouse(m) => {
                     let Some(g) = grid else { continue };
                     if m.row >= rows {
