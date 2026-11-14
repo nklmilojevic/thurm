@@ -655,3 +655,53 @@ fn finished_scripts_leave_no_threads() {
         "{before} threads before, {after} after"
     );
 }
+
+/// A script whose client leaves stops, and so does a program it waits on.
+#[test]
+fn a_scripts_program_stops_when_its_client_leaves() {
+    let env = Env::new("ext-script-leaves");
+    let _d = env.start();
+    let pidfile = env.dir.join("prog.pid");
+    let stream = std::os::unix::net::UnixStream::connect(&env.socket).unwrap();
+    let closer = stream.try_clone().unwrap();
+    let c = Client::from_stream(stream, "e2e", false, &[CAP_EXT], |_| {}, || {}).unwrap();
+    let source = format!(
+        "thurm.exec({{ 'sh', '-c', 'echo $$ > {}; exec sleep 30' }})",
+        pidfile.display()
+    );
+    let waiting = std::thread::spawn({
+        let c = c.clone();
+        move || call(&c, method::SCRIPT_RUN, json!({ "source": source }))
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let pid: i32 = loop {
+        if let Ok(t) = std::fs::read_to_string(&pidfile)
+            && let Ok(p) = t.trim().parse()
+        {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "the program did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The CLI goes (Ctrl-C).
+    closer.shutdown(std::net::Shutdown::Both).unwrap();
+    let at = Instant::now();
+    let _ = waiting.join();
+    let running = || {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        !state.is_empty() && !state.starts_with('Z')
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while running() {
+        assert!(
+            Instant::now() < deadline,
+            "program {pid} outlived its script"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(at.elapsed() < Duration::from_secs(15), "{:?}", at.elapsed());
+}

@@ -30,6 +30,9 @@ pub const TYPES: &str = include_str!("../types/thurm.lua");
 /// How long code may run without waiting before it is stopped as a runaway.
 const RUN_LIMIT: Duration = Duration::from_secs(5);
 
+/// The most calls one plugin may have waiting on the daemon at once: each takes a thread.
+const MAX_CALLS: usize = 64;
+
 /// The most timers fired before the runtime looks at its jobs again.
 const TIMER_BATCH: usize = 64;
 
@@ -179,6 +182,8 @@ struct Shared {
     depth: HashMap<usize, u32>,
     /// Tickets a coroutine of this plugin waits on.
     waiting: HashSet<u64>,
+    /// The tickets of calls running on a thread of their own.
+    calls: HashSet<u64>,
     new_timers: Vec<(u64, Duration, Option<Duration>, Fire)>,
     cancelled: HashSet<u64>,
 }
@@ -248,7 +253,12 @@ impl Engine {
             Job::Load(spec, done) => self.load(*spec, done),
             Job::Unload(instance) => self.unload(instance, "the plugin was stopped"),
             Job::Notice(instance, name, payload) => self.notice(instance, &name, payload),
-            Job::Resume(instance, ticket, result) => self.wake(instance, ticket, result),
+            Job::Resume(instance, ticket, result) => {
+                if let Some(p) = self.plugins.get(&instance) {
+                    p.shared.borrow_mut().calls.remove(&ticket);
+                }
+                self.wake(instance, ticket, result)
+            }
             Job::Stop => {}
             #[cfg(test)]
             Job::Inspect(tx) => {
@@ -365,10 +375,19 @@ impl Engine {
             "start",
             lua.create_function(move |lua, (m, params): (String, mlua::Value)| {
                 let params: Value = from_lua(lua, params)?;
+                if sh.borrow().calls.len() >= MAX_CALLS {
+                    return Ok((
+                        None,
+                        Some(format!(
+                            "{MAX_CALLS} calls are waiting already: wait for some"
+                        )),
+                    ));
+                }
                 let ticket = match waiting_ticket(lua, &sh, &ids) {
                     Ok(t) => t,
                     Err(e) => return Ok((None, Some(e))),
                 };
+                sh.borrow_mut().calls.insert(ticket);
                 let host = host.clone();
                 let tx = tx.clone();
                 std::thread::Builder::new()

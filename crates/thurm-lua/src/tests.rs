@@ -360,3 +360,28 @@ fn cancelled_timers_leave_the_heap() {
     assert_eq!(live, 0);
     assert!(heap <= 64, "{heap} timers left in the heap");
 }
+
+/// Each waiting call takes a thread: a plugin may have only so many at once.
+#[test]
+fn waiting_calls_are_bounded() {
+    let f = fixture();
+    let r = run(
+        &f,
+        r#"
+        local refused
+        for i = 1, 100 do
+            thurm.after(0, function()
+                local ok, err = pcall(thurm.exec, { "slowprog" })
+                if not ok then refused = refused or err end
+            end)
+        end
+        thurm.sleep(1)
+        return refused
+        "#,
+    )
+    .unwrap();
+    assert!(
+        r.as_str().unwrap_or_default().contains("waiting already"),
+        "{r}"
+    );
+}
