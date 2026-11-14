@@ -10,20 +10,10 @@ struct AgentPane {
     let hidden: Workspace?
 
     /// What the agent works on: its session topic, the topic in the title it sets, or its name.
-    var title: String {
-        agent.topic ?? Self.programTopic(info.title, agent: agent.name) ?? agent.name
-    }
+    var title: String { agent.title(paneTitle: info.title) }
 
     /// The age of the daemon's last reported change. Missing timestamps show no age.
-    func activityAge(now: Date = Date()) -> String? {
-        guard let updated = agent.updatedAtMs, updated > 0 else { return nil }
-        let seconds = max(0, now.timeIntervalSince1970 - Double(updated) / 1000)
-        if seconds < 1 { return "updated now" }
-        if seconds < 60 { return "updated \(Int(seconds))s ago" }
-        if seconds < 3600 { return "updated \(Int(seconds / 60))m ago" }
-        if seconds < 86400 { return "updated \(Int(seconds / 3600))h ago" }
-        return "updated \(Int(seconds / 86400))d ago"
-    }
+    func activityAge(now: Date = Date()) -> String? { agent.activityAge(now: now) }
 
     /// The remote host it runs on (nil on this Mac).
     var hostLabel: String? { pane.isRemote ? pane.host : nil }
@@ -35,37 +25,7 @@ struct AgentPane {
     }
 
     /// Its status in words ("Needs your permission to use Bash", "Done in 2m").
-    var statusDetail: String {
-        switch agent.status {
-        case .needsInput: return agent.message.map { Self.shorten($0, agent: agent.name) } ?? "Needs input"
-        case .working:
-            let message = agent.message?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return message.flatMap { $0.isEmpty ? nil : $0 } ?? "Working"
-        case .done:
-            let done = agent.turnMs.map { "Done in \(formatDuration($0))" } ?? "Done"
-            // The turn's summary (`ai.notifications`).
-            return agent.message.map { "\(done) · \($0)" } ?? done
-        case .error: return agent.message ?? "Failed"
-        case .idle: return "Idle"
-        }
-    }
-
-    /// The topic in the title the agent sets itself ("✳ Fix login bug", "⠐ Fix login bug"),
-    /// without its status glyph; nil when it only names the agent.
-    private static func programTopic(_ title: String, agent: String) -> String? {
-        let t = String(title.drop { !$0.isLetter && !$0.isNumber })
-            .trimmingCharacters(in: .whitespaces)
-        return t.isEmpty || t == agent ? nil : t
-    }
-
-    /// "Claude needs your permission to use Bash" → "Needs your permission to use Bash",
-    /// "Claude is waiting for your input" → "Waiting for your input".
-    private static func shorten(_ message: String, agent: String) -> String {
-        guard let first = agent.split(separator: " ").first, message.hasPrefix(first + " ") else { return message }
-        var rest = message.dropFirst(first.count + 1)
-        if rest.hasPrefix("is ") { rest = rest.dropFirst(3) }
-        return rest.prefix(1).uppercased() + rest.dropFirst()
-    }
+    var statusDetail: String { agent.statusDetail }
 }
 
 extension SessionManager {
