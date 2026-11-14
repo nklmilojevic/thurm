@@ -136,7 +136,8 @@ then what it returns. It has the same API, with `thurm.args`, and in
 machine's pane means nothing: use `thurm.focused()` or `thurm.panes()` there):
 
 ```lua
--- review.lua: open the diff of every changed file, staged or not, in a split.
+-- review.lua: open the diff of every changed tracked file, staged or not, in a split
+-- (new files git doesn't track yet are not in `git diff`).
 local root = thurm.info(thurm.pane or thurm.focused()).cwd
 local r = thurm.exec({ "git", "diff", "HEAD", "--name-only" }, { cwd = root })
 for file in r.stdout:gmatch("[^\n]+") do
@@ -260,4 +261,7 @@ JSON.
 | `plugins.reload`, `plugins.enable`, `plugins.disable`, `plugins.logs` | `{name}` (`lines` for logs) | |
 | `script.run` | `{source, name, args, dir, pane}` | What the script returned |
 
-A plugin's actions, keys and subscriptions go away when it stops.
+A plugin's actions, keys and subscriptions go away when it stops. `exec`,
+`script.run` and the `plugins.*` methods that change what runs are for clients
+on the daemon's machine (and its plugins): a caller over the tailnet is refused
+them.
