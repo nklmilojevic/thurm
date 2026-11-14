@@ -42,6 +42,7 @@ pub fn blocks(method: &str) -> bool {
     matches!(
         method,
         method::REQUEST
+            | method::PANES_OPEN
             | method::ACTIONS_RUN
             | method::UI_PICK
             | method::UI_INPUT
@@ -54,17 +55,11 @@ pub fn blocks(method: &str) -> bool {
     )
 }
 
-/// Methods that run programs or change what runs on this machine: host administration, for
-/// clients on this machine (and plugins) only.
-fn local_only(method: &str) -> bool {
-    matches!(
-        method,
-        method::EXEC
-            | method::SCRIPT_RUN
-            | method::PLUGINS_RELOAD
-            | method::PLUGINS_ENABLE
-            | method::PLUGINS_DISABLE
-    )
+/// What a tailnet caller may ask of the extension API: only to read what there is. Running
+/// actions and programs, providing actions, hearing events and managing plugins are for this
+/// machine's own clients and its plugins.
+fn over_tailnet(method: &str) -> bool {
+    matches!(method, method::ACTIONS_LIST | method::PLUGINS_LIST)
 }
 
 /// A caller the Tailscale helper admitted, rather than a process of this machine.
@@ -126,7 +121,7 @@ impl Daemon {
         if client.gone.load(Ordering::SeqCst) {
             return Err("this client was disconnected".into());
         }
-        if local_only(method) && client_is_tailnet(client) {
+        if client_is_tailnet(client) && !over_tailnet(method) {
             return Err(format!(
                 "{method} is for this machine's own clients, not over the tailnet"
             ));
@@ -169,7 +164,7 @@ impl Daemon {
             method::ACTIONS_RUN => {
                 let run: ext::RunAction = params(p)?;
                 let origin = self.ext_source(client);
-                self.run_action(&origin, run)
+                self.run_action(client, &origin, run)
             }
             method::ACTIONS_RESULT | method::UI_REPLY => {
                 let reply: ext::Reply = params(p)?;
@@ -230,15 +225,15 @@ impl Daemon {
                 if pick.items.is_empty() {
                     return Ok(Value::Null);
                 }
-                self.ask_ui(|id| ext::UiRequest::Pick { id, pick })
+                self.ask_ui(client, |id| ext::UiRequest::Pick { id, pick })
             }
             method::UI_INPUT => {
                 let input: ext::Input = params(p)?;
-                self.ask_ui(|id| ext::UiRequest::Input { id, input })
+                self.ask_ui(client, |id| ext::UiRequest::Input { id, input })
             }
             method::UI_CONFIRM => {
                 let confirm: ext::Confirm = params(p)?;
-                let answer = self.ask_ui(|id| ext::UiRequest::Confirm { id, confirm })?;
+                let answer = self.ask_ui(client, |id| ext::UiRequest::Confirm { id, confirm })?;
                 Ok(Value::Bool(answer.as_bool().unwrap_or(false)))
             }
             method::EXEC => {
@@ -258,6 +253,8 @@ impl Daemon {
                         stdin: exec.stdin.map(String::into_bytes),
                     },
                     exec.timeout_ms.map(Duration::from_millis),
+                    // Stopped with its caller (a script that ended, a client that left).
+                    &|| client.gone.load(Ordering::SeqCst),
                 )
                 .map_err(|e| format!("cannot run {:?}: {e}", exec.argv[0]))?;
                 serde_json::to_value(result).map_err(|e| e.to_string())
@@ -332,9 +329,10 @@ impl Daemon {
         }
     }
 
-    /// Runs the action `run.name` and returns what it returned.
+    /// Runs the action `run.name` for `caller` and returns what it returned.
     pub fn run_action(
         self: &Arc<Self>,
+        caller: &Client,
         origin: &str,
         run: ext::RunAction,
     ) -> Result<Value, String> {
@@ -373,7 +371,7 @@ impl Daemon {
                     },
                 };
                 send_ext(&client, notice::ACTION_INVOKE, &json!(invoke));
-                self.ext_wait(qid, &rx, &entry.info.source)
+                self.ext_wait(qid, &rx, &entry.info.source, caller)
             }
         }
     }
@@ -386,8 +384,31 @@ impl Daemon {
         (id, rx)
     }
 
-    fn ext_wait(&self, id: u64, rx: &Receiver<ext::Reply>, who: &str) -> Result<Value, String> {
-        let reply = rx.recv_timeout(REPLY_TIMEOUT);
+    /// Waits for the answer to question `id`; gives up when `caller`, who waits for it, is gone.
+    fn ext_wait(
+        &self,
+        id: u64,
+        rx: &Receiver<ext::Reply>,
+        who: &str,
+        caller: &Client,
+    ) -> Result<Value, String> {
+        let deadline = std::time::Instant::now() + REPLY_TIMEOUT;
+        let reply = loop {
+            let step = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(200));
+            match rx.recv_timeout(step) {
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    if caller.gone.load(Ordering::SeqCst) {
+                        self.ext.pending.lock().remove(&id);
+                        return Err("the caller went away".into());
+                    }
+                }
+                other => break other,
+            }
+        };
         self.ext.pending.lock().remove(&id);
         match reply {
             Ok(ext::Reply { error: Some(e), .. }) => Err(e),
@@ -635,13 +656,17 @@ impl Daemon {
     }
 
     /// Asks the app to show `make(id)` and waits for the user's answer.
-    fn ask_ui(&self, make: impl FnOnce(u64) -> ext::UiRequest) -> Result<Value, String> {
+    fn ask_ui(
+        &self,
+        caller: &Client,
+        make: impl FnOnce(u64) -> ext::UiRequest,
+    ) -> Result<Value, String> {
         let app = self
             .ui_client()
             .ok_or("no Thurm window is open to ask in (or the app is too old)")?;
         let (id, rx) = self.ext_question(app.id);
         send_ext(&app, notice::UI_REQUEST, &json!(make(id)));
-        let answer = self.ext_wait(id, &rx, "the app");
+        let answer = self.ext_wait(id, &rx, "the app", caller);
         if answer.is_err() {
             send_ext(&app, notice::UI_CANCEL, &json!({ "id": id }));
         }

@@ -82,7 +82,12 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Runs `launch` to its end and returns what it printed. Past `timeout` its process group gets
 /// SIGTERM, then SIGKILL after [`KILL_GRACE`].
-pub fn run(launch: Launch, timeout: Option<Duration>) -> io::Result<ExecResult> {
+/// `cancel` is asked as it runs: once true, the program is stopped the same way.
+pub fn run(
+    launch: Launch,
+    timeout: Option<Duration>,
+    cancel: &dyn Fn() -> bool,
+) -> io::Result<ExecResult> {
     let mut cmd = command(&launch);
     cmd.stdin(if launch.stdin.is_some() {
         Stdio::piped()
@@ -145,15 +150,15 @@ pub fn run(launch: Launch, timeout: Option<Duration>) -> io::Result<ExecResult> 
     let started = Instant::now();
     let mut timed_out = false;
     let mut killed_at: Option<Instant> = None;
+    let mut stopping = false;
     // Until it is reaped, the program's pid, and so its group's id, stay its own: signals to
     // the group are safe.
     while !exited(pid) {
         let now = Instant::now();
-        if let Some(t) = timeout
-            && !timed_out
-            && now.duration_since(started) >= t
-        {
-            timed_out = true;
+        let expired = timeout.is_some_and(|t| now.duration_since(started) >= t);
+        if killed_at.is_none() && !stopping && (expired || cancel()) {
+            timed_out = expired;
+            stopping = true;
             killed_at = Some(now);
             unsafe { libc::kill(-pid, libc::SIGTERM) };
         }
@@ -354,7 +359,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let r = super::run(launch(&argv, Some("in\n")), None).unwrap();
+        let r = super::run(launch(&argv, Some("in\n")), None, &|| false).unwrap();
         assert_eq!(r.stdout, "in\nx\n");
         assert_eq!(r.stderr, "err\n");
         assert_eq!((r.ok, r.code, r.timed_out), (false, Some(4), false));
@@ -370,7 +375,10 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let r = super::run(launch(&argv, None), Some(Duration::from_secs(60))).unwrap();
+        let r = super::run(launch(&argv, None), Some(Duration::from_secs(60)), &|| {
+            false
+        })
+        .unwrap();
         assert_eq!(r.stdout.len(), CAPTURE_MAX);
         assert_eq!(
             (r.code, r.timed_out, r.stderr.as_str()),
@@ -389,7 +397,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let at = Instant::now();
-        let r = super::run(launch(&argv, None), None).unwrap();
+        let r = super::run(launch(&argv, None), None, &|| false).unwrap();
         assert_eq!((r.stdout.as_str(), r.code), ("hi\n", Some(0)));
         assert!(at.elapsed() < Duration::from_secs(10), "{:?}", at.elapsed());
         // The one left behind was stopped with its group.
@@ -405,8 +413,24 @@ mod tests {
             .output()
             .unwrap();
         let state = String::from_utf8_lossy(&state.stdout).trim().to_owned();
-        assert!(state.is_empty() || state.starts_with('Z'), "sleep {pid} still runs: {state}");
+        assert!(
+            state.is_empty() || state.starts_with('Z'),
+            "sleep {pid} still runs: {state}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn run_stops_a_command_when_cancelled() {
+        let argv: Vec<String> = ["sh", "-c", "sleep 30"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let at = Instant::now();
+        let cancel = || at.elapsed() > Duration::from_millis(300);
+        let r = super::run(launch(&argv, None), None, &cancel).unwrap();
+        assert!(!r.ok && !r.timed_out);
+        assert!(at.elapsed() < Duration::from_secs(10), "{:?}", at.elapsed());
     }
 
     #[test]
@@ -416,7 +440,12 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let at = Instant::now();
-        let r = super::run(launch(&argv, None), Some(Duration::from_millis(300))).unwrap();
+        let r = super::run(
+            launch(&argv, None),
+            Some(Duration::from_millis(300)),
+            &|| false,
+        )
+        .unwrap();
         assert!(r.timed_out);
         assert!(!r.ok);
         assert_eq!(r.stdout, "started\n");

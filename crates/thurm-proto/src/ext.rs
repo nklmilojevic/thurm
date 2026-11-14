@@ -9,8 +9,8 @@
 //!   holding the result as JSON; what the daemon has to say on its own comes as
 //!   [`crate::Event::Ext`].
 //!
-//! `exec`, `script.run` and the `plugins.*` methods that change what runs are for clients on
-//! the daemon's machine (and its plugins): a tailnet caller is refused them.
+//! The API is for clients on the daemon's machine and its plugins: a tailnet caller may only
+//! read `actions.list` and `plugins.list`.
 //!
 //! JSON rather than postcard: a method or a field can be added without touching the wire
 //! format, so an app and a daemon of different versions keep working (an unknown method is an

@@ -380,8 +380,7 @@ fn an_unverified_app_is_not_asked() {
     assert!(rx.try_iter().all(|n| n != notice::UI_REQUEST));
 }
 
-/// Running programs and managing plugins is for this machine's clients: a tailnet caller is
-/// refused them.
+/// The extension API is for this machine's clients: a tailnet caller may only read the lists.
 #[test]
 fn a_tailnet_caller_cannot_run_programs() {
     use thurm_proto::tailnet::write_ingress;
@@ -400,6 +399,9 @@ fn a_tailnet_caller_cannot_run_programs() {
     .unwrap();
     let c = Client::from_stream(stream, "remote", false, &[CAP_EXT], |_| {}, || {}).unwrap();
     for (m, p) in [
+        (method::ACTIONS_RUN, json!({ "name": "x" })),
+        (method::ACTIONS_REGISTER, json!({ "actions": [] })),
+        (method::EVENTS_SUBSCRIBE, json!({ "names": ["bell"] })),
         (method::EXEC, json!({ "argv": ["true"] })),
         (method::SCRIPT_RUN, json!({ "source": "return 1" })),
         (method::PLUGINS_DISABLE, json!({ "name": "x" })),
@@ -407,6 +409,6 @@ fn a_tailnet_caller_cannot_run_programs() {
         let e = call(&c, m, p).unwrap_err();
         assert!(e.contains("tailnet"), "{m}: {e}");
     }
-    // What a tailnet caller may do still works.
+    // Reading what there is still works.
     assert!(call(&c, method::ACTIONS_LIST, Value::Null).is_ok());
 }
