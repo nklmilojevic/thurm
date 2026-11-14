@@ -44,24 +44,7 @@ pub struct Ext {
     next: AtomicU64,
 }
 
-/// Whether `method` can wait (on a program, another client, the user): such a request is not
-/// answered on the connection's reader thread.
-pub fn blocks(method: &str) -> bool {
-    matches!(
-        method,
-        method::REQUEST
-            | method::PANES_OPEN
-            | method::ACTIONS_RUN
-            | method::UI_PICK
-            | method::UI_INPUT
-            | method::UI_CONFIRM
-            | method::EXEC
-            | method::SCRIPT_RUN
-            | method::PLUGINS_RELOAD
-            | method::PLUGINS_ENABLE
-            | method::PLUGINS_DISABLE
-    )
-}
+pub use thurm_proto::ext::method_blocks as blocks;
 
 /// What a tailnet caller may ask of the extension API: only to read what there is. Running
 /// actions and programs, providing actions, hearing events and managing plugins are for this
@@ -278,18 +261,8 @@ impl Daemon {
                 }
                 Ok(Value::Null)
             }
-            other => self.ext_call_more(client, other, p),
+            other => self.plugin_method(client, other, p),
         }
-    }
-
-    /// Methods of later layers (plugins, scripts); unknown here.
-    fn ext_call_more(
-        self: &Arc<Self>,
-        _client: &Arc<Client>,
-        method: &str,
-        _params: Value,
-    ) -> Result<Value, String> {
-        Err(format!("unknown method {method:?}"))
     }
 
     /// The registry, to add what `client` provides or hears: refused once the client is gone.

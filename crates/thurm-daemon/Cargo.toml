@@ -13,6 +13,7 @@ path = "src/main.rs"
 thurm-proto.workspace = true
 thurm-config.workspace = true
 thurm-term.workspace = true
+thurm-lua = { path = "../thurm-lua" }
 serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true

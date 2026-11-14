@@ -207,6 +207,7 @@ fn main() {
         daemon.restore_session();
     }
     daemon.start_tailnet(tailnet);
+    daemon.start_plugins();
 
     {
         // A few, so one slow repository doesn't hold up every pane's status.

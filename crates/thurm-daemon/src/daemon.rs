@@ -5,6 +5,7 @@ mod active_size;
 mod agent_prompt;
 pub mod ext;
 mod focus;
+mod plugins;
 mod layouts;
 #[path = "terminal_attach.rs"]
 mod terminal_attach;
@@ -583,6 +584,8 @@ pub struct Daemon {
     focus: Mutex<focus::FocusLog>,
     /// Actions, key bindings and event subscriptions of the extension API.
     ext: ext::Ext,
+    /// The plugins and scripts the daemon runs.
+    plugins: plugins::Plugins,
 }
 
 impl Daemon {
@@ -639,6 +642,7 @@ impl Daemon {
             last_activity: Mutex::new(Instant::now()),
             focus: Mutex::new(focus::FocusLog::default()),
             ext: ext::Ext::default(),
+            plugins: plugins::Plugins::default(),
         });
         daemon.ext_config_applied();
         daemon
@@ -833,7 +837,7 @@ impl Daemon {
         }
     }
 
-    pub fn remove_client(&self, id: u64) {
+    pub fn remove_client(self: &Arc<Self>, id: u64) {
         log::info!("client {id} gone");
         // Before its registrations go: one it is making now sees the flag (see `ext_registry`).
         if let Some(c) = self.clients.lock().remove(&id) {
@@ -841,6 +845,7 @@ impl Daemon {
         }
         self.focus.lock().client_gone(id);
         self.ext_client_gone(id);
+        self.plugins_owner_gone(id);
         for p in self.all_panes() {
             let mut st = p.state.lock();
             st.subscribers.remove(&id);
@@ -3192,6 +3197,7 @@ impl Daemon {
                     log::warn!("config: {w}");
                 }
                 self.apply_config(cfg);
+                self.load_init();
                 Ok(Response::Ok)
             }
             Request::SaveSnapshot => self

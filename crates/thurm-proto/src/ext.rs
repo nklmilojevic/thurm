@@ -55,7 +55,8 @@ pub mod method {
     pub const PANES_OPEN: &str = "panes.open";
     /// `{text, pane?}`: a short message over a pane (the focused one).
     pub const UI_TOAST: &str = "ui.toast";
-    /// [`super::Pick`]: the user picks from a list. The result is `{index, id}` or null.
+    /// [`super::Pick`]: the user picks from a list. The result is `{index, id}` (`index` from
+    /// 0) or null when the user cancels.
     pub const UI_PICK: &str = "ui.pick";
     /// [`super::Input`]: the user types a line. The result is the text or null.
     pub const UI_INPUT: &str = "ui.input";
@@ -379,8 +380,30 @@ pub struct RunScript {
     pub args: Vec<String>,
     /// The directory `require` looks in.
     pub dir: Option<String>,
+    /// Modules for `require` brought along, by path relative to the script (`lib/util.lua`):
+    /// a script run on another host has no directory there.
+    pub modules: std::collections::BTreeMap<String, String>,
     /// `thurm.pane` in the script: the pane it was started from.
     pub pane: Option<crate::PaneId>,
+}
+
+/// Whether `method` can wait (on a program, another client, the user): a daemon answers it off
+/// the connection's reader thread, and a script waits for it without stopping others.
+pub fn method_blocks(method: &str) -> bool {
+    matches!(
+        method,
+        method::REQUEST
+            | method::PANES_OPEN
+            | method::ACTIONS_RUN
+            | method::UI_PICK
+            | method::UI_INPUT
+            | method::UI_CONFIRM
+            | method::EXEC
+            | method::SCRIPT_RUN
+            | method::PLUGINS_RELOAD
+            | method::PLUGINS_ENABLE
+            | method::PLUGINS_DISABLE
+    )
 }
 
 /// Whether `name` can name an action: 1 to 64 letters, digits, `.`, `_`, `-`, `:` and spaces,

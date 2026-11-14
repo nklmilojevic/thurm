@@ -548,3 +548,290 @@ fn an_invocation_named_sets_the_depth() {
     .unwrap();
     assert_eq!(hold.join().unwrap().unwrap(), json!(0));
 }
+
+#[test]
+fn init_lua_provides_actions_and_scripts_run() {
+    let env = Env::new("ext-lua");
+    let init = env.dir.join("config/init.lua");
+    std::fs::write(
+        &init,
+        r#"
+        thurm.action{ name = "lua.greet", run = function(ctx, args)
+            return "hello " .. (args or "you") .. " from " .. ctx.origin
+        end }
+        thurm.bind("cmd+shift+g", "lua.greet")
+        "#,
+    )
+    .unwrap();
+    let _d = env.start();
+    let (c, rx) = ext_client(&env, "e2e");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !action_names(&c).contains(&"lua.greet".to_owned()) {
+        assert!(Instant::now() < deadline, "init.lua did not load");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let list = call(&c, method::ACTIONS_LIST, Value::Null).unwrap();
+    assert_eq!(list["bindings"][0]["action"], "lua.greet");
+    assert_eq!(list["bindings"][0]["source"], "plugin:init");
+    let r = call(
+        &c,
+        method::ACTIONS_RUN,
+        json!({ "name": "lua.greet", "args": "e2e" }),
+    )
+    .unwrap();
+    assert_eq!(r, "hello e2e from e2e");
+
+    // A script calls the plugin's action, logs, and returns.
+    let r = call(
+        &c,
+        method::SCRIPT_RUN,
+        json!({ "source": "thurm.log('hi', thurm.args[1]); return thurm.run('lua.greet', 'script')", "args": ["x"] }),
+    )
+    .unwrap();
+    assert_eq!(r, "hello script from plugin:script");
+    let log = next(&rx, notice::SCRIPT_LOG);
+    assert_eq!(log["message"], "hi x");
+    let e = call(
+        &c,
+        method::SCRIPT_RUN,
+        json!({ "source": "error('nope')", "name": "s.lua" }),
+    )
+    .unwrap_err();
+    assert!(e.contains("s.lua:1: nope"), "{e}");
+
+    // A broken init.lua leaves the running one as it is.
+    std::fs::write(&init, "thurm.action{ name = ").unwrap();
+    c.request(Request::ReloadConfig).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(action_names(&c).contains(&"lua.greet".to_owned()));
+    // One that compiles but fails as it runs gives way to the one that worked: the app
+    // hears why, and the working action is back without the new one's.
+    let (_app, app_rx) = {
+        let (tx, rx) = unbounded();
+        let app = Client::connect_with(
+            ConnectOptions {
+                socket: env.socket.clone(),
+                spawn_daemon: None,
+                client_name: "app",
+                ui: true,
+            },
+            &[CAP_EXT, CAP_EXT_UI],
+            move |ev| {
+                if let Event::Ext { name, payload } = ev {
+                    let _ = tx.send((name, serde_json::from_str::<Value>(&payload).unwrap()));
+                }
+            },
+            || {},
+        )
+        .unwrap();
+        (app, rx)
+    };
+    std::fs::write(
+        &init,
+        "thurm.action{ name = 'lua.half', run = function() end }\nerror('no')",
+    )
+    .unwrap();
+    c.request(Request::ReloadConfig).unwrap();
+    let toast = next(&app_rx, notice::UI_REQUEST);
+    assert!(
+        toast["text"].as_str().unwrap().contains("init.lua:2: no;"),
+        "{toast}"
+    );
+    // The fallback ran to its end: its key binding, the last thing it sets up, is there, and
+    // its action answers.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let list = call(&c, method::ACTIONS_LIST, Value::Null).unwrap();
+        let bound = list["bindings"]
+            .as_array()
+            .is_some_and(|b| b.iter().any(|b| b["action"] == "lua.greet"));
+        if bound && action_names(&c) == ["lua.greet"] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{list}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let r = call(
+        &c,
+        method::ACTIONS_RUN,
+        json!({ "name": "lua.greet", "args": "again" }),
+    )
+    .unwrap();
+    assert_eq!(r, "hello again from e2e");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(action_names(&c), ["lua.greet"]);
+
+    // Reloading runs the new init.lua: its old actions go.
+    std::fs::write(
+        &init,
+        "thurm.action{ name = 'lua.other', run = function() end }",
+    )
+    .unwrap();
+    c.request(Request::ReloadConfig).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while action_names(&c) != ["lua.other"] {
+        assert!(Instant::now() < deadline, "{:?}", action_names(&c));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The threads of a process.
+fn thread_count(pid: u32) -> usize {
+    if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+        return tasks.count();
+    }
+    let out = Command::new("ps")
+        .args(["-M", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .count()
+        .saturating_sub(1)
+}
+
+/// Scripts that ended leave nothing running behind them.
+#[test]
+fn finished_scripts_leave_no_threads() {
+    let env = Env::new("ext-script-threads");
+    let d = env.start();
+    let (c, _rx) = ext_client(&env, "e2e");
+    let run = || {
+        call(
+            &c,
+            method::SCRIPT_RUN,
+            json!({ "source": "thurm.sleep(0.01); return 1" }),
+        )
+        .unwrap()
+    };
+    run();
+    std::thread::sleep(Duration::from_millis(300));
+    let before = thread_count(d.child.id());
+    for _ in 0..30 {
+        run();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let after = thread_count(d.child.id());
+    assert!(
+        after <= before + 5,
+        "{before} threads before, {after} after"
+    );
+}
+
+/// A script whose client leaves stops, and so does a program it waits on.
+#[test]
+fn a_scripts_program_stops_when_its_client_leaves() {
+    let env = Env::new("ext-script-leaves");
+    let _d = env.start();
+    let pidfile = env.dir.join("prog.pid");
+    let stream = std::os::unix::net::UnixStream::connect(&env.socket).unwrap();
+    let closer = stream.try_clone().unwrap();
+    let c = Client::from_stream(stream, "e2e", false, &[CAP_EXT], |_| {}, || {}).unwrap();
+    let source = format!(
+        "thurm.exec({{ 'sh', '-c', 'echo $$ > {}; exec sleep 30' }})",
+        pidfile.display()
+    );
+    let waiting = std::thread::spawn({
+        let c = c.clone();
+        move || call(&c, method::SCRIPT_RUN, json!({ "source": source }))
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let pid: i32 = loop {
+        if let Ok(t) = std::fs::read_to_string(&pidfile)
+            && let Ok(p) = t.trim().parse()
+        {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "the program did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The CLI goes (Ctrl-C).
+    closer.shutdown(std::net::Shutdown::Both).unwrap();
+    let at = Instant::now();
+    let _ = waiting.join();
+    let running = || {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        !state.is_empty() && !state.starts_with('Z')
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while running() {
+        assert!(
+            Instant::now() < deadline,
+            "program {pid} outlived its script"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(at.elapsed() < Duration::from_secs(15), "{:?}", at.elapsed());
+}
+
+/// Scripts waiting on an action nobody answers end when their clients go, and so do the
+/// calls they were waiting on.
+#[test]
+fn a_scripts_waiting_calls_end_when_its_client_leaves() {
+    let env = Env::new("ext-script-calls");
+    let d = env.start();
+    // Provides an action and never answers it.
+    let (provider, _prx) = ext_client(&env, "provider");
+    call(
+        &provider,
+        method::ACTIONS_REGISTER,
+        json!({ "actions": [{ "name": "never.answers" }] }),
+    )
+    .unwrap();
+    // A pane that runs on: waiting for its exit waits as long as it does.
+    let pane = match provider
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec!["sleep".into(), "60".into()]),
+            cwd: Some(env.dir.display().to_string()),
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    let before = thread_count(d.child.id());
+    let mut closers = Vec::new();
+    let mut waiting = Vec::new();
+    for i in 0..8 {
+        let source = if i % 2 == 0 {
+            "thurm.run('never.answers')".to_owned()
+        } else {
+            format!("thurm.wait({pane}, {{ exit = true }})")
+        };
+        let stream = std::os::unix::net::UnixStream::connect(&env.socket).unwrap();
+        closers.push(stream.try_clone().unwrap());
+        let c = Client::from_stream(stream, "e2e", false, &[CAP_EXT], |_| {}, || {}).unwrap();
+        waiting.push(std::thread::spawn(move || {
+            call(&c, method::SCRIPT_RUN, json!({ "source": source }))
+        }));
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(
+        thread_count(d.child.id()) > before + 8,
+        "the scripts are not waiting"
+    );
+    for c in &closers {
+        c.shutdown(std::net::Shutdown::Both).unwrap();
+    }
+    for w in waiting {
+        let _ = w.join();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = thread_count(d.child.id());
+        if now <= before + 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{before} threads before, {now} now"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
