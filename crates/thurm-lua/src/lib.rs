@@ -14,7 +14,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
@@ -35,6 +35,10 @@ const MAX_CALLS: usize = 64;
 
 /// The most timers fired before the runtime looks at its jobs again.
 const TIMER_BATCH: usize = 64;
+
+/// Notices waiting for the runtime: past this many, [`Runtime::notice`] waits, so a flood of
+/// events backs up in the plugin's client queue (which the daemon bounds) rather than here.
+const MAX_NOTICES: usize = 1024;
 
 /// The timers (`thurm.after`, `thurm.every`) one plugin may have set at a time.
 const MAX_TIMERS: usize = 4096;
@@ -109,18 +113,23 @@ enum Job {
 pub struct Runtime {
     tx: Sender<Job>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Notices sent and not yet taken.
+    notices: Arc<AtomicUsize>,
 }
 
 impl Runtime {
     pub fn start(host: Arc<dyn Host>) -> std::io::Result<Runtime> {
         let (tx, rx) = unbounded();
         let engine_tx = tx.clone();
+        let notices = Arc::new(AtomicUsize::new(0));
+        let taken = notices.clone();
         let thread = std::thread::Builder::new()
             .name("lua".into())
-            .spawn(move || Engine::new(host, engine_tx).run(rx))?;
+            .spawn(move || Engine::new(host, engine_tx, taken).run(rx))?;
         Ok(Runtime {
             tx,
             thread: Some(thread),
+            notices,
         })
     }
 
@@ -142,10 +151,22 @@ impl Runtime {
     }
 
     /// Something the daemon sent the plugin's client ([`thurm_proto::ext::notice`]).
+    /// Waits while the runtime has [`MAX_NOTICES`] still to take.
     pub fn notice(&self, instance: u64, name: &str, payload: Value) {
-        let _ = self
+        while self.notices.load(Ordering::Acquire) >= MAX_NOTICES {
+            if self.thread.as_ref().is_none_or(|t| t.is_finished()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.notices.fetch_add(1, Ordering::AcqRel);
+        if self
             .tx
-            .send(Job::Notice(instance, name.to_owned(), payload));
+            .send(Job::Notice(instance, name.to_owned(), payload))
+            .is_err()
+        {
+            self.notices.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -225,6 +246,8 @@ struct Engine {
     timers: BinaryHeap<Reverse<(Instant, u64)>>,
     timer_info: HashMap<u64, Timer>,
     ids: Arc<AtomicU64>,
+    /// Notices sent and not yet taken, shared with [`Runtime::notice`].
+    notices: Arc<AtomicUsize>,
 }
 
 fn ptr(t: &Thread) -> usize {
@@ -232,8 +255,9 @@ fn ptr(t: &Thread) -> usize {
 }
 
 impl Engine {
-    fn new(host: Arc<dyn Host>, tx: Sender<Job>) -> Engine {
+    fn new(host: Arc<dyn Host>, tx: Sender<Job>, notices: Arc<AtomicUsize>) -> Engine {
         Engine {
+            notices,
             host,
             tx,
             plugins: HashMap::new(),
@@ -271,7 +295,10 @@ impl Engine {
         match job {
             Job::Load(spec, done) => self.load(*spec, done),
             Job::Unload(instance) => self.unload(instance, "the plugin was stopped"),
-            Job::Notice(instance, name, payload) => self.notice(instance, &name, payload),
+            Job::Notice(instance, name, payload) => {
+                self.notices.fetch_sub(1, Ordering::AcqRel);
+                self.notice(instance, &name, payload)
+            }
             Job::Resume(instance, ticket, result) => {
                 if let Some(p) = self.plugins.get(&instance) {
                     p.shared.borrow_mut().calls.remove(&ticket);

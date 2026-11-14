@@ -502,3 +502,27 @@ fn a_refused_action_keeps_the_handler_it_had() {
         json!({ "id": 7, "result": "old" })
     );
 }
+
+/// While the runtime is busy, notices past the limit wait in the sender rather than pile up.
+#[test]
+fn notices_back_up_in_the_sender() {
+    let f = fixture();
+    let busy = f.rt.load(spec(
+        5,
+        "local t = os.clock() while os.clock() - t < 1 do end",
+        true,
+    ));
+    std::thread::sleep(Duration::from_millis(100));
+    std::thread::scope(|s| {
+        let sender = s.spawn(|| {
+            for _ in 0..MAX_NOTICES + 10 {
+                f.rt.notice(77, notice::EVENT, json!({}));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!sender.is_finished());
+        assert_eq!(f.rt.notices.load(Ordering::Acquire), MAX_NOTICES);
+        sender.join().unwrap();
+    });
+    busy.recv_timeout(Duration::from_secs(20)).unwrap().unwrap();
+}
