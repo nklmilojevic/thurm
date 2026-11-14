@@ -607,6 +607,59 @@ impl Daemon {
     }
 }
 
+/// Whether the peer on `stream` is the app this daemon belongs to. A daemon that runs from an
+/// app bundle (`Thurm.app/Contents/Helpers/thurmd`) takes only that bundle's own executable,
+/// by the peer's pid: another program of the same user cannot pose as the app to read what
+/// plugins ask. A daemon outside a bundle (a development build, Linux) has no app to tell
+/// apart, and the peer's user is the check.
+pub fn peer_is_our_app(stream: &std::os::unix::net::UnixStream) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let Some(app) = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.canonicalize().ok())
+            .and_then(|exe| {
+                let helpers = exe.parent()?;
+                let contents = helpers.parent()?;
+                let bundle = contents.parent()?;
+                (helpers.file_name()? == "Helpers"
+                    && contents.file_name()? == "Contents"
+                    && bundle.extension()? == "app")
+                    .then(|| contents.join("MacOS").join("Thurm"))
+            })
+        else {
+            return true;
+        };
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let got = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        };
+        if got != 0 {
+            return false;
+        }
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if n <= 0 {
+            return false;
+        }
+        let peer = std::path::PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).as_ref());
+        peer.canonicalize().ok() == app.canonicalize().ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = stream;
+        true
+    }
+}
+
 /// Sends a notice of the extension API to `client`.
 pub(super) fn send_ext(client: &Client, name: &str, payload: &Value) {
     client.send(ServerMessage::Event(Event::Ext {

@@ -91,8 +91,9 @@ pub const CAP_EXT: &str = "ext";
 
 /// Sent only by an app that shows what plugins ask for ([`ext::UiRequest`]: a toast, a picker,
 /// a text field, a confirmation) and answers with [`ext::method::UI_REPLY`]. The daemon takes
-/// it only from a desktop UI (`ui`, not a phone) of its own user on its own socket: a tailnet
-/// caller or another user saying so never gets those questions.
+/// it only from a desktop UI (`ui`, not a phone) of its own user on its own socket, and when
+/// it runs from an app bundle, only from that bundle's app (by the peer's pid): a tailnet
+/// caller, another user or another program saying so never gets those questions.
 pub const CAP_EXT_UI: &str = "ext-ui";
 
 /// The pane takes the size of the client that used it last (see the daemon's `active_size`)

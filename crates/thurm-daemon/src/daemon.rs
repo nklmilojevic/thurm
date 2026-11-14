@@ -2696,7 +2696,14 @@ impl Daemon {
                             && p.uid == Some(unsafe { libc::getuid() })
                     });
                     let desktop = ui && !client.mobile.load(Ordering::Relaxed);
-                    client.ext_ui.store(local && desktop, Ordering::Relaxed);
+                    let app = client
+                        .socket
+                        .lock()
+                        .as_ref()
+                        .is_none_or(ext::peer_is_our_app);
+                    client
+                        .ext_ui
+                        .store(local && desktop && app, Ordering::Relaxed);
                 }
                 log::info!(
                     "client {} hello: {name} (protocol {version}{}{}{}{}{})",

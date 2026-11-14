@@ -4,7 +4,10 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use thurm_proto::ext::ExecResult;
 
@@ -70,6 +73,10 @@ pub fn start(launch: Launch, on_failure: impl FnOnce(String) + Send + 'static) -
 /// The most of each of stdout and stderr that [`run`] keeps.
 const CAPTURE_MAX: usize = 16 << 20;
 
+/// How long a finished program's output may stay open (a program it left running holds it)
+/// before that program is stopped.
+const LEFT_BEHIND: Duration = Duration::from_secs(1);
+
 /// How long a command stopped with SIGTERM has before SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
@@ -94,17 +101,22 @@ pub fn run(launch: Launch, timeout: Option<Duration>) -> io::Result<ExecResult> 
                 let _ = pipe.write_all(&data);
             })
         });
+    // Each reader keeps what it read where `run` can take it even if the pipe never ends (a
+    // program left behind holds it open), and says when it is done.
     let reader = |r: Option<Box<dyn Read + Send>>| {
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done) = crossbeam_channel::bounded::<()>(1);
+        let out = kept.clone();
         std::thread::spawn(move || {
             // Read to the end, keeping the first CAPTURE_MAX bytes: a pipe closed early would
             // stop the program, or leave it blocked on a full pipe.
-            let mut out = Vec::new();
             if let Some(mut r) = r {
                 let mut buf = [0u8; 64 * 1024];
                 loop {
                     match r.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            let mut out = out.lock();
                             let room = CAPTURE_MAX.saturating_sub(out.len());
                             out.extend_from_slice(&buf[..n.min(room)]);
                         }
@@ -113,8 +125,9 @@ pub fn run(launch: Launch, timeout: Option<Duration>) -> io::Result<ExecResult> 
                     }
                 }
             }
-            out
-        })
+            drop(done_tx);
+        });
+        (kept, done)
     };
     let stdout = reader(
         child
@@ -128,14 +141,13 @@ pub fn run(launch: Launch, timeout: Option<Duration>) -> io::Result<ExecResult> 
             .take()
             .map(|r| Box::new(r) as Box<dyn Read + Send>),
     );
-    let pgid = child.id() as libc::pid_t;
+    let pid = child.id() as libc::pid_t;
     let started = Instant::now();
     let mut timed_out = false;
     let mut killed_at: Option<Instant> = None;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
+    // Until it is reaped, the program's pid, and so its group's id, stay its own: signals to
+    // the group are safe.
+    while !exited(pid) {
         let now = Instant::now();
         if let Some(t) = timeout
             && !timed_out
@@ -143,29 +155,53 @@ pub fn run(launch: Launch, timeout: Option<Duration>) -> io::Result<ExecResult> 
         {
             timed_out = true;
             killed_at = Some(now);
-            unsafe { libc::kill(-pgid, libc::SIGTERM) };
+            unsafe { libc::kill(-pid, libc::SIGTERM) };
         }
         if killed_at.is_some_and(|at| now.duration_since(at) >= KILL_GRACE) {
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
             killed_at = None;
         }
         std::thread::sleep(Duration::from_millis(10));
-    };
-    if let Some(w) = writer {
-        let _ = w.join();
     }
-    let text = |h: std::thread::JoinHandle<Vec<u8>>| {
-        String::from_utf8_lossy(&h.join().unwrap_or_default()).into_owned()
+    // A program it started in the background may hold the output open: it gets a moment to
+    // finish, then goes with the rest of the group.
+    let ended = |deadline: Instant| {
+        use crossbeam_channel::RecvTimeoutError::Disconnected;
+        matches!(stdout.1.recv_deadline(deadline), Err(Disconnected))
+            && matches!(stderr.1.recv_deadline(deadline), Err(Disconnected))
     };
+    if !ended(Instant::now() + LEFT_BEHIND) {
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        let _ = ended(Instant::now() + LEFT_BEHIND);
+    }
+    let status = child.wait()?;
+    // Not joined: a program left behind may never read its input.
+    drop(writer);
+    let text = |kept: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&kept.lock()).into_owned();
     use std::os::unix::process::ExitStatusExt;
     Ok(ExecResult {
         ok: status.success(),
         code: status.code(),
         signal: status.signal(),
-        stdout: text(stdout),
-        stderr: text(stderr),
+        stdout: text(&stdout.0),
+        stderr: text(&stderr.0),
         timed_out,
     })
+}
+
+/// Whether child `pid` has exited, without reaping it.
+fn exited(pid: libc::pid_t) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+    if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) } != 0 {
+        // Nothing to wait for: it is gone.
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    let found = unsafe { info.si_pid() };
+    #[cfg(not(target_os = "linux"))]
+    let found = info.si_pid;
+    found != 0
 }
 
 /// The last [`STDERR_TAIL`] bytes `r` gives before its end: a command can log for as long as
@@ -340,6 +376,31 @@ mod tests {
             (r.code, r.timed_out, r.stderr.as_str()),
             (Some(7), false, "done\n")
         );
+    }
+
+    #[test]
+    fn run_ends_when_the_program_does_though_it_left_one_running() {
+        let dir = std::env::temp_dir().join(format!("thurm-left-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let script = format!("sleep 30 & echo $! > {}; echo hi", pidfile.display());
+        let argv: Vec<String> = ["sh", "-c", &script]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let at = Instant::now();
+        let r = super::run(launch(&argv, None), None).unwrap();
+        assert_eq!((r.stdout.as_str(), r.code), ("hi\n", Some(0)));
+        assert!(at.elapsed() < Duration::from_secs(10), "{:?}", at.elapsed());
+        // The one left behind was stopped with its group.
+        let pid: libc::pid_t = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "sleep {pid} still runs");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
