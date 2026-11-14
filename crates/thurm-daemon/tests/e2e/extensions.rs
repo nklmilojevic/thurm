@@ -457,3 +457,43 @@ fn no_pane_means_no_pane() {
     assert_eq!(none, Value::Null);
     answering.join().unwrap();
 }
+
+/// A provider that runs its own action again, without saying how deep it is, still stops at
+/// the limit: the daemon knows what it asked it to carry out.
+#[test]
+fn actions_running_one_another_stop_without_a_depth() {
+    let env = Env::new("ext-depth");
+    let _d = env.start();
+    let (provider, provider_rx) = ext_client(&env, "provider");
+    let (user, _rx) = ext_client(&env, "user");
+    call(
+        &provider,
+        method::ACTIONS_REGISTER,
+        json!({ "actions": [{ "name": "loop.again" }] }),
+    )
+    .unwrap();
+    std::thread::spawn({
+        let provider = provider.clone();
+        move || {
+            while let Ok((name, invoke)) = provider_rx.recv() {
+                if name != notice::ACTION_INVOKE {
+                    continue;
+                }
+                let provider = provider.clone();
+                std::thread::spawn(move || {
+                    let reply = match call(
+                        &provider,
+                        method::ACTIONS_RUN,
+                        json!({ "name": "loop.again" }),
+                    ) {
+                        Ok(v) => json!({ "id": invoke["id"], "result": v }),
+                        Err(e) => json!({ "id": invoke["id"], "error": e }),
+                    };
+                    let _ = call(&provider, method::ACTIONS_RESULT, reply);
+                });
+            }
+        }
+    });
+    let e = call(&user, method::ACTIONS_RUN, json!({ "name": "loop.again" })).unwrap_err();
+    assert!(e.contains("deep"), "{e}");
+}

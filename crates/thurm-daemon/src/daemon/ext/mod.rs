@@ -26,13 +26,21 @@ const MAX_DEPTH: u32 = 16;
 /// How long a provider has to carry out an action, and the user to answer a picker.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// A question to a client: who was asked, how deep an action it is (0 for one to the user),
+/// and where the answer goes.
+struct Pending {
+    to: u64,
+    depth: u32,
+    tx: Sender<ext::Reply>,
+}
+
 /// The extension API's state in the daemon.
 #[derive(Default)]
 pub struct Ext {
     registry: Mutex<Registry>,
     /// Questions sent to clients (an action to carry out, a picker to show), by id: the asked
     /// client and where its answer goes.
-    pending: Mutex<HashMap<u64, (u64, Sender<ext::Reply>)>>,
+    pending: Mutex<HashMap<u64, Pending>>,
     next: AtomicU64,
 }
 
@@ -336,7 +344,11 @@ impl Daemon {
         origin: &str,
         run: ext::RunAction,
     ) -> Result<Value, String> {
-        if run.depth >= MAX_DEPTH {
+        // How deep this runs: what the caller says, or more if the caller is itself carrying
+        // out actions it was asked to (a provider need not pass its depth on for the limit to
+        // hold).
+        let depth = run.depth.max(self.ext_depth_of(caller));
+        if depth >= MAX_DEPTH {
             return Err(format!(
                 "actions ran one another {MAX_DEPTH} deep: stopped at {:?}",
                 run.name
@@ -363,7 +375,7 @@ impl Daemon {
                     .get(&id)
                     .cloned()
                     .ok_or_else(|| format!("{} is gone", entry.info.source))?;
-                let (qid, rx) = self.ext_question(id);
+                let (qid, rx) = self.ext_question(id, depth + 1);
                 // A provider that left before the question was there to be dropped with it.
                 if client.gone.load(Ordering::SeqCst) {
                     self.ext.pending.lock().remove(&qid);
@@ -379,7 +391,7 @@ impl Daemon {
                     ctx: ext::Context {
                         pane,
                         origin: origin.to_owned(),
-                        depth: run.depth + 1,
+                        depth: depth + 1,
                     },
                 };
                 send_ext(&client, notice::ACTION_INVOKE, &json!(invoke));
@@ -389,10 +401,13 @@ impl Daemon {
     }
 
     /// A new question to client `to`: its id, and where the answer comes.
-    fn ext_question(&self, to: u64) -> (u64, Receiver<ext::Reply>) {
+    fn ext_question(&self, to: u64, depth: u32) -> (u64, Receiver<ext::Reply>) {
         let id = self.ext.next.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = bounded(1);
-        self.ext.pending.lock().insert(id, (to, tx));
+        self.ext
+            .pending
+            .lock()
+            .insert(id, Pending { to, depth, tx });
         (id, rx)
     }
 
@@ -434,12 +449,24 @@ impl Daemon {
         }
     }
 
+    /// The deepest action `client` is carrying out now: 0 when none.
+    fn ext_depth_of(&self, client: &Client) -> u32 {
+        self.ext
+            .pending
+            .lock()
+            .values()
+            .filter(|p| p.to == client.id)
+            .map(|p| p.depth)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// An answer from client `from` to one of its questions; answers to someone else's are
     /// dropped.
     fn ext_reply(&self, from: u64, reply: ext::Reply) {
         let mut pending = self.ext.pending.lock();
-        if pending.get(&reply.id).is_some_and(|(to, _)| *to == from)
-            && let Some((_, tx)) = pending.remove(&reply.id)
+        if pending.get(&reply.id).is_some_and(|p| p.to == from)
+            && let Some(Pending { tx, .. }) = pending.remove(&reply.id)
         {
             let _ = tx.send(reply);
         }
@@ -448,7 +475,7 @@ impl Daemon {
     /// Forgets what `client` provided, heard and was asked.
     pub(super) fn ext_client_gone(&self, client: u64) {
         // Dropping the senders ends the waits on them.
-        self.ext.pending.lock().retain(|_, (to, _)| *to != client);
+        self.ext.pending.lock().retain(|_, p| p.to != client);
         if self.ext.registry.lock().client_gone(client) {
             self.actions_changed();
         }
@@ -676,7 +703,7 @@ impl Daemon {
         let app = self
             .ui_client()
             .ok_or("no Thurm window is open to ask in (or the app is too old)")?;
-        let (id, rx) = self.ext_question(app.id);
+        let (id, rx) = self.ext_question(app.id, 0);
         if app.gone.load(Ordering::SeqCst) {
             self.ext.pending.lock().remove(&id);
             return Err("the app went away".into());
