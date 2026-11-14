@@ -193,11 +193,15 @@ fn handlers_timers_and_sleep() {
         local t
         t = thurm.every(0.05, function()
             n = n + 1
-            if n == 3 then t.cancel(); thurm.log("ticked", n) end
+            if n == 3 then
+                t.cancel()
+                thurm.log("ticked", n)
+                -- Cancelled, it ticks no more.
+                thurm.after(0.2, function() thurm.log("after", n) end)
+            end
         end)
         local cancelled = thurm.after(0.05, function() thurm.log("never") end)
         cancelled.cancel()
-        thurm.after(0.3, function() thurm.log("after", n) end)
         local at = os.clock()
         thurm.sleep(0.1)
         thurm.log("slept")
