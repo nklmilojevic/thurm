@@ -31,6 +31,57 @@ pub fn osc_is_passed(body: &[u8]) -> bool {
     osc_number(body).is_some_and(|n| SHARED_OSC.contains(&n))
 }
 
+const MAX_PENDING_TITLE: usize = 4096;
+
+#[derive(Debug, Default)]
+pub struct TitleScan {
+    pending: Vec<u8>,
+}
+
+impl TitleScan {
+    pub fn only_titles(&mut self, bytes: &[u8]) -> bool {
+        let mut input = std::mem::take(&mut self.pending);
+        input.extend_from_slice(bytes);
+        let mut rest = &input[..];
+        while !rest.is_empty() {
+            if title_start(rest) {
+                self.keep(rest);
+                return true;
+            }
+            let Some(body) = rest.strip_prefix(b"\x1b]") else {
+                return false;
+            };
+            if !matches!(body, [b'0'..=b'2', b';', ..]) {
+                return false;
+            }
+            let Some(end) = body.iter().position(|&b| b == 0x07 || b == 0x1b) else {
+                self.keep(rest);
+                return true;
+            };
+            rest = match &body[end..] {
+                [0x07, after @ ..] => after,
+                [0x1b] => {
+                    self.keep(rest);
+                    return true;
+                }
+                [0x1b, b'\\', after @ ..] => after,
+                _ => return false,
+            };
+        }
+        !input.is_empty()
+    }
+
+    fn keep(&mut self, unfinished: &[u8]) {
+        if unfinished.len() <= MAX_PENDING_TITLE {
+            self.pending = unfinished.to_vec();
+        }
+    }
+}
+
+fn title_start(bytes: &[u8]) -> bool {
+    matches!(bytes, [0x1b] | [0x1b, b']'] | [0x1b, b']', b'0'..=b'2'])
+}
+
 /// Longest OSC we buffer before giving up and passing it through untouched.
 const MAX_OSC: usize = 8 * 1024 * 1024;
 /// Longest APC we accept (kitty chunks are ≤ 4 KiB, but be generous).
@@ -856,6 +907,28 @@ fn utf8_tail(bytes: &[u8], from: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_scan_tells_titles_from_output() {
+        let only = |bytes: &[u8]| TitleScan::default().only_titles(bytes);
+        assert!(only(b"\x1b]0;Command Code\x07"));
+        assert!(only(b"\x1b]2;a\x1b\\\x1b]1;b\x07"));
+        assert!(!only(b""));
+        assert!(!only(b"\x1b]0;title\x07x"));
+        assert!(!only(b"\x1b]7;file:///tmp\x07"));
+        assert!(!only(b"\x1b[2J"));
+    }
+
+    #[test]
+    fn title_scan_follows_a_title_across_reads() {
+        let mut scan = TitleScan::default();
+        assert!(scan.only_titles(b"\x1b]0;Comm"));
+        assert!(scan.only_titles(b"and Code\x1b"));
+        assert!(scan.only_titles(b"\\"));
+        assert!(scan.only_titles(b"\x1b"));
+        assert!(!scan.only_titles(b"[2J"));
+        assert!(scan.only_titles(b"\x1b]0;x\x07"));
+    }
 
     /// Feed `input` split at every possible position and in one piece; all must agree.
     fn run(input: &[u8]) -> (Vec<u8>, Vec<Chunk<'static>>) {

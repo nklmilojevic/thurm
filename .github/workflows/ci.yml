@@ -261,7 +261,7 @@ jobs:
     timeout-minutes: 20
     container:
       # Pinned to the tag's digest: a moved tag must not change what runs here.
-      image: mcr.microsoft.com/playwright:v1.65.0-resolute@sha256:916c9fb63a8340822589dd5c821dae82e8012106bb8515a72f278d97f277446a
+      image: mcr.microsoft.com/playwright:v1.65.1-resolute@sha256:dcf385f7a31aa1cbb0a7a0c97a539142bf70480b661f89f26a774ec1fe2edd1d
       options: --ipc=host
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -366,7 +366,7 @@ jobs:
         with:
           toolchain: 1.99.1
       # A release binary, checked by the action, rather than compiling cargo-audit every run.
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-audit
       - name: Dependency advisories
