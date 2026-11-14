@@ -82,29 +82,101 @@ impl Record {
     }
 }
 
+/// How many messages may wait for a program plugin to read them.
+const OUTBOX: usize = 1024;
+
 struct Process {
     pgid: libc::pid_t,
-    stdin: Mutex<Option<ChildStdin>>,
+    /// Messages for its standard input, which a thread of their own writes: a plugin that
+    /// writes before it reads must not hold up the thread reading its output. `None` once its
+    /// input is closed.
+    outbox: Mutex<Option<crossbeam_channel::Sender<String>>>,
+    life: Mutex<Life>,
+}
+
+#[derive(Default)]
+struct Life {
+    /// Its process was waited for: its pid, and so its group's, may name another one now.
+    reaped: bool,
+    /// When it was asked to stop.
+    stopping: Option<Instant>,
 }
 
 impl Process {
-    /// Writes one JSON-RPC message; a plugin that stopped reading loses it.
+    fn new(pgid: libc::pid_t, stdin: Option<ChildStdin>) -> Arc<Process> {
+        let (tx, rx) = crossbeam_channel::bounded::<String>(OUTBOX);
+        if let Some(mut w) = stdin {
+            let _ = std::thread::Builder::new()
+                .name("plugin-stdin".into())
+                .spawn(move || {
+                    // Ends, closing its input, when the outbox is closed.
+                    for line in rx {
+                        if w.write_all(line.as_bytes())
+                            .and_then(|()| w.flush())
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+        }
+        Arc::new(Process {
+            pgid,
+            outbox: Mutex::new(Some(tx)),
+            life: Mutex::new(Life::default()),
+        })
+    }
+
+    /// Queues one JSON-RPC message. A plugin that leaves a full outbox unread is not reading
+    /// its input at all: it is closed, which tells the plugin to stop.
     fn send(&self, msg: &Value) {
-        let mut stdin = self.stdin.lock();
-        if let Some(w) = stdin.as_mut() {
+        let mut outbox = self.outbox.lock();
+        if let Some(tx) = outbox.as_ref() {
             let mut line = msg.to_string();
             line.push('\n');
-            if w.write_all(line.as_bytes())
-                .and_then(|()| w.flush())
-                .is_err()
-            {
-                *stdin = None;
+            if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(line) {
+                log::warn!(
+                    "plugin process {} does not read its input; closing it",
+                    self.pgid
+                );
+                *outbox = None;
             }
         }
     }
 
-    fn signal(&self, sig: libc::c_int) {
-        unsafe { libc::kill(-self.pgid, sig) };
+    /// Closes its input and sends SIGTERM; the thread waiting for it sends SIGKILL after
+    /// [`STOP_GRACE`].
+    fn stop(&self) {
+        *self.outbox.lock() = None;
+        let mut life = self.life.lock();
+        if !life.reaped && life.stopping.is_none() {
+            life.stopping = Some(Instant::now());
+            unsafe { libc::kill(-self.pgid, libc::SIGTERM) };
+        }
+    }
+
+    /// Waits for its process, sending SIGKILL once it was asked to stop [`STOP_GRACE`] ago.
+    /// Signals go out only before the process is reaped, while its group id is still its own.
+    fn wait(&self, child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+        let mut killed = false;
+        loop {
+            {
+                let mut life = self.life.lock();
+                if let Some(status) = child.try_wait()? {
+                    life.reaped = true;
+                    return Ok(status);
+                }
+                if !killed && life.stopping.is_some_and(|at| at.elapsed() >= STOP_GRACE) {
+                    unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+                    killed = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn reaped(&self) -> bool {
+        self.life.lock().reaped
     }
 }
 
@@ -154,10 +226,23 @@ impl Daemon {
     }
 
     /// Stops every plugin (the daemon is going).
+    /// Waits for the program plugins to end (SIGKILL included), a little past [`STOP_GRACE`]:
+    /// none may outlive the daemon.
     pub fn stop_plugins(self: &Arc<Self>) {
+        let processes: Vec<Arc<Process>> = self
+            .plugins
+            .records
+            .lock()
+            .values()
+            .filter_map(|r| r.process.clone())
+            .collect();
         let names: Vec<String> = self.plugins.records.lock().keys().cloned().collect();
         for name in names {
             self.stop_plugin(&name, "stopped");
+        }
+        let deadline = Instant::now() + STOP_GRACE + Duration::from_millis(500);
+        while Instant::now() < deadline && !processes.iter().all(|p| p.reaped()) {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -244,11 +329,21 @@ impl Daemon {
 
     /// Starts plugin `name` (stopped before).
     fn start_plugin(self: &Arc<Self>, name: &str) {
+        self.start_plugin_if(name, None);
+    }
+
+    /// Starts plugin `name`; with `expected`, only if nothing stopped or started it since that
+    /// generation and it is not disabled, checked as it starts.
+    fn start_plugin_if(self: &Arc<Self>, name: &str, expected: Option<u64>) {
+        let disabled = self.config.read().plugins.is_disabled(name);
         let (found, settings, generation) = {
             let mut records = self.plugins.records.lock();
             let Some(r) = records.get_mut(name) else {
                 return;
             };
+            if expected.is_some_and(|g| g != r.generation || disabled) {
+                return;
+            }
             r.generation += 1;
             r.error = None;
             r.state = "running";
@@ -342,10 +437,7 @@ impl Daemon {
             stdin: None,
         })
         .map_err(|e| format!("cannot start {:?}: {e}", exec[0]))?;
-        let process = Arc::new(Process {
-            pgid: child.id() as libc::pid_t,
-            stdin: Mutex::new(child.stdin.take()),
-        });
+        let process = Process::new(child.id() as libc::pid_t, child.stdin.take());
         let to = process.clone();
         let (instance, client) = self.plugin_client(
             &name,
@@ -378,6 +470,9 @@ impl Daemon {
         }
         log::info!("plugin {name} started (pid {})", process.pgid);
 
+        // Its stderr goes to its log while the record is still this start's; the exit is
+        // logged after what it wrote last.
+        let (stderr_done, stderr_ended) = crossbeam_channel::bounded::<()>(1);
         if let Some(stderr) = child.stderr.take() {
             let daemon = Arc::downgrade(self);
             let name = name.clone();
@@ -386,10 +481,13 @@ impl Daemon {
                 .spawn(move || {
                     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                         let Some(d) = daemon.upgrade() else { return };
-                        if let Some(r) = d.plugins.records.lock().get_mut(&name) {
+                        if let Some(r) = d.plugins.records.lock().get_mut(&name)
+                            && r.generation == generation
+                        {
                             r.log(line);
                         }
                     }
+                    drop(stderr_done);
                 });
         }
         if let Some(stdout) = child.stdout.take() {
@@ -400,7 +498,7 @@ impl Daemon {
                 .spawn(move || {
                     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                         let Some(d) = daemon.upgrade() else { return };
-                        d.plugin_message(&client, &process, &line);
+                        d.plugin_message(instance, &client, &process, &line);
                     }
                 });
         }
@@ -409,7 +507,9 @@ impl Daemon {
         let _ = std::thread::Builder::new()
             .name("plugin-wait".into())
             .spawn(move || {
-                let status = child.wait();
+                let status = process.wait(&mut child);
+                // A child of its own may keep stderr open: not for long.
+                let _ = stderr_ended.recv_timeout(Duration::from_secs(1));
                 if let Some(d) = daemon.upgrade() {
                     d.process_exited(&name, instance, generation, started, status);
                 }
@@ -419,8 +519,15 @@ impl Daemon {
 
     /// One line a program plugin wrote: a request (or notification) to answer, or its answer
     /// to an `action.invoke`.
-    fn plugin_message(self: &Arc<Self>, client: &Arc<Client>, process: &Arc<Process>, line: &str) {
-        if line.trim().is_empty() {
+    fn plugin_message(
+        self: &Arc<Self>,
+        instance: u64,
+        client: &Arc<Client>,
+        process: &Arc<Process>,
+        line: &str,
+    ) {
+        // A plugin stopped has no say any more, though its process may still write.
+        if line.trim().is_empty() || !self.instance_live(instance) {
             return;
         }
         let msg: Value = match serde_json::from_str(line) {
@@ -452,7 +559,11 @@ impl Daemon {
             let client = client.clone();
             let process = process.clone();
             move || {
-                let result = daemon.ext_call(&client, &method, params);
+                let result = if daemon.instance_live(instance) {
+                    daemon.ext_call(&client, &method, params)
+                } else {
+                    Err("the plugin was stopped".into())
+                };
                 if let Some(id) = id {
                     let reply = match result {
                         Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
@@ -528,7 +639,7 @@ impl Daemon {
                 .get(&name)
                 .is_some_and(|r| r.generation == generation);
             if current && !d.shutdown.load(Ordering::Relaxed) {
-                d.start_plugin(&name);
+                d.start_plugin_if(&name, Some(generation));
                 d.plugins_changed();
             }
         });
@@ -552,13 +663,13 @@ impl Daemon {
         }
         if let Some(p) = process {
             // Its standard input closes too: a plugin may take that as its cue.
-            *p.stdin.lock() = None;
-            p.signal(libc::SIGTERM);
-            std::thread::spawn(move || {
-                std::thread::sleep(STOP_GRACE);
-                p.signal(libc::SIGKILL);
-            });
+            p.stop();
         }
+    }
+
+    /// The instance still runs: it was not stopped.
+    fn instance_live(&self, instance: u64) -> bool {
+        self.plugins.instances.lock().contains_key(&instance)
     }
 
     /// A new client for a plugin or script, and its instance id. What the client hears goes to
@@ -766,9 +877,8 @@ impl Daemon {
                 match params.get("name").and_then(Value::as_str) {
                     None => self.sync_plugins(true),
                     Some(name) => {
-                        if !self.plugins.records.lock().contains_key(name) {
-                            self.sync_plugins(false);
-                        }
+                        // Its files may have changed, or gone.
+                        self.sync_plugins(false);
                         if !self.plugins.records.lock().contains_key(name) {
                             return Err(format!("no plugin named {name:?}"));
                         }

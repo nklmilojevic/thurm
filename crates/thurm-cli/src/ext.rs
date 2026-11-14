@@ -392,6 +392,27 @@ fn write_types() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     Ok(dir)
 }
 
+/// Fails when a plugin called `name` exists already (a directory, a `.lua` file, or a program
+/// of that stem), or something is at `target`.
+fn name_free(
+    dir: &std::path::Path,
+    name: &str,
+    target: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (found, _) = thurm_config::plugins::discover(dir);
+    if let Some(p) = found.iter().find(|p| p.name == name) {
+        return Err(format!(
+            "a plugin called {name:?} exists already: {}",
+            p.path.display()
+        )
+        .into());
+    }
+    if target.exists() {
+        return Err(format!("{} exists already", target.display()).into());
+    }
+    Ok(())
+}
+
 /// Asks the daemon, when one runs, to look at the plugins again.
 fn reload_running(name: Option<&str>) {
     if let Ok(c) = crate::connect(false) {
@@ -453,9 +474,7 @@ pub fn plugin_local(cmd: PluginCmd, json: bool) -> R {
                 );
             }
             let target = dir.join(&name);
-            if target.exists() || dir.join(format!("{name}.lua")).exists() {
-                return Err(format!("{} exists already", target.display()).into());
-            }
+            name_free(&dir, &name, &target)?;
             std::fs::create_dir_all(&target)?;
             for (file, text, executable) in thurm_config::plugins::scaffold(&name, program) {
                 let path = target.join(file);
@@ -481,9 +500,7 @@ pub fn plugin_local(cmd: PluginCmd, json: bool) -> R {
                 return Err(format!("{name:?} cannot name a plugin; pick one with --name").into());
             }
             let target = dir.join(&name);
-            if target.exists() {
-                return Err(format!("{} exists already", target.display()).into());
-            }
+            name_free(&dir, &name, &target)?;
             eprintln!(
                 "thurm: plugins run with your rights and can do anything you can: install only \
                  plugins you trust."
@@ -647,6 +664,26 @@ mod tests {
         assert!(super::open_dir_path(&dir.join("real")).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_file(&secret).unwrap();
+    }
+
+    #[test]
+    fn a_new_plugin_takes_no_name_in_use() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("thurm-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("solo.lua"), "").unwrap();
+        std::fs::write(dir.join("tool.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dir.join("tool.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        for taken in ["solo", "tool"] {
+            assert!(
+                super::name_free(&dir, taken, &dir.join(taken)).is_err(),
+                "{taken}"
+            );
+        }
+        assert!(super::name_free(&dir, "fresh", &dir.join("fresh")).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -366,7 +366,7 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
     ("agents.presets", "Launch presets", Kind::Table),
     ("agents.install_hooks", "Install status hooks", Kind::Bool),
     ("plugins.enabled", "Run plugins", Kind::Bool),
-    ("plugins.disabled", "Disabled plugins", Kind::Table),
+    ("plugins.disabled", "Disabled plugins", Kind::List),
     ("plugins.settings", "Plugin settings", Kind::Table),
     ("ai.enabled", "Apple Intelligence features", Kind::Bool),
     ("ai.titles", "Name tabs after the task", Kind::Bool),
