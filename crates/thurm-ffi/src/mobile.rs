@@ -12,14 +12,20 @@ use crate::{
 };
 
 /// What the app says in `Hello` besides the build's capabilities: a phone that pages between
-/// panes (the iPad too, holding the panes it shows).
-const APP_CAPABILITIES: &[&str] = &[thurm_proto::CAP_MOBILE, thurm_proto::CAP_PANE_PAGER];
+/// panes (the iPad too, holding the panes it shows), and takes the time of each agent's last
+/// report (`PaneActivity`; a daemon without it sends `PaneInfo`).
+const APP_CAPABILITIES: &[&str] = &[
+    thurm_proto::CAP_MOBILE,
+    thurm_proto::CAP_PANE_PAGER,
+    thurm_proto::CAP_AGENT_ACTIVITY,
+];
 
 /// [`APP_CAPABILITIES`] for a daemon across the network (the tailnet), which deflates its events
 /// for the app. The in-app daemon of `thurm_direct_connect` is no such connection.
 const REMOTE_CAPABILITIES: &[&str] = &[
     thurm_proto::CAP_MOBILE,
     thurm_proto::CAP_PANE_PAGER,
+    thurm_proto::CAP_AGENT_ACTIVITY,
     thurm_proto::CAP_DEFLATE,
 ];
 

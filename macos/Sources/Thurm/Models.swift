@@ -211,6 +211,95 @@ struct AgentState: Equatable {
     var permission: UInt64? = nil
 }
 
+extension AgentState {
+    /// The agent of a `PaneInfo`, or of a `PaneActivity` (`{"info": PaneInfo, "updated_at_ms"}`),
+    /// as the JSON the core hands over; nil when the pane runs none.
+    init?(paneJSON payload: [String: Any]) {
+        let d = payload["info"] as? [String: Any] ?? payload
+        guard let a = d["agent"] as? [String: Any],
+              let statusName = jsonString(a["status"]),
+              let status = AgentStatus(rawValue: statusName) else { return nil }
+        self.init(updatedAtMs: Self.activityTimestamp(payload["updated_at_ms"]),
+                  name: jsonString(a["name"]) ?? "Agent",
+                  kind: jsonString(a["kind"]) ?? "",
+                  status: status,
+                  sessionId: jsonString(a["session_id"]),
+                  message: jsonString(a["message"]),
+                  turnMs: jsonUInt64(a["turn_ms"]),
+                  turns: jsonInt(a["turns"]) ?? 0,
+                  hooked: jsonBool(a["hooked"]) ?? false,
+                  topic: jsonString(a["topic"]),
+                  permission: jsonUInt64(a["permission"]))
+    }
+
+    private static func activityTimestamp(_ value: Any?) -> UInt64? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let timestamp = UInt64(number.stringValue), timestamp > 0 else { return nil }
+        return timestamp
+    }
+}
+
+/// How an agent reads in lists (the Mac's activity list and pickers, the iOS app's).
+extension AgentState {
+    /// What the agent works on: its session topic, the topic in the title it sets (`paneTitle`),
+    /// or its name.
+    func title(paneTitle: String) -> String {
+        topic ?? Self.programTopic(paneTitle, agent: name) ?? name
+    }
+
+    /// The age of the daemon's last reported change. Missing timestamps show no age.
+    func activityAge(now: Date = Date()) -> String? {
+        guard let updated = updatedAtMs, updated > 0 else { return nil }
+        let seconds = max(0, now.timeIntervalSince1970 - Double(updated) / 1000)
+        if seconds < 1 { return "updated now" }
+        if seconds < 60 { return "updated \(Int(seconds))s ago" }
+        if seconds < 3600 { return "updated \(Int(seconds / 60))m ago" }
+        if seconds < 86400 { return "updated \(Int(seconds / 3600))h ago" }
+        return "updated \(Int(seconds / 86400))d ago"
+    }
+
+    /// Its status in words ("Needs your permission to use Bash", "Done in 2m").
+    var statusDetail: String {
+        switch status {
+        case .needsInput: return message.map { Self.shorten($0, agent: name) } ?? "Needs input"
+        case .working:
+            let message = message?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return message.flatMap { $0.isEmpty ? nil : $0 } ?? "Working"
+        case .done:
+            let done = turnMs.map { "Done in \(formatDuration($0))" } ?? "Done"
+            // The turn's summary (`ai.notifications`).
+            return message.map { "\(done) · \($0)" } ?? done
+        case .error: return message ?? "Failed"
+        case .idle: return "Idle"
+        }
+    }
+
+    /// The topic in the title the agent sets itself ("✳ Fix login bug", "⠐ Fix login bug"),
+    /// without its status glyph; nil when it only names the agent.
+    private static func programTopic(_ title: String, agent: String) -> String? {
+        let t = String(title.drop { !$0.isLetter && !$0.isNumber })
+            .trimmingCharacters(in: .whitespaces)
+        return t.isEmpty || t == agent ? nil : t
+    }
+
+    /// "Claude needs your permission to use Bash" → "Needs your permission to use Bash",
+    /// "Claude is waiting for your input" → "Waiting for your input".
+    private static func shorten(_ message: String, agent: String) -> String {
+        guard let first = agent.split(separator: " ").first, message.hasPrefix(first + " ") else { return message }
+        var rest = message.dropFirst(first.count + 1)
+        if rest.hasPrefix("is ") { rest = rest.dropFirst(3) }
+        return rest.prefix(1).uppercased() + rest.dropFirst()
+    }
+}
+
+/// "42s", "3m 05s", "1h 02m" (same as the daemon's notifications).
+func formatDuration(_ ms: UInt64) -> String {
+    let s = ms / 1000
+    if s < 60 { return "\(s)s" }
+    if s < 3600 { return String(format: "%dm %02ds", s / 60, s % 60) }
+    return String(format: "%dh %02dm", s / 3600, (s % 3600) / 60)
+}
+
 /// Swift view of `thurm_proto::GitInfo`.
 struct GitInfo: Equatable {
     var root: String
@@ -281,22 +370,7 @@ struct PaneInfo {
         } else {
             program = nil
         }
-        if let a = d["agent"] as? [String: Any],
-           let statusName = jsonString(a["status"]),
-           let status = AgentStatus(rawValue: statusName) {
-            agent = AgentState(updatedAtMs: Self.activityTimestamp(payload["updated_at_ms"]), name: jsonString(a["name"]) ?? "Agent",
-                               kind: jsonString(a["kind"]) ?? "",
-                               status: status,
-                               sessionId: jsonString(a["session_id"]),
-                               message: jsonString(a["message"]),
-                               turnMs: jsonUInt64(a["turn_ms"]),
-                               turns: jsonInt(a["turns"]) ?? 0,
-                               hooked: jsonBool(a["hooked"]) ?? false,
-                               topic: jsonString(a["topic"]),
-                               permission: jsonUInt64(a["permission"]))
-        } else {
-            agent = nil
-        }
+        agent = AgentState(paneJSON: payload)
         alive = jsonBool(d["alive"]) ?? true
         passwordInput = jsonBool(d["password_input"]) ?? false
         atPrompt = jsonBool(d["at_prompt"]) ?? false
@@ -316,12 +390,6 @@ struct PaneInfo {
     }
 
     var key: PaneKey { PaneKey(host, id) }
-
-    private static func activityTimestamp(_ value: Any?) -> UInt64? {
-        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
-              let timestamp = UInt64(number.stringValue), timestamp > 0 else { return nil }
-        return timestamp
-    }
 
     /// Title for tabs: program title, else the cwd's last path component.
     var displayTitle: String {

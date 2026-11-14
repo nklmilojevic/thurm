@@ -44,14 +44,6 @@ final class AgentDotView: NSView {
     }
 }
 
-/// "42s", "3m 05s", "1h 02m" (same as the daemon's notifications).
-func formatDuration(_ ms: UInt64) -> String {
-    let s = ms / 1000
-    if s < 60 { return "\(s)s" }
-    if s < 3600 { return String(format: "%dm %02ds", s / 60, s % 60) }
-    return String(format: "%dh %02dm", s / 3600, (s % 3600) / 60)
-}
-
 /// One native tab = one NSWindow. Owns the tab's split tree (TabContentView).
 final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     let content: TabContentView

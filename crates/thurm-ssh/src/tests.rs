@@ -289,7 +289,7 @@ fn reaches_the_daemon_socket_as_a_mobile_client() {
         stream,
         "ios-test",
         false,
-        &[thurm_proto::CAP_MOBILE],
+        crate::MOBILE_CAPABILITIES,
         |_| {},
         || {},
     )
@@ -298,12 +298,15 @@ fn reaches_the_daemon_socket_as_a_mobile_client() {
         client.request(Request::ListPanes),
         Ok(Response::Ok)
     ));
-    assert!(
-        caps.lock()
-            .unwrap()
-            .iter()
-            .any(|c| c == thurm_proto::CAP_MOBILE)
-    );
+    let caps = caps.lock().unwrap();
+    for cap in [
+        thurm_proto::CAP_MOBILE,
+        thurm_proto::CAP_PANE_PAGER,
+        thurm_proto::CAP_AGENT_ACTIVITY,
+    ] {
+        assert!(caps.iter().any(|c| c == cap), "{cap} missing from {caps:?}");
+    }
+    drop(caps);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

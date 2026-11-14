@@ -576,6 +576,16 @@ pub struct Remote {
     pub session: Session,
 }
 
+/// What the app says in `Hello` over ssh besides the build's capabilities: a phone that pages
+/// between panes, takes the time of each agent's last report (`PaneActivity`) like its tailnet
+/// connection, and takes deflated events.
+pub const MOBILE_CAPABILITIES: &[&str] = &[
+    thurm_proto::CAP_MOBILE,
+    thurm_proto::CAP_PANE_PAGER,
+    thurm_proto::CAP_AGENT_ACTIVITY,
+    thurm_proto::CAP_DEFLATE,
+];
+
 /// Connects to `target`, starts its daemon when none runs, and says Hello as a mobile client.
 /// Mirrors the desktop tunnel (`thurm_remote::tunnel`): probe, socket, start, forward.
 pub fn connect(
@@ -602,11 +612,7 @@ pub fn connect(
         stream,
         client_name,
         false,
-        &[
-            thurm_proto::CAP_MOBILE,
-            thurm_proto::CAP_PANE_PAGER,
-            thurm_proto::CAP_DEFLATE,
-        ],
+        MOBILE_CAPABILITIES,
         on_event,
         on_disconnect,
     )
