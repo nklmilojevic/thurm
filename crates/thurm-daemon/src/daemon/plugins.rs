@@ -44,6 +44,9 @@ pub struct Plugins {
     instances: Mutex<HashMap<u64, Instance>>,
     next: AtomicU64,
     records: Mutex<BTreeMap<String, Record>>,
+    /// Every program plugin's process not reaped yet, recorded or still starting: shutdown
+    /// waits for them all.
+    processes: Mutex<Vec<Arc<Process>>>,
 }
 
 /// A running plugin or script, and its client.
@@ -181,7 +184,7 @@ impl Process {
                     killed = true;
                 }
                 // Done when nothing but the exited program is left in its group.
-                let group_alive = unsafe { libc::kill(-pgid, 0) } == 0;
+                let group_alive = group_has_others(pgid);
                 if leader_exited.is_some() && (killed || !group_alive) {
                     let status = child.wait()?;
                     life.reaped = true;
@@ -246,16 +249,14 @@ impl Daemon {
     /// Waits for the program plugins to end (SIGKILL included), a little past [`STOP_GRACE`]:
     /// none may outlive the daemon.
     pub fn stop_plugins(self: &Arc<Self>) {
-        let processes: Vec<Arc<Process>> = self
-            .plugins
-            .records
-            .lock()
-            .values()
-            .filter_map(|r| r.process.clone())
-            .collect();
         let names: Vec<String> = self.plugins.records.lock().keys().cloned().collect();
         for name in names {
             self.stop_plugin(&name, "stopped");
+        }
+        // Those still starting too: their start finds itself stopped and stops them.
+        let processes: Vec<Arc<Process>> = self.plugins.processes.lock().clone();
+        for p in &processes {
+            p.stop();
         }
         let deadline = Instant::now() + STOP_GRACE + Duration::from_millis(500);
         while Instant::now() < deadline && !processes.iter().all(|p| p.reaped()) {
@@ -332,7 +333,8 @@ impl Daemon {
                     generation: 0,
                     failures: 0,
                 });
-                let running = record.state == "running" || record.state == "failed";
+                // A plugin that failed is started again: its files may be fixed now.
+                let running = record.state == "running";
                 let changed = record.found != plugin || record.settings != settings;
                 let lua = matches!(plugin.kind, PluginKind::Lua { .. });
                 record.found = plugin;
@@ -346,6 +348,11 @@ impl Daemon {
             match restart {
                 None => self.stop_plugin(&name, "disabled"),
                 Some(true) => {
+                    // Lua code that doesn't compile leaves the running plugin as it is.
+                    if let Some(e) = self.lua_wont_compile(&name) {
+                        self.plugin_error(&name, &format!("{e}; the running one stays"));
+                        continue;
+                    }
                     self.stop_plugin(&name, "stopped");
                     self.start_plugin(&name);
                 }
@@ -353,6 +360,22 @@ impl Daemon {
             }
         }
         self.plugins_changed();
+    }
+
+    /// Why a running Lua plugin's code on disk would not start now: it doesn't compile.
+    /// `None` for a plugin that doesn't run, a program, or code that compiles.
+    fn lua_wont_compile(&self, name: &str) -> Option<String> {
+        let main = {
+            let records = self.plugins.records.lock();
+            let r = records.get(name)?;
+            r.instance?;
+            match &r.found.kind {
+                PluginKind::Lua { main } => main.clone(),
+                PluginKind::Process { .. } => return None,
+            }
+        };
+        let source = std::fs::read_to_string(&main).ok()?;
+        thurm_lua::check(&source, &main.display().to_string()).err()
     }
 
     /// Starts plugin `name` (stopped before).
@@ -482,6 +505,7 @@ impl Daemon {
         })
         .map_err(|e| format!("cannot start {:?}: {e}", exec[0]))?;
         let process = Process::new(child.id() as libc::pid_t, child.stdin.take());
+        self.plugins.processes.lock().push(process.clone());
         let to = process.clone();
         let (instance, client) = self.plugin_client(
             &name,
@@ -551,6 +575,12 @@ impl Daemon {
             .name("plugin-wait".into())
             .spawn(move || {
                 let status = process.wait(&mut child);
+                if let Some(d) = daemon.upgrade() {
+                    d.plugins
+                        .processes
+                        .lock()
+                        .retain(|p| !Arc::ptr_eq(p, &process));
+                }
                 // A child of its own may keep stderr open: not for long.
                 let _ = stderr_ended.recv_timeout(Duration::from_secs(1));
                 if let Some(d) = daemon.upgrade() {
@@ -1017,5 +1047,35 @@ impl Daemon {
             .unwrap_or_else(|_| Err("the Lua runtime stopped".into()));
         self.end_instance(instance);
         result
+    }
+}
+
+/// Whether process group `pgid` has members besides its exited leader, which stays unreaped
+/// (a zombie) while this is asked so the id stays the group's.
+fn group_has_others(pgid: libc::pid_t) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // A zombie counts as a member for kill(2) on Linux: look at the members themselves.
+        let Ok(procs) = std::fs::read_dir("/proc") else {
+            return unsafe { libc::kill(-pgid, 0) } == 0;
+        };
+        procs.filter_map(Result::ok).any(|p| {
+            let Ok(stat) = std::fs::read_to_string(p.path().join("stat")) else {
+                return false;
+            };
+            // pid (comm) state ppid pgrp ...: after the comm's closing parenthesis.
+            let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+                return false;
+            };
+            let mut f = rest.split_whitespace();
+            let state = f.next().unwrap_or("Z");
+            let pgrp = f.nth(1).and_then(|g| g.parse::<libc::pid_t>().ok());
+            pgrp == Some(pgid) && state != "Z"
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS refuses to signal a group of zombies (EPERM).
+        unsafe { libc::kill(-pgid, 0) == 0 }
     }
 }

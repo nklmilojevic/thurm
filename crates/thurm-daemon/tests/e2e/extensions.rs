@@ -809,11 +809,16 @@ fn plugins_in_the_plugins_directory_run_and_are_managed() {
         );
     }
 
-    // A program that keeps exiting waits longer each time.
-    let list = until_plugins(&c, "crash fails", |l| {
+    // A program that keeps exiting waits longer each time: 1 s, then 2 s.
+    until_plugins(&c, "crash fails", |l| {
         plugin(l, "crash")["error"]
             .as_str()
-            .is_some_and(|e| e.contains("status 3"))
+            .is_some_and(|e| e.contains("status 3; starting again in 1s"))
+    });
+    let list = until_plugins(&c, "crash fails again", |l| {
+        plugin(l, "crash")["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("status 3; starting again in 2s"))
     });
     assert_eq!(plugin(&list, "crash")["state"], "failed");
     let logs = call(&c, method::PLUGINS_LOGS, json!({ "name": "crash" })).unwrap();
@@ -1122,4 +1127,46 @@ while :; do sleep 1; done
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// A reload keeps a Lua plugin whose new code doesn't compile running as it was, and starts
+/// again a plugin that failed to start once it can.
+#[test]
+fn reloads_keep_what_works_and_retry_what_failed() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("ext-reload-retry");
+    let plugins = env.dir.join("config/plugins");
+    std::fs::create_dir_all(plugins.join("later")).unwrap();
+    std::fs::write(
+        plugins.join("good.lua"),
+        "thurm.action{ name = 'good.one', run = function() end }",
+    )
+    .unwrap();
+    std::fs::write(plugins.join("later/plugin.toml"), "exec = [\"./run.sh\"]\n").unwrap();
+    let _d = env.start();
+    let (c, _rx) = ext_client(&env, "e2e");
+    until_plugins(&c, "started", |l| {
+        plugin(l, "good")["actions"] == json!(["good.one"])
+            && plugin(l, "later")["state"] == "failed"
+    });
+
+    std::fs::write(plugins.join("good.lua"), "thurm.action{ name = ").unwrap();
+    let run = plugins.join("later/run.sh");
+    std::fs::write(
+        &run,
+        "#!/bin/sh\necho '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"actions.register\",\"params\":{\"actions\":[{\"name\":\"later.up\"}]}}'\ncat > /dev/null\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+    c.request(Request::ReloadConfig).unwrap();
+    let list = until_plugins(&c, "reloaded", |l| {
+        plugin(l, "later")["actions"] == json!(["later.up"])
+    });
+    assert_eq!(plugin(&list, "good")["actions"], json!(["good.one"]));
+    assert!(
+        plugin(&list, "good")["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stays")
+    );
 }

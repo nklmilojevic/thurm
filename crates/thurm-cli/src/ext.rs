@@ -514,8 +514,13 @@ pub fn plugin_local(cmd: PluginCmd, json: bool) -> R {
                 &url,
                 &target.display().to_string(),
             ])?;
-            if let Err(e) = find(&name) {
-                eprintln!("thurm: {e}: the repository has no plugin.toml or init.lua");
+            // Not a plugin: it goes again, rather than sitting in the plugins directory.
+            if find(&name).is_err() {
+                let _ = std::fs::remove_dir_all(&target);
+                return Err(format!(
+                    "{url} is not a Thurm plugin (no plugin.toml or init.lua at its top)"
+                )
+                .into());
             }
             println!("{}", target.display());
             reload_running(Some(&name));
@@ -634,6 +639,10 @@ pub fn plugin(c: &Client, cmd: PluginCmd, json: bool) -> R {
                 method::PLUGINS_LOGS,
                 json!({ "name": name, "lines": lines }),
             )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r["lines"])?);
+                return Ok(ExitCode::SUCCESS);
+            }
             for line in r["lines"].as_array().into_iter().flatten() {
                 println!("{}", line.as_str().unwrap_or_default());
             }
