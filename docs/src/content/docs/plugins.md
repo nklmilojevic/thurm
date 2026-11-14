@@ -114,7 +114,7 @@ your keys. Errors are raised: catch them with `pcall` where you expect them.
 | `thurm.open{command, cwd, env, agent, split, float, window, target, percent, background, hold}` | Opens a pane and returns its id |
 | `thurm.split(dir, opts)` | `thurm.open` with `split = dir` |
 | `thurm.send(pane, text, {enter})`, `thurm.capture(pane, {lines, scrollback, ansi})` | Types into a pane; reads its screen |
-| `thurm.wait(pane, {match, idle, exit, agent, timeout})` | Waits for the prompt, a regex, quiet, exit or a free agent; `true` (with the exit code for `exit`), or `false` and why |
+| `thurm.wait(pane, {match, idle, exit, agent, timeout})` | Waits for the prompt, a regex, quiet, exit or a free agent; `true`, or `false` and why; waiting for `exit`, the exit code is the third value (`true, nil, code`) |
 | `thurm.close(pane)`, `thurm.focus(pane)` | Closes or focuses a pane |
 | `thurm.ui.toast(text, pane)` | A short message over a pane |
 | `thurm.ui.pick{title, placeholder, items}` | The user picks an item (a string, or a table with `title` and `detail`); returns it and its index, or `nil` |
@@ -144,9 +144,10 @@ local cwd = thurm.info(thurm.pane or thurm.focused()).cwd
 local top = thurm.exec({ "git", "rev-parse", "--show-toplevel" }, { cwd = cwd })
 if not top.ok then error("not in a git repository: " .. top.stderr) end
 local root = top.stdout:gsub("%s+$", "")
-local r = thurm.exec({ "git", "diff", "HEAD", "--name-only" }, { cwd = root })
+-- -z: names as they are, NUL after each (a name may hold a newline).
+local r = thurm.exec({ "git", "diff", "HEAD", "--name-only", "-z" }, { cwd = root })
 if not r.ok then error(r.stderr) end
-for file in r.stdout:gmatch("[^\n]+") do
+for file in r.stdout:gmatch("[^\0]+") do
   thurm.split("down", { command = { "git", "diff", "HEAD", "--", file }, cwd = root, hold = true })
 end
 return "opened diffs"
