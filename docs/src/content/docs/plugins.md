@@ -126,7 +126,7 @@ your keys. Errors are raised: catch them with `pcall` where you expect them.
 `require` loads modules from the plugin's own directory. `io.popen`,
 `os.execute` and `os.exit` are not available (use `thurm.exec`). Code that
 runs for 5 seconds without waiting is stopped, and a plugin may use at most
-256 MiB.
+256 MiB (a script, 64 MiB).
 
 ## Scripts
 
@@ -154,7 +154,7 @@ echo 'return #thurm.panes()' | thurm do -
 thurm --remote build do deploy.lua staging
 ```
 
-Stopping `thurm do` (Ctrl-C) stops the script. At most 32 scripts run at
+Stopping `thurm do` (Ctrl-C) stops the script. At most 8 scripts run at
 once. With `--remote`, the `.lua` files
 beside the script (a few levels deep) go along, so `require` finds them on the
 other host. A host the app reaches over the tailnet, not ssh, refuses scripts and
