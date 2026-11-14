@@ -154,8 +154,8 @@ thurm --remote build do deploy.lua staging
 
 Stopping `thurm do` (Ctrl-C) stops the script. With `--remote`, the `.lua` files
 beside the script (a few levels deep) go along, so `require` finds them on the
-other host. A host the app reaches over the tailnet, not ssh, refuses scripts:
-running code there is for that machine's own clients.
+other host. A host the app reaches over the tailnet, not ssh, refuses scripts and
+actions: running code there is for that machine's own clients.
 
 ## Plugins
 
@@ -262,7 +262,7 @@ JSON.
 | `plugins.reload`, `plugins.enable`, `plugins.disable`, `plugins.logs` | `{name}` (`lines` for logs) | |
 | `script.run` | `{source, name, args, dir, pane}` | What the script returned |
 
-A plugin's actions, keys and subscriptions go away when it stops. `exec`,
-`script.run` and the `plugins.*` methods that change what runs are for clients
-on the daemon's machine (and its plugins): a caller over the tailnet is refused
-them.
+A plugin's actions, keys and subscriptions go away when it stops. The API is
+for clients on the daemon's machine and its plugins: a caller over the tailnet
+may only read `actions.list` and `plugins.list`. The app's Secure Keyboard
+Entry switch is never offered as an action.
