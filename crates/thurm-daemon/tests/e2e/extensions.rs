@@ -1097,7 +1097,16 @@ while :; do sleep 1; done
         .unwrap();
     call(&c, method::PLUGINS_DISABLE, json!({ "name": "parent" })).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while unsafe { libc::kill(child, 0) } == 0 {
+    // Gone, or a zombie nobody reaps (a container's init may not).
+    let running = || {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &child.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        !state.is_empty() && !state.starts_with('Z')
+    };
+    while running() {
         assert!(
             Instant::now() < deadline,
             "process {child} survived the plugin"
