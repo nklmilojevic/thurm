@@ -199,8 +199,9 @@ fn exited(pid: libc::pid_t) -> bool {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
     if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) } != 0 {
-        // Nothing to wait for: it is gone.
-        return true;
+        // Interrupted, or the like: asked again on the next look. Only "no such child" means
+        // it is gone already.
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
     }
     #[cfg(target_os = "linux")]
     let found = unsafe { info.si_pid() };
