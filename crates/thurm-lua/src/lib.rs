@@ -36,6 +36,9 @@ const MAX_CALLS: usize = 64;
 /// The most timers fired before the runtime looks at its jobs again.
 const TIMER_BATCH: usize = 64;
 
+/// The timers (`thurm.after`, `thurm.every`) one plugin may have set at a time.
+const MAX_TIMERS: usize = 4096;
+
 /// The most memory a plugin's Lua state may use.
 const MEMORY_LIMIT: usize = 256 << 20;
 
@@ -192,14 +195,16 @@ struct Shared {
     handlers: HashMap<String, Vec<Function>>,
     /// Coroutines the runtime runs: only these may wait.
     managed: HashSet<usize>,
-    /// The action depth of each running action coroutine.
-    depth: HashMap<usize, u32>,
+    /// The action depth of each running action coroutine, and the invocation it carries out.
+    depth: HashMap<usize, (u32, u64)>,
     /// Tickets a coroutine of this plugin waits on.
     waiting: HashSet<u64>,
     /// The tickets of calls running on a thread of their own.
     calls: HashSet<u64>,
     new_timers: Vec<(u64, Duration, Option<Duration>, Fire)>,
     cancelled: HashSet<u64>,
+    /// The plugin's timers set and not yet fired (once) or cancelled.
+    timers: HashSet<u64>,
 }
 
 struct Plugin {
@@ -441,13 +446,17 @@ impl Engine {
         p.set(
             "timer",
             lua.create_function(move |_, (secs, f, repeat): (f64, Function, bool)| {
+                let mut s = sh.borrow_mut();
+                if s.timers.len() >= MAX_TIMERS {
+                    let why = format!("too many timers: {MAX_TIMERS} are set; cancel some first");
+                    return Ok((None, Some(why)));
+                }
                 let id = ids.fetch_add(1, Ordering::Relaxed);
                 let after = seconds(secs);
                 let every = repeat.then_some(after.max(Duration::from_millis(10)));
-                sh.borrow_mut()
-                    .new_timers
-                    .push((id, after, every, Fire::Call(f)));
-                Ok(id)
+                s.timers.insert(id);
+                s.new_timers.push((id, after, every, Fire::Call(f)));
+                Ok((Some(id), None))
             })?,
         )?;
 
@@ -455,7 +464,10 @@ impl Engine {
         p.set(
             "cancel",
             lua.create_function(move |_, id: u64| {
-                sh.borrow_mut().cancelled.insert(id);
+                let mut s = sh.borrow_mut();
+                if s.timers.remove(&id) {
+                    s.cancelled.insert(id);
+                }
                 Ok(())
             })?,
         )?;
@@ -491,7 +503,16 @@ impl Engine {
             "depth",
             lua.create_function(move |lua, ()| {
                 let me = ptr(&lua.current_thread());
-                Ok(sh.borrow().depth.get(&me).copied().unwrap_or(0))
+                Ok(sh.borrow().depth.get(&me).map_or(0, |d| d.0))
+            })?,
+        )?;
+
+        let sh = shared.clone();
+        p.set(
+            "invocation",
+            lua.create_function(move |lua, ()| {
+                let me = ptr(&lua.current_thread());
+                Ok(sh.borrow().depth.get(&me).map(|d| d.1))
             })?,
         )?;
 
@@ -561,8 +582,8 @@ impl Engine {
         {
             let mut s = plugin.shared.borrow_mut();
             s.managed.insert(ptr(&thread));
-            if let Some(d) = depth {
-                s.depth.insert(ptr(&thread), d);
+            if let (Some(d), TaskKind::Action { reply }) = (depth, &kind) {
+                s.depth.insert(ptr(&thread), (d, *reply));
             }
         }
         self.resume(instance, Task { thread, kind }, args);
@@ -797,6 +818,11 @@ impl Engine {
             match timer.fire {
                 Fire::Wake(ticket) => self.wake(instance, ticket, Ok(Value::Null)),
                 Fire::Call(f) => {
+                    if timer.every.is_none()
+                        && let Some(p) = self.plugins.get(&instance)
+                    {
+                        p.shared.borrow_mut().timers.remove(&id);
+                    }
                     if let Some(every) = timer.every {
                         self.timers.push(Reverse((now + every, id)));
                         self.timer_info.insert(
@@ -836,11 +862,35 @@ fn seconds(secs: f64) -> Duration {
     Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(Duration::from_secs(365 * 86_400))
 }
 
+/// JSON for the API's results: a null field is a missing one (nil), while a null in an array
+/// stays `thurm.json.null`, so the items after it keep their places.
 fn to_lua(lua: &Lua, v: &Value) -> mlua::Result<mlua::Value> {
-    let options = mlua::serde::SerializeOptions::new()
-        .serialize_none_to_null(false)
-        .serialize_unit_to_null(false);
-    lua.to_value_with(v, options)
+    Ok(match v {
+        Value::Null => mlua::Value::Nil,
+        Value::Object(map) => {
+            let t = lua.create_table_with_capacity(0, map.len())?;
+            for (k, v) in map {
+                if !v.is_null() {
+                    t.raw_set(k.as_str(), to_lua(lua, v)?)?;
+                }
+            }
+            mlua::Value::Table(t)
+        }
+        Value::Array(items) => {
+            let t = lua.create_table_with_capacity(items.len(), 0)?;
+            for (i, v) in items.iter().enumerate() {
+                let v = if v.is_null() {
+                    lua.null()
+                } else {
+                    to_lua(lua, v)?
+                };
+                t.raw_set(i + 1, v)?;
+            }
+            t.set_metatable(Some(lua.array_metatable()))?;
+            mlua::Value::Table(t)
+        }
+        other => lua.to_value(other)?,
+    })
 }
 
 fn from_lua<T: serde::de::DeserializeOwned>(lua: &Lua, v: mlua::Value) -> mlua::Result<T> {

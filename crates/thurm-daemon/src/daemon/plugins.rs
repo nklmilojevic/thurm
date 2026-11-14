@@ -178,15 +178,18 @@ impl Daemon {
     /// (Re)starts `init.lua` from the config directory, if there is one.
     pub(super) fn load_init(self: &Arc<Self>) {
         // A start still running decides what there is to fall back on: wait for its outcome
-        // (its main chunk is stopped after 5 s of work without a wait).
+        // (its main chunk is stopped after 5 s of work without a wait). One that waits for
+        // longer keeps running: replaced now, a failing new file would have nothing to go back to.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let current = *self.plugins.init.lock();
-            if current.is_none()
-                || *self.plugins.init_settled.lock() == current
-                || std::time::Instant::now() >= deadline
-            {
+            if current.is_none() || *self.plugins.init_settled.lock() == current {
                 break;
+            }
+            if std::time::Instant::now() >= deadline {
+                log::warn!("init.lua: still starting after 10 s; not reloaded");
+                self.toast("init.lua is still starting; reload again once it has".into(), None);
+                return;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }

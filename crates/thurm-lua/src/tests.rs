@@ -30,6 +30,9 @@ impl Host for FakeHost {
             "events.subscribe" if params.to_string().contains("bad.") => {
                 Err("unknown event".into())
             }
+            "request" if params["request"] == "Nulls" => {
+                Ok(json!({ "gone": null, "list": [1, null, { "gone": null, "deep": [null, 2] }] }))
+            }
             "request" => Ok(json!({ "Panes": [{ "id": 7 }] })),
             _ => Ok(Value::Null),
         }
@@ -149,6 +152,7 @@ fn actions_run_in_coroutines_that_wait_without_blocking_others() {
         end }
         thurm.action{ name = "test.fast", run = function() return "fast" end }
         thurm.action{ name = "test.broken", run = function() error("broke") end }
+        thurm.action{ name = "test.nested", run = function() return thurm.run("x.y") end }
         "#,
         false,
     ));
@@ -189,6 +193,14 @@ fn actions_run_in_coroutines_that_wait_without_blocking_others() {
         broken["error"].as_str().unwrap().contains("init.lua:7:"),
         "{broken}"
     );
+    // An action run from an action says which invocation it comes from, and how deep it is.
+    f.rt.notice(
+        1,
+        notice::ACTION_INVOKE,
+        json!({ "id": 13, "name": "test.nested", "ctx": { "depth": 2 } }),
+    );
+    let run = next(&f, "actions.run");
+    assert_eq!((&run["invocation"], &run["depth"]), (&json!(13), &json!(2)));
 }
 
 #[test]
@@ -413,6 +425,53 @@ fn json_nulls_round_trip() {
     )
     .unwrap();
     assert_eq!(r, json!({ "n": 3, "null": true, "back": "[1,null,3]" }));
+}
+
+/// In the API's results a null field is missing, while nulls in arrays, at any depth, keep
+/// their places.
+#[test]
+fn api_results_keep_array_nulls_in_place() {
+    let f = fixture();
+    let r = run(
+        &f,
+        r#"
+        local r = thurm.request("Nulls")
+        local inner = r.list[3]
+        return { gone = r.gone == nil, n = #r.list, null = r.list[2] == thurm.json.null,
+                 inner_gone = inner.gone == nil, deep_n = #inner.deep,
+                 deep_null = inner.deep[1] == thurm.json.null, deep = inner.deep[2],
+                 back = thurm.json.encode(r.list) }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        r,
+        json!({ "gone": true, "n": 3, "null": true, "inner_gone": true, "deep_n": 2,
+                "deep_null": true, "deep": 2, "back": "[1,null,{\"deep\":[null,2]}]" })
+    );
+}
+
+/// A plugin may have only so many timers set at once; cancelled and fired ones free their
+/// places.
+#[test]
+fn timers_are_bounded() {
+    let f = fixture();
+    let r = run(
+        &f,
+        &format!(
+            r#"
+            local set = {{}}
+            for i = 1, {MAX_TIMERS} do set[i] = thurm.after(3600, function() end) end
+            local ok, err = pcall(thurm.after, 3600, function() end)
+            set[1].cancel()
+            local again = pcall(thurm.after, 3600, function() end)
+            for _, t in ipairs(set) do t.cancel() end
+            return {{ refused = not ok and err:find("too many timers") ~= nil, again = again }}
+            "#
+        ),
+    )
+    .unwrap();
+    assert_eq!(r, json!({ "refused": true, "again": true }));
 }
 
 /// A name the daemon refuses leaves the action that was there with its handler.

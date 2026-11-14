@@ -204,8 +204,8 @@ function thurm.sleep(seconds) end
 
 thurm.json = {}
 
---- JSON's null in what `thurm.json.decode` gives (`[1, null, 3]` keeps three items). The API's own
---- results give nil instead.
+--- JSON's null in what `thurm.json.decode` gives (`[1, null, 3]` keeps three items). In the API's
+--- own results a null field is nil, and a null in an array is this value.
 thurm.json.null = nil
 
 ---@param value any

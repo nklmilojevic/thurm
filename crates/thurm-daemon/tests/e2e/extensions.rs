@@ -634,17 +634,32 @@ fn init_lua_provides_actions_and_scripts_run() {
     c.request(Request::ReloadConfig).unwrap();
     let toast = next(&app_rx, notice::UI_REQUEST);
     assert!(
-        toast["text"]
-            .as_str()
-            .unwrap()
-            .contains("init.lua:2: no;"),
+        toast["text"].as_str().unwrap().contains("init.lua:2: no;"),
         "{toast}"
     );
+    // The fallback ran to its end: its key binding, the last thing it sets up, is there, and
+    // its action answers.
     let deadline = Instant::now() + Duration::from_secs(20);
-    while action_names(&c) != ["lua.greet"] {
-        assert!(Instant::now() < deadline, "{:?}", action_names(&c));
+    loop {
+        let list = call(&c, method::ACTIONS_LIST, Value::Null).unwrap();
+        let bound = list["bindings"]
+            .as_array()
+            .is_some_and(|b| b.iter().any(|b| b["action"] == "lua.greet"));
+        if bound && action_names(&c) == ["lua.greet"] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{list}");
         std::thread::sleep(Duration::from_millis(50));
     }
+    let r = call(
+        &c,
+        method::ACTIONS_RUN,
+        json!({ "name": "lua.greet", "args": "again" }),
+    )
+    .unwrap();
+    assert_eq!(r, "hello again from e2e");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(action_names(&c), ["lua.greet"]);
 
     // Reloading runs the new init.lua: its old actions go.
     std::fs::write(

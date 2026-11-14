@@ -65,7 +65,9 @@ function thurm.action(spec)
 end
 
 function thurm.run(name, args, pane)
-  return call("actions.run", { name = name, args = args, pane = pane, depth = P.depth() })
+  return call("actions.run", {
+    name = name, args = args, pane = pane, depth = P.depth(), invocation = P.invocation(),
+  })
 end
 
 function thurm.actions()
@@ -257,7 +259,10 @@ function thurm.exec(argv, opts)
   })
 end
 
-local function timer(id)
+local function timer(id, why)
+  if not id then
+    error(why, 3)
+  end
   return { id = id, cancel = function() P.cancel(id) end }
 end
 
@@ -285,8 +290,9 @@ end
 
 -- Odds and ends -------------------------------------------------------------------------------
 
--- decode keeps JSON nulls as thurm.json.null (arrays keep their length); the API's own results
--- give nil for null, as Lua code expects of a missing value.
+-- decode keeps JSON nulls as thurm.json.null (arrays keep their length). In the API's own
+-- results a null field is a missing one (nil), while a null in an array, at any depth, is
+-- thurm.json.null, so the items after it keep their places.
 thurm.json = { encode = P.json_encode, decode = P.json_decode, null = P.json_null }
 
 local function line(...)
