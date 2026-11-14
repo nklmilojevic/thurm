@@ -151,13 +151,10 @@ impl Process {
             let Some(tx) = outbox.as_ref() else { return };
             let mut line = msg.to_string();
             line.push('\n');
-            matches!(
-                tx.try_send(line),
-                Err(crossbeam_channel::TrySendError::Full(_))
-            )
+            tx.try_send(line).is_err()
         };
-        // A plugin that doesn't read what it is sent can't answer it either: it is stopped
-        // (and its actions go with it when it exits).
+        // A plugin that doesn't read what it is sent (or closed its input) can't answer it
+        // either: it is stopped (and its actions go with it when it exits).
         if full {
             log::warn!(
                 "plugin process {} does not read its input; stopping it",
@@ -203,9 +200,9 @@ impl Process {
                     unsafe { libc::kill(-pgid, libc::SIGKILL) };
                     killed = true;
                 }
-                // Done when nothing but the exited program is left in its group.
-                let group_alive = group_has_others(pgid);
-                if leader_exited.is_some() && (killed || !group_alive) {
+                // Done when nothing but the exited program is left in its group (looked for
+                // only once it exited: a scan of every process is not cheap).
+                if leader_exited.is_some() && (killed || !group_has_others(pgid)) {
                     let status = child.wait()?;
                     life.reaped = true;
                     return Ok(status);

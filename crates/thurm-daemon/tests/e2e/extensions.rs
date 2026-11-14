@@ -1059,10 +1059,14 @@ fn reloading_a_plugin_by_name_reads_its_files_again() {
         "thurm.action{ name = 'tool.b', run = function() end }",
     )
     .unwrap();
-    // Another Lua plugin, which a reload of `tool` leaves running.
+    // Another Lua plugin, which a reload of `tool` leaves running: it notes each start.
+    let starts = env.dir.join("other-starts");
     std::fs::write(
         env.dir.join("config/plugins/other.lua"),
-        "thurm.log('started')",
+        format!(
+            "local f = assert(io.open({:?}, 'a')) f:write('start\\n') f:close()",
+            starts.display().to_string()
+        ),
     )
     .unwrap();
     let _d = env.start();
@@ -1080,8 +1084,9 @@ fn reloading_a_plugin_by_name_reads_its_files_again() {
         plugin(l, "tool")["actions"] == json!(["tool.b"])
     });
     assert_eq!(plugin(&list, "tool")["version"], "2.0.0");
-    let logs = call(&c, method::PLUGINS_LOGS, json!({ "name": "other" })).unwrap();
-    assert_eq!(logs["lines"], json!(["started"]));
+    // Given the time a restart would take, `other` started once.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(std::fs::read_to_string(&starts).unwrap(), "start\n");
 }
 
 /// A program plugin's leader may exit on SIGTERM while something it started ignores it:

@@ -478,21 +478,29 @@ pub fn plugin_local(cmd: PluginCmd, json: bool) -> R {
             }
             let target = dir.join(&name);
             name_free(&dir, &name, &target)?;
-            std::fs::create_dir_all(&target)?;
-            for (file, text, executable) in thurm_config::plugins::scaffold(&name, program) {
-                let path = target.join(file);
-                std::fs::write(&path, text)?;
-                if executable {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            let made = || -> Result<(), Box<dyn std::error::Error>> {
+                std::fs::create_dir_all(&target)?;
+                for (file, text, executable) in thurm_config::plugins::scaffold(&name, program) {
+                    let path = target.join(file);
+                    std::fs::write(&path, text)?;
+                    if executable {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+                    }
                 }
-            }
-            if !program {
-                let types = write_types()?;
-                std::fs::write(
-                    target.join(".luarc.json"),
-                    thurm_config::plugins::luarc(&types),
-                )?;
+                if !program {
+                    let types = write_types()?;
+                    std::fs::write(
+                        target.join(".luarc.json"),
+                        thurm_config::plugins::luarc(&types),
+                    )?;
+                }
+                Ok(())
+            };
+            // Half made, it goes: the name was free, so the directory is this command's.
+            if let Err(e) = made() {
+                let _ = std::fs::remove_dir_all(&target);
+                return Err(e);
             }
             println!("{}", target.display());
             reload_running(Some(&name));
@@ -512,14 +520,18 @@ pub fn plugin_local(cmd: PluginCmd, json: bool) -> R {
                  plugins you trust."
             );
             std::fs::create_dir_all(&dir)?;
-            git(&[
+            // A clone that failed part way goes: the name was free, so what is there is its.
+            if let Err(e) = git(&[
                 "clone",
                 "--depth",
                 "1",
                 "--",
                 &url,
                 &target.display().to_string(),
-            ])?;
+            ]) {
+                let _ = std::fs::remove_dir_all(&target);
+                return Err(e);
+            }
             // Not a plugin: it goes again, rather than sitting in the plugins directory.
             if find(&name).is_err() {
                 let _ = std::fs::remove_dir_all(&target);
