@@ -239,6 +239,15 @@ notifications = true
 # Allow Edit > Explain Last Command and `thurm explain`.
 explain = true
 
+[plugins]
+# Run plugins: init.lua next to this file, and the plugins in plugins/.
+enabled = true
+# Plugins not to start, by name.
+disabled = []
+# Settings for one plugin, passed to it as they are.
+# [plugins.settings]
+# git-tools = { remote = "origin" }
+
 [updates]
 # "auto" follows the installed build's channel: "release" or "tip".
 # Use "release" or "tip" to select a fixed channel.

@@ -253,7 +253,9 @@ impl Daemon {
             method::LOG => {
                 let message = str_param(&p, "message")?;
                 let source = self.ext_source(client);
-                match p.get("level").and_then(Value::as_str).unwrap_or("info") {
+                let level = p.get("level").and_then(Value::as_str).unwrap_or("info");
+                self.plugin_log(client, level, message);
+                match level {
                     "error" => log::error!("{source}: {message}"),
                     "warn" => log::warn!("{source}: {message}"),
                     "debug" => log::debug!("{source}: {message}"),
@@ -277,6 +279,11 @@ impl Daemon {
             return Err("this client was disconnected".into());
         }
         Ok(reg)
+    }
+
+    /// Every action, for the plugin list.
+    pub(super) fn ext_actions(&self) -> Vec<ext::ActionInfo> {
+        self.ext.registry.lock().actions()
     }
 
     /// A [`Request`] answered to its end, including those `handle` answers on a thread of
@@ -442,7 +449,7 @@ impl Daemon {
 
     /// An answer from client `from` to one of its questions; answers to someone else's are
     /// dropped.
-    fn ext_reply(&self, from: u64, reply: ext::Reply) {
+    pub(super) fn ext_reply(&self, from: u64, reply: ext::Reply) {
         let mut pending = self.ext.pending.lock();
         if pending.get(&reply.id).is_some_and(|p| p.to == from)
             && let Some(Pending { tx, .. }) = pending.remove(&reply.id)

@@ -70,6 +70,16 @@ pub fn start(launch: Launch, on_failure: impl FnOnce(String) + Send + 'static) -
     Ok(())
 }
 
+/// Starts `launch` with its standard input, output and error piped, in a process group of
+/// its own (the child's pid), and returns it: for a program that runs alongside the daemon.
+pub fn spawn_piped(launch: Launch) -> io::Result<std::process::Child> {
+    let mut cmd = command(&launch);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    pty::spawn_locked(&mut cmd)
+}
+
 /// The most of each of stdout and stderr that [`run`] keeps.
 const CAPTURE_MAX: usize = 16 << 20;
 
