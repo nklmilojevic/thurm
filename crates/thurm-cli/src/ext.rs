@@ -379,7 +379,7 @@ mod tests {
     /// A directory's names are read only up to the limit.
     #[test]
     fn a_listing_stops_at_its_limit() {
-        let dir = std::env::temp_dir().join(format!("thurm-names-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("thurm-listing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for i in 0..20 {
