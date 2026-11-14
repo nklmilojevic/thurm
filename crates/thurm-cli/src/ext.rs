@@ -468,7 +468,10 @@ pub fn plugin_local(cmd: PluginCmd, json: bool) -> R {
     let dir = thurm_config::plugins_dir();
     match cmd {
         PluginCmd::New { name, program } => {
-            if !ext::valid_plugin_name(&name) || name == thurm_config::plugins::INIT {
+            if !ext::valid_plugin_name(&name)
+                || name == thurm_config::plugins::INIT
+                || name == thurm_config::plugins::SCRIPT
+            {
                 return Err(
                     format!("{name:?}: a plugin's name has only letters, digits, - and _").into(),
                 );
@@ -496,7 +499,10 @@ pub fn plugin_local(cmd: PluginCmd, json: bool) -> R {
         }
         PluginCmd::Install { url, name } => {
             let name = name.unwrap_or_else(|| name_from_url(&url));
-            if !ext::valid_plugin_name(&name) || name == thurm_config::plugins::INIT {
+            if !ext::valid_plugin_name(&name)
+                || name == thurm_config::plugins::INIT
+                || name == thurm_config::plugins::SCRIPT
+            {
                 return Err(format!("{name:?} cannot name a plugin; pick one with --name").into());
             }
             let target = dir.join(&name);

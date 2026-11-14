@@ -18,6 +18,9 @@ pub const MANIFEST: &str = "plugin.toml";
 /// The name `init.lua` beside the config file runs under.
 pub const INIT: &str = "init";
 
+/// The name scripts (`thurm do`) run under: no plugin takes it.
+pub const SCRIPT: &str = "script";
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PluginKind {
     /// Lua, run inside the daemon: its main file.
@@ -71,10 +74,16 @@ pub fn discover(dir: &Path) -> (Vec<FoundPlugin>, Vec<String>) {
         }
         match read(&path) {
             Ok(Some(p)) => {
-                if p.name == INIT {
+                if p.name == INIT || p.name == SCRIPT {
                     warnings.push(format!(
-                        "{}: \"init\" is the name of init.lua beside config.toml; rename it",
-                        path.display()
+                        "{}: {:?} names {} already; rename it",
+                        path.display(),
+                        p.name,
+                        if p.name == INIT {
+                            "init.lua beside config.toml"
+                        } else {
+                            "the scripts thurm do runs"
+                        }
                     ));
                 } else if !thurm_proto::ext::valid_plugin_name(&p.name) {
                     warnings.push(format!(
@@ -318,13 +327,14 @@ mod tests {
         std::fs::create_dir(dir.join("missing")).unwrap();
         std::fs::write(dir.join("missing/plugin.toml"), "main = \"gone.lua\"\n").unwrap();
         std::fs::write(dir.join("init.lua"), "").unwrap();
+        std::fs::write(dir.join("script.lua"), "").unwrap();
         std::fs::write(dir.join("bad name.lua"), "").unwrap();
         std::fs::write(dir.join("dup.lua"), "").unwrap();
         std::fs::create_dir(dir.join("dup")).unwrap();
         std::fs::write(dir.join("dup/init.lua"), "").unwrap();
         let (found, warnings) = discover(&dir);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(warnings.len(), 6, "{warnings:?}");
+        assert_eq!(warnings.len(), 7, "{warnings:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

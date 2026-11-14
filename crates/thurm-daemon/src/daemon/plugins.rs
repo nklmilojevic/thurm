@@ -910,7 +910,16 @@ impl Daemon {
 
     /// A line for a plugin's log, from its client.
     pub(super) fn plugin_log(&self, client: &Client, level: &str, message: &str) {
-        let Some(name) = client.plugin.lock().clone() else {
+        // By the instance the client belongs to: a script's client says nothing of a plugin,
+        // whatever it is called.
+        let Some(name) = self
+            .plugins
+            .instances
+            .lock()
+            .values()
+            .find(|i| i.client.id == client.id)
+            .and_then(|i| i.plugin.clone())
+        else {
             return;
         };
         if let Some(r) = self.plugins.records.lock().get_mut(&name) {
