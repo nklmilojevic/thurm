@@ -49,4 +49,19 @@ final class ExtensionsTests: XCTestCase {
         XCTAssertEqual(entries.map(\.args), [nil, nil, "{\"branch\":\"main\"}"])
         XCTAssertTrue(entries.allSatisfy { $0.name == "git.checkout" })
     }
+
+    /// A key bound with arguments to an app action (which takes none) is not bound.
+    func testAppActionKeysWithArgumentsAreNotBound() {
+        let ext = Extensions()
+        ext.load(actions: [], bindings: [
+            .init(key: "cmd+shift+j", action: "split_down", args: "{\"x\":1}"),
+            .init(key: "cmd+shift+k", action: "split_down"),
+        ], appActions: ["split_down"])
+        let (keys, _) = ext.menuInput(keybindings: [:], commands: [])
+        XCTAssertEqual(keys, ["cmd+shift+k": "split_down"])
+    }
+
+    func testSecureKeyboardEntryIsNotOffered() {
+        XCTAssertTrue(Extensions.personalActions.contains("secure_keyboard_entry"))
+    }
 }

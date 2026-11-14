@@ -32,6 +32,10 @@ final class Extensions {
     /// taken down for another) and how to take it down.
     private var shown: (id: UInt64, cancel: () -> Void, dismiss: () -> Void)?
     private var refreshQueued = false
+    /// Reads of the actions that failed in a row, for a bounded retry.
+    private var refreshFailures = 0
+    /// App actions that only a person at the Mac may take: never offered to plugins or the CLI.
+    static let personalActions: Set<String> = ["secure_keyboard_entry"]
     /// A question that came while the app was in the background: it shows once the user
     /// brings the app forward (the Dock icon bounces for it), not before.
     private var pending: [String: Any]?
@@ -65,12 +69,22 @@ final class Extensions {
     func refresh() {
         call("actions.list") { value, error in
             guard error == nil, let list = value as? [String: Any] else {
-                if self.available {
-                    self.available = false
-                    SessionManager.shared.applyKeys()
+                // A daemon without the API: the Commands menu comes from the file. Any other
+                // failure (a timeout, a reconnect) keeps what the menus have, and tries again.
+                let unsupported = error.map { $0.contains("no actions or plugins") || $0.contains("unknown") } ?? false
+                if unsupported {
+                    self.refreshFailures = 0
+                    if self.available {
+                        self.available = false
+                        SessionManager.shared.applyKeys()
+                    }
+                } else if self.refreshFailures < 5 {
+                    self.refreshFailures += 1
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Double(self.refreshFailures)) { self.refresh() }
                 }
                 return
             }
+            self.refreshFailures = 0
             let actions = (list["actions"] as? [[String: Any]] ?? []).compactMap { a -> Action? in
                 guard let name = jsonString(a["name"]) else { return nil }
                 return Action(name: name, title: jsonString(a["title"]) ?? "",
@@ -107,7 +121,8 @@ final class Extensions {
                     walk(sub, top: top.isEmpty ? item.title : top)
                     continue
                 }
-                guard let name = MainMenu.actionName(item.identifier), seen.insert(name).inserted
+                guard let name = MainMenu.actionName(item.identifier),
+                      !Extensions.personalActions.contains(name), seen.insert(name).inserted
                 else { continue }
                 list.append(["name": name, "title": item.title, "category": top])
             }
@@ -136,6 +151,12 @@ final class Extensions {
         let known = Dictionary(actions.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
         for b in bindings {
             if appActions.contains(b.action) {
+                // The app's actions take no arguments: a key bound with some is not taken
+                // as a plain one.
+                if b.args != nil {
+                    tlog("keys: \(b.key) binds \(b.action) with arguments, which app actions don't take; ignored")
+                    continue
+                }
                 keys[b.key] = b.action
             } else if b.args == nil, shownKey[b.action] == nil, known[b.action]?.hidden == false {
                 shownKey[b.action] = b.key
@@ -203,6 +224,10 @@ final class Extensions {
             if let error { reply["error"] = error }
             call("actions.result", reply)
         }
+        guard !Extensions.personalActions.contains(name) else {
+            answer("\"\(name)\" is only for the person at this Mac")
+            return
+        }
         guard let item = MainMenu.item(forAction: name), let action = item.action else {
             answer("the app has no action \"\(name)\"")
             return
@@ -221,7 +246,10 @@ final class Extensions {
             answer("\"\(name)\" is not available now (is a Thurm window in front?)")
             return
         }
-        NSApp.sendAction(action, to: item.target, from: item)
+        guard NSApp.sendAction(action, to: item.target, from: item) else {
+            answer("nothing in the app's front window takes \"\(name)\" now")
+            return
+        }
         answer(nil)
     }
 
