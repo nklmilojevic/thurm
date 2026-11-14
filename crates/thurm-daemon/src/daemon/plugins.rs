@@ -26,8 +26,9 @@ use super::ext::send_ext;
 use super::{Client, Daemon};
 use crate::user_exec;
 
-/// The most scripts that may run at once (each has a Lua state of its own).
-const MAX_SCRIPTS: usize = 32;
+/// The most scripts that may run at once (each has a Lua state of its own). With
+/// [`thurm_lua`]'s 64 MiB for each, scripts take at most 512 MiB together.
+const MAX_SCRIPTS: usize = 8;
 
 /// How many lines of its log the daemon keeps per plugin.
 const LOG_LINES: usize = 500;
