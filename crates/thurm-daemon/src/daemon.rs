@@ -3,6 +3,7 @@
 #[path = "active_size.rs"]
 mod active_size;
 mod agent_prompt;
+pub mod ext;
 mod focus;
 mod layouts;
 #[path = "terminal_attach.rs"]
@@ -353,6 +354,14 @@ pub struct Client {
     pub floating_new: AtomicBool,
     /// A UI that places floating panes ([`thurm_proto::CAP_FLOATING_PLACE`]).
     pub floating_place: AtomicBool,
+    /// Uses the extension API and hears its notices ([`thurm_proto::CAP_EXT`]).
+    pub ext: AtomicBool,
+    /// Shows what plugins ask the user ([`thurm_proto::CAP_EXT_UI`]).
+    pub ext_ui: AtomicBool,
+    /// The plugin this client is the daemon's connection for.
+    pub plugin: Mutex<Option<String>>,
+    /// Removed from the daemon: nothing it asks takes effect any more.
+    pub gone: AtomicBool,
     /// A remote client that takes deflated events ([`thurm_proto::CAP_DEFLATE`]). Shared with the
     /// client's writer thread, which encodes what it sends.
     pub deflate: Arc<AtomicBool>,
@@ -572,6 +581,8 @@ pub struct Daemon {
     last_activity: Mutex<Instant>,
     /// The panes UIs focused (`thurm focused`).
     focus: Mutex<focus::FocusLog>,
+    /// Actions, key bindings and event subscriptions of the extension API.
+    ext: ext::Ext,
 }
 
 impl Daemon {
@@ -593,7 +604,7 @@ impl Daemon {
         let ai_channel = crossbeam_channel::bounded(64);
         let push = crate::push::Pusher::new(&state_dir, !config.push.relay.is_empty());
         let tailnet = crate::tailnet::Tailnet::new(socket.clone(), state_dir.join("tailscale"));
-        Arc::new(Daemon {
+        let daemon = Arc::new(Daemon {
             engine: RwLock::new(EngineConfig::from_config(&config, true)),
             dark: AtomicBool::new(true),
             agent_defs: RwLock::new(config.agent_defs()),
@@ -627,7 +638,10 @@ impl Daemon {
             stopped_at: std::sync::OnceLock::new(),
             last_activity: Mutex::new(Instant::now()),
             focus: Mutex::new(focus::FocusLog::default()),
-        })
+            ext: ext::Ext::default(),
+        });
+        daemon.ext_config_applied();
+        daemon
     }
 
     pub fn pane(&self, id: PaneId) -> Option<Arc<Pane>> {
@@ -697,6 +711,7 @@ impl Daemon {
             }
             _ => {}
         }
+        self.emit_for(&event);
         let desktop_only = matches!(event, Event::Ui(_));
         let pane_info = matches!(event, Event::PaneInfo(_));
         for c in clients {
@@ -785,6 +800,10 @@ impl Daemon {
             floating: AtomicBool::new(false),
             floating_new: AtomicBool::new(false),
             floating_place: AtomicBool::new(false),
+            ext: AtomicBool::new(false),
+            ext_ui: AtomicBool::new(false),
+            plugin: Mutex::new(None),
+            gone: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
@@ -816,8 +835,12 @@ impl Daemon {
 
     pub fn remove_client(&self, id: u64) {
         log::info!("client {id} gone");
-        self.clients.lock().remove(&id);
+        // Before its registrations go: one it is making now sees the flag (see `ext_registry`).
+        if let Some(c) = self.clients.lock().remove(&id) {
+            c.gone.store(true, Ordering::SeqCst);
+        }
         self.focus.lock().client_gone(id);
+        self.ext_client_gone(id);
         for p in self.all_panes() {
             let mut st = p.state.lock();
             st.subscribers.remove(&id);
@@ -963,6 +986,12 @@ impl Daemon {
             true,
         )?;
         log::info!("pane {id} created (pid {pid})");
+        if restore.is_none()
+            && let Some(p) = self.pane(id)
+        {
+            let info = p.state.lock().info.clone();
+            self.emit("pane_created", Some(&info), serde_json::json!({}));
+        }
         Ok(id)
     }
 
@@ -1394,15 +1423,16 @@ impl Daemon {
                             }
                         }
                         let secs = started.map_or(0, |s| s.elapsed().as_secs());
-                        self.run_hooks(
-                            HookEvent::CommandFinished,
-                            &st.info,
+                        // The command line goes to the user's own hooks only: it may hold a
+                        // secret typed as an argument.
+                        self.emit_with_private(
+                            HookEvent::CommandFinished.name(),
+                            Some(&st.info),
                             serde_json::json!({
                                 "exit_code": code,
                                 "duration_secs": secs,
-                                "command": st.command_line,
                             }),
-                            secs,
+                            serde_json::json!({ "command": st.command_line }),
                         );
                         st.command_line = None;
                     }
@@ -1477,11 +1507,10 @@ impl Daemon {
             return;
         }
         log::info!("pane {} exited ({code:?})", pane.id);
-        self.run_hooks(
-            HookEvent::PaneExited,
-            &info,
+        self.emit(
+            HookEvent::PaneExited.name(),
+            Some(&info),
             serde_json::json!({ "exit_code": code }),
-            0,
         );
         {
             let mut recent = self.just_exited.lock();
@@ -2441,6 +2470,26 @@ impl Daemon {
                 });
                 return;
             }
+            Request::Ext { method, params } if ext::blocks(&method) => {
+                let daemon = self.clone();
+                let client = client.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("ext".into())
+                    .spawn(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            daemon.ext_request(&client, &method, &params)
+                        }))
+                        .unwrap_or_else(|_| Err("the daemon hit an internal error".into()));
+                        if id != 0 {
+                            client.send(ServerMessage::Response { id, result });
+                        }
+                    });
+                if let Err(e) = spawned {
+                    Err(format!("could not start a request thread: {e}"))
+                } else {
+                    return;
+                }
+            }
             // Slow queries and layout confirmation must not block later requests,
             // including the desktop client's reply. Responses carry their request ID.
             slow @ (Request::Complete { .. }
@@ -2519,7 +2568,11 @@ impl Daemon {
         let state = NoticeState::of(a.status, a.permission.is_some());
         let mut info = st.info.clone();
         info.agent = Some(a.clone());
-        self.run_hooks(HookEvent::Agent(state), &info, serde_json::json!({}), 0);
+        self.emit(
+            HookEvent::Agent(state).name(),
+            Some(&info),
+            serde_json::json!({}),
+        );
         let notice = n.notice(state);
         if !n.enabled || !notice.notify {
             return Vec::new();
@@ -2637,6 +2690,26 @@ impl Daemon {
                 }
                 if has(thurm_proto::CAP_DEFLATE) {
                     client.deflate.store(true, Ordering::Relaxed);
+                }
+                if has(thurm_proto::CAP_EXT) {
+                    client.ext.store(true, Ordering::Relaxed);
+                }
+                // Plugins' questions go only to a desktop app of this user on this machine:
+                // a tailnet caller or a phone saying so is not trusted with them.
+                if has(thurm_proto::CAP_EXT_UI) {
+                    let local = client.principal.lock().as_ref().is_none_or(|p| {
+                        p.kind == thurm_proto::PrincipalKind::Peer
+                            && p.uid == Some(unsafe { libc::getuid() })
+                    });
+                    let desktop = ui && !client.mobile.load(Ordering::Relaxed);
+                    let app = client
+                        .socket
+                        .lock()
+                        .as_ref()
+                        .is_none_or(ext::peer_is_our_app);
+                    client
+                        .ext_ui
+                        .store(local && desktop && app, Ordering::Relaxed);
                 }
                 log::info!(
                     "client {} hello: {name} (protocol {version}{}{}{}{}{})",
@@ -2900,6 +2973,7 @@ impl Daemon {
                         .focus(client.id, pane, focused, Instant::now());
                     // Looking at a finished agent acknowledges it (Done → Idle).
                     if focused {
+                        self.emit("pane_focused", Some(&st.info), serde_json::json!({}));
                         self.pane_read(pane);
                         st.agent.acknowledge();
                         self.acknowledge_programs(pane, st);
@@ -3347,7 +3421,24 @@ impl Daemon {
                     .map_err(|e| format!("cannot write {}: {e}", dir.display()))
             }
             Request::RunCommand { name, pane } => self.run_command(&name, pane),
+            Request::Ext { method, params } => self.ext_request(client, &method, &params),
         }
+    }
+
+    /// [`Request::Ext`]: a method of the extension API, its parameters and result as JSON text.
+    fn ext_request(
+        self: &Arc<Self>,
+        client: &Arc<Client>,
+        method: &str,
+        params: &str,
+    ) -> Result<Response, String> {
+        let params = if params.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(params).map_err(|e| format!("parameters: {e}"))?
+        };
+        let result = self.ext_call(client, method, params)?;
+        Ok(Response::Text(result.to_string()))
     }
 
     /// Starts the `[[commands]]` entry `name` for `pane`. Its failure shows as a notification
@@ -3391,10 +3482,14 @@ impl Daemon {
         Ok(Response::Ok)
     }
 
-    /// Runs the `[[on]]` hooks for `event` in the pane `info` describes, with `{"event", "pane",
-    /// ...extra}` on their stdin. `secs` is how long a finished command ran, for `min_secs`
-    /// (which other events ignore).
-    fn run_hooks(&self, event: HookEvent, info: &PaneInfo, extra: serde_json::Value, secs: u64) {
+    /// Runs the `[[on]]` hooks for `event` in the pane `info` describes, with `payload` (see
+    /// `emit`) on their stdin. A finished command's `duration_secs` is checked against
+    /// `min_secs`, which other events ignore.
+    fn run_hooks(&self, event: HookEvent, info: &PaneInfo, payload: &serde_json::Value) {
+        let secs = payload
+            .get("duration_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         let hooks: Vec<EventHook> = self
             .config
             .read()
@@ -3404,10 +3499,6 @@ impl Daemon {
             .collect();
         if hooks.is_empty() {
             return;
-        }
-        let mut payload = serde_json::json!({ "event": event.name(), "pane": info });
-        if let (Some(p), serde_json::Value::Object(extra)) = (payload.as_object_mut(), extra) {
-            p.extend(extra);
         }
         let mut stdin = payload.to_string().into_bytes();
         stdin.push(b'\n');
@@ -3467,6 +3558,7 @@ impl Daemon {
         self.push.set_enabled(!cfg.push.relay.is_empty());
         self.tailnet.configure(&cfg.tailscale);
         *self.config.write() = cfg;
+        self.ext_config_applied();
         let engine = self.engine.read().clone();
         for pane in self.all_panes() {
             let mut st = pane.state.lock();
@@ -4292,6 +4384,10 @@ mod tests {
             floating: AtomicBool::new(false),
             floating_new: AtomicBool::new(false),
             floating_place: AtomicBool::new(false),
+            ext: AtomicBool::new(false),
+            ext_ui: AtomicBool::new(false),
+            plugin: Mutex::new(None),
+            gone: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),

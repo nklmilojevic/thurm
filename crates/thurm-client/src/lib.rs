@@ -496,6 +496,14 @@ impl Client {
                 "Update Thurm on this host to use Insert Path.".into(),
             ));
         }
+        if matches!(env.request, Request::Ext { .. })
+            && !matches!(&*self.hello.lock(), Some(Response::Hello { capabilities, .. })
+                if capabilities.iter().any(|c| c == thurm_proto::CAP_EXT))
+        {
+            return Err(ClientError::Daemon(
+                "this Thurm daemon has no actions or plugins yet; update Thurm on this host".into(),
+            ));
+        }
         let buf = codec::encode(env)?;
         let mut w = match deadline {
             Some(d) => self.writer.try_lock_until(d).ok_or(ClientError::Timeout)?,

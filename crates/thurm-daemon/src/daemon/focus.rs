@@ -30,6 +30,11 @@ impl FocusLog {
         }
     }
 
+    /// The clients with a pane focused now.
+    pub fn focused_clients(&self) -> Vec<u64> {
+        self.now.keys().copied().collect()
+    }
+
     pub fn client_gone(&mut self, client: u64) {
         self.now.remove(&client);
     }

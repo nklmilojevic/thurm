@@ -8,6 +8,7 @@ mod agent;
 mod agent_prompt;
 mod attach;
 mod events;
+mod ext;
 mod hook_pgrp;
 mod layouts;
 mod pair;
@@ -420,6 +421,11 @@ enum Cmd {
         #[arg(short, long)]
         pane: Option<PaneId>,
         title: Vec<String>,
+    },
+    /// Actions: your `[[commands]]`, and what plugins and the app provide.
+    Action {
+        #[command(subcommand)]
+        action: ext::ActionCmd,
     },
     /// The app's workspaces.
     Workspace {
@@ -1418,6 +1424,7 @@ fn pane_size_default() -> PaneSize {
 fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
     match cmd {
         Cmd::Agent { action } => return agent::run(c, action, json),
+        Cmd::Action { action } => return ext::action(c, action, json),
         Cmd::List => {
             let panes = list(c)?;
             if json {
