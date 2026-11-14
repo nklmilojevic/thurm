@@ -59,7 +59,7 @@ final class SessionManager: NSObject, CoreDelegate {
 
     func start() {
         config = AppConfig.load()
-        config.loadWarnings += MainMenu.applyKeys(config.keybindings, commands: config.commands)
+        config.loadWarnings += applyKeys()
         if let err = config.loadError { tlog("config: \(err)") }
         Core.shared.delegate = self
         NotificationCenter.default.addObserver(self, selector: #selector(secureInputChanged(_:)),
@@ -149,6 +149,7 @@ final class SessionManager: NSObject, CoreDelegate {
             Notices.shared.localDaemonBuild = nil
         }
         sendAppearance()
+        Extensions.shared.connected()
         return true
     }
 
@@ -1032,7 +1033,7 @@ final class SessionManager: NSObject, CoreDelegate {
             Core.shared.request("\"ReloadConfig\"")
         }
         config = AppConfig.load()
-        config.loadWarnings += MainMenu.applyKeys(config.keybindings, commands: config.commands)
+        config.loadWarnings += applyKeys()
         if let o = sidebarTabsOverride { config.sidebarTabs = o }
         if let o = activePaneBorderOverride { config.activePaneBorder = o }
         for (path, on) in sidebarListingOverride { config[keyPath: path] = on }
@@ -1086,15 +1087,30 @@ final class SessionManager: NSObject, CoreDelegate {
     /// Asks this Mac's daemon to run the `[[commands]]` entry `name`, for the focused pane when
     /// it is one of this Mac's (a remote pane's id means nothing to it). A failure to start shows
     /// in the pane; one later comes as a notification.
-    func runUserCommand(_ name: String) {
+    func runUserCommand(_ name: String, args: String? = nil) {
         let view = currentController?.content.focusedView
         var pane: Any = NSNull()
         if let focused = currentController?.focusedPane, focused.host == localHost { pane = focused.id }
+        if Extensions.shared.available {
+            let remote = (currentController?.focusedPane).map { $0.host != localHost } ?? false
+            Extensions.shared.run(name, args: args, pane: pane as? UInt64, noPane: remote) { error in
+                if let error { view?.showToast("\(name): \(error)", duration: 5) }
+            }
+            return
+        }
         Core.shared.requestAsync(object: ["RunCommand": ["name": name, "pane": pane]], timeout: 10) { resp in
             let error = (resp as? [String: Any]).flatMap { jsonString($0["error"]) }
                 ?? (resp == nil ? "Thurm's daemon is not connected" : nil)
             if let error { view?.showToast("\(name): \(error)", duration: 5) }
         }
+    }
+
+    /// Applies `[keybindings]` and the Commands menu (the daemon's actions, or `[[commands]]`
+    /// from an older daemon) to the menus; returns what could not be used.
+    @discardableResult
+    func applyKeys() -> [String] {
+        let (keys, commands) = Extensions.shared.menuInput(keybindings: config.keybindings, commands: config.commands)
+        return MainMenu.applyKeys(keys, commands: commands)
     }
 
     func openConfigFile() {
@@ -1254,6 +1270,7 @@ final class SessionManager: NSObject, CoreDelegate {
             Remotes.shared.connectionLost(host)
             return
         }
+        Extensions.shared.disconnected()
         Core.shared.disconnect()
         if replacingDaemon {
             tlog("lost connection to thurmd while replacing it")
@@ -1367,6 +1384,9 @@ final class SessionManager: NSObject, CoreDelegate {
             if let id = key { Remotes.shared.clipboardRequest(id) }
         case "Ui":
             handleUi(payload, host: host)
+        case "Ext":
+            // A remote daemon's plugins ask its own users.
+            if host == localHost, let dict { Extensions.shared.handle(dict) }
         case "ConfigReloaded":
             // A remote daemon's config is its own business.
             if host == localHost { reloadConfig(notifyDaemon: false) }

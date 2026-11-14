@@ -81,10 +81,20 @@ struct AgentPreset {
     let command: [String]
 }
 
-/// A `[[commands]]` entry: the daemon runs it by name; `key` is a `[keybindings]`-style chord.
+/// An entry of the Commands menu: a `[[commands]]` entry, or an action of a plugin. The daemon
+/// runs it by name; `key` is a `[keybindings]`-style chord.
 struct UserCommand: Equatable {
     let name: String
     let key: String
+    var title: String = ""
+    /// A submenu of the Commands menu ("Git"); none for "" and "Commands".
+    var category: String = ""
+    /// Only on its key, not in the menu or the palette.
+    var hidden = false
+    /// What the action gets on this entry, as JSON (a key bound with arguments).
+    var args: String? = nil
+
+    var displayTitle: String { title.isEmpty ? name : title }
 }
 
 /// `colors.display_p3` of the loaded config: theme colors are Display P3 values, as the

@@ -93,6 +93,35 @@ final class MainMenuTests: XCTestCase {
         XCTAssertEqual(down.keyEquivalentModifierMask, [.command, .shift])
     }
 
+    /// Plugins' actions go in a submenu per category; a hidden one only keeps its key.
+    func testCommandsGoInCategorySubmenus() {
+        let (main, shell, _, _, _) = shellMenu()
+        MainMenu.applyKeys([:], commands: [
+            UserCommand(name: "Deploy", key: ""),
+            UserCommand(name: "git.sync", key: "cmd+shift+y", title: "Sync", category: "Git"),
+            UserCommand(name: "git.log", key: "", title: "Log", category: "Git"),
+            UserCommand(name: "init.key.3", key: "cmd+shift+u", hidden: true),
+        ], in: main)
+        let menu = MainMenu.commandsMenu
+        XCTAssertEqual(menu.items.map(\.title), ["Deploy", "Git"])
+        XCTAssertEqual(menu.items[1].submenu?.items.map(\.title), ["Sync", "Log"])
+        XCTAssertEqual(menu.items[1].submenu?.items[0].representedObject as? String, "git.sync")
+        XCTAssertEqual(menu.items[1].submenu?.items[0].keyEquivalent, "y")
+        // The hidden one sits in a visible menu, where AppKit finds its key.
+        let hidden = shell.items.last!
+        XCTAssertEqual(hidden.representedObject as? String, "init.key.3")
+        XCTAssertTrue(hidden.isHidden)
+        XCTAssertTrue(hidden.allowsKeyEquivalentWhenHidden)
+        XCTAssertEqual(hidden.keyEquivalent, "u")
+        // Only hidden ones: their keys still work, and they go with the next build.
+        MainMenu.applyKeys([:], commands: [UserCommand(name: "init.key.4", key: "cmd+shift+i", hidden: true)],
+                           in: main)
+        XCTAssertTrue(MainMenu.commandsMenu.items.isEmpty)
+        XCTAssertEqual(shell.items.filter { $0.representedObject as? String == "init.key.3" }.count, 0)
+        XCTAssertEqual(shell.items.last?.keyEquivalent, "i")
+        XCTAssertFalse(shell.items.last?.menu?.items.isEmpty ?? true)
+    }
+
     func testBindingToNoneRemovesAKey() {
         let (main, _, right, down, tab) = shellMenu()
         MainMenu.applyKeys(["cmd+t": "none", "CMD+D": " none "], commands: [], in: main)
