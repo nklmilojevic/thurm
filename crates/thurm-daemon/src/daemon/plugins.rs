@@ -374,8 +374,14 @@ impl Daemon {
             match restart {
                 None => self.stop_plugin(&name, "disabled"),
                 Some(true) => {
-                    // A start still running decides what there is to fall back on.
-                    self.wait_settled(&name);
+                    // A start still running decides what there is to fall back on. One that
+                    // waits for longer keeps running: replaced now, a failing new start would
+                    // have nothing to go back to.
+                    if !self.wait_settled(&name) {
+                        let e = "still starting after 10 s; reload again once it has";
+                        self.plugin_error(&name, e);
+                        continue;
+                    }
                     // Lua code that doesn't compile leaves the running plugin as it is.
                     if let Some(e) = self.lua_wont_compile(&name) {
                         self.plugin_error(&name, &format!("{e}; the running one stays"));
@@ -390,15 +396,19 @@ impl Daemon {
         self.plugins_changed();
     }
 
-    /// Waits (a while) for a Lua plugin's start that is still running to have an outcome.
-    fn wait_settled(&self, name: &str) {
+    /// Waits (a while) for a Lua plugin's start that is still running to have an outcome:
+    /// false when it has none yet.
+    fn wait_settled(&self, name: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
+        loop {
             let waiting = self.plugins.records.lock().get(name).is_some_and(|r| {
                 r.instance.is_some() && !r.settled && matches!(r.found.kind, PluginKind::Lua { .. })
             });
             if !waiting {
-                return;
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
