@@ -47,6 +47,17 @@ pub trait Host: Send + Sync + 'static {
     fn report(&self, instance: u64, error: &str);
 }
 
+/// Whether `source` compiles, as the main chunk of `file`: a reload checks this before it
+/// stops the code that runs.
+pub fn check(source: &str, file: &str) -> Result<(), String> {
+    Lua::new()
+        .load(source)
+        .set_name(format!("@{}", short_path(file)))
+        .into_function()
+        .map(|_| ())
+        .map_err(|e| describe(&e))
+}
+
 /// Where a script's `thurm.log` lines go: (level, message).
 pub type LogSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
 

@@ -385,3 +385,10 @@ fn waiting_calls_are_bounded() {
         "{r}"
     );
 }
+
+#[test]
+fn check_says_whether_code_compiles() {
+    assert!(super::check("return 1", "/x/init.lua").is_ok());
+    let e = super::check("return (", "/x/init.lua").unwrap_err();
+    assert!(e.contains("init.lua"), "{e}");
+}

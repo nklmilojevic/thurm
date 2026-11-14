@@ -599,6 +599,12 @@ fn init_lua_provides_actions_and_scripts_run() {
     .unwrap_err();
     assert!(e.contains("s.lua:1: nope"), "{e}");
 
+    // A broken init.lua leaves the running one as it is.
+    std::fs::write(&init, "thurm.action{ name = ").unwrap();
+    c.request(Request::ReloadConfig).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(action_names(&c).contains(&"lua.greet".to_owned()));
+
     // Reloading runs the new init.lua: its old actions go.
     std::fs::write(
         &init,
@@ -746,11 +752,7 @@ fn a_scripts_waiting_calls_end_when_its_client_leaves() {
         closers.push(stream.try_clone().unwrap());
         let c = Client::from_stream(stream, "e2e", false, &[CAP_EXT], |_| {}, || {}).unwrap();
         waiting.push(std::thread::spawn(move || {
-            call(
-                &c,
-                method::SCRIPT_RUN,
-                json!({ "source": "thurm.run('never.answers')" }),
-            )
+            call(&c, method::SCRIPT_RUN, json!({ "source": source }))
         }));
     }
     std::thread::sleep(Duration::from_millis(1000));

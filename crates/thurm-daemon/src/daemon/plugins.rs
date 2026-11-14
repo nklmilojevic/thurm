@@ -164,18 +164,31 @@ impl Daemon {
 
     /// (Re)starts `init.lua` from the config directory, if there is one.
     pub(super) fn load_init(self: &Arc<Self>) {
-        if let Some(old) = self.plugins.init.lock().take() {
-            self.stop_instance(old);
-        }
         let file = thurm_config::config_dir().join("init.lua");
+        // Read and checked before the running one stops: a file that can't be read or doesn't
+        // compile leaves what works running, and says why. One that is gone stops it.
         let source = match std::fs::read_to_string(&file) {
             Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(old) = self.plugins.init.lock().take() {
+                    self.stop_instance(old);
+                }
+                return;
+            }
             Err(e) => {
                 log::warn!("{}: {e}", file.display());
+                self.toast(format!("init.lua: {e}; the running one stays"), None);
                 return;
             }
         };
+        if let Err(e) = thurm_lua::check(&source, &file.display().to_string()) {
+            log::warn!("init.lua: {e}");
+            self.toast(format!("init.lua: {e}; the running one stays"), None);
+            return;
+        }
+        if let Some(old) = self.plugins.init.lock().take() {
+            self.stop_instance(old);
+        }
         let Ok(lua) = self.lua() else { return };
         let (instance, _) = self.plugin_client(INIT, None);
         *self.plugins.init.lock() = Some(instance);
