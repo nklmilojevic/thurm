@@ -27,6 +27,9 @@ pub struct Plugins {
     init: Mutex<Option<u64>>,
     /// The last init.lua that started without an error: what a reload falls back on.
     init_good: Mutex<Option<String>>,
+    /// Held through every change of init.lua (a reload, a start's outcome): one at a time, so
+    /// none acts on an init.lua another change already replaced.
+    init_changes: Mutex<()>,
     /// Scripts running now.
     scripts: std::sync::atomic::AtomicUsize,
 }
@@ -172,6 +175,7 @@ impl Daemon {
 
     /// (Re)starts `init.lua` from the config directory, if there is one.
     pub(super) fn load_init(self: &Arc<Self>) {
+        let _changing = self.plugins.init_changes.lock();
         let file = thurm_config::config_dir().join("init.lua");
         // Read and checked before the running one stops: a file that can't be read or doesn't
         // compile leaves what works running, and says why. One that is gone stops it.
@@ -226,7 +230,9 @@ impl Daemon {
         let daemon = Arc::downgrade(self);
         std::thread::spawn(move || {
             let Some(d) = daemon.upgrade() else { return };
-            match done.recv() {
+            let result = done.recv();
+            let _changing = d.plugins.init_changes.lock();
+            match result {
                 // Only the init.lua that runs now: a reload since made another one current.
                 Ok(Ok(_)) if *d.plugins.init.lock() == Some(instance) => {
                     *d.plugins.init_good.lock() = Some(source)
