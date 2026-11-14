@@ -705,3 +705,58 @@ fn a_scripts_program_stops_when_its_client_leaves() {
     }
     assert!(at.elapsed() < Duration::from_secs(15), "{:?}", at.elapsed());
 }
+
+/// Scripts waiting on an action nobody answers end when their clients go, and so do the
+/// calls they were waiting on.
+#[test]
+fn a_scripts_waiting_calls_end_when_its_client_leaves() {
+    let env = Env::new("ext-script-calls");
+    let d = env.start();
+    // Provides an action and never answers it.
+    let (provider, _prx) = ext_client(&env, "provider");
+    call(
+        &provider,
+        method::ACTIONS_REGISTER,
+        json!({ "actions": [{ "name": "never.answers" }] }),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let before = thread_count(d.child.id());
+    let mut closers = Vec::new();
+    let mut waiting = Vec::new();
+    for _ in 0..10 {
+        let stream = std::os::unix::net::UnixStream::connect(&env.socket).unwrap();
+        closers.push(stream.try_clone().unwrap());
+        let c = Client::from_stream(stream, "e2e", false, &[CAP_EXT], |_| {}, || {}).unwrap();
+        waiting.push(std::thread::spawn(move || {
+            call(
+                &c,
+                method::SCRIPT_RUN,
+                json!({ "source": "thurm.run('never.answers')" }),
+            )
+        }));
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(
+        thread_count(d.child.id()) > before + 10,
+        "the scripts are not waiting"
+    );
+    for c in &closers {
+        c.shutdown(std::net::Shutdown::Both).unwrap();
+    }
+    for w in waiting {
+        let _ = w.join();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = thread_count(d.child.id());
+        if now <= before + 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{before} threads before, {now} now"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
