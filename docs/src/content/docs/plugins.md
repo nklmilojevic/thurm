@@ -254,7 +254,7 @@ JSON.
 | `actions.list` | | `{actions, bindings}` |
 | `actions.register` | `{actions: [{name, title, description, category, hidden, args}]}` | |
 | `actions.unregister` | `{names}` | |
-| `actions.run` | `{name, args, pane}` | The action's result |
+| `actions.run` | `{name, args, pane, no_pane}`; without `pane` the focused one, unless `no_pane` | The action's result |
 | `keys.bind`, `keys.unbind` | `{key, action, args}`, `{key}` | |
 | `events.subscribe`, `events.unsubscribe` | `{names}` (`"*"` for all) | |
 | `events.emit` | `{name, payload}`; the name has a dot | |
