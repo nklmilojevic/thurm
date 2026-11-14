@@ -54,6 +54,28 @@ pub fn blocks(method: &str) -> bool {
     )
 }
 
+/// Methods that run programs or change what runs on this machine: host administration, for
+/// clients on this machine (and plugins) only.
+fn local_only(method: &str) -> bool {
+    matches!(
+        method,
+        method::EXEC
+            | method::SCRIPT_RUN
+            | method::PLUGINS_RELOAD
+            | method::PLUGINS_ENABLE
+            | method::PLUGINS_DISABLE
+    )
+}
+
+/// A caller the Tailscale helper admitted, rather than a process of this machine.
+fn client_is_tailnet(client: &Client) -> bool {
+    client
+        .principal
+        .lock()
+        .as_ref()
+        .is_some_and(|p| p.kind == thurm_proto::PrincipalKind::Tailscale)
+}
+
 fn params<T: DeserializeOwned + Default>(v: Value) -> Result<T, String> {
     if v.is_null() {
         return Ok(T::default());
@@ -103,6 +125,11 @@ impl Daemon {
         let p = params_json;
         if client.gone.load(Ordering::SeqCst) {
             return Err("this client was disconnected".into());
+        }
+        if local_only(method) && client_is_tailnet(client) {
+            return Err(format!(
+                "{method} is for this machine's own clients, not over the tailnet"
+            ));
         }
         match method {
             method::REQUEST => {

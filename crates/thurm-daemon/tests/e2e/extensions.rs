@@ -379,3 +379,34 @@ fn an_unverified_app_is_not_asked() {
     assert!(e.contains("window"), "{e}");
     assert!(rx.try_iter().all(|n| n != notice::UI_REQUEST));
 }
+
+/// Running programs and managing plugins is for this machine's clients: a tailnet caller is
+/// refused them.
+#[test]
+fn a_tailnet_caller_cannot_run_programs() {
+    use thurm_proto::tailnet::write_ingress;
+    let env = Env::new("ext-tailnet-exec");
+    let _d = env.start();
+    let stream = std::os::unix::net::UnixStream::connect(&env.socket).unwrap();
+    let mut s = stream.try_clone().unwrap();
+    write_ingress(
+        &mut s,
+        &Principal {
+            kind: PrincipalKind::Tailscale,
+            display: "someone@example.com".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c = Client::from_stream(stream, "remote", false, &[CAP_EXT], |_| {}, || {}).unwrap();
+    for (m, p) in [
+        (method::EXEC, json!({ "argv": ["true"] })),
+        (method::SCRIPT_RUN, json!({ "source": "return 1" })),
+        (method::PLUGINS_DISABLE, json!({ "name": "x" })),
+    ] {
+        let e = call(&c, m, p).unwrap_err();
+        assert!(e.contains("tailnet"), "{m}: {e}");
+    }
+    // What a tailnet caller may do still works.
+    assert!(call(&c, method::ACTIONS_LIST, Value::Null).is_ok());
+}
