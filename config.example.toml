@@ -290,6 +290,9 @@ animation_duration = 0.2
 # exec = ["~/bin/dev-layout", "--branch", "main"]
 # key = "cmd+shift+l"
 
+# For more than running a command, use init.lua next to this file, or a
+# plugin in plugins/.
+
 # A command the daemon runs on an event, with the event as JSON on stdin.
 # Events: agent_working, agent_waiting, agent_blocked, agent_finished,
 # agent_failed, agent_idle, command_finished and pane_exited.

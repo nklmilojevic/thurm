@@ -192,6 +192,19 @@ thurm close ID                   # kill a pane
 Settings, when the user asks for them: `thurm set SECTION.KEY VALUE` (writes `config.toml` and
 reloads), `thurm theme [NAME]`, `thurm reload`.
 
+## Actions, scripts and plugins
+
+```sh
+thurm action list                     # actions: [[commands]], the app's menu actions, plugins'
+thurm action run split_down --pane ID # run one (ARGS as JSON after the name)
+thurm do script.lua [ARGS]            # run Lua in the daemon with the `thurm` API; prints what it logs and returns
+thurm plugin list                     # plugins and their state; `thurm plugin logs NAME` for errors
+```
+
+For many steps in a row (open panes, run programs, wait, read output), a `thurm do` script is
+one call instead of many. Plugins and `~/.config/thurm/init.lua` are the user's: change them
+only when asked.
+
 ## Finish
 
 Verify the result before reporting it: capture the pane, check `thurm info`, or look at the

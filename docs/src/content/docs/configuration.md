@@ -278,6 +278,25 @@ jq -c '{text: "\(.pane.agent.name) finished in \(.pane.cwd)"}' |
 An entry with an unknown event or no `exec` is skipped with a warning, and the
 rest of the file still loads. Failures are written to the daemon's log.
 
+For more than running a command (actions that take arguments, ask you to pick
+something, open panes, or keep state between events), use `init.lua` or a
+plugin: see [Plugins and scripting](/plugins/). A `[[commands]]` entry is an
+action there too.
+
+## Plugins
+
+`[plugins]` turns plugins on or off, lists the ones not to start, and holds
+each plugin's own settings. See [Plugins and scripting](/plugins/#plugins).
+
+```toml
+[plugins]
+enabled = true
+disabled = ["watcher"]
+
+[plugins.settings]
+git-tools = { remote = "origin" }
+```
+
 ## On-device AI
 
 Set `ai.enabled = true` to enable the optional Apple Intelligence model.
