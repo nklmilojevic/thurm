@@ -9,8 +9,11 @@
 //!   holding the result as JSON; what the daemon has to say on its own comes as
 //!   [`crate::Event::Ext`].
 //!
-//! The API is for clients on the daemon's machine and its plugins: a tailnet caller may only
-//! read `actions.list` and `plugins.list`.
+//! Who may use it: the daemon's socket is its own user's alone (mode 0600, in a private
+//! directory), so a client there is that user, as the `thurm` CLI is, and may run
+//! actions and programs like the CLI may run panes. Its plugins are that user's code. A tailnet
+//! caller may only read `actions.list` and `plugins.list`; plugins' questions go only to the
+//! app this daemon belongs to.
 //!
 //! JSON rather than postcard: a method or a field can be added without touching the wire
 //! format, so an app and a daemon of different versions keep working (an unknown method is an

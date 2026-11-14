@@ -532,6 +532,9 @@ mod tests {
     fn fake_helper(name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = std::env::temp_dir().join(format!("thurm-ai-{name}-{}", std::process::id()));
+        // While the file is open for writing, a process another test starts would inherit it,
+        // and running the helper would then fail with "Text file busy".
+        let _spawning = crate::pty::SPAWN_LOCK.lock();
         std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path

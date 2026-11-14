@@ -360,6 +360,14 @@ impl Daemon {
                     .cloned()
                     .ok_or_else(|| format!("{} is gone", entry.info.source))?;
                 let (qid, rx) = self.ext_question(id);
+                // A provider that left before the question was there to be dropped with it.
+                if client.gone.load(Ordering::SeqCst) {
+                    self.ext.pending.lock().remove(&qid);
+                    return Err(format!(
+                        "{} went away before it answered",
+                        entry.info.source
+                    ));
+                }
                 let invoke = ext::Invoke {
                     id: qid,
                     name: run.name.clone(),
@@ -665,6 +673,10 @@ impl Daemon {
             .ui_client()
             .ok_or("no Thurm window is open to ask in (or the app is too old)")?;
         let (id, rx) = self.ext_question(app.id);
+        if app.gone.load(Ordering::SeqCst) {
+            self.ext.pending.lock().remove(&id);
+            return Err("the app went away".into());
+        }
         send_ext(&app, notice::UI_REQUEST, &json!(make(id)));
         let answer = self.ext_wait(id, &rx, "the app", caller);
         if answer.is_err() {
