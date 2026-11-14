@@ -96,18 +96,26 @@ pub fn action(c: &Client, cmd: ActionCmd, json: bool) -> R {
 /// another host to `require`. Only regular files really in the directory go: every name is
 /// opened relative to its opened parent without following a symlink, so one swapped in while
 /// the directory is read cannot send a file from elsewhere. `dir` is canonical: its path is
-/// opened component by component the same way. Bounded: what fits in 4 MiB.
+/// opened component by component the same way. Bounded: what fits in 4 MiB, from the first
+/// 10000 names the walk reads (a huge directory is not read to its end).
 fn lua_modules(dir: &std::path::Path) -> std::collections::BTreeMap<String, String> {
     const MAX_FILES: usize = 200;
     const MAX_BYTES: usize = 4 << 20;
+    const MAX_NAMES: usize = 10_000;
     let mut out = std::collections::BTreeMap::new();
     let Ok(root) = open_dir_path(dir) else {
         return out;
     };
     let mut bytes = 0;
+    let mut names_left = MAX_NAMES;
     let mut stack = vec![(root, String::new(), 0)];
     while let Some((fd, prefix, depth)) = stack.pop() {
-        for name in dir_names(&fd) {
+        if names_left == 0 {
+            break;
+        }
+        let names = dir_names(&fd, names_left);
+        names_left -= names.len();
+        for name in names {
             if name.to_string_lossy().starts_with('.') {
                 continue;
             }
@@ -195,8 +203,8 @@ fn open_dir_path(path: &std::path::Path) -> std::io::Result<std::os::fd::OwnedFd
     Ok(fd)
 }
 
-/// The names in the opened directory `fd`, sorted.
-fn dir_names(fd: &std::os::fd::OwnedFd) -> Vec<std::ffi::OsString> {
+/// The names in the opened directory `fd`, sorted: no more than `limit` of them.
+fn dir_names(fd: &std::os::fd::OwnedFd, limit: usize) -> Vec<std::ffi::OsString> {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     let mut names = Vec::new();
@@ -209,7 +217,9 @@ fn dir_names(fd: &std::os::fd::OwnedFd) -> Vec<std::ffi::OsString> {
         unsafe { libc::close(dup) };
         return names;
     }
-    loop {
+    // The copy shares the read position with `fd`: start from the top.
+    unsafe { libc::rewinddir(d) };
+    while names.len() < limit {
         let e = unsafe { libc::readdir(d) };
         if e.is_null() {
             break;
@@ -364,5 +374,20 @@ mod tests {
         assert_eq!(super::lua_modules(&dir).len(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_file(&secret).unwrap();
+    }
+
+    /// A directory's names are read only up to the limit.
+    #[test]
+    fn a_listing_stops_at_its_limit() {
+        let dir = std::env::temp_dir().join(format!("thurm-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..20 {
+            std::fs::write(dir.join(format!("{i}.lua")), "").unwrap();
+        }
+        let fd = super::open_dir_path(&dir.canonicalize().unwrap()).unwrap();
+        assert_eq!(super::dir_names(&fd, 5).len(), 5);
+        assert_eq!(super::dir_names(&fd, 100).len(), 20);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
