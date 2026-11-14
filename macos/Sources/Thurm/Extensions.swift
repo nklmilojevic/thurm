@@ -341,11 +341,24 @@ final class Extensions {
         if let ctx = payload["ctx"] as? [String: Any], let pane = jsonUInt64(ctx["pane"]) {
             // Never on another pane than the one named: not this app's, or gone.
             let key = PaneKey(localHost, pane)
-            guard SessionManager.shared.view(for: key) != nil else {
+            guard let view = SessionManager.shared.view(for: key) else {
                 answer("pane \(pane) is not in this app's windows")
                 return
             }
             SessionManager.shared.focusPane(key, activate: false)
+            // The action goes to that pane's window, whichever window is key: the first in its
+            // responder chain that takes it, else the app's own (one of no window).
+            guard let target = Extensions.target(for: action, item: item, in: view.window) else {
+                answer("\"\(name)\" does not apply to pane \(pane)'s window")
+                return
+            }
+            guard MainMenu.enabled(item, target: target) else {
+                answer("\"\(name)\" is not available now")
+                return
+            }
+            NSApp.sendAction(action, to: target, from: item)
+            answer(nil)
+            return
         }
         item.menu?.update()
         guard item.isEnabled else {
@@ -357,6 +370,25 @@ final class Extensions {
             return
         }
         answer(nil)
+    }
+
+    /// Who takes `action` of `item` for `window`: the item's own target, else the first of the
+    /// window's responder chain (from its focused view), its controller or delegate, else the
+    /// app or its delegate. `nil` when only something of another window would.
+    static func target(for action: Selector, item: NSMenuItem, in window: NSWindow?) -> AnyObject? {
+        if let t = item.target { return t as AnyObject }
+        guard let window else { return nil }
+        var r: NSResponder? = window.firstResponder
+        while let x = r {
+            if x.responds(to: action) { return x }
+            r = x.nextResponder
+        }
+        if window.responds(to: action) { return window }
+        if let c = window.windowController, c.responds(to: action) { return c }
+        if let d = window.delegate as? NSObject, d.responds(to: action) { return d }
+        if NSApp.responds(to: action) { return NSApp }
+        if let d = NSApp.delegate as? NSObject, d.responds(to: action) { return d }
+        return nil
     }
 
     /// Shows what a plugin asks for: a toast, a list to pick from, a line to type, or a yes/no.

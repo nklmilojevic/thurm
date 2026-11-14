@@ -64,4 +64,30 @@ final class ExtensionsTests: XCTestCase {
     func testSecureKeyboardEntryIsNotOffered() {
         XCTAssertTrue(Extensions.personalActions.contains("secure_keyboard_entry"))
     }
+
+    /// An action for a pane goes to its window's responder chain, not the key window's; one
+    /// nothing there takes is not sent.
+    func testAnActionForAPaneGoesToItsWindow() {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+                              styleMask: [.titled], backing: .buffered, defer: true)
+        let view = PaneActionView(frame: window.contentLayoutRect)
+        window.contentView = view
+        window.makeFirstResponder(view)
+        let item = NSMenuItem(title: "Split", action: #selector(PaneActionView.splitForTest(_:)),
+                              keyEquivalent: "")
+        XCTAssertTrue(Extensions.target(for: #selector(PaneActionView.splitForTest(_:)),
+                                        item: item, in: window) === view)
+        let other = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+                             styleMask: [.titled], backing: .buffered, defer: true)
+        XCTAssertNil(Extensions.target(for: #selector(PaneActionView.splitForTest(_:)),
+                                       item: item, in: other))
+        XCTAssertNil(Extensions.target(for: #selector(PaneActionView.splitForTest(_:)),
+                                       item: item, in: nil))
+    }
+}
+
+private final class PaneActionView: NSView {
+    override var acceptsFirstResponder: Bool { true }
+    @objc func splitForTest(_ sender: Any?) {}
 }
