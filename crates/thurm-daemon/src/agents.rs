@@ -63,6 +63,11 @@ pub struct AgentTracker {
     /// another hook event comes.
     screen_seen: Option<AgentStatus>,
     stop_signal: Option<AgentStatus>,
+    /// The foreground process group the current status start belongs to: another process of
+    /// the same kind is another run, with its own start.
+    status_instance: Option<u32>,
+    /// A session-start hook came since the state was last set: a new session starts anew.
+    session_started: bool,
 }
 
 /// What the on-device model said about the current agent session (`[ai]`).
@@ -302,6 +307,7 @@ impl AgentTracker {
     ) {
         if matches!(event, "session-start" | "session-end") {
             self.prompt.reset();
+            self.session_started = true;
         }
         if event == "session-end" {
             self.hook = None;
@@ -526,17 +532,31 @@ impl AgentTracker {
                 .ok()
                 .and_then(|d| u64::try_from(d.as_millis()).ok());
             // A Live Activity counts from when the status began, which a new message or topic
-            // does not change; a permission prompt coming or going does.
-            let phase = |s: &AgentState| (s.kind.clone(), s.status, s.permission.is_some());
+            // does not change. Another permission prompt, session or process of the agent does.
+            // An identity only differs once both are known: a session id that first comes with
+            // a hook mid-turn is the same run.
+            let differs =
+                |a: Option<&str>, b: Option<&str>| matches!((a, b), (Some(a), Some(b)) if a != b);
+            let instance = self.fg_pgrp;
+            let same_run = |c: &AgentState| {
+                c.kind == state.kind
+                    && c.status == state.status
+                    && c.permission == state.permission
+                    && !differs(c.session_id.as_deref(), state.session_id.as_deref())
+                    && !matches!((self.status_instance, instance), (Some(a), Some(b)) if a != b)
+                    && !self.session_started
+            };
             state.status_since_ms = match &self.current {
-                Some(current) if phase(current) == phase(state) => current.status_since_ms,
+                Some(current) if same_run(current) => current.status_since_ms,
                 _ => now_ms,
             };
+            self.status_instance = instance;
             state.updated_at_ms = self.current.as_ref().and_then(|s| s.updated_at_ms);
             if self.current.as_ref() != Some(state) {
                 state.updated_at_ms = now_ms;
             }
         }
+        self.session_started = false;
         self.plain = plain;
         self.prompt.observe(self.fg_pgrp, next.as_ref());
         if let Some(n) = &next {
@@ -862,6 +882,71 @@ mod tests {
         assert_eq!(prompt.status, AgentStatus::NeedsInput);
         assert!(prompt.permission.is_some());
         assert!(prompt.status_since_ms.unwrap() > 1);
+
+        // So does the next prompt replacing it before it cleared.
+        let first = prompt.permission;
+        tracker.current.as_mut().unwrap().status_since_ms = Some(1);
+        tracker.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "permission-prompt",
+            None,
+            Some("Claude needs your permission to use Edit".into()),
+        );
+        tracker.refresh();
+        let next = tracker.state().unwrap();
+        assert_ne!(next.permission, first);
+        assert!(next.status_since_ms.unwrap() > 1);
+    }
+
+    #[test]
+    fn a_new_session_or_process_starts_anew() {
+        let session = |t: &mut AgentTracker, id: Option<&str>| {
+            t.apply_hook(
+                Some(1),
+                "claude",
+                "Claude Code",
+                "session-start",
+                id.map(Into::into),
+                None,
+            );
+            t.refresh();
+        };
+        let mut tracker = AgentTracker::default();
+        tracker.saw_foreground(Some(1));
+        session(&mut tracker, Some("a"));
+        assert_eq!(tracker.state().unwrap().status, AgentStatus::Idle);
+
+        // Idle before and after: a new session (`/clear`), with or without a new id.
+        tracker.current.as_mut().unwrap().status_since_ms = Some(1);
+        session(&mut tracker, Some("b"));
+        assert!(tracker.state().unwrap().status_since_ms.unwrap() > 1);
+        tracker.current.as_mut().unwrap().status_since_ms = Some(1);
+        session(&mut tracker, None);
+        assert!(tracker.state().unwrap().status_since_ms.unwrap() > 1);
+
+        // A topic is no new session.
+        tracker.current.as_mut().unwrap().status_since_ms = Some(1);
+        tracker.set_ai_topic(Some("Check tests".into()));
+        tracker.refresh();
+        assert_eq!(tracker.state().unwrap().status_since_ms, Some(1));
+
+        // Another process of the same kind in the foreground, idle like the last one.
+        let defs = thurm_config::builtin_agents();
+        let (quiet, idle_after) = (Duration::from_secs(5), Duration::from_millis(1500));
+        let mut t = AgentTracker::default();
+        t.update(&defs, Some(&proc_in("claude", 10)), "> ", quiet, idle_after);
+        assert_eq!(t.state().unwrap().status, AgentStatus::Idle);
+        t.current.as_mut().unwrap().status_since_ms = Some(1);
+        t.update(&defs, Some(&proc_in("claude", 10)), "> ", quiet, idle_after);
+        assert_eq!(
+            t.state().unwrap().status_since_ms,
+            Some(1),
+            "the same process"
+        );
+        t.update(&defs, Some(&proc_in("claude", 11)), "> ", quiet, idle_after);
+        assert!(t.state().unwrap().status_since_ms.unwrap() > 1);
     }
 
     #[test]
