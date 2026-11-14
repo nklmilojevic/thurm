@@ -360,6 +360,8 @@ pub struct Client {
     pub ext_ui: AtomicBool,
     /// The plugin this client is the daemon's connection for.
     pub plugin: Mutex<Option<String>>,
+    /// Removed from the daemon: nothing it asks takes effect any more.
+    pub gone: AtomicBool,
     /// A remote client that takes deflated events ([`thurm_proto::CAP_DEFLATE`]). Shared with the
     /// client's writer thread, which encodes what it sends.
     pub deflate: Arc<AtomicBool>,
@@ -801,6 +803,7 @@ impl Daemon {
             ext: AtomicBool::new(false),
             ext_ui: AtomicBool::new(false),
             plugin: Mutex::new(None),
+            gone: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
@@ -832,7 +835,10 @@ impl Daemon {
 
     pub fn remove_client(&self, id: u64) {
         log::info!("client {id} gone");
-        self.clients.lock().remove(&id);
+        // Before its registrations go: one it is making now sees the flag (see `ext_registry`).
+        if let Some(c) = self.clients.lock().remove(&id) {
+            c.gone.store(true, Ordering::SeqCst);
+        }
         self.focus.lock().client_gone(id);
         self.ext_client_gone(id);
         for p in self.all_panes() {
@@ -4381,6 +4387,7 @@ mod tests {
             ext: AtomicBool::new(false),
             ext_ui: AtomicBool::new(false),
             plugin: Mutex::new(None),
+            gone: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),

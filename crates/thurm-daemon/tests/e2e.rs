@@ -104,6 +104,8 @@ impl Env {
             // where sh's own is `# `.
             .env("PS1", "$ ")
             .env("THURM_LOG", "debug")
+            // The tests' daemon runs outside an app bundle: its UI clients can't be verified.
+            .env("THURM_TRUST_UI_CLIENTS", "1")
             // Agents' settings (hooks installed on launch) stay in the test directory.
             .env("CLAUDE_CONFIG_DIR", self.dir.join("claude"))
             .env("CODEX_HOME", self.dir.join("codex"))

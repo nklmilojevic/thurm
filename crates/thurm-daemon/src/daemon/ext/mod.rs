@@ -101,6 +101,9 @@ impl Daemon {
         params_json: Value,
     ) -> Result<Value, String> {
         let p = params_json;
+        if client.gone.load(Ordering::SeqCst) {
+            return Err("this client was disconnected".into());
+        }
         match method {
             method::REQUEST => {
                 let req: Request =
@@ -125,9 +128,7 @@ impl Daemon {
                 )
                 .map_err(|e| format!("bad actions: {e}"))?;
                 let source = self.ext_source(client);
-                self.ext
-                    .registry
-                    .lock()
+                self.ext_registry(client)?
                     .register(client.id, &source, actions)?;
                 self.actions_changed();
                 Ok(Value::Null)
@@ -151,7 +152,7 @@ impl Daemon {
             method::KEYS_BIND => {
                 let b: ext::Binding = params(p)?;
                 let source = self.ext_source(client);
-                self.ext.registry.lock().bind(client.id, &source, b)?;
+                self.ext_registry(client)?.bind(client.id, &source, b)?;
                 self.actions_changed();
                 Ok(Value::Null)
             }
@@ -163,7 +164,7 @@ impl Daemon {
                 Ok(Value::Null)
             }
             method::EVENTS_SUBSCRIBE => {
-                self.ext.registry.lock().subscribe(client.id, names(&p))?;
+                self.ext_registry(client)?.subscribe(client.id, names(&p))?;
                 Ok(Value::Null)
             }
             method::EVENTS_UNSUBSCRIBE => {
@@ -257,6 +258,20 @@ impl Daemon {
         _params: Value,
     ) -> Result<Value, String> {
         Err(format!("unknown method {method:?}"))
+    }
+
+    /// The registry, to add what `client` provides or hears: refused once the client is gone.
+    /// Checked under the registry's lock, which its removal takes after setting `gone`, so a
+    /// registration either sees the flag or is cleaned up with the rest.
+    fn ext_registry(
+        &self,
+        client: &Client,
+    ) -> Result<parking_lot::MutexGuard<'_, Registry>, String> {
+        let reg = self.ext.registry.lock();
+        if client.gone.load(Ordering::SeqCst) {
+            return Err("this client was disconnected".into());
+        }
+        Ok(reg)
     }
 
     /// A [`Request`] answered to its end, including those `handle` answers on a thread of
@@ -610,8 +625,8 @@ impl Daemon {
 /// Whether the peer on `stream` is the app this daemon belongs to. A daemon that runs from an
 /// app bundle (`Thurm.app/Contents/Helpers/thurmd`) takes only that bundle's own executable,
 /// by the peer's pid: another program of the same user cannot pose as the app to read what
-/// plugins ask. A daemon outside a bundle (a development build, Linux) has no app to tell
-/// apart, and the peer's user is the check.
+/// plugins ask. A daemon outside a bundle (a development build, Linux) cannot tell the app
+/// apart, and takes none (see [`unverified_ui_allowed`]).
 pub fn peer_is_our_app(stream: &std::os::unix::net::UnixStream) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -629,7 +644,7 @@ pub fn peer_is_our_app(stream: &std::os::unix::net::UnixStream) -> bool {
                     .then(|| contents.join("MacOS").join("Thurm"))
             })
         else {
-            return true;
+            return unverified_ui_allowed();
         };
         let mut pid: libc::pid_t = 0;
         let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
@@ -656,8 +671,15 @@ pub fn peer_is_our_app(stream: &std::os::unix::net::UnixStream) -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = stream;
-        true
+        unverified_ui_allowed()
     }
+}
+
+/// Whether a desktop UI whose app cannot be identified (a daemon outside an app bundle: a
+/// development build, the tests) may still be asked what plugins ask: only when whoever
+/// started the daemon said so, with `THURM_TRUST_UI_CLIENTS=1`. Otherwise no client is.
+fn unverified_ui_allowed() -> bool {
+    std::env::var_os("THURM_TRUST_UI_CLIENTS").is_some_and(|v| v == "1")
 }
 
 /// Sends a notice of the extension API to `client`.

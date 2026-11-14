@@ -350,3 +350,32 @@ fn a_command_line_reaches_hooks_but_not_subscribers() {
     };
     assert!(hook.contains("login --password hunter2"), "{hook}");
 }
+
+/// A daemon outside an app bundle cannot tell its app from another program of the same
+/// user: unless told to trust them, it asks no client what plugins ask.
+#[test]
+fn an_unverified_app_is_not_asked() {
+    let env = Env::new("ext-ui-unverified");
+    let _d = env.start_with(&[("THURM_TRUST_UI_CLIENTS", Path::new("0"))]);
+    let (tx, rx) = unbounded();
+    let _app = Client::connect_with(
+        ConnectOptions {
+            socket: env.socket.clone(),
+            spawn_daemon: None,
+            client_name: "app",
+            ui: true,
+        },
+        &[CAP_EXT, CAP_EXT_UI],
+        move |ev| {
+            if let Event::Ext { name, .. } = ev {
+                let _ = tx.send(name);
+            }
+        },
+        || {},
+    )
+    .unwrap();
+    let (plugin, _prx) = ext_client(&env, "plugin");
+    let e = call(&plugin, method::UI_CONFIRM, json!({ "title": "Sure?" })).unwrap_err();
+    assert!(e.contains("window"), "{e}");
+    assert!(rx.try_iter().all(|n| n != notice::UI_REQUEST));
+}
