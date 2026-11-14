@@ -720,11 +720,28 @@ fn a_scripts_waiting_calls_end_when_its_client_leaves() {
         json!({ "actions": [{ "name": "never.answers" }] }),
     )
     .unwrap();
+    // A pane that runs on: waiting for its exit waits as long as it does.
+    let pane = match provider
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec!["sleep".into(), "60".into()]),
+            cwd: Some(env.dir.display().to_string()),
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
     std::thread::sleep(Duration::from_millis(300));
     let before = thread_count(d.child.id());
     let mut closers = Vec::new();
     let mut waiting = Vec::new();
-    for _ in 0..10 {
+    for i in 0..10 {
+        let source = if i % 2 == 0 {
+            "thurm.run('never.answers')".to_owned()
+        } else {
+            format!("thurm.wait({pane}, {{ exit = true }})")
+        };
         let stream = std::os::unix::net::UnixStream::connect(&env.socket).unwrap();
         closers.push(stream.try_clone().unwrap());
         let c = Client::from_stream(stream, "e2e", false, &[CAP_EXT], |_| {}, || {}).unwrap();
