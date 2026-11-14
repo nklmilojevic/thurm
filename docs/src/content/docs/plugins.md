@@ -68,8 +68,9 @@ thurm action run split_down --pane 4   # the app's own actions too
 The command palette and **Shell > Commands** show the actions of
 `[[commands]]` and plugins; an action's `category` makes a submenu. A key
 bound with `thurm.bind` (or by a plugin program) works like a
-`[keybindings]` entry: bound to one of the app's actions, it moves that
-action's key; bound to a plugin's action, it runs it. The binding made last
+`[keybindings]` entry: bound to one of the app's actions, it runs that
+action too, and the menu shows it (the action's own key keeps working, as with
+`[keybindings]`); bound to a plugin's action, it runs it. The binding made last
 wins, and goes when its plugin stops. A key bound with arguments
 (`thurm.bind(key, action, args)`) runs the action with them.
 
@@ -130,15 +131,16 @@ runs for 5 seconds without waiting is stopped, and a plugin may use at most
 ## Scripts
 
 `thurm do` runs a Lua file in the daemon to its end, prints what it logs, and
-then what it returns. It has the same API, with `thurm.args` and the pane it
-was started from in `thurm.pane`:
+then what it returns. It has the same API, with `thurm.args`, and in
+`thurm.pane` the pane it was started from (`nil` with `--remote`, where this
+machine's pane means nothing: use `thurm.focused()` or `thurm.panes()` there):
 
 ```lua
--- review.lua: open every changed file's diff in a split.
-local root = thurm.info(thurm.pane).cwd
-local r = thurm.exec({ "git", "diff", "--name-only" }, { cwd = root })
+-- review.lua: open the diff of every changed file, staged or not, in a split.
+local root = thurm.info(thurm.pane or thurm.focused()).cwd
+local r = thurm.exec({ "git", "diff", "HEAD", "--name-only" }, { cwd = root })
 for file in r.stdout:gmatch("[^\n]+") do
-  thurm.split("down", { command = { "git", "diff", "--", file }, cwd = root, hold = true })
+  thurm.split("down", { command = { "git", "diff", "HEAD", "--", file }, cwd = root, hold = true })
 end
 return "opened diffs"
 ```

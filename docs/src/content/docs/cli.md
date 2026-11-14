@@ -80,7 +80,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `hooks install\|uninstall\|status` | Manage hooks; `--agent claude\|codex` |
 | `skill show\|setup\|remove\|status` | Print the agent guide, or install the skill that points agents at it; `--agent claude\|agents` |
 | `action list` | List actions: `[[commands]]`, the app's menu actions and plugins' actions, with their keys |
-| `action run NAME [ARGS]` | Run an action for a pane (`--pane ID`); ARGS is JSON; prints what it returns. See [Plugins and scripting](/plugins/) |
+| `action run NAME [ARGS]` | Run an action for a pane (`--pane ID`); ARGS is a JSON value, and a word that isn't JSON is taken as a string; prints what it returns. See [Plugins and scripting](/plugins/) |
 | `do FILE [ARGS...]` | Run a Lua script in the daemon (`-` reads stdin); prints what it logs and returns |
 | `plugin list\|new\|install\|update\|remove\|enable\|disable\|reload\|logs\|types` | Manage plugins; `new --program` for a program plugin, `install URL [--name NAME]`, `logs NAME -n LINES`. See [Plugins and scripting](/plugins/#plugins) |
 | `explain` | Explain the last finished command; `--pane ID`; needs enabled AI |
