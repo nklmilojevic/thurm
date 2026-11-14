@@ -25,7 +25,14 @@ pub struct Plugins {
     next: AtomicU64,
     /// The running `init.lua`.
     init: Mutex<Option<u64>>,
+    /// The last init.lua that started without an error: what a reload falls back on.
+    init_good: Mutex<Option<String>>,
+    /// Scripts running now.
+    scripts: std::sync::atomic::AtomicUsize,
 }
+
+/// The most scripts that may run at once (each has a Lua state of its own).
+const MAX_SCRIPTS: usize = 32;
 
 struct Instance {
     client: Arc<Client>,
@@ -189,13 +196,21 @@ impl Daemon {
         if let Some(old) = self.plugins.init.lock().take() {
             self.stop_instance(old);
         }
+        let fallback = self.plugins.init_good.lock().clone();
+        self.start_init(source, file, fallback);
+    }
+
+    /// Runs `source` as init.lua. When its main chunk fails and `fallback` (the last one that
+    /// worked) is given, that one runs again instead: an error in the new file costs nothing
+    /// that worked.
+    fn start_init(self: &Arc<Self>, source: String, file: PathBuf, fallback: Option<String>) {
         let Ok(lua) = self.lua() else { return };
         let (instance, _) = self.plugin_client(INIT, None);
         *self.plugins.init.lock() = Some(instance);
         let done = lua.load(thurm_lua::Spec {
             instance,
             name: INIT.into(),
-            source,
+            source: source.clone(),
             file: file.display().to_string(),
             dir: file.parent().map(PathBuf::from),
             modules: Default::default(),
@@ -207,10 +222,23 @@ impl Daemon {
         });
         let daemon = Arc::downgrade(self);
         std::thread::spawn(move || {
-            if let Ok(Err(e)) = done.recv()
-                && let Some(d) = daemon.upgrade()
-            {
-                d.plugin_failed(instance, &e);
+            let Some(d) = daemon.upgrade() else { return };
+            match done.recv() {
+                Ok(Ok(_)) => *d.plugins.init_good.lock() = Some(source),
+                Ok(Err(e)) => {
+                    let current = *d.plugins.init.lock() == Some(instance);
+                    match fallback.filter(|f| current && *f != source) {
+                        Some(previous) => {
+                            d.plugin_failed(instance, &format!("{e}; the previous init.lua runs"));
+                            if let Some(i) = d.plugins.init.lock().take() {
+                                d.stop_instance(i);
+                            }
+                            d.start_init(previous, file, None);
+                        }
+                        None => d.plugin_failed(instance, &e),
+                    }
+                }
+                Err(_) => {}
             }
         });
     }
@@ -242,6 +270,18 @@ impl Daemon {
         run: ext::RunScript,
     ) -> Result<Value, String> {
         let lua = self.lua()?;
+        // Each script has a Lua state of its own: only so many at once.
+        if self.plugins.scripts.fetch_add(1, Ordering::SeqCst) >= MAX_SCRIPTS {
+            self.plugins.scripts.fetch_sub(1, Ordering::SeqCst);
+            return Err(format!("{MAX_SCRIPTS} scripts are running already"));
+        }
+        struct Running<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _running = Running(&self.plugins.scripts);
         let (instance, _) = self.plugin_client("script", Some(client.id));
         let to = client.clone();
         let log: thurm_lua::LogSink = Arc::new(move |level: &str, message: &str| {

@@ -604,6 +604,18 @@ fn init_lua_provides_actions_and_scripts_run() {
     c.request(Request::ReloadConfig).unwrap();
     std::thread::sleep(Duration::from_millis(300));
     assert!(action_names(&c).contains(&"lua.greet".to_owned()));
+    // One that compiles but fails as it runs gives way to the one that worked.
+    std::fs::write(
+        &init,
+        "thurm.action{ name = 'lua.half', run = function() end }\nerror('no')",
+    )
+    .unwrap();
+    c.request(Request::ReloadConfig).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while action_names(&c) != ["lua.greet"] {
+        assert!(Instant::now() < deadline, "{:?}", action_names(&c));
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     // Reloading runs the new init.lua: its old actions go.
     std::fs::write(
