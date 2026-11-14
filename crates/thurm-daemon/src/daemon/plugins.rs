@@ -155,20 +155,37 @@ impl Process {
         }
     }
 
-    /// Waits for its process, sending SIGKILL once it was asked to stop [`STOP_GRACE`] ago.
-    /// Signals go out only before the process is reaped, while its group id is still its own.
+    /// Waits for its process group. Once the program exits (or was asked to stop), what is
+    /// left of its group gets SIGTERM, and SIGKILL [`STOP_GRACE`] later: nothing it started
+    /// outlives it. The program is reaped only after that, so its group id stays its own while
+    /// it is signalled.
     fn wait(&self, child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+        let pgid = self.pgid;
         let mut killed = false;
+        let mut leader_exited: Option<Instant> = None;
         loop {
             {
                 let mut life = self.life.lock();
-                if let Some(status) = child.try_wait()? {
+                if leader_exited.is_none() && crate::user_exec::exited(pgid) {
+                    leader_exited = Some(Instant::now());
+                    if life.stopping.is_none() {
+                        unsafe { libc::kill(-pgid, libc::SIGTERM) };
+                    }
+                }
+                let since = match (life.stopping, leader_exited) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                if !killed && since.is_some_and(|at| at.elapsed() >= STOP_GRACE) {
+                    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                    killed = true;
+                }
+                // Done when nothing but the exited program is left in its group.
+                let group_alive = unsafe { libc::kill(-pgid, 0) } == 0;
+                if leader_exited.is_some() && (killed || !group_alive) {
+                    let status = child.wait()?;
                     life.reaped = true;
                     return Ok(status);
-                }
-                if !killed && life.stopping.is_some_and(|at| at.elapsed() >= STOP_GRACE) {
-                    unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
-                    killed = true;
                 }
             }
             std::thread::sleep(Duration::from_millis(20));

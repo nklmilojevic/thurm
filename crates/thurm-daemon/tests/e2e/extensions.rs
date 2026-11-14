@@ -1058,3 +1058,50 @@ fn reloading_a_plugin_by_name_reads_its_files_again() {
     });
     assert_eq!(plugin(&list, "tool")["version"], "2.0.0");
 }
+
+/// A program plugin's leader may exit on SIGTERM while something it started ignores it:
+/// that one is stopped too when the plugin is disabled.
+#[test]
+fn a_disabled_plugin_leaves_nothing_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("ext-group");
+    let plugins = env.dir.join("config/plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let pidfile = env.dir.join("child.pid");
+    let script = plugins.join("parent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+sh -c 'trap "" TERM; while :; do sleep 1; done' &
+echo $! > {pidfile:?}
+echo '{{"jsonrpc":"2.0","id":1,"method":"actions.register","params":{{"actions":[{{"name":"parent.up"}}]}}}}'
+trap 'exit 0' TERM
+while :; do sleep 1; done
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _d = env.start();
+    let (c, _rx) = ext_client(&env, "e2e");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !action_names(&c).contains(&"parent.up".to_owned()) {
+        assert!(Instant::now() < deadline, "the plugin did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let child: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    call(&c, method::PLUGINS_DISABLE, json!({ "name": "parent" })).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while unsafe { libc::kill(child, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "process {child} survived the plugin"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

@@ -205,7 +205,7 @@ pub fn run(
 }
 
 /// Whether child `pid` has exited, without reaping it.
-fn exited(pid: libc::pid_t) -> bool {
+pub fn exited(pid: libc::pid_t) -> bool {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
     if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) } != 0 {
