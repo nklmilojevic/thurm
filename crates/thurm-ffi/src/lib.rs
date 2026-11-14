@@ -437,8 +437,9 @@ pub unsafe extern "C" fn thurm_connect(
 ) -> *mut thurm_client {
     let socket = thurm_config::socket_path();
     unsafe {
+        // This Mac's daemon only: what a remote host's plugins ask goes to its own users.
         connect_to(
-            &[],
+            &[thurm_proto::CAP_EXT_UI],
             socket,
             daemon_path,
             client_name,

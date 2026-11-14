@@ -93,6 +93,25 @@ final class MainMenuTests: XCTestCase {
         XCTAssertEqual(down.keyEquivalentModifierMask, [.command, .shift])
     }
 
+    /// Plugins' actions go in a submenu per category; a hidden one only keeps its key.
+    func testCommandsGoInCategorySubmenus() {
+        let (main, _, _, _, _) = shellMenu()
+        MainMenu.applyKeys([:], commands: [
+            UserCommand(name: "Deploy", key: ""),
+            UserCommand(name: "git.sync", key: "cmd+shift+y", title: "Sync", category: "Git"),
+            UserCommand(name: "git.log", key: "", title: "Log", category: "Git"),
+            UserCommand(name: "init.key.3", key: "cmd+shift+u", hidden: true),
+        ], in: main)
+        let menu = MainMenu.commandsMenu
+        XCTAssertEqual(menu.items.map(\.title), ["Deploy", "Git", "init.key.3"])
+        XCTAssertEqual(menu.items[1].submenu?.items.map(\.title), ["Sync", "Log"])
+        XCTAssertEqual(menu.items[1].submenu?.items[0].representedObject as? String, "git.sync")
+        XCTAssertEqual(menu.items[1].submenu?.items[0].keyEquivalent, "y")
+        XCTAssertTrue(menu.items[2].isHidden)
+        XCTAssertTrue(menu.items[2].allowsKeyEquivalentWhenHidden)
+        XCTAssertEqual(menu.items[2].keyEquivalent, "u")
+    }
+
     func testBindingToNoneRemovesAKey() {
         let (main, _, right, down, tab) = shellMenu()
         MainMenu.applyKeys(["cmd+t": "none", "CMD+D": " none "], commands: [], in: main)

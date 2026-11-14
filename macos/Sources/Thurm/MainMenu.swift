@@ -10,7 +10,7 @@ enum MainMenu {
     private static let rightArrow = "\u{F703}"
 
     /// The Shell menu's Commands submenu: the config's `[[commands]]`, refilled on every load.
-    private static let commandsMenu = NSMenu(title: "Commands")
+    static let commandsMenu = NSMenu(title: "Commands")
     private static var commandsItem: NSMenuItem?
     /// Built-in items whose key `applyKeys` changed, with the key they had.
     private static var changed: [(item: NSMenuItem, key: String, mods: NSEvent.ModifierFlags)] = []
@@ -54,15 +54,44 @@ enum MainMenu {
             }
         }
         commandsMenu.removeAllItems()
+        var submenus: [String: NSMenu] = [:]
         for command in commands {
             let (key, mods) = keyEquivalent(command.key) ?? ("", [])
             if !key.isEmpty, let main { displace(chord(key, mods), in: main) }
-            let entry = item(command.name, #selector(AppDelegate.runUserCommand(_:)), key, mods)
+            let entry = item(command.displayTitle, #selector(AppDelegate.runUserCommand(_:)), key, mods)
             entry.representedObject = command.name
-            commandsMenu.addItem(entry)
+            if command.hidden {
+                entry.isHidden = true
+                entry.allowsKeyEquivalentWhenHidden = true
+            }
+            let category = command.category == "Commands" ? "" : command.category
+            if category.isEmpty || command.hidden {
+                commandsMenu.addItem(entry)
+            } else if let sub = submenus[category] {
+                sub.addItem(entry)
+            } else {
+                let sub = NSMenu(title: category)
+                sub.addItem(entry)
+                submenus[category] = sub
+                let holder = NSMenuItem(title: category, action: nil, keyEquivalent: "")
+                holder.submenu = sub
+                commandsMenu.addItem(holder)
+            }
         }
-        commandsItem?.isHidden = commands.isEmpty
+        commandsItem?.isHidden = !commands.contains { !$0.hidden }
         return warnings
+    }
+
+    /// The `[keybindings]` name of an item's identifier.
+    static func actionName(_ id: NSUserInterfaceItemIdentifier?) -> String? {
+        guard let raw = id?.rawValue, raw.hasPrefix("thurm.action.") else { return nil }
+        let name = String(raw.dropFirst("thurm.action.".count))
+        return name.isEmpty ? nil : name
+    }
+
+    /// The main menu's item of a `[keybindings]` action name.
+    static func item(forAction name: String, in main: NSMenu? = NSApp.mainMenu) -> NSMenuItem? {
+        main.flatMap { actionItem(name, in: $0) }
     }
 
     /// The identifier of a `[keybindings]` action's item. Namespaced: AppKit names an item
