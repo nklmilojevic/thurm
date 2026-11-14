@@ -205,8 +205,10 @@ git-tools = { remote = "origin", fetch_every = 300 }
 
 A plugin's settings reach it as `thurm.settings`, or as JSON in
 `THURM_PLUGIN_SETTINGS` for a program. Reloading the configuration starts new
-plugins, stops removed and disabled ones, and restarts those whose settings
-changed and the Lua ones.
+plugins and those that failed to start, stops removed and disabled ones, and
+restarts those whose settings changed and the Lua ones. A Lua plugin (or
+`init.lua`) whose new code doesn't compile keeps running as it was, and the
+error shows.
 
 ## Program plugins
 
