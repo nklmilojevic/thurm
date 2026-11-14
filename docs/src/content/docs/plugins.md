@@ -138,7 +138,9 @@ machine's pane means nothing: use `thurm.focused()` or `thurm.panes()` there):
 ```lua
 -- review.lua: open the diff of every changed tracked file, staged or not, in a split
 -- (new files git doesn't track yet are not in `git diff`).
-local root = thurm.info(thurm.pane or thurm.focused()).cwd
+local cwd = thurm.info(thurm.pane or thurm.focused()).cwd
+local top = thurm.exec({ "git", "rev-parse", "--show-toplevel" }, { cwd = cwd })
+local root = top.stdout:gsub("%s+$", "")
 local r = thurm.exec({ "git", "diff", "HEAD", "--name-only" }, { cwd = root })
 for file in r.stdout:gmatch("[^\n]+") do
   thurm.split("down", { command = { "git", "diff", "HEAD", "--", file }, cwd = root, hold = true })
