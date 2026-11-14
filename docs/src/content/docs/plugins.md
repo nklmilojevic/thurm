@@ -72,7 +72,9 @@ bound with `thurm.bind` (or by a plugin program) works like a
 action too, and the menu shows it (the action's own key keeps working, as with
 `[keybindings]`); bound to a plugin's action, it runs it. The binding made last
 wins, and goes when its plugin stops. A key bound with arguments
-(`thurm.bind(key, action, args)`) runs the action with them.
+(`thurm.bind(key, action, args)`) runs a plugin's or `[[commands]]` action
+with them; the app's own actions take no arguments, and the app ignores such a
+key for them.
 
 ## Events
 
@@ -112,7 +114,7 @@ your keys. Errors are raised: catch them with `pcall` where you expect them.
 | `thurm.open{command, cwd, env, agent, split, float, window, target, percent, background, hold}` | Opens a pane and returns its id |
 | `thurm.split(dir, opts)` | `thurm.open` with `split = dir` |
 | `thurm.send(pane, text, {enter})`, `thurm.capture(pane, {lines, scrollback, ansi})` | Types into a pane; reads its screen |
-| `thurm.wait(pane, {match, idle, exit, agent, timeout})` | Waits for the prompt, a regex, quiet, exit or a free agent; `true`, or `false` and why |
+| `thurm.wait(pane, {match, idle, exit, agent, timeout})` | Waits for the prompt, a regex, quiet, exit or a free agent; `true` (with the exit code for `exit`), or `false` and why |
 | `thurm.close(pane)`, `thurm.focus(pane)` | Closes or focuses a pane |
 | `thurm.ui.toast(text, pane)` | A short message over a pane |
 | `thurm.ui.pick{title, placeholder, items}` | The user picks an item (a string, or a table with `title` and `detail`); returns it and its index, or `nil` |
@@ -120,7 +122,7 @@ your keys. Errors are raised: catch them with `pcall` where you expect them.
 | `thurm.exec(argv, {cwd, env, stdin, timeout})` | Runs a program to its end through your login shell; `ok`, `code`, `stdout`, `stderr`, `timed_out`. A string runs with `sh -c` |
 | `thurm.after(s, fn)`, `thurm.every(s, fn)`, `thurm.sleep(s)` | Timers; the first two return a handle with `cancel()` |
 | `thurm.call(method, params)`, `thurm.request(request)` | Any method of the API below, or any daemon request as JSON |
-| `thurm.json.encode`, `thurm.json.decode`, `thurm.log(...)`, `thurm.warn(...)` | JSON, and the plugin's log (`print` logs too) |
+| `thurm.json.encode`, `thurm.json.decode`, `thurm.json.null`, `thurm.log(...)`, `thurm.warn(...)` | JSON (decode keeps nulls as `thurm.json.null`; the API's results give `nil`), and the plugin's log (`print` logs too) |
 | `thurm.plugin`, `thurm.dir`, `thurm.settings`, `thurm.args`, `thurm.pane` | The plugin's name, directory and settings; a script's arguments and pane |
 
 `require` loads modules from the plugin's own directory. `io.popen`,
@@ -140,8 +142,10 @@ machine's pane means nothing: use `thurm.focused()` or `thurm.panes()` there):
 -- (new files git doesn't track yet are not in `git diff`).
 local cwd = thurm.info(thurm.pane or thurm.focused()).cwd
 local top = thurm.exec({ "git", "rev-parse", "--show-toplevel" }, { cwd = cwd })
+if not top.ok then error("not in a git repository: " .. top.stderr) end
 local root = top.stdout:gsub("%s+$", "")
 local r = thurm.exec({ "git", "diff", "HEAD", "--name-only" }, { cwd = root })
+if not r.ok then error(r.stderr) end
 for file in r.stdout:gmatch("[^\n]+") do
   thurm.split("down", { command = { "git", "diff", "HEAD", "--", file }, cwd = root, hold = true })
 end
@@ -155,9 +159,9 @@ thurm --remote build do deploy.lua staging
 ```
 
 Stopping `thurm do` (Ctrl-C) stops the script. At most 8 scripts run at
-once. With `--remote`, the `.lua` files
-beside the script (a few levels deep) go along, so `require` finds them on the
-other host. A host the app reaches over the tailnet, not ssh, refuses scripts and
+once. With `--remote --with-modules`, the `.lua` files beside the script (a few
+levels deep) go along, so `require` finds them on the other host; without it,
+only the script goes. A host the app reaches over the tailnet, not ssh, refuses scripts and
 actions: running code there is for that machine's own clients.
 
 ## Plugins
