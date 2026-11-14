@@ -95,12 +95,13 @@ pub fn action(c: &Client, cmd: ActionCmd, json: bool) -> R {
 /// The Lua files under `dir` (a few levels deep), by path relative to it, for a script run on
 /// another host to `require`. Only regular files really in the directory go: every name is
 /// opened relative to its opened parent without following a symlink, so one swapped in while
-/// the directory is read cannot send a file from elsewhere. Bounded: what fits in 4 MiB.
+/// the directory is read cannot send a file from elsewhere. `dir` is canonical: its path is
+/// opened component by component the same way. Bounded: what fits in 4 MiB.
 fn lua_modules(dir: &std::path::Path) -> std::collections::BTreeMap<String, String> {
     const MAX_FILES: usize = 200;
     const MAX_BYTES: usize = 4 << 20;
     let mut out = std::collections::BTreeMap::new();
-    let Ok(root) = open_nofollow(None, dir.as_os_str(), true) else {
+    let Ok(root) = open_dir_path(dir) else {
         return out;
     };
     let mut bytes = 0;
@@ -173,6 +174,24 @@ fn open_nofollow(
     }
     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
     // O_NONBLOCK only kept a FIFO from blocking the open: reads of a regular file don't care.
+    Ok(fd)
+}
+
+/// Opens the directory at absolute `path` one component at a time from `/`, none followed
+/// through a symlink: a component swapped for one fails the walk.
+fn open_dir_path(path: &std::path::Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    if !path.is_absolute() {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let mut fd = open_nofollow(None, std::ffi::OsStr::new("/"), true)?;
+    for part in path.components() {
+        match part {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => fd = open_nofollow(Some(&fd), name, true)?,
+            // A canonical path has no `.` or `..`.
+            _ => return Err(std::io::ErrorKind::InvalidInput.into()),
+        }
+    }
     Ok(fd)
 }
 
@@ -296,9 +315,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let secret = dir.with_extension("secret.lua");
         std::fs::write(&secret, "token").unwrap();
-        let root = super::open_nofollow(None, dir.as_os_str(), true).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let root = super::open_dir_path(&dir).unwrap();
         std::os::unix::fs::symlink(&secret, dir.join("m.lua")).unwrap();
         assert!(super::open_nofollow(Some(&root), std::ffi::OsStr::new("m.lua"), false).is_err());
+        // A directory on the way swapped for a symlink fails the walk.
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("via")).unwrap();
+        assert!(super::open_dir_path(&dir.join("via")).is_err());
+        assert!(super::open_dir_path(&dir.join("real")).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_file(&secret).unwrap();
     }
@@ -319,6 +344,7 @@ mod tests {
         std::fs::write(&secret, "return 'token'").unwrap();
         std::os::unix::fs::symlink(&secret, dir.join("lib/private.lua")).unwrap();
         std::os::unix::fs::symlink(std::env::temp_dir(), dir.join("outside")).unwrap();
+        let dir = dir.canonicalize().unwrap();
         let m = super::lua_modules(&dir);
         assert_eq!(
             m.keys().map(String::as_str).collect::<Vec<_>>(),
