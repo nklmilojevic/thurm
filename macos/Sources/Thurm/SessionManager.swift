@@ -1269,6 +1269,7 @@ final class SessionManager: NSObject, CoreDelegate {
             Remotes.shared.connectionLost(host)
             return
         }
+        Extensions.shared.disconnected()
         Core.shared.disconnect()
         if replacingDaemon {
             tlog("lost connection to thurmd while replacing it")

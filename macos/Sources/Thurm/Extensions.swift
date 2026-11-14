@@ -29,8 +29,13 @@ final class Extensions {
     /// The names of the app's own actions: menu items with a `[keybindings]` name.
     private(set) var appActions: Set<String> = []
     /// The question a plugin asked that shows now: how to answer it (nothing, when it is
-    /// taken down for another) and how to take it down.
-    private var shown: (id: UInt64, cancel: () -> Void, dismiss: () -> Void)?
+    /// taken down for another) and how to take it down; `pick` for the palette, which goes
+    /// with the app's focus.
+    private var shown: (id: UInt64, pick: Bool, cancel: () -> Void, dismiss: () -> Void)?
+    /// Bumped with every connection to the daemon: an answer to a question of an earlier one
+    /// is not sent (its ids may name another plugin's question now).
+    private var connection = 0
+    private var resignObserver: NSObjectProtocol?
     private var refreshQueued = false
     /// Reads of the actions that failed in a row, for a bounded retry.
     private var refreshFailures = 0
@@ -61,8 +66,23 @@ final class Extensions {
 
     /// After (re)connecting to this Mac's daemon: offer it the app's actions, read its own.
     func connected() {
+        invalidateQuestions()
         registerAppActions()
         refresh()
+    }
+
+    /// The connection to this Mac's daemon is gone: its questions go, unanswered.
+    func disconnected() {
+        invalidateQuestions()
+    }
+
+    private func invalidateQuestions() {
+        connection += 1
+        pending = nil
+        if let s = shown {
+            shown = nil
+            s.dismiss()
+        }
     }
 
     /// Reads the actions and key bindings again, and applies them to the menus.
@@ -132,10 +152,25 @@ final class Extensions {
                 if let sub = top.submenu { walk(sub, top: top.title.isEmpty ? "Thurm" : top.title) }
             }
         }
-        appActions = seen
-        guard !list.isEmpty else { return }
-        call("actions.register", ["actions": list]) { _, error in
-            if let error { tlog("could not offer the app's actions: \(error)") }
+        guard !list.isEmpty else {
+            appActions = []
+            return
+        }
+        // A name the config or a plugin uses already stays theirs: the others are offered
+        // (the daemon refuses a whole list with a taken name in it).
+        call("actions.list") { value, _ in
+            let taken = Set(((value as? [String: Any])?["actions"] as? [[String: Any]] ?? [])
+                .compactMap { a -> String? in
+                    jsonString(a["source"]) == "Thurm.app" ? nil : jsonString(a["name"])
+                })
+            let free = list.filter { !taken.contains(jsonString($0["name"]) ?? "") }
+            for name in seen.intersection(taken).sorted() {
+                tlog("app action \(name) not offered: the name is taken")
+            }
+            self.appActions = seen.subtracting(taken)
+            self.call("actions.register", ["actions": free]) { _, error in
+                if let error { tlog("could not offer the app's actions: \(error)") }
+            }
         }
     }
 
@@ -290,10 +325,13 @@ final class Extensions {
             s.dismiss()
         }
         var answered = false
+        let asked = connection
         let reply: (Any) -> Void = { [weak self] value in
             guard !answered else { return }
             answered = true
             if self?.shown?.id == id { self?.shown = nil }
+            // Not to a daemon that came since: the id may be another plugin's question there.
+            guard self?.connection == asked else { return }
             self?.call("ui.reply", ["id": id, "result": value])
         }
         let window = NSApp.keyWindow ?? SessionManager.shared.currentController?.window
@@ -307,7 +345,19 @@ final class Extensions {
             }
             let placeholder = jsonString(req["placeholder"]).flatMap { $0.isEmpty ? nil : $0 }
                 ?? (title.isEmpty ? "Pick one…" : title)
-            shown = (id, { reply(NSNull()) }, { CommandPalette.shared.close() })
+            shown = (id, true, { reply(NSNull()) }, { CommandPalette.shared.close() })
+            // The palette hides when the app loses the focus: the question is answered with
+            // nothing then, rather than left waiting behind it.
+            if resignObserver == nil {
+                resignObserver = NotificationCenter.default.addObserver(
+                    forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+                ) { [weak self] _ in
+                    guard let self, let s = self.shown, s.pick else { return }
+                    self.shown = nil
+                    s.cancel()
+                    s.dismiss()
+                }
+            }
             CommandPalette.shared.show(items: items, over: window, placeholder: placeholder,
                                        footer: title.isEmpty || placeholder == title ? nil : title,
                                        onCancel: { reply(NSNull()) })
@@ -315,7 +365,7 @@ final class Extensions {
             let alert = NSAlert()
             alert.messageText = title
             // Before it shows: a modal alert answers before `present` returns.
-            shown = (id, { reply(NSNull()) }, { [weak alert] in
+            shown = (id, false, { reply(NSNull()) }, { [weak alert] in
                 guard let alert else { return }
                 if let parent = alert.window.sheetParent {
                     parent.endSheet(alert.window, returnCode: .cancel)
