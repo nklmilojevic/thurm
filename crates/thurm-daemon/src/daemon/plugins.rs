@@ -280,12 +280,22 @@ impl Daemon {
     /// do all Lua plugins (they are cheap to start, and pick up edits). With `restart_all`
     /// every plugin starts again.
     pub(super) fn sync_plugins(self: &Arc<Self>, restart_all: bool) {
+        self.sync_plugins_in(restart_all, None);
+    }
+
+    /// [`Daemon::sync_plugins`] for plugin `only` alone when given: the others are left as
+    /// they are.
+    fn sync_plugins_in(self: &Arc<Self>, restart_all: bool, only: Option<&str>) {
         let cfg = self.config.read().plugins.clone();
         let (found, warnings) = thurm_config::plugins::discover(&thurm_config::plugins_dir());
         for w in &warnings {
             log::warn!("plugins: {w}");
         }
-        let found: Vec<FoundPlugin> = init_plugin().into_iter().chain(found).collect();
+        let found: Vec<FoundPlugin> = init_plugin()
+            .into_iter()
+            .chain(found)
+            .filter(|f| only.is_none_or(|n| f.name == n))
+            .collect();
         let settings = |name: &str| {
             cfg.settings
                 .get(name)
@@ -296,6 +306,7 @@ impl Daemon {
             let records = self.plugins.records.lock();
             records
                 .keys()
+                .filter(|n| only.is_none_or(|o| o == n.as_str()))
                 .filter(|n| !found.iter().any(|f| &f.name == *n))
                 .cloned()
                 .collect()
@@ -361,13 +372,15 @@ impl Daemon {
             if expected.is_some_and(|g| g != r.generation || disabled) {
                 return;
             }
-            r.generation += 1;
+            // Unique across records: one made again for the same name never matches an older
+            // start's.
+            r.generation = self.plugins.next.fetch_add(1, Ordering::Relaxed) + 1;
             r.error = None;
             r.state = "running";
             (r.found.clone(), r.settings.clone(), r.generation)
         };
         let started = match &found.kind {
-            PluginKind::Lua { main } => self.start_lua(&found, main, settings),
+            PluginKind::Lua { main } => self.start_lua(&found, main, settings, generation),
             PluginKind::Process { exec } => self.start_process(&found, exec, settings, generation),
         };
         if let Err(e) = started {
@@ -383,15 +396,13 @@ impl Daemon {
         found: &FoundPlugin,
         main: &std::path::Path,
         settings: Value,
+        generation: u64,
     ) -> Result<(), String> {
         let source = std::fs::read_to_string(main)
             .map_err(|e| format!("cannot read {}: {e}", main.display()))?;
         let lua = self.lua()?;
         let (instance, _) =
             self.plugin_client(&found.name, Some(found.name.clone()), None, self.lua_sink());
-        if let Some(r) = self.plugins.records.lock().get_mut(&found.name) {
-            r.instance = Some(instance);
-        }
         let done = lua.load(thurm_lua::Spec {
             instance,
             name: found.name.clone(),
@@ -405,6 +416,12 @@ impl Daemon {
             log: None,
             script: false,
         });
+        // Registered once the load is queued, if this start still holds: a stop after this
+        // unloads it (the runtime takes the unload after the load), one before it is caught here.
+        if !self.claim_start(&found.name, generation, instance, None) {
+            self.end_instance(instance);
+            return Ok(());
+        }
         let daemon = Arc::downgrade(self);
         let name = found.name.clone();
         std::thread::spawn(move || {
@@ -478,12 +495,11 @@ impl Daemon {
                 to.send(&msg);
             }),
         );
-        {
-            let mut records = self.plugins.records.lock();
-            if let Some(r) = records.get_mut(&name) {
-                r.instance = Some(instance);
-                r.process = Some(process.clone());
-            }
+        // Stopped while it was starting: it goes at once. Nothing reads what it writes yet,
+        // so it had no say; a stop from here on finds its process in the record.
+        if !self.claim_start(&name, generation, instance, Some(process.clone())) {
+            self.end_instance(instance);
+            process.stop();
         }
         log::info!("plugin {name} started (pid {})", process.pgid);
 
@@ -669,7 +685,9 @@ impl Daemon {
             let Some(r) = records.get_mut(name) else {
                 return;
             };
-            r.generation += 1;
+            // Unique across records: one made again for the same name never matches an older
+            // start's.
+            r.generation = self.plugins.next.fetch_add(1, Ordering::Relaxed) + 1;
             r.state = state;
             r.error = None;
             r.failures = 0;
@@ -681,6 +699,26 @@ impl Daemon {
         if let Some(p) = process {
             // Its standard input closes too: a plugin may take that as its cue.
             p.stop();
+        }
+    }
+
+    /// Records `instance` (and `process`) as plugin `name`'s if the start `generation` still
+    /// holds, under the records lock a stop takes: false when it was stopped meanwhile.
+    fn claim_start(
+        &self,
+        name: &str,
+        generation: u64,
+        instance: u64,
+        process: Option<Arc<Process>>,
+    ) -> bool {
+        let mut records = self.plugins.records.lock();
+        match records.get_mut(name) {
+            Some(r) if r.generation == generation => {
+                r.instance = Some(instance);
+                r.process = process;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -859,7 +897,7 @@ impl Daemon {
         thurm_config::write_setting("plugins.disabled", &literal)?;
         let cfg = thurm_config::Config::load().map_err(|e| e.to_string())?;
         self.apply_config(cfg);
-        self.sync_plugins(false);
+        self.sync_plugins_in(false, Some(name));
         Ok(())
     }
 
@@ -894,17 +932,15 @@ impl Daemon {
                 match params.get("name").and_then(Value::as_str) {
                     None => self.sync_plugins(true),
                     Some(name) => {
-                        // Its files may have changed, or gone.
-                        self.sync_plugins(false);
+                        // Read again from its files (which may have changed, or gone) and
+                        // started again; the other plugins are left alone.
+                        self.sync_plugins_in(true, Some(name));
                         if !self.plugins.records.lock().contains_key(name) {
                             return Err(format!("no plugin named {name:?}"));
                         }
                         if self.config.read().plugins.is_disabled(name) {
                             return Err(format!("{name} is disabled"));
                         }
-                        self.stop_plugin(name, "stopped");
-                        self.start_plugin(name);
-                        self.plugins_changed();
                     }
                 }
                 Ok(Value::Null)
