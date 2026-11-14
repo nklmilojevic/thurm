@@ -30,6 +30,8 @@ pub struct Plugins {
     /// Held through every change of init.lua (a reload, a start's outcome): one at a time, so
     /// none acts on an init.lua another change already replaced.
     init_changes: Mutex<()>,
+    /// The init.lua instance whose start has an outcome.
+    init_settled: Mutex<Option<u64>>,
     /// Scripts running now.
     scripts: std::sync::atomic::AtomicUsize,
 }
@@ -175,6 +177,19 @@ impl Daemon {
 
     /// (Re)starts `init.lua` from the config directory, if there is one.
     pub(super) fn load_init(self: &Arc<Self>) {
+        // A start still running decides what there is to fall back on: wait for its outcome
+        // (its main chunk is stopped after 5 s of work without a wait).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let current = *self.plugins.init.lock();
+            if current.is_none()
+                || *self.plugins.init_settled.lock() == current
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let _changing = self.plugins.init_changes.lock();
         let file = thurm_config::config_dir().join("init.lua");
         // Read and checked before the running one stops: a file that can't be read or doesn't
@@ -232,6 +247,7 @@ impl Daemon {
             let Some(d) = daemon.upgrade() else { return };
             let result = done.recv();
             let _changing = d.plugins.init_changes.lock();
+            *d.plugins.init_settled.lock() = Some(instance);
             match result {
                 // Only the init.lua that runs now: a reload since made another one current.
                 Ok(Ok(_)) if *d.plugins.init.lock() == Some(instance) => {
@@ -248,7 +264,14 @@ impl Daemon {
                             }
                             d.start_init(previous, file, None);
                         }
-                        None => d.plugin_failed(instance, &e),
+                        // Nothing to fall back on: what it set up before it failed goes too,
+                        // rather than half of it staying.
+                        None => {
+                            d.plugin_failed(instance, &e);
+                            if current && let Some(i) = d.plugins.init.lock().take() {
+                                d.stop_instance(i);
+                            }
+                        }
                     }
                 }
                 Err(_) => {}

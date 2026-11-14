@@ -50,7 +50,6 @@ end
 function thurm.action(spec)
   check(type(spec) == "table" and type(spec.name) == "string" and type(spec.run) == "function",
     "usage: thurm.action{ name = \"x.y\", run = function(ctx, args) ... end }")
-  P.set_action(spec.name, spec.run)
   call("actions.register", {
     actions = { {
       name = spec.name,
@@ -61,6 +60,8 @@ function thurm.action(spec)
       args = spec.args,
     } },
   })
+  -- Only once the daemon took it: a refused name keeps whatever ran before.
+  P.set_action(spec.name, spec.run)
 end
 
 function thurm.run(name, args, pane)
@@ -77,8 +78,8 @@ function thurm.bind(key, target, args)
   local name = target
   if type(target) == "function" then
     name = P.plugin .. ".key." .. P.next_id()
-    P.set_action(name, target)
     call("actions.register", { actions = { { name = name, title = key, hidden = true } } })
+    P.set_action(name, target)
   end
   call("keys.bind", { key = key, action = name, args = args })
 end
@@ -189,7 +190,12 @@ function thurm.wait(pane, opts)
   elseif r == "Timeout" then
     return false, "timeout"
   end
-  return false, "exited", r.Exited and r.Exited.code
+  local code = r.Exited and r.Exited.code
+  -- Waiting for the exit, the exit is what was waited for.
+  if opts.exit then
+    return true, nil, code
+  end
+  return false, "exited", code
 end
 
 -- The user ------------------------------------------------------------------------------------
@@ -279,7 +285,9 @@ end
 
 -- Odds and ends -------------------------------------------------------------------------------
 
-thurm.json = { encode = P.json_encode, decode = P.json_decode }
+-- decode keeps JSON nulls as thurm.json.null (arrays keep their length); the API's own results
+-- give nil for null, as Lua code expects of a missing value.
+thurm.json = { encode = P.json_encode, decode = P.json_decode, null = P.json_null }
 
 local function line(...)
   local parts = {}

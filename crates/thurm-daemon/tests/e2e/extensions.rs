@@ -604,13 +604,42 @@ fn init_lua_provides_actions_and_scripts_run() {
     c.request(Request::ReloadConfig).unwrap();
     std::thread::sleep(Duration::from_millis(300));
     assert!(action_names(&c).contains(&"lua.greet".to_owned()));
-    // One that compiles but fails as it runs gives way to the one that worked.
+    // One that compiles but fails as it runs gives way to the one that worked: the app
+    // hears why, and the working action is back without the new one's.
+    let (_app, app_rx) = {
+        let (tx, rx) = unbounded();
+        let app = Client::connect_with(
+            ConnectOptions {
+                socket: env.socket.clone(),
+                spawn_daemon: None,
+                client_name: "app",
+                ui: true,
+            },
+            &[CAP_EXT, CAP_EXT_UI],
+            move |ev| {
+                if let Event::Ext { name, payload } = ev {
+                    let _ = tx.send((name, serde_json::from_str::<Value>(&payload).unwrap()));
+                }
+            },
+            || {},
+        )
+        .unwrap();
+        (app, rx)
+    };
     std::fs::write(
         &init,
         "thurm.action{ name = 'lua.half', run = function() end }\nerror('no')",
     )
     .unwrap();
     c.request(Request::ReloadConfig).unwrap();
+    let toast = next(&app_rx, notice::UI_REQUEST);
+    assert!(
+        toast["text"]
+            .as_str()
+            .unwrap()
+            .contains("previous init.lua"),
+        "{toast}"
+    );
     let deadline = Instant::now() + Duration::from_secs(20);
     while action_names(&c) != ["lua.greet"] {
         assert!(Instant::now() < deadline, "{:?}", action_names(&c));

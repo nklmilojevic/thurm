@@ -226,7 +226,15 @@ fn dir_names(fd: &std::os::fd::OwnedFd) -> Vec<std::ffi::OsString> {
 }
 
 /// `thurm do FILE [ARGS]`: runs a Lua script in the daemon, printing what it logs.
-pub fn script(remote: Option<&str>, file: &str, args: Vec<String>, json: bool) -> R {
+/// `with_modules`: with `--remote`, send the `.lua` files beside the script for `require`
+/// (only when asked: they may be anything the directory holds).
+pub fn script(
+    remote: Option<&str>,
+    file: &str,
+    args: Vec<String>,
+    with_modules: bool,
+    json: bool,
+) -> R {
     use std::io::Read;
     let (source, name, dir) = if file == "-" {
         let mut s = String::new();
@@ -284,7 +292,8 @@ pub fn script(remote: Option<&str>, file: &str, args: Vec<String>, json: bool) -
     let pane: Option<PaneId> = std::env::var(ENV_PANE_ID).ok().and_then(|v| v.parse().ok());
     // On another host the script's directory is not there: its modules go along.
     let (dir, modules) = match (remote, dir) {
-        (Some(_), Some(d)) => (None, lua_modules(std::path::Path::new(&d))),
+        (Some(_), Some(d)) if with_modules => (None, lua_modules(std::path::Path::new(&d))),
+        (Some(_), _) => (None, Default::default()),
         (_, dir) => (dir, Default::default()),
     };
     let run = ext::RunScript {

@@ -26,6 +26,7 @@ impl Host for FakeHost {
                 )
             }
             "fail" => Err("it failed".into()),
+            "actions.register" if params.to_string().contains("refuse") => Err("refused".into()),
             "events.subscribe" if params.to_string().contains("bad.") => {
                 Err("unknown event".into())
             }
@@ -398,4 +399,47 @@ fn a_script_has_less_memory_than_a_plugin() {
     let f = fixture();
     let e = run(&f, "local t = {} for i = 1, 1e8 do t[i] = i end").unwrap_err();
     assert!(e.to_lowercase().contains("memory"), "{e}");
+}
+
+#[test]
+fn json_nulls_round_trip() {
+    let f = fixture();
+    let r = run(
+        &f,
+        r#"
+        local t = thurm.json.decode('[1,null,3]')
+        return { n = #t, null = t[2] == thurm.json.null, back = thurm.json.encode(t) }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(r, json!({ "n": 3, "null": true, "back": "[1,null,3]" }));
+}
+
+/// A name the daemon refuses leaves the action that was there with its handler.
+#[test]
+fn a_refused_action_keeps_the_handler_it_had() {
+    let f = fixture();
+    let done = f.rt.load(spec(
+        30,
+        r#"
+        thurm.action{ name = "test.keep", run = function() return "old" end }
+        local ok = pcall(thurm.call, "fail")
+        -- The fake host refuses this registration.
+        pcall(thurm.action, { name = "test.keep", title = "refuse", run = function() return "new" end })
+        "#,
+        false,
+    ));
+    assert_eq!(
+        done.recv_timeout(Duration::from_secs(20)).unwrap(),
+        Ok(Value::Null)
+    );
+    f.rt.notice(
+        30,
+        notice::ACTION_INVOKE,
+        json!({ "id": 7, "name": "test.keep", "ctx": {} }),
+    );
+    assert_eq!(
+        next(&f, "actions.result"),
+        json!({ "id": 7, "result": "old" })
+    );
 }

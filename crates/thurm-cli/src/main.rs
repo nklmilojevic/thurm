@@ -425,6 +425,10 @@ enum Cmd {
     /// Run a Lua script in the daemon, with the `thurm` API of plugins (`-` reads it from
     /// stdin). What it logs is printed, then what it returns.
     Do {
+        /// With --remote: also send the .lua files beside FILE (a few levels deep) for
+        /// `require`. Only what you are fine sending to that host.
+        #[arg(long)]
+        with_modules: bool,
         file: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -1006,7 +1010,11 @@ fn run(cli: Cli) -> R {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Do { file, args } => ext::script(remote.as_deref(), &file, args, json),
+        Cmd::Do {
+            file,
+            args,
+            with_modules,
+        } => ext::script(remote.as_deref(), &file, args, with_modules, json),
         Cmd::Daemon { action } => daemon_cmd(&action, json),
         Cmd::AgentHook { agent, event } => {
             agent_hook(agent, event);

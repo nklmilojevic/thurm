@@ -154,7 +154,8 @@ function thurm.close(pane) end
 function thurm.focus(pane) end
 
 --- Waits until the pane's command finishes (default), or `match` (a regex) shows, it is `idle`
---- for some seconds, its process `exit`s, or its `agent` is free. False and why on timeout or exit.
+--- for some seconds, its process `exit`s, or its `agent` is free. True when it came (with the
+--- exit code, waiting for the exit); false and why ("timeout", "exited") otherwise.
 ---@param pane integer
 ---@param opts { match: string?, idle: number?, exit: boolean?, agent: boolean?, timeout: number? }?
 ---@return boolean ok, string? why, integer? exit_code
@@ -202,6 +203,10 @@ function thurm.every(seconds, fn) end
 function thurm.sleep(seconds) end
 
 thurm.json = {}
+
+--- JSON's null in what `thurm.json.decode` gives (`[1, null, 3]` keeps three items). The API's own
+--- results give nil instead.
+thurm.json.null = nil
 
 ---@param value any
 ---@return string

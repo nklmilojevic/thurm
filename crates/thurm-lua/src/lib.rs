@@ -512,9 +512,11 @@ impl Engine {
             "json_decode",
             lua.create_function(|lua, s: String| {
                 let v: Value = serde_json::from_str(&s).map_err(mlua::Error::external)?;
-                to_lua(lua, &v)
+                // JSON's null stays a value (thurm.json.null): `[1, null, 3]` keeps 3 items.
+                lua.to_value_with(&v, mlua::serde::SerializeOptions::new())
             })?,
         )?;
+        p.set("json_null", lua.null())?;
 
         let host = self.host.clone();
         let sink = spec.log.clone();
