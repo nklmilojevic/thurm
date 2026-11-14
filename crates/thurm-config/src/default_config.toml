@@ -361,6 +361,9 @@ animation_duration = 0.2
 # exec = ["~/bin/dev-layout", "--branch", "main"]
 # key = "cmd+shift+l"          # optional, written like a [keybindings] chord
 
+# For actions with arguments, pickers, panes and state between events, use init.lua beside
+# this file, or a plugin in plugins/ (`thurm plugin new NAME`).
+
 # Commands the daemon runs when something happens in a pane, with the event as JSON on stdin
 # (`{"event": …, "pane": {…}}`, the pane as `thurm info --json` shows it) and THURM_EVENT,
 # THURM_PANE_ID and THURM_SOCKET set. Events: agent_working, agent_waiting, agent_blocked,
