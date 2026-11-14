@@ -462,7 +462,7 @@ final class SessionManager: NSObject, CoreDelegate {
         restoreFailures = 0
         panes = panes.filter { $0.key.isRemote }
         for info in infos { panes[info.key] = info }
-        let alive = Set(infos.filter { $0.alive }.map { $0.key })
+        let listed = Set(infos.map(\.key))
         // Remote tabs come back as they were and attach once their host connects (tabs of a
         // host no longer configured go).
         let remotes = Set(config.remoteNames)
@@ -473,7 +473,7 @@ final class SessionManager: NSObject, CoreDelegate {
         var placed = Set(liveControllers.flatMap { $0.content.paneIds })
         var layout = saved
         layout.retainPanes { key in
-            !placed.contains(key) && (key.isRemote ? remotes.contains(key.host) : alive.contains(key))
+            !placed.contains(key) && (key.isRemote ? remotes.contains(key.host) : listed.contains(key))
         }
         workspaces = layout.workspaces.map { Workspace(layout: $0) }
         if let quick = layout.quick {
@@ -499,7 +499,7 @@ final class SessionManager: NSObject, CoreDelegate {
         }
 
         // Panes that exist but are not in the layout: tabs of a workspace in the background.
-        let orphans = infos.filter { $0.alive && !used.contains($0.key) }.map { $0.key }
+        let orphans = infos.filter { !used.contains($0.key) }.map { $0.key }
             .sorted { $0.id < $1.id }
         if !orphans.isEmpty {
             makeWorkspace().hiddenTabs = orphans.map { TabLayout(title: nil, root: .pane($0), focused: $0.id, zoomed: nil) }
@@ -1318,7 +1318,13 @@ final class SessionManager: NSObject, CoreDelegate {
         switch name {
         case "PaneInfo", "PaneActivity":
             if let info = PaneInfo(json: payload, host: host) { paneInfoUpdated(info) }
-        case "PaneExited", "PaneClosed":
+        case "PaneExited":
+            if let id = key {
+                Notifications.shared.withdraw(pane: id)
+                panes[id]?.alive = false
+                updateDockBadge()
+            }
+        case "PaneClosed":
             if let id = key {
                 Notifications.shared.withdraw(pane: id)
                 panes.removeValue(forKey: id)

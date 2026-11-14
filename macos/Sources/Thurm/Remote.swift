@@ -420,32 +420,35 @@ extension SessionManager {
             return info.restored || (pid != 0 && info.pid == pid)
         }
         var stillPending: [UInt64: UInt32] = [:]
-        for info in fetched where info.alive && isClosed(info) {
+        for info in fetched where isClosed(info) {
             let answer = JSON.variant(Core.shared.request(object: ["ClosePane": ["pane": NSNumber(value: info.id)]],
                                                           host: host))
             if answer?.name != "Ok" { stillPending[info.id] = info.pid ?? pending[info.id] ?? 0 }
         }
         Remotes.shared.pendingCloses[host] = stillPending.isEmpty ? nil : stillPending
         let infos = fetched.filter { !isClosed($0) }
-        let alive = Set(infos.filter { $0.alive }.map { $0.key })
-        for key in panes.keys where key.host == host && !alive.contains(key) {
+        let listed = Set(infos.map(\.key))
+        for key in panes.keys where key.host == host && !listed.contains(key) {
             panes.removeValue(forKey: key)
         }
         // Tabs of panes the host no longer has close, with a notice.
         var gone = 0
         for c in liveControllers {
-            for id in c.content.paneIds where id.host == host && !alive.contains(id) {
+            for id in c.content.paneIds where id.host == host && !listed.contains(id) {
                 removePaneFromUI(id)
                 gone += 1
             }
         }
         for ws in workspaces where !isShown(ws) {
             let before = ws.hiddenTabs.flatMap { $0.panes }.count
-            ws.hiddenTabs = retainTabs(ws.hiddenTabs) { $0.host != host || alive.contains($0) }
+            ws.hiddenTabs = retainTabs(ws.hiddenTabs) { $0.host != host || listed.contains($0) }
             gone += before - ws.hiddenTabs.flatMap { $0.panes }.count
             ws.hiddenSelectedTab = min(ws.hiddenSelectedTab, max(0, ws.hiddenTabs.count - 1))
         }
-        for info in infos where info.alive { paneInfoUpdated(info) }
+        for info in infos {
+            if panes[info.key] == nil { panes[info.key] = info }
+            paneInfoUpdated(info)
+        }
         for view in views(of: host) {
             view.setOffline(nil)
             view.resubscribe()
@@ -453,7 +456,7 @@ extension SessionManager {
         // Panes the layout doesn't know about: new tabs in the host's workspace.
         var known = Set(liveControllers.flatMap { $0.content.paneIds })
         known.formUnion(workspaces.flatMap { $0.hiddenTabs.flatMap { $0.panes } })
-        let unknown = infos.filter { $0.alive && !known.contains($0.key) }.map(\.key).sorted { $0.id < $1.id }
+        let unknown = infos.filter { !known.contains($0.key) }.map(\.key).sorted { $0.id < $1.id }
         if !unknown.isEmpty { adoptRemotePanes(unknown, host: host) }
 
         if let resp = JSON.variant(Core.shared.request("\"ListAgentPresets\"", host: host)),
