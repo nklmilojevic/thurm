@@ -190,6 +190,10 @@ pub struct RunAction {
     /// For no pane at all: without `pane`, the daemon otherwise takes the focused one (an app
     /// whose focus is on another host's pane says this).
     pub no_pane: bool,
+    /// The [`Invoke::id`] of the action the caller is carrying out, when it runs this one from
+    /// it: the depth is that one's. Without it, a provider is taken to be as deep as the
+    /// deepest action it has been asked to carry out.
+    pub invocation: Option<u64>,
 }
 
 /// What an action's provider gets with [`notice::ACTION_INVOKE`].

@@ -347,7 +347,7 @@ impl Daemon {
         // How deep this runs: what the caller says, or more if the caller is itself carrying
         // out actions it was asked to (a provider need not pass its depth on for the limit to
         // hold).
-        let depth = run.depth.max(self.ext_depth_of(caller));
+        let depth = run.depth.max(self.ext_depth_of(caller, run.invocation));
         if depth >= MAX_DEPTH {
             return Err(format!(
                 "actions ran one another {MAX_DEPTH} deep: stopped at {:?}",
@@ -449,11 +449,17 @@ impl Daemon {
         }
     }
 
-    /// The deepest action `client` is carrying out now: 0 when none.
-    fn ext_depth_of(&self, client: &Client) -> u32 {
-        self.ext
-            .pending
-            .lock()
+    /// How deep an action `client` is carrying out: invocation `from`'s, when it names one it
+    /// was asked to carry out, else the deepest one; 0 when none.
+    fn ext_depth_of(&self, client: &Client, from: Option<u64>) -> u32 {
+        let pending = self.ext.pending.lock();
+        if let Some(p) = from
+            .and_then(|id| pending.get(&id))
+            .filter(|p| p.to == client.id)
+        {
+            return p.depth;
+        }
+        pending
             .values()
             .filter(|p| p.to == client.id)
             .map(|p| p.depth)

@@ -497,3 +497,54 @@ fn actions_running_one_another_stop_without_a_depth() {
     let e = call(&user, method::ACTIONS_RUN, json!({ "name": "loop.again" })).unwrap_err();
     assert!(e.contains("deep"), "{e}");
 }
+
+/// A provider that says which action it runs another from is as deep as that one, not as the
+/// deepest it carries out: an unrelated chain in progress does not count against it.
+#[test]
+fn an_invocation_named_sets_the_depth() {
+    let env = Env::new("ext-invocation-depth");
+    let _d = env.start();
+    let (provider, provider_rx) = ext_client(&env, "provider");
+    let (user, _rx) = ext_client(&env, "user");
+    call(
+        &provider,
+        method::ACTIONS_REGISTER,
+        json!({ "actions": [{ "name": "deep.hold" }, { "name": "deep.leaf" }] }),
+    )
+    .unwrap();
+    // One invocation is held open while an action is run from it, naming it.
+    let hold = std::thread::spawn({
+        let user = user.clone();
+        move || call(&user, method::ACTIONS_RUN, json!({ "name": "deep.hold" }))
+    });
+    let held = next(&provider_rx, notice::ACTION_INVOKE);
+    assert_eq!(held["ctx"]["depth"], 1);
+    // An action run from it, naming it: depth 2.
+    let leaf = std::thread::spawn({
+        let provider = provider.clone();
+        let id = held["id"].clone();
+        move || {
+            call(
+                &provider,
+                method::ACTIONS_RUN,
+                json!({ "name": "deep.leaf", "invocation": id }),
+            )
+        }
+    });
+    let invoke = next(&provider_rx, notice::ACTION_INVOKE);
+    assert_eq!(invoke["ctx"]["depth"], 2);
+    call(
+        &provider,
+        method::ACTIONS_RESULT,
+        json!({ "id": invoke["id"], "result": 1 }),
+    )
+    .unwrap();
+    assert_eq!(leaf.join().unwrap().unwrap(), json!(1));
+    call(
+        &provider,
+        method::ACTIONS_RESULT,
+        json!({ "id": held["id"], "result": 0 }),
+    )
+    .unwrap();
+    assert_eq!(hold.join().unwrap().unwrap(), json!(0));
+}
