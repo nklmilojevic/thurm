@@ -64,7 +64,7 @@ pub struct AgentTracker {
     screen_seen: Option<AgentStatus>,
     stop_signal: Option<AgentStatus>,
     /// The foreground process group the current status start belongs to: another process of
-    /// the same kind is another run, with its own start.
+    /// the same kind is another run, with its own start. None for a program's report.
     status_instance: Option<u32>,
     /// A session-start hook came since the state was last set: a new session starts anew.
     session_started: bool,
@@ -537,7 +537,13 @@ impl AgentTracker {
             // a hook mid-turn is the same run.
             let differs =
                 |a: Option<&str>, b: Option<&str>| matches!((a, b), (Some(a), Some(b)) if a != b);
-            let instance = self.fg_pgrp;
+            // A program known only from its report stays the same whatever runs in the
+            // foreground (its result outlives it, under the shell).
+            let instance = if self.from_program {
+                None
+            } else {
+                self.fg_pgrp
+            };
             let same_run = |c: &AgentState| {
                 c.kind == state.kind
                     && c.status == state.status
