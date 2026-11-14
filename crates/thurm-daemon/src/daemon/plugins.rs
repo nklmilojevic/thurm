@@ -230,11 +230,6 @@ impl Daemon {
     ) -> Result<Value, String> {
         let lua = self.lua()?;
         let (instance, _) = self.plugin_client("script", Some(client.id));
-        // Its owner may have left before the instance was there to be stopped with it.
-        if !self.clients.lock().contains_key(&client.id) {
-            self.stop_instance(instance);
-            return Err("the client running the script went away".into());
-        }
         let to = client.clone();
         let log: thurm_lua::LogSink = Arc::new(move |level: &str, message: &str| {
             send_ext(
@@ -261,6 +256,13 @@ impl Daemon {
             log: Some(log),
             script: true,
         });
+        // Its owner may have left before the instance was there to be stopped with it. Checked
+        // once the load is queued: an owner leaving after this stops it with an unload, which
+        // the runtime takes after the load.
+        if !self.clients.lock().contains_key(&client.id) {
+            self.stop_instance(instance);
+            return Err("the client running the script went away".into());
+        }
         let result = done
             .recv()
             .unwrap_or_else(|_| Err("the Lua runtime stopped".into()));
