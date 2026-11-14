@@ -4,6 +4,9 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use thurm_proto::ext::ExecResult;
 
 use crate::{pty, shell};
 
@@ -62,6 +65,94 @@ pub fn start(launch: Launch, on_failure: impl FnOnce(String) + Send + 'static) -
             }
         })?;
     Ok(())
+}
+
+/// The most of each of stdout and stderr that [`run`] keeps.
+const CAPTURE_MAX: usize = 16 << 20;
+
+/// How long a command stopped with SIGTERM has before SIGKILL.
+const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Runs `launch` to its end and returns what it printed. Past `timeout` its process group gets
+/// SIGTERM, then SIGKILL after [`KILL_GRACE`].
+pub fn run(launch: Launch, timeout: Option<Duration>) -> io::Result<ExecResult> {
+    let mut cmd = command(&launch);
+    cmd.stdin(if launch.stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = pty::spawn_locked(&mut cmd)?;
+    let writer = child
+        .stdin
+        .take()
+        .zip(launch.stdin)
+        .map(|(mut pipe, data)| {
+            std::thread::spawn(move || {
+                let _ = pipe.write_all(&data);
+            })
+        });
+    let reader = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(r) = r {
+                let _ = r.take(CAPTURE_MAX as u64).read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = reader(
+        child
+            .stdout
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let stderr = reader(
+        child
+            .stderr
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let pgid = child.id() as libc::pid_t;
+    let started = Instant::now();
+    let mut timed_out = false;
+    let mut killed_at: Option<Instant> = None;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let now = Instant::now();
+        if let Some(t) = timeout
+            && !timed_out
+            && now.duration_since(started) >= t
+        {
+            timed_out = true;
+            killed_at = Some(now);
+            unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        }
+        if killed_at.is_some_and(|at| now.duration_since(at) >= KILL_GRACE) {
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            killed_at = None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    let text = |h: std::thread::JoinHandle<Vec<u8>>| {
+        String::from_utf8_lossy(&h.join().unwrap_or_default()).into_owned()
+    };
+    use std::os::unix::process::ExitStatusExt;
+    Ok(ExecResult {
+        ok: status.success(),
+        code: status.code(),
+        signal: status.signal(),
+        stdout: text(stdout),
+        stderr: text(stderr),
+        timed_out,
+    })
 }
 
 /// The last [`STDERR_TAIL`] bytes `r` gives before its end: a command can log for as long as
@@ -128,7 +219,6 @@ fn command(launch: &Launch) -> Command {
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     fn run(argv: &[&str], env: Vec<(String, String)>, stdin: Option<&str>) -> Option<String> {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
@@ -198,5 +288,40 @@ mod tests {
             "{\"event\":1}|agent_finished|it's $HOME"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn launch<'a>(argv: &'a [String], stdin: Option<&str>) -> Launch<'a> {
+        Launch {
+            argv,
+            cwd: None,
+            env: vec![("THURM_X".into(), "x".into())],
+            stdin: stdin.map(|s| s.as_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn run_returns_the_output_and_status() {
+        let argv: Vec<String> = ["sh", "-c", "cat; echo \"$THURM_X\"; echo err >&2; exit 4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let r = super::run(launch(&argv, Some("in\n")), None).unwrap();
+        assert_eq!(r.stdout, "in\nx\n");
+        assert_eq!(r.stderr, "err\n");
+        assert_eq!((r.ok, r.code, r.timed_out), (false, Some(4), false));
+    }
+
+    #[test]
+    fn run_stops_a_command_at_its_timeout() {
+        let argv: Vec<String> = ["sh", "-c", "echo started; sleep 30"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let at = Instant::now();
+        let r = super::run(launch(&argv, None), Some(Duration::from_millis(300))).unwrap();
+        assert!(r.timed_out);
+        assert!(!r.ok);
+        assert_eq!(r.stdout, "started\n");
+        assert!(at.elapsed() < Duration::from_secs(10));
     }
 }

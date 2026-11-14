@@ -36,6 +36,9 @@ mod user_commands;
 #[path = "e2e/ui_layout.rs"]
 mod ui_layout;
 
+#[path = "e2e/extensions.rs"]
+mod extensions;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;

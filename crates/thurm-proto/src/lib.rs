@@ -8,6 +8,7 @@
 
 pub mod bytes;
 pub mod codec;
+pub mod ext;
 pub mod layout;
 pub mod tailnet;
 pub mod template;
@@ -78,10 +79,19 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_FLOATING_PLACE,
     CAP_PANE_OWNER,
     CAP_PATH_SEARCH,
+    CAP_EXT,
 ];
 
 /// The daemon accepts `SearchPaths` and returns `PathMatches` only for that request.
 pub const CAP_PATH_SEARCH: &str = "path-search";
+
+/// The daemon answers [`Request::Ext`], the extension API (see [`ext`]): actions, plugins,
+/// scripts. A client that says it decodes [`Event::Ext`].
+pub const CAP_EXT: &str = "ext";
+
+/// Sent only by an app that shows what plugins ask for ([`ext::UiRequest`]: a toast, a picker,
+/// a text field, a confirmation) and answers with [`ext::method::UI_REPLY`].
+pub const CAP_EXT_UI: &str = "ext-ui";
 
 /// The pane takes the size of the client that used it last (see the daemon's `active_size`)
 /// instead of the last `Resize`.
@@ -481,6 +491,12 @@ pub enum Request {
         pane: PaneId,
         query: String,
     },
+    /// A method of the extension API ([`ext::method`]) with its parameters as JSON (empty for
+    /// none). Answers [`Response::Text`] with the result as JSON. Requires [`CAP_EXT`].
+    Ext {
+        method: String,
+        params: String,
+    },
 }
 
 /// How [`Request::OwnPanes`] treats a pane another client holds.
@@ -726,6 +742,12 @@ pub enum Event {
     },
     /// Pane state and its activity time, for clients with `CAP_AGENT_ACTIVITY`.
     PaneActivity(PaneActivity),
+    /// Something the extension API has to say ([`ext::notice`]), with its payload as JSON. Sent
+    /// only to clients with [`CAP_EXT`].
+    Ext {
+        name: String,
+        payload: String,
+    },
 }
 
 /// An extended pane snapshot. The original `PaneInfo` binary format stays unchanged.
