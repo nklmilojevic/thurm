@@ -96,9 +96,22 @@ pub fn run(launch: Launch, timeout: Option<Duration>) -> io::Result<ExecResult> 
         });
     let reader = |r: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
+            // Read to the end, keeping the first CAPTURE_MAX bytes: a pipe closed early would
+            // stop the program, or leave it blocked on a full pipe.
             let mut out = Vec::new();
-            if let Some(r) = r {
-                let _ = r.take(CAPTURE_MAX as u64).read_to_end(&mut out);
+            if let Some(mut r) = r {
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    match r.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let room = CAPTURE_MAX.saturating_sub(out.len());
+                            out.extend_from_slice(&buf[..n.min(room)]);
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
             }
             out
         })
@@ -309,6 +322,24 @@ mod tests {
         assert_eq!(r.stdout, "in\nx\n");
         assert_eq!(r.stderr, "err\n");
         assert_eq!((r.ok, r.code, r.timed_out), (false, Some(4), false));
+    }
+
+    #[test]
+    fn run_reads_past_the_capture_limit_to_the_end() {
+        let script = format!(
+            "head -c {} /dev/zero; echo done >&2; exit 7",
+            CAPTURE_MAX + 1_000_000
+        );
+        let argv: Vec<String> = ["sh", "-c", &script]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let r = super::run(launch(&argv, None), Some(Duration::from_secs(60))).unwrap();
+        assert_eq!(r.stdout.len(), CAPTURE_MAX);
+        assert_eq!(
+            (r.code, r.timed_out, r.stderr.as_str()),
+            (Some(7), false, "done\n")
+        );
     }
 
     #[test]

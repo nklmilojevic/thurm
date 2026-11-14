@@ -21,7 +21,10 @@ pub struct Entry {
 
 #[derive(Default)]
 pub struct Registry {
+    /// Clients' actions. One of the config's of the same name hides it while it exists.
     actions: BTreeMap<String, Entry>,
+    /// The config's `[[commands]]`.
+    config: BTreeMap<String, Entry>,
     /// In the order they were bound: of two bindings of one key, the later one counts.
     bindings: Vec<(Binding, Provider)>,
     /// Per client, the events it hears (`*` for all).
@@ -31,11 +34,12 @@ pub struct Registry {
 impl Registry {
     /// Replaces the config's actions and keys with `commands`' (name, key).
     pub fn set_config(&mut self, commands: &[thurm_config::CommandConfig]) {
-        self.actions.retain(|_, e| e.provider != Provider::Config);
+        self.config.clear();
         self.bindings.retain(|(_, p)| *p != Provider::Config);
         for c in commands {
-            // A client's action of the same name gives way: the file is the user's own word.
-            self.actions.insert(
+            // A client's action of the same name gives way while this one exists: the file is
+            // the user's own word.
+            self.config.insert(
                 c.name.clone(),
                 Entry {
                     info: ActionInfo {
@@ -81,7 +85,7 @@ impl Registry {
             if !seen.insert(a.name.as_str()) {
                 return Err(format!("{:?} is registered twice", a.name));
             }
-            if let Some(e) = self.actions.get(&a.name)
+            if let Some(e) = self.get(&a.name)
                 && e.provider != Provider::Client(client)
             {
                 return Err(format!(
@@ -134,8 +138,9 @@ impl Registry {
 
     pub fn unbind(&mut self, client: u64, key: &str) -> bool {
         let before = self.bindings.len();
+        let key = normalize_key(key);
         self.bindings
-            .retain(|(b, p)| !(*p == Provider::Client(client) && b.key == key.trim()));
+            .retain(|(b, p)| !(*p == Provider::Client(client) && normalize_key(&b.key) == key));
         self.bindings.len() != before
     }
 
@@ -151,11 +156,13 @@ impl Registry {
     }
 
     pub fn get(&self, name: &str) -> Option<&Entry> {
-        self.actions.get(name)
+        self.config.get(name).or_else(|| self.actions.get(name))
     }
 
     pub fn actions(&self) -> Vec<ActionInfo> {
-        self.actions.values().map(|e| e.info.clone()).collect()
+        let mut all: BTreeMap<&String, &Entry> = self.actions.iter().collect();
+        all.extend(self.config.iter());
+        all.into_values().map(|e| e.info.clone()).collect()
     }
 
     /// The binding that counts for each key (the last one made), in key order.
@@ -308,6 +315,39 @@ mod tests {
         bind(&mut r, 3, "cmd+shift+d", "third");
         r.set_config(&[command("Deploy", "cmd+shift+d")]);
         assert_eq!(r.bindings()[0].action, "third");
+    }
+
+    #[test]
+    fn a_config_command_hides_a_clients_action_only_while_it_exists() {
+        let mut r = Registry::default();
+        r.register(1, "plugin:a", vec![action("Deploy")]).unwrap();
+        r.set_config(&[command("Deploy", "")]);
+        assert_eq!(r.get("Deploy").unwrap().provider, Provider::Config);
+        assert_eq!(r.actions().len(), 1);
+        r.set_config(&[]);
+        assert_eq!(r.get("Deploy").unwrap().provider, Provider::Client(1));
+    }
+
+    #[test]
+    fn a_key_is_one_key_however_it_is_spelled() {
+        let mut r = Registry::default();
+        let bind = |r: &mut Registry, key: &str, action: &str| {
+            r.bind(
+                1,
+                "p",
+                Binding {
+                    key: key.into(),
+                    action: action.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        bind(&mut r, "cmd+shift+l", "first");
+        bind(&mut r, "Shift+Cmd+L", "second");
+        assert_eq!(r.bindings.len(), 1);
+        assert!(r.unbind(1, "SHIFT+cmd+l"));
+        assert!(r.bindings().is_empty());
     }
 
     #[test]

@@ -1417,14 +1417,16 @@ impl Daemon {
                             }
                         }
                         let secs = started.map_or(0, |s| s.elapsed().as_secs());
-                        self.emit(
+                        // The command line goes to the user's own hooks only: it may hold a
+                        // secret typed as an argument.
+                        self.emit_with_private(
                             HookEvent::CommandFinished.name(),
                             Some(&st.info),
                             serde_json::json!({
                                 "exit_code": code,
                                 "duration_secs": secs,
-                                "command": st.command_line,
                             }),
+                            serde_json::json!({ "command": st.command_line }),
                         );
                         st.command_line = None;
                     }
@@ -2686,8 +2688,15 @@ impl Daemon {
                 if has(thurm_proto::CAP_EXT) {
                     client.ext.store(true, Ordering::Relaxed);
                 }
+                // Plugins' questions go only to a desktop app of this user on this machine:
+                // a tailnet caller or a phone saying so is not trusted with them.
                 if has(thurm_proto::CAP_EXT_UI) {
-                    client.ext_ui.store(true, Ordering::Relaxed);
+                    let local = client.principal.lock().as_ref().is_none_or(|p| {
+                        p.kind == thurm_proto::PrincipalKind::Peer
+                            && p.uid == Some(unsafe { libc::getuid() })
+                    });
+                    let desktop = ui && !client.mobile.load(Ordering::Relaxed);
+                    client.ext_ui.store(local && desktop, Ordering::Relaxed);
                 }
                 log::info!(
                     "client {} hello: {name} (protocol {version}{}{}{}{}{})",

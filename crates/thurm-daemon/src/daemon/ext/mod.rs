@@ -309,8 +309,9 @@ impl Daemon {
             .get(&run.name)
             .cloned()
             .ok_or_else(|| format!("no action named {:?}", run.name))?;
+        let pane = run.pane.or_else(|| self.focused_pane());
         match entry.provider {
-            Provider::Config => self.run_command(&run.name, run.pane).map(|_| Value::Null),
+            Provider::Config => self.run_command(&run.name, pane).map(|_| Value::Null),
             Provider::Client(id) => {
                 let client = self
                     .clients
@@ -324,7 +325,7 @@ impl Daemon {
                     name: run.name.clone(),
                     args: run.args,
                     ctx: ext::Context {
-                        pane: run.pane.or_else(|| self.focused_pane()),
+                        pane,
                         origin: origin.to_owned(),
                         depth: run.depth + 1,
                     },
@@ -398,6 +399,18 @@ impl Daemon {
     /// An event of the daemon's own: the `[[on]]` hooks for it run, and the clients that
     /// subscribed hear it. `extra` is merged into the payload, beside `event` and `pane`.
     pub(super) fn emit(&self, event: &str, pane: Option<&PaneInfo>, extra: Value) {
+        self.emit_with_private(event, pane, extra, Value::Null);
+    }
+
+    /// [`Daemon::emit`], with `private` added for the `[[on]]` hooks only: the user's own
+    /// commands may see what other clients must not (a command line may hold a secret).
+    pub(super) fn emit_with_private(
+        &self,
+        event: &str,
+        pane: Option<&PaneInfo>,
+        extra: Value,
+        private: Value,
+    ) {
         let hooks = thurm_config::HookEvent::parse(event).is_some_and(|e| {
             let secs = extra
                 .get("duration_secs")
@@ -420,7 +433,11 @@ impl Daemon {
             p.extend(extra);
         }
         if hooks && let (Some(e), Some(info)) = (thurm_config::HookEvent::parse(event), pane) {
-            self.run_hooks(e, info, &payload);
+            let mut hook_payload = payload.clone();
+            if let (Some(p), Value::Object(private)) = (hook_payload.as_object_mut(), private) {
+                p.extend(private);
+            }
+            self.run_hooks(e, info, &hook_payload);
         }
         self.send_event(&listeners, &payload);
     }
@@ -435,11 +452,16 @@ impl Daemon {
         if listeners.is_empty() {
             return;
         }
-        let clients = self.clients.lock();
-        for id in listeners {
-            if let Some(c) = clients.get(id) {
-                send_ext(c, notice::EVENT, payload);
-            }
+        // Not under the clients lock: sending can take a while.
+        let targets: Vec<Arc<Client>> = {
+            let clients = self.clients.lock();
+            listeners
+                .iter()
+                .filter_map(|id| clients.get(id).cloned())
+                .collect()
+        };
+        for c in targets {
+            send_ext(&c, notice::EVENT, payload);
         }
     }
 
@@ -523,8 +545,9 @@ impl Daemon {
         };
         let shown = match self.layout_ui(cmd) {
             Ok(_) => true,
-            // An app from before `Open`: the plain commands.
-            Err(_) if self.has_ui_clients() => {
+            // An app from before `Open` shows a split or a tab with the plain commands; a
+            // floating pane it cannot show, and stays unshown rather than misplaced.
+            Err(e) if e == thurm_proto::UI_TOO_OLD && !open.float && self.has_ui_clients() => {
                 let plain = match split {
                     Some(dir) => UiCommand::Split { target, pane, dir },
                     None => UiCommand::NewTab {

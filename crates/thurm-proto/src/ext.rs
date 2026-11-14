@@ -97,7 +97,9 @@ pub mod notice {
 }
 
 /// Events of the daemon's own that [`method::EVENTS_SUBSCRIBE`] takes. Each payload has
-/// `event` (the name) and, when it is about a pane, `pane` (its [`crate::PaneInfo`]).
+/// `event` (the name). The agent events, `command_finished`, `pane_exited`, `pane_created`,
+/// `pane_changed` and `pane_focused` have the pane's [`crate::PaneInfo`] in `pane`;
+/// `pane_closed`, `bell` and `notification` have only its id, in `id`.
 pub const EVENTS: &[&str] = &[
     "agent_working",
     "agent_waiting",
@@ -197,7 +199,7 @@ pub struct Invoke {
 #[serde(default)]
 pub struct Context {
     pub pane: Option<crate::PaneId>,
-    /// Who asked: `client` (an app or the CLI), `plugin:<name>`.
+    /// Who asked: a socket client's name (`Thurm.app`, `thurm-cli`), or `plugin:<name>`.
     pub origin: String,
     /// How many actions deep this one runs (an action may run others).
     pub depth: u32,
