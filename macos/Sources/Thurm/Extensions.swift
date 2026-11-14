@@ -26,8 +26,14 @@ final class Extensions {
     private(set) var available = false
     private(set) var actions: [Action] = []
     private(set) var bindings: [Binding] = []
-    /// The names of the app's own actions: menu items with a `[keybindings]` name.
+    /// The names of the app's own actions: menu items with a `[keybindings]` name, which the
+    /// daemon lists as the app's (a name the config or a plugin has is theirs).
     private(set) var appActions: Set<String> = []
+    /// Every name the app could offer: those not offered because they were taken are offered
+    /// once they are free again.
+    private var menuActions: Set<String> = []
+    /// An offer of the app's actions is under way (or being retried).
+    private var registering = false
     /// The question a plugin asked that shows now: how to answer it (nothing, when it is
     /// taken down for another) and how to take it down; `pick` for the palette, which goes
     /// with the app's focus.
@@ -67,6 +73,7 @@ final class Extensions {
     /// After (re)connecting to this Mac's daemon: offer it the app's actions, read its own.
     func connected() {
         invalidateQuestions()
+        registering = false
         registerAppActions()
         refresh()
     }
@@ -128,9 +135,19 @@ final class Extensions {
                 let args = b["args"].flatMap { $0 is NSNull ? nil : JSON.encode($0) }
                 return Binding(key: key, action: action, args: args)
             }
+            // The app's actions are those the daemon lists as the app's: a config reload or a
+            // plugin can take a name over, and where a key goes follows.
+            let owned = Set(actions.filter { $0.source == "Thurm.app" }.map(\.name))
             let changed = !self.available || actions != self.actions || bindings != self.bindings
-            self.load(actions: actions, bindings: bindings)
+                || owned != self.appActions
+            self.load(actions: actions, bindings: bindings, appActions: owned)
             if changed { SessionManager.shared.applyKeys() }
+            // Names of the app's that were taken and are free again (a plugin that had one
+            // left): offer them now.
+            let listed = Set(actions.map(\.name))
+            if !self.registering, !self.menuActions.subtracting(listed).isEmpty {
+                self.registerAppActions()
+            }
         }
     }
 
@@ -164,10 +181,12 @@ final class Extensions {
                 if let sub = top.submenu { walk(sub, top: top.title.isEmpty ? "Thurm" : top.title) }
             }
         }
+        menuActions = seen
         guard !list.isEmpty else {
             appActions = []
             return
         }
+        registering = true
         // A name the config or a plugin uses already stays theirs: the others are offered
         // (the daemon refuses a whole list with a taken name in it).
         let asked = connection
@@ -181,6 +200,7 @@ final class Extensions {
                         self.registerAppActions(attempt: attempt + 1)
                     }
                 } else {
+                    self.registering = false
                     tlog("could not offer the app's actions: \(error ?? "no list")")
                 }
                 return
@@ -204,13 +224,17 @@ final class Extensions {
                     // Which names are the app's decides where a key goes: build the menus again.
                     if self.available { SessionManager.shared.applyKeys() }
                 }
-                guard let error else { return }
+                guard let error else {
+                    self.registering = false
+                    return
+                }
                 if attempt < 5 {
                     DispatchQueue.main.asyncAfter(deadline: .now() + Double(attempt + 1)) {
                         guard self.connection == asked else { return }
                         self.registerAppActions(attempt: attempt + 1)
                     }
                 } else {
+                    self.registering = false
                     tlog("could not offer the app's actions: \(error)")
                 }
             }
