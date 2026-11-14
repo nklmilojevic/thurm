@@ -194,14 +194,25 @@ final class Extensions {
                 tlog("app action \(name) not offered: the name is taken")
             }
             let offered = seen.subtracting(taken)
-            if offered != self.appActions {
-                self.appActions = offered
-                // Which names are the app's decides where a key goes: build the menus again.
-                if self.available { SessionManager.shared.applyKeys() }
-            }
             self.call("actions.register", ["actions": free]) { _, error in
-                guard self.connection == asked, let error else { return }
-                tlog("could not offer the app's actions: \(error)")
+                guard self.connection == asked else { return }
+                // The app's names are those the daemon took: until then (or if it refused
+                // them) a key bound to one is not routed to the app.
+                let now: Set<String> = error == nil ? offered : []
+                if now != self.appActions {
+                    self.appActions = now
+                    // Which names are the app's decides where a key goes: build the menus again.
+                    if self.available { SessionManager.shared.applyKeys() }
+                }
+                guard let error else { return }
+                if attempt < 5 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Double(attempt + 1)) {
+                        guard self.connection == asked else { return }
+                        self.registerAppActions(attempt: attempt + 1)
+                    }
+                } else {
+                    tlog("could not offer the app's actions: \(error)")
+                }
             }
         }
     }
