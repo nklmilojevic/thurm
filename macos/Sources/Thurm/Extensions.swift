@@ -87,7 +87,10 @@ final class Extensions {
 
     /// Reads the actions and key bindings again, and applies them to the menus.
     func refresh() {
+        let asked = connection
         call("actions.list") { value, error in
+            // An answer from an earlier connection says nothing of the daemon there is now.
+            guard self.connection == asked else { return }
             guard error == nil, let list = value as? [String: Any] else {
                 // A daemon without the API: the Commands menu comes from the file. Any other
                 // failure (a timeout, a reconnect) keeps what the menus have, and tries again.
@@ -132,7 +135,7 @@ final class Extensions {
 
     /// Offers the main menu's named items to the daemon, so plugins, scripts and `thurm action
     /// run` can use them (`split_down`, `new_tab`...).
-    private func registerAppActions() {
+    private func registerAppActions(attempt: Int = 0) {
         var seen = Set<String>()
         var list: [[String: Any]] = []
         func walk(_ menu: NSMenu, top: String) {
@@ -158,7 +161,21 @@ final class Extensions {
         }
         // A name the config or a plugin uses already stays theirs: the others are offered
         // (the daemon refuses a whole list with a taken name in it).
-        call("actions.list") { value, _ in
+        let asked = connection
+        call("actions.list") { value, error in
+            guard self.connection == asked else { return }
+            // Without the list, which names are free is unknown: try again a little later.
+            guard error == nil, value is [String: Any] else {
+                if attempt < 5 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Double(attempt + 1)) {
+                        guard self.connection == asked else { return }
+                        self.registerAppActions(attempt: attempt + 1)
+                    }
+                } else {
+                    tlog("could not offer the app's actions: \(error ?? "no list")")
+                }
+                return
+            }
             let taken = Set(((value as? [String: Any])?["actions"] as? [[String: Any]] ?? [])
                 .compactMap { a -> String? in
                     jsonString(a["source"]) == "Thurm.app" ? nil : jsonString(a["name"])
@@ -169,7 +186,8 @@ final class Extensions {
             }
             self.appActions = seen.subtracting(taken)
             self.call("actions.register", ["actions": free]) { _, error in
-                if let error { tlog("could not offer the app's actions: \(error)") }
+                guard self.connection == asked, let error else { return }
+                tlog("could not offer the app's actions: \(error)")
             }
         }
     }
