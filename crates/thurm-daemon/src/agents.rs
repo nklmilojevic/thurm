@@ -459,6 +459,7 @@ impl AgentTracker {
         let h = self.hook.as_ref()?;
         Some(AgentState {
             updated_at_ms: None,
+            status_since_ms: None,
             name: h.name.clone(),
             kind: h.kind.clone(),
             status: h.status,
@@ -520,12 +521,20 @@ impl AgentTracker {
     fn set(&mut self, plain: Option<AgentState>) -> Option<Option<AgentState>> {
         let mut next = plain.clone().map(|s| self.with_program(s));
         if let Some(state) = &mut next {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|d| u64::try_from(d.as_millis()).ok());
+            // A Live Activity counts from when the status began, which a new message or topic
+            // does not change; a permission prompt coming or going does.
+            let phase = |s: &AgentState| (s.kind.clone(), s.status, s.permission.is_some());
+            state.status_since_ms = match &self.current {
+                Some(current) if phase(current) == phase(state) => current.status_since_ms,
+                _ => now_ms,
+            };
             state.updated_at_ms = self.current.as_ref().and_then(|s| s.updated_at_ms);
             if self.current.as_ref() != Some(state) {
-                state.updated_at_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()
-                    .and_then(|d| u64::try_from(d.as_millis()).ok());
+                state.updated_at_ms = now_ms;
             }
         }
         self.plain = plain;
@@ -630,6 +639,7 @@ impl AgentTracker {
             self.with_ai(self.with_hook(
                 AgentState {
                     updated_at_ms: None,
+                    status_since_ms: None,
                     name: d.name.clone(),
                     kind: d.kind.clone(),
                     status,
@@ -798,6 +808,60 @@ mod tests {
         assert!(tracker.refresh().is_none());
         tracker.set(None);
         assert!(tracker.state().is_none());
+    }
+
+    #[test]
+    fn status_start_survives_messages_and_topics() {
+        let mut tracker = AgentTracker::default();
+        tracker.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "prompt-submit",
+            None,
+            None,
+        );
+        tracker.saw_foreground(Some(1));
+        tracker.refresh();
+        let started = tracker.state().unwrap();
+        assert!(started.status_since_ms.is_some());
+        assert_eq!(started.status_since_ms, started.updated_at_ms);
+
+        // Marked, to tell a kept start from a new one.
+        tracker.current.as_mut().unwrap().status_since_ms = Some(1);
+        tracker.set_ai_topic(Some("Check tests".into()));
+        assert!(tracker.refresh().is_some());
+        assert_eq!(tracker.state().unwrap().status_since_ms, Some(1));
+
+        tracker.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "notification",
+            None,
+            Some("Which option?".into()),
+        );
+        tracker.refresh();
+        let asking = tracker.state().unwrap();
+        assert_eq!(asking.status, AgentStatus::NeedsInput);
+        assert_eq!(asking.permission, None);
+        assert!(asking.status_since_ms.unwrap() > 1);
+
+        // A permission prompt starts anew within the same status.
+        tracker.current.as_mut().unwrap().status_since_ms = Some(1);
+        tracker.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "permission-prompt",
+            None,
+            Some("Claude needs your permission to use Bash".into()),
+        );
+        tracker.refresh();
+        let prompt = tracker.state().unwrap();
+        assert_eq!(prompt.status, AgentStatus::NeedsInput);
+        assert!(prompt.permission.is_some());
+        assert!(prompt.status_since_ms.unwrap() > 1);
     }
 
     #[test]
@@ -1546,6 +1610,7 @@ mod tests {
     fn generic_titles() {
         let a = AgentState {
             updated_at_ms: None,
+            status_since_ms: None,
             name: "Claude Code".into(),
             kind: "claude".into(),
             status: AgentStatus::Idle,
@@ -1632,27 +1697,64 @@ mod tests {
         let defs = thurm_config::builtin_agents();
         let mut tracker = AgentTracker::default();
         tracker.update(
-            &defs, Some(&proc("claude")), "> ",
-            Duration::from_secs(5), Duration::from_millis(1500),
+            &defs,
+            Some(&proc("claude")),
+            "> ",
+            Duration::from_secs(5),
+            Duration::from_millis(1500),
         );
-        tracker.apply_hook(Some(1), "claude", "Claude Code", "session-start", None, None);
+        tracker.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "session-start",
+            None,
+            None,
+        );
         tracker.refresh();
-        let token = tracker.prompt.reserve(tracker.state().unwrap().status)
+        let token = tracker
+            .prompt
+            .reserve(tracker.state().unwrap().status)
             .unwrap();
-        tracker.apply_hook(Some(1), "claude", "Claude Code", "prompt-submit", None, None);
+        tracker.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "prompt-submit",
+            None,
+            None,
+        );
         tracker.refresh();
         tracker.apply_hook(
-            Some(1), "claude", "Claude Code", "permission-prompt", None, None,
+            Some(1),
+            "claude",
+            "Claude Code",
+            "permission-prompt",
+            None,
+            None,
         );
         tracker.refresh();
         let prompt = tracker.permission_prompt().unwrap();
-        assert!(tracker.answer_permission(prompt.wrapping_add(1), true).is_none());
-        assert!(tracker.prompt.outcome(token, AgentStatus::NeedsInput).is_ok());
+        assert!(
+            tracker
+                .answer_permission(prompt.wrapping_add(1), true)
+                .is_none()
+        );
+        assert!(
+            tracker
+                .prompt
+                .outcome(token, AgentStatus::NeedsInput)
+                .is_ok()
+        );
         assert_eq!(tracker.answer_permission(prompt, true), Some(&b"\r"[..]));
         tracker.apply_hook(Some(1), "claude", "Claude Code", "stop", None, None);
         tracker.refresh();
-        assert!(tracker.prompt.outcome(token, tracker.state().unwrap().status)
-            .is_err());
+        assert!(
+            tracker
+                .prompt
+                .outcome(token, tracker.state().unwrap().status)
+                .is_err()
+        );
     }
 
     #[test]

@@ -926,6 +926,10 @@ pub struct AgentState {
     /// Unix milliseconds of the last state change. Sent through `PaneActivity` only.
     #[serde(skip)]
     pub updated_at_ms: Option<u64>,
+    /// Unix milliseconds of when the current status (and whether a permission prompt shows)
+    /// began: the daemon's own, for the Live Activities it posts. Never sent.
+    #[serde(skip)]
+    pub status_since_ms: Option<u64>,
     /// Display name, e.g. "Claude Code".
     pub name: String,
     /// Stable identifier, e.g. "claude".
@@ -1596,6 +1600,7 @@ mod tests {
         .unwrap();
         assert_eq!(state.updated_at_ms, None);
         state.updated_at_ms = Some(1_800_000_000_123);
+        state.status_since_ms = Some(1_800_000_000_000);
         // The original fields, followed by another field to detect shifted bytes.
         let old = (
             "Agent",
@@ -1613,6 +1618,7 @@ mod tests {
         assert_eq!(bytes, postcard::to_allocvec(&(old, 42u64)).unwrap());
         let (decoded, tail): (AgentState, u64) = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.updated_at_ms, None);
+        assert_eq!(decoded.status_since_ms, None);
         assert_eq!(decoded.status, state.status);
         assert_eq!(tail, 42);
 
