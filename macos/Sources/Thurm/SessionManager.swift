@@ -1087,12 +1087,12 @@ final class SessionManager: NSObject, CoreDelegate {
     /// Asks this Mac's daemon to run the `[[commands]]` entry `name`, for the focused pane when
     /// it is one of this Mac's (a remote pane's id means nothing to it). A failure to start shows
     /// in the pane; one later comes as a notification.
-    func runUserCommand(_ name: String) {
+    func runUserCommand(_ name: String, args: String? = nil) {
         let view = currentController?.content.focusedView
         var pane: Any = NSNull()
         if let focused = currentController?.focusedPane, focused.host == localHost { pane = focused.id }
         if Extensions.shared.available {
-            Extensions.shared.run(name, pane: pane as? UInt64) { error in
+            Extensions.shared.run(name, args: args, pane: pane as? UInt64) { error in
                 if let error { view?.showToast("\(name): \(error)", duration: 5) }
             }
             return

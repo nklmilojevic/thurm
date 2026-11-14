@@ -31,4 +31,22 @@ final class ExtensionsTests: XCTestCase {
         XCTAssertEqual(entries[1].category, "Git")
         XCTAssertTrue(entries[2].hidden)
     }
+
+    /// A second chord of an action, and a key with arguments, each get a hidden entry that
+    /// runs the action (with those arguments); the visible entry keeps the first plain key.
+    func testEveryKeyOfAnActionRunsIt() {
+        let ext = Extensions()
+        ext.load(actions: [
+            .init(name: "git.checkout", title: "Checkout", category: "Git", source: "plugin:git", hidden: false),
+        ], bindings: [
+            .init(key: "cmd+shift+o", action: "git.checkout"),
+            .init(key: "cmd+alt+o", action: "git.checkout"),
+            .init(key: "cmd+alt+m", action: "git.checkout", args: "{\"branch\":\"main\"}"),
+        ], appActions: [])
+        let (_, entries) = ext.menuInput(keybindings: [:], commands: [])
+        XCTAssertEqual(entries.map(\.key), ["cmd+shift+o", "cmd+alt+o", "cmd+alt+m"])
+        XCTAssertEqual(entries.map(\.hidden), [false, true, true])
+        XCTAssertEqual(entries.map(\.args), [nil, nil, "{\"branch\":\"main\"}"])
+        XCTAssertTrue(entries.allSatisfy { $0.name == "git.checkout" })
+    }
 }

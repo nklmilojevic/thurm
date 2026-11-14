@@ -59,7 +59,7 @@ enum MainMenu {
             let (key, mods) = keyEquivalent(command.key) ?? ("", [])
             if !key.isEmpty, let main { displace(chord(key, mods), in: main) }
             let entry = item(command.displayTitle, #selector(AppDelegate.runUserCommand(_:)), key, mods)
-            entry.representedObject = command.name
+            entry.representedObject = command.args.map { ["name": command.name, "args": $0] } ?? command.name
             if command.hidden {
                 entry.isHidden = true
                 entry.allowsKeyEquivalentWhenHidden = true

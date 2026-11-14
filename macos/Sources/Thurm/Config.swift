@@ -91,6 +91,8 @@ struct UserCommand: Equatable {
     var category: String = ""
     /// Only on its key, not in the menu or the palette.
     var hidden = false
+    /// What the action gets on this entry, as JSON (a key bound with arguments).
+    var args: String? = nil
 
     var displayTitle: String { title.isEmpty ? name : title }
 }

@@ -17,6 +17,8 @@ final class Extensions {
     struct Binding: Equatable {
         let key: String
         let action: String
+        /// What the action gets on this key, as JSON; `nil` for none.
+        var args: String? = nil
     }
 
     /// This Mac's daemon answers the extension API (an older one does not: the Commands menu
@@ -26,8 +28,9 @@ final class Extensions {
     private(set) var bindings: [Binding] = []
     /// The names of the app's own actions: menu items with a `[keybindings]` name.
     private(set) var appActions: Set<String> = []
-    /// The question a plugin asked that shows now, and how to take it down.
-    private var shown: (id: UInt64, dismiss: () -> Void)?
+    /// The question a plugin asked that shows now: how to answer it (nothing, when it is
+    /// taken down for another) and how to take it down.
+    private var shown: (id: UInt64, cancel: () -> Void, dismiss: () -> Void)?
     private var refreshQueued = false
 
     // MARK: Calling the daemon
@@ -72,7 +75,8 @@ final class Extensions {
             }
             let bindings = (list["bindings"] as? [[String: Any]] ?? []).compactMap { b -> Binding? in
                 guard let key = jsonString(b["key"]), let action = jsonString(b["action"]) else { return nil }
-                return Binding(key: key, action: action)
+                let args = b["args"].flatMap { $0 is NSNull ? nil : JSON.encode($0) }
+                return Binding(key: key, action: action, args: args)
             }
             let changed = !self.available || actions != self.actions || bindings != self.bindings
             self.load(actions: actions, bindings: bindings)
@@ -121,27 +125,35 @@ final class Extensions {
     func menuInput(keybindings: [String: String], commands: [UserCommand]) -> ([String: String], [UserCommand]) {
         guard available else { return (keybindings, commands) }
         var keys = keybindings
-        var commandKeys: [String: String] = [:]
+        // An action's visible entry takes its first key without arguments; every other key
+        // (another chord, or one with arguments) gets a hidden entry of its own.
+        var shownKey: [String: String] = [:]
+        var extra: [UserCommand] = []
+        let known = Dictionary(actions.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
         for b in bindings {
             if appActions.contains(b.action) {
                 keys[b.key] = b.action
-            } else if commandKeys[b.action] == nil {
-                commandKeys[b.action] = b.key
+            } else if b.args == nil, shownKey[b.action] == nil, known[b.action]?.hidden == false {
+                shownKey[b.action] = b.key
+            } else if known[b.action] != nil {
+                extra.append(UserCommand(name: b.action, key: b.key, title: known[b.action]?.title ?? "",
+                                         hidden: true, args: b.args))
             }
         }
         let entries = actions
-            .filter { !appActions.contains($0.name) }
-            .map { UserCommand(name: $0.name, key: commandKeys[$0.name] ?? "", title: $0.title,
-                               category: $0.category, hidden: $0.hidden) }
-            // A hidden action without a key has nothing to show or run in the menu.
-            .filter { !$0.hidden || !$0.key.isEmpty }
-        return (keys, entries)
+            .filter { !appActions.contains($0.name) && !$0.hidden }
+            .map { UserCommand(name: $0.name, key: shownKey[$0.name] ?? "", title: $0.title,
+                               category: $0.category) }
+        return (keys, entries + extra)
     }
 
-    /// Runs action `name` for the focused pane; `completion` gets the error, if any.
-    func run(_ name: String, pane: UInt64?, completion: @escaping (String?) -> Void) {
+    /// Runs action `name` for the focused pane, with `args` (JSON) when a key gives some;
+    /// `completion` gets the error, if any.
+    func run(_ name: String, args: String? = nil, pane: UInt64?, completion: @escaping (String?) -> Void) {
+        var params: [String: Any] = ["name": name, "pane": pane.map { $0 as Any } ?? NSNull()]
+        if let args, let value = JSON.decode(args) { params["args"] = value }
         // An action may ask the user, or run a while: the answer can take long.
-        call("actions.run", ["name": name, "pane": pane.map { $0 as Any } ?? NSNull()], timeout: 30 * 60) { _, e in
+        call("actions.run", params, timeout: 30 * 60) { _, e in
             completion(e)
         }
     }
@@ -189,10 +201,13 @@ final class Extensions {
             return
         }
         if let ctx = payload["ctx"] as? [String: Any], let pane = jsonUInt64(ctx["pane"]) {
+            // Never on another pane than the one named: not this app's, or gone.
             let key = PaneKey(localHost, pane)
-            if SessionManager.shared.view(for: key) != nil {
-                SessionManager.shared.focusPane(key, activate: false)
+            guard SessionManager.shared.view(for: key) != nil else {
+                answer("pane \(pane) is not in this app's windows")
+                return
             }
+            SessionManager.shared.focusPane(key, activate: false)
         }
         item.menu?.update()
         guard item.isEnabled else {
@@ -214,8 +229,10 @@ final class Extensions {
             view?.showToast(jsonString(req["text"]) ?? "", duration: 4)
             return
         }
+        // One question at a time: the one showing is answered with nothing, and goes.
         if let s = shown {
             shown = nil
+            s.cancel()
             s.dismiss()
         }
         var answered = false
@@ -240,13 +257,22 @@ final class Extensions {
             }
             let placeholder = jsonString(req["placeholder"]).flatMap { $0.isEmpty ? nil : $0 }
                 ?? (title.isEmpty ? "Pick one…" : title)
+            shown = (id, { reply(NSNull()) }, { CommandPalette.shared.close() })
             CommandPalette.shared.show(items: items, over: window, placeholder: placeholder,
                                        footer: title.isEmpty || placeholder == title ? nil : title,
                                        onCancel: { reply(NSNull()) })
-            shown = (id, { CommandPalette.shared.close() })
         case "input", "confirm":
             let alert = NSAlert()
             alert.messageText = title
+            // Before it shows: a modal alert answers before `present` returns.
+            shown = (id, { reply(NSNull()) }, { [weak alert] in
+                guard let alert else { return }
+                if let parent = alert.window.sheetParent {
+                    parent.endSheet(alert.window, returnCode: .cancel)
+                } else {
+                    NSApp.abortModal()
+                }
+            })
             if kind == "input" {
                 let field = NSTextField(string: jsonString(req["value"]) ?? "")
                 field.placeholderString = jsonString(req["placeholder"])
@@ -266,14 +292,6 @@ final class Extensions {
                     reply(response == .alertFirstButtonReturn)
                 }
             }
-            shown = (id, { [weak alert] in
-                guard let alert else { return }
-                if let parent = alert.window.sheetParent {
-                    parent.endSheet(alert.window, returnCode: .cancel)
-                } else {
-                    NSApp.abortModal()
-                }
-            })
         default:
             reply(NSNull())
         }
