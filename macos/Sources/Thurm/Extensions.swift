@@ -71,9 +71,18 @@ final class Extensions {
         refresh()
     }
 
-    /// The connection to this Mac's daemon is gone: its questions go, unanswered.
+    /// The connection to this Mac's daemon is gone: its questions go, unanswered, and so do
+    /// its actions and keys: the menus fall back on the file's [[commands]] until a daemon says
+    /// what it has (an older one says nothing).
     func disconnected() {
         invalidateQuestions()
+        refreshFailures = 0
+        let had = available || !actions.isEmpty || !bindings.isEmpty
+        available = false
+        actions = []
+        bindings = []
+        appActions = []
+        if had { SessionManager.shared.applyKeys() }
     }
 
     private func invalidateQuestions() {
@@ -184,7 +193,12 @@ final class Extensions {
             for name in seen.intersection(taken).sorted() {
                 tlog("app action \(name) not offered: the name is taken")
             }
-            self.appActions = seen.subtracting(taken)
+            let offered = seen.subtracting(taken)
+            if offered != self.appActions {
+                self.appActions = offered
+                // Which names are the app's decides where a key goes: build the menus again.
+                if self.available { SessionManager.shared.applyKeys() }
+            }
             self.call("actions.register", ["actions": free]) { _, error in
                 guard self.connection == asked, let error else { return }
                 tlog("could not offer the app's actions: \(error)")
@@ -227,8 +241,12 @@ final class Extensions {
 
     /// Runs action `name` for the focused pane, with `args` (JSON) when a key gives some;
     /// `completion` gets the error, if any.
-    func run(_ name: String, args: String? = nil, pane: UInt64?, completion: @escaping (String?) -> Void) {
+    /// `noPane`: the focus is on no pane of this Mac's daemon (another host's), so the action
+    /// gets none rather than the daemon's own focused one.
+    func run(_ name: String, args: String? = nil, pane: UInt64?, noPane: Bool = false,
+             completion: @escaping (String?) -> Void) {
         var params: [String: Any] = ["name": name, "pane": pane.map { $0 as Any } ?? NSNull()]
+        if noPane { params["no_pane"] = true }
         if let args, let value = JSON.decode(args) { params["args"] = value }
         // An action may ask the user, or run a while: the answer can take long.
         call("actions.run", params, timeout: 30 * 60) { _, e in

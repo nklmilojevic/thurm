@@ -1092,7 +1092,8 @@ final class SessionManager: NSObject, CoreDelegate {
         var pane: Any = NSNull()
         if let focused = currentController?.focusedPane, focused.host == localHost { pane = focused.id }
         if Extensions.shared.available {
-            Extensions.shared.run(name, args: args, pane: pane as? UInt64) { error in
+            let remote = (currentController?.focusedPane).map { $0.host != localHost } ?? false
+            Extensions.shared.run(name, args: args, pane: pane as? UInt64, noPane: remote) { error in
                 if let error { view?.showToast("\(name): \(error)", duration: 5) }
             }
             return
