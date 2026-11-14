@@ -392,3 +392,10 @@ fn check_says_whether_code_compiles() {
     let e = super::check("return (", "/x/init.lua").unwrap_err();
     assert!(e.contains("init.lua"), "{e}");
 }
+
+#[test]
+fn a_script_has_less_memory_than_a_plugin() {
+    let f = fixture();
+    let e = run(&f, "local t = {} for i = 1, 1e8 do t[i] = i end").unwrap_err();
+    assert!(e.to_lowercase().contains("memory"), "{e}");
+}

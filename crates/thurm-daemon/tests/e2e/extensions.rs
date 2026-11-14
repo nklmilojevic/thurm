@@ -754,7 +754,7 @@ fn a_scripts_waiting_calls_end_when_its_client_leaves() {
     let before = thread_count(d.child.id());
     let mut closers = Vec::new();
     let mut waiting = Vec::new();
-    for i in 0..10 {
+    for i in 0..8 {
         let source = if i % 2 == 0 {
             "thurm.run('never.answers')".to_owned()
         } else {
@@ -769,7 +769,7 @@ fn a_scripts_waiting_calls_end_when_its_client_leaves() {
     }
     std::thread::sleep(Duration::from_millis(1000));
     assert!(
-        thread_count(d.child.id()) > before + 10,
+        thread_count(d.child.id()) > before + 8,
         "the scripts are not waiting"
     );
     for c in &closers {

@@ -36,8 +36,11 @@ const MAX_CALLS: usize = 64;
 /// The most timers fired before the runtime looks at its jobs again.
 const TIMER_BATCH: usize = 64;
 
-/// The most memory one Lua state may use.
+/// The most memory a plugin's Lua state may use.
 const MEMORY_LIMIT: usize = 256 << 20;
+
+/// The most memory a script's Lua state may use: scripts are many and short.
+const SCRIPT_MEMORY_LIMIT: usize = 64 << 20;
 
 /// What the runtime needs from the daemon.
 pub trait Host: Send + Sync + 'static {
@@ -318,7 +321,11 @@ impl Engine {
     #[allow(clippy::type_complexity)]
     fn state(&self, spec: &Spec) -> mlua::Result<(Lua, Rc<RefCell<Shared>>, Rc<Cell<Instant>>)> {
         let lua = Lua::new();
-        lua.set_memory_limit(MEMORY_LIMIT)?;
+        lua.set_memory_limit(if spec.script {
+            SCRIPT_MEMORY_LIMIT
+        } else {
+            MEMORY_LIMIT
+        })?;
         let deadline = Rc::new(Cell::new(Instant::now() + RUN_LIMIT));
         {
             let deadline = deadline.clone();

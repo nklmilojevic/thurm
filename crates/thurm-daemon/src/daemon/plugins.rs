@@ -32,7 +32,8 @@ pub struct Plugins {
 }
 
 /// The most scripts that may run at once (each has a Lua state of its own).
-const MAX_SCRIPTS: usize = 32;
+/// With [`thurm_lua`]'s 64 MiB for each, scripts take at most 512 MiB together.
+const MAX_SCRIPTS: usize = 8;
 
 struct Instance {
     client: Arc<Client>,
@@ -177,6 +178,8 @@ impl Daemon {
         let source = match std::fs::read_to_string(&file) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Gone: nothing to fall back on if it comes back broken.
+                *self.plugins.init_good.lock() = None;
                 if let Some(old) = self.plugins.init.lock().take() {
                     self.stop_instance(old);
                 }
@@ -224,7 +227,11 @@ impl Daemon {
         std::thread::spawn(move || {
             let Some(d) = daemon.upgrade() else { return };
             match done.recv() {
-                Ok(Ok(_)) => *d.plugins.init_good.lock() = Some(source),
+                // Only the init.lua that runs now: a reload since made another one current.
+                Ok(Ok(_)) if *d.plugins.init.lock() == Some(instance) => {
+                    *d.plugins.init_good.lock() = Some(source)
+                }
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     let current = *d.plugins.init.lock() == Some(instance);
                     match fallback.filter(|f| current && *f != source) {
