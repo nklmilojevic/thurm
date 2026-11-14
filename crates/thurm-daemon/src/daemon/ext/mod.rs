@@ -349,7 +349,11 @@ impl Daemon {
             .get(&run.name)
             .cloned()
             .ok_or_else(|| format!("no action named {:?}", run.name))?;
-        let pane = run.pane.or_else(|| self.focused_pane());
+        let pane = if run.no_pane {
+            None
+        } else {
+            run.pane.or_else(|| self.focused_pane())
+        };
         match entry.provider {
             Provider::Config => self.run_command(&run.name, pane).map(|_| Value::Null),
             Provider::Client(id) => {

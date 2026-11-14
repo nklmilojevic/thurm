@@ -412,3 +412,48 @@ fn a_tailnet_caller_cannot_run_programs() {
     // Reading what there is still works.
     assert!(call(&c, method::ACTIONS_LIST, Value::Null).is_ok());
 }
+
+/// Without a pane an action runs for the focused one, unless the caller says it has none.
+#[test]
+fn no_pane_means_no_pane() {
+    let env = Env::new("ext-no-pane");
+    let _d = env.start();
+    let (provider, provider_rx) = ext_client(&env, "provider");
+    let (user, _rx) = ext_client(&env, "user");
+    call(
+        &provider,
+        method::ACTIONS_REGISTER,
+        json!({ "actions": [{ "name": "ctx.pane" }] }),
+    )
+    .unwrap();
+    let answering = std::thread::spawn({
+        let provider = provider.clone();
+        move || {
+            for _ in 0..2 {
+                let invoke = next(&provider_rx, notice::ACTION_INVOKE);
+                call(
+                    &provider,
+                    method::ACTIONS_RESULT,
+                    json!({ "id": invoke["id"], "result": invoke["ctx"]["pane"] }),
+                )
+                .unwrap();
+            }
+        }
+    });
+    let pane = create(&user, &env.dir);
+    user.request(Request::Focus {
+        pane,
+        focused: true,
+    })
+    .unwrap();
+    let focused = call(&user, method::ACTIONS_RUN, json!({ "name": "ctx.pane" })).unwrap();
+    assert_eq!(focused, json!(pane));
+    let none = call(
+        &user,
+        method::ACTIONS_RUN,
+        json!({ "name": "ctx.pane", "no_pane": true }),
+    )
+    .unwrap();
+    assert_eq!(none, Value::Null);
+    answering.join().unwrap();
+}

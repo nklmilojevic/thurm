@@ -187,6 +187,9 @@ pub struct RunAction {
     /// How many actions deep the caller runs: an action that runs another passes its
     /// [`Context::depth`].
     pub depth: u32,
+    /// For no pane at all: without `pane`, the daemon otherwise takes the focused one (an app
+    /// whose focus is on another host's pane says this).
+    pub no_pane: bool,
 }
 
 /// What an action's provider gets with [`notice::ACTION_INVOKE`].
