@@ -54,6 +54,9 @@ enum MainMenu {
             }
         }
         commandsMenu.removeAllItems()
+        // Hidden entries (a key and no title) go in the menu that holds Commands, which stays
+        // visible: in a hidden menu AppKit would not find their keys.
+        let host = commandsItem?.menu ?? main?.items.first(where: { $0.submenu != nil })?.submenu
         var submenus: [String: NSMenu] = [:]
         for command in commands {
             let (key, mods) = keyEquivalent(command.key) ?? ("", [])
@@ -65,7 +68,11 @@ enum MainMenu {
                 entry.allowsKeyEquivalentWhenHidden = true
             }
             let category = command.category == "Commands" ? "" : command.category
-            if category.isEmpty || command.hidden {
+            if command.hidden {
+                guard let host else { continue }
+                host.addItem(entry)
+                extraKeys.append(entry)
+            } else if category.isEmpty {
                 commandsMenu.addItem(entry)
             } else if let sub = submenus[category] {
                 sub.addItem(entry)

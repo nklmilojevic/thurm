@@ -32,6 +32,10 @@ final class Extensions {
     /// taken down for another) and how to take it down.
     private var shown: (id: UInt64, cancel: () -> Void, dismiss: () -> Void)?
     private var refreshQueued = false
+    /// A question that came while the app was in the background: it shows once the user
+    /// brings the app forward (the Dock icon bounces for it), not before.
+    private var pending: [String: Any]?
+    private var activeObserver: NSObjectProtocol?
 
     // MARK: Calling the daemon
 
@@ -182,6 +186,9 @@ final class Extensions {
                 shown = nil
                 s.dismiss()
             }
+            if let id = jsonUInt64(payload["id"]), let p = pending, jsonUInt64(p["id"]) == id {
+                pending = nil
+            }
         default:
             break
         }
@@ -229,6 +236,25 @@ final class Extensions {
             view?.showToast(jsonString(req["text"]) ?? "", duration: 4)
             return
         }
+        // The app in the background: the question waits until the user comes, rather than
+        // taking the focus from what they are doing. One waits at a time.
+        if !NSApp.isActive {
+            if let old = pending, let oldId = jsonUInt64(old["id"]) {
+                call("ui.reply", ["id": oldId, "result": NSNull()])
+            }
+            pending = req
+            NSApp.requestUserAttention(.informationalRequest)
+            if activeObserver == nil {
+                activeObserver = NotificationCenter.default.addObserver(
+                    forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+                ) { [weak self] _ in
+                    guard let self, let req = self.pending else { return }
+                    self.pending = nil
+                    self.show(req)
+                }
+            }
+            return
+        }
         // One question at a time: the one showing is answered with nothing, and goes.
         if let s = shown {
             shown = nil
@@ -242,10 +268,6 @@ final class Extensions {
             if self?.shown?.id == id { self?.shown = nil }
             self?.call("ui.reply", ["id": id, "result": value])
         }
-        NSApp.activate()
-        // Activation is only a request: a plugin waiting on an app in the background bounces
-        // its icon instead.
-        if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
         let window = NSApp.keyWindow ?? SessionManager.shared.currentController?.window
         let title = jsonString(req["title"]) ?? ""
         switch kind {

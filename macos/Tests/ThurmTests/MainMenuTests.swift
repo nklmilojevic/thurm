@@ -95,7 +95,7 @@ final class MainMenuTests: XCTestCase {
 
     /// Plugins' actions go in a submenu per category; a hidden one only keeps its key.
     func testCommandsGoInCategorySubmenus() {
-        let (main, _, _, _, _) = shellMenu()
+        let (main, shell, _, _, _) = shellMenu()
         MainMenu.applyKeys([:], commands: [
             UserCommand(name: "Deploy", key: ""),
             UserCommand(name: "git.sync", key: "cmd+shift+y", title: "Sync", category: "Git"),
@@ -103,13 +103,23 @@ final class MainMenuTests: XCTestCase {
             UserCommand(name: "init.key.3", key: "cmd+shift+u", hidden: true),
         ], in: main)
         let menu = MainMenu.commandsMenu
-        XCTAssertEqual(menu.items.map(\.title), ["Deploy", "Git", "init.key.3"])
+        XCTAssertEqual(menu.items.map(\.title), ["Deploy", "Git"])
         XCTAssertEqual(menu.items[1].submenu?.items.map(\.title), ["Sync", "Log"])
         XCTAssertEqual(menu.items[1].submenu?.items[0].representedObject as? String, "git.sync")
         XCTAssertEqual(menu.items[1].submenu?.items[0].keyEquivalent, "y")
-        XCTAssertTrue(menu.items[2].isHidden)
-        XCTAssertTrue(menu.items[2].allowsKeyEquivalentWhenHidden)
-        XCTAssertEqual(menu.items[2].keyEquivalent, "u")
+        // The hidden one sits in a visible menu, where AppKit finds its key.
+        let hidden = shell.items.last!
+        XCTAssertEqual(hidden.representedObject as? String, "init.key.3")
+        XCTAssertTrue(hidden.isHidden)
+        XCTAssertTrue(hidden.allowsKeyEquivalentWhenHidden)
+        XCTAssertEqual(hidden.keyEquivalent, "u")
+        // Only hidden ones: their keys still work, and they go with the next build.
+        MainMenu.applyKeys([:], commands: [UserCommand(name: "init.key.4", key: "cmd+shift+i", hidden: true)],
+                           in: main)
+        XCTAssertTrue(MainMenu.commandsMenu.items.isEmpty)
+        XCTAssertEqual(shell.items.filter { $0.representedObject as? String == "init.key.3" }.count, 0)
+        XCTAssertEqual(shell.items.last?.keyEquivalent, "i")
+        XCTAssertFalse(shell.items.last?.menu?.items.isEmpty ?? true)
     }
 
     func testBindingToNoneRemovesAKey() {
