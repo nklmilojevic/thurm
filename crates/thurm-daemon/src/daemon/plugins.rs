@@ -1,0 +1,259 @@
+//! The plugins the daemon runs. Each running plugin (and each script `thurm do` runs) has a
+//! client of its own, through which it uses the extension API like any other client; the
+//! notices that client gets go to the plugin.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+
+use parking_lot::Mutex;
+use serde_json::{Value, json};
+use thurm_proto::ext::{self, method, notice};
+use thurm_proto::{Event, ServerMessage};
+
+use super::ext::send_ext;
+use super::{Client, Daemon};
+
+/// The name of the plugin `init.lua` in the config directory is.
+pub const INIT: &str = "init";
+
+#[derive(Default)]
+pub struct Plugins {
+    lua: OnceLock<Option<thurm_lua::Runtime>>,
+    instances: Mutex<HashMap<u64, Instance>>,
+    next: AtomicU64,
+    /// The running `init.lua`.
+    init: Mutex<Option<u64>>,
+}
+
+struct Instance {
+    client: Arc<Client>,
+    name: String,
+    /// For a script: the client that runs it, whose leaving stops it.
+    owner: Option<u64>,
+}
+
+/// The daemon as the Lua runtime sees it.
+struct Host(Weak<Daemon>);
+
+impl thurm_lua::Host for Host {
+    fn call(&self, instance: u64, method: &str, params: Value) -> Result<Value, String> {
+        let daemon = self.0.upgrade().ok_or("the daemon is stopping")?;
+        let client = daemon
+            .plugins
+            .instances
+            .lock()
+            .get(&instance)
+            .map(|i| i.client.clone())
+            .ok_or("the plugin was stopped")?;
+        daemon.ext_call(&client, method, params)
+    }
+
+    fn report(&self, instance: u64, error: &str) {
+        if let Some(daemon) = self.0.upgrade() {
+            daemon.plugin_failed(instance, error);
+        }
+    }
+}
+
+impl Daemon {
+    /// Starts the Lua runtime and `init.lua`.
+    pub fn start_plugins(self: &Arc<Self>) {
+        let _ = self.lua();
+        self.load_init();
+    }
+
+    fn lua(self: &Arc<Self>) -> Result<&thurm_lua::Runtime, String> {
+        self.plugins
+            .lua
+            .get_or_init(|| {
+                thurm_lua::Runtime::start(Arc::new(Host(Arc::downgrade(self))))
+                    .map_err(|e| log::error!("cannot start the Lua runtime: {e}"))
+                    .ok()
+            })
+            .as_ref()
+            .ok_or_else(|| "the Lua runtime did not start".to_owned())
+    }
+
+    /// A new client for plugin `name`, and its instance id. What the client hears goes to the
+    /// plugin.
+    fn plugin_client(self: &Arc<Self>, name: &str, owner: Option<u64>) -> (u64, Arc<Client>) {
+        let (client, rx) = self.add_client();
+        client.ext.store(true, Ordering::Relaxed);
+        *client.plugin.lock() = Some(name.to_owned());
+        *client.name.lock() = format!("plugin:{name}");
+        let instance = self.plugins.next.fetch_add(1, Ordering::Relaxed) + 1;
+        self.plugins.instances.lock().insert(
+            instance,
+            Instance {
+                client: client.clone(),
+                name: name.to_owned(),
+                owner,
+            },
+        );
+        let daemon = Arc::downgrade(self);
+        let counted = client.clone();
+        let _ = std::thread::Builder::new()
+            .name("plugin-events".into())
+            .spawn(move || {
+                // Ends once the client is gone from everywhere: its sender with it.
+                for msg in rx {
+                    counted.queued.fetch_sub(
+                        super::message_weight(&msg).min(counted.queued.load(Ordering::Relaxed)),
+                        Ordering::Relaxed,
+                    );
+                    counted.unflushed.fetch_sub(1, Ordering::AcqRel);
+                    let ServerMessage::Event(Event::Ext { name, payload }) = msg else {
+                        continue;
+                    };
+                    let Some(daemon) = daemon.upgrade() else {
+                        return;
+                    };
+                    if let Some(Some(lua)) = daemon.plugins.lua.get() {
+                        let payload = serde_json::from_str(&payload).unwrap_or(Value::Null);
+                        lua.notice(instance, &name, payload);
+                    }
+                }
+            });
+        (instance, client)
+    }
+
+    /// Stops a plugin instance: its code, and its client with what it provided.
+    fn stop_instance(self: &Arc<Self>, instance: u64) {
+        if let Some(Some(lua)) = self.plugins.lua.get() {
+            lua.unload(instance);
+        }
+        let gone = self.plugins.instances.lock().remove(&instance);
+        if let Some(i) = gone {
+            self.remove_client(i.client.id);
+        }
+    }
+
+    /// Stops the scripts client `owner` runs: it left.
+    pub(super) fn plugins_owner_gone(self: &Arc<Self>, owner: u64) {
+        let owned: Vec<u64> = self
+            .plugins
+            .instances
+            .lock()
+            .iter()
+            .filter(|(_, i)| i.owner == Some(owner))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in owned {
+            self.stop_instance(id);
+        }
+    }
+
+    /// Code of a plugin failed and nothing caught it.
+    fn plugin_failed(&self, instance: u64, error: &str) {
+        let name = self
+            .plugins
+            .instances
+            .lock()
+            .get(&instance)
+            .map(|i| i.name.clone())
+            .unwrap_or_default();
+        log::warn!("plugin {name}: {error}");
+        self.toast(format!("{name}: {error}"), None);
+    }
+
+    /// (Re)starts `init.lua` from the config directory, if there is one.
+    pub(super) fn load_init(self: &Arc<Self>) {
+        if let Some(old) = self.plugins.init.lock().take() {
+            self.stop_instance(old);
+        }
+        let file = thurm_config::config_dir().join("init.lua");
+        let source = match std::fs::read_to_string(&file) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                log::warn!("{}: {e}", file.display());
+                return;
+            }
+        };
+        let Ok(lua) = self.lua() else { return };
+        let (instance, _) = self.plugin_client(INIT, None);
+        *self.plugins.init.lock() = Some(instance);
+        let done = lua.load(thurm_lua::Spec {
+            instance,
+            name: INIT.into(),
+            source,
+            file: file.display().to_string(),
+            dir: file.parent().map(PathBuf::from),
+            settings: Value::Null,
+            args: Vec::new(),
+            pane: None,
+            log: None,
+            script: false,
+        });
+        let daemon = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            if let Ok(Err(e)) = done.recv()
+                && let Some(d) = daemon.upgrade()
+            {
+                d.plugin_failed(instance, &e);
+            }
+        });
+    }
+
+    /// The extension API's methods about plugins and scripts.
+    pub(super) fn plugin_method(
+        self: &Arc<Self>,
+        client: &Arc<Client>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        match method {
+            method::SCRIPT_RUN => {
+                let run: ext::RunScript = if params.is_null() {
+                    Default::default()
+                } else {
+                    serde_json::from_value(params).map_err(|e| format!("bad parameters: {e}"))?
+                };
+                self.run_script(client, run)
+            }
+            other => Err(format!("unknown method {other:?}")),
+        }
+    }
+
+    /// Runs a script to its end; its log lines go to `client` as they come.
+    fn run_script(
+        self: &Arc<Self>,
+        client: &Arc<Client>,
+        run: ext::RunScript,
+    ) -> Result<Value, String> {
+        let lua = self.lua()?;
+        let (instance, _) = self.plugin_client("script", Some(client.id));
+        let to = client.clone();
+        let log: thurm_lua::LogSink = Arc::new(move |level: &str, message: &str| {
+            send_ext(
+                &to,
+                notice::SCRIPT_LOG,
+                &json!({ "run": instance, "level": level, "message": message }),
+            );
+        });
+        let name = if run.name.is_empty() {
+            "script.lua".to_owned()
+        } else {
+            run.name
+        };
+        let done = lua.load(thurm_lua::Spec {
+            instance,
+            name: "script".into(),
+            source: run.source,
+            file: name,
+            dir: run.dir.map(PathBuf::from),
+            settings: Value::Null,
+            args: run.args,
+            pane: run.pane,
+            log: Some(log),
+            script: true,
+        });
+        let result = done
+            .recv()
+            .unwrap_or_else(|_| Err("the Lua runtime stopped".into()));
+        self.stop_instance(instance);
+        result
+    }
+}

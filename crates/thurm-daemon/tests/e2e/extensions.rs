@@ -548,3 +548,67 @@ fn an_invocation_named_sets_the_depth() {
     .unwrap();
     assert_eq!(hold.join().unwrap().unwrap(), json!(0));
 }
+
+#[test]
+fn init_lua_provides_actions_and_scripts_run() {
+    let env = Env::new("ext-lua");
+    let init = env.dir.join("config/init.lua");
+    std::fs::write(
+        &init,
+        r#"
+        thurm.action{ name = "lua.greet", run = function(ctx, args)
+            return "hello " .. (args or "you") .. " from " .. ctx.origin
+        end }
+        thurm.bind("cmd+shift+g", "lua.greet")
+        "#,
+    )
+    .unwrap();
+    let _d = env.start();
+    let (c, rx) = ext_client(&env, "e2e");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !action_names(&c).contains(&"lua.greet".to_owned()) {
+        assert!(Instant::now() < deadline, "init.lua did not load");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let list = call(&c, method::ACTIONS_LIST, Value::Null).unwrap();
+    assert_eq!(list["bindings"][0]["action"], "lua.greet");
+    assert_eq!(list["bindings"][0]["source"], "plugin:init");
+    let r = call(
+        &c,
+        method::ACTIONS_RUN,
+        json!({ "name": "lua.greet", "args": "e2e" }),
+    )
+    .unwrap();
+    assert_eq!(r, "hello e2e from e2e");
+
+    // A script calls the plugin's action, logs, and returns.
+    let r = call(
+        &c,
+        method::SCRIPT_RUN,
+        json!({ "source": "thurm.log('hi', thurm.args[1]); return thurm.run('lua.greet', 'script')", "args": ["x"] }),
+    )
+    .unwrap();
+    assert_eq!(r, "hello script from plugin:script");
+    let log = next(&rx, notice::SCRIPT_LOG);
+    assert_eq!(log["message"], "hi x");
+    let e = call(
+        &c,
+        method::SCRIPT_RUN,
+        json!({ "source": "error('nope')", "name": "s.lua" }),
+    )
+    .unwrap_err();
+    assert!(e.contains("s.lua:1: nope"), "{e}");
+
+    // Reloading runs the new init.lua: its old actions go.
+    std::fs::write(
+        &init,
+        "thurm.action{ name = 'lua.other', run = function() end }",
+    )
+    .unwrap();
+    c.request(Request::ReloadConfig).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while action_names(&c) != ["lua.other"] {
+        assert!(Instant::now() < deadline, "{:?}", action_names(&c));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

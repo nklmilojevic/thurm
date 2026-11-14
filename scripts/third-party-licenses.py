@@ -35,6 +35,7 @@ EXTRA = [
     ("Ghostty (libghostty-vt)", "terminal emulation, linked into the app, thurmd and thurm",
      ["licenses/ghostty-MIT.txt"]),
     ("Sparkle", "software updates, macOS app", ["licenses/sparkle.txt"]),
+    ("Lua 5.4", "plugins and scripts, compiled into thurmd (lua-src)", ["licenses/lua-MIT.txt"]),
     ("LobeHub Icons", "OpenAI mark for Codex panes, macOS app", ["licenses/lobehub-icons-MIT.txt"]),
     ("iTerm2-Color-Schemes", "built-in color themes", ["crates/thurm-config/themes/LICENSE"]),
     ("tty7 and Fig autocomplete specs", "tab completion specs",

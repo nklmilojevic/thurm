@@ -422,6 +422,13 @@ enum Cmd {
         pane: Option<PaneId>,
         title: Vec<String>,
     },
+    /// Run a Lua script in the daemon, with the `thurm` API of plugins (`-` reads it from
+    /// stdin). What it logs is printed, then what it returns.
+    Do {
+        file: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Actions: your `[[commands]]`, and what plugins and the app provide.
     Action {
         #[command(subcommand)]
@@ -999,6 +1006,7 @@ fn run(cli: Cli) -> R {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Do { file, args } => ext::script(remote.as_deref(), &file, args, json),
         Cmd::Daemon { action } => daemon_cmd(&action, json),
         Cmd::AgentHook { agent, event } => {
             agent_hook(agent, event);
@@ -2121,6 +2129,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
         | Cmd::Notify { .. }
         | Cmd::Daemon { .. }
         | Cmd::Events { .. }
+        | Cmd::Do { .. }
         | Cmd::AgentHook { .. }
         | Cmd::Hooks { .. }
         | Cmd::Skill { .. }

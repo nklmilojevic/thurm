@@ -91,3 +91,77 @@ pub fn action(c: &Client, cmd: ActionCmd, json: bool) -> R {
     }
     Ok(ExitCode::SUCCESS)
 }
+
+/// `thurm do FILE [ARGS]`: runs a Lua script in the daemon, printing what it logs.
+pub fn script(remote: Option<&str>, file: &str, args: Vec<String>, json: bool) -> R {
+    use std::io::Read;
+    let (source, name, dir) = if file == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        (s, "stdin".to_owned(), None)
+    } else {
+        let path = std::path::Path::new(file);
+        let source =
+            std::fs::read_to_string(path).map_err(|e| format!("cannot read {file}: {e}"))?;
+        let dir = path
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.display().to_string()));
+        (source, file.to_owned(), dir)
+    };
+    let socket = match remote {
+        Some(name) => {
+            drop(crate::remote::connect_remote(name)?);
+            thurm_config::remote_socket_path(name)
+        }
+        None => {
+            // Starts the daemon when it is not running.
+            drop(crate::connect(true)?);
+            thurm_config::socket_path()
+        }
+    };
+    let stream = thurm_client::connect_daemon(&socket)
+        .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?;
+    let client = Client::from_stream(
+        stream,
+        "thurm-do",
+        false,
+        &[],
+        move |event| {
+            let thurm_proto::Event::Ext { name, payload } = event else {
+                return;
+            };
+            if name != ext::notice::SCRIPT_LOG {
+                return;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&payload) else {
+                return;
+            };
+            let message = v["message"].as_str().unwrap_or_default();
+            if json {
+                println!("{}", json!({ "log": v["level"], "message": message }));
+            } else if v["level"] == "info" {
+                println!("{message}");
+            } else {
+                eprintln!("{message}");
+            }
+        },
+        || {},
+    )?;
+    let pane: Option<PaneId> = std::env::var(ENV_PANE_ID).ok().and_then(|v| v.parse().ok());
+    let run = ext::RunScript {
+        source,
+        name,
+        args,
+        dir,
+        pane: if remote.is_some() { None } else { pane },
+    };
+    let result = call(&client, method::SCRIPT_RUN, serde_json::to_value(run)?)?;
+    match result {
+        Value::Null => {}
+        Value::String(s) if !json => println!("{s}"),
+        other if json => println!("{}", json!({ "result": other })),
+        other => println!("{}", serde_json::to_string_pretty(&other)?),
+    }
+    Ok(ExitCode::SUCCESS)
+}
