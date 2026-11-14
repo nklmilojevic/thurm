@@ -324,6 +324,353 @@ pub fn script(
     Ok(ExitCode::SUCCESS)
 }
 
+#[derive(Subcommand)]
+pub enum PluginCmd {
+    /// List plugins: init.lua and those in the plugins directory, with their state.
+    List,
+    /// Make a new plugin in the plugins directory, ready to edit: Lua, or with --program one
+    /// that runs as a program (a Python example).
+    New {
+        name: String,
+        #[arg(long)]
+        program: bool,
+    },
+    /// Install a plugin from a git repository into the plugins directory. A plugin runs with
+    /// your rights: install only what you trust.
+    Install {
+        url: String,
+        /// The plugin's name (default: the repository's).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Update installed plugins from their repositories (git pull), or only NAME.
+    Update { name: Option<String> },
+    /// Delete a plugin's files.
+    Remove {
+        name: String,
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Start a disabled plugin, and keep it out of `plugins.disabled`.
+    Enable { name: String },
+    /// Stop a plugin, and add it to `plugins.disabled`.
+    Disable { name: String },
+    /// Start plugins again, picking up changes to their files (all, or only NAME).
+    Reload { name: Option<String> },
+    /// Print the end of a plugin's log: what it logged and wrote to stderr, and its errors.
+    Logs {
+        name: String,
+        #[arg(short = 'n', long, default_value_t = 100)]
+        lines: usize,
+    },
+    /// Write the `thurm` API's types for lua-language-server, and a .luarc.json for init.lua,
+    /// into the config directory.
+    Types,
+}
+
+impl PluginCmd {
+    /// Works on this machine's files, not through a daemon.
+    pub fn local(&self) -> bool {
+        matches!(
+            self,
+            PluginCmd::New { .. }
+                | PluginCmd::Install { .. }
+                | PluginCmd::Update { .. }
+                | PluginCmd::Remove { .. }
+                | PluginCmd::Types
+        )
+    }
+}
+
+const LUA_TYPES: &str = include_str!("../../thurm-lua/types/thurm.lua");
+
+/// Writes the `thurm` types into the config directory; returns their directory.
+fn write_types() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let dir = thurm_config::config_dir().join("types");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("thurm.lua"), LUA_TYPES)?;
+    Ok(dir)
+}
+
+/// Fails when a plugin called `name` exists already (a directory, a `.lua` file, or a program
+/// of that stem), or something is at `target`.
+fn name_free(
+    dir: &std::path::Path,
+    name: &str,
+    target: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (found, _) = thurm_config::plugins::discover(dir);
+    if let Some(p) = found.iter().find(|p| p.name == name) {
+        return Err(format!(
+            "a plugin called {name:?} exists already: {}",
+            p.path.display()
+        )
+        .into());
+    }
+    if target.exists() {
+        return Err(format!("{} exists already", target.display()).into());
+    }
+    Ok(())
+}
+
+/// Asks the daemon, when one runs, to look at the plugins again.
+fn reload_running(name: Option<&str>) {
+    if let Ok(c) = crate::connect(false) {
+        let params = match name {
+            Some(n) => json!({ "name": n }),
+            None => Value::Null,
+        };
+        if let Err(e) = call(&c, method::PLUGINS_RELOAD, params) {
+            eprintln!("thurm: {e}");
+        }
+    }
+}
+
+fn find(name: &str) -> Result<thurm_config::plugins::FoundPlugin, Box<dyn std::error::Error>> {
+    let (found, _) = thurm_config::plugins::discover(&thurm_config::plugins_dir());
+    found.into_iter().find(|p| p.name == name).ok_or_else(|| {
+        format!(
+            "no plugin named {name:?} in {}",
+            thurm_config::plugins_dir().display()
+        )
+        .into()
+    })
+}
+
+fn git(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .status()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if !status.success() {
+        return Err(format!("git {} failed", args.first().unwrap_or(&"")).into());
+    }
+    Ok(())
+}
+
+/// The plugin name a repository URL suggests: its last part, without `.git` and a `thurm-`
+/// prefix.
+fn name_from_url(url: &str) -> String {
+    let last = url
+        .trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or_default();
+    let last = last.strip_suffix(".git").unwrap_or(last);
+    last.strip_prefix("thurm-plugin-")
+        .or_else(|| last.strip_prefix("thurm-"))
+        .unwrap_or(last)
+        .to_owned()
+}
+
+/// `thurm plugin` commands that work on this machine's files.
+pub fn plugin_local(cmd: PluginCmd, json: bool) -> R {
+    let dir = thurm_config::plugins_dir();
+    match cmd {
+        PluginCmd::New { name, program } => {
+            if !ext::valid_plugin_name(&name)
+                || name == thurm_config::plugins::INIT
+                || name == thurm_config::plugins::SCRIPT
+            {
+                return Err(
+                    format!("{name:?}: a plugin's name has only letters, digits, - and _").into(),
+                );
+            }
+            let target = dir.join(&name);
+            name_free(&dir, &name, &target)?;
+            let made = || -> Result<(), Box<dyn std::error::Error>> {
+                std::fs::create_dir_all(&target)?;
+                for (file, text, executable) in thurm_config::plugins::scaffold(&name, program) {
+                    let path = target.join(file);
+                    std::fs::write(&path, text)?;
+                    if executable {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+                    }
+                }
+                if !program {
+                    let types = write_types()?;
+                    std::fs::write(
+                        target.join(".luarc.json"),
+                        thurm_config::plugins::luarc(&types),
+                    )?;
+                }
+                Ok(())
+            };
+            // Half made, it goes: the name was free, so the directory is this command's.
+            if let Err(e) = made() {
+                let _ = std::fs::remove_dir_all(&target);
+                return Err(e);
+            }
+            println!("{}", target.display());
+            reload_running(Some(&name));
+        }
+        PluginCmd::Install { url, name } => {
+            let name = name.unwrap_or_else(|| name_from_url(&url));
+            if !ext::valid_plugin_name(&name)
+                || name == thurm_config::plugins::INIT
+                || name == thurm_config::plugins::SCRIPT
+            {
+                return Err(format!("{name:?} cannot name a plugin; pick one with --name").into());
+            }
+            let target = dir.join(&name);
+            name_free(&dir, &name, &target)?;
+            eprintln!(
+                "thurm: plugins run with your rights and can do anything you can: install only \
+                 plugins you trust."
+            );
+            std::fs::create_dir_all(&dir)?;
+            // A clone that failed part way goes: the name was free, so what is there is its.
+            if let Err(e) = git(&[
+                "clone",
+                "--depth",
+                "1",
+                "--",
+                &url,
+                &target.display().to_string(),
+            ]) {
+                let _ = std::fs::remove_dir_all(&target);
+                return Err(e);
+            }
+            // Not a plugin: it goes again, rather than sitting in the plugins directory.
+            if find(&name).is_err() {
+                let _ = std::fs::remove_dir_all(&target);
+                return Err(format!(
+                    "{url} is not a Thurm plugin (no plugin.toml or init.lua at its top)"
+                )
+                .into());
+            }
+            println!("{}", target.display());
+            reload_running(Some(&name));
+        }
+        PluginCmd::Update { name } => {
+            let (found, _) = thurm_config::plugins::discover(&dir);
+            let mut updated = 0;
+            for p in found
+                .iter()
+                .filter(|p| name.as_deref().is_none_or(|n| n == p.name))
+            {
+                if !p.path.join(".git").exists() {
+                    if name.is_some() {
+                        return Err(format!("{} was not installed from git", p.name).into());
+                    }
+                    continue;
+                }
+                eprintln!("{}:", p.name);
+                git(&["-C", &p.path.display().to_string(), "pull", "--ff-only"])?;
+                // Running its new files now: a later pull that fails leaves this one current.
+                reload_running(Some(&p.name));
+                updated += 1;
+            }
+            if name.is_some() && updated == 0 {
+                find(name.as_deref().unwrap_or_default())?;
+            }
+        }
+        PluginCmd::Remove { name, yes } => {
+            let p = find(&name)?;
+            if !yes {
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() {
+                    return Err("pass --yes to remove without asking".into());
+                }
+                eprint!("Delete {}? [y/N] ", p.path.display());
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+            if p.path.is_dir() {
+                std::fs::remove_dir_all(&p.path)?;
+            } else {
+                std::fs::remove_file(&p.path)?;
+            }
+            reload_running(None);
+        }
+        PluginCmd::Types => {
+            let types = write_types()?;
+            let luarc = thurm_config::config_dir().join(".luarc.json");
+            if !luarc.exists() {
+                std::fs::write(&luarc, thurm_config::plugins::luarc(&types))?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    json!({ "types": types.join("thurm.lua"), "luarc": luarc })
+                );
+            } else {
+                println!("{}", types.join("thurm.lua").display());
+            }
+        }
+        _ => unreachable!("not a local command"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `thurm plugin` commands that go through a daemon.
+pub fn plugin(c: &Client, cmd: PluginCmd, json: bool) -> R {
+    match cmd {
+        PluginCmd::List => {
+            let list: Vec<ext::PluginInfo> =
+                serde_json::from_value(call(c, method::PLUGINS_LIST, Value::Null)?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if list.is_empty() {
+                println!(
+                    "No plugins. `thurm plugin new NAME` makes one in {}",
+                    thurm_config::plugins_dir().display()
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!(
+                "{:<20} {:<8} {:<9} {:<9} ACTIONS",
+                "NAME", "KIND", "STATE", "VERSION"
+            );
+            for p in &list {
+                println!(
+                    "{:<20} {:<8} {:<9} {:<9} {}",
+                    p.name,
+                    p.kind,
+                    p.state,
+                    p.version,
+                    p.actions.join(", ")
+                );
+                if let Some(e) = &p.error {
+                    println!("  {e}");
+                }
+            }
+        }
+        PluginCmd::Enable { name } => {
+            call(c, method::PLUGINS_ENABLE, json!({ "name": name }))?;
+        }
+        PluginCmd::Disable { name } => {
+            call(c, method::PLUGINS_DISABLE, json!({ "name": name }))?;
+        }
+        PluginCmd::Reload { name } => {
+            let params = name.map_or(Value::Null, |n| json!({ "name": n }));
+            call(c, method::PLUGINS_RELOAD, params)?;
+        }
+        PluginCmd::Logs { name, lines } => {
+            let r = call(
+                c,
+                method::PLUGINS_LOGS,
+                json!({ "name": name, "lines": lines }),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r["lines"])?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            for line in r["lines"].as_array().into_iter().flatten() {
+                println!("{}", line.as_str().unwrap_or_default());
+            }
+        }
+        _ => unreachable!("a local command"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 #[cfg(test)]
 mod tests {
     /// A name swapped for a symlink after the directory was listed is not opened.
@@ -345,6 +692,26 @@ mod tests {
         assert!(super::open_dir_path(&dir.join("real")).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_file(&secret).unwrap();
+    }
+
+    #[test]
+    fn a_new_plugin_takes_no_name_in_use() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("thurm-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("solo.lua"), "").unwrap();
+        std::fs::write(dir.join("tool.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dir.join("tool.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        for taken in ["solo", "tool"] {
+            assert!(
+                super::name_free(&dir, taken, &dir.join(taken)).is_err(),
+                "{taken}"
+            );
+        }
+        assert!(super::name_free(&dir, "fresh", &dir.join("fresh")).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -389,5 +756,18 @@ mod tests {
         assert_eq!(super::dir_names(&fd, 5).len(), 5);
         assert_eq!(super::dir_names(&fd, 100).len(), 20);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_repository_names_its_plugin() {
+        assert_eq!(
+            super::name_from_url("https://github.com/a/thurm-git-tools.git"),
+            "git-tools"
+        );
+        assert_eq!(super::name_from_url("git@github.com:a/thurm-plugin-x"), "x");
+        assert_eq!(
+            super::name_from_url("https://example.com/a/zoxide/"),
+            "zoxide"
+        );
     }
 }

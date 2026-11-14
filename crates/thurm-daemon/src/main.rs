@@ -267,6 +267,7 @@ fn main() {
         }
     }
     daemon.shutdown.store(true, Ordering::Relaxed);
+    daemon.stop_plugins();
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(&pid_path);
     log::info!("bye");

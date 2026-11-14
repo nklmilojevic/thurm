@@ -1,50 +1,220 @@
-//! The plugins the daemon runs. Each running plugin (and each script `thurm do` runs) has a
-//! client of its own, through which it uses the extension API like any other client; the
-//! notices that client gets go to the plugin.
+//! The plugins the daemon runs: `init.lua` beside the config file, the plugins in `plugins/`,
+//! and the scripts `thurm do` runs.
+//!
+//! Each running plugin has a client of its own, through which it uses the extension API like
+//! any other client; the notices that client gets go to the plugin. A Lua plugin runs in the
+//! daemon ([`thurm_lua`]); a program plugin runs alongside it and speaks JSON-RPC 2.0, one
+//! message per line, on its standard input and output: its requests are the API's methods,
+//! the daemon's notices come as notifications, and an action to carry out comes as an
+//! `action.invoke` request it answers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::process::ChildStdin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use thurm_config::plugins::{FoundPlugin, INIT, PluginKind};
 use thurm_proto::ext::{self, method, notice};
 use thurm_proto::{Event, ServerMessage};
 
 use super::ext::send_ext;
 use super::{Client, Daemon};
+use crate::user_exec;
 
-/// The name of the plugin `init.lua` in the config directory is.
-pub const INIT: &str = "init";
+/// The most scripts that may run at once (each has a Lua state of its own). With
+/// [`thurm_lua`]'s 64 MiB for each, scripts take at most 512 MiB together.
+const MAX_SCRIPTS: usize = 8;
+
+/// How many lines of its log the daemon keeps per plugin.
+const LOG_LINES: usize = 500;
+
+/// A program plugin that ran this long before it exited starts again at once.
+const HEALTHY_RUN: Duration = Duration::from_secs(60);
+
+/// The longest a failing program plugin waits before it is started again.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// How long a stopped program plugin has before SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub struct Plugins {
     lua: OnceLock<Option<thurm_lua::Runtime>>,
     instances: Mutex<HashMap<u64, Instance>>,
     next: AtomicU64,
-    /// The running `init.lua`.
-    init: Mutex<Option<u64>>,
-    /// The last init.lua that started without an error: what a reload falls back on.
-    init_good: Mutex<Option<String>>,
-    /// Held through every change of init.lua (a reload, a start's outcome): one at a time, so
-    /// none acts on an init.lua another change already replaced.
-    init_changes: Mutex<()>,
-    /// The init.lua instance whose start has an outcome.
-    init_settled: Mutex<Option<u64>>,
+    records: Mutex<BTreeMap<String, Record>>,
+    /// Held while plugins.disabled is changed in the config file.
+    config_edits: Mutex<()>,
     /// Scripts running now.
     scripts: std::sync::atomic::AtomicUsize,
+    /// Every program plugin's process not reaped yet, recorded or still starting: shutdown
+    /// waits for them all. `true` once the daemon is stopping them: none starts after.
+    processes: Mutex<(bool, Vec<Arc<Process>>)>,
 }
 
-/// The most scripts that may run at once (each has a Lua state of its own).
-/// With [`thurm_lua`]'s 64 MiB for each, scripts take at most 512 MiB together.
-const MAX_SCRIPTS: usize = 8;
-
+/// A running plugin or script, and its client.
 struct Instance {
     client: Arc<Client>,
-    name: String,
+    /// The plugin it runs, or `None` for a script.
+    plugin: Option<String>,
     /// For a script: the client that runs it, whose leaving stops it.
     owner: Option<u64>,
+}
+
+/// A plugin the daemon knows of, running or not.
+struct Record {
+    found: FoundPlugin,
+    /// `plugins.settings.<name>`, as it was when the plugin started.
+    settings: Value,
+    state: &'static str,
+    error: Option<String>,
+    instance: Option<u64>,
+    /// The program of a program plugin, while it runs.
+    process: Option<Arc<Process>>,
+    log: VecDeque<String>,
+    /// Bumped whenever the plugin is stopped or started: a supervisor of an older start knows
+    /// that the exit it saw is not for it to act on.
+    generation: u64,
+    /// Program exits in a row, each soon after starting.
+    failures: u32,
+    /// A Lua plugin's code that last started without an error: what a start of newer code
+    /// that fails as it runs falls back on.
+    last_good: Option<String>,
+    /// Its current start has an outcome (a Lua plugin's main chunk returned or failed).
+    settled: bool,
+}
+
+impl Record {
+    fn log(&mut self, line: String) {
+        if self.log.len() == LOG_LINES {
+            self.log.pop_front();
+        }
+        self.log.push_back(line);
+    }
+}
+
+/// How many messages may wait for a program plugin to read them.
+const OUTBOX: usize = 1024;
+
+struct Process {
+    pgid: libc::pid_t,
+    /// Messages for its standard input, which a thread of their own writes: a plugin that
+    /// writes before it reads must not hold up the thread reading its output. `None` once its
+    /// input is closed.
+    outbox: Mutex<Option<crossbeam_channel::Sender<String>>>,
+    life: Mutex<Life>,
+}
+
+#[derive(Default)]
+struct Life {
+    /// Its process was waited for: its pid, and so its group's, may name another one now.
+    reaped: bool,
+    /// When it was asked to stop.
+    stopping: Option<Instant>,
+}
+
+impl Process {
+    fn new(pgid: libc::pid_t, stdin: Option<ChildStdin>) -> Arc<Process> {
+        let (tx, rx) = crossbeam_channel::bounded::<String>(OUTBOX);
+        if let Some(mut w) = stdin {
+            let _ = std::thread::Builder::new()
+                .name("plugin-stdin".into())
+                .spawn(move || {
+                    // Ends, closing its input, when the outbox is closed.
+                    for line in rx {
+                        if w.write_all(line.as_bytes())
+                            .and_then(|()| w.flush())
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+        }
+        Arc::new(Process {
+            pgid,
+            outbox: Mutex::new(Some(tx)),
+            life: Mutex::new(Life::default()),
+        })
+    }
+
+    /// Queues one JSON-RPC message. A plugin that leaves a full outbox unread is not reading
+    /// its input at all: it is closed, which tells the plugin to stop.
+    fn send(&self, msg: &Value) {
+        let full = {
+            let outbox = self.outbox.lock();
+            let Some(tx) = outbox.as_ref() else { return };
+            let mut line = msg.to_string();
+            line.push('\n');
+            tx.try_send(line).is_err()
+        };
+        // A plugin that doesn't read what it is sent (or closed its input) can't answer it
+        // either: it is stopped (and its actions go with it when it exits).
+        if full {
+            log::warn!(
+                "plugin process {} does not read its input; stopping it",
+                self.pgid
+            );
+            self.stop();
+        }
+    }
+
+    /// Closes its input and sends SIGTERM; the thread waiting for it sends SIGKILL after
+    /// [`STOP_GRACE`].
+    fn stop(&self) {
+        *self.outbox.lock() = None;
+        let mut life = self.life.lock();
+        if !life.reaped && life.stopping.is_none() {
+            life.stopping = Some(Instant::now());
+            unsafe { libc::kill(-self.pgid, libc::SIGTERM) };
+        }
+    }
+
+    /// Waits for its process group. Once the program exits (or was asked to stop), what is
+    /// left of its group gets SIGTERM, and SIGKILL [`STOP_GRACE`] later: nothing it started
+    /// outlives it. The program is reaped only after that, so its group id stays its own while
+    /// it is signalled.
+    fn wait(&self, child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+        let pgid = self.pgid;
+        let mut killed = false;
+        let mut leader_exited: Option<Instant> = None;
+        loop {
+            {
+                let mut life = self.life.lock();
+                if leader_exited.is_none() && crate::user_exec::exited(pgid) {
+                    leader_exited = Some(Instant::now());
+                    if life.stopping.is_none() {
+                        unsafe { libc::kill(-pgid, libc::SIGTERM) };
+                    }
+                }
+                let since = match (life.stopping, leader_exited) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                if !killed && since.is_some_and(|at| at.elapsed() >= STOP_GRACE) {
+                    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                    killed = true;
+                }
+                // Done when nothing but the exited program is left in its group (looked for
+                // only once it exited: a scan of every process is not cheap).
+                if leader_exited.is_some() && (killed || !group_has_others(pgid)) {
+                    let status = child.wait()?;
+                    life.reaped = true;
+                    return Ok(status);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn reaped(&self) -> bool {
+        self.life.lock().reaped
+    }
 }
 
 /// The daemon as the Lua runtime sees it.
@@ -70,11 +240,49 @@ impl thurm_lua::Host for Host {
     }
 }
 
+/// Where the notices of a plugin's client go.
+type Sink = Box<dyn Fn(u64, &str, Value) + Send>;
+
+fn init_plugin() -> Option<FoundPlugin> {
+    let main = thurm_config::config_dir().join("init.lua");
+    main.is_file().then(|| FoundPlugin {
+        name: INIT.into(),
+        version: String::new(),
+        description: "init.lua beside config.toml".into(),
+        path: main.clone(),
+        dir: thurm_config::config_dir(),
+        kind: PluginKind::Lua { main },
+    })
+}
+
 impl Daemon {
-    /// Starts the Lua runtime and `init.lua`.
+    /// Finds the plugins and starts them.
     pub fn start_plugins(self: &Arc<Self>) {
         let _ = self.lua();
-        self.load_init();
+        self.sync_plugins(true);
+    }
+
+    /// Stops every plugin (the daemon is going).
+    /// Waits for the program plugins to end (SIGKILL included), a little past [`STOP_GRACE`]:
+    /// none may outlive the daemon.
+    pub fn stop_plugins(self: &Arc<Self>) {
+        let names: Vec<String> = self.plugins.records.lock().keys().cloned().collect();
+        for name in names {
+            self.stop_plugin(&name, "stopped");
+        }
+        // Those still starting too: their start finds itself stopped and stops them.
+        let processes: Vec<Arc<Process>> = {
+            let mut list = self.plugins.processes.lock();
+            list.0 = true;
+            list.1.clone()
+        };
+        for p in &processes {
+            p.stop();
+        }
+        let deadline = Instant::now() + STOP_GRACE + Duration::from_millis(500);
+        while Instant::now() < deadline && !processes.iter().all(|p| p.reaped()) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn lua(self: &Arc<Self>) -> Result<&thurm_lua::Runtime, String> {
@@ -89,9 +297,599 @@ impl Daemon {
             .ok_or_else(|| "the Lua runtime did not start".to_owned())
     }
 
-    /// A new client for plugin `name`, and its instance id. What the client hears goes to the
-    /// plugin.
-    fn plugin_client(self: &Arc<Self>, name: &str, owner: Option<u64>) -> (u64, Arc<Client>) {
+    /// Looks for plugins again and brings the running ones in line with the config: new ones
+    /// start, removed or disabled ones stop, and those whose settings changed start again, as
+    /// do all Lua plugins (they are cheap to start, and pick up edits). With `restart_all`
+    /// every plugin starts again.
+    pub(super) fn sync_plugins(self: &Arc<Self>, restart_all: bool) {
+        self.sync_plugins_in(restart_all, None);
+    }
+
+    /// [`Daemon::sync_plugins`] for plugin `only` alone when given: the others are left as
+    /// they are.
+    fn sync_plugins_in(self: &Arc<Self>, restart_all: bool, only: Option<&str>) {
+        let cfg = self.config.read().plugins.clone();
+        let (found, warnings) = thurm_config::plugins::discover(&thurm_config::plugins_dir());
+        for w in &warnings {
+            log::warn!("plugins: {w}");
+        }
+        let found: Vec<FoundPlugin> = init_plugin()
+            .into_iter()
+            .chain(found)
+            .filter(|f| only.is_none_or(|n| f.name == n))
+            .collect();
+        let settings = |name: &str| {
+            cfg.settings
+                .get(name)
+                .and_then(|v| serde_json::to_value(v).ok())
+                .unwrap_or(Value::Null)
+        };
+        let gone: Vec<String> = {
+            let records = self.plugins.records.lock();
+            records
+                .keys()
+                .filter(|n| only.is_none_or(|o| o == n.as_str()))
+                .filter(|n| !found.iter().any(|f| &f.name == *n))
+                .cloned()
+                .collect()
+        };
+        for name in gone {
+            self.stop_plugin(&name, "stopped");
+            self.plugins.records.lock().remove(&name);
+        }
+        for plugin in found {
+            let name = plugin.name.clone();
+            let settings = settings(&name);
+            let disabled = cfg.is_disabled(&name);
+            let restart = {
+                let mut records = self.plugins.records.lock();
+                let record = records.entry(name.clone()).or_insert_with(|| Record {
+                    found: plugin.clone(),
+                    settings: settings.clone(),
+                    state: "stopped",
+                    error: None,
+                    instance: None,
+                    process: None,
+                    log: VecDeque::new(),
+                    generation: 0,
+                    failures: 0,
+                    last_good: None,
+                    settled: false,
+                });
+                // A plugin that failed is started again: its files may be fixed now.
+                let running = record.state == "running";
+                let changed = record.found != plugin || record.settings != settings;
+                let lua = matches!(plugin.kind, PluginKind::Lua { .. });
+                record.found = plugin;
+                record.settings = settings;
+                if disabled {
+                    None
+                } else {
+                    Some(!running || restart_all || changed || lua)
+                }
+            };
+            match restart {
+                None => self.stop_plugin(&name, "disabled"),
+                Some(true) => {
+                    // A start still running decides what there is to fall back on. One that
+                    // waits for longer keeps running: replaced now, a failing new start would
+                    // have nothing to go back to.
+                    if !self.wait_settled(&name) {
+                        let e = "still starting after 10 s; reload again once it has";
+                        self.plugin_error(&name, e);
+                        continue;
+                    }
+                    // Lua code that doesn't compile leaves the running plugin as it is.
+                    if let Some(e) = self.lua_wont_compile(&name) {
+                        self.plugin_error(&name, &format!("{e}; the running one stays"));
+                        continue;
+                    }
+                    self.stop_plugin(&name, "stopped");
+                    self.start_plugin(&name);
+                }
+                Some(false) => {}
+            }
+        }
+        self.plugins_changed();
+    }
+
+    /// Waits (a while) for a Lua plugin's start that is still running to have an outcome:
+    /// false when it has none yet.
+    fn wait_settled(&self, name: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let waiting = self.plugins.records.lock().get(name).is_some_and(|r| {
+                r.instance.is_some() && !r.settled && matches!(r.found.kind, PluginKind::Lua { .. })
+            });
+            if !waiting {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Why a running Lua plugin's code on disk would not start now: it doesn't compile.
+    /// `None` for a plugin that doesn't run, a program, or code that compiles.
+    fn lua_wont_compile(&self, name: &str) -> Option<String> {
+        let main = {
+            let records = self.plugins.records.lock();
+            let r = records.get(name)?;
+            r.instance?;
+            match &r.found.kind {
+                PluginKind::Lua { main } => main.clone(),
+                PluginKind::Process { .. } => return None,
+            }
+        };
+        let source = match std::fs::read_to_string(&main) {
+            Ok(s) => s,
+            Err(e) => return Some(format!("cannot read {}: {e}", main.display())),
+        };
+        thurm_lua::check(&source, &main.display().to_string()).err()
+    }
+
+    /// Starts plugin `name` (stopped before).
+    fn start_plugin(self: &Arc<Self>, name: &str) {
+        self.start_plugin_if(name, None);
+    }
+
+    /// Starts plugin `name`; with `expected`, only if nothing stopped or started it since that
+    /// generation and it is not disabled, checked as it starts.
+    fn start_plugin_if(self: &Arc<Self>, name: &str, expected: Option<u64>) {
+        let disabled = self.config.read().plugins.is_disabled(name);
+        let (found, settings, generation) = {
+            let mut records = self.plugins.records.lock();
+            let Some(r) = records.get_mut(name) else {
+                return;
+            };
+            if expected.is_some_and(|g| g != r.generation || disabled) {
+                return;
+            }
+            // Unique across records: one made again for the same name never matches an older
+            // start's.
+            r.generation = self.plugins.next.fetch_add(1, Ordering::Relaxed) + 1;
+            r.error = None;
+            r.state = "running";
+            (r.found.clone(), r.settings.clone(), r.generation)
+        };
+        let started = match &found.kind {
+            PluginKind::Lua { main } => self.start_lua(&found, main, settings, generation),
+            PluginKind::Process { exec } => self.start_process(&found, exec, settings, generation),
+        };
+        if let Err(e) = started {
+            // Only while this start is still the plugin's: a stop or another start since
+            // keeps the state it set.
+            let current = match self.plugins.records.lock().get_mut(name) {
+                Some(r) if r.generation == generation => {
+                    r.state = "failed";
+                    true
+                }
+                _ => false,
+            };
+            if current {
+                self.plugin_error(name, &e);
+            } else {
+                log::warn!("plugin {name}: a start stopped since failed: {e}");
+            }
+        }
+    }
+
+    fn start_lua(
+        self: &Arc<Self>,
+        found: &FoundPlugin,
+        main: &std::path::Path,
+        settings: Value,
+        generation: u64,
+    ) -> Result<(), String> {
+        let source = std::fs::read_to_string(main)
+            .map_err(|e| format!("cannot read {}: {e}", main.display()))?;
+        let fallback = self
+            .plugins
+            .records
+            .lock()
+            .get(&found.name)
+            .and_then(|r| r.last_good.clone())
+            .filter(|good| *good != source);
+        self.start_lua_source(found, main, settings, generation, source, fallback)
+    }
+
+    /// Runs `source` as Lua plugin `found`. When its main chunk fails and `fallback` (the code
+    /// that last worked) is given, that runs again instead.
+    fn start_lua_source(
+        self: &Arc<Self>,
+        found: &FoundPlugin,
+        main: &std::path::Path,
+        settings: Value,
+        generation: u64,
+        source: String,
+        fallback: Option<String>,
+    ) -> Result<(), String> {
+        let lua = self.lua()?;
+        let (instance, _) =
+            self.plugin_client(&found.name, Some(found.name.clone()), None, self.lua_sink());
+        let done = lua.load(thurm_lua::Spec {
+            instance,
+            name: found.name.clone(),
+            source: source.clone(),
+            file: main.display().to_string(),
+            dir: Some(found.dir.clone()),
+            modules: Default::default(),
+            settings: settings.clone(),
+            args: Vec::new(),
+            pane: None,
+            log: None,
+            script: false,
+        });
+        // Registered once the load is queued, if this start still holds: a stop after this
+        // unloads it (the runtime takes the unload after the load), one before it is caught here.
+        if !self.claim_start(&found.name, generation, instance, None) {
+            self.end_instance(instance);
+            return Ok(());
+        }
+        let daemon = Arc::downgrade(self);
+        let found = found.clone();
+        let main = main.to_owned();
+        std::thread::spawn(move || {
+            let Some(d) = daemon.upgrade() else { return };
+            let result = done.recv();
+            let mut records = d.plugins.records.lock();
+            if let Some(r) = records.get_mut(&found.name)
+                && r.instance == Some(instance)
+            {
+                r.settled = true;
+            }
+            let Some(r) = records
+                .get_mut(&found.name)
+                .filter(|r| r.instance == Some(instance))
+            else {
+                return;
+            };
+            match result {
+                Ok(Ok(_)) => r.last_good = Some(source),
+                Ok(Err(e)) => match fallback {
+                    Some(previous) => {
+                        drop(records);
+                        d.plugin_error(&found.name, &format!("{e}; the code that worked runs"));
+                        d.end_instance(instance);
+                        if let Err(e) =
+                            d.start_lua_source(&found, &main, settings, generation, previous, None)
+                        {
+                            d.plugin_error(&found.name, &e);
+                        }
+                    }
+                    // Nothing to fall back on: what it set up before it failed goes too,
+                    // rather than half of it staying.
+                    None => {
+                        r.state = "failed";
+                        r.instance = None;
+                        drop(records);
+                        d.plugin_error(&found.name, &e);
+                        d.end_instance(instance);
+                    }
+                },
+                Err(_) => {}
+            }
+        });
+        Ok(())
+    }
+
+    /// Notices for a Lua instance go to the runtime.
+    fn lua_sink(self: &Arc<Self>) -> Sink {
+        let daemon = Arc::downgrade(self);
+        Box::new(move |instance, name, payload| {
+            if let Some(d) = daemon.upgrade()
+                && let Some(Some(lua)) = d.plugins.lua.get()
+            {
+                lua.notice(instance, name, payload);
+            }
+        })
+    }
+
+    fn start_process(
+        self: &Arc<Self>,
+        found: &FoundPlugin,
+        exec: &[String],
+        settings: Value,
+        generation: u64,
+    ) -> Result<(), String> {
+        let name = found.name.clone();
+        let mut env = self.user_exec_env(None, None);
+        env.push(("THURM_PLUGIN".into(), name.clone()));
+        env.push(("THURM_PLUGIN_DIR".into(), found.dir.display().to_string()));
+        env.push(("THURM_PLUGIN_SETTINGS".into(), settings.to_string()));
+        let dir = found.dir.display().to_string();
+        // Started and listed under one lock with shutdown's: a process either starts before
+        // shutdown looks, and is waited for, or not at all.
+        let (mut child, process) = {
+            let mut list = self.plugins.processes.lock();
+            if list.0 {
+                return Err("the daemon is stopping".into());
+            }
+            let mut child = user_exec::spawn_piped(user_exec::Launch {
+                argv: exec,
+                cwd: Some(&dir),
+                env,
+                stdin: None,
+            })
+            .map_err(|e| format!("cannot start {:?}: {e}", exec[0]))?;
+            let process = Process::new(child.id() as libc::pid_t, child.stdin.take());
+            list.1.push(process.clone());
+            (child, process)
+        };
+        let to = process.clone();
+        let (instance, client) = self.plugin_client(
+            &name,
+            Some(name.clone()),
+            None,
+            Box::new(move |_, notice_name, payload| {
+                let msg = if notice_name == notice::ACTION_INVOKE {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "method": notice_name,
+                        "params": {
+                            "name": payload["name"],
+                            "args": payload["args"],
+                            "ctx": payload["ctx"],
+                        },
+                    })
+                } else {
+                    json!({ "jsonrpc": "2.0", "method": notice_name, "params": payload })
+                };
+                to.send(&msg);
+            }),
+        );
+        // Stopped while it was starting: it goes at once. Nothing reads what it writes yet,
+        // so it had no say; a stop from here on finds its process in the record.
+        if !self.claim_start(&name, generation, instance, Some(process.clone())) {
+            self.end_instance(instance);
+            process.stop();
+        }
+        log::info!("plugin {name} started (pid {})", process.pgid);
+
+        // Its stderr goes to its log while the record is still this start's; the exit is
+        // logged after what it wrote last.
+        let (stderr_done, stderr_ended) = crossbeam_channel::bounded::<()>(1);
+        if let Some(stderr) = child.stderr.take() {
+            let daemon = Arc::downgrade(self);
+            let name = name.clone();
+            let _ = std::thread::Builder::new()
+                .name("plugin-stderr".into())
+                .spawn(move || {
+                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                        let Some(d) = daemon.upgrade() else { return };
+                        if let Some(r) = d.plugins.records.lock().get_mut(&name)
+                            && r.generation == generation
+                        {
+                            r.log(line);
+                        }
+                    }
+                    drop(stderr_done);
+                });
+        }
+        if let Some(stdout) = child.stdout.take() {
+            let daemon = Arc::downgrade(self);
+            let process = process.clone();
+            let _ = std::thread::Builder::new()
+                .name("plugin-rpc".into())
+                .spawn(move || {
+                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                        let Some(d) = daemon.upgrade() else { return };
+                        d.plugin_message(instance, &client, &process, &line);
+                    }
+                });
+        }
+        let daemon = Arc::downgrade(self);
+        let started = Instant::now();
+        let _ = std::thread::Builder::new()
+            .name("plugin-wait".into())
+            .spawn(move || {
+                let status = process.wait(&mut child);
+                if let Some(d) = daemon.upgrade() {
+                    d.plugins
+                        .processes
+                        .lock()
+                        .1
+                        .retain(|p| !Arc::ptr_eq(p, &process));
+                }
+                // A child of its own may keep stderr open: not for long.
+                let _ = stderr_ended.recv_timeout(Duration::from_secs(1));
+                if let Some(d) = daemon.upgrade() {
+                    d.process_exited(&name, instance, generation, started, status);
+                }
+            });
+        Ok(())
+    }
+
+    /// One line a program plugin wrote: a request (or notification) to answer, or its answer
+    /// to an `action.invoke`.
+    fn plugin_message(
+        self: &Arc<Self>,
+        instance: u64,
+        client: &Arc<Client>,
+        process: &Arc<Process>,
+        line: &str,
+    ) {
+        // A plugin stopped has no say any more, though its process may still write.
+        if line.trim().is_empty() || !self.instance_live(instance) {
+            return;
+        }
+        let msg: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                process.send(&json!({ "jsonrpc": "2.0", "id": null,
+                    "error": { "code": -32700, "message": format!("not JSON: {e}") } }));
+                return;
+            }
+        };
+        let Some(method) = msg.get("method").and_then(Value::as_str).map(str::to_owned) else {
+            // An answer to the daemon's question.
+            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                let error = msg.get("error").map(|e| {
+                    e.get("message")
+                        .and_then(Value::as_str)
+                        .map_or_else(|| e.to_string(), str::to_owned)
+                });
+                let result = msg.get("result").cloned().unwrap_or(Value::Null);
+                self.ext_reply(client.id, ext::Reply { id, result, error });
+            }
+            return;
+        };
+        let id = msg.get("id").cloned();
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        let blocks = ext::method_blocks(&method);
+        let answer = {
+            let daemon = self.clone();
+            let client = client.clone();
+            let process = process.clone();
+            move || {
+                let result = if daemon.instance_live(instance) {
+                    daemon.ext_call(&client, &method, params)
+                } else {
+                    Err("the plugin was stopped".into())
+                };
+                if let Some(id) = id {
+                    let reply = match result {
+                        Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
+                        Err(e) => json!({ "jsonrpc": "2.0", "id": id,
+                            "error": { "code": -32000, "message": e } }),
+                    };
+                    process.send(&reply);
+                }
+            }
+        };
+        if blocks {
+            std::thread::spawn(answer);
+        } else {
+            answer();
+        }
+    }
+
+    /// A program plugin's process ended: unless it was stopped, it starts again, at once if
+    /// it ran a while, else after a pause that doubles with each quick exit.
+    fn process_exited(
+        self: &Arc<Self>,
+        name: &str,
+        instance: u64,
+        generation: u64,
+        started: Instant,
+        status: std::io::Result<std::process::ExitStatus>,
+    ) {
+        self.end_instance(instance);
+        let how = match status {
+            Ok(s) => match (s.code(), std::os::unix::process::ExitStatusExt::signal(&s)) {
+                (Some(c), _) => format!("exited with status {c}"),
+                (None, Some(sig)) => format!("killed by signal {sig}"),
+                _ => "exited".into(),
+            },
+            Err(e) => e.to_string(),
+        };
+        let delay = {
+            let mut records = self.plugins.records.lock();
+            let Some(r) = records.get_mut(name) else {
+                return;
+            };
+            if r.generation != generation {
+                return;
+            }
+            r.process = None;
+            r.instance = None;
+            r.failures = if started.elapsed() >= HEALTHY_RUN {
+                0
+            } else {
+                r.failures + 1
+            };
+            let delay = match r.failures {
+                0 => Duration::ZERO,
+                n => Duration::from_secs(1 << (n - 1).min(6)).min(MAX_BACKOFF),
+            };
+            let error = format!("{how}; starting again in {}s", delay.as_secs());
+            r.log(format!("[thurm] {error}"));
+            r.state = "failed";
+            r.error = Some(error);
+            delay
+        };
+        log::warn!("plugin {name} {how}");
+        self.plugins_changed();
+        let daemon = Arc::downgrade(self);
+        let name = name.to_owned();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let Some(d) = daemon.upgrade() else { return };
+            let current = d
+                .plugins
+                .records
+                .lock()
+                .get(&name)
+                .is_some_and(|r| r.generation == generation);
+            if current && !d.shutdown.load(Ordering::Relaxed) {
+                d.start_plugin_if(&name, Some(generation));
+                d.plugins_changed();
+            }
+        });
+    }
+
+    /// Stops plugin `name`, leaving it in `state` (`stopped`, `disabled`).
+    fn stop_plugin(self: &Arc<Self>, name: &str, state: &'static str) {
+        let (instance, process) = {
+            let mut records = self.plugins.records.lock();
+            let Some(r) = records.get_mut(name) else {
+                return;
+            };
+            // Unique across records: one made again for the same name never matches an older
+            // start's.
+            r.generation = self.plugins.next.fetch_add(1, Ordering::Relaxed) + 1;
+            r.state = state;
+            r.error = None;
+            r.failures = 0;
+            (r.instance.take(), r.process.take())
+        };
+        if let Some(i) = instance {
+            self.end_instance(i);
+        }
+        if let Some(p) = process {
+            // Its standard input closes too: a plugin may take that as its cue.
+            p.stop();
+        }
+    }
+
+    /// Records `instance` (and `process`) as plugin `name`'s if the start `generation` still
+    /// holds, under the records lock a stop takes: false when it was stopped meanwhile.
+    fn claim_start(
+        &self,
+        name: &str,
+        generation: u64,
+        instance: u64,
+        process: Option<Arc<Process>>,
+    ) -> bool {
+        let mut records = self.plugins.records.lock();
+        match records.get_mut(name) {
+            Some(r) if r.generation == generation => {
+                r.instance = Some(instance);
+                r.process = process;
+                r.settled = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The instance still runs: it was not stopped.
+    fn instance_live(&self, instance: u64) -> bool {
+        self.plugins.instances.lock().contains_key(&instance)
+    }
+
+    /// A new client for a plugin or script, and its instance id. What the client hears goes to
+    /// `sink`.
+    fn plugin_client(
+        self: &Arc<Self>,
+        name: &str,
+        plugin: Option<String>,
+        owner: Option<u64>,
+        sink: Sink,
+    ) -> (u64, Arc<Client>) {
         let (client, rx) = self.add_client();
         client.ext.store(true, Ordering::Relaxed);
         *client.plugin.lock() = Some(name.to_owned());
@@ -101,11 +899,10 @@ impl Daemon {
             instance,
             Instance {
                 client: client.clone(),
-                name: name.to_owned(),
+                plugin,
                 owner,
             },
         );
-        let daemon = Arc::downgrade(self);
         // Weak: the client holds the sender of `rx`, which must go with the client for the
         // loop to end.
         let weak = Arc::downgrade(&client);
@@ -121,23 +918,17 @@ impl Daemon {
                         Ordering::Relaxed,
                     );
                     counted.unflushed.fetch_sub(1, Ordering::AcqRel);
-                    let ServerMessage::Event(Event::Ext { name, payload }) = msg else {
-                        continue;
-                    };
-                    let Some(daemon) = daemon.upgrade() else {
-                        return;
-                    };
-                    if let Some(Some(lua)) = daemon.plugins.lua.get() {
+                    if let ServerMessage::Event(Event::Ext { name, payload }) = msg {
                         let payload = serde_json::from_str(&payload).unwrap_or(Value::Null);
-                        lua.notice(instance, &name, payload);
+                        sink(instance, &name, payload);
                     }
                 }
             });
         (instance, client)
     }
 
-    /// Stops a plugin instance: its code, and its client with what it provided.
-    fn stop_instance(self: &Arc<Self>, instance: u64) {
+    /// Ends an instance: its Lua code, and its client with what it provided.
+    fn end_instance(self: &Arc<Self>, instance: u64) {
         if let Some(Some(lua)) = self.plugins.lua.get() {
             lua.unload(instance);
         }
@@ -158,128 +949,121 @@ impl Daemon {
             .map(|(id, _)| *id)
             .collect();
         for id in owned {
-            self.stop_instance(id);
+            self.end_instance(id);
+        }
+    }
+
+    /// A line for a plugin's log, from its client.
+    pub(super) fn plugin_log(&self, client: &Client, level: &str, message: &str) {
+        // By the instance the client belongs to: a script's client says nothing of a plugin,
+        // whatever it is called.
+        let Some(name) = self
+            .plugins
+            .instances
+            .lock()
+            .values()
+            .find(|i| i.client.id == client.id)
+            .and_then(|i| i.plugin.clone())
+        else {
+            return;
+        };
+        if let Some(r) = self.plugins.records.lock().get_mut(&name) {
+            r.log(if level == "info" {
+                message.to_owned()
+            } else {
+                format!("[{level}] {message}")
+            });
         }
     }
 
     /// Code of a plugin failed and nothing caught it.
     fn plugin_failed(&self, instance: u64, error: &str) {
-        let name = self
+        let plugin = self
             .plugins
             .instances
             .lock()
             .get(&instance)
-            .map(|i| i.name.clone())
-            .unwrap_or_default();
+            .and_then(|i| i.plugin.clone());
+        match plugin {
+            Some(name) => self.plugin_error(&name, error),
+            None => log::warn!("script: {error}"),
+        }
+    }
+
+    /// Plugin `name` hit `error`: it goes in its log, and to the user.
+    fn plugin_error(&self, name: &str, error: &str) {
         log::warn!("plugin {name}: {error}");
+        if let Some(r) = self.plugins.records.lock().get_mut(name) {
+            r.log(format!("[error] {error}"));
+            r.error = Some(error.to_owned());
+        }
         self.toast(format!("{name}: {error}"), None);
+        self.plugins_changed();
     }
 
-    /// (Re)starts `init.lua` from the config directory, if there is one.
-    pub(super) fn load_init(self: &Arc<Self>) {
-        // A start still running decides what there is to fall back on: wait for its outcome
-        // (its main chunk is stopped after 5 s of work without a wait). One that waits for
-        // longer keeps running: replaced now, a failing new file would have nothing to go back to.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let current = *self.plugins.init.lock();
-            if current.is_none() || *self.plugins.init_settled.lock() == current {
-                break;
+    fn plugins_changed(&self) {
+        let clients: Vec<_> = self.clients.lock().values().cloned().collect();
+        for c in clients {
+            if c.ext.load(Ordering::Relaxed) && c.plugin.lock().is_none() {
+                send_ext(&c, notice::PLUGINS_CHANGED, &json!({}));
             }
-            if std::time::Instant::now() >= deadline {
-                log::warn!("init.lua: still starting after 10 s; not reloaded");
-                self.toast("init.lua is still starting; reload again once it has".into(), None);
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let _changing = self.plugins.init_changes.lock();
-        let file = thurm_config::config_dir().join("init.lua");
-        // Read and checked before the running one stops: a file that can't be read or doesn't
-        // compile leaves what works running, and says why. One that is gone stops it.
-        let source = match std::fs::read_to_string(&file) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Gone: nothing to fall back on if it comes back broken.
-                *self.plugins.init_good.lock() = None;
-                if let Some(old) = self.plugins.init.lock().take() {
-                    self.stop_instance(old);
-                }
-                return;
-            }
-            Err(e) => {
-                log::warn!("{}: {e}", file.display());
-                self.toast(format!("init.lua: {e}; the running one stays"), None);
-                return;
-            }
-        };
-        if let Err(e) = thurm_lua::check(&source, &file.display().to_string()) {
-            log::warn!("init.lua: {e}");
-            self.toast(format!("init.lua: {e}; the running one stays"), None);
-            return;
-        }
-        if let Some(old) = self.plugins.init.lock().take() {
-            self.stop_instance(old);
-        }
-        let fallback = self.plugins.init_good.lock().clone();
-        self.start_init(source, file, fallback);
     }
 
-    /// Runs `source` as init.lua. When its main chunk fails and `fallback` (the last one that
-    /// worked) is given, that one runs again instead: an error in the new file costs nothing
-    /// that worked.
-    fn start_init(self: &Arc<Self>, source: String, file: PathBuf, fallback: Option<String>) {
-        let Ok(lua) = self.lua() else { return };
-        let (instance, _) = self.plugin_client(INIT, None);
-        *self.plugins.init.lock() = Some(instance);
-        let done = lua.load(thurm_lua::Spec {
-            instance,
-            name: INIT.into(),
-            source: source.clone(),
-            file: file.display().to_string(),
-            dir: file.parent().map(PathBuf::from),
-            modules: Default::default(),
-            settings: Value::Null,
-            args: Vec::new(),
-            pane: None,
-            log: None,
-            script: false,
-        });
-        let daemon = Arc::downgrade(self);
-        std::thread::spawn(move || {
-            let Some(d) = daemon.upgrade() else { return };
-            let result = done.recv();
-            let _changing = d.plugins.init_changes.lock();
-            *d.plugins.init_settled.lock() = Some(instance);
-            match result {
-                // Only the init.lua that runs now: a reload since made another one current.
-                Ok(Ok(_)) if *d.plugins.init.lock() == Some(instance) => {
-                    *d.plugins.init_good.lock() = Some(source)
+    fn plugin_list(&self) -> Vec<ext::PluginInfo> {
+        let actions = self.ext_actions();
+        self.plugins
+            .records
+            .lock()
+            .values()
+            .map(|r| {
+                let source = format!("plugin:{}", r.found.name);
+                ext::PluginInfo {
+                    name: r.found.name.clone(),
+                    version: r.found.version.clone(),
+                    description: r.found.description.clone(),
+                    kind: match r.found.kind {
+                        PluginKind::Lua { .. } => "lua".into(),
+                        PluginKind::Process { .. } => "process".into(),
+                    },
+                    path: r.found.path.display().to_string(),
+                    state: r.state.into(),
+                    error: r.error.clone(),
+                    actions: actions
+                        .iter()
+                        .filter(|a| a.source == source && !a.hidden)
+                        .map(|a| a.name.clone())
+                        .collect(),
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    let current = *d.plugins.init.lock() == Some(instance);
-                    match fallback.filter(|f| current && *f != source) {
-                        Some(previous) => {
-                            d.plugin_failed(instance, &format!("{e}; the previous init.lua runs"));
-                            if let Some(i) = d.plugins.init.lock().take() {
-                                d.stop_instance(i);
-                            }
-                            d.start_init(previous, file, None);
-                        }
-                        // Nothing to fall back on: what it set up before it failed goes too,
-                        // rather than half of it staying.
-                        None => {
-                            d.plugin_failed(instance, &e);
-                            if current && let Some(i) = d.plugins.init.lock().take() {
-                                d.stop_instance(i);
-                            }
-                        }
-                    }
-                }
-                Err(_) => {}
-            }
-        });
+            })
+            .collect()
+    }
+
+    /// Writes `plugins.disabled` with `name` in it (`disable`) or not, and applies the config.
+    fn set_disabled(self: &Arc<Self>, name: &str, disable: bool) -> Result<(), String> {
+        if !ext::valid_plugin_name(name) {
+            return Err(format!("{name:?} is not a plugin name"));
+        }
+        // Read, write and apply as one: two at once would each write the list they read.
+        let _editing = self.plugins.config_edits.lock();
+        let mut disabled = self.config.read().plugins.disabled.clone();
+        disabled.retain(|n| n != name);
+        if disable {
+            disabled.push(name.to_owned());
+        }
+        let literal = format!(
+            "[{}]",
+            disabled
+                .iter()
+                .map(|n| format!("{n:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        thurm_config::write_setting("plugins.disabled", &literal)?;
+        let cfg = thurm_config::Config::load().map_err(|e| e.to_string())?;
+        self.apply_config(cfg);
+        self.sync_plugins_in(false, Some(name));
+        Ok(())
     }
 
     /// The extension API's methods about plugins and scripts.
@@ -289,14 +1073,54 @@ impl Daemon {
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
+        let name = || {
+            params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| "missing \"name\"".to_owned())
+        };
         match method {
             method::SCRIPT_RUN => {
                 let run: ext::RunScript = if params.is_null() {
                     Default::default()
                 } else {
-                    serde_json::from_value(params).map_err(|e| format!("bad parameters: {e}"))?
+                    serde_json::from_value(params.clone())
+                        .map_err(|e| format!("bad parameters: {e}"))?
                 };
                 self.run_script(client, run)
+            }
+            method::PLUGINS_LIST => {
+                serde_json::to_value(self.plugin_list()).map_err(|e| e.to_string())
+            }
+            method::PLUGINS_RELOAD => {
+                match params.get("name").and_then(Value::as_str) {
+                    None => self.sync_plugins(true),
+                    Some(name) => {
+                        // Read again from its files (which may have changed, or gone) and
+                        // started again; the other plugins are left alone.
+                        self.sync_plugins_in(true, Some(name));
+                        if !self.plugins.records.lock().contains_key(name) {
+                            return Err(format!("no plugin named {name:?}"));
+                        }
+                        if self.config.read().plugins.is_disabled(name) {
+                            return Err(format!("{name} is disabled"));
+                        }
+                    }
+                }
+                Ok(Value::Null)
+            }
+            method::PLUGINS_ENABLE => self.set_disabled(&name()?, false).map(|()| Value::Null),
+            method::PLUGINS_DISABLE => self.set_disabled(&name()?, true).map(|()| Value::Null),
+            method::PLUGINS_LOGS => {
+                let name = name()?;
+                let lines = params.get("lines").and_then(Value::as_u64).unwrap_or(100) as usize;
+                let records = self.plugins.records.lock();
+                let r = records
+                    .get(&name)
+                    .ok_or_else(|| format!("no plugin named {name:?}"))?;
+                let skip = r.log.len().saturating_sub(lines);
+                Ok(json!({ "lines": r.log.iter().skip(skip).collect::<Vec<_>>() }))
             }
             other => Err(format!("unknown method {other:?}")),
         }
@@ -321,7 +1145,7 @@ impl Daemon {
             }
         }
         let _running = Running(&self.plugins.scripts);
-        let (instance, _) = self.plugin_client("script", Some(client.id));
+        let (instance, _) = self.plugin_client("script", None, Some(client.id), self.lua_sink());
         let to = client.clone();
         let log: thurm_lua::LogSink = Arc::new(move |level: &str, message: &str| {
             send_ext(
@@ -330,7 +1154,7 @@ impl Daemon {
                 &json!({ "run": instance, "level": level, "message": message }),
             );
         });
-        let name = if run.name.is_empty() {
+        let file = if run.name.is_empty() {
             "script.lua".to_owned()
         } else {
             run.name
@@ -339,7 +1163,7 @@ impl Daemon {
             instance,
             name: "script".into(),
             source: run.source,
-            file: name,
+            file,
             dir: run.dir.map(PathBuf::from),
             modules: run.modules,
             settings: Value::Null,
@@ -352,13 +1176,43 @@ impl Daemon {
         // once the load is queued: an owner leaving after this stops it with an unload, which
         // the runtime takes after the load.
         if !self.clients.lock().contains_key(&client.id) {
-            self.stop_instance(instance);
+            self.end_instance(instance);
             return Err("the client running the script went away".into());
         }
         let result = done
             .recv()
             .unwrap_or_else(|_| Err("the Lua runtime stopped".into()));
-        self.stop_instance(instance);
+        self.end_instance(instance);
         result
+    }
+}
+
+/// Whether process group `pgid` has members besides its exited leader, which stays unreaped
+/// (a zombie) while this is asked so the id stays the group's.
+fn group_has_others(pgid: libc::pid_t) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // A zombie counts as a member for kill(2) on Linux: look at the members themselves.
+        let Ok(procs) = std::fs::read_dir("/proc") else {
+            return unsafe { libc::kill(-pgid, 0) } == 0;
+        };
+        procs.filter_map(Result::ok).any(|p| {
+            let Ok(stat) = std::fs::read_to_string(p.path().join("stat")) else {
+                return false;
+            };
+            // pid (comm) state ppid pgrp ...: after the comm's closing parenthesis.
+            let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+                return false;
+            };
+            let mut f = rest.split_whitespace();
+            let state = f.next().unwrap_or("Z");
+            let pgrp = f.nth(1).and_then(|g| g.parse::<libc::pid_t>().ok());
+            pgrp == Some(pgid) && state != "Z"
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS refuses to signal a group of zombies (EPERM).
+        unsafe { libc::kill(-pgid, 0) == 0 }
     }
 }

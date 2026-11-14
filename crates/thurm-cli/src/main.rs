@@ -433,6 +433,11 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Plugins: list, make, install, enable and disable them, read their logs.
+    Plugin {
+        #[command(subcommand)]
+        action: ext::PluginCmd,
+    },
     /// Actions: your `[[commands]]`, and what plugins and the app provide.
     Action {
         #[command(subcommand)]
@@ -1015,6 +1020,12 @@ fn run(cli: Cli) -> R {
             args,
             with_modules,
         } => ext::script(remote.as_deref(), &file, args, with_modules, json),
+        Cmd::Plugin { action } if action.local() => {
+            if remote.is_some() {
+                return Err("this works on this machine's plugins; drop --remote".into());
+            }
+            ext::plugin_local(action, json)
+        }
         Cmd::Daemon { action } => daemon_cmd(&action, json),
         Cmd::AgentHook { agent, event } => {
             agent_hook(agent, event);
@@ -1441,6 +1452,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool) -> R {
     match cmd {
         Cmd::Agent { action } => return agent::run(c, action, json),
         Cmd::Action { action } => return ext::action(c, action, json),
+        Cmd::Plugin { action } => return ext::plugin(c, action, json),
         Cmd::List => {
             let panes = list(c)?;
             if json {

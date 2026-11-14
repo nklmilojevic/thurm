@@ -5,8 +5,8 @@ mod active_size;
 mod agent_prompt;
 pub mod ext;
 mod focus;
-mod plugins;
 mod layouts;
+mod plugins;
 #[path = "terminal_attach.rs"]
 mod terminal_attach;
 
@@ -3197,7 +3197,7 @@ impl Daemon {
                     log::warn!("config: {w}");
                 }
                 self.apply_config(cfg);
-                self.load_init();
+                self.sync_plugins(false);
                 Ok(Response::Ok)
             }
             Request::SaveSnapshot => self

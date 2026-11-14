@@ -6,6 +6,8 @@
 
 mod agents;
 pub mod hooks;
+#[cfg(unix)]
+pub mod plugins;
 mod overlay;
 mod programs;
 pub mod settings;
@@ -42,6 +44,8 @@ pub struct Config {
     pub push: PushConfig,
     /// Serving the daemon over Tailscale (`[tailscale]`).
     pub tailscale: TailscaleConfig,
+    /// Plugins in the config directory's `plugins/` (`[plugins]`).
+    pub plugins: PluginsConfig,
     /// Extra key bindings: `"cmd+shift+d" = "split_down"`.
     pub keybindings: std::collections::BTreeMap<String, String>,
     /// Commands of your own, in the command palette and on keys (`[[commands]]`).
@@ -1000,6 +1004,39 @@ impl Default for ProgramsConfig {
             define: Vec::new(),
         }
     }
+}
+
+/// Plugins: what the daemon runs from `plugins/` in the config directory.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct PluginsConfig {
+    /// Run plugins at all (init.lua included).
+    pub enabled: bool,
+    /// Plugins not to start, by name.
+    pub disabled: Vec<String>,
+    /// Each plugin's own settings (`[plugins.settings.<name>]`), handed to it as they are.
+    pub settings: std::collections::BTreeMap<String, toml::Value>,
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            disabled: Vec::new(),
+            settings: Default::default(),
+        }
+    }
+}
+
+impl PluginsConfig {
+    pub fn is_disabled(&self, name: &str) -> bool {
+        !self.enabled || self.disabled.iter().any(|d| d == name)
+    }
+}
+
+/// The directory plugins are found in: `plugins/` in the config directory.
+pub fn plugins_dir() -> PathBuf {
+    config_dir().join("plugins")
 }
 
 /// Apple Intelligence's on-device model (macOS 26+, Apple silicon, Apple Intelligence on).

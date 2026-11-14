@@ -718,6 +718,141 @@ fn finished_scripts_leave_no_threads() {
     );
 }
 
+/// Writes plugin `name` from its template into the env's plugins directory.
+fn scaffold(env: &Env, name: &str, program: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = env.dir.join("config/plugins").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file, text, executable) in thurm_config::plugins::scaffold(name, program) {
+        std::fs::write(dir.join(file), text).unwrap();
+        if executable {
+            std::fs::set_permissions(dir.join(file), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+    }
+}
+
+fn plugin<'a>(list: &'a Value, name: &str) -> &'a Value {
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("no {name} in {list}"))
+}
+
+/// Polls `plugins.list` until `ok` holds for it.
+fn until_plugins(c: &Client, what: &str, ok: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let list = call(c, method::PLUGINS_LIST, Value::Null).unwrap();
+        if ok(&list) {
+            return list;
+        }
+        assert!(Instant::now() < deadline, "{what}: {list}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn plugins_in_the_plugins_directory_run_and_are_managed() {
+    let python = Command::new("python3").arg("--version").output().is_ok();
+    let env = Env::new("ext-plugins");
+    scaffold(&env, "luaplug", false);
+    if python {
+        scaffold(&env, "pyplug", true);
+    }
+    let plugins = env.dir.join("config/plugins");
+    std::fs::write(
+        plugins.join("noisy.lua"),
+        "thurm.log('hello log'); thurm.warn('careful')",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let crash = plugins.join("crash.sh");
+        std::fs::write(&crash, "#!/bin/sh\necho dying >&2\nexit 3\n").unwrap();
+        std::fs::set_permissions(&crash, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _d = env.start();
+    let (c, _rx) = ext_client(&env, "e2e");
+
+    let expected: &[&str] = if python {
+        &["luaplug.hello", "pyplug.hello"]
+    } else {
+        &["luaplug.hello"]
+    };
+    let list = until_plugins(&c, "plugins up", |l| {
+        expected.iter().all(|a| {
+            l.as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["actions"].as_array().unwrap().iter().any(|x| x == *a))
+        })
+    });
+    assert_eq!(plugin(&list, "luaplug")["kind"], "lua");
+    assert_eq!(plugin(&list, "luaplug")["state"], "running");
+    assert_eq!(plugin(&list, "luaplug")["version"], "0.1.0");
+
+    // Actions of both kinds run, and say hello over the app's pane.
+    let (_app, app_rx) = app_client(&env);
+    call(&c, method::ACTIONS_RUN, json!({ "name": "luaplug.hello" })).unwrap();
+    assert_eq!(
+        next(&app_rx, notice::UI_REQUEST)["text"],
+        "Hello from luaplug"
+    );
+    if python {
+        assert_eq!(plugin(&list, "pyplug")["kind"], "process");
+        call(&c, method::ACTIONS_RUN, json!({ "name": "pyplug.hello" })).unwrap();
+        assert_eq!(
+            next(&app_rx, notice::UI_REQUEST)["text"],
+            "Hello from pyplug"
+        );
+    }
+
+    // A program that keeps exiting waits longer each time: 1 s, then 2 s.
+    until_plugins(&c, "crash fails", |l| {
+        plugin(l, "crash")["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("status 3; starting again in 1s"))
+    });
+    let list = until_plugins(&c, "crash fails again", |l| {
+        plugin(l, "crash")["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("status 3; starting again in 2s"))
+    });
+    assert_eq!(plugin(&list, "crash")["state"], "failed");
+    let logs = call(&c, method::PLUGINS_LOGS, json!({ "name": "crash" })).unwrap();
+    assert!(logs["lines"][0] == "dying", "{logs}");
+    let logs = call(&c, method::PLUGINS_LOGS, json!({ "name": "noisy" })).unwrap();
+    assert_eq!(logs["lines"], json!(["hello log", "[warn] careful"]));
+
+    // Disabled, it stops and its actions go; the config file says so.
+    call(&c, method::PLUGINS_DISABLE, json!({ "name": "luaplug" })).unwrap();
+    let list = until_plugins(&c, "disabled", |l| {
+        plugin(l, "luaplug")["state"] == "disabled"
+    });
+    assert!(
+        plugin(&list, "luaplug")["actions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let config = std::fs::read_to_string(env.dir.join("config/config.toml")).unwrap();
+    assert!(config.contains("disabled = [\"luaplug\"]"), "{config}");
+    assert!(!action_names(&c).contains(&"luaplug.hello".to_owned()));
+    call(&c, method::PLUGINS_ENABLE, json!({ "name": "luaplug" })).unwrap();
+    until_plugins(&c, "enabled", |l| {
+        plugin(l, "luaplug")["state"] == "running"
+    });
+
+    // A plugin removed from the directory goes on reload.
+    std::fs::remove_file(plugins.join("noisy.lua")).unwrap();
+    call(&c, method::PLUGINS_RELOAD, Value::Null).unwrap();
+    until_plugins(&c, "removed", |l| {
+        !l.as_array().unwrap().iter().any(|p| p["name"] == "noisy")
+    });
+}
+
 /// A script whose client leaves stops, and so does a program it waits on.
 #[test]
 fn a_scripts_program_stops_when_its_client_leaves() {
@@ -834,4 +969,220 @@ fn a_scripts_waiting_calls_end_when_its_client_leaves() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// A desktop app on this machine: it is asked what plugins ask.
+fn app_client(env: &Env) -> (Arc<Client>, Receiver<(String, Value)>) {
+    let (tx, rx) = unbounded();
+    let c = Client::connect_with(
+        ConnectOptions {
+            socket: env.socket.clone(),
+            spawn_daemon: None,
+            client_name: "app",
+            ui: true,
+        },
+        &[CAP_EXT, CAP_EXT_UI],
+        move |ev| {
+            if let Event::Ext { name, payload } = ev {
+                let _ = tx.send((name, serde_json::from_str(&payload).unwrap()));
+            }
+        },
+        || {},
+    )
+    .unwrap();
+    (c, rx)
+}
+
+/// A program plugin that ignores SIGTERM and writes after it was disabled has no say: what
+/// it asks then is not done.
+#[test]
+fn a_stopped_program_plugin_is_not_heard() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("ext-zombie");
+    let plugins = env.dir.join("config/plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let script = plugins.join("zombie.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+trap '' TERM
+echo '{"jsonrpc":"2.0","id":1,"method":"actions.register","params":{"actions":[{"name":"zombie.alive"}]}}'
+cat > /dev/null
+touch "$THURM_PLUGIN_DIR/late-written"
+echo '{"jsonrpc":"2.0","id":2,"method":"actions.register","params":{"actions":[{"name":"zombie.late"}]}}'
+sleep 10
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _d = env.start();
+    let (c, _rx) = ext_client(&env, "e2e");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !action_names(&c).contains(&"zombie.alive".to_owned()) {
+        assert!(Instant::now() < deadline, "the plugin did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    call(&c, method::PLUGINS_DISABLE, json!({ "name": "zombie" })).unwrap();
+    // It writes its late request (after this mark) once its input closed.
+    let mark = plugins.join("late-written");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !mark.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the plugin did not write after its stop"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let names = action_names(&c);
+    assert!(!names.iter().any(|n| n.starts_with("zombie.")), "{names:?}");
+}
+
+/// Reloading one plugin reads its manifest again.
+#[test]
+fn reloading_a_plugin_by_name_reads_its_files_again() {
+    let env = Env::new("ext-reload-one");
+    let dir = env.dir.join("config/plugins/tool");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "version = \"1.0.0\"\nmain = \"a.lua\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a.lua"),
+        "thurm.action{ name = 'tool.a', run = function() end }",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("b.lua"),
+        "thurm.action{ name = 'tool.b', run = function() end }",
+    )
+    .unwrap();
+    // Another Lua plugin, which a reload of `tool` leaves running: it notes each start.
+    let starts = env.dir.join("other-starts");
+    std::fs::write(
+        env.dir.join("config/plugins/other.lua"),
+        format!(
+            "local f = assert(io.open({:?}, 'a')) f:write('start\\n') f:close()",
+            starts.display().to_string()
+        ),
+    )
+    .unwrap();
+    let _d = env.start();
+    let (c, _rx) = ext_client(&env, "e2e");
+    until_plugins(&c, "started", |l| {
+        plugin(l, "tool")["actions"] == json!(["tool.a"])
+    });
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "version = \"2.0.0\"\nmain = \"b.lua\"\n",
+    )
+    .unwrap();
+    call(&c, method::PLUGINS_RELOAD, json!({ "name": "tool" })).unwrap();
+    let list = until_plugins(&c, "reloaded", |l| {
+        plugin(l, "tool")["actions"] == json!(["tool.b"])
+    });
+    assert_eq!(plugin(&list, "tool")["version"], "2.0.0");
+    // Given the time a restart would take, `other` started once.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(std::fs::read_to_string(&starts).unwrap(), "start\n");
+}
+
+/// A program plugin's leader may exit on SIGTERM while something it started ignores it:
+/// that one is stopped too when the plugin is disabled.
+#[test]
+fn a_disabled_plugin_leaves_nothing_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("ext-group");
+    let plugins = env.dir.join("config/plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let pidfile = env.dir.join("child.pid");
+    let script = plugins.join("parent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+sh -c 'trap "" TERM; while :; do sleep 1; done' &
+echo $! > {pidfile:?}
+echo '{{"jsonrpc":"2.0","id":1,"method":"actions.register","params":{{"actions":[{{"name":"parent.up"}}]}}}}'
+trap 'exit 0' TERM
+while :; do sleep 1; done
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _d = env.start();
+    let (c, _rx) = ext_client(&env, "e2e");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !action_names(&c).contains(&"parent.up".to_owned()) {
+        assert!(Instant::now() < deadline, "the plugin did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let child: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    call(&c, method::PLUGINS_DISABLE, json!({ "name": "parent" })).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // Gone, or a zombie nobody reaps (a container's init may not).
+    let running = || {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &child.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        !state.is_empty() && !state.starts_with('Z')
+    };
+    while running() {
+        assert!(
+            Instant::now() < deadline,
+            "process {child} survived the plugin"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A reload keeps a Lua plugin whose new code doesn't compile running as it was, and starts
+/// again a plugin that failed to start once it can.
+#[test]
+fn reloads_keep_what_works_and_retry_what_failed() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("ext-reload-retry");
+    let plugins = env.dir.join("config/plugins");
+    std::fs::create_dir_all(plugins.join("later")).unwrap();
+    std::fs::write(
+        plugins.join("good.lua"),
+        "thurm.action{ name = 'good.one', run = function() end }",
+    )
+    .unwrap();
+    std::fs::write(plugins.join("later/plugin.toml"), "exec = [\"./run.sh\"]\n").unwrap();
+    let _d = env.start();
+    let (c, _rx) = ext_client(&env, "e2e");
+    until_plugins(&c, "started", |l| {
+        plugin(l, "good")["actions"] == json!(["good.one"])
+            && plugin(l, "later")["state"] == "failed"
+    });
+
+    std::fs::write(plugins.join("good.lua"), "thurm.action{ name = ").unwrap();
+    let run = plugins.join("later/run.sh");
+    std::fs::write(
+        &run,
+        "#!/bin/sh\necho '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"actions.register\",\"params\":{\"actions\":[{\"name\":\"later.up\"}]}}'\ncat > /dev/null\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+    c.request(Request::ReloadConfig).unwrap();
+    let list = until_plugins(&c, "reloaded", |l| {
+        plugin(l, "later")["actions"] == json!(["later.up"])
+    });
+    assert_eq!(plugin(&list, "good")["actions"], json!(["good.one"]));
+    assert!(
+        plugin(&list, "good")["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stays")
+    );
 }
