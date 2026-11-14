@@ -612,3 +612,46 @@ fn init_lua_provides_actions_and_scripts_run() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// The threads of a process.
+fn thread_count(pid: u32) -> usize {
+    if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+        return tasks.count();
+    }
+    let out = Command::new("ps")
+        .args(["-M", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .count()
+        .saturating_sub(1)
+}
+
+/// Scripts that ended leave nothing running behind them.
+#[test]
+fn finished_scripts_leave_no_threads() {
+    let env = Env::new("ext-script-threads");
+    let d = env.start();
+    let (c, _rx) = ext_client(&env, "e2e");
+    let run = || {
+        call(
+            &c,
+            method::SCRIPT_RUN,
+            json!({ "source": "thurm.sleep(0.01); return 1" }),
+        )
+        .unwrap()
+    };
+    run();
+    std::thread::sleep(Duration::from_millis(300));
+    let before = thread_count(d.child.id());
+    for _ in 0..30 {
+        run();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let after = thread_count(d.child.id());
+    assert!(
+        after <= before + 5,
+        "{before} threads before, {after} after"
+    );
+}

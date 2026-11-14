@@ -92,9 +92,11 @@ end
 function thurm.on(event, fn)
   check(type(event) == "string" and type(fn) == "function",
     "usage: thurm.on(\"agent_finished\", function(ev) ... end)")
-  if P.on(event, fn) then
+  -- Subscribed with the first handler: one the daemon refuses is not kept.
+  if P.handlers(event) == 0 then
     call("events.subscribe", { names = { event } })
   end
+  P.on(event, fn)
 end
 
 function thurm.emit(name, payload)
@@ -312,5 +314,21 @@ else
   package.path = ""
 end
 package.cpath = ""
+
+-- Modules brought along (a script run on another host) come first.
+table.insert(package.searchers, 2, function(name)
+  local path = name:gsub("%.", "/")
+  for _, file in ipairs({ path .. ".lua", path .. "/init.lua" }) do
+    local source = P.modules[file]
+    if source then
+      local chunk, err = load(source, "@" .. file)
+      if not chunk then
+        error(err, 0)
+      end
+      return chunk, file
+    end
+  end
+  return "\n\tno module brought along as '" .. path .. ".lua'"
+end)
 
 return thurm

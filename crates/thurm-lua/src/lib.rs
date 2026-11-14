@@ -30,6 +30,9 @@ pub const TYPES: &str = include_str!("../types/thurm.lua");
 /// How long code may run without waiting before it is stopped as a runaway.
 const RUN_LIMIT: Duration = Duration::from_secs(5);
 
+/// The most timers fired before the runtime looks at its jobs again.
+const TIMER_BATCH: usize = 64;
+
 /// The most memory one Lua state may use.
 const MEMORY_LIMIT: usize = 256 << 20;
 
@@ -56,6 +59,9 @@ pub struct Spec {
     pub file: String,
     /// The directory `require` looks in.
     pub dir: Option<PathBuf>,
+    /// Modules `require` finds before the directory, by file path relative to the main
+    /// chunk's (`lib/util.lua`): a script run on another host brings its own.
+    pub modules: std::collections::BTreeMap<String, String>,
     /// `thurm.settings`.
     pub settings: Value,
     /// `thurm.args`.
@@ -74,6 +80,9 @@ enum Job {
     Notice(u64, String, Value),
     Resume(u64, u64, Result<Value, String>),
     Stop,
+    /// Tests: the timer heap's size and the live timers.
+    #[cfg(test)]
+    Inspect(Sender<(usize, usize)>),
 }
 
 /// Runs Lua plugins and scripts on a thread of its own.
@@ -241,6 +250,10 @@ impl Engine {
             Job::Notice(instance, name, payload) => self.notice(instance, &name, payload),
             Job::Resume(instance, ticket, result) => self.wake(instance, ticket, result),
             Job::Stop => {}
+            #[cfg(test)]
+            Job::Inspect(tx) => {
+                let _ = tx.send((self.timers.len(), self.timer_info.len()));
+            }
         }
         self.collect_timers();
     }
@@ -325,6 +338,7 @@ impl Engine {
         p.set("settings", to_lua(lua, &spec.settings)?)?;
         p.set("args", spec.args.clone())?;
         p.set("pane", spec.pane)?;
+        p.set("modules", spec.modules.clone())?;
 
         p.set(
             "blocks",
@@ -422,10 +436,16 @@ impl Engine {
         p.set(
             "on",
             lua.create_function(move |_, (event, f): (String, Function)| {
-                let mut s = sh.borrow_mut();
-                let list = s.handlers.entry(event).or_default();
-                list.push(f);
-                Ok(list.len() == 1)
+                sh.borrow_mut().handlers.entry(event).or_default().push(f);
+                Ok(())
+            })?,
+        )?;
+
+        let sh = shared.clone();
+        p.set(
+            "handlers",
+            lua.create_function(move |_, event: String| {
+                Ok(sh.borrow().handlers.get(&event).map_or(0, Vec::len))
             })?,
         )?;
 
@@ -625,6 +645,16 @@ impl Engine {
             let _ = done.send(Err(why.to_owned()));
         }
         self.timer_info.retain(|_, t| t.instance != instance);
+        self.prune_timers();
+    }
+
+    /// Drops the heap entries of timers that were cancelled or whose plugin went, once they
+    /// outnumber the live ones: a far-off timer cancelled must not stay until it is due.
+    fn prune_timers(&mut self) {
+        if self.timers.len() > 2 * self.timer_info.len() + 64 {
+            let live = &self.timer_info;
+            self.timers.retain(|Reverse((_, id))| live.contains_key(id));
+        }
     }
 
     fn notice(&mut self, instance: u64, name: &str, payload: Value) {
@@ -704,16 +734,20 @@ impl Engine {
                 self.timer_info.remove(&id);
             }
         }
+        self.prune_timers();
     }
 
+    /// Fires the timers due when it is called, then returns to the jobs: a timer due at once,
+    /// set by one that fired, waits for the next round, so it cannot keep others out.
     fn fire_timers(&mut self) {
-        loop {
-            self.collect_timers();
+        self.collect_timers();
+        let due = Instant::now();
+        for _ in 0..TIMER_BATCH {
             let now = Instant::now();
             let Some(&Reverse((at, id))) = self.timers.peek() else {
                 return;
             };
-            if at > now {
+            if at > due {
                 return;
             }
             self.timers.pop();
@@ -738,6 +772,7 @@ impl Engine {
                     self.start(instance, f, MultiValue::new(), TaskKind::Timer, None);
                 }
             }
+            self.collect_timers();
         }
     }
 }

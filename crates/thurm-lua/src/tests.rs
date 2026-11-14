@@ -26,6 +26,9 @@ impl Host for FakeHost {
                 )
             }
             "fail" => Err("it failed".into()),
+            "events.subscribe" if params.to_string().contains("bad.") => {
+                Err("unknown event".into())
+            }
             "request" => Ok(json!({ "Panes": [{ "id": 7 }] })),
             _ => Ok(Value::Null),
         }
@@ -59,6 +62,12 @@ fn spec(instance: u64, source: &str, script: bool) -> Spec {
         source: source.into(),
         file: "/plugins/test/init.lua".into(),
         dir: None,
+        modules: [(
+            "lib/util.lua".to_owned(),
+            "return { twice = function(x) return 2 * x end }".to_owned(),
+        )]
+        .into_iter()
+        .collect(),
         settings: json!({ "greeting": "hi" }),
         args: vec!["a1".into()],
         pane: Some(3),
@@ -259,4 +268,95 @@ fn unloading_drops_a_waiting_plugin() {
     let r = done.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(r.unwrap_err().contains("stopped"));
     drop(f.host);
+}
+
+#[test]
+fn modules_brought_along_are_required() {
+    let f = fixture();
+    assert_eq!(
+        run(&f, "return require('lib.util').twice(21)").unwrap(),
+        json!(42)
+    );
+    let e = run(&f, "require('nope')").unwrap_err();
+    assert!(e.contains("nope"), "{e}");
+}
+
+/// A plugin that sleeps 0 or sets a timer for now, over and over, still lets the others run,
+/// and can be stopped.
+#[test]
+fn timers_due_at_once_do_not_keep_others_out() {
+    let f = fixture();
+    let spinner =
+        f.rt.load(spec(20, "while true do thurm.sleep(0) end", false));
+    let rearm = f.rt.load(spec(
+        21,
+        "local function again() thurm.after(0, again) end again()",
+        false,
+    ));
+    let done = f.rt.load(spec(
+        22,
+        "thurm.action{ name = 'test.ping', run = function() return 'pong' end }",
+        false,
+    ));
+    assert_eq!(
+        done.recv_timeout(Duration::from_secs(20)).unwrap(),
+        Ok(Value::Null)
+    );
+    f.rt.notice(
+        22,
+        notice::ACTION_INVOKE,
+        json!({ "id": 1, "name": "test.ping", "ctx": {} }),
+    );
+    assert_eq!(
+        next(&f, "actions.result"),
+        json!({ "id": 1, "result": "pong" })
+    );
+    f.rt.unload(20);
+    let r = spinner.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert!(r.unwrap_err().contains("stopped"));
+    f.rt.unload(21);
+    drop(rearm);
+}
+
+#[test]
+fn a_refused_subscription_is_tried_again() {
+    let f = fixture();
+    // The fake host refuses `events.subscribe` for "bad.*" events.
+    run(
+        &f,
+        r#"
+        local ok = pcall(thurm.on, "bad.event", function() end)
+        assert(not ok)
+        pcall(thurm.on, "bad.event", function() end)
+        "#,
+    )
+    .unwrap();
+    let subscribes = f
+        .host
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, _)| m == "events.subscribe")
+        .count();
+    assert_eq!(subscribes, 2);
+}
+
+#[test]
+fn cancelled_timers_leave_the_heap() {
+    let f = fixture();
+    run(
+        &f,
+        r#"
+        for _ = 1, 2000 do thurm.after(3600, function() end).cancel() end
+        thurm.sleep(0)
+        "#,
+    )
+    .unwrap();
+    // Asked from the runtime's own thread: how many entries its heap keeps.
+    let (tx, rx) = bounded(1);
+    f.rt.tx.send(Job::Inspect(tx)).unwrap();
+    let (heap, live) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(live, 0);
+    assert!(heap <= 64, "{heap} timers left in the heap");
 }

@@ -92,6 +92,46 @@ pub fn action(c: &Client, cmd: ActionCmd, json: bool) -> R {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The Lua files under `dir` (a few levels deep), by path relative to it, for a script run on
+/// another host to `require`. Bounded: a script in a large directory brings what fits.
+fn lua_modules(dir: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    const MAX_FILES: usize = 200;
+    const MAX_BYTES: usize = 4 << 20;
+    let mut out = std::collections::BTreeMap::new();
+    let mut bytes = 0;
+    let mut stack = vec![(dir.to_path_buf(), 0)];
+    while let Some((d, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        let mut paths: Vec<_> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        paths.sort();
+        for path in paths {
+            let hidden = path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+            if hidden {
+                continue;
+            }
+            if path.is_dir() {
+                if depth < 3 {
+                    stack.push((path, depth + 1));
+                }
+            } else if path.extension().is_some_and(|e| e == "lua")
+                && let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(rel) = path.strip_prefix(dir)
+            {
+                if out.len() >= MAX_FILES || bytes + text.len() > MAX_BYTES {
+                    return out;
+                }
+                bytes += text.len();
+                out.insert(rel.display().to_string(), text);
+            }
+        }
+    }
+    out
+}
+
 /// `thurm do FILE [ARGS]`: runs a Lua script in the daemon, printing what it logs.
 pub fn script(remote: Option<&str>, file: &str, args: Vec<String>, json: bool) -> R {
     use std::io::Read;
@@ -149,11 +189,17 @@ pub fn script(remote: Option<&str>, file: &str, args: Vec<String>, json: bool) -
         || {},
     )?;
     let pane: Option<PaneId> = std::env::var(ENV_PANE_ID).ok().and_then(|v| v.parse().ok());
+    // On another host the script's directory is not there: its modules go along.
+    let (dir, modules) = match (remote, dir) {
+        (Some(_), Some(d)) => (None, lua_modules(std::path::Path::new(&d))),
+        (_, dir) => (dir, Default::default()),
+    };
     let run = ext::RunScript {
         source,
         name,
         args,
         dir,
+        modules,
         pane: if remote.is_some() { None } else { pane },
     };
     let result = call(&client, method::SCRIPT_RUN, serde_json::to_value(run)?)?;
@@ -164,4 +210,26 @@ pub fn script(remote: Option<&str>, file: &str, args: Vec<String>, json: bool) -
         other => println!("{}", serde_json::to_string_pretty(&other)?),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_remote_script_brings_its_lua_modules() {
+        let dir = std::env::temp_dir().join(format!("thurm-modules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib/deep")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("main.lua"), "a").unwrap();
+        std::fs::write(dir.join("lib/util.lua"), "b").unwrap();
+        std::fs::write(dir.join("lib/deep/init.lua"), "c").unwrap();
+        std::fs::write(dir.join("lib/notes.txt"), "d").unwrap();
+        std::fs::write(dir.join(".git/hook.lua"), "e").unwrap();
+        let m = super::lua_modules(&dir);
+        assert_eq!(
+            m.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["lib/deep/init.lua", "lib/util.lua", "main.lua"]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

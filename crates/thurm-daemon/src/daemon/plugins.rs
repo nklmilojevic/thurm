@@ -93,12 +93,16 @@ impl Daemon {
             },
         );
         let daemon = Arc::downgrade(self);
-        let counted = client.clone();
+        // Weak: the client holds the sender of `rx`, which must go with the client for the
+        // loop to end.
+        let weak = Arc::downgrade(&client);
         let _ = std::thread::Builder::new()
             .name("plugin-events".into())
             .spawn(move || {
-                // Ends once the client is gone from everywhere: its sender with it.
                 for msg in rx {
+                    let Some(counted) = weak.upgrade() else {
+                        return;
+                    };
                     counted.queued.fetch_sub(
                         super::message_weight(&msg).min(counted.queued.load(Ordering::Relaxed)),
                         Ordering::Relaxed,
@@ -181,6 +185,7 @@ impl Daemon {
             source,
             file: file.display().to_string(),
             dir: file.parent().map(PathBuf::from),
+            modules: Default::default(),
             settings: Value::Null,
             args: Vec::new(),
             pane: None,
@@ -225,6 +230,11 @@ impl Daemon {
     ) -> Result<Value, String> {
         let lua = self.lua()?;
         let (instance, _) = self.plugin_client("script", Some(client.id));
+        // Its owner may have left before the instance was there to be stopped with it.
+        if !self.clients.lock().contains_key(&client.id) {
+            self.stop_instance(instance);
+            return Err("the client running the script went away".into());
+        }
         let to = client.clone();
         let log: thurm_lua::LogSink = Arc::new(move |level: &str, message: &str| {
             send_ext(
@@ -244,6 +254,7 @@ impl Daemon {
             source: run.source,
             file: name,
             dir: run.dir.map(PathBuf::from),
+            modules: run.modules,
             settings: Value::Null,
             args: run.args,
             pane: run.pane,

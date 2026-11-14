@@ -380,6 +380,9 @@ pub struct RunScript {
     pub args: Vec<String>,
     /// The directory `require` looks in.
     pub dir: Option<String>,
+    /// Modules for `require` brought along, by path relative to the script (`lib/util.lua`):
+    /// a script run on another host has no directory there.
+    pub modules: std::collections::BTreeMap<String, String>,
     /// `thurm.pane` in the script: the pane it was started from.
     pub pane: Option<crate::PaneId>,
 }
