@@ -70,7 +70,8 @@ The command palette and **Shell > Commands** show the actions of
 bound with `thurm.bind` (or by a plugin program) works like a
 `[keybindings]` entry: bound to one of the app's actions, it moves that
 action's key; bound to a plugin's action, it runs it. The binding made last
-wins, and goes when its plugin stops.
+wins, and goes when its plugin stops. A key bound with arguments
+(`thurm.bind(key, action, args)`) runs the action with them.
 
 ## Events
 
@@ -80,12 +81,12 @@ for an event about a pane, `pane` (as `thurm info --json` shows it).
 | Event | When |
 | --- | --- |
 | `agent_working`, `agent_waiting`, `agent_blocked`, `agent_finished`, `agent_failed`, `agent_idle` | An agent enters that state |
-| `command_finished` | A command at the prompt finished; `exit_code`, `duration_secs`, `command` |
+| `command_finished` | A command at the prompt finished; `exit_code`, `duration_secs` (the command line itself goes only to `[[on]]` hooks: it may hold a secret) |
 | `pane_exited` | A pane's process exited; `exit_code` |
 | `pane_created`, `pane_closed` | A pane was created or closed (`id` for a closed one) |
 | `pane_changed` | A pane's title, directory, program or agent changed |
 | `pane_focused` | A pane got the keyboard focus in an app |
-| `bell`, `notification` | A program rang the bell, or sent a notification (`title`, `body`) |
+| `bell`, `notification` | A program rang the bell, or sent a notification (`title`, `body`); these and `pane_closed` carry the pane's `id`, not `pane` |
 | `config_reloaded` | The configuration was reloaded |
 | `NAME.anything` | A plugin's own event, sent with `thurm.emit` |
 | `*` | Every event above |
@@ -148,7 +149,9 @@ echo 'return #thurm.panes()' | thurm do -
 thurm --remote build do deploy.lua staging
 ```
 
-Stopping `thurm do` (Ctrl-C) stops the script.
+Stopping `thurm do` (Ctrl-C) stops the script. With `--remote`, the `.lua` files
+beside the script (a few levels deep) go along, so `require` finds them on the
+other host.
 
 ## Plugins
 
