@@ -154,7 +154,8 @@ thurm --remote build do deploy.lua staging
 
 Stopping `thurm do` (Ctrl-C) stops the script. With `--remote`, the `.lua` files
 beside the script (a few levels deep) go along, so `require` finds them on the
-other host.
+other host. A host the app reaches over the tailnet, not ssh, refuses scripts:
+running code there is for that machine's own clients.
 
 ## Plugins
 
