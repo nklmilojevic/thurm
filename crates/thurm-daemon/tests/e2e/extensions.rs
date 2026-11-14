@@ -637,7 +637,7 @@ fn init_lua_provides_actions_and_scripts_run() {
         toast["text"]
             .as_str()
             .unwrap()
-            .contains("previous init.lua"),
+            .contains("init.lua:2: no;"),
         "{toast}"
     );
     let deadline = Instant::now() + Duration::from_secs(20);
