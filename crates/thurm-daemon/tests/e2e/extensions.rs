@@ -964,6 +964,7 @@ fn a_scripts_waiting_calls_end_when_its_client_leaves() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
 
 /// A desktop app on this machine: it is asked what plugins ask.
 fn app_client(env: &Env) -> (Arc<Client>, Receiver<(String, Value)>) {

@@ -384,10 +384,20 @@ impl Daemon {
             PluginKind::Process { exec } => self.start_process(&found, exec, settings, generation),
         };
         if let Err(e) = started {
-            if let Some(r) = self.plugins.records.lock().get_mut(name) {
-                r.state = "failed";
+            // Only while this start is still the plugin's: a stop or another start since
+            // keeps the state it set.
+            let current = match self.plugins.records.lock().get_mut(name) {
+                Some(r) if r.generation == generation => {
+                    r.state = "failed";
+                    true
+                }
+                _ => false,
+            };
+            if current {
+                self.plugin_error(name, &e);
+            } else {
+                log::warn!("plugin {name}: a start stopped since failed: {e}");
             }
-            self.plugin_error(name, &e);
         }
     }
 
