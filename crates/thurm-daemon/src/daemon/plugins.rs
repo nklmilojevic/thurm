@@ -85,6 +85,8 @@ struct Record {
     /// A Lua plugin's code that last started without an error: what a start of newer code
     /// that fails as it runs falls back on.
     last_good: Option<String>,
+    /// Its current start has an outcome (a Lua plugin's main chunk returned or failed).
+    settled: bool,
 }
 
 impl Record {
@@ -355,6 +357,7 @@ impl Daemon {
                     generation: 0,
                     failures: 0,
                     last_good: None,
+                    settled: false,
                 });
                 // A plugin that failed is started again: its files may be fixed now.
                 let running = record.state == "running";
@@ -371,6 +374,8 @@ impl Daemon {
             match restart {
                 None => self.stop_plugin(&name, "disabled"),
                 Some(true) => {
+                    // A start still running decides what there is to fall back on.
+                    self.wait_settled(&name);
                     // Lua code that doesn't compile leaves the running plugin as it is.
                     if let Some(e) = self.lua_wont_compile(&name) {
                         self.plugin_error(&name, &format!("{e}; the running one stays"));
@@ -383,6 +388,20 @@ impl Daemon {
             }
         }
         self.plugins_changed();
+    }
+
+    /// Waits (a while) for a Lua plugin's start that is still running to have an outcome.
+    fn wait_settled(&self, name: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let waiting = self.plugins.records.lock().get(name).is_some_and(|r| {
+                r.instance.is_some() && !r.settled && matches!(r.found.kind, PluginKind::Lua { .. })
+            });
+            if !waiting {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Why a running Lua plugin's code on disk would not start now: it doesn't compile.
@@ -509,6 +528,11 @@ impl Daemon {
             let Some(d) = daemon.upgrade() else { return };
             let result = done.recv();
             let mut records = d.plugins.records.lock();
+            if let Some(r) = records.get_mut(&found.name)
+                && r.instance == Some(instance)
+            {
+                r.settled = true;
+            }
             let Some(r) = records
                 .get_mut(&found.name)
                 .filter(|r| r.instance == Some(instance))
@@ -528,10 +552,14 @@ impl Daemon {
                             d.plugin_error(&found.name, &e);
                         }
                     }
+                    // Nothing to fall back on: what it set up before it failed goes too,
+                    // rather than half of it staying.
                     None => {
                         r.state = "failed";
+                        r.instance = None;
                         drop(records);
-                        d.plugin_failed(instance, &e);
+                        d.plugin_error(&found.name, &e);
+                        d.end_instance(instance);
                     }
                 },
                 Err(_) => {}
@@ -834,6 +862,7 @@ impl Daemon {
             Some(r) if r.generation == generation => {
                 r.instance = Some(instance);
                 r.process = process;
+                r.settled = false;
                 true
             }
             _ => false,
