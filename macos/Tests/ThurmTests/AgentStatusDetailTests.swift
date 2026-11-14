@@ -9,7 +9,7 @@ final class AgentStatusDetailTests: XCTestCase {
     /// Hooks can report a permission prompt while the status still says the agent works or
     /// idles: the prompt is what the row says.
     func testAPermissionPromptComesBeforeTheStatus() {
-        for status in [AgentStatus.working, .idle, .done] {
+        for status in [AgentStatus.working, .idle, .done, .needsInput, .error] {
             XCTAssertEqual(agent(status, message: "Claude needs your permission to use Bash", permission: 4).statusDetail,
                            "Needs your permission to use Bash", "\(status)")
             XCTAssertEqual(agent(status, permission: 4).statusDetail, "Needs permission", "\(status)")

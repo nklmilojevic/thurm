@@ -259,9 +259,10 @@ extension AgentState {
     }
 
     /// Its status in words ("Needs your permission to use Bash", "Done in 2m"). A permission prompt
-    /// comes first: hooks can report one while the status still says the agent works or idles.
+    /// comes first, whatever the status says (hooks can report one while it still says the agent
+    /// works or idles), and says what it asks, else "Needs permission".
     var statusDetail: String {
-        if permission != nil, status != .needsInput {
+        if permission != nil {
             let message = message?.trimmingCharacters(in: .whitespacesAndNewlines)
             return message.flatMap { $0.isEmpty ? nil : Self.shorten($0, agent: name) } ?? "Needs permission"
         }
