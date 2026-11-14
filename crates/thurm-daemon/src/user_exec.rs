@@ -399,7 +399,13 @@ mod tests {
             .parse()
             .unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "sleep {pid} still runs");
+        // Gone, or a zombie nobody reaps (a container's init may not).
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&state.stdout).trim().to_owned();
+        assert!(state.is_empty() || state.starts_with('Z'), "sleep {pid} still runs: {state}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
