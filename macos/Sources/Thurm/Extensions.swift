@@ -312,8 +312,15 @@ final class Extensions {
         let kind = jsonString(req["kind"]) ?? ""
         let pane = jsonUInt64(req["pane"]).map { PaneKey(localHost, $0) }
         if kind == "toast" {
-            let view = pane.flatMap { SessionManager.shared.view(for: $0) }
-                ?? SessionManager.shared.currentController?.content.focusedView
+            // Over the pane it names, if the app shows it; over the focused one when it names
+            // none. Never over another pane than the one named.
+            let view: TerminalView?
+            if let pane {
+                view = SessionManager.shared.view(for: pane)
+                if view == nil { tlog("toast for pane \(pane.id), which this app doesn't show") }
+            } else {
+                view = SessionManager.shared.currentController?.content.focusedView
+            }
             view?.showToast(jsonString(req["text"]) ?? "", duration: 4)
             return
         }
