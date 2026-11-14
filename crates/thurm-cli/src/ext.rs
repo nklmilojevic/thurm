@@ -110,20 +110,47 @@ fn lua_modules(dir: &std::path::Path) -> std::collections::BTreeMap<String, Stri
             let hidden = path
                 .file_name()
                 .is_some_and(|n| n.to_string_lossy().starts_with('.'));
-            if hidden {
+            // Only what is really in the directory: a symlink may point at a file of the
+            // user's own that must not leave the machine.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if hidden || meta.file_type().is_symlink() {
                 continue;
             }
-            if path.is_dir() {
+            if meta.is_dir() {
                 if depth < 3 {
                     stack.push((path, depth + 1));
                 }
-            } else if path.extension().is_some_and(|e| e == "lua")
-                && let Ok(text) = std::fs::read_to_string(&path)
-                && let Ok(rel) = path.strip_prefix(dir)
+                continue;
+            }
+            if !meta.is_file() || path.extension().is_none_or(|e| e != "lua") {
+                continue;
+            }
+            // Within the budget, read no more than it allows.
+            let room = MAX_BYTES - bytes;
+            if out.len() >= MAX_FILES {
+                return out;
+            }
+            // A file larger than what is left is not sent: skipped without reading it.
+            if meta.len() > room as u64 {
+                continue;
+            }
+            let Ok(file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            let mut text = String::new();
+            if std::io::Read::read_to_string(
+                &mut std::io::Read::take(file, room as u64 + 1),
+                &mut text,
+            )
+            .is_err()
+                || text.len() > room
             {
-                if out.len() >= MAX_FILES || bytes + text.len() > MAX_BYTES {
-                    return out;
-                }
+                // Not text, or it grew while read: left out.
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(dir) {
                 bytes += text.len();
                 out.insert(rel.display().to_string(), text);
             }
@@ -225,11 +252,20 @@ mod tests {
         std::fs::write(dir.join("lib/deep/init.lua"), "c").unwrap();
         std::fs::write(dir.join("lib/notes.txt"), "d").unwrap();
         std::fs::write(dir.join(".git/hook.lua"), "e").unwrap();
+        // A link out of the directory stays home, file or directory.
+        let secret = std::env::temp_dir().join(format!("thurm-secret-{}.lua", std::process::id()));
+        std::fs::write(&secret, "return 'token'").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("lib/private.lua")).unwrap();
+        std::os::unix::fs::symlink(std::env::temp_dir(), dir.join("outside")).unwrap();
         let m = super::lua_modules(&dir);
         assert_eq!(
             m.keys().map(String::as_str).collect::<Vec<_>>(),
             ["lib/deep/init.lua", "lib/util.lua", "main.lua"]
         );
+        // A file over the budget is left out, unread.
+        std::fs::write(dir.join("zbig.lua"), vec![b'x'; (4 << 20) + 1]).unwrap();
+        assert_eq!(super::lua_modules(&dir).len(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_file(&secret).unwrap();
     }
 }
