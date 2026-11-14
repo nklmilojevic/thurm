@@ -48,6 +48,8 @@ pub struct Plugins {
     instances: Mutex<HashMap<u64, Instance>>,
     next: AtomicU64,
     records: Mutex<BTreeMap<String, Record>>,
+    /// Held while plugins.disabled is changed in the config file.
+    config_edits: Mutex<()>,
     /// Scripts running now.
     scripts: std::sync::atomic::AtomicUsize,
     /// Every program plugin's process not reaped yet, recorded or still starting: shutdown
@@ -142,17 +144,24 @@ impl Process {
     /// Queues one JSON-RPC message. A plugin that leaves a full outbox unread is not reading
     /// its input at all: it is closed, which tells the plugin to stop.
     fn send(&self, msg: &Value) {
-        let mut outbox = self.outbox.lock();
-        if let Some(tx) = outbox.as_ref() {
+        let full = {
+            let outbox = self.outbox.lock();
+            let Some(tx) = outbox.as_ref() else { return };
             let mut line = msg.to_string();
             line.push('\n');
-            if let Err(crossbeam_channel::TrySendError::Full(_)) = tx.try_send(line) {
-                log::warn!(
-                    "plugin process {} does not read its input; closing it",
-                    self.pgid
-                );
-                *outbox = None;
-            }
+            matches!(
+                tx.try_send(line),
+                Err(crossbeam_channel::TrySendError::Full(_))
+            )
+        };
+        // A plugin that doesn't read what it is sent can't answer it either: it is stopped
+        // (and its actions go with it when it exits).
+        if full {
+            log::warn!(
+                "plugin process {} does not read its input; stopping it",
+                self.pgid
+            );
+            self.stop();
         }
     }
 
@@ -999,6 +1008,8 @@ impl Daemon {
         if !ext::valid_plugin_name(name) {
             return Err(format!("{name:?} is not a plugin name"));
         }
+        // Read, write and apply as one: two at once would each write the list they read.
+        let _editing = self.plugins.config_edits.lock();
         let mut disabled = self.config.read().plugins.disabled.clone();
         disabled.retain(|n| n != name);
         if disable {

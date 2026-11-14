@@ -1008,6 +1008,7 @@ fn a_stopped_program_plugin_is_not_heard() {
 trap '' TERM
 echo '{"jsonrpc":"2.0","id":1,"method":"actions.register","params":{"actions":[{"name":"zombie.alive"}]}}'
 cat > /dev/null
+touch "$THURM_PLUGIN_DIR/late-written"
 echo '{"jsonrpc":"2.0","id":2,"method":"actions.register","params":{"actions":[{"name":"zombie.late"}]}}'
 sleep 10
 "#,
@@ -1022,7 +1023,17 @@ sleep 10
         std::thread::sleep(Duration::from_millis(50));
     }
     call(&c, method::PLUGINS_DISABLE, json!({ "name": "zombie" })).unwrap();
-    std::thread::sleep(Duration::from_millis(1000));
+    // It writes its late request (after this mark) once its input closed.
+    let mark = plugins.join("late-written");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !mark.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the plugin did not write after its stop"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
     let names = action_names(&c);
     assert!(!names.iter().any(|n| n.starts_with("zombie.")), "{names:?}");
 }

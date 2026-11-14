@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NAME: a Thurm plugin that runs as a program. After editing: thurm plugin reload NAME
+"""__PLUGIN__: a Thurm plugin that runs as a program. After editing: thurm plugin reload __PLUGIN__
 
 Thurm starts it with THURM_PLUGIN, THURM_PLUGIN_DIR and THURM_PLUGIN_SETTINGS (JSON) set, and
 talks to it in JSON-RPC 2.0, one message per line, on its standard input and output. Its
@@ -12,7 +12,7 @@ import os
 import sys
 import threading
 
-NAME = os.environ.get("THURM_PLUGIN", "NAME")
+NAME = os.environ.get("THURM_PLUGIN", "__PLUGIN__")
 SETTINGS = json.loads(os.environ.get("THURM_PLUGIN_SETTINGS") or "null") or {}
 
 _lock = threading.Lock()

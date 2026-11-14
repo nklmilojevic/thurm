@@ -546,12 +546,13 @@ pub fn plugin_local(cmd: PluginCmd, json: bool) -> R {
                 }
                 eprintln!("{}:", p.name);
                 git(&["-C", &p.path.display().to_string(), "pull", "--ff-only"])?;
+                // Running its new files now: a later pull that fails leaves this one current.
+                reload_running(Some(&p.name));
                 updated += 1;
             }
             if name.is_some() && updated == 0 {
                 find(name.as_deref().unwrap_or_default())?;
             }
-            reload_running(name.as_deref());
         }
         PluginCmd::Remove { name, yes } => {
             let p = find(&name)?;

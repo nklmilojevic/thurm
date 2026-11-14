@@ -1,11 +1,11 @@
--- NAME: a Thurm plugin. After editing: thurm plugin reload NAME
+-- __PLUGIN__: a Thurm plugin. After editing: thurm plugin reload __PLUGIN__
 -- Editor completion for the thurm API: thurm plugin types
 
 thurm.action{
-  name = "NAME.hello",
-  title = "NAME: Say hello",
+  name = "__PLUGIN__.hello",
+  title = "__PLUGIN__: Say hello",
   run = function(ctx)
-    thurm.ui.toast("Hello from NAME", ctx.pane)
+    thurm.ui.toast("Hello from __PLUGIN__", ctx.pane)
   end,
 }
 

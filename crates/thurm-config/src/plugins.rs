@@ -204,7 +204,8 @@ fn read(path: &Path) -> Result<Option<FoundPlugin>, String> {
 /// The files of a new plugin `name`: (path in its directory, contents, executable). A Lua
 /// plugin, or with `program` one that runs as a program (in Python).
 pub fn scaffold(name: &str, program: bool) -> Vec<(&'static str, String, bool)> {
-    let fill = |text: &str| text.replace("NAME", name);
+    // A placeholder no code uses: a name with a `-` stays out of identifiers.
+    let fill = |text: &str| text.replace("__PLUGIN__", name);
     if program {
         vec![
             (
@@ -336,5 +337,18 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(warnings.len(), 7, "{warnings:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_hyphenated_name_leaves_the_python_valid() {
+        let files = scaffold("git-tools", true);
+        let py = &files.iter().find(|(f, _, _)| *f == "plugin.py").unwrap().1;
+        assert!(
+            py.contains("NAME = os.environ.get(\"THURM_PLUGIN\", \"git-tools\")"),
+            "{py}"
+        );
+        assert!(!py.contains("git-tools ="));
+        let lua = &scaffold("git-tools", false)[1].1;
+        assert!(lua.contains("name = \"git-tools.hello\""), "{lua}");
     }
 }
