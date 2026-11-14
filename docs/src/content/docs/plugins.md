@@ -154,7 +154,8 @@ echo 'return #thurm.panes()' | thurm do -
 thurm --remote build do deploy.lua staging
 ```
 
-Stopping `thurm do` (Ctrl-C) stops the script. With `--remote`, the `.lua` files
+Stopping `thurm do` (Ctrl-C) stops the script. At most 32 scripts run at
+once. With `--remote`, the `.lua` files
 beside the script (a few levels deep) go along, so `require` finds them on the
 other host. A host the app reaches over the tailnet, not ssh, refuses scripts and
 actions: running code there is for that machine's own clients.
@@ -207,8 +208,9 @@ A plugin's settings reach it as `thurm.settings`, or as JSON in
 `THURM_PLUGIN_SETTINGS` for a program. Reloading the configuration starts new
 plugins and those that failed to start, stops removed and disabled ones, and
 restarts those whose settings changed and the Lua ones. A Lua plugin (or
-`init.lua`) whose new code doesn't compile keeps running as it was, and the
-error shows.
+`init.lua`) whose new code doesn't compile keeps running as it was, and one
+whose new code fails as it starts runs its code that worked again; the error
+shows either way.
 
 ## Program plugins
 
