@@ -26,6 +26,9 @@ use super::ext::send_ext;
 use super::{Client, Daemon};
 use crate::user_exec;
 
+/// The most scripts that may run at once (each has a Lua state of its own).
+const MAX_SCRIPTS: usize = 32;
+
 /// How many lines of its log the daemon keeps per plugin.
 const LOG_LINES: usize = 500;
 
@@ -44,9 +47,11 @@ pub struct Plugins {
     instances: Mutex<HashMap<u64, Instance>>,
     next: AtomicU64,
     records: Mutex<BTreeMap<String, Record>>,
+    /// Scripts running now.
+    scripts: std::sync::atomic::AtomicUsize,
     /// Every program plugin's process not reaped yet, recorded or still starting: shutdown
-    /// waits for them all.
-    processes: Mutex<Vec<Arc<Process>>>,
+    /// waits for them all. `true` once the daemon is stopping them: none starts after.
+    processes: Mutex<(bool, Vec<Arc<Process>>)>,
 }
 
 /// A running plugin or script, and its client.
@@ -74,6 +79,9 @@ struct Record {
     generation: u64,
     /// Program exits in a row, each soon after starting.
     failures: u32,
+    /// A Lua plugin's code that last started without an error: what a start of newer code
+    /// that fails as it runs falls back on.
+    last_good: Option<String>,
 }
 
 impl Record {
@@ -254,7 +262,11 @@ impl Daemon {
             self.stop_plugin(&name, "stopped");
         }
         // Those still starting too: their start finds itself stopped and stops them.
-        let processes: Vec<Arc<Process>> = self.plugins.processes.lock().clone();
+        let processes: Vec<Arc<Process>> = {
+            let mut list = self.plugins.processes.lock();
+            list.0 = true;
+            list.1.clone()
+        };
         for p in &processes {
             p.stop();
         }
@@ -332,6 +344,7 @@ impl Daemon {
                     log: VecDeque::new(),
                     generation: 0,
                     failures: 0,
+                    last_good: None,
                 });
                 // A plugin that failed is started again: its files may be fixed now.
                 let running = record.state == "running";
@@ -374,7 +387,10 @@ impl Daemon {
                 PluginKind::Process { .. } => return None,
             }
         };
-        let source = std::fs::read_to_string(&main).ok()?;
+        let source = match std::fs::read_to_string(&main) {
+            Ok(s) => s,
+            Err(e) => return Some(format!("cannot read {}: {e}", main.display())),
+        };
         thurm_lua::check(&source, &main.display().to_string()).err()
     }
 
@@ -433,17 +449,38 @@ impl Daemon {
     ) -> Result<(), String> {
         let source = std::fs::read_to_string(main)
             .map_err(|e| format!("cannot read {}: {e}", main.display()))?;
+        let fallback = self
+            .plugins
+            .records
+            .lock()
+            .get(&found.name)
+            .and_then(|r| r.last_good.clone())
+            .filter(|good| *good != source);
+        self.start_lua_source(found, main, settings, generation, source, fallback)
+    }
+
+    /// Runs `source` as Lua plugin `found`. When its main chunk fails and `fallback` (the code
+    /// that last worked) is given, that runs again instead.
+    fn start_lua_source(
+        self: &Arc<Self>,
+        found: &FoundPlugin,
+        main: &std::path::Path,
+        settings: Value,
+        generation: u64,
+        source: String,
+        fallback: Option<String>,
+    ) -> Result<(), String> {
         let lua = self.lua()?;
         let (instance, _) =
             self.plugin_client(&found.name, Some(found.name.clone()), None, self.lua_sink());
         let done = lua.load(thurm_lua::Spec {
             instance,
             name: found.name.clone(),
-            source,
+            source: source.clone(),
             file: main.display().to_string(),
             dir: Some(found.dir.clone()),
             modules: Default::default(),
-            settings,
+            settings: settings.clone(),
             args: Vec::new(),
             pane: None,
             log: None,
@@ -456,17 +493,38 @@ impl Daemon {
             return Ok(());
         }
         let daemon = Arc::downgrade(self);
-        let name = found.name.clone();
+        let found = found.clone();
+        let main = main.to_owned();
         std::thread::spawn(move || {
-            if let Ok(Err(e)) = done.recv()
-                && let Some(d) = daemon.upgrade()
-            {
-                if let Some(r) = d.plugins.records.lock().get_mut(&name)
-                    && r.instance == Some(instance)
-                {
-                    r.state = "failed";
-                }
-                d.plugin_failed(instance, &e);
+            let Some(d) = daemon.upgrade() else { return };
+            let result = done.recv();
+            let mut records = d.plugins.records.lock();
+            let Some(r) = records
+                .get_mut(&found.name)
+                .filter(|r| r.instance == Some(instance))
+            else {
+                return;
+            };
+            match result {
+                Ok(Ok(_)) => r.last_good = Some(source),
+                Ok(Err(e)) => match fallback {
+                    Some(previous) => {
+                        drop(records);
+                        d.plugin_error(&found.name, &format!("{e}; the code that worked runs"));
+                        d.end_instance(instance);
+                        if let Err(e) =
+                            d.start_lua_source(&found, &main, settings, generation, previous, None)
+                        {
+                            d.plugin_error(&found.name, &e);
+                        }
+                    }
+                    None => {
+                        r.state = "failed";
+                        drop(records);
+                        d.plugin_failed(instance, &e);
+                    }
+                },
+                Err(_) => {}
             }
         });
         Ok(())
@@ -497,15 +555,24 @@ impl Daemon {
         env.push(("THURM_PLUGIN_DIR".into(), found.dir.display().to_string()));
         env.push(("THURM_PLUGIN_SETTINGS".into(), settings.to_string()));
         let dir = found.dir.display().to_string();
-        let mut child = user_exec::spawn_piped(user_exec::Launch {
-            argv: exec,
-            cwd: Some(&dir),
-            env,
-            stdin: None,
-        })
-        .map_err(|e| format!("cannot start {:?}: {e}", exec[0]))?;
-        let process = Process::new(child.id() as libc::pid_t, child.stdin.take());
-        self.plugins.processes.lock().push(process.clone());
+        // Started and listed under one lock with shutdown's: a process either starts before
+        // shutdown looks, and is waited for, or not at all.
+        let (mut child, process) = {
+            let mut list = self.plugins.processes.lock();
+            if list.0 {
+                return Err("the daemon is stopping".into());
+            }
+            let mut child = user_exec::spawn_piped(user_exec::Launch {
+                argv: exec,
+                cwd: Some(&dir),
+                env,
+                stdin: None,
+            })
+            .map_err(|e| format!("cannot start {:?}: {e}", exec[0]))?;
+            let process = Process::new(child.id() as libc::pid_t, child.stdin.take());
+            list.1.push(process.clone());
+            (child, process)
+        };
         let to = process.clone();
         let (instance, client) = self.plugin_client(
             &name,
@@ -579,6 +646,7 @@ impl Daemon {
                     d.plugins
                         .processes
                         .lock()
+                        .1
                         .retain(|p| !Arc::ptr_eq(p, &process));
                 }
                 // A child of its own may keep stderr open: not for long.
@@ -1008,6 +1076,18 @@ impl Daemon {
         run: ext::RunScript,
     ) -> Result<Value, String> {
         let lua = self.lua()?;
+        // Each script has a Lua state of its own: only so many at once.
+        if self.plugins.scripts.fetch_add(1, Ordering::SeqCst) >= MAX_SCRIPTS {
+            self.plugins.scripts.fetch_sub(1, Ordering::SeqCst);
+            return Err(format!("{MAX_SCRIPTS} scripts are running already"));
+        }
+        struct Running<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _running = Running(&self.plugins.scripts);
         let (instance, _) = self.plugin_client("script", None, Some(client.id), self.lua_sink());
         let to = client.clone();
         let log: thurm_lua::LogSink = Arc::new(move |level: &str, message: &str| {
