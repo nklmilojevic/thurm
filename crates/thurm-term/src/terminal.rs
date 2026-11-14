@@ -525,6 +525,7 @@ pub struct Terminal {
     selecting: Option<Drag>,
     /// Last time bytes were fed.
     pub last_output: Instant,
+    titles: crate::filter::TitleScan,
     /// Frame counter bumped whenever the screen may have changed.
     generation: u64,
 }
@@ -574,6 +575,7 @@ impl Terminal {
             focused: true,
             selecting: None,
             last_output: Instant::now(),
+            titles: Default::default(),
             generation: 0,
             cfg,
         };
@@ -714,7 +716,10 @@ impl Terminal {
 
     /// Feed PTY output.
     pub fn advance(&mut self, bytes: &[u8]) {
-        self.last_output = Instant::now();
+        let title_only = self.titles.only_titles(bytes);
+        if !title_only {
+            self.last_output = Instant::now();
+        }
         self.generation += 1;
         let mut chunks = Vec::new();
         self.filter.feed(bytes, &mut chunks);
@@ -772,6 +777,7 @@ impl Terminal {
         // updates can arrive first: wait for the input-start mark before starting this timer.
         if self.resize_redraw_ready
             && !bytes.is_empty()
+            && !title_only
             && let Some((latest, end)) = &mut self.resize_hold
         {
             *end = (self.last_output + RESIZE_SETTLE).min(*latest);
