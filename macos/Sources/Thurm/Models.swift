@@ -258,8 +258,13 @@ extension AgentState {
         return "updated \(Int(seconds / 86400))d ago"
     }
 
-    /// Its status in words ("Needs your permission to use Bash", "Done in 2m").
+    /// Its status in words ("Needs your permission to use Bash", "Done in 2m"). A permission prompt
+    /// comes first: hooks can report one while the status still says the agent works or idles.
     var statusDetail: String {
+        if permission != nil, status != .needsInput {
+            let message = message?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return message.flatMap { $0.isEmpty ? nil : Self.shorten($0, agent: name) } ?? "Needs permission"
+        }
         switch status {
         case .needsInput: return message.map { Self.shorten($0, agent: name) } ?? "Needs input"
         case .working:
