@@ -646,8 +646,10 @@ pub fn activity_body(
     .to_string()
 }
 
-/// A pane's agent as a Live Activity shows it, or None when the pane has no agent.
-pub fn activity_state(info: &thurm_proto::PaneInfo, since: u64) -> Option<ActivityState> {
+/// A pane's agent as a Live Activity shows it, or None when the pane has no agent. It counts
+/// from when the agent's status began, so an activity followed twenty minutes into a turn shows
+/// twenty minutes; from now when that is not known.
+pub fn activity_state(info: &thurm_proto::PaneInfo) -> Option<ActivityState> {
     use thurm_proto::AgentStatus;
     let agent = info.agent.as_ref()?;
     let status = if agent.permission.is_some() {
@@ -672,13 +674,12 @@ pub fn activity_state(info: &thurm_proto::PaneInfo, since: u64) -> Option<Activi
         agent: agent.name.clone(),
         status: status.to_owned(),
         title,
-        since,
+        since: agent
+            .status_since_ms
+            .map(|ms| ms / 1000)
+            .unwrap_or_else(now_secs),
         permission: agent.permission,
     })
-}
-
-pub fn now() -> u64 {
-    now_secs()
 }
 
 /// HTTPS only, except to this machine (tests, a relay on the same host). The host is parsed:
@@ -948,6 +949,36 @@ mod tests {
             ..a.clone()
         };
         assert!(!a.same_as(&done));
+    }
+
+    #[test]
+    fn activities_count_from_when_the_status_began() {
+        let mut agent: thurm_proto::AgentState =
+            serde_json::from_str(r#"{"name":"Claude Code","kind":"claude","status":"Working"}"#)
+                .unwrap();
+        agent.status_since_ms = Some(1_800_000_000_999);
+        agent.topic = Some("✳ Fix the sidebar".into());
+        let mut info = thurm_proto::PaneInfo {
+            id: 3,
+            title: "⠴ thurm".into(),
+            agent: Some(agent),
+            ..Default::default()
+        };
+        let state = activity_state(&info).unwrap();
+        assert_eq!(state.since, 1_800_000_000);
+        assert_eq!(state.status, "working");
+        assert_eq!(state.title, "Fix the sidebar");
+
+        // Without a known start (an agent state from before it was kept), from now.
+        let agent = info.agent.as_mut().unwrap();
+        agent.status_since_ms = None;
+        agent.topic = None;
+        agent.permission = Some(9);
+        let before = now_secs();
+        let state = activity_state(&info).unwrap();
+        assert!(state.since >= before && state.since <= now_secs());
+        assert_eq!(state.status, "permission");
+        assert_eq!(state.title, "thurm");
     }
 
     #[test]

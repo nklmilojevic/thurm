@@ -677,11 +677,10 @@ impl Daemon {
                     );
                 }
             }
-            Event::PaneInfo(info) => self.push.agent_changed(
-                info.id,
-                crate::push::activity_state(info, crate::push::now()),
-                &open(),
-            ),
+            Event::PaneInfo(info) => {
+                self.push
+                    .agent_changed(info.id, crate::push::activity_state(info), &open())
+            }
             // Phones with the app open take the pane's notices down themselves.
             Event::PaneRead { pane } => self.push.read(*pane, &open()),
             Event::PaneClosed { pane } => {
@@ -3017,9 +3016,7 @@ impl Daemon {
                 pane,
                 token,
             } => {
-                let state = self.with_pane(pane, |_, st| {
-                    crate::push::activity_state(&st.info, crate::push::now())
-                })?;
+                let state = self.with_pane(pane, |_, st| crate::push::activity_state(&st.info))?;
                 log::info!("pane {pane}: a live activity follows it (device {device:.6}…)");
                 self.push.follow(&device, pane, token, state)?;
                 *client.push_device.lock() = Some(device);
@@ -3840,6 +3837,7 @@ mod tests {
     fn agent(status: AgentStatus, permission: Option<u64>) -> AgentState {
         AgentState {
             updated_at_ms: None,
+            status_since_ms: None,
             name: "Claude Code".into(),
             kind: "claude".into(),
             status,

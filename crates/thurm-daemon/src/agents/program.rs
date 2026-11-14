@@ -100,6 +100,7 @@ impl AgentTracker {
         let p = self.program.as_ref()?;
         Some(AgentState {
             updated_at_ms: None,
+            status_since_ms: None,
             name: p.name.clone(),
             kind: p.kind.clone(),
             status: p.status,
