@@ -1109,6 +1109,65 @@ fn a_held_panes_notice_comes_down_when_it_exits() {
     );
 }
 
+/// A held pane outlives its process, not its agent: no state is left there to answer, and a
+/// hook arriving late does not bring one back.
+#[test]
+fn a_held_panes_agent_goes_with_its_process() {
+    let env = Env::new("held-agent-exit");
+    let _daemon = env.start();
+    let (c, events) = env.connect();
+    let pane = match c
+        .request(Request::CreatePane(CreatePane {
+            cwd: Some(env.dir.display().to_string()),
+            size: size(80, 24),
+            hold: true,
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    run_cat(&c, pane);
+    hook(&c, pane, "prompt-submit", None);
+    hook(&c, pane, "stop", None);
+    assert_eq!(agent(&c, pane).map(|a| a.status), Some(AgentStatus::Done));
+    let pid = match c.request(Request::PaneInfo { pane }).unwrap() {
+        Response::PaneInfo(info) => info.pid.expect("the shell's pid"),
+        other => panic!("{other:?}"),
+    };
+    std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    // Clients hear it before the exit itself.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut cleared = false;
+    loop {
+        match events.recv_timeout(Duration::from_millis(200)) {
+            Ok(Event::PaneInfo(i)) if i.id == pane && !i.alive && i.agent.is_none() => {
+                cleared = true
+            }
+            Ok(Event::PaneExited { pane: p, .. }) if p == pane => break,
+            _ => assert!(Instant::now() < deadline, "the held pane never exited"),
+        }
+    }
+    assert!(cleared, "no PaneInfo without the agent before PaneExited");
+    assert_eq!(agent(&c, pane), None);
+
+    let r = c.request(Request::AgentHook {
+        pane,
+        agent: "claude".into(),
+        event: "stop".into(),
+        session_id: None,
+        message: None,
+        transcript_path: None,
+        pgrp: None,
+    });
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+    assert_eq!(agent(&c, pane), None);
+}
+
 /// The iPad showing a tab of splits: it claims the tab's panes instead of paging one.
 fn ipad(env: &Env) -> (Arc<Client>, Receiver<Event>) {
     mobile_with(env, &[CAP_MOBILE])

@@ -996,7 +996,8 @@ final class SessionManager: NSObject, CoreDelegate {
 
     /// Whether the pane's agent state counts on the Dock badge.
     private func onBadge(_ id: PaneKey) -> Bool {
-        guard let agent = panes[id]?.agent else { return false }
+        // An older daemon keeps an exited held pane's agent: nothing is left there to answer.
+        guard let info = panes[id], info.alive, let agent = info.agent else { return false }
         return config.notice(for: agent).badge
     }
 

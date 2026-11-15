@@ -38,4 +38,14 @@ final class DockBadgeTests: XCTestCase {
         manager.coreDidReceiveEvent("PaneInfo", payload: info(alive: false), host: localHost)
         XCTAssertEqual(manager.panes[key]?.alive, false)
     }
+
+    /// A held pane outlives its agent: once it exits, its finished agent is off the badge.
+    func testAnExitedPanesAgentIsOffTheBadge() {
+        func count() -> Int { Int(NSApp.dockTile.badgeLabel ?? "") ?? 0 }
+        manager.coreDidReceiveEvent("PaneInfo", payload: info(alive: true), host: localHost)
+        let lit = count()
+        XCTAssertGreaterThan(lit, 0)
+        manager.coreDidReceiveEvent("PaneInfo", payload: info(alive: false), host: localHost)
+        XCTAssertEqual(count(), lit - 1)
+    }
 }
