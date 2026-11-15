@@ -474,19 +474,13 @@ mod tests {
         };
         let mut want = Frame::blank(10, 4);
         want.put_str(0, 0, "ab", Style::default());
-        for c in 2..10 {
-            want.lines[0][c] = narrow(" ", blue);
-        }
+        want.lines[0][2..10].fill(narrow(" ", blue));
         // Blanks that show an underline are printed, not erased.
         want.put_str(1, 0, "cd", Style::default());
-        for c in 2..10 {
-            want.lines[1][c] = narrow(" ", underlined);
-        }
+        want.lines[1][2..10].fill(narrow(" ", underlined));
         // Only the default-styled run at the end is erased; the blue blanks before it are not.
         want.put_str(2, 0, "x", Style::default());
-        for c in 1..4 {
-            want.lines[2][c] = narrow(" ", blue);
-        }
+        want.lines[2][1..4].fill(narrow(" ", blue));
 
         // Rows 0, 2 and 3 end in erasable blanks; row 1 does not.
         let out = draw(&mut PaneRenderer::new(), &want);
