@@ -13,9 +13,12 @@
       "automergeType": "pr"
     }
   },
+  "vulnerabilityAlerts": {
+    "groupName": "{{#if (equals manager 'gomod')}}{{#if (containsString packageFile 'tailnet/')}}tailnet Go modules{{else}}Go modules{{/if}}{{else if (equals manager 'cargo')}}Rust crates{{else if (or (equals manager 'npm') (equals manager 'bun'))}}npm packages{{else}}security updates{{/if}}"
+  },
   "packageRules": [
     {
-      "description": "flake.nix keys tailnet's vendored modules on vendorHash, which Renovate cannot recompute. One weekly PR, merged by hand after `just tailnet-hash`. tailnet/e2e replaces tailnet with ../, so a dependency both share (tailscale.com) must move in both go.mod files at once.",
+      "description": "flake.nix keys tailnet's vendored modules on vendorHash. Renovate rewrites it in its own commit with the go-vendor-hash helper, which builds with a fake hash so stale modules in a cache cannot pass. One weekly PR. tailnet/e2e replaces tailnet with ../, so a dependency both share (tailscale.com) must move in both go.mod files at once. The command must match RENOVATE_ALLOWED_COMMANDS on the runner.",
       "matchManagers": [
         "gomod"
       ],
@@ -29,7 +32,19 @@
       "schedule": [
         "before 6am on monday"
       ],
-      "automerge": false
+      "automerge": false,
+      "postUpgradeTasks": {
+        "commands": [
+          "nix --extra-experimental-features nix-command --extra-experimental-features flakes run git+https://github.com/nklmilojevic/renovate-config?rev=95f0da7f2c8530b813606dcbcea0f416ade15d5f#go-vendor-hash -- flake.nix .#thurm.tailnet"
+        ],
+        "fileFilters": [
+          "flake.nix"
+        ],
+        "executionMode": "branch",
+        "installTools": {
+          "nix": {}
+        }
+      }
     },
     {
       "description": "Workflows hold the release signing keys: their updates are reviewed, never merged automatically.",
