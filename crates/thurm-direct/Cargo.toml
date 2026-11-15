@@ -4,6 +4,7 @@ description = "A host without Thurm, served to the iOS app as a daemon in the ap
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 thurm-proto.workspace = true

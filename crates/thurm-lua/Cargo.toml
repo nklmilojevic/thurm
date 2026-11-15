@@ -4,6 +4,7 @@ description = "Lua plugins and scripts for the Thurm daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 mlua = { version = "0.12", features = ["lua54", "vendored", "serialize"] }

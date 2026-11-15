@@ -4,6 +4,7 @@ description = "Thurm session daemon: owns PTYs, terminal state and session persi
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "thurmd"

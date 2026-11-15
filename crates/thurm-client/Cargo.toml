@@ -4,11 +4,11 @@ description = "Client library for the Thurm daemon (used by the CLI and the macO
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 thurm-proto.workspace = true
 thurm-config.workspace = true
 parking_lot.workspace = true
 crossbeam-channel.workspace = true
-log.workspace = true
 libc.workspace = true

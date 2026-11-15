@@ -2554,7 +2554,6 @@ version = "0.23.0"
 dependencies = [
  "crossbeam-channel",
  "libc",
- "log",
  "parking_lot 0.13.0",
  "thurm-config",
  "thurm-proto",
@@ -2746,7 +2745,6 @@ dependencies = [
  "flate2",
  "ghostty-vt-rs-sys",
  "libc",
- "log",
  "memchr",
  "png",
  "regex",

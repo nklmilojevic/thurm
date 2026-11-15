@@ -4,6 +4,7 @@ description = "Remote workspaces: ssh and tailnet tunnels to thurmd on other mac
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 thurm-proto.workspace = true

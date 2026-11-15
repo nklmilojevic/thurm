@@ -4,6 +4,7 @@ description = "thurm-nvim: Neovim with each of its windows in a Thurm pane"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "thurm-nvim"

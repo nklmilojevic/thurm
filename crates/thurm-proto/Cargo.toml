@@ -4,6 +4,7 @@ description = "Wire protocol shared by the Thurm daemon, CLI and GUI bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true

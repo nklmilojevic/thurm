@@ -4,6 +4,7 @@ description = "C ABI bridge between the Thurm macOS app and the Rust core (see i
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "thurm_ffi"

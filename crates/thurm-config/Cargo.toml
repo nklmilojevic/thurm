@@ -4,6 +4,7 @@ description = "Thurm configuration (TOML) shared by the daemon and the GUI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true
