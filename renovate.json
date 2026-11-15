@@ -35,7 +35,7 @@
       "automerge": false,
       "postUpgradeTasks": {
         "commands": [
-          "nix --extra-experimental-features nix-command --extra-experimental-features flakes run git+https://github.com/nklmilojevic/renovate-config?rev=95f0da7f2c8530b813606dcbcea0f416ade15d5f#go-vendor-hash -- flake.nix .#thurm.tailnet"
+          "nix --extra-experimental-features nix-command --extra-experimental-features flakes run git+https://github.com/nklmilojevic/renovate-config?rev=2ccac4df935f18066002b388984c33a5c5d11d45#go-vendor-hash -- flake.nix .#thurm.tailnet"
         ],
         "fileFilters": [
           "flake.nix"
