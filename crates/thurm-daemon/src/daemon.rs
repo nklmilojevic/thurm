@@ -1504,13 +1504,14 @@ impl Daemon {
                 };
                 st.term.print(&msg);
             }
+            // The exit hook hears what exited, agent included.
             let info = st.info.clone();
             // A held pane outlives its process, not its agent: its state would hold the badge
-            // and the agent lists with nothing left to answer.
+            // and the agent lists with nothing left to answer. The title stays what it was at
+            // the exit (the session's topic, say), not what the agent last set on the terminal.
             if st.hold && !st.closed && st.info.agent.is_some() {
                 st.agent = AgentTracker::default();
                 st.info.agent = None;
-                st.info.title = pane_title(&st, st.info.foreground.as_ref());
                 self.broadcast(Event::PaneInfo(st.info.clone()), false);
             }
             (st.hold, info, st.closed)

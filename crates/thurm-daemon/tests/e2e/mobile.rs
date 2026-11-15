@@ -1132,8 +1132,8 @@ fn a_held_panes_agent_goes_with_its_process() {
     hook(&c, pane, "prompt-submit", None);
     hook(&c, pane, "stop", None);
     assert_eq!(agent(&c, pane).map(|a| a.status), Some(AgentStatus::Done));
-    let pid = match c.request(Request::PaneInfo { pane }).unwrap() {
-        Response::PaneInfo(info) => info.pid.expect("the shell's pid"),
+    let (pid, title) = match c.request(Request::PaneInfo { pane }).unwrap() {
+        Response::PaneInfo(info) => (info.pid.expect("the shell's pid"), info.title),
         other => panic!("{other:?}"),
     };
     std::process::Command::new("kill")
@@ -1146,6 +1146,8 @@ fn a_held_panes_agent_goes_with_its_process() {
     loop {
         match events.recv_timeout(Duration::from_millis(200)) {
             Ok(Event::PaneInfo(i)) if i.id == pane && !i.alive && i.agent.is_none() => {
+                // What it was at the exit, not the agent's last terminal title.
+                assert_eq!(i.title, title);
                 cleared = true
             }
             Ok(Event::PaneExited { pane: p, .. }) if p == pane => break,
