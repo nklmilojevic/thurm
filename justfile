@@ -43,8 +43,8 @@ watch:
     id="$(gh run list --repo {{ repo }} --workflow Release --limit 1 --json databaseId -q '.[0].databaseId')"
     gh run watch "$id" --repo {{ repo }} --exit-status
 
-# Renovate bumps tailnet/go.mod and go.sum but not this hash. On its PR:
-# `gh pr checkout N && just tailnet-hash && git commit -am "chore(nix): tailnet vendorHash" && git push`
+# Renovate writes this hash itself on its tailnet PRs (renovate.json runs the go-vendor-hash helper).
+# Run this after changing tailnet/go.mod by hand, or if a Renovate PR still fails with "inconsistent vendoring".
 [doc("Recompute flake.nix's vendorHash for tailnet/ and check that it builds")]
 tailnet-hash:
     #!/usr/bin/env bash
