@@ -1794,9 +1794,22 @@ final class TabContentView: NSView {
                 stop.pointee = true
                 return
             }
+            // The chip and where it would drop follow the pointer, up to where the button comes up.
+            func follow(_ p: CGPoint) {
+                let area = self.paneArea
+                dropped = startRect.offsetBy(dx: p.x - origin.x, dy: p.y - origin.y)
+                self.floating[i].chip = FloatingGeometry.chipFraction(
+                    of: FloatingGeometry.chipRect(FloatingGeometry.chipFraction(of: dropped, in: area),
+                                                  size: dropped.size, in: area), in: area)
+                let drop = sidebar?.cardDrop(at: self.convert(p, to: nil), for: pane)
+                tabGap = drop?.gap
+                sidebar?.showCardDrop(drop?.line)
+                self.needsLayout = true
+            }
             switch e.type {
             case .leftMouseUp:
                 released = self.convert(e.locationInWindow, from: nil)
+                if moved { follow(released) }
                 stop.pointee = true
             case .keyDown:
                 guard e.keyCode == 53 else { return }
@@ -1807,15 +1820,7 @@ final class TabContentView: NSView {
                 let p = self.convert(e.locationInWindow, from: nil)
                 if !moved && hypot(p.x - origin.x, p.y - origin.y) < 3 { return }
                 moved = true
-                let area = self.paneArea
-                dropped = startRect.offsetBy(dx: p.x - origin.x, dy: p.y - origin.y)
-                self.floating[i].chip = FloatingGeometry.chipFraction(
-                    of: FloatingGeometry.chipRect(FloatingGeometry.chipFraction(of: dropped, in: area),
-                                                  size: dropped.size, in: area), in: area)
-                let drop = sidebar?.cardDrop(at: self.convert(p, to: nil), for: pane)
-                tabGap = drop?.gap
-                sidebar?.showCardDrop(drop?.line)
-                self.needsLayout = true
+                follow(p)
             }
         }
         sidebar?.showCardDrop(nil)
