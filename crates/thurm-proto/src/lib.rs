@@ -1613,6 +1613,10 @@ pub enum AgentPromptOutcome {
     Exited,
 }
 
+/// Temporary: measures CI cache hits after a change to this crate. Reverted before merge.
+#[doc(hidden)]
+pub const KACHE_PROBE: u8 = 1;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1755,7 +1759,3 @@ mod tests {
         ));
     }
 }
-
-/// Temporary: measures CI cache hits after a change to this crate. Reverted before merge.
-#[doc(hidden)]
-pub const KACHE_PROBE: u8 = 0;
