@@ -85,7 +85,7 @@ jobs:
           # renovate: depName=kunobi-ninja/kache
           version: v2.1.1
           cache-key-prefix: kache-rust
-          save-cache: true
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
           pr-comment: false
       # thurm-mosh's and thurm-direct's tests talk to a real mosh-server (skipped without one).
       - name: Install mosh
@@ -145,7 +145,7 @@ jobs:
           # renovate: depName=kunobi-ninja/kache
           version: v2.1.1
           cache-key-prefix: kache-linux
-          save-cache: true
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
           pr-comment: false
       # The daemon and terminal suites, and the remote ones (loopback ssh, handoffs). Here sshd
       # is there, and so is the network namespace in a privileged container, so the tests
@@ -222,7 +222,7 @@ jobs:
           # renovate: depName=kunobi-ninja/kache
           version: v2.1.1
           cache-key-prefix: kache-web
-          save-cache: true
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
           pr-comment: false
       # wasm-bindgen and wasm-opt from the flake's nixpkgs: the dev shell's versions, the
       # wasm-bindgen one being the version thurm-web pins.
