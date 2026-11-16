@@ -539,6 +539,12 @@ final class MinimizedCardChip: NSView {
     override func mouseEntered(with event: NSEvent) { hovering = true }
     override func mouseExited(with event: NSEvent) { hovering = false }
 
+    /// A press that neither moved the chip nor was cancelled, released over the chip (`chip`,
+    /// in the coordinates of `released`).
+    static func isClick(moved: Bool, cancelled: Bool, released: CGPoint, chip: CGRect) -> Bool {
+        !moved && !cancelled && chip.contains(released)
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard let onPress else { return }
         if !onPress(event) { onClick?() }

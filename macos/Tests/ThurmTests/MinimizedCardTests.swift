@@ -251,6 +251,15 @@ final class MinimizedCardTests: XCTestCase {
         XCTAssertNil(content.placedChips[key(10)])
     }
 
+    func testOnlyAPressReleasedOverTheChipRestoresIt() {
+        let chip = CGRect(x: 10, y: 10, width: 100, height: 26)
+        XCTAssertTrue(MinimizedCardChip.isClick(moved: false, cancelled: false, released: CGPoint(x: 50, y: 20), chip: chip))
+        XCTAssertFalse(MinimizedCardChip.isClick(moved: false, cancelled: false, released: CGPoint(x: 111, y: 20), chip: chip),
+                       "released just past its edge, without a drag")
+        XCTAssertFalse(MinimizedCardChip.isClick(moved: true, cancelled: false, released: CGPoint(x: 50, y: 20), chip: chip))
+        XCTAssertFalse(MinimizedCardChip.isClick(moved: false, cancelled: true, released: CGPoint(x: 50, y: 20), chip: chip))
+    }
+
     func testTabLayoutCodesWhereAChipWasLeft() throws {
         let json = #"{"id":2,"frame":[0.1,0.2,0.5,0.5],"minimized":true,"chip":[0.25,0.75]}"#
         let card = try JSONDecoder().decode(FloatingPane.self, from: Data(json.utf8))

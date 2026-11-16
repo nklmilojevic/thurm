@@ -1773,8 +1773,8 @@ final class TabContentView: NSView {
 
     /// Moves the chip of minimized `pane` until the mouse button is released: anywhere in the
     /// tab, where it stays; back into the row of chips when dropped on it; or onto the sidebar,
-    /// where the pane becomes a tab there. Esc puts it back. Returns whether the press became a
-    /// drag (or was cancelled): false for a click.
+    /// where the pane becomes a tab there. Esc puts it back. Returns false for a click (released
+    /// over the chip without a drag), true for anything else.
     @discardableResult
     func trackChipDrag(_ pane: PaneKey, from event: NSEvent) -> Bool {
         guard let window, let first = floating.first(where: { $0.pane == pane && $0.minimized }),
@@ -1785,6 +1785,7 @@ final class TabContentView: NSView {
         var moved = false
         var cancelled = false
         var dropped = startRect
+        var released = origin
         var tabGap: TabGap?
         let sidebar = self.sidebar
         window.trackEvents(matching: [.leftMouseDragged, .leftMouseUp, .keyDown],
@@ -1795,6 +1796,7 @@ final class TabContentView: NSView {
             }
             switch e.type {
             case .leftMouseUp:
+                released = self.convert(e.locationInWindow, from: nil)
                 stop.pointee = true
             case .keyDown:
                 guard e.keyCode == 53 else { return }
@@ -1828,7 +1830,7 @@ final class TabContentView: NSView {
         }
         needsLayout = true
         if moved && !cancelled { SessionManager.shared.scheduleLayoutSave() }
-        return moved || cancelled
+        return !MinimizedCardChip.isClick(moved: moved, cancelled: cancelled, released: released, chip: startRect)
     }
 
     /// Moves a card until the mouse button is released. Command docks it beside a split pane.
