@@ -80,9 +80,13 @@ jobs:
           toolchain: 1.100.0
           components: clippy, rustfmt
           targets: aarch64-apple-ios, wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # renovate: depName=kunobi-ninja/kache
+          version: v2.1.1
+          cache-key-prefix: kache-rust
+          save-cache: true
+          pr-comment: false
       # thurm-mosh's and thurm-direct's tests talk to a real mosh-server (skipped without one).
       - name: Install mosh
         run: brew install mosh
@@ -136,10 +140,13 @@ jobs:
         with:
           toolchain: 1.100.0
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: x86_64-unknown-linux-musl
+          # renovate: depName=kunobi-ninja/kache
+          version: v2.1.1
+          cache-key-prefix: kache-linux
+          save-cache: true
+          pr-comment: false
       # The daemon and terminal suites, and the remote ones (loopback ssh, handoffs). Here sshd
       # is there, and so is the network namespace in a privileged container, so the tests
       # needing them must not skip.
@@ -210,10 +217,13 @@ jobs:
           toolchain: 1.100.0
           components: clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: web
+          # renovate: depName=kunobi-ninja/kache
+          version: v2.1.1
+          cache-key-prefix: kache-web
+          save-cache: true
+          pr-comment: false
       # wasm-bindgen and wasm-opt from the flake's nixpkgs: the dev shell's versions, the
       # wasm-bindgen one being the version thurm-web pins.
       - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
