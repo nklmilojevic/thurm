@@ -246,6 +246,13 @@ enum Cmd {
         on: bool,
         #[arg(long, conflicts_with_all = ["frame", "cells"])]
         off: bool,
+        /// Minimize it to a chip in its tab (floating it first if it is in the splits). Its
+        /// program keeps running.
+        #[arg(long, conflicts_with_all = ["off", "restore"])]
+        minimize: bool,
+        /// Bring a minimized card back, without focusing it.
+        #[arg(long, conflicts_with = "off")]
+        restore: bool,
         #[command(flatten)]
         place: PlaceArgs,
     },
@@ -270,6 +277,10 @@ enum Cmd {
         /// Wait for COMMAND to exit, and exit with its status.
         #[arg(long)]
         wait: bool,
+        /// Start it minimized to a chip in the tab, for a command to run out of the way: it
+        /// takes neither the focus nor the screen (implies `--background`).
+        #[arg(long)]
+        minimized: bool,
         #[command(flatten)]
         place: PlaceArgs,
         #[arg(trailing_var_arg = true)]
@@ -1609,13 +1620,23 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool, remote: Option<&str>) -> R {
             pane,
             on,
             off,
+            minimize,
+            restore,
             place,
         } => {
             let pane = current_pane(pane)?;
             let place = float_place(&place, pane, current_pane(None).ok())?;
             check_anchor(c, place.as_ref(), Some(pane))?;
+            let placed = place.is_some();
             if let Some(place) = place {
                 layout_ui(c, UiCommand::PlaceFloating { pane, place })?;
+            }
+            if minimize || restore {
+                let minimized = minimize;
+                layout_ui(c, UiCommand::MinimizeFloating { pane, minimized })?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            if placed {
                 return Ok(ExitCode::SUCCESS);
             }
             let on = if on {
@@ -1633,6 +1654,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool, remote: Option<&str>) -> R {
             hold,
             background,
             wait,
+            minimized,
             place,
             command,
         } => {
@@ -1654,6 +1676,22 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool, remote: Option<&str>) -> R {
                 _ => current_pane(pane).ok(),
             };
             let new = create(c, command, cwd, target, hold || wait, None)?;
+            let background = background || minimized;
+            if minimized {
+                let cmd = UiCommand::OpenFloatingMinimized {
+                    pane: new,
+                    target,
+                    place,
+                };
+                match ui(c, cmd) {
+                    Ok(()) => return opened(c, new, wait, hold, json),
+                    Err(e) if e == thurm_proto::LAYOUT_NO_WINDOW => {
+                        eprintln!("thurm: pane created but not shown: {e}");
+                        return opened(c, new, wait, hold, json);
+                    }
+                    Err(e) => eprintln!("thurm: {e}; opening it in the background, not minimized"),
+                }
+            }
             if let Some(place) = place {
                 match ui(
                     c,
@@ -2589,6 +2627,11 @@ mod tests {
         assert!(parse(&["new-float", "--frame", "0,0,1,1", "--cells", "0,0,1x1"]).is_err());
         assert!(parse(&["float", "--off", "--frame", "0,0,1,1"]).is_err());
         assert!(parse(&["float", "-p", "4", "--cells", "0,0,10x2", "--anchor", "3"]).is_ok());
+        assert!(parse(&["new-float", "--minimized", "--frame", "0,0,0.5,0.5", "npm"]).is_ok());
+        assert!(parse(&["float", "--minimize", "--frame", "0,0,0.5,0.5"]).is_ok());
+        assert!(parse(&["float", "--minimize", "--restore"]).is_err());
+        assert!(parse(&["float", "--minimize", "--off"]).is_err());
+        assert!(parse(&["float", "--restore", "--off"]).is_err());
 
         let args = PlaceArgs {
             cells: Some((1, 2, 3, 4)),
@@ -2656,6 +2699,7 @@ mod tests {
                     zoomed: false,
                     cells: None,
                     minimized: false,
+                    chip: None,
                 })
                 .collect(),
             floating_hidden: false,

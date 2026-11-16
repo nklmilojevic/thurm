@@ -272,6 +272,8 @@ final class TabContentView: NSView {
     /// The cards on screen: none while hidden, and never the minimized ones.
     private var shownCards: [FloatingCard] { floatingHidden ? [] : floating.filter { !$0.minimized } }
     let minimizedBar = MinimizedCardsBar()
+    /// The chips of minimized cards dragged out of the row, by pane.
+    private(set) var placedChips: [PaneKey: MinimizedCardChip] = [:]
     /// Each card's fill and outline, by pane.
     private var cardParts: [PaneKey: (back: FloatingCardBack, rim: FloatingCardRim)] = [:]
     /// The pane of the splits focused last: where they split while a card has the focus.
@@ -456,6 +458,7 @@ final class TabContentView: NSView {
         addSubview(dockIndicator)
         addSubview(minimizedBar)
         minimizedBar.onRestore = { [weak self] pane in self?.focus(pane) }
+        minimizedBar.onPress = { [weak self] pane, event in self?.trackChipDrag(pane, from: event) ?? false }
         registerForDraggedTypes([TabSidebarViewController.dragType])
         syncViews()
         setNotices(Notices.shared.current)
@@ -553,6 +556,7 @@ final class TabContentView: NSView {
             set(cardParts[id]?.rim, base + 3)
         }
         set(minimizedBar, 40_000)
+        for chip in placedChips.values { set(chip, 40_001) }
         set(dockIndicator, 50_000)
         withUnsafeMutablePointer(to: &rank) { ranks in
             sortSubviews({ a, b, context in
@@ -675,7 +679,8 @@ final class TabContentView: NSView {
 
     private func layoutBottomRight(in full: NSRect) {
         var bottom = full.maxY - 10
-        let chips = floatingHidden ? [] : floating.filter(\.minimized).map(\.pane)
+        layoutPlacedChips(in: full)
+        let chips = floatingHidden ? [] : floating.filter { $0.minimized && $0.chip == nil }.map(\.pane)
         minimizedBar.panes = chips
         minimizedBar.isHidden = chips.isEmpty
         if !chips.isEmpty {
@@ -1031,6 +1036,9 @@ final class TabContentView: NSView {
             return super.hitTest(point)
         }
         if !minimizedBar.isHidden, minimizedBar.frame.contains(local) {
+            return super.hitTest(point)
+        }
+        if placedChips.values.contains(where: { !$0.isHidden && $0.frame.contains(local) }) {
             return super.hitTest(point)
         }
         if cardEdges(at: local) != nil || dividerAt(local) != nil {
@@ -1471,17 +1479,19 @@ final class TabContentView: NSView {
     }
 
     /// Floats `pane`, a new pane of this tab, above the splits (at `place`, or where new cards
-    /// go) and focuses it (unless `takeFocus` is false). Hidden cards show again.
-    func addNewFloating(_ pane: PaneKey, place: FloatPlace? = nil, takeFocus: Bool = true) {
+    /// go) and focuses it (unless `takeFocus` is false, or it starts `minimized` to a chip).
+    /// Hidden cards show again.
+    func addNewFloating(_ pane: PaneKey, place: FloatPlace? = nil, takeFocus: Bool = true,
+                        minimized: Bool = false) {
         guard !contains(pane) else { return }
         let placed = place.flatMap { cardFrame(for: $0) }
         if place != nil && placed == nil { tlog("new floating pane \(pane): its place's anchor is not shown here") }
         let frame = placed?.frame ?? FloatingGeometry.defaultFraction(index: floating.count)
         transitionLayout {
-            floating.append(FloatingCard(pane: pane, frame: frame, cells: placed?.cells))
+            floating.append(FloatingCard(pane: pane, frame: frame, cells: placed?.cells, minimized: minimized))
             floatingHidden = false
         }
-        if takeFocus { focus(pane) }
+        if takeFocus && !minimized { focus(pane) }
         window?.invalidateCursorRects(for: self)
         SessionManager.shared.scheduleLayoutSave()
     }
@@ -1623,6 +1633,21 @@ final class TabContentView: NSView {
         return true
     }
 
+    /// Minimizes `pane` to a chip (floating it first when it is in the splits), or brings it
+    /// back, leaving the focus where it is (on the card shown on top, when it was on `pane`).
+    /// False when it cannot float: the splits keep at least one pane.
+    @discardableResult
+    func minimize(_ pane: PaneKey, _ on: Bool) -> Bool {
+        guard contains(pane) else { return false }
+        if on && !isFloating(pane) {
+            let focused = focusedPane
+            guard setFloating(pane, true) else { return false }
+            if focused != pane { focus(focused) }
+        }
+        setMinimized(pane, on)
+        return true
+    }
+
     func setMinimized(_ pane: PaneKey, _ on: Bool) {
         guard let i = floating.firstIndex(where: { $0.pane == pane }), floating[i].minimized != on else { return }
         let refocus = on && pane == focusedPane
@@ -1681,6 +1706,103 @@ final class TabContentView: NSView {
         guard let (id, rect) = tiles.first(where: { $0.1.contains(point) }) else { return nil }
         let side = FloatingGeometry.dockSide(point, in: rect)
         return (id, side, FloatingGeometry.dockRect(rect, side: side, gap: splitGap))
+    }
+
+    /// Shows the chips of the minimized cards dragged out of the row where they were left,
+    /// inside `full`; none while the cards are hidden.
+    private func layoutPlacedChips(in full: NSRect) {
+        let placed = floatingHidden ? [] : floating.compactMap { card in
+            card.minimized ? card.chip.map { (card.pane, $0) } : nil
+        }
+        let keep = Set(placed.map(\.0))
+        for (pane, chip) in placedChips where !keep.contains(pane) {
+            chip.removeFromSuperview()
+            placedChips[pane] = nil
+        }
+        var added = false
+        for (pane, fraction) in placed {
+            let chip = placedChips[pane] ?? {
+                let chip = MinimizedCardChip(pane: pane)
+                chip.onClick = { [weak self] in self?.focus(pane) }
+                chip.onPress = { [weak self] event in self?.trackChipDrag(pane, from: event) ?? false }
+                addSubview(chip)
+                placedChips[pane] = chip
+                added = true
+                return chip
+            }()
+            let size = CGSize(width: chip.fittingSize.width, height: MinimizedCardChip.height)
+            chip.frame = FloatingGeometry.chipRect(fraction, size: size, in: full)
+            chip.isHidden = false
+        }
+        if added { restack() }
+    }
+
+    /// The chip of minimized `pane`, where it is on screen: in the row or on its own.
+    private func chipFrame(_ pane: PaneKey) -> CGRect? {
+        if let chip = placedChips[pane], !chip.isHidden { return chip.frame }
+        guard !minimizedBar.isHidden,
+              let chip = minimizedBar.chips.first(where: { $0.pane == pane && !$0.isHidden }) else { return nil }
+        return convert(chip.frame, from: minimizedBar)
+    }
+
+    /// Moves the chip of minimized `pane` until the mouse button is released: anywhere in the
+    /// tab, where it stays; back into the row of chips when dropped on it; or onto the sidebar,
+    /// where the pane becomes a tab there. Esc puts it back. Returns whether the press became a
+    /// drag (or was cancelled): false for a click.
+    @discardableResult
+    func trackChipDrag(_ pane: PaneKey, from event: NSEvent) -> Bool {
+        guard let window, let first = floating.first(where: { $0.pane == pane && $0.minimized }),
+              let startRect = chipFrame(pane) else { return false }
+        let start = first.chip
+        let row = minimizedBar.isHidden ? nil : minimizedBar.frame
+        let origin = convert(event.locationInWindow, from: nil)
+        var moved = false
+        var cancelled = false
+        var dropped = startRect
+        var tabGap: TabGap?
+        let sidebar = self.sidebar
+        window.trackEvents(matching: [.leftMouseDragged, .leftMouseUp, .keyDown],
+                           timeout: NSEvent.foreverDuration, mode: .eventTracking) { [weak self] e, stop in
+            guard let self, let e, let i = self.floating.firstIndex(where: { $0.pane == pane && $0.minimized }) else {
+                stop.pointee = true
+                return
+            }
+            switch e.type {
+            case .leftMouseUp:
+                stop.pointee = true
+            case .keyDown:
+                guard e.keyCode == 53 else { return }
+                cancelled = true
+                self.floating[i].chip = start
+                stop.pointee = true
+            default:
+                let p = self.convert(e.locationInWindow, from: nil)
+                if !moved && hypot(p.x - origin.x, p.y - origin.y) < 3 { return }
+                moved = true
+                let area = self.paneArea
+                dropped = startRect.offsetBy(dx: p.x - origin.x, dy: p.y - origin.y)
+                self.floating[i].chip = FloatingGeometry.chipFraction(
+                    of: FloatingGeometry.chipRect(FloatingGeometry.chipFraction(of: dropped, in: area),
+                                                  size: dropped.size, in: area), in: area)
+                let drop = sidebar?.cardDrop(at: self.convert(p, to: nil), for: pane)
+                tabGap = drop?.gap
+                sidebar?.showCardDrop(drop?.line)
+                self.needsLayout = true
+            }
+        }
+        sidebar?.showCardDrop(nil)
+        if let tabGap, !cancelled, let controller {
+            SessionManager.shared.moveCardToNewTab(pane, from: controller, next: tabGap)
+            return true
+        }
+        // Dropped on the row of chips (the row it left, or another's): back into it.
+        if moved, !cancelled, let row, row.intersects(dropped),
+           let i = floating.firstIndex(where: { $0.pane == pane }) {
+            floating[i].chip = nil
+        }
+        needsLayout = true
+        if moved && !cancelled { SessionManager.shared.scheduleLayoutSave() }
+        return moved || cancelled
     }
 
     /// Moves a card until the mouse button is released. Command docks it beside a split pane.
@@ -1861,7 +1983,8 @@ final class TabContentView: NSView {
     func refreshHeaders() {
         for (id, header) in headers { header.update(focused: id == focusedPane) }
         minimizedBar.refresh()
-        if !minimizedBar.isHidden { layoutBottomRight(in: paneArea) }
+        placedChips.values.forEach { $0.refresh() }
+        if !minimizedBar.isHidden || !placedChips.isEmpty { layoutBottomRight(in: paneArea) }
         if showsHeaders { updateBackdrop() }
     }
 
@@ -1869,6 +1992,7 @@ final class TabContentView: NSView {
     func applyConfig() {
         for badge in noticeBadges { badge.applyTheme() }
         minimizedBar.refresh()
+        placedChips.values.forEach { $0.refresh() }
         findBar?.applyTheme()
         layoutPanes()
         window?.invalidateCursorRects(for: self)

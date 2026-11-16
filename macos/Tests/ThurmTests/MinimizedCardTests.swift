@@ -152,6 +152,79 @@ final class MinimizedCardTests: XCTestCase {
         XCTAssertEqual(content.focusedPane, key(10))
     }
 
+    func testANewMinimizedCardStartsAsAChipWithoutTheFocus() throws {
+        try requireMetal()
+        let content = TabContentView(root: .leaf(key(1)), focused: key(1), zoomed: nil, floating: [])
+        content.frame = CGRect(x: 0, y: 0, width: 1000, height: 600)
+        defer { content.detachAll() }
+        content.addNewFloating(key(4), minimized: true)
+        XCTAssertTrue(content.isMinimized(key(4)))
+        XCTAssertEqual(content.focusedPane, key(1))
+        XCTAssertEqual(content.visiblePaneIds, [key(1)])
+        content.layoutPanes()
+        XCTAssertEqual(content.minimizedBar.chips.map(\.pane), [key(4)])
+    }
+
+    func testMinimizingATiledPaneFloatsItAndLeavesTheFocus() throws {
+        try requireMetal()
+        let content = tab()
+        defer { content.detachAll() }
+        content.focus(key(1))
+        XCTAssertTrue(content.minimize(key(2), true))
+        XCTAssertTrue(content.isFloating(key(2)))
+        XCTAssertTrue(content.isMinimized(key(2)))
+        XCTAssertEqual(content.root.panes, [key(1)])
+        XCTAssertEqual(content.focusedPane, key(1))
+        XCTAssertTrue(content.minimize(key(2), false))
+        XCTAssertFalse(content.isMinimized(key(2)))
+        XCTAssertEqual(content.focusedPane, key(1), "bringing it back does not focus it")
+    }
+
+    func testTheSplitsKeepTheirLastPane() throws {
+        try requireMetal()
+        let content = TabContentView(root: .leaf(key(1)), focused: key(1), zoomed: nil, floating: [])
+        content.frame = CGRect(x: 0, y: 0, width: 1000, height: 600)
+        defer { content.detachAll() }
+        XCTAssertFalse(content.minimize(key(1), true))
+        XCTAssertEqual(content.root.panes, [key(1)])
+    }
+
+    func testAChipDraggedOutOfTheRowStaysWhereItWasLeft() throws {
+        try requireMetal()
+        let floating = [
+            FloatingPane(pane: key(10), frame: [0.2, 0.2, 0.5, 0.5], minimized: true, chip: [0.25, 0.5]),
+            FloatingPane(pane: key(11), frame: [0.2, 0.2, 0.5, 0.5], minimized: true),
+        ]
+        let content = TabContentView(root: .leaf(key(1)), focused: key(1), zoomed: nil, floating: floating)
+        content.frame = CGRect(x: 0, y: 0, width: 1000, height: 600)
+        content.layoutPanes()
+        defer { content.detachAll() }
+        XCTAssertEqual(content.minimizedBar.chips.map(\.pane), [key(11)], "the row keeps the others")
+        let chip = try XCTUnwrap(content.placedChips[key(10)])
+        let area = content.paneArea
+        XCTAssertEqual(chip.frame.minX, area.minX + 0.25 * area.width, accuracy: 1)
+        XCTAssertEqual(chip.frame.minY, area.minY + 0.5 * area.height, accuracy: 1)
+        XCTAssertEqual(content.tabLayout(title: nil).floating?.first?.chip, [0.25, 0.5])
+        // Off the edge after a resize: kept inside the tab.
+        content.frame.size.width = 200
+        content.layoutPanes()
+        XCTAssertLessThanOrEqual(chip.frame.maxX, content.paneArea.maxX)
+        // Restored, it leaves the tab's chips.
+        content.focus(key(10))
+        content.layoutPanes()
+        XCTAssertNil(content.placedChips[key(10)])
+    }
+
+    func testTabLayoutCodesWhereAChipWasLeft() throws {
+        let json = #"{"id":2,"frame":[0.1,0.2,0.5,0.5],"minimized":true,"chip":[0.25,0.75]}"#
+        let card = try JSONDecoder().decode(FloatingPane.self, from: Data(json.utf8))
+        XCTAssertEqual(card.chip, [0.25, 0.75])
+        XCTAssertEqual(FloatingCard(card).chip, CGPoint(x: 0.25, y: 0.75))
+        XCTAssertEqual(FloatingCard(card).saved, card)
+        let row = FloatingPane(pane: key(2), frame: [0.1, 0.2, 0.5, 0.5], minimized: true)
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(row), as: UTF8.self).contains("chip"))
+    }
+
     func testChipsThatDoNotFitGoBehindAMenu() throws {
         try requireMetal()
         let count = 30

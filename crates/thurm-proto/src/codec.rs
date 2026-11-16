@@ -523,4 +523,30 @@ mod tests {
             r#"{"PlaceFloating":{"pane":5,"place":{"Cells":{"anchor":2,"col":-1,"row":3,"cols":40,"rows":10}}}}"#
         );
     }
+
+    #[test]
+    fn minimized_floats_come_after_the_older_ui_commands() {
+        let open = UiCommand::OpenFloatingMinimized {
+            pane: 5,
+            target: Some(2),
+            place: None,
+        };
+        let bytes = postcard::to_allocvec(&open).unwrap();
+        assert_eq!(bytes[0], 17);
+        assert_eq!(postcard::from_bytes::<UiCommand>(&bytes).unwrap(), open);
+        let minimize = UiCommand::MinimizeFloating {
+            pane: 5,
+            minimized: true,
+        };
+        assert_eq!(postcard::to_allocvec(&minimize).unwrap(), [18, 5, 1]);
+        // The app reads UI commands as JSON.
+        assert_eq!(
+            serde_json::to_string(&open).unwrap(),
+            r#"{"OpenFloatingMinimized":{"pane":5,"target":2,"place":null}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&minimize).unwrap(),
+            r#"{"MinimizeFloating":{"pane":5,"minimized":true}}"#
+        );
+    }
 }

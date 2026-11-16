@@ -10,13 +10,18 @@ struct FloatingCard: Equatable {
     /// Placed in cells: its terminal keeps this size, below the size of a card made by hand.
     var cells: CardCells?
     var minimized = false
+    /// Where its chip sits while minimized, dragged out of the row of chips: the chip's top left
+    /// corner as fractions of the tab's area. `nil` in the row.
+    var chip: CGPoint?
 
-    init(pane: PaneKey, frame: CGRect, zoomed: Bool = false, cells: CardCells? = nil, minimized: Bool = false) {
+    init(pane: PaneKey, frame: CGRect, zoomed: Bool = false, cells: CardCells? = nil, minimized: Bool = false,
+         chip: CGPoint? = nil) {
         self.pane = pane
         self.frame = frame
         self.zoomed = zoomed
         self.cells = cells
         self.minimized = minimized
+        self.chip = chip
     }
 
     var minSize: CGSize { cells == nil ? FloatingGeometry.minSize : FloatingGeometry.exactMinSize }
@@ -27,12 +32,14 @@ struct FloatingCard: Equatable {
             return [d.minX, d.minY, d.width, d.height]
         }()
         self.init(pane: saved.pane, frame: CGRect(x: f[0], y: f[1], width: f[2], height: f[3]), zoomed: saved.zoomed,
-                  cells: saved.cells, minimized: saved.minimized)
+                  cells: saved.cells, minimized: saved.minimized,
+                  chip: saved.chip.map { CGPoint(x: $0[0], y: $0[1]) })
     }
 
     var saved: FloatingPane {
         FloatingPane(pane: pane, frame: [frame.minX, frame.minY, frame.width, frame.height].map(Double.init),
-                     zoomed: zoomed, cells: cells, minimized: minimized)
+                     zoomed: zoomed, cells: cells, minimized: minimized,
+                     chip: chip.map { [Double($0.x), Double($0.y)] })
     }
 }
 
@@ -67,6 +74,24 @@ enum FloatingGeometry {
         let x = min(max(area.minX + fraction.minX * area.width, area.minX), area.maxX - w)
         let y = min(max(area.minY + fraction.minY * area.height, area.minY), area.maxY - h)
         return CGRect(x: x, y: y, width: w, height: h).integral
+    }
+
+    /// How far a chip dragged out of the row keeps from the tab's edges.
+    static let chipInset: CGFloat = 8
+
+    /// The chip of `size` whose top left corner is at `fraction` of `area`, kept inside it.
+    static func chipRect(_ fraction: CGPoint, size: CGSize, in area: CGRect) -> CGRect {
+        let inner = area.insetBy(dx: chipInset, dy: chipInset)
+        let w = min(size.width, max(0, inner.width))
+        let x = min(max(area.minX + fraction.x * area.width, inner.minX), max(inner.minX, inner.maxX - w))
+        let y = min(max(area.minY + fraction.y * area.height, inner.minY), max(inner.minY, inner.maxY - size.height))
+        return CGRect(x: x, y: y, width: w, height: size.height).integral
+    }
+
+    /// The top left corner of `rect` as fractions of `area`.
+    static func chipFraction(of rect: CGRect, in area: CGRect) -> CGPoint {
+        guard area.width > 0, area.height > 0 else { return .zero }
+        return CGPoint(x: (rect.minX - area.minX) / area.width, y: (rect.minY - area.minY) / area.height)
     }
 
     /// `rect` as fractions of `area`.
@@ -315,6 +340,8 @@ final class MinimizedCardsBar: NSView {
     static let spacing: CGFloat = 6
 
     var onRestore: ((PaneKey) -> Void)?
+    /// A press on a chip (see `MinimizedCardChip.onPress`).
+    var onPress: ((PaneKey, NSEvent) -> Bool)?
     var panes: [PaneKey] = [] {
         didSet { if panes != oldValue { rebuild() } }
     }
@@ -344,6 +371,7 @@ final class MinimizedCardsBar: NSView {
         chips = panes.map { pane in
             let chip = MinimizedCardChip(pane: pane)
             chip.onClick = { [weak self] in self?.onRestore?(pane) }
+            chip.onPress = { [weak self] event in self?.onPress?(pane, event) ?? false }
             addSubview(chip)
             return chip
         }
@@ -408,6 +436,9 @@ final class MinimizedCardChip: NSView {
 
     let pane: PaneKey
     var onClick: (() -> Void)?
+    /// Tracks a press until the button is released; true when it moved the chip (or was
+    /// cancelled), false for a click.
+    var onPress: ((NSEvent) -> Bool)?
     private let icon = NSImageView()
     private let dot = NSView()
     private let title = NSTextField(labelWithString: "")
@@ -468,7 +499,7 @@ final class MinimizedCardChip: NSView {
         }
         let text = PaneHeader.title(of: pane, info: info)
         if title.stringValue != text { title.stringValue = text }
-        toolTip = "\(text)\nClick to restore"
+        toolTip = "\(text)\nClick to restore, drag to move"
         title.textColor = hovering ? chrome.contentPrimary : chrome.contentSecondary
         icon.contentTintColor = hovering ? chrome.contentPrimary : chrome.contentSecondary
         layer?.backgroundColor = chrome.surfaceRaised.cgColor
@@ -508,10 +539,13 @@ final class MinimizedCardChip: NSView {
     override func mouseEntered(with event: NSEvent) { hovering = true }
     override func mouseExited(with event: NSEvent) { hovering = false }
 
-    override func mouseDown(with event: NSEvent) {}
+    override func mouseDown(with event: NSEvent) {
+        guard let onPress else { return }
+        if !onPress(event) { onClick?() }
+    }
 
     override func mouseUp(with event: NSEvent) {
-        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+        if onPress == nil, bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
     }
 
     override func resetCursorRects() {

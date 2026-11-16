@@ -544,17 +544,22 @@ struct FloatingPane: Codable, Equatable {
     /// (only its position follows `frame`), stored as `[cols, rows]`.
     var cells: CardCells? = nil
     var minimized = false
+    /// `[x, y]`: where its chip sits while minimized, dragged out of the row of chips: the chip's
+    /// top left corner as fractions of the tab's area. `nil` in the row.
+    var chip: [Double]? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case id, host, frame, zoomed, cells, minimized
+        case id, host, frame, zoomed, cells, minimized, chip
     }
 
-    init(pane: PaneKey, frame: [Double], zoomed: Bool = false, cells: CardCells? = nil, minimized: Bool = false) {
+    init(pane: PaneKey, frame: [Double], zoomed: Bool = false, cells: CardCells? = nil, minimized: Bool = false,
+         chip: [Double]? = nil) {
         self.pane = pane
         self.frame = frame
         self.zoomed = zoomed
         self.cells = cells
         self.minimized = minimized
+        self.chip = chip
     }
 
     init(from decoder: Decoder) throws {
@@ -565,6 +570,7 @@ struct FloatingPane: Codable, Equatable {
         zoomed = try c.decodeIfPresent(Bool.self, forKey: .zoomed) ?? false
         cells = try c.decodeIfPresent([Int].self, forKey: .cells).flatMap(CardCells.init(array:))
         minimized = try c.decodeIfPresent(Bool.self, forKey: .minimized) ?? false
+        chip = try c.decodeIfPresent([Double].self, forKey: .chip).flatMap { $0.count == 2 ? $0 : nil }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -575,6 +581,7 @@ struct FloatingPane: Codable, Equatable {
         if zoomed { try c.encode(true, forKey: .zoomed) }
         if let cells { try c.encode([cells.cols, cells.rows], forKey: .cells) }
         if minimized { try c.encode(true, forKey: .minimized) }
+        if let chip { try c.encode(chip, forKey: .chip) }
     }
 }
 

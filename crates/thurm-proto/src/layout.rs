@@ -107,6 +107,10 @@ pub struct FloatingPane {
     pub cells: Option<[u16; 2]>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub minimized: bool,
+    /// `[x, y]`: where its chip sits while minimized, dragged out of the row of chips: the
+    /// chip's top left corner as fractions of the tab's area. `None` in the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chip: Option<[f64; 2]>,
 }
 
 impl TabLayout {
@@ -536,6 +540,7 @@ mod tests {
             zoomed: false,
             cells: None,
             minimized: false,
+            chip: None,
         };
         let mut l = sample();
         // A tab without floating panes says nothing of them, and older layouts have none.
@@ -568,6 +573,7 @@ mod tests {
             zoomed: false,
             cells: None,
             minimized: true,
+            chip: None,
         }];
         let json = serde_json::to_string(&l).unwrap();
         assert!(
@@ -580,6 +586,26 @@ mod tests {
     }
 
     #[test]
+    fn a_minimized_pane_keeps_where_its_chip_was_dragged() {
+        let mut l = sample();
+        l.windows[0].tabs[1].floating = vec![FloatingPane {
+            id: 6,
+            host: None,
+            frame: [0.2, 0.2, 0.5, 0.5],
+            zoomed: false,
+            cells: None,
+            minimized: true,
+            chip: Some([0.25, 0.75]),
+        }];
+        let json = serde_json::to_string(&l).unwrap();
+        assert!(json.contains(r#""minimized":true,"chip":[0.25,0.75]}"#));
+        assert_eq!(serde_json::from_str::<Layout>(&json).unwrap(), l);
+        let older = json.replace(r#","chip":[0.25,0.75]"#, "");
+        let read = serde_json::from_str::<Layout>(&older).unwrap();
+        assert_eq!(read.windows[0].tabs[1].floating[0].chip, None);
+    }
+
+    #[test]
     fn hidden_floating_panes_stay_hidden_while_there_are_any() {
         let card = |id| FloatingPane {
             id,
@@ -588,6 +614,7 @@ mod tests {
             zoomed: false,
             cells: None,
             minimized: false,
+            chip: None,
         };
         let mut l = sample();
         let tab = &mut l.windows[0].tabs[1];
@@ -630,6 +657,7 @@ mod tests {
             zoomed: true,
             cells: None,
             minimized: false,
+            chip: None,
         };
         let mut l = sample();
         let tab = &mut l.windows[0].tabs[1];
@@ -656,6 +684,7 @@ mod tests {
             zoomed: false,
             cells: Some([40, 10]),
             minimized: false,
+            chip: None,
         }];
         let tab = |pane| l.tab_of(pane).map(|t| t.focused);
         assert_eq!(tab(1), Some(2));

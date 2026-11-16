@@ -56,6 +56,11 @@ thurm procs --pane "$id" --ports
   background; name it with `thurm workspace rename --pane "$id" NAME`.
 - New tabs and splits take the focus and bring the app forward. Pass `--background` for
   servers, watchers and anything the user didn't ask to look at.
+- When the user asks for a command to run out of sight, use
+  `thurm new-float --minimized -- CMD...`: a card minimized to a chip in the bottom right of
+  the tab. It takes no space and no focus, and its program keeps running. `capture` and
+  `wait` work on it as usual. The user clicks the chip to bring it back.
+  `thurm float --pane ID --minimize` (or `--restore`) does the same for an existing pane.
 - A pane closes when its command exits. Pass `--hold` to keep it open with the output (for
   test runs and anything the user should read); `thurm info --pane "$id"` then has `exit_code`.
 - `--wait` on `new-tab` or `split` waits for the command to exit and exits with its status
@@ -181,6 +186,8 @@ thurm float --pane ID --on       # lift it above its tab's splits as a card (--o
 thurm new-float -- lazygit       # run it in a new card above this tab's splits (--pane ID: that tab)
 thurm new-float --cells 2,1,40x10 -- htop   # a card whose terminal is 40x10 cells, over cell (2, 1) of this pane
 thurm float --pane ID --frame 0.1,0.1,0.5,0.4   # move/resize a card (fractions of the tab); --cells C,R,WxH --anchor PANE
+thurm new-float --minimized -- npm run dev      # a card minimized to a chip from the start (no focus, no space)
+thurm float --pane ID --minimize # minimize it to a chip (floats it first); --restore brings it back unfocused
 thurm title "backend"            # tab title (empty to reset)
 thurm workspace rename "api"     # name the current pane's workspace (--pane ID for another)
 thurm scroll --pane ID prev-prompt   # up, down, top, bottom, prev-prompt, next-prompt
@@ -208,8 +215,8 @@ only when asked.
 ## Finish
 
 Verify the result before reporting it: capture the pane, check `thurm info`, or look at the
-layout. `zoom`, `move`, `swap`, `wall`, `float`, `new-float`, `--background` and `--size` need a current Thurm app; an older
-one refuses them (`new-float` then falls back to a split, and `--background` and `--size` to a
-plain split or tab, with a warning). Report it in the user's terms ("opened a split below with the dev server on port
+layout. `zoom`, `move`, `swap`, `wall`, `float`, `new-float`, `--minimized`, `--background` and `--size` need a current Thurm app; an older
+one refuses them (`new-float` then falls back to a split, `--minimized` to a card in the
+background, and `--background` and `--size` to a plain split or tab, with a warning). Report it in the user's terms ("opened a split below with the dev server on port
 5173"), with anything that failed. Close the panes you created with `thurm close` when you no
 longer need them, and leave the user's panes alone.

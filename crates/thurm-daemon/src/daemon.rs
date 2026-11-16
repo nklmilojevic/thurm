@@ -355,6 +355,8 @@ pub struct Client {
     pub floating_new: AtomicBool,
     /// A UI that places floating panes ([`thurm_proto::CAP_FLOATING_PLACE`]).
     pub floating_place: AtomicBool,
+    /// A UI that minimizes floating panes ([`thurm_proto::CAP_FLOATING_MINIMIZE`]).
+    pub floating_minimize: AtomicBool,
     /// Uses the extension API and hears its notices ([`thurm_proto::CAP_EXT`]).
     pub ext: AtomicBool,
     /// Shows what plugins ask the user ([`thurm_proto::CAP_EXT_UI`]).
@@ -758,12 +760,14 @@ impl Daemon {
         let floating = cmd.needs_floating();
         let floating_new = cmd.needs_floating_new();
         let floating_place = cmd.needs_floating_place();
+        let floating_minimize = cmd.needs_floating_minimize();
         let (capable, older): (Vec<_>, Vec<_>) = desktops.into_iter().partition(|c| {
             c.ui_layout.load(Ordering::Relaxed)
                 && (!wall || c.agent_wall.load(Ordering::Relaxed))
                 && (!floating || c.floating.load(Ordering::Relaxed))
                 && (!floating_new || c.floating_new.load(Ordering::Relaxed))
                 && (!floating_place || c.floating_place.load(Ordering::Relaxed))
+                && (!floating_minimize || c.floating_minimize.load(Ordering::Relaxed))
         });
         let shown_by_older = cmd.layout_panes().into_iter().any(|p| {
             self.pane(p).is_some_and(|p| {
@@ -804,6 +808,7 @@ impl Daemon {
             floating: AtomicBool::new(false),
             floating_new: AtomicBool::new(false),
             floating_place: AtomicBool::new(false),
+            floating_minimize: AtomicBool::new(false),
             ext: AtomicBool::new(false),
             ext_ui: AtomicBool::new(false),
             plugin: Mutex::new(None),
@@ -2703,6 +2708,9 @@ impl Daemon {
                 if has(thurm_proto::CAP_FLOATING_PLACE) {
                     client.floating_place.store(true, Ordering::Relaxed);
                 }
+                if has(thurm_proto::CAP_FLOATING_MINIMIZE) {
+                    client.floating_minimize.store(true, Ordering::Relaxed);
+                }
                 if has(thurm_proto::CAP_DEFLATE) {
                     client.deflate.store(true, Ordering::Relaxed);
                 }
@@ -4404,6 +4412,7 @@ mod tests {
             floating: AtomicBool::new(false),
             floating_new: AtomicBool::new(false),
             floating_place: AtomicBool::new(false),
+            floating_minimize: AtomicBool::new(false),
             ext: AtomicBool::new(false),
             ext_ui: AtomicBool::new(false),
             plugin: Mutex::new(None),
