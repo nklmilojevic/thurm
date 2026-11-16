@@ -242,15 +242,15 @@ enum Cmd {
         /// Pane to float (default: current pane).
         #[arg(short, long)]
         pane: Option<PaneId>,
-        #[arg(long, conflicts_with = "off")]
+        #[arg(long, conflicts_with_all = ["off", "minimize", "restore"])]
         on: bool,
         #[arg(long, conflicts_with_all = ["frame", "cells"])]
         off: bool,
-        /// Minimize it to a chip in its tab (floating it first if it is in the splits). Its
-        /// program keeps running.
+        /// Minimize it to a chip in its tab (floating it first if it is in the splits; with
+        /// `--frame` or `--cells`, there), without focusing it. Its program keeps running.
         #[arg(long, conflicts_with_all = ["off", "restore"])]
         minimize: bool,
-        /// Bring a minimized card back, without focusing it.
+        /// Bring a minimized card back (with `--frame` or `--cells`, there), without focusing it.
         #[arg(long, conflicts_with = "off")]
         restore: bool,
         #[command(flatten)]
@@ -1627,16 +1627,21 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool, remote: Option<&str>) -> R {
             let pane = current_pane(pane)?;
             let place = float_place(&place, pane, current_pane(None).ok())?;
             check_anchor(c, place.as_ref(), Some(pane))?;
-            let placed = place.is_some();
-            if let Some(place) = place {
-                layout_ui(c, UiCommand::PlaceFloating { pane, place })?;
-            }
+            // One command with its place: placing first would float and focus the pane.
             if minimize || restore {
                 let minimized = minimize;
-                layout_ui(c, UiCommand::MinimizeFloating { pane, minimized })?;
+                layout_ui(
+                    c,
+                    UiCommand::MinimizeFloating {
+                        pane,
+                        minimized,
+                        place,
+                    },
+                )?;
                 return Ok(ExitCode::SUCCESS);
             }
-            if placed {
+            if let Some(place) = place {
+                layout_ui(c, UiCommand::PlaceFloating { pane, place })?;
                 return Ok(ExitCode::SUCCESS);
             }
             let on = if on {
@@ -2632,6 +2637,9 @@ mod tests {
         assert!(parse(&["float", "--minimize", "--restore"]).is_err());
         assert!(parse(&["float", "--minimize", "--off"]).is_err());
         assert!(parse(&["float", "--restore", "--off"]).is_err());
+        assert!(parse(&["float", "--on", "--minimize"]).is_err());
+        assert!(parse(&["float", "--on", "--restore"]).is_err());
+        assert!(parse(&["float", "--restore", "--cells", "0,0,10x2", "--anchor", "3"]).is_ok());
 
         let args = PlaceArgs {
             cells: Some((1, 2, 3, 4)),

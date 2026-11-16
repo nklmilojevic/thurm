@@ -285,6 +285,7 @@ fn minimized_floating_panes_need_a_ui_that_knows_them() {
         UiCommand::MinimizeFloating {
             pane,
             minimized: false,
+            place: Some(FloatPlace::Fraction([0.2, 0.2, 0.3, 0.3])),
         },
     ];
     for (i, cmd) in commands.iter().enumerate() {

@@ -262,6 +262,8 @@ final class TabContentView: NSView {
     /// cards draw their own).
     private let focusRing = FocusRing()
     private(set) var focusedPane: PaneKey
+    /// How many times the focus went to another pane.
+    private(set) var focusMoves = 0
     private(set) var zoomedPane: PaneKey?
     /// Panes floating above the splits, back to front (see FloatingPanes.swift).
     private(set) var floating: [FloatingCard] = [] {
@@ -680,7 +682,8 @@ final class TabContentView: NSView {
     private func layoutBottomRight(in full: NSRect) {
         var bottom = full.maxY - 10
         layoutPlacedChips(in: full)
-        let chips = floatingHidden ? [] : floating.filter { $0.minimized && $0.chip == nil }.map(\.pane)
+        // Chips show while the cards are hidden too: they take no room, and are the way back.
+        let chips = floating.filter { $0.minimized && $0.chip == nil }.map(\.pane)
         minimizedBar.panes = chips
         minimizedBar.isHidden = chips.isEmpty
         if !chips.isEmpty {
@@ -1311,6 +1314,7 @@ final class TabContentView: NSView {
     func setFocusedPane(_ pane: PaneKey) {
         guard views[pane] != nil else { return }
         let changed = pane != focusedPane
+        if changed { focusMoves += 1 }
         focusedPane = pane
         if root.contains(pane) {
             lastTiledFocus = pane
@@ -1452,17 +1456,25 @@ final class TabContentView: NSView {
             return true
         }
         guard !floats else { return true }
+        guard lift(pane) else { return false }
+        focus(pane)
+        SessionManager.shared.scheduleLayoutSave()
+        return true
+    }
+
+    /// Takes `pane` out of the splits as a card where it floated last (or where new cards go),
+    /// leaving the focus alone. A `minimized` one goes straight to a chip, and hidden cards stay
+    /// hidden; another shows them. False when the splits would lose their last pane.
+    private func lift(_ pane: PaneKey, minimized: Bool = false) -> Bool {
         guard canFloat(pane), let rest = root.removing(pane) else { return false }
         let frame = floatedFrames[pane] ?? FloatingGeometry.defaultFraction(index: floating.count)
         transitionLayout {
             if zoomedPane == pane { zoomedPane = nil }
             root = SessionManager.shared.config.autoBalance ? rest.equalized() : rest
-            floating.append(FloatingCard(pane: pane, frame: frame))
-            floatingHidden = false
+            floating.append(FloatingCard(pane: pane, frame: frame, minimized: minimized))
+            if !minimized { floatingHidden = false }
         }
-        focus(pane)
         window?.invalidateCursorRects(for: self)
-        SessionManager.shared.scheduleLayoutSave()
         return true
     }
 
@@ -1480,7 +1492,7 @@ final class TabContentView: NSView {
 
     /// Floats `pane`, a new pane of this tab, above the splits (at `place`, or where new cards
     /// go) and focuses it (unless `takeFocus` is false, or it starts `minimized` to a chip).
-    /// Hidden cards show again.
+    /// Hidden cards show again, but for a `minimized` one: its chip shows without them.
     func addNewFloating(_ pane: PaneKey, place: FloatPlace? = nil, takeFocus: Bool = true,
                         minimized: Bool = false) {
         guard !contains(pane) else { return }
@@ -1489,7 +1501,7 @@ final class TabContentView: NSView {
         let frame = placed?.frame ?? FloatingGeometry.defaultFraction(index: floating.count)
         transitionLayout {
             floating.append(FloatingCard(pane: pane, frame: frame, cells: placed?.cells, minimized: minimized))
-            floatingHidden = false
+            if !minimized { floatingHidden = false }
         }
         if takeFocus && !minimized { focus(pane) }
         window?.invalidateCursorRects(for: self)
@@ -1634,17 +1646,31 @@ final class TabContentView: NSView {
     }
 
     /// Minimizes `pane` to a chip (floating it first when it is in the splits), or brings it
-    /// back, leaving the focus where it is (on the card shown on top, when it was on `pane`).
-    /// False when it cannot float: the splits keep at least one pane.
+    /// back (showing hidden cards), at `place` when given. The focus never goes to `pane`: it
+    /// stays where it is, or when it was on `pane`, goes to the card on top or the splits.
+    /// False when it cannot float (the splits keep at least one pane) or `place` counts from a
+    /// pane not in this tab.
     @discardableResult
-    func minimize(_ pane: PaneKey, _ on: Bool) -> Bool {
+    func minimize(_ pane: PaneKey, _ on: Bool, at place: FloatPlace? = nil) -> Bool {
         guard contains(pane) else { return false }
-        if on && !isFloating(pane) {
-            let focused = focusedPane
-            guard setFloating(pane, true) else { return false }
-            if focused != pane { focus(focused) }
+        if let place, cardFrame(for: place, excluding: pane) == nil { return false }
+        if !isFloating(pane) {
+            // Bringing back a pane of the splits with no place: nothing to do.
+            guard on || place != nil else { return true }
+            guard lift(pane, minimized: on) else { return false }
+        }
+        // Out of the splits first: the panes left there, the anchor among them, take their space.
+        if let place, let placed = cardFrame(for: place, excluding: pane),
+           let i = floating.firstIndex(where: { $0.pane == pane }) {
+            floating[i].frame = placed.frame
+            floating[i].cells = placed.cells
+            floating[i].zoomed = false
         }
         setMinimized(pane, on)
+        if !on && floatingHidden { setFloatingHidden(false, focusing: false) }
+        if on && pane == focusedPane { focus(shownCards.last?.pane ?? tiledFocus) }
+        layoutPanes()
+        SessionManager.shared.scheduleLayoutSave()
         return true
     }
 
@@ -1709,9 +1735,9 @@ final class TabContentView: NSView {
     }
 
     /// Shows the chips of the minimized cards dragged out of the row where they were left,
-    /// inside `full`; none while the cards are hidden.
+    /// inside `full`.
     private func layoutPlacedChips(in full: NSRect) {
-        let placed = floatingHidden ? [] : floating.compactMap { card in
+        let placed = floating.compactMap { card in
             card.minimized ? card.chip.map { (card.pane, $0) } : nil
         }
         let keep = Set(placed.map(\.0))

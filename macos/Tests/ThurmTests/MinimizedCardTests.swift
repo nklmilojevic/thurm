@@ -170,6 +170,7 @@ final class MinimizedCardTests: XCTestCase {
         let content = tab()
         defer { content.detachAll() }
         content.focus(key(1))
+        let moves = content.focusMoves
         XCTAssertTrue(content.minimize(key(2), true))
         XCTAssertTrue(content.isFloating(key(2)))
         XCTAssertTrue(content.isMinimized(key(2)))
@@ -178,6 +179,41 @@ final class MinimizedCardTests: XCTestCase {
         XCTAssertTrue(content.minimize(key(2), false))
         XCTAssertFalse(content.isMinimized(key(2)))
         XCTAssertEqual(content.focusedPane, key(1), "bringing it back does not focus it")
+        XCTAssertEqual(content.focusMoves, moves, "the focus never went to it, not even for a moment")
+    }
+
+    func testMinimizingAtAPlaceMovesTheCardWithoutTheFocus() throws {
+        try requireMetal()
+        let content = tab()
+        defer { content.detachAll() }
+        content.focus(key(1))
+        let moves = content.focusMoves
+        XCTAssertTrue(content.minimize(key(2), true, at: .fraction(CGRect(x: 0.1, y: 0.1, width: 0.3, height: 0.3))))
+        XCTAssertTrue(content.isMinimized(key(2)))
+        let card = try XCTUnwrap(content.floating.first { $0.pane == key(2) })
+        XCTAssertEqual(card.frame.minX, 0.1, accuracy: 0.01)
+        XCTAssertEqual(card.frame.width, 0.3, accuracy: 0.01)
+        XCTAssertTrue(content.minimize(key(2), false, at: .fraction(CGRect(x: 0.5, y: 0.5, width: 0.3, height: 0.3))))
+        XCTAssertFalse(content.isMinimized(key(2)))
+        XCTAssertEqual(try XCTUnwrap(content.floating.first { $0.pane == key(2) }).frame.minX, 0.5, accuracy: 0.01)
+        XCTAssertEqual(content.focusMoves, moves)
+    }
+
+    func testAMinimizedCardLeavesHiddenCardsHidden() throws {
+        try requireMetal()
+        let content = tab()
+        defer { content.detachAll() }
+        content.setFloatingHidden(true)
+        content.addNewFloating(key(4), minimized: true)
+        content.layoutPanes()
+        XCTAssertTrue(content.floatingHidden)
+        XCTAssertTrue(content.isCardHidden(key(3)))
+        XCTAssertEqual(content.minimizedBar.chips.map(\.pane), [key(4)], "its chip shows all the same")
+        XCTAssertFalse(content.minimizedBar.isHidden)
+        // Minimizing a pane of the splits leaves them hidden too.
+        XCTAssertTrue(content.minimize(key(2), true))
+        XCTAssertTrue(content.floatingHidden)
+        XCTAssertTrue(content.isCardHidden(key(3)))
     }
 
     func testTheSplitsKeepTheirLastPane() throws {

@@ -537,8 +537,9 @@ mod tests {
         let minimize = UiCommand::MinimizeFloating {
             pane: 5,
             minimized: true,
+            place: None,
         };
-        assert_eq!(postcard::to_allocvec(&minimize).unwrap(), [18, 5, 1]);
+        assert_eq!(postcard::to_allocvec(&minimize).unwrap(), [18, 5, 1, 0]);
         // The app reads UI commands as JSON.
         assert_eq!(
             serde_json::to_string(&open).unwrap(),
@@ -546,7 +547,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&minimize).unwrap(),
-            r#"{"MinimizeFloating":{"pane":5,"minimized":true}}"#
+            r#"{"MinimizeFloating":{"pane":5,"minimized":true,"place":null}}"#
         );
     }
 }

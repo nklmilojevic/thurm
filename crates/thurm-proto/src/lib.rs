@@ -1509,10 +1509,12 @@ pub enum UiCommand {
         place: Option<FloatPlace>,
     },
     /// Minimize floating `pane` to a chip (`true`, floating it first if it is in the splits),
-    /// or bring it back (`false`) without focusing it. Needs [`CAP_FLOATING_MINIMIZE`].
+    /// or bring it back (`false`), at `place` when given. Neither focuses it. Needs
+    /// [`CAP_FLOATING_MINIMIZE`].
     MinimizeFloating {
         pane: PaneId,
         minimized: bool,
+        place: Option<FloatPlace>,
     },
 }
 
@@ -1563,7 +1565,9 @@ impl UiCommand {
                 .copied()
                 .chain(place.and_then(|p| p.anchor()))
                 .collect(),
-            UiCommand::MinimizeFloating { pane, .. } => vec![*pane],
+            UiCommand::MinimizeFloating { pane, place, .. } => std::iter::once(*pane)
+                .chain(place.and_then(|p| p.anchor()))
+                .collect(),
             UiCommand::Zoom { pane, .. } => vec![*pane],
             UiCommand::MovePane { pane, target, .. } => vec![*pane, *target],
             UiCommand::SwapPanes { a, b } => vec![*a, *b],
