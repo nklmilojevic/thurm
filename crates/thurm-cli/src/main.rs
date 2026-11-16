@@ -2409,6 +2409,10 @@ fn key_bytes(k: &str) -> Option<Vec<u8>> {
     Some(k.as_bytes().to_vec())
 }
 
+/// Temporary: measures CI cache hits after a change to a leaf crate. Reverted before merge.
+#[allow(dead_code)]
+const KACHE_PROBE: u8 = 2;
+
 #[cfg(test)]
 mod tests {
     use super::*;
