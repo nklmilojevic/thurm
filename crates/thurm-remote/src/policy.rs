@@ -32,7 +32,8 @@ pub fn clipboard_read(cfg: &Config, host: Option<&str>) -> Decision {
     }
 }
 
-/// OSC 52 write from a pane of `host`: follows this Mac's `terminal.osc52`.
+/// OSC 52 write, or a clipboard tool's copy or clear, from a pane of `host`: follows this Mac's
+/// `terminal.osc52`.
 pub fn clipboard_write(cfg: &Config, host: Option<&str>) -> Decision {
     if host.is_none() {
         return Decision::Allow;

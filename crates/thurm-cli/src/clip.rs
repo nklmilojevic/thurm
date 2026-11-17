@@ -51,19 +51,35 @@ pub enum Action {
     Help(&'static str),
 }
 
-/// The clipboard type `t` names, in the tools' various spellings.
+/// Whether `t` is `text/plain` in UTF-8, the text the app gives: no parameters, or a UTF-8
+/// `charset` only (`text/plain;charset=utf-8`, any case, quoted or not).
+fn utf8_text(t: &str) -> bool {
+    let mut parts = t.split(';').map(str::trim);
+    if !parts
+        .next()
+        .is_some_and(|m| m.eq_ignore_ascii_case(CLIP_TEXT))
+    {
+        return false;
+    }
+    parts.all(|p| match p.split_once('=') {
+        Some((k, v)) if k.trim().eq_ignore_ascii_case("charset") => {
+            let v = v.trim().trim_matches('"');
+            v.eq_ignore_ascii_case("utf-8") || v.eq_ignore_ascii_case("utf8")
+        }
+        _ => false,
+    })
+}
+
+/// The clipboard type `t` names, in the tools' various spellings. Text is UTF-8 only: X11's
+/// STRING (Latin-1) and COMPOUND_TEXT, or another charset, would get bytes they cannot read.
 fn mime(t: &str) -> Result<String, String> {
     match t {
-        "text" | "TEXT" | "STRING" | "UTF8_STRING" | "COMPOUND_TEXT" => Ok(CLIP_TEXT.into()),
-        t if t.eq_ignore_ascii_case(CLIP_TEXT)
-            || t.to_ascii_lowercase().starts_with("text/plain;") =>
-        {
-            Ok(CLIP_TEXT.into())
-        }
+        "text" | "TEXT" | "UTF8_STRING" => Ok(CLIP_TEXT.into()),
+        t if utf8_text(t) => Ok(CLIP_TEXT.into()),
         t if t.eq_ignore_ascii_case(CLIP_PNG) => Ok(CLIP_PNG.into()),
         CLIP_TARGETS => Ok(CLIP_TARGETS.into()),
         t => Err(format!(
-            "unsupported clipboard type {t} (text/plain or image/png)"
+            "unsupported clipboard type {t} (text/plain in UTF-8, or image/png)"
         )),
     }
 }
@@ -172,6 +188,8 @@ pub fn parse(
         }
         "xclip" => {
             let (mut out, mut target, mut echo, mut trim) = (false, None, false, false);
+            // xclip's own default is PRIMARY.
+            let mut clipboard = false;
             // A copy that should go away (after some pastes, a time or one paste): not done here.
             let mut expires = None;
             while let Some(a) = it.next() {
@@ -181,8 +199,18 @@ pub fn parse(
                     Some("filter") => echo = true,
                     Some("rmlastnl") => trim = true,
                     Some("target") => target = Some(operand(&mut it, "xclip", a)?.clone()),
-                    // Every selection is this Mac's one clipboard.
-                    Some("selection" | "display") => {
+                    // Only the clipboard: PRIMARY or SECONDARY is not this Mac's clipboard, and
+                    // must not be written over it or read from it.
+                    Some("selection") => {
+                        let sel = operand(&mut it, "xclip", a)?;
+                        clipboard = !sel.is_empty() && "clipboard".starts_with(sel.as_str());
+                        if !clipboard {
+                            return Err(format!(
+                                "xclip: only -selection clipboard is supported, not {sel}"
+                            ));
+                        }
+                    }
+                    Some("display") => {
                         operand(&mut it, "xclip", a)?;
                     }
                     Some(opt @ ("loops" | "wait")) => {
@@ -202,6 +230,11 @@ pub fn parse(
                     }
                     _ => return Err(format!("xclip: unknown option {a}")),
                 }
+            }
+            if !clipboard {
+                return Err(
+                    "xclip: only -selection clipboard is supported (the default is PRIMARY)".into(),
+                );
             }
             if let (false, Some(opt)) = (out, expires) {
                 return Err(format!(
@@ -227,6 +260,7 @@ pub fn parse(
         "xsel" => {
             let (mut input, mut output, mut clear, mut trim) = (false, false, false, false);
             let mut timeout = false;
+            let mut selection = 'p';
             while let Some(a) = it.next() {
                 let flags: Vec<char> = match a.strip_prefix("--") {
                     Some(long) => vec![match long {
@@ -238,8 +272,10 @@ pub fn parse(
                         "follow" => 'f',
                         "exchange" => 'x',
                         "trim" => 'T',
-                        "clipboard" | "primary" | "secondary" | "keep" | "nodetach" | "verbose"
-                        | "zeroflush" => 'b',
+                        "clipboard" => 'b',
+                        "primary" => 'p',
+                        "secondary" => 's',
+                        "keep" | "nodetach" | "verbose" | "zeroflush" => 'n',
                         "logfile" | "display" | "window-name" => 'l',
                         "selectionTimeout" => 't',
                         "help" | "version" => 'h',
@@ -260,7 +296,9 @@ pub fn parse(
                         'a' => return Err("xsel: --append is not supported".into()),
                         'f' => return Err("xsel: --follow is not supported".into()),
                         'x' => return Err("xsel: --exchange is not supported".into()),
-                        'b' | 'p' | 's' | 'k' | 'n' | 'v' | 'z' => {}
+                        // The selection: xsel's own default is PRIMARY, the last one named wins.
+                        'b' | 'p' | 's' => selection = f,
+                        'k' | 'n' | 'v' | 'z' => {}
                         'l' | 'w' => {
                             operand(&mut it, "xsel", a)?;
                         }
@@ -274,6 +312,16 @@ pub fn parse(
                         _ => return Err(format!("xsel: unknown option -{f}")),
                     }
                 }
+            }
+            if selection != 'b' {
+                let name = if selection == 's' {
+                    "SECONDARY"
+                } else {
+                    "PRIMARY"
+                };
+                return Err(format!(
+                    "xsel: only --clipboard (-b) is supported, not {name} (xsel's default)"
+                ));
             }
             if clear {
                 return Ok(Action::Clear);
@@ -318,7 +366,11 @@ pub fn parse(
                     "-o" | "--paste-once" => {
                         return Err("wl-copy: --paste-once is not supported".into());
                     }
-                    "-f" | "--foreground" | "-p" | "--primary" | "--regular" => {}
+                    "-f" | "--foreground" | "--regular" => {}
+                    // PRIMARY is not this Mac's clipboard: refused, not copied over it.
+                    "-p" | "--primary" => {
+                        return Err("wl-copy: --primary is not supported".into());
+                    }
                     "-t" | "--type" => {
                         let t = mime(operand(&mut it, "wl-copy", a)?)?;
                         if t != CLIP_TEXT {
@@ -361,7 +413,9 @@ pub fn parse(
                 match a.as_str() {
                     "-n" | "--no-newline" => newline = false,
                     "-l" | "--list-types" => list = true,
-                    "-p" | "--primary" => {}
+                    "-p" | "--primary" => {
+                        return Err("wl-paste: --primary is not supported".into());
+                    }
                     "-t" | "--type" => target = Some(operand(&mut it, "wl-paste", a)?.clone()),
                     "-s" | "--seat" => {
                         operand(&mut it, "wl-paste", a)?;
@@ -628,14 +682,14 @@ mod tests {
             &["-loops", "1"][..],
             &["-i", "-wait", "500"],
             &["-sensitive"],
-            &["-selection", "clipboard", "-loops", "2", "-i"],
+            &["-loops", "2", "-i"],
         ] {
-            let e = p("xclip", args).expect_err(&format!("{args:?}"));
+            let e = xc(args).expect_err(&format!("{args:?}"));
             assert!(e.contains("not supported"), "{args:?}: {e}");
         }
-        assert_eq!(p("xclip", &["-loops", "0"]), Ok(copy()), "0: no limit");
+        assert_eq!(xc(&["-loops", "0"]), Ok(copy()), "0: no limit");
         assert_eq!(
-            p("xclip", &["-o", "-loops", "1"]),
+            xc(&["-o", "-loops", "1"]),
             Ok(paste(CLIP_TEXT)),
             "pastes have none"
         );
@@ -647,9 +701,98 @@ mod tests {
         assert_eq!(p("xsel", &["-bi", "--logfile", "/tmp/x"]), Ok(copy()));
     }
 
+    /// xclip with `-selection clipboard` before `args`.
+    fn xc(args: &[&str]) -> Result<Action, String> {
+        let mut all = vec!["-selection", "clipboard"];
+        all.extend(args);
+        p("xclip", &all)
+    }
+
+    #[test]
+    fn only_the_clipboard_selection() {
+        // PRIMARY and SECONDARY are not this Mac's clipboard: refused, to write and to read,
+        // and so is xclip's and xsel's default, PRIMARY.
+        for args in [
+            &[][..],
+            &["-i"],
+            &["-o"],
+            &["-selection", "primary", "-i"],
+            &["-selection", "primary", "-o"],
+            &["-sel", "p", "-o"],
+            &["-selection", "secondary", "-i"],
+            &["-selection", "s", "-o"],
+            &["-selection", "bogus"],
+        ] {
+            assert!(p("xclip", args).is_err(), "xclip {args:?}");
+        }
+        for sel in ["c", "cl", "clip", "clipboard"] {
+            assert_eq!(
+                p("xclip", &["-selection", sel, "-o"]),
+                Ok(paste(CLIP_TEXT)),
+                "{sel}"
+            );
+        }
+        for args in [
+            &["-i"][..],
+            &["-o"],
+            &["-p", "-i"],
+            &["--primary", "--output"],
+            &["-s", "-o"],
+            &["--secondary", "--input"],
+            &["-bp", "-i"],
+        ] {
+            let e = p("xsel", args).expect_err(&format!("xsel {args:?}"));
+            assert!(e.contains("--clipboard"), "xsel {args:?}: {e}");
+        }
+        assert_eq!(
+            p("xsel", &["-pb", "-o"]),
+            Ok(paste(CLIP_TEXT)),
+            "the last one named"
+        );
+        for (tool, opt) in [
+            ("wl-copy", "-p"),
+            ("wl-copy", "--primary"),
+            ("wl-paste", "-p"),
+            ("wl-paste", "--primary"),
+        ] {
+            let e = p(tool, &[opt]).expect_err(opt);
+            assert!(e.contains("not supported"), "{tool} {opt}: {e}");
+        }
+    }
+
+    #[test]
+    fn text_is_utf8_only() {
+        for t in [
+            "text/plain",
+            "TEXT/PLAIN",
+            "text/plain;charset=utf-8",
+            "text/plain; charset=UTF-8",
+            "text/plain;charset=\"utf8\"",
+            "UTF8_STRING",
+            "TEXT",
+            "text",
+        ] {
+            assert_eq!(mime(t).as_deref(), Ok(CLIP_TEXT), "{t}");
+        }
+        // Another encoding would get UTF-8 bytes it reads wrong.
+        for t in [
+            "text/plain;charset=iso-8859-1",
+            "text/plain;charset=utf-16",
+            "text/plain;format=flowed",
+            "text/plainx",
+            "STRING",
+            "COMPOUND_TEXT",
+        ] {
+            assert!(mime(t).is_err(), "{t}");
+        }
+        assert!(xc(&["-o", "-t", "text/plain;charset=iso-8859-1"]).is_err());
+        assert!(p("wl-paste", &["-t", "STRING"]).is_err());
+        assert!(p("wl-copy", &["--type", "text/plain;charset=latin1"]).is_err());
+    }
+
     #[test]
     fn xclip() {
-        assert_eq!(p("xclip", &[]), Ok(copy()));
+        assert!(p("xclip", &[]).is_err(), "PRIMARY by default");
         assert_eq!(p("xclip", &["-selection", "clipboard"]), Ok(copy()));
         assert_eq!(p("xclip", &["-sel", "c", "-i"]), Ok(copy()));
         assert_eq!(
@@ -660,7 +803,7 @@ mod tests {
             p("xclip", &["-selection", "clipboard", "-o"]),
             Ok(paste(CLIP_TEXT))
         );
-        assert_eq!(p("xclip", &["-out"]), Ok(paste(CLIP_TEXT)));
+        assert_eq!(xc(&["-out"]), Ok(paste(CLIP_TEXT)));
         assert_eq!(
             p(
                 "xclip",
@@ -672,12 +815,9 @@ mod tests {
             p("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"]),
             Ok(Action::Types { xclip: true })
         );
+        assert_eq!(xc(&["-o", "-target", "UTF8_STRING"]), Ok(paste(CLIP_TEXT)));
         assert_eq!(
-            p("xclip", &["-o", "-target", "UTF8_STRING"]),
-            Ok(paste(CLIP_TEXT))
-        );
-        assert_eq!(
-            p("xclip", &["-f", "-r"]),
+            xc(&["-f", "-r"]),
             Ok(Action::Copy {
                 text: None,
                 trim: true,
@@ -712,7 +852,7 @@ mod tests {
             assert!(e.contains("needs a value"), "{tool} {args:?}: {e}");
         }
         assert_eq!(p("xclip", &["-selection", "c", "-o"]), Ok(paste(CLIP_TEXT)));
-        assert_eq!(p("xsel", &["-l", "/tmp/log", "-o"]), Ok(paste(CLIP_TEXT)));
+        assert_eq!(p("xsel", &["-l", "/tmp/log", "-bo"]), Ok(paste(CLIP_TEXT)));
         assert_eq!(p("wl-paste", &["-s", "seat0"]).map(|_| ()), Ok(()));
     }
 
@@ -903,7 +1043,12 @@ mod tests {
     #[test]
     fn only_tool_names_switch_modes() {
         for t in CLIP_TOOLS {
-            assert!(parse(t, &[], false, true).is_ok(), "{t}");
+            let args: Vec<String> = match *t {
+                "xclip" => vec!["-selection".into(), "clipboard".into()],
+                "xsel" => vec!["-b".into()],
+                _ => vec![],
+            };
+            assert!(parse(t, &args, false, true).is_ok(), "{t}");
         }
         assert!(parse("thurm", &[], false, true).is_err());
     }

@@ -439,13 +439,15 @@ final class Remotes {
         Core.shared.clipboardAnswer(host: key.host, id: id, data: done ? Data() : nil)
     }
 
-    /// Puts `text` on `pb`, or clears it when nil (nothing left, no empty text a later paste
-    /// would find), if `allowed`. Whether it did.
-    static func clipboardWrite(_ pb: NSPasteboard, text: String?, allowed: Bool) -> Bool {
+    /// Puts `text` on `pb` (through `put`, `setString` but in tests), or clears it when nil
+    /// (nothing left, no empty text a later paste would find), if `allowed`. Whether it did: a
+    /// copy the pasteboard refused is not one.
+    static func clipboardWrite(_ pb: NSPasteboard, text: String?, allowed: Bool,
+                               put: ((NSPasteboard, String) -> Bool)? = nil) -> Bool {
         guard allowed else { return false }
         pb.clearContents()
-        if let text { pb.setString(text, forType: .string) }
-        return true
+        guard let text else { return true }
+        return (put ?? { $0.setString($1, forType: .string) })(pb, text)
     }
 
     /// The types a clipboard tool can paste from `pb`, without reading them: a large or lazily
@@ -502,7 +504,8 @@ final class Remotes {
         return out as Data
     }
 
-    /// OSC 52 write from `host`: follows this Mac's `terminal.osc52`.
+    /// OSC 52 write, or a clipboard tool's copy or clear, from `host`: follows this Mac's
+    /// `terminal.osc52`.
     func clipboardWriteAllowed(_ host: HostId) -> Bool {
         guard host != localHost else { return true }
         return Core.shared.remoteCall(["op": "clipboard_write", "host": host]) as? String == "allow"

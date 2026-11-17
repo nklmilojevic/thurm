@@ -33,8 +33,7 @@ typedef uint64_t thurm_pane_id;
  *   "ConfigReloaded"                     (unit variants are bare strings)
  *   "Disconnected"                       (connection to the daemon was lost)
  *   {"ClipboardStore":{"pane":1,"text":"...","user":true}}   (copy on select: the user's own
- *                                        selection; without "user" it is a program's OSC 52
- *                                        or clipboard tool)
+ *                                        selection; without "user" it is a program's OSC 52)
  *   {"ClipboardWrite":{"pane":1,"id":7,"text":"..."}}   (a clipboard tool copies, or clears with
  *                                        "text":null; per the Mac's write policy, then answer it
  *                                        with thurm_clipboard_answer: empty data done, NULL refused)

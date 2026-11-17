@@ -356,9 +356,15 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
   environment has no `DISPLAY` or `WAYLAND_DISPLAY` (the daemon's, with the
   host's `[terminal.env]` and what the client passes on top) have them first
   on `PATH`, ahead of a `PATH` set in `[terminal.env]`. After the shell's
-  startup files (for a pane that runs a command as for a shell), they are put
-  first again, or taken off `PATH` when those files set a display, whose own
-  tools then work. What is checked, and where:
+  startup files they are put first again, or taken off `PATH` when those files
+  set a display, whose own tools then work: by the shell integration in bash,
+  zsh and fish, and for a pane that runs a command in any shell. In an
+  interactive shell without the integration (`terminal.shell_integration =
+  false`, or another shell), they stay first only if its startup files keep
+  the `PATH` they are given. Only the clipboard selection is this Mac's
+  clipboard: PRIMARY and SECONDARY are refused, and with them xclip's and
+  xsel's default (use `xclip -selection clipboard`, `xsel -b`). Text is UTF-8:
+  another charset, or X11's `STRING`, is refused. What is checked, and where:
 
   | | On the host (its daemon) | On this Mac (the app) |
   | --- | --- | --- |
@@ -370,14 +376,14 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
   it. A copy, clear or paste goes to the Thurm app that last showed the pane,
   which answers it, so the tool hears whether it was done: anything refused,
   on the host or on this Mac, fails the tool. Listing the types
-  (`xclip -t TARGETS -o`, `wl-paste --list-types`) fails where reads from that
+  (`xclip -selection clipboard -t TARGETS -o`, `wl-paste --list-types`) fails where reads from that
   host are refused (`clipboard_read = "never"`, or pastes off in either
   `terminal.osc52`). Pastes carry text or a PNG image (an agent's image paste
   works; a screenshot, copied as TIFF, is converted when it is at most 256 MiB
   and 64 megapixels), at most 32 MiB each, and at most 128 MiB at once on its way through
   the host's daemon or queued there for a program or app that has not read it
   yet (a paste or copy over that is refused, to try again).
-  A clear (`xsel --clear`, `wl-copy --clear`) empties
+  A clear (`xsel -b --clear`, `wl-copy --clear`) empties
   the clipboard, leaving no type. Options the tools cannot honour here are
   refused rather than ignored: a copy meant to go away (`xclip -loops`,
   `-wait`, `-sensitive`, `xsel --selectionTimeout`, `wl-copy --paste-once`),
@@ -550,7 +556,7 @@ reach the Mac's disk, clipboard, or credentials without you doing something:
   read and every paste asks "devbox wants to read your clipboard — Allow Once /
   Always for devbox / Deny"; with `always` they go ahead without asking
   ("Always" writes that to the host's `[[remote]]`); with `never` they are
-  refused. Listing the clipboard's types (`xclip -t TARGETS -o`,
+  refused. Listing the clipboard's types (`xclip -selection clipboard -t TARGETS -o`,
   `wl-paste --list-types`) never asks: it says whether there is text or an
   image, not what, and is refused wherever reads are. Your `terminal.osc52`
   setting caps every host, and the host's own `terminal.osc52` can only be

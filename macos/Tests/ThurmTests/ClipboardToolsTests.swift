@@ -105,6 +105,8 @@ final class ClipboardToolsTests: XCTestCase {
         XCTAssertTrue(Remotes.clipboardWrite(pb, text: nil, allowed: true))
         XCTAssertEqual(Remotes.clipboardTypes(pb), [])
         XCTAssertNil(Remotes.clipboardData(pb, mime: "text/plain"))
+        // The pasteboard refusing the text is no copy: the tool must hear so.
+        XCTAssertFalse(Remotes.clipboardWrite(pb, text: "x", allowed: true, put: { _, _ in false }))
     }
 
     /// This Mac's `terminal.osc52` decides whether a remote host's tool may write the clipboard:

@@ -428,9 +428,33 @@ impl Client {
         self.unflushed.fetch_add(1, Ordering::AcqRel);
         if self.tx.send(msg).is_err() {
             self.queued.store(0, Ordering::Relaxed);
-            self.clip_queued.fetch_sub(clip, Ordering::SeqCst);
+            self.clip_give_back(clip);
             self.unflushed.store(0, Ordering::Release);
         }
+    }
+
+    /// `n` clipboard bytes left the queue. Never below zero: after [`Client::writer_ended`]
+    /// set the count to zero, a send that counted its message and then failed gives it back
+    /// to nothing.
+    fn clip_give_back(&self, n: usize) {
+        let _ = self
+            .clip_queued
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_sub(n))
+            });
+    }
+
+    /// The writer wrote `msg`.
+    pub fn clip_written(&self, msg: &ServerMessage) {
+        self.clip_give_back(clip::clip_weight(msg));
+    }
+
+    /// The writer stopped and its queue (`rx`, dropped before this) went with it: nothing is
+    /// queued any more, whatever its last message, the one it failed to write, or one sent
+    /// while it stopped.
+    pub fn writer_ended(&self) {
+        self.unflushed.store(0, Ordering::Release);
+        self.clip_queued.store(0, Ordering::SeqCst);
     }
 
     /// The client is far enough behind that it should get fresh state instead of output.
@@ -4763,6 +4787,50 @@ mod tests {
         assert!(c.backlogged() && !c.caught_up());
         c.queued.store(0, Ordering::Relaxed);
         assert!(!c.backlogged());
+    }
+
+    /// Clipboard bytes queued for a client are counted until written, and once its writer has
+    /// stopped, none are: a send failing after that cannot take the count below zero.
+    #[test]
+    fn clipboard_bytes_queued_are_counted_once() {
+        let dir = std::env::temp_dir().join(format!("thurm-clip-queued-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (client, rx) = daemon.add_client();
+        let data = |n| ServerMessage::Response {
+            id: 1,
+            result: Ok(Response::ClipboardData { data: vec![0; n] }),
+        };
+        client.send(data(100));
+        client.send(ServerMessage::Event(Event::ClipboardStore {
+            pane: 1,
+            text: "x".repeat(30),
+        }));
+        assert_eq!(client.clip_queued.load(Ordering::SeqCst), 130);
+        let first = rx.recv().unwrap();
+        client.clip_written(&first);
+        assert_eq!(client.clip_queued.load(Ordering::SeqCst), 30);
+        // The writer stops with a message still queued, and a send fails after it.
+        drop(rx);
+        client.writer_ended();
+        client.send(data(50));
+        assert_eq!(
+            client.clip_queued.load(Ordering::SeqCst),
+            0,
+            "not wrapped, not 50"
+        );
+        client.clip_written(&data(10));
+        assert_eq!(
+            client.clip_queued.load(Ordering::SeqCst),
+            0,
+            "never below zero"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The main loop exits soon after it sees `shutdown`, waiting only for queued replies, so the
