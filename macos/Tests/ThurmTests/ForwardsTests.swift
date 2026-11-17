@@ -146,6 +146,22 @@ final class ForwardsTests: XCTestCase {
                                                               "local_port": 18444]))
     }
 
+    func testARequestOpensItsOwnLinkNotTheOneReusedSince() {
+        // Two links to one port, opened close together: the forward now holds the second.
+        let first = ForwardInfo(json: ["id": 4, "host": "devbox", "remote_port": 3000, "local_port": 3000,
+                                       "url": "http://localhost:3000/orders/1/cancel"])!
+        let now: [String: Any] = ["id": 4, "host": "devbox", "remote_port": 3000, "local_port": 3000,
+                                  "url": "http://localhost:3000/admin"]
+        // The first request still opens what it asked for.
+        XCTAssertEqual(ForwardInfo.requestedLink(first, answer: now), "http://localhost:3000/orders/1/cancel")
+        // Lists' Open and Copy Link go by the link it holds now.
+        XCTAssertEqual(ForwardInfo.liveLink(of: first, answer: now), "http://localhost:3000/admin")
+        // Closed meanwhile, or on another port now: nothing.
+        XCTAssertNil(ForwardInfo.requestedLink(first, answer: ["error": "that forward has closed"]))
+        XCTAssertNil(ForwardInfo.requestedLink(first, answer: ["id": 4, "host": "devbox", "remote_port": 3000,
+                                                               "local_port": 3001]))
+    }
+
     func testEveryOpenForwardKeepsCopyLinkAndClose() {
         let f = ForwardInfo(json: ["id": 4, "host": "devbox", "remote_port": 8443, "local_port": 18443,
                                    "url": "https://localhost:18443/app"])!
