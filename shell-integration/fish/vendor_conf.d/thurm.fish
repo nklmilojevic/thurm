@@ -19,9 +19,13 @@ if status is-interactive; and not set -q __thurm_fish_loaded
     if set -q THURM_BIN_DIR; and not contains -- $THURM_BIN_DIR $PATH
         set -gx PATH $PATH $THURM_BIN_DIR
     end
-    # Clipboard tools that reach the app's clipboard, first again after the startup files.
-    if set -q THURM_CLIP_SHIMS; and not contains -- $THURM_CLIP_SHIMS $PATH
-        set -gx PATH $THURM_CLIP_SHIMS $PATH
+    # Clipboard tools that reach the app's clipboard: first on PATH at the first prompt, once
+    # config.fish (which runs after this file) has made its changes.
+    if set -q THURM_CLIP_SHIMS
+        function __thurm_clip_shims --on-event fish_prompt
+            functions -e __thurm_clip_shims
+            set -gx PATH $THURM_CLIP_SHIMS (string match -v -- $THURM_CLIP_SHIMS $PATH)
+        end
     end
 
     function __thurm_prompt --on-event fish_prompt

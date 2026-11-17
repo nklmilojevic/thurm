@@ -28,9 +28,15 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
   if [[ -n "${THURM_BIN_DIR-}" && ":$PATH:" != *":$THURM_BIN_DIR:"* ]]; then
     export PATH="$PATH:$THURM_BIN_DIR"
   fi
-  # Clipboard tools that reach the app's clipboard, first again after the startup files.
-  if [[ -n "${THURM_CLIP_SHIMS-}" && ":$PATH:" != *":$THURM_CLIP_SHIMS:"* ]]; then
-    export PATH="$THURM_CLIP_SHIMS:$PATH"
+  # Clipboard tools that reach the app's clipboard: first on PATH, after the startup files
+  # above made their changes.
+  if [[ -n "${THURM_CLIP_SHIMS-}" ]]; then
+    _thurm_p=":$PATH:"
+    _thurm_p=${_thurm_p//":$THURM_CLIP_SHIMS:"/:}
+    _thurm_p=${_thurm_p#:}
+    _thurm_p=${_thurm_p%:}
+    export PATH="$THURM_CLIP_SHIMS${_thurm_p:+:$_thurm_p}"
+    builtin unset _thurm_p
   fi
 
   _thurm_prompt_start() {

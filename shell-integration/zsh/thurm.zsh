@@ -11,10 +11,6 @@ builtin unset THURM_SHELL_TOKEN
 if [[ -n "${THURM_BIN_DIR-}" && ":$PATH:" != *":$THURM_BIN_DIR:"* ]]; then
   export PATH="$PATH:$THURM_BIN_DIR"
 fi
-# Clipboard tools that reach the app's clipboard, first again after the startup files.
-if [[ -n "${THURM_CLIP_SHIMS-}" && ":$PATH:" != *":$THURM_CLIP_SHIMS:"* ]]; then
-  export PATH="$THURM_CLIP_SHIMS:$PATH"
-fi
 
 _thurm_urlencode() {
   local LC_ALL=C s="$1" out="" c i
@@ -62,6 +58,12 @@ _thurm_preexec() {
 _thurm_precmd_last() {
   precmd_functions=(${precmd_functions:#_thurm_precmd} _thurm_precmd)
   precmd_functions=(${precmd_functions:#_thurm_precmd_last})
+  # Clipboard tools that reach the app's clipboard: first on PATH once .zprofile and .zshrc
+  # (which run after this file) have made their changes.
+  if [[ -n "${THURM_CLIP_SHIMS-}" ]]; then
+    path=("$THURM_CLIP_SHIMS" ${path:#${(b)THURM_CLIP_SHIMS}})
+    export PATH
+  fi
   _thurm_precmd
 }
 

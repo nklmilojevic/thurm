@@ -43,6 +43,11 @@ impl FocusLog {
         self.last.retain(|_, c| *c != client);
     }
 
+    /// `pane` is gone: forget who focused it.
+    pub fn pane_closed(&mut self, pane: PaneId) {
+        self.last.remove(&pane);
+    }
+
     /// The client that focused `pane` last, if it is still connected.
     pub fn last_client(&self, pane: PaneId) -> Option<u64> {
         self.last.get(&pane).copied()
@@ -139,5 +144,21 @@ mod tests {
         assert_eq!(log.last_client(11), None);
         log.client_gone(2);
         assert_eq!(log.last_client(10), None);
+    }
+
+    #[test]
+    fn closed_panes_are_forgotten() {
+        let t = Instant::now();
+        let mut log = FocusLog::default();
+        for pane in 0..1000 {
+            log.focus(1, pane, true, t);
+            log.pane_closed(pane);
+        }
+        assert!(
+            log.last.is_empty(),
+            "a connected client's closed panes add nothing"
+        );
+        log.focus(1, 5, true, t);
+        assert_eq!(log.last_client(5), Some(1));
     }
 }

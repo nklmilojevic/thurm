@@ -108,7 +108,11 @@ const PROBE: &str = concat!(
     "{ [ -f \"${CLAUDE_CONFIG_DIR:-$TH/.claude}/.credentials.json\" ] || [ -n \"$ANTHROPIC_API_KEY\" ]; } && echo claude_login=1; ",
     "command -v thurm >/dev/null 2>&1 && echo \"hooks=$(HOME=\"$TH\" thurm hooks status --json 2>/dev/null | head -n 1)\"; ",
     "command -v thurm >/dev/null 2>&1 && echo \"skill=$(HOME=\"$TH\" thurm skill status --json 2>/dev/null | head -n 1)\"; ",
-    "n=0; for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do [ -L \"$TH/.local/share/thurm/shims/$t\" ] && n=$((n+1)); done; echo \"shims=$n\"; ",
+    "B=\"$(command -v thurm 2>/dev/null)\"; [ -n \"$B\" ] && B=\"$(readlink -f \"$B\")\"; n=0; o=; ",
+    "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do L=\"$TH/.local/share/thurm/shims/$t\"; ",
+    "if [ -L \"$L\" ] && [ -n \"$B\" ] && [ \"$(readlink -f \"$L\" 2>/dev/null)\" = \"$B\" ]; then n=$((n+1)); ",
+    "elif { [ -e \"$L\" ] || [ -L \"$L\" ]; } && [ \"$(basename \"$(readlink \"$L\" 2>/dev/null)x\")\" != thurmx ]; then o=\"$o $t\"; fi; done; ",
+    "echo \"shims=$n\"; echo \"shims_other=${o# }\"; ",
     "true"
 );
 
@@ -125,8 +129,10 @@ struct Probe {
     hooks: Vec<Value>,
     /// `thurm skill status --json` there (empty from a Thurm without `thurm skill`).
     skill: Vec<Value>,
-    /// How many of the clipboard tools are linked in `~/.local/share/thurm/shims`.
+    /// How many of the clipboard tools in `~/.local/share/thurm/shims` lead to this `thurm`.
     shims: usize,
+    /// The ones there that are something else: a file, or a link to another program.
+    shims_other: Vec<String>,
 }
 
 fn parse(out: &str) -> Probe {
@@ -143,6 +149,7 @@ fn parse(out: &str) -> Probe {
             "curl" => p.curl = true,
             "claude_login" => p.claude_login = true,
             "shims" => p.shims = v.parse().unwrap_or(0),
+            "shims_other" => p.shims_other = v.split_whitespace().map(str::to_owned).collect(),
             "hooks" => {
                 p.hooks = serde_json::from_str::<Vec<Value>>(v).unwrap_or_default();
             }
@@ -587,6 +594,14 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
         // An older `thurm` does not act as the tools it would be linked as.
         c.state = State::Skip;
         c.detail = "needs this build of Thurm".into();
+    } else if !probe.shims_other.is_empty() {
+        // Not Thurm's to replace: the fix would refuse too.
+        c.state = State::Warn;
+        c.detail = format!(
+            "{} in ~/{} are other programs; remove them to install the clipboard tools",
+            probe.shims_other.join(", "),
+            thurm_proto::CLIP_SHIMS_DIR
+        );
     } else if probe.shims < thurm_proto::CLIP_TOOLS.len() {
         c.state = State::Warn;
         c.detail = format!("not installed: {tools} in panes there do not reach this Mac");
@@ -641,15 +656,18 @@ const LINK: &str = concat!(
     "mkdir -p \"$TH/.local/bin\" && ln -sfn \"$B\" \"$L\""
 );
 
-/// Links the clipboard tools to `thurm` in the shims directory, leaving other files alone.
+/// Links the clipboard tools to `thurm` in the shims directory. Replaces only links to a
+/// `thurm` (an older install's); anything else there is refused before a link changes.
 const SHIMS: &str = concat!(
     "TH=\"${THURM_HOME:-$HOME}\"; ",
     "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
     "B=\"$(command -v thurm)\" || { echo \"Thurm is not installed\" >&2; exit 3; }; ",
-    "S=\"$TH/.local/share/thurm/shims\"; mkdir -p \"$S\" || exit 1; ",
+    "S=\"$TH/.local/share/thurm/shims\"; ",
     "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do ",
-    "[ ! -e \"$S/$t\" ] || [ -L \"$S/$t\" ] || { echo \"$S/$t is another file\" >&2; exit 3; }; ",
-    "ln -sfn \"$B\" \"$S/$t\" || exit 1; done"
+    "if [ -e \"$S/$t\" ] || [ -L \"$S/$t\" ]; then case \"$(readlink \"$S/$t\" 2>/dev/null)\" in ",
+    "thurm|*/thurm) ;; *) echo \"$S/$t is another program; remove it to install the clipboard tools\" >&2; exit 3;; esac; fi; done; ",
+    "mkdir -p \"$S\" || exit 1; ",
+    "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do ln -sfn \"$B\" \"$S/$t\" || exit 1; done"
 );
 
 /// Without a password prompt: logind lets you linger yourself on most distributions, else
@@ -910,6 +928,90 @@ mod tests {
             state(&checks("pi", &mac, &parse("")), "clipboard"),
             State::Skip
         );
+    }
+
+    #[test]
+    fn other_programs_among_the_clipboard_tools_are_left_alone() {
+        let p = parse("shims=4\nshims_other=xclip wl-paste\n");
+        assert_eq!(p.shims_other, ["xclip", "wl-paste"]);
+        let c = checks("pi", &plan(true), &p);
+        let clip = c.iter().find(|c| c.id == "clipboard").unwrap();
+        assert_eq!(clip.state, State::Warn);
+        assert!(clip.detail.contains("xclip, wl-paste"), "{}", clip.detail);
+        assert!(clip.fix.is_none(), "the fix would refuse them");
+        assert!(parse("shims_other=\n").shims_other.is_empty());
+    }
+
+    /// Runs `script` as the doctor would over ssh, with `th` as the home directory.
+    fn run_script(script: &str, th: &Path) -> std::process::Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("THURM_HOME", th)
+            .env("THURM_BASE_PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_shim_scripts_count_and_link_only_thurm() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let th = std::env::temp_dir().join(format!("thurm-shims-doctor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&th);
+        let bin = th.join(crate::ssh::REMOTE_BIN_DIR);
+        std::fs::create_dir_all(&bin).unwrap();
+        let thurm = bin.join("thurm");
+        std::fs::write(&thurm, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&thurm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shims = th.join(thurm_proto::CLIP_SHIMS_DIR);
+        std::fs::create_dir_all(&shims).unwrap();
+        let probe = || parse(&String::from_utf8_lossy(&run_script(PROBE, &th).stdout));
+
+        // Six links, none to this thurm: dangling, an older install's, other programs.
+        symlink(th.join("gone/thurm"), shims.join("pbcopy")).unwrap();
+        symlink("/opt/old/bin/thurm", shims.join("pbpaste")).unwrap();
+        symlink("/bin/sh", shims.join("xclip")).unwrap();
+        symlink("/bin/sh", shims.join("xsel")).unwrap();
+        symlink("/bin/sh", shims.join("wl-copy")).unwrap();
+        std::fs::write(shims.join("wl-paste"), "mine").unwrap();
+        let p = probe();
+        assert_eq!(
+            p.shims, 0,
+            "links that do not lead to this thurm are not installed"
+        );
+        assert_eq!(p.shims_other, ["xclip", "xsel", "wl-copy", "wl-paste"]);
+
+        let out = run_script(SHIMS, &th);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("another program"));
+        assert_eq!(
+            std::fs::read_link(shims.join("xclip")).unwrap(),
+            Path::new("/bin/sh"),
+            "another program's link is kept"
+        );
+        assert_eq!(
+            std::fs::read_link(shims.join("pbcopy")).unwrap(),
+            th.join("gone/thurm"),
+            "nothing changes while anything is refused"
+        );
+
+        for t in ["xclip", "xsel", "wl-copy", "wl-paste"] {
+            std::fs::remove_file(shims.join(t)).unwrap();
+        }
+        let out = run_script(SHIMS, &th);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let p = probe();
+        assert_eq!(
+            p.shims,
+            thurm_proto::CLIP_TOOLS.len(),
+            "older thurm links replaced"
+        );
+        assert!(p.shims_other.is_empty());
+        let _ = std::fs::remove_dir_all(&th);
     }
 
     #[test]

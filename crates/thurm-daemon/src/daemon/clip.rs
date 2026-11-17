@@ -34,20 +34,21 @@ impl Daemon {
         Ok(Response::Ok)
     }
 
-    /// The desktop UI to ask about `pane`: the one that focused it last, else the first one.
+    /// The desktop UI to ask about `pane` (see [`pick_ui`]).
     fn clipboard_ui(&self, pane: PaneId) -> Option<Arc<Client>> {
         let last = self.focus.lock().last_client(pane);
         let clients = self.clients.lock();
-        let can = |c: &&Arc<Client>| {
-            c.ui.load(Ordering::Relaxed)
-                && !c.mobile.load(Ordering::Relaxed)
-                && c.clip_query.load(Ordering::Relaxed)
-                && !c.gone.load(Ordering::Relaxed)
-        };
-        last.and_then(|id| clients.get(&id))
-            .filter(can)
-            .or_else(|| clients.values().filter(can).min_by_key(|c| c.id))
-            .cloned()
+        let candidates: Vec<(u64, bool)> = clients
+            .values()
+            .filter(|c| {
+                c.ui.load(Ordering::Relaxed)
+                    && !c.mobile.load(Ordering::Relaxed)
+                    && c.clip_query.load(Ordering::Relaxed)
+                    && !c.gone.load(Ordering::Relaxed)
+            })
+            .map(|c| (c.id, c.clip_verified.load(Ordering::Relaxed)))
+            .collect();
+        pick_ui(last, &candidates).and_then(|id| clients.get(&id).cloned())
     }
 
     pub(super) fn clipboard_get(
@@ -137,5 +138,48 @@ impl Daemon {
         };
         let _ = request.reply.try_send(answer);
         result
+    }
+}
+
+/// Of the desktop UIs that can answer (`candidates`: id, and whether it is verified as this
+/// daemon's own app, see `ext::peer_is_our_app`), the one to ask: the one that focused the pane
+/// `last`, else the first. A verified app goes before every other client, so another program
+/// saying it is a UI cannot take the app's questions; a daemon that cannot verify its app (on a
+/// remote host, reached through ssh or the tailnet) verifies none and goes by focus alone.
+fn pick_ui(last: Option<u64>, candidates: &[(u64, bool)]) -> Option<u64> {
+    let any_verified = candidates.iter().any(|&(_, v)| v);
+    let eligible = |&&(_, v): &&(u64, bool)| v || !any_verified;
+    last.filter(|id| candidates.iter().filter(eligible).any(|(c, _)| c == id))
+        .or_else(|| candidates.iter().filter(eligible).map(|&(id, _)| id).min())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_ui;
+
+    #[test]
+    fn the_app_that_looked_last_is_asked() {
+        assert_eq!(pick_ui(Some(3), &[(2, false), (3, false)]), Some(3));
+        assert_eq!(pick_ui(None, &[(3, false), (2, false)]), Some(2));
+        assert_eq!(
+            pick_ui(Some(9), &[(3, false)]),
+            Some(3),
+            "gone: the first one"
+        );
+        assert_eq!(pick_ui(Some(1), &[]), None);
+    }
+
+    #[test]
+    fn a_verified_app_goes_before_any_other_client() {
+        // Another program said it is a UI and focused the pane last.
+        assert_eq!(pick_ui(Some(5), &[(2, true), (5, false)]), Some(2));
+        assert_eq!(
+            pick_ui(Some(5), &[(2, true), (4, true), (5, false)]),
+            Some(2)
+        );
+        assert_eq!(
+            pick_ui(Some(4), &[(2, true), (4, true), (5, false)]),
+            Some(4)
+        );
     }
 }

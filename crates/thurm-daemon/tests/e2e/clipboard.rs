@@ -265,3 +265,87 @@ fn older_apps_and_phones_are_never_asked() {
         );
     }
 }
+
+/// The clipboard tools stay first on PATH though the user's startup files put another `xclip`
+/// in front of them: zsh reads `.zshrc` after the integration loads, fish its `config.fish`.
+#[test]
+fn clipboard_tools_come_first_after_the_startup_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let on_path = |name: &str| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+    };
+    let shells: Vec<String> = ["zsh", "bash", "fish"]
+        .into_iter()
+        .filter_map(on_path)
+        .map(|p| p.display().to_string())
+        .collect();
+    assert!(!shells.is_empty(), "no zsh, bash or fish to test with");
+    for shell in &shells {
+        let name = shell.rsplit('/').next().unwrap();
+        let env = Env::new(&format!("clip-path-{name}"));
+        let home = env.dir.join("home");
+        let shims = env.dir.join("shims");
+        let real = home.join("real");
+        for dir in [&shims, &real, &home.join(".config/fish")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for dir in [&shims, &real] {
+            let tool = dir.join("xclip");
+            std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let rc = format!("PS1='$ '\nexport PATH=\"{}:$PATH\"\n", real.display());
+        std::fs::write(home.join(".zshrc"), &rc).unwrap();
+        std::fs::write(home.join(".bashrc"), &rc).unwrap();
+        std::fs::write(
+            home.join(".config/fish/config.fish"),
+            format!(
+                "set -gx PATH {} $PATH\nfunction fish_prompt; echo -n '$ '; end\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            env.dir.join("config/config.toml"),
+            format!(
+                "[terminal]\nshell = [{shell:?}]\n[terminal.env]\nTHURM_CLIP_SHIMS = {:?}\n",
+                shims.display().to_string()
+            ),
+        )
+        .unwrap();
+        let _daemon = env.start_with(&[("HOME", &home), ("ZDOTDIR", &home)]);
+        let (c, _) = env.connect();
+        let Response::PaneCreated { pane } = c
+            .request(Request::CreatePane(CreatePane {
+                cwd: Some(home.display().to_string()),
+                size: PaneSize {
+                    cols: 300,
+                    rows: 24,
+                    cell_width: 8,
+                    cell_height: 16,
+                },
+                ..Default::default()
+            }))
+            .unwrap()
+        else {
+            panic!("no pane");
+        };
+        wait_match(&c, pane, r"\$");
+        let first = regex_escape(&shims.join("xclip").display().to_string());
+        send_until(&c, pane, b"command -v xclip\r", &format!("(?m)^{first}$"));
+    }
+}
+
+fn regex_escape(s: &str) -> String {
+    s.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '/' || ch == '_' || ch == '-' {
+                ch.to_string()
+            } else {
+                format!("\\{ch}")
+            }
+        })
+        .collect()
+}

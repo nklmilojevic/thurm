@@ -386,6 +386,8 @@ pub struct Client {
     pub last_written: Arc<Mutex<Instant>>,
     /// Answers clipboard tools' pastes ([`thurm_proto::CAP_CLIP_QUERY`]).
     pub clip_query: AtomicBool,
+    /// That client is this daemon's own app (see `ext::peer_is_our_app`): asked before others.
+    pub clip_verified: AtomicBool,
 }
 
 impl Client {
@@ -728,6 +730,7 @@ impl Daemon {
             Event::PaneRead { pane } => self.push.read(*pane, &open()),
             Event::PaneClosed { pane } => {
                 self.ports.poke();
+                self.focus.lock().pane_closed(*pane);
                 // Its notices would open nothing.
                 self.unread.lock().remove(pane);
                 self.push.read(*pane, &open());
@@ -847,6 +850,7 @@ impl Daemon {
             unflushed: std::sync::atomic::AtomicUsize::new(0),
             last_written: Arc::new(Mutex::new(Instant::now())),
             clip_query: AtomicBool::new(false),
+            clip_verified: AtomicBool::new(false),
         });
         self.clients.lock().insert(id, client.clone());
         *self.last_activity.lock() = Instant::now();
@@ -2768,6 +2772,12 @@ impl Daemon {
                 }
                 if has(thurm_proto::CAP_CLIP_QUERY) {
                     client.clip_query.store(true, Ordering::Relaxed);
+                    let verified = client
+                        .socket
+                        .lock()
+                        .as_ref()
+                        .is_some_and(ext::peer_is_our_app);
+                    client.clip_verified.store(verified, Ordering::Relaxed);
                 }
                 // Plugins' questions go only to a desktop app of this user on this machine:
                 // a tailnet caller or a phone saying so is not trusted with them.
@@ -4606,6 +4616,7 @@ mod tests {
             unflushed: std::sync::atomic::AtomicUsize::new(0),
             last_written: Arc::new(Mutex::new(Instant::now())),
             clip_query: AtomicBool::new(false),
+            clip_verified: AtomicBool::new(false),
         };
         // A few big outputs are a backlog, not only thousands of messages.
         for _ in 0..70 {

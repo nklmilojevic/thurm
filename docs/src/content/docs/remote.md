@@ -73,7 +73,7 @@ selected host's checklist with a **Fix** button for each problem.
 | Claude Code | Runs the official installer (`https://claude.ai/install.sh`), after asking |
 | Claude Code sign-in | Opens a tab running `claude` on the host, to sign in (Linux hosts) |
 | Claude Code / Codex hooks | Installs them for exact agent status |
-| Clipboard tools | Links `pbcopy`, `pbpaste`, `xclip`, `xsel`, `wl-copy` and `wl-paste` to `thurm` in `~/.local/share/thurm/shims`, after asking (Linux hosts) |
+| Clipboard tools | Links `pbcopy`, `pbpaste`, `xclip`, `xsel`, `wl-copy` and `wl-paste` to `thurm` in `~/.local/share/thurm/shims`, after asking (Linux hosts); other programs already there are left alone and reported |
 
 A fix that needs you at the host (a password, a sign-in) runs over `ssh -t`:
 in a tab of this Mac from the app, in your terminal from `thurm remote doctor
