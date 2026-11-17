@@ -340,7 +340,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return SessionManager.shared.canGoForwardInTabHistory
         }
         if menuItem.action == #selector(forwardPort(_:)) {
-            return SessionManager.shared.forwardHost != nil
+            return SessionManager.shared.forwardHost != .none
         }
         if menuItem.action == #selector(renameWorkspace(_:)) || menuItem.action == #selector(closeWorkspace(_:)) {
             return SessionManager.shared.currentWorkspace != nil

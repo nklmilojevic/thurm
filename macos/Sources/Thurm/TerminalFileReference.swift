@@ -171,11 +171,15 @@ enum FilePreviewError: Error, LocalizedError {
 
 /// Files of remote panes, fetched to preview here: kept in the app's caches directory by host and
 /// path, fetched again only when the host says the file changed, and never more than
-/// `maxBytes` in all.
+/// `maxBytes` in all, downloads under way included.
+///
+/// An entry is a directory per host and path. Each fetched copy goes in a folder of its own
+/// inside it (`c-<id>/<name>`), and `.current` names the one in use: a refresh never replaces a
+/// file Quick Look is showing, and a copy it shows is deleted only once let go. Main thread only.
 final class RemoteFileCache {
     static let shared = RemoteFileCache()
 
-    /// The largest file fetched, and the most kept.
+    /// The largest file fetched, and the most kept and on its way.
     let maxBytes: UInt64
 
     let root: URL
@@ -187,26 +191,39 @@ final class RemoteFileCache {
             .appendingPathComponent("remote-files", isDirectory: true)
     }
 
+    /// Downloads into the cache (`Core.startDownload`; tests stand in for it).
+    var download: Core.DownloadStarter = Core.startDownload
+
     /// Where the file `path` on `host` (as `cwd` resolves it) is kept: a directory of its own.
     func entry(host: HostId, path: String, cwd: String?) -> URL {
         var key = path
         if !path.hasPrefix("/") && !path.hasPrefix("~") { key = (cwd ?? "") + "/" + path }
         let digest = SHA256.hash(data: Data((host + "\u{0}" + key).utf8))
         let name = digest.prefix(16).map { String(format: "%02x", $0) }.joined()
-        return root.appendingPathComponent(name, isDirectory: true)
+        return root.appendingPathComponent(name, isDirectory: true).standardizedFileURL
+    }
+
+    /// The copy in use in `entry`, as `.current` names it (`c-<id>/<name>`), whether or not it
+    /// has a version.
+    private func current(_ entry: URL) -> URL? {
+        guard let rel = try? String(contentsOf: entry.appendingPathComponent(".current"), encoding: .utf8)
+        else { return nil }
+        let parts = rel.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 2, parts[0].hasPrefix("c-"), !parts[1].isEmpty, !parts[1].hasPrefix(".")
+        else { return nil }
+        let file = entry.appendingPathComponent(parts[0], isDirectory: true).appendingPathComponent(parts[1])
+        return FileManager.default.fileExists(atPath: file.path) ? file : nil
     }
 
     /// The cached copy in `entry` and the version it is, if any.
     func cached(_ entry: URL) -> (file: URL, version: String)? {
-        guard let version = try? String(contentsOf: entry.appendingPathComponent(".version"), encoding: .utf8),
-              let name = try? String(contentsOf: entry.appendingPathComponent(".name"), encoding: .utf8),
-              !name.isEmpty, !name.contains("/") else { return nil }
-        let file = entry.appendingPathComponent(name)
-        guard FileManager.default.fileExists(atPath: file.path) else { return nil }
+        guard let file = current(entry),
+              let version = try? String(contentsOf: entry.appendingPathComponent(".version"), encoding: .utf8)
+        else { return nil }
         return (file, version)
     }
 
-    /// A new file in `entry` (made if needed) for one download to write: the cached copy, if
+    /// A new file in `entry` (made if needed) for one download to write: the copy in use, if
     /// any, stays as it is until `install` replaces it.
     func stage(_ entry: URL) throws -> URL {
         try FileManager.default.createDirectory(at: entry, withIntermediateDirectories: true,
@@ -214,87 +231,104 @@ final class RemoteFileCache {
         return entry.appendingPathComponent(".staging-\(UUID().uuidString)")
     }
 
-    /// Puts the downloaded `staged` file in place of the cached copy under its own name and
-    /// records its version (none: fetched again next time). The old copy goes only once the
-    /// new one is there. Returns where it is.
+    /// Makes the downloaded `staged` file the copy in use, in a folder of its own under its own
+    /// name, and records its version (none: fetched again next time). The copy it replaces is
+    /// deleted unless Quick Look shows it; then when it is let go. Returns where the new one is.
     func install(_ entry: URL, staged: URL, name: String, version: String?) throws -> URL {
         let fm = FileManager.default
         let safe = name.isEmpty || name.contains("/") || name.hasPrefix(".") ? "file" : name
-        let file = entry.appendingPathComponent(safe)
-        let old = (try? String(contentsOf: entry.appendingPathComponent(".name"), encoding: .utf8))
-            .flatMap { $0.isEmpty || $0.contains("/") ? nil : entry.appendingPathComponent($0) }
-        if fm.fileExists(atPath: file.path) {
-            _ = try fm.replaceItemAt(file, withItemAt: staged)
-        } else {
+        let copy = "c-\(UUID().uuidString)"
+        let folder = entry.appendingPathComponent(copy, isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let file = folder.appendingPathComponent(safe)
+        do {
             try fm.moveItem(at: staged, to: file)
+            try "\(copy)/\(safe)".write(to: entry.appendingPathComponent(".current"), atomically: true, encoding: .utf8)
+        } catch {
+            try? fm.removeItem(at: folder)
+            throw error
         }
-        if let old, old.lastPathComponent != safe { try? fm.removeItem(at: old) }
-        try safe.write(to: entry.appendingPathComponent(".name"), atomically: true, encoding: .utf8)
         let versionFile = entry.appendingPathComponent(".version")
         if let version {
             try version.write(to: versionFile, atomically: true, encoding: .utf8)
         } else {
             try? fm.removeItem(at: versionFile)
         }
+        retireCopies(in: entry)
         prune(keeping: entry)
         return file
     }
 
-    /// Entries a Quick Look panel shows a file of, with how many: pruning leaves them alone.
+    /// Deletes the copies in `entry` that are neither in use nor shown.
+    private func retireCopies(in entry: URL) {
+        let fm = FileManager.default
+        let inUse = current(entry)?.deletingLastPathComponent().standardizedFileURL
+        let copies = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)) ?? []
+        for folder in copies where folder.lastPathComponent.hasPrefix("c-") {
+            let folder = folder.standardizedFileURL
+            if folder == inUse || held.keys.contains(where: { $0.deletingLastPathComponent() == folder }) { continue }
+            try? fm.removeItem(at: folder)
+        }
+    }
+
+    /// Files Quick Look shows, with how many times: neither pruned nor replaced in place.
     private var held: [URL: Int] = [:]
 
-    /// The entry `file` is kept in, if it is one of the cache's.
+    /// The entry `file` is a copy in, if it is one of the cache's.
     private func entryOf(_ file: URL) -> URL? {
-        let entry = file.deletingLastPathComponent().standardizedFileURL
+        let entry = file.standardizedFileURL.deletingLastPathComponent().deletingLastPathComponent()
         return entry.deletingLastPathComponent() == root.standardizedFileURL ? entry : nil
     }
 
-    /// Keeps `file`'s entry from being pruned while it is shown (no-op for other files).
+    /// Keeps `file` while it is shown (no-op for other files).
     func hold(_ file: URL) {
-        guard let entry = entryOf(file) else { return }
-        held[entry, default: 0] += 1
+        guard entryOf(file) != nil else { return }
+        held[file.standardizedFileURL, default: 0] += 1
     }
 
-    /// Lets `file`'s entry go again, and prunes what no longer fits.
+    /// Lets `file` go again: a copy no longer in use goes, and what no longer fits is pruned.
     func release(_ file: URL) {
-        guard let entry = entryOf(file), let n = held[entry] else { return }
-        held[entry] = n > 1 ? n - 1 : nil
+        let file = file.standardizedFileURL
+        guard let entry = entryOf(file), let n = held[file] else { return }
+        held[file] = n > 1 ? n - 1 : nil
+        retireCopies(in: entry)
         prune()
     }
 
-    /// Forgets the least recently fetched entries until the rest fit in `maxBytes`; held entries
-    /// and `keep` stay.
-    func prune(keeping keep: URL? = nil) {
+    /// Bytes reserved by downloads under way, by fetch, with the entry each writes to.
+    private var reserved: [UUID: (entry: URL, bytes: UInt64)] = [:]
+
+    /// The bytes of the copies in `entry`.
+    private func size(of entry: URL) -> UInt64 {
         let fm = FileManager.default
-        let keys: [URLResourceKey] = [.contentModificationDateKey, .totalFileAllocatedSizeKey, .fileSizeKey]
-        guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: keys) else { return }
-        var sized: [(url: URL, date: Date, size: UInt64)] = entries.map { entry in
-            let files = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: keys)) ?? []
-            // The cached file; its name and version beside it are a few bytes.
-            let size = files.filter { !$0.lastPathComponent.hasPrefix(".") }.reduce(UInt64(0)) { sum, f in
-                sum + UInt64((try? f.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-            }
-            let date = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
-                ?? .distantPast
-            return (entry, date, size)
-        }
-        sized.sort { $0.date < $1.date }
-        var total = sized.reduce(UInt64(0)) { $0 + $1.size }
-        for e in sized where total > maxBytes && e.url.standardizedFileURL != keep?.standardizedFileURL
-            && held[e.url.standardizedFileURL] == nil {
-            try? fm.removeItem(at: e.url)
-            total -= e.size
+        let copies = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)) ?? []
+        return copies.filter { $0.lastPathComponent.hasPrefix("c-") }.reduce(UInt64(0)) { sum, folder in
+            let files = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+            return files.reduce(sum) { $0 + UInt64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
         }
     }
 
-    /// Downloads `path` as `pane` sees it to `dest` unless `ifVersion` is still its version, at
-    /// most `maxBytes` (`Core.download`; tests stand in for it). `completion` on the main thread.
-    typealias Downloader = (_ pane: PaneKey, _ path: String, _ dest: URL, _ ifVersion: String?,
-                            _ maxBytes: UInt64, _ completion: @escaping (TransferOutcome) -> Void) -> Void
-
-    var download: Downloader = { pane, path, dest, ifVersion, maxBytes, completion in
-        Core.shared.download(pane, path: path, to: dest, ifVersion: ifVersion, maxBytes: maxBytes,
-                             onProgress: { _ in }, onFinish: completion)
+    /// Forgets the least recently fetched entries until the rest, with the downloads under way,
+    /// fit in `maxBytes`. Entries shown, being downloaded to, or `keep` stay, and an entry that
+    /// could not be deleted still counts. Whether it all fits.
+    @discardableResult
+    func prune(keeping keep: URL? = nil) -> Bool {
+        let fm = FileManager.default
+        let busy = Set(held.keys.compactMap(entryOf) + reserved.values.map(\.entry) + [keep].compactMap { $0 })
+            .map(\.standardizedFileURL)
+        let entries = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey]))
+            ?? []
+        var sized: [(url: URL, date: Date, size: UInt64)] = entries.map { entry in
+            let date = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                ?? .distantPast
+            return (entry.standardizedFileURL, date, size(of: entry))
+        }
+        sized.sort { $0.date < $1.date }
+        var total = sized.reduce(UInt64(0)) { $0 + $1.size } + reserved.values.reduce(UInt64(0)) { $0 + $1.bytes }
+        for e in sized where total > maxBytes && !busy.contains(e.url) {
+            if (try? fm.removeItem(at: e.url)) != nil { total -= e.size }
+        }
+        return total <= maxBytes
     }
 
     /// Fetches under way, by the entry of their first path, with everyone waiting on each.
@@ -302,7 +336,7 @@ final class RemoteFileCache {
 
     /// Fetches `reference`, as `pane` sees it, into the cache (or finds it there unchanged);
     /// `completion` runs on the main thread. A fetch of a file already on its way waits for that
-    /// one instead of starting another. Main thread only.
+    /// one instead of starting another.
     func fetch(_ reference: TerminalFileReference, pane: PaneKey, cwd: String?,
                completion: @escaping (Result<URL, Error>) -> Void) {
         let paths: [String]
@@ -328,11 +362,32 @@ final class RemoteFileCache {
         let cached = cached(entry)
         let staged: URL
         do { staged = try stage(entry) } catch { return completion(.failure(error)) }
-        download(pane, path, staged, cached?.version, maxBytes) { [self] outcome in
+        let token = UUID()
+        reserved[token] = (entry, 0)
+        var cancel: (() -> Void)?
+        var tooMuch = false
+        let onProgress: (TransferProgress) -> Void = { [self] p in
+            // The size is known from the first report: it is reserved, and must fit beside the
+            // rest, or the download stops.
+            guard let r = reserved[token], r.bytes == 0, p.total > 0 else { return }
+            reserved[token] = (entry, p.total)
+            if !prune() {
+                tooMuch = true
+                cancel?()
+            }
+        }
+        cancel = download(pane, path, staged, cached?.version, maxBytes, onProgress) { [self] outcome in
+            reserved[token] = nil
             if outcome.notModified, let cached {
                 try? FileManager.default.removeItem(at: staged)
                 try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: entry.path)
                 return completion(.success(cached.file))
+            }
+            if tooMuch {
+                try? FileManager.default.removeItem(at: staged)
+                return completion(.failure(RemoteFileError.failed(
+                    "There is no room to preview this file while other previews download "
+                        + "(\(maxBytes >> 20) MiB in all).")))
             }
             if let error = outcome.error {
                 try? FileManager.default.removeItem(at: staged)

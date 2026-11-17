@@ -55,6 +55,8 @@ final class Extensions {
     private var forwardRequests = ForwardRequests()
     /// Remote hosts' port lists, passed on to plugins.
     private var remotePorts = RemotePorts()
+    /// The Rust core's `thurm_remote_call` (a stand-in in tests). Called on any thread.
+    var remoteCall: ([String: Any]) -> Any? = { Core.shared.remoteCall($0) }
 
     // MARK: Calling the daemon
 
@@ -471,13 +473,13 @@ final class Extensions {
     /// The forwards open now (the status callback's report).
     func forwardsNow(_ ids: Set<UInt64>) { forwardRequests.forwardsNow(ids) }
 
-    /// Closes forwards opened for plugins' requests nobody waits for and nobody else has.
+    /// Closes forwards opened for plugins' requests nobody waits for and nobody else has: now,
+    /// on the main thread where that was decided, before an open that could be handed one starts
+    /// (closing is quick: nothing goes to the host).
     private func closeAbandoned(_ ids: [UInt64]) {
         for id in ids {
             tlog("closing forward \(id): the plugin that asked for it no longer waits")
-            DispatchQueue.global(qos: .utility).async {
-                _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: id)])
-            }
+            _ = remoteCall(["op": "forward_close", "id": NSNumber(value: id)])
         }
     }
 
@@ -515,33 +517,44 @@ final class Extensions {
         }
         let browse = jsonBool(req["browse"]) == true
         forwardRequests.begin(key, opening: opening)
-        // Opening connects to the host's daemon first: not on the main thread.
-        DispatchQueue.global(qos: .userInitiated).async {
-            let v = Core.shared.remoteCall(op) as? [String: Any]
-            DispatchQueue.main.async {
-                // The daemon gave up on it meanwhile: it changes nothing. A forward it opened is
-                // closed again once nobody else has it (and both are reported, as every change is).
-                let (finish, close) = self.forwardRequests.finish(key, opening: opening, result: v)
-                self.closeAbandoned(close)
-                guard finish == .answer else { return }
-                if let e = jsonString(v?["error"]) {
-                    answer(NSNull(), e)
-                    return
-                }
-                guard let v else {
-                    answer(NSNull(), "the app did not answer")
-                    return
-                }
-                if let f = ForwardInfo(json: v), jsonBool(v["new"]) == true {
-                    SessionManager.shared.currentController?.content.focusedView?.showToast(
-                        ForwardText.toast(host: f.host, remotePort: f.remotePort, localPort: f.localPort),
-                        duration: 4)
-                }
-                if browse, let url = jsonString(v["url"]).flatMap(URL.init(string:)) {
-                    NSWorkspace.shared.open(url)
-                }
-                answer(v, nil)
+        let done = { [weak self] (v: [String: Any]?) in
+            guard let self else { return }
+            // The daemon gave up on it meanwhile: it changes nothing. A forward it opened is
+            // closed again once nobody else has it (and both are reported, as every change is).
+            let (finish, close) = self.forwardRequests.finish(key, opening: opening, result: v)
+            self.closeAbandoned(close)
+            guard finish == .answer else { return }
+            if let e = jsonString(v?["error"]) {
+                answer(NSNull(), e)
+                return
             }
+            guard let v else {
+                answer(NSNull(), "the app did not answer")
+                return
+            }
+            if let f = ForwardInfo(json: v), jsonBool(v["new"]) == true {
+                SessionManager.shared.currentController?.content.focusedView?.showToast(
+                    ForwardText.toast(host: f.host, remotePort: f.remotePort, localPort: f.localPort),
+                    duration: 4)
+            }
+            if browse, let url = jsonString(v["url"]).flatMap(URL.init(string:)) {
+                NSWorkspace.shared.open(url)
+            }
+            answer(v, nil)
+        }
+        // A close is quick (nothing goes to the host): done now, on the main thread, where a
+        // cancel is taken too, so none the app has seen can be overtaken by it.
+        guard opening != nil else {
+            done(remoteCall(op) as? [String: Any])
+            return
+        }
+        // Opening connects to the host's daemon first: not on the main thread, and only if the
+        // daemon has not given up on it before it starts.
+        let call = remoteCall
+        DispatchQueue.global(qos: .userInitiated).async {
+            let live = DispatchQueue.main.sync { self.forwardRequests.isLive(key) }
+            let v = live ? call(op) as? [String: Any] : nil
+            DispatchQueue.main.async { done(v) }
         }
     }
 

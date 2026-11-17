@@ -124,6 +124,34 @@ struct Inner {
     hosts: HashMap<String, HostPorts>,
     controls: HashMap<String, Arc<Client>>,
     sweeping: bool,
+    /// How many times each host has moved ([`Forwards::host_moved`]).
+    epochs: HashMap<String, u64>,
+    /// Hosts that moved, and the tunnel settings a connection to their new destination has:
+    /// no forward opens for them before such a connection ([`Forwards::host_connected`]).
+    /// `u64::MAX` until known ([`Forwards::await_settings`]).
+    moving: HashMap<String, u64>,
+    /// Each host's tunnel (a token per supervisor started), and the newest settings it has
+    /// connected with. Reports from a tunnel that has been replaced are not counted.
+    tunnels: HashMap<String, (u64, Option<u64>)>,
+    next_tunnel: u64,
+}
+
+impl Inner {
+    fn epoch(&self, host: &str) -> u64 {
+        self.epochs.get(host).copied().unwrap_or(0)
+    }
+
+    /// Why no forward may open for `host` now, if it may not.
+    fn refuses(&self, host: &str, since: u64) -> Option<String> {
+        if self.epoch(host) != since {
+            return Some(format!(
+                "{host} was pointed elsewhere while the forward was opening; open it again"
+            ));
+        }
+        self.moving.contains_key(host).then(|| {
+            format!("{host} is reconnecting to its new address; try again once it is connected")
+        })
+    }
 }
 
 /// Every forward of this process.
@@ -246,8 +274,26 @@ impl Forwards {
         preferred: Option<u16>,
         link: Option<&str>,
     ) -> Result<(Forward, bool), String> {
+        let since = self.epoch(host);
+        self.open_since(host, remote_port, preferred, link, since)
+    }
+
+    /// Like [`Forwards::open_for`], refused when `host` has moved since [`Forwards::epoch`]
+    /// said `since`, or while it reconnects to where it moved: the check made before (that the
+    /// host answers, and is the one the link came from) is about the old destination.
+    pub fn open_since(
+        &self,
+        host: &str,
+        remote_port: u16,
+        preferred: Option<u16>,
+        link: Option<&str>,
+        since: u64,
+    ) -> Result<(Forward, bool), String> {
         if remote_port == 0 {
             return Err("port 0 is not a port to forward".into());
+        }
+        if let Some(why) = self.inner.lock().refuses(host, since) {
+            return Err(why);
         }
         if let Some(f) = self.find(host, remote_port) {
             return self.reuse(f, preferred, link);
@@ -267,6 +313,11 @@ impl Forwards {
         };
         let local = listeners.port;
         let mut g = self.inner.lock();
+        // Checked again with the listener bound, under the lock `host_moved` takes: a forward
+        // opened before a move is closed by it, one after it is refused here.
+        if let Some(why) = g.refuses(host, since) {
+            return Err(why);
+        }
         // Another thread may have opened it meanwhile; theirs stands.
         if let Some(e) = g
             .open
@@ -415,6 +466,8 @@ impl Forwards {
     pub fn host_moved(&self, host: &str) {
         let ids: Vec<u64> = {
             let mut g = self.inner.lock();
+            *g.epochs.entry(host.to_owned()).or_default() += 1;
+            g.moving.insert(host.to_owned(), u64::MAX);
             g.hosts.remove(host);
             g.controls.remove(host);
             g.open
@@ -426,6 +479,48 @@ impl Forwards {
         for id in ids {
             self.close_why(id, "host");
         }
+    }
+
+    /// `host`, moved, reaches its new destination once its tunnel connects with `settings`
+    /// ([`crate::tunnel::Supervisor::settings`]) or later ones.
+    pub fn await_settings(&self, host: &str, settings: u64) {
+        let mut g = self.inner.lock();
+        if let Some(want) = g.moving.get_mut(host) {
+            *want = settings;
+        }
+        settle(&mut g, host);
+    }
+
+    /// A tunnel to `host` is being started (the host is new, or every tunnel is restarted): the
+    /// token its reports carry. Until it connects, no forward opens for `host`, and a forward
+    /// checked before is refused: an older tunnel may still be up while this one starts.
+    pub fn host_started(&self, host: &str) -> u64 {
+        let mut g = self.inner.lock();
+        g.next_tunnel += 1;
+        let token = g.next_tunnel;
+        g.tunnels.insert(host.to_owned(), (token, None));
+        *g.epochs.entry(host.to_owned()).or_default() += 1;
+        g.moving.insert(host.to_owned(), 0);
+        token
+    }
+
+    /// The tunnel `token` of `host` connected with `settings` ([`crate::tunnel::Status::settings`]).
+    pub fn host_connected(&self, host: &str, token: u64, settings: u64) {
+        let mut g = self.inner.lock();
+        match g.tunnels.get_mut(host) {
+            Some((t, have)) if *t == token => {
+                *have = Some(have.map_or(settings, |h| h.max(settings)));
+            }
+            _ => return,
+        }
+        settle(&mut g, host);
+    }
+
+    /// How many times `host` has moved: taken before checking a host for a forward and given
+    /// to [`Forwards::open_since`], so a forward checked against the old destination is not
+    /// opened after the move.
+    pub fn epoch(&self, host: &str) -> u64 {
+        self.inner.lock().epoch(host)
     }
 
     /// Whether a connection to `host`'s daemon is kept.
@@ -440,6 +535,18 @@ impl Forwards {
             let mut g = self.inner.lock();
             g.hosts.retain(|h, _| hosts.contains(&h.as_str()));
             g.controls.retain(|h, _| hosts.contains(&h.as_str()));
+            // A forward being opened for a host now gone (or turned off) is refused when it gets
+            // there, as one checked before a move is.
+            let dropped: Vec<String> = g
+                .epochs
+                .keys()
+                .chain(g.tunnels.keys())
+                .filter(|h| !hosts.contains(&h.as_str()))
+                .cloned()
+                .collect();
+            for h in dropped {
+                *g.epochs.entry(h).or_default() += 1;
+            }
             g.open
                 .values()
                 .filter(|e| !hosts.contains(&e.forward.host.as_str()))
@@ -556,7 +663,7 @@ impl Forwards {
             .name("forward-sweep".into())
             .spawn(move || {
                 loop {
-                    std::thread::sleep(Duration::from_secs(1).min(me.grace));
+                    std::thread::sleep(sweep_tick(me.grace));
                     me.sweep(Instant::now());
                     let mut g = me.inner.lock();
                     if !g.open.values().any(|e| e.missing_since.is_some()) {
@@ -642,7 +749,11 @@ impl Forwards {
 
     /// A control connection to `host`'s daemon, made once and kept.
     fn control(&self, host: &str, fresh: bool) -> Result<Arc<Client>, ClientError> {
-        if !fresh && let Some(c) = self.inner.lock().controls.get(host) {
+        // A kept connection that has dropped (the tunnel went down) is made again.
+        if !fresh
+            && let Some(c) = self.inner.lock().controls.get(host)
+            && c.is_alive()
+        {
             return Ok(c.clone());
         }
         let c = Client::connect(
@@ -695,6 +806,23 @@ impl Forwards {
     /// Keeps `local` as the port for (`host`, `remote_port`), so a URL stays the same between
     /// runs. Best effort.
     fn remember(&self, host: &str, remote_port: u16, local: u16) {
+        if let Some(dir) = self.remembered.parent()
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            log::info!("cannot remember the forward's port: {e}");
+            return;
+        }
+        // Read, change, write under one lock, which this process's other forwards and the
+        // other processes keeping forwards (the app, `thurm remote forward`) take too: two
+        // forwards opened at once both stay remembered.
+        let _lock =
+            match crate::handoff::FileLock::acquire(&self.remembered.with_extension("json.lock")) {
+                Ok(l) => l,
+                Err(e) => {
+                    log::info!("cannot remember the forward's port: {e}");
+                    return;
+                }
+            };
         let mut all = self.remembered();
         if all.insert(key(host, remote_port), local) == Some(local) {
             return;
@@ -713,6 +841,17 @@ fn existing(f: Forward, preferred: Option<u16>) -> Result<(Forward, bool), Strin
             f.host, f.remote_port, f.local
         )),
         _ => Ok((f, false)),
+    }
+}
+
+/// Opens `host` to forwards again once a connection with the settings it waits for is there.
+fn settle(g: &mut Inner, host: &str) {
+    let have = g.tunnels.get(host).and_then(|(_, s)| *s);
+    if g.moving
+        .get(host)
+        .is_some_and(|&want| want != u64::MAX && have.is_some_and(|h| h >= want))
+    {
+        g.moving.remove(host);
     }
 }
 
@@ -742,7 +881,13 @@ fn write_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+    // Its own name, per process and per write: writers never share a temporary file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "json.tmp{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -792,6 +937,12 @@ fn bind(port: u16) -> std::io::Result<Listeners> {
         }
     }
     Err(last.unwrap_or_else(|| std::io::ErrorKind::AddrInUse.into()))
+}
+
+/// How often the sweep runs: about as often as the grace allows, up to once a second, and never
+/// back to back (a zero grace with a forward held open by a connection would spin).
+fn sweep_tick(grace: Duration) -> Duration {
+    grace.clamp(Duration::from_millis(10), Duration::from_secs(1))
 }
 
 /// Takes a connection slot of `active` if fewer than `max` are taken: one atomic step, so the
@@ -1382,6 +1533,120 @@ mod tests {
         assert!(!f.connected("devbox"));
         f.close(b.id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_open_checked_before_a_move_is_refused_after_it() {
+        let dir = tempdir("open-race");
+        let f = forwards(&dir);
+        let tunnel = f.host_started("devbox");
+        f.host_connected("devbox", tunnel, 0);
+        // A forward is checked against devbox's old destination; then devbox is pointed
+        // elsewhere before it opens.
+        let since = f.epoch("devbox");
+        f.host_moved("devbox");
+        let e = f
+            .open_since("devbox", 7500, Some(0), None, since)
+            .unwrap_err();
+        assert!(e.contains("pointed elsewhere"), "{e}");
+        assert!(f.list().is_empty());
+        // Checked after the move, before the tunnel reaches the new destination: refused too.
+        let since = f.epoch("devbox");
+        f.await_settings("devbox", 3);
+        let e = f
+            .open_since("devbox", 7500, Some(0), None, since)
+            .unwrap_err();
+        assert!(e.contains("reconnecting"), "{e}");
+        // A connection still on older settings opens nothing.
+        f.host_connected("devbox", tunnel, 2);
+        assert!(f.open_since("devbox", 7500, Some(0), None, since).is_err());
+        // One with the new settings does.
+        f.host_connected("devbox", tunnel, 3);
+        let (fw, _) = f.open_since("devbox", 7500, Some(0), None, since).unwrap();
+        // Other hosts never waited.
+        let (other, _) = f.open("pi", 7500, Some(0)).unwrap();
+        f.close(fw.id).unwrap();
+        f.close(other.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_connection_reported_before_its_settings_still_opens_the_host() {
+        let dir = tempdir("settle-order");
+        let f = forwards(&dir);
+        let tunnel = f.host_started("devbox");
+        f.host_moved("devbox");
+        f.host_connected("devbox", tunnel, 1);
+        assert!(
+            f.open("devbox", 7600, Some(0)).is_err(),
+            "settings not known yet"
+        );
+        f.await_settings("devbox", 1);
+        let (fw, _) = f.open("devbox", 7600, Some(0)).unwrap();
+        f.close(fw.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_replaced_tunnel_does_not_speak_for_the_new_one() {
+        let dir = tempdir("tunnel-token");
+        let f = forwards(&dir);
+        let old = f.host_started("devbox");
+        f.host_connected("devbox", old, 0);
+        let (fw, _) = f.open("devbox", 7700, Some(0)).unwrap();
+        f.close(fw.id).unwrap();
+        // Every tunnel restarted: the old one, still stopping, says it is connected.
+        let since = f.epoch("devbox");
+        let new = f.host_started("devbox");
+        assert!(f.open_since("devbox", 7700, Some(0), None, since).is_err());
+        f.host_connected("devbox", old, 5);
+        assert!(
+            f.open("devbox", 7700, Some(0)).is_err(),
+            "the old tunnel opened the host"
+        );
+        // The new one connects: forwards open again.
+        f.host_connected("devbox", new, 0);
+        let (fw, _) = f.open("devbox", 7700, Some(0)).unwrap();
+        f.close(fw.id).unwrap();
+        // A host removed while a forward to it was being checked: refused when it gets there.
+        let since = f.epoch("devbox");
+        f.retain_hosts(&[]);
+        assert!(f.open_since("devbox", 7700, Some(0), None, since).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forwards_opened_at_once_are_all_remembered() {
+        let dir = tempdir("remember");
+        // Forwards of their own, as two processes (the app, the CLI) would have, and threads.
+        let all: Vec<std::thread::JoinHandle<()>> = (0..16u16)
+            .map(|i| {
+                let f = forwards(&dir);
+                std::thread::spawn(move || f.remember("devbox", 9000 + i, 20000 + i))
+            })
+            .collect();
+        for t in all {
+            t.join().unwrap();
+        }
+        let kept = forwards(&dir).remembered();
+        for i in 0..16u16 {
+            assert_eq!(
+                kept.get(&key("devbox", 9000 + i)),
+                Some(&(20000 + i)),
+                "{kept:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_never_spins() {
+        assert_eq!(sweep_tick(Duration::ZERO), Duration::from_millis(10));
+        assert_eq!(
+            sweep_tick(Duration::from_millis(300)),
+            Duration::from_millis(300)
+        );
+        assert_eq!(sweep_tick(GONE_GRACE), Duration::from_secs(1));
     }
 
     #[test]

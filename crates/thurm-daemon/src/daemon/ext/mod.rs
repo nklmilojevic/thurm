@@ -317,9 +317,19 @@ impl Daemon {
                 only_the_app(client, method)?;
                 let host = str_param(&p, "host")?;
                 // The app's connection to the host is gone: what it listed is not known now.
+                // Plugins that heard its lists hear them end: nothing is known of them now.
                 if p.get("gone").and_then(Value::as_bool) == Some(true) {
+                    let mut ended = Vec::new();
                     if let Some(lists) = self.ext.remote_ports.lock().get_mut(&client.id) {
-                        lists.retain(|(h, _), _| h != host);
+                        lists.retain(|(h, pane), _| {
+                            if h == host {
+                                ended.push((h.clone(), *pane));
+                            }
+                            h != host
+                        });
+                    }
+                    if self.forwarding_app_id() == Some(client.id) {
+                        self.remote_lists_ended(&ended);
                     }
                     return Ok(Value::Null);
                 }
@@ -409,6 +419,17 @@ impl Daemon {
                 })
             })
             .collect()
+    }
+
+    /// Remote panes whose lists plugins heard and nobody keeps up now (the app lost the host,
+    /// or quit): each gets an empty list, not complete, as nothing is known of its ports.
+    fn remote_lists_ended(&self, panes: &[(String, u64)]) {
+        for (host, pane) in panes {
+            let payload = json!({
+                "event": PORTS_CHANGED, "host": host, "id": pane, "ports": [], "complete": false,
+            });
+            self.deliver_event(PORTS_CHANGED, &payload);
+        }
     }
 
     /// An app that forwards connected ([`thurm_proto::CAP_EXT_FORWARDS`]).
@@ -742,15 +763,24 @@ impl Daemon {
         self.ext.pending.lock().retain(|_, p| p.to != client);
         // An app's forwards end with it; when it was the first, the next app's are plugins'
         // now.
-        let (gone, next, next_app) = {
+        let (first, gone, next, next_app) = {
             let mut forwards = self.ext.forwards.lock();
             let first = forwards.keys().min() == Some(&client);
             let gone = forwards.remove(&client).filter(|_| first);
             let next_app = forwards.keys().min().copied().filter(|_| first);
             let next = next_app.and_then(|id| forwards.get(&id).cloned());
-            (gone, next, next_app)
+            (first, gone, next, next_app)
         };
-        self.ext.remote_ports.lock().remove(&client);
+        // The panes only the app that held plugins' lists knew of: no one tells of them now.
+        let ended: Vec<(String, u64)> = {
+            let mut all = self.ext.remote_ports.lock();
+            let had = all.remove(&client).unwrap_or_default();
+            let next_has = next_app.and_then(|a| all.get(&a));
+            had.into_keys()
+                .filter(|k| first && !next_has.is_some_and(|n| n.contains_key(k)))
+                .collect()
+        };
+        self.remote_lists_ended(&ended);
         for f in gone.iter().flatten() {
             self.forward_event(FORWARD_CLOSED, f, Some("app"));
         }
@@ -1015,6 +1045,10 @@ impl Daemon {
         caller: &Client,
         make: impl FnOnce(u64) -> ext::UiRequest,
     ) -> Result<Value, String> {
+        // Nothing is asked for a caller that went: the app would act for no one.
+        if caller.gone.load(Ordering::SeqCst) {
+            return Err("the caller went away".into());
+        }
         let (id, rx) = self.ext_question(app.id, 0);
         if app.gone.load(Ordering::SeqCst) {
             self.ext.pending.lock().remove(&id);

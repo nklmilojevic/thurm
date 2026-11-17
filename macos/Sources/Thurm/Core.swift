@@ -541,6 +541,28 @@ final class Core {
         thurm_download_cancel(id)
     }
 
+    /// Starts a download (`download`), returning what cancels it; tests stand in for it.
+    typealias DownloadStarter = (_ pane: PaneKey, _ path: String, _ dest: URL, _ ifVersion: String?,
+                                 _ maxBytes: UInt64,
+                                 _ onProgress: @escaping (TransferProgress) -> Void,
+                                 _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)?
+
+    static let startDownload: DownloadStarter = { pane, path, dest, ifVersion, maxBytes, onProgress, onFinish in
+        let id = Core.shared.download(pane, path: path, to: dest, ifVersion: ifVersion, maxBytes: maxBytes,
+                                      onProgress: onProgress, onFinish: onFinish)
+        return id.map { id in { Core.shared.cancelTransfer(id) } }
+    }
+
+    /// Starts an upload of one batch (`upload`), returning what cancels it; tests stand in for it.
+    typealias UploadStarter = (_ pane: PaneKey, _ files: [(path: String, name: String?)],
+                               _ onProgress: @escaping (TransferProgress) -> Void,
+                               _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)?
+
+    static let startUpload: UploadStarter = { pane, files, onProgress, onFinish in
+        let id = Core.shared.upload(pane, files: files, onProgress: onProgress, onFinish: onFinish)
+        return id.map { id in { Core.shared.cancelTransfer(id) } }
+    }
+
     /// Answers `host`'s clipboard query `id` with `data`, or refuses it (nil).
     func clipboardAnswer(host: HostId, id: UInt64, data: Data?) {
         guard let c = clients[host] else { return }

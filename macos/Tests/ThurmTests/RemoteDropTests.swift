@@ -32,36 +32,117 @@ final class RemoteDropTests: XCTestCase {
         return rep.representation(using: .png, properties: [:])!
     }
 
-    /// A remote pane whose host takes files, recording each upload instead of sending it.
-    private func remotePane(takesFiles: Bool = true) -> (TerminalView, () -> [[String]]) {
+    /// Transfers started, standing in for Core: each with its progress, end and cancels.
+    final class FakeTransfers {
+        var started: [[String]] = []
+        var progress: [(TransferProgress) -> Void] = []
+        var finish: [(TransferOutcome) -> Void] = []
+        var cancels = 0
+
+        func upload(_ pane: PaneKey, _ files: [(path: String, name: String?)],
+                    _ onProgress: @escaping (TransferProgress) -> Void,
+                    _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)? {
+            started.append(files.map(\.path))
+            progress.append(onProgress)
+            finish.append(onFinish)
+            return { [weak self] in self?.cancels += 1 }
+        }
+
+        func download(_ pane: PaneKey, _ path: String, _ dest: URL, _ ifVersion: String?, _ maxBytes: UInt64,
+                      _ onProgress: @escaping (TransferProgress) -> Void,
+                      _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)? {
+            started.append([path, dest.path])
+            progress.append(onProgress)
+            finish.append(onFinish)
+            return { [weak self] in self?.cancels += 1 }
+        }
+    }
+
+    /// A remote pane whose host takes files, its uploads going to a `FakeTransfers`.
+    private func remotePane(takesFiles: Bool = true) -> (TerminalView, FakeTransfers) {
         let view = TerminalView(pane: PaneKey("devbox", 7))
         // No connection in the tests: the pane would show as offline and take no input.
         view.setOffline(nil)
         view.transfersFiles = takesFiles
-        var uploads: [[String]] = []
-        view.uploadFiles = { files in uploads.append(files.map(\.path)) }
-        return (view, { uploads })
+        let fake = FakeTransfers()
+        view.uploader = fake.upload
+        return (view, fake)
     }
 
     func testADropOrPasteSendsTheFilesAsOneBatchInOrder() throws {
         let urls = [try file("one.txt"), try file("two words.png"), try file("three")]
         pb.clearContents()
         pb.writeObjects(urls as [NSURL])
-        let (view, uploads) = remotePane()
+        let (view, fake) = remotePane()
         XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        XCTAssertEqual(fake.started, [urls.map(\.path)])
+        fake.finish[0](TransferOutcome())
         view.paste(from: pb)
-        XCTAssertEqual(uploads(), [urls.map(\.path), urls.map(\.path)])
+        XCTAssertEqual(fake.started, [urls.map(\.path), urls.map(\.path)])
     }
 
-    func testAnotherToastDoesNotTakeTheUploadsCancelAway() {
-        let (view, _) = remotePane()
-        view.showUploadToast("Sending 3 files to devbox…")
+    func testASecondDropWaitsForTheFirstInsteadOfCancellingIt() throws {
+        let first = [try file("a.txt")]
+        let second = [try file("b.txt"), try file("c.txt")]
+        let (view, fake) = remotePane()
+        pb.clearContents()
+        pb.writeObjects(first as [NSURL])
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        pb.clearContents()
+        pb.writeObjects(second as [NSURL])
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        XCTAssertEqual(fake.started, [first.map(\.path)])
+        XCTAssertEqual(fake.cancels, 0)
+        XCTAssertEqual(view.shownTransfer, "Sending a.txt to devbox… (1 more)")
+        // The first lands; then the second goes.
+        fake.finish[0](TransferOutcome())
+        XCTAssertEqual(fake.started, [first.map(\.path), second.map(\.path)])
+        XCTAssertEqual(fake.cancels, 0)
+        XCTAssertEqual(view.shownTransfer, "Sending 2 files to devbox…")
+        // Cancel stops the one shown, and only it.
+        view.cancelShownTransfer(nil)
+        XCTAssertEqual(fake.cancels, 1)
+        var cancelled = TransferOutcome(error: "cancelled")
+        cancelled.cancelled = true
+        fake.finish[1](cancelled)
+        XCTAssertNil(view.shownTransfer)
+    }
+
+    func testAnotherToastDoesNotTakeTheUploadsCancelAway() throws {
+        let (view, fake) = remotePane()
+        pb.clearContents()
+        pb.writeObjects([try file("a.txt")] as [NSURL])
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
         view.showToast("Session restored", duration: 0.05)
         // Its fade has begun, and its removal is due, when the next progress comes.
         RunLoop.current.run(until: Date().addingTimeInterval(0.08))
-        view.showUploadToast("Sending 3 files to devbox… 40%")
+        fake.progress[0](TransferProgress(done: 2, total: 5))
         RunLoop.current.run(until: Date().addingTimeInterval(0.6))
-        XCTAssertTrue(view.showsUploadToast)
+        XCTAssertEqual(view.shownTransfer, "Sending a.txt to devbox… 40%")
+    }
+
+    func testADownloadCanBeCancelledAndLeavesNoFile() throws {
+        let (view, fake) = remotePane()
+        var revealed: [URL] = []
+        view.download(remotePath: "/srv/big.iso", into: dir, start: fake.download) { revealed.append($0) }
+        let dest = dir.appendingPathComponent("big.iso")
+        // The name is reserved at once.
+        XCTAssertEqual(fake.started, [["/srv/big.iso", dest.path]])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dest.path))
+        fake.progress[0](TransferProgress(done: 1, total: 4))
+        XCTAssertEqual(view.shownTransfer, "Downloading big.iso from devbox… 25%")
+        view.cancelShownTransfer(nil)
+        XCTAssertEqual(fake.cancels, 1)
+        var cancelled = TransferOutcome(error: "cancelled")
+        cancelled.cancelled = true
+        fake.finish[0](cancelled)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dest.path))
+        XCTAssertNil(view.shownTransfer)
+        XCTAssertEqual(revealed, [])
+        // One that finishes is shown in Finder.
+        view.download(remotePath: "/srv/big.iso", into: dir, start: fake.download) { revealed.append($0) }
+        fake.finish[1](TransferOutcome())
+        XCTAssertEqual(revealed, [dest])
     }
 
     func testAFolderOrAnOlderHostSendsNothing() throws {
@@ -69,14 +150,14 @@ final class RemoteDropTests: XCTestCase {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         pb.clearContents()
         pb.writeObjects([try file("one.txt"), folder] as [NSURL])
-        let (view, uploads) = remotePane()
+        let (view, fake) = remotePane()
         XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
-        XCTAssertEqual(uploads(), [])
+        XCTAssertEqual(fake.started, [])
         pb.clearContents()
         pb.writeObjects([try file("two.txt")] as [NSURL])
-        let (older, olderUploads) = remotePane(takesFiles: false)
+        let (older, olderFake) = remotePane(takesFiles: false)
         _ = older.performDragOperation(FakeDrag(pb))
-        XCTAssertEqual(olderUploads(), [])
+        XCTAssertEqual(olderFake.started, [])
     }
 
     func testDroppedFilesArePlannedInOrder() throws {
