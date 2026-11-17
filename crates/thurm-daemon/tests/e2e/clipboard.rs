@@ -268,6 +268,7 @@ fn older_apps_and_phones_are_never_asked() {
 
 /// The clipboard tools stay first on PATH though the user's startup files put another `xclip`
 /// in front of them: zsh reads `.zshrc` after the integration loads, fish its `config.fish`.
+/// The daemon starts with a clean environment, so the shells read only the files written here.
 #[test]
 fn clipboard_tools_come_first_after_the_startup_files() {
     use std::os::unix::fs::PermissionsExt;
@@ -281,7 +282,7 @@ fn clipboard_tools_come_first_after_the_startup_files() {
         .filter_map(on_path)
         .map(|p| p.display().to_string())
         .collect();
-    assert!(!shells.is_empty(), "no zsh, bash or fish to test with");
+    let mut tested: Vec<String> = Vec::new();
     for shell in &shells {
         let name = shell.rsplit('/').next().unwrap();
         let env = Env::new(&format!("clip-path-{name}"));
@@ -315,7 +316,15 @@ fn clipboard_tools_come_first_after_the_startup_files() {
             ),
         )
         .unwrap();
-        let _daemon = env.start_with(&[("HOME", &home), ("ZDOTDIR", &home)]);
+        // As under a login shell that set up a NixOS or nix-darwin environment: their system
+        // fish setup replaces XDG_DATA_DIRS, where the integration goes in, unless it is done.
+        let done = Path::new("1");
+        let _daemon = env.start_clean(&[
+            ("HOME", &home),
+            ("ZDOTDIR", &home),
+            ("__NIX_DARWIN_SET_ENVIRONMENT_DONE", done),
+            ("__NIXOS_SET_ENVIRONMENT_DONE", done),
+        ]);
         let (c, _) = env.connect();
         let Response::PaneCreated { pane } = c
             .request(Request::CreatePane(CreatePane {
@@ -332,10 +341,33 @@ fn clipboard_tools_come_first_after_the_startup_files() {
         else {
             panic!("no pane");
         };
-        wait_match(&c, pane, r"\$");
+        // Not waiting for a prompt: system-wide startup files may give it any look. A line
+        // typed now waits for the shell, which runs it after its first prompt.
+        if name == "fish" && !fish_integration_loaded(&c, pane) {
+            // The integration goes in through XDG_DATA_DIRS, which another system-wide fish
+            // setup may replace before fish reads it: nothing of Thurm's runs there.
+            eprintln!("skipping fish: this machine's fish setup does not load the integration");
+            continue;
+        }
         let first = regex_escape(&shims.join("xclip").display().to_string());
         send_until(&c, pane, b"command -v xclip\r", &format!("(?m)^{first}$"));
+        tested.push(name.to_owned());
     }
+    assert!(
+        tested.iter().any(|s| s != "fish"),
+        "no zsh or bash to test with: {shells:?}"
+    );
+}
+
+/// Whether Thurm's integration runs in the fish of `pane`.
+fn fish_integration_loaded(c: &Client, pane: PaneId) -> bool {
+    send_until(
+        c,
+        pane,
+        b"set -q __thurm_fish_loaded; and echo THURM-(echo ON); or echo THURM-(echo OFF)\r",
+        "(?m)^THURM-(ON|OFF)$",
+    );
+    capture(c, pane).lines().any(|l| l == "THURM-ON")
 }
 
 fn regex_escape(s: &str) -> String {

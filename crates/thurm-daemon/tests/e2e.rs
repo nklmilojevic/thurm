@@ -42,12 +42,12 @@ mod extensions;
 #[path = "e2e/streams.rs"]
 mod streams;
 
+#[path = "e2e/clipboard.rs"]
+mod clipboard;
 #[path = "e2e/ports.rs"]
 mod ports;
 #[path = "e2e/transfer.rs"]
 mod transfer;
-#[path = "e2e/clipboard.rs"]
-mod clipboard;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -104,7 +104,25 @@ impl Env {
 
     /// Like `start`, with extra environment variables for the daemon.
     fn start_with(&self, vars: &[(&str, &Path)]) -> Daemon {
-        let child = Command::new(env!("CARGO_BIN_EXE_thurmd"))
+        self.spawn(Command::new(env!("CARGO_BIN_EXE_thurmd")), vars)
+    }
+
+    /// Like `start_with`, with none of this process's environment besides `PATH`'s system
+    /// directories, `USER` and `TMPDIR`: the panes' shells then read the startup files the test
+    /// writes, not the developer's (`XDG_CONFIG_HOME`, `ZDOTDIR`, `BASH_ENV`...).
+    fn start_clean(&self, vars: &[(&str, &Path)]) -> Daemon {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_thurmd"));
+        cmd.env_clear().env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        for keep in ["USER", "LOGNAME", "TMPDIR"] {
+            if let Some(v) = std::env::var_os(keep) {
+                cmd.env(keep, v);
+            }
+        }
+        self.spawn(cmd, vars)
+    }
+
+    fn spawn(&self, mut cmd: Command, vars: &[(&str, &Path)]) -> Daemon {
+        let child = cmd
             .args(["--foreground", "--socket"])
             .arg(&self.socket)
             .env("THURM_CONFIG_DIR", self.dir.join("config"))
@@ -569,7 +587,10 @@ fn title_keeps_a_command_that_did_not_start_the_program() {
 
 /// A copy of sleep named nvim, which Thurm takes for Neovim.
 fn fake_nvim(dir: &Path) -> std::path::PathBuf {
-    let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| Path::new(p).exists()).unwrap();
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .unwrap();
     let nvim = dir.join("nvim");
     std::fs::copy(sleep, &nvim).unwrap();
     // A copied system binary runs only signed as itself.
