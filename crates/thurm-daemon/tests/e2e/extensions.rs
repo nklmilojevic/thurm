@@ -1973,6 +1973,7 @@ fn a_lost_host_or_app_ends_its_remote_lists() {
         method::PORTS_REPORT,
         json!({ "host": "devbox", "gone": true }),
     )
+    .map(|answer| assert_eq!(answer, json!({ "heard": true })))
     .unwrap();
     let mut ended: Vec<u64> = (0..2)
         .map(|_| {
@@ -1990,12 +1991,13 @@ fn a_lost_host_or_app_ends_its_remote_lists() {
     assert_eq!(ended, [1, 2]);
 
     // A host the second app lost is not the plugins' news: it does not hold them.
-    call(
+    let answer = call(
         &second,
         method::PORTS_REPORT,
         json!({ "host": "nas", "gone": true }),
     )
     .unwrap();
+    assert_eq!(answer, json!({ "heard": false }));
     // The first quits: pi, which the second doesn't know, ends. nas, which the second has
     // forgotten too, ends; nothing else is said.
     drop(first);
@@ -2189,6 +2191,8 @@ fn the_next_apps_lists_keep_what_they_were() {
     report(&second, 2, vite(8080), true);
     report(&second, 3, vite(9000), true);
     report(&second, 4, json!([]), false);
+    // Pane 5: known to listen on nothing, never heard of by plugins: no news.
+    report(&second, 5, json!([]), false);
     drop(first);
     let mut heard: Vec<(u64, bool, Value, Value)> = (0..3)
         .map(|_| {
@@ -2241,4 +2245,54 @@ fn ports_of_a_pane_not_looked_at_are_its_own() {
         json!([{ "pane": pane, "ports": [], "complete": true }]),
         "{list}"
     );
+}
+
+/// A plugin that subscribes to `ports_changed`, leaves and subscribes again before the watch's
+/// next look gets its first lists once, not once per subscription.
+#[test]
+fn subscribing_again_before_the_look_gets_the_lists_once() {
+    require_python();
+    let env = Env::new("ext-ports-resubscribe");
+    let _d = env.start_with(&[
+        ("THURM_PORTS_INTERVAL_MS", Path::new("200")),
+        ("THURM_PORTS_LOOK_DELAY_MS", Path::new("800")),
+    ]);
+    let (c, rx) = ext_client(&env, "plugin");
+    let pane = listener_pane(&c, &env);
+    wait_match(&c, pane, r"port=\d+");
+    let sub = |names: Value| call(&c, method::EVENTS_SUBSCRIBE, json!({ "names": names })).unwrap();
+    sub(json!(["ports_changed"]));
+    call(
+        &c,
+        method::EVENTS_UNSUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    sub(json!(["ports_changed"]));
+    let first = loop {
+        let ev = next_event(&rx, "ports_changed");
+        if ev["id"] == pane {
+            break ev;
+        }
+    };
+    assert_eq!(first["initial"], true, "{first}");
+    // Two looks later, nothing more of that pane.
+    std::thread::sleep(Duration::from_millis(2200));
+    call(
+        &c,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["test.sentinel"] }),
+    )
+    .unwrap();
+    call(&c, method::EVENTS_EMIT, json!({ "name": "test.sentinel" })).unwrap();
+    loop {
+        let ev = next(&rx, notice::EVENT);
+        assert!(
+            !(ev["event"] == "ports_changed" && ev["id"] == pane),
+            "the first lists came twice: {ev}"
+        );
+        if ev["event"] == "test.sentinel" {
+            break;
+        }
+    }
 }

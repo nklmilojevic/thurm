@@ -89,7 +89,7 @@ pub mod method {
     /// marked it so (sent as the app joined its watch), or the app sends it again to this daemon
     /// on connecting. The result is `{heard}`: whether plugins heard it (only the lists of the
     /// app that holds plugins' forwards are passed on). `{host, gone: true}`: the app's
-    /// connection to the host is gone. The daemon keeps each pane's latest list for new
+    /// connection to the host is gone (answered `{heard}` the same way). The daemon keeps each pane's latest list for new
     /// subscribers and for an app taking over. Only from the app
     /// ([`crate::CAP_EXT_FORWARDS`]), which hears them; subscribers hear `ports_changed` with
     /// `host`.
