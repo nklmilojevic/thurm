@@ -4276,10 +4276,7 @@ mod tests {
                 batch: None,
             },
         );
-        assert!(
-            matches!(&got, Err(e) if e.contains("went away")),
-            "{got:?}"
-        );
+        assert!(matches!(&got, Err(e) if e.contains("went away")), "{got:?}");
         assert!(!dir.join("state/drops").join(pane.to_string()).exists());
         daemon.close_pane(pane);
         let _ = std::fs::remove_dir_all(&dir);
