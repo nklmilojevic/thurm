@@ -378,7 +378,7 @@ the same. Limits:
 | Files on their way to one pane | 64 |
 | Drops not complete yet | 8 per app, 32 in all, and 512 of their files waiting for the rest |
 | Space left free on the host's disk | 1 GiB, and room for 10 000 more files: the oldest finished drops give way for the space, and an upload that still does not fit is refused |
-| Kept | 24 hours, 8 GiB and 1024 drops in all, drops on their way included (every file and folder counts as 4 KiB at least, an empty one too): the oldest finished drops go first, and a file that still does not fit is refused |
+| Kept | 24 hours from when a drop was complete (one never complete: from its last write), 8 GiB and 1024 drops in all, drops on their way included (every file and folder counts as 4 KiB at least, an empty one too): the oldest finished drops go first, and a file that still does not fit is refused |
 
 The other way, ⌘⌥-click a path in a remote pane, or right-click it and pick
 **Quick Look**, to preview the host's file here (the toast shows it coming, with
