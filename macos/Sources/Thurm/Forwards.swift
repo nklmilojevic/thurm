@@ -31,6 +31,13 @@ struct ForwardInfo: Equatable {
         }
         return now.url
     }
+
+    /// The link a request opened `requested` for (`forward_open`'s answer), if the forward is still
+    /// open on the same port. Not the link it holds now: another request on the same port may have
+    /// given it its own since, and this one must open what it asked for.
+    static func requestedLink(_ requested: ForwardInfo, answer: Any?) -> String? {
+        liveLink(of: requested, answer: answer) == nil ? nil : requested.url
+    }
 }
 
 /// What forwards say to the user.
@@ -224,8 +231,9 @@ extension SessionManager {
                     return
                 }
                 guard let f = ForwardInfo(json: v) else { return }
-                // Closed in the meantime (a move, the sweep): its port is no longer ours to open.
-                guard let link = SessionManager.liveLink(of: f), let target = URL(string: link) else {
+                // Closed in the meantime (a move, the sweep): its port is no longer ours to open. Open,
+                // and show, the link this request asked for.
+                guard let link = SessionManager.requestedLink(f), let target = URL(string: link) else {
                     SessionManager.show(ForwardNotice.failure(host: host, "the forward closed before it opened",
                                                               onPane: pane != nil), on: pane)
                     return
@@ -239,11 +247,12 @@ extension SessionManager {
         }
     }
 
-    /// `forward`: the one Copy Link copies, checked again when it is clicked.
+    /// `forward`: the one Copy Link copies (the link the notice shows, while that forward is
+    /// still open), checked again when it is clicked.
     private static func show(_ notice: ForwardNotice, on pane: TerminalView?, forward: ForwardInfo? = nil) {
         switch notice {
         case .toast(let text, let link):
-            let copy = forward.flatMap { f in link.map { _ in ("Copy Link", { copyForwardLink(f) }) } }
+            let copy = forward.flatMap { f in link.map { url in ("Copy Link", { copyForwardLink(f, url: url) }) } }
             pane?.showToast(text, duration: 6, action: copy)
         case .alert(let text, let link):
             let alert = NSAlert()
@@ -253,7 +262,7 @@ extension SessionManager {
                 alert.informativeText = link
                 alert.addButton(withTitle: "Copy Link")
             }
-            if alert.runModal() == .alertSecondButtonReturn, let forward { copyForwardLink(forward) }
+            if alert.runModal() == .alertSecondButtonReturn, let forward { copyForwardLink(forward, url: link) }
         }
     }
 
@@ -318,12 +327,20 @@ extension SessionManager {
         ForwardInfo.liveLink(of: f, answer: Core.shared.remoteCall(["op": "forward_get", "id": NSNumber(value: f.id)]))
     }
 
+    /// `f`'s request link (`ForwardInfo.requestedLink`), or nil once it has closed.
+    static func requestedLink(_ f: ForwardInfo) -> String? {
+        ForwardInfo.requestedLink(f, answer: Core.shared.remoteCall(["op": "forward_get", "id": NSNumber(value: f.id)]))
+    }
+
     /// Copies `f`'s link if it is still open; a list or a toast may show one that closed since.
-    static func copyForwardLink(_ f: ForwardInfo) {
-        guard let url = liveLink(of: f) else {
+    /// `url`: a notice's own link, copied as shown; else the forward's link as it is now (the
+    /// lists' Copy Link).
+    static func copyForwardLink(_ f: ForwardInfo, url shown: String? = nil) {
+        guard let current = liveLink(of: f) else {
             NSSound.beep()
             return
         }
+        let url = shown ?? current
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(url, forType: .string)
