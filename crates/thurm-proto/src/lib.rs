@@ -567,6 +567,9 @@ pub enum Request {
     },
 }
 
+/// The most files a batch of [`Request::UploadBegin`] holds (its `count`).
+pub const MAX_UPLOAD_BATCH: u32 = 256;
+
 /// Where a file of [`Request::UploadBegin`] goes in a batch: the `index`th of `count` files
 /// the client calls `id`. The paths are pasted in `index` order.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

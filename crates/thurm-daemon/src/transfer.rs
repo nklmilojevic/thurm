@@ -28,7 +28,7 @@ use crate::streams::{Kind, OpenStream};
 /// The largest file one upload takes.
 pub const MAX_FILE: u64 = 4 << 30;
 /// The most files in one batch.
-pub const MAX_BATCH: u32 = 256;
+pub const MAX_BATCH: u32 = thurm_proto::MAX_UPLOAD_BATCH;
 /// Files reserved and not landed yet, per pane.
 pub const MAX_RESERVED_PER_PANE: usize = 64;
 /// What an upload must leave free on the disk.
@@ -314,11 +314,25 @@ impl Transfers {
                 self.max_waiting_files
             ));
         }
+        // What files on their way have yet to take: all of one not started, the rest of one
+        // being written (what it wrote is out of the free space already).
         let pending: u64 = st
             .batches
             .values()
-            .flat_map(|b| b.files.values().filter(move |f| on_way(b, f)))
-            .map(|f| charge(f.size))
+            .flat_map(|b| {
+                b.files
+                    .iter()
+                    .filter(move |(_, f)| on_way(b, f))
+                    .map(move |(index, f)| (b, *index, f))
+            })
+            .map(|(b, index, f)| match f.state {
+                SlotState::Writing => {
+                    let written = std::fs::metadata(b.dir.join(PARTS).join(index.to_string()))
+                        .map_or(0, |m| m.len());
+                    charge(f.size.saturating_sub(written))
+                }
+                _ => charge(f.size),
+            })
             .sum();
         // The batch this file joins, checked before anything changes for it.
         let existing = id.as_ref().and_then(|id| {
@@ -1074,9 +1088,15 @@ impl Transfers {
             return close(&mut writer, StreamClose::Internal(e));
         }
         // The caller says it has it all, or gives up; one that says nothing is not waited on
-        // for ever, holding the pane's download slot.
-        let _ = writer.set_read_timeout(Some(self.ack));
+        // for ever, holding the pane's download slot, nor one that keeps sending something
+        // else: the wait has one deadline, not one per frame.
+        let deadline = Instant::now() + self.ack;
         loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || writer.set_read_timeout(Some(left)).is_err() {
+                let _ = writer.shutdown(std::net::Shutdown::Both);
+                return;
+            }
             match stream::read_frame(&mut reader) {
                 Ok(Some(StreamFrame::End)) => return close(&mut writer, StreamClose::Ok),
                 Ok(Some(StreamFrame::Data(_))) => {}

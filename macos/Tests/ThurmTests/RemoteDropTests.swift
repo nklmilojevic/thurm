@@ -53,6 +53,12 @@ final class RemoteDropTests: XCTestCase {
             return { [weak self] in self?.cancels += 1 }
         }
 
+        func downloadReserved(_ pane: PaneKey, _ path: String, _ reserved: Reservation,
+                              _ onProgress: @escaping (TransferProgress) -> Void,
+                              _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)? {
+            download(pane, path, reserved.url, nil, 0, onProgress, onFinish)
+        }
+
         func download(_ pane: PaneKey, _ path: String, _ dest: URL, _ ifVersion: String?, _ maxBytes: UInt64,
                       _ onProgress: @escaping (TransferProgress) -> Void,
                       _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)? {
@@ -138,10 +144,13 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertEqual(view.shownTransfer, "Sending a.txt to devbox… 40%")
     }
 
-    func testADownloadCanBeCancelledAndLeavesNoFile() throws {
+    /// The toast's Cancel, and Finder for one that finishes. What a cancelled download leaves
+    /// is the download's to clean up, checked with the real one in thurm-daemon's
+    /// a_reserved_download_is_written_into_its_own_file_only.
+    func testADownloadCanBeCancelledFromItsToast() throws {
         let (view, fake) = remotePane()
         var revealed: [URL] = []
-        view.download(remotePath: "/srv/big.iso", into: dir, start: fake.download) { revealed.append($0) }
+        view.download(remotePath: "/srv/big.iso", into: dir, start: fake.downloadReserved) { revealed.append($0) }
         let dest = dir.appendingPathComponent("big.iso")
         // The name is reserved at once.
         XCTAssertEqual(fake.started, [["/srv/big.iso", dest.path]])
@@ -153,14 +162,12 @@ final class RemoteDropTests: XCTestCase {
         var cancelled = TransferOutcome(error: "cancelled")
         cancelled.cancelled = true
         fake.finish[0](cancelled)
-        // The reserved file goes with the download itself, which alone can tell the name still
-        // holds it (thurm-daemon's a_reserved_download_is_written_into_its_own_file_only); the
-        // stand-in here does what it does.
+        // The stand-in's own cleanup (the real download deletes its reservation itself).
         try FileManager.default.removeItem(at: dest)
         XCTAssertNil(view.shownTransfer)
         XCTAssertEqual(revealed, [])
         // One that finishes is shown in Finder, with what was saved in it.
-        view.download(remotePath: "/srv/big.iso", into: dir, start: fake.download) { revealed.append($0) }
+        view.download(remotePath: "/srv/big.iso", into: dir, start: fake.downloadReserved) { revealed.append($0) }
         try Data("iso bytes".utf8).write(to: URL(fileURLWithPath: fake.started[1][1]))
         fake.finish[1](TransferOutcome())
         XCTAssertEqual(revealed, [dest])
@@ -336,6 +343,9 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertEqual(view.shownTransfer, "Fetching notes.md from devbox…")
         fake.progress[0](TransferProgress(done: 1, total: 2))
         XCTAssertEqual(view.shownTransfer, "Fetching notes.md from devbox… 50%")
+        // Half of it written where it was going.
+        let staged = URL(fileURLWithPath: fake.started[0][1])
+        try Data("half".utf8).write(to: staged)
         view.cancelShownTransfer(nil)
         XCTAssertEqual(fake.cancels, 1)
         XCTAssertNil(view.shownTransfer)
@@ -343,6 +353,7 @@ final class RemoteDropTests: XCTestCase {
         cancelled.cancelled = true
         fake.finish[0](cancelled)
         XCTAssertNil(view.shownTransfer)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staged.path))
         // Nothing staged is left of it.
         let entries = (try? FileManager.default.subpathsOfDirectory(atPath: root.path)) ?? []
         XCTAssertEqual(entries.filter { $0.contains(".staging") }, [])
@@ -365,7 +376,7 @@ final class RemoteDropTests: XCTestCase {
 
     func testADownloadThatNeverStartedLeavesNoReservation() throws {
         let (view, _) = remotePane()
-        view.download(remotePath: "/srv/x.bin", into: dir, start: { _, _, _, _, _, _, done in
+        view.download(remotePath: "/srv/x.bin", into: dir, start: { _, _, _, _, done in
             done(TransferOutcome(error: "devbox is not connected"))
             return nil
         }) { _ in }
@@ -381,6 +392,29 @@ final class RemoteDropTests: XCTestCase {
         view.showToast("second", duration: 5)
         RunLoop.current.run(until: Date().addingTimeInterval(0.6))
         XCTAssertEqual(view.shownMessage, "second")
+    }
+
+    func testAReservationGoesOnlyWhileItIsTheFileMadeForIt() throws {
+        let mine = try XCTUnwrap(SessionManager.reserveFreeName("mine.bin", in: dir))
+        XCTAssertTrue(mine.held)
+        mine.release()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: mine.url.path))
+        // Taken by another file, even an empty one: that file stays.
+        let taken = try XCTUnwrap(SessionManager.reserveFreeName("taken.bin", in: dir))
+        try FileManager.default.removeItem(at: taken.url)
+        FileManager.default.createFile(atPath: taken.url.path, contents: Data())
+        XCTAssertFalse(taken.held)
+        taken.release()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: taken.url.path))
+        // A download that never starts gives back its name the same way.
+        let (view, _) = remotePane()
+        view.download(remotePath: "/srv/other.bin", into: dir, start: { _, _, reserved, _, done in
+            try? FileManager.default.removeItem(at: reserved.url)
+            try? Data("theirs".utf8).write(to: reserved.url)
+            done(TransferOutcome(error: "devbox is not connected"))
+            return nil
+        }) { _ in }
+        XCTAssertEqual(try String(contentsOf: dir.appendingPathComponent("other.bin"), encoding: .utf8), "theirs")
     }
 
     func testAFolderOrAnOlderHostSendsNothing() throws {
@@ -438,31 +472,31 @@ final class RemoteDropTests: XCTestCase {
     }
 
     func testDownloadsReserveAFreeName() throws {
-        let first = try XCTUnwrap(SessionManager.reserveFreeName("a.txt", in: dir))
+        let first = try XCTUnwrap(SessionManager.reserveFreeName("a.txt", in: dir)).url
         XCTAssertEqual(first.lastPathComponent, "a.txt")
         // Reserved at once: a second download of the same name, started before the first
         // finished, gets another.
-        let second = try XCTUnwrap(SessionManager.reserveFreeName("a.txt", in: dir))
+        let second = try XCTUnwrap(SessionManager.reserveFreeName("a.txt", in: dir)).url
         XCTAssertEqual(second.lastPathComponent, "a 2.txt")
         XCTAssertTrue(FileManager.default.fileExists(atPath: first.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: second.path))
         _ = try file("Makefile")
-        XCTAssertEqual(SessionManager.reserveFreeName("Makefile", in: dir)?.lastPathComponent, "Makefile 2")
+        XCTAssertEqual(SessionManager.reserveFreeName("Makefile", in: dir)?.url.lastPathComponent, "Makefile 2")
         XCTAssertNil(SessionManager.reserveFreeName("x", in: dir.appendingPathComponent("missing")))
         // Reserved for this user only, as the download itself will be.
         let mode = try FileManager.default.attributesOfItem(atPath: first.path)[.posixPermissions] as? Int
         XCTAssertEqual(mode, 0o600)
         // A name as long as names go is shortened to make room for its number.
         let long = String(repeating: "l", count: 251) + ".txt"
-        XCTAssertEqual(SessionManager.reserveFreeName(long, in: dir)?.lastPathComponent, long)
-        let numbered = try XCTUnwrap(SessionManager.reserveFreeName(long, in: dir)).lastPathComponent
+        XCTAssertEqual(SessionManager.reserveFreeName(long, in: dir)?.url.lastPathComponent, long)
+        let numbered = try XCTUnwrap(SessionManager.reserveFreeName(long, in: dir)).url.lastPathComponent
         XCTAssertEqual(numbered.utf8.count, 255)
         XCTAssertTrue(numbered.hasSuffix(" 2.txt"), numbered)
         // So is an extension as long as names go.
         let longExt = "a." + String(repeating: "e", count: 253)
-        let first2 = try XCTUnwrap(SessionManager.reserveFreeName(longExt, in: dir)).lastPathComponent
+        let first2 = try XCTUnwrap(SessionManager.reserveFreeName(longExt, in: dir)).url.lastPathComponent
         XCTAssertEqual(first2, longExt)
-        let second2 = try XCTUnwrap(SessionManager.reserveFreeName(longExt, in: dir)).lastPathComponent
+        let second2 = try XCTUnwrap(SessionManager.reserveFreeName(longExt, in: dir)).url.lastPathComponent
         XCTAssertNotEqual(second2, first2)
         XCTAssertLessThanOrEqual(second2.utf8.count, 255)
         XCTAssertTrue(second2.hasPrefix("a 2."), second2)

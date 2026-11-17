@@ -3511,6 +3511,13 @@ impl Daemon {
                 size,
                 batch,
             } => {
+                // Admitted while the client is still here, or not at all: its leaving waits for
+                // this, then ends what was admitted. (The request runs off its connection, which
+                // may have closed while it waited to.)
+                let _exit = client.exit.lock();
+                if client.gone.load(Ordering::SeqCst) {
+                    return Err("the app sending the files went away".into());
+                }
                 // Its paths go to the program in the pane: a pane whose program ended (held
                 // open) takes no files,
                 // nor one whose input another client's attached terminal holds: refused now, not
@@ -4204,33 +4211,76 @@ mod tests {
         let (client, _rx) = daemon.add_client();
         let id = client.id;
         let (checked_tx, checked) = crossbeam_channel::bounded(1);
+        let (release_tx, release) = crossbeam_channel::bounded::<()>(1);
         let pasting = {
             let daemon = daemon.clone();
             std::thread::spawn(move || {
-                let r = daemon.paste_for_then(id, pane, "a.txt ", || {
+                daemon.paste_for_then(id, pane, "a.txt ", || {
                     checked_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_millis(300));
-                });
-                (r, Instant::now())
+                    let _ = release.recv();
+                })
             })
         };
         checked.recv().unwrap();
-        let leaving = {
+        let (left_tx, left) = crossbeam_channel::bounded(1);
+        {
             let daemon = daemon.clone();
             std::thread::spawn(move || {
                 daemon.remove_client(id);
-                Instant::now()
-            })
-        };
-        let (pasted, written) = pasting.join().unwrap();
-        let left = leaving.join().unwrap();
-        assert!(pasted.is_ok(), "{pasted:?}");
+                let _ = left_tx.send(());
+            });
+        }
+        // The paste holds the client: its leaving waits.
         assert!(
-            left >= written,
-            "the client left before its paste was written"
+            left.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the client left while a paste for it was being written"
         );
+        release_tx.send(()).unwrap();
+        assert!(pasting.join().unwrap().is_ok());
+        left.recv_timeout(Duration::from_secs(5))
+            .expect("the client never left");
         // Gone, it is pasted for no more.
         assert!(daemon.paste_for(id, pane, "b.txt ").is_err());
+        daemon.close_pane(pane);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An upload asked for by a client that has gone by the time it is handled admits nothing.
+    #[test]
+    fn an_upload_handled_after_its_client_left_is_refused() {
+        let dir = std::env::temp_dir().join(format!("thurm-upload-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let pane = daemon
+            .create_pane(
+                CreatePane {
+                    command: Some(vec!["cat".into()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let (client, _rx) = daemon.add_client();
+        daemon.remove_client(client.id);
+        let got = daemon.dispatch(
+            &client,
+            Request::UploadBegin {
+                pane,
+                name: "a.txt".into(),
+                size: 1,
+                batch: None,
+            },
+        );
+        assert!(
+            matches!(&got, Err(e) if e.contains("went away")),
+            "{got:?}"
+        );
+        assert!(!dir.join("state/drops").join(pane.to_string()).exists());
         daemon.close_pane(pane);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -102,13 +102,15 @@ uint64_t thurm_download(thurm_client *client, thurm_pane_id pane, const char *pa
 void thurm_download_cancel(uint64_t transfer);
 
 /* Like thurm_download, into `reserved`: an empty file the caller made (O_EXCL) to hold the
- * name in a folder others may write to. The file is written into that very file, never
+ * name in a folder others may write to, with the `device` and `inode` it had when made (only
+ * that file is written into or deleted, whatever takes its name). The file is written into that very file, never
  * renamed over its name: if the name holds anything else by then (the file replaced, removed,
  * or no longer empty), nothing is saved and what is there is left alone. A failed or cancelled
  * download deletes the reserved file if it is still the one. Cancel with
  * thurm_download_cancel. */
 uint64_t thurm_download_reserved(thurm_client *client, thurm_pane_id pane, const char *path,
-                                 const char *reserved, thurm_transfer_cb cb, void *ctx);
+                                 const char *reserved, uint64_t device, uint64_t inode,
+                                 thurm_transfer_cb cb, void *ctx);
 
 /* Re-read this Mac's config into the connection's terminal copies. The local daemon's
  * "ConfigReloaded" does this for its own connection; call it for remote connections. */

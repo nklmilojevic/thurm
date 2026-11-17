@@ -540,7 +540,7 @@ final class Core {
     /// file if it is still the one. Callbacks on the main thread; returns the id for
     /// `cancelTransfer`.
     @discardableResult
-    func downloadReserved(_ pane: PaneKey, path: String, into reserved: URL,
+    func downloadReserved(_ pane: PaneKey, path: String, into reserved: Reservation,
                           onProgress: @escaping (TransferProgress) -> Void,
                           onFinish: @escaping (TransferOutcome) -> Void) -> UInt64? {
         guard let c = clients[pane.host] else {
@@ -549,7 +549,9 @@ final class Core {
         }
         let box = Unmanaged.passRetained(TransferBox(onProgress, onFinish)).toOpaque()
         let id = path.withCString { p in
-            reserved.path.withCString { r in thurm_download_reserved(c, pane.id, p, r, coreTransferCallback, box) }
+            reserved.url.path.withCString { r in
+                thurm_download_reserved(c, pane.id, p, r, reserved.device, reserved.inode, coreTransferCallback, box)
+            }
         }
         return id == 0 ? nil : id
     }
@@ -578,7 +580,12 @@ final class Core {
 
     /// Starts a download into a reserved file (`downloadReserved`; the version and size limit
     /// do not apply), returning what cancels it.
-    static let startReservedDownload: DownloadStarter = { pane, path, reserved, _, _, onProgress, onFinish in
+    /// Starts a download into a reserved name, returning what cancels it; tests stand in for it.
+    typealias ReservedDownloadStarter = (_ pane: PaneKey, _ path: String, _ reserved: Reservation,
+                                         _ onProgress: @escaping (TransferProgress) -> Void,
+                                         _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)?
+
+    static let startReservedDownload: ReservedDownloadStarter = { pane, path, reserved, onProgress, onFinish in
         cancelling(Core.shared.downloadReserved(pane, path: path, into: reserved,
                                                 onProgress: onProgress, onFinish: onFinish))
     }
