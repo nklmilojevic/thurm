@@ -36,15 +36,45 @@ enum ForwardText {
     }
 }
 
-/// How a forward's failure reaches the user: a toast on the focused pane, or an alert when no
-/// pane is there to show one (Forward Port… with no terminal window open).
-enum ForwardFailure: Equatable {
-    case toast(String)
-    case alert(String)
+/// What the user hears of a forward: on the pane it was started from, as a toast; or, when that
+/// pane is gone (closed meanwhile, or none: Forward Port… with no terminal window), as an alert,
+/// never on whichever pane has focus now. `copyLink`: the link to offer to copy.
+enum ForwardNotice: Equatable {
+    case toast(String, copyLink: String?)
+    case alert(String, copyLink: String?)
 
-    static func report(host: HostId, _ why: String, hasView: Bool) -> ForwardFailure {
+    static func failure(host: HostId, _ why: String, onPane: Bool) -> ForwardNotice {
         let text = ForwardText.failure(host: host, why)
-        return hasView ? .toast(text) : .alert(text)
+        return onPane ? .toast(text, copyLink: nil) : .alert(text, copyLink: nil)
+    }
+
+    /// A forward opened for the first time: where it went, and its link.
+    static func opened(host: HostId, remotePort: Int, localPort: Int, url: String, onPane: Bool) -> ForwardNotice {
+        let text = ForwardText.toast(host: host, remotePort: remotePort, localPort: localPort)
+        return onPane ? .toast(text, copyLink: url) : .alert(text, copyLink: url)
+    }
+}
+
+/// The `Ports` request of each host's current connection: a reply to an earlier one (a
+/// connection that dropped meanwhile, or one replaced by a reconnect) is not applied.
+struct RequestGenerations {
+    private var current: [HostId: Int] = [:]
+    private var next = 0
+
+    /// A request goes out on `host`'s connection now; it supersedes any before it.
+    mutating func start(_ host: HostId) -> Int {
+        next += 1
+        current[host] = next
+        return next
+    }
+
+    /// `host`'s connection dropped: no reply pending for it applies any more.
+    mutating func invalidate(_ host: HostId) {
+        current[host] = nil
+    }
+
+    func isCurrent(_ host: HostId, _ generation: Int) -> Bool {
+        current[host] == generation
     }
 }
 
@@ -132,33 +162,44 @@ extension Remotes {
 
 extension SessionManager {
     /// Opens `host`'s `port`, or `url` (a link to its localhost), through a forward and then in the
-    /// browser. The first use shows where it went, with Copy Link; a failure says why.
-    func openForwarded(host: HostId, port: Int? = nil, url: String? = nil) {
+    /// browser. The first use shows where it went, with Copy Link; a failure says why. Both on
+    /// `source`, the pane it was started from, while that pane is still there (`ForwardNotice`).
+    func openForwarded(host: HostId, port: Int? = nil, url: String? = nil, from source: TerminalView?) {
         var call: [String: Any] = ["op": "forward_open", "host": host]
         if let port { call["port"] = port }
         if let url { call["url"] = url }
+        weak var source = source
         DispatchQueue.global(qos: .userInitiated).async {
             let v = Core.shared.remoteCall(call) as? [String: Any]
             DispatchQueue.main.async {
-                let view = SessionManager.shared.currentController?.content.focusedView
+                let pane = source.flatMap { $0.window == nil ? nil : $0 }
                 if let e = jsonString(v?["error"]) {
-                    switch ForwardFailure.report(host: host, e, hasView: view != nil) {
-                    case .toast(let text):
-                        view?.showToast(text, duration: 6)
-                    case .alert(let text):
-                        let alert = NSAlert()
-                        alert.messageText = text
-                        alert.runModal()
-                    }
+                    SessionManager.show(ForwardNotice.failure(host: host, e, onPane: pane != nil), on: pane)
                     return
                 }
                 guard let f = ForwardInfo(json: v), let target = URL(string: f.url) else { return }
                 if jsonBool(v?["new"]) == true {
-                    view?.showToast(ForwardText.toast(host: host, remotePort: f.remotePort, localPort: f.localPort),
-                                    duration: 6, action: ("Copy Link", { SessionManager.copyForwardLink(f.url) }))
+                    SessionManager.show(ForwardNotice.opened(host: host, remotePort: f.remotePort, localPort: f.localPort,
+                                                             url: f.url, onPane: pane != nil), on: pane)
                 }
                 NSWorkspace.shared.open(target)
             }
+        }
+    }
+
+    private static func show(_ notice: ForwardNotice, on pane: TerminalView?) {
+        switch notice {
+        case .toast(let text, let link):
+            pane?.showToast(text, duration: 6, action: link.map { url in ("Copy Link", { copyForwardLink(url) }) })
+        case .alert(let text, let link):
+            let alert = NSAlert()
+            alert.messageText = text
+            alert.addButton(withTitle: "OK")
+            if let link {
+                alert.informativeText = link
+                alert.addButton(withTitle: "Copy Link")
+            }
+            if alert.runModal() == .alertSecondButtonReturn, let link { copyForwardLink(link) }
         }
     }
 
@@ -181,12 +222,13 @@ extension SessionManager {
                 return (p, jsonString(k["command"]) ?? "")
             }
         let open = Remotes.shared.forwards
+        weak var source = currentController?.content.focusedView
         let items = { (query: String) -> [CommandPalette.Item] in
             ForwardPicker.choices(query: query, host: host, known: known, open: open).map { c in
                 CommandPalette.Item(title: c.title, detail: c.detail) {
                     switch c.target {
-                    case .port(let p): SessionManager.shared.openForwarded(host: host, port: p)
-                    case .url(let u): SessionManager.shared.openForwarded(host: host, url: u)
+                    case .port(let p): SessionManager.shared.openForwarded(host: host, port: p, from: source)
+                    case .url(let u): SessionManager.shared.openForwarded(host: host, url: u, from: source)
                     }
                 }
             }
@@ -208,7 +250,10 @@ extension SessionManager {
     /// `host` connected: every pane's port list at once, so its forwards don't go by lists of
     /// panes that ended while it was away (no event says so). An older daemon answers an error.
     func fetchRemotePorts(_ host: HostId) {
+        let generation = Remotes.shared.portsRequests.start(host)
         Core.shared.requestAsync(object: ["Ports": ["pane": NSNull()]], host: host, timeout: 10) { resp in
+            // From a connection that has dropped (or been replaced) since: what it says is old.
+            guard Remotes.shared.portsRequests.isCurrent(host, generation) else { return }
             guard let v = JSON.variant(resp), v.name == "Ports", let panes = v.payload as? [Any] else { return }
             _ = Core.shared.remoteCall(["op": "ports_snapshot", "host": host, "panes": panes])
         }
@@ -216,6 +261,7 @@ extension SessionManager {
 
     /// `host`'s connection dropped: what listens there is unknown until it is back.
     func remotePortsUnknown(_ host: HostId) {
+        Remotes.shared.portsRequests.invalidate(host)
         _ = Core.shared.remoteCall(["op": "host_disconnected", "host": host])
     }
 

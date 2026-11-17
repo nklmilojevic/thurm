@@ -152,6 +152,8 @@ final class Remotes {
     private(set) var handoffs: [String: HandoffInfo] = [:]
     /// Every open forward (`forwardsChanged`).
     var forwards: [ForwardInfo] = []
+    /// The `Ports` request of each host's connection (`fetchRemotePorts`).
+    var portsRequests = RequestGenerations()
     /// The last fetch of a handoff failed (shown on its tab until the next one succeeds).
     var handoffErrors: [String: String] = [:]
 
@@ -545,7 +547,7 @@ extension SessionManager {
         case .open:
             NSWorkspace.shared.open(url)
         case .forward:
-            openForwarded(host: pane.host, url: url.absoluteString)
+            openForwarded(host: pane.host, url: url.absoluteString, from: view(for: pane))
         case .reveal(let path):
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path ?? url.path)])
         case .ask:
