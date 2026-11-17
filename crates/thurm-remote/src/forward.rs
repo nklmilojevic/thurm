@@ -426,24 +426,6 @@ impl Forwards {
         }
     }
 
-    /// Forward `id` was opened for `link`: reopening it from a list opens that link. Reported
-    /// as [`Change::Linked`] when it is a new one.
-    pub fn set_link(&self, id: u64, link: &str) {
-        let changed = {
-            let mut g = self.inner.lock();
-            match g.open.get_mut(&id) {
-                Some(e) if e.forward.link.as_deref() != Some(link) => {
-                    e.forward.link = Some(link.to_owned());
-                    Some(e.forward.clone())
-                }
-                _ => None,
-            }
-        };
-        if let Some(forward) = changed {
-            self.changed(Change::Linked { forward });
-        }
-    }
-
     /// Reports what reusing a forward changed, outside the lock.
     fn reused(&self, r: Reused) -> Result<(Forward, bool), String> {
         let (f, linked) = r?;
@@ -817,14 +799,35 @@ impl Forwards {
         conn: TcpStream,
         closed: &AtomicBool,
     ) -> Result<(), String> {
-        let ticket = match self.control(host, false).and_then(|c| c.dial_begin(port)) {
-            Ok(t) => t,
-            // The kept connection may be gone (the tunnel reconnected): once more, afresh.
-            Err(_) => self
-                .control(host, true)
-                .and_then(|c| c.dial_begin(port))
-                .map_err(|e| e.to_string())?,
+        // A forward closed (by hand, the sweep, its host moving) between accepting this
+        // connection and here asks nothing of the host: no stream is dialled to its port, on the
+        // old destination or the new one.
+        let gone = || {
+            closed
+                .load(Ordering::Acquire)
+                .then(|| "the forward closed".to_owned())
         };
+        if let Some(why) = gone() {
+            return Err(why);
+        }
+        // Checked again once the connection to the daemon is made (that can take a while), just
+        // before asking it to dial.
+        let dial = |fresh: bool| -> Result<_, String> {
+            let c = self.control(host, fresh).map_err(|e| e.to_string())?;
+            if let Some(why) = gone() {
+                return Err(why);
+            }
+            c.dial_begin(port).map_err(|e| e.to_string())
+        };
+        let ticket = match dial(false) {
+            Ok(t) => t,
+            Err(why) if closed.load(Ordering::Acquire) => return Err(why),
+            // The kept connection may be gone (the tunnel reconnected): once more, afresh.
+            Err(_) => dial(true)?,
+        };
+        if let Some(why) = gone() {
+            return Err(why);
+        }
         let socket = (self.socket_for)(host);
         let (mut down, up) =
             thurm_client::stream::open(&socket, &ticket.ticket).map_err(|e| e.to_string())?;
@@ -1499,7 +1502,12 @@ mod tests {
         let f = forwards(&dir);
         let (fw, _) = f.open("devbox", 8443, Some(0)).unwrap();
         assert_eq!(f.list()[0].link, None);
-        f.set_link(fw.id, "https://localhost:8443/app?x=1");
+        // Opened again for a link: the forward there, with that link.
+        let (again, new) = f
+            .open_for("devbox", 8443, None, Some("https://localhost:8443/app?x=1"))
+            .unwrap();
+        assert!(!new);
+        assert_eq!(again.id, fw.id);
         let listed = f.list().remove(0);
         assert_eq!(
             listed.link.as_deref(),
