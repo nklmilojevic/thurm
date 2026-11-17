@@ -365,6 +365,9 @@ final class RemoteFileCache {
     private final class Fetch {
         var waiters: [UUID: (progress: (TransferProgress) -> Void, done: (Result<URL, Error>) -> Void)] = [:]
         var cancel: (() -> Void)?
+        /// No one waits for it any more: whatever its download brings, even a whole file, is
+        /// thrown away, never put in the cache over a newer fetch's copy.
+        var abandoned = false
     }
 
     /// Fetches under way, by the entry of their first path.
@@ -403,6 +406,7 @@ final class RemoteFileCache {
             // No one waits: it is given up, and a new request for the file starts afresh rather
             // than joining a download on its way out.
             if fetch.waiters.isEmpty {
+                fetch.abandoned = true
                 if self?.inFlight[key] === fetch { self?.inFlight[key] = nil }
                 fetch.cancel?()
             }
@@ -416,7 +420,8 @@ final class RemoteFileCache {
         inFlight[key] = fetch
         self.fetch(paths[...], pane: pane, cwd: cwd, firstError: nil,
                    progress: { p in for w in fetch.waiters.values { w.progress(p) } },
-                   started: { fetch.cancel = $0 }) { [self] result in
+                   started: { fetch.cancel = $0 },
+                   abandoned: { fetch.abandoned }) { [self] result in
             if inFlight[key] === fetch { inFlight[key] = nil }
             for w in fetch.waiters.values { w.done(result) }
             fetch.waiters.removeAll()
@@ -427,6 +432,7 @@ final class RemoteFileCache {
     private func fetch(_ paths: ArraySlice<String>, pane: PaneKey, cwd: String?, firstError: String?,
                        progress: @escaping (TransferProgress) -> Void,
                        started: @escaping (@escaping () -> Void) -> Void,
+                       abandoned: @escaping () -> Bool,
                        completion: @escaping (Result<URL, Error>) -> Void) {
         guard let path = paths.first else {
             return completion(.failure(RemoteFileError.failed(firstError ?? "The file was not found.")))
@@ -452,6 +458,11 @@ final class RemoteFileCache {
         }
         cancel = download(pane, path, staged, cached?.version, maxBytes, onProgress) { [self] outcome in
             reserved[token] = nil
+            // Given up: its file, however it ended, is not this cache's (a newer fetch's is).
+            if abandoned() {
+                try? FileManager.default.removeItem(at: staged)
+                return completion(.failure(RemoteFileError.cancelled))
+            }
             if outcome.notModified, let cached {
                 try? FileManager.default.removeItem(at: staged)
                 try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: entry.path)
@@ -470,7 +481,8 @@ final class RemoteFileCache {
                 // suffix: any other failure is this file's, and another file is not shown for it.
                 guard outcome.notFound else { return completion(.failure(RemoteFileError.failed(error))) }
                 return fetch(paths.dropFirst(), pane: pane, cwd: cwd, firstError: firstError ?? error,
-                             progress: progress, started: started, completion: completion)
+                             progress: progress, started: started, abandoned: abandoned,
+                             completion: completion)
             }
             do {
                 completion(.success(try install(entry, staged: staged, name: outcome.name ?? "file",
