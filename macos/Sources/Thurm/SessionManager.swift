@@ -18,6 +18,8 @@ final class SessionManager: NSObject, CoreDelegate {
     /// View > Group Tabs by Repository, Tabs from All Workspaces and Only Active Tabs, as
     /// `sidebarTabsOverride`.
     private var sidebarListingOverride: [WritableKeyPath<AppConfig, Bool>: Bool] = [:]
+    /// `window.sidebar_host` chosen when config.toml cannot record it ("" for every host).
+    private var sidebarHostOverride: String?
     private var sidebarUsageOverride: [UsageProvider: Bool] = [:]
     /// A theme chosen when config.toml cannot record it is in use (see `setTheme`).
     private var sessionTheme = false
@@ -1027,6 +1029,30 @@ final class SessionManager: NSObject, CoreDelegate {
         refreshLockBadges()
     }
 
+    /// The sidebar's hosts button and View > Tabs by Host: whether the sidebar lists every
+    /// host's tabs under the host, and the one host it narrows to (nil: every host). Saved as
+    /// `toggleSidebarListing` saves.
+    func setSidebarHosts(byHost: Bool, host: HostId?) {
+        var changed = false
+        if byHost != config.sidebarByHost {
+            sidebarListingOverride[\.sidebarByHost] = toggleSetting("window.sidebar_by_host", to: byHost)
+            if sidebarListingOverride[\.sidebarByHost] != nil {
+                config.sidebarByHost = byHost
+                changed = true
+            }
+        }
+        if byHost, host != config.sidebarHost {
+            let value = host ?? ""
+            let resp = Core.shared.request(object: ["SetSetting": ["key": "window.sidebar_host", "value": "\"\(value)\""]])
+            sidebarHostOverride = JSON.variant(resp)?.name == "Text" ? nil : value
+            if sidebarHostOverride != nil {
+                config.sidebarHost = host
+                changed = true
+            }
+        }
+        if changed { applyConfigToUI() }
+    }
+
     // MARK: - Config and fonts
 
     func reloadConfig(notifyDaemon: Bool) {
@@ -1038,6 +1064,7 @@ final class SessionManager: NSObject, CoreDelegate {
         if let o = sidebarTabsOverride { config.sidebarTabs = o }
         if let o = activePaneBorderOverride { config.activePaneBorder = o }
         for (path, on) in sidebarListingOverride { config[keyPath: path] = on }
+        if let h = sidebarHostOverride { config.sidebarHost = h.isEmpty ? nil : h }
         for (p, on) in sidebarUsageOverride {
             if on { config.sidebarUsage.insert(p) } else { config.sidebarUsage.remove(p) }
         }

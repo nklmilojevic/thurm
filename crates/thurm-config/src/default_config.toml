@@ -83,6 +83,13 @@ sidebar_group_by_repo = true
 # List the tabs of every workspace in the sidebar, under a header each (instead of grouping by
 # repository); click a hidden workspace's tab to switch to it. View > Tabs from All Workspaces.
 sidebar_all_workspaces = false
+# List the tabs of every host in the sidebar, under a header each: this Mac first, then each
+# remote host, with their workspaces under them. The hosts button at the top of the sidebar,
+# View > Tabs by Host.
+sidebar_by_host = false
+# With sidebar_by_host, list one host only: "" for every host, "local" for this Mac, or the
+# name of a remote host.
+sidebar_host = ""
 # List only what is going on, by status (Needs input, Failed, Done, Working): every agent that
 # isn't idle, in any window or workspace, one row per pane; then the tabs with a program
 # reporting progress, and the selected tab when its focused pane has no agent row. The filter

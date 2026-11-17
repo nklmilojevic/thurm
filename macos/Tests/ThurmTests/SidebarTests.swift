@@ -116,6 +116,9 @@ final class SidebarTests: XCTestCase {
         config.sidebarGroupByRepo = true
         config.sidebarAllWorkspaces = true
         XCTAssertFalse(TabSidebarViewController.groupsByRepo(config))
+        config.sidebarAllWorkspaces = false
+        config.sidebarByHost = true
+        XCTAssertFalse(TabSidebarViewController.groupsByRepo(config))
     }
 
     /// A remote workspace's header names its host, so the header doesn't change when a window
@@ -172,6 +175,88 @@ final class SidebarTests: XCTestCase {
         XCTAssertTrue(drop(terminals, 0, false, 0))
         XCTAssertTrue(drop(nil, 0, false, 0))
         XCTAssertFalse(drop(elsewhere, 0, false, 0))
+    }
+}
+
+final class SidebarHostsTests: XCTestCase {
+    /// Workspaces in the order they were made: local 1, devbox 2, local 3, buildbox 4, and 5 on
+    /// a host gone from the config.
+    private let workspaces: [(id: UInt64, host: HostId)] = [(1, localHost), (2, "devbox"), (3, localHost),
+                                                            (4, "buildbox"), (5, "old")]
+    private let remotes = ["devbox", "buildbox", "staging"]
+
+    private func sections(shown: UInt64?, filter: HostId? = nil,
+                          offline: [HostId: String] = [:]) -> [SidebarHosts.Section] {
+        SidebarHosts.sections(remotes: remotes, workspaces: workspaces, shown: shown, filter: filter) { offline[$0] }
+    }
+
+    /// This Mac first, then the remotes in config order, then hosts only workspaces still name;
+    /// each host's workspaces in the order they were made.
+    func testHostsInOrderWithTheirWorkspaces() {
+        let s = sections(shown: 1)
+        XCTAssertEqual(s.map(\.host), [localHost, "devbox", "buildbox", "staging", "old"])
+        XCTAssertEqual(s.map(\.workspaces), [[1, 3], [2], [4], [], [5]])
+        XCTAssertEqual(SidebarHosts.title(localHost), "This Mac")
+        XCTAssertEqual(SidebarHosts.title("devbox"), "devbox")
+    }
+
+    /// A connected host without a workspace offers one; one with workspaces does not.
+    func testEmptyConnectedHostOffersAWorkspace() {
+        let s = sections(shown: 1)
+        XCTAssertEqual(s.filter(\.offersNewWorkspace).map(\.host), ["staging"])
+        XCTAssertNil(s.first { $0.host == "staging" }?.state)
+    }
+
+    /// A host that is not connected shows its state and lists nothing, but the workspace this
+    /// window shows; it offers no workspace. This Mac is always connected.
+    func testDisconnectedHostShowsItsStateAndNoRows() {
+        let offline = ["buildbox": "connecting", "staging": "needs attention", localHost: "never"]
+        var s = sections(shown: 1, offline: offline)
+        XCTAssertEqual(s.first { $0.host == "buildbox" },
+                       SidebarHosts.Section(host: "buildbox", state: "connecting", workspaces: [],
+                                            offersNewWorkspace: false))
+        XCTAssertEqual(s.first { $0.host == "staging" }?.offersNewWorkspace, false)
+        XCTAssertNil(s.first?.state)
+        s = sections(shown: 4, offline: offline)
+        XCTAssertEqual(s.first { $0.host == "buildbox" }?.workspaces, [4])
+    }
+
+    /// Narrowed to one host, only it is listed; a host that is gone means every host.
+    func testFilterToOneHost() {
+        XCTAssertEqual(sections(shown: 1, filter: "devbox").map(\.host), ["devbox"])
+        XCTAssertEqual(sections(shown: 1, filter: localHost).map(\.workspaces), [[1, 3]])
+        XCTAssertEqual(sections(shown: 1, filter: "old").map(\.host), ["old"])
+        XCTAssertEqual(sections(shown: 1, filter: "gone").count, 5)
+        XCTAssertNil(SidebarHosts.effectiveFilter("gone", hosts: [localHost, "devbox"]))
+        XCTAssertEqual(SidebarHosts.effectiveFilter("devbox", hosts: [localHost, "devbox"]), "devbox")
+    }
+
+    /// Switching to a workspace on another connected host lists the same thing: only the
+    /// selection moves.
+    func testSwitchingAcrossHostsKeepsTheListing() {
+        let offline = ["buildbox": "connecting"]
+        let before = sections(shown: 1, offline: offline)
+        for shown: UInt64? in [2, 3, 5, nil] {
+            XCTAssertEqual(sections(shown: shown, offline: offline), before, "shown \(String(describing: shown))")
+        }
+    }
+
+    /// The popover: the list as before, every host, then each host; the choice is checked.
+    func testPopoverRowsCheckTheCurrentChoice() {
+        let hosts = [localHost, "devbox"]
+        let state: (HostId) -> String? = { $0 == "devbox" ? "connecting" : nil }
+        var rows = SidebarHostsPopover.rows(byHost: false, filter: nil, allWorkspaces: false, hosts: hosts, state: state)
+        XCTAssertEqual(rows.map(\.title), ["This Workspace", "All Hosts", "This Mac", "devbox"])
+        XCTAssertEqual(rows.map(\.checked), [true, false, false, false])
+        XCTAssertEqual(rows[3].detail, "connecting")
+        XCTAssertEqual(rows[2].choice, SidebarHostsPopover.Choice(byHost: true, host: localHost))
+        rows = SidebarHostsPopover.rows(byHost: true, filter: nil, allWorkspaces: true, hosts: hosts, state: state)
+        XCTAssertEqual(rows.first?.title, "All Workspaces")
+        XCTAssertEqual(rows.map(\.checked), [false, true, false, false])
+        rows = SidebarHostsPopover.rows(byHost: true, filter: "devbox", allWorkspaces: false, hosts: hosts, state: state)
+        XCTAssertEqual(rows.map(\.checked), [false, false, false, true])
+        rows = SidebarHostsPopover.rows(byHost: true, filter: "gone", allWorkspaces: false, hosts: hosts, state: state)
+        XCTAssertEqual(rows.map(\.checked), [false, true, false, false])
     }
 }
 

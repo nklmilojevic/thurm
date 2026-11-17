@@ -137,6 +137,43 @@ final class ActivityListViewTests: XCTestCase {
         }
     }
 
+    /// By host: This Mac's workspaces with their tabs, then a remote that is not connected,
+    /// with its state and none of its tabs. Clicking another workspace's tab switches to it, and
+    /// the window it comes into lists the same rows with that tab selected.
+    func testByHostListsEveryHostAndAClickedTabKeepsTheList() throws {
+        let first = try tabs()
+        let remote = manager.makeWorkspace(name: "far", host: "devbox")
+        remote.hiddenTabs = [TabLayout(title: nil, root: .pane(PaneKey("devbox", 9)), focused: 9, zoomed: nil)]
+        manager.config.remoteNames = ["devbox"]
+        manager.config.sidebarByHost = true
+        let sidebar = try XCTUnwrap(first.sidebar)
+        sidebar.reload()
+        let outline = try outline(sidebar)
+        let rows = ["This Mac", "main", "tab", "tab", "tab", "api", "tab", "devbox"]
+        XCTAssertEqual(listed(outline), rows)
+        XCTAssertEqual((outline.item(atRow: 7) as? SidebarGroup)?.state, Remotes.shared.phaseLabel("devbox"))
+        XCTAssertEqual(outline.selectedRow, 2)
+        let title = try XCTUnwrap(sidebar.view.subviews.compactMap { $0 as? NSButton }.first)
+        XCTAssertEqual(title.title, "This Mac")
+
+        manager.config.sidebarHost = "devbox"
+        sidebar.reload()
+        XCTAssertEqual(listed(outline), ["devbox"])
+        manager.config.sidebarHost = localHost
+        sidebar.reload()
+        XCTAssertEqual(listed(outline), Array(rows.dropLast()))
+        manager.config.sidebarHost = nil
+        sidebar.reload()
+
+        click(6, in: outline)
+        let api = try XCTUnwrap(manager.workspaces.first { $0.name == "api" })
+        let shown = try XCTUnwrap(manager.controllerShowing(api))
+        controllers += manager.group(of: shown).filter { c in !controllers.contains { $0 === c } }
+        let other = try self.outline(try XCTUnwrap(shown.sidebar))
+        XCTAssertEqual(listed(other), rows)
+        XCTAssertEqual(other.selectedRow, 6)
+    }
+
     func testActiveOnlyListsAgentsByStatusFromEveryWorkspace() throws {
         let first = try tabs()
         setStatus(1, .working)
@@ -268,8 +305,10 @@ final class ActivityListViewTests: XCTestCase {
         XCTAssertEqual(heading.label.stringValue, "Done")
         heading.layoutSubtreeIfNeeded()
         XCTAssertEqual(heading.label.convert(NSPoint.zero, to: sidebar.view).x, SidebarHeadingView.inset, accuracy: 0.5)
+        let icon = try XCTUnwrap(sidebar.view.subviews.compactMap { $0 as? NSImageView }.first)
+        XCTAssertEqual(icon.frame.minX, SidebarHeadingView.inset, accuracy: 0.5)
         let button = try XCTUnwrap(sidebar.view.subviews.compactMap { $0 as? NSButton }.first)
-        XCTAssertEqual(button.frame.minX, SidebarHeadingView.inset, accuracy: 0.5)
+        XCTAssertEqual(button.frame.minX, SidebarHeadingView.inset + SidebarHeadingView.hostLabelOffset, accuracy: 0.5)
         XCTAssertEqual(outline.rect(ofRow: 0).height, SidebarHeadingView.height, accuracy: 4)
     }
 

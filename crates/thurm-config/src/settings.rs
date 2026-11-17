@@ -205,6 +205,8 @@ const OPTIONS: &[(&str, &str, Kind)] = &[
         "Tabs from all workspaces",
         Kind::Bool,
     ),
+    ("window.sidebar_by_host", "Tabs by host", Kind::Bool),
+    ("window.sidebar_host", "Sidebar host", Kind::Text),
     ("window.sidebar_active_only", "Only active tabs", Kind::Bool),
     (
         "window.sidebar_usage_claude",

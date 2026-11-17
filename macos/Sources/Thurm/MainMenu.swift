@@ -415,6 +415,8 @@ enum MainMenu {
                           name: "toggle_sidebar_group_by_repo"))
         menu.addItem(item("Tabs from All Workspaces", #selector(AppDelegate.toggleSidebarAllWorkspaces(_:)),
                           name: "toggle_sidebar_all_workspaces"))
+        menu.addItem(item("Tabs by Host", #selector(AppDelegate.toggleSidebarByHost(_:)),
+                          name: "toggle_sidebar_by_host"))
         menu.addItem(item("Only Active Tabs", #selector(AppDelegate.toggleSidebarActiveOnly(_:)),
                           name: "toggle_sidebar_active_only"))
         // The actions of the agents panel the active tabs replaced, so their bindings still work.

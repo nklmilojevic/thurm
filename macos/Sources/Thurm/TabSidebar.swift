@@ -67,11 +67,81 @@ final class SidebarGroup {
     var tabs: [SidebarTab] = []
     /// Row objects, built once per reload (NSOutlineView tracks items by identity).
     var boxes: [TabBox] = []
-    init(name: String, key: String? = nil, elsewhere: Bool = false, workspace: UInt64? = nil) {
+    /// A host's header, in the list by host (`window.sidebar_by_host`): its workspaces' groups
+    /// are under it, not tabs.
+    let host: HostId?
+    /// The host's connection state while it is not connected, after its name.
+    var state: String?
+    var subgroups: [SidebarGroup] = []
+    /// A connected host without a workspace: the row that opens one.
+    var newWorkspace: NewWorkspaceBox?
+    init(name: String, key: String? = nil, elsewhere: Bool = false, workspace: UInt64? = nil, host: HostId? = nil) {
         self.name = name
         self.key = key ?? name
         self.elsewhere = elsewhere
         self.workspace = workspace
+        self.host = host
+    }
+
+    /// What the outline lists under it.
+    var children: [AnyObject] {
+        host == nil ? boxes : subgroups + (newWorkspace.map { [$0] } ?? [])
+    }
+
+    /// Itself and the groups under it, headers first.
+    var flattened: [SidebarGroup] { [self] + subgroups.flatMap(\.flattened) }
+}
+
+/// "New Workspace on <host>", under a connected host that has none.
+final class NewWorkspaceBox {
+    let host: HostId
+    init(host: HostId) { self.host = host }
+
+    var title: String { host == localHost ? "New Workspace" : "New Workspace on \(host)" }
+}
+
+/// The list by host (`window.sidebar_by_host`): which hosts it shows, in what order, and what
+/// each lists, before any row is made. Nothing in it depends on which workspace a window shows
+/// (but for a host that is not connected), so switching tabs or workspaces moves only the
+/// selection.
+enum SidebarHosts {
+    struct Section: Equatable {
+        let host: HostId
+        /// Its connection state while it is not connected (it then lists nothing).
+        var state: String?
+        /// Its workspaces, in the order they were made.
+        var workspaces: [UInt64]
+        /// Connected without a workspace: a row opens one.
+        var offersNewWorkspace: Bool
+    }
+
+    static func title(_ host: HostId) -> String { host == localHost ? "This Mac" : host }
+
+    /// This Mac, then the `[[remote]]` hosts in config order, then the hosts of workspaces
+    /// whose remote is gone from the config.
+    static func hosts(remotes: [HostId], workspaceHosts: [HostId]) -> [HostId] {
+        var hosts = [localHost]
+        for h in remotes + workspaceHosts where !hosts.contains(h) { hosts.append(h) }
+        return hosts
+    }
+
+    /// The one host listed: `filter` when it is one of `hosts`, else every host (nil).
+    static func effectiveFilter(_ filter: HostId?, hosts: [HostId]) -> HostId? {
+        filter.flatMap { hosts.contains($0) ? $0 : nil }
+    }
+
+    /// `state` is nil for a connected host. A host that is not connected lists none of its
+    /// workspaces but the one `shown`, so the selected tab stays in sight.
+    static func sections(remotes: [HostId], workspaces: [(id: UInt64, host: HostId)], shown: UInt64?,
+                         filter: HostId?, state: (HostId) -> String?) -> [Section] {
+        var hosts = Self.hosts(remotes: remotes, workspaceHosts: workspaces.map(\.host))
+        if let only = effectiveFilter(filter, hosts: hosts) { hosts = [only] }
+        return hosts.map { h in
+            let state = h == localHost ? nil : state(h)
+            var ids = workspaces.filter { $0.host == h }.map(\.id)
+            if state != nil { ids = ids.filter { $0 == shown } }
+            return Section(host: h, state: state, workspaces: ids, offersNewWorkspace: state == nil && ids.isEmpty)
+        }
     }
 }
 
@@ -248,8 +318,14 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     }
     /// Headers only when there is more than one group.
     private var showHeaders = false
-    /// The window's workspace; click for the workspace picker.
+    /// Where the window's workspace runs ("This Mac" or the host); click for the workspace picker.
     private let workspaceButton = NSButton(title: "", target: nil, action: nil)
+    private let hostIcon = NSImageView()
+    /// Lists every host's tabs, or one host's (`window.sidebar_by_host`).
+    private let hostsButton = NSButton(title: "", target: nil, action: nil)
+    /// Set while expanding and collapsing the groups after a reload, which must not change
+    /// what the user collapsed.
+    private var restoringExpansion = false
     private let usage = UsagePanel()
     /// Moves the agents' "updated 20s ago" on while the activity list shows.
     private var ageTimer: Timer?
@@ -301,19 +377,38 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         workspaceButton.toolTip = "Workspaces (⌘⇧O)"
         workspaceButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         workspaceButton.translatesAutoresizingMaskIntoConstraints = false
+        hostIcon.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+        hostIcon.contentTintColor = .secondaryLabelColor
+        hostIcon.translatesAutoresizingMaskIntoConstraints = false
+        hostsButton.target = self
+        hostsButton.action = #selector(showHostsPopover(_:))
+        hostsButton.isBordered = false
+        hostsButton.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+        hostsButton.contentTintColor = .secondaryLabelColor
+        hostsButton.toolTip = "Hosts"
+        hostsButton.setAccessibilityLabel("Hosts")
+        hostsButton.translatesAutoresizingMaskIntoConstraints = false
 
         let root = NSView()
         root.wantsLayer = true
         root.layer?.backgroundColor = backgroundColor?.cgColor
         scroll.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(hostIcon)
         root.addSubview(workspaceButton)
+        root.addSubview(hostsButton)
         root.addSubview(scroll)
         root.addSubview(usage)
         usage.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             workspaceButton.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: 2),
-            workspaceButton.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            workspaceButton.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -12),
+            // The icon starts where the headings do, the name where a host's header names it.
+            hostIcon.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: SidebarHeadingView.inset),
+            hostIcon.widthAnchor.constraint(equalToConstant: SidebarHeadingView.hostLabelOffset - 5),
+            hostIcon.centerYAnchor.constraint(equalTo: workspaceButton.centerYAnchor),
+            workspaceButton.leadingAnchor.constraint(equalTo: hostIcon.trailingAnchor, constant: 5),
+            workspaceButton.trailingAnchor.constraint(lessThanOrEqualTo: hostsButton.leadingAnchor, constant: -6),
+            hostsButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            hostsButton.centerYAnchor.constraint(equalTo: workspaceButton.centerYAnchor),
             scroll.topAnchor.constraint(equalTo: workspaceButton.bottomAnchor, constant: 4),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -355,6 +450,29 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     /// Opens the same picker as the native tab strip's workspace button.
     @objc private func showWorkspaceMenu(_ sender: NSButton) {
         WorkspacePicker.shared.toggle(relativeTo: sender)
+    }
+
+    @objc private func showHostsPopover(_ sender: NSButton) {
+        SidebarHostsPopover.shared.toggle(relativeTo: sender)
+    }
+
+    /// The top row: where the window's workspace runs, and the hosts button (hidden while there
+    /// is no other host to list and the list by host is off).
+    private func syncTopRow(_ shown: Workspace?, config: AppConfig) {
+        let host = shown?.host ?? controller?.host ?? localHost
+        let place = SidebarHosts.title(host)
+        if workspaceButton.title != place { workspaceButton.title = place }
+        let tip = shown.map { "Workspace \($0.name) · Workspaces (⌘⇧O)" } ?? "Workspaces (⌘⇧O)"
+        if workspaceButton.toolTip != tip { workspaceButton.toolTip = tip }
+        let symbol = host == localHost ? "laptopcomputer" : "globe"
+        if hostIcon.image?.accessibilityDescription != symbol {
+            hostIcon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol)
+        }
+        hostsButton.isHidden = config.remoteNames.isEmpty && !config.sidebarByHost
+        let filled = config.sidebarByHost ? "square.stack.3d.up.fill" : "square.stack.3d.up"
+        if hostsButton.image?.accessibilityDescription != filled {
+            hostsButton.image = NSImage(systemSymbolName: filled, accessibilityDescription: filled)
+        }
     }
 
     /// How far the tab list is scrolled.
@@ -445,18 +563,26 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     /// `window.sidebar_active_only`: what needs a look. Every agent that isn't idle, in any
     /// window or workspace, one row per pane under its status; then the tabs of `listed` that
     /// `activityTabRow` keeps.
-    private func activityGroups(listed: [SidebarGroup], shown: Workspace?,
+    private func activityGroups(listed: [SidebarGroup], shown: Workspace?, host only: HostId?,
                                 panes info: [PaneKey: PaneInfo]) -> [SidebarGroup] {
         let sm = SessionManager.shared
         var agents = sm.agentPanes(first: controller).filter { $0.agent.status != .idle }
-        if sm.config.sidebarAllWorkspaces {
-            // By workspace in the tab list's order, so a switch moves none.
-            let rank = { (a: AgentPane) -> Int in
+        if let only { agents = agents.filter { $0.pane.host == only } }
+        if sm.config.sidebarAllWorkspaces || sm.config.sidebarByHost {
+            // By host when listed by host, then by workspace in the tab list's order, so a
+            // switch moves none.
+            let hosts = sm.config.sidebarByHost
+                ? SidebarHosts.hosts(remotes: sm.config.remoteNames, workspaceHosts: sm.workspaces.map(\.host)) : []
+            let rank = { (a: AgentPane) -> (Int, Int) in
                 let ws = a.hidden?.id ?? a.controller?.workspaceID
-                return sm.workspaces.firstIndex { $0.id == ws } ?? sm.workspaces.count
+                return (hosts.firstIndex(of: a.pane.host) ?? 0,
+                        sm.workspaces.firstIndex { $0.id == ws } ?? sm.workspaces.count)
             }
             agents = agents.enumerated()
-                .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+                .sorted {
+                    let x = rank($0.element), y = rank($1.element)
+                    return (x.0, x.1, $0.offset) < (y.0, y.1, $1.offset)
+                }
                 .map(\.element)
         }
         let rows = agents.map { a -> SidebarTab in
@@ -472,7 +598,10 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                 guard let (ids, focused) = Self.panes(of: tab),
                       var row = Self.activityTabRow(tab, panes: ids, focused: focused, listed: listedPanes, info: info)
                 else { continue }
-                if g.elsewhere { row.subtitle = [row.subtitle, g.name].compactMap { $0 }.joined(separator: " · ") }
+                if g.elsewhere {
+                    let name = g.workspace.flatMap { sm.workspace($0) }.map(Self.heading) ?? g.name
+                    row.subtitle = [row.subtitle, name].compactMap { $0 }.joined(separator: " · ")
+                }
                 tabs.append(row)
             }
         }
@@ -488,7 +617,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     /// Whether the window's tabs are listed under their repository: every workspace's tabs are
     /// listed under the workspace instead.
     static func groupsByRepo(_ config: AppConfig) -> Bool {
-        config.sidebarGroupByRepo && !config.sidebarAllWorkspaces
+        config.sidebarGroupByRepo && !config.sidebarAllWorkspaces && !config.sidebarByHost
     }
 
     /// `items` grouped by `key`: the groups in the order of their first item, then the items
@@ -597,6 +726,31 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     /// What a workspace's group keeps its collapsed state under.
     private static func collapseKey(_ ws: Workspace) -> String { "workspace:\(ws.id)" }
 
+    /// The group of a workspace this window does not show, under `name`: its tabs as the window
+    /// showing it lists them, or its hidden tabs; pinned tabs are under Pinned.
+    private static func workspaceGroup(_ ws: Workspace, name: String, info panes: [PaneKey: PaneInfo],
+                                       config: AppConfig) -> SidebarGroup {
+        let sm = SessionManager.shared
+        let g = SidebarGroup(name: name, key: collapseKey(ws), elsewhere: true, workspace: ws.id)
+        if let shownIn = sm.controllerShowing(ws) {
+            g.tabs = sm.group(of: shownIn).filter { !$0.pinned }.map {
+                row($0, shortcut: nil, selected: false, info: panes, config: config)
+            }
+        } else {
+            g.tabs = ws.hiddenTabs.enumerated().filter { $0.element.pinned != true }.map {
+                hiddenRow($0.element, index: $0.offset, of: ws, info: panes, config: config)
+            }
+        }
+        return g
+    }
+
+    /// A host's state on its header in the list by host: nil while it is connected.
+    static func hostState(_ host: HostId) -> String? {
+        guard host != localHost, !Core.shared.isConnected(host) else { return nil }
+        guard SessionManager.shared.config.remoteNames.contains(host) else { return "not configured" }
+        return Remotes.shared.phaseLabel(host)
+    }
+
     /// The group a tab is listed under: its repository ("devbox · repo" on a remote host), or
     /// for a handoff tab the local repository it came from.
     static func group(for c: TerminalWindowController) -> (key: String, name: String)? {
@@ -620,9 +774,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         }
         let sm = SessionManager.shared
         let shownWorkspace = controller.flatMap { sm.workspace($0.workspaceID) }
-        let workspace = shownWorkspace?.name ?? ""
-        if workspaceButton.title != workspace { workspaceButton.title = workspace }
         let config = sm.config
+        syncTopRow(shownWorkspace, config: config)
         usage.reload()
         let windows = controller?.orderedTabs ?? [window]
         let panes = sm.panes
@@ -630,8 +783,11 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         var byRoot: [String: SidebarGroup] = [:]
         var order: [SidebarGroup] = []
         let pinned = SidebarGroup(name: "Pinned", key: Self.pinnedKey)
-        // Every workspace listed: this window's tabs under its workspace.
-        let other = config.sidebarAllWorkspaces
+        // Every workspace listed: this window's tabs under its workspace (under its host, the
+        // workspace's name is enough).
+        let other = config.sidebarByHost
+            ? SidebarGroup(name: shownWorkspace?.name ?? "Tabs", key: shownWorkspace.map(Self.collapseKey))
+            : config.sidebarAllWorkspaces
             ? SidebarGroup(name: shownWorkspace.map(Self.heading) ?? "Tabs", key: shownWorkspace.map(Self.collapseKey))
             : SidebarGroup(name: "Terminals")
         for (index, w) in windows.enumerated() {
@@ -664,7 +820,26 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                 }
             }
         }
-        if config.sidebarAllWorkspaces {
+        var hostFilter: HostId?
+        if config.sidebarByHost {
+            let sections = SidebarHosts.sections(remotes: config.remoteNames,
+                                                 workspaces: sm.workspaces.map { ($0.id, $0.host) },
+                                                 shown: shownWorkspace?.id, filter: config.sidebarHost,
+                                                 state: Self.hostState)
+            if sections.count == 1, config.sidebarHost != nil { hostFilter = sections.first?.host }
+            if shownWorkspace == nil { order.append(other) }
+            for section in sections {
+                let g = SidebarGroup(name: SidebarHosts.title(section.host), key: "host:\(section.host)",
+                                     host: section.host)
+                g.state = section.state
+                g.subgroups = section.workspaces.compactMap { id -> SidebarGroup? in
+                    if id == shownWorkspace?.id { return other }
+                    return sm.workspace(id).map { Self.workspaceGroup($0, name: $0.name, info: panes, config: config) }
+                }.filter { !$0.tabs.isEmpty }
+                if section.offersNewWorkspace { g.newWorkspace = NewWorkspaceBox(host: section.host) }
+                order.append(g)
+            }
+        } else if config.sidebarAllWorkspaces {
             // The workspaces in the order they were made, so switching to one moves nothing.
             if !sm.workspaces.contains(where: { $0.id == shownWorkspace?.id }) { order.append(other) }
             for ws in sm.workspaces {
@@ -672,29 +847,21 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                     order.append(other)
                     continue
                 }
-                let g = SidebarGroup(name: Self.heading(ws), key: Self.collapseKey(ws), elsewhere: true,
-                                     workspace: ws.id)
-                if let shownIn = sm.controllerShowing(ws) {
-                    g.tabs = sm.group(of: shownIn).filter { !$0.pinned }.map {
-                        Self.row($0, shortcut: nil, selected: false, info: panes, config: config)
-                    }
-                } else {
-                    g.tabs = ws.hiddenTabs.enumerated().filter { $0.element.pinned != true }.map {
-                        Self.hiddenRow($0.element, index: $0.offset, of: ws, info: panes, config: config)
-                    }
-                }
-                order.append(g)
+                order.append(Self.workspaceGroup(ws, name: Self.heading(ws), info: panes, config: config))
             }
         } else if !other.tabs.isEmpty {
             order.append(other)
         }
         order.insert(pinned, at: 0)
         if config.sidebarActiveOnly {
-            order = [pinned] + activityGroups(listed: order.filter { $0 !== pinned }, shown: shownWorkspace,
-                                              panes: panes)
+            let listed = order.flatMap(\.flattened).filter { $0 !== pinned && $0.host == nil }
+            order = [pinned] + activityGroups(listed: listed, shown: shownWorkspace, host: hostFilter, panes: panes)
         }
-        order.removeAll { $0.tabs.isEmpty }
-        let names = order.map { [$0.key, $0.name] }, tabs = order.map(\.tabs)
+        // A host's header stays without rows: it shows the host's state, or offers a workspace.
+        order.removeAll { $0.host == nil && $0.tabs.isEmpty }
+        let all = order.flatMap(\.flattened), leaves = all.filter { $0.host == nil }
+        let names = all.map { [$0.key, $0.name, $0.state ?? "", $0.newWorkspace?.host ?? ""] }
+        let tabs = leaves.map(\.tabs)
         let theme = SessionManager.shared.config.theme
         if let s = shown, s.names == names, s.theme == theme,
            Self.sameRows(s.tabs.map(Self.identities), tabs.map(Self.identities)) {
@@ -703,7 +870,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             // agent retitles its tab several times a second.
             if s.tabs != tabs {
                 shown = (names, tabs, theme)
-                for (g, new) in zip(groups, tabs) {
+                for (g, new) in zip(groups.flatMap(\.flattened).filter { $0.host == nil }, tabs) {
                     g.tabs = new
                     for (box, tab) in zip(g.boxes, new) where box.tab != tab {
                         // A program reports progress many times a second: move only the bar.
@@ -723,14 +890,19 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             }
         } else {
             shown = (names, tabs, theme)
-            for g in order { g.boxes = g.tabs.map(TabBox.init) }
+            for g in leaves { g.boxes = g.tabs.map(TabBox.init) }
             groups = order
             // Every workspace listed: each under its name, also when the others have no tabs to
             // show. The activity list: each status under its name, also when it is the only one.
-            showHeaders = config.sidebarActiveOnly || config.sidebarAllWorkspaces || groups.count > 1 || groups.first?.key == Self.pinnedKey
+            showHeaders = config.sidebarActiveOnly || config.sidebarAllWorkspaces || config.sidebarByHost
+                || groups.count > 1 || groups.first?.key == Self.pinnedKey
             outline.reloadData()
+            // Every group open first, so a workspace under a collapsed host keeps its own state.
             let collapsed = Self.collapsed
-            for g in groups where !collapsed.contains(g.key) { outline.expandItem(g) }
+            restoringExpansion = true
+            for g in all { outline.expandItem(g) }
+            for g in all.reversed() where collapsed.contains(g.key) { outline.collapseItem(g) }
+            restoringExpansion = false
         }
         // Select the row of this window's tab, also when the rows are unchanged: a click on
         // another tab's row selected that row here, and this window's tab is the one shown again.
@@ -775,7 +947,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         if item == nil {
             return showHeaders ? groups.count : groups.first?.boxes.count ?? 0
         }
-        if let g = item as? SidebarGroup { return g.boxes.count }
+        if let g = item as? SidebarGroup { return g.children.count }
         return 0
     }
 
@@ -784,7 +956,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             if showHeaders { return groups[index] }
             return groups[0].boxes[index]
         }
-        return (item as! SidebarGroup).boxes[index]
+        return (item as! SidebarGroup).children[index]
     }
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
@@ -793,10 +965,12 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
 
     // Collapsing a repository group sticks.
     func outlineViewItemDidCollapse(_ notification: Notification) {
+        guard !restoringExpansion else { return }
         if let g = notification.userInfo?["NSObject"] as? SidebarGroup { Self.collapsed.insert(g.key) }
     }
 
     func outlineViewItemDidExpand(_ notification: Notification) {
+        guard !restoringExpansion else { return }
         if let g = notification.userInfo?["NSObject"] as? SidebarGroup { Self.collapsed.remove(g.key) }
     }
 
@@ -853,6 +1027,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
 
     private func allowsDrop(_ moving: NSWindow, into item: Any?, at index: Int) -> Bool {
         let group = item as? SidebarGroup
+        // A host's header lists workspaces, not tabs.
+        if group?.host != nil { return false }
         let own = group?.boxes.prefix { $0.tab.controller?.window.map(ownsTab) == true }.count ?? 0
         return Self.allowsDrop(into: group, at: index,
                                pinned: (moving.windowController as? TerminalWindowController)?.pinned == true,
@@ -916,12 +1092,17 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     }
 
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
-        if item is SidebarGroup { return SidebarHeadingView.height }
+        if let g = item as? SidebarGroup { return g.host != nil ? SidebarHeadingView.hostHeight : SidebarHeadingView.height }
+        if item is NewWorkspaceBox { return NewWorkspaceRowView.height }
         return 40
     }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
-        if let g = item as? SidebarGroup { return SidebarHeadingView(g.name) }
+        if let g = item as? SidebarGroup {
+            guard let host = g.host else { return SidebarHeadingView(g.name) }
+            return SidebarHeadingView(g.name, symbol: host == localHost ? "laptopcomputer" : "globe", detail: g.state)
+        }
+        if let box = item as? NewWorkspaceBox { return NewWorkspaceRowView(box.title) }
         guard let box = item as? TabBox else { return nil }
         let cell = outlineView.makeView(withIdentifier: TabRowView.identifier, owner: nil) as? TabRowView
             ?? TabRowView()
@@ -936,6 +1117,10 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     @objc private func rowClicked(_ sender: Any?) {
         TabHoverCard.shared.dismiss()
         let row = outline.clickedRow >= 0 ? outline.clickedRow : outline.selectedRow
+        if row >= 0, let box = outline.item(atRow: row) as? NewWorkspaceBox {
+            SessionManager.shared.newWorkspace(host: box.host)
+            return
+        }
         guard row >= 0, let box = outline.item(atRow: row) as? TabBox else { return }
         if let pane = box.tab.pane {
             focusAgent(pane)
@@ -1119,16 +1304,45 @@ extension TabSidebarViewController: NSMenuItemValidation {
 /// wherever the outline places the row.
 final class SidebarHeadingView: NSView {
     static let height: CGFloat = 22
+    /// A host's header, in the list by host.
+    static let hostHeight: CGFloat = 28
     static let inset: CGFloat = 16
+    /// Where a host's name starts after its icon.
+    static let hostLabelOffset: CGFloat = 22
     let label: NSTextField
+    private var icon: NSImageView?
+    /// A host's state while it is not connected.
+    private var detail: NSTextField?
 
-    init(_ title: String) {
+    init(_ title: String, symbol: String? = nil, detail state: String? = nil) {
         label = NSTextField(labelWithString: title)
         super.init(frame: .zero)
-        label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-        label.textColor = SessionManager.shared.config.chrome.contentSecondary
+        let chrome = SessionManager.shared.config.chrome
         label.lineBreakMode = .byTruncatingTail
+        if let symbol {
+            label.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+            label.textColor = chrome.contentPrimary
+            let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
+            icon.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+            icon.contentTintColor = chrome.contentSecondary
+            addSubview(icon)
+            self.icon = icon
+        } else {
+            label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+            label.textColor = chrome.contentSecondary
+        }
         addSubview(label)
+        if let state {
+            let d = NSTextField(labelWithString: state)
+            d.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            d.textColor = chrome.contentSecondary
+            d.lineBreakMode = .byTruncatingTail
+            addSubview(d)
+            detail = d
+        }
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        setAccessibilityLabel([title, state].compactMap { $0 }.joined(separator: ", "))
     }
 
     required init?(coder: NSCoder) {
@@ -1140,10 +1354,64 @@ final class SidebarHeadingView: NSView {
         var table = superview
         while let v = table, !(v is NSTableView) { table = v.superview }
         let x = table.map { convert(NSPoint.zero, to: $0).x } ?? 0
-        let left = max(0, Self.inset - x)
+        var left = max(0, Self.inset - x)
+        if let icon {
+            let s = icon.intrinsicContentSize
+            icon.frame = NSRect(x: left, y: ((bounds.height - s.height) / 2).rounded(), width: s.width, height: s.height)
+            left += Self.hostLabelOffset
+        }
         let size = label.intrinsicContentSize
+        var right = bounds.width - 12
+        if let detail {
+            let d = detail.intrinsicContentSize
+            let w = min(d.width, max(0, (right - left) / 2))
+            detail.frame = NSRect(x: right - w, y: ((bounds.height - d.height) / 2).rounded(), width: w, height: d.height)
+            right -= w + 6
+        }
         label.frame = NSRect(x: left, y: ((bounds.height - size.height) / 2).rounded(),
-                             width: max(0, bounds.width - left), height: size.height)
+                             width: max(0, right - left), height: size.height)
+    }
+}
+
+/// "New Workspace on <host>" under a connected host without one: a plus and the title, quieter
+/// than a tab.
+final class NewWorkspaceRowView: NSView {
+    static let height: CGFloat = 28
+    private let icon = NSImageView()
+    private let label: NSTextField
+
+    init(_ title: String) {
+        label = NSTextField(labelWithString: title)
+        super.init(frame: .zero)
+        let chrome = SessionManager.shared.config.chrome
+        icon.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
+        icon.symbolConfiguration = .init(pointSize: 11, weight: .medium)
+        icon.contentTintColor = chrome.contentSecondary
+        label.font = .systemFont(ofSize: NSFont.systemFontSize)
+        label.textColor = chrome.contentSecondary
+        label.lineBreakMode = .byTruncatingTail
+        addSubview(icon)
+        addSubview(label)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(title)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override func layout() {
+        super.layout()
+        var table = superview
+        while let v = table, !(v is NSTableView) { table = v.superview }
+        let x = table.map { convert(NSPoint.zero, to: $0).x } ?? 0
+        let left = max(0, SidebarHeadingView.inset - x)
+        let s = icon.intrinsicContentSize
+        icon.frame = NSRect(x: left + 2, y: ((bounds.height - s.height) / 2).rounded(), width: s.width, height: s.height)
+        let size = label.intrinsicContentSize
+        label.frame = NSRect(x: left + 22, y: ((bounds.height - size.height) / 2).rounded(),
+                             width: max(0, bounds.width - left - 34), height: size.height)
     }
 }
 

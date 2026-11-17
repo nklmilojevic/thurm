@@ -250,6 +250,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         SessionManager.shared.toggleSidebarListing("window.sidebar_all_workspaces", \.sidebarAllWorkspaces)
     }
 
+    @objc func toggleSidebarByHost(_ sender: Any?) {
+        let config = SessionManager.shared.config
+        SessionManager.shared.setSidebarHosts(byHost: !config.sidebarByHost, host: config.sidebarHost)
+    }
+
     @objc func toggleSidebarActiveOnly(_ sender: Any?) {
         SessionManager.shared.toggleSidebarListing("window.sidebar_active_only", \.sidebarActiveOnly)
     }
@@ -361,13 +366,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let listing: [Selector: KeyPath<AppConfig, Bool>] = [
             #selector(toggleSidebarGroupByRepo(_:)): \.sidebarGroupByRepo,
             #selector(toggleSidebarAllWorkspaces(_:)): \.sidebarAllWorkspaces,
+            #selector(toggleSidebarByHost(_:)): \.sidebarByHost,
             #selector(toggleSidebarActiveOnly(_:)): \.sidebarActiveOnly,
         ]
         if let action = menuItem.action, let path = listing[action] {
             let config = SessionManager.shared.config
             menuItem.state = config[keyPath: path] ? .on : .off
-            // Every workspace's tabs are listed under the workspace, not the repository.
-            return config.sidebarTabs && !(action == #selector(toggleSidebarGroupByRepo(_:)) && config.sidebarAllWorkspaces)
+            // Every workspace's tabs are listed under the workspace, not the repository; by host,
+            // every workspace is listed under its host.
+            let overridden = (action == #selector(toggleSidebarGroupByRepo(_:))
+                && (config.sidebarAllWorkspaces || config.sidebarByHost))
+                || (action == #selector(toggleSidebarAllWorkspaces(_:)) && config.sidebarByHost)
+            return config.sidebarTabs && !overridden
         }
         let usage: [Selector: UsageProvider] = [#selector(toggleSidebarUsageClaude(_:)): .claude,
                                                 #selector(toggleSidebarUsageCodex(_:)): .codex]

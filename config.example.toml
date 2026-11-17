@@ -64,10 +64,13 @@ animation_speed = "normal"
 # Tab location: "native" or "sidebar".
 tab_style = "sidebar"
 sidebar_width = 240.0
-# Group the sidebar's tabs by repository; or list every workspace's tabs; or only what is
+# Group the sidebar's tabs by repository; or list every workspace's tabs; or every host's
+# tabs under the host (all hosts, or the one named: "local" is this Mac); or only what is
 # going on: every agent that isn't idle, by status, and the tabs with progress.
 sidebar_group_by_repo = true
 sidebar_all_workspaces = false
+sidebar_by_host = false
+sidebar_host = ""
 sidebar_active_only = false
 # What is left of the Claude Code / Codex subscription limits, at the bottom of the sidebar.
 sidebar_usage_claude = false

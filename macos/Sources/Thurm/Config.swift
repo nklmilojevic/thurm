@@ -160,6 +160,10 @@ final class AppConfig {
     var sidebarGroupByRepo = true
     /// `window.sidebar_all_workspaces`: every workspace's tabs in the sidebar.
     var sidebarAllWorkspaces = false
+    /// `window.sidebar_by_host`: every host's tabs in the sidebar, under the host.
+    var sidebarByHost = false
+    /// `window.sidebar_host`: with `sidebarByHost`, the one host listed (nil: every host).
+    var sidebarHost: HostId?
     /// `window.sidebar_active_only`: only the tabs where something is going on.
     var sidebarActiveOnly = false
     var mouseNavigationButtons = true
@@ -361,6 +365,8 @@ final class AppConfig {
             sidebarWidth = CGFloat(min(480, max(180, jsonDouble(w["sidebar_width"]) ?? Double(sidebarWidth))))
             sidebarGroupByRepo = jsonBool(w["sidebar_group_by_repo"]) ?? sidebarGroupByRepo
             sidebarAllWorkspaces = jsonBool(w["sidebar_all_workspaces"]) ?? sidebarAllWorkspaces
+            sidebarByHost = jsonBool(w["sidebar_by_host"]) ?? sidebarByHost
+            if let host = jsonString(w["sidebar_host"]) { sidebarHost = host.isEmpty ? nil : host }
             sidebarActiveOnly = jsonBool(w["sidebar_active_only"]) ?? sidebarActiveOnly
             mouseNavigationButtons = jsonBool(w["mouse_navigation_buttons"]) ?? mouseNavigationButtons
             for p in UsageProvider.allCases {

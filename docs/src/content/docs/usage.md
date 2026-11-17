@@ -133,6 +133,13 @@ The View menu changes what the sidebar lists, as do the settings below:
 - **Tabs from All Workspaces** (`window.sidebar_all_workspaces`). Every workspace's
   tabs show under a header for the workspace. Click a tab of another workspace to
   switch to it. Drag a tab onto another workspace to move it there.
+- **Tabs by Host** (`window.sidebar_by_host`, or the hosts button at the top right of the
+  sidebar). Every host's tabs show under a header for the host: **This Mac** first, then each
+  remote host, with their workspaces under them. Click a tab on another host to switch to it;
+  the list stays as it is. A host that is not connected shows its state, and a connected host
+  without a workspace offers **New Workspace on** the host. The hosts button can also narrow
+  the list to one host (`window.sidebar_host`: `local` for this Mac, or the remote's name), or
+  turn the list by host off.
 - **Only Active Tabs** (`window.sidebar_active_only`, or the filter button next to
   the sidebar button in the titlebar). The sidebar lists what is going on, by status:
   **Needs input**, **Failed**, **Done** and **Working**. Each agent that isn't idle gets its

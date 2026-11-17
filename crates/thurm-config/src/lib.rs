@@ -549,6 +549,12 @@ pub struct WindowConfig {
     pub sidebar_group_by_repo: bool,
     /// List every workspace's tabs in the sidebar, under a header each.
     pub sidebar_all_workspaces: bool,
+    /// List the tabs of every host in the sidebar: under a header each, this Mac first, then
+    /// each `[[remote]]`, with their workspaces under them.
+    pub sidebar_by_host: bool,
+    /// With `sidebar_by_host`, the one host listed: empty for every host, `local` for this Mac,
+    /// or a `[[remote]]` name.
+    pub sidebar_host: String,
     /// List only what is going on, by status: every agent that isn't idle, one row per pane,
     /// and the tabs with progress.
     pub sidebar_active_only: bool,
@@ -589,6 +595,8 @@ impl Default for WindowConfig {
             sidebar_width: 240.0,
             sidebar_group_by_repo: true,
             sidebar_all_workspaces: false,
+            sidebar_by_host: false,
+            sidebar_host: String::new(),
             sidebar_active_only: false,
             sidebar_agents: true,
             sidebar_agent_rows: 5,
@@ -2665,6 +2673,15 @@ clipboard_read = "always"
         let window = Config::parse(&out).unwrap().window;
         assert!(!window.sidebar_group_by_repo);
         assert!(window.sidebar_all_workspaces && window.sidebar_active_only);
+        assert!(
+            !window.sidebar_by_host && window.sidebar_host.is_empty(),
+            "opt-in"
+        );
+        let out = with_setting(&out, "window.sidebar_by_host", "true").unwrap();
+        let out = with_setting(&out, "window.sidebar_host", "\"devbox\"").unwrap();
+        let window = Config::parse(&out).unwrap().window;
+        assert!(window.sidebar_by_host);
+        assert_eq!(window.sidebar_host, "devbox");
         let window = Config::parse(&out).unwrap().window;
         assert!(!window.sidebar_usage_claude && !window.sidebar_usage_codex, "opt-in");
         let out = with_setting(&out, "window.sidebar_usage_codex", "true").unwrap();
