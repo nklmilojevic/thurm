@@ -611,7 +611,7 @@ extension SessionManager {
             while stem.utf8.count + tail.utf8.count > 255, !stem.isEmpty { stem.removeLast() }
             let numbered = stem + tail
             let candidate = dir.appendingPathComponent(numbered)
-            let fd = open(candidate.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o644)
+            let fd = open(candidate.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
             if fd >= 0 {
                 close(fd)
                 return candidate

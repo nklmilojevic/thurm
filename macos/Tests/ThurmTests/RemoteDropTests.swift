@@ -153,7 +153,10 @@ final class RemoteDropTests: XCTestCase {
         var cancelled = TransferOutcome(error: "cancelled")
         cancelled.cancelled = true
         fake.finish[0](cancelled)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: dest.path))
+        // The reserved file goes with the download itself, which alone can tell the name still
+        // holds it (thurm-daemon's a_reserved_download_is_written_into_its_own_file_only); the
+        // stand-in here does what it does.
+        try FileManager.default.removeItem(at: dest)
         XCTAssertNil(view.shownTransfer)
         XCTAssertEqual(revealed, [])
         // One that finishes is shown in Finder, with what was saved in it.
@@ -411,6 +414,9 @@ final class RemoteDropTests: XCTestCase {
         _ = try file("Makefile")
         XCTAssertEqual(SessionManager.reserveFreeName("Makefile", in: dir)?.lastPathComponent, "Makefile 2")
         XCTAssertNil(SessionManager.reserveFreeName("x", in: dir.appendingPathComponent("missing")))
+        // Reserved for this user only, as the download itself will be.
+        let mode = try FileManager.default.attributesOfItem(atPath: first.path)[.posixPermissions] as? Int
+        XCTAssertEqual(mode, 0o600)
         // A name as long as names go is shortened to make room for its number.
         let long = String(repeating: "l", count: 251) + ".txt"
         XCTAssertEqual(SessionManager.reserveFreeName(long, in: dir)?.lastPathComponent, long)

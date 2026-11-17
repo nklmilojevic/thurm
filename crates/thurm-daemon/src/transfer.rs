@@ -38,7 +38,8 @@ pub const MIN_FREE_FILES: u64 = 10_000;
 /// files until the last arrives.
 pub const MAX_WAITING_BATCHES_PER_CLIENT: usize = 8;
 pub const MAX_WAITING_BATCHES: usize = 32;
-/// Landed files waiting for the rest of their batch, over all: a stream (and a thread) each.
+/// Files of batches not complete yet, over all, whether on their way or landed and waiting for
+/// the rest: each takes a stream (and threads) once sent.
 pub const MAX_WAITING_FILES: usize = 512;
 /// Batches kept, over all panes, however small.
 pub const MAX_KEPT_BATCHES: usize = 1024;
@@ -60,6 +61,8 @@ pub const MAX_KEPT: u64 = 8 << 30;
 pub const KEEP: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often kept uploads are pruned while nothing else asks for it.
 pub const PRUNE_EVERY: Duration = Duration::from_secs(10 * 60);
+/// How long a download that sent its file waits for its caller to say it has it.
+pub const ACK: Duration = Duration::from_secs(30);
 /// Downloads sending at once, per pane.
 pub const MAX_DOWNLOADS_PER_PANE: usize = 4;
 /// The longest file name, in bytes.
@@ -69,6 +72,14 @@ const PARTS: &str = ".parts";
 /// When a batch was complete (milliseconds since the Unix epoch), inside its directory: what it
 /// is aged from, by this daemon and the next.
 const DONE: &str = ".done";
+
+/// A kept batch: since when it is aged, what it takes on disk, and in files.
+struct Kept {
+    since: SystemTime,
+    size: u64,
+    files: u64,
+    dir: PathBuf,
+}
 
 pub struct Transfers {
     root: PathBuf,
@@ -83,6 +94,10 @@ pub struct Transfers {
     /// A pause between a batch's last file landing and its paths being typed:
     /// `THURM_TRANSFER_PASTE_DELAY_MS` (tests), none otherwise.
     paste_delay: Duration,
+    /// [`ACK`], or `THURM_TRANSFER_ACK_MS` (tests).
+    ack: Duration,
+    /// [`MAX_WAITING_FILES`], or `THURM_TRANSFER_MAX_WAITING_FILES` (tests).
+    max_waiting_files: usize,
 }
 
 /// A duration in milliseconds from the environment variable `var`, else `default` (tests).
@@ -165,6 +180,11 @@ impl Transfers {
                 .unwrap_or(MAX_KEPT),
             keep: env_ms("THURM_TRANSFER_KEEP_MS", KEEP),
             paste_delay: env_ms("THURM_TRANSFER_PASTE_DELAY_MS", Duration::ZERO),
+            ack: env_ms("THURM_TRANSFER_ACK_MS", ACK),
+            max_waiting_files: std::env::var("THURM_TRANSFER_MAX_WAITING_FILES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MAX_WAITING_FILES),
         }
     }
 
@@ -174,7 +194,7 @@ impl Transfers {
     pub fn prune(&self) {
         let mut st = self.state.lock();
         self.sweep(&mut st);
-        self.make_room(&st, 0, 0);
+        self.make_room(&st, 0, 0, 0);
     }
 
     /// [`thurm_proto::Request::UploadBegin`]: reserves the file's place in its batch and a
@@ -221,16 +241,18 @@ impl Transfers {
             ));
         }
         let incomplete = |b: &&Batch| b.waiting() && !b.pasting;
+        // Every file admitted will hold a stream until its batch is complete: they count from
+        // their reservation, not from when they land.
         let waiting_files = st
             .batches
             .values()
             .filter(incomplete)
-            .flat_map(|b| b.files.values())
-            .filter(|f| f.state == SlotState::Landed)
-            .count();
-        if waiting_files >= MAX_WAITING_FILES {
+            .map(|b| b.files.len())
+            .sum::<usize>();
+        if waiting_files >= self.max_waiting_files {
             return Err(format!(
-                "too many sent files are waiting for the rest of their batch (at most {MAX_WAITING_FILES})"
+                "too many files are on their way in uploads not complete yet (at most {})",
+                self.max_waiting_files
             ));
         }
         let pending: u64 = st
@@ -302,16 +324,21 @@ impl Transfers {
             .saturating_add(dir_cost)
             .saturating_add(pending)
             .saturating_add(MIN_FREE);
-        // A batch's directory, its parts directory, the file and its part.
+        // Drops past their time go first (`kept` deletes them): the space and files they leave
+        // count before any are found missing. What the rest would give back if deleted is what
+        // admitting this file may still take from them.
+        let kept_now = self.kept(&st);
+        let recoverable: u64 = kept_now.iter().map(|k| k.size).sum();
+        let recoverable_files: u64 = kept_now.iter().map(|k| k.files).sum();
+        // A new batch's directory and its parts directory, and the file and its part.
+        let files_needed = if existing.is_none() { 4 } else { 2 };
         let files = free_files(&self.root)?;
-        if files < MIN_FREE_FILES + 4 {
-            return Err(format!(
-                "this host's disk can take too few more files ({files} left)"
-            ));
+        let files_short = (MIN_FREE_FILES + files_needed).saturating_sub(files);
+        let too_few_files =
+            |files: u64| format!("this host's disk can take too few more files ({files} left)");
+        if files_short > recoverable_files {
+            return Err(too_few_files(files));
         }
-        // Drops past their time go first (`kept` deletes them): the space they leave counts
-        // before any is found missing.
-        let recoverable: u64 = self.kept(&st).iter().map(|(_, size, _)| size).sum();
         let free = free_space(&self.root)?;
         let short = need.saturating_sub(free);
         let no_space = |free: u64| {
@@ -365,9 +392,24 @@ impl Transfers {
             }
         };
         // Only an admitted file makes older drops give way, and only what was deleted counts.
-        if !self.make_room(&st, incoming, short) {
+        if !self.make_room(&st, incoming, short, files_short) {
             undo(&mut st);
             return Err(too_much());
+        }
+        if files_short > 0 {
+            match free_files(&self.root) {
+                // The new batch's two directories are made already: the file and its part remain.
+                Ok(files)
+                    if files >= MIN_FREE_FILES + files_needed - if created { 2 } else { 0 } => {}
+                Ok(files) => {
+                    undo(&mut st);
+                    return Err(too_few_files(files));
+                }
+                Err(e) => {
+                    undo(&mut st);
+                    return Err(e);
+                }
+            }
         }
         if short > 0 {
             let free = match free_space(&self.root) {
@@ -591,7 +633,7 @@ impl Transfers {
 
     /// The kept batches on disk, oldest first, with their sizes; those past their time
     /// (`keep`) are deleted on the way. Batches in use are left out.
-    fn kept(&self, st: &State) -> Vec<(SystemTime, u64, PathBuf)> {
+    fn kept(&self, st: &State) -> Vec<Kept> {
         let busy: HashSet<&Path> = st
             .batches
             .values()
@@ -613,42 +655,50 @@ impl Transfers {
                     let size = dir_size(&dir);
                     let old = since.elapsed().is_ok_and(|age| age > self.keep);
                     if !(old && remove_batch(&dir)) {
-                        kept.push((since, size, dir));
+                        let files = count_entries(&dir) + 1;
+                        kept.push(Kept {
+                            since,
+                            size,
+                            files,
+                            dir,
+                        });
                     }
                 }
                 // Gone once empty (a closed pane's).
                 let _ = std::fs::remove_dir(pane.path());
             }
         }
-        kept.sort_by_key(|(modified, _, _)| *modified);
+        kept.sort_by_key(|k| k.since);
         kept
     }
 
     /// Deletes the oldest kept batches until `incoming` more bytes stay within the kept limit
-    /// and at least `free` bytes were freed. A batch that could not be deleted still counts.
-    /// Whether both hold now.
-    fn make_room(&self, st: &State, incoming: u64, free: u64) -> bool {
+    /// and at least `free` bytes and `files` files were freed. A batch that could not be deleted
+    /// still counts. Whether all hold now.
+    fn make_room(&self, st: &State, incoming: u64, free: u64, files: u64) -> bool {
         let kept = self.kept(st);
-        let mut total: u64 = kept.iter().map(|(_, size, _)| size).sum();
-        let mut freed = 0u64;
+        let mut total: u64 = kept.iter().map(|k| k.size).sum();
+        let (mut freed, mut freed_files) = (0u64, 0u64);
         let mut count = kept.len();
         // Room for one more batch, however small its files.
-        let fits = |total: u64, freed: u64, count: usize| {
+        let fits = |total: u64, freed: u64, freed_files: u64, count: usize| {
             total.saturating_add(incoming) <= self.max_kept
                 && freed >= free
+                && freed_files >= files
                 && count < MAX_KEPT_BATCHES
         };
-        for (_, size, dir) in kept {
-            if fits(total, freed, count) {
+        for k in kept {
+            if fits(total, freed, freed_files, count) {
                 break;
             }
-            if remove_batch(&dir) {
-                total = total.saturating_sub(size);
-                freed += size;
+            if remove_batch(&k.dir) {
+                total = total.saturating_sub(k.size);
+                freed += k.size;
+                freed_files += k.files;
                 count -= 1;
             }
         }
-        fits(total, freed, count)
+        fits(total, freed, freed_files, count)
     }
 
     /// File `index` of batch `serial` arrived whole at its place. When it is the last, types
@@ -837,7 +887,9 @@ impl Transfers {
         if let Err(e) = sent {
             return close(&mut writer, StreamClose::Internal(e));
         }
-        // The caller says it has it all, or gives up.
+        // The caller says it has it all, or gives up; one that says nothing is not waited on
+        // for ever, holding the pane's download slot.
+        let _ = writer.set_read_timeout(Some(self.ack));
         loop {
             match stream::read_frame(&mut reader) {
                 Ok(Some(StreamFrame::End)) => return close(&mut writer, StreamClose::Ok),

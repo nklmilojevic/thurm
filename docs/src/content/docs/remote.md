@@ -377,7 +377,7 @@ the same. Limits:
 | One file | 4 GiB |
 | Files in one drop | 256 |
 | Files on their way to one pane | 64 |
-| Drops not complete yet | 8 per app, 32 in all, and 512 of their files waiting for the rest |
+| Drops not complete yet | 8 per app, 32 in all, and 512 files in them, sent or not |
 | Space left free on the host's disk | 1 GiB, and room for 10 000 more files: the oldest finished drops give way for the space, and an upload that still does not fit is refused |
 | Kept | 24 hours from when a drop was complete (one never complete: from its last write), 8 GiB and 1024 drops in all, drops on their way included (every file and folder counts as 4 KiB at least, an empty one too): the oldest finished drops go first, and a file that still does not fit is refused |
 
@@ -536,8 +536,10 @@ reach the Mac's disk, clipboard, or credentials without you doing something:
   sites. This is how any port forward behaves; a host you would not give those
   cookies to should keep `forward_links = false`, and its links then open on the
   Mac as they are.
-- **Files.** Only what you paste or drop goes to the host, and only the files you
-  preview or download come back.
+- **Files.** Only files you paste, drop, or send with **Send Copied Files** go to the
+  host, and only the files you preview or download come back. A download into
+  `~/Downloads` is written into the name it reserved, never over a file that took
+  that name meanwhile.
 - **Over Tailscale.** The host admits this Mac by its Tailscale identity. On
   this Mac, the tunnel's socket and Thurm's dial socket (next to the daemon's)
   are yours alone, and the dial socket reaches tailnet devices only.

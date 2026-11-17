@@ -1687,7 +1687,7 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Downloads the file at `path` on this pane's host into `dir` (`~/Downloads`) under a
     /// free name, reserved now so nothing else takes it, with progress and Cancel in the toast.
     /// Shows the file in Finder when done.
-    func download(remotePath path: String, into dir: URL, start: Core.DownloadStarter = Core.startDownload,
+    func download(remotePath path: String, into dir: URL, start: Core.DownloadStarter = Core.startReservedDownload,
                   reveal: @escaping (URL) -> Void = { NSWorkspace.shared.activateFileViewerSelecting([$0]) }) {
         let name = (path as NSString).lastPathComponent
         guard let dest = SessionManager.reserveFreeName(name.isEmpty ? "file" : name, in: dir) else {
@@ -1705,8 +1705,8 @@ final class TerminalView: NSView, NSTextInputClient {
             finished = true
             self?.endTransfer(item)
             if outcome.error != nil {
-                // The reserved name goes with a download that did not finish.
-                try? FileManager.default.removeItem(at: dest)
+                // The reserved file went with it, if the name still held it (the download sees
+                // to that: it is the one that can tell it is still ours).
                 if outcome.cancelled {
                     self?.showToast("Download of \(name) cancelled")
                 } else if let e = outcome.error {

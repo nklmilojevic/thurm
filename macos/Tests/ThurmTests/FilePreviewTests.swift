@@ -291,6 +291,8 @@ final class FilePreviewTests: XCTestCase {
         // A file URL printed on the host names the host's file, whatever host it carries.
         XCTAssertEqual(try TerminalFileReference.fileURL(URL(string: "file://devbox/tmp/My%20Report.pdf")!)
             .remotePaths(), ["/tmp/My Report.pdf"])
+        // An absolute path may hold `://` in a name; a URL is still no path.
+        XCTAssertEqual(try TerminalFileReference.path("/tmp/a://b").remotePaths(), ["/tmp/a://b"])
         for bad in ["~root/x", "sftp://host/tmp/a.pdf", "host:/tmp/a.pdf", "user@host:report.pdf"] {
             XCTAssertThrowsError(try TerminalFileReference.path(bad).remotePaths(), bad) {
                 XCTAssertEqual($0 as? FilePreviewError, .invalid)

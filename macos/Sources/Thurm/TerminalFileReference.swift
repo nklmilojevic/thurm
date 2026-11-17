@@ -121,7 +121,8 @@ enum TerminalFileReference: Equatable {
             }
             path = parts.path
         case .path(let value):
-            guard !value.contains("://") else { throw FilePreviewError.invalid }
+            // A URL is not a path; an absolute path may hold `://` in a name.
+            guard value.hasPrefix("/") || !value.contains("://") else { throw FilePreviewError.invalid }
             let base = Self.withoutLocationSuffix(value)
             if let colon = base.firstIndex(of: ":"), !base[..<colon].contains("/") {
                 throw FilePreviewError.invalid

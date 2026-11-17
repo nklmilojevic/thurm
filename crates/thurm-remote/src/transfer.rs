@@ -496,6 +496,79 @@ pub enum Downloaded {
     Saved(DownloadInfo),
 }
 
+/// Fetches the file at `path`, as `pane` sees it, into `reserved`: an empty file the caller
+/// made to hold the name (in a folder others write to, like Downloads). The file goes into that
+/// very file, never by a rename over its name: if something else took the name since (the
+/// reserved file is gone, replaced, or no longer empty), the download is refused and what is
+/// there is left alone. A download that fails or is cancelled deletes the reserved file, if it
+/// is still the one.
+pub fn download_reserved(
+    host: Host,
+    pane: PaneId,
+    path: &str,
+    reserved: &Path,
+    cancel: &Cancel,
+    mut progress: impl FnMut(Progress),
+) -> Result<DownloadInfo, TransferError> {
+    use std::os::unix::fs::MetadataExt;
+    if !host.client.has_capability(CAP_TRANSFER) {
+        return Err(TransferError::Unsupported);
+    }
+    let changed = || {
+        TransferError::Local(format!(
+            "{} changed since it was reserved; nothing was saved over it",
+            reserved.display()
+        ))
+    };
+    // Never through a link put in its place, and only into the empty file reserved.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(reserved)
+        .map_err(|_| changed())?;
+    let meta = file
+        .metadata()
+        .map_err(|e| TransferError::Local(format!("{}: {e}", reserved.display())))?;
+    if !meta.is_file() || meta.len() != 0 {
+        return Err(changed());
+    }
+    let ours = (meta.dev(), meta.ino());
+    // On a failure, the reserved file goes, but only if the name still holds it.
+    let give_back = || {
+        if std::fs::symlink_metadata(reserved).is_ok_and(|m| (m.dev(), m.ino()) == ours) {
+            let _ = std::fs::remove_file(reserved);
+        }
+    };
+    let got = (|| {
+        let info = host.client.download_begin(pane, path, None)?;
+        let ticket = info
+            .ticket
+            .as_deref()
+            .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
+        let (mut reader, mut writer, _watch, handle) = open_watched(host.socket, ticket, cancel)?;
+        if let Err(e) = receive(
+            &mut reader,
+            file,
+            reserved,
+            info.size,
+            cancel,
+            &mut progress,
+        ) {
+            abort(writer, &handle);
+            return Err(e);
+        }
+        writer
+            .finish()
+            .map_err(|e| TransferError::Remote(e.to_string()))
+            .and_then(|()| wait(reader, cancel))?;
+        Ok(info)
+    })();
+    if got.is_err() {
+        give_back();
+    }
+    got
+}
+
 /// Fetches the file at `path`, as `pane` sees it, into `dest` (written beside it first, then
 /// moved into place). With `if_version` still the file's version, writes nothing. A file over
 /// `max_bytes` is refused before anything is sent.

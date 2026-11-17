@@ -3516,8 +3516,11 @@ impl Daemon {
                 size,
                 batch,
             } => {
-                self.pane(pane)
-                    .ok_or_else(|| format!("no such pane: {pane}"))?;
+                // Its paths go to the program in the pane: a pane whose program ended (held
+                // open) takes no files.
+                if !self.with_pane(pane, |_, st| st.info.alive)? {
+                    return Err("This terminal has closed.".into());
+                }
                 let principal = client.principal.lock().clone().unwrap_or_default();
                 self.transfers
                     .upload_begin(self, client.id, principal, pane, &name, size, batch)
@@ -3578,13 +3581,18 @@ impl Daemon {
             .ok_or("the app sending the files went away")?;
         between();
         self.with_input_pane(client, pane, |p, st| {
+            // A program that ended while its files came has nothing to type them to.
+            if !st.info.alive {
+                return Err("This terminal has closed.".to_owned());
+            }
             self.used_by(&asker, st);
             st.agent.prompt.interrupted();
             st.agent.user_input();
             self.acknowledge_programs(pane, st);
             self.pane_read(pane);
             p.write(st.term.paste(text));
-        })
+            Ok(())
+        })?
     }
 
     /// [`Request::Ext`]: a method of the extension API, its parameters and result as JSON text.
