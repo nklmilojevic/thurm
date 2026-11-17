@@ -433,6 +433,13 @@ impl Client {
         }
     }
 
+    /// A process of this daemon's user on this machine: not a tailnet caller, nor another user.
+    pub fn is_local_peer(&self) -> bool {
+        self.principal.lock().as_ref().is_none_or(|p| {
+            p.kind == thurm_proto::PrincipalKind::Peer && p.uid == Some(unsafe { libc::getuid() })
+        })
+    }
+
     /// `n` clipboard bytes left the queue. Never below zero: after [`Client::writer_ended`]
     /// set the count to zero, a send that counted its message and then failed gives it back
     /// to nothing.
@@ -2853,10 +2860,7 @@ impl Daemon {
                 // Plugins' questions go only to a desktop app of this user on this machine:
                 // a tailnet caller or a phone saying so is not trusted with them.
                 if has(thurm_proto::CAP_EXT_UI) {
-                    let local = client.principal.lock().as_ref().is_none_or(|p| {
-                        p.kind == thurm_proto::PrincipalKind::Peer
-                            && p.uid == Some(unsafe { libc::getuid() })
-                    });
+                    let local = client.is_local_peer();
                     let desktop = ui && !client.mobile.load(Ordering::Relaxed);
                     let app = client
                         .socket
@@ -4809,11 +4813,22 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         let (client, _rx) = daemon.add_client();
-        client.send(ServerMessage::Event(Event::ClipboardStore {
+        client.send(ServerMessage::Event(Event::ClipboardWrite {
             pane: 1,
-            text: "x".repeat(thurm_proto::CLIP_MAX),
+            id: 1,
+            text: Some("x".repeat(thurm_proto::CLIP_MAX)),
         }));
         assert!(!client.backlogged());
+        assert_eq!(
+            client.clip_queued.load(Ordering::SeqCst),
+            thurm_proto::CLIP_MAX
+        );
+        // An OSC 52 copy, sent to every app and phone, is not the tools' to count: a phone
+        // that stops reading must not stop them.
+        client.send(ServerMessage::Event(Event::ClipboardStore {
+            pane: 1,
+            text: "y".repeat(1000),
+        }));
         assert_eq!(
             client.clip_queued.load(Ordering::SeqCst),
             thurm_proto::CLIP_MAX
@@ -4839,9 +4854,10 @@ mod tests {
             result: Ok(Response::ClipboardData { data: vec![0; n] }),
         };
         client.send(data(100));
-        client.send(ServerMessage::Event(Event::ClipboardStore {
+        client.send(ServerMessage::Event(Event::ClipboardWrite {
             pane: 1,
-            text: "x".repeat(30),
+            id: 2,
+            text: Some("x".repeat(30)),
         }));
         assert_eq!(client.clip_queued.load(Ordering::SeqCst), 130);
         let first = rx.recv().unwrap();

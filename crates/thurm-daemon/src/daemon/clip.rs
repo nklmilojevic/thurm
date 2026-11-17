@@ -25,11 +25,12 @@ pub(super) fn max_held() -> usize {
         .unwrap_or(MAX_HELD)
 }
 
-/// The clipboard contents `msg` carries, for [`Client::clip_queued`]: counted while it is
-/// queued for the client, until its writer has written or dropped it.
+/// The clipboard tools' contents `msg` carries, for [`Client::clip_queued`]: counted while it
+/// is queued for the client, until its writer has written or dropped it. Only the tools' own (a
+/// copy handed to the app, a paste's answer): an OSC 52 copy goes to every app and phone, and a
+/// phone that stops reading must not stop the tools in every pane.
 pub fn clip_weight(msg: &ServerMessage) -> usize {
     match msg {
-        ServerMessage::Event(Event::ClipboardStore { text, .. }) => text.len(),
         ServerMessage::Event(Event::ClipboardWrite { text, .. }) => {
             text.as_ref().map_or(0, String::len)
         }
@@ -152,10 +153,7 @@ impl Daemon {
     ) -> Result<Slot, String> {
         // A clipboard tool runs in a pane, a process of this user on this machine: a phone or
         // a tailnet caller reading or writing the clipboard through a pane is not one.
-        let local = caller.principal.lock().as_ref().is_none_or(|p| {
-            p.kind == thurm_proto::PrincipalKind::Peer && p.uid == Some(unsafe { libc::getuid() })
-        });
-        if !local || caller.mobile.load(Ordering::Relaxed) {
+        if !caller.is_local_peer() || caller.mobile.load(Ordering::Relaxed) {
             return Err("clipboard tools are for programs on this machine".into());
         }
         let osc52 = self.config.read().terminal.osc52;
@@ -309,11 +307,10 @@ impl Daemon {
                     }))
                 }),
         };
-        let result = match sent {
+        match sent {
             Err(e) => Err(e),
             Ok(()) => self.wait_answer(caller, ui.id, answer),
-        };
-        result
+        }
     }
 
     fn wait_answer(

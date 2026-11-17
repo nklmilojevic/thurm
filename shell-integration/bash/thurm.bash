@@ -39,7 +39,12 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
     _thurm_p=${_thurm_p#:}
     _thurm_p=${_thurm_p%:}
     if [[ -z "${DISPLAY-}${WAYLAND_DISPLAY-}" ]]; then
-      _thurm_p="$THURM_CLIP_SHIMS${_thurm_p:+:$_thurm_p}"
+      # Nothing left but an empty entry (the current directory), as in PATH=: — kept.
+      if [[ -n "$_thurm_p" || ":$PATH:" == *"::"* ]]; then
+        _thurm_p="$THURM_CLIP_SHIMS:$_thurm_p"
+      else
+        _thurm_p=$THURM_CLIP_SHIMS
+      fi
     fi
     export PATH="$_thurm_p"
     builtin unset _thurm_p
