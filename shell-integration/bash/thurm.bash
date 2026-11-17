@@ -32,7 +32,10 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
   # above made their changes.
   if [[ -n "${THURM_CLIP_SHIMS-}" ]]; then
     _thurm_p=":$PATH:"
-    _thurm_p=${_thurm_p//":$THURM_CLIP_SHIMS:"/:}
+    # Again until none is left: two entries side by side share the colon between them.
+    while [[ "$_thurm_p" == *":$THURM_CLIP_SHIMS:"* ]]; do
+      _thurm_p=${_thurm_p//":$THURM_CLIP_SHIMS:"/:}
+    done
     _thurm_p=${_thurm_p#:}
     _thurm_p=${_thurm_p%:}
     export PATH="$THURM_CLIP_SHIMS${_thurm_p:+:$_thurm_p}"

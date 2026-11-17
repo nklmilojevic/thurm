@@ -613,6 +613,12 @@ pub enum Request {
         #[serde(with = "bytes::option")]
         data: Option<Vec<u8>>,
     },
+    /// A clipboard tool in `pane` empties the clipboard (`xsel --clear`, `wl-copy --clear`): sent
+    /// to the apps as [`Event::ClipboardClear`], under the same rules as a copy. Requires
+    /// [`CAP_CLIP_QUERY`].
+    ClipboardClear {
+        pane: PaneId,
+    },
 }
 
 /// Where a file of [`Request::UploadBegin`] goes in a batch: the `index`th of `count` files
@@ -924,6 +930,12 @@ pub enum Event {
         pane: PaneId,
         id: u64,
         mime: String,
+    },
+    /// A clipboard tool in `pane` empties the clipboard ([`Request::ClipboardClear`]): the app
+    /// clears it, leaving no type at all, as it would store a copy. Sent only to UIs with
+    /// [`CAP_CLIP_QUERY`].
+    ClipboardClear {
+        pane: PaneId,
     },
 }
 

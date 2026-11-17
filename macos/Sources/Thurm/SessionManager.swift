@@ -1398,6 +1398,11 @@ final class SessionManager: NSObject, CoreDelegate {
                 pb.clearContents()
                 pb.setString(text, forType: .string)
             }
+        case "ClipboardClear":
+            // A clipboard tool's clear: a copy of nothing, under the same policy.
+            if Remotes.shared.clipboardWriteAllowed(host) {
+                Remotes.clearClipboard(NSPasteboard.general)
+            }
         case "ClipboardRequest":
             if let id = key { Remotes.shared.clipboardRequest(id) }
         case "PortsChanged":

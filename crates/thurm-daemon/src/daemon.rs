@@ -3136,6 +3136,7 @@ impl Daemon {
                 unreachable!("handled in handle()")
             }
             Request::ClipboardSet { pane, text } => self.clipboard_set(pane, text),
+            Request::ClipboardClear { pane } => self.clipboard_clear(pane),
             Request::ClipboardAnswer { id, data } => self.clipboard_answer(client.id, id, data),
             Request::SetLayout { json } => {
                 serde_json::from_str::<Layout>(&json)

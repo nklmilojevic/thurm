@@ -50,19 +50,46 @@ fn answer_timeout() -> Duration {
 }
 
 impl Daemon {
-    pub(super) fn clipboard_set(&self, pane: PaneId, text: String) -> Result<Response, String> {
-        // As for an OSC 52 copy: this host's config can turn them off.
-        if !matches!(
+    /// As for an OSC 52 copy: this host's config can turn copies (and clears) off.
+    fn clipboard_writes(&self) -> Result<(), String> {
+        if matches!(
             self.config.read().terminal.osc52,
             thurm_config::Osc52Mode::Copy | thurm_config::Osc52Mode::CopyPaste
         ) {
-            return Err("copies to the clipboard are off on this host (terminal.osc52)".into());
+            Ok(())
+        } else {
+            Err("copies to the clipboard are off on this host (terminal.osc52)".into())
         }
+    }
+
+    pub(super) fn clipboard_set(&self, pane: PaneId, text: String) -> Result<Response, String> {
+        self.clipboard_writes()?;
         if text.len() > thurm_proto::CLIP_MAX {
             return Err("the text is larger than 32 MiB".into());
         }
         self.pane(pane).ok_or("no such pane")?;
         self.broadcast(Event::ClipboardStore { pane, text }, true);
+        Ok(Response::Ok)
+    }
+
+    /// Empties the clipboard: [`Event::ClipboardClear`] to the UIs that take it, which an
+    /// older app does not (it gets nothing, as a copy it could not store).
+    pub(super) fn clipboard_clear(&self, pane: PaneId) -> Result<Response, String> {
+        self.clipboard_writes()?;
+        self.pane(pane).ok_or("no such pane")?;
+        let uis: Vec<_> = self
+            .clients
+            .lock()
+            .values()
+            .filter(|c| c.ui.load(Ordering::Relaxed) && c.clip_query.load(Ordering::Relaxed))
+            .cloned()
+            .collect();
+        if uis.is_empty() {
+            return Err("no Thurm app that can clear its clipboard is connected".into());
+        }
+        for ui in uis {
+            ui.send(ServerMessage::Event(Event::ClipboardClear { pane }));
+        }
         Ok(Response::Ok)
     }
 

@@ -228,6 +228,12 @@ fn this_hosts_osc52_setting_applies_to_clipboard_tools() {
             text: "x".into(),
         });
         assert_eq!(copied.is_ok(), copy, "{osc52}: {copied:?}");
+        let cleared = tool.request(Request::ClipboardClear { pane });
+        assert_eq!(
+            cleared.is_ok(),
+            copy,
+            "a clear is a copy: {osc52}: {cleared:?}"
+        );
         for mime in [CLIP_TEXT, CLIP_TARGETS] {
             let paste_thread = get(&tool, pane, mime);
             if paste {
@@ -301,6 +307,67 @@ fn a_flood_of_pastes_is_bounded() {
     }
     assert_eq!(asked, 64);
     no_query(&rx);
+}
+
+/// A clear goes to the apps as a clear, not as empty text, and never to an older app.
+#[test]
+fn a_clear_empties_the_clipboard() {
+    let env = clip_env("clip-clear", "copy-paste");
+    let _daemon = env.start();
+    let (app, rx) = env.connect();
+    let pane = create(&app, &env.dir);
+    tool(&env)
+        .request(Request::ClipboardClear { pane })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Event::ClipboardClear { pane: p }) => {
+                assert_eq!(p, pane);
+                break;
+            }
+            Ok(Event::ClipboardStore { text, .. }) => panic!("stored {text:?} instead"),
+            Ok(_) => {}
+            Err(_) => panic!("no ClipboardClear"),
+        }
+    }
+    assert!(
+        tool(&env)
+            .request(Request::ClipboardClear { pane: u64::MAX })
+            .is_err()
+    );
+    drop(app);
+    // Only an app from before clipboard tools is left: it is sent nothing, and the tool hears.
+    let mut old = UnixStream::connect(&env.socket).unwrap();
+    let hello = Request::Hello {
+        client: "e2e-old-app".into(),
+        version: PROTOCOL_VERSION,
+        ui: true,
+        capabilities: vec![CAP_ACTIVE_SIZE.into()],
+    };
+    old.write_all(
+        &codec::encode(&Envelope {
+            id: 1,
+            request: hello,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let e = tool(&env)
+        .request(Request::ClipboardClear { pane })
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("no Thurm app"), "{e}");
+    old.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    while let Ok(Some(frame)) = codec::read_frame(&mut old) {
+        let msg: ServerMessage = codec::decode(&frame).unwrap();
+        assert!(
+            !matches!(msg, ServerMessage::Event(Event::ClipboardClear { .. })),
+            "{msg:?}"
+        );
+    }
 }
 
 #[test]
@@ -422,12 +489,12 @@ fn clipboard_tools_come_first_after_the_startup_files() {
             std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         // The user's startup files put another xclip first, keep the look-alike directory,
-        // and name the shims once more further down.
+        // and name the shims twice side by side and once more further down.
         let entries = format!(
-            "{}:{}:$PATH:{}",
+            "{}:{}:{s}:{s}:$PATH:{s}",
             real.display(),
             lookalike.display(),
-            shims.display()
+            s = shims.display()
         );
         let rc = format!("PS1='$ '\nexport PATH=\"{entries}\"\n");
         std::fs::write(home.join(".zshrc"), format!("{zsh_opts}{rc}")).unwrap();
@@ -435,10 +502,10 @@ fn clipboard_tools_come_first_after_the_startup_files() {
         std::fs::write(
             home.join(".config/fish/config.fish"),
             format!(
-                "set -gx PATH {:?} {:?} $PATH {:?}\nfunction fish_prompt; echo -n '$ '; end\n",
+                "set -gx PATH {:?} {:?} {s:?} {s:?} $PATH {s:?}\nfunction fish_prompt; echo -n '$ '; end\n",
                 real.display().to_string(),
                 lookalike.display().to_string(),
-                shims.display().to_string()
+                s = shims.display().to_string()
             ),
         )
         .unwrap();

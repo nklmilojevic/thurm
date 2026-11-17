@@ -20,6 +20,8 @@ pub enum ClipCmd {
         #[arg(long = "type", value_name = "MIME", default_value = CLIP_TEXT)]
         mime: String,
     },
+    /// Empty the clipboard.
+    Clear,
 }
 
 /// What a tool's arguments ask for.
@@ -41,8 +43,10 @@ pub enum Action {
     /// Print the types the clipboard holds, in the tool's own terms.
     Types { xclip: bool },
     /// Print the clipboard's text, then copy standard input (`xsel` with both of its standard
-    /// streams redirected and neither mode asked for).
-    PasteThenCopy,
+    /// streams redirected and neither mode asked for), one trailing newline dropped with `trim`.
+    PasteThenCopy { trim: bool },
+    /// Empty the clipboard (`xsel --clear`, `wl-copy --clear`): no type left, not empty text.
+    Clear,
     /// Print a usage line, do nothing else.
     Help(&'static str),
 }
@@ -171,15 +175,20 @@ pub fn parse(
             }
         }
         "xsel" => {
-            let (mut input, mut output, mut clear) = (false, false, false);
+            let (mut input, mut output, mut clear, mut trim) = (false, false, false, false);
             while let Some(a) = it.next() {
                 let flags: Vec<char> = match a.strip_prefix("--") {
                     Some(long) => vec![match long {
                         "input" => 'i',
                         "output" => 'o',
                         "clear" => 'c',
-                        "clipboard" | "primary" | "secondary" | "keep" | "exchange"
-                        | "nodetach" | "verbose" | "trim" | "zeroflush" => 'b',
+                        "delete" => 'd',
+                        "append" => 'a',
+                        "follow" => 'f',
+                        "exchange" => 'x',
+                        "trim" => 'T',
+                        "clipboard" | "primary" | "secondary" | "keep" | "nodetach" | "verbose"
+                        | "zeroflush" => 'b',
                         "logfile" | "display" | "selectionTimeout" | "window-name" => 't',
                         "help" | "version" => 'h',
                         _ => return Err(format!("xsel: unknown option {a}")),
@@ -194,7 +203,12 @@ pub fn parse(
                         'i' => input = true,
                         'o' => output = true,
                         'c' | 'd' => clear = true,
-                        'b' | 'p' | 's' | 'k' | 'x' | 'n' | 'v' | 'z' | 'a' | 'f' => {}
+                        'T' => trim = true,
+                        // Not done here: refused rather than run as a plain copy.
+                        'a' => return Err("xsel: --append is not supported".into()),
+                        'f' => return Err("xsel: --follow is not supported".into()),
+                        'x' => return Err("xsel: --exchange is not supported".into()),
+                        'b' | 'p' | 's' | 'k' | 'n' | 'v' | 'z' => {}
                         'l' | 't' | 'w' => {
                             operand(&mut it, "xsel", a)?;
                         }
@@ -204,11 +218,7 @@ pub fn parse(
                 }
             }
             if clear {
-                return Ok(Action::Copy {
-                    text: Some(String::new()),
-                    trim: false,
-                    echo: false,
-                });
+                return Ok(Action::Clear);
             }
             // As xsel does: the modes asked for; with none, output when standard output is not
             // a terminal and input when standard input is not (both when neither is), and output
@@ -219,14 +229,14 @@ pub fn parse(
                 asked => asked,
             };
             Ok(match (output, input) {
-                (true, true) => Action::PasteThenCopy,
+                (true, true) => Action::PasteThenCopy { trim },
                 (true, false) => Action::Paste {
                     mime: CLIP_TEXT.into(),
                     newline: false,
                 },
                 _ => Action::Copy {
                     text: None,
-                    trim: false,
+                    trim,
                     echo: false,
                 },
             })
@@ -241,8 +251,11 @@ pub fn parse(
                     }
                     "-n" | "--trim-newline" => trim = true,
                     "-c" | "--clear" => clear = true,
-                    "-o" | "--paste-once" | "-f" | "--foreground" | "-p" | "--primary"
-                    | "--regular" => {}
+                    // The text would stay after its one paste: refused rather than ignored.
+                    "-o" | "--paste-once" => {
+                        return Err("wl-copy: --paste-once is not supported".into());
+                    }
+                    "-f" | "--foreground" | "-p" | "--primary" | "--regular" => {}
                     "-t" | "--type" => {
                         let t = mime(operand(&mut it, "wl-copy", a)?)?;
                         if t != CLIP_TEXT {
@@ -270,12 +283,11 @@ pub fn parse(
                     }
                 }
             }
+            if clear {
+                return Ok(Action::Clear);
+            }
             Ok(Action::Copy {
-                text: if clear {
-                    Some(String::new())
-                } else {
-                    (!words.is_empty()).then(|| words.join(" "))
-                },
+                text: (!words.is_empty()).then(|| words.join(" ")),
                 trim,
                 echo: false,
             })
@@ -382,6 +394,7 @@ pub fn run(cmd: ClipCmd, remote: bool) -> Result<ExitCode, Box<dyn std::error::E
                 newline: false,
             },
         },
+        ClipCmd::Clear => Action::Clear,
     })?;
     Ok(ExitCode::SUCCESS)
 }
@@ -441,7 +454,7 @@ fn copy_then_echo(
 }
 
 fn perform(action: Action) -> Result<(), Box<dyn std::error::Error>> {
-    if let Action::PasteThenCopy = action {
+    if let Action::PasteThenCopy { trim } = action {
         // The copy goes ahead though the paste failed (a refused read), as xsel's does.
         let pasted = perform(Action::Paste {
             mime: CLIP_TEXT.into(),
@@ -449,7 +462,7 @@ fn perform(action: Action) -> Result<(), Box<dyn std::error::Error>> {
         });
         let copied = perform(Action::Copy {
             text: None,
-            trim: false,
+            trim,
             echo: false,
         });
         return pasted.and(copied);
@@ -485,7 +498,10 @@ fn perform(action: Action) -> Result<(), Box<dyn std::error::Error>> {
             let data = get(pane()?, CLIP_TARGETS)?;
             out.write_all(list_types(&String::from_utf8_lossy(&data), xclip).as_bytes())?;
         }
-        Action::PasteThenCopy => unreachable!("handled above"),
+        Action::PasteThenCopy { .. } => unreachable!("handled above"),
+        Action::Clear => {
+            crate::connect(false)?.request(Request::ClipboardClear { pane: pane()? })?;
+        }
     }
     out.flush()?;
     Ok(())
@@ -636,14 +652,35 @@ mod tests {
             p("xsel", &["--clipboard", "--output"]),
             Ok(paste(CLIP_TEXT))
         );
+        assert_eq!(p("xsel", &["-bc"]), Ok(Action::Clear));
+        assert_eq!(p("xsel", &["--clipboard", "--delete"]), Ok(Action::Clear));
+        // --trim drops the input's trailing newline, in either mode that copies.
+        let trimmed = Action::Copy {
+            text: None,
+            trim: true,
+            echo: false,
+        };
         assert_eq!(
-            p("xsel", &["-bc"]),
-            Ok(Action::Copy {
-                text: Some(String::new()),
-                trim: false,
-                echo: false
-            })
+            p("xsel", &["--clipboard", "--input", "--trim"]),
+            Ok(trimmed)
         );
+        assert_eq!(
+            parse("xsel", &["-b".into(), "--trim".into()], false, false),
+            Ok(Action::PasteThenCopy { trim: true })
+        );
+        // What the shim cannot do is refused, not run as a plain copy.
+        for opt in [
+            "-a",
+            "--append",
+            "-f",
+            "--follow",
+            "-x",
+            "--exchange",
+            "-bia",
+        ] {
+            let e = p("xsel", &[opt]).expect_err(opt);
+            assert!(e.contains("not supported"), "{opt}: {e}");
+        }
         // Neither -i nor -o: input when stdin is piped, output from a terminal.
         assert_eq!(p("xsel", &["-b"]), Ok(copy()));
         assert_eq!(
@@ -660,7 +697,7 @@ mod tests {
         assert_eq!(parse("xsel", &b, false, true), Ok(copy()), "piped in");
         assert_eq!(
             parse("xsel", &b, false, false),
-            Ok(Action::PasteThenCopy),
+            Ok(Action::PasteThenCopy { trim: false }),
             "both redirected: the old selection out, then the new one in"
         );
         // A mode asked for is the only one, whatever the streams.
@@ -671,7 +708,7 @@ mod tests {
         );
         assert_eq!(
             parse("xsel", &["-b".into(), "-i".into(), "-o".into()], true, true),
-            Ok(Action::PasteThenCopy)
+            Ok(Action::PasteThenCopy { trim: false })
         );
         assert!(p("xsel", &["-q"]).is_err());
     }
@@ -700,14 +737,12 @@ mod tests {
             p("wl-copy", &["--type=text/plain;charset=utf-8"]),
             Ok(copy())
         );
-        assert_eq!(
-            p("wl-copy", &["--clear"]),
-            Ok(Action::Copy {
-                text: Some(String::new()),
-                trim: false,
-                echo: false
-            })
-        );
+        assert_eq!(p("wl-copy", &["--clear"]), Ok(Action::Clear));
+        assert_eq!(p("wl-copy", &["-c"]), Ok(Action::Clear));
+        for opt in ["-o", "--paste-once"] {
+            let e = p("wl-copy", &[opt]).expect_err(opt);
+            assert!(e.contains("not supported"), "{opt}: {e}");
+        }
         assert!(p("wl-copy", &["--type", "image/png"]).is_err());
         assert!(p("wl-copy", &["--bogus"]).is_err());
     }

@@ -2113,5 +2113,9 @@ mod tests {
             ev, r#"{"ClipboardQuery":{"pane":1,"id":7,"mime":"text/plain"}}"#,
             "as the header documents it"
         );
+        assert_eq!(
+            serde_json::to_string(&Event::ClipboardClear { pane: 1 }).unwrap(),
+            r#"{"ClipboardClear":{"pane":1}}"#
+        );
     }
 }

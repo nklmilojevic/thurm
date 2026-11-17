@@ -35,6 +35,7 @@ typedef uint64_t thurm_pane_id;
  *   {"ClipboardStore":{"pane":1,"text":"...","user":true}}   (copy on select: the user's own
  *                                        selection; without "user" it is a program's OSC 52
  *                                        or clipboard tool)
+ *   {"ClipboardClear":{"pane":1}}       (a clipboard tool empties the clipboard; same policy)
  */
 typedef void (*thurm_event_cb)(void *ctx, const char *json);
 

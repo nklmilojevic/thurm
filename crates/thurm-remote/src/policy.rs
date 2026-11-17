@@ -14,8 +14,8 @@ pub enum Decision {
     Ask,
 }
 
-/// OSC 52 read from a pane of `host` (`None`: this Mac's daemon, whose own config already
-/// decided, as before remote workspaces).
+/// OSC 52 read, or a clipboard tool's paste or type listing, from a pane of `host` (`None`: this
+/// Mac's daemon, whose own config already decided, as before remote workspaces).
 pub fn clipboard_read(cfg: &Config, host: Option<&str>) -> Decision {
     let Some(host) = host else {
         return Decision::Allow;

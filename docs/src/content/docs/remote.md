@@ -353,15 +353,26 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
 - **Clipboard tools.** Programs on a Linux host that call `pbcopy`, `pbpaste`,
   `xclip`, `xsel`, `wl-copy` or `wl-paste` reach this Mac's clipboard once the
   doctor's **Clipboard tools** fix has linked them. New panes on a host
-  without `DISPLAY` or `WAYLAND_DISPLAY` have them first on `PATH`. Copies and
-  pastes follow `terminal.osc52` like OSC 52 does, on this Mac and in the
-  host's own config (a paste needs `paste` or `copy-paste` in both), and a
-  paste asks like an OSC 52 read (`clipboard_read`). Pastes carry text or a
-  PNG image (an agent's image paste works), at most 32 MiB. Listing the types
-  (`xclip -t TARGETS -o`, `wl-paste --list-types`) asks nothing, but fails
-  where reads from that host are refused (`clipboard_read = "never"`, or
-  pastes off in either `terminal.osc52`). `thurm clip copy` and `thurm clip
-  paste [--type image/png]` do the same on any host.
+  without `DISPLAY` or `WAYLAND_DISPLAY` have them first on `PATH`. What is
+  checked, and where:
+
+  | | On the host (its daemon) | On this Mac (the app) |
+  | --- | --- | --- |
+  | Copy, clear | the host's `terminal.osc52` is `copy` or `copy-paste` | this Mac's `terminal.osc52` is `copy` or `copy-paste` |
+  | Paste | the host's `terminal.osc52` is `paste` or `copy-paste` | this Mac's `terminal.osc52` is `paste` or `copy-paste`, then the host's `clipboard_read`: asks, always, or never |
+  | List the types | as a paste | as a paste, but never asks |
+
+  These are the checks an OSC 52 copy or read gets, and both sides must allow
+  it. A refused paste or listing fails the tool; listing the types
+  (`xclip -t TARGETS -o`, `wl-paste --list-types`) fails where reads from that
+  host are refused (`clipboard_read = "never"`, or pastes off in either
+  `terminal.osc52`). Pastes carry text or a PNG image (an agent's image paste
+  works), at most 32 MiB. A clear (`xsel --clear`, `wl-copy --clear`) empties
+  the clipboard, leaving no type. Options the tools cannot honour here
+  (`xsel --append`, `--follow`, `--exchange`, `wl-copy --paste-once`) are
+  refused. `thurm clip copy`, `thurm clip paste [--type image/png]` and
+  `thurm clip clear` do the same on any host; on this Mac's own panes only
+  this Mac's `terminal.osc52` applies.
 
 ## Files
 

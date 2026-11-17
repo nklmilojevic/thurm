@@ -357,16 +357,37 @@ final class Remotes {
         Core.shared.send(object: ["ClipboardReply": ["pane": key.number, "text": text]], host: key.host)
     }
 
-    /// Whether a program in `key`'s pane may read this Mac's clipboard: this Mac's panes always,
-    /// a remote pane per `clipboard_read`, asking first when it says so. `asker` says how the
-    /// program asked, in the question.
+    /// What a read of this Mac's clipboard from a pane gets, an OSC 52 read and a clipboard tool's
+    /// paste alike.
+    enum ClipboardRead: Equatable { case allow, ask, deny }
+
+    /// The decision for a read: `policy` is `policy::clipboard_read` for a remote pane's host
+    /// ("allow", "ask" or "deny": this Mac's `terminal.osc52` must allow pastes, then the host's
+    /// `clipboard_read` decides), nil for this Mac's own panes, whose daemon applied this Mac's
+    /// `terminal.osc52` already. Listing the types (`listing`) is not asked about, but is refused
+    /// where reads are.
+    static func clipboardRead(policy: String?, listing: Bool) -> ClipboardRead {
+        guard let policy else { return .allow }
+        switch policy {
+        case "allow": return .allow
+        case "ask": return listing ? .allow : .ask
+        default: return .deny
+        }
+    }
+
+    /// `policy::clipboard_read` for `key`'s host; nil for this Mac's own panes.
+    private func clipboardReadPolicy(_ key: PaneKey) -> String? {
+        guard key.isRemote else { return nil }
+        return Core.shared.remoteCall(["op": "clipboard_read", "host": key.host]) as? String ?? "deny"
+    }
+
+    /// Whether a program in `key`'s pane may read this Mac's clipboard (see ``clipboardRead``),
+    /// asking first when the policy says so. `asker` says how the program asked, in the question.
     private func clipboardReadAllowed(_ key: PaneKey, asker: String) -> Bool {
-        guard key.isRemote else { return true }
-        let decision = Core.shared.remoteCall(["op": "clipboard_read", "host": key.host]) as? String ?? "deny"
-        switch decision {
-        case "allow":
+        switch Self.clipboardRead(policy: clipboardReadPolicy(key), listing: false) {
+        case .allow:
             return true
-        case "ask":
+        case .ask:
             let alert = NSAlert()
             alert.messageText = "\(key.host) wants to read your clipboard"
             alert.informativeText = "A program in a pane on \(key.host) asked for the contents of this Mac's "
@@ -385,21 +406,20 @@ final class Remotes {
             default:
                 return false
             }
-        default:
+        case .deny:
             return false
         }
     }
 
     /// A clipboard tool in `key`'s pane (pbpaste, xclip -o, wl-paste) asks for this Mac's
-    /// clipboard: decided like an OSC 52 read. Listing the types it holds asks nothing, unless
-    /// reads from that host are refused.
+    /// clipboard: decided as an OSC 52 read is (``clipboardRead``). Listing the types it holds
+    /// asks nothing, unless reads from that host are refused.
     func clipboardQuery(_ key: PaneKey, id: UInt64, mime: String) {
         let pb = NSPasteboard.general
         let answer = { (data: Data?) in Core.shared.clipboardAnswer(host: key.host, id: id, data: data) }
         if mime == Self.clipTargets {
-            let refused = key.isRemote
-                && (Core.shared.remoteCall(["op": "clipboard_read", "host": key.host]) as? String ?? "deny") == "deny"
-            answer(refused ? nil : Data(Self.clipboardTypes(pb).map { $0 + "\n" }.joined().utf8))
+            let read = Self.clipboardRead(policy: clipboardReadPolicy(key), listing: true)
+            answer(read == .deny ? nil : Data(Self.clipboardTypes(pb).map { $0 + "\n" }.joined().utf8))
             return
         }
         let tool = mime == Self.clipPNG ? "an image, through a clipboard tool" : "a clipboard tool such as xclip or pbpaste"
@@ -411,6 +431,11 @@ final class Remotes {
     static let clipTargets = "TARGETS"
     /// The most a clipboard tool gets (the daemon refuses more).
     static let clipMax = 32 * 1024 * 1024
+
+    /// A clipboard tool's clear: nothing left, no empty text a later paste would find.
+    static func clearClipboard(_ pb: NSPasteboard) {
+        pb.clearContents()
+    }
 
     /// The types a clipboard tool can paste from `pb`, without reading them: a large or lazily
     /// provided clipboard is fetched only for a paste the user allowed.

@@ -512,7 +512,9 @@ impl Client {
         }
         if matches!(
             env.request,
-            Request::ClipboardSet { .. } | Request::ClipboardGet { .. }
+            Request::ClipboardSet { .. }
+                | Request::ClipboardGet { .. }
+                | Request::ClipboardClear { .. }
         ) && !matches!(&*self.hello.lock(), Some(Response::Hello { capabilities, .. })
                 if capabilities.iter().any(|c| c == thurm_proto::CAP_CLIP_QUERY))
         {
