@@ -197,11 +197,12 @@ extension SessionManager {
                                                               onPane: pane != nil), on: pane)
                     return
                 }
+                // The link first: the notice may be an alert, which waits for the user.
+                NSWorkspace.shared.open(target)
                 if jsonBool(v?["new"]) == true {
                     SessionManager.show(ForwardNotice.opened(host: host, remotePort: f.remotePort, localPort: f.localPort,
                                                              url: link, onPane: pane != nil), on: pane, forward: f)
                 }
-                NSWorkspace.shared.open(target)
             }
         }
     }

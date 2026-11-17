@@ -277,8 +277,10 @@ pub fn deliver(
     seen: HashMap<PaneId, Seen>,
     joined: &[u64],
 ) -> Delivery {
+    // Copied only for a client that joined: most looks have none.
     let mut first: Vec<(PaneId, Seen)> = seen
         .iter()
+        .filter(|_| !joined.is_empty())
         .map(|(p, s)| {
             let mut s = s.clone();
             s.ports.sort();
