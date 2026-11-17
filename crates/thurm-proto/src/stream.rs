@@ -2,10 +2,10 @@
 //!
 //! A stream takes two connections. On the normal one, a request reserves the stream and the
 //! daemon answers with a single-use ticket ([`Request::DialBegin`](crate::Request::DialBegin) →
-//! [`Response::Ticket`](crate::Response::Ticket)). A second connection to the same socket says
-//! `Hello`, presents the ticket ([`Request::StreamOpen`](crate::Request::StreamOpen)) and, once
-//! the daemon answers `Ok`, both sides send only [`StreamFrame`]s on it, in the length framing
-//! of [`codec`](crate::codec).
+//! [`Response::Ticket`](crate::Response::Ticket)), good while that connection stays open. A
+//! second connection to the same socket says `Hello`, presents the ticket
+//! ([`Request::StreamOpen`](crate::Request::StreamOpen)) and, once the daemon answers `Ok`, both
+//! sides send only [`StreamFrame`]s on it, in the length framing of [`codec`](crate::codec).
 //!
 //! Frames rather than raw bytes: the tailnet path is a WebSocket relay, and neither it nor an
 //! ssh socket forward is sure to carry a socket half-close. [`StreamFrame::End`] is the
@@ -59,21 +59,35 @@ impl std::fmt::Display for StreamClose {
     }
 }
 
-/// Writes one frame.
+/// Writes one frame. A frame over [`MAX_FRAME`] (a close reason too long) is refused with
+/// `InvalidInput` before anything is written: the other side could not read it.
 pub fn write_frame<W: Write>(w: &mut W, frame: &StreamFrame) -> io::Result<()> {
-    w.write_all(&crate::codec::encode(frame)?)?;
-    w.flush()
+    write_encoded(w, crate::codec::encode(frame)?)
 }
 
-/// Writes `data` as one [`StreamFrame::Data`] without copying it (at most [`MAX_DATA`]).
+/// Writes `data` as one [`StreamFrame::Data`] without copying it. More than [`MAX_DATA`] is
+/// refused like an oversized frame in [`write_frame`].
 pub fn write_data<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
     #[derive(Serialize)]
     enum Borrowed<'a> {
         Data(#[serde(with = "crate::bytes")] &'a [u8]),
     }
-    debug_assert!(data.len() <= MAX_DATA);
-    w.write_all(&crate::codec::encode(&Borrowed::Data(data))?)?;
+    if data.len() > MAX_DATA {
+        return Err(too_large(io::ErrorKind::InvalidInput));
+    }
+    write_encoded(w, crate::codec::encode(&Borrowed::Data(data))?)
+}
+
+fn write_encoded<W: Write>(w: &mut W, encoded: Vec<u8>) -> io::Result<()> {
+    if encoded.len() - 4 > MAX_FRAME {
+        return Err(too_large(io::ErrorKind::InvalidInput));
+    }
+    w.write_all(&encoded)?;
     w.flush()
+}
+
+fn too_large(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(kind, "stream frame too large")
 }
 
 /// Reads one frame; `Ok(None)` when the connection ends between frames. A frame over
@@ -87,10 +101,7 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Option<StreamFrame>> {
     }
     let len = u32::from_le_bytes(len) as usize;
     if len > MAX_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "stream frame too large",
-        ));
+        return Err(too_large(io::ErrorKind::InvalidData));
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
@@ -135,6 +146,28 @@ mod tests {
             read_frame(&mut borrowed.as_slice()).unwrap(),
             Some(StreamFrame::Data(data))
         );
+    }
+
+    #[test]
+    fn a_frame_the_reader_would_refuse_is_never_written() {
+        let longest = "x".repeat(MAX_FRAME - 16);
+        let mut wire = Vec::new();
+        write_frame(
+            &mut wire,
+            &StreamFrame::Close(StreamClose::Internal(longest.clone())),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut wire.as_slice()).unwrap(),
+            Some(StreamFrame::Close(StreamClose::Internal(longest)))
+        );
+        let mut wire = Vec::new();
+        let why = StreamClose::Refused("x".repeat(MAX_FRAME));
+        let e = write_frame(&mut wire, &StreamFrame::Close(why)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let e = write_data(&mut wire, &vec![0; MAX_DATA + 1]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(wire.is_empty());
     }
 
     #[test]

@@ -81,7 +81,7 @@ fn handshake(stream: &UnixStream, ticket: &str) -> Result<StreamReader, ClientEr
     if !capabilities.iter().any(|c| c == CAP_STREAMS) {
         return Err(ClientError::Daemon(NO_STREAMS.into()));
     }
-    ask(
+    let opened = ask(
         stream,
         &mut r,
         2,
@@ -89,6 +89,10 @@ fn handshake(stream: &UnixStream, ticket: &str) -> Result<StreamReader, ClientEr
             ticket: ticket.to_owned(),
         },
     )?;
+    // Only Ok says the daemon switched the connection to frames.
+    if !matches!(opened, Response::Ok) {
+        return Err(ClientError::Daemon(UNREADABLE_ANSWER.into()));
+    }
     // macOS refuses socket options once the peer has closed; reading then ends anyway.
     let _ = stream.set_read_timeout(None);
     let _ = stream.set_write_timeout(None);
@@ -242,10 +246,12 @@ impl StreamWriter {
         Ok(())
     }
 
-    /// Ends the stream in both directions, saying `why`.
+    /// Ends the stream in both directions, saying `why`. A reason too long for one frame is
+    /// refused (`InvalidInput`), and the stream is aborted instead.
     pub fn close(mut self, why: StreamClose) -> io::Result<()> {
+        stream::write_frame(&mut self.socket, &StreamFrame::Close(why))?;
         self.closed = true;
-        stream::write_frame(&mut self.socket, &StreamFrame::Close(why))
+        Ok(())
     }
 }
 
@@ -387,6 +393,25 @@ mod tests {
     }
 
     #[test]
+    fn a_close_reason_too_long_aborts_instead() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ours, server) = fake_daemon("t7", move |peer| {
+            tx.send(stream::read_frame(peer).unwrap()).unwrap();
+        });
+        let (_r, w) = open_on(ours, "t7").unwrap();
+        let why = StreamClose::Internal("x".repeat(MAX_DATA * 2));
+        assert_eq!(
+            w.close(why).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            Some(StreamFrame::Close(StreamClose::Aborted))
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn a_daemon_without_streams_is_refused_before_the_ticket() {
         let (ours, mut peer) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
@@ -399,6 +424,32 @@ mod tests {
             panic!("opened without streams");
         };
         assert_eq!(e, NO_STREAMS);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_answer_other_than_ok_does_not_open_the_stream() {
+        let (ours, mut peer) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let hello: Envelope = codec::read_message(&mut peer).unwrap().unwrap();
+            let caps = [CAP_ACTIVE_SIZE, CAP_STREAMS];
+            codec::write_message(&mut peer, &hello_answer(hello.id, &caps)).unwrap();
+            let open: Envelope = codec::read_message(&mut peer).unwrap().unwrap();
+            codec::write_message(
+                &mut peer,
+                &ServerMessage::Response {
+                    id: open.id,
+                    result: Ok(Response::Panes(Vec::new())),
+                },
+            )
+            .unwrap();
+            // Shut down on refusal: no frame follows.
+            assert!(codec::read_frame(&mut peer).unwrap().is_none());
+        });
+        let Err(ClientError::Daemon(e)) = open_on(ours, "t6") else {
+            panic!("opened on an answer other than Ok");
+        };
+        assert_eq!(e, UNREADABLE_ANSWER);
         server.join().unwrap();
     }
 
