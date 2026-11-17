@@ -869,7 +869,7 @@ pub fn forward_cmd(name: &str, target: &str, local: Option<u16>, open: bool, jso
     connect_remote(name)?;
     let forwards = thurm_remote::forward::Forwards::default();
     forwards.check(name)?;
-    let (fw, _) = forwards.open(name, port, local)?;
+    let (fw, _) = forwards.open_for(name, port, local, url)?;
     let url = url
         .and_then(|u| thurm_remote::forward::rewrite(u, fw.local))
         .unwrap_or_else(|| format!("http://localhost:{}/", fw.local));

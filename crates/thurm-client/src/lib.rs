@@ -641,6 +641,22 @@ impl Client {
         }
     }
 
+    /// [`Client::dial_begin`] to the loopback address `at` only. A daemon without
+    /// [`thurm_proto::CAP_DIAL_AT`] dials as for `Any` (`127.0.0.1`, then `[::1]`).
+    pub fn dial_at(
+        &self,
+        port: u16,
+        at: thurm_proto::stream::Loopback,
+    ) -> Result<stream::Ticket, ClientError> {
+        if at.is_any() || !self.has_capability(thurm_proto::CAP_DIAL_AT) {
+            return self.dial_begin(port);
+        }
+        match self.request(Request::DialAt { port, at })? {
+            Response::Ticket { ticket, expires_ms } => Ok(stream::Ticket { ticket, expires_ms }),
+            _ => Err(ClientError::Daemon(UNREADABLE_ANSWER.into())),
+        }
+    }
+
     /// Reserves a stream that writes a file of `size` bytes for `pane` on the daemon's host,
     /// alone or as part of `batch` ([`Request::UploadBegin`]); open it with [`stream::open`]
     /// before the ticket expires.

@@ -246,7 +246,7 @@ final class RemoteFileCache {
         for mark in marks {
             guard let pid = pid_t(mark.lastPathComponent.dropFirst(".use-".count)) else { continue }
             if pid == me { continue }
-            if Self.running(pid) {
+            if Self.running(pid, madeAfter: mark) {
                 other = true
             } else {
                 try? fm.removeItem(at: mark)
@@ -260,16 +260,36 @@ final class RemoteFileCache {
         kill(pid, 0) == 0 || errno == EPERM
     }
 
+    /// Whether the process that made `file`, `pid`, still runs: a process by that number that
+    /// started after the file was made is another one, the number used again.
+    static func running(_ pid: pid_t, madeAfter file: URL) -> Bool {
+        guard running(pid) else { return false }
+        guard let started = startTime(pid),
+              let made = (try? file.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+        else { return true }
+        return started <= made.addingTimeInterval(1)
+    }
+
+    /// When process `pid` started, if it can be told.
+    static func startTime(_ pid: pid_t) -> Date? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        let t = info.kp_proc.p_un.__p_starttime
+        return Date(timeIntervalSince1970: Double(t.tv_sec) + Double(t.tv_usec) / 1_000_000)
+    }
+
     /// Deletes the downloads in `entry` no fetch is writing: this process's, as it writes into
-    /// none of them, and those of a process that has ended (left by an earlier run). Another
-    /// running instance's are its own. Returns the bytes of those left, which still count.
+    /// none of them, and those of a process that has ended (left by an earlier run), its number
+    /// taken since by another or not. Another running instance's are its own. Returns the bytes of those left, which still count.
     private func clearStaleDownloads(in entry: URL) -> UInt64 {
         let fm = FileManager.default
         let me = getpid()
         let files = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: [.fileSizeKey])) ?? []
         return files.filter(Self.isDownload).reduce(UInt64(0)) { left, file in
             let owner = Self.downloadOwner(file)
-            let stale = owner.map { $0 == me || !Self.running($0) } ?? true
+            let stale = owner.map { $0 == me || !Self.running($0, madeAfter: file) } ?? true
             if stale, (try? fm.removeItem(at: file)) != nil { return left }
             return left + UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
@@ -302,6 +322,17 @@ final class RemoteFileCache {
         return FileManager.default.fileExists(atPath: file.path) ? file : nil
     }
 
+    /// `name` within the 255 bytes a file name may take: the part before its extension is cut,
+    /// by whole characters, and the extension kept when it fits.
+    static func fitName(_ name: String, limit: Int = 255) -> String {
+        if name.utf8.count <= limit { return name }
+        let ext = (name as NSString).pathExtension
+        let keep = ext.isEmpty || ext.utf8.count + 2 > limit ? "" : "." + ext
+        var stem = Substring(keep.isEmpty ? name : String(name.dropLast(keep.count)))
+        while stem.utf8.count + keep.utf8.count > limit { stem = stem.dropLast() }
+        return String(stem) + keep
+    }
+
     /// The cached copy in `entry` and the version it is, if any. The version is kept in the
     /// copy's own folder, written before the copy is put in use: whichever copy `.current`
     /// names, its version is its own, even when two app instances install at once.
@@ -329,7 +360,7 @@ final class RemoteFileCache {
         let fm = FileManager.default
         // A hidden name (.eslintrc.json) keeps its extension, for Quick Look to know it, but
         // not its leading dot, which marks the cache's own files.
-        let safe = name.isEmpty || name.contains("/") ? "file" : name.hasPrefix(".") ? "dot" + name : name
+        let safe = Self.fitName(name.isEmpty || name.contains("/") ? "file" : name.hasPrefix(".") ? "dot" + name : name)
         let copy = "c-\(UUID().uuidString)"
         let folder = entry.appendingPathComponent(copy, isDirectory: true)
         try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -467,11 +498,11 @@ final class RemoteFileCache {
             return (entry.standardizedFileURL, date, size(of: entry) + (stale[Self.path(entry)] ?? 0))
         }
         sized.sort { $0.date < $1.date }
-        // A download refreshing an entry replaces its copy in use, unless Quick Look shows it:
-        // only what it adds beyond that copy is reserved.
+        // A download refreshing an entry replaces its copy in use, unless Quick Look shows it,
+        // here or in another instance: only what it adds beyond that copy is reserved.
         let extra = reserved.values.reduce(UInt64(0)) { sum, r in
             var replaced: UInt64 = 0
-            if let file = current(r.entry), held[file.standardizedFileURL] == nil {
+            if let file = current(r.entry), held[file.standardizedFileURL] == nil, !usedElsewhere(r.entry) {
                 replaced = UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
             }
             return sum + (r.bytes > replaced ? r.bytes - replaced : 0)

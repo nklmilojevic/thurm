@@ -46,6 +46,8 @@ struct TransferOutcome {
     var path: String?
     var size: UInt64 = 0
     var version: String?
+    /// Where a download into a folder was saved.
+    var savedTo: String?
 
     init(error: String? = nil) {
         self.error = error
@@ -58,6 +60,7 @@ struct TransferOutcome {
         folder = json["folder"] as? Bool ?? false
         notFound = json["not_found"] as? Bool ?? false
         notModified = json["not_modified"] as? Bool ?? false
+        savedTo = json["saved_to"] as? String
         if let info = json["info"] as? [String: Any] {
             name = info["name"] as? String
             path = info["path"] as? String
@@ -535,23 +538,24 @@ final class Core {
         return id == 0 ? nil : id
     }
 
-    /// Fetches the file at `path` as `pane` sees it into `reserved`, an empty file made to hold
-    /// the name: written into that file, never renamed over the name, so a file that took the
-    /// name meanwhile is left alone (the download fails). A failed download deletes the reserved
-    /// file if it is still the one. Callbacks on the main thread; returns the id for
-    /// `cancelTransfer`.
+    /// Fetches the file at `path` as `pane` sees it into the folder `dir` as `name` (or
+    /// `name 2`… when taken), moved in by a rename that never replaces a file: nothing already
+    /// in `dir` is touched. `savedTo` in the outcome is where it went. Callbacks on the main
+    /// thread; returns the id for `cancelTransfer`.
     @discardableResult
-    func downloadReserved(_ pane: PaneKey, path: String, into reserved: Reservation,
-                          onProgress: @escaping (TransferProgress) -> Void,
-                          onFinish: @escaping (TransferOutcome) -> Void) -> UInt64? {
+    func download(_ pane: PaneKey, path: String, intoFolder dir: URL, name: String,
+                  onProgress: @escaping (TransferProgress) -> Void,
+                  onFinish: @escaping (TransferOutcome) -> Void) -> UInt64? {
         guard let c = clients[pane.host] else {
             onFinish(TransferOutcome(error: "\(pane.host) is not connected"))
             return nil
         }
         let box = Unmanaged.passRetained(TransferBox(onProgress, onFinish)).toOpaque()
         let id = path.withCString { p in
-            reserved.url.path.withCString { r in
-                thurm_download_reserved(c, pane.id, p, r, reserved.device, reserved.inode, coreTransferCallback, box)
+            dir.path.withCString { d in
+                name.withCString { n in
+                    thurm_download_to_folder(c, pane.id, p, d, n, coreTransferCallback, box)
+                }
             }
         }
         return id == 0 ? nil : id
@@ -579,16 +583,15 @@ final class Core {
                                         onProgress: onProgress, onFinish: onFinish))
     }
 
-    /// Starts a download into a reserved file (`downloadReserved`; the version and size limit
-    /// do not apply), returning what cancels it.
-    /// Starts a download into a reserved name, returning what cancels it; tests stand in for it.
-    typealias ReservedDownloadStarter = (_ pane: PaneKey, _ path: String, _ reserved: Reservation,
-                                         _ onProgress: @escaping (TransferProgress) -> Void,
-                                         _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)?
+    /// Starts a download into a folder (`download(_:path:intoFolder:name:…)`), returning what
+    /// cancels it; tests stand in for it.
+    typealias FolderDownloadStarter = (_ pane: PaneKey, _ path: String, _ dir: URL, _ name: String,
+                                       _ onProgress: @escaping (TransferProgress) -> Void,
+                                       _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)?
 
-    static let startReservedDownload: ReservedDownloadStarter = { pane, path, reserved, onProgress, onFinish in
-        cancelling(Core.shared.downloadReserved(pane, path: path, into: reserved,
-                                                onProgress: onProgress, onFinish: onFinish))
+    static let startFolderDownload: FolderDownloadStarter = { pane, path, dir, name, onProgress, onFinish in
+        cancelling(Core.shared.download(pane, path: path, intoFolder: dir, name: name,
+                                        onProgress: onProgress, onFinish: onFinish))
     }
 
     /// Starts an upload of one batch (`upload`), returning what cancels it; tests stand in for it.

@@ -70,6 +70,63 @@ fn closing_a_forward_ends_its_open_connections() {
 }
 
 #[test]
+fn a_link_to_one_loopback_dials_that_one() {
+    use thurm_proto::stream::Loopback;
+    let d = dir("family");
+    let socket = d.join("d.sock");
+    fakes::daemon(&socket);
+    let theirs = socket.clone();
+    let f = Forwards::new(d.join("forwards.json"), move |_| theirs.clone());
+    f.check("devbox").unwrap();
+    let dials = |port| {
+        fakes::DIALS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| *p == port)
+            .map(|(_, at)| *at)
+            .collect::<Vec<_>>()
+    };
+    let roundtrip = |local: u16| {
+        let mut conn = TcpStream::connect(("127.0.0.1", local)).unwrap();
+        conn.write_all(b"ping").unwrap();
+        let mut got = [0u8; 4];
+        conn.read_exact(&mut got).unwrap();
+    };
+    // The host has one program on 127.0.0.1:4000 and another on [::1]:4000.
+    let (v6, _) = f
+        .open_for("devbox", 4000, Some(0), Some("http://[::1]:4000/"))
+        .unwrap();
+    let (any, new) = f
+        .open_for("devbox", 4000, Some(0), Some("http://localhost:4000/"))
+        .unwrap();
+    assert!(new, "a localhost link reused the [::1] forward");
+    let (v4, new) = f
+        .open_for("devbox", 4000, Some(0), Some("http://127.0.0.1:4000/"))
+        .unwrap();
+    assert!(new, "a 127.0.0.1 link reused another forward");
+    assert_eq!(
+        (v6.at, any.at, v4.at),
+        (Loopback::V6, Loopback::Any, Loopback::V4)
+    );
+    roundtrip(v6.local);
+    assert_eq!(dials(4000), [Loopback::V6]);
+    roundtrip(v4.local);
+    roundtrip(any.local);
+    assert_eq!(dials(4000), [Loopback::V6, Loopback::V4, Loopback::Any]);
+    // Opened again for an [::1] link: the [::1] forward, no other.
+    let (again, new) = f
+        .open_for("devbox", 4000, Some(0), Some("http://[::1]:4000/x"))
+        .unwrap();
+    assert!(!new);
+    assert_eq!(again.id, v6.id);
+    for fw in [v6, any, v4] {
+        f.close(fw.id).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn a_forward_carries_a_bounded_number_of_connections() {
     let d = dir("cap");
     // A daemon that never answers: each connection's worker waits on it.
