@@ -5,7 +5,8 @@
 //! One thread looks at every pane at once: one process table and one socket listing per look.
 //! It runs only while such a client is connected, looks every 10 s, and doubles the wait while
 //! nothing changes, up to 5 min. A new pane, a command starting or finishing, a
-//! [`thurm_proto::Request::Ports`], or any change brings it back to 10 s.
+//! [`thurm_proto::Request::Ports`], or any change brings it back to 10 s: the next look within
+//! 10 s of the last, not at once. A client that joins gets its lists at once.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -334,6 +335,15 @@ impl Watcher {
     }
 }
 
+/// When to look after a poke: the time already set, if sooner; else the shortest wait after the
+/// last look (now, if there was none yet or it is that long ago).
+fn after_poke(next: Instant, last_look: Option<Instant>, interval: Duration) -> Instant {
+    match last_look {
+        Some(last) => next.min(last + interval),
+        None => next,
+    }
+}
+
 fn min_interval() -> Duration {
     interval_from(std::env::var("THURM_PORTS_INTERVAL_MS").ok().as_deref())
 }
@@ -351,6 +361,7 @@ fn run<H: Host>(h: Arc<H>) {
     let mut tracker = Tracker::default();
     let mut backoff = Backoff::new(min_interval());
     let mut next = Instant::now();
+    let mut last_look: Option<Instant> = None;
     loop {
         let w = h.watcher();
         let joined = {
@@ -363,10 +374,18 @@ fn run<H: Host>(h: Arc<H>) {
                     w.wake.wait(&mut st);
                     continue;
                 }
+                // A client that joined waits for its lists: look now.
+                if !st.joined.is_empty() {
+                    break;
+                }
+                // Something that may change ports: the next look comes within the shortest
+                // wait of the last one, not at once (commands run back to back would each make
+                // one).
                 if st.poked {
                     st.poked = false;
                     backoff.poke();
-                    break;
+                    next = after_poke(next, last_look, backoff.interval());
+                    continue;
                 }
                 let now = Instant::now();
                 if now >= next {
@@ -377,6 +396,7 @@ fn run<H: Host>(h: Arc<H>) {
             std::mem::take(&mut st.joined)
         };
         let roots = h.pane_roots();
+        last_look = Some(Instant::now());
         let changed = match look(&roots) {
             Some(seen) => {
                 let d = deliver(&mut tracker, Instant::now(), seen, &joined);
@@ -602,6 +622,28 @@ mod tests {
         );
         assert!(d.broadcast.is_empty());
         assert_eq!(d.retry, Some(t0 + PER_PANE));
+    }
+
+    #[test]
+    fn a_poke_brings_the_next_look_within_the_shortest_wait_not_now() {
+        let t0 = Instant::now();
+        let min = Duration::from_secs(10);
+        // Waiting 5 min after a look at t0: a poke brings it to t0 + 10 s.
+        assert_eq!(
+            after_poke(t0 + Duration::from_secs(300), Some(t0), min),
+            t0 + min
+        );
+        // Already sooner than that: unchanged.
+        let soon = t0 + Duration::from_secs(3);
+        assert_eq!(after_poke(soon, Some(t0), min), soon);
+        // Many pokes in a row (commands back to back) never make it sooner than t0 + 10 s.
+        let mut next = t0 + Duration::from_secs(300);
+        for _ in 0..100 {
+            next = after_poke(next, Some(t0), min);
+        }
+        assert_eq!(next, t0 + min);
+        // No look yet: the first one is not put off.
+        assert_eq!(after_poke(t0, None, min), t0);
     }
 
     #[test]

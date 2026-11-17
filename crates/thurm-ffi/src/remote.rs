@@ -57,15 +57,42 @@ fn forwards() -> &'static Forwards {
     static FORWARDS: std::sync::OnceLock<Forwards> = std::sync::OnceLock::new();
     FORWARDS.get_or_init(|| {
         let f = Forwards::default();
-        let me = f.clone();
-        f.on_change(move |change| {
-            let report = json!({ "forwards": forward_list(&me), "change": change });
+        report_changes(&f, |report| {
             if let Some((cb, ctx)) = *FORWARD_CB.lock() {
-                emit(cb, ctx, &report.to_string());
+                emit(cb, ctx, report);
             }
         });
         f
     })
+}
+
+/// Reports each change of `f` to `out` as `{forwards, change}`: every open forward and what
+/// changed, each forward as the app reads it ([`forward_json`]). One report at a time, each
+/// built and sent together: one built earlier is never sent after one built later, so the last
+/// list the app gets is the one in force.
+fn report_changes(f: &Forwards, out: impl Fn(&str) + Send + Sync + 'static) {
+    let me = f.clone();
+    let in_order = Mutex::new(());
+    f.on_change(move |change| {
+        let _one_at_a_time = in_order.lock();
+        let report = json!({ "forwards": forward_list(&me), "change": change_json(&change) });
+        out(&report.to_string());
+    });
+}
+
+/// `change` with its forward as [`forward_json`] gives it (`local_port`, `url`).
+fn change_json(change: &forward::Change) -> Value {
+    match change {
+        forward::Change::Opened { forward } => {
+            json!({ "change": "opened", "forward": forward_json(forward, None) })
+        }
+        forward::Change::Linked { forward } => {
+            json!({ "change": "linked", "forward": forward_json(forward, None) })
+        }
+        forward::Change::Closed { forward, why } => {
+            json!({ "change": "closed", "why": why, "forward": forward_json(forward, None) })
+        }
+    }
 }
 
 /// Every forward, with the URL it opens at.
@@ -107,8 +134,6 @@ fn emit(cb: thurm_remote_status_cb, ctx: Ctx, json: &str) {
     }
 }
 
-/// Starts or stops supervisors so they match the config's enabled remotes; updates changed
-/// ones.
 /// Brings `f` in line with the config: closes the forwards of a host pointed elsewhere (before
 /// its tunnel moves) and of a host removed or turned off, and remembers where each host points.
 /// A config that could not be read changes nothing: an empty list in its place would close
@@ -144,14 +169,23 @@ fn reconcile_forwards(
     f.retain_hosts(&enabled);
 }
 
+/// Starts or stops supervisors so they match the config's enabled remotes; updates changed
+/// ones.
 fn sync(m: &mut Manager) {
-    let loaded = Config::load();
-    reconcile_forwards(
-        forwards(),
-        &mut m.destinations,
-        loaded.as_ref().map_err(|e| e.to_string()),
-    );
-    let cfg = loaded.unwrap_or_default();
+    sync_with(m, Config::load().map_err(|e| e.to_string()));
+}
+
+/// [`sync`] with the config `loaded`. One that could not be read (being rewritten) changes
+/// nothing: taken for no hosts, it would stop every tunnel, and every forward with it.
+fn sync_with(m: &mut Manager, loaded: Result<Config, String>) {
+    let cfg = match loaded {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            log::warn!("remotes kept as they are: the config could not be read: {e}");
+            return;
+        }
+    };
+    reconcile_forwards(forwards(), &mut m.destinations, Ok(&cfg));
     let wanted: HashMap<String, thurm_config::RemoteConfig> = cfg
         .remote
         .iter()
@@ -939,6 +973,85 @@ mod tests {
         })
         .unwrap_err();
         assert!(e.contains("not a Thurm device key"), "{e}");
+    }
+
+    #[test]
+    fn an_unreadable_config_stops_no_tunnel() {
+        let remote = |name: &str| thurm_config::RemoteConfig {
+            name: name.into(),
+            host: "me@nowhere".into(),
+            socket: None,
+            // Turned off: its supervisor makes no connection.
+            enabled: false,
+            clipboard_read: Default::default(),
+            tailnet: None,
+            forward_links: true,
+        };
+        let sup = Supervisor::start(
+            remote("devbox"),
+            Ssh::new("me@nowhere").unwrap(),
+            false,
+            |_| {},
+        );
+        let mut m = Manager {
+            supervisors: HashMap::from([("devbox".to_owned(), sup)]),
+            cb: None,
+            ctx: Ctx(std::ptr::null_mut()),
+            destinations: HashMap::new(),
+        };
+        // Being rewritten: nothing stops.
+        sync_with(&mut m, Err("expected `=`".into()));
+        assert!(m.supervisors.contains_key("devbox"));
+        // Read, without the host: its tunnel stops.
+        sync_with(&mut m, Ok(Config::parse("").unwrap()));
+        assert!(m.supervisors.is_empty());
+    }
+
+    #[test]
+    fn reports_list_forwards_as_the_app_reads_them_and_in_order() {
+        let dir = std::env::temp_dir().join(format!("thurm-ffi-reports-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = Forwards::new(dir.join("forwards.json"), dir_socket);
+        let reports = std::sync::Arc::new(Mutex::new(Vec::<Value>::new()));
+        let theirs = reports.clone();
+        report_changes(&f, move |r| {
+            theirs.lock().push(serde_json::from_str(r).unwrap())
+        });
+        let (fw, _) = f.open("devbox", 7000, Some(0)).unwrap();
+        f.close(fw.id).unwrap();
+        {
+            let r = reports.lock();
+            assert_eq!(r[0]["change"]["change"], "opened");
+            assert_eq!(r[0]["change"]["forward"]["local_port"], fw.local);
+            assert_eq!(r[0]["forwards"][0]["local_port"], fw.local);
+            assert_eq!(r[1]["change"]["why"], "closed");
+            assert_eq!(r[1]["change"]["forward"]["local_port"], fw.local);
+            assert_eq!(r[1]["forwards"], json!([]));
+        }
+        // Forwards opened and closed on many threads at once: the last report is what is open.
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let f = f.clone();
+                std::thread::spawn(move || {
+                    for j in 0..10 {
+                        let (fw, _) = f.open(&format!("h{i}"), 8000 + j, Some(0)).unwrap();
+                        if j % 2 == 0 {
+                            f.close(fw.id).unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let last = reports.lock().last().unwrap()["forwards"].clone();
+        assert_eq!(last, json!(forward_list(&f)));
+        for fw in f.list() {
+            f.close(fw.id).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
