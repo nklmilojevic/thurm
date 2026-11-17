@@ -371,7 +371,9 @@ Mac instead.
 Other ways to open one:
 
 - **Shell › Forward Port…** (⌘⇧P, **Forward Port…**) lists the ports the
-  focused host's panes listen on, and takes a port number or a link.
+  focused host's panes listen on, and takes a port number or a link. With a
+  pane of this Mac focused and more than one host connected, it asks which host
+  first.
 - **Shell › Processes & Ports…**: double-click a remote row with a port.
 - `thurm remote forward devbox 5173` from a terminal, until Ctrl-C.
   `--local PORT` picks the port on the Mac (an error if the port is forwarded to

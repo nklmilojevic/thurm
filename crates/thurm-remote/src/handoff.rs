@@ -792,10 +792,10 @@ impl Registry {
 }
 
 /// `flock(LOCK_EX)` on a file, released on drop (and by the kernel if the process dies).
-struct FileLock(std::fs::File);
+pub(crate) struct FileLock(std::fs::File);
 
 impl FileLock {
-    fn acquire(path: &Path) -> Result<FileLock, String> {
+    pub(crate) fn acquire(path: &Path) -> Result<FileLock, String> {
         use std::os::fd::AsRawFd;
         let file = std::fs::OpenOptions::new()
             .create(true)
