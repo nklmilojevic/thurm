@@ -858,7 +858,9 @@ final class TerminalView: NSView, NSTextInputClient {
             ctx.timingFunction = Motion.timingFunction
             box.animator().alphaValue = 1
         }
+        // An earlier toast's fade and removal, still due, are not this one's.
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(fadeToast), object: nil)
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(removeToast), object: nil)
         perform(#selector(fadeToast), with: nil, afterDelay: duration)
     }
 

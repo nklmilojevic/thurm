@@ -373,6 +373,16 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertEqual(view.shownMessage, "Could not download x.bin: devbox is not connected")
     }
 
+    func testAToastIsNotTakenDownByAnEarlierOnesRemoval() {
+        let (view, _) = remotePane()
+        view.showToast("first", duration: 0.05)
+        // Its fade has begun and its removal is due when the next comes.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.08))
+        view.showToast("second", duration: 5)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.6))
+        XCTAssertEqual(view.shownMessage, "second")
+    }
+
     func testAFolderOrAnOlderHostSendsNothing() throws {
         let folder = dir.appendingPathComponent("folder", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

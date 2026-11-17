@@ -1482,3 +1482,37 @@ fn a_stream_closed_once_all_is_said_is_no_cancel() {
     let [batch] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
     assert!(batch.join("one.txt").exists() && batch.join("two.txt").exists());
 }
+
+#[test]
+fn drops_are_not_deleted_for_an_upload_they_cannot_make_room_for() {
+    // Permissions do not stop root.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let env = Env::new("transfer-plan-room");
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_MAX_KEPT", Path::new("10")),
+        ("THURM_TRANSFER_BLOCK", Path::new("1")),
+    ]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let other = cat_pane(&c, &dir);
+    // Two kept drops of 5 each (2 bytes, two directories, the record): one cannot be deleted.
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 2, b"aa")
+        .wait_closed()
+        .unwrap();
+    send(&env, &c, other, ("b", 0, 1), "b.txt", 2, b"bb")
+        .wait_closed()
+        .unwrap();
+    let [stuck] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    let [free] = <[PathBuf; 1]>::try_from(batches(&env, other)).unwrap();
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // 5 more and its two directories need 7 freed; the deletable drop frees 5: refused, and
+    // it is not deleted for nothing.
+    let e = c.upload_begin(other, "c.txt", 5, None).unwrap_err();
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(e.to_string().contains("does not fit"), "{e}");
+    assert!(free.join("b.txt").exists());
+    assert!(stuck.join("a.txt").exists());
+}

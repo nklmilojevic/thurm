@@ -329,6 +329,13 @@ final class FilePreviewTests: XCTestCase {
         let stagedOdd = try cache.stage(odd)
         try Data("1".utf8).write(to: stagedOdd)
         XCTAssertEqual(try cache.install(odd, staged: stagedOdd, name: "../../x", version: "v").lastPathComponent, "file")
+        // A hidden name keeps its extension, for Quick Look to know what it is.
+        let dotted = cache.entry(host: "devbox", path: "/.eslintrc.json", cwd: nil)
+        let stagedDotted = try cache.stage(dotted)
+        try Data("{}".utf8).write(to: stagedDotted)
+        let kept = try cache.install(dotted, staged: stagedDotted, name: ".eslintrc.json", version: "v")
+        XCTAssertEqual(kept.lastPathComponent, "dot.eslintrc.json")
+        XCTAssertEqual(cache.cached(dotted)?.file, kept)
 
         // Over the limit, the least recently fetched entries go; the one just stored stays.
         try FileManager.default.setAttributes([.modificationDate: Date.distantPast], ofItemAtPath: entry.path)

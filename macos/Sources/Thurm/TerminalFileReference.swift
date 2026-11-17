@@ -324,7 +324,9 @@ final class RemoteFileCache {
     /// deleted unless Quick Look shows it; then when it is let go. Returns where the new one is.
     func install(_ entry: URL, staged: URL, name: String, version: String?) throws -> URL {
         let fm = FileManager.default
-        let safe = name.isEmpty || name.contains("/") || name.hasPrefix(".") ? "file" : name
+        // A hidden name (.eslintrc.json) keeps its extension, for Quick Look to know it, but
+        // not its leading dot, which marks the cache's own files.
+        let safe = name.isEmpty || name.contains("/") ? "file" : name.hasPrefix(".") ? "dot" + name : name
         // The old version goes first: whatever fails below, a copy is never paired with a
         // version it is not (no version only means fetching again).
         let versionFile = entry.appendingPathComponent(".version")

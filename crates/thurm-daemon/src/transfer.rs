@@ -687,6 +687,12 @@ impl Transfers {
             return;
         };
         b.writers.retain(|(i, _)| *i != index);
+        // A batch whose last writer left is no longer in use: a walk of the kept drops that
+        // left it out is stale.
+        st.kept_seen = None;
+        let Some(b) = st.batches.get_mut(&serial) else {
+            return;
+        };
         let failed = matches!(b.outcome, Some(Err(_)));
         if failed {
             if let Some(f) = b.files.get_mut(&index) {
@@ -809,26 +815,41 @@ impl Transfers {
         let mut total: u64 = kept.iter().map(|k| k.size).sum();
         let (mut freed, mut freed_files) = (0u64, 0u64);
         let mut count = kept.len();
-        let mut deleted = false;
         let fits = |total: u64, freed: u64, freed_files: u64, count: usize| {
             total.saturating_add(incoming) <= self.max_kept
                 && freed >= free
                 && freed_files >= files
                 && count + busy <= self.max_drops
         };
+        // Planned first, oldest first, from the drops that can be deleted: if they are not
+        // enough, nothing is deleted for a file that is refused all the same.
+        let mut doomed = Vec::new();
         for k in kept {
             if fits(total, freed, freed_files, count) {
                 break;
             }
-            if remove_batch(&k.dir) {
+            if deletable(&k.dir) {
                 total = total.saturating_sub(k.size);
                 freed += k.size;
                 freed_files += k.files;
                 count -= 1;
-                deleted = true;
+                doomed.push(k);
             }
         }
-        (fits(total, freed, freed_files, count), deleted)
+        if !fits(total, freed, freed_files, count) {
+            return (false, false);
+        }
+        let mut deleted = false;
+        let mut ok = true;
+        for k in doomed {
+            if remove_batch(&k.dir) {
+                deleted = true;
+            } else {
+                // Deletable as far as could be told, and still not deleted: it counts.
+                ok = false;
+            }
+        }
+        (ok, deleted)
     }
 
     /// File `index` of batch `serial` arrived whole at its place. When it is the last, types
@@ -1428,6 +1449,25 @@ fn file_charge(name: &std::ffi::OsStr, m: &std::fs::Metadata) -> u64 {
         0
     };
     charge(m.len()).max(allocated)
+}
+
+/// Whether this process can delete the batch in `dir`: write and search on it, on every
+/// directory in it, and on the directory holding it.
+fn deletable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let can = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0)
+    };
+    fn dirs_ok(dir: &Path, can: &dyn Fn(&Path) -> bool) -> bool {
+        can(dir)
+            && std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .all(|e| !e.file_type().is_ok_and(|t| t.is_dir()) || dirs_ok(&e.path(), can))
+            })
+    }
+    dir.parent().is_some_and(can) && dirs_ok(dir, &can)
 }
 
 /// Deletes a kept batch; whether it is gone. What could not be deleted is logged and kept.
