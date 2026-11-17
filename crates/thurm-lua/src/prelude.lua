@@ -220,7 +220,8 @@ end
 thurm.forward = {}
 
 function thurm.forward.open(host, port, opts)
-  check(type(host) == "string" and math.type(port) == "integer",
+  check(type(host) == "string" and math.type(port) == "integer"
+      and (opts == nil or type(opts) == "table"),
     "usage: thurm.forward.open(\"host\", 5173, { browse = true })")
   opts = opts or {}
   return call("forwards.open", { host = host, port = port, browse = opts.browse == true })

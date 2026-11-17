@@ -57,7 +57,8 @@ pub struct Ext {
     /// Taken before any other of these locks.
     forward_events: Mutex<()>,
     /// The remote hosts' port lists each app relayed last ([`method::PORTS_REPORT`]), by
-    /// client, host and pane: what a new subscriber is told first.
+    /// client, host and pane: what a new subscriber is told first. Taken before `forwards`,
+    /// whose first app is the one whose lists plugins hear.
     remote_ports: Mutex<HashMap<u64, RemoteLists>>,
     /// Subscribers to `ports_changed` waiting for the look that sends them their first lists:
     /// until it is done, they hear none of the watch's changes (a look under way when they
@@ -998,6 +999,10 @@ impl Daemon {
         // An app's forwards end with it; when it was the first, the next app's are plugins'
         // now. Their events go out before any report of the next app changes them.
         let ordered = self.ext.forward_events.lock();
+        // The lists' lock is taken before the next app holds them, as a report takes it before
+        // it asks who holds them: a report of the next app is heard as the holder's only after
+        // the handover, which then does not tell it again.
+        let mut all = self.ext.remote_ports.lock();
         let (first, gone, next, next_app) = {
             let mut forwards = self.ext.forwards.lock();
             let first = forwards.keys().min() == Some(&client);
@@ -1006,10 +1011,15 @@ impl Daemon {
             let next = next_app.and_then(|id| forwards.get(&id).cloned());
             (first, gone, next, next_app)
         };
+        // Tests: a handover that takes a while, for a report of the next app meanwhile.
+        if next_app.is_some()
+            && let Some(delay) = crate::ports::test_delay("THURM_EXT_HANDOVER_DELAY_MS")
+        {
+            std::thread::sleep(delay);
+        }
         // The panes only the app that held plugins' lists knew of: no one tells of them now.
         // Under the lists' lock, as their reports: the next app's newer lists come after.
         {
-            let mut all = self.ext.remote_ports.lock();
             let had = all.remove(&client).unwrap_or_default();
             let next_has = next_app.and_then(|a| all.get(&a));
             let ended: Vec<(String, u64)> = had
@@ -1041,6 +1051,7 @@ impl Daemon {
                 lists.retain(|_, list| !list.is_known_empty());
             }
         }
+        drop(all);
         // Tests: an app gone takes a while to tell of the next app's forwards.
         if next.as_ref().is_some_and(|n| !n.is_empty())
             && let Some(delay) = crate::ports::test_delay("THURM_EXT_FORWARD_EVENT_DELAY_MS")
@@ -1054,8 +1065,18 @@ impl Daemon {
             self.forward_event(FORWARD_OPENED, f, None);
         }
         drop(ordered);
-        if self.ext.registry.lock().client_gone(client) {
+        let (changed, watched) = {
+            let mut registry = self.ext.registry.lock();
+            let watched = registry.has(client, PORTS_CHANGED);
+            (registry.client_gone(client), watched)
+        };
+        if changed {
             self.actions_changed();
+        }
+        // The last to hear of ports may have gone without unsubscribing: the watch sees whether
+        // to go on, as on `events.unsubscribe`.
+        if watched {
+            self.ports.poke();
         }
         // After the registry's cleanup: a subscription under way holds the registry's lock while
         // it marks the client as joining, so it is done by now, and its mark goes too.
