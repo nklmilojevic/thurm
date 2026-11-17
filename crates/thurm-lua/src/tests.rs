@@ -734,6 +734,9 @@ fn the_dev_server_example_opens_only_new_servers() {
     // again when a complete list has it.
     ports(None, 3, &[4001], false, false);
     ports(None, 3, &[4000, 4001], true, false);
+    // The pane read in part at load stays incomplete (a process this user cannot read): a
+    // server that shows up meanwhile listens for sure, and opens.
+    ports(None, 6, &[4300], false, false);
     // The pane read in part at load: its first complete list says what ran, opening nothing.
     ports(None, 6, &[4100], true, false);
     // The app lost devbox: its lists go; what it lists as the app connects again runs already.
@@ -771,6 +774,7 @@ fn the_dev_server_example_opens_only_new_servers() {
         json!(["devbox", 5174, true]),
         json!(["open", "http://localhost:4001/"]),
         json!(["other", 3000, true]),
+        json!(["open", "http://localhost:4300/"]),
         json!(["open", "http://localhost:4200/"]),
         json!(["open", "http://localhost:4000/"]),
     ];

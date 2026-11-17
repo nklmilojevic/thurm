@@ -188,6 +188,33 @@ final class ForwardsTests: XCTestCase {
         XCTAssertEqual(p.all.map(\.host), ["pi"])
     }
 
+    /// Connected again to this Mac's daemon, the app sends its remote lists again: those the
+    /// daemon had as running already, one it never got (sent while it was away) as it came, so a
+    /// server that started meanwhile is still news to its plugins.
+    func testRemoteListsSentAgainKeepWhatTheDaemonNeverHeard() {
+        let ext = Extensions.shared
+        var daemonUp = true
+        var reported: [[String: Any]] = []
+        ext.portsReported = { reported.append($0); return daemonUp }
+        defer { ext.portsReported = nil }
+        let host = "again-test"
+        defer { ext.remoteHostDisconnected(host) }
+        let list = { (port: Int) -> [[String: Any]] in [["port": port]] }
+        // Heard while the daemon was there: pane 1 running already, pane 2 a change.
+        ext.reportPorts(host: host, pane: 1, ports: list(5173), complete: true, initial: true)
+        ext.reportPorts(host: host, pane: 2, ports: list(8080), complete: true, initial: false)
+        // The daemon goes; pane 3 starts a server, pane 4 is listed as running already.
+        daemonUp = false
+        ext.reportPorts(host: host, pane: 3, ports: list(3000), complete: true, initial: false)
+        ext.reportPorts(host: host, pane: 4, ports: list(9000), complete: true, initial: true)
+        daemonUp = true
+        reported = []
+        ext.sendRemotePortsAgain()
+        let again = reported.filter { jsonString($0["host"]) == host }
+            .map { "\($0["pane"]!)\(jsonBool($0["initial"]) == true ? "*" : "")" }
+        XCTAssertEqual(again, ["1*", "2*", "3", "4*"])
+    }
+
     /// Whether a remote list is of servers running already is the host's daemon's to say, by
     /// `initial` on the lists it sends the app as it joins its watch; every other list is a
     /// change. No request of the app's own decides it: a server that starts right after the app
@@ -197,7 +224,7 @@ final class ForwardsTests: XCTestCase {
     func testOnlyAListTheHostMarkedInitialIsRunningAlready() {
         let ext = Extensions.shared
         var reported: [[String: Any]] = []
-        ext.portsReported = { reported.append($0) }
+        ext.portsReported = { reported.append($0); return true }
         defer { ext.portsReported = nil }
         let host = "initial-test"
         func list(_ pane: Int, _ list: [Int], initial: Bool? = nil) -> [String: Any] {
@@ -222,7 +249,7 @@ final class ForwardsTests: XCTestCase {
     func testAReplayedRemoteListIsNotReportedAgain() {
         let ext = Extensions.shared
         var reported: [[String: Any]] = []
-        ext.portsReported = { reported.append($0) }
+        ext.portsReported = { reported.append($0); return true }
         defer { ext.portsReported = nil }
         let started: [String: Any] = ["pane": 2, "ports": [["port": 5173]], "complete": true]
         let stopped: [String: Any] = ["pane": 2, "ports": [] as [Any], "complete": true]

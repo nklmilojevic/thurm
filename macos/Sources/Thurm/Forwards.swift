@@ -135,18 +135,40 @@ struct RemotePorts {
         let pane: UInt64
         let ports: Any
         let complete: Any
+        /// The host's daemon sent it as running already, not as a change.
+        let initial: Bool
+        /// Which report it is, for `delivered`.
+        let seq: Int
+        /// This Mac's daemon took it.
+        var delivered = false
+
+        /// What it is said as when sent again to a daemon the app connects to: running already
+        /// once the daemon had it (that daemon's plugins heard it, and a new one's knew nothing
+        /// before); else as it came, a change the daemon never heard.
+        var initialWhenSentAgain: Bool { delivered || initial }
     }
 
     private var lists: [HostId: [UInt64: Entry]] = [:]
+    private var seq = 0
 
     /// A pane of `host` listed `ports`: kept as its latest. A complete empty list forgets the
-    /// pane; an incomplete one is kept (servers it could not read may run), to send again.
-    mutating func listed(_ host: HostId, pane: UInt64, ports: Any, complete: Any) {
+    /// pane; an incomplete one is kept (servers it could not read may run), to send again. The
+    /// number of this report, for `delivered`.
+    @discardableResult
+    mutating func listed(_ host: HostId, pane: UInt64, ports: Any, complete: Any, initial: Bool = false) -> Int {
+        seq += 1
         if (ports as? [Any])?.isEmpty ?? false, jsonBool(complete) != false {
             lists[host]?[pane] = nil
         } else {
-            lists[host, default: [:]][pane] = Entry(host: host, pane: pane, ports: ports, complete: complete)
+            lists[host, default: [:]][pane] = Entry(host: host, pane: pane, ports: ports, complete: complete,
+                                                    initial: initial, seq: seq)
         }
+        return seq
+    }
+
+    /// This Mac's daemon took report `seq` of `host`'s `pane` (if it is still the latest).
+    mutating func delivered(_ host: HostId, pane: UInt64, seq: Int) {
+        if lists[host]?[pane]?.seq == seq { lists[host]?[pane]?.delivered = true }
     }
 
     /// The connection to `host` is gone: its lists with it.

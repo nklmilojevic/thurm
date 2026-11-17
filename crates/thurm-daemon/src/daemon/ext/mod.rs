@@ -73,15 +73,21 @@ struct RemoteList {
     initial: bool,
 }
 
-/// `ports_changed` of a remote host's pane, as plugins hear it.
-fn remote_payload(host: &str, pane: u64, list: &RemoteList) -> Value {
-    let mut payload = json!({
-        "event": PORTS_CHANGED, "host": host, "id": pane, "ports": list.ports,
-        "complete": list.complete,
-    });
-    if list.initial {
+/// `ports_changed` as plugins hear it: of pane `id`, with `initial` when it was sent as running
+/// already. A local pane adds `pane` (its info), a remote one `host`.
+fn ports_changed(id: u64, ports: &[PortEntry], complete: bool, initial: bool) -> Value {
+    let mut payload =
+        json!({ "event": PORTS_CHANGED, "id": id, "ports": ports, "complete": complete });
+    if initial {
         payload["initial"] = true.into();
     }
+    payload
+}
+
+/// `ports_changed` of a remote host's pane.
+fn remote_payload(host: &str, pane: u64, list: &RemoteList) -> Value {
+    let mut payload = ports_changed(pane, &list.ports, list.complete, list.initial);
+    payload["host"] = host.into();
     payload
 }
 
@@ -143,18 +149,6 @@ fn remote_lists(all: &HashMap<u64, RemoteLists>, app: Option<u64>) -> Vec<Value>
             )
         })
         .collect()
-}
-
-/// Test builds: `var` as a number of milliseconds, for a step that takes a while on purpose.
-/// Release builds never read it.
-fn test_delay(var: &str) -> Option<Duration> {
-    if !cfg!(debug_assertions) {
-        return None;
-    }
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_millis)
 }
 
 /// Refuses `method` unless `client` is the app, which opens forwards.
@@ -473,7 +467,7 @@ impl Daemon {
                     return Ok(Value::Null);
                 }
                 // Tests: a report that takes a while, for what happens while it holds the lock.
-                if let Some(delay) = test_delay("THURM_EXT_REPORT_DELAY_MS") {
+                if let Some(delay) = crate::ports::test_delay("THURM_EXT_REPORT_DELAY_MS") {
                     std::thread::sleep(delay);
                 }
                 // `initial`: listening already when the app connected to the host, not news.
@@ -612,11 +606,8 @@ impl Daemon {
     /// the ones that joined at this look, which get every list on their own
     /// ([`Daemon::ext_ports_to`]).
     pub(super) fn ext_ports_changed(&self, event: &Event, except: &[u64]) {
-        let Some(payload) = self.ports_payload(event) else {
-            return;
-        };
         // `ports_changed` has no `[[on]]` hooks: only the subscribers hear it, but those waiting
-        // for their first lists.
+        // for their first lists. With none, nothing is built.
         let listeners: Vec<u64> = self.ext.registry.lock().listeners(PORTS_CHANGED);
         let joining = self.ext.ports_joining.lock();
         let listeners: Vec<u64> = listeners
@@ -624,7 +615,12 @@ impl Daemon {
             .filter(|c| !except.contains(c) && !joining.contains(c))
             .collect();
         drop(joining);
-        self.send_event(&listeners, &payload);
+        if listeners.is_empty() {
+            return;
+        }
+        if let Some(payload) = self.ports_payload(event) {
+            self.send_event(&listeners, &payload);
+        }
     }
 
     /// A list of the watch for `client` alone, which joined it by subscribing: sent as running
@@ -659,13 +655,9 @@ impl Daemon {
         else {
             return None;
         };
-        let mut payload =
-            json!({ "event": PORTS_CHANGED, "id": pane, "ports": ports, "complete": complete });
+        let mut payload = ports_changed(*pane, ports, *complete, *initial);
         if let Some(info) = self.pane(*pane).map(|p| p.state.lock().info.clone()) {
             payload["pane"] = serde_json::to_value(info).unwrap_or_default();
-        }
-        if *initial {
-            payload["initial"] = true.into();
         }
         Some(payload)
     }

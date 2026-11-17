@@ -13,7 +13,7 @@
 -- list without them. A pane first read that way (at load, or as Thurm connects to its host)
 -- may have servers the read missed, which its next complete list shows: that list settles
 -- what runs and opens nothing, even for one that started meanwhile (a tab not opened rather
--- than one opened twice).
+-- than one opened twice). A server that shows up in a list that is still incomplete opens.
 --
 -- Settings, in config.toml:
 --
@@ -103,10 +103,12 @@ thurm.on("ports_changed", function(ev)
     end
   end
   listed[key] = next(now) and now or nil
-  if unsure[key] then
-    if ev.complete then
-      unsure[key] = nil
-    end
+  -- A pane first read in part: its first complete list may show servers that read missed, and
+  -- settles what runs. Until then, a server an incomplete list shows anew listens for sure (a
+  -- pane with a process this user cannot read, such as a `sudo` one, stays incomplete), and
+  -- opens as usual.
+  if unsure[key] and ev.complete then
+    unsure[key] = nil
     return
   end
   -- A remote host's lists sent as the app connected to it: running already. One that could

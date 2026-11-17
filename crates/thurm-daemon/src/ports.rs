@@ -336,12 +336,13 @@ impl Watcher {
     }
 }
 
-/// Test builds: a look that takes this long. Release builds never read it.
-fn look_delay() -> Option<Duration> {
+/// Test builds: `var` as a number of milliseconds, for a step that takes a while on purpose (a
+/// look, a report). Release builds never read it.
+pub(crate) fn test_delay(var: &str) -> Option<Duration> {
     if !cfg!(debug_assertions) {
         return None;
     }
-    std::env::var("THURM_PORTS_LOOK_DELAY_MS")
+    std::env::var(var)
         .ok()
         .and_then(|v| v.parse().ok())
         .map(Duration::from_millis)
@@ -391,7 +392,7 @@ fn run<H: Host>(host: Weak<H>) {
             std::mem::take(&mut st.joined)
         };
         // Tests: a look that takes a while, for what happens while it is under way.
-        if let Some(delay) = look_delay() {
+        if let Some(delay) = test_delay("THURM_PORTS_LOOK_DELAY_MS") {
             std::thread::sleep(delay);
         }
         let roots = h.pane_roots();
