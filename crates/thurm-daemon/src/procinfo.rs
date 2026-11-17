@@ -556,26 +556,72 @@ pub struct Listening {
 /// failed as a whole (`lsof` could not run).
 #[cfg(target_os = "linux")]
 pub fn listeners(pids: &[u32]) -> Option<Listening> {
+    Some(listeners_in(pids, &RealProc))
+}
+
+/// What [`listeners_in`] reads of a process, from `/proc` ([`RealProc`]) or, in tests, made up.
+#[cfg(any(target_os = "linux", test))]
+trait ProcFs {
+    /// `/proc/<pid>/ns/net`: the network namespace, to read its tables once.
+    fn netns(&self, pid: u32) -> Option<std::path::PathBuf>;
+    /// `/proc/<pid>/net/<name>` (`tcp`, `tcp6`).
+    fn table(&self, pid: u32, name: &str) -> std::io::Result<String>;
+    /// The targets of `/proc/<pid>/fd/*`, each read on its own.
+    fn fd_links(&self, pid: u32) -> std::io::Result<Vec<std::io::Result<std::path::PathBuf>>>;
+}
+
+#[cfg(target_os = "linux")]
+struct RealProc;
+
+#[cfg(target_os = "linux")]
+impl ProcFs for RealProc {
+    fn netns(&self, pid: u32) -> Option<std::path::PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/ns/net")).ok()
+    }
+
+    fn table(&self, pid: u32, name: &str) -> std::io::Result<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/net/{name}"))
+    }
+
+    fn fd_links(&self, pid: u32) -> std::io::Result<Vec<std::io::Result<std::path::PathBuf>>> {
+        Ok(std::fs::read_dir(format!("/proc/{pid}/fd"))?
+            .map(|fd| fd.and_then(|fd| std::fs::read_link(fd.path())))
+            .collect())
+    }
+}
+
+/// Whether a failed read means the process may not be read (another user's, a namespace the
+/// daemon can't see), so what it listens on is unknown. Any other failure means it, or the
+/// descriptor, has gone: a process that exited (a zombie not reaped yet has `/proc/<pid>`, but
+/// no network tables and no descriptors), or a descriptor closed between listing and reading.
+/// That is not an unreadable process, and its ports are none.
+#[cfg(any(target_os = "linux", test))]
+fn denied(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn listeners_in(pids: &[u32], fs: &impl ProcFs) -> Listening {
     use std::collections::HashMap;
     let mut out = Listening::default();
     let mut by_netns: HashMap<std::path::PathBuf, HashMap<u64, Listener>> = HashMap::new();
     for &pid in pids {
-        let gone = || !std::path::Path::new(&format!("/proc/{pid}")).exists();
-        let netns = std::fs::read_link(format!("/proc/{pid}/ns/net")).ok();
+        let netns = fs.netns(pid);
         let cached = netns.as_ref().and_then(|ns| by_netns.get(ns));
         let own;
         let by_inode = match cached {
             Some(t) => t,
             None => {
-                let tables: Option<Vec<String>> = ["tcp", "tcp6"]
-                    .iter()
-                    .map(|t| std::fs::read_to_string(format!("/proc/{pid}/net/{t}")).ok())
-                    .collect();
-                let Some(tables) = tables else {
-                    if !gone() {
-                        out.unread.insert(pid);
+                let tables: Result<Vec<String>, std::io::Error> =
+                    ["tcp", "tcp6"].iter().map(|t| fs.table(pid, t)).collect();
+                let tables = match tables {
+                    Ok(t) => t,
+                    Err(e) => {
+                        if denied(&e) {
+                            out.unread.insert(pid);
+                        }
+                        continue;
                     }
-                    continue;
                 };
                 let parsed: HashMap<u64, Listener> = tables
                     .iter()
@@ -590,18 +636,22 @@ pub fn listeners(pids: &[u32]) -> Option<Listening> {
                 }
             }
         };
+        // No listening socket in the process's namespace: it listens on none, whatever its
+        // descriptors are.
         if by_inode.is_empty() {
             continue;
         }
-        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-            if !gone() {
-                out.unread.insert(pid);
+        let links = match fs.fd_links(pid) {
+            Ok(l) => l,
+            Err(e) => {
+                if denied(&e) {
+                    out.unread.insert(pid);
+                }
+                continue;
             }
-            continue;
         };
-        let links = fds.map(|fd| fd.and_then(|fd| std::fs::read_link(fd.path())));
-        let (inodes, partial) = socket_inodes(links);
-        if partial && !gone() {
+        let (inodes, partial) = socket_inodes(links.into_iter());
+        if partial {
             out.unread.insert(pid);
         }
         for l in inodes.iter().filter_map(|i| by_inode.get(i)) {
@@ -611,12 +661,13 @@ pub fn listeners(pids: &[u32]) -> Option<Listening> {
             }
         }
     }
-    Some(out)
+    out
 }
 
-/// The socket inodes among a process's fd links (`/proc/<pid>/fd/*`), and whether one could not
-/// be read: then what it listens on is only partly known. A link gone meanwhile (the fd closed
-/// between listing and reading) is not such a failure.
+/// The socket inodes among a process's fd links (`/proc/<pid>/fd/*`), and whether one may not be
+/// read: then what it listens on is only partly known. A link that failed otherwise has gone
+/// (its descriptor closed between listing and reading, or the process exited): not a partial
+/// read ([`denied`]).
 #[cfg(any(target_os = "linux", test))]
 fn socket_inodes(
     links: impl Iterator<Item = std::io::Result<std::path::PathBuf>>,
@@ -632,8 +683,8 @@ fn socket_inodes(
                     .and_then(|t| t.strip_suffix(']'))
                     .and_then(|t| t.parse::<u64>().ok()),
             ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => partial = true,
+            Err(e) if denied(&e) => partial = true,
+            Err(_) => {}
         }
     }
     (inodes, partial)
@@ -939,6 +990,125 @@ mod proc_tests {
         );
         assert_eq!(inodes, [41234]);
         assert!(partial);
+        // Gone with its process (ESRCH): not partial either.
+        let (_, partial) =
+            socket_inodes([Err(Error::from_raw_os_error(3)), link("socket:[1]")].into_iter());
+        assert!(!partial);
+    }
+
+    /// A pid's fd links (each a target or its read's error), or the error listing them gives.
+    type FakeFds = Result<Vec<Result<&'static str, std::io::Error>>, std::io::ErrorKind>;
+
+    /// A made-up `/proc`: each pid's tables and fd links, or the error reading them gives.
+    #[derive(Default)]
+    struct FakeProc {
+        tables: std::collections::HashMap<u32, Result<String, std::io::ErrorKind>>,
+        fds: std::collections::HashMap<u32, FakeFds>,
+    }
+
+    impl ProcFs for FakeProc {
+        fn netns(&self, pid: u32) -> Option<std::path::PathBuf> {
+            // Each pid in a namespace of its own: every table is read.
+            Some(std::path::PathBuf::from(format!("net:[{pid}]")))
+        }
+
+        fn table(&self, pid: u32, name: &str) -> std::io::Result<String> {
+            match self.tables.get(&pid) {
+                Some(Ok(t)) if name == "tcp" => Ok(t.clone()),
+                Some(Ok(_)) => Ok(HEADER.into()),
+                Some(Err(k)) => Err((*k).into()),
+                None => Err(std::io::ErrorKind::NotFound.into()),
+            }
+        }
+
+        fn fd_links(&self, pid: u32) -> std::io::Result<Vec<std::io::Result<std::path::PathBuf>>> {
+            match self.fds.get(&pid) {
+                Some(Ok(links)) => Ok(links
+                    .iter()
+                    .map(|l| match l {
+                        Ok(t) => Ok(std::path::PathBuf::from(t)),
+                        Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+                    })
+                    .collect()),
+                Some(Err(k)) => Err((*k).into()),
+                None => Err(std::io::ErrorKind::NotFound.into()),
+            }
+        }
+    }
+
+    const HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
+    /// A tcp table with one LISTEN socket on 127.0.0.1:`port`, inode `inode`.
+    fn listening(port: u16, inode: u64) -> String {
+        format!(
+            "{HEADER}   0: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 {inode} 1 0000000000000000 100 0 0 10 0\n"
+        )
+    }
+
+    #[test]
+    fn only_a_refused_read_makes_a_process_unread() {
+        use std::io::ErrorKind::{NotFound, PermissionDenied};
+        let esrch = || std::io::Error::from_raw_os_error(3);
+        let mut fs = FakeProc::default();
+        // 10: listening, all read.
+        fs.tables.insert(10, Ok(listening(5173, 100)));
+        fs.fds
+            .insert(10, Ok(vec![Ok("socket:[100]"), Ok("/dev/null")]));
+        // 11: exited and not reaped yet (a zombie): `/proc/11` is there, its tables are not.
+        fs.tables.insert(11, Err(NotFound));
+        // 12: exits between reading its table and listing its descriptors.
+        fs.tables.insert(12, Ok(listening(3000, 200)));
+        fs.fds.insert(12, Err(NotFound));
+        // 13: a descriptor closed between listing and reading, another gone with the process.
+        fs.tables.insert(13, Ok(listening(8080, 300)));
+        fs.fds.insert(
+            13,
+            Ok(vec![
+                Ok("socket:[300]"),
+                Err(std::io::Error::from(NotFound)),
+                Err(esrch()),
+            ]),
+        );
+        // 14, 15, 16: another user's process, refused at the table, the fd directory, a link.
+        fs.tables.insert(14, Err(PermissionDenied));
+        fs.tables.insert(15, Ok(listening(9000, 500)));
+        fs.fds.insert(15, Err(PermissionDenied));
+        fs.tables.insert(16, Ok(listening(9100, 600)));
+        fs.fds.insert(
+            16,
+            Ok(vec![
+                Ok("socket:[600]"),
+                Err(std::io::Error::from(PermissionDenied)),
+            ]),
+        );
+        // 17: no listening socket in its namespace, descriptors refused: it listens on none.
+        fs.tables.insert(17, Ok(HEADER.into()));
+        fs.fds.insert(17, Err(PermissionDenied));
+
+        let found = listeners_in(&[10, 11, 12, 13, 14, 15, 16, 17], &fs);
+        let mut unread: Vec<u32> = found.unread.iter().copied().collect();
+        unread.sort();
+        assert_eq!(unread, [14, 15, 16]);
+        let port = |pid| {
+            found
+                .by_pid
+                .get(&pid)
+                .map(|l| l.iter().map(|l| l.port).collect::<Vec<_>>())
+        };
+        assert_eq!(port(10), Some(vec![5173]));
+        assert_eq!(
+            port(13),
+            Some(vec![8080]),
+            "the socket read before the others went"
+        );
+        assert_eq!(
+            port(16),
+            Some(vec![9100]),
+            "a partial read keeps what it found"
+        );
+        assert_eq!(port(11), None);
+        assert_eq!(port(12), None);
+        assert_eq!(port(17), None);
     }
 
     #[cfg(target_os = "macos")]
