@@ -103,7 +103,7 @@ for an event about a pane, `pane` (as `thurm info --json` shows it).
 
 The daemon looks at its panes' ports only while someone listens: subscribing
 to `ports_changed` by name starts it (`*` alone does not). A plugin that
-subscribes gets the list of every pane with ports first, on its own and marked `initial`, with
+subscribes gets every pane's list first (an empty one too), on its own and marked `initial`, with
 the remote hosts' lists the app passed on so far; the others hear nothing
 again. A remote host's ports and the forwards come from the app, so
 a plugin on this Mac hears them while Thurm is open.

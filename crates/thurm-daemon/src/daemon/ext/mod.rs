@@ -493,13 +493,24 @@ impl Daemon {
         names: Vec<String>,
     ) -> Result<Value, String> {
         let ports = names.iter().any(|n| n == PORTS_CHANGED);
-        let all = ports.then(|| self.ext.remote_ports.lock());
+        // Only one that joins (it does not hear `ports_changed` yet) takes the remote lists' lock;
+        // a subscription that joins nothing does not wait on reports.
+        let joining = ports && !self.ext.registry.lock().has(client.id, PORTS_CHANGED);
+        let mut all = joining.then(|| self.ext.remote_ports.lock());
         // Only a new subscriber joins: one that has the lists keeps hearing changes.
         // `queue`: not waiting in the watch already (subscribed, out and in again before the look
         // that serves it): queued once, it gets its first lists once.
         let (joins, queue) = {
             let mut reg = self.ext_registry(client)?;
-            let joins = ports && !reg.has(client.id, PORTS_CHANGED);
+            let mut joins = ports && !reg.has(client.id, PORTS_CHANGED);
+            // It stopped hearing them since the look above (another call of the same client):
+            // the lock first, in its order, then the registry again.
+            if joins && all.is_none() {
+                drop(reg);
+                all = Some(self.ext.remote_ports.lock());
+                reg = self.ext_registry(client)?;
+                joins = !reg.has(client.id, PORTS_CHANGED);
+            }
             // Waiting for its first lists before it is a listener: no change of a look under way
             // reaches it first.
             let queue = joins && self.ext.ports_joining.lock().insert(client.id);
@@ -512,8 +523,8 @@ impl Daemon {
             (joins, queue)
         };
         // Its panes' ports are watched only while someone hears of them. A new subscriber joins
-        // the watch as a client does: the next look sends it alone the list of every pane with
-        // ports (`ext_ports_to`), as running already. Of remote hosts, it gets the lists the app
+        // the watch as a client does: the next look sends it alone every pane's list, empty ones
+        // too (`ext_ports_to`), as running already. Of remote hosts, it gets the lists the app
         // relayed so far, the same way.
         if joins && let Some(all) = &all {
             if queue {

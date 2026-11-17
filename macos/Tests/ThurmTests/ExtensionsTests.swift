@@ -231,23 +231,30 @@ final class ExtensionsTests: XCTestCase {
             XCTAssertTrue(finished.contains(id), "request \(id) never finished")
         }
 
-        // A close is done, and answered, as soon as it is asked: before any cancel of it.
+        // A close starts as soon as it is asked: a cancel that comes after cannot stop it, and
+        // only keeps it from being answered.
         ext.handle(event("ui.request", ["kind": "forward_close", "id": 901, "forward": 7]))
-        XCTAssertEqual(seen(), ["forward_close"], "the close was queued, where a cancel could not stop it")
-        XCTAssertEqual(replies[901]?.count, 1)
         ext.handle(event("ui.cancel", ["id": 901]))
+        waitDone(901)
+        XCTAssertEqual(seen(), ["forward_close"])
+        XCTAssertNil(replies[901], "a cancelled close was answered")
+        // Not cancelled: closed, and answered.
+        ext.handle(event("ui.request", ["kind": "forward_close", "id": 904, "forward": 8]))
+        waitDone(904)
+        XCTAssertEqual(seen(), ["forward_close", "forward_close"])
+        XCTAssertEqual(replies[904]?.count, 1)
 
         // An open cancelled before it starts: not started, not answered.
         ext.handle(event("ui.request", ["kind": "forward_open", "id": 902, "host": "devbox", "port": 5173]))
         ext.handle(event("ui.cancel", ["id": 902]))
         waitDone(902)
-        XCTAssertEqual(seen(), ["forward_close"], "an open the daemon gave up on was started")
+        XCTAssertEqual(seen(), ["forward_close", "forward_close"], "an open the daemon gave up on was started")
         XCTAssertNil(replies[902], "a cancelled open was answered")
 
         // One still waited for: started, and answered (here, with the core's error).
         ext.handle(event("ui.request", ["kind": "forward_open", "id": 903, "host": "devbox", "port": 5173]))
         waitDone(903)
-        XCTAssertEqual(seen(), ["forward_close", "forward_open"])
+        XCTAssertEqual(seen(), ["forward_close", "forward_close", "forward_open"])
         XCTAssertEqual(replies[903]?.count, 1)
         XCTAssertEqual(jsonString(replies[903]?.first?["error"]), "not in a test")
     }
@@ -296,7 +303,8 @@ final class ExtensionsTests: XCTestCase {
         ext.forwardRequestDone = { finished.insert($0) }
         /// Asks for an open and waits until the app is done with it: the calls it made, and what
         /// the plugin was answered.
-        func open(_ id: UInt64, result: [String: Any], cancel: Bool) -> (calls: [String], replies: [[String: Any]]) {
+        func open(_ id: UInt64, result: [String: Any], cancel: Bool,
+                  calls expected: Int) -> (calls: [String], replies: [[String: Any]]) {
             lock.lock()
             calls = []
             cancelOnCall = cancel ? id : nil
@@ -309,6 +317,16 @@ final class ExtensionsTests: XCTestCase {
                 RunLoop.main.run(until: Date().addingTimeInterval(0.02))
             }
             XCTAssertTrue(finished.contains(id), "request \(id) never finished")
+            // A forward it opened is closed off the main thread, after the request is done.
+            func count() -> Int {
+                lock.lock()
+                defer { lock.unlock() }
+                return calls.count
+            }
+            while count() < expected, Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
             lock.lock()
             defer { lock.unlock() }
             return (calls, replies[id] ?? [])
@@ -321,16 +339,16 @@ final class ExtensionsTests: XCTestCase {
 
         // Cancelled between the check and the call: the forward it opened is closed again, and
         // the plugin, which waits no more, is not answered.
-        let cancelled = open(911, result: opened, cancel: true)
+        let cancelled = open(911, result: opened, cancel: true, calls: 2)
         XCTAssertEqual(cancelled.calls, ["forward_open", "close 71"])
         XCTAssertEqual(cancelled.replies.count, 0, "a cancelled open was answered: \(cancelled.replies)")
         // One it only found open is someone else's: it stays. Not answered either.
-        let foundOpen = open(912, result: found, cancel: true)
+        let foundOpen = open(912, result: found, cancel: true, calls: 1)
         XCTAssertEqual(foundOpen.calls, ["forward_open"])
         XCTAssertEqual(foundOpen.replies.count, 0, "a cancelled open was answered: \(foundOpen.replies)")
         // Not cancelled: kept (and looked at again, before anything is shown for it), and answered
         // with it.
-        let kept = open(913, result: opened, cancel: false)
+        let kept = open(913, result: opened, cancel: false, calls: 2)
         XCTAssertEqual(kept.calls, ["forward_open", "forward_get"])
         XCTAssertEqual(kept.replies.count, 1)
         XCTAssertNil(kept.replies.first?["error"])
@@ -390,6 +408,66 @@ final class ExtensionsTests: XCTestCase {
         XCTAssertEqual(browsed, ["http://localhost:5174/app"])
         XCTAssertNil(replies.first?["error"])
         XCTAssertEqual(jsonUInt64((replies.first?["result"] as? [String: Any])?["id"]), 81)
+    }
+
+    /// A close waits for the forward's listeners to let go, up to two seconds: neither a plugin's
+    /// close nor the close of a forward a given-up open left holds up the main thread for it.
+    func testClosingAForwardDoesNotHoldUpTheMainThread() {
+        let ext = Extensions.shared
+        let saved = (ext.remoteCall, ext.forwardReplies, ext.forwardRequestDone)
+        defer {
+            ext.remoteCall = saved.0
+            ext.forwardReplies = saved.1
+            ext.forwardRequestDone = saved.2
+            ext.forwardsNow([])
+        }
+        let lock = NSLock()
+        var closesEnded = 0
+        ext.remoteCall = { op in
+            switch jsonString(op["op"]) {
+            case "forward_close":
+                Thread.sleep(forTimeInterval: 0.5)
+                lock.lock()
+                closesEnded += 1
+                lock.unlock()
+                return ["id": op["id"] ?? 0]
+            case "forward_open":
+                // Given up on while it opens.
+                DispatchQueue.main.sync {
+                    ext.handle(["name": "ui.cancel", "payload": JSON.encode(["id": 932])])
+                }
+                return ["id": 91, "host": "slow-close", "remote_port": 5173, "local_port": 5173,
+                        "url": "http://localhost:5173/", "new": true]
+            default:
+                return ["error": "not in a test"]
+            }
+        }
+        var finished: Set<UInt64> = []
+        ext.forwardReplies = { _ in }
+        ext.forwardRequestDone = { finished.insert($0) }
+        func ended() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return closesEnded
+        }
+
+        let start = Date()
+        ext.handle(["name": "ui.request", "payload": JSON.encode(["kind": "forward_close", "id": 931, "forward": 9])])
+        XCTAssertLessThan(Date().timeIntervalSince(start), 0.2, "a plugin's close held up the main thread")
+
+        ext.handle(["name": "ui.request", "payload": JSON.encode(
+            ["kind": "forward_open", "id": 932, "host": "slow-close", "port": 5173])])
+        let deadline = Date().addingTimeInterval(5)
+        while !finished.contains(932), Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertTrue(finished.contains(932))
+        // The given-up open is done with while the close of its forward still runs.
+        XCTAssertLessThan(ended(), 2, "the close of a given-up open's forward held up the main thread")
+        while ended() < 2, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        XCTAssertEqual(ended(), 2)
     }
 }
 
