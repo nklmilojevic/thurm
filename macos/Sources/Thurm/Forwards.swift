@@ -24,6 +24,36 @@ struct ForwardInfo: Equatable {
     }
 }
 
+/// The forward requests of plugins the app is carrying out, by the daemon's id for each. One
+/// the daemon gave up on (`ui.cancel`: its caller went away or waited too long), or one of a
+/// connection that is gone, must change nothing once it finishes.
+struct ForwardRequests {
+    enum Finish: Equatable {
+        /// Still asked for: answer it, and open the browser if it said so.
+        case answer
+        /// Nobody waits for it: show and open nothing, and close the forward it opened, if any.
+        case abandoned(close: UInt64?)
+    }
+
+    private var live: Set<UInt64> = []
+
+    mutating func begin(_ id: UInt64) { live.insert(id) }
+
+    mutating func cancel(_ id: UInt64) { live.remove(id) }
+
+    /// The connection to the daemon changed: none of its requests is waited for any more.
+    mutating func cancelAll() { live.removeAll() }
+
+    /// Request `id` finished with `result` (`forward_open`'s or `forward_close`'s).
+    mutating func finish(_ id: UInt64, result: [String: Any]?) -> Finish {
+        if live.remove(id) != nil { return .answer }
+        // Only a forward opened for it goes again: one it found open was someone else's.
+        guard let r = result, jsonString(r["error"]) == nil, jsonBool(r["new"]) == true,
+              let forward = jsonUInt64(r["id"]) else { return .abandoned(close: nil) }
+        return .abandoned(close: forward)
+    }
+}
+
 /// What forwards say to the user.
 enum ForwardText {
     /// The toast on a forward's first use: `devbox:5173 → localhost:5173`.

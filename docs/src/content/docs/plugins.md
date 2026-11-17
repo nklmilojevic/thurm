@@ -345,6 +345,9 @@ own forwards, so with two open (a development build beside the installed one),
 plugins see only the forwards of the one that connected first, and open and
 close through it; when it quits, its forwards are heard closed and the other's
 opened.
+A `forwards.open` whose caller stopped waiting (the plugin stopped, or the call
+timed out) changes nothing: the app opens no browser, and closes again a
+forward it opened for it.
 
 A plugin's actions, keys and subscriptions go away when it stops. The API is
 for clients on the daemon's machine and its plugins: a caller over the tailnet

@@ -51,6 +51,8 @@ final class Extensions {
     /// brings the app forward (the Dock icon bounces for it), not before.
     private var pending: [String: Any]?
     private var activeObserver: NSObjectProtocol?
+    /// Forwards being opened or closed for plugins.
+    private var forwardRequests = ForwardRequests()
 
     // MARK: Calling the daemon
 
@@ -96,6 +98,7 @@ final class Extensions {
     private func invalidateQuestions() {
         connection += 1
         pending = nil
+        forwardRequests.cancelAll()
         if let s = shown {
             shown = nil
             s.dismiss()
@@ -335,6 +338,7 @@ final class Extensions {
             if let id = jsonUInt64(payload["id"]), let p = pending, jsonUInt64(p["id"]) == id {
                 pending = nil
             }
+            if let id = jsonUInt64(payload["id"]) { forwardRequests.cancel(id) }
         default:
             break
         }
@@ -471,10 +475,22 @@ final class Extensions {
             return
         }
         let browse = jsonBool(req["browse"]) == true
+        forwardRequests.begin(id)
         // Opening connects to the host's daemon first: not on the main thread.
         DispatchQueue.global(qos: .userInitiated).async {
             let v = Core.shared.remoteCall(op) as? [String: Any]
             DispatchQueue.main.async {
+                // The daemon gave up on it meanwhile: it changes nothing. A forward it opened is
+                // closed again (and both are reported, as every change is).
+                if case .abandoned(let close) = self.forwardRequests.finish(id, result: v) {
+                    if let close {
+                        tlog("closing forward \(close): the plugin that asked for it no longer waits")
+                        DispatchQueue.global(qos: .utility).async {
+                            _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: close)])
+                        }
+                    }
+                    return
+                }
                 if let e = jsonString(v?["error"]) {
                     answer(NSNull(), e)
                     return
