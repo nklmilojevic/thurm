@@ -86,6 +86,9 @@ struct Batch {
     pasting: bool,
     outcome: Option<Result<(), String>>,
     touched: Instant,
+    /// The streams writing a file of the batch now, by its index: shut when the batch fails,
+    /// and until they have let go, the batch's directory stays and its bytes count.
+    writers: Vec<(u32, UnixStream)>,
 }
 
 struct Slot {
@@ -98,12 +101,26 @@ struct Slot {
 enum SlotState {
     Reserved,
     Writing,
+    /// Of a failed batch, its writer gone: nothing of it is left to count.
+    Gone,
     Landed,
 }
 
 impl Batch {
     fn waiting(&self) -> bool {
         self.outcome.is_none()
+    }
+
+    /// Its directory is in use: on its way, being typed, or still written to.
+    fn busy(&self) -> bool {
+        self.waiting() || self.pasting || !self.writers.is_empty()
+    }
+
+    /// Whether `f` takes room: every file of a batch still on its way, and a file of a failed
+    /// one while it is written.
+    fn occupies(&self, f: &Slot) -> bool {
+        f.state != SlotState::Gone
+            && (self.waiting() || self.pasting || f.state == SlotState::Writing)
     }
 }
 
@@ -128,7 +145,7 @@ impl Transfers {
     pub fn prune(&self) {
         let mut st = self.state.lock();
         self.sweep(&mut st);
-        self.make_room(&st, 0);
+        self.make_room(&st, 0, 0);
     }
 
     /// [`thurm_proto::Request::UploadBegin`]: reserves the file's place in its batch and a
@@ -162,18 +179,12 @@ impl Transfers {
         }
         let mut st = self.state.lock();
         self.sweep(&mut st);
-        let open = |b: &&Batch| b.waiting() && !b.pasting;
+        let on_way = |b: &Batch, f: &Slot| b.occupies(f) && f.state != SlotState::Landed;
         let reserved: usize = st
             .batches
             .values()
             .filter(|b| b.pane == pane)
-            .filter(open)
-            .map(|b| {
-                b.files
-                    .values()
-                    .filter(|f| f.state != SlotState::Landed)
-                    .count()
-            })
+            .map(|b| b.files.values().filter(|f| on_way(b, f)).count())
             .sum();
         if reserved >= MAX_RESERVED_PER_PANE {
             return Err(format!(
@@ -183,20 +194,9 @@ impl Transfers {
         let pending: u64 = st
             .batches
             .values()
-            .filter(open)
-            .flat_map(|b| b.files.values())
-            .filter(|f| f.state != SlotState::Landed)
+            .flat_map(|b| b.files.values().filter(move |f| on_way(b, f)))
             .map(|f| f.size)
             .sum();
-        make_private_dir(&self.root)?;
-        let free = free_space(&self.root)?;
-        if free < size.saturating_add(pending).saturating_add(MIN_FREE) {
-            return Err(format!(
-                "not enough free space for {name}: {} MiB free, and {} GiB must stay free",
-                free >> 20,
-                MIN_FREE >> 30
-            ));
-        }
         // The batch this file joins, checked before anything changes for it.
         let existing = id.as_ref().and_then(|id| {
             st.batches
@@ -223,8 +223,7 @@ impl Transfers {
         let active: u64 = st
             .batches
             .values()
-            .filter(|b| b.waiting() || b.pasting)
-            .flat_map(|b| b.files.values())
+            .flat_map(|b| b.files.values().filter(move |f| b.occupies(f)))
             .map(|f| f.size)
             .sum();
         let incoming = active.saturating_add(size);
@@ -236,6 +235,22 @@ impl Transfers {
         };
         if incoming > self.max_kept {
             return Err(too_much());
+        }
+        // The disk keeps its floor: kept drops may give way for it, but only if enough of them
+        // can, and only once the file is admitted.
+        make_private_dir(&self.root)?;
+        let need = size.saturating_add(pending).saturating_add(MIN_FREE);
+        let free = free_space(&self.root)?;
+        let short = need.saturating_sub(free);
+        let no_space = |free: u64| {
+            format!(
+                "not enough free space for {name}: {} MiB free, and {} GiB must stay free",
+                free >> 20,
+                MIN_FREE >> 30
+            )
+        };
+        if short > 0 && self.kept(&st).iter().map(|(_, size, _)| size).sum::<u64>() < short {
+            return Err(no_space(free));
         }
         // A new batch's number is used up here, whatever follows: a ticket left by a refusal
         // below names a file that does not exist (its stream is refused), never another batch's.
@@ -252,8 +267,14 @@ impl Transfers {
             principal,
         )?;
         // Only an admitted file makes older drops give way, and only what was deleted counts.
-        if !self.make_room(&st, incoming) {
+        if !self.make_room(&st, incoming, short) {
             return Err(too_much());
+        }
+        if short > 0 {
+            let free = free_space(&self.root)?;
+            if free < need {
+                return Err(no_space(free));
+            }
         }
         if existing.is_none() {
             let dir = self.new_batch_dir(pane)?;
@@ -270,6 +291,7 @@ impl Transfers {
                     pasting: false,
                     outcome: None,
                     touched: Instant::now(),
+                    writers: Vec::new(),
                 },
             );
         }
@@ -385,7 +407,14 @@ impl Transfers {
         log::info!("upload to pane {} failed: {why}", b.pane);
         b.outcome = Some(Err(why));
         b.touched = Instant::now();
-        remove_batch(&b.dir);
+        // Streams still writing stop taking bytes now; the directory goes when the last lets go
+        // (`writer_done`), its bytes counted until then.
+        for (_, socket) in &b.writers {
+            let _ = socket.shutdown(std::net::Shutdown::Read);
+        }
+        if b.writers.is_empty() {
+            remove_batch(&b.dir);
+        }
         self.changed.notify_all();
     }
 
@@ -401,12 +430,36 @@ impl Transfers {
             self.fail(st, serial, "the upload stalled".into());
         }
         st.batches
-            .retain(|_, b| b.waiting() || b.touched.elapsed() <= self.idle);
+            .retain(|_, b| b.busy() || b.touched.elapsed() <= self.idle);
     }
 
-    fn touch(&self, serial: u64) {
-        if let Some(b) = self.state.lock().batches.get_mut(&serial) {
-            b.touched = Instant::now();
+    /// Marks batch `serial` as moving; whether it is still on its way (a writer of a failed
+    /// batch stops).
+    fn touch(&self, serial: u64) -> bool {
+        match self.state.lock().batches.get_mut(&serial) {
+            Some(b) => {
+                b.touched = Instant::now();
+                b.waiting()
+            }
+            None => false,
+        }
+    }
+
+    /// The writer of file `index` of batch `serial` let go: a failed batch's file stops
+    /// counting, and its directory goes with the last writer.
+    fn writer_done(&self, serial: u64, index: u32) {
+        let mut st = self.state.lock();
+        let Some(b) = st.batches.get_mut(&serial) else {
+            return;
+        };
+        b.writers.retain(|(i, _)| *i != index);
+        if matches!(b.outcome, Some(Err(_))) {
+            if let Some(f) = b.files.get_mut(&index) {
+                f.state = SlotState::Gone;
+            }
+            if b.writers.is_empty() {
+                remove_batch(&b.dir);
+            }
         }
     }
 
@@ -435,14 +488,13 @@ impl Transfers {
         Err("no free directory name for the upload".into())
     }
 
-    /// Deletes kept batches older than [`KEEP`] (`keep`), then the oldest until `incoming` more bytes
-    /// stay within the kept limit. Batches on their way are left alone, and a batch that could
-    /// not be deleted still counts. Whether `incoming` fits now.
-    fn make_room(&self, st: &State, incoming: u64) -> bool {
+    /// The kept batches on disk, oldest first, with their sizes; those past their time
+    /// (`keep`) are deleted on the way. Batches in use are left out.
+    fn kept(&self, st: &State) -> Vec<(SystemTime, u64, PathBuf)> {
         let busy: HashSet<&Path> = st
             .batches
             .values()
-            .filter(|b| b.waiting() || b.pasting)
+            .filter(|b| b.busy())
             .map(|b| b.dir.as_path())
             .collect();
         let mut kept = Vec::new();
@@ -471,16 +523,29 @@ impl Transfers {
             }
         }
         kept.sort_by_key(|(modified, _, _)| *modified);
+        kept
+    }
+
+    /// Deletes the oldest kept batches until `incoming` more bytes stay within the kept limit
+    /// and at least `free` bytes were freed. A batch that could not be deleted still counts.
+    /// Whether both hold now.
+    fn make_room(&self, st: &State, incoming: u64, free: u64) -> bool {
+        let kept = self.kept(st);
         let mut total: u64 = kept.iter().map(|(_, size, _)| size).sum();
+        let mut freed = 0u64;
+        let fits = |total: u64, freed: u64| {
+            total.saturating_add(incoming) <= self.max_kept && freed >= free
+        };
         for (_, size, dir) in kept {
-            if total.saturating_add(incoming) <= self.max_kept {
+            if fits(total, freed) {
                 break;
             }
             if remove_batch(&dir) {
                 total = total.saturating_sub(size);
+                freed += size;
             }
         }
-        total.saturating_add(incoming) <= self.max_kept
+        fits(total, freed)
     }
 
     /// File `index` of batch `serial` arrived whole at its place. When it is the last, types
@@ -560,11 +625,15 @@ impl Transfers {
                 None => Err("the upload was cancelled".to_owned()),
                 Some(b) => match (&b.outcome, b.files.get_mut(&index)) {
                     (Some(Err(e)), _) => Err(e.clone()),
-                    (None, Some(f)) if f.state == SlotState::Reserved => {
-                        f.state = SlotState::Writing;
-                        b.touched = Instant::now();
-                        Ok((f.path.clone(), f.size))
-                    }
+                    (None, Some(f)) if f.state == SlotState::Reserved => match writer.try_clone() {
+                        Ok(socket) => {
+                            f.state = SlotState::Writing;
+                            b.touched = Instant::now();
+                            b.writers.push((index, socket));
+                            Ok((f.path.clone(), f.size))
+                        }
+                        Err(e) => Err(format!("cannot take the file: {e}")),
+                    },
                     _ => Err("that file is not expected".to_owned()),
                 },
             }
@@ -580,17 +649,20 @@ impl Transfers {
             .join(index.to_string());
         let received = receive(&mut reader, &part, size, || self.touch(serial))
             .and_then(|()| std::fs::rename(&part, &path).map_err(|e| e.to_string()));
+        if received.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
         // Waiting for the rest of the batch holds no stream slot: a batch may be as large as
         // the daemon's limit on open streams.
         drop(open);
         match received {
             Ok(()) => self.landed(daemon, serial, index),
             Err(e) => {
-                let _ = std::fs::remove_file(&part);
                 let mut st = self.state.lock();
                 self.fail(&mut st, serial, e);
             }
         }
+        self.writer_done(serial, index);
         // While the batch waits, the sender may still give up: an abort on this stream ends the
         // batch. A connection that merely closes does not (the sender only waits on its last
         // file's stream).
@@ -718,7 +790,7 @@ fn receive<R: Read>(
     reader: &mut R,
     part: &Path,
     size: u64,
-    mut progress: impl FnMut(),
+    mut progress: impl FnMut() -> bool,
 ) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -736,7 +808,9 @@ fn receive<R: Read>(
                 }
                 file.write_all(&data)
                     .map_err(|e| format!("cannot write {}: {e}", part.display()))?;
-                progress();
+                if !progress() {
+                    return Err("the upload was cancelled".into());
+                }
             }
             Ok(Some(StreamFrame::End)) => {
                 if written != size {
@@ -955,11 +1029,12 @@ fn dir_size(dir: &Path) -> u64 {
 
 /// Bytes free for this user on the disk holding `dir`; `THURM_TRANSFER_FREE_BYTES` in tests.
 fn free_space(dir: &Path) -> Result<u64, String> {
+    // Tests: the disk's free bytes with no uploads kept; what is kept takes from it.
     if let Some(free) = std::env::var("THURM_TRANSFER_FREE_BYTES")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<u64>().ok())
     {
-        return Ok(free);
+        return Ok(free.saturating_sub(dir_size(dir)));
     }
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| e.to_string())?;

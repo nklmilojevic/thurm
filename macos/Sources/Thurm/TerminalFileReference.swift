@@ -191,6 +191,9 @@ final class RemoteFileCache {
             .appendingPathComponent("remote-files", isDirectory: true)
     }
 
+    /// Writes a metadata file whole (tests make it fail).
+    var writeText: (String, URL) throws -> Void = { try $0.write(to: $1, atomically: true, encoding: .utf8) }
+
     /// Downloads into the cache (`Core.startDownload`; tests stand in for it).
     var download: Core.DownloadStarter = Core.startDownload
 
@@ -237,24 +240,28 @@ final class RemoteFileCache {
     func install(_ entry: URL, staged: URL, name: String, version: String?) throws -> URL {
         let fm = FileManager.default
         let safe = name.isEmpty || name.contains("/") || name.hasPrefix(".") ? "file" : name
+        // The old version goes first: whatever fails below, a copy is never paired with a
+        // version it is not (no version only means fetching again).
+        let versionFile = entry.appendingPathComponent(".version")
+        do {
+            try fm.removeItem(at: versionFile)
+        } catch CocoaError.fileNoSuchFile {
+        }
         let copy = "c-\(UUID().uuidString)"
         let folder = entry.appendingPathComponent(copy, isDirectory: true)
         try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let file = folder.appendingPathComponent(safe)
         do {
             try fm.moveItem(at: staged, to: file)
-            try "\(copy)/\(safe)".write(to: entry.appendingPathComponent(".current"), atomically: true, encoding: .utf8)
+            try writeText("\(copy)/\(safe)", entry.appendingPathComponent(".current"))
         } catch {
             try? fm.removeItem(at: folder)
             throw error
         }
-        let versionFile = entry.appendingPathComponent(".version")
-        if let version {
-            try version.write(to: versionFile, atomically: true, encoding: .utf8)
-        } else {
-            try? fm.removeItem(at: versionFile)
-        }
         retireCopies(in: entry)
+        if let version {
+            try writeText(version, versionFile)
+        }
         prune(keeping: entry)
         return file
     }
@@ -324,7 +331,16 @@ final class RemoteFileCache {
             return (entry.standardizedFileURL, date, size(of: entry))
         }
         sized.sort { $0.date < $1.date }
-        var total = sized.reduce(UInt64(0)) { $0 + $1.size } + reserved.values.reduce(UInt64(0)) { $0 + $1.bytes }
+        // A download refreshing an entry replaces its copy in use, unless Quick Look shows it:
+        // only what it adds beyond that copy is reserved.
+        let extra = reserved.values.reduce(UInt64(0)) { sum, r in
+            var replaced: UInt64 = 0
+            if let file = current(r.entry), held[file.standardizedFileURL] == nil {
+                replaced = UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            }
+            return sum + (r.bytes > replaced ? r.bytes - replaced : 0)
+        }
+        var total = sized.reduce(UInt64(0)) { $0 + $1.size } + extra
         for e in sized where total > maxBytes && !busy.contains(e.url) {
             if (try? fm.removeItem(at: e.url)) != nil { total -= e.size }
         }
@@ -340,7 +356,19 @@ final class RemoteFileCache {
     func fetch(_ reference: TerminalFileReference, pane: PaneKey, cwd: String?,
                completion: @escaping (Result<URL, Error>) -> Void) {
         let paths: [String]
-        do { paths = try reference.remotePaths() } catch { return completion(.failure(error)) }
+        do {
+            // A relative path is the directory's the pane had when it was clicked, not the one
+            // it is in by the time the host is asked.
+            paths = try reference.remotePaths().map { path in
+                if path.hasPrefix("/") || path.hasPrefix("~") { return path }
+                guard let cwd, cwd.hasPrefix("/"), !cwd.hasPrefix("//"), !cwd.contains("\0") else {
+                    throw FilePreviewError.noDirectory
+                }
+                return cwd.hasSuffix("/") ? cwd + path : cwd + "/" + path
+            }
+        } catch {
+            return completion(.failure(error))
+        }
         let key = entry(host: pane.host, path: paths[0], cwd: cwd)
         if inFlight[key] != nil {
             inFlight[key]?.append(completion)

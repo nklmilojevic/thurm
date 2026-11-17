@@ -362,8 +362,9 @@ by spaces, as a paste, so an agent at its prompt gets them as one paste. If a
 file fails or you cancel, nothing is typed and nothing is kept. Folders are
 refused; drop the files in them instead.
 
-Uploads are kept on the host, readable by you only, under the daemon's runtime
-directory: `drops/<pane>/<batch>/<name>`, next to its socket. Names keep their last path component without control
+Uploads are kept on the host, readable by you only, in Thurm's state directory
+(`$XDG_STATE_HOME/thurm`, usually `~/.local/state/thurm`; `~/Library/Application
+Support/Thurm` on a Mac): `drops/<pane>/<batch>/<name>`. Names keep their last path component without control
 characters, at most 255 bytes, numbered (`name-2.txt`) when two in a batch are
 the same. Limits:
 
@@ -372,7 +373,7 @@ the same. Limits:
 | One file | 4 GiB |
 | Files in one drop | 256 |
 | Files on their way to one pane | 64 |
-| Space left free on the host's disk | 1 GiB, or the upload is refused |
+| Space left free on the host's disk | 1 GiB: the oldest finished drops give way for it, and an upload that still does not fit is refused |
 | Kept | 24 hours, and 8 GiB in all, drops on their way included: the oldest finished drops go first, and a file that still does not fit is refused |
 
 The other way, ⌘⌥-click a path in a remote pane, or right-click it and pick
