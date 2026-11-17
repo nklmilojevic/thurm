@@ -56,6 +56,8 @@ commands:
 | `thurm remote remove NAME` | Forget a host; its daemon and panes keep running there |
 | `thurm remote ports NAME` | The ports programs in the host's panes listen on |
 | `thurm remote forward NAME PORT\|URL` | Open one of the host's ports on this Mac (see [Ports](#ports)) |
+| `thurm remote forwards [NAME]` | The forwards the app has open, and the connections each carries |
+| `thurm cp SOURCE... DEST` | Copy files to or from a host, named `NAME:PATH` (see [Copying files](#copying-files)) |
 
 **Thurm › Remotes…** lists the same hosts with their state and build, and the
 selected host's checklist with a **Fix** button for each problem.
@@ -446,6 +448,36 @@ A host running an older Thurm keeps the earlier behavior: a pasted or dropped
 image is written to a private file on the host and its path pasted; other files
 insert their paths on this Mac.
 
+### Copying files
+
+`thurm cp` copies files between this Mac and a host from a terminal, through the
+connection the app keeps to the host. A host's file is `NAME:PATH`, as `scp`
+names it:
+
+```sh
+thurm cp notes.txt devbox:work/          # into a folder, under its own name
+thurm cp a.png b.png devbox:shots        # several files go into a folder
+thurm cp devbox:app.log .                # from the host
+thurm cp devbox:app.log pi:boot.log logs # from two hosts into a folder here
+thurm cp --force build.tar devbox:/srv/build.tar
+```
+
+On the host, `~` and relative paths are under your home directory there, and
+`devbox:` alone is that directory. The folder a file goes into must exist. A
+file that is already at the destination is kept and the copy fails; `--force`
+replaces it, and only a regular file is replaced, never a folder or a link. A
+file is written beside its place and moved there once it is whole, so a copy
+that fails or that you stop with Ctrl-C leaves nothing behind. A file copied to
+a host keeps its permission bits. One copied from a host is readable by everyone
+(`0644`), or keeps the bits of the file it replaced.
+
+Only regular files are copied, each at most 4 GiB, and one side of every copy is
+this Mac: to copy between two hosts, copy to this Mac first. A name before a
+colon that is not one of your hosts is an error unless a file of that name
+exists here; write `./name:with-colon` for such a file. With `--json`, the files
+copied are printed as `[{from, to, bytes}]`. Thurm must be connected to the
+host, and the host needs a Thurm daemon of this version or later.
+
 ## Ports
 
 A dev server on the host prints `http://localhost:5173`. That is the host's
@@ -486,7 +518,8 @@ Nothing is forwarded until you or a plugin you installed does one of these: a
 port that merely opens on the host stays there, and a host that is turned off
 gets no forwards. The host's
 details in **Thurm › Remotes…** list its forwards, with **Open** (the link it
-was opened for), **Copy Link** and **Close**; ⌘⇧P has **Copy Forward Link** and
+was opened for), **Copy Link** and **Close**, and the number of connections a
+forward carries while it carries any; ⌘⇧P has **Copy Forward Link** and
 **Close Forward** for each too. Each checks first that the forward is still open
 on the same port: one that has closed meanwhile is neither opened nor copied (its
 port may be another program's by then). Closing a forward also ends the connections it
@@ -496,6 +529,14 @@ connection open (while part of a host's processes can't be read, or the host is
 disconnected, that clock doesn't run). A forward to a port no pane listed (a
 container, a system service) stays until you close it. One forward carries at
 most 64 connections at a time.
+
+`thurm remote forwards` lists the app's forwards from a terminal, `thurm remote
+forwards devbox` those of one host: the host, its port, the port on this Mac,
+the connections it carries now and its link. The numbers are the app's, a moment
+old at most; a `-` stands for an app that does not count them. Forwards of
+`thurm remote forward` belong to that command, not to the app, and are not
+listed. `--json` prints `[{id, host, remote_port, local_port, url,
+connections}]`.
 
 The host needs a Thurm daemon of this version or later; an older one is
 reported when you open the link.

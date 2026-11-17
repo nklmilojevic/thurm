@@ -31,6 +31,14 @@ final class ForwardsTests: XCTestCase {
         XCTAssertEqual(ForwardInfo(json: ["id": 3, "host": "devbox", "remote_port": 1, "local_port": 2])?.url,
                        "http://localhost:2/")
         XCTAssertNil(ForwardInfo(json: ["id": 3, "host": "devbox"]))
+        // The connections it carries come with the list, not with an answer about one forward.
+        XCTAssertNil(f?.connections)
+        XCTAssertEqual(ForwardInfo(json: ["id": 3, "host": "devbox", "remote_port": 1, "local_port": 2,
+                                          "connections": 2])?.connections, 2)
+        XCTAssertNil(ForwardText.connections(nil))
+        XCTAssertNil(ForwardText.connections(0))
+        XCTAssertEqual(ForwardText.connections(1), "1 connection")
+        XCTAssertEqual(ForwardText.connections(4), "4 connections")
     }
 
     func testProcessPanelRowsOpenRemotePortsThroughAForward() {

@@ -2646,7 +2646,9 @@ impl Daemon {
             | Request::ApplyLayout { .. }
             // An upload's admission may walk and prune the kept drops.
             | Request::UploadBegin { .. }
-            | Request::DownloadBegin { .. }) => {
+            | Request::DownloadBegin { .. }
+            | Request::CopyTo { .. }
+            | Request::CopyFrom { .. }) => {
                 let daemon = self.clone();
                 let client = client.clone();
                 let spawned = std::thread::Builder::new()
@@ -3680,6 +3682,36 @@ impl Daemon {
                         home.as_deref(),
                         if_version.as_deref(),
                     )
+                    .map(Response::Download)
+            }
+            Request::CopyTo {
+                path,
+                name,
+                size,
+                mode,
+                replace,
+            } => {
+                let home = std::env::var("HOME").ok();
+                let principal = client.principal.lock().clone().unwrap_or_default();
+                self.transfers
+                    .copy_to_begin(
+                        self,
+                        client.id,
+                        principal,
+                        &path,
+                        &name,
+                        size,
+                        mode,
+                        replace,
+                        home.as_deref(),
+                    )
+                    .map(|(ticket, expires_ms)| Response::Ticket { ticket, expires_ms })
+            }
+            Request::CopyFrom { path } => {
+                let home = std::env::var("HOME").ok();
+                let principal = client.principal.lock().clone().unwrap_or_default();
+                self.transfers
+                    .copy_from_begin(self, client.id, principal, &path, home.as_deref())
                     .map(Response::Download)
             }
         }

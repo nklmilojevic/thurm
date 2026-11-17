@@ -8,6 +8,7 @@ mod agent;
 mod agent_prompt;
 mod attach;
 mod clip;
+mod cp;
 mod events;
 mod ext;
 mod hook_pgrp;
@@ -128,6 +129,9 @@ enum RemoteCmd {
     },
     /// The TCP ports programs in a host's panes listen on.
     Ports { name: String },
+    /// The forwards the Thurm app has open (of one host, or all), with the connections each
+    /// carries.
+    Forwards { name: Option<String> },
     /// Open a host's port on this machine (127.0.0.1) until interrupted, and print its URL.
     Forward {
         name: String,
@@ -607,6 +611,16 @@ enum Cmd {
         #[command(subcommand)]
         action: clip::ClipCmd,
     },
+    /// Copy files between this machine and a remote host: a host's file is NAME:PATH (`~` and
+    /// relative paths are under the home directory there). Several files go into a folder.
+    Cp {
+        /// Replace a file that is already at the destination.
+        #[arg(long, short = 'f')]
+        force: bool,
+        /// The files to copy, then where to: `notes.txt devbox:work/`, `devbox:app.log .`
+        #[arg(required = true, num_args = 2.., value_name = "SOURCE... DEST")]
+        paths: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -940,6 +954,7 @@ fn run(cli: Cli) -> R {
                 | Cmd::Hooks { .. }
                 | Cmd::Skill { .. }
                 | Cmd::Remote { .. }
+                | Cmd::Cp { .. }
                 | Cmd::Pair { .. }
                 | Cmd::Theme { .. }
                 | Cmd::Set { .. }
@@ -975,6 +990,7 @@ fn run(cli: Cli) -> R {
         } => tailscale::nc(&host, port),
         Cmd::Attach { pane } => attach::run(pane, remote.as_deref(), json),
         Cmd::Clip { action } => clip::run(action, remote.is_some()),
+        Cmd::Cp { force, paths } => cp::run(&paths, force, json),
         Cmd::SocketPath => {
             println!("{}", thurm_config::socket_path().display());
             Ok(ExitCode::SUCCESS)
@@ -1015,6 +1031,15 @@ fn run(cli: Cli) -> R {
                 remote::doctor_cmd(name.as_deref(), fix, yes.then_some(true), json)
             }
             RemoteCmd::Ports { name } => remote::ports_cmd(&name, json),
+            RemoteCmd::Forwards { name } => {
+                // The daemon that is running has the app's list; none is started to say so.
+                let client = connect(false).map_err(|e| {
+                    format!(
+                        "the forwards are the Thurm app's, and its daemon is not reachable: {e}"
+                    )
+                })?;
+                remote::forwards_cmd(&client, name.as_deref(), json)
+            }
             RemoteCmd::Forward {
                 name,
                 target,
@@ -2237,6 +2262,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool, remote: Option<&str>) -> R {
         | Cmd::Hooks { .. }
         | Cmd::Skill { .. }
         | Cmd::Clip { .. }
+        | Cmd::Cp { .. }
         | Cmd::Theme { spec: None } => unreachable!(),
     }
     Ok(ExitCode::SUCCESS)

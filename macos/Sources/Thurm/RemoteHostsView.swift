@@ -237,6 +237,9 @@ private struct HostDetails: View {
                         } label: {
                             Text(ForwardText.toast(host: name, remotePort: f.remotePort, localPort: f.localPort))
                                 .font(.system(.body, design: .monospaced))
+                            if let carried = ForwardText.connections(f.connections) {
+                                Text(carried)
+                            }
                         }
                     }
                 }

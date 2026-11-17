@@ -1730,3 +1730,114 @@ fn more_files_than_a_batch_holds_are_refused_before_any_goes() {
     );
     assert!(batches(&env, pane).is_empty());
 }
+
+/// `thurm cp`: a file goes to a path its sender names and comes back, whole or not at all,
+/// replacing a file only when told to.
+#[test]
+fn a_file_is_copied_to_a_named_path_and_back() {
+    use thurm_remote::transfer::{self, Cancel, Host, TransferError};
+    let env = Env::new("transfer-copy");
+    let home = env.dir.join("home");
+    std::fs::create_dir_all(home.join("inbox")).unwrap();
+    let _daemon = env.start_with(&[("HOME", &home)]);
+    let (c, _rx) = env.connect();
+    assert!(c.has_capability(CAP_COPY));
+    let host = Host {
+        client: &c,
+        socket: &env.socket,
+    };
+    let dir = work_dir(&env);
+    let data: Vec<u8> = (0..300_000).map(|i| (i % 239) as u8).collect();
+    let src = dir.join("data.bin");
+    std::fs::write(&src, &data).unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let cancel = Cancel::default();
+    let to =
+        |dest: &str, replace: bool| transfer::copy_to(host, &src, dest, replace, &cancel, |_| {});
+
+    // Into a folder under its own name; `~` and relative paths are under the home directory.
+    let mut seen = Vec::new();
+    let sent = transfer::copy_to(host, &src, "inbox", false, &cancel, |p| seen.push(p)).unwrap();
+    assert_eq!(sent, data.len() as u64);
+    assert_eq!(seen.last().map(|p| (p.done, p.total)), Some((sent, sent)));
+    let landed = home.join("inbox/data.bin");
+    assert!(std::fs::read(&landed).unwrap() == data);
+    assert_eq!(mode(&landed), 0o640, "the file keeps its permission bits");
+    to("~/inbox/named.bin", false).unwrap();
+    assert!(std::fs::read(home.join("inbox/named.bin")).unwrap() == data);
+    let abs = dir.join("abs.bin");
+    to(&abs.display().to_string(), false).unwrap();
+    assert!(std::fs::read(&abs).unwrap() == data);
+
+    // A file that is there stays unless it is to be replaced; nothing else gives way.
+    std::fs::write(&landed, b"old").unwrap();
+    let e = to("inbox/", false).unwrap_err();
+    assert!(e.to_string().contains("is there already"), "{e}");
+    assert_eq!(std::fs::read(&landed).unwrap(), b"old");
+    to("inbox/", true).unwrap();
+    assert!(std::fs::read(&landed).unwrap() == data);
+    std::fs::create_dir(home.join("inbox/data.bin.d")).unwrap();
+    std::os::unix::fs::symlink(&abs, home.join("inbox/link")).unwrap();
+    let e = to("inbox/link", true).unwrap_err();
+    assert!(e.to_string().contains("not a regular file"), "{e}");
+    let e = to("inbox/missing/", false).unwrap_err();
+    assert!(e.to_string().contains("not a folder"), "{e}");
+    let e = to("nowhere/data.bin", false).unwrap_err();
+    assert!(e.to_string().contains("not a folder"), "{e}");
+    let e = transfer::copy_to(host, &dir, "inbox", false, &cancel, |_| {}).unwrap_err();
+    assert!(matches!(e, TransferError::Folder(_)), "{e}");
+    // Nothing is left beside the files: no part of a refused or finished copy.
+    let mut names: Vec<String> = std::fs::read_dir(home.join("inbox"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["data.bin", "data.bin.d", "link", "named.bin"]);
+
+    // A copy that says more than it sends leaves nothing.
+    let ticket = c
+        .copy_to_begin("inbox/short.bin", "short.bin", 10, 0o644, false)
+        .unwrap();
+    let (r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
+    w.write_all(b"12345").unwrap();
+    w.finish().unwrap();
+    assert!(r.wait_closed().is_err());
+    assert!(!home.join("inbox/short.bin").exists());
+    assert_eq!(std::fs::read_dir(home.join("inbox")).unwrap().count(), 4);
+
+    // And back: into a folder under its name, or to a name of its own.
+    let out = dir.join("out");
+    std::fs::create_dir(&out).unwrap();
+    let from = |path: &str, dest: &Path, replace: bool| {
+        transfer::copy_from(host, path, dest, replace, &cancel, |_| {})
+    };
+    let (at, size) = from("inbox/named.bin", &out, false).unwrap();
+    assert_eq!(
+        (at.as_path(), size),
+        (out.join("named.bin").as_path(), sent)
+    );
+    assert!(std::fs::read(&at).unwrap() == data);
+    assert_eq!(mode(&at), 0o644);
+    let e = from("~/inbox/named.bin", &out, false).unwrap_err();
+    assert!(e.to_string().contains("is there already"), "{e}");
+    std::fs::write(&at, b"old").unwrap();
+    std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o600)).unwrap();
+    from("~/inbox/named.bin", &out, true).unwrap();
+    assert!(std::fs::read(&at).unwrap() == data);
+    assert_eq!(
+        mode(&at),
+        0o600,
+        "a replaced file keeps its own permission bits"
+    );
+    let (at, _) = from(&abs.display().to_string(), &out.join("other.bin"), false).unwrap();
+    assert_eq!(at, out.join("other.bin"));
+    let e = from("inbox/none", &out, false).unwrap_err();
+    assert!(matches!(e, TransferError::NotFound(_)), "{e}");
+    let e = from("inbox", &out, false).unwrap_err();
+    assert!(e.to_string().contains("not a regular file"), "{e}");
+    assert_eq!(
+        std::fs::read_dir(&out).unwrap().count(),
+        2,
+        "a part was left"
+    );
+}

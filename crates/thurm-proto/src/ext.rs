@@ -98,7 +98,8 @@ pub mod method {
     /// ([`crate::CAP_EXT_FORWARDS`]); subscribers hear `forward_opened` and `forward_closed`.
     pub const FORWARDS_REPORT: &str = "forwards.report";
     /// The forwards of the app that holds plugins' forwards (the one that connected first; ids
-    /// are that app's own): `[ForwardInfo]`. Fails when no app that forwards is connected.
+    /// are that app's own): `[ForwardInfo]`, each with the `connections` it carries when the app
+    /// counts them. Fails when no app that forwards is connected.
     pub const FORWARDS_LIST: &str = "forwards.list";
     /// [`super::ForwardOpen`]: the app opens a remote host's port on this Mac (or finds the
     /// forward that has it). The result is a [`super::ForwardInfo`] with one more field, `new`:
@@ -392,6 +393,10 @@ pub struct ForwardInfo {
     /// Where it opens: the link it was last opened for, on its local port
     /// (`http://localhost:<local_port>/app`), else `http://localhost:<local_port>/`.
     pub url: String,
+    /// The connections it carries, as the app last said (it says so within moments of a
+    /// change); `None` from an app that does not count them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connections: Option<u32>,
 }
 
 /// Parameters of [`method::FORWARDS_OPEN`].

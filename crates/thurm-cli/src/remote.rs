@@ -849,6 +849,55 @@ fn ports_table(list: &[thurm_proto::PanePorts]) -> String {
     out
 }
 
+/// `thurm remote forwards [NAME]`: the forwards the app has open, as this machine's daemon
+/// last heard of them, with the connections each carries.
+pub fn forwards_cmd(c: &Client, name: Option<&str>, json: bool) -> R {
+    if let Some(name) = name {
+        remote_config(name)?;
+    }
+    let listed = crate::ext::call(
+        c,
+        thurm_proto::ext::method::FORWARDS_LIST,
+        serde_json::Value::Null,
+    )?;
+    let mut list: Vec<thurm_proto::ext::ForwardInfo> = serde_json::from_value(listed)?;
+    list.retain(|f| name.is_none_or(|n| f.host == n));
+    list.sort_by(|a, b| (&a.host, a.remote_port, a.id).cmp(&(&b.host, b.remote_port, b.id)));
+    if json {
+        println!("{}", serde_json::to_string(&list)?);
+    } else {
+        print!("{}", forwards_table(&list));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn forwards_table(list: &[thurm_proto::ext::ForwardInfo]) -> String {
+    if list.is_empty() {
+        return "no forwards\n".into();
+    }
+    let host = list
+        .iter()
+        .map(|f| f.host.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("HOST".len());
+    let mut out = format!(
+        "{:<host$} {:<6} {:<6} {:<11} URL\n",
+        "HOST", "PORT", "LOCAL", "CONNECTIONS"
+    );
+    for f in list {
+        // An app that does not count them says nothing: not the same as none.
+        let connections = f
+            .connections
+            .map_or_else(|| "-".to_owned(), |n| n.to_string());
+        out.push_str(&format!(
+            "{:<host$} {:<6} {:<6} {:<11} {}\n",
+            f.host, f.remote_port, f.local_port, connections, f.url
+        ));
+    }
+    out
+}
+
 /// Whether `thurm remote forward` opens the browser: not with `--no-open`, nor with `--json`.
 fn opens_browser(open: bool, json: bool) -> bool {
     open && !json
@@ -929,6 +978,35 @@ mod tests {
         assert!(!opens_browser(true, true));
         assert!(!opens_browser(false, false));
         assert!(!opens_browser(false, true));
+    }
+
+    #[test]
+    fn forwards_print_as_a_table() {
+        use thurm_proto::ext::ForwardInfo;
+        let forward = |host: &str, remote_port, local_port, connections| ForwardInfo {
+            id: 1,
+            host: host.into(),
+            remote_port,
+            local_port,
+            url: format!("http://localhost:{local_port}/"),
+            connections,
+        };
+        let t = forwards_table(&[
+            forward("devbox", 5173, 5173, Some(2)),
+            forward("build-machine", 3000, 13000, None),
+        ]);
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines[0], "HOST          PORT   LOCAL  CONNECTIONS URL");
+        assert_eq!(
+            lines[1],
+            "devbox        5173   5173   2           http://localhost:5173/"
+        );
+        // An app that does not count connections: unknown, not none.
+        assert_eq!(
+            lines[2],
+            "build-machine 3000   13000  -           http://localhost:13000/"
+        );
+        assert_eq!(forwards_table(&[]), "no forwards\n");
     }
 
     #[test]

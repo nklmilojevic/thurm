@@ -1633,6 +1633,26 @@ fn forwards_go_through_the_app() {
         call(&plugin, method::FORWARDS_LIST, Value::Null).unwrap()[0]["local_port"],
         5174
     );
+    // An app that does not count a forward's connections lists none, not zero.
+    assert_eq!(
+        call(&plugin, method::FORWARDS_LIST, Value::Null).unwrap()[0].get("connections"),
+        None
+    );
+
+    // The connections a forward carries come in a report with no change: the list has them,
+    // and nothing is heard as opened or closed.
+    let mut busy = forward.clone();
+    busy["connections"] = json!(3);
+    call(&app, method::FORWARDS_REPORT, json!({ "forwards": [busy] })).unwrap();
+    assert_eq!(
+        call(&plugin, method::FORWARDS_LIST, Value::Null).unwrap()[0]["connections"],
+        3
+    );
+    assert!(
+        rx.try_iter()
+            .all(|(_, e)| e["event"] != "forward_opened" && e["event"] != "forward_closed"),
+        "a change in connections was heard as a forward opened or closed"
+    );
 
     // Closing goes to the app; what it answers comes back.
     let closing = std::thread::spawn({

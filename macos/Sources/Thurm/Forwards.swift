@@ -13,6 +13,8 @@ struct ForwardInfo: Equatable {
     var localPort: Int
     /// Where it opens: `http://localhost:<local>/`, or the link it was opened for.
     var url: String
+    /// The connections it carries now; nil where they are not said (an answer about one forward).
+    var connections: Int?
 
     init?(json: Any?) {
         guard let d = json as? [String: Any], let id = jsonUInt64(d["id"]), let host = jsonString(d["host"]),
@@ -22,6 +24,7 @@ struct ForwardInfo: Equatable {
         remotePort = remote
         localPort = local
         url = jsonString(d["url"]) ?? "http://localhost:\(local)/"
+        connections = jsonInt(d["connections"])
     }
 
     /// `known`'s link, if `answer` (to `forward_get`) says that forward is still open on the
@@ -226,6 +229,12 @@ enum ForwardText {
 
     static func failure(host: HostId, _ why: String) -> String {
         "Could not forward from \(host): \(why)"
+    }
+
+    /// The connections a forward carries, for its row: nothing while it carries none.
+    static func connections(_ count: Int?) -> String? {
+        guard let count, count > 0 else { return nil }
+        return count == 1 ? "1 connection" : "\(count) connections"
     }
 }
 

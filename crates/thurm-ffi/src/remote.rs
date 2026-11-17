@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -69,13 +70,21 @@ fn forwards() -> &'static Forwards {
 /// Reports each change of `f` to `out` as `{forwards, change}`: every open forward and what
 /// changed, each forward as the app reads it ([`forward_json`]). One report at a time, each
 /// built and sent together: one built earlier is never sent after one built later, so the last
-/// list the app gets is the one in force.
+/// list the app gets is the one in force. A forward's connections coming and going are reported
+/// the same way, with no `change`: only the numbers in the list differ.
 fn report_changes(f: &Forwards, out: impl Fn(&str) + Send + Sync + 'static) {
-    let me = f.clone();
-    let in_order = Mutex::new(());
+    let in_order = Arc::new(Mutex::new(()));
+    let out = Arc::new(out);
+    let (me, one, send) = (f.clone(), in_order.clone(), out.clone());
     f.on_change(move |change| {
-        let _one_at_a_time = in_order.lock();
+        let _one_at_a_time = one.lock();
         let report = json!({ "forwards": forward_list(&me), "change": change_json(&change) });
+        send(&report.to_string());
+    });
+    let me = f.clone();
+    f.on_connections(move || {
+        let _one_at_a_time = in_order.lock();
+        let report = json!({ "forwards": forward_list(&me) });
         out(&report.to_string());
     });
 }
@@ -95,9 +104,17 @@ fn change_json(change: &forward::Change) -> Value {
     }
 }
 
-/// Every forward, with the URL it opens at.
+/// Every forward, with the URL it opens at and the connections it carries now.
 fn forward_list(f: &Forwards) -> Vec<Value> {
-    f.list().iter().map(|fw| forward_json(fw, None)).collect()
+    let connections = f.connections();
+    f.list()
+        .iter()
+        .map(|fw| {
+            let mut v = forward_json(fw, None);
+            v["connections"] = connections.get(&fw.id).copied().unwrap_or(0).into();
+            v
+        })
+        .collect()
 }
 
 /// The forward's JSON for the app; `url` the link it opens at: `url` (the link it was just

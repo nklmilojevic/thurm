@@ -46,6 +46,9 @@ pub const UNREADABLE_ANSWER: &str = "the daemon's answer could not be read";
 pub const NO_TRANSFER: &str =
     "this Thurm daemon cannot take or send files yet; update Thurm on this host";
 
+/// What a daemon without [`thurm_proto::CAP_COPY`] is told.
+pub const NO_COPY: &str = "this Thurm daemon cannot copy files yet; update Thurm on this host";
+
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -705,6 +708,47 @@ impl Client {
             pane,
             path: path.to_owned(),
             if_version: if_version.map(str::to_owned),
+        })? {
+            Response::Download(info) => Ok(info),
+            _ => Err(ClientError::Daemon(UNREADABLE_ANSWER.into())),
+        }
+    }
+}
+
+impl Client {
+    /// Reserves a stream that writes a file of `size` bytes at `path` on the daemon's host
+    /// ([`Request::CopyTo`]); open it with [`stream::open`] before the ticket expires.
+    pub fn copy_to_begin(
+        &self,
+        path: &str,
+        name: &str,
+        size: u64,
+        mode: u32,
+        replace: bool,
+    ) -> Result<stream::Ticket, ClientError> {
+        if !self.has_capability(thurm_proto::CAP_COPY) {
+            return Err(ClientError::Daemon(NO_COPY.into()));
+        }
+        match self.request(Request::CopyTo {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            size,
+            mode,
+            replace,
+        })? {
+            Response::Ticket { ticket, expires_ms } => Ok(stream::Ticket { ticket, expires_ms }),
+            _ => Err(ClientError::Daemon(UNREADABLE_ANSWER.into())),
+        }
+    }
+
+    /// Asks for the file at `path` on the daemon's host ([`Request::CopyFrom`]): its details,
+    /// and a ticket for a stream sending it.
+    pub fn copy_from_begin(&self, path: &str) -> Result<thurm_proto::DownloadInfo, ClientError> {
+        if !self.has_capability(thurm_proto::CAP_COPY) {
+            return Err(ClientError::Daemon(NO_COPY.into()));
+        }
+        match self.request(Request::CopyFrom {
+            path: path.to_owned(),
         })? {
             Response::Download(info) => Ok(info),
             _ => Err(ClientError::Daemon(UNREADABLE_ANSWER.into())),

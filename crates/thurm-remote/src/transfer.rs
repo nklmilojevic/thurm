@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use thurm_client::stream::{self, StreamReader, StreamWriter};
 use thurm_client::{Client, ClientError};
 use thurm_proto::stream::{MAX_DATA, StreamClose};
-use thurm_proto::{CAP_TRANSFER, DownloadInfo, PaneId, UploadBatch};
+use thurm_proto::{CAP_COPY, CAP_TRANSFER, DownloadInfo, PaneId, UploadBatch};
 
 /// A host's daemon: the connection that asks, and the socket streams open on (the tunnel's
 /// local end for a remote host).
@@ -862,6 +862,131 @@ pub fn download(
         TransferError::Local(format!("{}: {e}", dest.display()))
     })?;
     Ok(Downloaded::Saved(info))
+}
+
+/// What a copy says of a file it would have to replace, and was not told to.
+pub const COPY_EXISTS: &str = "is there already (--force replaces it)";
+
+/// Copies the file `src` to `dest` on the host ([`thurm_proto::CAP_COPY`]): a path of the
+/// host's user, `~` and relative ones under its home, the file's own name inside it when it is
+/// a folder. A file already there is replaced only with `replace`. The file is whole there or
+/// not there at all. Returns its size.
+pub fn copy_to(
+    host: Host,
+    src: &Path,
+    dest: &str,
+    replace: bool,
+    cancel: &Cancel,
+    mut progress: impl FnMut(Progress),
+) -> Result<u64, TransferError> {
+    if !host.client.has_capability(CAP_COPY) {
+        return Err(TransferError::Unsupported);
+    }
+    let upload = Upload::Path(src.to_owned());
+    let planned = plan(&upload)?;
+    let mut source = open_planned(&planned)?;
+    let mode = std::fs::metadata(src)
+        .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777)
+        .map_err(|e| TransferError::Local(format!("{}: {e}", src.display())))?;
+    let ticket = host
+        .client
+        .copy_to_begin(dest, &source.name, source.size, mode, replace)?;
+    let (reader, writer, watch, handle) = open_watched(host.socket, &ticket.ticket, cancel)?;
+    let mut p = Progress {
+        done: 0,
+        total: source.size,
+    };
+    progress(p);
+    let writer = send_one(&mut source, writer, watch, &handle, cancel, |n| {
+        p.done += n;
+        progress(p);
+    })?;
+    wait_cancellable(reader, writer, handle, cancel)?;
+    Ok(p.total)
+}
+
+/// Copies the file at `path` on the host ([`thurm_proto::CAP_COPY`], read as [`copy_to`] reads
+/// its destination) to `dest` here, under its own name inside `dest` when that is a folder. A
+/// file already there is replaced only with `replace`, and only a regular file is. Written
+/// beside its place first, then moved there. Returns where it is and its size.
+pub fn copy_from(
+    host: Host,
+    path: &str,
+    dest: &Path,
+    replace: bool,
+    cancel: &Cancel,
+    mut progress: impl FnMut(Progress),
+) -> Result<(PathBuf, u64), TransferError> {
+    if !host.client.has_capability(CAP_COPY) {
+        return Err(TransferError::Unsupported);
+    }
+    let info = host.client.copy_from_begin(path)?;
+    let ticket = info
+        .ticket
+        .as_deref()
+        .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
+    // A copy refused here uses its ticket up (opened and dropped at once) rather than leave it
+    // to lapse, counted against this client's tickets for a minute.
+    let refuse = |e: TransferError| {
+        if let Ok(opened) = stream::open(host.socket, ticket) {
+            drop(opened);
+        }
+        e
+    };
+    let dest = if dest.is_dir() {
+        let name = Path::new(&info.name)
+            .file_name()
+            .ok_or_else(|| refuse(TransferError::Remote("the host's file has no name".into())))?;
+        dest.join(name)
+    } else {
+        dest.to_owned()
+    };
+    // Its mode once in place: the one of the file it replaces, else what a new file gets.
+    let mode = match std::fs::symlink_metadata(&dest) {
+        Ok(m) if !m.is_file() => {
+            return Err(refuse(TransferError::Local(format!(
+                "{} is not a regular file; it is not replaced",
+                dest.display()
+            ))));
+        }
+        Ok(_) if !replace => {
+            return Err(refuse(TransferError::Local(format!(
+                "{} {COPY_EXISTS}",
+                dest.display()
+            ))));
+        }
+        Ok(m) => std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0o644,
+        Err(e) => {
+            return Err(refuse(TransferError::Local(format!(
+                "{}: {e}",
+                dest.display()
+            ))));
+        }
+    };
+    let (part, file) = create_part(&dest).map_err(refuse)?;
+    let local = |e: std::io::Error| TransferError::Local(format!("{}: {e}", dest.display()));
+    let placed = fetch_into(host, ticket, file, &part, info.size, cancel, &mut progress)
+        .and_then(|()| {
+            std::fs::set_permissions(&part, std::os::unix::fs::PermissionsExt::from_mode(mode))
+                .map_err(local)
+        })
+        .and_then(|()| {
+            if replace {
+                std::fs::rename(&part, &dest).map_err(local)
+            } else {
+                // Into its place without replacing a file that came there meanwhile.
+                std::fs::hard_link(&part, &dest).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => {
+                        TransferError::Local(format!("{} {COPY_EXISTS}", dest.display()))
+                    }
+                    _ => local(e),
+                })
+            }
+        });
+    // Moved into place, the part's name is gone; linked there, or failed, it is not.
+    let _ = std::fs::remove_file(&part);
+    placed.map(|()| (dest, info.size))
 }
 
 /// Opens the stream `ticket` reserved and writes the `size` bytes it sends into `file` (`shown`

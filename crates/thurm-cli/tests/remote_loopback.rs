@@ -628,6 +628,60 @@ fn remote_workspace_over_loopback_ssh() {
         "no implicit local pane with --remote"
     );
 
+    // 4a. `thurm cp` copies a file to the host and back through the same tunnel.
+    let cp_dir = w.base.join("cp");
+    std::fs::create_dir_all(cp_dir.join("there")).unwrap();
+    std::fs::create_dir_all(cp_dir.join("back")).unwrap();
+    let note = cp_dir.join("note.txt");
+    std::fs::write(&note, "copied-42\n").unwrap();
+    let there = format!("loop:{}", cp_dir.join("there").display());
+    let out = cli(&w, &["cp", note.to_str().unwrap(), &there, "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let copied: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(copied[0]["bytes"], 10, "{copied}");
+    assert_eq!(
+        std::fs::read_to_string(cp_dir.join("there/note.txt")).unwrap(),
+        "copied-42\n"
+    );
+    // A file that is there is kept unless it is to be replaced.
+    let out = cli(&w, &["cp", note.to_str().unwrap(), &there]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("loop: ") && err.contains("is there already"),
+        "{err}"
+    );
+    let out = cli(&w, &["cp", "--force", note.to_str().unwrap(), &there]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let from = format!("{there}/note.txt");
+    let out = cli(&w, &["cp", &from, cp_dir.join("back").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(cp_dir.join("back/note.txt")).unwrap(),
+        "copied-42\n"
+    );
+    let out = cli(&w, &["cp", "nobody:a", cp_dir.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("no remote named \"nobody\""),
+        "{err}"
+    );
+    // The forwards are the app's: with none open, and no daemon of this machine, it says so.
+    let out = cli(&w, &["remote", "forwards"]);
+    assert!(!out.status.success());
+
     // 4b. `thurm remote ports` lists what a program in the remote pane listens on, with its
     //     pane.
     let pane_port = free_port();

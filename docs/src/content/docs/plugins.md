@@ -135,7 +135,7 @@ prints it and exits with 1.
 | `thurm.wait(pane, {match, idle, exit, agent, timeout})` | Waits for the prompt, a regex, quiet, exit or a free agent; `true`, or `false` and why; waiting for `exit`, the exit code is the third value (`true, nil, code`) |
 | `thurm.close(pane)`, `thurm.focus(pane)` | Closes or focuses a pane |
 | `thurm.ports(pane)` | The ports the pane's programs listen on (`port`, `address`, `pid`, `command`), and whether all its processes could be read; without a pane, every pane's as `{pane, ports, complete}`. This Mac's panes only: a remote host's pane is known by its `ports_changed` (its `id` is that host's, with `host`) |
-| `thurm.forward.open(host, port, {browse})`, `thurm.forward.close(id)`, `thurm.forward.list()` | Opens a remote host's port on this Mac through the app (or finds the forward that has it), closes one, lists them; a forward has `id`, `host`, `remote_port`, `local_port` and `url` (the link it was last opened for, on its local port), and `browse` opens the URL too. A forward that closed (its port went away), or moved to another local port, before the app could use it is an error, and nothing is opened |
+| `thurm.forward.open(host, port, {browse})`, `thurm.forward.close(id)`, `thurm.forward.list()` | Opens a remote host's port on this Mac through the app (or finds the forward that has it), closes one, lists them; a forward has `id`, `host`, `remote_port`, `local_port` and `url` (the link it was last opened for, on its local port), and `browse` opens the URL too. A listed forward also has `connections`, the number it carries now, when the app counts them. A forward that closed (its port went away), or moved to another local port, before the app could use it is an error, and nothing is opened |
 | `thurm.ui.toast(text, pane)` | A short message over a pane |
 | `thurm.ui.pick{title, placeholder, items}` | The user picks an item (a string, or a table with `title` and `detail`); returns it and its index, or `nil` |
 | `thurm.ui.input{title, placeholder, value}`, `thurm.ui.confirm{title, body, ok, cancel}` | A line of text, or yes or no |
@@ -337,7 +337,7 @@ JSON.
 | `plugins.reload`, `plugins.enable`, `plugins.disable`, `plugins.logs` | `{name}` (`lines` for logs) | |
 | `script.run` | `{source, name, args, dir, pane}` | What the script returned |
 | `ports.list` | `{pane}` (every pane without) | `[{pane, ports, complete}]` |
-| `forwards.list` | | `[{id, host, remote_port, local_port, url}]` |
+| `forwards.list` | | `[{id, host, remote_port, local_port, url, connections}]` (`connections` when the app counts them) |
 | `forwards.open` | `{host, port, browse}` | The forward, with `new` when it was opened now |
 | `forwards.close` | `{id}` | The forward |
 | `forwards.report`, `ports.report` | From the app only: its forwards, and a remote host's ports | |

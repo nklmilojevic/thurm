@@ -106,7 +106,8 @@ a separate Thurm account or relay service. Agent forwarding is disabled.
 A remote pane works like a local one. ⌘-click a `localhost` link a dev server
 prints there and Thurm opens the host's port on your Mac. Drop or paste files and
 screenshots and they are copied to the host, with their paths typed into the pane.
-Quick Look and download the host's files. On a Linux host without a display,
+Quick Look and download the host's files, or copy them from a terminal with
+`thurm cp notes.txt devbox:work/`. On a Linux host without a display,
 `pbcopy`, `xclip` and `wl-paste` in new panes can reach your Mac's clipboard,
 once you install them with the Clipboard tools fix of `thurm remote doctor`.
 Copies follow `terminal.osc52` on both sides; a paste also needs it set to

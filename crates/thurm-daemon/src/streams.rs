@@ -39,6 +39,14 @@ pub enum Kind {
         size: u64,
         stamp: u64,
     },
+    /// A file coming in to a place its sender named (`crate::transfer`): `size` bytes for
+    /// `path`, with the permission bits `mode`, replacing a file there only with `replace`.
+    Put {
+        path: std::path::PathBuf,
+        size: u64,
+        mode: u32,
+        replace: bool,
+    },
 }
 
 /// A stream reserved by a ticket.

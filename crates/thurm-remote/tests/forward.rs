@@ -70,6 +70,63 @@ fn closing_a_forward_ends_its_open_connections() {
 }
 
 #[test]
+fn a_forward_counts_its_connections_and_tells_of_changes() {
+    let d = dir("count");
+    let socket = d.join("d.sock");
+    fakes::daemon(&socket);
+    let theirs = socket.clone();
+    let f = Forwards::new(d.join("forwards.json"), move |_| theirs.clone());
+    f.check("devbox").unwrap();
+    let told = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let heard = told.clone();
+    f.on_connections(move || {
+        heard.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+    assert_eq!(f.connections().get(&fw.id), Some(&0));
+    assert_eq!(told.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let roundtrip = |conn: &mut TcpStream| {
+        conn.write_all(b"ping").unwrap();
+        let mut got = [0u8; 4];
+        conn.read_exact(&mut got).unwrap();
+    };
+    let mut one = TcpStream::connect(("127.0.0.1", fw.local)).unwrap();
+    let mut two = TcpStream::connect(("127.0.0.1", fw.local)).unwrap();
+    roundtrip(&mut one);
+    roundtrip(&mut two);
+    assert_eq!(f.connections().get(&fw.id), Some(&2));
+    let until = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    until("the connections were not told of", &|| {
+        told.load(std::sync::atomic::Ordering::SeqCst) >= 1
+    });
+    // Two that came together are told of together, not one by one.
+    assert!(told.load(std::sync::atomic::Ordering::SeqCst) <= 2);
+
+    let before = told.load(std::sync::atomic::Ordering::SeqCst);
+    drop(one);
+    until("a connection that ended is still counted", &|| {
+        f.connections().get(&fw.id) == Some(&1)
+    });
+    until("the connection that ended was not told of", &|| {
+        told.load(std::sync::atomic::Ordering::SeqCst) > before
+    });
+    f.close(fw.id).unwrap();
+    assert!(
+        f.connections().is_empty(),
+        "a closed forward is not counted"
+    );
+    drop(two);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn a_link_to_one_loopback_dials_that_one() {
     use thurm_proto::stream::Loopback;
     let d = dir("family");

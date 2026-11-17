@@ -7,11 +7,14 @@
 //! types nothing.
 //!
 //! Downloads send one regular file, resolved against the pane's working directory.
+//!
+//! Copies ([`thurm_proto::CAP_COPY`], `thurm cp`) write one file where its sender says, or send
+//! the one it names: paths are the daemon's user's own, `~` and relative ones under its home.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,6 +69,9 @@ pub const PRUNE_EVERY: Duration = Duration::from_secs(10 * 60);
 pub const ACK: Duration = Duration::from_secs(30);
 /// Downloads sending at once, per pane.
 pub const MAX_DOWNLOADS_PER_PANE: usize = 4;
+/// The pane downloads of [`thurm_proto::Request::CopyFrom`] are counted under: none (pane ids
+/// start at 1), so they share one limit of their own.
+const NO_PANE: PaneId = 0;
 /// The longest file name, in bytes.
 const NAME_MAX: usize = 255;
 /// Where files are written until whole, inside a batch's directory.
@@ -614,6 +620,127 @@ impl Transfers {
             expires_ms,
             ..info
         })
+    }
+
+    /// [`thurm_proto::Request::CopyTo`]: checks where the file goes and reserves a stream to
+    /// write it there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_to_begin(
+        &self,
+        daemon: &Daemon,
+        client: u64,
+        principal: Principal,
+        path: &str,
+        name: &str,
+        size: u64,
+        mode: u32,
+        replace: bool,
+        home: Option<&str>,
+    ) -> Result<(String, u32), String> {
+        if size > MAX_FILE {
+            return Err(format!(
+                "{name} is too large to send (at most {} GiB)",
+                MAX_FILE >> 30
+            ));
+        }
+        let dest = copy_dest(path, name, home)?;
+        match std::fs::symlink_metadata(&dest) {
+            Ok(m) if !m.is_file() => {
+                return Err(format!(
+                    "{} is not a regular file; it is not replaced",
+                    dest.display()
+                ));
+            }
+            Ok(_) if !replace => return Err(format!("{} {COPY_EXISTS}", dest.display())),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot read {}: {e}", dest.display())),
+        }
+        let dir = dest.parent().unwrap_or(Path::new("/"));
+        if !dir.is_dir() {
+            return Err(format!("{} is not a folder", dir.display()));
+        }
+        if free_space(dir)? < size {
+            return Err(format!("not enough space in {} for {name}", dir.display()));
+        }
+        daemon.streams.reserve(
+            Kind::Put {
+                path: dest,
+                size,
+                mode: mode & 0o777,
+                replace,
+            },
+            client,
+            principal,
+        )
+    }
+
+    /// [`thurm_proto::Request::CopyFrom`]: as a download, of a path that is the daemon's
+    /// user's own rather than a pane's.
+    pub fn copy_from_begin(
+        &self,
+        daemon: &Daemon,
+        client: u64,
+        principal: Principal,
+        path: &str,
+        home: Option<&str>,
+    ) -> Result<DownloadInfo, String> {
+        self.download_begin(daemon, client, principal, NO_PANE, path, home, home, None)
+    }
+
+    /// Writes the stream's file beside `path`, then moves it there.
+    fn serve_put<R: Read>(
+        &self,
+        path: &Path,
+        size: u64,
+        mode: u32,
+        replace: bool,
+        mut reader: R,
+        mut writer: UnixStream,
+    ) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = path.parent().unwrap_or(Path::new("/"));
+        let part = dir.join(format!(
+            ".thurm-{}-{}.part",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A sender that stops mid-file is not waited on for ever.
+        let _ = writer.set_read_timeout(Some(self.idle));
+        let placed = receive(&mut reader, &part, size, || true).and_then(|()| {
+            std::fs::set_permissions(&part, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            if replace {
+                // Only a regular file gives way, as when the copy was asked for: a folder or a
+                // link put there since is kept.
+                match std::fs::symlink_metadata(path) {
+                    Ok(m) if !m.is_file() => {
+                        return Err(format!(
+                            "{} is not a regular file; it is not replaced",
+                            path.display()
+                        ));
+                    }
+                    _ => {}
+                }
+                std::fs::rename(&part, path)
+                    .map_err(|e| format!("cannot write {}: {e}", path.display()))
+            } else {
+                // Into its place without replacing a file that came there meanwhile.
+                std::fs::hard_link(&part, path).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => {
+                        format!("{} {COPY_EXISTS}", path.display())
+                    }
+                    _ => format!("cannot write {}: {e}", path.display()),
+                })
+            }
+        });
+        let _ = writer.set_read_timeout(None);
+        // Moved into place, the part's name is gone; linked there, or failed, it is not.
+        let _ = std::fs::remove_file(&part);
+        match placed {
+            Ok(()) => close(&mut writer, StreamClose::Ok),
+            Err(e) => close(&mut writer, StreamClose::Internal(e)),
+        }
     }
 
     /// The connection `client` is gone: its batches still on their way are dropped.
@@ -1217,6 +1344,12 @@ pub fn serve<R: Read + Send>(
             size,
             stamp,
         } => t.serve_download(pane, &path, size, stamp, reader, writer),
+        Kind::Put {
+            path,
+            size,
+            mode,
+            replace,
+        } => t.serve_put(&path, size, mode, replace, reader, writer),
         Kind::Tcp { .. } | Kind::TcpAt { .. } => close(
             &mut writer,
             StreamClose::Internal("not a file stream".into()),
@@ -1339,6 +1472,28 @@ fn resolve(path: &str, cwd: Option<&str>, home: Option<&str>) -> Result<PathBuf,
         .filter(|c| c.starts_with('/'))
         .ok_or("the pane's working directory is not known; use an absolute path")?;
     Ok(Path::new(cwd).join(path))
+}
+
+/// How the error for a copy onto a file that is there ends, when it may not replace it.
+const COPY_EXISTS: &str = "is there already";
+
+/// Where [`thurm_proto::Request::CopyTo`] writes: `path` with `~` and relative paths under
+/// `home`, and inside it under `name` when it is a folder (which a `path` ending in `/` must be).
+fn copy_dest(path: &str, name: &str, home: Option<&str>) -> Result<PathBuf, String> {
+    let at = resolve(path, home, home).map_err(|e| {
+        if path.starts_with('/') || path.starts_with('~') {
+            e
+        } else {
+            "the home directory is not known; use an absolute path".into()
+        }
+    })?;
+    if at.is_dir() {
+        return Ok(at.join(clean_name(name)));
+    }
+    if path.ends_with('/') {
+        return Err(format!("{path} is not a folder"));
+    }
+    Ok(at)
 }
 
 fn modified_ms(meta: &std::fs::Metadata) -> u64 {

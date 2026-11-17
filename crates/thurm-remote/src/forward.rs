@@ -26,6 +26,10 @@ use thurm_proto::{PaneId, PortEntry};
 /// How long a forward outlives its port's disappearance from every complete list.
 pub const GONE_GRACE: Duration = Duration::from_secs(30);
 
+/// How long changes in the number of connections are gathered before they are told
+/// ([`Forwards::on_connections`]): a page that loads opens and closes several at once.
+pub const CONNECTIONS_TICK: Duration = Duration::from_millis(500);
+
 /// The most connections one forward carries at once; more are closed as they arrive.
 pub const MAX_CONNECTIONS: usize = 64;
 
@@ -87,6 +91,7 @@ pub struct KnownPort {
 }
 
 type OnChange = Arc<dyn Fn(Change) + Send + Sync>;
+type OnConnections = Arc<dyn Fn() + Send + Sync>;
 type Live = Arc<(Mutex<usize>, parking_lot::Condvar)>;
 
 /// What a forward's accept loops share with it: [`Entry`]'s `stop`, `active`, `conns`, `live`.
@@ -193,6 +198,9 @@ pub struct Forwards {
     remembered: PathBuf,
     socket_for: SocketFor,
     on_change: Arc<Mutex<Option<OnChange>>>,
+    on_connections: Arc<Mutex<Option<OnConnections>>>,
+    /// A notice to `on_connections` is on its way.
+    connections_due: Arc<AtomicBool>,
     grace: Duration,
     max_connections: usize,
     /// Runs in [`Forwards::sweep`] between finding forwards due and closing them (tests).
@@ -257,6 +265,8 @@ impl Forwards {
             remembered,
             socket_for: Arc::new(socket_for),
             on_change: Default::default(),
+            on_connections: Default::default(),
+            connections_due: Default::default(),
             grace: GONE_GRACE,
             max_connections: MAX_CONNECTIONS,
             #[cfg(test)]
@@ -290,6 +300,47 @@ impl Forwards {
         if let Some(f) = f {
             f(c);
         }
+    }
+
+    /// `f` hears that the number of connections some forward carries changed, a moment after
+    /// it did and at most once per [`CONNECTIONS_TICK`], on a thread of its own:
+    /// [`Forwards::connections`] has the numbers.
+    pub fn on_connections(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_connections.lock() = Some(Arc::new(f));
+    }
+
+    /// A connection came or went: whoever listens hears of it within [`CONNECTIONS_TICK`],
+    /// once for all that came and went until then.
+    fn connections_changed(&self) {
+        if self.on_connections.lock().is_none() || self.connections_due.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let me = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("forward-connections".into())
+            .spawn(move || {
+                std::thread::sleep(CONNECTIONS_TICK);
+                // Cleared before the call: a change during it gets a notice of its own.
+                me.connections_due.store(false, Ordering::Release);
+                let f = me.on_connections.lock().clone();
+                if let Some(f) = f {
+                    f();
+                }
+            });
+        if spawned.is_err() {
+            self.connections_due.store(false, Ordering::Release);
+        }
+    }
+
+    /// The connections each open forward carries now, by its id.
+    pub fn connections(&self) -> HashMap<u64, usize> {
+        self.inner
+            .lock()
+            .open
+            .values()
+            .map(|e| (e.forward.id, e.active.load(Ordering::Acquire)))
+            .collect()
     }
 
     /// Forward `id` as it is now; `None` once it has closed.
@@ -889,6 +940,7 @@ impl Forwards {
                 let _ = conn.shutdown(Shutdown::Both);
                 continue;
             }
+            self.connections_changed();
             let me = self.clone();
             let (host, port, target) = (host.clone(), forward.remote_port, forward.clone());
             let (theirs_active, theirs_conns, theirs_stop) =
@@ -901,10 +953,12 @@ impl Forwards {
                     }
                     theirs_conns.lock().remove(&conn_id);
                     theirs_active.fetch_sub(1, Ordering::AcqRel);
+                    me.connections_changed();
                 });
             if spawned.is_err() {
                 conns.lock().remove(&conn_id);
                 active.fetch_sub(1, Ordering::AcqRel);
+                self.connections_changed();
             }
         }
     }
