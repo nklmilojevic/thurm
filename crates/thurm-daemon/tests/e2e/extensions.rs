@@ -1812,3 +1812,93 @@ fn a_late_subscriber_hears_the_remote_lists_as_initial() {
         "{gone}"
     );
 }
+
+/// A plugin that subscribes to `ports_changed` while others listen gets every pane's list
+/// first, as running already, and only it: the others hear nothing again. Subscribing again
+/// changes nothing.
+#[test]
+fn a_new_ports_subscriber_alone_gets_every_list_first() {
+    assert!(
+        std::process::Command::new("python3")
+            .args(["-c", ""])
+            .status()
+            .is_ok_and(|s| s.success()),
+        "this test needs python3 (for a listener in a pane)"
+    );
+    let env = Env::new("ext-ports-join");
+    let _d = env.start_with(&[("THURM_PORTS_INTERVAL_MS", Path::new("200"))]);
+    let (early, early_rx) = ext_client(&env, "early");
+    call(
+        &early,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    let pane = match early
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec![
+                "python3".into(),
+                "-c".into(),
+                "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print('port=%d' % s.getsockname()[1], flush=True); time.sleep(600)".into(),
+            ]),
+            cwd: Some(env.dir.display().to_string()),
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    let heard = loop {
+        let ev = next_event(&early_rx, "ports_changed");
+        if ev["id"] == pane {
+            break ev;
+        }
+    };
+    assert!(
+        heard.get("initial").is_none(),
+        "a change, not a list resent: {heard}"
+    );
+
+    let (late, late_rx) = ext_client(&env, "late");
+    call(
+        &late,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    let first = loop {
+        let ev = next_event(&late_rx, "ports_changed");
+        if ev["id"] == pane {
+            break ev;
+        }
+    };
+    assert_eq!(first["initial"], true, "{first}");
+    assert_eq!(first["pane"]["id"], pane);
+    assert_eq!(first["ports"], heard["ports"]);
+
+    // Subscribing again is not joining again.
+    call(
+        &early,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    // Several looks later, neither heard the pane's list again.
+    std::thread::sleep(Duration::from_millis(1500));
+    let again = |rx: &Receiver<(String, Value)>| {
+        rx.try_iter()
+            .filter(|(n, p)| n == notice::EVENT && p["event"] == "ports_changed" && p["id"] == pane)
+            .count()
+    };
+    assert_eq!(
+        again(&early_rx),
+        0,
+        "the early subscriber heard the list again"
+    );
+    assert_eq!(
+        again(&late_rx),
+        0,
+        "the late subscriber heard the list twice"
+    );
+}

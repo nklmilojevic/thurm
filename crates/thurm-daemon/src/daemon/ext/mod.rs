@@ -203,13 +203,20 @@ impl Daemon {
             }
             method::EVENTS_SUBSCRIBE => {
                 let names = names(&p);
-                let ports = names.iter().any(|n| n == PORTS_CHANGED);
-                self.ext_registry(client)?.subscribe(client.id, names)?;
-                // Its panes' ports are watched only while someone hears of them; a new
-                // subscriber hears every list there is first. Of remote hosts, the lists the
-                // app relayed so far, as running already.
-                if ports {
-                    self.ports.subscribed(Arc::downgrade(self));
+                // Only a new subscriber joins: one that has the lists keeps hearing changes.
+                let joins = {
+                    let mut reg = self.ext_registry(client)?;
+                    let joins = names.iter().any(|n| n == PORTS_CHANGED)
+                        && !reg.has(client.id, PORTS_CHANGED);
+                    reg.subscribe(client.id, names)?;
+                    joins
+                };
+                // Its panes' ports are watched only while someone hears of them. A new
+                // subscriber joins the watch as a client does: the next look sends it alone
+                // every pane's list (`ext_ports_to`), as running already. Of remote hosts, it
+                // gets the lists the app relayed so far, the same way.
+                if joins {
+                    self.ports.subscribed(Arc::downgrade(self), client.id);
                     for payload in self.remote_lists(self.forwarding_app_id()) {
                         send_ext(client, notice::EVENT, &payload);
                     }
@@ -473,21 +480,55 @@ impl Daemon {
         self.ext.registry.lock().named(PORTS_CHANGED)
     }
 
-    /// A [`Event::PortsChanged`] of the watch, for the extension API's subscribers.
-    pub(super) fn ext_ports_changed(&self, event: &Event) {
-        if let Event::PortsChanged {
+    /// A change the watch found, for the extension API's subscribers but those in `except`:
+    /// the ones that joined at this look, which get every list on their own
+    /// ([`Daemon::ext_ports_to`]).
+    pub(super) fn ext_ports_changed(&self, event: &Event, except: &[u64]) {
+        let Some(payload) = self.ports_payload(event, false) else {
+            return;
+        };
+        // `ports_changed` has no `[[on]]` hooks: only the subscribers hear it.
+        let listeners: Vec<u64> = self
+            .ext
+            .registry
+            .lock()
+            .listeners(PORTS_CHANGED)
+            .into_iter()
+            .filter(|c| !except.contains(c))
+            .collect();
+        self.send_event(&listeners, &payload);
+    }
+
+    /// A list of the watch for `client` alone, which joined it by subscribing: sent as running
+    /// already, while it still hears `ports_changed`.
+    pub(super) fn ext_ports_to(&self, client: &Client, event: &Event) {
+        if !self.ext.registry.lock().has(client.id, PORTS_CHANGED) {
+            return;
+        }
+        if let Some(payload) = self.ports_payload(event, true) {
+            send_ext(client, notice::EVENT, &payload);
+        }
+    }
+
+    /// `ports_changed`'s payload for `event`, with `pane` while the pane is there.
+    fn ports_payload(&self, event: &Event, initial: bool) -> Option<Value> {
+        let Event::PortsChanged {
             pane,
             ports,
             complete,
         } = event
-        {
-            let info = self.pane(*pane).map(|p| p.state.lock().info.clone());
-            self.emit(
-                PORTS_CHANGED,
-                info.as_ref(),
-                json!({ "id": pane, "ports": ports, "complete": complete }),
-            );
+        else {
+            return None;
+        };
+        let mut payload =
+            json!({ "event": PORTS_CHANGED, "id": pane, "ports": ports, "complete": complete });
+        if let Some(info) = self.pane(*pane).map(|p| p.state.lock().info.clone()) {
+            payload["pane"] = serde_json::to_value(info).unwrap_or_default();
         }
+        if initial {
+            payload["initial"] = true.into();
+        }
+        Some(payload)
     }
 
     /// Files sent to `pane` landed and their paths were typed there.

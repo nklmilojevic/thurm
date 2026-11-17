@@ -135,7 +135,8 @@ pub mod notice {
 ///   ports (empty once they went), with `pane` while the pane is there. A remote host's pane
 ///   (reported by the app) has `host`, and no `pane`, and `initial` for the lists it had as the
 ///   app connected to it. Subscribing to it by name starts the daemon's watch of its panes'
-///   ports, and sends the subscriber the remote hosts' lists known so far, with `initial`.
+///   ports. A new subscriber gets every pane's list first, on its own (the others hear
+///   nothing again), and the remote hosts' lists known so far, all with `initial`.
 /// - `files_uploaded`: `{id, paths}`, the files sent to a pane, once their paths were typed
 ///   there, with `pane` while it is there.
 /// - `forward_opened` and `forward_closed`: [`ForwardInfo`], as the app that holds plugins'

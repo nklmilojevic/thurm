@@ -3950,7 +3950,7 @@ impl crate::ports::Host for Daemon {
     }
 
     fn send_ports(&self, event: Event, except: &[u64]) {
-        self.ext_ports_changed(&event);
+        self.ext_ports_changed(&event, except);
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
         for c in clients {
             if c.port_events.load(Ordering::Relaxed) && !except.contains(&c.id) {
@@ -3960,8 +3960,12 @@ impl crate::ports::Host for Daemon {
     }
 
     fn send_ports_to(&self, client: u64, event: Event) {
-        let c = self.clients.lock().get(&client).cloned();
-        if let Some(c) = c.filter(|c| c.port_events.load(Ordering::Relaxed)) {
+        let Some(c) = self.clients.lock().get(&client).cloned() else {
+            return;
+        };
+        // A plugin (or socket client) that joined by subscribing to `ports_changed`.
+        self.ext_ports_to(&c, &event);
+        if c.port_events.load(Ordering::Relaxed) {
             c.send(ServerMessage::Event(event));
         }
     }
