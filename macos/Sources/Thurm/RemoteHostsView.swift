@@ -227,11 +227,9 @@ private struct HostDetails: View {
                     ForEach(open, id: \.id) { f in
                         LabeledContent {
                             HStack(spacing: 10) {
-                                Button("Open") {
-                                    if let url = URL(string: f.url) { NSWorkspace.shared.open(url) }
-                                }
-                                .help(f.url)
-                                Button("Copy Link") { SessionManager.copyForwardLink(f.url) }
+                                Button("Open") { SessionManager.openForwardLink(f) }
+                                    .help(f.url)
+                                Button("Copy Link") { SessionManager.copyForwardLink(f) }
                                 Button("Close") {
                                     _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: f.id)])
                                 }

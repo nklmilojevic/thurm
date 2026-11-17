@@ -653,7 +653,7 @@ extension SessionManager {
         for entry in ForwardPicker.manageEntries(Remotes.shared.forwards) {
             items.append(CommandPalette.Item(title: entry.title, detail: entry.detail) {
                 switch entry.action {
-                case .copyLink(let url): SessionManager.copyForwardLink(url)
+                case .copyLink(let f): SessionManager.copyForwardLink(f)
                 case .close(let id): _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: id)])
                 }
             })

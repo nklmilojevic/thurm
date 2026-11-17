@@ -1696,6 +1696,28 @@ pub extern "C" fn thurm_settings_overlay_path() -> *mut c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_events_reach_the_app_saying_whether_they_are_initial() {
+        // The JSON the app decodes: the event's name, then its fields, `initial` among them.
+        let json = |initial| {
+            serde_json::to_value(Event::PortsChanged {
+                pane: 3,
+                ports: vec![thurm_proto::PortEntry {
+                    port: 5173,
+                    address: "127.0.0.1".into(),
+                    pid: 9,
+                    command: "vite".into(),
+                }],
+                complete: true,
+                initial,
+            })
+            .unwrap()
+        };
+        assert_eq!(json(true)["PortsChanged"]["initial"], true);
+        assert_eq!(json(false)["PortsChanged"]["initial"], false);
+        assert_eq!(json(true)["PortsChanged"]["ports"][0]["port"], 5173);
+    }
     use thurm_proto::{Cell, FrameRow};
 
     #[test]

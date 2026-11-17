@@ -166,6 +166,9 @@ pub struct Forwards {
     /// Runs in [`Forwards::sweep`] between finding forwards due and closing them (tests).
     #[cfg(test)]
     before_close: Arc<Mutex<Option<Hook>>>,
+    /// Runs in [`Forwards::open_since`] before it looks for a forward to reuse (tests).
+    #[cfg(test)]
+    before_reuse: Arc<Mutex<Option<Hook>>>,
 }
 
 impl Default for Forwards {
@@ -194,6 +197,8 @@ impl Forwards {
             max_connections: MAX_CONNECTIONS,
             #[cfg(test)]
             before_close: Default::default(),
+            #[cfg(test)]
+            before_reuse: Default::default(),
         }
     }
 
@@ -219,6 +224,11 @@ impl Forwards {
         if let Some(f) = f {
             f(c);
         }
+    }
+
+    /// Forward `id` as it is now; `None` once it has closed.
+    pub fn get(&self, id: u64) -> Option<Forward> {
+        self.inner.lock().open.get(&id).map(|e| e.forward.clone())
     }
 
     pub fn list(&self) -> Vec<Forward> {
@@ -292,11 +302,19 @@ impl Forwards {
         if remote_port == 0 {
             return Err("port 0 is not a port to forward".into());
         }
-        if let Some(why) = self.inner.lock().refuses(host, since) {
-            return Err(why);
+        #[cfg(test)]
+        if let Some(hook) = self.before_reuse.lock().as_ref() {
+            hook();
         }
-        if let Some(f) = self.find(host, remote_port) {
-            return self.reuse(f, preferred, link);
+        {
+            let mut g = self.inner.lock();
+            if let Some(why) = g.refuses(host, since) {
+                return Err(why);
+            }
+            if let Some(reused) = reuse_locked(&mut g, host, remote_port, preferred, link) {
+                drop(g);
+                return self.reused(reused);
+            }
         }
         let listeners = match preferred {
             Some(p) => bind(p).map_err(|e| format!("cannot listen on localhost:{p}: {e}"))?,
@@ -318,15 +336,11 @@ impl Forwards {
         if let Some(why) = g.refuses(host, since) {
             return Err(why);
         }
-        // Another thread may have opened it meanwhile; theirs stands.
-        if let Some(e) = g
-            .open
-            .values()
-            .find(|e| e.forward.host == host && e.forward.remote_port == remote_port)
-        {
-            let f = e.forward.clone();
+        // Another thread may have opened it meanwhile; theirs stands (and the listeners bound
+        // here close).
+        if let Some(reused) = reuse_locked(&mut g, host, remote_port, preferred, link) {
             drop(g);
-            return self.reuse(f, preferred, link);
+            return self.reused(reused);
         }
         g.next_id += 1;
         let forward = Forward {
@@ -409,29 +423,13 @@ impl Forwards {
         }
     }
 
-    /// The forward that has the port already, unless another local port was asked for; opened
-    /// again for `link`, it takes that link.
-    fn reuse(
-        &self,
-        f: Forward,
-        preferred: Option<u16>,
-        link: Option<&str>,
-    ) -> Result<(Forward, bool), String> {
-        let (mut f, new) = existing(f, preferred)?;
-        if let Some(link) = link {
-            self.set_link(f.id, link);
-            f.link = Some(link.to_owned());
+    /// Reports what reusing a forward changed, outside the lock.
+    fn reused(&self, r: Reused) -> Result<(Forward, bool), String> {
+        let (f, linked) = r?;
+        if linked {
+            self.changed(Change::Linked { forward: f.clone() });
         }
-        Ok((f, new))
-    }
-
-    fn find(&self, host: &str, remote_port: u16) -> Option<Forward> {
-        self.inner
-            .lock()
-            .open
-            .values()
-            .find(|e| e.forward.host == host && e.forward.remote_port == remote_port)
-            .map(|e| e.forward.clone())
+        Ok((f, false))
     }
 
     /// Closes forward `id` (by the user).
@@ -831,6 +829,32 @@ impl Forwards {
             log::info!("cannot remember the forward's port: {e}");
         }
     }
+}
+
+/// The forward of `host`'s `remote_port`, found and (when opened again for `link`) given that
+/// link in one step under the lock that closes forwards: what it returns is open when returned,
+/// never one a move, a close or the sweep took away meanwhile, whose local port may be another
+/// program's by now. `None`: there is none. With the forward, whether its link changed.
+type Reused = Result<(Forward, bool), String>;
+
+fn reuse_locked(
+    g: &mut Inner,
+    host: &str,
+    remote_port: u16,
+    preferred: Option<u16>,
+    link: Option<&str>,
+) -> Option<Reused> {
+    let e = g
+        .open
+        .values_mut()
+        .find(|e| e.forward.host == host && e.forward.remote_port == remote_port)?;
+    Some(existing(e.forward.clone(), preferred).map(|(_, _)| {
+        let linked = link.is_some_and(|l| e.forward.link.as_deref() != Some(l));
+        if let Some(l) = link {
+            e.forward.link = Some(l.to_owned());
+        }
+        (e.forward.clone(), linked)
+    }))
 }
 
 /// The forward that has the port already, unless another local port was asked for (`0`: any).
@@ -1647,6 +1671,49 @@ mod tests {
             Duration::from_millis(300)
         );
         assert_eq!(sweep_tick(GONE_GRACE), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_closed_forward_is_gone_by_its_id() {
+        let dir = tempdir("get");
+        let f = forwards(&dir);
+        let (fw, _) = f.open("devbox", 7900, Some(0)).unwrap();
+        assert_eq!(f.get(fw.id), Some(fw.clone()));
+        f.close(fw.id).unwrap();
+        assert_eq!(f.get(fw.id), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forward_closed_while_being_reused_is_not_handed_out() {
+        let dir = tempdir("reuse-race");
+        let f = forwards(&dir);
+        let (first, _) = f.open("devbox", 7800, Some(0)).unwrap();
+        // Opened again; just before the existing forward is taken, it closes (a move, a close,
+        // the sweep).
+        let closer = f.clone();
+        let id = first.id;
+        *f.before_reuse.lock() = Some(Box::new(move || {
+            let _ = closer.close(id);
+        }));
+        let (got, new) = f
+            .open_for("devbox", 7800, Some(0), Some("http://localhost:7800/"))
+            .unwrap();
+        *f.before_reuse.lock() = None;
+        // Not the closed one: a forward that is open, and listening where it says.
+        assert!(new, "the closed forward was handed out: {got:?}");
+        assert_ne!(got.id, first.id);
+        assert_eq!(f.list(), vec![got.clone()]);
+        assert!(TcpStream::connect(("127.0.0.1", got.local)).is_ok());
+        // Reused while open: the same one, with the link, in one step.
+        let (again, new) = f
+            .open_for("devbox", 7800, None, Some("http://localhost:7800/x"))
+            .unwrap();
+        assert!(!new);
+        assert_eq!(again.id, got.id);
+        assert_eq!(f.list()[0].link.as_deref(), Some("http://localhost:7800/x"));
+        f.close(got.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

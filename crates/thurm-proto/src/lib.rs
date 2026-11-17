@@ -855,14 +855,19 @@ pub enum Event {
         name: String,
         payload: String,
     },
-    /// The ports `pane`'s programs listen on changed: the whole list, at most one event a second
-    /// per pane. `complete` is false when part of its process tree could not be read. A pane
-    /// whose first list is empty sends nothing; one that exits sends an empty list. Sent only to
+    /// The ports `pane`'s programs listen on: the whole list, at most one event a second per
+    /// pane. `complete` is false when part of its process tree could not be read. A pane whose
+    /// first list is empty sends nothing; one that exits sends an empty list. Sent only to
     /// clients with [`CAP_PORT_EVENTS`].
+    ///
+    /// `initial`: a list sent to a client as it joins the watch, one per pane with ports, of what
+    /// was listening already then, not a change. Every later event is a change (`false`), and
+    /// clients that had joined before never get an `initial` one.
     PortsChanged {
         pane: PaneId,
         ports: Vec<PortEntry>,
         complete: bool,
+        initial: bool,
     },
 }
 
