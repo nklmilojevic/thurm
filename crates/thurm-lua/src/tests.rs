@@ -23,6 +23,10 @@ impl Host for FakeHost {
             let _ = tx.send((method.to_owned(), params.clone()));
         }
         match method {
+            // A link no program on this Mac opens.
+            "exec" if params["argv"] == json!(["open", "http://localhost:4999/"]) => Ok(json!({
+                "ok": false, "code": 1, "stdout": "", "stderr": "no application can open it\n",
+            })),
             "exec" => {
                 std::thread::sleep(Duration::from_millis(200));
                 Ok(
@@ -709,6 +713,8 @@ fn ports_and_forwards() {
     );
     let e = run(&f, "thurm.forward.open('devbox', '5173')").unwrap_err();
     assert!(e.contains("usage: thurm.forward.open"), "{e}");
+    let e = run(&f, "thurm.forward.open('devbox', 5173, true)").unwrap_err();
+    assert!(e.contains("usage: thurm.forward.open"), "{e}");
     // A pane that is not one is refused, not taken for every pane.
     for bad in ["-1", "'3'", "1.5"] {
         let e = run(&f, &format!("return thurm.ports({bad})")).unwrap_err();
@@ -841,6 +847,35 @@ fn the_dev_server_example_opens_only_new_servers() {
     }
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(sorted(opened(&f)), sorted(want));
+}
+
+/// A server the dev-server example cannot open in the browser is warned of, not taken as opened.
+#[test]
+fn the_dev_server_example_warns_of_a_server_it_cannot_open() {
+    let f = fixture();
+    assert_eq!(
+        f.rt.load(spec(
+            7,
+            include_str!("../../../examples/plugins/dev-server/init.lua"),
+            false,
+        ))
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap(),
+        Ok(Value::Null)
+    );
+    f.rt.notice(
+        7,
+        notice::EVENT,
+        json!({ "event": "ports_changed", "id": 9, "complete": true,
+            "ports": [{ "port": 4999, "address": "127.0.0.1", "pid": 9, "command": "vite" }] }),
+    );
+    let warned = next(&f, "log");
+    assert_eq!(warned["level"], "warn", "{warned}");
+    let message = warned["message"].as_str().unwrap();
+    assert!(
+        message.contains("http://localhost:4999/") && message.contains("no application"),
+        "{warned}"
+    );
 }
 
 /// The dev-server example takes `commands` as a list, or one program as a string, and warns of

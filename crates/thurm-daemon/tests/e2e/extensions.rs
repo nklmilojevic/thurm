@@ -2414,3 +2414,40 @@ fn forward_events_keep_the_order_of_their_changes() {
         json!([])
     );
 }
+
+/// A report of the next app while the first app's handover is under way is heard once: as the
+/// holder's, after the handover, which does not tell it again.
+#[test]
+fn a_report_during_a_handover_is_heard_once() {
+    let env = Env::new("ext-handover-report");
+    let _d = env.start_with(&[("THURM_EXT_HANDOVER_DELAY_MS", Path::new("800"))]);
+    let caps = [CAP_EXT, CAP_EXT_UI, CAP_EXT_FORWARDS];
+    let (first, _first_rx) = forwarding_app(&env, &caps);
+    let (second, _second_rx) = forwarding_app(&env, &caps);
+    let (plugin, rx) = ext_client(&env, "plugin");
+    call(
+        &plugin,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    // The first quits: its handover takes a while; a server starts in the second's pane meanwhile.
+    drop(first);
+    std::thread::sleep(Duration::from_millis(300));
+    let vite = json!([{ "port": 5173, "address": "127.0.0.1", "pid": 9, "command": "vite" }]);
+    assert_eq!(
+        call(
+            &second,
+            method::PORTS_REPORT,
+            json!({ "host": "devbox", "pane": 1, "ports": vite, "complete": true, "initial": false }),
+        )
+        .unwrap(),
+        json!({ "heard": true })
+    );
+    let ev = next_event(&rx, "ports_changed");
+    assert_eq!(ev["id"], 1, "{ev}");
+    assert_ne!(ev["initial"], true, "{ev}");
+    // The handover is done by now, and told nothing more.
+    std::thread::sleep(Duration::from_millis(800));
+    no_more_ports(&plugin, &rx);
+}

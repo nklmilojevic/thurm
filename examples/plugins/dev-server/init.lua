@@ -95,7 +95,14 @@ local tries = {}
 
 local function open(host, port, key, attempt, token)
   if not host then
-    thurm.exec({ "open", "http://localhost:" .. port .. "/" })
+    -- `open` that fails (no program opens the link) is warned of: there is nothing to retry.
+    local url = "http://localhost:" .. port .. "/"
+    local ok, r = pcall(thurm.exec, { "open", url })
+    local why = not ok and tostring(r)
+      or not r.ok and ((r.stderr or "") ~= "" and r.stderr:gsub("%s+$", "") or "exit " .. tostring(r.code))
+    if why then
+      thurm.warn("cannot open " .. url .. ": " .. why)
+    end
     return
   end
   local id = key .. "#" .. port

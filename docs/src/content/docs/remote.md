@@ -428,9 +428,14 @@ Other ways to open one:
   another one already), `--no-open` only prints the URL, and `--json` prints
   `{host, remote_port, local_port, url}` without opening it.
   `thurm remote ports devbox` lists what listens there.
+- A [plugin](/plugins/#plugins) you installed, with `thurm.forward.open` when it
+  hears a port start listening: the
+  [`dev-server`](https://github.com/nklmilojevic/thurm/tree/main/examples/plugins/dev-server)
+  example opens a dev server's port as it starts.
 
-Nothing is forwarded until you do one of these: a port that merely opens on the
-host stays there, and a host that is turned off gets no forwards. The host's
+Nothing is forwarded until you or a plugin you installed does one of these: a
+port that merely opens on the host stays there, and a host that is turned off
+gets no forwards. The host's
 details in **Thurm › Remotes…** list its forwards, with **Open** (the link it
 was opened for), **Copy Link** and **Close**; ⌘⇧P has **Copy Forward Link** and
 **Close Forward** for each too. Each checks first that the forward is still open

@@ -267,13 +267,17 @@ final class ExtensionsTests: XCTestCase {
         // A forward opened for a request still waited for shows a toast, over the app's windows.
         _ = NSApplication.shared
         let ext = Extensions.shared
-        let saved = (ext.remoteCall, ext.forwardReplies, ext.forwardRequestDone)
+        let saved = (ext.remoteCall, ext.forwardReplies, ext.forwardRequestDone, ext.browse)
         defer {
             ext.remoteCall = saved.0
             ext.forwardReplies = saved.1
             ext.forwardRequestDone = saved.2
+            ext.browse = saved.3
             ext.forwardsNow([])
         }
+        // Every open asks for the browser: only one that is answered opens it.
+        var browsed: [String] = []
+        ext.browse = { browsed.append($0.absoluteString) }
         let lock = NSLock()
         var calls: [String] = []
         var cancelOnCall: UInt64?
@@ -311,7 +315,7 @@ final class ExtensionsTests: XCTestCase {
             openResult = result
             lock.unlock()
             ext.handle(["name": "ui.request", "payload": JSON.encode(
-                ["kind": "forward_open", "id": id, "host": "undo-test", "port": 5173])])
+                ["kind": "forward_open", "id": id, "host": "undo-test", "port": 5173, "browse": true])])
             let deadline = Date().addingTimeInterval(5)
             while !finished.contains(id), Date() < deadline {
                 RunLoop.main.run(until: Date().addingTimeInterval(0.02))
@@ -346,6 +350,7 @@ final class ExtensionsTests: XCTestCase {
         let foundOpen = open(912, result: found, cancel: true, calls: 1)
         XCTAssertEqual(foundOpen.calls, ["forward_open"])
         XCTAssertEqual(foundOpen.replies.count, 0, "a cancelled open was answered: \(foundOpen.replies)")
+        XCTAssertEqual(browsed, [], "a cancelled open opened the browser")
         // Not cancelled: kept (and looked at again, before anything is shown for it), and answered
         // with it.
         let kept = open(913, result: opened, cancel: false, calls: 2)
@@ -353,6 +358,7 @@ final class ExtensionsTests: XCTestCase {
         XCTAssertEqual(kept.replies.count, 1)
         XCTAssertNil(kept.replies.first?["error"])
         XCTAssertEqual(jsonUInt64((kept.replies.first?["result"] as? [String: Any])?["id"]), 71)
+        XCTAssertEqual(browsed, ["http://localhost:5173/"])
     }
 
     /// A forward closed because the plugin that asked for it went away is closed before any

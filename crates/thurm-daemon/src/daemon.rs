@@ -4845,6 +4845,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The watch stops as soon as its last subscriber goes without unsubscribing, too.
+    #[test]
+    fn the_port_watch_stops_when_its_last_subscriber_goes() {
+        let dir = std::env::temp_dir().join(format!("thurm-ports-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (client, _rx) = daemon.add_client();
+        client.ext.store(true, Ordering::SeqCst);
+        let wait = |idle: bool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while daemon.ports.idle() != idle {
+                assert!(Instant::now() < deadline, "the watch is not idle={idle}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        daemon.handle(
+            &client,
+            1,
+            Request::Ext {
+                method: thurm_proto::ext::method::EVENTS_SUBSCRIBE.into(),
+                params: r#"{"names":["ports_changed"]}"#.into(),
+            },
+        );
+        wait(false);
+        // Its first look is done: the next is the shortest wait away.
+        std::thread::sleep(Duration::from_millis(500));
+        daemon.remove_client(client.id);
+        wait(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An older version's plain-text scrollback goes at start-up even when sessions are not
     /// saved.
     #[test]
