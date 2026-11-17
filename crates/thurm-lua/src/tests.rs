@@ -1,5 +1,8 @@
 use std::sync::Mutex;
 
+/// Forward opens to the host `flaky` so far (the first fails).
+static FLAKY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 use super::*;
 
 /// A daemon stand-in: answers `exec` after a pause, records the rest.
@@ -49,6 +52,13 @@ impl Host for FakeHost {
                 // Read in part: a server it left out still runs.
                 { "pane": 6, "ports": [], "complete": false },
             ])),
+            // A host whose first forward fails, as when its tunnel is down a moment.
+            "forwards.open"
+                if params["host"] == "flaky"
+                    && FLAKY.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
+            {
+                Err("devbox is not connected".into())
+            }
             "forwards.open" => Ok(json!({
                 "id": 4, "host": params["host"], "remote_port": params["port"],
                 "local_port": 5174, "url": "http://localhost:5174/", "new": params["browse"],
@@ -697,7 +707,7 @@ fn the_dev_server_example_opens_only_new_servers() {
         include_str!("../../../examples/plugins/dev-server/init.lua"),
         false,
     );
-    s.settings = json!({});
+    s.settings = json!({ "retry_seconds": 0.2 });
     let done = f.rt.load(s);
     assert_eq!(
         done.recv_timeout(Duration::from_secs(20)).unwrap(),
@@ -752,6 +762,8 @@ fn the_dev_server_example_opens_only_new_servers() {
     // A server listening on every address, as macOS says it: a dev server too.
     event(json!({ "event": "ports_changed", "id": 8, "complete": true,
                   "ports": [{ "port": 4200, "address": "*", "pid": 9, "command": "node_modules/.bin/vite" }] }));
+    // A forward that fails once (the host's tunnel down a moment) is tried again while listed.
+    ports(Some("flaky"), 9, &[7000], true, false);
     // 4000 really stops (a complete list) and starts again: news.
     ports(None, 3, &[4001], true, false);
     ports(None, 3, &[4000, 4001], true, false);
@@ -776,7 +788,9 @@ fn the_dev_server_example_opens_only_new_servers() {
         json!(["other", 3000, true]),
         json!(["open", "http://localhost:4300/"]),
         json!(["open", "http://localhost:4200/"]),
+        json!(["flaky", 7000, true]),
         json!(["open", "http://localhost:4000/"]),
+        json!(["flaky", 7000, true]),
     ];
     let deadline = Instant::now() + Duration::from_secs(20);
     while opened(&f).len() < want.len() {

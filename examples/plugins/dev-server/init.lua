@@ -19,6 +19,7 @@
 --
 --   [plugins.settings]
 --   dev-server = { commands = ["vite", "next"] }   -- which listening programs count
+--   dev-server = { retry_seconds = 5 }             -- between tries of a forward that failed
 --
 -- A program counts when a word of its command line is one of `commands`; the default list
 -- has the common ones (vite, next, astro, webpack, rails, uvicorn...).
@@ -75,14 +76,28 @@ for _, entry in ipairs(thurm.ports()) do
   end
 end
 
-local function open(host, port)
-  if host then
-    local ok, err = pcall(thurm.forward.open, host, port, { browse = true })
-    if not ok then
-      thurm.warn("cannot forward " .. host .. ":" .. port .. ": " .. tostring(err))
-    end
-  else
+-- A forward that could not be opened (the host's tunnel was down a moment, the app busy) is
+-- tried again a few times while the server is still listed.
+local RETRY_SECONDS = tonumber(thurm.settings.retry_seconds) or 5
+local RETRIES = 3
+
+local function open(host, port, key, attempt)
+  if not host then
     thurm.exec({ "open", "http://localhost:" .. port .. "/" })
+    return
+  end
+  local ok, err = pcall(thurm.forward.open, host, port, { browse = true })
+  if ok then
+    return
+  end
+  attempt = attempt or 1
+  thurm.warn("cannot forward " .. host .. ":" .. port .. ": " .. tostring(err))
+  if attempt < RETRIES then
+    thurm.after(RETRY_SECONDS, function()
+      if listed[key] and listed[key][port] then
+        open(host, port, key, attempt + 1)
+      end
+    end)
   end
 end
 
@@ -122,7 +137,7 @@ thurm.on("ports_changed", function(ev)
   end
   for port in pairs(now) do
     if not before[port] then
-      open(ev.host, port)
+      open(ev.host, port, key)
     end
   end
 end)

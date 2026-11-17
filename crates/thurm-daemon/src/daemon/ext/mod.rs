@@ -139,14 +139,9 @@ fn remote_lists(all: &HashMap<u64, RemoteLists>, app: Option<u64>) -> Vec<Value>
         .into_iter()
         .flatten()
         .map(|((host, pane), list)| {
-            remote_payload(
-                host,
-                *pane,
-                &RemoteList {
-                    initial: true,
-                    ..list.clone()
-                },
-            )
+            let mut payload = ports_changed(*pane, &list.ports, list.complete, true);
+            payload["host"] = host.as_str().into();
+            payload
         })
         .collect()
 }
@@ -302,7 +297,8 @@ impl Daemon {
                 };
                 // Its panes' ports are watched only while someone hears of them. A new
                 // subscriber joins the watch as a client does: the next look sends it alone
-                // every pane's list (`ext_ports_to`), as running already. Of remote hosts, it
+                // every pane's list that has ports (`ext_ports_to`), as running already. Of
+                // remote hosts, it
                 // gets the lists the app relayed so far, the same way.
                 if joins && let Some(all) = &all {
                     self.ports.subscribed(Arc::downgrade(self), client.id);

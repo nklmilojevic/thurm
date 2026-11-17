@@ -549,7 +549,7 @@ final class Extensions {
                   let link = ForwardInfo.requestedLink(
                       f, answer: self.remoteCall(["op": "forward_get", "id": NSNumber(value: f.id)]))
             else {
-                answer(NSNull(), "the forward closed before it could be used")
+                answer(NSNull(), "the forward closed, or moved to another local port, before it could be used")
                 return
             }
             if jsonBool(v["new"]) == true {

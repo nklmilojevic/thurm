@@ -87,7 +87,7 @@
 ---@class thurm.Event
 ---@field event string Its name.
 ---@field pane thurm.Pane? The pane it is about.
----@field id integer? The pane's id, where `pane` may be missing (pane_closed, bell, notification, ports_changed, files_uploaded).
+---@field id integer? The pane's id, where `pane` may be missing (pane_closed, bell, notification, ports_changed, files_uploaded); in forward_opened and forward_closed, the forward's (as `thurm.forward.close` takes it), not a pane's.
 ---@field host string? ports_changed of a remote host's pane, and forward events: the `[[remote]]` host.
 ---@field ports thurm.Port[]? ports_changed: every port the pane listens on now.
 ---@field complete boolean? ports_changed: false when part of the pane's processes could not be read (servers may be left out), or with `gone`.
@@ -216,7 +216,7 @@ thurm.forward = {}
 
 --- Opens a remote host's port on this Mac through the app (or finds the forward that has it);
 --- `browse` opens its URL in the browser too. Raises an error, opening nothing, when the
---- forward closed before the app could use it.
+--- forward closed (or moved to another local port) before the app could use it.
 ---@param host string The `[[remote]]` host.
 ---@param port integer
 ---@param opts { browse: boolean? }?
