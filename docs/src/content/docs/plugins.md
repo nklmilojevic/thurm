@@ -318,7 +318,7 @@ JSON.
 
 | Method | Parameters | Result |
 | --- | --- | --- |
-| `request` | `{request}`: any daemon request, as `thurm --json` would send it, but `Hello`, `Ext` and the clipboard tools' `ClipboardGet`, `ClipboardSet` and `ClipboardClear` (send those as requests of their own) | Its response |
+| `request` | `{request}`: any daemon request, as `thurm --json` would send it, but `Hello`, `Ext`, and the clipboard requests `ClipboardGet`, `ClipboardSet`, `ClipboardClear` and `ClipboardAnswer` (send those as requests of their own) | Its response |
 | `actions.list` | | `{actions, bindings}` |
 | `actions.register` | `{actions: [{name, title, description, category, hidden, args}]}` | |
 | `actions.unregister` | `{names}` | |

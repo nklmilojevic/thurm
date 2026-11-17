@@ -144,7 +144,20 @@ fn answer_timeout() -> Duration {
 impl Daemon {
     /// Checks a tool's request and takes a slot for it, on the reader's thread: what is refused
     /// here gets its answer without a thread being made.
-    pub(super) fn clipboard_admit(&self, pane: PaneId, ask: &Ask) -> Result<Slot, String> {
+    pub(super) fn clipboard_admit(
+        &self,
+        caller: &Client,
+        pane: PaneId,
+        ask: &Ask,
+    ) -> Result<Slot, String> {
+        // A clipboard tool runs in a pane, a process of this user on this machine: a phone or
+        // a tailnet caller reading or writing the clipboard through a pane is not one.
+        let local = caller.principal.lock().as_ref().is_none_or(|p| {
+            p.kind == thurm_proto::PrincipalKind::Peer && p.uid == Some(unsafe { libc::getuid() })
+        });
+        if !local || caller.mobile.load(Ordering::Relaxed) {
+            return Err("clipboard tools are for programs on this machine".into());
+        }
         let osc52 = self.config.read().terminal.osc52;
         use thurm_config::Osc52Mode::{Copy, CopyPaste, Paste};
         match ask {
@@ -219,7 +232,10 @@ impl Daemon {
             })
             .map(|c| (c.id, c.clip_verified.load(Ordering::Relaxed)))
             .collect();
-        pick_ui(last, &candidates).and_then(|id| clients.get(&id).cloned())
+        // A daemon that can tell its own app asks only that: another client saying it is a UI
+        // is never asked, the app connected or not.
+        let only_verified = ext::verifies_its_app();
+        pick_ui(last, &candidates, only_verified).and_then(|id| clients.get(&id).cloned())
     }
 
     /// A request [`Daemon::clipboard_admit`] let through: asks the app and waits for it. The
@@ -248,8 +264,9 @@ impl Daemon {
         let refused = match ask {
             // The app answers only yes or no: every reason for a no is named.
             Ask::Paste(_) => {
-                "the clipboard was not shared: it has nothing of that type, or the Thurm app \
-                 refused, or is still asking about an earlier read from this host"
+                "the clipboard was not shared: it has nothing of that type (or an image too large \
+                 to send), or the Thurm app refused, or is still asking about an earlier read \
+                 from this host"
             }
             Ask::Write(_) => {
                 "the Thurm app did not take it: this Mac's terminal.osc52 does not allow copies \
@@ -261,10 +278,8 @@ impl Daemon {
         // behind would hold one of MAX_PENDING for good.
         let _pending = PendingGuard(&self.pending_clips, id);
         {
+            // Bounded by the slots `clipboard_admit` hands out.
             let mut pending = self.pending_clips.lock();
-            if pending.len() >= MAX_PENDING {
-                return Err("too many clipboard requests are waiting".into());
-            }
             pending.insert(
                 id,
                 PendingClip {
@@ -369,8 +384,8 @@ impl Daemon {
 /// `last`, else the first. A verified app goes before every other client, so another program
 /// saying it is a UI cannot take the app's questions; a daemon that cannot verify its app (on a
 /// remote host, reached through ssh or the tailnet) verifies none and goes by focus alone.
-fn pick_ui(last: Option<u64>, candidates: &[(u64, bool)]) -> Option<u64> {
-    let any_verified = candidates.iter().any(|&(_, v)| v);
+fn pick_ui(last: Option<u64>, candidates: &[(u64, bool)], only_verified: bool) -> Option<u64> {
+    let any_verified = only_verified || candidates.iter().any(|&(_, v)| v);
     let eligible = |&&(_, v): &&(u64, bool)| v || !any_verified;
     last.filter(|id| candidates.iter().filter(eligible).any(|(c, _)| c == id))
         .or_else(|| candidates.iter().filter(eligible).map(|&(id, _)| id).min())
@@ -469,26 +484,35 @@ mod tests {
 
     #[test]
     fn the_app_that_looked_last_is_asked() {
-        assert_eq!(pick_ui(Some(3), &[(2, false), (3, false)]), Some(3));
-        assert_eq!(pick_ui(None, &[(3, false), (2, false)]), Some(2));
+        assert_eq!(pick_ui(Some(3), &[(2, false), (3, false)], false), Some(3));
+        assert_eq!(pick_ui(None, &[(3, false), (2, false)], false), Some(2));
         assert_eq!(
-            pick_ui(Some(9), &[(3, false)]),
+            pick_ui(Some(9), &[(3, false)], false),
             Some(3),
             "gone: the first one"
         );
-        assert_eq!(pick_ui(Some(1), &[]), None);
+        assert_eq!(pick_ui(Some(1), &[], false), None);
+    }
+
+    /// A daemon that can verify its app (in an app bundle) asks only it: with the app not
+    /// connected, nobody, not another client saying it is a UI.
+    #[test]
+    fn a_daemon_that_verifies_asks_only_its_app() {
+        assert_eq!(pick_ui(Some(5), &[(5, false)], true), None);
+        assert_eq!(pick_ui(None, &[(5, false), (6, false)], true), None);
+        assert_eq!(pick_ui(Some(5), &[(2, true), (5, false)], true), Some(2));
     }
 
     #[test]
     fn a_verified_app_goes_before_any_other_client() {
         // Another program said it is a UI and focused the pane last.
-        assert_eq!(pick_ui(Some(5), &[(2, true), (5, false)]), Some(2));
+        assert_eq!(pick_ui(Some(5), &[(2, true), (5, false)], false), Some(2));
         assert_eq!(
-            pick_ui(Some(5), &[(2, true), (4, true), (5, false)]),
+            pick_ui(Some(5), &[(2, true), (4, true), (5, false)], false),
             Some(2)
         );
         assert_eq!(
-            pick_ui(Some(4), &[(2, true), (4, true), (5, false)]),
+            pick_ui(Some(4), &[(2, true), (4, true), (5, false)], false),
             Some(4)
         );
     }

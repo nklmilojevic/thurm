@@ -1148,19 +1148,7 @@ pub fn peer_is_our_app(stream: &std::os::unix::net::UnixStream) -> bool {
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
-        let Some(app) = std::env::current_exe()
-            .ok()
-            .and_then(|e| e.canonicalize().ok())
-            .and_then(|exe| {
-                let helpers = exe.parent()?;
-                let contents = helpers.parent()?;
-                let bundle = contents.parent()?;
-                (helpers.file_name()? == "Helpers"
-                    && contents.file_name()? == "Contents"
-                    && bundle.extension()? == "app")
-                    .then(|| contents.join("MacOS").join("Thurm"))
-            })
-        else {
+        let Some(app) = bundle_app() else {
             return unverified_ui_allowed();
         };
         let mut pid: libc::pid_t = 0;
@@ -1189,6 +1177,33 @@ pub fn peer_is_our_app(stream: &std::os::unix::net::UnixStream) -> bool {
     {
         let _ = stream;
         unverified_ui_allowed()
+    }
+}
+
+/// The app executable of the bundle this daemon runs from (`Thurm.app/Contents/Helpers/thurmd`
+/// → `Contents/MacOS/Thurm`); `None` outside a bundle.
+#[cfg(target_os = "macos")]
+fn bundle_app() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let helpers = exe.parent()?;
+    let contents = helpers.parent()?;
+    let bundle = contents.parent()?;
+    (helpers.file_name()? == "Helpers"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+        .then(|| contents.join("MacOS").join("Thurm"))
+}
+
+/// Whether this daemon can tell its own app from other clients ([`peer_is_our_app`]): it runs
+/// from an app bundle. A remote host's daemon cannot.
+pub fn verifies_its_app() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        bundle_app().is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 

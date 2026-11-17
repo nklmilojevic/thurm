@@ -553,6 +553,35 @@ fn clipboard_requests_are_not_taken_through_request() {
     assert!(copied.join().unwrap().is_ok());
 }
 
+/// Only programs on this machine use the clipboard tools' requests: a phone sending them for a
+/// pane is refused, and no app is asked.
+#[test]
+fn a_phone_cannot_use_the_tools_requests() {
+    let env = clip_env("clip-phone-asks", "copy-paste");
+    let _daemon = env.start();
+    let (app, rx) = env.connect();
+    let pane = create(&app, &env.dir);
+    focus(&app, pane);
+    let stream = thurm_client::connect_daemon(&env.socket).unwrap();
+    let phone =
+        Client::from_stream(stream, "e2e-ios", false, &[CAP_MOBILE], |_| {}, || {}).unwrap();
+    for req in [
+        Request::ClipboardGet {
+            pane,
+            mime: CLIP_TEXT.into(),
+        },
+        Request::ClipboardSet {
+            pane,
+            text: "x".into(),
+        },
+        Request::ClipboardClear { pane },
+    ] {
+        let e = phone.request(req).unwrap_err().to_string();
+        assert!(e.contains("programs on this machine"), "{e}");
+    }
+    nothing_asked(&rx);
+}
+
 #[test]
 fn older_apps_and_phones_are_never_asked() {
     let env = clip_env("clip-old", "copy-paste");

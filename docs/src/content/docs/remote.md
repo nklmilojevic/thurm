@@ -563,6 +563,9 @@ reach the Mac's disk, clipboard, or credentials without you doing something:
   image, not what, and is refused wherever reads are. Your `terminal.osc52`
   setting caps every host, and the host's own `terminal.osc52` can only be
   stricter.
+- **Clipboard tools' requests** come only from programs on the host itself
+  (a phone or tailnet caller sending them is refused), and go to the Thurm app
+  that last showed the pane; this Mac's own daemon asks only the Thurm app.
 - **Clipboard writes** (a copy, or a clipboard tool's clear) follow your
   `terminal.osc52` setting, and the host's.
 - **Links.** ⌘-click opens `http` and `https` links from remote panes (a link

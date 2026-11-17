@@ -470,8 +470,7 @@ impl Client {
 }
 
 /// What a queued message costs, for [`Client::queued`]: its output or state bytes, else a
-/// little. Clipboard contents are counted apart ([`Client::clip_queued`]): a large copy on its
-/// way is no sign the client lags behind its panes' output.
+/// little.
 pub fn message_weight(msg: &ServerMessage) -> usize {
     match msg {
         ServerMessage::Event(Event::Output { data, .. }) => data.len(),
@@ -2506,7 +2505,7 @@ impl Daemon {
                 let Ok((pane, ask)) = clip::Ask::of(req) else {
                     unreachable!("a clipboard request")
                 };
-                match self.clipboard_admit(pane, &ask) {
+                match self.clipboard_admit(client, pane, &ask) {
                     Err(e) => Err(e),
                     Ok(slot) => {
                         let daemon = self.clone();
