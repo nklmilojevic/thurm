@@ -596,9 +596,12 @@ pub fn download_reserved(
             cancel,
             &mut progress,
         )?;
-        // The name still holds what was written: one taken meanwhile (the file replaced or
-        // moved while it came) keeps what is there, and this download is not saved over it.
-        if !std::fs::symlink_metadata(reserved).is_ok_and(|m| (m.dev(), m.ino()) == ours) {
+        // The name still holds what was written, and only that: one taken meanwhile (the file
+        // replaced or moved while it came) keeps what is there, and so does the file written
+        // into by another as well; this download is not reported saved in either.
+        if !std::fs::symlink_metadata(reserved)
+            .is_ok_and(|m| (m.dev(), m.ino()) == ours && m.len() == info.size)
+        {
             return Err(changed());
         }
         Ok(info)

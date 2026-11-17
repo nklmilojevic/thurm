@@ -1317,6 +1317,23 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
     .unwrap_err();
     assert!(matches!(e, TransferError::Cancelled), "{e}");
     assert!(!cancelled.exists());
+    // Written into by another while it comes: not reported saved, and what is there stays.
+    let joined = downloads.join("joined.bin");
+    let id = reserve(&joined);
+    let mut appended = false;
+    let e = get("big.bin", &joined, id, &mut |p| {
+        if p.total > 0 && p.done == p.total && !appended {
+            appended = true;
+            let mut other = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&joined)
+                .unwrap();
+            other.write_all(b"theirs").unwrap();
+        }
+    })
+    .unwrap_err();
+    assert!(matches!(e, TransferError::Local(_)), "{e}");
+    assert!(std::fs::read(&joined).unwrap().ends_with(b"theirs"));
     // Written into by another while it comes, then cancelled: what is there is not only this
     // download's, and stays.
     let shared = downloads.join("shared.bin");
