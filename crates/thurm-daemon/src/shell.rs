@@ -115,6 +115,20 @@ fn term_features(cfg: &Config) -> String {
 }
 
 pub fn spawn_options(l: PaneLaunch<'_>) -> SpawnOptions {
+    let shims = clip_shims(
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        cfg!(target_os = "linux"),
+    );
+    spawn_options_with(l, shims, |k| std::env::var(k).ok())
+}
+
+/// [`spawn_options`], with the clipboard tools' directory (if installed) and the daemon's own
+/// environment (`inherited`) given.
+fn spawn_options_with(
+    l: PaneLaunch<'_>,
+    shims: Option<PathBuf>,
+    inherited: impl Fn(&str) -> Option<String>,
+) -> SpawnOptions {
     let cfg = l.config;
     let mut env: Vec<(String, String)> = vec![
         ("TERM".into(), cfg.terminal.term.clone()),
@@ -134,22 +148,13 @@ pub fn spawn_options(l: PaneLaunch<'_>) -> SpawnOptions {
     if let Some(dir) = cli_dir() {
         env.push(("THURM_BIN_DIR".into(), dir.display().to_string()));
     }
-    if let Some(dir) = clip_shims(
-        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
-        cfg!(target_os = "linux"),
-        ["DISPLAY", "WAYLAND_DISPLAY"]
-            .iter()
-            .any(|v| std::env::var_os(v).is_some_and(|d| !d.is_empty())),
-    ) {
-        let dir = dir.display().to_string();
-        let path = std::env::var("PATH").unwrap_or_default();
-        env.push(("PATH".into(), format!("{dir}:{path}")));
-        env.push((ENV_CLIP_SHIMS.into(), dir));
-    }
     for (k, v) in &cfg.terminal.env {
         env.push((k.clone(), v.clone()));
     }
     env.extend(l.extra_env);
+    // Last: on the PATH and display the pane ends up with, `[terminal.env]` and the client's
+    // variables included.
+    let shims = add_clip_shims(&mut env, shims, inherited);
 
     let cwd = l
         .cwd
@@ -166,9 +171,10 @@ pub fn spawn_options(l: PaneLaunch<'_>) -> SpawnOptions {
             .map(|a| shell_quote(a))
             .collect::<Vec<_>>()
             .join(" ");
+        let line = exec_line(&shell, &line, shims);
         return SpawnOptions {
             program: shell,
-            args: vec!["-l".into(), "-c".into(), format!("exec {line}")],
+            args: vec!["-l".into(), "-c".into(), line],
             argv0: None,
             cwd,
             env,
@@ -262,11 +268,59 @@ pub fn spawn_options(l: PaneLaunch<'_>) -> SpawnOptions {
     }
 }
 
-/// The clipboard tools `thurm remote doctor` installed under `home`, for panes on a Linux host
-/// without a display of its own: there `xclip` and the rest reach the app's clipboard instead.
-fn clip_shims(home: Option<&Path>, linux: bool, display: bool) -> Option<PathBuf> {
+/// The clipboard tools `thurm remote doctor` installed under `home`, for panes on a Linux host:
+/// there `xclip` and the rest reach the app's clipboard instead (see [`add_clip_shims`]).
+fn clip_shims(home: Option<&Path>, linux: bool) -> Option<PathBuf> {
     let dir = home?.join(thurm_proto::CLIP_SHIMS_DIR);
-    (linux && !display && dir.is_dir()).then_some(dir)
+    (linux && dir.is_dir()).then_some(dir)
+}
+
+/// Puts `shims` first on the PATH of a pane whose `env` (later entries win over earlier ones
+/// and over `inherited`, the daemon's own) has no display: a pane with X11 or Wayland keeps the
+/// real tools. Returns whether it did.
+fn add_clip_shims(
+    env: &mut Vec<(String, String)>,
+    shims: Option<PathBuf>,
+    inherited: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let value = |k: &str| {
+        env.iter()
+            .rev()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.clone())
+            .or_else(|| inherited(k))
+    };
+    let display = ["DISPLAY", "WAYLAND_DISPLAY"]
+        .iter()
+        .any(|v| value(v).is_some_and(|d| !d.is_empty()));
+    let Some(dir) = shims.filter(|_| !display) else {
+        return false;
+    };
+    let dir = dir.display().to_string();
+    let path = match value("PATH").filter(|p| !p.is_empty()) {
+        Some(p) => format!("{dir}:{p}"),
+        None => dir.clone(),
+    };
+    env.push(("PATH".into(), path));
+    env.push((ENV_CLIP_SHIMS.into(), dir));
+    true
+}
+
+/// The `-c` line a pane's explicit command runs with in `shell`: `exec` of it, with the
+/// clipboard tools (`shims`) put first on PATH again after the login shell's profile, which
+/// may set PATH anew. A shell whose syntax is not known here gets the plain `exec`.
+fn exec_line(shell: &str, line: &str, shims: bool) -> String {
+    let name = shell.rsplit('/').next().unwrap_or(shell);
+    let first = match name {
+        _ if !shims => "",
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "yash" => {
+            "PATH=\"$THURM_CLIP_SHIMS:$PATH\"; export PATH; "
+        }
+        "fish" => "set -gx PATH $THURM_CLIP_SHIMS $PATH; ",
+        "csh" | "tcsh" => "setenv PATH \"${THURM_CLIP_SHIMS}:${PATH}\"; ",
+        _ => "",
+    };
+    format!("{first}exec {line}")
 }
 
 /// Directory holding the `thurm` CLI next to this daemon (`Thurm.app/Contents/Helpers`).
@@ -376,23 +430,160 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_tools_only_on_a_linux_host_without_a_display() {
+    fn clipboard_tools_only_on_a_linux_host() {
         let home = std::env::temp_dir().join(format!("thurm-shims-{}", std::process::id()));
-        assert_eq!(clip_shims(Some(&home), true, false), None, "not installed");
+        assert_eq!(clip_shims(Some(&home), true), None, "not installed");
         let dir = home.join(thurm_proto::CLIP_SHIMS_DIR);
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(clip_shims(Some(&home), true, false), Some(dir));
-        assert_eq!(
-            clip_shims(Some(&home), true, true),
-            None,
-            "X11 or Wayland there"
-        );
-        assert_eq!(
-            clip_shims(Some(&home), false, false),
-            None,
-            "macOS has pbcopy"
-        );
-        assert_eq!(clip_shims(None, true, false), None);
+        assert_eq!(clip_shims(Some(&home), true), Some(dir));
+        assert_eq!(clip_shims(Some(&home), false), None, "macOS has pbcopy");
+        assert_eq!(clip_shims(None, true), None);
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// The pane's options with the shims at `/s`, `terminal_env` in the config, `extra` from
+    /// the client and `inherited` from the daemon.
+    fn with_shims(
+        command: Option<Vec<String>>,
+        terminal_env: &[(&str, &str)],
+        extra: &[(&str, &str)],
+        inherited: &[(&str, &str)],
+    ) -> SpawnOptions {
+        let mut cfg = Config::default();
+        for (k, v) in terminal_env {
+            cfg.terminal.env.insert((*k).into(), (*v).into());
+        }
+        let sock = PathBuf::from("/tmp/x.sock");
+        let inherited: Vec<(String, String)> = inherited
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect();
+        spawn_options_with(
+            PaneLaunch {
+                id: 1,
+                command,
+                cwd: None,
+                extra_env: extra
+                    .iter()
+                    .map(|(k, v)| ((*k).into(), (*v).into()))
+                    .collect(),
+                size: PaneSize::default(),
+                config: &cfg,
+                socket: &sock,
+                integration_dir: None,
+                token: "",
+            },
+            Some(PathBuf::from("/s")),
+            |k| {
+                inherited
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| v.clone())
+            },
+        )
+    }
+
+    #[test]
+    fn clipboard_tools_come_first_on_the_path_the_pane_ends_up_with() {
+        let path = |o: &SpawnOptions| last(&o.env, "PATH").map(str::to_owned);
+        let daemon = [("PATH", "/usr/bin")];
+        assert_eq!(
+            path(&with_shims(None, &[], &[], &daemon)).as_deref(),
+            Some("/s:/usr/bin")
+        );
+        // `[terminal.env]` and the client's variables set PATH after the daemon's.
+        let o = with_shims(None, &[("PATH", "/conf/bin")], &[], &daemon);
+        assert_eq!(path(&o).as_deref(), Some("/s:/conf/bin"));
+        let o = with_shims(
+            None,
+            &[("PATH", "/conf/bin")],
+            &[("PATH", "/client/bin")],
+            &daemon,
+        );
+        assert_eq!(path(&o).as_deref(), Some("/s:/client/bin"));
+        assert_eq!(last(&o.env, ENV_CLIP_SHIMS), Some("/s"));
+        assert_eq!(
+            path(&with_shims(None, &[], &[], &[])).as_deref(),
+            Some("/s")
+        );
+        // A display, wherever it comes from, keeps the real tools; an empty one is none.
+        for (conf, client, daemon) in [
+            (&[("DISPLAY", ":0")][..], &[][..], &[][..]),
+            (&[], &[("WAYLAND_DISPLAY", "wayland-0")], &[]),
+            (&[], &[], &[("DISPLAY", ":1")]),
+        ] {
+            let o = with_shims(None, conf, client, daemon);
+            assert_eq!(
+                last(&o.env, ENV_CLIP_SHIMS),
+                None,
+                "{conf:?} {client:?} {daemon:?}"
+            );
+            assert_eq!(last(&o.env, "PATH"), None);
+        }
+        let o = with_shims(None, &[("DISPLAY", "")], &[], &[("DISPLAY", ":1")]);
+        assert_eq!(
+            last(&o.env, ENV_CLIP_SHIMS),
+            Some("/s"),
+            "DISPLAY emptied in the config"
+        );
+    }
+
+    #[test]
+    fn an_explicit_command_puts_the_tools_first_after_the_profile() {
+        let o = with_shims(Some(vec!["xclip".into(), "-o".into()]), &[], &[], &[]);
+        assert!(o.args[2].ends_with("exec xclip -o"), "{:?}", o.args);
+        assert_eq!(exec_line("/bin/bash", "x", false), "exec x");
+        assert_eq!(
+            exec_line("/usr/bin/nu", "x", true),
+            "exec x",
+            "unknown syntax"
+        );
+        // Run by each shell there is, with a PATH that has another xclip first.
+        let dir = std::env::temp_dir().join(format!("thurm-exec-line-{}", std::process::id()));
+        let (shims, real) = (dir.join("shims"), dir.join("real"));
+        for d in [&shims, &real] {
+            std::fs::create_dir_all(d).unwrap();
+            let tool = d.join("xclip");
+            std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut ran = 0;
+        for shell in [
+            "/bin/sh",
+            "/bin/bash",
+            "/bin/zsh",
+            "/usr/bin/zsh",
+            "/bin/dash",
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain(["fish", "tcsh", "csh"].iter().filter_map(|n| {
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|d| d.join(n))
+                .find(|p| p.is_file())
+                .map(|p| p.display().to_string())
+        }))
+        .filter(|s| Path::new(s).is_file())
+        {
+            let line = exec_line(&shell, "/bin/sh -c 'command -v xclip'", true);
+            let out = std::process::Command::new(&shell)
+                .args(["-c", &line])
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", real.display()))
+                .env("THURM_CLIP_SHIMS", &shims)
+                .env("HOME", &dir)
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                shims.join("xclip").display().to_string(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            ran += 1;
+        }
+        assert!(ran > 0, "no shell to run the line with");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

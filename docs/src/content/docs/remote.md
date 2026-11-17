@@ -352,8 +352,11 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
 - **Files.** See [Files](#files).
 - **Clipboard tools.** Programs on a Linux host that call `pbcopy`, `pbpaste`,
   `xclip`, `xsel`, `wl-copy` or `wl-paste` reach this Mac's clipboard once the
-  doctor's **Clipboard tools** fix has linked them. New panes on a host
-  without `DISPLAY` or `WAYLAND_DISPLAY` have them first on `PATH`. What is
+  doctor's **Clipboard tools** fix has linked them. New panes whose
+  environment has no `DISPLAY` or `WAYLAND_DISPLAY` (the daemon's, with the
+  host's `[terminal.env]` and what the client passes on top) have them first
+  on `PATH`, ahead of a `PATH` set in `[terminal.env]`, and again after the
+  login shell's profile, for a pane that runs a command as for a shell. What is
   checked, and where:
 
   | | On the host (its daemon) | On this Mac (the app) |
