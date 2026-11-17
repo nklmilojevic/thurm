@@ -224,7 +224,9 @@ final class RemoteDropTests: XCTestCase {
         cancelled.cancelled = true
         fake.finish[1](cancelled)
         XCTAssertFalse(FileManager.default.fileExists(atPath: second))
-        // One cancelled while waiting is not sent, and its image goes.
+        // One waiting behind a file of the user's goes once sent and ended; the user's file
+        // stays. (A waiting batch is dropped, with its image, when its pane's view goes:
+        // testAViewGoingAwayEndsItsTransfers.)
         let user = try file("mine.txt")
         pb.clearContents()
         pb.writeObjects([user] as [NSURL])
@@ -285,11 +287,46 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertEqual(fake.cancels, 1)
         let left = drops().subtracting(before)
         XCTAssertEqual(left.map(\.path), [fake.started[0][0]].map { URL(fileURLWithPath: $0).standardizedFileURL.path })
-        // The sent one's image goes when its upload ends.
+        // The sent one's image goes when its upload ends, and the dropped one never starts.
         var cancelled = TransferOutcome(error: "cancelled")
         cancelled.cancelled = true
         fake.finish[0](cancelled)
         XCTAssertEqual(drops().subtracting(before), [])
+        XCTAssertEqual(fake.started.count, 1)
+    }
+
+    func testTheSendQuestionNamesEveryFile() throws {
+        let urls = try (1...12).map { try file("f\($0).txt") }
+        let alert = TerminalView.sendAlert(urls, "devbox")
+        XCTAssertEqual(alert.messageText, "Send 12 files to devbox?")
+        let list = try XCTUnwrap((alert.accessoryView as? NSScrollView)?.documentView as? NSTextView)
+        // The ninth and every later one too, none behind an ellipsis.
+        XCTAssertEqual(list.string, urls.map(\.path).joined(separator: "\n"))
+        XCTAssertFalse(alert.informativeText.contains("…"))
+    }
+
+    func testAPreviewBeingFetchedShowsProgressAndCancels() throws {
+        let (view, fake) = remotePane()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thurm-preview-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = RemoteFileCache(root: root)
+        cache.download = fake.download
+        view.previewCache = cache
+        view.previewRemote(.path("/srv/notes.md"), cwd: nil)
+        XCTAssertEqual(view.shownTransfer, "Fetching notes.md from devbox…")
+        fake.progress[0](TransferProgress(done: 1, total: 2))
+        XCTAssertEqual(view.shownTransfer, "Fetching notes.md from devbox… 50%")
+        view.cancelShownTransfer(nil)
+        XCTAssertEqual(fake.cancels, 1)
+        XCTAssertNil(view.shownTransfer)
+        var cancelled = TransferOutcome(error: "cancelled")
+        cancelled.cancelled = true
+        fake.finish[0](cancelled)
+        XCTAssertNil(view.shownTransfer)
+        // Nothing staged is left of it.
+        let entries = (try? FileManager.default.subpathsOfDirectory(atPath: root.path)) ?? []
+        XCTAssertEqual(entries.filter { $0.contains(".staging") }, [])
     }
 
     func testAFolderOrAnOlderHostSendsNothing() throws {

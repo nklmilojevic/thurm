@@ -361,14 +361,23 @@ final class RemoteFileCache {
         return total <= maxBytes
     }
 
-    /// Fetches under way, by the entry of their first path, with everyone waiting on each.
-    private var inFlight: [URL: [(Result<URL, Error>) -> Void]] = [:]
+    /// A fetch under way: those waiting on it, and what stops its download.
+    private final class Fetch {
+        var waiters: [UUID: (progress: (TransferProgress) -> Void, done: (Result<URL, Error>) -> Void)] = [:]
+        var cancel: (() -> Void)?
+    }
+
+    /// Fetches under way, by the entry of their first path.
+    private var inFlight: [URL: Fetch] = [:]
 
     /// Fetches `reference`, as `pane` sees it, into the cache (or finds it there unchanged);
-    /// `completion` runs on the main thread. A fetch of a file already on its way waits for that
-    /// one instead of starting another.
+    /// `progress` and `completion` run on the main thread. A fetch of a file already on its way
+    /// waits for that one instead of starting another. Returns what cancels this request: it
+    /// completes with `RemoteFileError.cancelled`, and the download stops once no one waits.
+    @discardableResult
     func fetch(_ reference: TerminalFileReference, pane: PaneKey, cwd: String?,
-               completion: @escaping (Result<URL, Error>) -> Void) {
+               progress: @escaping (TransferProgress) -> Void = { _ in },
+               completion: @escaping (Result<URL, Error>) -> Void) -> () -> Void {
         let paths: [String]
         do {
             // A relative path is the directory's the pane had when it was clicked, not the one
@@ -381,21 +390,38 @@ final class RemoteFileCache {
                 return cwd.hasSuffix("/") ? cwd + path : cwd + "/" + path
             }
         } catch {
-            return completion(.failure(error))
+            completion(.failure(error))
+            return {}
         }
         let key = entry(host: pane.host, path: paths[0], cwd: cwd)
-        if inFlight[key] != nil {
-            inFlight[key]?.append(completion)
-            return
+        let id = UUID()
+        let cancel: () -> Void = { [weak self] in
+            guard let fetch = self?.inFlight[key], let waiter = fetch.waiters.removeValue(forKey: id) else {
+                return
+            }
+            waiter.done(.failure(RemoteFileError.cancelled))
+            if fetch.waiters.isEmpty { fetch.cancel?() }
         }
-        inFlight[key] = [completion]
-        fetch(paths[...], pane: pane, cwd: cwd, firstError: nil) { [self] result in
-            let waiting = inFlight.removeValue(forKey: key) ?? []
-            for done in waiting { done(result) }
+        if let running = inFlight[key] {
+            running.waiters[id] = (progress, completion)
+            return cancel
         }
+        let fetch = Fetch()
+        fetch.waiters[id] = (progress, completion)
+        inFlight[key] = fetch
+        self.fetch(paths[...], pane: pane, cwd: cwd, firstError: nil,
+                   progress: { p in for w in fetch.waiters.values { w.progress(p) } },
+                   started: { fetch.cancel = $0 }) { [self] result in
+            if inFlight[key] === fetch { inFlight[key] = nil }
+            for w in fetch.waiters.values { w.done(result) }
+            fetch.waiters.removeAll()
+        }
+        return cancel
     }
 
     private func fetch(_ paths: ArraySlice<String>, pane: PaneKey, cwd: String?, firstError: String?,
+                       progress: @escaping (TransferProgress) -> Void,
+                       started: @escaping (@escaping () -> Void) -> Void,
                        completion: @escaping (Result<URL, Error>) -> Void) {
         guard let path = paths.first else {
             return completion(.failure(RemoteFileError.failed(firstError ?? "The file was not found.")))
@@ -411,6 +437,7 @@ final class RemoteFileCache {
         let onProgress: (TransferProgress) -> Void = { [self] p in
             // The size is known from the first report: it is reserved, and must fit beside the
             // rest, or the download stops.
+            progress(p)
             guard let r = reserved[token], r.bytes == 0, p.total > 0 else { return }
             reserved[token] = (entry, p.total)
             if !prune() {
@@ -438,7 +465,7 @@ final class RemoteFileCache {
                 // suffix: any other failure is this file's, and another file is not shown for it.
                 guard outcome.notFound else { return completion(.failure(RemoteFileError.failed(error))) }
                 return fetch(paths.dropFirst(), pane: pane, cwd: cwd, firstError: firstError ?? error,
-                             completion: completion)
+                             progress: progress, started: started, completion: completion)
             }
             do {
                 completion(.success(try install(entry, staged: staged, name: outcome.name ?? "file",
@@ -448,15 +475,19 @@ final class RemoteFileCache {
                 completion(.failure(error))
             }
         }
+        started { cancel?() }
     }
 }
 
-enum RemoteFileError: Error, LocalizedError {
+enum RemoteFileError: Error, LocalizedError, Equatable {
     case failed(String)
+    /// Its request was cancelled.
+    case cancelled
 
     var errorDescription: String? {
         switch self {
         case .failed(let why): return why
+        case .cancelled: return "Cancelled."
         }
     }
 }

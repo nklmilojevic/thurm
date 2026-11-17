@@ -835,3 +835,29 @@ fn batches_left_incomplete_are_capped() {
     other.upload_begin(pane, "x", 1, None).unwrap();
     drop(held);
 }
+
+#[test]
+fn cancelling_the_last_file_before_its_paste_types_nothing() {
+    let env = Env::new("transfer-cancel-before-paste");
+    // Time between the last file landing and the paste, for the cancel to come in.
+    let _daemon = env.start_with(&[("THURM_TRANSFER_PASTE_DELAY_MS", Path::new("500"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let ticket = c.upload_begin(pane, "last.txt", 4, None).unwrap();
+    let (r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
+    w.write_all(b"last").unwrap();
+    w.finish().unwrap();
+    eventually(5, "the file did not land", || {
+        batches(&env, pane)
+            .first()
+            .is_some_and(|b| b.join("last.txt").exists())
+    });
+    w.close(thurm_proto::stream::StreamClose::Aborted).unwrap();
+    let e = r.wait_closed().unwrap_err().to_string();
+    assert!(e.contains("cancelled"), "{e}");
+    eventually(5, "the cancelled batch was kept", || {
+        batches(&env, pane).is_empty()
+    });
+    assert_eq!(typed(&c, pane, &dir), "\n");
+}
