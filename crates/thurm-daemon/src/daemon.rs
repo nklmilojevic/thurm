@@ -2769,7 +2769,7 @@ impl Daemon {
                 }
                 if has(thurm_proto::CAP_PORT_EVENTS) {
                     client.port_events.store(true, Ordering::Relaxed);
-                    self.ports.subscribed(Arc::downgrade(self));
+                    self.ports.subscribed(Arc::downgrade(self), client.id);
                 }
                 if has(thurm_proto::CAP_CLIP_QUERY) {
                     client.clip_query.store(true, Ordering::Relaxed);
@@ -3949,13 +3949,20 @@ impl crate::ports::Host for Daemon {
             .collect()
     }
 
-    fn send_ports(&self, event: Event) {
+    fn send_ports(&self, event: Event, except: &[u64]) {
         self.ext_ports_changed(&event);
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
         for c in clients {
-            if c.port_events.load(Ordering::Relaxed) {
+            if c.port_events.load(Ordering::Relaxed) && !except.contains(&c.id) {
                 c.send(ServerMessage::Event(event.clone()));
             }
+        }
+    }
+
+    fn send_ports_to(&self, client: u64, event: Event) {
+        let c = self.clients.lock().get(&client).cloned();
+        if let Some(c) = c.filter(|c| c.port_events.load(Ordering::Relaxed)) {
+            c.send(ServerMessage::Event(event));
         }
     }
 

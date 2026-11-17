@@ -86,7 +86,10 @@ pub mod method {
     pub const PORTS_LIST: &str = "ports.list";
     /// `{host, pane, ports, complete, initial?}`: a remote host's pane listed these ports
     /// ([`crate::Event::PortsChanged`] from that host's daemon); `initial` when they were
-    /// listening already as the app connected to the host. Only from the app
+    /// listening already as the app connected to the host (or to this daemon). `{host, gone:
+    /// true}`: the app's connection to the host is gone. The daemon keeps each pane's latest
+    /// list for new subscribers, and passes on only the lists of the app that holds plugins'
+    /// forwards. Only from the app
     /// ([`crate::CAP_EXT_FORWARDS`]), which hears them; subscribers hear `ports_changed` with
     /// `host`.
     pub const PORTS_REPORT: &str = "ports.report";
@@ -132,7 +135,7 @@ pub mod notice {
 ///   ports (empty once they went), with `pane` while the pane is there. A remote host's pane
 ///   (reported by the app) has `host`, and no `pane`, and `initial` for the lists it had as the
 ///   app connected to it. Subscribing to it by name starts the daemon's watch of its panes'
-///   ports.
+///   ports, and sends the subscriber the remote hosts' lists known so far, with `initial`.
 /// - `files_uploaded`: `{id, paths}`, the files sent to a pane, once their paths were typed
 ///   there, with `pane` while it is there.
 /// - `forward_opened` and `forward_closed`: [`ForwardInfo`], as the app that holds plugins'

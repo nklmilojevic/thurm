@@ -51,8 +51,10 @@ final class Extensions {
     /// brings the app forward (the Dock icon bounces for it), not before.
     private var pending: [String: Any]?
     private var activeObserver: NSObjectProtocol?
-    /// Forwards being opened or closed for plugins.
+    /// Forwards being opened or closed for plugins, and who has which.
     private var forwardRequests = ForwardRequests()
+    /// Remote hosts' port lists, passed on to plugins.
+    private var remotePorts = RemotePorts()
 
     // MARK: Calling the daemon
 
@@ -79,6 +81,11 @@ final class Extensions {
         registerAppActions()
         refresh()
         reportForwards(Core.shared.remoteCall(["op": "forward_list"]) as? [Any] ?? [], change: nil)
+        // A daemon (a new one, or one started again) knows nothing of remote hosts' ports: what
+        // they list now was listening already.
+        for e in remotePorts.all {
+            sendPorts(host: e.host, pane: e.pane, ports: e.ports, complete: e.complete, initial: true)
+        }
     }
 
     /// The connection to this Mac's daemon is gone: its questions go, unanswered, and so do
@@ -338,7 +345,9 @@ final class Extensions {
             if let id = jsonUInt64(payload["id"]), let p = pending, jsonUInt64(p["id"]) == id {
                 pending = nil
             }
-            if let id = jsonUInt64(payload["id"]) { forwardRequests.cancel(id) }
+            if let id = jsonUInt64(payload["id"]) {
+                forwardRequests.cancel(.init(connection: connection, id: id))
+            }
         default:
             break
         }
@@ -413,35 +422,62 @@ final class Extensions {
 
     /// A remote host's pane listed its ports: this Mac's plugins hear of it (with the host).
     /// `initial`: they were listening already when the app connected to the host, as is every
-    /// list relayed before `remoteHostConnected` has the host's own answer.
+    /// list relayed before `remoteHostConnected` has the host's own answer. Kept, for a daemon
+    /// the app connects to later: sent while it is not connected, it is lost.
     func reportPorts(host: HostId, pane: UInt64, ports: Any, complete: Any, initial: Bool = false) {
-        guard available else { return }
-        var params: [String: Any] = ["host": host, "pane": NSNumber(value: pane), "ports": ports,
-                                     "complete": complete]
-        if initial || learningPorts[host] != nil { params["initial"] = true }
-        call("ports.report", params)
+        remotePorts.listed(host, pane: pane, ports: ports, complete: complete)
+        sendPorts(host: host, pane: pane, ports: ports, complete: complete,
+                  initial: initial || remotePorts.isLearning(host))
     }
 
-    /// Hosts the app connected to whose ports it is still asking for, by the ask's number: what
-    /// they list meanwhile was listening before (the daemon there sends every list on connect).
-    private var learningPorts: [HostId: Int] = [:]
-    private var learnings = 0
+    private func sendPorts(host: HostId, pane: UInt64, ports: Any, complete: Any, initial: Bool) {
+        var params: [String: Any] = ["host": host, "pane": NSNumber(value: pane), "ports": ports,
+                                     "complete": complete]
+        if initial { params["initial"] = true }
+        call("ports.report", params)
+    }
 
     /// The app connected to `host`: its panes' ports now go to plugins as `initial`, so a
     /// server that was running already is not taken for one that just started.
     func remoteHostConnected(_ host: HostId) {
-        learnings += 1
-        let ask = learnings
-        learningPorts[host] = ask
+        let ask = remotePorts.connected(host)
         Core.shared.requestAsync(object: ["Ports": ["pane": NSNull()]], host: host, timeout: 10) { [weak self] resp in
-            guard let self, self.learningPorts[host] == ask else { return }
+            // Not an answer of a connection that is gone since, or was replaced.
+            guard let self, self.remotePorts.learned(host, ask: ask) else { return }
             // A daemon from before ports answers with an error: it sends no lists either.
             for entry in (resp as? [String: Any])?["Ports"] as? [[String: Any]] ?? [] {
                 guard let pane = jsonUInt64(entry["pane"]) else { continue }
                 self.reportPorts(host: host, pane: pane, ports: entry["ports"] ?? [],
                                  complete: entry["complete"] ?? true, initial: true)
             }
-            self.learningPorts[host] = nil
+        }
+    }
+
+    /// The connection to `host` is gone: what it listed is no longer known, and an answer it
+    /// still gives is not taken.
+    func remoteHostDisconnected(_ host: HostId) {
+        remotePorts.disconnected(host)
+        call("ports.report", ["host": host, "gone": true])
+    }
+
+    /// The user opens a forward of `host` (a link, Forward Port…).
+    func userOpensForward(_ host: HostId) { forwardRequests.userOpens(host) }
+
+    /// The user's open finished: they have that forward now.
+    func userOpenedForward(_ host: HostId, result: [String: Any]?) {
+        closeAbandoned(forwardRequests.userOpened(host, result: result))
+    }
+
+    /// The forwards open now (the status callback's report).
+    func forwardsNow(_ ids: Set<UInt64>) { forwardRequests.forwardsNow(ids) }
+
+    /// Closes forwards opened for plugins' requests nobody waits for and nobody else has.
+    private func closeAbandoned(_ ids: [UInt64]) {
+        for id in ids {
+            tlog("closing forward \(id): the plugin that asked for it no longer waits")
+            DispatchQueue.global(qos: .utility).async {
+                _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: id)])
+            }
         }
     }
 
@@ -450,6 +486,7 @@ final class Extensions {
     private func forwardRequest(_ req: [String: Any]) {
         guard let id = jsonUInt64(req["id"]) else { return }
         let asked = connection
+        let key = ForwardRequests.Key(connection: asked, id: id)
         let answer = { [weak self] (result: Any, error: String?) in
             guard let self, self.connection == asked else { return }
             var reply: [String: Any] = ["id": id, "result": result]
@@ -457,6 +494,7 @@ final class Extensions {
             self.call("ui.reply", reply)
         }
         let op: [String: Any]
+        var opening: HostId?
         switch jsonString(req["kind"]) {
         case "forward_open":
             guard let host = jsonString(req["host"]), let port = jsonInt(req["port"]) else {
@@ -464,6 +502,7 @@ final class Extensions {
                 return
             }
             op = ["op": "forward_open", "host": host, "port": port]
+            opening = host
         case "forward_close":
             guard let forward = jsonUInt64(req["forward"]) else {
                 answer(NSNull(), "a forward to close")
@@ -475,22 +514,16 @@ final class Extensions {
             return
         }
         let browse = jsonBool(req["browse"]) == true
-        forwardRequests.begin(id)
+        forwardRequests.begin(key, opening: opening)
         // Opening connects to the host's daemon first: not on the main thread.
         DispatchQueue.global(qos: .userInitiated).async {
             let v = Core.shared.remoteCall(op) as? [String: Any]
             DispatchQueue.main.async {
                 // The daemon gave up on it meanwhile: it changes nothing. A forward it opened is
-                // closed again (and both are reported, as every change is).
-                if case .abandoned(let close) = self.forwardRequests.finish(id, result: v) {
-                    if let close {
-                        tlog("closing forward \(close): the plugin that asked for it no longer waits")
-                        DispatchQueue.global(qos: .utility).async {
-                            _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: close)])
-                        }
-                    }
-                    return
-                }
+                // closed again once nobody else has it (and both are reported, as every change is).
+                let (finish, close) = self.forwardRequests.finish(key, opening: opening, result: v)
+                self.closeAbandoned(close)
+                guard finish == .answer else { return }
                 if let e = jsonString(v?["error"]) {
                     answer(NSNull(), e)
                     return

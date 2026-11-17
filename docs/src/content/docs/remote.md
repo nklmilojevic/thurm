@@ -405,8 +405,9 @@ this Mac first: it listens on port 5173 of this Mac's loopback, `127.0.0.1` and
 (another free port when 5173 is taken on either, kept for next time), carries
 each connection to the host's daemon, which connects to
 port 5173 on the host's own loopback, and opens the link pointed at it. The
-first time, a toast says where it went (`devbox:5173 → localhost:5173`), with
-**Copy Link**. Links to `localhost`, `127.0.0.1`, `[::1]` and `0.0.0.0` are
+first time, a toast on that pane says where it went (`devbox:5173 →
+localhost:5173`), with **Copy Link**; an alert does when the pane is gone by then,
+or when there was none (Forward Port… with no window open). Links to `localhost`, `127.0.0.1`, `[::1]` and `0.0.0.0` are
 forwarded; set `forward_links = false` in the host's `[[remote]]` (or turn off
 **Open localhost links through a forward** in its details) to open them on the
 Mac instead.

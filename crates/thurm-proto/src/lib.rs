@@ -110,6 +110,10 @@ pub const CAP_PORT_EVENTS: &str = "port-events";
 /// [`Request::UploadBegin`] and [`Request::DownloadBegin`]. Implies [`CAP_STREAMS`].
 pub const CAP_TRANSFER: &str = "transfer";
 
+/// How a [`Request::DownloadBegin`] error for a path with nothing at it ends, so a client can
+/// tell "not there" from every other failure.
+pub const DOWNLOAD_NOT_FOUND: &str = "no such file";
+
 /// Sent only by an app that shows what plugins ask for ([`ext::UiRequest`]: a toast, a picker,
 /// a text field, a confirmation) and answers with [`ext::method::UI_REPLY`]. The daemon takes
 /// it only from a desktop UI (`ui`, not a phone) of its own user on its own socket, and when

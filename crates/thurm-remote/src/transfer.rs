@@ -70,6 +70,8 @@ pub enum TransferError {
     Local(String),
     /// The daemon refused, or the stream failed.
     Remote(String),
+    /// Nothing is at the path asked for ([`thurm_proto::DOWNLOAD_NOT_FOUND`]).
+    NotFound(String),
 }
 
 impl std::fmt::Display for TransferError {
@@ -84,7 +86,9 @@ impl std::fmt::Display for TransferError {
                 size.div_ceil(1 << 20),
                 max >> 20
             ),
-            TransferError::Local(e) | TransferError::Remote(e) => f.write_str(e),
+            TransferError::Local(e) | TransferError::Remote(e) | TransferError::NotFound(e) => {
+                f.write_str(e)
+            }
         }
     }
 }
@@ -93,7 +97,12 @@ impl std::error::Error for TransferError {}
 
 impl From<ClientError> for TransferError {
     fn from(e: ClientError) -> Self {
-        TransferError::Remote(e.to_string())
+        match e {
+            ClientError::Daemon(why) if why.ends_with(thurm_proto::DOWNLOAD_NOT_FOUND) => {
+                TransferError::NotFound(why)
+            }
+            e => TransferError::Remote(e.to_string()),
+        }
     }
 }
 
@@ -189,19 +198,33 @@ pub fn upload(
         total: sources.iter().map(|s| s.size).sum(),
     };
     progress(p);
-    let mut last = None;
+    // The last file's stream, sent and finished: kept until the next one opens, so a failure
+    // to start that one can still end the batch on the daemon (an aborted stream does; a
+    // closed one does not, as the earlier files' streams close).
+    let mut last: Option<(StreamReader, StreamWriter)> = None;
     for (index, source) in sources.iter_mut().enumerate() {
-        let ticket = host.client.upload_begin(
-            pane,
-            &source.name,
-            source.size,
-            Some(UploadBatch {
-                id: id.clone(),
-                index: index as u32,
-                count,
-            }),
-        )?;
-        let (reader, mut writer) = stream::open(host.socket, &ticket.ticket)?;
+        let next = host
+            .client
+            .upload_begin(
+                pane,
+                &source.name,
+                source.size,
+                Some(UploadBatch {
+                    id: id.clone(),
+                    index: index as u32,
+                    count,
+                }),
+            )
+            .and_then(|ticket| stream::open(host.socket, &ticket.ticket));
+        let (reader, mut writer) = match next {
+            Ok(opened) => opened,
+            Err(e) => {
+                if let Some((_, w)) = last.take() {
+                    let _ = w.close(StreamClose::Aborted);
+                }
+                return Err(e.into());
+            }
+        };
         // A cancel between files still has to reach the daemon: it ends the batch on this
         // stream, which is aborted unfinished.
         send(source, &mut writer, cancel, |n| {
@@ -361,7 +384,14 @@ pub fn download(
         .ticket
         .as_deref()
         .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
-    let (mut reader, mut writer) = stream::open(host.socket, ticket)?;
+    let socket = thurm_client::connect_daemon(host.socket)
+        .map_err(|e| ClientError::Connect(e.to_string()))?;
+    let shutdown = socket
+        .try_clone()
+        .map_err(|e| TransferError::Local(format!("cannot watch the download: {e}")))?;
+    let (mut reader, mut writer) = stream::open_on(socket, ticket)?;
+    // A read blocks until the host sends; Cancel ends the connection under it.
+    let _watch = CancelWatch::start(cancel.clone(), shutdown);
     let (part, file) = create_part(dest)?;
     let received = receive(&mut reader, file, &part, info.size, cancel, &mut progress);
     if let Err(e) = received {
@@ -382,6 +412,42 @@ pub fn download(
         TransferError::Local(format!("{}: {e}", dest.display()))
     })?;
     Ok(Downloaded::Saved(info))
+}
+
+/// Shuts a stream's connection down once `cancel` is set, until dropped: a read blocked on a
+/// host that stopped sending then returns.
+struct CancelWatch {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CancelWatch {
+    fn start(cancel: Cancel, socket: std::os::unix::net::UnixStream) -> CancelWatch {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("transfer-cancel".into())
+            .spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    if cancel.is_cancelled() {
+                        let _ = socket.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+            .ok();
+        CancelWatch { stop, thread }
+    }
+}
+
+impl Drop for CancelWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// A new file beside `dest` that this download alone writes until whole: two downloads to
@@ -434,6 +500,7 @@ fn receive(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) if cancel.is_cancelled() => return Err(TransferError::Cancelled),
             Err(e) => return Err(remote_error(&e)),
         };
         p.done += n as u64;
@@ -446,6 +513,9 @@ fn receive(
         progress(p);
     }
     if p.done != size {
+        if cancel.is_cancelled() {
+            return Err(TransferError::Cancelled);
+        }
         return Err(TransferError::Remote(format!(
             "{} of {size} bytes arrived",
             p.done
@@ -476,6 +546,26 @@ mod tests {
     /// A daemon's end of a stream: answers the Hello and the StreamOpen, then the frames it
     /// gets until a `Close`, which it answers with `answer`.
     fn fake_daemon(answer: StreamClose) -> (UnixStream, std::thread::JoinHandle<Vec<StreamFrame>>) {
+        fake_daemon_then(move |r, w| {
+            let mut seen = Vec::new();
+            while let Ok(Some(frame)) = thurm_proto::stream::read_frame(r) {
+                let done = matches!(frame, StreamFrame::Close(_));
+                seen.push(frame);
+                if done {
+                    thurm_proto::stream::write_frame(w, &StreamFrame::Close(answer)).unwrap();
+                    break;
+                }
+            }
+            seen
+        })
+    }
+
+    /// A daemon's end that answers the Hello and the StreamOpen, then runs `then`.
+    fn fake_daemon_then(
+        then: impl FnOnce(&mut std::io::BufReader<UnixStream>, &mut UnixStream) -> Vec<StreamFrame>
+        + Send
+        + 'static,
+    ) -> (UnixStream, std::thread::JoinHandle<Vec<StreamFrame>>) {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let daemon = std::thread::spawn(move || {
             let mut r = std::io::BufReader::new(theirs.try_clone().unwrap());
@@ -503,18 +593,64 @@ mod tests {
                 };
                 codec::write_message(&mut w, &msg).unwrap();
             }
+            then(&mut r, &mut w)
+        });
+        (ours, daemon)
+    }
+
+    #[test]
+    fn cancel_ends_a_download_the_host_stopped_sending() {
+        // Some bytes, then nothing, the connection held open.
+        let (socket, daemon) = fake_daemon_then(|r, w| {
+            thurm_proto::stream::write_frame(w, &StreamFrame::Data(b"part".to_vec())).unwrap();
             let mut seen = Vec::new();
-            while let Ok(Some(frame)) = thurm_proto::stream::read_frame(&mut r) {
-                let done = matches!(frame, StreamFrame::Close(_));
+            while let Ok(Some(frame)) = thurm_proto::stream::read_frame(r) {
                 seen.push(frame);
-                if done {
-                    thurm_proto::stream::write_frame(&mut w, &StreamFrame::Close(answer)).unwrap();
-                    break;
-                }
             }
             seen
         });
-        (ours, daemon)
+        let shutdown = socket.try_clone().unwrap();
+        let (mut reader, _writer) = stream::open_on(socket, "ticket").unwrap();
+        let dir = temp_dir("stalled");
+        let (part, file) = create_part(&dir.join("big.bin")).unwrap();
+        let cancel = Cancel::default();
+        let watch = CancelWatch::start(cancel.clone(), shutdown);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let theirs = cancel.clone();
+        let reading = std::thread::spawn(move || {
+            let mut seen = Progress::default();
+            let got = receive(&mut reader, file, &part, 1000, &theirs, &mut |p| seen = p);
+            let _ = tx.send((got, seen));
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        cancel.cancel();
+        let (got, seen) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read stayed blocked after Cancel");
+        assert!(matches!(got, Err(TransferError::Cancelled)), "{got:?}");
+        assert_eq!(seen.done, 4);
+        reading.join().unwrap();
+        drop(watch);
+        daemon.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nothing_at_the_path_is_told_from_other_failures() {
+        let missing = ClientError::Daemon(format!("notes.md: {}", thurm_proto::DOWNLOAD_NOT_FOUND));
+        assert!(matches!(
+            TransferError::from(missing),
+            TransferError::NotFound(_)
+        ));
+        let denied = ClientError::Daemon("cannot open notes.md: Permission denied".into());
+        assert!(matches!(
+            TransferError::from(denied),
+            TransferError::Remote(_)
+        ));
+        assert!(matches!(
+            TransferError::from(ClientError::Disconnected),
+            TransferError::Remote(_)
+        ));
     }
 
     #[test]

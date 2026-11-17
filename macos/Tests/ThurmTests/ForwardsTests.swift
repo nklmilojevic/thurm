@@ -65,47 +65,163 @@ final class ForwardsTests: XCTestCase {
         XCTAssertEqual(link.map(\.target), [.url("http://localhost:3000/")])
     }
 
-    func testAForwardRequestTheDaemonGaveUpOnChangesNothing() {
-        let opened: [String: Any] = ["id": 7, "host": "devbox", "remote_port": 5173, "local_port": 5173,
-                                     "url": "http://localhost:5173/", "new": true]
-        var found = opened
-        found["new"] = false
-        var r = ForwardRequests()
-
-        // Still waited for: answered.
-        r.begin(1)
-        XCTAssertEqual(r.finish(1, result: opened), .answer)
-
-        // Cancelled while opening: the forward it opened is closed again.
-        r.begin(2)
-        r.cancel(2)
-        XCTAssertEqual(r.finish(2, result: opened), .abandoned(close: 7))
-        // One it found open already was not its own to close; nor is anything after a failure.
-        r.begin(3)
-        r.cancel(3)
-        XCTAssertEqual(r.finish(3, result: found), .abandoned(close: nil))
-        r.begin(4)
-        r.cancel(4)
-        XCTAssertEqual(r.finish(4, result: ["error": "devbox is not connected"]), .abandoned(close: nil))
-        XCTAssertEqual(r.finish(5, result: nil), .abandoned(close: nil))
-
-        // A new connection to the daemon: the old one's requests are no one's.
-        r.begin(6)
-        r.begin(8)
-        r.cancelAll()
-        XCTAssertEqual(r.finish(6, result: opened), .abandoned(close: 7))
-        // A cancel of another request leaves this one alone; an id answers once.
-        r.begin(9)
-        r.cancel(10)
-        XCTAssertEqual(r.finish(9, result: opened), .answer)
-        XCTAssertEqual(r.finish(9, result: opened), .abandoned(close: 7))
+    private func opened(_ id: UInt64, new: Bool = true) -> [String: Any] {
+        ["id": id, "host": "devbox", "remote_port": 5173, "local_port": 5173,
+         "url": "http://localhost:5173/", "new": new]
     }
 
+    private func key(_ id: UInt64, _ connection: Int = 1) -> ForwardRequests.Key {
+        ForwardRequests.Key(connection: connection, id: id)
+    }
+
+    func testAForwardRequestTheDaemonGaveUpOnChangesNothing() {
+        var r = ForwardRequests()
+        // Still waited for: answered, nothing closed.
+        r.begin(key(1), opening: "devbox")
+        XCTAssertEqual(r.finish(key(1), opening: "devbox", result: opened(7)).0, .answer)
+        XCTAssertEqual(r.finish(key(1), opening: "devbox", result: opened(7)).close, [])
+
+        // Cancelled while opening, nobody else has it: closed again.
+        r.begin(key(2), opening: "devbox")
+        r.cancel(key(2))
+        let (finish, close) = r.finish(key(2), opening: "devbox", result: opened(8))
+        XCTAssertEqual(finish, .abandoned)
+        XCTAssertEqual(close, [8])
+        // One it found open already is not its own to close; nor is anything after a failure.
+        r.begin(key(3), opening: "devbox")
+        r.cancel(key(3))
+        XCTAssertEqual(r.finish(key(3), opening: "devbox", result: opened(9, new: false)).close, [])
+        r.begin(key(4), opening: "devbox")
+        r.cancel(key(4))
+        XCTAssertEqual(r.finish(key(4), opening: "devbox", result: ["error": "devbox is not connected"]).close, [])
+        // A cancelled close is not answered; it closes nothing more.
+        r.begin(key(5), opening: nil)
+        r.cancel(key(5))
+        XCTAssertEqual(r.finish(key(5), opening: nil, result: opened(7)).0, .abandoned)
+        XCTAssertEqual(r.finish(key(5), opening: nil, result: opened(7)).close, [])
+    }
+
+    /// Two plugins open the same port: the first opens it and is given up on, the second gets
+    /// that forward (`new` false). It stays, whichever finishes first.
+    func testAnAbandonedOpenLeavesAForwardAnotherCallerHas() {
+        // The second finishes first.
+        var r = ForwardRequests()
+        r.begin(key(1), opening: "devbox")
+        r.begin(key(2), opening: "devbox")
+        r.cancel(key(1))
+        XCTAssertEqual(r.finish(key(2), opening: "devbox", result: opened(7, new: false)).0, .answer)
+        XCTAssertEqual(r.finish(key(1), opening: "devbox", result: opened(7)).close, [])
+
+        // The abandoned one finishes first: its close waits for the other open, which gets it.
+        r = ForwardRequests()
+        r.begin(key(1), opening: "devbox")
+        r.begin(key(2), opening: "devbox")
+        r.cancel(key(1))
+        XCTAssertEqual(r.finish(key(1), opening: "devbox", result: opened(7)).close, [])
+        XCTAssertEqual(r.finish(key(2), opening: "devbox", result: opened(7, new: false)).close, [])
+
+        // The other open fails: nobody has it, and it goes then.
+        r = ForwardRequests()
+        r.begin(key(1), opening: "devbox")
+        r.begin(key(2), opening: "devbox")
+        r.cancel(key(1))
+        XCTAssertEqual(r.finish(key(1), opening: "devbox", result: opened(7)).close, [])
+        XCTAssertEqual(r.finish(key(2), opening: "devbox", result: ["error": "timed out"]).close, [7])
+
+        // The user clicking the link meanwhile has it too.
+        r = ForwardRequests()
+        r.begin(key(1), opening: "devbox")
+        r.userOpens("devbox")
+        r.cancel(key(1))
+        XCTAssertEqual(r.finish(key(1), opening: "devbox", result: opened(7)).close, [])
+        XCTAssertEqual(r.userOpened("devbox", result: opened(7, new: false)), [])
+        // Another host's opens don't hold it back.
+        r = ForwardRequests()
+        r.begin(key(1), opening: "devbox")
+        r.userOpens("pi")
+        r.cancel(key(1))
+        XCTAssertEqual(r.finish(key(1), opening: "devbox", result: opened(7)).close, [7])
+        // A forward someone had, closed since and its id handed out again, is no one's.
+        r = ForwardRequests()
+        r.begin(key(1), opening: "devbox")
+        _ = r.finish(key(1), opening: "devbox", result: opened(7))
+        r.forwardsNow([])
+        r.begin(key(2), opening: "devbox")
+        r.cancel(key(2))
+        XCTAssertEqual(r.finish(key(2), opening: "devbox", result: opened(7)).close, [7])
+    }
+
+    /// A daemon started again numbers its requests from 1 again: an old connection's request
+    /// that finishes late leaves the new one's with the same id waited for.
+    func testRequestsAreScopedToTheirConnection() {
+        var r = ForwardRequests()
+        r.begin(key(1, 1), opening: "devbox")
+        r.cancelAll()
+        r.begin(key(1, 2), opening: "devbox")
+        XCTAssertEqual(r.finish(key(1, 1), opening: "devbox", result: ["error": "gone"]).0, .abandoned)
+        XCTAssertEqual(r.finish(key(1, 2), opening: "devbox", result: opened(7)).0, .answer)
+        // And a cancel of the old one's id leaves the new one alone.
+        r.begin(key(2, 2), opening: nil)
+        r.cancel(key(2, 1))
+        XCTAssertEqual(r.finish(key(2, 2), opening: nil, result: opened(7)).0, .answer)
+    }
+
+    func testRemotePortsAreKeptAndTheirAskEndsWithTheConnection() {
+        var p = RemotePorts()
+        let ask = p.connected("devbox")
+        XCTAssertTrue(p.isLearning("devbox"))
+        p.listed("devbox", pane: 2, ports: [["port": 5173]], complete: true)
+        p.listed("devbox", pane: 3, ports: [["port": 8080]], complete: true)
+        p.listed("pi", pane: 1, ports: [["port": 22]], complete: true)
+        // An empty list forgets the pane; the rest is there to send a daemon connected later.
+        p.listed("devbox", pane: 3, ports: [] as [Any], complete: true)
+        XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "pi/1"])
+
+        // The host goes before its answer comes: the late answer is not taken, its lists go.
+        p.disconnected("devbox")
+        XCTAssertFalse(p.isLearning("devbox"))
+        XCTAssertFalse(p.learned("devbox", ask: ask))
+        XCTAssertEqual(p.all.map(\.host), ["pi"])
+
+        // Connected again: only the newest ask's answer counts, once.
+        let old = p.connected("devbox")
+        let new = p.connected("devbox")
+        XCTAssertFalse(p.learned("devbox", ask: old))
+        XCTAssertTrue(p.isLearning("devbox"))
+        XCTAssertTrue(p.learned("devbox", ask: new))
+        XCTAssertFalse(p.isLearning("devbox"))
+        XCTAssertFalse(p.learned("devbox", ask: new))
+    }
     func testAFailureWithoutAPaneIsAnAlert() {
-        XCTAssertEqual(ForwardFailure.report(host: "pi", "pi is not connected", hasView: true),
-                       .toast("Could not forward from pi: pi is not connected"))
-        XCTAssertEqual(ForwardFailure.report(host: "pi", "pi is not connected", hasView: false),
-                       .alert("Could not forward from pi: pi is not connected"))
+        XCTAssertEqual(ForwardNotice.failure(host: "pi", "pi is not connected", onPane: true),
+                       .toast("Could not forward from pi: pi is not connected", copyLink: nil))
+        XCTAssertEqual(ForwardNotice.failure(host: "pi", "pi is not connected", onPane: false),
+                       .alert("Could not forward from pi: pi is not connected", copyLink: nil))
+    }
+
+    func testAFirstForwardWithoutAPaneIsAnAlertWithItsLink() {
+        let url = "http://localhost:5173/"
+        XCTAssertEqual(ForwardNotice.opened(host: "devbox", remotePort: 5173, localPort: 5173, url: url, onPane: true),
+                       .toast("devbox:5173 → localhost:5173", copyLink: url))
+        XCTAssertEqual(ForwardNotice.opened(host: "devbox", remotePort: 5173, localPort: 5173, url: url, onPane: false),
+                       .alert("devbox:5173 → localhost:5173", copyLink: url))
+    }
+
+    func testAPortsReplyFromAnOldConnectionIsDropped() {
+        var g = RequestGenerations()
+        // Asked, then the connection drops before the answer: the answer is old.
+        let first = g.start("devbox")
+        XCTAssertTrue(g.isCurrent("devbox", first))
+        g.invalidate("devbox")
+        XCTAssertFalse(g.isCurrent("devbox", first))
+        // Reconnected and asked again: only the newer answer counts, whichever comes last.
+        let second = g.start("devbox")
+        XCTAssertFalse(g.isCurrent("devbox", first))
+        XCTAssertTrue(g.isCurrent("devbox", second))
+        // Hosts are apart.
+        let other = g.start("pi")
+        XCTAssertTrue(g.isCurrent("devbox", second))
+        XCTAssertTrue(g.isCurrent("pi", other))
     }
 
     func testEveryOpenForwardKeepsCopyLinkAndClose() {
