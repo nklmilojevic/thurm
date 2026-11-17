@@ -273,6 +273,7 @@ fn remote_events_reject_unknown_and_disconnected_hosts_before_socket_access() {
                 tunnel_pid: None,
                 transport: Default::default(),
                 via: None,
+                settings: 0,
             };
             std::fs::write(
                 env.dir.join("testbox.state"),

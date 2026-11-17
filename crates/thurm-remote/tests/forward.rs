@@ -128,3 +128,89 @@ fn a_host_that_moves_drops_its_connection_and_forwards() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A daemon that answers Hello and keeps each connection open until [`Downable::down`].
+struct Downable {
+    path: PathBuf,
+    conns: std::sync::Arc<std::sync::Mutex<Vec<std::os::unix::net::UnixStream>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Downable {
+    fn up(path: PathBuf) -> Downable {
+        use thurm_proto::{Envelope, Request, Response, ServerMessage, codec};
+        let ln = UnixListener::bind(&path).unwrap();
+        let conns: std::sync::Arc<std::sync::Mutex<Vec<std::os::unix::net::UnixStream>>> =
+            Default::default();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (kept, stopped) = (conns.clone(), stop.clone());
+        std::thread::spawn(move || {
+            for conn in ln.incoming() {
+                if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let Ok(mut conn) = conn else { return };
+                kept.lock().unwrap().push(conn.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut conn) {
+                        let result = match env.request {
+                            Request::Hello { .. } => Ok(Response::Hello {
+                                version: thurm_proto::PROTOCOL_VERSION,
+                                daemon_pid: std::process::id(),
+                                restored: false,
+                                build: thurm_proto::BUILD.into(),
+                                capabilities: thurm_proto::CAPABILITIES
+                                    .iter()
+                                    .map(|c| (*c).to_owned())
+                                    .collect(),
+                            }),
+                            _ => Ok(Response::Ok),
+                        };
+                        let msg = ServerMessage::Response { id: env.id, result };
+                        if codec::write_message(&mut conn, &msg).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Downable { path, conns, stop }
+    }
+
+    /// The tunnel goes down: its connections end, and nothing answers on its socket.
+    fn down(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = std::os::unix::net::UnixStream::connect(&self.path);
+        for c in self.conns.lock().unwrap().drain(..) {
+            let _ = c.shutdown(std::net::Shutdown::Both);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[test]
+fn a_dropped_connection_is_not_taken_for_a_live_host() {
+    let d = dir("dropped");
+    let socket = d.join("d.sock");
+    let daemon = Downable::up(socket.clone());
+    let theirs = socket.clone();
+    let f = Forwards::new(d.join("forwards.json"), move |_| theirs.clone());
+    f.check("devbox").unwrap();
+    assert!(f.connected("devbox"));
+    daemon.down();
+    // The kept connection notices it is gone.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while f.check("devbox").is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "a dropped connection still passes the check"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let e = f.check("devbox").unwrap_err();
+    assert!(e.contains("not connected"), "{e}");
+    // Back up: the check makes a new connection.
+    let _again = Downable::up(socket.clone());
+    f.check("devbox").unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}

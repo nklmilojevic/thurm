@@ -598,7 +598,7 @@ extension SessionManager {
                 thurm_remote_kick(host, true)
             })
         }
-        if forwardHost != nil {
+        if forwardHost != .none {
             items.append(CommandPalette.Item(title: "Forward Port…", detail: "open a remote host's port on this Mac") {
                 SessionManager.shared.showForwardPortPicker()
             })
