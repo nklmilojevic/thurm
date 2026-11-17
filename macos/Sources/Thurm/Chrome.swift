@@ -19,6 +19,11 @@ struct ChromePalette {
     let controlHover: NSColor
     let controlPressed: NSColor
     let controlSelected: NSColor
+    /// The selected tab's pill (see `ChromeColors.selected` and `drawSelectionPill`).
+    let selected: NSColor
+    let selectedInactive: NSColor
+    let selectedStroke: NSColor
+    let selectedShadow: NSColor?
     let contentPrimary: NSColor
     let contentSecondary: NSColor
     let contentTertiary: NSColor
@@ -47,6 +52,10 @@ struct ChromePalette {
         controlHover = NSColor(chrome: c.controlHover)
         controlPressed = NSColor(chrome: c.controlPressed)
         controlSelected = NSColor(chrome: c.controlSelected)
+        selected = NSColor(chrome: c.selected)
+        selectedInactive = NSColor(chrome: c.selectedInactive)
+        selectedStroke = NSColor(chrome: c.selectedStroke)
+        selectedShadow = c.selectedShadow.map(NSColor.init(chrome:))
         contentPrimary = NSColor(chrome: c.contentPrimary)
         contentSecondary = NSColor(chrome: c.contentSecondary)
         contentTertiary = NSColor(chrome: c.contentTertiary)
@@ -78,6 +87,57 @@ struct ChromePalette {
     static func dimmedBackgroundScale(drawn: Float, dim: CGFloat, isDark: Bool) -> CGFloat {
         CGFloat(1 - drawn * (1 - dimFill(dim: dim, isDark: isDark)))
     }
+
+    /// The selected tab's capsule filling `rect`, at `opacity` of its full strength (the tab
+    /// strip fades it in and out). `key`: the window is key, which lifts the pill in dark themes.
+    func drawSelectionPill(in rect: NSRect, key: Bool, opacity: CGFloat = 1) {
+        let r = rect.height / 2
+        NSGraphicsContext.saveGraphicsState()
+        if let selectedShadow {
+            let shadow = NSShadow()
+            shadow.shadowColor = selectedShadow.withAlphaComponent(
+                selectedShadow.alphaComponent * CGFloat(ChromeColors.selectedShadowOpacity) * opacity)
+            shadow.shadowBlurRadius = CGFloat(ChromeColors.selectedShadowBlur)
+            // Shadow offsets are in base space, where y grows upward, flipped view or not.
+            shadow.shadowOffset = NSSize(width: 0, height: -CGFloat(ChromeColors.selectedShadowOffset))
+            shadow.set()
+        }
+        let fill = key ? selected : selectedInactive
+        fill.withAlphaComponent(fill.alphaComponent * opacity).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: r, yRadius: r).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        guard key || !isDark else { return }
+        let w = CGFloat(ChromeColors.selectedStrokeWidth)
+        let outline = NSBezierPath(roundedRect: rect.insetBy(dx: w / 2, dy: w / 2),
+                                   xRadius: r - w / 2, yRadius: r - w / 2)
+        outline.lineWidth = w
+        selectedStroke.withAlphaComponent(selectedStroke.alphaComponent * opacity).setStroke()
+        outline.stroke()
+    }
+}
+
+/// Redraws a view when its window becomes or resigns key and `when` holds (the view shows
+/// something that depends on it): call `track` from the view's `viewDidMoveToWindow`.
+final class KeyWindowRedraw {
+    private var observers: [NSObjectProtocol] = []
+
+    func track(_ view: NSView, when: @escaping () -> Bool) {
+        stop()
+        guard let window = view.window else { return }
+        let nc = NotificationCenter.default
+        observers = [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification].map {
+            nc.addObserver(forName: $0, object: window, queue: .main) { [weak view] _ in
+                if when() { view?.needsDisplay = true }
+            }
+        }
+    }
+
+    private func stop() {
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers = []
+    }
+
+    deinit { stop() }
 }
 
 extension AppConfig {

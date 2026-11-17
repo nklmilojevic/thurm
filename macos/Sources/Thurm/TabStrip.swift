@@ -431,6 +431,13 @@ private final class TabPill: NSView {
 
     override var isFlipped: Bool { true }
 
+    private let keyRedraw = KeyWindowRedraw()
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        keyRedraw.track(self) { [weak self] in self?.tab?.selected == true }
+    }
+
     override func setFrameSize(_ newSize: NSSize) {
         let was = compact
         super.setFrameSize(newSize)
@@ -481,11 +488,7 @@ private final class TabPill: NSView {
             path.fill()
         }
         if selected > 0.001 {
-            chrome.controlSelected.withAlphaComponent(chrome.controlSelected.alphaComponent * selected).setFill()
-            path.fill()
-            chrome.stroke.withAlphaComponent(chrome.stroke.alphaComponent * selected).setStroke()
-            path.lineWidth = ChromeStroke.width
-            path.stroke()
+            chrome.drawSelectionPill(in: bounds, key: window?.isKeyWindow == true, opacity: selected)
         }
         let p = min(1, max(0, CGFloat(ring.value(at: now))))
         if p < 1 {
