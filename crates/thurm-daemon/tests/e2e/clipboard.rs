@@ -506,53 +506,47 @@ fn copies_queued_for_an_app_that_does_not_read_are_bounded() {
     );
 }
 
-/// A plugin's `request` of a clipboard tool's request goes the same way as the tool's own:
-/// asked of the app and answered, not lost in the daemon.
+/// A plugin's `request` of a clipboard tool's request is refused with a reason (JSON would make
+/// its up to 32 MiB many times that), and the requests of its own still work for that client.
 #[test]
-fn a_plugins_clipboard_request_goes_the_same_way() {
+fn clipboard_requests_are_not_taken_through_request() {
     let env = clip_env("clip-plugin", "copy-paste");
     let _daemon = env.start();
     let (app, rx) = env.connect();
     let pane = create(&app, &env.dir);
     focus(&app, pane);
     let plugin = tool(&env);
-    let call = |req: Request| {
-        let plugin = plugin.clone();
-        std::thread::spawn(move || {
-            plugin
-                .request(Request::Ext {
-                    method: ext::method::REQUEST.into(),
-                    params: serde_json::json!({ "request": req }).to_string(),
-                })
-                .map_err(|e| e.to_string())
-        })
-    };
-    let copied = call(Request::ClipboardSet {
-        pane,
-        text: "from a plugin".into(),
-    });
-    let (_, id, text) = write_of(&rx).expect("asked to copy");
-    assert_eq!(text.as_deref(), Some("from a plugin"));
+    for req in [
+        Request::ClipboardGet {
+            pane,
+            mime: CLIP_TEXT.into(),
+        },
+        Request::ClipboardSet {
+            pane,
+            text: "x".into(),
+        },
+        Request::ClipboardClear { pane },
+    ] {
+        let e = plugin
+            .request(Request::Ext {
+                method: ext::method::REQUEST.into(),
+                params: serde_json::json!({ "request": req }).to_string(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not through `request`"), "{e}");
+    }
+    nothing_asked(&rx);
+    let copied = ask(
+        &plugin,
+        Request::ClipboardSet {
+            pane,
+            text: "direct".into(),
+        },
+    );
+    let (_, id, _) = write_of(&rx).expect("asked");
     answer(&app, id, Some(Vec::new())).unwrap();
     assert!(copied.join().unwrap().is_ok());
-
-    let pasted = call(Request::ClipboardGet {
-        pane,
-        mime: CLIP_TEXT.into(),
-    });
-    let (_, id, _) = query(&rx).expect("asked to paste");
-    answer(&app, id, Some(b"pasted".to_vec())).unwrap();
-    let Ok(Response::Text(json)) = pasted.join().unwrap() else {
-        panic!("no answer");
-    };
-    assert!(json.contains("ClipboardData"), "{json}");
-
-    let cleared = call(Request::ClipboardClear { pane });
-    let (_, id, text) = write_of(&rx).expect("asked to clear");
-    assert_eq!(text, None);
-    answer(&app, id, None).unwrap();
-    let e = cleared.join().unwrap().unwrap_err();
-    assert!(e.contains("terminal.osc52"), "{e}");
 }
 
 #[test]

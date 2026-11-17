@@ -956,6 +956,7 @@ impl Daemon {
                         super::message_weight(&msg).min(counted.queued.load(Ordering::Relaxed)),
                         Ordering::Relaxed,
                     );
+                    counted.clip_written(&msg);
                     counted.unflushed.fetch_sub(1, Ordering::AcqRel);
                     if let ServerMessage::Event(Event::Ext { name, payload }) = msg {
                         let payload = serde_json::from_str(&payload).unwrap_or(Value::Null);

@@ -127,7 +127,9 @@ const PROBE: &str = concat!(
     "{ [ -f \"${CLAUDE_CONFIG_DIR:-$TH/.claude}/.credentials.json\" ] || [ -n \"$ANTHROPIC_API_KEY\" ]; } && echo claude_login=1; ",
     "command -v thurm >/dev/null 2>&1 && echo \"hooks=$(HOME=\"$TH\" thurm hooks status --json 2>/dev/null | head -n 1)\"; ",
     "command -v thurm >/dev/null 2>&1 && echo \"skill=$(HOME=\"$TH\" thurm skill status --json 2>/dev/null | head -n 1)\"; ",
-    "C=\"$(command -v thurm 2>/dev/null)\"; B=; [ -n \"$C\" ] && B=\"$(readlink -f \"$C\")\"; n=0; o=; ",
+    // No thurm found: C names none, so an empty link text (a file, not a link) matches no
+    // pattern and counts as another program's.
+    "C=\"$(command -v thurm 2>/dev/null)\"; B=; [ -n \"$C\" ] && B=\"$(readlink -f \"$C\")\"; C=\"${C:-/ no thurm}\"; n=0; o=; ",
     "for t in ",
     clip_tools!(),
     "; do L=\"$TH/.local/share/thurm/shims/$t\"; ",
@@ -1010,6 +1012,28 @@ mod tests {
             .env("THURM_BASE_PATH", "/usr/bin:/bin")
             .output()
             .unwrap()
+    }
+
+    /// With no thurm to be found, a file among the tools is still another program's.
+    #[test]
+    fn the_probe_without_thurm_still_reports_other_programs() {
+        let th = std::env::temp_dir().join(format!("thurm-shims-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&th);
+        let shims = th.join(thurm_proto::CLIP_SHIMS_DIR);
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::write(shims.join("xclip"), "mine").unwrap();
+        // The system's own directories only: no thurm there, nor in the empty home.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(PROBE)
+            .env("THURM_HOME", &th)
+            .env("THURM_BASE_PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        let p = parse(&String::from_utf8_lossy(&out.stdout));
+        assert_eq!(p.shims, 0);
+        assert_eq!(p.shims_other, ["xclip"]);
+        let _ = std::fs::remove_dir_all(th);
     }
 
     #[test]

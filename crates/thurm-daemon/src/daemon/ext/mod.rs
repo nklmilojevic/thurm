@@ -191,6 +191,20 @@ impl Daemon {
                 if matches!(req, Request::Hello { .. } | Request::Ext { .. }) {
                     return Err("not through `request`".into());
                 }
+                // A clipboard tool's requests carry up to 32 MiB both ways, which JSON would make
+                // many times that, past the daemon's bound on clipboard data: sent as themselves.
+                if matches!(
+                    req,
+                    Request::ClipboardGet { .. }
+                        | Request::ClipboardSet { .. }
+                        | Request::ClipboardClear { .. }
+                ) {
+                    return Err(
+                        "not through `request`: send ClipboardGet, ClipboardSet or ClipboardClear \
+                         as requests of their own"
+                            .into(),
+                    );
+                }
                 let resp = self.answer(client, req)?;
                 serde_json::to_value(resp).map_err(|e| e.to_string())
             }
@@ -668,12 +682,13 @@ impl Daemon {
                 self.wait_agent_prompt(client.id, pane, ticket)
                     .map(Response::AgentPrompt)
             }
-            req @ (Request::ClipboardGet { .. }
+            // Refused by the `request` method before this; anything else asking gets an error,
+            // not dispatch's unreachable arm.
+            Request::ClipboardGet { .. }
             | Request::ClipboardSet { .. }
-            | Request::ClipboardClear { .. }) => match super::clip::Ask::of(req) {
-                Ok((pane, ask)) => self.clipboard_request(client.id, pane, ask),
-                Err(_) => unreachable!("a clipboard request"),
-            },
+            | Request::ClipboardClear { .. } => {
+                Err("clipboard requests are answered only as requests of their own".into())
+            }
             other => self.dispatch(client, other),
         }
     }

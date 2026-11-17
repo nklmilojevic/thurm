@@ -213,18 +213,6 @@ impl Daemon {
         pick_ui(last, &candidates).and_then(|id| clients.get(&id).cloned())
     }
 
-    /// A clipboard tool's request answered to its end on this thread (a plugin's `request`,
-    /// already on a thread of its own): admitted, then asked, as `handle` does on a new one.
-    pub(super) fn clipboard_request(
-        &self,
-        caller: u64,
-        pane: PaneId,
-        ask: Ask,
-    ) -> Result<Response, String> {
-        let _slot = self.clipboard_admit(pane, &ask)?;
-        self.clipboard_ask(caller, pane, ask).0
-    }
-
     /// A request [`Daemon::clipboard_admit`] let through: asks the app and waits for it. The
     /// [`Slot`] with a paste's answer holds its bytes until the response is queued, where
     /// [`Client::clip_queued`] counts them on.
