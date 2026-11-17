@@ -697,10 +697,8 @@ fn call(c: Call) -> Result<Value, String> {
             let port = forward_port(&cfg, &host, port, url.as_deref())?;
             let f = forwards();
             f.check(&host)?;
-            let (fw, new) = f.open(&host, port, local)?;
-            if let Some(u) = &url {
-                f.set_link(fw.id, u);
-            }
+            // With its link from the start: the change it reports lists the URL it opens at.
+            let (fw, new) = f.open_for(&host, port, local, url.as_deref())?;
             let mut v = forward_json(&fw, url.as_deref());
             v["new"] = json!(new);
             v
