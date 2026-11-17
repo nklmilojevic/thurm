@@ -450,12 +450,15 @@ final class Extensions {
             if portsReported(params) { remotePorts.delivered(host, pane: pane, seq: seq) }
             return
         }
-        call("ports.report", params) { [weak self] _, error in
-            if error == nil { self?.remotePorts.delivered(host, pane: pane, seq: seq) }
+        call("ports.report", params) { [weak self] value, error in
+            // Heard by plugins, not only taken: the daemon keeps a second app's lists unheard.
+            if error == nil, jsonBool((value as? [String: Any])?["heard"]) == true {
+                self?.remotePorts.delivered(host, pane: pane, seq: seq)
+            }
         }
     }
 
-    /// Takes the `ports.report`s in place of the daemon (tests): whether the daemon took it.
+    /// Takes the `ports.report`s in place of the daemon (tests): whether plugins heard it.
     var portsReported: (([String: Any]) -> Bool)?
 
     /// The connection to `host` is gone: what it listed is no longer known.

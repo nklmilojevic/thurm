@@ -139,30 +139,27 @@ struct RemotePorts {
         let initial: Bool
         /// Which report it is, for `delivered`.
         let seq: Int
-        /// This Mac's daemon took it.
+        /// This Mac's daemon passed it on to its plugins (`ports.report` answered `heard`): it
+        /// took a list from an app that does not hold plugins' lists without passing it on.
         var delivered = false
 
         /// What it is said as when sent again to a daemon the app connects to: running already
-        /// once the daemon had it (that daemon's plugins heard it, and a new one's knew nothing
-        /// before); else as it came, a change the daemon never heard.
+        /// once plugins heard it (and a new daemon's knew nothing before); else as it came, a
+        /// change they never heard.
         var initialWhenSentAgain: Bool { delivered || initial }
     }
 
     private var lists: [HostId: [UInt64: Entry]] = [:]
     private var seq = 0
 
-    /// A pane of `host` listed `ports`: kept as its latest. A complete empty list forgets the
-    /// pane; an incomplete one is kept (servers it could not read may run), to send again. The
-    /// number of this report, for `delivered`.
+    /// A pane of `host` listed `ports`: kept as its latest, an empty list too (a daemon this app
+    /// connects to later must hear that the pane's servers went, and an incomplete one that
+    /// servers may run unseen), until the host goes. The number of this report, for `delivered`.
     @discardableResult
     mutating func listed(_ host: HostId, pane: UInt64, ports: Any, complete: Any, initial: Bool = false) -> Int {
         seq += 1
-        if (ports as? [Any])?.isEmpty ?? false, jsonBool(complete) != false {
-            lists[host]?[pane] = nil
-        } else {
-            lists[host, default: [:]][pane] = Entry(host: host, pane: pane, ports: ports, complete: complete,
-                                                    initial: initial, seq: seq)
-        }
+        lists[host, default: [:]][pane] = Entry(host: host, pane: pane, ports: ports, complete: complete,
+                                                initial: initial, seq: seq)
         return seq
     }
 

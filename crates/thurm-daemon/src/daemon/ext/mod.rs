@@ -84,7 +84,13 @@ fn ports_changed(id: u64, ports: &[PortEntry], complete: bool, initial: bool) ->
     payload
 }
 
-/// `ports_changed` of a remote host's pane.
+impl RemoteList {
+    /// Listens on nothing, for sure (an empty, complete list).
+    fn is_known_empty(&self) -> bool {
+        self.ports.is_empty() && self.complete
+    }
+}
+
 /// `ports_changed` of remote `host`'s `pane`; `initial` as given (what its daemon said, or that
 /// a new subscriber hears it as running already).
 fn remote_payload(host: &str, pane: u64, list: &RemoteList, initial: bool) -> Value {
@@ -140,6 +146,8 @@ fn remote_lists(all: &HashMap<u64, RemoteLists>, app: Option<u64>) -> Vec<Value>
     app.and_then(|a| all.get(&a))
         .into_iter()
         .flatten()
+        // A pane that listens on nothing, for sure, is no news to a new subscriber.
+        .filter(|(_, list)| !list.is_known_empty())
         .map(|((host, pane), list)| remote_payload(host, *pane, list, true))
         .collect()
 }
@@ -389,8 +397,9 @@ impl Daemon {
                     let mut all = self.ext.remote_ports.lock();
                     let mut ended = Vec::new();
                     if let Some(lists) = all.get_mut(&client.id) {
-                        lists.retain(|(h, pane), _| {
-                            if h == host {
+                        lists.retain(|(h, pane), list| {
+                            // Plugins know an empty pane listens on nothing: no news.
+                            if h == host && !list.is_known_empty() {
                                 ended.push((h.clone(), *pane));
                             }
                             h != host
@@ -418,14 +427,14 @@ impl Daemon {
                     complete,
                     initial,
                 };
-                if list.ports.is_empty() && complete {
-                    lists.remove(&at);
-                } else {
-                    lists.insert(at, list.clone());
-                }
-                // Only the app that holds plugins' forwards is heard, as with its forwards.
+                // Kept even when empty: an app that takes over lists what it knows, an empty pane
+                // too, rather than leave plugins guessing (a pane it never listed is `gone`).
+                lists.insert(at, list.clone());
+                // Only the app that holds plugins' forwards is heard, as with its forwards. The
+                // answer says whether plugins heard it: an app sends one they did not again as it
+                // came.
                 if self.forwarding_app_id() != Some(client.id) {
-                    return Ok(Value::Null);
+                    return Ok(json!({ "heard": false }));
                 }
                 // Tests: a report that takes a while, for what happens while it holds the lock.
                 if let Some(delay) = crate::ports::test_delay("THURM_EXT_REPORT_DELAY_MS") {
@@ -438,7 +447,7 @@ impl Daemon {
                     remote_payload(host, pane, &list, list.initial),
                 );
                 drop(all);
-                Ok(Value::Null)
+                Ok(json!({ "heard": true }))
             }
             method::FORWARDS_REPORT => {
                 only_the_app(client, method)?;
@@ -879,7 +888,6 @@ impl Daemon {
     pub(super) fn ext_client_gone(&self, client: u64) {
         // Dropping the senders ends the waits on them.
         self.ext.pending.lock().retain(|_, p| p.to != client);
-        self.ext.ports_joining.lock().remove(&client);
         // An app's forwards end with it; when it was the first, the next app's are plugins'
         // now.
         let (first, gone, next, next_app) = {
@@ -897,9 +905,11 @@ impl Daemon {
             let had = all.remove(&client).unwrap_or_default();
             let next_has = next_app.and_then(|a| all.get(&a));
             let ended: Vec<(String, u64)> = had
-                .keys()
-                .filter(|k| first && !next_has.is_some_and(|n| n.contains_key(*k)))
-                .cloned()
+                .iter()
+                .filter(|(k, list)| {
+                    first && !list.is_known_empty() && !next_has.is_some_and(|n| n.contains_key(*k))
+                })
+                .map(|(k, _)| k.clone())
                 .collect();
             self.remote_lists_ended(&ended);
             // The remote lists heard from now on are that app's. Plugins heard the first app's:
@@ -925,6 +935,9 @@ impl Daemon {
         if self.ext.registry.lock().client_gone(client) {
             self.actions_changed();
         }
+        // After the registry's cleanup: a subscription under way holds the registry's lock while
+        // it marks the client as joining, so it is done by now, and its mark goes too.
+        self.ext.ports_joining.lock().remove(&client);
     }
 
     /// The config's `[[commands]]` as actions; called whenever the config is applied.

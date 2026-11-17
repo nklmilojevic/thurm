@@ -1,15 +1,14 @@
 use std::sync::Mutex;
 
-/// Forward opens to the host `flaky` so far (the first fails).
-static FLAKY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static FLAKY2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 use super::*;
 
 /// A daemon stand-in: answers `exec` after a pause, records the rest.
 #[derive(Default)]
 struct FakeHost {
     calls: Mutex<Vec<(String, Value)>>,
+    /// Forward opens to the hosts `flaky` and `flaky2` so far: the first of each fails.
+    flaky: std::sync::atomic::AtomicUsize,
+    flaky2: std::sync::atomic::AtomicUsize,
     events: Mutex<Option<Sender<(String, Value)>>>,
 }
 
@@ -56,14 +55,17 @@ impl Host for FakeHost {
             // A host whose first forward fails, as when its tunnel is down a moment.
             "forwards.open"
                 if params["host"] == "flaky"
-                    && FLAKY.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
+                    && self.flaky.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
             {
                 Err("devbox is not connected".into())
             }
             // Another whose first forward fails.
             "forwards.open"
                 if params["host"] == "flaky2"
-                    && FLAKY2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
+                    && self
+                        .flaky2
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        == 0 =>
             {
                 Err("devbox is not connected".into())
             }

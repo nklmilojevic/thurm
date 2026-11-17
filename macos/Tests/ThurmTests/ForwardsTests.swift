@@ -175,22 +175,23 @@ final class ForwardsTests: XCTestCase {
         p.listed("devbox", pane: 2, ports: ports([5173]), complete: true)
         p.listed("devbox", pane: 3, ports: ports([8080]), complete: true)
         p.listed("pi", pane: 1, ports: ports([22]), complete: true)
-        // An empty list forgets the pane; the rest is there to send a daemon connected later.
+        // An empty list is kept too: a daemon connected later must hear the servers went.
         p.listed("devbox", pane: 3, ports: [] as [Any], complete: true)
-        XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "pi/1"])
+        XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "devbox/3", "pi/1"])
         // An empty list that could not read every process is kept: servers it missed may run,
         // and a daemon connected later must hear the pane is unsure.
         p.listed("devbox", pane: 4, ports: [] as [Any], complete: false)
-        XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "devbox/4", "pi/1"])
+        XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "devbox/3", "devbox/4", "pi/1"])
         XCTAssertEqual(p.all.first { $0.pane == 4 }.flatMap { jsonBool($0.complete) }, false)
         p.listed("devbox", pane: 4, ports: [] as [Any], complete: true)
         p.disconnected("devbox")
         XCTAssertEqual(p.all.map(\.host), ["pi"])
     }
 
-    /// Connected again to this Mac's daemon, the app sends its remote lists again: those the
-    /// daemon had as running already, one it never got (sent while it was away) as it came, so a
-    /// server that started meanwhile is still news to its plugins.
+    /// Connected again to this Mac's daemon, the app sends its remote lists again: those its
+    /// plugins heard as running already; one they never heard (sent while the daemon was away, or
+    /// taken without being passed on, as a second app's are) as it came, so a server that started
+    /// meanwhile is still news to them. A pane whose servers went is sent again too.
     func testRemoteListsSentAgainKeepWhatTheDaemonNeverHeard() {
         let ext = Extensions.shared
         var daemonUp = true
@@ -208,11 +209,13 @@ final class ForwardsTests: XCTestCase {
         ext.reportPorts(host: host, pane: 3, ports: list(3000), complete: true, initial: false)
         ext.reportPorts(host: host, pane: 4, ports: list(9000), complete: true, initial: true)
         daemonUp = true
+        // Pane 2's server went, heard.
+        ext.reportPorts(host: host, pane: 2, ports: [] as [Any], complete: true, initial: false)
         reported = []
         ext.sendRemotePortsAgain()
         let again = reported.filter { jsonString($0["host"]) == host }
-            .map { "\($0["pane"]!)\(jsonBool($0["initial"]) == true ? "*" : "")" }
-        XCTAssertEqual(again, ["1*", "2*", "3", "4*"])
+            .map { "\($0["pane"]!):\(($0["ports"] as? [Any])?.count ?? -1)\(jsonBool($0["initial"]) == true ? "*" : "")" }
+        XCTAssertEqual(again, ["1:1*", "2:0*", "3:1", "4:1*"])
     }
 
     /// Whether a remote list is of servers running already is the host's daemon's to say, by
