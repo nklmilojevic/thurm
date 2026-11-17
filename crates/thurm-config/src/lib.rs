@@ -133,7 +133,9 @@ impl EventHook {
 pub struct RemoteConfig {
     /// Shown in the sidebar and used by `thurm --remote NAME`: letters, digits, `-`, `_`.
     pub name: String,
-    /// ssh target: a `Host` alias, `user@host` or `ssh://user@host:port`.
+    /// ssh target: a `Host` alias, `user@host` or `ssh://user@host:port`. Empty for a host
+    /// reached over the tailnet only (see [`RemoteConfig::ssh_target`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host: String,
     /// The remote daemon's socket; discovered with `thurm socket-path` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,13 +148,24 @@ pub struct RemoteConfig {
     /// Reach the daemon over the tailnet instead of an ssh tunnel: its
     /// `wss://<node>.<tailnet>.ts.net/v1/connect`, a `ws://<address>:<port>/v1/connect` of its
     /// host listener, or a peer's name (see [`parse_remote_tailnet`]). `host` stays ssh's, for
-    /// installing, the doctor and handoff.
+    /// installing, the doctor and handoff, when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tailnet: Option<String>,
+    /// The daemon's identifier as it was when the host was added, to refuse adding the same
+    /// daemon under a second name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_id: Option<String>,
     /// Cmd-click on a `localhost` link in this host's panes opens it through a forward of that
     /// port to this Mac, instead of this Mac's own port.
     #[serde(default = "default_true")]
     pub forward_links: bool,
+}
+
+impl RemoteConfig {
+    /// Its ssh target, `None` for a host reached over the tailnet only.
+    pub fn ssh_target(&self) -> Option<&str> {
+        Some(self.host.trim()).filter(|h| !h.is_empty())
+    }
 }
 
 /// Where a `[[remote]]`'s `tailnet` points.
@@ -393,8 +406,11 @@ impl Config {
         let mut seen = std::collections::HashSet::new();
         for r in &self.remote {
             validate_remote_name(&r.name)?;
-            if r.host.trim().is_empty() {
-                return Err(format!("remote {:?} has an empty host", r.name));
+            if r.host.trim().is_empty() && r.tailnet.is_none() {
+                return Err(format!(
+                    "remote {:?} needs a host (its ssh target) or a tailnet address",
+                    r.name
+                ));
             }
             if r.host.starts_with('-') {
                 return Err(format!("remote {:?}: host must not start with '-'", r.name));
@@ -1498,6 +1514,64 @@ pub fn remote_socket_path(name: &str) -> PathBuf {
     remote_dir().join(format!("{name}.sock"))
 }
 
+/// Left by adding `name` (`thurm remote add`, Add Host…): the app opens a first workspace on
+/// the host when it connects with no panes, and removes the file once it has connected.
+pub fn remote_added_path(name: &str) -> PathBuf {
+    remote_dir().join(format!("{name}.added"))
+}
+
+/// Marks `name` as just added (see [`remote_added_path`]).
+pub fn mark_remote_added(name: &str) -> std::io::Result<()> {
+    let path = remote_added_path(name);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, b"")
+}
+
+/// Whether `name` was just added, forgetting it: true once.
+pub fn take_remote_added(name: &str) -> bool {
+    std::fs::remove_file(remote_added_path(name)).is_ok()
+}
+
+/// This user's daemon identifier (`daemon-id` in [`state_dir`]): made up once, then the same
+/// for every daemon and `thurm` of the user on this machine, across restarts and upgrades.
+pub fn daemon_id() -> std::io::Result<String> {
+    daemon_id_in(&state_dir())
+}
+
+fn daemon_id_in(dir: &Path) -> std::io::Result<String> {
+    use std::io::{Read, Write};
+    let path = dir.join("daemon-id");
+    let read = |p: &Path| -> std::io::Result<Option<String>> {
+        let id = std::fs::read_to_string(p)?.trim().to_owned();
+        Ok((!id.is_empty()).then_some(id))
+    };
+    if let Ok(Some(id)) = read(&path) {
+        return Ok(id);
+    }
+    std::fs::create_dir_all(dir)?;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    // Written beside it and linked into place: of two first runs at once, one id wins and
+    // both return it.
+    let tmp = dir.join(format!("daemon-id.{id}"));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(id.as_bytes())?;
+        f.write_all(b"\n")?;
+    }
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(id),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read(&path)?
+            .ok_or_else(|| std::io::Error::other(format!("{} is empty", path.display()))),
+        Err(e) => Err(e),
+    }
+}
+
 /// The tunnel state the app writes for `name` (JSON, see `thurm-remote`).
 pub fn remote_state_path(name: &str) -> PathBuf {
     remote_dir().join(format!("{name}.state"))
@@ -1945,7 +2019,9 @@ pub fn with_remote_added(text: &str, remote: &RemoteConfig) -> Result<String, St
     }
     let mut t = toml_edit::Table::new();
     t["name"] = toml_edit::value(remote.name.as_str());
-    t["host"] = toml_edit::value(remote.host.as_str());
+    if let Some(host) = remote.ssh_target() {
+        t["host"] = toml_edit::value(host);
+    }
     if let Some(sock) = &remote.socket {
         t["socket"] = toml_edit::value(sock.as_str());
     }
@@ -1964,6 +2040,9 @@ pub fn with_remote_added(text: &str, remote: &RemoteConfig) -> Result<String, St
     }
     if !remote.forward_links {
         t["forward_links"] = toml_edit::value(false);
+    }
+    if let Some(id) = &remote.daemon_id {
+        t["daemon_id"] = toml_edit::value(id.as_str());
     }
     tables.push(t);
     let out = doc.to_string();
@@ -2343,6 +2422,7 @@ clipboard_read = "always"
             clipboard_read: ClipboardRead::Ask,
             tailnet: None,
             forward_links: true,
+            daemon_id: None,
         };
         let added = with_remote_added(text, &r).unwrap();
         assert!(added.starts_with("# my config") && added.contains("# big"));
@@ -2370,6 +2450,7 @@ clipboard_read = "always"
             clipboard_read: ClipboardRead::Ask,
             tailnet: Some("wss://bastion.tail1234.ts.net/v1/connect".into()),
             forward_links: true,
+            daemon_id: None,
         };
         let added = with_remote_added("", &r).unwrap();
         assert!(added.contains("tailnet = \"wss://bastion.tail1234.ts.net/v1/connect\""));
@@ -2379,6 +2460,68 @@ clipboard_read = "always"
         // Without it, an entry is the ssh remote it always was.
         let ssh = Config::parse("[[remote]]\nname = \"a\"\nhost = \"a\"\n").unwrap();
         assert_eq!(ssh.remote[0].tailnet, None);
+    }
+
+    #[test]
+    fn a_tailnet_only_remote_round_trips_without_a_host() {
+        let r = RemoteConfig {
+            name: "bastion".into(),
+            host: String::new(),
+            socket: None,
+            enabled: true,
+            clipboard_read: ClipboardRead::Ask,
+            tailnet: Some("wss://bastion.tail2177a1.ts.net/v1/connect".into()),
+            forward_links: true,
+            daemon_id: Some("0123abcd".into()),
+        };
+        let added = with_remote_added("", &r).unwrap();
+        assert!(!added.contains("host"), "{added}");
+        assert!(added.contains("daemon_id = \"0123abcd\""), "{added}");
+        let (cfg, warnings) = Config::parse_with_warnings(&added).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.remote, vec![r.clone()]);
+        assert_eq!(cfg.remote[0].ssh_target(), None);
+        // An empty or blank host written by hand is no ssh target either.
+        let blank = "[[remote]]\nname = \"b\"\nhost = \" \"\ntailnet = \"bastion\"\n";
+        assert_eq!(Config::parse(blank).unwrap().remote[0].ssh_target(), None);
+        // Given one later, it is an ssh host reached over the tailnet.
+        let with_ssh = with_remote_setting(&added, "bastion", "host", "\"me@bastion\"").unwrap();
+        let cfg = Config::parse(&with_ssh).unwrap();
+        assert_eq!(cfg.remote[0].ssh_target(), Some("me@bastion"));
+        assert_eq!(cfg.remote[0].tailnet, r.tailnet);
+        // Neither an ssh target nor a tailnet address: nothing to reach it with.
+        let e = Config::parse("[[remote]]\nname = \"c\"\n").unwrap_err();
+        assert!(e.to_string().contains("needs a host"), "{e}");
+        // Entries written before tailnet-only hosts and daemon identifiers read as they did.
+        let old = "[[remote]]\nname = \"d\"\nhost = \"me@d\"\nsocket = \"/run/t.sock\"\n";
+        let (cfg, warnings) = Config::parse_with_warnings(old).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let d = &cfg.remote[0];
+        assert_eq!(d.ssh_target(), Some("me@d"));
+        assert_eq!((d.tailnet.as_deref(), d.daemon_id.as_deref()), (None, None));
+    }
+
+    #[test]
+    fn the_daemon_id_is_made_once_and_kept() {
+        let dir = std::env::temp_dir().join(format!("thurm-did-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = daemon_id_in(&dir).unwrap();
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(daemon_id_in(&dir).unwrap(), first);
+        // Of several made at once, every caller gets the one that was kept.
+        let ids: Vec<String> = (0..8)
+            .map(|_| {
+                let d = dir.join("race");
+                std::thread::spawn(move || daemon_id_in(&d).unwrap())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        assert!(ids.iter().all(|i| *i == ids[0]), "{ids:?}");
+        assert_ne!(ids[0], first);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

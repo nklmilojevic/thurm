@@ -269,6 +269,34 @@ pub struct Checked {
     pub via: Via,
     pub protocol: u32,
     pub build: String,
+    /// Its identifier, when it says one (see [`thurm_proto::CAP_DAEMON_ID`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_id: Option<String>,
+}
+
+/// Why [`check`] found no Thurm daemon to add.
+#[derive(Debug)]
+pub enum CheckError {
+    /// The address is no good.
+    Config(String),
+    Open(OpenError),
+    /// Something answered at `url`, but not as a Thurm daemon.
+    NotThurm {
+        url: String,
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckError::Config(e) => write!(f, "{e}"),
+            CheckError::Open(e) => write!(f, "{e}"),
+            CheckError::NotThurm { url, detail } => {
+                write!(f, "{url} answers, but not as a Thurm daemon: {detail}")
+            }
+        }
+    }
 }
 
 /// The host part of an ssh target (`me@devbox`, `ssh://me@devbox:2222`), as the peer's name to
@@ -288,24 +316,24 @@ pub fn peer_name(target: &str) -> &str {
 }
 
 /// Reaches the daemon at `value` (a `tailnet` setting, or a peer's name) and says Hello, for
-/// adding a host: resolves a name to its `wss://` address, and refuses what isn't a reachable
-/// Thurm daemon with the reason.
-pub fn check(value: &str, socket: &Path, timeout: Duration) -> Result<Checked, String> {
-    let target = thurm_config::parse_remote_tailnet(value)?;
-    let opened = open(&target, socket, timeout).map_err(|e| e.to_string())?;
+/// adding a host: resolves a name to its `wss://` address, asks for the daemon's identifier,
+/// and refuses what isn't a reachable Thurm daemon with the reason.
+pub fn check(value: &str, socket: &Path, timeout: Duration) -> Result<Checked, CheckError> {
+    let target = thurm_config::parse_remote_tailnet(value).map_err(CheckError::Config)?;
+    let opened = open(&target, socket, timeout).map_err(CheckError::Open)?;
     let Opened {
         stream,
         session,
         via,
         url,
     } = opened;
-    let pinged = crate::tunnel::ping_stream(stream, timeout);
+    let pinged = crate::tunnel::hello_stream(stream, timeout, true);
     drop(session);
-    let (protocol, build) = match pinged {
-        Ok(v) => v,
-        Err(crate::tunnel::PingError::Protocol(v)) => (v, String::new()),
-        Err(crate::tunnel::PingError::Unreachable(e)) => {
-            return Err(format!("{url} answers, but not as a Thurm daemon: {e}"));
+    let (protocol, build, daemon_id) = match pinged {
+        Ok(h) => (h.version, h.build, h.daemon_id),
+        Err(crate::tunnel::PingError::Protocol(v)) => (v, String::new(), None),
+        Err(crate::tunnel::PingError::Unreachable(detail)) => {
+            return Err(CheckError::NotThurm { url, detail });
         }
     };
     Ok(Checked {
@@ -313,6 +341,7 @@ pub fn check(value: &str, socket: &Path, timeout: Duration) -> Result<Checked, S
         via,
         protocol,
         build,
+        daemon_id,
     })
 }
 

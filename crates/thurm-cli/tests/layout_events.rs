@@ -274,6 +274,7 @@ fn remote_events_reject_unknown_and_disconnected_hosts_before_socket_access() {
                 transport: Default::default(),
                 via: None,
                 settings: 0,
+                daemon_id: None,
             };
             std::fs::write(
                 env.dir.join("testbox.state"),

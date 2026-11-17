@@ -115,6 +115,9 @@ pub struct Status {
     /// the host's ssh target, socket or tailnet address changes ([`Supervisor::settings`]).
     #[serde(default)]
     pub settings: u64,
+    /// The daemon's identifier, once connected to one that says it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_id: Option<String>,
 }
 
 impl Status {
@@ -144,6 +147,7 @@ impl Status {
             settings: 0,
             transport: transport_of(remote),
             via: None,
+            daemon_id: None,
         }
     }
 
@@ -186,6 +190,31 @@ pub fn ping(socket: &Path, timeout: Duration) -> Result<(u32, String), PingError
 
 /// Like [`ping`], over a connection already open to the daemon.
 pub fn ping_stream(stream: UnixStream, timeout: Duration) -> Result<(u32, String), PingError> {
+    hello_stream(stream, timeout, false).map(|h| (h.version, h.build))
+}
+
+/// What a daemon said to Hello.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hello {
+    pub version: u32,
+    pub build: String,
+    /// Its [`Request::DaemonId`], when asked for and it has one (a daemon from before
+    /// [`thurm_proto::CAP_DAEMON_ID`] doesn't).
+    pub daemon_id: Option<String>,
+}
+
+/// Like [`ping`], also asking for the daemon's identifier.
+pub fn identify(socket: &Path, timeout: Duration) -> Result<Hello, PingError> {
+    let stream = UnixStream::connect(socket).map_err(|e| PingError::Unreachable(e.to_string()))?;
+    hello_stream(stream, timeout, true)
+}
+
+/// Says Hello on `stream`; with `identify`, then asks a daemon that can say for its identifier.
+pub fn hello_stream(
+    stream: UnixStream,
+    timeout: Duration,
+    identify: bool,
+) -> Result<Hello, PingError> {
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     let mut w = stream
@@ -205,23 +234,27 @@ pub fn ping_stream(stream: UnixStream, timeout: Duration) -> Result<(u32, String
     )
     .map_err(|e| PingError::Unreachable(e.to_string()))?;
     let mut r = BufReader::new(stream);
-    loop {
+    let (version, build, capabilities) = loop {
         match codec::read_message::<_, ServerMessage>(&mut r) {
             Ok(Some(ServerMessage::Response { id: 1, result })) => {
-                return match result {
+                break match result {
                     Ok(Response::Hello {
                         version,
                         build,
                         capabilities,
                         ..
                     }) if thurm_proto::hello_compatible(version, &capabilities) => {
-                        Ok((version, build))
+                        (version, build, capabilities)
                     }
-                    Ok(Response::Hello { version, .. }) => Err(PingError::Protocol(version)),
-                    Ok(other) => Err(PingError::Unreachable(format!("unexpected {other:?}"))),
+                    Ok(Response::Hello { version, .. }) => {
+                        return Err(PingError::Protocol(version));
+                    }
+                    Ok(other) => {
+                        return Err(PingError::Unreachable(format!("unexpected {other:?}")));
+                    }
                     Err(e) => match mismatched_protocol(&e) {
-                        Some(v) => Err(PingError::Protocol(v)),
-                        None => Err(PingError::Unreachable(e)),
+                        Some(v) => return Err(PingError::Protocol(v)),
+                        None => return Err(PingError::Unreachable(e)),
                     },
                 };
             }
@@ -229,7 +262,38 @@ pub fn ping_stream(stream: UnixStream, timeout: Duration) -> Result<(u32, String
             Ok(None) => return Err(PingError::Unreachable("connection closed".into())),
             Err(e) => return Err(PingError::Unreachable(e.to_string())),
         }
+    };
+    let mut hello = Hello {
+        version,
+        build,
+        daemon_id: None,
+    };
+    if !identify || !capabilities.iter().any(|c| c == thurm_proto::CAP_DAEMON_ID) {
+        return Ok(hello);
     }
+    // Answered or not, the daemon is there: an identifier it can't give is an unknown one.
+    let asked = codec::write_message(
+        &mut w,
+        &Envelope {
+            id: 2,
+            request: Request::DaemonId,
+        },
+    );
+    if asked.is_ok() {
+        loop {
+            match codec::read_message::<_, ServerMessage>(&mut r) {
+                Ok(Some(ServerMessage::Response { id: 2, result })) => {
+                    if let Ok(Response::Text(id)) = result {
+                        hello.daemon_id = Some(id).filter(|i| !i.trim().is_empty());
+                    }
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+    }
+    Ok(hello)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,7 +315,8 @@ type Listener = Box<dyn Fn(&Status) + Send + Sync>;
 
 struct Inner {
     remote: Mutex<RemoteConfig>,
-    ssh: Mutex<Ssh>,
+    /// `None` for a host reached over the tailnet only.
+    ssh: Mutex<Option<Ssh>>,
     status: Mutex<Status>,
     /// Retry now; with `restart`, also drop a connected tunnel first.
     wake: Mutex<Option<bool>>,
@@ -272,7 +337,7 @@ struct Inner {
 #[derive(Clone, Debug)]
 struct Destination {
     settings: u64,
-    ssh: Ssh,
+    ssh: Option<Ssh>,
     socket: Option<String>,
     tailnet: Option<String>,
 }
@@ -284,11 +349,12 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    /// Starts supervising `remote`. `listener` runs on the supervisor thread after every
-    /// change. With `write_state`, the state file for `thurm --remote` is kept up to date.
+    /// Starts supervising `remote`, with `ssh` to its ssh target (`None` for a host reached
+    /// over the tailnet only). `listener` runs on the supervisor thread after every change.
+    /// With `write_state`, the state file for `thurm --remote` is kept up to date.
     pub fn start(
         remote: RemoteConfig,
-        ssh: Ssh,
+        ssh: Option<Ssh>,
         write_state: bool,
         listener: impl Fn(&Status) + Send + Sync + 'static,
     ) -> Supervisor {
@@ -342,7 +408,7 @@ impl Supervisor {
     /// Picks up an edited `[[remote]]` entry (the tunnel is replaced when the host or the
     /// socket changed).
     pub fn update(&self, remote: RemoteConfig) -> Result<(), String> {
-        let ssh = Ssh::new(&remote.host)?;
+        let ssh = remote.ssh_target().map(Ssh::new).transpose()?;
         let (changed, moved) = {
             // The ssh target, the remote entry and the settings number change together, under
             // the lock `connect` takes its destination under: a connection never pairs the new
@@ -354,8 +420,11 @@ impl Supervisor {
                 || cur.tailnet != remote.tailnet;
             if moved {
                 let mut current = self.inner.ssh.lock();
-                let extra = current.extra.clone();
-                *current = Ssh { extra, ..ssh };
+                let extra = current.as_ref().map(|c| c.extra.clone());
+                *current = ssh.map(|ssh| Ssh {
+                    extra: extra.unwrap_or(ssh.extra.clone()),
+                    ..ssh
+                });
                 self.inner.settings.fetch_add(1, Ordering::SeqCst);
             }
             *cur = remote.clone();
@@ -759,11 +828,11 @@ impl Inner {
             via,
             ..
         } = opened;
-        let pinged = ping_stream(stream, Duration::from_secs(10));
+        let pinged = hello_stream(stream, Duration::from_secs(10), true);
         drop(session);
-        let (version, build) = match pinged {
-            Ok(v) => v,
-            Err(PingError::Protocol(v)) => (v, String::new()),
+        let (version, build, daemon_id) = match pinged {
+            Ok(h) => (h.version, h.build, h.daemon_id),
+            Err(PingError::Protocol(v)) => (v, String::new(), None),
             Err(PingError::Unreachable(e)) => {
                 return Err(Failure::Transient(format!(
                     "the daemon on {name} does not answer over the tailnet: {e}"
@@ -798,6 +867,7 @@ impl Inner {
             s.remote_protocol = Some(version);
             s.upgrade_available = upgrade_available;
             s.via = Some(via);
+            s.daemon_id = daemon_id;
         });
         Ok(relay)
     }
@@ -846,7 +916,9 @@ impl Inner {
             .lock()
             .clone()
             .unwrap_or_else(|| self.destination());
+        let name = self.remote.lock().name.clone();
         let (ssh, configured) = (dest.ssh, dest.socket);
+        let ssh = ssh.ok_or_else(|| crate::no_ssh_target(&name))?;
         let host = probe(&ssh).map_err(|e| e.to_string())?;
         let socket = configured
             .or(host.info.map(|i| i.socket))
@@ -855,7 +927,11 @@ impl Inner {
     }
 
     fn connect_ssh(&self, dest: &Destination) -> Result<Tunnel, Failure> {
-        let ssh = dest.ssh.clone();
+        let Some(ssh) = dest.ssh.clone() else {
+            return Err(Failure::Attention(crate::no_ssh_target(
+                &self.remote.lock().name,
+            )));
+        };
         let configured_socket = dest.socket.clone();
         crate::ssh::prepare_dir().map_err(|e| Failure::Attention(e.to_string()))?;
         let effective = ssh.effective_config()?;
@@ -919,7 +995,8 @@ impl Inner {
             });
         }
         let mut tunnel = Tunnel { child, stderr };
-        let (version, build) = self.await_tunnel(&mut tunnel, &local)?;
+        let (version, build, daemon_id) = self.await_tunnel(&mut tunnel, &local)?;
+        let daemon_id = daemon_id.or(host.info.as_ref().and_then(|i| i.daemon_id.clone()));
         if version != PROTOCOL_VERSION {
             return Err(Failure::Upgrade(format!(
                 "the daemon on {} speaks protocol {version}, this app {PROTOCOL_VERSION}",
@@ -943,12 +1020,17 @@ impl Inner {
             s.remote_build = Some(build);
             s.remote_protocol = Some(version);
             s.upgrade_available = upgrade_available;
+            s.daemon_id = daemon_id;
         });
         Ok(tunnel)
     }
 
-    /// Waits for the forward to answer. Returns the daemon's protocol and build.
-    fn await_tunnel(&self, t: &mut Tunnel, local: &Path) -> Result<(u32, String), Failure> {
+    /// Waits for the forward to answer. Returns the daemon's protocol, build and identifier.
+    fn await_tunnel(
+        &self,
+        t: &mut Tunnel,
+        local: &Path,
+    ) -> Result<(u32, String, Option<String>), Failure> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if self.stopped() {
@@ -964,9 +1046,9 @@ impl Inner {
                 });
             }
             if local.exists() {
-                match ping(local, Duration::from_secs(5)) {
-                    Ok(v) => return Ok(v),
-                    Err(PingError::Protocol(v)) => return Ok((v, String::new())),
+                match identify(local, Duration::from_secs(5)) {
+                    Ok(h) => return Ok((h.version, h.build, h.daemon_id)),
+                    Err(PingError::Protocol(v)) => return Ok((v, String::new(), None)),
                     Err(PingError::Unreachable(e)) if Instant::now() > deadline => {
                         return Err(Failure::Transient(format!(
                             "the tunnel is up but the daemon does not answer: {e} (an ssh server \
@@ -1163,8 +1245,14 @@ mod tests {
             clipboard_read: Default::default(),
             tailnet: None,
             forward_links: true,
+            daemon_id: None,
         };
-        let sup = Supervisor::start(remote("me@one"), Ssh::new("me@one").unwrap(), false, |_| {});
+        let sup = Supervisor::start(
+            remote("me@one"),
+            Some(Ssh::new("me@one").unwrap()),
+            false,
+            |_| {},
+        );
         let inner = sup.inner.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let reader = {
@@ -1179,11 +1267,8 @@ mod tests {
                     } else {
                         "me@two"
                     };
-                    assert_eq!(
-                        d.ssh.target, want,
-                        "settings {} with {}",
-                        d.settings, d.ssh.target
-                    );
+                    let target = d.ssh.map(|s| s.target).unwrap_or_default();
+                    assert_eq!(target, want, "settings {} with {target}", d.settings);
                     seen += 1;
                 }
                 seen
@@ -1289,6 +1374,7 @@ mod tests {
             clipboard_read: Default::default(),
             tailnet: None,
             forward_links: true,
+            daemon_id: None,
         };
         let s = Status::new(&r);
         let json = serde_json::to_string(&s).unwrap();

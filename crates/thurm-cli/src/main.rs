@@ -75,19 +75,22 @@ enum WorkspaceCmd {
 #[derive(Subcommand)]
 enum RemoteCmd {
     /// Add a host: checks the connection, offers to install Thurm there, writes `[[remote]]`.
-    /// With --tailnet, connects over the tailnet instead of ssh (no install offer).
+    /// The address says how: user@host, a Host alias or ssh://user@host:port is ssh; a
+    /// *.ts.net name or a wss:// or ws://ADDR:PORT address is the tailnet, with no ssh target
+    /// (no install offer: give it one later with `thurm remote edit NAME --ssh`).
     Add {
         name: String,
-        /// ssh target: a Host alias, user@host, or ssh://user@host:port. Still used over the
-        /// tailnet, to install, check and hand off; its host is the peer's name when --tailnet
-        /// has none.
-        target: String,
+        /// The host's address. With --tailnet, its ssh target, still used to install, check
+        /// and hand off; its host is the peer's name when --tailnet has none.
+        #[arg(value_name = "ADDRESS")]
+        address: String,
         /// The daemon's socket there (default: what `thurm socket-path` prints there).
         #[arg(long)]
         socket: Option<String>,
-        /// Reach the daemon over the tailnet (it serves there with `thurm tailscale on`): a
-        /// peer's name, or its wss:// or ws://ADDR:PORT address. Through Thurm's own Tailscale
-        /// node when it runs here, else this Mac's Tailscale.
+        /// Reach the daemon over the tailnet as well as having ADDRESS as its ssh target (it
+        /// serves there with `thurm tailscale on`): a peer's name, or its wss:// or
+        /// ws://ADDR:PORT address. Through Thurm's own Tailscale node when it runs here, else
+        /// this Mac's Tailscale.
         #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "PEER|URL")]
         tailnet: Option<String>,
         /// Answer yes to every question.
@@ -103,6 +106,14 @@ enum RemoteCmd {
     /// Forget a host (its daemon and panes keep running there).
     #[command(alias = "rm")]
     Remove { name: String },
+    /// Change a host: give it an ssh target (a host added over the tailnet has none), used to
+    /// install, check and hand off.
+    Edit {
+        name: String,
+        /// The ssh target: a Host alias, user@host, or ssh://user@host:port.
+        #[arg(long, value_name = "TARGET")]
+        ssh: String,
+    },
     /// Connection state of one host (or all).
     Status { name: Option<String> },
     /// Install this build of Thurm on a host, and upgrade its daemon in place.
@@ -1003,14 +1014,14 @@ fn run(cli: Cli) -> R {
         Cmd::Remote { action } => match action {
             RemoteCmd::Add {
                 name,
-                target,
+                address,
                 socket,
                 tailnet,
                 yes,
                 no,
             } => remote::add(remote::AddOptions {
                 name,
-                target,
+                address,
                 socket,
                 tailnet,
                 assume: if yes {
@@ -1023,6 +1034,7 @@ fn run(cli: Cli) -> R {
             }),
             RemoteCmd::List => remote::list(json),
             RemoteCmd::Remove { name } => remote::remove(&name),
+            RemoteCmd::Edit { name, ssh } => remote::edit(&name, &ssh),
             RemoteCmd::Status { name } => remote::status(name.as_deref(), json),
             RemoteCmd::Install { name, yes, no } => {
                 remote::install_cmd(&name, if yes { Some(true) } else { no.then_some(false) })

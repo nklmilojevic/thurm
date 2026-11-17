@@ -707,11 +707,26 @@ extension SessionManager {
             currentController?.content.focusedView?.showToast(
                 "\(gone) \(gone == 1 ? "pane" : "panes") on \(host) ended while it was away", duration: 5)
         }
+        // Just added (here or with `thurm remote add`) and empty: a first workspace on it, so it
+        // shows in the sidebar. Taken once: an empty host that connects again gets none.
+        if (Core.shared.remoteCall(["op": "take_added", "name": host]) as? Bool) == true,
+           infos.isEmpty, !workspaces.contains(where: { $0.host == host }) {
+            openFirstWorkspace(on: host)
+        }
         runPendingHandoffCleanups(host)
         refreshSidebars()
         updateDockBadge()
         for c in liveControllers { c.updateTitle() }
         scheduleLayoutSave()
+    }
+
+    /// A new workspace on `host` with one shell, left in the background: the window in front
+    /// keeps what it shows.
+    private func openFirstWorkspace(on host: HostId) {
+        let size = currentController.map { gridSize(forPoints: $0.content.bounds.size) }
+            ?? (cols: config.columns, rows: config.rows)
+        guard let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, host: host) else { return }
+        adoptRemotePanes([pane], host: host)
     }
 
     /// Opens `keys` (all on `host`) as tabs of the host's workspace, shown or not.
@@ -1228,16 +1243,22 @@ final class RemoteHosts: ObservableObject {
 
     // MARK: Hosts in the config
 
-    /// Adds `name` after checking that ssh reaches `target`, then checks what it needs. With
-    /// `tailnet` (a peer's name or address; empty: the target), checks the daemon answers over
-    /// the tailnet instead, and leaves the ssh checks for Check Again.
-    /// `done` gets the error, if it failed.
-    func add(name: String, target: String, tailnet: String? = nil, done: @escaping (String?) -> Void) {
-        var call: [String: Any] = ["op": "add", "name": name, "target": target]
-        if let tailnet { call["tailnet"] = tailnet }
-        edit(call) { error in
-            if error == nil, tailnet == nil { self.recheck(name) }
-            done(error)
+    /// Adds `name` at `address`, read as `thurm remote add` reads it: over ssh once ssh logs in
+    /// there, over the tailnet once its daemon answers. `done` gets nil, or why it was not added
+    /// and, apart, what was said.
+    func add(name: String, address: String, done: @escaping (_ error: String?, _ detail: String?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = Core.shared.remoteCall(["op": "add", "name": name, "address": address]) as? [String: Any]
+            DispatchQueue.main.async {
+                let error = r == nil ? "Thurm's core did not answer." : jsonString(r?["error"])
+                if error == nil {
+                    SessionManager.shared.reloadConfig(notifyDaemon: false)
+                    SettingsWindow.shared.reload()
+                    // Over ssh: what it needs (Thurm itself, lingering...) shows in its details.
+                    if r?["host"] != nil { self.recheck(name) }
+                }
+                done(error, jsonString(r?["detail"]))
+            }
         }
     }
 

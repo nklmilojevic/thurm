@@ -400,6 +400,7 @@ mod tests {
             clipboard_read: crate::ClipboardRead::Ask,
             tailnet: None,
             forward_links: true,
+            daemon_id: None,
         }
     }
 

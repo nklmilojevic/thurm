@@ -1,6 +1,8 @@
 //! Remote workspaces: the app attaches to `thurmd` on other machines through the system
 //! `ssh`, or over the tailnet (see `specs/remote-workspaces.md`).
 //!
+//! - [`add`]: adding a host from one address: its transport, why it can't be reached, and
+//!   whether it is a host already saved under another name.
 //! - [`ssh`]: the hardened ssh invocations.
 //! - [`tailnet`]: reaching a host's daemon over the tailnet, through the embedded node's dial
 //!   socket or this machine's Tailscale.
@@ -14,6 +16,7 @@
 //! - [`forward`]: a host's ports opened on this Mac's loopback, through its daemon.
 //! - [`transfer`]: files up to a host and back, on streams through its daemon.
 
+pub mod add;
 pub mod doctor;
 pub mod forward;
 pub mod handoff;
@@ -44,6 +47,10 @@ pub struct ThurmInfo {
     /// Rust target triple of that `thurm`.
     #[serde(default)]
     pub target: String,
+    /// Its user's daemon identifier ([`thurm_config::daemon_id`]): the same daemon however the
+    /// host is reached. Absent from a `thurm` that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_id: Option<String>,
 }
 
 impl ThurmInfo {
@@ -55,8 +62,25 @@ impl ThurmInfo {
             hot_upgrade_protocol: thurm_proto::HOT_UPGRADE_PROTOCOL,
             socket: thurm_config::socket_path().display().to_string(),
             target: current_target().to_owned(),
+            daemon_id: None,
         }
     }
+}
+
+/// Why `name` can't be reached over ssh: it has no ssh target, and how to give it one.
+pub fn no_ssh_target(name: &str) -> String {
+    format!(
+        "{name} has no ssh target (it is reached over the tailnet only): add one with \
+         `thurm remote edit {name} --ssh user@host`, or in Settings › Remotes › {name} › Details."
+    )
+}
+
+/// ssh to `remote`'s ssh target, or why it has none.
+pub fn ssh_for(remote: &thurm_config::RemoteConfig) -> Result<Ssh, String> {
+    let target = remote
+        .ssh_target()
+        .ok_or_else(|| no_ssh_target(&remote.name))?;
+    Ssh::new(target)
 }
 
 /// The Rust target this code was built for (`thurm_proto::BUILD` names the version).

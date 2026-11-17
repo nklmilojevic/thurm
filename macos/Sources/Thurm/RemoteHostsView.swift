@@ -17,7 +17,7 @@ struct RemoteHostRows: View {
             OverlayHostsNote(item: item, store: store)
         }
         if hosts.isEmpty {
-            Text("No hosts yet. Add Host\u{2026} connects to one over ssh.")
+            Text("No hosts yet. Add Host\u{2026} connects to one over ssh or Tailscale.")
                 .foregroundStyle(.secondary)
         }
         ForEach(hosts) { host in
@@ -93,7 +93,7 @@ private struct HostRow: View {
                 StatusDot(host: host.name)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(host.name)
-                    Text(host.target)
+                    Text(host.target.isEmpty ? host.tailnet ?? "" : host.target)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -179,7 +179,7 @@ private struct HostDetails: View {
                         ))
                         .help("Off: Thurm keeps the host but doesn't connect to it.")
                         LabeledContent("SSH target") {
-                            TextField("", text: $target, prompt: Text("me@devbox"))
+                            TextField("", text: $target, prompt: Text(host.tailnet == nil ? "me@devbox" : "None (to install and check)"))
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 260)
                                 .focused($targetFocused)
@@ -312,7 +312,10 @@ private struct HostDetails: View {
 
     @ViewBuilder private var checks: some View {
         let report = remotes.reports[name]
-        if let error = report?["error"] as? String {
+        if let host, host.target.isEmpty {
+            Text("Checks and installing need ssh: give \(name) an SSH target above.")
+                .foregroundStyle(.secondary)
+        } else if let error = report?["error"] as? String {
             CheckRow(host: name, check: ["id": "ssh", "title": "ssh", "state": "fail", "detail": error],
                      remotes: remotes)
         } else if let list = report?["checks"] as? [[String: Any]] {
@@ -329,10 +332,11 @@ private struct HostDetails: View {
         remotes.set(name, key, value) { failure = $0 }
     }
 
+    /// Empty only for a host reached over Tailscale: it has no ssh target then.
     private func saveTarget() {
         let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let host, trimmed != host.target else { return }
-        guard !trimmed.isEmpty else {
+        guard !trimmed.isEmpty || host.tailnet != nil else {
             NSSound.beep()
             target = host.target
             return
@@ -425,53 +429,74 @@ private struct CheckRow: View {
     }
 }
 
-/// Add Host…: a name and an ssh target, checked over ssh before the host is added; or, over
-/// Tailscale, checked by reaching its daemon on the tailnet.
+/// The name Add Host… gives a host whose name is left empty: the first label of its address's
+/// host (devbox for me@devbox.example.org), as a `[[remote]]` name allows.
+enum HostNameSuggestion {
+    static func from(_ address: String) -> String {
+        var host = Substring(address.trimmingCharacters(in: .whitespacesAndNewlines))
+        if let scheme = host.range(of: "://") { host = host[scheme.upperBound...] }
+        if let at = host.lastIndex(of: "@") { host = host[host.index(after: at)...] }
+        let authority = host.split(whereSeparator: { ":/[]".contains($0) }).first ?? ""
+        // An IPv4 address whole (10-50-0-24), a name by its first label.
+        let label = authority.allSatisfy({ $0.isNumber || $0 == "." })
+            ? Substring(authority.replacingOccurrences(of: ".", with: "-"))
+            : authority.split(separator: ".").first ?? ""
+        let allowed = label.filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
+        let name = String(allowed.prefix(32))
+        return name == "local" ? "" : name
+    }
+}
+
+/// Add Host…: a name and one address, read as `thurm remote add` reads it. user@host, an ssh
+/// Host alias or ssh://… connects with ssh; a *.ts.net name, or a wss:// or ws:// address,
+/// reaches the host's daemon over the tailnet. The host is saved once it answers there.
 private struct AddHostSheet: View {
     @ObservedObject var remotes: RemoteHosts
     @State private var name = ""
-    @State private var target = ""
-    @State private var overTailnet = false
-    @State private var tailnet = ""
+    @State private var address = ""
     @State private var failure: String?
+    @State private var failureDetail: String?
     @State private var connecting = false
 
-    private var trimmedName: String { name.trimmingCharacters(in: .whitespacesAndNewlines) }
-    private var trimmedTarget: String { target.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var trimmedAddress: String { address.trimmingCharacters(in: .whitespacesAndNewlines) }
+    /// The name typed, else one made from the address (devbox for me@devbox.example.org).
+    private var effectiveName: String {
+        let typed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return typed.isEmpty ? HostNameSuggestion.from(trimmedAddress) : typed
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Add a Host")
                 .font(.headline)
-            Text(overTailnet
-                ? "Thurm reaches the host's daemon over your tailnet, through its own Tailscale node "
-                    + "(Settings \u{203A} Tailscale) or the Tailscale app. The host serves there (thurm tailscale on there) "
-                    + "and must let your account in. Installing and checks still use ssh."
-                : "Thurm connects with the system ssh: the host needs a key that works without a prompt "
-                    + "(an agent is fine). Connect once with ssh in a terminal to accept its host key.")
+            Text("The address says how Thurm connects. user@host, an SSH Host alias or ssh://user@host:port "
+                + "connect with the system ssh: the host needs a key that works without a prompt (an agent is "
+                + "fine). A name ending in .ts.net, or a wss:// or ws://address:port address, reaches Thurm on the "
+                + "host over your tailnet (thurm tailscale on there), with no ssh.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Form {
-                TextField("Name", text: $name, prompt: Text("devbox"))
-                TextField("SSH target", text: $target, prompt: Text("me@devbox, a Host alias, or ssh://me@devbox:2222"))
-                Toggle("Over Tailscale", isOn: $overTailnet)
-                if overTailnet {
-                    TextField("Tailscale address", text: $tailnet,
-                              prompt: Text("bastion, or wss://bastion.tail1234.ts.net"))
-                    Text("Blank: the SSH target's host (devbox in me@devbox) as its name on the tailnet. "
-                        + "An SSH Host alias may name another machine; give the address then.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                TextField("Address", text: $address,
+                          prompt: Text("me@devbox, or bastion.tail1234.ts.net"))
+                TextField("Name", text: $name,
+                          prompt: Text(HostNameSuggestion.from(trimmedAddress).isEmpty ? "devbox" : HostNameSuggestion.from(trimmedAddress)))
             }
             .disabled(connecting)
             if let failure {
                 Label {
-                    Text(failure)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(failure)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let failureDetail {
+                            Text(failureDetail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(4)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .textSelection(.enabled)
                 } icon: {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
@@ -482,7 +507,7 @@ private struct AddHostSheet: View {
                 if connecting {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Connecting to \(trimmedTarget)\u{2026}")
+                    Text("Connecting to \(trimmedAddress)\u{2026}")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -490,7 +515,7 @@ private struct AddHostSheet: View {
                     .keyboardShortcut(.cancelAction)
                 Button("Add", action: add)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(connecting || trimmedName.isEmpty || trimmedTarget.isEmpty)
+                    .disabled(connecting || effectiveName.isEmpty || trimmedAddress.isEmpty)
             }
         }
         .padding(20)
@@ -498,14 +523,15 @@ private struct AddHostSheet: View {
     }
 
     private func add() {
-        let name = trimmedName
+        let name = effectiveName
         connecting = true
         failure = nil
-        let address = overTailnet ? tailnet.trimmingCharacters(in: .whitespacesAndNewlines) : nil
-        remotes.add(name: name, target: trimmedTarget, tailnet: address) { error in
+        failureDetail = nil
+        remotes.add(name: name, address: trimmedAddress) { error, detail in
             connecting = false
             if let error {
                 failure = error
+                failureDetail = detail
             } else {
                 remotes.showDetails(name)
             }

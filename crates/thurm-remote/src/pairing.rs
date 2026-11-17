@@ -539,6 +539,7 @@ mod tests {
             clipboard_read: Default::default(),
             tailnet: None,
             forward_links: true,
+            daemon_id: None,
         };
         for file in [&known, &hashed] {
             let e = host_entry(&remote, &ssh_for(22, file));

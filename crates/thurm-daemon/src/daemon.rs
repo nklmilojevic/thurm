@@ -3719,6 +3719,9 @@ impl Daemon {
                     .copy_from_begin(self, client.id, principal, &path, home.as_deref())
                     .map(Response::Download)
             }
+            Request::DaemonId => thurm_config::daemon_id()
+                .map(Response::Text)
+                .map_err(|e| format!("the daemon's identifier: {e}")),
         }
     }
 

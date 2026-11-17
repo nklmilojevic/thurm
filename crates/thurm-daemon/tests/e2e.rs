@@ -1671,6 +1671,27 @@ fn unknown_requests_are_answered_not_dropped() {
     assert_eq!(answered, vec![(7, false), (8, true)]);
 }
 
+#[test]
+fn the_daemon_says_the_identifier_it_keeps() {
+    let env = Env::new("daemon-id");
+    let id = {
+        let _daemon = env.start();
+        let (c, _rx) = env.connect();
+        assert!(c.has_capability(thurm_proto::CAP_DAEMON_ID));
+        let Response::Text(id) = c.request(Request::DaemonId).unwrap() else {
+            panic!("not a text answer");
+        };
+        id
+    };
+    assert_eq!(id.len(), 32, "{id}");
+    let kept = std::fs::read_to_string(env.dir.join("state/daemon-id")).unwrap();
+    assert_eq!(kept.trim(), id);
+    // The next daemon of the same user says the same.
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    assert!(matches!(c.request(Request::DaemonId).unwrap(), Response::Text(again) if again == id));
+}
+
 /// Spawns another daemon on `env`'s socket and returns whether it exited by itself in time.
 fn second_daemon_exits(env: &Env) -> bool {
     let mut child = Command::new(env!("CARGO_BIN_EXE_thurmd"))

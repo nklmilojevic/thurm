@@ -29,6 +29,9 @@ pub fn rt() -> &'static tokio::runtime::Runtime {
 pub static DIALS: std::sync::Mutex<Vec<(u16, thurm_proto::stream::Loopback)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// What the stand-in daemons answer `DaemonId` with.
+pub const FAKE_DAEMON_ID: &str = "fa4e0000000000000000000000000001";
+
 /// A stand-in daemon on `path`: answers Hello on every connection, then whatever else with Ok;
 /// a `StreamOpen` makes its connection an echoing stream.
 pub fn daemon(path: &Path) {
@@ -67,6 +70,7 @@ pub fn daemon(path: &Path) {
                                 expires_ms: 60_000,
                             })
                         }
+                        Request::DaemonId => Ok(Response::Text(FAKE_DAEMON_ID.into())),
                         _ => Ok(Response::Ok),
                     };
                     let msg = ServerMessage::Response { id: env.id, result };

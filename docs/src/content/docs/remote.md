@@ -22,14 +22,30 @@ serves there: see [Reach a host over Tailscale](#reach-a-host-over-tailscale).
 
 ```sh
 thurm remote add devbox me@devbox.example.org
+thurm remote add bastion bastion.YOUR-TAILNET.ts.net
 ```
 
-`thurm remote add NAME SSH-TARGET` connects once, shows the host's platform,
-offers to install this build of Thurm there, and writes the entry to your
-config. Then it checks the rest the host needs (see
-[Check a host](#check-a-host)) and offers each fix. In the app, **Thurm ›
-Remotes… › Add Host…** does the same. Run without a terminal (from a script),
-it needs `--yes` or `--no`, and it says so instead of assuming "no".
+`thurm remote add NAME ADDRESS` takes one address and works out how to connect:
+`user@host`, an ssh `Host` alias or `ssh://user@host:port` is ssh; a name ending
+in `.ts.net`, or a `wss://` or `ws://ADDRESS:PORT` address, is the tailnet (see
+[Reach a host over Tailscale](#reach-a-host-over-tailscale)). An address with a
+port but no scheme is refused with both readings spelled out.
+
+Over ssh, it connects once, shows the host's platform, offers to install this
+build of Thurm there, and writes the entry to your config. Then it checks the
+rest the host needs (see [Check a host](#check-a-host)) and offers each fix. In
+the app, **Thurm › Remotes… › Add Host…** takes the same address. Run without a
+terminal (from a script), it needs `--yes` or `--no`, and it says so instead of
+assuming "no".
+
+Nothing is written when the host can't be reached, and each reason has its own
+message: ssh can't log in, the name isn't found, nothing answers in time,
+something answers that isn't Thurm, the protocol differs (and which side to
+update), Tailscale isn't connected on this Mac. Nor when the daemon there is one
+you have added already under another name: every daemon keeps an identifier,
+and `remote add` says `two is the same host as one; use one.` Once the app
+connects to a new host with no panes, it opens a first workspace on it in the
+sidebar.
 
 The entry it writes:
 
@@ -54,6 +70,7 @@ commands:
 | `thurm remote install NAME` | Install this build there, and upgrade its daemon in place |
 | `thurm remote doctor [NAME]` | Check what the host needs; `--fix` offers each fix, `--yes` runs them |
 | `thurm remote remove NAME` | Forget a host; its daemon and panes keep running there |
+| `thurm remote edit NAME --ssh TARGET` | Give a host its ssh target (or another one) |
 | `thurm remote ports NAME` | The ports programs in the host's panes listen on |
 | `thurm remote forward NAME PORT\|URL` | Open one of the host's ports on this Mac (see [Ports](#ports)) |
 | `thurm remote forwards [NAME]` | The forwards the app has open, and the connections each carries |
@@ -283,15 +300,20 @@ A host that serves over Tailscale (`thurm tailscale on` there) can be reached
 from this Mac the same way, without ssh:
 
 ```sh
-thurm remote add bastion bastion --tailnet
+thurm remote add bastion bastion.YOUR-TAILNET.ts.net
 ```
 
-`--tailnet` takes the host's name on the tailnet (default: the ssh target's host), or
-its address: `wss://bastion.YOUR-TAILNET.ts.net/v1/connect` for a device of its
-own, `ws://100.x.y.z:7297` for one that listens through its machine's Tailscale
-(`host_listen`). Thurm checks that the daemon answers, then writes `tailnet` with
-the full address next to `host`. In the app, turn on **Over Tailscale** in
-**Add Host…**.
+The address is the host's name on the tailnet, or its address:
+`wss://bastion.YOUR-TAILNET.ts.net/v1/connect` for a device of its own,
+`ws://100.x.y.z:7297` for one that listens through its machine's Tailscale
+(`host_listen`). Thurm checks that the daemon answers, then writes `tailnet`
+with the full address, and no `host`: the host has no ssh target.
+
+To have both, give the ssh target as the address and the tailnet with
+`--tailnet` (its name on the tailnet, default the ssh target's host, or its
+address): `thurm remote add bastion me@bastion --tailnet`. A host added over the
+tailnet alone gets one later with `thurm remote edit bastion --ssh me@bastion`,
+or under **SSH target** in its details in the app.
 
 The connection goes through this Mac's own Thurm device when it runs
 (`thurm tailscale on` here), so it works with the Tailscale app stopped. When
@@ -311,7 +333,8 @@ port 443 (or the `host_listen` port).
 
 ssh is still what installs, checks and hands off: `thurm remote install`,
 `thurm remote doctor` and `thurm handoff` use `host`, as do starting a daemon
-that isn't running and the ssh config's `LocalForward`s. With the Tailscale app
+that isn't running and the ssh config's `LocalForward`s. On a host with no ssh
+target they say so, and how to give it one. With the Tailscale app
 stopped, ssh can go through Thurm's device too:
 
 ```

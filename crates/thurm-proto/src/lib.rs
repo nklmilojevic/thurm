@@ -88,6 +88,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_TRANSFER,
     CAP_CLIP_QUERY,
     CAP_COPY,
+    CAP_DAEMON_ID,
 ];
 
 /// The daemon accepts `SearchPaths` and returns `PathMatches` only for that request.
@@ -118,6 +119,10 @@ pub const CAP_TRANSFER: &str = "transfer";
 /// The daemon copies files to and from paths its caller names: it answers [`Request::CopyTo`]
 /// and [`Request::CopyFrom`] (`thurm cp`). Implies [`CAP_STREAMS`].
 pub const CAP_COPY: &str = "copy";
+
+/// The daemon answers [`Request::DaemonId`]: an identifier it keeps across restarts, so a client
+/// can tell that two addresses reach the same daemon.
+pub const CAP_DAEMON_ID: &str = "daemon-id";
 
 /// How a [`Request::DownloadBegin`] error for a path with nothing at it ends, so a client can
 /// tell "not there" from every other failure.
@@ -658,6 +663,9 @@ pub enum Request {
     CopyFrom {
         path: String,
     },
+    /// The daemon's identifier ([`Response::Text`]), the same across its restarts and
+    /// upgrades. Requires [`CAP_DAEMON_ID`].
+    DaemonId,
 }
 
 /// The most files a batch of [`Request::UploadBegin`] holds (its `count`).

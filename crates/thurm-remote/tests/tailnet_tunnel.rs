@@ -54,6 +54,7 @@ fn remote(name: &str, tailnet: &str) -> RemoteConfig {
         clipboard_read: Default::default(),
         tailnet: Some(tailnet.into()),
         forward_links: true,
+        daemon_id: None,
     }
 }
 
@@ -61,7 +62,7 @@ fn start(r: RemoteConfig) -> Supervisor {
     // Never the real tunnels' directory.
     let base = base();
     assert!(thurm_config::remote_dir().starts_with(base));
-    let ssh = Ssh::new(&r.host).unwrap();
+    let ssh = r.ssh_target().map(|t| Ssh::new(t).unwrap());
     Supervisor::start(r, ssh, true, |_| {})
 }
 
@@ -216,7 +217,8 @@ fn check_says_how_the_host_answers() {
     assert_eq!(c.protocol, thurm_proto::PROTOCOL_VERSION);
     let e =
         thurm_remote::tailnet::check("ws://nobody.ts.net:7297", &socket, Duration::from_secs(8))
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
     assert!(e.contains("nobody"), "{e}");
 }
 
@@ -236,6 +238,33 @@ fn a_host_that_stops_letting_this_mac_in_needs_attention() {
     let msg = s.message.unwrap();
     assert!(msg.contains("allow_tailnet_members"), "{msg}");
     assert_eq!(s.via, None);
+}
+
+#[test]
+fn a_host_with_no_ssh_target_connects_and_says_its_daemon() {
+    let d = stand_in_daemon("nossh");
+    dial_socket();
+    let (port, _stop, answer) = switchable_gateway(d, None);
+    let r = RemoteConfig {
+        host: String::new(),
+        ..remote("nossh", &format!("ws://127.0.0.1:{port}"))
+    };
+    let sup = start(r);
+    let s = wait_for(&sup, |s| s.phase == Phase::Connected);
+    assert_eq!(s.daemon_id.as_deref(), Some(fakes::FAKE_DAEMON_ID));
+    assert_eq!(
+        Status::read("nossh").and_then(|s| s.daemon_id).as_deref(),
+        Some(fakes::FAKE_DAEMON_ID)
+    );
+    // A daemon that is down can't be started without ssh: it says why.
+    *answer.lock().unwrap() = Some((503, "the Thurm daemon is not reachable"));
+    sup.kick(true);
+    let s = wait_for(&sup, |s| {
+        s.message
+            .as_deref()
+            .is_some_and(|m| m.contains("nossh has no ssh target"))
+    });
+    assert_eq!(s.phase, Phase::Reconnecting);
 }
 
 #[test]

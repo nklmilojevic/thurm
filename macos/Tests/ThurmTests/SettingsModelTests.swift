@@ -326,6 +326,30 @@ final class RemoteHostEntryTests: XCTestCase {
             RemoteHostEntry(name: "bastion", target: "bastion", tailnet: "wss://bastion.tail1234.ts.net/v1/connect"),
         ])
     }
+
+    func testATailnetOnlyHostHasNoSSHTarget() {
+        let value = JSON.decode("""
+        [{"name": "bastion", "tailnet": "wss://bastion.tail2177a1.ts.net/v1/connect"}]
+        """)
+        XCTAssertEqual(RemoteHostEntry.entries(value), [
+            RemoteHostEntry(name: "bastion", target: "", tailnet: "wss://bastion.tail2177a1.ts.net/v1/connect"),
+        ])
+    }
+}
+
+final class HostNameSuggestionTests: XCTestCase {
+    func testANameFromTheAddress() {
+        XCTAssertEqual(HostNameSuggestion.from("me@devbox.example.org"), "devbox")
+        XCTAssertEqual(HostNameSuggestion.from("bastion.tail2177a1.ts.net"), "bastion")
+        XCTAssertEqual(HostNameSuggestion.from("ssh://me@mini:2222"), "mini")
+        XCTAssertEqual(HostNameSuggestion.from("wss://build-01.tail1.ts.net/v1/connect"), "build-01")
+        XCTAssertEqual(HostNameSuggestion.from(" pi "), "pi")
+        XCTAssertEqual(HostNameSuggestion.from("ws://100.64.0.1:7297"), "100-64-0-1")
+        XCTAssertEqual(HostNameSuggestion.from("nkl@10.50.0.24"), "10-50-0-24")
+        // None a `[[remote]]` could have: the name is asked for.
+        XCTAssertEqual(HostNameSuggestion.from("local"), "")
+        XCTAssertEqual(HostNameSuggestion.from(""), "")
+    }
 }
 
 final class RemoteStatusTests: XCTestCase {

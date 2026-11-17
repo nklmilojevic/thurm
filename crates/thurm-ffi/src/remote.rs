@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thurm_config::Config;
+use thurm_remote::add;
 use thurm_remote::doctor;
 use thurm_remote::forward::{self, Forwards};
 use thurm_remote::handoff::{self, Registry, SshHost};
@@ -234,7 +235,7 @@ fn sync_with(m: &mut Manager, loaded: Result<Config, String>) {
                 }
             },
             None => {
-                let ssh = match Ssh::new(&r.host) {
+                let ssh = match r.ssh_target().map(Ssh::new).transpose() {
                     Ok(s) => s,
                     Err(e) => {
                         log::warn!("remote {name}: {e}");
@@ -349,15 +350,17 @@ enum Call {
         name: String,
         allow_restart: bool,
     },
-    /// Adds `[[remote]]` `name` after checking that ssh reaches `target` (Thurm › Remotes… ›
-    /// Add Host…). Installing and the rest are `doctor` and `doctor_fix`.
+    /// Adds `[[remote]]` `name` at `address` (Settings › Remotes › Add Host…), read as
+    /// `thurm remote add` reads it: over ssh once ssh logs in there (installing and the rest are
+    /// `doctor` and `doctor_fix`), over the tailnet once its daemon answers. Refused, with
+    /// `{error, kind, detail}`, when it can't be reached or is a host saved already.
     Add {
         name: String,
-        target: String,
-        /// Reach it over the tailnet instead (a peer's name or address; empty: the target), after
-        /// checking the daemon answers there. ssh is not tried.
-        #[serde(default)]
-        tailnet: Option<String>,
+        address: String,
+    },
+    /// Whether `name` was just added, so the app opens a first workspace on it; true once.
+    TakeAdded {
+        name: String,
     },
     /// Removes `[[remote]]` `name` (its daemon and panes keep running there).
     Remove {
@@ -560,8 +563,8 @@ fn remote(name: &str) -> Result<thurm_config::RemoteConfig, String> {
 
 fn ssh_for(name: &str) -> Result<(thurm_config::RemoteConfig, Ssh), String> {
     let r = remote(name)?;
+    let ssh = thurm_remote::ssh_for(&r)?;
     thurm_remote::ssh::prepare_dir().map_err(|e| e.to_string())?;
-    let ssh = Ssh::new(&r.host)?;
     Ok((r, ssh))
 }
 
@@ -626,42 +629,27 @@ fn call(c: Call) -> Result<Value, String> {
                 Err(e) => return Err(e.to_string()),
             }
         }
-        Call::Add {
-            name,
-            target,
-            tailnet,
-        } => {
+        Call::Add { name, address } => {
             thurm_config::validate_remote_name(&name)?;
-            if Config::load()
-                .map_err(|e| e.to_string())?
-                .remote(&name)
-                .is_some()
-            {
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            if cfg.remote(&name).is_some() {
                 return Err(format!("a remote named {name:?} exists already"));
             }
-            if let Some(tailnet) = tailnet {
-                return add_tailnet(name, target, &tailnet);
-            }
-            thurm_remote::ssh::prepare_dir().map_err(|e| e.to_string())?;
-            let ssh = Ssh::new(&target)?;
-            let effective = ssh.effective_config().map_err(|e| e.to_string())?;
-            thurm_remote::ssh::check_forwards(&effective)?;
-            let host = thurm_remote::probe(&ssh).map_err(|e| e.to_string())?;
-            let entry = thurm_config::RemoteConfig {
-                name: name.clone(),
-                host: target,
-                socket: None,
-                enabled: true,
-                clipboard_read: thurm_config::ClipboardRead::Ask,
-                tailnet: None,
-                forward_links: true,
+            let added = match add::parse_address(&address)? {
+                add::Address::Ssh(target) => add_ssh(&name, &target, &cfg.remote),
+                add::Address::Tailnet(address) => add_tailnet(&name, &address, &cfg.remote),
             };
-            thurm_config::edit_remotes(|t| thurm_config::with_remote_added(t, &entry))?;
-            if let Some(m) = MANAGER.lock().as_mut() {
-                sync(m);
+            match added {
+                Ok(v) => v,
+                Err(Refused::Add(e)) => json!({
+                    "error": e.to_string(),
+                    "kind": e.kind(),
+                    "detail": e.detail(),
+                }),
+                Err(Refused::Other(e)) => return Err(e),
             }
-            json!({ "name": name, "host": host })
         }
+        Call::TakeAdded { name } => json!(thurm_config::take_remote_added(&name)),
         Call::Remove { name } => {
             thurm_config::edit_remotes(|t| thurm_config::with_remote_removed(t, &name))?;
             if let Some(m) = MANAGER.lock().as_mut() {
@@ -784,8 +772,17 @@ fn call(c: Call) -> Result<Value, String> {
                 .remote
                 .iter()
                 .filter(|r| r.enabled)
-                .map(|r| match Ssh::new(&r.host) {
+                .map(|r| match thurm_remote::ssh_for(r) {
                     Ok(ssh) => pairing::host_entry(r, &ssh),
+                    // The phone reaches it over the tailnet, as this Mac does.
+                    Err(_) if r.ssh_target().is_none() => pairing::HostEntry {
+                        name: r.name.clone(),
+                        error: Some(format!(
+                            "{} is reached over the tailnet only: the iPhone connects to it there",
+                            r.name
+                        )),
+                        ..Default::default()
+                    },
                     Err(e) => pairing::HostEntry {
                         name: r.name.clone(),
                         error: Some(e),
@@ -875,8 +872,12 @@ fn call(c: Call) -> Result<Value, String> {
 fn remote_setting_literal(key: &str, value: &serde_json::Value) -> Result<String, String> {
     // A JSON string is also a TOML basic string.
     match (key, value) {
+        // Empty: no ssh target, for a host reached over the tailnet (the config refuses it
+        // for any other).
         ("host", serde_json::Value::String(s)) => {
-            thurm_remote::ssh::validate_target(s.trim())?;
+            if !s.trim().is_empty() {
+                thurm_remote::ssh::validate_target(s.trim())?;
+            }
             Ok(json!(s.trim()).to_string())
         }
         ("enabled" | "forward_links", serde_json::Value::Bool(b)) => Ok(b.to_string()),
@@ -893,34 +894,98 @@ fn remote_setting_literal(key: &str, value: &serde_json::Value) -> Result<String
     }
 }
 
-/// Adds `name` reached over the tailnet at `tailnet` (empty: the host of the ssh `target`, as a
-/// peer's name), once its daemon answers there.
-fn add_tailnet(name: String, target: String, tailnet: &str) -> Result<Value, String> {
-    let target = target.trim().to_owned();
-    thurm_remote::ssh::validate_target(&target)?;
-    let value = if tailnet.trim().is_empty() {
-        thurm_remote::tailnet::peer_name(&target)
-    } else {
-        tailnet.trim()
+/// Why an add was refused: a failure `add` describes, or anything else.
+enum Refused {
+    Add(add::AddError),
+    Other(String),
+}
+
+impl From<String> for Refused {
+    fn from(e: String) -> Self {
+        Refused::Other(e)
+    }
+}
+
+impl From<add::AddError> for Refused {
+    fn from(e: add::AddError) -> Self {
+        Refused::Add(e)
+    }
+}
+
+/// Writes `entry`, marked as just added, and has the app connect to it.
+fn save_added(entry: &thurm_config::RemoteConfig) -> Result<(), String> {
+    thurm_config::edit_remotes(|t| thurm_config::with_remote_added(t, entry))?;
+    if let Err(e) = thurm_config::mark_remote_added(&entry.name) {
+        log::warn!(
+            "remote {}: no first workspace on connecting: {e}",
+            entry.name
+        );
+    }
+    if let Some(m) = MANAGER.lock().as_mut() {
+        sync(m);
+    }
+    Ok(())
+}
+
+/// Adds `name` at the ssh `target`, once ssh logs in there.
+fn add_ssh(
+    name: &str,
+    target: &str,
+    saved: &[thurm_config::RemoteConfig],
+) -> Result<Value, Refused> {
+    thurm_remote::ssh::prepare_dir().map_err(|e| e.to_string())?;
+    let ssh = Ssh::new(target)?;
+    let classify = |e: thurm_remote::SshError| add::classify_ssh(target, &e);
+    let effective = ssh.effective_config().map_err(classify)?;
+    thurm_remote::ssh::check_forwards(&effective)?;
+    let host = thurm_remote::probe(&ssh).map_err(classify)?;
+    let candidate = add::Candidate {
+        ssh_target: Some(target.to_owned()),
+        tailnet: None,
+        daemon_id: host.info.as_ref().and_then(|i| i.daemon_id.clone()),
     };
+    add::check_new(name, &candidate, saved)?;
+    save_added(&thurm_config::RemoteConfig {
+        name: name.to_owned(),
+        host: target.to_owned(),
+        socket: None,
+        enabled: true,
+        clipboard_read: thurm_config::ClipboardRead::Ask,
+        tailnet: None,
+        forward_links: true,
+        daemon_id: candidate.daemon_id,
+    })?;
+    Ok(json!({ "name": name, "host": host }))
+}
+
+/// Adds `name` reached over the tailnet at `address`, with no ssh target, once a daemon this
+/// Mac can talk to answers there.
+fn add_tailnet(
+    name: &str,
+    address: &str,
+    saved: &[thurm_config::RemoteConfig],
+) -> Result<Value, Refused> {
     let checked = thurm_remote::tailnet::check(
-        value,
+        address,
         &thurm_config::tailnet_dial_socket_path(),
         thurm_remote::tailnet::CONNECT_TIMEOUT,
-    )?;
-    let entry = thurm_config::RemoteConfig {
-        name: name.clone(),
-        host: target,
+    )
+    .map_err(|e| add::classify_tailnet(address, e))?;
+    if let Some(e) = add::protocol_problem(address, checked.protocol, &checked.build) {
+        return Err(e.into());
+    }
+    let candidate = add::tailnet_candidate(&checked);
+    add::check_new(name, &candidate, saved)?;
+    save_added(&thurm_config::RemoteConfig {
+        name: name.to_owned(),
+        host: String::new(),
         socket: None,
         enabled: true,
         clipboard_read: thurm_config::ClipboardRead::Ask,
         tailnet: Some(checked.url.clone()),
         forward_links: true,
-    };
-    thurm_config::edit_remotes(|t| thurm_config::with_remote_added(t, &entry))?;
-    if let Some(m) = MANAGER.lock().as_mut() {
-        sync(m);
-    }
+        daemon_id: candidate.daemon_id.clone(),
+    })?;
     Ok(json!({ "name": name, "tailnet": checked }))
 }
 
@@ -958,7 +1023,9 @@ mod tests {
             r#"{"op":"handoff_prepare","host":"devbox","path":"/r","branch":null}"#,
             r#"{"op":"handoff_cleanup","id":"a/b/c","force":true}"#,
             r#"{"op":"handoff_list"}"#,
-            r#"{"op":"add","name":"pi","target":"me@pi"}"#,
+            r#"{"op":"add","name":"pi","address":"me@pi"}"#,
+            r#"{"op":"add","name":"bastion","address":"bastion.tail1234.ts.net"}"#,
+            r#"{"op":"take_added","name":"pi"}"#,
             r#"{"op":"doctor","name":"pi","bins":null}"#,
             r#"{"op":"doctor_fix","name":"pi","id":"hooks.claude","bins":null}"#,
             r#"{"op":"terminal_argv","name":"pi","script":"exec claude"}"#,
@@ -1012,10 +1079,11 @@ mod tests {
             clipboard_read: Default::default(),
             tailnet: None,
             forward_links: true,
+            daemon_id: None,
         };
         let sup = Supervisor::start(
             remote("devbox"),
-            Ssh::new("me@nowhere").unwrap(),
+            Some(Ssh::new("me@nowhere").unwrap()),
             false,
             |_| {},
         );
@@ -1045,6 +1113,7 @@ mod tests {
             clipboard_read: Default::default(),
             tailnet: None,
             forward_links: true,
+            daemon_id: None,
         };
         let cfg = |host: &str| {
             let mut c = Config::parse("").unwrap();
@@ -1053,7 +1122,12 @@ mod tests {
         };
         // Its tunnel, connected with the settings it starts with.
         let tunnel = forwards().host_started(name);
-        let sup = Supervisor::start(remote("me@one"), Ssh::new("me@one").unwrap(), false, |_| {});
+        let sup = Supervisor::start(
+            remote("me@one"),
+            Some(Ssh::new("me@one").unwrap()),
+            false,
+            |_| {},
+        );
         forwards().host_connected(name, tunnel, sup.settings());
         let mut m = Manager {
             supervisors: HashMap::from([(name.to_owned(), sup)]),
@@ -1245,7 +1319,13 @@ mod tests {
             remote_setting_literal("clipboard_read", &json!("never")).unwrap(),
             "\"never\""
         );
-        assert!(remote_setting_literal("host", &json!("")).is_err());
+        // No ssh target: only a host reached over the tailnet may have none.
+        let empty = remote_setting_literal("host", &json!(" ")).unwrap();
+        assert_eq!(empty, "\"\"");
+        let ssh_only = "[[remote]]\nname = \"a\"\nhost = \"me@a\"\n";
+        assert!(thurm_config::with_remote_setting(ssh_only, "a", "host", &empty).is_err());
+        let tailnet = "[[remote]]\nname = \"a\"\nhost = \"me@a\"\ntailnet = \"a\"\n";
+        assert!(thurm_config::with_remote_setting(tailnet, "a", "host", &empty).is_ok());
         assert!(remote_setting_literal("host", &json!("a b")).is_err());
         assert!(remote_setting_literal("host", &json!("-oProxyCommand=evil")).is_err());
         assert!(remote_setting_literal("host", &json!(1)).is_err());

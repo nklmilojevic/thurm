@@ -245,6 +245,7 @@ fn remote(name: &str, socket: Option<String>) -> RemoteConfig {
         clipboard_read: Default::default(),
         tailnet: None,
         forward_links: true,
+        daemon_id: None,
     }
 }
 
@@ -355,7 +356,7 @@ fn remote_workspace_over_loopback_ssh() {
 
     // 1. Nothing installed: reported, never installed in the background.
     let (watch, listener) = Watch::new();
-    let sup = Supervisor::start(remote("loop", None), w.ssh.clone(), true, listener);
+    let sup = Supervisor::start(remote("loop", None), Some(w.ssh.clone()), true, listener);
     let s = watch.wait(&sup, Phase::NotInstalled, 30);
     assert!(s.message.unwrap().contains("not installed"));
     assert!(!w.base.join("rhome/.local/share/thurm/bin/thurm").exists());
@@ -921,7 +922,7 @@ fn remote_workspace_over_loopback_ssh() {
     let (watch, listener) = Watch::new();
     let sup = Supervisor::start(
         remote("old", Some(old.display().to_string())),
-        w.ssh.clone(),
+        Some(w.ssh.clone()),
         false,
         listener,
     );
@@ -934,7 +935,12 @@ fn remote_workspace_over_loopback_ssh() {
 
     // 9. Authentication that needs a person (BatchMode): needs attention, with ssh's words.
     let (watch, listener) = Watch::new();
-    let sup = Supervisor::start(remote("stranger", None), w.bad_ssh.clone(), false, listener);
+    let sup = Supervisor::start(
+        remote("stranger", None),
+        Some(w.bad_ssh.clone()),
+        false,
+        listener,
+    );
     let s = watch.wait(&sup, Phase::NeedsAttention, 30);
     let m = s.message.unwrap_or_default();
     assert!(m.contains("Permission denied"), "{m}");

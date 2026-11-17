@@ -12,6 +12,7 @@ use std::sync::Arc;
 use thurm_client::{Client, ClientError, ConnectOptions};
 use thurm_config::{ClipboardRead, Config, RemoteConfig};
 use thurm_proto::{CreatePane, PaneSize, Request, Response, UiCommand};
+use thurm_remote::add::{self, AddError, Address, Candidate};
 use thurm_remote::doctor::{self, Report, State};
 use thurm_remote::handoff::{self, Registry, SshHost};
 use thurm_remote::install;
@@ -25,9 +26,7 @@ fn remote_config(name: &str) -> Result<RemoteConfig, String> {
     cfg.remote(name).cloned().ok_or_else(|| {
         let known: Vec<&str> = cfg.remote.iter().map(|r| r.name.as_str()).collect();
         if known.is_empty() {
-            format!(
-                "no remote named {name:?} (add one with `thurm remote add {name} <ssh-target>`)"
-            )
+            format!("no remote named {name:?} (add one with `thurm remote add {name} <address>`)")
         } else {
             format!(
                 "no remote named {name:?} (configured: {})",
@@ -119,9 +118,10 @@ fn local_bins() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
-/// Tells the app (through the local daemon) that the config changed.
-fn reload_app() {
-    if let Ok(c) = Client::connect(
+/// Tells the app (through the local daemon) that the config changed. Returns whether a Thurm
+/// window is open to pick it up.
+fn reload_app() -> bool {
+    match Client::connect(
         ConnectOptions {
             client_name: "thurm-cli",
             ..Default::default()
@@ -129,18 +129,44 @@ fn reload_app() {
         |_| {},
         || {},
     ) {
-        let _ = c.request(Request::ReloadConfig);
+        Ok(c) => {
+            let _ = c.request(Request::ReloadConfig);
+            c.request(Request::CheckUi).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
+/// The last thing `remote add` says: where the new host shows up.
+fn added_sentence(name: &str, app_open: bool) -> String {
+    if app_open {
+        format!(
+            "Thurm connects to {name} now, and opens a workspace on it in the sidebar once it is \
+             connected."
+        )
+    } else {
+        format!(
+            "Thurm connects to {name} when it next opens, and opens a workspace on it in the \
+             sidebar then."
+        )
     }
 }
 
 pub struct AddOptions {
     pub name: String,
-    pub target: String,
+    /// `user@host`, an ssh `Host` alias, `ssh://…`, a `*.ts.net` name, or a `wss://` or `ws://`
+    /// address. With `--tailnet`, the ssh target.
+    pub address: String,
     pub socket: Option<String>,
     /// `--tailnet`: `Some("")` without a value (the target is the peer's name).
     pub tailnet: Option<String>,
     /// Answer every question (`--yes` / `--no`), for scripts.
     pub assume: Option<bool>,
+}
+
+/// An add that failed: its sentence, then what was said.
+fn failed(e: AddError) -> Box<dyn std::error::Error> {
+    e.with_detail().into()
 }
 
 pub fn add(o: AddOptions) -> R {
@@ -150,71 +176,141 @@ pub fn add(o: AddOptions) -> R {
         return Err(format!("a remote named {:?} exists already", o.name).into());
     }
     if let Some(tailnet) = &o.tailnet {
-        return add_tailnet(&o, tailnet);
+        return add_tailnet(&o, tailnet, &cfg.remote);
     }
+    match add::parse_address(&o.address)? {
+        Address::Ssh(target) => add_ssh(&o, &target, &cfg.remote),
+        Address::Tailnet(address) => add_tailnet_only(&o, &address, &cfg.remote),
+    }
+}
+
+/// `thurm remote add NAME user@host`: over ssh, with the install offer and the doctor.
+fn add_ssh(o: &AddOptions, target: &str, saved: &[RemoteConfig]) -> R {
     thurm_remote::ssh::prepare_dir()?;
-    let ssh = Ssh::new(&o.target)?;
-    println!("Connecting to {} …", o.target);
-    let effective = ssh.effective_config()?;
+    let ssh = Ssh::new(target)?;
+    let classify = |e: thurm_remote::SshError| failed(add::classify_ssh(target, &e));
+    println!("Connecting to {target} …");
+    let effective = ssh.effective_config().map_err(classify)?;
     thurm_remote::ssh::check_forwards(&effective)?;
-    let plan = install::plan(&ssh, o.socket.as_deref(), local_bins().as_deref())?;
+    let plan =
+        install::plan(&ssh, o.socket.as_deref(), local_bins().as_deref()).map_err(classify)?;
     let host = &plan.host;
     println!("{}: {} {}", o.name, host.os, host.arch);
-    install_flow(&ssh, &o.name, o.socket.as_deref(), plan.clone(), o.assume)?;
+    let mut candidate = Candidate {
+        ssh_target: Some(target.to_owned()),
+        tailnet: None,
+        daemon_id: host.info.as_ref().and_then(|i| i.daemon_id.clone()),
+    };
+    // Before installing anything on a host that would be refused.
+    add::check_new(&o.name, &candidate, saved).map_err(failed)?;
+    let installed = install_flow(&ssh, &o.name, o.socket.as_deref(), plan.clone(), o.assume)?;
+    if candidate.daemon_id.is_none() {
+        candidate.daemon_id = installed.and_then(|i| i.daemon_id);
+        add::check_new(&o.name, &candidate, saved).map_err(failed)?;
+    }
 
     let entry = RemoteConfig {
         name: o.name.clone(),
-        host: o.target.clone(),
+        host: target.to_owned(),
         socket: o.socket.clone(),
         enabled: true,
         clipboard_read: ClipboardRead::Ask,
         tailnet: None,
         forward_links: true,
+        daemon_id: candidate.daemon_id,
     };
     let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
     println!("Added [[remote]] {} to {}", o.name, file.display());
+    mark_added(&o.name);
 
     // The rest the host needs (lingering, PATH, agents, hooks), fixed where you agree.
     let report = doctor::run(&ssh, &o.name, o.socket.as_deref(), local_bins().as_deref())?;
-    print_report(&o.name, &o.target, &report);
+    print_report(&o.name, target, &report);
     if !settled(&report) {
         fix_flow(&ssh, &o.name, o.socket.as_deref(), &report, o.assume)?;
     }
-    reload_app();
-    println!(
-        "Thurm connects to {} now; it shows as a workspace in the sidebar.",
-        o.name
-    );
+    println!("{}", added_sentence(&o.name, reload_app()));
     Ok(ExitCode::SUCCESS)
 }
 
-/// `thurm remote add NAME TARGET --tailnet [PEER|URL]`: checks the daemon answers over the
-/// tailnet and writes the entry. Installing and the doctor stay ssh's (`thurm remote install`).
-fn add_tailnet(o: &AddOptions, tailnet: &str) -> R {
-    let value = if tailnet.is_empty() {
-        thurm_remote::tailnet::peer_name(&o.target)
-    } else {
-        tailnet
-    };
-    Ssh::new(&o.target)?;
-    println!("Connecting to {value} over the tailnet …");
+/// The app opens a first workspace on the host once it connects (see
+/// [`thurm_config::remote_added_path`]).
+fn mark_added(name: &str) {
+    if let Err(e) = thurm_config::mark_remote_added(name) {
+        eprintln!("thurm: {name} gets no workspace of its own when it connects: {e}");
+    }
+}
+
+/// `thurm remote add NAME bastion.tail1234.ts.net` (or a `wss://` or `ws://` address): a daemon
+/// serving on the tailnet, with no ssh target.
+fn add_tailnet_only(o: &AddOptions, address: &str, saved: &[RemoteConfig]) -> R {
+    println!("Connecting to {address} over the tailnet …");
     let checked = thurm_remote::tailnet::check(
-        value,
+        address,
         &thurm_config::tailnet_dial_socket_path(),
         thurm_remote::tailnet::CONNECT_TIMEOUT,
-    )?;
+    )
+    .map_err(|e| failed(add::classify_tailnet(address, e)))?;
     println!("{}: {} ({})", o.name, checked.url, checked.via.label());
+    // Without ssh, nothing here can install a build it could talk to.
+    if let Some(e) = add::protocol_problem(address, checked.protocol, &checked.build) {
+        return Err(failed(e));
+    }
+    let candidate = add::tailnet_candidate(&checked);
+    add::check_new(&o.name, &candidate, saved).map_err(failed)?;
     let entry = RemoteConfig {
         name: o.name.clone(),
-        host: o.target.clone(),
+        host: String::new(),
         socket: o.socket.clone(),
         enabled: true,
         clipboard_read: ClipboardRead::Ask,
         tailnet: Some(checked.url.clone()),
         forward_links: true,
+        daemon_id: candidate.daemon_id,
     };
     let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
     println!("Added [[remote]] {} to {}", o.name, file.display());
+    mark_added(&o.name);
+    println!("{}", added_sentence(&o.name, reload_app()));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `thurm remote add NAME TARGET --tailnet [PEER|URL]`: checks the daemon answers over the
+/// tailnet and writes the entry. Installing and the doctor stay ssh's (`thurm remote install`).
+fn add_tailnet(o: &AddOptions, tailnet: &str, saved: &[RemoteConfig]) -> R {
+    let target = o.address.trim();
+    let value = if tailnet.is_empty() {
+        thurm_remote::tailnet::peer_name(target)
+    } else {
+        tailnet
+    };
+    Ssh::new(target)?;
+    println!("Connecting to {value} over the tailnet …");
+    let checked = thurm_remote::tailnet::check(
+        value,
+        &thurm_config::tailnet_dial_socket_path(),
+        thurm_remote::tailnet::CONNECT_TIMEOUT,
+    )
+    .map_err(|e| failed(add::classify_tailnet(value, e)))?;
+    println!("{}: {} ({})", o.name, checked.url, checked.via.label());
+    let candidate = Candidate {
+        ssh_target: Some(target.to_owned()),
+        ..add::tailnet_candidate(&checked)
+    };
+    add::check_new(&o.name, &candidate, saved).map_err(failed)?;
+    let entry = RemoteConfig {
+        name: o.name.clone(),
+        host: target.to_owned(),
+        socket: o.socket.clone(),
+        enabled: true,
+        clipboard_read: ClipboardRead::Ask,
+        tailnet: Some(checked.url.clone()),
+        forward_links: true,
+        daemon_id: candidate.daemon_id,
+    };
+    let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
+    println!("Added [[remote]] {} to {}", o.name, file.display());
+    mark_added(&o.name);
     if checked.protocol != thurm_proto::PROTOCOL_VERSION || checked.build.is_empty() {
         println!(
             "note: its daemon speaks protocol {}, this Thurm {}: install this build there \
@@ -224,12 +320,30 @@ fn add_tailnet(o: &AddOptions, tailnet: &str) -> R {
             o.name
         );
     }
-    reload_app();
-    println!(
-        "Thurm connects to {} now; it shows as a workspace in the sidebar.",
-        o.name
-    );
+    println!("{}", added_sentence(&o.name, reload_app()));
     Ok(ExitCode::SUCCESS)
+}
+
+/// `thurm remote edit NAME --ssh TARGET`: gives the host an ssh target (a host added over the
+/// tailnet has none), or another one.
+pub fn edit(name: &str, ssh: &str) -> R {
+    remote_config(name)?;
+    let target = ssh.trim();
+    Ssh::new(target)?;
+    let literal = serde_json::to_string(target)?;
+    thurm_config::edit_remotes(|text| {
+        thurm_config::with_remote_setting(text, name, "host", &literal)
+    })?;
+    reload_app();
+    println!("{name}'s ssh target is {target}.");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The host's ssh target, or its tailnet address when it has none.
+fn host_label(r: &RemoteConfig) -> &str {
+    r.ssh_target()
+        .or(r.tailnet.as_deref())
+        .unwrap_or("no address")
 }
 
 /// How a host is reached, for lists.
@@ -244,14 +358,16 @@ fn transport_label(r: &RemoteConfig, s: Option<&Status>) -> String {
     }
 }
 
-/// Offers to install our build (and replace the daemon) when the host needs it.
+/// Offers to install our build (and replace the daemon) when the host needs it. Returns what was
+/// installed.
 fn install_flow(
     ssh: &Ssh,
     name: &str,
     socket: Option<&str>,
     plan: install::Plan,
     assume: Option<bool>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<ThurmInfo>, Box<dyn std::error::Error>> {
+    let mut installed = None;
     let host = &plan.host;
     if !plan.installed {
         let what = match &host.info {
@@ -300,6 +416,7 @@ fn install_flow(
         }
         let info: ThurmInfo = install::install(ssh, host, method, local_bins().as_deref())?;
         println!("Installed thurm {} on {name}.", info.build);
+        installed = Some(info);
     }
     if let Some(d) = &plan.daemon
         && d.running
@@ -330,7 +447,7 @@ fn install_flow(
             println!("{out}");
         }
     }
-    Ok(())
+    Ok(installed)
 }
 
 /// Nothing left to offer: every problem is fixed or has no fix at all.
@@ -486,7 +603,7 @@ pub fn doctor_cmd(name: Option<&str>, fix: bool, assume: Option<bool>, json: boo
         );
     }
     if names.is_empty() {
-        println!("no remotes (add one with `thurm remote add <name> <ssh-target>`)");
+        println!("no remotes (add one with `thurm remote add <name> <address>`)");
         return Ok(ExitCode::SUCCESS);
     }
     thurm_remote::ssh::prepare_dir()?;
@@ -494,7 +611,22 @@ pub fn doctor_cmd(name: Option<&str>, fix: bool, assume: Option<bool>, json: boo
     let mut reports = Vec::new();
     for (i, n) in names.iter().enumerate() {
         let r = remote_config(n)?;
-        let ssh = Ssh::new(&r.host)?;
+        let ssh = match thurm_remote::ssh_for(&r) {
+            Ok(ssh) => ssh,
+            // Asked for by name: that host can't be checked. Among all of them: it is skipped.
+            Err(e) if name.is_some() => return Err(e.into()),
+            Err(e) => {
+                if json {
+                    reports.push(serde_json::json!({"name": n, "skipped": e}));
+                } else {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!("{n} ({})\n  - {e}", host_label(&r));
+                }
+                continue;
+            }
+        };
         let mut report = match doctor::run(&ssh, n, r.socket.as_deref(), local_bins().as_deref()) {
             Ok(rep) => rep,
             Err(e) => {
@@ -502,7 +634,7 @@ pub fn doctor_cmd(name: Option<&str>, fix: bool, assume: Option<bool>, json: boo
                 if json {
                     reports.push(serde_json::json!({"name": n, "error": e.to_string()}));
                 } else {
-                    println!("{n} ({})\n  ✗ ssh  {e}", r.host);
+                    println!("{n} ({})\n  ✗ ssh  {e}", host_label(&r));
                 }
                 continue;
             }
@@ -515,7 +647,7 @@ pub fn doctor_cmd(name: Option<&str>, fix: bool, assume: Option<bool>, json: boo
         if i > 0 {
             println!();
         }
-        print_report(n, &r.host, &report);
+        print_report(n, &ssh.target, &report);
         if fix && !settled(&report) {
             println!();
             report = fix_flow(&ssh, n, r.socket.as_deref(), &report, assume)?;
@@ -537,8 +669,8 @@ pub fn doctor_cmd(name: Option<&str>, fix: bool, assume: Option<bool>, json: boo
 
 pub fn install_cmd(name: &str, assume: Option<bool>) -> R {
     let r = remote_config(name)?;
+    let ssh = thurm_remote::ssh_for(&r)?;
     thurm_remote::ssh::prepare_dir()?;
-    let ssh = Ssh::new(&r.host)?;
     let plan = install::plan(&ssh, r.socket.as_deref(), local_bins().as_deref())?;
     install_flow(&ssh, name, r.socket.as_deref(), plan, assume)?;
     reload_app();
@@ -547,6 +679,7 @@ pub fn install_cmd(name: &str, assume: Option<bool>) -> R {
 
 pub fn remove(name: &str) -> R {
     thurm_config::edit_remotes(|text| thurm_config::with_remote_removed(text, name))?;
+    thurm_config::take_remote_added(name);
     reload_app();
     println!("Removed remote {name}. Its daemon and panes keep running there.");
     Ok(ExitCode::SUCCESS)
@@ -574,7 +707,7 @@ pub fn list(json: bool) -> R {
         return Ok(ExitCode::SUCCESS);
     }
     if rows.is_empty() {
-        println!("no remotes (add one with `thurm remote add <name> <ssh-target>`)");
+        println!("no remotes (add one with `thurm remote add <name> <address>`)");
         return Ok(ExitCode::SUCCESS);
     }
     println!(
@@ -591,7 +724,10 @@ pub fn list(json: bool) -> R {
         let build = s.and_then(|s| s.remote_build).unwrap_or_default();
         println!(
             "{:<16} {:<32} {:<15} {:<16} {build}",
-            r.name, r.host, via, state
+            r.name,
+            r.ssh_target().unwrap_or("-"),
+            via,
+            state
         );
     }
     Ok(ExitCode::SUCCESS)
@@ -610,7 +746,7 @@ pub fn status(name: Option<&str>, json: bool) -> R {
         );
         return Ok(ExitCode::SUCCESS);
     }
-    println!("{} ({})", r.name, r.host);
+    println!("{} ({})", r.name, host_label(&r));
     if let Some(url) = &r.tailnet {
         println!("  via:      {} {url}", transport_label(&r, s.as_ref()));
     }
@@ -700,7 +836,7 @@ pub fn handoff_cmd(o: HandoffOptions, json: bool) -> R {
         let r = remote_config(&h.host)?;
         let host = SshHost {
             name: r.name.clone(),
-            ssh: Ssh::new(&r.host)?,
+            ssh: thurm_remote::ssh_for(&r)?,
         };
         if o.cleanup.is_some() {
             let out = handoff::cleanup(&host, &mut h, o.force);
@@ -725,15 +861,15 @@ pub fn handoff_cmd(o: HandoffOptions, json: bool) -> R {
 
     let name = o.remote.ok_or("which host? pass --remote NAME")?;
     let r = remote_config(&name)?;
+    let host = SshHost {
+        name: r.name.clone(),
+        ssh: thurm_remote::ssh_for(&r)?,
+    };
     // The agent's tab opens through the app: it must be connected.
     let client = connect_remote(&name)?;
     let path = match o.path {
         Some(p) => p,
         None => std::env::current_dir()?,
-    };
-    let host = SshHost {
-        name: r.name.clone(),
-        ssh: Ssh::new(&r.host)?,
     };
     // Recorded as soon as the worktree exists on the host: findable for --fetch and
     // --cleanup even when its pane never starts.
@@ -963,7 +1099,11 @@ pub fn forward_cmd(name: &str, target: &str, local: Option<u16>, open: bool, jso
 
 /// `thurm remote-info` (hidden): what the app's install check reads over ssh.
 pub fn remote_info() -> R {
-    println!("{}", serde_json::to_string(&ThurmInfo::current())?);
+    let info = ThurmInfo {
+        daemon_id: thurm_config::daemon_id().ok(),
+        ..ThurmInfo::current()
+    };
+    println!("{}", serde_json::to_string(&info)?);
     Ok(ExitCode::SUCCESS)
 }
 

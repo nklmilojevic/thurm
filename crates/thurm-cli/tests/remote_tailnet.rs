@@ -148,3 +148,154 @@ fn the_dial_socket_commands_refuse_remote() {
         assert!(text(&out).contains("drop --remote"), "{}", text(&out));
     }
 }
+
+#[test]
+fn a_tailnet_address_adds_a_host_with_no_ssh_target() {
+    let w = World::new("f");
+    let port = stand_in_host(&w);
+    let address = format!("ws://127.0.0.1:{port}");
+    let out = w.thurm(&["remote", "add", "bastion", &address]);
+    assert!(out.status.success(), "{}", text(&out));
+    let cfg = thurm_config::Config::parse(&w.config()).unwrap();
+    let r = cfg.remote("bastion").unwrap();
+    assert_eq!(r.ssh_target(), None, "{}", w.config());
+    let config = w.config();
+    let entry: Vec<&str> = config
+        .rsplit("\n[[remote]]\n")
+        .next()
+        .unwrap()
+        .lines()
+        .take_while(|l| !l.starts_with('#'))
+        .collect();
+    let entry = entry.join("\n");
+    assert!(!entry.contains("host"), "{entry}");
+    assert_eq!(
+        r.tailnet.as_deref(),
+        Some(format!("{address}/v1/connect").as_str())
+    );
+    assert_eq!(r.daemon_id.as_deref(), Some(fakes::FAKE_DAEMON_ID));
+    // The app opens a workspace on it once it connects; no app runs here, and it says so.
+    assert!(w.path("remote/bastion.added").exists());
+    assert!(
+        text(&out).contains("when it next opens, and opens a workspace on it"),
+        "{}",
+        text(&out)
+    );
+
+    // What needs ssh says the host has none, and how to give it one.
+    for args in [
+        &["remote", "install", "bastion", "--yes"][..],
+        &["remote", "doctor", "bastion"][..],
+        &["handoff", "--remote", "bastion"][..],
+    ] {
+        let out = w.thurm(args);
+        assert!(!out.status.success(), "{args:?}: {}", text(&out));
+        let said = text(&out);
+        assert!(
+            said.contains("bastion has no ssh target")
+                && said.contains("thurm remote edit bastion --ssh"),
+            "{args:?}: {said}"
+        );
+    }
+    // Among every host, the doctor skips it.
+    let all = w.thurm(&["remote", "doctor"]);
+    assert!(text(&all).contains("has no ssh target"), "{}", text(&all));
+    let list = text(&w.thurm(&["remote", "list"]));
+    assert!(
+        list.contains("bastion") && list.contains("tailnet"),
+        "{list}"
+    );
+
+    // Given an ssh target, it keeps its tailnet address.
+    let out = w.thurm(&["remote", "edit", "bastion", "--ssh", "me@bastion"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let cfg = thurm_config::Config::parse(&w.config()).unwrap();
+    let r = cfg.remote("bastion").unwrap();
+    assert_eq!(r.ssh_target(), Some("me@bastion"));
+    assert!(r.tailnet.is_some());
+    let bad = w.thurm(&["remote", "edit", "bastion", "--ssh", "-oProxyCommand=x"]);
+    assert!(!bad.status.success());
+
+    // Removing it forgets that it was just added.
+    let out = w.thurm(&["remote", "remove", "bastion"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!w.path("remote/bastion.added").exists());
+}
+
+#[test]
+fn the_same_daemon_is_not_added_under_a_second_name() {
+    let w = World::new("g");
+    let port = stand_in_host(&w);
+    let out = w.thurm(&["remote", "add", "one", &format!("ws://127.0.0.1:{port}")]);
+    assert!(out.status.success(), "{}", text(&out));
+    let before = w.config();
+    // Another spelling of the address: told apart by the daemon's identifier.
+    let out = w.thurm(&["remote", "add", "two", &format!("ws://bastion:{port}")]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("two is the same host as one; use one."),
+        "{}",
+        text(&out)
+    );
+    // With an ssh target as well (--tailnet), it is still the same daemon.
+    let out = w.thurm(&[
+        "remote",
+        "add",
+        "three",
+        "me@elsewhere",
+        "--tailnet",
+        &format!("ws://127.0.0.1:{port}"),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("three is the same host as one"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(w.config(), before);
+}
+
+#[test]
+fn unreachable_and_ambiguous_addresses_are_not_added() {
+    let w = World::new("h");
+    // The stand-in tailnet has no such machine.
+    let out = w.thurm(&["remote", "add", "nobody", "nobody.tail1234.ts.net"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("There is no machine named nobody.tail1234.ts.net on your tailnet."),
+        "{}",
+        text(&out)
+    );
+    // Nothing listens there.
+    let free = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let out = w.thurm(&["remote", "add", "gone", &format!("ws://127.0.0.1:{free}")]);
+    assert!(!out.status.success(), "{}", text(&out));
+    let out = w.thurm(&["remote", "add", "port", "devbox:2222"]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("ssh://devbox:2222"), "{}", text(&out));
+    assert!(!w.config().contains("[[remote]]"), "{}", w.config());
+}
+
+#[test]
+fn remote_info_says_the_daemon_identifier() {
+    let w = World::new("i");
+    let info = |w: &World| -> serde_json::Value {
+        let out = w.thurm(&["remote-info"]);
+        assert!(out.status.success(), "{}", text(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let first = info(&w);
+    let id = first["daemon_id"].as_str().unwrap().to_owned();
+    assert_eq!(id.len(), 32);
+    assert_eq!(info(&w)["daemon_id"], id.as_str());
+    assert_eq!(
+        std::fs::read_to_string(w.path("state/daemon-id"))
+            .unwrap()
+            .trim(),
+        id
+    );
+}
