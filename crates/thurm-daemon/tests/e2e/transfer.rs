@@ -251,12 +251,15 @@ fn names_are_cleaned_and_kept_apart() {
 #[test]
 fn an_upload_that_would_fill_the_disk_is_refused() {
     let env = Env::new("transfer-full");
-    let _daemon = env.start_with(&[("THURM_TRANSFER_FREE_BYTES", Path::new("1073741900"))]);
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_FREE_BYTES", Path::new("1073741900")),
+        ("THURM_TRANSFER_BLOCK", Path::new("1")),
+    ]);
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     let pane = cat_pane(&c, &dir);
-    // 1 GiB must stay free: 76 bytes fit, 77 don't.
-    c.upload_begin(pane, "fits", 76, None).unwrap();
+    // 1 GiB must stay free, and the directories count (a byte each here): 74 bytes fit.
+    c.upload_begin(pane, "fits", 74, None).unwrap();
     let e = c.upload_begin(pane, "too-much", 1000, None).unwrap_err();
     assert!(e.to_string().contains("free space"), "{e}");
     let e = c.upload_begin(pane, "huge", 5 << 30, None).unwrap_err();
@@ -369,7 +372,10 @@ fn a_file_changed_after_it_was_asked_for_is_not_sent() {
 #[test]
 fn kept_uploads_stay_within_the_limit_batch_and_all() {
     let env = Env::new("transfer-kept");
-    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_KEPT", Path::new("10"))]);
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_MAX_KEPT", Path::new("10")),
+        ("THURM_TRANSFER_BLOCK", Path::new("1")),
+    ]);
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     let pane = cat_pane(&c, &dir);
@@ -409,7 +415,7 @@ fn kept_uploads_stay_within_the_limit_batch_and_all() {
     drop(first_file);
     // Beside the 6 bytes of "c", still open, a batch that fits whole goes.
     let readers: Vec<StreamReader> = (0..2)
-        .map(|i| send(&env, &c, pane, ("d", i, 2), "d.txt", 2, b"dd"))
+        .map(|i| send(&env, &c, pane, ("d", i, 2), "d.txt", 1, b"d"))
         .collect();
     for r in readers {
         r.wait_closed().unwrap();
@@ -458,7 +464,10 @@ fn cancelling_after_the_last_bytes_drops_the_batch() {
 #[test]
 fn a_refused_upload_deletes_nothing_kept() {
     let env = Env::new("transfer-refused-keeps");
-    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_KEPT", Path::new("10"))]);
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_MAX_KEPT", Path::new("10")),
+        ("THURM_TRANSFER_BLOCK", Path::new("1")),
+    ]);
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     let pane = cat_pane(&c, &dir);
@@ -470,13 +479,14 @@ fn a_refused_upload_deletes_nothing_kept() {
     let e = c.upload_begin(pane, "big.txt", 11, None).unwrap_err();
     assert!(e.to_string().contains("does not fit"), "{e}");
     assert!(kept.join("a.txt").exists());
-    // The same for a batch whose files together can never fit.
-    let first = send(&env, &c, pane, ("b", 0, 2), "b1.txt", 6, b"bbbbbb");
+    // The same for a batch whose files together can never fit (a byte a directory here: the
+    // kept drop takes 6 with its two).
+    let first = send(&env, &c, pane, ("b", 0, 2), "b1.txt", 3, b"bbb");
     let e = c
         .upload_begin(
             pane,
             "b2.txt",
-            6,
+            7,
             Some(UploadBatch {
                 id: "b".into(),
                 index: 1,
@@ -574,11 +584,15 @@ fn a_batch_whose_sender_went_before_its_paste_types_nothing() {
 #[test]
 fn a_reservation_refused_for_its_batch_deletes_nothing_kept() {
     let env = Env::new("transfer-dup-keeps");
-    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_KEPT", Path::new("10"))]);
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_MAX_KEPT", Path::new("10")),
+        ("THURM_TRANSFER_BLOCK", Path::new("1")),
+    ]);
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     let pane = cat_pane(&c, &dir);
-    send(&env, &c, pane, ("a", 0, 1), "a.txt", 7, b"aaaaaaa")
+    // 5 bytes and two directories of a byte each here: 7 kept.
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 5, b"aaaaa")
         .wait_closed()
         .unwrap();
     let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
@@ -606,7 +620,10 @@ fn a_kept_drop_that_cannot_be_deleted_still_counts() {
         return;
     }
     let env = Env::new("transfer-undeletable");
-    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_KEPT", Path::new("10"))]);
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_MAX_KEPT", Path::new("10")),
+        ("THURM_TRANSFER_BLOCK", Path::new("1")),
+    ]);
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     let pane = cat_pane(&c, &dir);
@@ -670,7 +687,10 @@ fn kept_uploads_expire_without_another_upload() {
 fn kept_drops_make_room_for_the_free_space_floor() {
     let env = Env::new("transfer-floor");
     // 1 GiB must stay free; this disk has 10 bytes more than that with nothing kept.
-    let _daemon = env.start_with(&[("THURM_TRANSFER_FREE_BYTES", Path::new("1073741834"))]);
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_FREE_BYTES", Path::new("1073741834")),
+        ("THURM_TRANSFER_BLOCK", Path::new("1")),
+    ]);
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     let pane = cat_pane(&c, &dir);
@@ -731,4 +751,87 @@ fn a_failed_batch_stops_its_writers_and_leaves_nothing() {
     eventually(5, "the failed batch was kept", || {
         batches(&env, pane).is_empty()
     });
+}
+
+#[test]
+fn empty_files_count_against_what_is_kept() {
+    let env = Env::new("transfer-empty");
+    // Room for two kept drops of an empty file: a block for it and for each of its two
+    // directories, 4 KiB each.
+    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_KEPT", Path::new("24576"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    for i in 0..6 {
+        send(&env, &c, pane, (&format!("e{i}"), 0, 1), "empty", 0, b"")
+            .wait_closed()
+            .unwrap();
+        assert!(batches(&env, pane).len() <= 2, "{:?}", batches(&env, pane));
+    }
+}
+
+#[test]
+fn an_upload_leaves_the_disk_files_to_spare() {
+    let env = Env::new("transfer-inodes");
+    // 10 000 files must stay; this disk takes 7 more with nothing kept.
+    let _daemon = env.start_with(&[("THURM_TRANSFER_FREE_FILES", Path::new("10007"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 1, b"a")
+        .wait_closed()
+        .unwrap();
+    // The first took four (its pane's and batch's directories, the parts one, the file).
+    let e = c.upload_begin(pane, "b.txt", 1, None).unwrap_err();
+    assert!(e.to_string().contains("too few more files"), "{e}");
+}
+
+#[test]
+fn batches_left_incomplete_are_capped() {
+    let env = Env::new("transfer-waiting");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    // The first file of each two-file batch, and never the second.
+    let mut held = Vec::new();
+    for i in 0..8 {
+        held.push(send(
+            &env,
+            &c,
+            pane,
+            (&format!("w{i}"), 0, 2),
+            "one",
+            1,
+            b"1",
+        ));
+    }
+    let e = c
+        .upload_begin(
+            pane,
+            "one",
+            1,
+            Some(UploadBatch {
+                id: "w8".into(),
+                index: 0,
+                count: 2,
+            }),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("not complete yet"), "{e}");
+    // The open ones go on, and another app is not held up.
+    c.upload_begin(
+        pane,
+        "two",
+        1,
+        Some(UploadBatch {
+            id: "w0".into(),
+            index: 1,
+            count: 2,
+        }),
+    )
+    .unwrap();
+    let (other, _orx) = env.connect();
+    other.upload_begin(pane, "x", 1, None).unwrap();
+    drop(held);
 }

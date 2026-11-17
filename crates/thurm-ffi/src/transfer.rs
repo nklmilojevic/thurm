@@ -111,7 +111,8 @@ fn host_of(c: &thurm_client) -> Result<(std::sync::Arc<::thurm_client::Client>, 
 
 /// Sends files to `pane`'s host as one batch: `files_json` is an array of `{"path": ...}`,
 /// with `"name"` to send one under another name. Returns the transfer's id (for
-/// `thurm_upload_cancel`), or 0 when it could not start; either way `cb` hears the end.
+/// `thurm_upload_cancel`), or 0 when it could not start; either way `cb` hears the end: on the
+/// transfer's thread, or for a 0, on the calling thread before this returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_upload(
     client: *mut thurm_client,
@@ -165,7 +166,8 @@ pub extern "C" fn thurm_upload_cancel(id: u64) {
 /// Fetches the file at `path` (as `pane` sees it) into `dest`. With `if_version` (or NULL)
 /// still the file's version, writes nothing (`"not_modified": true`). A file over `max_bytes`
 /// (0 for no limit) is refused. The final callback carries `"info"`: the file's `name`, `path`,
-/// `size`, `modified` and `version`. Returns the transfer's id, or 0.
+/// `size`, `modified` and `version`. Returns the transfer's id, or 0 when it could not start
+/// (the final callback then came on the calling thread, before this returns).
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn thurm_download(
@@ -229,7 +231,9 @@ pub unsafe extern "C" fn thurm_download(
     })
 }
 
-/// Stops download `id`; nothing is left at its destination.
+/// Stops download `id` while under way: what it wrote beside its destination is deleted, and a
+/// file already at the destination is left as it was. A download already moved into place
+/// stays; the final callback says so.
 #[unsafe(no_mangle)]
 pub extern "C" fn thurm_download_cancel(id: u64) {
     cancel(id);

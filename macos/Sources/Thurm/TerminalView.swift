@@ -80,8 +80,7 @@ final class TerminalView: NSView, NSTextInputClient {
         // A remote file stays in the cache while Quick Look shows it.
         didSet {
             guard previewURL != oldValue else { return }
-            if let oldValue { RemoteFileCache.shared.release(oldValue) }
-            if let previewURL { RemoteFileCache.shared.hold(previewURL) }
+            RemoteFileCache.shared.switchHeld(from: oldValue, to: previewURL)
         }
     }
     private weak var previewPanel: QLPreviewPanel?
@@ -139,6 +138,18 @@ final class TerminalView: NSView, NSTextInputClient {
         frameLink?.invalidate()
         blinkTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
+        endTransfers()
+        if let previewURL { RemoteFileCache.shared.release(previewURL) }
+    }
+
+    /// The pane's view is going: transfers under way are cancelled (their ends clean up after
+    /// them), and batches still waiting are dropped with the images made for them.
+    private func endTransfers() {
+        for waiting in uploadQueue {
+            if let owned = waiting.owned { try? FileManager.default.removeItem(at: owned) }
+        }
+        uploadQueue.removeAll()
+        for transfer in transfers { transfer.cancel() }
     }
 
     // MARK: Layer
@@ -1394,6 +1405,22 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Whether this pane's host takes files (tests set it).
     var transfersFiles: Bool?
 
+    /// Asks whether to send pasted files to the host (tests answer for the user).
+    var confirmSend: (([URL], HostId) -> Bool)?
+
+    /// "Send 2 files to devbox?", naming them.
+    static func askToSend(_ urls: [URL], _ host: HostId) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = urls.count == 1 ? "Send \(urls[0].lastPathComponent) to \(host)?"
+            : "Send \(urls.count) files to \(host)?"
+        let shown = urls.prefix(8).map(\.path).joined(separator: "\n")
+        alert.informativeText = shown + (urls.count > 8 ? "\n…" : "")
+            + "\n\nThe files on the pasteboard are copied to the host and their paths there typed."
+        alert.addButton(withTitle: "Send")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
     /// Starts an upload (`Core.startUpload`; tests stand in for it).
     var uploader: Core.UploadStarter = Core.startUpload
 
@@ -1403,10 +1430,17 @@ final class TerminalView: NSView, NSTextInputClient {
 
     func paste(from pb: NSPasteboard) {
         if isOffline { return }
-        // Files and images copied here go to a remote pane's host as files.
+        // Files and images copied here go to a remote pane's host as files. Files only once
+        // asked: a paste names them less plainly than a drop does, and any app can put a file's
+        // address on the pasteboard.
         if hostTakesFiles {
             switch Self.uploadPlan(pb, pasting: true) {
             case .none: break
+            case .files(let urls):
+                if (confirmSend ?? Self.askToSend)(urls, pane.host) {
+                    startUpload(.files(urls), from: pb)
+                }
+                return
             case let plan: return startUpload(plan, from: pb)
             }
         }

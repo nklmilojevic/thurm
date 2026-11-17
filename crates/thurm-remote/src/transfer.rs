@@ -5,6 +5,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -241,7 +242,7 @@ pub fn upload(
     // The last file's stream, sent and finished: kept until the next one opens, so a failure
     // to start that one can still end the batch on the daemon (an aborted stream does; a
     // closed one does not, as the earlier files' streams close).
-    let mut last: Option<(StreamReader, StreamWriter)> = None;
+    let mut last: Option<(StreamReader, StreamWriter, UnixStream)> = None;
     for (index, planned) in planned.iter().enumerate() {
         let next = open_planned(planned).and_then(|source| {
             host.client
@@ -259,11 +260,11 @@ pub fn upload(
                 .and_then(|ticket| open_watched(host.socket, &ticket.ticket, cancel))
                 .map(|opened| (source, opened))
         });
-        let (mut source, (reader, mut writer, watch)) = match next {
+        let (mut source, (reader, mut writer, watch, handle)) = match next {
             Ok(next) => next,
             Err(e) => {
-                if let Some((_, w)) = last.take() {
-                    let _ = w.close(StreamClose::Aborted);
+                if let Some((_, w, handle)) = last.take() {
+                    abort(w, &handle);
                 }
                 return Err(e);
             }
@@ -276,10 +277,10 @@ pub fn upload(
         })?;
         // Every stream of the batch closes with the same outcome: waiting on the last one is
         // enough, and the others need no connection meanwhile.
-        last = Some((reader, writer));
+        last = Some((reader, writer, handle));
     }
-    let (reader, writer) = last.expect("at least one file");
-    wait_cancellable(reader, writer, cancel)
+    let (reader, writer, handle) = last.expect("at least one file");
+    wait_cancellable(reader, writer, handle, cancel)
 }
 
 /// Opens the stream `ticket` reserved, with a watch that cuts its connection once `cancel` is
@@ -288,16 +289,33 @@ fn open_watched(
     socket: &Path,
     ticket: &str,
     cancel: &Cancel,
-) -> Result<(StreamReader, StreamWriter, CancelWatch), TransferError> {
+) -> Result<(StreamReader, StreamWriter, CancelWatch, UnixStream), TransferError> {
     let conn =
         thurm_client::connect_daemon(socket).map_err(|e| ClientError::Connect(e.to_string()))?;
-    let shutdown = conn
-        .try_clone()
-        .map_err(|e| TransferError::Local(format!("cannot watch the transfer: {e}")))?;
+    let clone = || {
+        conn.try_clone()
+            .map_err(|e| TransferError::Local(format!("cannot watch the transfer: {e}")))
+    };
+    let (shutdown, handle) = (clone()?, clone()?);
     let (reader, writer) = stream::open_on(conn, ticket)?;
     let watch = CancelWatch::start(cancel.clone(), shutdown)
         .map_err(|e| TransferError::Local(format!("cannot watch the transfer for Cancel: {e}")))?;
-    Ok((reader, writer, watch))
+    Ok((reader, writer, watch, handle))
+}
+
+/// How long an abort may wait for a host that stopped reading before the connection is cut.
+const ABORT_WRITE: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long, once aborted, the daemon's answer is waited for.
+const ABORT_ANSWER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Aborts a stream (`Close(Aborted)`, which ends its batch on the daemon), without waiting on a
+/// host that stopped reading: if the frame cannot go out soon, the connection (`handle`, the
+/// stream's socket) is cut, which ends the batch all the same.
+fn abort(writer: StreamWriter, handle: &UnixStream) {
+    let _ = handle.set_write_timeout(Some(ABORT_WRITE));
+    if writer.close(StreamClose::Aborted).is_err() {
+        let _ = handle.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 /// Waits for the batch's outcome on its last stream, everything sent. A cancel meanwhile
@@ -306,6 +324,7 @@ fn open_watched(
 fn wait_cancellable(
     reader: StreamReader,
     writer: StreamWriter,
+    handle: UnixStream,
     cancel: &Cancel,
 ) -> Result<(), TransferError> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -316,6 +335,7 @@ fn wait_cancellable(
         })
         .map_err(|e| TransferError::Local(format!("cannot wait for the upload: {e}")))?;
     let mut writer = Some(writer);
+    let mut aborted: Option<std::time::Instant> = None;
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(Ok(())) => return Ok(()),
@@ -330,7 +350,13 @@ fn wait_cancellable(
                 if cancel.is_cancelled()
                     && let Some(w) = writer.take()
                 {
-                    let _ = w.close(StreamClose::Aborted);
+                    abort(w, &handle);
+                    aborted = Some(std::time::Instant::now());
+                }
+                // A host that takes the abort but never answers is not waited on for ever.
+                if aborted.is_some_and(|at| at.elapsed() > ABORT_ANSWER) {
+                    let _ = handle.shutdown(std::net::Shutdown::Both);
+                    return Err(TransferError::Cancelled);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -471,7 +497,7 @@ pub fn download(
         .as_deref()
         .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
     // A read blocks until the host sends; Cancel ends the connection under it.
-    let (mut reader, mut writer, _watch) = open_watched(host.socket, ticket, cancel)?;
+    let (mut reader, mut writer, _watch, _handle) = open_watched(host.socket, ticket, cancel)?;
     let (part, file) = create_part(dest)?;
     let received = receive(&mut reader, file, &part, info.size, cancel, &mut progress);
     if let Err(e) = received {
@@ -750,6 +776,7 @@ mod tests {
     fn cancelling_while_the_batch_waits_aborts_its_stream() {
         let (socket, daemon) =
             fake_daemon(StreamClose::Internal("the upload was cancelled".into()));
+        let handle = socket.try_clone().unwrap();
         let (reader, mut writer) = stream::open_on(socket, "ticket").unwrap();
         writer.write_all(b"all of it").unwrap();
         writer.finish().unwrap();
@@ -759,7 +786,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             later.cancel();
         });
-        let got = wait_cancellable(reader, writer, &cancel);
+        let got = wait_cancellable(reader, writer, handle, &cancel);
         assert!(matches!(got, Err(TransferError::Cancelled)), "{got:?}");
         assert_eq!(
             daemon.join().unwrap(),
@@ -775,11 +802,12 @@ mod tests {
     fn a_cancel_too_late_reports_what_the_daemon_did() {
         // The daemon was typing the paths already: it closes Ok, and the upload went.
         let (socket, daemon) = fake_daemon(StreamClose::Ok);
+        let handle = socket.try_clone().unwrap();
         let (reader, mut writer) = stream::open_on(socket, "ticket").unwrap();
         writer.finish().unwrap();
         let cancel = Cancel::default();
         cancel.cancel();
-        assert!(wait_cancellable(reader, writer, &cancel).is_ok());
+        assert!(wait_cancellable(reader, writer, handle, &cancel).is_ok());
         daemon.join().unwrap();
     }
 
@@ -959,6 +987,46 @@ mod tests {
         let got = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("writing the End stayed blocked after Cancel");
+        assert!(matches!(got, Err(TransferError::Cancelled)), "{got:?}");
+        let _ = release.send(());
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn cancel_while_waiting_ends_even_if_the_host_stopped_reading() {
+        // The host took everything up to the End, then reads and answers nothing.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (socket, daemon) = fake_daemon_then(move |r, _| {
+            while let Ok(Some(frame)) = thurm_proto::stream::read_frame(r) {
+                if frame == StreamFrame::End {
+                    break;
+                }
+            }
+            let _ = held.recv();
+            Vec::new()
+        });
+        let handle = socket.try_clone().unwrap();
+        let fill = socket.try_clone().unwrap();
+        let (reader, mut writer) = stream::open_on(socket, "ticket").unwrap();
+        writer.write_all(b"all of it").unwrap();
+        writer.finish().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        // Its side of the connection full: no abort frame can go out.
+        fill.set_nonblocking(true).unwrap();
+        let junk = vec![0u8; 64 * 1024];
+        while (&fill).write(&junk).is_ok() {}
+        fill.set_nonblocking(false).unwrap();
+        let cancel = Cancel::default();
+        let theirs = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(wait_cancellable(reader, writer, handle, &theirs));
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        cancel.cancel();
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Cancel stayed stuck on the abort");
         assert!(matches!(got, Err(TransferError::Cancelled)), "{got:?}");
         let _ = release.send(());
         daemon.join().unwrap();
