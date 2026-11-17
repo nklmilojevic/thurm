@@ -505,6 +505,49 @@ impl Forwards {
         Some(self.closed(e, why))
     }
 
+    /// Takes forwards `ids` out at once (no new connection, none listed) and stops them on a
+    /// thread of their own: for a caller that must not wait for their listeners (the app's
+    /// config sync, under its lock).
+    fn close_soon(&self, ids: &[u64], why: &'static str) {
+        let taken: Vec<Entry> = {
+            let mut g = self.inner.lock();
+            ids.iter().filter_map(|id| g.open.remove(id)).collect()
+        };
+        if taken.is_empty() {
+            return;
+        }
+        for e in &taken {
+            // Ended now, as a closed forward's are, even before its listeners stop.
+            e.stop.store(true, Ordering::Release);
+            for conn in e.conns.lock().values() {
+                let _ = conn.local.shutdown(Shutdown::Both);
+                if let Some(s) = &conn.stream {
+                    let _ = s.shutdown(Shutdown::Both);
+                }
+            }
+        }
+        let me = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("forward-close".into())
+            .spawn(move || {
+                for e in taken {
+                    me.closed(e, why);
+                }
+            });
+        if let Err(e) = spawned {
+            log::warn!("cannot close forwards in the background: {e}");
+        }
+    }
+
+    /// Whether a forward for `host` may open now: why not, if it may not (moving, connecting).
+    pub fn opens(&self, host: &str) -> Result<(), String> {
+        let g = self.inner.lock();
+        match g.refuses(host, g.epoch(host)) {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }
+    }
+
     /// Stops `e`, taken out of the open forwards, and reports it.
     fn closed(&self, e: Entry, why: &str) -> Forward {
         #[cfg(test)]
@@ -553,9 +596,7 @@ impl Forwards {
                 .map(|e| e.forward.id)
                 .collect()
         };
-        for id in ids {
-            self.close_why(id, "host");
-        }
+        self.close_soon(&ids, "host");
     }
 
     /// `host`, moved, reaches its new destination once its tunnel connects with `settings`
@@ -631,9 +672,7 @@ impl Forwards {
                 .map(|e| e.forward.id)
                 .collect()
         };
-        for id in ids {
-            self.close_why(id, "host");
-        }
+        self.close_soon(&ids, "host");
     }
 
     /// `host`'s pane `pane` listens on `ports` now (its whole list; `complete`: all of its
@@ -2066,6 +2105,28 @@ mod tests {
         assert!(started.elapsed() < HELD_BRIEFLY, "{:?}", started.elapsed());
         assert_ne!(fw.local, port);
         f.close(fw.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_a_host_does_not_wait_for_its_forwards_listeners() {
+        let dir = tempdir("move-fast");
+        let f = forwards(&dir);
+        // Its listeners stop only at their next tick, with no connection to wake them.
+        f.no_wake.store(true, Ordering::Relaxed);
+        let port = private_port();
+        let (fw, _) = f.open("devbox", 7370, Some(port)).unwrap();
+        let started = Instant::now();
+        f.host_moved("devbox");
+        assert!(
+            started.elapsed() < ACCEPT_TICK / 2,
+            "host_moved waited {:?}",
+            started.elapsed()
+        );
+        // Gone at once, and its port free soon after.
+        assert!(f.list().is_empty());
+        assert!(f.close(fw.id).is_err());
+        assert_free(port);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
