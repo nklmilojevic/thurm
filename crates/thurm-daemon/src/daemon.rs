@@ -556,6 +556,10 @@ pub struct Daemon {
     pub ports: crate::ports::Watcher,
     /// Files coming in and going out on streams.
     pub transfers: crate::transfer::Transfers,
+    /// Held while a client is taken out of `clients`, and while files are pasted for one
+    /// (`paste_for`): a client that went away never has paths typed after it left. Reentrant:
+    /// what a paste sets off may end a plugin's client on the same thread.
+    client_exit: parking_lot::ReentrantMutex<()>,
     layout: Mutex<Option<String>>,
     next_pane: AtomicU64,
     next_client: AtomicU64,
@@ -630,6 +634,7 @@ impl Daemon {
             // On the state directory's disk: the socket's runtime directory is often a small
             // memory-backed one.
             transfers: crate::transfer::Transfers::new(state_dir.join("drops")),
+            client_exit: parking_lot::ReentrantMutex::new(()),
             layout: Mutex::new(None),
             next_pane: AtomicU64::new(1),
             next_client: AtomicU64::new(1),
@@ -861,8 +866,11 @@ impl Daemon {
     pub fn remove_client(self: &Arc<Self>, id: u64) {
         log::info!("client {id} gone");
         // Before its registrations go: one it is making now sees the flag (see `ext_registry`).
-        if let Some(c) = self.clients.lock().remove(&id) {
-            c.gone.store(true, Ordering::SeqCst);
+        {
+            let _exit = self.client_exit.lock();
+            if let Some(c) = self.clients.lock().remove(&id) {
+                c.gone.store(true, Ordering::SeqCst);
+            }
         }
         self.focus.lock().client_gone(id);
         self.transfers.client_gone(id);
@@ -3545,6 +3553,20 @@ impl Daemon {
     /// Pastes `text` into `pane` as [`Request::Paste`] does, for `client`, unless it has gone
     /// since it asked: files it uploaded, once they landed.
     pub(crate) fn paste_for(&self, client: u64, pane: PaneId, text: &str) -> Result<(), String> {
+        self.paste_for_then(client, pane, text, || {})
+    }
+
+    /// [`Daemon::paste_for`], running `between` after the client is checked and before the
+    /// write (tests).
+    fn paste_for_then(
+        &self,
+        client: u64,
+        pane: PaneId,
+        text: &str,
+        between: impl FnOnce(),
+    ) -> Result<(), String> {
+        // The client stays from this check through the write: `remove_client` waits.
+        let _exit = self.client_exit.lock();
         // A client that went away asked for nothing more (`remove_client` takes it out of the
         // map before it fails its uploads).
         let asker = self
@@ -3554,6 +3576,7 @@ impl Daemon {
             .cloned()
             .filter(|c| !c.gone.load(Ordering::SeqCst))
             .ok_or("the app sending the files went away")?;
+        between();
         self.with_input_pane(client, pane, |p, st| {
             self.used_by(&asker, st);
             st.agent.prompt.interrupted();
@@ -4136,6 +4159,61 @@ mod tests {
         // Nothing recorded: no group, and the report falls back to the terminal's now.
         assert_eq!(read_groups(4, &[]), vec![(0, 4, None)]);
         assert_eq!(read_groups(0, &[]), vec![(0, 0, None)]);
+    }
+
+    /// A client leaving while files are pasted for it waits for the paste: nothing is typed for
+    /// a client after it is gone.
+    #[test]
+    fn a_client_leaves_only_after_a_paste_for_it() {
+        let dir = std::env::temp_dir().join(format!("thurm-paste-exit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let pane = daemon
+            .create_pane(
+                CreatePane {
+                    command: Some(vec!["cat".into()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let (client, _rx) = daemon.add_client();
+        let id = client.id;
+        let (checked_tx, checked) = crossbeam_channel::bounded(1);
+        let pasting = {
+            let daemon = daemon.clone();
+            std::thread::spawn(move || {
+                let r = daemon.paste_for_then(id, pane, "a.txt ", || {
+                    checked_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                });
+                (r, Instant::now())
+            })
+        };
+        checked.recv().unwrap();
+        let leaving = {
+            let daemon = daemon.clone();
+            std::thread::spawn(move || {
+                daemon.remove_client(id);
+                Instant::now()
+            })
+        };
+        let (pasted, written) = pasting.join().unwrap();
+        let left = leaving.join().unwrap();
+        assert!(pasted.is_ok(), "{pasted:?}");
+        assert!(
+            left >= written,
+            "the client left before its paste was written"
+        );
+        // Gone, it is pasted for no more.
+        assert!(daemon.paste_for(id, pane, "b.txt ").is_err());
+        daemon.close_pane(pane);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A job that reports and exits at once can have given the terminal back by the time its

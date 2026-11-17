@@ -38,6 +38,9 @@ final class RemoteDropTests: XCTestCase {
         var progress: [(TransferProgress) -> Void] = []
         var finish: [(TransferOutcome) -> Void] = []
         var cancels = 0
+        /// Pasted files asked about, and the answer.
+        var asked: [[String]] = []
+        var answer = true
 
         func upload(_ pane: PaneKey, _ files: [(path: String, name: String?)],
                     _ onProgress: @escaping (TransferProgress) -> Void,
@@ -58,6 +61,13 @@ final class RemoteDropTests: XCTestCase {
         }
     }
 
+    /// The images saved for uploads now.
+    private func drops() -> Set<URL> {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("thurm-drops")
+        let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        return Set(files.map(\.standardizedFileURL))
+    }
+
     /// A remote pane whose host takes files, its uploads going to a `FakeTransfers`.
     private func remotePane(takesFiles: Bool = true) -> (TerminalView, FakeTransfers) {
         let view = TerminalView(pane: PaneKey("devbox", 7))
@@ -66,6 +76,10 @@ final class RemoteDropTests: XCTestCase {
         view.transfersFiles = takesFiles
         let fake = FakeTransfers()
         view.uploader = fake.upload
+        view.confirmSend = { urls, _ in
+            fake.asked.append(urls.map(\.path))
+            return fake.answer
+        }
         return (view, fake)
     }
 
@@ -217,22 +231,65 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
         pb.clearContents()
         pb.setData(png, forType: .png)
+        let before = drops()
         XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
-        let waiting = try FileManager.default.contentsOfDirectory(
-            at: FileManager.default.temporaryDirectory.appendingPathComponent("thurm-drops"),
-            includingPropertiesForKeys: [.creationDateKey]
-        ).max { a, b in
-            let da = (try? a.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-            let db = (try? b.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-            return da < db
-        }
-        let image = try XCTUnwrap(waiting)
+        let added = drops().subtracting(before)
+        XCTAssertEqual(added.count, 1, "\(added)")
+        let image = try XCTUnwrap(added.first)
         fake.finish[2](TransferOutcome())
         XCTAssertEqual(fake.started.count, 4)
         fake.finish[3](cancelled)
         XCTAssertFalse(FileManager.default.fileExists(atPath: image.path))
         // A file of the user's is never deleted.
         XCTAssertTrue(FileManager.default.fileExists(atPath: user.path))
+    }
+
+    func testPastedFilesGoOnlyOnceTheUserSaysSo() throws {
+        let files = [try file("one.txt"), try file("two.txt")]
+        let (view, fake) = remotePane()
+        pb.clearContents()
+        pb.writeObjects(files as [NSURL])
+        fake.answer = false
+        view.paste(from: pb)
+        XCTAssertEqual(fake.asked, [files.map(\.path)])
+        XCTAssertEqual(fake.started, [])
+        fake.answer = true
+        view.paste(from: pb)
+        XCTAssertEqual(fake.started, [files.map(\.path)])
+        // A drop is its own consent; a pasted image names no file of this Mac.
+        fake.finish[0](TransferOutcome())
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        fake.finish[1](TransferOutcome())
+        pb.clearContents()
+        pb.setData(png, forType: .png)
+        view.paste(from: pb)
+        XCTAssertEqual(fake.asked.count, 2)
+        XCTAssertEqual(fake.started.count, 3)
+    }
+
+    func testAViewGoingAwayEndsItsTransfers() throws {
+        let fake = FakeTransfers()
+        let before = drops()
+        autoreleasepool {
+            let view = TerminalView(pane: PaneKey("devbox", 8))
+            view.setOffline(nil)
+            view.transfersFiles = true
+            view.uploader = fake.upload
+            pb.clearContents()
+            pb.setData(png, forType: .png)
+            view.paste(from: pb)
+            view.paste(from: pb)
+        }
+        // The one being sent is cancelled; the one waiting is dropped with its image.
+        XCTAssertEqual(fake.started.count, 1)
+        XCTAssertEqual(fake.cancels, 1)
+        let left = drops().subtracting(before)
+        XCTAssertEqual(left.map(\.path), [fake.started[0][0]].map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        // The sent one's image goes when its upload ends.
+        var cancelled = TransferOutcome(error: "cancelled")
+        cancelled.cancelled = true
+        fake.finish[0](cancelled)
+        XCTAssertEqual(drops().subtracting(before), [])
     }
 
     func testAFolderOrAnOlderHostSendsNothing() throws {

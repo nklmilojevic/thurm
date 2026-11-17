@@ -32,6 +32,28 @@ pub const MAX_BATCH: u32 = 256;
 pub const MAX_RESERVED_PER_PANE: usize = 64;
 /// What an upload must leave free on the disk.
 pub const MIN_FREE: u64 = 1 << 30;
+/// Files the disk must still be able to take (inodes) after an upload.
+pub const MIN_FREE_FILES: u64 = 10_000;
+/// Batches not complete yet, per client and over all: each holds the streams of its landed
+/// files until the last arrives.
+pub const MAX_WAITING_BATCHES_PER_CLIENT: usize = 8;
+pub const MAX_WAITING_BATCHES: usize = 32;
+/// Landed files waiting for the rest of their batch, over all: a stream (and a thread) each.
+pub const MAX_WAITING_FILES: usize = 512;
+/// Batches kept, over all panes, however small.
+pub const MAX_KEPT_BATCHES: usize = 1024;
+/// What one file or directory takes on disk at least: an empty file is not free. 4 KiB, or
+/// `THURM_TRANSFER_BLOCK` (tests, to count in bytes).
+fn block() -> u64 {
+    static BLOCK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BLOCK.get_or_init(|| {
+        std::env::var("THURM_TRANSFER_BLOCK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|b| *b > 0)
+            .unwrap_or(4096)
+    })
+}
 /// Uploads kept, over all panes; the oldest batches go first.
 pub const MAX_KEPT: u64 = 8 << 30;
 /// How long uploads are kept.
@@ -195,11 +217,24 @@ impl Transfers {
                 "too many files on their way to this pane (at most {MAX_RESERVED_PER_PANE})"
             ));
         }
+        let incomplete = |b: &&Batch| b.waiting() && !b.pasting;
+        let waiting_files = st
+            .batches
+            .values()
+            .filter(incomplete)
+            .flat_map(|b| b.files.values())
+            .filter(|f| f.state == SlotState::Landed)
+            .count();
+        if waiting_files >= MAX_WAITING_FILES {
+            return Err(format!(
+                "too many sent files are waiting for the rest of their batch (at most {MAX_WAITING_FILES})"
+            ));
+        }
         let pending: u64 = st
             .batches
             .values()
             .flat_map(|b| b.files.values().filter(move |f| on_way(b, f)))
-            .map(|f| f.size)
+            .map(|f| charge(f.size))
             .sum();
         // The batch this file joins, checked before anything changes for it.
         let existing = id.as_ref().and_then(|id| {
@@ -209,6 +244,21 @@ impl Transfers {
                 .find(|(_, b)| b.id.as_ref() == Some(id))
                 .map(|(serial, _)| *serial)
         });
+        if existing.is_none() {
+            let waiting = st.batches.values().filter(incomplete);
+            if waiting.clone().filter(|b| b.client == client).count()
+                >= MAX_WAITING_BATCHES_PER_CLIENT
+            {
+                return Err(format!(
+                    "too many uploads from this app are not complete yet (at most {MAX_WAITING_BATCHES_PER_CLIENT})"
+                ));
+            }
+            if waiting.count() >= MAX_WAITING_BATCHES {
+                return Err(format!(
+                    "too many uploads are not complete yet (at most {MAX_WAITING_BATCHES})"
+                ));
+            }
+        }
         if let Some(b) = existing.and_then(|serial| st.batches.get(&serial)) {
             match &b.outcome {
                 Some(Err(e)) => return Err(e.clone()),
@@ -228,9 +278,10 @@ impl Transfers {
             .batches
             .values()
             .flat_map(|b| b.files.values().filter(move |f| b.occupies(f)))
-            .map(|f| f.size)
+            .map(|f| charge(f.size))
             .sum();
-        let incoming = active.saturating_add(size);
+        // With its directory, should it be the batch's first.
+        let incoming = active.saturating_add(charge(size)).saturating_add(block());
         let too_much = || {
             format!(
                 "{name} does not fit in what this host keeps of sent files ({} MiB)",
@@ -243,7 +294,17 @@ impl Transfers {
         // The disk keeps its floor: kept drops may give way for it, but only if enough of them
         // can, and only once the file is admitted.
         make_private_dir(&self.root)?;
-        let need = size.saturating_add(pending).saturating_add(MIN_FREE);
+        let need = charge(size)
+            .saturating_add(block())
+            .saturating_add(pending)
+            .saturating_add(MIN_FREE);
+        // A batch's directory, its parts directory, the file and its part.
+        let files = free_files(&self.root)?;
+        if files < MIN_FREE_FILES + 4 {
+            return Err(format!(
+                "this host's disk can take too few more files ({files} left)"
+            ));
+        }
         let free = free_space(&self.root)?;
         let short = need.saturating_sub(free);
         let no_space = |free: u64| {
@@ -537,19 +598,24 @@ impl Transfers {
         let kept = self.kept(st);
         let mut total: u64 = kept.iter().map(|(_, size, _)| size).sum();
         let mut freed = 0u64;
-        let fits = |total: u64, freed: u64| {
-            total.saturating_add(incoming) <= self.max_kept && freed >= free
+        let mut count = kept.len();
+        // Room for one more batch, however small its files.
+        let fits = |total: u64, freed: u64, count: usize| {
+            total.saturating_add(incoming) <= self.max_kept
+                && freed >= free
+                && count < MAX_KEPT_BATCHES
         };
         for (_, size, dir) in kept {
-            if fits(total, freed) {
+            if fits(total, freed, count) {
                 break;
             }
             if remove_batch(&dir) {
                 total = total.saturating_sub(size);
                 freed += size;
+                count -= 1;
             }
         }
-        fits(total, freed)
+        fits(total, freed, count)
     }
 
     /// File `index` of batch `serial` arrived whole at its place. When it is the last, types
@@ -1022,17 +1088,72 @@ fn dir_size(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
-    entries
+    let inside: u64 = entries
         .flatten()
         .filter_map(|e| {
             let m = e.metadata().ok()?;
             Some(if m.is_dir() {
                 dir_size(&e.path())
             } else {
-                m.len()
+                // What the disk allocated, when it is more (counted in bytes in tests).
+                let allocated = if block() >= 512 {
+                    m.blocks().saturating_mul(512)
+                } else {
+                    0
+                };
+                charge(m.len()).max(allocated)
             })
         })
+        .sum();
+    inside.saturating_add(block())
+}
+
+/// What a file of `len` bytes is counted as taking: whole blocks, one at least.
+fn charge(len: u64) -> u64 {
+    len.div_ceil(block()).max(1).saturating_mul(block())
+}
+
+/// How many more files the disk holding `dir` can take; `THURM_TRANSFER_FREE_FILES` in tests
+/// (the count with no uploads kept; what is kept takes from it).
+fn free_files(dir: &Path) -> Result<u64, String> {
+    if let Some(free) = std::env::var("THURM_TRANSFER_FREE_FILES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Ok(free.saturating_sub(count_entries(dir)));
+    }
+    #[allow(clippy::unnecessary_cast)]
+    statvfs(dir).map(|s| s.f_favail as u64)
+}
+
+fn count_entries(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            1 + if e.path().is_dir() {
+                count_entries(&e.path())
+            } else {
+                0
+            }
+        })
         .sum()
+}
+
+fn statvfs(dir: &Path) -> Result<libc::statvfs, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return Err(format!(
+            "cannot tell the free space of {}: {}",
+            dir.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(s)
 }
 
 /// Bytes free for this user on the disk holding `dir`; `THURM_TRANSFER_FREE_BYTES` in tests.
@@ -1044,16 +1165,7 @@ fn free_space(dir: &Path) -> Result<u64, String> {
     {
         return Ok(free.saturating_sub(dir_size(dir)));
     }
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return Err(format!(
-            "cannot tell the free space of {}: {}",
-            dir.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
+    let s = statvfs(dir)?;
     #[allow(clippy::unnecessary_cast)]
     Ok((s.f_bavail as u64).saturating_mul(s.f_frsize as u64))
 }

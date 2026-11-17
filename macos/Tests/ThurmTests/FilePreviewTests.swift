@@ -683,4 +683,27 @@ final class FilePreviewTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: got[1].path))
         XCTAssertTrue(cache.prune())
     }
+
+    func testQuickLookHoldsTheNextPreviewBeforeLettingTheLastGo() throws {
+        let cache = tempCache(maxBytes: 10)
+        let pane = PaneKey("devbox", 3)
+        func fetch(_ path: String) -> URL? {
+            cache.download = downloads { _, _, dest, _, done in
+                try! Data(repeating: 1, count: 8).write(to: dest)
+                done(self.outcome(name: (path as NSString).lastPathComponent, version: "v"))
+            }
+            var got: URL?
+            cache.fetch(.path(path), pane: pane, cwd: nil) { got = try? $0.get() }
+            return got
+        }
+        let first = try XCTUnwrap(fetch("/first.bin"))
+        cache.switchHeld(from: nil, to: first)
+        // Over the limit beside the shown one: shown, not kept.
+        let second = try XCTUnwrap(fetch("/second.bin"))
+        cache.switchHeld(from: first, to: second)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: second.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: first.path))
+        cache.switchHeld(from: second, to: nil)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: second.path))
+    }
 }
