@@ -126,6 +126,35 @@ struct ForwardRequests {
     }
 }
 
+/// The forwards being closed because nobody waits for them any more, by host. An open of a
+/// host starts once none of its closes is under way: forwards are shared, so it could be
+/// handed one of them just before it closes.
+final class ForwardCloses: @unchecked Sendable {
+    private let cond = NSCondition()
+    private var closing: [HostId: Int] = [:]
+
+    func begin(_ host: HostId) {
+        cond.lock()
+        closing[host, default: 0] += 1
+        cond.unlock()
+    }
+
+    func end(_ host: HostId) {
+        cond.lock()
+        if let n = closing[host] { closing[host] = n > 1 ? n - 1 : nil }
+        cond.broadcast()
+        cond.unlock()
+    }
+
+    /// Waits until no close of `host` is under way. Off the main thread: a close can take
+    /// seconds.
+    func wait(_ host: HostId) {
+        cond.lock()
+        while closing[host] != nil { cond.wait() }
+        cond.unlock()
+    }
+}
+
 /// The remote hosts' port lists the app passes on to this Mac's daemon for its plugins
 /// (`ports.report`): the latest of each pane, sent again whenever the app connects to the
 /// daemon. Whether a list is of servers running already (`initial`) is the host's daemon's to
@@ -330,7 +359,9 @@ extension SessionManager {
         if let url { call["url"] = url }
         Extensions.shared.userOpensForward(host)
         weak var source = source
+        let closes = Extensions.shared.forwardCloses
         DispatchQueue.global(qos: .userInitiated).async {
+            closes.wait(host)
             let v = Core.shared.remoteCall(call) as? [String: Any]
             DispatchQueue.main.async {
                 // The user has it now: a plugin's abandoned open of it is not closed under them.

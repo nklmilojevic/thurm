@@ -18,8 +18,10 @@
 -- Settings, in config.toml:
 --
 --   [plugins.settings]
---   dev-server = { commands = ["vite", "next"] }   -- which listening programs count
---   dev-server = { retry_seconds = 5 }             -- between tries of a forward that failed
+--   dev-server = { commands = ["vite", "next"], retry_seconds = 5 }
+--
+-- `commands` says which listening programs count; `retry_seconds` is the wait between tries
+-- of a forward that failed.
 --
 -- A program counts when a word of its command line is one of `commands`; the default list
 -- has the common ones (vite, next, astro, webpack, rails, uvicorn...).

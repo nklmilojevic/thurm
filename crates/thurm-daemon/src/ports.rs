@@ -268,6 +268,8 @@ struct State {
     poked: bool,
     /// Clients subscribed since the last look: each gets every list, on its own.
     joined: Vec<u64>,
+    /// Asleep until someone listens.
+    idle: bool,
 }
 
 /// What one look sends: `broadcast` to the clients that had subscribed before it (by the per-pane
@@ -324,6 +326,24 @@ impl Watcher {
     pub fn poke(&self) {
         let mut st = self.state.lock();
         if st.started {
+            st.poked = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// Whether the watcher runs and sleeps until someone listens.
+    #[cfg(test)]
+    pub fn idle(&self) -> bool {
+        let st = self.state.lock();
+        st.started && st.idle
+    }
+
+    /// Client `client` waits for its first lists again (a look left it out): the next look,
+    /// soon, sends them. Only while the watcher runs.
+    pub fn rejoin(&self, client: u64) {
+        let mut st = self.state.lock();
+        if st.started {
+            st.joined.push(client);
             st.poked = true;
             self.wake.notify_all();
         }
@@ -401,9 +421,11 @@ fn run<H: Host>(h: Arc<H>) {
                     // Nobody listens: forget what was sent, and sleep until someone does.
                     tracker.reset();
                     st.poked = false;
+                    st.idle = true;
                     w.wake.wait(&mut st);
                     continue;
                 }
+                st.idle = false;
                 // A client that joined waits for its lists: look now.
                 if !st.joined.is_empty() {
                     break;

@@ -355,6 +355,74 @@ final class ExtensionsTests: XCTestCase {
         XCTAssertEqual(jsonUInt64((kept.replies.first?["result"] as? [String: Any])?["id"]), 71)
     }
 
+    /// A forward closed because the plugin that asked for it went away is closed before any
+    /// open of its host starts: an open that came meanwhile, handed that same forward, would
+    /// lose it to the close.
+    func testAnOpenWaitsForItsHostsAbandonedCloses() {
+        // The open still waited for shows a toast, over the app's windows.
+        _ = NSApplication.shared
+        let ext = Extensions.shared
+        let saved = (ext.remoteCall, ext.forwardReplies, ext.forwardRequestDone)
+        let closing = DispatchSemaphore(value: 0)
+        defer {
+            ext.remoteCall = saved.0
+            ext.forwardReplies = saved.1
+            ext.forwardRequestDone = saved.2
+            ext.forwardsNow([])
+        }
+        let opened: [String: Any] = ["id": 91, "host": "close-test", "remote_port": 5173, "local_port": 5173,
+                                     "url": "http://localhost:5173/", "new": true]
+        let lock = NSLock()
+        var calls: [String] = []
+        var cancelOnCall: UInt64? = 931
+        ext.remoteCall = { op in
+            let name = jsonString(op["op"]) ?? ""
+            lock.lock()
+            calls.append(name)
+            let cancel = cancelOnCall
+            cancelOnCall = nil
+            lock.unlock()
+            if name == "forward_open", let cancel {
+                DispatchQueue.main.sync {
+                    ext.handle(["name": "ui.cancel", "payload": JSON.encode(["id": cancel])])
+                }
+            }
+            // The close takes a while (its listeners let go).
+            if name == "forward_close" { closing.wait() }
+            return name == "forward_close" ? ["id": 0] : opened
+        }
+        var finished: Set<UInt64> = []
+        ext.forwardReplies = { _ in }
+        ext.forwardRequestDone = { finished.insert($0) }
+        func seen() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return calls
+        }
+        func run(until done: () -> Bool) {
+            let deadline = Date().addingTimeInterval(5)
+            while !done(), Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+        }
+        func open(_ id: UInt64) {
+            ext.handle(["name": "ui.request", "payload": JSON.encode(
+                ["kind": "forward_open", "id": id, "host": "close-test", "port": 5173])])
+        }
+
+        // Cancelled once it called: what it opened is being closed.
+        open(931)
+        run { finished.contains(931) && seen().count == 2 }
+        XCTAssertEqual(seen(), ["forward_open", "forward_close"])
+        // Another open of that host meanwhile: it waits for the close.
+        open(932)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertEqual(seen(), ["forward_open", "forward_close"], "an open went ahead of a close")
+        closing.signal()
+        run { finished.contains(932) }
+        XCTAssertEqual(Array(seen().prefix(3)), ["forward_open", "forward_close", "forward_open"])
+    }
+
     /// An open a plugin asked to browse goes to the browser only while its forward is still open
     /// on the same local port, as the app found it: one that closed meanwhile may have left the
     /// port to another program. The plugin then hears it closed, and nothing is opened.

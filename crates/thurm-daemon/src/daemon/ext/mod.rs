@@ -52,13 +52,19 @@ pub struct Ext {
     /// ([`method::FORWARDS_REPORT`]). Its ids are that app's own: plugins see only the first
     /// app's (see [`Daemon::forwarding_app`]).
     forwards: Mutex<HashMap<u64, Vec<ext::ForwardInfo>>>,
+    /// Held from a change of `forwards` until its `forward_opened` and `forward_closed` are
+    /// sent (a report, an app gone): plugins hear the changes in the order they were made.
+    /// Taken before any other of these locks.
+    forward_events: Mutex<()>,
     /// The remote hosts' port lists each app relayed last ([`method::PORTS_REPORT`]), by
     /// client, host and pane: what a new subscriber is told first.
     remote_ports: Mutex<HashMap<u64, RemoteLists>>,
     /// Subscribers to `ports_changed` waiting for the look that sends them their first lists:
     /// until it is done, they hear none of the watch's changes (a look under way when they
-    /// subscribed may have a change they would take for a server just started).
-    ports_joining: Mutex<std::collections::HashSet<u64>>,
+    /// subscribed may have a change they would take for a server just started). With each,
+    /// whether that look left it out (it had unsubscribed meanwhile): back by the time the
+    /// look is done, it is queued again.
+    ports_joining: Mutex<HashMap<u64, bool>>,
 }
 
 /// A remote host's panes' lists: by host and pane, the ports and whether they are complete.
@@ -278,7 +284,12 @@ impl Daemon {
                 // A client waiting for its first lists stays marked: it is still queued in the
                 // watch, whose look clears the mark (`ext_ports_served`), and a subscription
                 // again meanwhile is not queued twice.
-                self.ext.registry.lock().unsubscribe(client.id, &names(&p));
+                let names = names(&p);
+                self.ext.registry.lock().unsubscribe(client.id, &names);
+                // The last to hear of ports may have left: the watch sees whether to go on.
+                if names.is_empty() || names.iter().any(|n| n == PORTS_CHANGED) {
+                    self.ports.poke();
+                }
                 Ok(Value::Null)
             }
             method::EVENTS_EMIT => {
@@ -529,7 +540,14 @@ impl Daemon {
             }
             // Waiting for its first lists before it is a listener: no change of a look under way
             // reaches it first.
-            let queue = joins && self.ext.ports_joining.lock().insert(client.id);
+            let queue = joins
+                && match self.ext.ports_joining.lock().entry(client.id) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(false);
+                        true
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => false,
+                };
             if let Err(e) = reg.subscribe(client.id, names) {
                 if queue {
                     self.ext.ports_joining.lock().remove(&client.id);
@@ -616,6 +634,7 @@ impl Daemon {
     /// another app's are only kept.
     fn forwards_reported(&self, app: &Client, report: ext::ForwardsReport) {
         let client = app.id;
+        let _ordered = self.ext.forward_events.lock();
         let changed = report.change.get("forward").and_then(|f| f.get("id"));
         let why = report
             .change
@@ -680,7 +699,7 @@ impl Daemon {
         let joining = self.ext.ports_joining.lock();
         let listeners: Vec<u64> = listeners
             .into_iter()
-            .filter(|c| !except.contains(c) && !joining.contains(c))
+            .filter(|c| !except.contains(c) && !joining.contains_key(c))
             .collect();
         drop(joining);
         if listeners.is_empty() {
@@ -694,9 +713,16 @@ impl Daemon {
     /// A list of the watch for `client` alone, which joined it by subscribing: sent as running
     /// already, while it still hears `ports_changed`.
     pub(super) fn ext_ports_to(&self, client: &Client, event: &Event) {
-        if !self.ext.registry.lock().has(client.id, PORTS_CHANGED) {
+        let reg = self.ext.registry.lock();
+        if !reg.has(client.id, PORTS_CHANGED) {
+            // Left out: queued again if it is back before the look is done. Under the
+            // registry's lock, as a subscription marks it.
+            if let Some(missed) = self.ext.ports_joining.lock().get_mut(&client.id) {
+                *missed = true;
+            }
             return;
         }
+        drop(reg);
         if let Some(payload) = self.ports_payload(event) {
             send_ext(client, notice::EVENT, &payload);
         }
@@ -704,9 +730,26 @@ impl Daemon {
 
     /// The look that sent `joined` their first lists is done: they hear changes now.
     pub(super) fn ext_ports_served(&self, joined: &[u64]) {
+        // Tests: a look that takes a while to be done after it sent its lists.
+        if !joined.is_empty()
+            && let Some(delay) = crate::ports::test_delay("THURM_EXT_SERVED_DELAY_MS")
+        {
+            std::thread::sleep(delay);
+        }
+        let reg = self.ext.registry.lock();
         let mut joining = self.ext.ports_joining.lock();
+        let mut again = Vec::new();
         for c in joined {
-            joining.remove(c);
+            // Left out by this look and subscribed again since: the next look serves it.
+            if joining.remove(c) == Some(true) && reg.has(*c, PORTS_CHANGED) {
+                joining.insert(*c, false);
+                again.push(*c);
+            }
+        }
+        drop(joining);
+        drop(reg);
+        for c in again {
+            self.ports.rejoin(c);
         }
     }
 
@@ -940,7 +983,8 @@ impl Daemon {
         // Dropping the senders ends the waits on them.
         self.ext.pending.lock().retain(|_, p| p.to != client);
         // An app's forwards end with it; when it was the first, the next app's are plugins'
-        // now.
+        // now. Their events go out before any report of the next app changes them.
+        let ordered = self.ext.forward_events.lock();
         let (first, gone, next, next_app) = {
             let mut forwards = self.ext.forwards.lock();
             let first = forwards.keys().min() == Some(&client);
@@ -984,12 +1028,19 @@ impl Daemon {
                 lists.retain(|_, list| !list.is_known_empty());
             }
         }
+        // Tests: an app gone takes a while to tell of the next app's forwards.
+        if next.as_ref().is_some_and(|n| !n.is_empty())
+            && let Some(delay) = crate::ports::test_delay("THURM_EXT_FORWARD_EVENT_DELAY_MS")
+        {
+            std::thread::sleep(delay);
+        }
         for f in gone.iter().flatten() {
             self.forward_event(FORWARD_CLOSED, f, Some("app"));
         }
         for f in next.iter().flatten() {
             self.forward_event(FORWARD_OPENED, f, None);
         }
+        drop(ordered);
         if self.ext.registry.lock().client_gone(client) {
             self.actions_changed();
         }

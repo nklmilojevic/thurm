@@ -2334,3 +2334,83 @@ fn an_empty_remote_list_is_news_only_after_ports() {
     report(json!([]), false);
     no_more_ports(&plugin, &rx);
 }
+
+/// A plugin that unsubscribes while its first look sends the lists, and subscribes again
+/// before that look is done, still gets its first lists: the look that left it out queues it
+/// again.
+#[test]
+fn a_subscriber_back_before_its_skipped_look_is_done_gets_its_lists() {
+    let env = Env::new("ext-resubscribe-race");
+    let _d = env.start_with(&[
+        ("THURM_PORTS_INTERVAL_MS", Path::new("200")),
+        ("THURM_PORTS_LOOK_DELAY_MS", Path::new("800")),
+        ("THURM_EXT_SERVED_DELAY_MS", Path::new("1500")),
+    ]);
+    let (plugin, rx) = ext_client(&env, "plugin");
+    let pane = match plugin
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 600".into()]),
+            cwd: Some(env.dir.display().to_string()),
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    let ports = json!({ "names": ["ports_changed"] });
+    call(&plugin, method::EVENTS_SUBSCRIBE, ports.clone()).unwrap();
+    // Out before the look sends its lists, back in after it sent them and before it is done.
+    std::thread::sleep(Duration::from_millis(300));
+    call(&plugin, method::EVENTS_UNSUBSCRIBE, ports.clone()).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    call(&plugin, method::EVENTS_SUBSCRIBE, ports).unwrap();
+    let first = loop {
+        let ev = next_event(&rx, "ports_changed");
+        if ev["id"] == pane {
+            break ev;
+        }
+    };
+    assert_eq!(first["initial"], true, "{first}");
+}
+
+/// The first app quits while the next one reports a change: plugins hear the next app's
+/// forwards as theirs before that change, so the last event matches what is listed.
+#[test]
+fn forward_events_keep_the_order_of_their_changes() {
+    let env = Env::new("ext-forwards-order");
+    let _d = env.start_with(&[("THURM_EXT_FORWARD_EVENT_DELAY_MS", Path::new("800"))]);
+    let (plugin, rx) = ext_client(&env, "plugin");
+    call(
+        &plugin,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["forward_opened", "forward_closed"] }),
+    )
+    .unwrap();
+    let caps = [CAP_EXT, CAP_EXT_UI, CAP_EXT_FORWARDS];
+    let (first, _first_rx) = forwarding_app(&env, &caps);
+    let (second, _second_rx) = forwarding_app(&env, &caps);
+    let forward = json!({
+        "id": 7, "host": "devbox", "remote_port": 5173, "local_port": 5174,
+        "url": "http://localhost:5174/",
+    });
+    call(
+        &second,
+        method::FORWARDS_REPORT,
+        json!({ "forwards": [forward] }),
+    )
+    .unwrap();
+    // The first quits: telling of the second's forward takes a while; the second closes it
+    // meanwhile.
+    drop(first);
+    std::thread::sleep(Duration::from_millis(300));
+    call(&second, method::FORWARDS_REPORT, json!({ "forwards": [] })).unwrap();
+    let opened = next(&rx, notice::EVENT);
+    assert_eq!(opened["event"], "forward_opened", "{opened}");
+    let closed = next(&rx, notice::EVENT);
+    assert_eq!(closed["event"], "forward_closed", "{closed}");
+    assert_eq!(
+        call(&plugin, method::FORWARDS_LIST, Value::Null).unwrap(),
+        json!([])
+    );
+}
