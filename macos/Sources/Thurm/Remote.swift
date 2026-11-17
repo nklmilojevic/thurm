@@ -623,6 +623,10 @@ extension SessionManager {
         }
         Remotes.shared.pendingCloses[host] = stillPending.isEmpty ? nil : stillPending
         let infos = fetched.filter { !isClosed($0) }
+        // Its forwards learn which panes it has: a host back with no pane sends no port list,
+        // and a forward listed before would otherwise never close on its own.
+        _ = Core.shared.remoteCall(["op": "host_panes", "host": host,
+                                    "panes": infos.map { NSNumber(value: $0.id) }])
         let listed = Set(infos.map(\.key))
         for key in panes.keys where key.host == host && !listed.contains(key) {
             panes.removeValue(forKey: key)
@@ -759,7 +763,7 @@ extension SessionManager {
 
     /// Creates an empty file `name` in `dir`, or `name 2`, `name 3`… when taken, atomically:
     /// two callers never get the same one. Nil when none can be created.
-    static func reserveFreeName(_ name: String, in dir: URL) -> URL? {
+    static func reserveFreeName(_ name: String, in dir: URL) -> Reservation? {
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
         for n in 1...10_000 {
@@ -775,8 +779,11 @@ extension SessionManager {
             let candidate = dir.appendingPathComponent(numbered)
             let fd = open(candidate.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
             if fd >= 0 {
-                close(fd)
-                return candidate
+                defer { close(fd) }
+                // What the file made is, whatever takes its name later.
+                var st = stat()
+                guard fstat(fd, &st) == 0 else { return nil }
+                return Reservation(url: candidate, device: UInt64(st.st_dev), inode: UInt64(st.st_ino))
             }
             if errno != EEXIST { return nil }
         }
@@ -1260,5 +1267,25 @@ final class RemoteHosts: ObservableObject {
                 done(error)
             }
         }
+    }
+}
+
+/// A name taken in a folder others may write to (~/Downloads): the empty file made for it, known
+/// by its device and inode, so what is done to it later is done to that file only.
+struct Reservation: Equatable {
+    let url: URL
+    let device: UInt64
+    let inode: UInt64
+
+    /// Whether the name still holds the file made for it.
+    var held: Bool {
+        var st = stat()
+        return lstat(url.path, &st) == 0 && UInt64(st.st_dev) == device && UInt64(st.st_ino) == inode
+    }
+
+    /// Gives the name back: deletes the file made for it, if the name still holds it, and
+    /// leaves whatever else has taken it.
+    func release() {
+        if held { unlink(url.path) }
     }
 }

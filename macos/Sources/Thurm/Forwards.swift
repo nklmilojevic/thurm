@@ -2,7 +2,8 @@ import AppKit
 
 // Forwards: a remote host's TCP port opened on this Mac's loopback (Rust:
 // crates/thurm-remote/src/forward.rs). A `localhost` link in a remote pane, a remote row of
-// Processes & Ports, or Forward Port… opens one; nothing is forwarded without such an action.
+// Processes & Ports, Forward Port…, or a plugin's request (`thurm.forward.open`: code the user
+// installed) opens one; nothing is forwarded without one of those.
 
 /// An open forward, as `forward_list` and the status callback report it.
 struct ForwardInfo: Equatable {
@@ -163,9 +164,15 @@ struct RemotePorts {
         return seq
     }
 
-    /// This Mac's daemon took report `seq` of `host`'s `pane` (if it is still the latest).
+    /// This Mac's daemon passed report `seq` of `host`'s `pane` on to plugins (if it is still the
+    /// latest). An empty, complete one is all said then, and goes: a closed pane's would pile up.
     mutating func delivered(_ host: HostId, pane: UInt64, seq: Int) {
-        if lists[host]?[pane]?.seq == seq { lists[host]?[pane]?.delivered = true }
+        guard let e = lists[host]?[pane], e.seq == seq else { return }
+        if (e.ports as? [Any])?.isEmpty ?? false, jsonBool(e.complete) != false {
+            lists[host]?[pane] = nil
+        } else {
+            lists[host]?[pane]?.delivered = true
+        }
     }
 
     /// The connection to `host` is gone: its lists with it.
@@ -212,8 +219,6 @@ enum ForwardNotice: Equatable {
     }
 }
 
-/// The `Ports` request of each host's current connection: a reply to an earlier one (a
-/// connection that dropped meanwhile, or one replaced by a reconnect) is not applied.
 /// Which host Forward Port… is for: the focused pane's when it is remote; else the one
 /// connected host; else the user picks among them.
 enum ForwardHostChoice: Equatable {
@@ -343,11 +348,12 @@ extension SessionManager {
                                                               onPane: pane != nil), on: pane)
                     return
                 }
+                // The link first: the notice may be an alert, which waits for the user.
+                NSWorkspace.shared.open(target)
                 if jsonBool(v?["new"]) == true {
                     SessionManager.show(ForwardNotice.opened(host: host, remotePort: f.remotePort, localPort: f.localPort,
                                                              url: link, onPane: pane != nil), on: pane, forward: f)
                 }
-                NSWorkspace.shared.open(target)
             }
         }
     }

@@ -146,8 +146,6 @@ fn remote_lists(all: &HashMap<u64, RemoteLists>, app: Option<u64>) -> Vec<Value>
     app.and_then(|a| all.get(&a))
         .into_iter()
         .flatten()
-        // A pane that listens on nothing, for sure, is no news to a new subscriber.
-        .filter(|(_, list)| !list.is_known_empty())
         .map(|((host, pane), list)| remote_payload(host, *pane, list, true))
         .collect()
 }
@@ -423,6 +421,11 @@ impl Daemon {
                 let complete = opt_bool(&p, "complete")?.unwrap_or(true);
                 let initial = opt_bool(&p, "initial")? == Some(true);
                 let mut all = self.ext.remote_ports.lock();
+                // Not for an app that went: its lists went with it (`ext_client_gone`, which takes
+                // this lock after the flag is set), and none are made for it again.
+                if client.gone.load(Ordering::SeqCst) {
+                    return Err("this client was disconnected".into());
+                }
                 let lists = all.entry(client.id).or_default();
                 let at = (host.to_owned(), pane);
                 // An empty list that could not read every process may have missed servers: kept,
@@ -433,13 +436,26 @@ impl Daemon {
                     complete,
                     initial,
                 };
-                // Kept even when empty: an app that takes over lists what it knows, an empty pane
-                // too, rather than leave plugins guessing (a pane it never listed is `gone`).
-                lists.insert(at, list.clone());
+                let holder = self.forwarding_app_id() == Some(client.id);
+                // Kept even when empty for another app: one that takes over lists what it knows,
+                // an empty pane too, rather than leave plugins guessing (a pane it never listed is
+                // `gone`). The holder's empty pane is dropped once plugins heard it (a closed
+                // pane's would pile up): what it said is all there is to say.
+                // A pane plugins never heard listen on anything, still listening on nothing: no news
+                // (as many come as the app connects to a host: a list for each of its panes).
+                let unheard = !lists.contains_key(&at);
+                if holder && list.is_known_empty() {
+                    lists.remove(&at);
+                    if unheard {
+                        return Ok(json!({ "heard": true }));
+                    }
+                } else {
+                    lists.insert(at, list.clone());
+                }
                 // Only the app that holds plugins' forwards is heard, as with its forwards. The
                 // answer says whether plugins heard it: an app sends one they did not again as it
                 // came.
-                if self.forwarding_app_id() != Some(client.id) {
+                if !holder {
                     return Ok(json!({ "heard": false }));
                 }
                 // Tests: a report that takes a while, for what happens while it holds the lock.
@@ -458,7 +474,7 @@ impl Daemon {
             method::FORWARDS_REPORT => {
                 only_the_app(client, method)?;
                 let report: ext::ForwardsReport = params(p)?;
-                self.forwards_reported(client.id, report);
+                self.forwards_reported(client, report);
                 Ok(Value::Null)
             }
             method::FORWARDS_LIST => {
@@ -501,13 +517,24 @@ impl Daemon {
         names: Vec<String>,
     ) -> Result<Value, String> {
         let ports = names.iter().any(|n| n == PORTS_CHANGED);
-        let all = ports.then(|| self.ext.remote_ports.lock());
+        // Only one that joins (it does not hear `ports_changed` yet) takes the remote lists' lock;
+        // a subscription that joins nothing does not wait on reports.
+        let joining = ports && !self.ext.registry.lock().has(client.id, PORTS_CHANGED);
+        let mut all = joining.then(|| self.ext.remote_ports.lock());
         // Only a new subscriber joins: one that has the lists keeps hearing changes.
         // `queue`: not waiting in the watch already (subscribed, out and in again before the look
         // that serves it): queued once, it gets its first lists once.
         let (joins, queue) = {
             let mut reg = self.ext_registry(client)?;
-            let joins = ports && !reg.has(client.id, PORTS_CHANGED);
+            let mut joins = ports && !reg.has(client.id, PORTS_CHANGED);
+            // It stopped hearing them since the look above (another call of the same client):
+            // the lock first, in its order, then the registry again.
+            if joins && all.is_none() {
+                drop(reg);
+                all = Some(self.ext.remote_ports.lock());
+                reg = self.ext_registry(client)?;
+                joins = !reg.has(client.id, PORTS_CHANGED);
+            }
             // Waiting for its first lists before it is a listener: no change of a look under way
             // reaches it first.
             let queue = joins && self.ext.ports_joining.lock().insert(client.id);
@@ -520,8 +547,8 @@ impl Daemon {
             (joins, queue)
         };
         // Its panes' ports are watched only while someone hears of them. A new subscriber joins
-        // the watch as a client does: the next look sends it alone the list of every pane with
-        // ports (`ext_ports_to`), as running already. Of remote hosts, it gets the lists the app
+        // the watch as a client does: the next look sends it alone every pane's list, empty ones
+        // too (`ext_ports_to`), as running already. Of remote hosts, it gets the lists the app
         // relayed so far, the same way.
         if joins && let Some(all) = &all {
             if queue {
@@ -595,7 +622,8 @@ impl Daemon {
     /// The forwards app `client` has now. Of the first app's, the ones that came are
     /// `forward_opened`, the ones that went `forward_closed`, with why when the report says;
     /// another app's are only kept.
-    fn forwards_reported(&self, client: u64, report: ext::ForwardsReport) {
+    fn forwards_reported(&self, app: &Client, report: ext::ForwardsReport) {
+        let client = app.id;
         let changed = report.change.get("forward").and_then(|f| f.get("id"));
         let why = report
             .change
@@ -604,6 +632,10 @@ impl Daemon {
             .unwrap_or("closed");
         let old = {
             let mut forwards = self.ext.forwards.lock();
+            // Not for an app that went: its forwards went with it.
+            if app.gone.load(Ordering::SeqCst) {
+                return;
+            }
             let old = forwards
                 .insert(client, report.forwards.clone())
                 .unwrap_or_default();
@@ -649,8 +681,9 @@ impl Daemon {
     /// the ones that joined at this look, which get every list on their own
     /// ([`Daemon::ext_ports_to`]).
     pub(super) fn ext_ports_changed(&self, event: &Event, except: &[u64]) {
-        // `ports_changed` has no `[[on]]` hooks: only the subscribers hear it, but those waiting
-        // for their first lists. With none, nothing is built.
+        // `ports_changed` has no `[[on]]` hooks: only the subscribers hear it. Left out: those still
+        // waiting for their first lists (they get them on their own, and a change must not come
+        // before them). With none, nothing is built.
         let listeners: Vec<u64> = self.ext.registry.lock().listeners(PORTS_CHANGED);
         let joining = self.ext.ports_joining.lock();
         let listeners: Vec<u64> = listeners
@@ -959,6 +992,10 @@ impl Daemon {
                 news.push(remote_payload(host, *pane, list, list.initial));
             }
             self.deliver_ports(news);
+            // The next app holds plugins' lists now: its empty panes were said, or are no news.
+            if let Some(lists) = next_app.and_then(|a| all.get_mut(&a)) {
+                lists.retain(|_, list| !list.is_known_empty());
+            }
         }
         for f in gone.iter().flatten() {
             self.forward_event(FORWARD_CLOSED, f, Some("app"));

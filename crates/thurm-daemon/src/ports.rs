@@ -105,7 +105,7 @@ impl Tracker {
         for pane in gone {
             let known = &self.panes[&pane];
             // Its empty list too waits for the second to pass; the pane stays known till then.
-            if !known.sent.ports.is_empty()
+            if says_something(&known.sent)
                 && let Some(at) = known.sent_at
                 && now < at + PER_PANE
             {
@@ -114,7 +114,9 @@ impl Tracker {
                 continue;
             }
             let known = self.panes.remove(&pane).expect("listed");
-            if !known.sent.ports.is_empty() && known.sent_at.is_some() {
+            // Anything but an empty complete list (ports, or an incomplete look, sent or told a
+            // joiner) leaves something behind: the empty complete list takes it down.
+            if says_something(&known.sent) {
                 events.push(Event::PortsChanged {
                     pane,
                     ports: Vec::new(),
@@ -130,7 +132,7 @@ impl Tracker {
             s.ports.dedup();
             match self.panes.get_mut(&pane) {
                 None => {
-                    let send = !s.ports.is_empty();
+                    let send = says_something(&s);
                     if send {
                         events.push(event(pane, &s, false));
                     }
@@ -145,7 +147,7 @@ impl Tracker {
                 Some(k) if k.sent == s => {}
                 Some(k) => {
                     // Never sent anything, and still nothing to say.
-                    if k.sent_at.is_none() && s.ports.is_empty() {
+                    if k.sent_at.is_none() && !says_something(&s) {
                         k.sent = s;
                         continue;
                     }
@@ -167,6 +169,12 @@ impl Tracker {
 }
 
 /// `pane`'s list `s`: a change, or (`initial`) what a joining client is told is there already.
+/// Whether `s` tells a client anything: ports, or that part of the pane could not be read. An
+/// empty complete list (no ports, all read) is what a pane nobody heard of has anyway.
+fn says_something(s: &Seen) -> bool {
+    !s.ports.is_empty() || !s.complete
+}
+
 fn event(pane: PaneId, s: &Seen, initial: bool) -> Event {
     Event::PortsChanged {
         pane,
@@ -280,8 +288,10 @@ pub fn deliver(
     seen: HashMap<PaneId, Seen>,
     joined: &[u64],
 ) -> Delivery {
+    // Copied only for a client that joined: most looks have none.
     let mut first: Vec<(PaneId, Seen)> = seen
         .iter()
+        .filter(|_| !joined.is_empty())
         .map(|(p, s)| {
             let mut s = s.clone();
             s.ports.sort();
@@ -558,6 +568,41 @@ mod tests {
         t.update(t0, HashMap::from([(3, seen(&[]))]));
         let (ev, _) = t.update(t0 + Duration::from_secs(10), HashMap::new());
         assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_pane_is_told_and_its_end_too() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        let unread = Seen {
+            ports: vec![],
+            complete: false,
+        };
+        // Nothing found, but not all of it read: said, so no one takes its ports for gone.
+        let (ev, _) = t.update(t0, HashMap::from([(1, unread.clone())]));
+        assert_eq!(
+            ev.iter().map(ports_of).collect::<Vec<_>>(),
+            [(1, vec![], false)]
+        );
+        // A pane that listed a port, then could not be read, then went: its end is said.
+        let (ev, _) = t.update(
+            t0 + PER_PANE,
+            HashMap::from([(1, unread.clone()), (2, seen(&[5173]))]),
+        );
+        assert_eq!(
+            ev.iter().map(ports_of).collect::<Vec<_>>(),
+            [(2, vec![5173], true)]
+        );
+        let (ev, _) = t.update(t0 + PER_PANE * 2, HashMap::from([(2, unread)]));
+        assert_eq!(
+            ev.iter().map(ports_of).collect::<Vec<_>>(),
+            [(1, vec![], true), (2, vec![], false)]
+        );
+        let (ev, _) = t.update(t0 + PER_PANE * 3, HashMap::new());
+        assert_eq!(
+            ev.iter().map(ports_of).collect::<Vec<_>>(),
+            [(2, vec![], true)]
+        );
     }
 
     #[test]

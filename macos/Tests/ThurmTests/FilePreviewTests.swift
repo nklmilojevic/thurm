@@ -742,7 +742,9 @@ final class FilePreviewTests: XCTestCase {
         XCTAssertEqual(seen, [[1], [1]])
         // One of two gives up: it is told so, and the download goes on for the other.
         cancelFirst()
-        XCTAssertEqual((try? XCTUnwrap(results[0]).get()) == nil, true)
+        XCTAssertThrowsError(try XCTUnwrap(results[0]).get()) {
+            XCTAssertEqual($0 as? RemoteFileError, .cancelled)
+        }
         XCTAssertEqual(cancels, 0)
         try Data("ab".utf8).write(to: dests[0])
         finish[0](outcome(name: "a.bin", version: "v"))
@@ -938,5 +940,26 @@ final class FilePreviewTests: XCTestCase {
         _ = RemoteFileCache(root: root, maxBytes: 4)
         XCTAssertTrue(FileManager.default.fileExists(atPath: live.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: gone.path))
+    }
+
+    func testAVersionGoesWithItsOwnCopyWhoeverInstallsAtOnce() throws {
+        let cache = tempCache()
+        let other = RemoteFileCache(root: cache.root)
+        let entry = cache.entry(host: "devbox", path: "/a.txt", cwd: nil)
+        func install(_ by: RemoteFileCache, _ content: String, _ version: String) throws -> URL {
+            let staged = try by.stage(entry)
+            try Data(content.utf8).write(to: staged)
+            return try by.install(entry, staged: staged, name: "a.txt", version: version)
+        }
+        // Two instances install the same entry in turn: whichever copy is in use, the version
+        // read with it is its own.
+        _ = try install(cache, "one", "v1")
+        _ = try install(other, "two", "v2")
+        let seen = try XCTUnwrap(cache.cached(entry))
+        XCTAssertEqual(seen.version, "v2")
+        XCTAssertEqual(try String(contentsOf: seen.file, encoding: .utf8), "two")
+        // A version left beside the entry by an older build is no copy's.
+        try "stale".write(to: entry.appendingPathComponent(".version"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(cache.cached(entry)?.version, "v2")
     }
 }

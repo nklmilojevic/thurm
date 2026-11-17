@@ -78,7 +78,7 @@
 ---@field host string The `[[remote]]` host.
 ---@field remote_port integer
 ---@field local_port integer The port on this Mac's `127.0.0.1`.
----@field url string `http://localhost:<local_port>/`.
+---@field url string The link it was last opened for, on its local port (`http://localhost:<local_port>/app`); else `http://localhost:<local_port>/`.
 ---@field new boolean? From `thurm.forward.open`: it was opened now, rather than found open.
 
 ---@class thurm.Timer

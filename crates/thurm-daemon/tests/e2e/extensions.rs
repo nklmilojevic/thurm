@@ -1779,17 +1779,19 @@ fn the_first_app_holds_the_forwards() {
     assert_eq!(list[0]["remote_port"], 8080, "{list}");
 
     // A host's lists as the app connected to it say so.
+    let vite =
+        |port: u16| json!([{ "port": port, "address": "127.0.0.1", "pid": 9, "command": "vite" }]);
     call(
         &second,
         method::PORTS_REPORT,
-        json!({ "host": "devbox", "pane": 1, "ports": [], "complete": true, "initial": true }),
+        json!({ "host": "devbox", "pane": 1, "ports": vite(5173), "complete": true, "initial": true }),
     )
     .unwrap();
     assert_eq!(next_event(&rx, "ports_changed")["initial"], true);
     call(
         &second,
         method::PORTS_REPORT,
-        json!({ "host": "devbox", "pane": 1, "ports": [], "complete": true }),
+        json!({ "host": "devbox", "pane": 1, "ports": vite(5174), "complete": true }),
     )
     .unwrap();
     assert!(next_event(&rx, "ports_changed").get("initial").is_none());
@@ -2295,4 +2297,40 @@ fn subscribing_again_before_the_look_gets_the_lists_once() {
             break;
         }
     }
+}
+
+/// A remote pane plugins never heard listen on anything, listing nothing, is no news (as many
+/// come as the app connects to a host); one whose servers go is, once.
+#[test]
+fn an_empty_remote_list_is_news_only_after_ports() {
+    let env = Env::new("ext-remote-empty");
+    let _d = env.start();
+    let (app, _app_rx) = forwarding_app(&env, &[CAP_EXT, CAP_EXT_UI, CAP_EXT_FORWARDS]);
+    let (plugin, rx) = ext_client(&env, "plugin");
+    call(
+        &plugin,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    let report = |ports: Value, initial: bool| {
+        call(
+            &app,
+            method::PORTS_REPORT,
+            json!({ "host": "devbox", "pane": 7, "ports": ports, "complete": true, "initial": initial }),
+        )
+        .unwrap()
+    };
+    let vite = json!([{ "port": 5173, "address": "127.0.0.1", "pid": 9, "command": "vite" }]);
+    // As the app connects: an empty pane, said to nobody.
+    assert_eq!(report(json!([]), true), json!({ "heard": true }));
+    no_more_ports(&plugin, &rx);
+    // A server starts, then goes: both news.
+    report(vite.clone(), false);
+    assert_eq!(next_event(&rx, "ports_changed")["ports"][0]["port"], 5173);
+    report(json!([]), false);
+    assert_eq!(next_event(&rx, "ports_changed")["ports"], json!([]));
+    // Empty again: nothing new.
+    report(json!([]), false);
+    no_more_ports(&plugin, &rx);
 }

@@ -101,7 +101,8 @@ pub mod method {
     /// are that app's own): `[ForwardInfo]`. Fails when no app that forwards is connected.
     pub const FORWARDS_LIST: &str = "forwards.list";
     /// [`super::ForwardOpen`]: the app opens a remote host's port on this Mac (or finds the
-    /// forward that has it). The result is [`super::ForwardInfo`] with `new`.
+    /// forward that has it). The result is a [`super::ForwardInfo`] with one more field, `new`:
+    /// true when the forward was opened now.
     pub const FORWARDS_OPEN: &str = "forwards.open";
     /// `{id}`: the app closes that forward. The result is its [`super::ForwardInfo`].
     pub const FORWARDS_CLOSE: &str = "forwards.close";
@@ -136,9 +137,9 @@ pub mod notice {
 ///   ports (empty once they went), with `pane` while the pane is there. A remote host's pane
 ///   (reported by the app) has `host`, and no `pane`, and `initial` for the lists its daemon
 ///   sent the app as it joined that daemon's watch. Subscribing to it by name starts the
-///   daemon's watch of its panes' ports. A new subscriber gets the list of every pane with
-///   ports first, on its own (the others hear nothing again), and the remote hosts' lists known
-///   so far, all with `initial`. When the app loses a host (or quits), each of its panes heard
+///   daemon's watch of its panes' ports. A new subscriber gets every pane's list first, empty
+///   ones too, on its own (the others hear nothing again), and the remote hosts' lists known so
+///   far (but panes plugins already heard listen on nothing), all with `initial`. When the app loses a host (or quits), each of its panes heard
 ///   of gets an empty list, `complete` false, with `gone`.
 /// - `files_uploaded`: `{id, paths}`, the files sent to a pane, once their paths were typed
 ///   there, with `pane` while it is there.
@@ -388,7 +389,8 @@ pub struct ForwardInfo {
     pub remote_port: u16,
     /// The port on `127.0.0.1`.
     pub local_port: u16,
-    /// Where it opens: `http://localhost:<local_port>/`.
+    /// Where it opens: the link it was last opened for, on its local port
+    /// (`http://localhost:<local_port>/app`), else `http://localhost:<local_port>/`.
     pub url: String,
 }
 

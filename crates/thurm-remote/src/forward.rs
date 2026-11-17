@@ -90,7 +90,14 @@ struct Shared {
     conns: Conns,
     live: Live,
 }
-type Conns = Arc<Mutex<HashMap<u64, TcpStream>>>;
+type Conns = Arc<Mutex<HashMap<u64, Conn>>>;
+
+/// A connection a forward carries: the local socket, and once dialled, the socket of its stream
+/// to the daemon. Closing the forward shuts both, so neither direction outlives it.
+struct Conn {
+    local: TcpStream,
+    stream: Option<std::os::unix::net::UnixStream>,
+}
 #[cfg(test)]
 type Hook = Box<dyn Fn() + Send>;
 type SocketFor = Arc<dyn Fn(&str) -> PathBuf + Send + Sync>;
@@ -372,12 +379,17 @@ impl Forwards {
         let listeners = match preferred {
             Some(p) => bind(p).map_err(|e| format!("cannot listen on localhost:{p}: {e}"))?,
             None => {
+                // The remote port's own number is tried once (it is often this Mac's own dev
+                // server's), the one remembered for it a moment longer (so the URL stays the same
+                // after a close and reopen; see `bind`).
                 let remembered = self.remembered().get(&key(host, remote_port)).copied();
-                [Some(remote_port), remembered]
-                    .into_iter()
-                    .flatten()
-                    .filter(|&p| p >= 1024 || p == remote_port)
-                    .find_map(|p| bind(p).ok())
+                bind_once(remote_port)
+                    .ok()
+                    .or_else(|| {
+                        remembered
+                            .filter(|&p| p >= 1024 || p == remote_port)
+                            .and_then(|p| bind(p).ok())
+                    })
                     .map_or_else(|| bind(0), Ok)
                     .map_err(|e| format!("cannot listen on localhost: {e}"))?
             }
@@ -455,6 +467,9 @@ impl Forwards {
     pub fn check(&self, host: &str) -> Result<(), String> {
         let c = match self.control(host, false) {
             Ok(c) => c,
+            // Refused (the host moved meanwhile, another protocol): no use asking again.
+            Err(ClientError::Daemon(why)) => return Err(why),
+            // The kept connection dropped: once more, afresh.
             Err(_) => self
                 .control(host, true)
                 .map_err(|e| format!("{host} is not connected: {e}"))?,
@@ -490,6 +505,49 @@ impl Forwards {
         Some(self.closed(e, why))
     }
 
+    /// Takes forwards `ids` out at once (no new connection, none listed) and stops them on a
+    /// thread of their own: for a caller that must not wait for their listeners (the app's
+    /// config sync, under its lock).
+    fn close_soon(&self, ids: &[u64], why: &'static str) {
+        let taken: Vec<Entry> = {
+            let mut g = self.inner.lock();
+            ids.iter().filter_map(|id| g.open.remove(id)).collect()
+        };
+        if taken.is_empty() {
+            return;
+        }
+        for e in &taken {
+            // Ended now, as a closed forward's are, even before its listeners stop.
+            e.stop.store(true, Ordering::Release);
+            for conn in e.conns.lock().values() {
+                let _ = conn.local.shutdown(Shutdown::Both);
+                if let Some(s) = &conn.stream {
+                    let _ = s.shutdown(Shutdown::Both);
+                }
+            }
+        }
+        let me = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("forward-close".into())
+            .spawn(move || {
+                for e in taken {
+                    me.closed(e, why);
+                }
+            });
+        if let Err(e) = spawned {
+            log::warn!("cannot close forwards in the background: {e}");
+        }
+    }
+
+    /// Whether a forward for `host` may open now: why not, if it may not (moving, connecting).
+    pub fn opens(&self, host: &str) -> Result<(), String> {
+        let g = self.inner.lock();
+        match g.refuses(host, g.epoch(host)) {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }
+    }
+
     /// Stops `e`, taken out of the open forwards, and reports it.
     fn closed(&self, e: Entry, why: &str) -> Forward {
         #[cfg(test)]
@@ -501,7 +559,10 @@ impl Forwards {
         #[cfg(not(test))]
         stop_listening(&e);
         for conn in e.conns.lock().values() {
-            let _ = conn.shutdown(Shutdown::Both);
+            let _ = conn.local.shutdown(Shutdown::Both);
+            if let Some(s) = &conn.stream {
+                let _ = s.shutdown(Shutdown::Both);
+            }
         }
         // Its listeners released before this returns: the port is free again for whoever opens
         // it next (a forward reopened, `thurm remote forward` run again), not still ours for a
@@ -535,9 +596,7 @@ impl Forwards {
                 .map(|e| e.forward.id)
                 .collect()
         };
-        for id in ids {
-            self.close_why(id, "host");
-        }
+        self.close_soon(&ids, "host");
     }
 
     /// `host`, moved, reaches its new destination once its tunnel connects with `settings`
@@ -613,9 +672,7 @@ impl Forwards {
                 .map(|e| e.forward.id)
                 .collect()
         };
-        for id in ids {
-            self.close_why(id, "host");
-        }
+        self.close_soon(&ids, "host");
     }
 
     /// `host`'s pane `pane` listens on `ports` now (its whole list; `complete`: all of its
@@ -653,6 +710,26 @@ impl Forwards {
         for e in g.open.values_mut().filter(|e| e.forward.host == host) {
             e.missing_since = None;
         }
+    }
+
+    /// `host`'s panes are exactly `panes` (as its daemon listed them on connecting): the lists
+    /// of panes not among them are dropped, and every forward of the host is looked at again.
+    /// A host with no pane left sends a joining client no list at all, so without this a forward
+    /// listed before a reconnect would never close on its own.
+    pub fn host_panes(&self, host: &str, panes: &[PaneId]) {
+        self.host_panes_at(Instant::now(), host, panes);
+        self.ensure_sweeping();
+    }
+
+    /// [`Forwards::host_panes`] at `now` (tests).
+    pub fn host_panes_at(&self, now: Instant, host: &str, panes: &[PaneId]) {
+        let mut g = self.inner.lock();
+        g.hosts
+            .entry(host.to_owned())
+            .or_default()
+            .panes
+            .retain(|p, _| panes.contains(p));
+        recompute(&mut g, host, now);
     }
 
     /// Closes the forwards whose port has been gone for the grace period with no connection
@@ -741,12 +818,15 @@ impl Forwards {
         // the connection that wakes it can't be made (out of descriptors), or accepting fails.
         let waits = listener.set_nonblocking(true).is_ok();
         static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // Accepting failing over and over (out of descriptors) is said once, not every time.
+        let mut failing = false;
         loop {
             if stop.load(Ordering::Acquire) {
                 return;
             }
             let conn = match listener.accept() {
                 Ok((c, _)) => {
+                    failing = false;
                     // Accepted sockets may inherit the listener's non-blocking mode (BSD).
                     let _ = c.set_nonblocking(false);
                     c
@@ -756,7 +836,10 @@ impl Forwards {
                     continue;
                 }
                 Err(e) => {
-                    log::warn!("forward {host}:{}: {e}", forward.remote_port);
+                    if !failing {
+                        log::warn!("forward {host}:{}: {e}", forward.remote_port);
+                    }
+                    failing = true;
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
@@ -781,7 +864,13 @@ impl Forwards {
                     );
                     None
                 } else {
-                    conns.lock().insert(conn_id, registered);
+                    conns.lock().insert(
+                        conn_id,
+                        Conn {
+                            local: registered,
+                            stream: None,
+                        },
+                    );
                     Some(())
                 }
             };
@@ -796,7 +885,9 @@ impl Forwards {
             let spawned = std::thread::Builder::new()
                 .name(format!("forward-{host}-{port}-conn"))
                 .spawn(move || {
-                    if let Err(e) = me.carry(&host, port, conn, &theirs_stop) {
+                    if let Err(e) =
+                        me.carry(&host, port, conn, &theirs_stop, &theirs_conns, conn_id)
+                    {
                         log::info!("forward {host}:{port}: {e}");
                     }
                     theirs_conns.lock().remove(&conn_id);
@@ -812,12 +903,16 @@ impl Forwards {
     /// A control connection to `host`'s daemon, made once and kept.
     fn control(&self, host: &str, fresh: bool) -> Result<Arc<Client>, ClientError> {
         // A kept connection that has dropped (the tunnel went down) is made again.
-        if !fresh
-            && let Some(c) = self.inner.lock().controls.get(host)
-            && c.is_alive()
-        {
-            return Ok(c.clone());
-        }
+        let since = {
+            let g = self.inner.lock();
+            if !fresh
+                && let Some(c) = g.controls.get(host)
+                && c.is_alive()
+            {
+                return Ok(c.clone());
+            }
+            g.epoch(host)
+        };
         let c = Client::connect(
             ConnectOptions {
                 socket: (self.socket_for)(host),
@@ -828,10 +923,15 @@ impl Forwards {
             |_| {},
             || {},
         )?;
-        self.inner
-            .lock()
-            .controls
-            .insert(host.to_owned(), c.clone());
+        // Made while the host was pointed elsewhere (or removed): it may reach the old
+        // destination, so it is neither kept nor used.
+        let mut g = self.inner.lock();
+        if g.epoch(host) != since {
+            return Err(ClientError::Daemon(format!(
+                "{host} was pointed elsewhere while connecting to it"
+            )));
+        }
+        g.controls.insert(host.to_owned(), c.clone());
         Ok(c)
     }
 
@@ -842,6 +942,8 @@ impl Forwards {
         port: u16,
         conn: TcpStream,
         closed: &AtomicBool,
+        conns: &Conns,
+        conn_id: u64,
     ) -> Result<(), String> {
         // A forward closed (by hand, the sweep, its host moving) between accepting this
         // connection and here asks nothing of the host: no stream is dialled to its port, on the
@@ -872,9 +974,22 @@ impl Forwards {
         if let Some(why) = gone() {
             return Err(why);
         }
+        // The stream's socket is registered beside the local one before it is used, so closing
+        // the forward cuts it too: a client that already sent all it had (its side ended) would
+        // otherwise leave the host's side waiting on the service for good.
         let socket = (self.socket_for)(host);
+        let to_daemon = thurm_client::connect_daemon(&socket).map_err(|e| e.to_string())?;
+        let closer = to_daemon.try_clone().map_err(|e| e.to_string())?;
+        if let Some(c) = conns.lock().get_mut(&conn_id) {
+            c.stream = Some(closer);
+        }
+        // Closed between the check above and the registration: `close` did not see it.
+        if let Some(why) = gone() {
+            let _ = to_daemon.shutdown(Shutdown::Both);
+            return Err(why);
+        }
         let (mut down, up) =
-            thurm_client::stream::open(&socket, &ticket.ticket).map_err(|e| e.to_string())?;
+            thurm_client::stream::open_on(to_daemon, &ticket.ticket).map_err(|e| e.to_string())?;
         let _ = conn.set_nodelay(true);
         splice(conn, &mut down, up, closed)
     }
@@ -1940,6 +2055,85 @@ mod tests {
             l.rlim_cur,
             l.rlim_max
         );
+    }
+
+    #[test]
+    fn a_host_back_with_no_pane_lets_its_forwards_close() {
+        let dir = tempdir("no-panes");
+        let f = forwards(&dir);
+        let t0 = Instant::now();
+        f.ports_changed_at(t0, "devbox", 1, vec![entry(5173)], true);
+        let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+        // Away; its last pane closed meanwhile. Back with no pane: no list will ever come.
+        f.host_disconnected("devbox");
+        let t1 = t0 + Duration::from_secs(60);
+        f.host_panes_at(t1, "devbox", &[]);
+        assert!(
+            f.sweep(t1 + GONE_GRACE - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(f.sweep(t1 + GONE_GRACE), vec![fw]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_host_back_keeps_the_lists_of_its_panes_and_drops_the_others() {
+        let dir = tempdir("some-panes");
+        let f = forwards(&dir);
+        let t0 = Instant::now();
+        let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+        // Lists of panes 2 and 3 (the joiner's lists came first); the host has pane 2 only.
+        f.ports_changed_at(t0, "devbox", 2, vec![entry(5173)], true);
+        f.ports_changed_at(t0, "devbox", 3, vec![entry(9000)], true);
+        f.host_panes_at(t0, "devbox", &[2]);
+        assert_eq!(
+            f.known("devbox")
+                .iter()
+                .map(|k| k.entry.port)
+                .collect::<Vec<_>>(),
+            [5173]
+        );
+        // Pane 2 still lists the forward's port: no clock.
+        assert!(f.sweep(t0 + GONE_GRACE * 3).is_empty());
+        f.close(fw.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_taken_remote_port_number_costs_no_wait() {
+        let dir = tempdir("no-wait");
+        let f = forwards(&dir);
+        // The remote port's number is this Mac's own (a local dev server's): straight to another.
+        let port = private_port();
+        let _local_server = listen_soon((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        let started = Instant::now();
+        let (fw, _) = f.open("devbox", port, None).unwrap();
+        assert!(started.elapsed() < HELD_BRIEFLY, "{:?}", started.elapsed());
+        assert_ne!(fw.local, port);
+        f.close(fw.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_a_host_does_not_wait_for_its_forwards_listeners() {
+        let dir = tempdir("move-fast");
+        let f = forwards(&dir);
+        // Its listeners stop only at their next tick, with no connection to wake them.
+        f.no_wake.store(true, Ordering::Relaxed);
+        let port = private_port();
+        let (fw, _) = f.open("devbox", 7370, Some(port)).unwrap();
+        let started = Instant::now();
+        f.host_moved("devbox");
+        assert!(
+            started.elapsed() < ACCEPT_TICK / 2,
+            "host_moved waited {:?}",
+            started.elapsed()
+        );
+        // Gone at once, and its port free soon after.
+        assert!(f.list().is_empty());
+        assert!(f.close(fw.id).is_err());
+        assert_free(port);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

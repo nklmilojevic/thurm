@@ -88,7 +88,10 @@ final class Extensions {
         registering = false
         registerAppActions()
         refresh()
-        reportForwards(Core.shared.remoteCall(["op": "forward_list"]) as? [Any] ?? [], change: nil)
+        // Only a list read: one that failed would say this app has no forwards.
+        if let list = Extensions.forwardList(Core.shared.remoteCall(["op": "forward_list"])) {
+            reportForwards(list, change: nil)
+        }
         sendRemotePortsAgain()
     }
 
@@ -458,6 +461,9 @@ final class Extensions {
         }
     }
 
+    /// The core's `forward_list` answer, if it is a list (an error answers an object).
+    static func forwardList(_ answer: Any?) -> [Any]? { answer as? [Any] }
+
     /// Takes the `ports.report`s in place of the daemon (tests): whether plugins heard it.
     var portsReported: (([String: Any]) -> Bool)?
 
@@ -478,13 +484,17 @@ final class Extensions {
     /// The forwards open now (the status callback's report).
     func forwardsNow(_ ids: Set<UInt64>) { forwardRequests.forwardsNow(ids) }
 
-    /// Closes forwards opened for plugins' requests nobody waits for and nobody else has: now,
-    /// on the main thread where that was decided, before an open that could be handed one starts
-    /// (closing is quick: nothing goes to the host).
+    /// Closes forwards opened for plugins' requests nobody waits for and nobody else has. Off
+    /// the main thread: a close waits for the forward's listeners to let go (up to two seconds).
+    /// An open that starts meanwhile and is handed one of them finds it closed when it checks it
+    /// (`forward_get`) before using it, and says so.
     private func closeAbandoned(_ ids: [UInt64]) {
+        let call = remoteCall
         for id in ids {
             tlog("closing forward \(id): the plugin that asked for it no longer waits")
-            _ = remoteCall(["op": "forward_close", "id": NSNumber(value: id)])
+            DispatchQueue.global(qos: .utility).async {
+                _ = call(["op": "forward_close", "id": NSNumber(value: id)])
+            }
         }
     }
 
@@ -565,17 +575,21 @@ final class Extensions {
             }
             answer(v, nil)
         }
-        // A close is quick (nothing goes to the host): done now, on the main thread, where a
-        // cancel is taken too, so none the app has seen can be overtaken by it.
+        // A close starts as soon as it is asked (a cancel that comes later is too late to stop
+        // it, and only keeps it from being answered); off the main thread, as it waits for the
+        // forward's listeners to let go.
+        let call = remoteCall
         guard opening != nil else {
-            done(remoteCall(op) as? [String: Any])
+            DispatchQueue.global(qos: .userInitiated).async {
+                let v = call(op) as? [String: Any]
+                DispatchQueue.main.async { done(v) }
+            }
             return
         }
         // Opening connects to the host's daemon first: not on the main thread, and only if the
         // daemon has not given up on it before it starts. A cancel that comes after that check
         // (the call cannot be held back without holding up the main thread) is undone in `done`:
         // the forward the call opened is closed again.
-        let call = remoteCall
         DispatchQueue.global(qos: .userInitiated).async {
             let live = DispatchQueue.main.sync { self.forwardRequests.isLive(key) }
             let v = live ? call(op) as? [String: Any] : nil
