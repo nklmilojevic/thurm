@@ -146,11 +146,12 @@ fn sync(m: &mut Manager) {
     );
     for (name, r) in wanted {
         match m.supervisors.get(&name) {
-            Some(s) => {
-                if let Err(e) = s.update(r) {
-                    log::warn!("remote {name}: {e}");
-                }
-            }
+            Some(s) => match s.update(r) {
+                // Forwards to a moved host open again once a connection with these settings
+                // (the new destination's) is up.
+                Ok(()) => forwards().await_settings(&name, s.settings()),
+                Err(e) => log::warn!("remote {name}: {e}"),
+            },
             None => {
                 let ssh = match Ssh::new(&r.host) {
                     Ok(s) => s,
@@ -160,7 +161,11 @@ fn sync(m: &mut Manager) {
                     }
                 };
                 let (cb, ctx) = (m.cb, m.ctx);
+                let tunnel = forwards().host_started(&name);
                 let sup = Supervisor::start(r, ssh, true, move |status| {
+                    if status.phase == thurm_remote::tunnel::Phase::Connected {
+                        forwards().host_connected(&status.name, tunnel, status.settings);
+                    }
                     if let Ok(j) = serde_json::to_string(status) {
                         emit(cb, ctx, &j);
                     }
@@ -410,11 +415,19 @@ fn forward_port(
         .remote(host)
         .ok_or_else(|| format!("no remote named {host:?}"))?;
     forward::forwardable(r)?;
-    match (port, url) {
-        (Some(p), _) => Ok(p),
-        (None, Some(u)) => Ok(policy::LocalUrl::parse(u)
-            .ok_or_else(|| format!("{u} is not a link to {host}'s localhost"))?
-            .port),
+    let from_url = url
+        .map(|u| {
+            policy::LocalUrl::parse(u)
+                .map(|l| l.port)
+                .ok_or_else(|| format!("{u} is not a link to {host}'s localhost"))
+        })
+        .transpose()?;
+    match (port, from_url) {
+        // Both: they must agree, or the link would open at another service's forward.
+        (Some(p), Some(u)) if p != u => Err(format!(
+            "port {p} and the link's port {u} differ; give one of them"
+        )),
+        (Some(p), _) | (None, Some(p)) => Ok(p),
         (None, None) => Err("a port or a URL to forward".into()),
     }
 }
@@ -723,12 +736,16 @@ fn call(c: Call) -> Result<Value, String> {
             url,
             local,
         } => {
+            let f = forwards();
+            // Before reading where the host is: if it is pointed elsewhere from here on, this
+            // open (checked against the old destination) is refused rather than attached to the
+            // new one.
+            let since = f.epoch(&host);
             let cfg = Config::load().map_err(|e| e.to_string())?;
             let port = forward_port(&cfg, &host, port, url.as_deref())?;
-            let f = forwards();
             f.check(&host)?;
             // With its link from the start: the change it reports lists the URL it opens at.
-            let (fw, new) = f.open_for(&host, port, local, url.as_deref())?;
+            let (fw, new) = f.open_since(&host, port, local, url.as_deref(), since)?;
             let mut v = forward_json(&fw, url.as_deref());
             v["new"] = json!(new);
             v
@@ -944,6 +961,14 @@ mod tests {
         assert!(forward_port(&cfg, "gone", Some(5173), None).is_err());
         assert!(forward_port(&cfg, "on", None, Some("https://example.com")).is_err());
         assert!(forward_port(&cfg, "on", None, None).is_err());
+        // A port and a link that agree; and that don't.
+        assert_eq!(
+            forward_port(&cfg, "on", Some(8443), Some("https://localhost:8443/x")),
+            Ok(8443)
+        );
+        let e = forward_port(&cfg, "on", Some(5173), Some("http://localhost:3000/")).unwrap_err();
+        assert!(e.contains("differ"), "{e}");
+        assert!(forward_port(&cfg, "on", Some(5173), Some("https://example.com/")).is_err());
     }
 
     #[test]

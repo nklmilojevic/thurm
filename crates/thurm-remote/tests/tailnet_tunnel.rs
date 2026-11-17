@@ -256,3 +256,32 @@ fn a_daemon_that_goes_down_is_started_over_ssh() {
     });
     assert_eq!(s.phase, Phase::Reconnecting);
 }
+
+#[test]
+fn a_connection_says_which_settings_it_was_made_with() {
+    let a = stand_in_daemon("moves-a");
+    let b = stand_in_daemon("moves-b");
+    dial_socket();
+    let (port_a, _stop_a) = gateway(a, None);
+    let (port_b, _stop_b) = gateway(b, None);
+    let sup = start(remote(
+        "moves",
+        &format!("ws://127.0.0.1:{port_a}/v1/connect"),
+    ));
+    let s = wait_for(&sup, |s| s.phase == Phase::Connected);
+    assert_eq!((s.settings, sup.settings()), (0, 0));
+    // Settings that keep the destination: the same settings.
+    let mut same = remote("moves", &format!("ws://127.0.0.1:{port_a}/v1/connect"));
+    same.forward_links = false;
+    sup.update(same).unwrap();
+    assert_eq!(sup.settings(), 0);
+    // Another address: new settings, and a connection made with them says so.
+    sup.update(remote(
+        "moves",
+        &format!("ws://127.0.0.1:{port_b}/v1/connect"),
+    ))
+    .unwrap();
+    assert_eq!(sup.settings(), 1);
+    let s = wait_for(&sup, |s| s.phase == Phase::Connected && s.settings == 1);
+    assert_eq!(s.settings, 1);
+}
