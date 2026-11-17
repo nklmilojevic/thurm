@@ -31,8 +31,10 @@ for _, c in ipairs(thurm.settings.commands or DEFAULT_COMMANDS) do
   commands[tostring(c)] = true
 end
 
--- Addresses reachable as localhost.
-local LOCAL = { ["127.0.0.1"] = true, ["::1"] = true, ["0.0.0.0"] = true, ["::"] = true, [""] = true }
+-- Addresses reachable as localhost: loopback, or every address (`*` is how macOS says it).
+local LOCAL = {
+  ["127.0.0.1"] = true, ["::1"] = true, ["0.0.0.0"] = true, ["::"] = true, ["*"] = true, [""] = true,
+}
 
 local function is_dev_server(command)
   for word in command:gmatch("[^%s]+") do

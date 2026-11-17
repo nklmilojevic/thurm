@@ -2009,3 +2009,163 @@ fn a_lost_host_or_app_ends_its_remote_lists() {
         .collect();
     assert!(more.is_empty(), "{more:?}");
 }
+
+/// A plugin that subscribes while the app's report of a host's list is under way hears that
+/// list first as running already (its replay), never as a change ahead of it.
+#[test]
+fn a_report_under_way_does_not_overtake_a_new_subscribers_lists() {
+    let env = Env::new("ext-report-race");
+    let _d = env.start_with(&[("THURM_EXT_REPORT_DELAY_MS", Path::new("800"))]);
+    let (app, _app_rx) = forwarding_app(&env, &[CAP_EXT, CAP_EXT_UI, CAP_EXT_FORWARDS]);
+    let reporting = std::thread::spawn({
+        let app = app.clone();
+        move || {
+            call(
+                &app,
+                method::PORTS_REPORT,
+                json!({ "host": "devbox", "pane": 1, "complete": true,
+                        "ports": [{ "port": 5173, "address": "127.0.0.1", "pid": 9, "command": "vite" }] }),
+            )
+        }
+    });
+    // The report holds the lists now; the plugin subscribes meanwhile.
+    std::thread::sleep(Duration::from_millis(200));
+    let (plugin, rx) = ext_client(&env, "plugin");
+    call(
+        &plugin,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    reporting.join().unwrap().unwrap();
+    let first = next_event(&rx, "ports_changed");
+    assert_eq!(
+        first["initial"], true,
+        "a change came before the lists: {first}"
+    );
+    assert_eq!(first["ports"][0]["port"], 5173);
+    std::thread::sleep(Duration::from_millis(300));
+    let more: Vec<Value> = rx
+        .try_iter()
+        .filter(|(n, p)| n == notice::EVENT && p["event"] == "ports_changed")
+        .map(|(_, p)| p)
+        .collect();
+    assert!(more.is_empty(), "{more:?}");
+}
+
+/// A plugin that subscribes while a look of the watch is under way hears none of that look's
+/// changes before its own first lists.
+#[test]
+fn a_look_under_way_does_not_reach_a_new_subscriber_first() {
+    assert!(
+        std::process::Command::new("python3")
+            .args(["-c", ""])
+            .status()
+            .is_ok_and(|s| s.success()),
+        "this test needs python3 (for a listener in a pane)"
+    );
+    let env = Env::new("ext-look-race");
+    let _d = env.start_with(&[
+        ("THURM_PORTS_INTERVAL_MS", Path::new("200")),
+        ("THURM_PORTS_LOOK_DELAY_MS", Path::new("1500")),
+    ]);
+    let (early, early_rx) = ext_client(&env, "early");
+    call(
+        &early,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    // The early subscriber's own first look is done.
+    std::thread::sleep(Duration::from_millis(2000));
+    // A new pane starts a look (it pokes the watch), whose scan comes once its listener runs;
+    // the late plugin subscribes while that look is under way.
+    let pane = match early
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec![
+                "python3".into(),
+                "-c".into(),
+                "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); time.sleep(600)".into(),
+            ]),
+            cwd: Some(env.dir.display().to_string()),
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let (late, late_rx) = ext_client(&env, "late");
+    call(
+        &late,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    let change = loop {
+        let ev = next_event(&early_rx, "ports_changed");
+        if ev["id"] == pane {
+            break ev;
+        }
+    };
+    assert!(change.get("initial").is_none(), "{change}");
+    let first = loop {
+        let ev = next_event(&late_rx, "ports_changed");
+        if ev["id"] == pane {
+            break ev;
+        }
+    };
+    assert_eq!(
+        first["initial"], true,
+        "a change came before the lists: {first}"
+    );
+}
+
+/// A remote pane whose read missed some processes and found nothing is kept: a plugin that
+/// subscribes later hears it, as running already and not complete, before the next list.
+#[test]
+fn a_late_subscriber_hears_an_incomplete_empty_remote_list() {
+    let env = Env::new("ext-remote-incomplete");
+    let _d = env.start();
+    let (app, _app_rx) = forwarding_app(&env, &[CAP_EXT, CAP_EXT_UI, CAP_EXT_FORWARDS]);
+    call(
+        &app,
+        method::PORTS_REPORT,
+        json!({ "host": "devbox", "pane": 1, "complete": false, "ports": [] }),
+    )
+    .unwrap();
+    let (plugin, rx) = ext_client(&env, "plugin");
+    call(
+        &plugin,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    let first = next_event(&rx, "ports_changed");
+    assert_eq!(first["initial"], true, "{first}");
+    assert_eq!(first["complete"], false, "{first}");
+    assert_eq!(first["ports"], json!([]), "{first}");
+    // A complete empty list forgets it.
+    call(
+        &app,
+        method::PORTS_REPORT,
+        json!({ "host": "devbox", "pane": 1, "complete": true, "ports": [] }),
+    )
+    .unwrap();
+    next_event(&rx, "ports_changed");
+    let (later, later_rx) = ext_client(&env, "later");
+    call(
+        &later,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        later_rx
+            .try_iter()
+            .all(|(n, p)| n != notice::EVENT || p["event"] != "ports_changed"),
+        "a forgotten pane was replayed"
+    );
+}

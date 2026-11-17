@@ -4030,6 +4030,10 @@ impl crate::ports::Host for Daemon {
         }
     }
 
+    fn served(&self, joined: &[u64]) {
+        self.ext_ports_served(joined);
+    }
+
     fn watcher(&self) -> &crate::ports::Watcher {
         &self.ports
     }

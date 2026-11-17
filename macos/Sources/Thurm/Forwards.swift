@@ -139,9 +139,10 @@ struct RemotePorts {
 
     private var lists: [HostId: [UInt64: Entry]] = [:]
 
-    /// A pane of `host` listed `ports`: kept as its latest; an empty list forgets the pane.
+    /// A pane of `host` listed `ports`: kept as its latest. A complete empty list forgets the
+    /// pane; an incomplete one is kept (servers it could not read may run), to send again.
     mutating func listed(_ host: HostId, pane: UInt64, ports: Any, complete: Any) {
-        if (ports as? [Any])?.isEmpty ?? false {
+        if (ports as? [Any])?.isEmpty ?? false, jsonBool(complete) != false {
             lists[host]?[pane] = nil
         } else {
             lists[host, default: [:]][pane] = Entry(host: host, pane: pane, ports: ports, complete: complete)

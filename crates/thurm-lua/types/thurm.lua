@@ -64,7 +64,7 @@
 
 ---@class thurm.Port
 ---@field port integer
----@field address string Where it listens: `127.0.0.1`, `::1`, `0.0.0.0`, `::`; empty when the system did not say.
+---@field address string Where it listens: `127.0.0.1`, `::1`, `0.0.0.0`, `::`, `*` (every address, on macOS); empty when the system did not say.
 ---@field pid integer
 ---@field command string The listening process's command line.
 
