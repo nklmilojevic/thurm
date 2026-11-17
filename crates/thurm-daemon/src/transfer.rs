@@ -530,6 +530,17 @@ impl Transfers {
 
     /// A new directory for a batch to `pane`.
     fn new_batch_dir(&self, pane: PaneId) -> Result<PathBuf, String> {
+        self.new_batch_dir_with(pane, |parts| {
+            std::fs::DirBuilder::new().mode(0o700).create(parts)
+        })
+    }
+
+    /// [`Transfers::new_batch_dir`], making the parts directory with `make_parts` (tests).
+    fn new_batch_dir_with(
+        &self,
+        pane: PaneId,
+        make_parts: impl Fn(&Path) -> std::io::Result<()>,
+    ) -> Result<PathBuf, String> {
         let pane_dir = self.root.join(pane.to_string());
         make_private_dir(&pane_dir)?;
         let stamp = SystemTime::now()
@@ -540,10 +551,12 @@ impl Transfers {
             let dir = pane_dir.join(format!("{stamp}-{n}"));
             match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => {
-                    std::fs::DirBuilder::new()
-                        .mode(0o700)
-                        .create(dir.join(PARTS))
-                        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+                    // A batch directory without its parts is no batch: it goes, not kept to
+                    // count against the drops that are.
+                    if let Err(e) = make_parts(&dir.join(PARTS)) {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return Err(format!("cannot create {}: {e}", dir.display()));
+                    }
                     return Ok(dir);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -729,17 +742,10 @@ impl Transfers {
         // Waiting for the rest of the batch holds no stream slot: a batch may be as large as
         // the daemon's limit on open streams.
         drop(open);
-        match received {
-            Ok(()) => self.landed(daemon, serial, index),
-            Err(e) => {
-                let mut st = self.state.lock();
-                self.fail(&mut st, serial, e);
-            }
-        }
-        self.writer_done(serial, index);
-        // While the batch waits, the sender may still give up: an abort on this stream ends the
-        // batch. A connection that merely closes does not (the sender only waits on its last
-        // file's stream).
+        // From here on the sender may still give up: an abort on this stream ends the batch,
+        // the last file's too while its paths wait to be typed (`landed` decides under the lock
+        // `fail` takes). A connection that merely closes does not (the sender only waits on its
+        // last file's stream).
         std::thread::scope(|scope| {
             let watching = std::thread::Builder::new()
                 .name("upload-abort".into())
@@ -754,6 +760,14 @@ impl Transfers {
                 let mut st = self.state.lock();
                 self.fail(&mut st, serial, format!("cannot watch the upload: {e}"));
             }
+            match received {
+                Ok(()) => self.landed(daemon, serial, index),
+                Err(e) => {
+                    let mut st = self.state.lock();
+                    self.fail(&mut st, serial, e);
+                }
+            }
+            self.writer_done(serial, index);
             match self.outcome(serial) {
                 Ok(()) => close(&mut writer, StreamClose::Ok),
                 Err(e) => close(&mut writer, StreamClose::Internal(e)),
@@ -1173,6 +1187,25 @@ fn free_space(dir: &Path) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_batch_directory_that_cannot_be_made_whole_is_not_left() {
+        let root = std::env::temp_dir().join(format!("thurm-batch-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let t = Transfers::new(root.clone());
+        let e = t
+            .new_batch_dir_with(3, |_| Err(std::io::Error::other("no inodes left")))
+            .unwrap_err();
+        assert!(e.contains("no inodes left"), "{e}");
+        let left: Vec<_> = std::fs::read_dir(root.join("3"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        let dir = t.new_batch_dir(3).unwrap();
+        assert!(dir.join(PARTS).is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn names_keep_their_last_component_without_control_characters() {

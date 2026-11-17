@@ -80,7 +80,7 @@ final class TerminalView: NSView, NSTextInputClient {
         // A remote file stays in the cache while Quick Look shows it.
         didSet {
             guard previewURL != oldValue else { return }
-            RemoteFileCache.shared.switchHeld(from: oldValue, to: previewURL)
+            previewCache.switchHeld(from: oldValue, to: previewURL)
         }
     }
     private weak var previewPanel: QLPreviewPanel?
@@ -139,7 +139,7 @@ final class TerminalView: NSView, NSTextInputClient {
         blinkTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
         endTransfers()
-        if let previewURL { RemoteFileCache.shared.release(previewURL) }
+        if let previewURL { previewCache.release(previewURL) }
     }
 
     /// The pane's view is going: transfers under way are cancelled (their ends clean up after
@@ -1405,20 +1405,43 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Whether this pane's host takes files (tests set it).
     var transfersFiles: Bool?
 
+    /// Where remote previews are fetched and kept (tests use their own).
+    var previewCache = RemoteFileCache.shared
+
     /// Asks whether to send pasted files to the host (tests answer for the user).
     var confirmSend: (([URL], HostId) -> Bool)?
 
-    /// "Send 2 files to devbox?", naming them.
+    /// "Send 2 files to devbox?", naming every one of them.
     static func askToSend(_ urls: [URL], _ host: HostId) -> Bool {
+        sendAlert(urls, host).runModal() == .alertFirstButtonReturn
+    }
+
+    /// The question `askToSend` asks: every file it would send is listed, in a list that
+    /// scrolls, none left out.
+    static func sendAlert(_ urls: [URL], _ host: HostId) -> NSAlert {
         let alert = NSAlert()
         alert.messageText = urls.count == 1 ? "Send \(urls[0].lastPathComponent) to \(host)?"
             : "Send \(urls.count) files to \(host)?"
-        let shown = urls.prefix(8).map(\.path).joined(separator: "\n")
-        alert.informativeText = shown + (urls.count > 8 ? "\n…" : "")
-            + "\n\nThe files on the pasteboard are copied to the host and their paths there typed."
+        alert.informativeText = "These files on the pasteboard are copied to the host and their "
+            + "paths there typed."
+        let list = NSTextView(frame: NSRect(x: 0, y: 0, width: 420, height: 0))
+        list.isEditable = false
+        list.isSelectable = true
+        list.drawsBackground = false
+        list.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        list.string = urls.map(\.path).joined(separator: "\n")
+        list.isVerticallyResizable = true
+        list.textContainer?.widthTracksTextView = true
+        list.sizeToFit()
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420,
+                                                height: min(160, max(40, list.frame.height + 8))))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.documentView = list
+        alert.accessoryView = scroll
         alert.addButton(withTitle: "Send")
         alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn
+        return alert
     }
 
     /// Starts an upload (`Core.startUpload`; tests stand in for it).
@@ -1598,15 +1621,9 @@ final class TerminalView: NSView, NSTextInputClient {
         }
         let what = files.count == 1 ? (files[0].name ?? (files[0].path as NSString).lastPathComponent)
             : "\(files.count) files"
-        // A batch dropped while another is sent waits for it: neither is given up.
+        // A batch dropped while another is sent waits for it: neither is given up. Waiting, it
+        // is behind the one being sent in the toast; its Cancel comes once it is sent.
         let item = PaneTransfer(text: "Waiting to send \(what) to \(host)…")
-        item.cancel = { [weak self, weak item] in
-            guard let self, let item else { return }
-            self.uploadQueue.removeAll { $0.item === item }
-            if let owned { try? FileManager.default.removeItem(at: owned) }
-            self.endTransfer(item)
-            self.showToast("Upload of \(what) cancelled")
-        }
         uploadQueue.append((files, what, item, owned))
         beginTransfer(item)
         sendNextUpload()
@@ -2211,18 +2228,34 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     /// Fetches a file of this remote pane's host (or finds it cached) and previews it.
+    /// With progress and Cancel in the pane's transfer toast until it is shown or fails.
     func previewRemote(_ reference: TerminalFileReference, cwd: String?) {
-        showToast("Fetching the file from \(pane.host)…", duration: 20)
-        RemoteFileCache.shared.fetch(reference, pane: pane, cwd: cwd) { [weak self] result in
+        let host = pane.host
+        let name: String
+        switch reference {
+        case .path(let path): name = (path as NSString).lastPathComponent
+        case .fileURL(let url): name = url.lastPathComponent
+        }
+        let item = PaneTransfer(text: "Fetching \(name) from \(host)…")
+        beginTransfer(item)
+        var finished = false
+        let cancel = previewCache.fetch(reference, pane: pane, cwd: cwd, progress: { [weak self] p in
+            guard !finished else { return }
+            self?.updateTransfer(item, "Fetching \(name) from \(host)… \(Int(p.fraction * 100))%")
+        }) { [weak self] result in
+            finished = true
             guard let self else { return }
+            self.endTransfer(item)
             switch result {
             case .success(let url):
-                self.removeToast()
                 self.present(url)
+            case .failure(let error as RemoteFileError) where error == .cancelled:
+                self.showToast("Preview of \(name) cancelled")
             case .failure(let error):
                 self.showToast(error.localizedDescription, duration: 6)
             }
         }
+        item.cancel = cancel
     }
 
     /// Shows `url`, a file on this Mac, in Quick Look.
