@@ -78,8 +78,9 @@ final class ForwardsTests: XCTestCase {
         var r = ForwardRequests()
         // Still waited for: answered, nothing closed.
         r.begin(key(1), opening: "devbox")
-        XCTAssertEqual(r.finish(key(1), opening: "devbox", result: opened(7)).0, .answer)
-        XCTAssertEqual(r.finish(key(1), opening: "devbox", result: opened(7)).close, [])
+        let waited = r.finish(key(1), opening: "devbox", result: opened(7))
+        XCTAssertEqual(waited.0, .answer)
+        XCTAssertEqual(waited.close, [])
 
         // Cancelled while opening, nobody else has it: closed again.
         r.begin(key(2), opening: "devbox")
@@ -97,8 +98,9 @@ final class ForwardsTests: XCTestCase {
         // A cancelled close is not answered; it closes nothing more.
         r.begin(key(5), opening: nil)
         r.cancel(key(5))
-        XCTAssertEqual(r.finish(key(5), opening: nil, result: opened(7)).0, .abandoned)
-        XCTAssertEqual(r.finish(key(5), opening: nil, result: opened(7)).close, [])
+        let cancelledClose = r.finish(key(5), opening: nil, result: opened(7))
+        XCTAssertEqual(cancelledClose.0, .abandoned)
+        XCTAssertEqual(cancelledClose.close, [])
     }
 
     /// Two plugins open the same port: the first opens it and is given up on, the second gets

@@ -409,8 +409,9 @@ the same. Limits:
 | Kept | 24 hours, 8 GiB and 1024 drops in all, drops on their way included (every file and folder counts as 4 KiB at least, an empty one too): the oldest finished drops go first, and a file that still does not fit is refused |
 
 The other way, ⌘⌥-click a path in a remote pane, or right-click it and pick
-**Quick Look**, to preview the host's file here: relative paths use the pane's
-directory, `~` is your home on the host. A `file://` link offers **Quick Look**
+**Quick Look**, to preview the host's file here (the toast shows it coming, with
+**Cancel**): relative paths use the pane's directory when you clicked, `~` is your
+home on the host. A `file://` link offers **Quick Look**
 and **Download** (to `~/Downloads`, with progress and **Cancel**) beside **Copy
 Path**. Previewed files are kept in the app's caches folder and fetched again
 only when they changed on the host. Kept previews and those downloading share

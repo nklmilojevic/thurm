@@ -57,6 +57,10 @@ final class Extensions {
     private var remotePorts = RemotePorts()
     /// The Rust core's `thurm_remote_call` (a stand-in in tests). Called on any thread.
     var remoteCall: ([String: Any]) -> Any? = { Core.shared.remoteCall($0) }
+    /// Opens a link in the browser (a stand-in in tests).
+    var browse: (URL) -> Void = { NSWorkspace.shared.open($0) }
+    /// Takes the answers to plugins' forward requests in place of the daemon (tests).
+    var forwardReplies: (([String: Any]) -> Void)?
 
     // MARK: Calling the daemon
 
@@ -482,6 +486,10 @@ final class Extensions {
             guard let self, self.connection == asked else { return }
             var reply: [String: Any] = ["id": id, "result": result]
             if let error { reply["error"] = error }
+            if let replies = self.forwardReplies {
+                replies(reply)
+                return
+            }
             self.call("ui.reply", reply)
         }
         let op: [String: Any]
@@ -521,13 +529,26 @@ final class Extensions {
                 answer(NSNull(), "the app did not answer")
                 return
             }
-            if let f = ForwardInfo(json: v), jsonBool(v["new"]) == true {
+            guard opening != nil else {
+                answer(v, nil)
+                return
+            }
+            // Closed meanwhile (the port went away, a move): its local port may be another
+            // program's now. Nothing is shown or opened for it, and the plugin hears so.
+            guard let f = ForwardInfo(json: v),
+                  let link = ForwardInfo.requestedLink(
+                      f, answer: self.remoteCall(["op": "forward_get", "id": NSNumber(value: f.id)]))
+            else {
+                answer(NSNull(), "the forward closed before it could be used")
+                return
+            }
+            if jsonBool(v["new"]) == true {
                 SessionManager.shared.currentController?.content.focusedView?.showToast(
                     ForwardText.toast(host: f.host, remotePort: f.remotePort, localPort: f.localPort),
                     duration: 4)
             }
-            if browse, let url = jsonString(v["url"]).flatMap(URL.init(string:)) {
-                NSWorkspace.shared.open(url)
+            if browse, let url = URL(string: link) {
+                self.browse(url)
             }
             answer(v, nil)
         }

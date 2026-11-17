@@ -706,4 +706,43 @@ final class FilePreviewTests: XCTestCase {
         cache.switchHeld(from: second, to: nil)
         XCTAssertFalse(FileManager.default.fileExists(atPath: second.path))
     }
+
+    func testAFetchReportsProgressAndCancelsOnlyWhenNoOneWaits() throws {
+        let cache = tempCache()
+        let pane = PaneKey("devbox", 3)
+        var progress: [(TransferProgress) -> Void] = []
+        var finish: [(TransferOutcome) -> Void] = []
+        var dests: [URL] = []
+        var cancels = 0
+        cache.download = { _, _, dest, _, _, onProgress, done in
+            dests.append(dest)
+            progress.append(onProgress)
+            finish.append(done)
+            return { cancels += 1 }
+        }
+        var seen: [[UInt64]] = [[], []]
+        var results: [Result<URL, Error>?] = [nil, nil]
+        let cancelFirst = cache.fetch(.path("/a.bin"), pane: pane, cwd: nil,
+                                      progress: { seen[0].append($0.done) }) { results[0] = $0 }
+        cache.fetch(.path("/a.bin"), pane: pane, cwd: nil,
+                    progress: { seen[1].append($0.done) }) { results[1] = $0 }
+        XCTAssertEqual(progress.count, 1)
+        progress[0](TransferProgress(done: 1, total: 2))
+        XCTAssertEqual(seen, [[1], [1]])
+        // One of two gives up: it is told so, and the download goes on for the other.
+        cancelFirst()
+        XCTAssertEqual((try? XCTUnwrap(results[0]).get()) == nil, true)
+        XCTAssertEqual(cancels, 0)
+        try Data("ab".utf8).write(to: dests[0])
+        finish[0](outcome(name: "a.bin", version: "v"))
+        XCTAssertEqual(try String(contentsOf: try XCTUnwrap(results[1]).get(), encoding: .utf8), "ab")
+        // Alone, giving up stops the download.
+        var last: Result<URL, Error>?
+        let cancel = cache.fetch(.path("/b.bin"), pane: pane, cwd: nil) { last = $0 }
+        cancel()
+        XCTAssertEqual(cancels, 1)
+        XCTAssertThrowsError(try XCTUnwrap(last).get()) {
+            XCTAssertEqual($0 as? RemoteFileError, .cancelled)
+        }
+    }
 }
