@@ -24,7 +24,12 @@ if status is-interactive; and not set -q __thurm_fish_loaded
     if set -q THURM_CLIP_SHIMS
         function __thurm_clip_shims --on-event fish_prompt
             functions -e __thurm_clip_shims
-            set -gx PATH $THURM_CLIP_SHIMS (string match -v -- $THURM_CLIP_SHIMS $PATH)
+            # Compared as text: the path may hold characters a pattern would read as a glob.
+            set -l rest
+            for p in $PATH
+                test "$p" = "$THURM_CLIP_SHIMS"; or set -a rest $p
+            end
+            set -gx PATH $THURM_CLIP_SHIMS $rest
         end
     end
 

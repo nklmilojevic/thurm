@@ -40,6 +40,9 @@ pub enum Action {
     },
     /// Print the types the clipboard holds, in the tool's own terms.
     Types { xclip: bool },
+    /// Print the clipboard's text, then copy standard input (`xsel` with both of its standard
+    /// streams redirected and neither mode asked for).
+    PasteThenCopy,
     /// Print a usage line, do nothing else.
     Help(&'static str),
 }
@@ -106,7 +109,15 @@ fn operand<'a>(
 }
 
 /// Parses the arguments `tool` was run with (without its name).
-pub fn parse(tool: &str, args: &[String], stdin_tty: bool) -> Result<Action, String> {
+///
+/// `stdin_tty` and `stdout_tty` say whether those are terminals: `xsel` without a mode picks
+/// one by them.
+pub fn parse(
+    tool: &str,
+    args: &[String],
+    stdin_tty: bool,
+    stdout_tty: bool,
+) -> Result<Action, String> {
     let mut it = args.iter();
     match tool {
         "pbcopy" => Ok(Action::Copy {
@@ -193,23 +204,32 @@ pub fn parse(tool: &str, args: &[String], stdin_tty: bool) -> Result<Action, Str
                 }
             }
             if clear {
-                Ok(Action::Copy {
+                return Ok(Action::Copy {
                     text: Some(String::new()),
                     trim: false,
                     echo: false,
-                })
-            } else if output || (!input && stdin_tty) {
-                Ok(Action::Paste {
+                });
+            }
+            // As xsel does: the modes asked for; with none, output when standard output is not
+            // a terminal and input when standard input is not (both when neither is), and output
+            // from a terminal.
+            let (output, input) = match (output, input) {
+                (false, false) if stdin_tty && stdout_tty => (true, false),
+                (false, false) => (!stdout_tty, !stdin_tty),
+                asked => asked,
+            };
+            Ok(match (output, input) {
+                (true, true) => Action::PasteThenCopy,
+                (true, false) => Action::Paste {
                     mime: CLIP_TEXT.into(),
                     newline: false,
-                })
-            } else {
-                Ok(Action::Copy {
+                },
+                _ => Action::Copy {
                     text: None,
                     trim: false,
                     echo: false,
-                })
-            }
+                },
+            })
         }
         "wl-copy" => {
             let (mut trim, mut clear, mut words) = (false, false, Vec::new());
@@ -328,8 +348,13 @@ pub fn run_as_tool(argv0: &str, args: &[String]) -> Option<ExitCode> {
     if !CLIP_TOOLS.contains(&name) {
         return None;
     }
-    let done = parse(name, args, std::io::stdin().is_terminal())
-        .and_then(|action| perform(action).map_err(|e| e.to_string()));
+    let done = parse(
+        name,
+        args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )
+    .and_then(|action| perform(action).map_err(|e| e.to_string()));
     Some(match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -416,6 +441,19 @@ fn copy_then_echo(
 }
 
 fn perform(action: Action) -> Result<(), Box<dyn std::error::Error>> {
+    if let Action::PasteThenCopy = action {
+        // The copy goes ahead though the paste failed (a refused read), as xsel's does.
+        let pasted = perform(Action::Paste {
+            mime: CLIP_TEXT.into(),
+            newline: false,
+        });
+        let copied = perform(Action::Copy {
+            text: None,
+            trim: false,
+            echo: false,
+        });
+        return pasted.and(copied);
+    }
     let mut out = std::io::stdout().lock();
     match action {
         Action::Help(usage) => writeln!(out, "{usage}")?,
@@ -447,6 +485,7 @@ fn perform(action: Action) -> Result<(), Box<dyn std::error::Error>> {
             let data = get(pane()?, CLIP_TARGETS)?;
             out.write_all(list_types(&String::from_utf8_lossy(&data), xclip).as_bytes())?;
         }
+        Action::PasteThenCopy => unreachable!("handled above"),
     }
     out.flush()?;
     Ok(())
@@ -458,7 +497,8 @@ mod tests {
 
     fn p(tool: &str, args: &[&str]) -> Result<Action, String> {
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-        parse(tool, &args, false)
+        // Piped input, output to a terminal.
+        parse(tool, &args, false, true)
     }
 
     fn copy() -> Action {
@@ -607,8 +647,31 @@ mod tests {
         // Neither -i nor -o: input when stdin is piped, output from a terminal.
         assert_eq!(p("xsel", &["-b"]), Ok(copy()));
         assert_eq!(
-            parse("xsel", &["-b".to_string()], true),
+            parse("xsel", &["-b".to_string()], true, true),
             Ok(paste(CLIP_TEXT))
+        );
+        // Without a mode, by which standard streams are terminals (stdin, stdout).
+        let b = ["-b".to_string()];
+        assert_eq!(
+            parse("xsel", &b, true, false),
+            Ok(paste(CLIP_TEXT)),
+            "> file"
+        );
+        assert_eq!(parse("xsel", &b, false, true), Ok(copy()), "piped in");
+        assert_eq!(
+            parse("xsel", &b, false, false),
+            Ok(Action::PasteThenCopy),
+            "both redirected: the old selection out, then the new one in"
+        );
+        // A mode asked for is the only one, whatever the streams.
+        assert_eq!(parse("xsel", &["-bi".into()], false, false), Ok(copy()));
+        assert_eq!(
+            parse("xsel", &["-bo".into()], false, false),
+            Ok(paste(CLIP_TEXT))
+        );
+        assert_eq!(
+            parse("xsel", &["-b".into(), "-i".into(), "-o".into()], true, true),
+            Ok(Action::PasteThenCopy)
         );
         assert!(p("xsel", &["-q"]).is_err());
     }
@@ -688,8 +751,8 @@ mod tests {
     #[test]
     fn only_tool_names_switch_modes() {
         for t in CLIP_TOOLS {
-            assert!(parse(t, &[], false).is_ok(), "{t}");
+            assert!(parse(t, &[], false, true).is_ok(), "{t}");
         }
-        assert!(parse("thurm", &[], false).is_err());
+        assert!(parse("thurm", &[], false, true).is_err());
     }
 }

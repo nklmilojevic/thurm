@@ -387,29 +387,58 @@ fn clipboard_tools_come_first_after_the_startup_files() {
         .filter_map(on_path)
         .map(|p| p.display().to_string())
         .collect();
+    // zsh twice: GLOB_SUBST changes how it reads a substituted value in a pattern.
+    let cases: Vec<(&String, &str)> = shells
+        .iter()
+        .flat_map(|sh| {
+            let opts: &[&str] = if sh.ends_with("/zsh") {
+                &["", "setopt globsubst\n"]
+            } else {
+                &[""]
+            };
+            opts.iter().map(move |o| (sh, *o))
+        })
+        .collect();
     let mut tested: Vec<String> = Vec::new();
-    for shell in &shells {
+    for (i, (shell, zsh_opts)) in cases.into_iter().enumerate() {
         let name = shell.rsplit('/').next().unwrap();
-        let env = Env::new(&format!("clip-path-{name}"));
+        let env = Env::new(&format!("clip-path-{name}-{i}"));
         let home = env.dir.join("home");
-        let shims = env.dir.join("shims");
+        // A glob character in the shims' path, and a directory its pattern would match: the
+        // shims must be compared literally.
+        let shims = env.dir.join("shims*x");
+        let lookalike = env.dir.join("shims1x");
         let real = home.join("real");
-        for dir in [&shims, &real, &home.join(".config/fish")] {
+        for dir in [&shims, &lookalike, &real, &home.join(".config/fish")] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        for dir in [&shims, &real] {
-            let tool = dir.join("xclip");
+        for (dir, name) in [
+            (&shims, "xclip"),
+            (&real, "xclip"),
+            (&lookalike, "lookalike-tool"),
+        ] {
+            let tool = dir.join(name);
             std::fs::write(&tool, "#!/bin/sh\n").unwrap();
             std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let rc = format!("PS1='$ '\nexport PATH=\"{}:$PATH\"\n", real.display());
-        std::fs::write(home.join(".zshrc"), &rc).unwrap();
+        // The user's startup files put another xclip first, keep the look-alike directory,
+        // and name the shims once more further down.
+        let entries = format!(
+            "{}:{}:$PATH:{}",
+            real.display(),
+            lookalike.display(),
+            shims.display()
+        );
+        let rc = format!("PS1='$ '\nexport PATH=\"{entries}\"\n");
+        std::fs::write(home.join(".zshrc"), format!("{zsh_opts}{rc}")).unwrap();
         std::fs::write(home.join(".bashrc"), &rc).unwrap();
         std::fs::write(
             home.join(".config/fish/config.fish"),
             format!(
-                "set -gx PATH {} $PATH\nfunction fish_prompt; echo -n '$ '; end\n",
-                real.display()
+                "set -gx PATH {:?} {:?} $PATH {:?}\nfunction fish_prompt; echo -n '$ '; end\n",
+                real.display().to_string(),
+                lookalike.display().to_string(),
+                shims.display().to_string()
             ),
         )
         .unwrap();
@@ -456,6 +485,20 @@ fn clipboard_tools_come_first_after_the_startup_files() {
         }
         let first = regex_escape(&shims.join("xclip").display().to_string());
         send_until(&c, pane, b"command -v xclip\r", &format!("(?m)^{first}$"));
+        let kept = regex_escape(&lookalike.join("lookalike-tool").display().to_string());
+        send_until(
+            &c,
+            pane,
+            b"command -v lookalike-tool\r",
+            &format!("(?m)^{kept}$"),
+        );
+        // Once on PATH: the line counts the entries with `s*x`, which only the shims' has.
+        send_until(
+            &c,
+            pane,
+            b"sh -c 'echo SHIMS-$(echo \"$PATH\" | tr : \"\\n\" | grep -cF \"s*x\")'\r",
+            "(?m)^SHIMS-1$",
+        );
         tested.push(name.to_owned());
     }
     assert!(

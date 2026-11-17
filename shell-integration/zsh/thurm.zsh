@@ -61,7 +61,8 @@ _thurm_precmd_last() {
   # Clipboard tools that reach the app's clipboard: first on PATH once .zprofile and .zshrc
   # (which run after this file) have made their changes.
   if [[ -n "${THURM_CLIP_SHIMS-}" ]]; then
-    path=("$THURM_CLIP_SHIMS" ${path:#${(b)THURM_CLIP_SHIMS}})
+    # The directory as text: quoted for a pattern, read as one even under GLOB_SUBST.
+    path=("$THURM_CLIP_SHIMS" ${path:#${~${(b)THURM_CLIP_SHIMS}}})
     export PATH
   fi
   _thurm_precmd
