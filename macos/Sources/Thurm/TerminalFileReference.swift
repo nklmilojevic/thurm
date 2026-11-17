@@ -302,6 +302,17 @@ final class RemoteFileCache {
         return FileManager.default.fileExists(atPath: file.path) ? file : nil
     }
 
+    /// `name` within the 255 bytes a file name may take: the part before its extension is cut,
+    /// by whole characters, and the extension kept when it fits.
+    static func fitName(_ name: String, limit: Int = 255) -> String {
+        if name.utf8.count <= limit { return name }
+        let ext = (name as NSString).pathExtension
+        let keep = ext.isEmpty || ext.utf8.count + 2 > limit ? "" : "." + ext
+        var stem = Substring(keep.isEmpty ? name : String(name.dropLast(keep.count)))
+        while stem.utf8.count + keep.utf8.count > limit { stem = stem.dropLast() }
+        return String(stem) + keep
+    }
+
     /// The cached copy in `entry` and the version it is, if any. The version is kept in the
     /// copy's own folder, written before the copy is put in use: whichever copy `.current`
     /// names, its version is its own, even when two app instances install at once.
@@ -329,7 +340,7 @@ final class RemoteFileCache {
         let fm = FileManager.default
         // A hidden name (.eslintrc.json) keeps its extension, for Quick Look to know it, but
         // not its leading dot, which marks the cache's own files.
-        let safe = name.isEmpty || name.contains("/") ? "file" : name.hasPrefix(".") ? "dot" + name : name
+        let safe = Self.fitName(name.isEmpty || name.contains("/") ? "file" : name.hasPrefix(".") ? "dot" + name : name)
         let copy = "c-\(UUID().uuidString)"
         let folder = entry.appendingPathComponent(copy, isDirectory: true)
         try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -467,11 +478,11 @@ final class RemoteFileCache {
             return (entry.standardizedFileURL, date, size(of: entry) + (stale[Self.path(entry)] ?? 0))
         }
         sized.sort { $0.date < $1.date }
-        // A download refreshing an entry replaces its copy in use, unless Quick Look shows it:
-        // only what it adds beyond that copy is reserved.
+        // A download refreshing an entry replaces its copy in use, unless Quick Look shows it,
+        // here or in another instance: only what it adds beyond that copy is reserved.
         let extra = reserved.values.reduce(UInt64(0)) { sum, r in
             var replaced: UInt64 = 0
-            if let file = current(r.entry), held[file.standardizedFileURL] == nil {
+            if let file = current(r.entry), held[file.standardizedFileURL] == nil, !usedElsewhere(r.entry) {
                 replaced = UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
             }
             return sum + (r.bytes > replaced ? r.bytes - replaced : 0)

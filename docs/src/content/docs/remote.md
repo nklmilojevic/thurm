@@ -360,8 +360,8 @@ dropped them. Once every file has
 arrived, the host's daemon types their paths into the pane, quoted and separated
 by spaces, as a paste, so an agent at its prompt gets them as one paste. If a
 file fails or you cancel before every file has arrived, nothing is typed and
-nothing is kept. Copied files are sent once you confirm them in the dialog that
-names them. Pasting pastes text whenever there is some, even when the app that
+nothing is kept. Dropped and copied files are sent once you confirm them in the
+dialog that names them. Pasting pastes text whenever there is some, even when the app that
 copied it put a file beside it: Finder's copies carry their names as text, so
 pasting them pastes the names. Folders are
 refused; drop the files in them instead.

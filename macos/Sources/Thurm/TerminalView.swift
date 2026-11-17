@@ -1420,7 +1420,7 @@ final class TerminalView: NSView, NSTextInputClient {
         Core.shared.paste(pane, text: text)
     }
 
-    /// Asks whether to send pasted files to the host (tests answer for the user).
+    /// Asks whether to send copied or dropped files to the host (tests answer for the user).
     var confirmSend: (([URL], HostId) -> Bool)?
 
     /// "Send 2 files to devbox?", naming every one of them.
@@ -1434,8 +1434,7 @@ final class TerminalView: NSView, NSTextInputClient {
         let alert = NSAlert()
         alert.messageText = urls.count == 1 ? "Send \(urls[0].lastPathComponent) to \(host)?"
             : "Send \(urls.count) files to \(host)?"
-        alert.informativeText = "These files on the pasteboard are copied to the host and their "
-            + "paths there typed."
+        alert.informativeText = "These files are copied to the host and their paths there typed."
         let list = NSTextView(frame: NSRect(x: 0, y: 0, width: 420, height: 0))
         list.isEditable = false
         list.isSelectable = true
@@ -1466,8 +1465,7 @@ final class TerminalView: NSView, NSTextInputClient {
     func paste(from pb: NSPasteboard) {
         if isOffline { return }
         // Files and images copied here go to a remote pane's host as files. Files only once
-        // asked: a paste names them less plainly than a drop does, and any app can put a file's
-        // address on the pasteboard.
+        // asked: any app can put a file's address on the pasteboard.
         if hostTakesFiles {
             switch Self.uploadPlan(pb, pasting: true) {
             case .none: break
@@ -1519,10 +1517,18 @@ final class TerminalView: NSView, NSTextInputClient {
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         if isOffline { return false }
-        // Files dropped on a remote pane go to its host, and their paths there are typed.
+        // Files dropped on a remote pane go to its host, and their paths there are typed. Files
+        // only once asked, by name: the app a drag comes from may put a file's address in it
+        // beside what it shows.
         if hostTakesFiles {
             switch Self.uploadPlan(sender.draggingPasteboard, pasting: false) {
             case .none: break
+            case .files(let urls):
+                window?.makeKeyAndOrderFront(nil)
+                window?.makeFirstResponder(self)
+                guard (confirmSend ?? Self.askToSend)(urls, pane.host) else { return false }
+                startUpload(.files(urls), from: sender.draggingPasteboard)
+                return true
             case let plan:
                 window?.makeKeyAndOrderFront(nil)
                 window?.makeFirstResponder(self)
