@@ -538,7 +538,9 @@ final class Extensions {
             return
         }
         // Opening connects to the host's daemon first: not on the main thread, and only if the
-        // daemon has not given up on it before it starts.
+        // daemon has not given up on it before it starts. A cancel that comes after that check
+        // (the call cannot be held back without holding up the main thread) is undone in `done`:
+        // the forward the call opened is closed again.
         let call = remoteCall
         DispatchQueue.global(qos: .userInitiated).async {
             let live = DispatchQueue.main.sync { self.forwardRequests.isLive(key) }
