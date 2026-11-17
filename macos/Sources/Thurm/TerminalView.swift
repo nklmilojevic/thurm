@@ -102,9 +102,13 @@ final class TerminalView: NSView, NSTextInputClient {
     private var lockBadge: NSImageView?
     private var markedLabel: NSTextField?
     private var toastView: NSView?
-    /// The upload under way from this pane, and the toast that shows it.
-    private var uploadID: UInt64?
-    private var uploadToast: (box: NSView, label: NSTextField)?
+    /// The transfers under way from this pane, the first shown in the toast, and that toast.
+    private var transfers: [PaneTransfer] = []
+    private var transferToast: (box: NSView, label: NSTextField)?
+    /// Batches waiting for the one being sent: each goes when the one before it ends, so their
+    /// paths are typed in the order they were dropped.
+    private var uploadQueue: [(files: [(path: String, name: String?)], what: String, item: PaneTransfer)] = []
+    private var uploading = false
     private var restoredToastShown = false
     private var progressBar: ProgressBarView?
     private var offlineOverlay: OfflineOverlay?
@@ -1386,8 +1390,8 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Whether this pane's host takes files (tests set it).
     var transfersFiles: Bool?
 
-    /// Takes the files an upload would send, in order, in place of sending them (tests).
-    var uploadFiles: (([(path: String, name: String?)]) -> Void)?
+    /// Starts an upload (`Core.startUpload`; tests stand in for it).
+    var uploader: Core.UploadStarter = Core.startUpload
 
     private var hostTakesFiles: Bool {
         pane.isRemote && (transfersFiles ?? Core.shared.canTransfer(pane.host))
@@ -1534,44 +1538,122 @@ final class TerminalView: NSView, NSTextInputClient {
             }
             files = [(path, (path as NSString).lastPathComponent)]
         }
-        if let uploadFiles { return uploadFiles(files) }
-        if let running = uploadID { Core.shared.cancelTransfer(running) }
         let what = files.count == 1 ? (files[0].name ?? (files[0].path as NSString).lastPathComponent)
             : "\(files.count) files"
-        showUploadToast("Sending \(what) to \(host)…")
-        var id: UInt64?
-        id = Core.shared.upload(pane, files: files, onProgress: { [weak self] p in
-            guard let self, self.uploadID == id else { return }
-            self.showUploadToast("Sending \(what) to \(host)… \(Int(p.fraction * 100))%")
-        }, onFinish: { [weak self] outcome in
+        // A batch dropped while another is sent waits for it: neither is given up.
+        let item = PaneTransfer(text: "Waiting to send \(what) to \(host)…")
+        item.cancel = { [weak self, weak item] in
+            guard let self, let item else { return }
+            self.uploadQueue.removeAll { $0.item === item }
+            self.endTransfer(item)
+            self.showToast("Upload of \(what) cancelled")
+        }
+        uploadQueue.append((files, what, item))
+        beginTransfer(item)
+        sendNextUpload()
+    }
+
+    /// Starts the first waiting batch, unless one is being sent.
+    private func sendNextUpload() {
+        guard !uploading, !uploadQueue.isEmpty else { return }
+        let (files, what, item) = uploadQueue.removeFirst()
+        let host = pane.host
+        uploading = true
+        var finished = false
+        updateTransfer(item, "Sending \(what) to \(host)…")
+        let cancel = uploader(pane, files, { [weak self] p in
+            guard !finished else { return }
+            self?.updateTransfer(item, "Sending \(what) to \(host)… \(Int(p.fraction * 100))%")
+        }, { [weak self] outcome in
+            finished = true
             guard let self else { return }
-            if id != nil, self.uploadID != id { return }
-            self.uploadID = nil
-            self.hideUploadToast()
+            self.endTransfer(item)
             if outcome.cancelled {
-                self.showToast("Upload cancelled")
+                self.showToast("Upload of \(what) cancelled")
             } else if outcome.folder {
                 self.showToast("Only files are sent to \(host), not folders.", duration: 5)
             } else if let e = outcome.error {
                 self.showToast("Could not send \(what) to \(host): \(e)", duration: 6)
             }
+            self.uploading = false
+            self.sendNextUpload()
         })
-        uploadID = id
-        if id == nil { hideUploadToast() }
+        item.cancel = cancel ?? {}
     }
 
-    /// Whether the upload's toast, with its Cancel, is showing.
-    var showsUploadToast: Bool {
-        guard let t = uploadToast else { return false }
-        return t.box === toastView && t.box.superview === self && t.box.alphaValue > 0
+    /// Downloads the file at `path` on this pane's host into `dir` (`~/Downloads`) under a
+    /// free name, reserved now so nothing else takes it, with progress and Cancel in the toast.
+    /// Shows the file in Finder when done.
+    func download(remotePath path: String, into dir: URL, start: Core.DownloadStarter = Core.startDownload,
+                  reveal: @escaping (URL) -> Void = { NSWorkspace.shared.activateFileViewerSelecting([$0]) }) {
+        let name = (path as NSString).lastPathComponent
+        guard let dest = SessionManager.reserveFreeName(name.isEmpty ? "file" : name, in: dir) else {
+            showToast("Could not create a file in \(dir.lastPathComponent).", duration: 6)
+            return
+        }
+        let host = pane.host
+        let item = PaneTransfer(text: "Downloading \(name) from \(host)…")
+        beginTransfer(item)
+        var finished = false
+        let cancel = start(pane, path, dest, nil, 0, { [weak self] p in
+            guard !finished else { return }
+            self?.updateTransfer(item, "Downloading \(name) from \(host)… \(Int(p.fraction * 100))%")
+        }, { [weak self] outcome in
+            finished = true
+            self?.endTransfer(item)
+            if outcome.error != nil {
+                // The reserved name goes with a download that did not finish.
+                try? FileManager.default.removeItem(at: dest)
+                if outcome.cancelled {
+                    self?.showToast("Download of \(name) cancelled")
+                } else if let e = outcome.error {
+                    self?.showToast("Could not download \(name): \(e)", duration: 6)
+                }
+                return
+            }
+            self?.showToast("Downloaded \(dest.lastPathComponent) to \(dir.lastPathComponent)")
+            reveal(dest)
+        })
+        item.cancel = cancel ?? {}
     }
 
-    /// The upload toast, made or updated: stays until the upload ends. A transient toast shown
-    /// meanwhile must not take it down with its fade.
-    func showUploadToast(_ text: String) {
+    // MARK: Transfer toast
+
+    private func beginTransfer(_ item: PaneTransfer) {
+        transfers.append(item)
+        refreshTransferToast()
+    }
+
+    private func updateTransfer(_ item: PaneTransfer, _ text: String) {
+        item.text = text
+        if transfers.first === item { refreshTransferToast() }
+    }
+
+    private func endTransfer(_ item: PaneTransfer) {
+        transfers.removeAll { $0 === item }
+        refreshTransferToast()
+    }
+
+    /// The first transfer, and how many more, or no toast once none is left.
+    private func refreshTransferToast() {
+        guard let first = transfers.first else { return hideTransferToast() }
+        let more = transfers.count - 1
+        showTransferToast(more > 0 ? "\(first.text) (\(more) more)" : first.text)
+    }
+
+    /// Whether the transfer toast, with its Cancel, is showing, and what it says.
+    var shownTransfer: String? {
+        guard let t = transferToast, t.box === toastView, t.box.superview === self, t.box.alphaValue > 0
+        else { return nil }
+        return t.label.stringValue
+    }
+
+    /// The transfer toast, made or updated: stays until the transfers end. A transient toast
+    /// shown meanwhile must not take it down with its fade.
+    private func showTransferToast(_ text: String) {
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(fadeToast), object: nil)
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(removeToast), object: nil)
-        if let t = uploadToast, t.box === toastView {
+        if let t = transferToast, t.box === toastView {
             t.box.alphaValue = 1
             t.label.stringValue = text
             t.label.sizeToFit()
@@ -1585,7 +1667,7 @@ final class TerminalView: NSView, NSTextInputClient {
         label.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         label.textColor = chrome.contentPrimary
         label.sizeToFit()
-        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelUpload(_:)))
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelShownTransfer(_:)))
         cancel.bezelStyle = .inline
         cancel.controlSize = .small
         cancel.font = NSFont.systemFont(ofSize: 11)
@@ -1604,20 +1686,21 @@ final class TerminalView: NSView, NSTextInputClient {
         box.addSubview(cancel)
         addSubview(box)
         toastView = box
-        uploadToast = (box, label)
+        transferToast = (box, label)
         layoutOverlays()
     }
 
-    private func hideUploadToast() {
-        if let t = uploadToast, t.box === toastView {
+    private func hideTransferToast() {
+        if let t = transferToast, t.box === toastView {
             toastView?.removeFromSuperview()
             toastView = nil
         }
-        uploadToast = nil
+        transferToast = nil
     }
 
-    @objc private func cancelUpload(_ sender: Any?) {
-        if let id = uploadID { Core.shared.cancelTransfer(id) }
+    /// The toast's Cancel: stops the transfer it shows.
+    @objc func cancelShownTransfer(_ sender: Any?) {
+        transfers.first?.cancel()
     }
 
     /// The pasteboard's image as PNG.
@@ -2139,6 +2222,16 @@ extension TerminalView: QLPreviewPanelDataSource {
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
         guard index == 0 else { return nil }
         return previewURL as NSURL?
+    }
+}
+
+/// A transfer a pane's toast shows: what it says, and what Cancel does.
+final class PaneTransfer {
+    var text: String
+    var cancel: () -> Void = {}
+
+    init(text: String) {
+        self.text = text
     }
 }
 
