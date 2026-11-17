@@ -2545,7 +2545,10 @@ impl Daemon {
             | Request::SearchPaths { .. }
             | Request::Processes { .. }
             | Request::Ports { .. }
-            | Request::ApplyLayout { .. }) => {
+            | Request::ApplyLayout { .. }
+            // An upload's admission may walk and prune the kept drops.
+            | Request::UploadBegin { .. }
+            | Request::DownloadBegin { .. }) => {
                 let daemon = self.clone();
                 let client = client.clone();
                 let spawned = std::thread::Builder::new()

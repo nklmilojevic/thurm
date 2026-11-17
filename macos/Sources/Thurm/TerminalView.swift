@@ -1406,7 +1406,8 @@ final class TerminalView: NSView, NSTextInputClient {
     var transfersFiles: Bool?
 
     /// Where remote previews are fetched and kept (tests use their own).
-    var previewCache = RemoteFileCache.shared
+    /// Taken on first use: a pane that never previews a remote file never opens the cache.
+    lazy var previewCache = RemoteFileCache.shared
 
     /// Takes what a paste or drop types into the pane, in place of sending it (tests).
     var pasteText: ((String) -> Void)?

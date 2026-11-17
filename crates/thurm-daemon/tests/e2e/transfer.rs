@@ -1348,3 +1348,47 @@ fn a_refused_upload_gives_its_ticket_back() {
         assert!(e.to_string().contains("cannot create"), "{e}");
     }
 }
+
+#[test]
+fn drops_on_their_way_count_toward_the_drops_kept() {
+    let env = Env::new("transfer-max-drops");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_DROPS", Path::new("2"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("k", 0, 1), "kept.txt", 1, b"k")
+        .wait_closed()
+        .unwrap();
+    let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    // One on its way, and then another: three drops on disk would be one too many.
+    let _waiting = send(&env, &c, pane, ("w", 0, 2), "w.txt", 1, b"w");
+    c.upload_begin(pane, "n.txt", 1, None).unwrap();
+    assert!(!kept.exists());
+}
+
+#[test]
+fn a_file_whose_ticket_ran_out_unused_ends_its_batch() {
+    let env = Env::new("transfer-lapsed");
+    // Tickets last 300 ms; batches stall after 2 s.
+    let _daemon = env.start_with(&[("THURM_STREAM_TICKET_MS", Path::new("300"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    // Reserved, its stream never opened.
+    c.upload_begin(
+        pane,
+        "never.txt",
+        1,
+        Some(UploadBatch {
+            id: "n".into(),
+            index: 0,
+            count: 2,
+        }),
+    )
+    .unwrap();
+    let [batch] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    std::thread::sleep(Duration::from_millis(1200));
+    // The next upload looks: the batch is gone before it would have stalled.
+    c.upload_begin(pane, "next.txt", 1, None).unwrap();
+    assert!(!batch.exists());
+}

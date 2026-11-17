@@ -41,7 +41,7 @@ pub const MAX_WAITING_BATCHES: usize = 32;
 /// Files of batches not complete yet, over all, whether on their way or landed and waiting for
 /// the rest: each takes a stream (and threads) once sent.
 pub const MAX_WAITING_FILES: usize = 512;
-/// Batches kept, over all panes, however small.
+/// Drops on disk, kept or on their way, over all panes, however small.
 pub const MAX_KEPT_BATCHES: usize = 1024;
 /// What one file or directory takes on disk at least: an empty file is not free. 4 KiB, or
 /// `THURM_TRANSFER_BLOCK` (tests, to count in bytes).
@@ -99,6 +99,10 @@ pub struct Transfers {
     ack: Duration,
     /// [`MAX_WAITING_FILES`], or `THURM_TRANSFER_MAX_WAITING_FILES` (tests).
     max_waiting_files: usize,
+    /// [`MAX_KEPT_BATCHES`], or `THURM_TRANSFER_MAX_DROPS` (tests).
+    max_drops: usize,
+    /// How long a stream ticket lasts unused.
+    ticket_ttl: Duration,
 }
 
 /// A duration in milliseconds from the environment variable `var`, else `default` (tests).
@@ -145,6 +149,8 @@ struct Slot {
     path: PathBuf,
     size: u64,
     state: SlotState,
+    /// When its ticket was given: unused past the ticket's life, the file can never come.
+    reserved: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -192,6 +198,11 @@ impl Transfers {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(MAX_WAITING_FILES),
+            max_drops: std::env::var("THURM_TRANSFER_MAX_DROPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MAX_KEPT_BATCHES),
+            ticket_ttl: crate::streams::ticket_ttl(),
         }
     }
 
@@ -203,7 +214,8 @@ impl Transfers {
         self.sweep(&mut st);
         st.kept_seen = None;
         let kept = self.kept(&mut st);
-        self.make_room(kept, 0, 0, 0);
+        let busy = st.batches.values().filter(|b| b.busy()).count();
+        self.make_room(kept, busy, 0, 0, 0);
         st.kept_seen = None;
     }
 
@@ -416,8 +428,13 @@ impl Transfers {
         };
         // Only an admitted file makes older drops give way, and only what was deleted counts.
         // The drops looked at above, not walked again: the new batch is not among them.
-        let room = self.make_room(kept_now, incoming, short, files_short);
-        st.kept_seen = None;
+        // Drops on their way count toward the drops kept, this new one included.
+        let busy = st.batches.values().filter(|b| b.busy()).count();
+        let (room, deleted) = self.make_room(kept_now, busy, incoming, short, files_short);
+        // The walk stands for the next file unless something in it went.
+        if deleted {
+            st.kept_seen = None;
+        }
         if !room {
             undo(&mut st);
             return Err(too_much());
@@ -459,6 +476,7 @@ impl Transfers {
                 path: b.dir.join(&name),
                 size,
                 state: SlotState::Reserved,
+                reserved: Instant::now(),
             },
         );
         b.touched = Instant::now();
@@ -588,6 +606,23 @@ impl Transfers {
             .collect();
         for serial in stalled {
             self.fail(st, serial, "the upload stalled".into());
+        }
+        // A file whose ticket ran out unused can never come (its stream never opened): its
+        // batch goes now, not when it would stall.
+        let lapsed = self.ticket_ttl + Duration::from_millis(200);
+        let never: Vec<u64> = st
+            .batches
+            .iter()
+            .filter(|(_, b)| b.waiting() && !b.pasting)
+            .filter(|(_, b)| {
+                b.files
+                    .values()
+                    .any(|f| f.state == SlotState::Reserved && f.reserved.elapsed() > lapsed)
+            })
+            .map(|(serial, _)| *serial)
+            .collect();
+        for serial in never {
+            self.fail(st, serial, "a file of the upload never came".into());
         }
         st.batches
             .retain(|_, b| b.busy() || b.touched.elapsed() <= self.idle);
@@ -721,16 +756,25 @@ impl Transfers {
     /// Deletes the oldest kept batches until `incoming` more bytes stay within the kept limit
     /// and at least `free` bytes and `files` files were freed. A batch that could not be deleted
     /// still counts. Whether all hold now.
-    fn make_room(&self, kept: Vec<Kept>, incoming: u64, free: u64, files: u64) -> bool {
+    /// `busy` drops on their way (on disk, not among `kept`) count toward the drops kept.
+    /// Returns whether all hold now, and whether any was deleted.
+    fn make_room(
+        &self,
+        kept: Vec<Kept>,
+        busy: usize,
+        incoming: u64,
+        free: u64,
+        files: u64,
+    ) -> (bool, bool) {
         let mut total: u64 = kept.iter().map(|k| k.size).sum();
         let (mut freed, mut freed_files) = (0u64, 0u64);
         let mut count = kept.len();
-        // Room for one more batch, however small its files.
+        let mut deleted = false;
         let fits = |total: u64, freed: u64, freed_files: u64, count: usize| {
             total.saturating_add(incoming) <= self.max_kept
                 && freed >= free
                 && freed_files >= files
-                && count < MAX_KEPT_BATCHES
+                && count + busy <= self.max_drops
         };
         for k in kept {
             if fits(total, freed, freed_files, count) {
@@ -741,9 +785,10 @@ impl Transfers {
                 freed += k.size;
                 freed_files += k.files;
                 count -= 1;
+                deleted = true;
             }
         }
-        fits(total, freed, freed_files, count)
+        (fits(total, freed, freed_files, count), deleted)
     }
 
     /// File `index` of batch `serial` arrived whole at its place. When it is the last, types
@@ -1425,6 +1470,30 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
         let dir = t.new_batch_dir(3).unwrap();
         assert!(dir.join(PARTS).is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn making_room_says_whether_anything_went() {
+        let root = std::env::temp_dir().join(format!("thurm-make-room-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let t = Transfers::new(root.clone());
+        let old = root.join("1/old");
+        std::fs::create_dir_all(&old).unwrap();
+        let kept = || {
+            vec![Kept {
+                since: SystemTime::UNIX_EPOCH,
+                size: 10,
+                files: 1,
+                dir: old.clone(),
+            }]
+        };
+        // Room already: nothing deleted, so a walk of the drops still stands.
+        assert_eq!(t.make_room(kept(), 0, 10, 0, 0), (true, false));
+        assert!(old.exists());
+        // Room only once it goes.
+        assert_eq!(t.make_room(kept(), 0, MAX_KEPT, 0, 0), (true, true));
+        assert!(!old.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
