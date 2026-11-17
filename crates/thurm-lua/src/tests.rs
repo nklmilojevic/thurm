@@ -40,11 +40,15 @@ impl Host for FakeHost {
                 "complete": false,
             }])),
             "ports.list" if params["pane"].is_u64() => Ok(json!([])),
-            "ports.list" => Ok(json!([{
-                "pane": 3,
-                "ports": [{ "port": 4000, "address": "127.0.0.1", "pid": 9, "command": "node_modules/.bin/vite" }],
-                "complete": true,
-            }])),
+            "ports.list" => Ok(json!([
+                {
+                    "pane": 3,
+                    "ports": [{ "port": 4000, "address": "127.0.0.1", "pid": 9, "command": "node_modules/.bin/vite" }],
+                    "complete": true,
+                },
+                // Read in part: a server it left out still runs.
+                { "pane": 6, "ports": [], "complete": false },
+            ])),
             "forwards.open" => Ok(json!({
                 "id": 4, "host": params["host"], "remote_port": params["port"],
                 "local_port": 5174, "url": "http://localhost:5174/", "new": params["browse"],
@@ -701,26 +705,46 @@ fn the_dev_server_example_opens_only_new_servers() {
     );
     let vite = |port: u16| json!({ "port": port, "address": "127.0.0.1", "pid": 9, "command": "node_modules/.bin/vite" });
     let event = |payload: Value| f.rt.notice(5, notice::EVENT, payload);
-    // The lists sent on subscribing: the server this Mac had at load.
-    event(json!({ "event": "ports_changed", "id": 3, "ports": [vite(4000)], "complete": true }));
+    let ports = |host: Option<&str>, id: u64, list: &[u16], complete: bool, initial: bool| {
+        let mut ev = json!({ "event": "ports_changed", "id": id, "complete": complete,
+                             "ports": list.iter().map(|&p| vite(p)).collect::<Vec<_>>() });
+        if let Some(h) = host {
+            ev["host"] = h.into();
+        }
+        if initial {
+            ev["initial"] = true.into();
+        }
+        event(ev);
+    };
+    // The lists the subscription brings: the server this Mac had at load, and one that
+    // started between that read and the subscription, which is news.
+    ports(None, 3, &[4000], true, true);
+    ports(None, 5, &[4002], true, true);
     // A host the app connects to after the plugin has long been running.
     std::thread::sleep(Duration::from_millis(3500));
-    event(
-        json!({ "event": "ports_changed", "host": "devbox", "id": 1, "initial": true,
-                  "ports": [vite(5173)], "complete": true }),
-    );
+    ports(Some("devbox"), 1, &[5173], true, true);
     // Then servers start: one more on the host, one more here, one on a host connected before.
-    event(json!({ "event": "ports_changed", "host": "devbox", "id": 1,
-                  "ports": [vite(5173), vite(5174)], "complete": true }));
-    event(
-        json!({ "event": "ports_changed", "id": 3, "ports": [vite(4000), vite(4001)], "complete": true }),
-    );
-    event(
-        json!({ "event": "ports_changed", "host": "other", "id": 2, "ports": [vite(3000)], "complete": true }),
-    );
+    ports(Some("devbox"), 1, &[5173, 5174], true, false);
+    ports(None, 3, &[4000, 4001], true, false);
+    ports(Some("other"), 2, &[3000], true, false);
     // Not a dev server.
     event(json!({ "event": "ports_changed", "id": 4, "complete": true,
                   "ports": [{ "port": 22, "address": "0.0.0.0", "pid": 1, "command": "sshd" }] }));
+    // A read that missed some processes leaves out 4000, which still runs: it does not open
+    // again when a complete list has it.
+    ports(None, 3, &[4001], false, false);
+    ports(None, 3, &[4000, 4001], true, false);
+    // The pane read in part at load: its first complete list says what ran, opening nothing.
+    ports(None, 6, &[4100], true, false);
+    // The app lost devbox: its lists go; what it lists as the app connects again runs already.
+    event(
+        json!({ "event": "ports_changed", "host": "devbox", "id": 1, "ports": [],
+                  "complete": false, "gone": true }),
+    );
+    ports(Some("devbox"), 1, &[5173, 5174], true, true);
+    // 4000 really stops (a complete list) and starts again: news.
+    ports(None, 3, &[4001], true, false);
+    ports(None, 3, &[4000, 4001], true, false);
     event(json!({ "event": "bell", "id": 0 }));
     let opened = |f: &Fixture| -> Vec<Value> {
         f.host
@@ -736,9 +760,11 @@ fn the_dev_server_example_opens_only_new_servers() {
             .collect()
     };
     let want = vec![
+        json!(["open", "http://localhost:4002/"]),
         json!(["devbox", 5174, true]),
         json!(["open", "http://localhost:4001/"]),
         json!(["other", 3000, true]),
+        json!(["open", "http://localhost:4000/"]),
     ];
     let deadline = Instant::now() + Duration::from_secs(20);
     while opened(&f).len() < want.len() {

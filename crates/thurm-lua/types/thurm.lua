@@ -90,7 +90,8 @@
 ---@field id integer? The pane's id, where `pane` may be missing (pane_closed, bell, notification, ports_changed, files_uploaded).
 ---@field host string? ports_changed of a remote host's pane, and forward events: the `[[remote]]` host.
 ---@field ports thurm.Port[]? ports_changed: every port the pane listens on now.
----@field complete boolean? ports_changed: false when part of the pane's processes could not be read, or (with no ports) the app lost the remote host.
+---@field complete boolean? ports_changed: false when part of the pane's processes could not be read (servers may be left out), or with `gone`.
+---@field gone boolean? ports_changed of a remote host's pane: the app lost the host (or quit); nothing is known of its ports.
 ---@field initial boolean? ports_changed: listening already (sent when this plugin subscribed, or by a remote host's daemon as the app connected to it); any other list is a change.
 ---@field paths string[]? files_uploaded: where the files landed.
 ---@field remote_port integer? forward_opened, forward_closed.

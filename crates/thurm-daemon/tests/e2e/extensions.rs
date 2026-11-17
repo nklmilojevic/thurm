@@ -1973,6 +1973,7 @@ fn a_lost_host_or_app_ends_its_remote_lists() {
                 (ev["ports"].clone(), ev["complete"].clone()),
                 (json!([]), json!(false))
             );
+            assert_eq!(ev["gone"], true, "{ev}");
             ev["id"].as_u64().unwrap()
         })
         .collect();
@@ -1994,6 +1995,7 @@ fn a_lost_host_or_app_ends_its_remote_lists() {
             let ev = next_event(&rx, "ports_changed");
             assert_eq!(ev["ports"], json!([]), "{ev}");
             assert_eq!(ev["complete"], false, "{ev}");
+            assert_eq!(ev["gone"], true, "{ev}");
             ev["host"].as_str().unwrap().to_owned()
         })
         .collect();

@@ -444,11 +444,13 @@ impl Daemon {
     }
 
     /// Remote panes whose lists plugins heard and nobody keeps up now (the app lost the host,
-    /// or quit): each gets an empty list, not complete, as nothing is known of its ports.
+    /// or quit): each gets an empty list, not complete, as nothing is known of its ports, with
+    /// `gone` (an incomplete list is otherwise a read that missed some processes).
     fn remote_lists_ended(&self, panes: &[(String, u64)]) {
         for (host, pane) in panes {
             let payload = json!({
                 "event": PORTS_CHANGED, "host": host, "id": pane, "ports": [], "complete": false,
+                "gone": true,
             });
             self.deliver_event(PORTS_CHANGED, &payload);
         }
