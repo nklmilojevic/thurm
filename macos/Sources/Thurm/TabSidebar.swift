@@ -1156,6 +1156,16 @@ final class SidebarRowView: NSTableRowView {
 
     private let keyRedraw = KeyWindowRedraw()
 
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // The light themes' shadow falls below the row.
+        clipsToBounds = false
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         keyRedraw.track(self) { [weak self] in self?.isSelected == true }
