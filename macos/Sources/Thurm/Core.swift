@@ -537,6 +537,24 @@ final class Core {
         thurm_download_cancel(id)
     }
 
+    /// Answers `host`'s clipboard query `id` with `data`, or refuses it (nil).
+    func clipboardAnswer(host: HostId, id: UInt64, data: Data?) {
+        guard let c = clients[host] else { return }
+        guard let data else {
+            thurm_clipboard_answer(c, id, nil, 0)
+            return
+        }
+        // An empty answer still needs a pointer: NULL is a refusal.
+        var empty: UInt8 = 0
+        if data.isEmpty {
+            thurm_clipboard_answer(c, id, &empty, 0)
+            return
+        }
+        data.withUnsafeBytes { buf in
+            thurm_clipboard_answer(c, id, buf.bindMemory(to: UInt8.self).baseAddress, buf.count)
+        }
+    }
+
     // MARK: Remote operations
 
     /// `thurm_remote_call`: blocking; ssh-backed operations belong off the main thread.

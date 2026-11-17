@@ -1402,6 +1402,10 @@ final class SessionManager: NSObject, CoreDelegate {
             if let id = key { Remotes.shared.clipboardRequest(id) }
         case "PortsChanged":
             remotePortsChanged(dict, host: host)
+        case "ClipboardQuery":
+            if let key, let id = jsonUInt64(dict?["id"]), let mime = jsonString(dict?["mime"]) {
+                Remotes.shared.clipboardQuery(key, id: id, mime: mime)
+            }
         case "Ui":
             handleUi(payload, host: host)
         case "Ext":

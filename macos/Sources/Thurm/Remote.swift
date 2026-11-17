@@ -345,40 +345,88 @@ final class Remotes {
 
     /// OSC 52 read: this Mac's panes as before; a remote pane asks (per `clipboard_read`).
     func clipboardRequest(_ key: PaneKey) {
-        let reply = { (text: String) in
-            Core.shared.send(object: ["ClipboardReply": ["pane": key.number, "text": text]], host: key.host)
-        }
-        let clipboard = { NSPasteboard.general.string(forType: .string) ?? "" }
-        guard key.isRemote else {
-            reply(clipboard())
-            return
-        }
+        let allowed = clipboardReadAllowed(key, asker: "OSC 52")
+        let text = allowed ? NSPasteboard.general.string(forType: .string) ?? "" : ""
+        Core.shared.send(object: ["ClipboardReply": ["pane": key.number, "text": text]], host: key.host)
+    }
+
+    /// Whether a program in `key`'s pane may read this Mac's clipboard: this Mac's panes always,
+    /// a remote pane per `clipboard_read`, asking first when it says so. `asker` says how the
+    /// program asked, in the question.
+    private func clipboardReadAllowed(_ key: PaneKey, asker: String) -> Bool {
+        guard key.isRemote else { return true }
         let decision = Core.shared.remoteCall(["op": "clipboard_read", "host": key.host]) as? String ?? "deny"
         switch decision {
         case "allow":
-            reply(clipboard())
+            return true
         case "ask":
             let alert = NSAlert()
             alert.messageText = "\(key.host) wants to read your clipboard"
             alert.informativeText = "A program in a pane on \(key.host) asked for the contents of this Mac's "
-                + "clipboard (OSC 52)."
+                + "clipboard (\(asker))."
             alert.addButton(withTitle: "Allow Once")
             alert.addButton(withTitle: "Always for \(key.host)")
             alert.addButton(withTitle: "Deny")
             switch alert.runModal() {
             case .alertFirstButtonReturn:
-                reply(clipboard())
+                return true
             case .alertSecondButtonReturn:
                 if let e = (Core.shared.remoteCall(["op": "allow_clipboard", "name": key.host]) as? [String: Any])?["error"] {
                     tlog("could not save the clipboard permission: \(e)")
                 }
-                reply(clipboard())
+                return true
             default:
-                reply("")
+                return false
             }
         default:
-            reply("")
+            return false
         }
+    }
+
+    /// A clipboard tool in `key`'s pane (pbpaste, xclip -o, wl-paste) asks for this Mac's
+    /// clipboard: decided like an OSC 52 read. Listing the types it holds asks nothing, unless
+    /// reads from that host are refused.
+    func clipboardQuery(_ key: PaneKey, id: UInt64, mime: String) {
+        let pb = NSPasteboard.general
+        let answer = { (data: Data?) in Core.shared.clipboardAnswer(host: key.host, id: id, data: data) }
+        if mime == Self.clipTargets {
+            let refused = key.isRemote
+                && (Core.shared.remoteCall(["op": "clipboard_read", "host": key.host]) as? String ?? "deny") == "deny"
+            answer(refused ? nil : Data(Self.clipboardTypes(pb).map { $0 + "\n" }.joined().utf8))
+            return
+        }
+        let tool = mime == Self.clipPNG ? "an image, through a clipboard tool" : "a clipboard tool such as xclip or pbpaste"
+        answer(clipboardReadAllowed(key, asker: tool) ? Self.clipboardData(pb, mime: mime) : nil)
+    }
+
+    static let clipText = "text/plain"
+    static let clipPNG = "image/png"
+    static let clipTargets = "TARGETS"
+    /// The most a clipboard tool gets (the daemon refuses more).
+    static let clipMax = 32 * 1024 * 1024
+
+    /// The types a clipboard tool can paste from `pb`.
+    static func clipboardTypes(_ pb: NSPasteboard) -> [String] {
+        var types: [String] = []
+        if pb.string(forType: .string) != nil { types.append(clipText) }
+        if pb.availableType(from: [.png, .tiff]) != nil { types.append(clipPNG) }
+        return types
+    }
+
+    /// `pb`'s contents as `mime`: UTF-8 text, or a PNG (converted from TIFF, as screenshots
+    /// copy). Nil when it holds none, or more than ``clipMax``.
+    static func clipboardData(_ pb: NSPasteboard, mime: String) -> Data? {
+        let data: Data?
+        switch mime {
+        case clipText:
+            data = pb.string(forType: .string).map { Data($0.utf8) }
+        case clipPNG:
+            data = pb.data(forType: .png) ?? pb.data(forType: .tiff)
+                .flatMap { NSBitmapImageRep(data: $0)?.representation(using: .png, properties: [:]) }
+        default:
+            data = nil
+        }
+        return data.flatMap { $0.count <= clipMax ? $0 : nil }
     }
 
     /// OSC 52 write from `host`: follows this Mac's `terminal.osc52`.

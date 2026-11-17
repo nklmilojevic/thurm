@@ -33,7 +33,8 @@ typedef uint64_t thurm_pane_id;
  *   "ConfigReloaded"                     (unit variants are bare strings)
  *   "Disconnected"                       (connection to the daemon was lost)
  *   {"ClipboardStore":{"pane":1,"text":"...","user":true}}   (copy on select: the user's own
- *                                        selection; without "user" it is a program's OSC 52)
+ *                                        selection; without "user" it is a program's OSC 52
+ *                                        or clipboard tool)
  */
 typedef void (*thurm_event_cb)(void *ctx, const char *json);
 
@@ -93,6 +94,11 @@ uint64_t thurm_download(thurm_client *client, thurm_pane_id pane, const char *pa
                         const char *dest, const char *if_version, uint64_t max_bytes,
                         thurm_transfer_cb cb, void *ctx);
 void thurm_download_cancel(uint64_t transfer);
+
+/* Answer the daemon's {"ClipboardQuery":{"pane":1,"id":7,"mime":"text/plain"}} (a clipboard tool
+ * in the pane pastes): `len` bytes at `data` in that type ("TARGETS": the types the clipboard
+ * holds, one per line), at most 32 MiB, or NULL to refuse. Does not wait. */
+void thurm_clipboard_answer(thurm_client *client, uint64_t id, const uint8_t *data, size_t len);
 
 /* Re-read this Mac's config into the connection's terminal copies. The local daemon's
  * "ConfigReloaded" does this for its own connection; call it for remote connections. */
