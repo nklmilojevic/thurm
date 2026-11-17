@@ -862,6 +862,7 @@ impl Daemon {
         self.focus.lock().client_gone(id);
         self.ext_client_gone(id);
         self.plugins_owner_gone(id);
+        self.streams.client_gone(id);
         for p in self.all_panes() {
             let mut st = p.state.lock();
             st.subscribers.remove(&id);
