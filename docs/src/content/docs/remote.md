@@ -543,9 +543,10 @@ reach the Mac's disk, clipboard, or credentials without you doing something:
   Mac as they are.
 - **Files.** Only files you paste, drop, or send with **Send Copied Files** go to the
   host, and only the files you preview or download come back. A download into
-  `~/Downloads` is written into a file of its own and then put in the name it
-  reserved, only while that name still holds the empty file reserved: a file that
-  took the name, or was written into it, stays as it is.
+  `~/Downloads` is written in a private folder of its own there, then moved in
+  under a free name (`report 2.pdf` beside an existing `report.pdf`) by a rename
+  that never replaces a file: nothing already in `~/Downloads` is written into,
+  moved or deleted.
 - **Over Tailscale.** The host admits this Mac by its Tailscale identity. On
   this Mac, the tunnel's socket and Thurm's dial socket (next to the daemon's)
   are yours alone, and the dial socket reaches tailnet devices only.

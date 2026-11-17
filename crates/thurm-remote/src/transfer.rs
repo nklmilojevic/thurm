@@ -545,162 +545,119 @@ pub enum Downloaded {
     Saved(DownloadInfo),
 }
 
-/// Fetches the file at `path`, as `pane` sees it, into `reserved`: an empty file the caller
-/// made to hold the name (in a folder others write to, like Downloads). The file is written
-/// beside it, into a new file of its own that nothing else writes, and then exchanged with the
-/// reserved file in one step; what came out of the name must be the reserved file, still empty,
-/// or it is put back at once. So if something else took the name since, or wrote into the
-/// reserved file, the download is refused, what is there is left alone, and nothing of anyone
-/// else's is mixed into a download reported saved. A download that fails or is cancelled
-/// deletes the reserved file, if it is still the one and still empty.
-pub fn download_reserved(
+/// Fetches the file at `path`, as `pane` sees it, into the folder `dir` (one others write to,
+/// like Downloads) as `name`, or `name 2`, `name 3`… when that is taken. The file is written in
+/// a new private folder of its own inside `dir`, then moved into `dir` by a rename that never
+/// replaces anything: no file already in `dir` is written into, moved or deleted, whatever
+/// else writes there meanwhile. Returns the file's details and where it was saved.
+pub fn download_to_folder(
     host: Host,
     pane: PaneId,
     path: &str,
-    reserved: &Path,
-    identity: (u64, u64),
+    dir: &Path,
+    name: &str,
     cancel: &Cancel,
     mut progress: impl FnMut(Progress),
-) -> Result<DownloadInfo, TransferError> {
-    use std::os::unix::fs::MetadataExt;
-    // The reservation is the file made for it (`identity`: its device and inode, taken when
-    // it was made), not whatever has its name now, and only while nothing was written into it.
-    let ours = identity;
-    let ours_and_empty = |p: &Path| {
-        std::fs::symlink_metadata(p)
-            .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == ours && m.len() == 0)
-    };
-    let give_back = || {
-        let _ = remove_if(reserved, |m| {
-            m.is_file() && (m.dev(), m.ino()) == ours && m.len() == 0
-        });
-    };
+) -> Result<(DownloadInfo, PathBuf), TransferError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if !host.client.has_capability(CAP_TRANSFER) {
-        give_back();
         return Err(TransferError::Unsupported);
     }
-    let changed = || {
-        TransferError::Local(format!(
-            "{} changed since it was reserved; nothing was saved over it",
-            reserved.display()
-        ))
+    let name = if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        "file"
+    } else {
+        name
     };
-    let got = (|| {
-        if !ours_and_empty(reserved) {
-            return Err(changed());
+    let shown = dir.join(name);
+    let local = |e: std::io::Error| TransferError::Local(format!("{}: {e}", shown.display()));
+    // Made new, readable by this user only: nothing else is in it.
+    let private = loop {
+        let private = dir.join(format!(".thurm-{}", batch_id()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&private) {
+            Ok(()) => break private,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(TransferError::Local(format!("{}: {e}", dir.display()))),
         }
+    };
+    let part = private.join("part");
+    let got = (|| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&part)
+            .map_err(local)?;
+        let made = file.metadata().map(|m| (m.dev(), m.ino())).map_err(local)?;
         let info = host.client.download_begin(pane, path, None)?;
         let ticket = info
             .ticket
             .as_deref()
             .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
-        let (part, file) = create_part(reserved)?;
-        // The download's own file, known by its device and inode too: its name is in a folder
-        // others write to.
-        let staging = file
-            .metadata()
-            .map(|m| (m.dev(), m.ino()))
-            .map_err(|e| TransferError::Local(format!("{}: {e}", part.display())))?;
-        let is_staging = |p: &Path, len: u64| {
-            std::fs::symlink_metadata(p)
-                .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == staging && m.len() == len)
-        };
-        let fetched = fetch_into(
-            host,
-            ticket,
-            file,
-            reserved,
-            info.size,
-            cancel,
-            &mut progress,
-        );
-        // Into the name only in place of the empty file reserved: exchanged with it, and what
-        // came out checked. Anything else is put back, while the name still holds the download,
-        // and never deleted.
-        let installed = fetched.and_then(|()| {
-            if !is_staging(&part, info.size) {
-                return Err(TransferError::Local(format!(
-                    "{} was replaced while the download came; nothing was saved",
-                    part.display()
-                )));
+        fetch_into(host, ticket, file, &shown, info.size, cancel, &mut progress)?;
+        if !std::fs::symlink_metadata(&part)
+            .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == made && m.len() == info.size)
+        {
+            return Err(TransferError::Local(format!(
+                "{} changed while it came; nothing was saved",
+                shown.display()
+            )));
+        }
+        // Into `dir` under the first of its names that is free, taken in the same step.
+        for n in 1..=10_000 {
+            let dest = dir.join(numbered(name, n));
+            match rename_noreplace(&part, &dest) {
+                Ok(()) => return Ok((info, dest)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(TransferError::Local(format!("{}: {e}", dest.display()))),
             }
-            exchange(&part, reserved).map_err(|_| changed())?;
-            if ours_and_empty(&part) {
-                return Ok(());
-            }
-            if is_staging(reserved, info.size) && exchange(&part, reserved).is_ok() {
-                return Err(changed());
-            }
-            Err(TransferError::Local(format!(
-                "{} changed since it was reserved; what was there is at {}",
-                reserved.display(),
-                part.display()
-            )))
-        });
-        // Only the download's own file goes, or, once it is saved, the empty reservation it
-        // took the place of.
-        let saved = installed.is_ok();
-        let _ = remove_if(&part, |m| {
-            m.is_file()
-                && ((m.dev(), m.ino()) == staging
-                    || (saved && (m.dev(), m.ino()) == ours && m.len() == 0))
-        });
-        installed.map(|()| info)
+        }
+        Err(TransferError::Local(format!(
+            "no free name for {name} in {}",
+            dir.display()
+        )))
     })();
-    if got.is_err() {
-        give_back();
-    }
+    // The private folder goes, with the file in it if it was not saved.
+    let _ = std::fs::remove_file(&part);
+    let _ = std::fs::remove_dir(&private);
     got
 }
 
-/// Deletes the file named `path` only if `ours` takes it for this download's: it is moved in
-/// one step to a name of its own and looked at there, so a file put in its place meanwhile is
-/// never what is deleted. Anything else goes back, never over a file that took the name since;
-/// if it cannot, it stays where it was moved, which is returned.
-fn remove_if(path: &Path, ours: impl Fn(&std::fs::Metadata) -> bool) -> Result<(), PathBuf> {
-    if !std::fs::symlink_metadata(path).is_ok_and(|m| ours(&m)) {
-        return Ok(());
-    }
-    let aside = loop {
-        let aside = path.with_file_name(format!(".thurm-{}.gone", batch_id()));
-        if std::fs::symlink_metadata(&aside).is_err() {
-            break aside;
-        }
+/// `name`, numbered `n` past the first (`a 2.txt`, as Finder names copies), within the 255
+/// bytes a name may take: the part before the extension is cut, by whole characters, to make
+/// room, and an extension too long by itself is cut too, keeping a character before it.
+fn numbered(name: &str, n: u32) -> String {
+    let (base, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i + 1..]),
+        _ => (name, ""),
     };
-    if rename_with(path, &aside, Rename::NoReplace).is_err() {
-        return Ok(());
+    let number = if n == 1 {
+        String::new()
+    } else {
+        format!(" {n}")
+    };
+    let mut ext = ext.to_owned();
+    while !ext.is_empty() && 1 + number.len() + 1 + ext.len() > 255 {
+        ext.pop();
     }
-    if std::fs::symlink_metadata(&aside).is_ok_and(|m| ours(&m)) {
-        let _ = std::fs::remove_file(&aside);
-        return Ok(());
+    let tail = if ext.is_empty() {
+        number
+    } else {
+        format!("{number}.{ext}")
+    };
+    let mut stem = if base.is_empty() { "file" } else { base }.to_owned();
+    while stem.len() + tail.len() > 255 && !stem.is_empty() {
+        stem.pop();
     }
-    rename_with(&aside, path, Rename::NoReplace).map_err(|_| aside)
+    stem + &tail
 }
 
-/// Exchanges the files named `a` and `b` in one step: each name then holds the other's file.
-fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
-    rename_with(a, b, Rename::Exchange)
-}
-
-enum Rename {
-    /// Each name takes the other's file.
-    Exchange,
-    /// `a`'s file takes the name `b` only if nothing has it.
-    NoReplace,
-}
-
-fn rename_with(a: &Path, b: &Path, how: Rename) -> std::io::Result<()> {
+/// Gives `a`'s file the name `b` only if nothing has that name, in one step.
+fn rename_noreplace(a: &Path, b: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
     let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let r = {
-        let flags = match how {
-            Rename::Exchange => libc::RENAME_SWAP,
-            Rename::NoReplace => libc::RENAME_EXCL,
-        };
-        unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), flags) }
-    };
+    let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_EXCL) };
     // The system call itself: not every C library has a wrapper for it (musl's older ones).
     #[cfg(target_os = "linux")]
     let r = unsafe {
@@ -710,15 +667,12 @@ fn rename_with(a: &Path, b: &Path, how: Rename) -> std::io::Result<()> {
             a.as_ptr(),
             libc::AT_FDCWD,
             b.as_ptr(),
-            match how {
-                Rename::Exchange => libc::RENAME_EXCHANGE,
-                Rename::NoReplace => libc::RENAME_NOREPLACE,
-            },
+            libc::RENAME_NOREPLACE,
         )
     };
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
     let r = {
-        let _ = (&a, &b, how);
+        let _ = (&a, &b);
         return Err(std::io::ErrorKind::Unsupported.into());
     };
     if r == 0 {
@@ -730,7 +684,7 @@ fn rename_with(a: &Path, b: &Path, how: Rename) -> std::io::Result<()> {
 
 /// Fetches the file at `path`, as `pane` sees it, into `dest` (written beside it first, then
 /// moved into place, replacing whatever `dest` is: for a destination this caller owns, like a
-/// cache's; [`download_reserved`] saves into a name others may take). With `if_version` still the file's version, writes nothing. A file over
+/// cache's; [`download_to_folder`] saves into a folder others write to). With `if_version` still the file's version, writes nothing. A file over
 /// `max_bytes` is refused before anything is sent.
 #[allow(clippy::too_many_arguments)]
 pub fn download(
@@ -1083,6 +1037,36 @@ mod tests {
                 StreamFrame::End,
                 StreamFrame::Close(StreamClose::Aborted)
             ]
+        );
+    }
+
+    #[test]
+    fn a_taken_name_is_numbered_within_what_names_take() {
+        assert_eq!(numbered("a.txt", 1), "a.txt");
+        assert_eq!(numbered("a.txt", 2), "a 2.txt");
+        assert_eq!(numbered("Makefile", 2), "Makefile 2");
+        assert_eq!(numbered(".bashrc", 3), ".bashrc 3");
+        assert_eq!(numbered("a.tar.gz", 2), "a.tar 2.gz");
+        // A name as long as names go is cut to make room for its number.
+        let long = "l".repeat(251) + ".txt";
+        assert_eq!(numbered(&long, 1), long);
+        let second = numbered(&long, 2);
+        assert_eq!(second.len(), 255);
+        assert!(second.ends_with(" 2.txt"), "{second}");
+        // By whole characters.
+        let wide = "é".repeat(125) + ".txt";
+        let second = numbered(&wide, 2);
+        assert!(
+            second.len() <= 255 && second.ends_with(" 2.txt"),
+            "{second}"
+        );
+        // So is an extension as long as names go, a character kept before it.
+        let long_ext = "a.".to_owned() + &"e".repeat(253);
+        assert_eq!(numbered(&long_ext, 1), long_ext);
+        let second = numbered(&long_ext, 2);
+        assert!(
+            second.len() <= 255 && second.starts_with("a 2."),
+            "{second}"
         );
     }
 

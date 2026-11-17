@@ -164,7 +164,7 @@ pub extern "C" fn thurm_upload_cancel(id: u64) {
 }
 
 /// Fetches the file at `path` (as `pane` sees it) into `dest`, replacing what is there (use
-/// `thurm_download_reserved` for a name others may take). With `if_version` (or NULL)
+/// `thurm_download_to_folder` for a folder others write to). With `if_version` (or NULL)
 /// still the file's version, writes nothing (`"not_modified": true`). A file over `max_bytes`
 /// (0 for no limit) is refused. The final callback carries `"info"`: the file's `name`, `path`,
 /// `size`, `modified` and `version`. Returns the transfer's id, or 0 when it could not start
@@ -235,22 +235,19 @@ fn saved(info: &thurm_proto::DownloadInfo) -> serde_json::Value {
     done
 }
 
-/// Fetches the file at `path` (as `pane` sees it) into `reserved`, the empty file the caller
-/// made to hold the name, whose `device` and `inode` it took then: written beside it and
-/// exchanged with it in one step, only in place of that file still empty. If the name holds
-/// something else by then, or the file was written into, nothing is saved and it is left
-/// alone; a failed or cancelled download deletes the reserved file if it is still the one and
-/// still empty. Cancel with
-/// `thurm_download_cancel`. Returns the transfer's id, or 0 when it could not start (the final
-/// callback then came on the calling thread, before this returns).
+/// Fetches the file at `path` (as `pane` sees it) into the folder `dir` as `name` (or
+/// `name 2`… when taken): written in a private folder of its own there, then moved in by a
+/// rename that never replaces a file, so nothing already in `dir` is touched. The final
+/// callback's `saved_to` is where it went. Cancel with `thurm_download_cancel`. Returns the
+/// transfer's id, or 0 when it could not start (the final callback then came on the calling
+/// thread, before this returns).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn thurm_download_reserved(
+pub unsafe extern "C" fn thurm_download_to_folder(
     client: *mut thurm_client,
     pane: u64,
     path: *const c_char,
-    reserved: *const c_char,
-    device: u64,
-    inode: u64,
+    dir: *const c_char,
+    name: *const c_char,
     cb: thurm_transfer_cb,
     ctx: *mut c_void,
 ) -> u64 {
@@ -262,11 +259,11 @@ pub unsafe extern "C" fn thurm_download_reserved(
     let Some(c) = (unsafe { client_ref(client) }) else {
         return fail("not connected".into());
     };
-    let (Some(path), Some(reserved)) = (unsafe { opt_str(path) }, unsafe { opt_str(reserved) })
-    else {
+    let (Some(path), Some(dir)) = (unsafe { opt_str(path) }, unsafe { opt_str(dir) }) else {
         return fail("no path".into());
     };
-    let (path, reserved) = (path.to_owned(), PathBuf::from(reserved));
+    let name = unsafe { opt_str(name) }.unwrap_or_default().to_owned();
+    let (path, dir) = (path.to_owned(), PathBuf::from(dir));
     let (client, socket) = match host_of(c) {
         Ok(h) => h,
         Err(e) => return fail(e),
@@ -276,16 +273,20 @@ pub unsafe extern "C" fn thurm_download_reserved(
             client: &client,
             socket: &socket,
         };
-        match transfer::download_reserved(
+        match transfer::download_to_folder(
             host,
             pane,
             &path,
-            &reserved,
-            (device, inode),
+            &dir,
+            &name,
             cancel,
             progress(cb, ctx),
         ) {
-            Ok(info) => saved(&info),
+            Ok((info, dest)) => {
+                let mut done = saved(&info);
+                done["saved_to"] = json!(dest.to_string_lossy());
+                done
+            }
             Err(e) => finished(Some(&e)),
         }
     })

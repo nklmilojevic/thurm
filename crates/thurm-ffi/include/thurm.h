@@ -90,7 +90,7 @@ void thurm_upload_cancel(uint64_t transfer);
 
 /* Fetch the regular file at `path` on `pane`'s host (relative to the pane's directory, `~`
  * for home) into `dest`, written beside it and then moved there, replacing whatever `dest` is
- * (for a destination the caller owns; see thurm_download_reserved for one others may take). Cancelling stops a download
+ * (for a destination the caller owns; see thurm_download_to_folder for a folder others write to). Cancelling stops a download
  * under way and deletes what it wrote beside `dest`, leaving a file already at `dest` as it was;
  * a download already moved into place stays, and the final callback says it was saved. With `if_version` (or NULL)
  * still the file's version, nothing is written ("not_modified":true). A file over `max_bytes`
@@ -101,16 +101,14 @@ uint64_t thurm_download(thurm_client *client, thurm_pane_id pane, const char *pa
                         thurm_transfer_cb cb, void *ctx);
 void thurm_download_cancel(uint64_t transfer);
 
-/* Like thurm_download, into `reserved`: an empty file the caller made (O_EXCL) to hold the
- * name in a folder others may write to, with the `device` and `inode` it had when made. The
- * file is written beside it, into a file of its own, then exchanged with the reserved file in
- * one step, kept only if what came out of the name is the reserved file, still empty (else
- * put back): a name taken or a reserved file written into meanwhile is left as it is, and
- * nothing is saved. A failed or cancelled download deletes the reserved file if it is still
- * the one and still empty. Cancel with thurm_download_cancel. */
-uint64_t thurm_download_reserved(thurm_client *client, thurm_pane_id pane, const char *path,
-                                 const char *reserved, uint64_t device, uint64_t inode,
-                                 thurm_transfer_cb cb, void *ctx);
+/* Like thurm_download, into the folder `dir` (one others write to, like ~/Downloads) as
+ * `name`, or `name 2`, `name 3`... when taken: written in a private folder of its own inside
+ * `dir`, then moved in by a rename that never replaces a file, so nothing already in `dir` is
+ * written into, moved or deleted. The final callback's "saved_to" is where it went. Cancel
+ * with thurm_download_cancel. */
+uint64_t thurm_download_to_folder(thurm_client *client, thurm_pane_id pane, const char *path,
+                                  const char *dir, const char *name, thurm_transfer_cb cb,
+                                  void *ctx);
 
 /* Re-read this Mac's config into the connection's terminal copies. The local daemon's
  * "ConfigReloaded" does this for its own connection; call it for remote connections. */

@@ -1213,29 +1213,15 @@ fn a_download_nobody_answers_gives_its_slot_back() {
     drop(held);
 }
 
-/// Moves the reservation at `path` out of the name's way, still there: a file deleted can
-/// hand its inode number to the next one made (Linux does), which would then pass for it.
-fn set_aside(path: &Path) {
-    let mut aside = path.as_os_str().to_owned();
-    aside.push(".aside");
-    std::fs::rename(path, aside).unwrap();
-}
-
-/// Makes `path` as a reservation does (a new empty file), and gives its device and inode.
-fn reserve(path: &Path) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    let m = std::fs::File::create_new(path).unwrap().metadata().unwrap();
-    (m.dev(), m.ino())
-}
-
 #[test]
-fn a_reserved_download_is_written_into_its_own_file_only() {
+fn a_download_into_a_folder_takes_a_free_name_and_touches_nothing_there() {
     use thurm_remote::transfer::{self, Cancel, Host, TransferError};
-    let env = Env::new("transfer-reserved");
+    let env = Env::new("transfer-to-folder");
     let _daemon = env.start();
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     std::fs::write(dir.join("report.pdf"), b"the report").unwrap();
+    std::fs::write(dir.join("big.bin"), vec![1u8; 4 << 20]).unwrap();
     let pane = cat_pane(&c, &dir);
     let host = Host {
         client: &c,
@@ -1243,173 +1229,61 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
     };
     let downloads = env.dir.join("downloads");
     std::fs::create_dir_all(&downloads).unwrap();
-    let get = |path: &str, at: &Path, id, progress: &mut dyn FnMut(transfer::Progress)| {
-        transfer::download_reserved(host, pane, path, at, id, &Cancel::default(), progress)
+    let get = |path: &str, name: &str| {
+        transfer::download_to_folder(
+            host,
+            pane,
+            path,
+            &downloads,
+            name,
+            &Cancel::default(),
+            |_| {},
+        )
     };
-    // Reserved, then the file is written into it.
-    let reserved = downloads.join("report.pdf");
-    let id = reserve(&reserved);
-    let info = get("report.pdf", &reserved, id, &mut |_| {}).unwrap();
+    // Under its name, and the next time beside it, the first left as it was.
+    let (info, first) = get("report.pdf", "report.pdf").unwrap();
     assert_eq!(info.name, "report.pdf");
-    assert_eq!(std::fs::read(&reserved).unwrap(), b"the report");
-    // Something else took the name since it was reserved, an empty file like the reservation:
-    // it is not the reserved file, so nothing is written into it, and it is left alone.
-    let taken = downloads.join("taken.pdf");
-    let id = reserve(&taken);
-    set_aside(&taken);
-    std::fs::File::create_new(&taken).unwrap();
-    let e = get("report.pdf", &taken, id, &mut |_| {}).unwrap_err();
-    assert!(matches!(e, TransferError::Local(_)), "{e}");
-    assert!(taken.exists());
-    assert_eq!(std::fs::read(&taken).unwrap(), b"");
-    // A file with something in it in its place is left alone too.
-    let full = downloads.join("full.pdf");
-    let id = reserve(&full);
-    set_aside(&full);
-    std::fs::write(&full, b"someone else's").unwrap();
-    assert!(get("report.pdf", &full, id, &mut |_| {}).is_err());
-    assert_eq!(std::fs::read(&full).unwrap(), b"someone else's");
-    // The reserved file itself, written into by another before the download opens it: not
-    // written over, nor deleted.
-    let filled = downloads.join("filled.pdf");
-    let id = reserve(&filled);
-    std::fs::write(&filled, b"written in place").unwrap();
-    let e = get("report.pdf", &filled, id, &mut |_| {}).unwrap_err();
-    assert!(matches!(e, TransferError::Local(_)), "{e}");
-    assert_eq!(std::fs::read(&filled).unwrap(), b"written in place");
-    // Or a link in its place: not followed.
+    assert_eq!(first, downloads.join("report.pdf"));
+    assert_eq!(std::fs::read(&first).unwrap(), b"the report");
+    std::fs::write(&first, b"edited since").unwrap();
+    let (_, second) = get("report.pdf", "report.pdf").unwrap();
+    assert_eq!(second, downloads.join("report 2.pdf"));
+    assert_eq!(std::fs::read(&second).unwrap(), b"the report");
+    assert_eq!(std::fs::read(&first).unwrap(), b"edited since");
+    // A link under the name is neither followed nor replaced.
     let linked = downloads.join("linked.pdf");
-    let id = reserve(&linked);
-    set_aside(&linked);
     std::os::unix::fs::symlink(dir.join("elsewhere"), &linked).unwrap();
-    assert!(get("report.pdf", &linked, id, &mut |_| {}).is_err());
+    let (_, saved) = get("report.pdf", "linked.pdf").unwrap();
+    assert_eq!(saved, downloads.join("linked 2.pdf"));
+    assert!(std::fs::symlink_metadata(&linked).unwrap().is_symlink());
     assert!(!dir.join("elsewhere").exists());
-    // The name taken while the file comes: not reported saved, and what took it stays.
-    std::fs::write(dir.join("big.bin"), vec![1u8; 4 << 20]).unwrap();
-    let moving = downloads.join("moving.bin");
-    let id = reserve(&moving);
-    let mut swapped = false;
-    let e = get("big.bin", &moving, id, &mut |p| {
-        if !swapped && p.done > 0 {
-            swapped = true;
-            std::fs::remove_file(&moving).unwrap();
-            std::fs::write(&moving, b"theirs").unwrap();
-        }
-    })
-    .unwrap_err();
-    assert!(matches!(e, TransferError::Local(_)), "{e}");
-    assert_eq!(std::fs::read(&moving).unwrap(), b"theirs");
-    // A download that fails, or is cancelled, gives its reservation back.
-    let missing = downloads.join("missing.pdf");
-    let id = reserve(&missing);
-    let e = get("nothing-here", &missing, id, &mut |_| {}).unwrap_err();
-    assert!(matches!(e, TransferError::NotFound(_)), "{e}");
-    assert!(!missing.exists());
-    let cancelled = downloads.join("cancelled.bin");
-    let id = reserve(&cancelled);
-    let cancel = Cancel::default();
-    let stop = cancel.clone();
-    let e = transfer::download_reserved(host, pane, "big.bin", &cancelled, id, &cancel, |p| {
-        if p.done > 0 {
-            stop.cancel();
-        }
-    })
-    .unwrap_err();
-    assert!(matches!(e, TransferError::Cancelled), "{e}");
-    assert!(!cancelled.exists());
-    // Written into by another while it comes: not reported saved, and what is there stays.
-    let joined = downloads.join("joined.bin");
-    let id = reserve(&joined);
-    let mut appended = false;
-    let e = get("big.bin", &joined, id, &mut |p| {
-        if p.total > 0 && p.done == p.total && !appended {
-            appended = true;
-            let mut other = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&joined)
-                .unwrap();
-            other.write_all(b"theirs").unwrap();
-        }
-    })
-    .unwrap_err();
-    assert!(matches!(e, TransferError::Local(_)), "{e}");
-    assert!(std::fs::read(&joined).unwrap().ends_with(b"theirs"));
-    // Written into by another while it comes, then cancelled: what is there is not only this
-    // download's, and stays.
-    let shared = downloads.join("shared.bin");
-    let id = reserve(&shared);
-    let cancel = Cancel::default();
-    let stop = cancel.clone();
-    let mut appended = false;
-    let e = transfer::download_reserved(host, pane, "big.bin", &shared, id, &cancel, |p| {
-        if p.done > 0 && !appended {
-            appended = true;
-            let mut other = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&shared)
-                .unwrap();
-            other.write_all(b"theirs").unwrap();
-            stop.cancel();
-        }
-    })
-    .unwrap_err();
-    assert!(matches!(e, TransferError::Cancelled), "{e}");
-    assert!(std::fs::read(&shared).unwrap().ends_with(b"theirs"));
-    // The reserved file overwritten in place while the download comes, at its very size: the
-    // download went to a file of its own, so what is in the name stays theirs, untouched.
-    let overwritten = downloads.join("overwritten.bin");
-    let id = reserve(&overwritten);
-    let theirs = vec![2u8; 4 << 20];
-    let mut wrote = false;
-    let e = get("big.bin", &overwritten, id, &mut |p| {
-        if p.done > 0 && !wrote {
-            wrote = true;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&overwritten)
-                .unwrap()
-                .write_all(&theirs)
-                .unwrap();
-        }
-    })
-    .unwrap_err();
-    assert!(matches!(e, TransferError::Local(_)), "{e}");
-    assert!(std::fs::read(&overwritten).unwrap() == theirs);
-    // The download's own file replaced under its name before it goes in: what replaced it is
-    // neither put in the reserved name nor deleted.
-    let swapped = downloads.join("swapped.bin");
-    let id = reserve(&swapped);
-    let mut replaced = None;
-    let e = get("big.bin", &swapped, id, &mut |p| {
-        if p.total > 0 && p.done == p.total && replaced.is_none() {
-            let part = std::fs::read_dir(&downloads)
-                .unwrap()
-                .flatten()
-                .map(|e| e.path())
-                .find(|p| p.to_string_lossy().ends_with(".part"))
-                .unwrap();
-            std::fs::remove_file(&part).unwrap();
-            std::fs::write(&part, b"theirs").unwrap();
-            replaced = Some(part);
-        }
-    })
-    .unwrap_err();
-    assert!(matches!(e, TransferError::Local(_)), "{e}");
-    let replaced = replaced.unwrap();
-    assert_eq!(std::fs::read(&replaced).unwrap(), b"theirs");
-    assert!(!swapped.exists());
-    std::fs::remove_file(&replaced).unwrap();
-    // No file a download wrote into is left beside the names.
-    let left: Vec<_> = std::fs::read_dir(&downloads)
+    // A name that would leave the folder is not taken.
+    let (_, saved) = get("report.pdf", "../escape.pdf").unwrap();
+    assert_eq!(saved, downloads.join("file"));
+    // A download that fails, or is cancelled, leaves nothing.
+    let before: std::collections::BTreeSet<_> = std::fs::read_dir(&downloads)
         .unwrap()
         .flatten()
         .map(|e| e.file_name())
-        .filter(|n| {
-            let n = n.to_string_lossy();
-            n.ends_with(".part") || n.ends_with(".gone")
-        })
         .collect();
-    assert!(left.is_empty(), "{left:?}");
+    let e = get("nothing-here", "missing.pdf").unwrap_err();
+    assert!(matches!(e, TransferError::NotFound(_)), "{e}");
+    let cancel = Cancel::default();
+    let stop = cancel.clone();
+    let e =
+        transfer::download_to_folder(host, pane, "big.bin", &downloads, "big.bin", &cancel, |p| {
+            if p.done > 0 {
+                stop.cancel();
+            }
+        })
+        .unwrap_err();
+    assert!(matches!(e, TransferError::Cancelled), "{e}");
+    let after: std::collections::BTreeSet<_> = std::fs::read_dir(&downloads)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(before, after);
 }
 
 #[test]
