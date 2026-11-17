@@ -124,17 +124,56 @@ pub fn parse(
 ) -> Result<Action, String> {
     let mut it = args.iter();
     match tool {
-        "pbcopy" => Ok(Action::Copy {
-            text: None,
-            trim: false,
-            echo: false,
-        }),
-        "pbpaste" => Ok(Action::Paste {
-            mime: CLIP_TEXT.into(),
-            newline: false,
-        }),
+        "pbcopy" | "pbpaste" => {
+            let copy = tool == "pbcopy";
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    // Only the general pasteboard is this Mac's clipboard: copying to the find
+                    // or font one must not overwrite it.
+                    "-pboard" => match operand(&mut it, tool, a)?.as_str() {
+                        "general" => {}
+                        other => {
+                            return Err(format!(
+                                "{tool}: only the general pasteboard is supported, not {other}"
+                            ));
+                        }
+                    },
+                    // Text only: a format asked for is not swapped for plain text.
+                    "-Prefer" if !copy => match operand(&mut it, tool, a)?.as_str() {
+                        "txt" => {}
+                        other => {
+                            return Err(format!(
+                                "{tool}: only text (-Prefer txt) is supported, not {other}"
+                            ));
+                        }
+                    },
+                    "-help" => {
+                        return Ok(Action::Help(if copy {
+                            "pbcopy (thurm): [-pboard general] < text"
+                        } else {
+                            "pbpaste (thurm): [-pboard general] [-Prefer txt]"
+                        }));
+                    }
+                    _ => return Err(format!("{tool}: unknown option {a}")),
+                }
+            }
+            Ok(if copy {
+                Action::Copy {
+                    text: None,
+                    trim: false,
+                    echo: false,
+                }
+            } else {
+                Action::Paste {
+                    mime: CLIP_TEXT.into(),
+                    newline: false,
+                }
+            })
+        }
         "xclip" => {
             let (mut out, mut target, mut echo, mut trim) = (false, None, false, false);
+            // A copy that should go away (after some pastes, a time or one paste): not done here.
+            let mut expires = None;
             while let Some(a) = it.next() {
                 match xclip_opt(a) {
                     Some("in") => out = false,
@@ -143,10 +182,16 @@ pub fn parse(
                     Some("rmlastnl") => trim = true,
                     Some("target") => target = Some(operand(&mut it, "xclip", a)?.clone()),
                     // Every selection is this Mac's one clipboard.
-                    Some("selection" | "loops" | "display" | "wait") => {
+                    Some("selection" | "display") => {
                         operand(&mut it, "xclip", a)?;
                     }
-                    Some("quiet" | "silent" | "verbose" | "noutf8" | "sensitive") => {}
+                    Some(opt @ ("loops" | "wait")) => {
+                        if operand(&mut it, "xclip", a)? != "0" {
+                            expires = Some(opt);
+                        }
+                    }
+                    Some("sensitive") => expires = Some("sensitive"),
+                    Some("quiet" | "silent" | "verbose" | "noutf8") => {}
                     Some("help" | "version") => {
                         return Ok(Action::Help(
                             "xclip (thurm): -i | -o [-selection c] [-t TYPE] [-f] [-r]",
@@ -157,6 +202,11 @@ pub fn parse(
                     }
                     _ => return Err(format!("xclip: unknown option {a}")),
                 }
+            }
+            if let (false, Some(opt)) = (out, expires) {
+                return Err(format!(
+                    "xclip: -{opt} is not supported: the copy would stay"
+                ));
             }
             match (out, target.as_deref().map(mime).transpose()?) {
                 (true, Some(t)) if t == CLIP_TARGETS => Ok(Action::Types { xclip: true }),
@@ -176,6 +226,7 @@ pub fn parse(
         }
         "xsel" => {
             let (mut input, mut output, mut clear, mut trim) = (false, false, false, false);
+            let mut timeout = false;
             while let Some(a) = it.next() {
                 let flags: Vec<char> = match a.strip_prefix("--") {
                     Some(long) => vec![match long {
@@ -189,7 +240,8 @@ pub fn parse(
                         "trim" => 'T',
                         "clipboard" | "primary" | "secondary" | "keep" | "nodetach" | "verbose"
                         | "zeroflush" => 'b',
-                        "logfile" | "display" | "selectionTimeout" | "window-name" => 't',
+                        "logfile" | "display" | "window-name" => 'l',
+                        "selectionTimeout" => 't',
                         "help" | "version" => 'h',
                         _ => return Err(format!("xsel: unknown option {a}")),
                     }],
@@ -209,8 +261,14 @@ pub fn parse(
                         'f' => return Err("xsel: --follow is not supported".into()),
                         'x' => return Err("xsel: --exchange is not supported".into()),
                         'b' | 'p' | 's' | 'k' | 'n' | 'v' | 'z' => {}
-                        'l' | 't' | 'w' => {
+                        'l' | 'w' => {
                             operand(&mut it, "xsel", a)?;
+                        }
+                        // The selection would go after this many milliseconds: not done here.
+                        't' => {
+                            if operand(&mut it, "xsel", a)? != "0" {
+                                timeout = true;
+                            }
                         }
                         'h' => return Ok(Action::Help("xsel (thurm): -b [-i | -o | -c]")),
                         _ => return Err(format!("xsel: unknown option -{f}")),
@@ -228,6 +286,11 @@ pub fn parse(
                 (false, false) => (!stdout_tty, !stdin_tty),
                 asked => asked,
             };
+            if input && timeout {
+                return Err(
+                    "xsel: --selectionTimeout is not supported: the copy would stay".into(),
+                );
+            }
             Ok(match (output, input) {
                 (true, true) => Action::PasteThenCopy { trim },
                 (true, false) => Action::Paste {
@@ -535,8 +598,53 @@ mod tests {
     #[test]
     fn pbcopy_and_pbpaste() {
         assert_eq!(p("pbcopy", &[]), Ok(copy()));
+        assert_eq!(p("pbcopy", &["-pboard", "general"]), Ok(copy()));
         assert_eq!(p("pbpaste", &[]), Ok(paste(CLIP_TEXT)));
         assert_eq!(p("pbpaste", &["-Prefer", "txt"]), Ok(paste(CLIP_TEXT)));
+        assert_eq!(
+            p("pbpaste", &["-pboard", "general", "-Prefer", "txt"]),
+            Ok(paste(CLIP_TEXT))
+        );
+        // Another pasteboard or format, or an option they do not have, is refused: pbcopy
+        // -pboard find must not overwrite the clipboard, pbpaste -Prefer rtf not get text.
+        for (tool, args) in [
+            ("pbcopy", &["-pboard", "find"][..]),
+            ("pbcopy", &["-pboard", "font"]),
+            ("pbcopy", &["-Prefer", "txt"]),
+            ("pbpaste", &["-pboard", "ruler"]),
+            ("pbpaste", &["-Prefer", "rtf"]),
+            ("pbpaste", &["-Prefer", "ps"]),
+            ("pbpaste", &["-x"]),
+            ("pbcopy", &["file.txt"]),
+            ("pbcopy", &["-pboard"]),
+        ] {
+            assert!(p(tool, args).is_err(), "{tool} {args:?}");
+        }
+    }
+
+    #[test]
+    fn copies_that_would_expire_are_refused() {
+        for args in [
+            &["-loops", "1"][..],
+            &["-i", "-wait", "500"],
+            &["-sensitive"],
+            &["-selection", "clipboard", "-loops", "2", "-i"],
+        ] {
+            let e = p("xclip", args).expect_err(&format!("{args:?}"));
+            assert!(e.contains("not supported"), "{args:?}: {e}");
+        }
+        assert_eq!(p("xclip", &["-loops", "0"]), Ok(copy()), "0: no limit");
+        assert_eq!(
+            p("xclip", &["-o", "-loops", "1"]),
+            Ok(paste(CLIP_TEXT)),
+            "pastes have none"
+        );
+        let e = p("xsel", &["-bi", "-t", "1000"]).unwrap_err();
+        assert!(e.contains("not supported"), "{e}");
+        assert!(p("xsel", &["-bi", "--selectionTimeout", "5"]).is_err());
+        assert_eq!(p("xsel", &["-bi", "-t", "0"]), Ok(copy()));
+        assert_eq!(p("xsel", &["-bo", "-t", "1000"]), Ok(paste(CLIP_TEXT)));
+        assert_eq!(p("xsel", &["-bi", "--logfile", "/tmp/x"]), Ok(copy()));
     }
 
     #[test]

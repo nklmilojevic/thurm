@@ -10,34 +10,52 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// At most this many pastes wait at once.
 const MAX_PENDING: usize = 64;
 
-/// The pastes waiting now, each on a thread of its own: a slot is taken before the thread is
-/// made, so a client sending pastes without waiting for answers cannot make more threads.
+/// At most this many bytes of clipboard contents are held at once, on their way between the
+/// app and the tools (answers) or from a tool to the apps (copies): four of the largest. Without
+/// it, 64 pastes answered with 32 MiB images each held 2 GiB.
+const MAX_HELD: usize = 4 * thurm_proto::CLIP_MAX;
+
+/// [`MAX_HELD`], or `THURM_CLIP_HELD_BYTES` (tests).
+pub(super) fn max_held() -> usize {
+    std::env::var("THURM_CLIP_HELD_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_HELD)
+}
+
+/// A bounded amount in use: the pastes waiting now (each on a thread of its own: a slot is
+/// taken before the thread is made, so a client sending pastes without waiting for answers
+/// cannot make more threads), or the clipboard bytes held.
 #[derive(Default)]
 pub(super) struct Slots(std::sync::atomic::AtomicUsize);
 
-/// One of [`Slots`], given back when dropped.
-pub(super) struct Slot(Arc<Slots>);
+/// Some of [`Slots`], given back when dropped.
+pub(super) struct Slot(Arc<Slots>, usize);
 
 impl Slots {
-    fn take(self: &Arc<Self>, max: usize) -> Option<Slot> {
+    /// Takes `n` of at most `max`, or nothing when that much is not free.
+    fn take(self: &Arc<Self>, n: usize, max: usize) -> Option<Slot> {
         self.0
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < max).then_some(n + 1)
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(n).filter(|u| *u <= max)
             })
             .ok()
-            .map(|_| Slot(self.clone()))
+            .map(|_| Slot(self.clone(), n))
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.0.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.0.fetch_sub(self.1, Ordering::SeqCst);
     }
 }
 
+/// An answer's contents, with the share of [`MAX_HELD`] they take until sent on.
+type Held = (Vec<u8>, Slot);
+
 pub(super) struct PendingClip {
     ui: u64,
-    reply: Sender<Result<Vec<u8>, String>>,
+    reply: Sender<Result<Held, String>>,
 }
 
 /// [`ANSWER_TIMEOUT`], or `THURM_CLIP_TIMEOUT_MS` (tests).
@@ -68,6 +86,8 @@ impl Daemon {
             return Err("the text is larger than 32 MiB".into());
         }
         self.pane(pane).ok_or("no such pane")?;
+        // Held while it is copied out to every app.
+        let _held = self.clip_held_bytes(text.len())?;
         self.broadcast(Event::ClipboardStore { pane, text }, true);
         Ok(Response::Ok)
     }
@@ -131,17 +151,32 @@ impl Daemon {
         }
         self.pane(pane).ok_or("no such pane")?;
         self.clip_slots
-            .take(MAX_PENDING)
+            .take(1, MAX_PENDING)
             .ok_or_else(|| "too many clipboard requests are waiting".into())
     }
 
-    /// A paste [`Daemon::clipboard_admit`] let through: asks the app and waits for it.
+    /// Takes `n` bytes of [`max_held`] for clipboard contents on their way.
+    fn clip_held_bytes(&self, n: usize) -> Result<Slot, String> {
+        self.clip_bytes.take(n, max_held()).ok_or_else(|| {
+            "too much clipboard data is on its way already; try again in a moment".into()
+        })
+    }
+
+    /// A paste [`Daemon::clipboard_admit`] let through: asks the app and waits for it. The
+    /// [`Slot`] with an answer holds its bytes' share until the response is sent.
     pub(super) fn clipboard_get(
         &self,
         caller: u64,
         pane: PaneId,
         mime: String,
-    ) -> Result<Response, String> {
+    ) -> (Result<Response, String>, Option<Slot>) {
+        match self.clipboard_get_held(caller, pane, mime) {
+            Ok((data, held)) => (Ok(Response::ClipboardData { data }), Some(held)),
+            Err(e) => (Err(e), None),
+        }
+    }
+
+    fn clipboard_get_held(&self, caller: u64, pane: PaneId, mime: String) -> Result<Held, String> {
         if ![
             thurm_proto::CLIP_TEXT,
             thurm_proto::CLIP_PNG,
@@ -185,7 +220,7 @@ impl Daemon {
                 }
             }
             match answer.recv_timeout((deadline - now).min(Duration::from_millis(50))) {
-                Ok(answer) => break answer.map(|data| Response::ClipboardData { data }),
+                Ok(answer) => break answer,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     break Err("the clipboard request was dropped".into());
@@ -215,7 +250,10 @@ impl Daemon {
                 let e = "the clipboard is larger than 32 MiB".to_string();
                 (Err(e.clone()), Err(e))
             }
-            Some(d) => (Ok(d), Ok(Response::Ok)),
+            Some(d) => match self.clip_held_bytes(d.len()) {
+                Ok(held) => (Ok((d, held)), Ok(Response::Ok)),
+                Err(e) => (Err(e.clone()), Err(e)),
+            },
             None => (
                 Err("the clipboard has nothing of that type, or was not shared".into()),
                 Ok(Response::Ok),
@@ -247,11 +285,32 @@ mod tests {
     #[test]
     fn slots_are_bounded_and_given_back() {
         let slots = Arc::new(Slots::default());
-        let held: Vec<_> = (0..3).map(|_| slots.take(3).expect("free")).collect();
-        assert!(slots.take(3).is_none(), "all taken");
+        let held: Vec<_> = (0..3).map(|_| slots.take(1, 3).expect("free")).collect();
+        assert!(slots.take(1, 3).is_none(), "all taken");
         drop(held);
-        let again: Vec<_> = (0..3).map(|_| slots.take(3).expect("given back")).collect();
+        let again: Vec<_> = (0..3)
+            .map(|_| slots.take(1, 3).expect("given back"))
+            .collect();
         assert_eq!(again.len(), 3);
+    }
+
+    /// Four answers of the largest size fit; a fifth waits for one of them to be sent on.
+    #[test]
+    fn clipboard_bytes_held_at_once_are_bounded() {
+        let bytes = Arc::new(Slots::default());
+        let max = super::MAX_HELD;
+        let full = thurm_proto::CLIP_MAX;
+        let held: Vec<_> = (0..4)
+            .map(|_| bytes.take(full, max).expect("fits"))
+            .collect();
+        assert!(
+            bytes.take(full, max).is_none(),
+            "64 of them no longer add up to 2 GiB"
+        );
+        assert!(bytes.take(1, max).is_none());
+        drop(held);
+        assert!(bytes.take(full, max).is_some(), "given back once sent on");
+        assert!(bytes.take(usize::MAX, max).is_none(), "no overflow");
     }
 
     #[test]

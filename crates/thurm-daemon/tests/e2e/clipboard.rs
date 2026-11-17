@@ -370,6 +370,46 @@ fn a_clear_empties_the_clipboard() {
     }
 }
 
+/// Clipboard contents on their way through the daemon are bounded in all: an answer or a copy
+/// over what is left is refused, and what was held is given back once sent on.
+#[test]
+fn clipboard_data_held_at_once_is_bounded() {
+    let env = clip_env("clip-held", "copy-paste");
+    let _daemon = env.start_with(&[("THURM_CLIP_HELD_BYTES", Path::new("1000"))]);
+    let (app, rx) = env.connect();
+    let pane = create(&app, &env.dir);
+    focus(&app, pane);
+    let tool = tool(&env);
+    for _ in 0..3 {
+        let paste = get(&tool, pane, CLIP_PNG);
+        let (_, id, _) = query(&rx).unwrap();
+        answer(&app, id, Some(vec![1; 600])).unwrap();
+        assert_eq!(
+            paste.join().unwrap(),
+            Ok(vec![1; 600]),
+            "given back after each"
+        );
+    }
+    let paste = get(&tool, pane, CLIP_PNG);
+    let (_, id, _) = query(&rx).unwrap();
+    assert!(answer(&app, id, Some(vec![1; 1001])).is_err());
+    let e = paste.join().unwrap().unwrap_err();
+    assert!(e.contains("too much clipboard data"), "{e}");
+    let e = tool
+        .request(Request::ClipboardSet {
+            pane,
+            text: "x".repeat(1001),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("too much clipboard data"), "{e}");
+    tool.request(Request::ClipboardSet {
+        pane,
+        text: "x".repeat(1000),
+    })
+    .unwrap();
+}
+
 #[test]
 fn older_apps_and_phones_are_never_asked() {
     let env = clip_env("clip-old", "copy-paste");

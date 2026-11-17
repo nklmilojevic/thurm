@@ -371,10 +371,15 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
   (`xclip -t TARGETS -o`, `wl-paste --list-types`) fails where reads from that
   host are refused (`clipboard_read = "never"`, or pastes off in either
   `terminal.osc52`). Pastes carry text or a PNG image (an agent's image paste
-  works), at most 32 MiB. A clear (`xsel --clear`, `wl-copy --clear`) empties
-  the clipboard, leaving no type. Options the tools cannot honour here
-  (`xsel --append`, `--follow`, `--exchange`, `wl-copy --paste-once`) are
-  refused. `thurm clip copy`, `thurm clip paste [--type image/png]` and
+  works), at most 32 MiB each, and at most 128 MiB on its way through the
+  host's daemon at once (a paste or copy over that is refused, to try again).
+  A clear (`xsel --clear`, `wl-copy --clear`) empties
+  the clipboard, leaving no type. Options the tools cannot honour here are
+  refused rather than ignored: a copy meant to go away (`xclip -loops`,
+  `-wait`, `-sensitive`, `xsel --selectionTimeout`, `wl-copy --paste-once`),
+  `xsel --append`, `--follow` and `--exchange`, and a pasteboard or format
+  other than the general one and text (`pbcopy -pboard find`,
+  `pbpaste -Prefer rtf`). `thurm clip copy`, `thurm clip paste [--type image/png]` and
   `thurm clip clear` do the same on any host; on this Mac's own panes only
   this Mac's `terminal.osc52` applies.
 

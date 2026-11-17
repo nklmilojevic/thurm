@@ -612,6 +612,8 @@ pub struct Daemon {
     pending_clips: Mutex<HashMap<u64, clip::PendingClip>>,
     /// The pastes on threads of their own, at most `clip::MAX_PENDING`.
     clip_slots: Arc<clip::Slots>,
+    /// The clipboard bytes on their way, at most `clip::max_held()`.
+    clip_bytes: Arc<clip::Slots>,
 }
 
 impl Daemon {
@@ -678,6 +680,7 @@ impl Daemon {
             next_clip: AtomicU64::new(1),
             pending_clips: Mutex::new(HashMap::new()),
             clip_slots: Arc::default(),
+            clip_bytes: Arc::default(),
         });
         daemon.ext_config_applied();
         daemon
@@ -2474,11 +2477,12 @@ impl Daemon {
                     let daemon = self.clone();
                     let client = client.clone();
                     std::thread::spawn(move || {
-                        let result = daemon.clipboard_get(client.id, pane, mime);
+                        let (result, held) = daemon.clipboard_get(client.id, pane, mime);
                         drop(slot);
                         if id != 0 {
                             client.send(ServerMessage::Response { id, result });
                         }
+                        drop(held);
                     });
                     return;
                 }
