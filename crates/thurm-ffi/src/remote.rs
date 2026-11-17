@@ -455,12 +455,8 @@ enum Call {
     KnownPorts {
         host: String,
     },
-    /// `host`'s answer to `Ports` on connecting: every pane's list, replacing what was known.
-    PortsSnapshot {
-        host: String,
-        panes: Vec<thurm_proto::PanePorts>,
-    },
-    /// The connection to `host` dropped: its port lists are unknown until the next snapshot.
+    /// The connection to `host` dropped: its port lists are unknown until the daemon sends them
+    /// again (every pane's, as the app joins the watch on connecting).
     HostDisconnected {
         host: String,
     },
@@ -700,10 +696,10 @@ fn call(c: Call) -> Result<Value, String> {
             let cfg = Config::load().unwrap_or_default();
             json!(policy::clipboard_write(&cfg, host.as_deref()))
         }
-        Call::Link { host, url } => {
-            let cfg = Config::load().unwrap_or_default();
-            json!(policy::link(&cfg, host.as_deref(), &url))
-        }
+        Call::Link { host, url } => match Config::load() {
+            Ok(cfg) => json!(policy::link(&cfg, host.as_deref(), &url)),
+            Err(_) => json!(policy::link_without_config(host.as_deref(), &url)),
+        },
         Call::HandoffPrepare { host, path, branch } => {
             let h = handoff::prepare_registered(
                 &host_for(&host)?,
@@ -828,10 +824,6 @@ fn call(c: Call) -> Result<Value, String> {
             json!("Ok")
         }
         Call::KnownPorts { host } => json!(forwards().known(&host)),
-        Call::PortsSnapshot { host, panes } => {
-            forwards().ports_snapshot(&host, panes);
-            json!("Ok")
-        }
         Call::HostDisconnected { host } => {
             forwards().host_disconnected(&host);
             json!("Ok")
@@ -953,7 +945,6 @@ mod tests {
             r#"{"op":"known_ports","host":"pi"}"#,
             // As the app relays a PortsChanged: with `initial`, a list like any other here.
             r#"{"op":"ports_changed","host":"pi","pane":2,"ports":[],"complete":true,"initial":true}"#,
-            r#"{"op":"ports_snapshot","host":"pi","panes":[{"pane":2,"ports":[],"complete":false}]}"#,
             r#"{"op":"host_disconnected","host":"pi"}"#,
         ] {
             serde_json::from_str::<Call>(s).unwrap_or_else(|e| panic!("{s}: {e}"));

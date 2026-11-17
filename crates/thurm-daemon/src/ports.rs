@@ -245,6 +245,10 @@ pub trait Host: Send + Sync + 'static {
     /// Sends `event` to client `client` alone.
     fn send_ports_to(&self, client: u64, event: Event);
     fn watcher(&self) -> &Watcher;
+    /// One look at the system ([`look`]).
+    fn look(&self, roots: &[(PaneId, u32)]) -> Option<HashMap<PaneId, Seen>> {
+        look(roots)
+    }
 }
 
 #[derive(Default)]
@@ -256,8 +260,8 @@ struct State {
 }
 
 /// What one look sends: `broadcast` to the clients that had subscribed before it (by the per-pane
-/// rules, as changes), and to each of `joined` its own first lists, every pane with ports as seen
-/// now, marked `initial`. A
+/// rules, as changes), and to each of `joined` its own first lists, every pane's as seen now
+/// (empty ones too: they are the joiner's whole picture), marked `initial`. A
 /// client joining doesn't make the others hear a list again, nor sooner than a second after the
 /// last one.
 #[derive(Debug)]
@@ -275,7 +279,6 @@ pub fn deliver(
 ) -> Delivery {
     let mut first: Vec<(PaneId, Seen)> = seen
         .iter()
-        .filter(|(_, s)| !s.ports.is_empty())
         .map(|(p, s)| {
             let mut s = s.clone();
             s.ports.sort();
@@ -362,6 +365,8 @@ fn run<H: Host>(h: Arc<H>) {
     let mut backoff = Backoff::new(min_interval());
     let mut next = Instant::now();
     let mut last_look: Option<Instant> = None;
+    // Clients whose first look failed: served by the next one, at its time.
+    let mut waiting: Vec<u64> = Vec::new();
     loop {
         let w = h.watcher();
         let joined = {
@@ -393,11 +398,13 @@ fn run<H: Host>(h: Arc<H>) {
                 }
                 w.wake.wait_for(&mut st, next - now);
             }
-            std::mem::take(&mut st.joined)
+            let mut joined = std::mem::take(&mut waiting);
+            joined.append(&mut st.joined);
+            joined
         };
         let roots = h.pane_roots();
         last_look = Some(Instant::now());
-        let changed = match look(&roots) {
+        let changed = match h.look(&roots) {
             Some(seen) => {
                 let d = deliver(&mut tracker, Instant::now(), seen, &joined);
                 let changed = !d.broadcast.is_empty() || d.retry.is_some();
@@ -413,9 +420,10 @@ fn run<H: Host>(h: Arc<H>) {
                 changed
             }
             // A failed look sends nothing; try again at the shortest wait, the clients that
-            // joined still waiting for their lists.
+            // joined still waiting for their lists (not put back with the new joiners: those
+            // are looked at once, and a look failing again would then never wait).
             None => {
-                w.state.lock().joined.extend(joined);
+                waiting = joined;
                 backoff.poke();
                 next = Instant::now() + backoff.interval();
                 false
@@ -595,9 +603,14 @@ mod tests {
             d.broadcast.iter().map(ports_of).collect::<Vec<_>>(),
             [(1, vec![3000], true)]
         );
-        assert_eq!(d.initial.len(), 1);
-        assert_eq!(d.initial[0].0, 1);
-        assert_eq!(ports_of(&d.initial[0].1), (1, vec![3000], true));
+        assert_eq!(
+            d.initial
+                .iter()
+                .map(|(c, e)| (*c, ports_of(e)))
+                .collect::<Vec<_>>(),
+            [(1, (1, vec![3000], true)), (1, (2, vec![], true))],
+            "every pane's list, the empty one too"
+        );
         // Client 2 joins 300 ms later: it gets the list; nothing goes to everyone again.
         let d = deliver(
             &mut t,
@@ -611,7 +624,7 @@ mod tests {
                 .iter()
                 .map(|(c, e)| (*c, ports_of(e)))
                 .collect::<Vec<_>>(),
-            [(2, (1, vec![3000], true))]
+            [(2, (1, vec![3000], true)), (2, (2, vec![], true))]
         );
         // And the per-pane second still holds for a change right after.
         let d = deliver(
@@ -622,6 +635,43 @@ mod tests {
         );
         assert!(d.broadcast.is_empty());
         assert_eq!(d.retry, Some(t0 + PER_PANE));
+    }
+
+    /// A daemon whose looks always fail, counting them.
+    struct Failing {
+        watcher: Watcher,
+        looks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Host for Failing {
+        fn wants_ports(&self) -> bool {
+            true
+        }
+        fn pane_roots(&self) -> Vec<(PaneId, u32)> {
+            vec![(1, 1)]
+        }
+        fn send_ports(&self, _: Event, _: &[u64]) {}
+        fn send_ports_to(&self, _: u64, _: Event) {}
+        fn watcher(&self) -> &Watcher {
+            &self.watcher
+        }
+        fn look(&self, _: &[(PaneId, u32)]) -> Option<HashMap<PaneId, Seen>> {
+            self.looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+    }
+
+    #[test]
+    fn a_failing_look_is_not_retried_at_once_for_a_joiner() {
+        let h = Arc::new(Failing {
+            watcher: Watcher::default(),
+            looks: Default::default(),
+        });
+        h.watcher().subscribed(h.clone(), 7);
+        std::thread::sleep(Duration::from_millis(300));
+        // One look for the joiner, then the shortest wait (10 s) before the next.
+        let looks = h.looks.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(looks, 1, "{looks} looks in 300 ms");
     }
 
     #[test]
