@@ -208,7 +208,13 @@ fn sync_with(m: &mut Manager, loaded: Result<Config, String>) {
                 // Forwards to a moved host open again once a connection with these settings
                 // (the new destination's) is up.
                 Ok(()) => forwards().await_settings(&name, s.settings()),
-                Err(e) => log::warn!("remote {name}: {e}"),
+                // Not taken (an ssh target it can't use): the tunnel keeps where it goes, and
+                // the host's panes are still there, so its forwards may open once it is
+                // connected with the settings it has.
+                Err(e) => {
+                    log::warn!("remote {name}: {e}");
+                    forwards().await_settings(&name, s.settings());
+                }
             },
             None => {
                 let ssh = match Ssh::new(&r.host) {
@@ -459,6 +465,12 @@ enum Call {
     /// again (every pane's, as the app joins the watch on connecting).
     HostDisconnected {
         host: String,
+    },
+    /// `host`'s panes on connecting (`ListPanes`): lists of others are dropped, and its
+    /// forwards are looked at again, a host with no pane included.
+    HostPanes {
+        host: String,
+        panes: Vec<u64>,
     },
 }
 
@@ -828,6 +840,10 @@ fn call(c: Call) -> Result<Value, String> {
             forwards().host_disconnected(&host);
             json!("Ok")
         }
+        Call::HostPanes { host, panes } => {
+            forwards().host_panes(&host, &panes);
+            json!("Ok")
+        }
         Call::LocalProbe => {
             let host = thurm_remote::probe(&LocalShell).map_err(|e| e.to_string())?;
             json!({
@@ -946,6 +962,8 @@ mod tests {
             // As the app relays a PortsChanged: with `initial`, a list like any other here.
             r#"{"op":"ports_changed","host":"pi","pane":2,"ports":[],"complete":true,"initial":true}"#,
             r#"{"op":"host_disconnected","host":"pi"}"#,
+            r#"{"op":"host_panes","host":"pi","panes":[]}"#,
+            r#"{"op":"host_panes","host":"pi","panes":[2,3]}"#,
         ] {
             serde_json::from_str::<Call>(s).unwrap_or_else(|e| panic!("{s}: {e}"));
         }
@@ -996,6 +1014,41 @@ mod tests {
         // Read, without the host: its tunnel stops.
         sync_with(&mut m, Ok(Config::parse("").unwrap()));
         assert!(m.supervisors.is_empty());
+    }
+
+    #[test]
+    fn a_move_the_tunnel_cannot_take_does_not_shut_its_forwards_out_for_good() {
+        // A name of its own: the app's forwards are shared by these tests.
+        let name = "bad-move";
+        let remote = |host: &str| thurm_config::RemoteConfig {
+            name: name.into(),
+            host: host.into(),
+            socket: None,
+            enabled: false,
+            clipboard_read: Default::default(),
+            tailnet: None,
+            forward_links: true,
+        };
+        let cfg = |host: &str| {
+            let mut c = Config::parse("").unwrap();
+            c.remote = vec![remote(host)];
+            c
+        };
+        // Its tunnel, connected with the settings it starts with.
+        let tunnel = forwards().host_started(name);
+        let sup = Supervisor::start(remote("me@one"), Ssh::new("me@one").unwrap(), false, |_| {});
+        forwards().host_connected(name, tunnel, sup.settings());
+        let mut m = Manager {
+            supervisors: HashMap::from([(name.to_owned(), sup)]),
+            cb: None,
+            ctx: Ctx(std::ptr::null_mut()),
+            destinations: HashMap::new(),
+        };
+        sync_with(&mut m, Ok(cfg("me@one")));
+        assert_eq!(forwards().opens(name), Ok(()));
+        // Pointed at an ssh target the tunnel refuses: it keeps going where it went.
+        sync_with(&mut m, Ok(cfg("-oProxyCommand=x")));
+        assert_eq!(forwards().opens(name), Ok(()), "forwards shut out for good");
     }
 
     #[test]

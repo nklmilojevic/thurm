@@ -282,3 +282,96 @@ fn a_connection_to_a_closed_forward_asks_the_host_for_nothing() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A daemon whose streams take the data and never answer or end (an idle service): it reports
+/// when a stream's connection goes away.
+fn idle_daemon(path: PathBuf) -> std::sync::mpsc::Receiver<()> {
+    use thurm_proto::{Envelope, Request, Response, ServerMessage, codec};
+    let (gone_tx, gone_rx) = std::sync::mpsc::channel();
+    let ln = UnixListener::bind(&path).unwrap();
+    std::thread::spawn(move || {
+        for conn in ln.incoming() {
+            let Ok(mut conn) = conn else { return };
+            let gone_tx = gone_tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut conn) {
+                    let stream = matches!(env.request, Request::StreamOpen { .. });
+                    let result = match env.request {
+                        Request::Hello { .. } => Ok(Response::Hello {
+                            version: thurm_proto::PROTOCOL_VERSION,
+                            daemon_pid: std::process::id(),
+                            restored: false,
+                            build: thurm_proto::BUILD.into(),
+                            capabilities: thurm_proto::CAPABILITIES
+                                .iter()
+                                .map(|c| (*c).to_owned())
+                                .collect(),
+                        }),
+                        Request::DialBegin { port } => Ok(Response::Ticket {
+                            ticket: format!("ticket-{port}"),
+                            expires_ms: 60_000,
+                        }),
+                        _ => Ok(Response::Ok),
+                    };
+                    let msg = ServerMessage::Response { id: env.id, result };
+                    if codec::write_message(&mut conn, &msg).is_err() {
+                        return;
+                    }
+                    if stream {
+                        // Take frames, End included, and never say anything back.
+                        while let Ok(Some(_)) = thurm_proto::stream::read_frame(&mut conn) {}
+                        let _ = gone_tx.send(());
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    gone_rx
+}
+
+#[test]
+fn closing_ends_a_stream_whose_client_had_finished_sending() {
+    let d = dir("half");
+    let socket = d.join("idle.sock");
+    let gone = idle_daemon(socket.clone());
+    let theirs = socket.clone();
+    let f = Forwards::new(d.join("forwards.json"), move |_| theirs.clone());
+    let (fw, _) = f.open("devbox", 5177, Some(0)).unwrap();
+    // A client sends its request and ends its side; the service on the host says nothing yet.
+    let mut conn = TcpStream::connect(("127.0.0.1", fw.local)).unwrap();
+    conn.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+    conn.shutdown(std::net::Shutdown::Write).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    // Closing the forward ends the host's side too.
+    f.close(fw.id).unwrap();
+    assert!(
+        gone.recv_timeout(Duration::from_secs(3)).is_ok(),
+        "the stream to the host outlived its forward"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_connection_made_while_the_host_moved_is_not_kept() {
+    let d = dir("moving-control");
+    let socket = d.join("slow.sock");
+    let _dials = slow_daemon(socket.clone(), Duration::from_millis(400));
+    let theirs = socket.clone();
+    let f = Forwards::new(d.join("forwards.json"), move |_| theirs.clone());
+    // A check starts connecting to the host's daemon (slowly); the host is pointed elsewhere
+    // meanwhile.
+    let checking = {
+        let f = f.clone();
+        std::thread::spawn(move || f.check("devbox"))
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    f.host_moved("devbox");
+    let r = checking.join().unwrap();
+    assert!(r.is_err(), "a check across a move passed: {r:?}");
+    assert!(
+        !f.connected("devbox"),
+        "a connection made for the old destination was kept"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

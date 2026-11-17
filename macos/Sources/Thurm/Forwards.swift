@@ -71,8 +71,6 @@ enum ForwardNotice: Equatable {
     }
 }
 
-/// The `Ports` request of each host's current connection: a reply to an earlier one (a
-/// connection that dropped meanwhile, or one replaced by a reconnect) is not applied.
 /// Which host Forward Port… is for: the focused pane's when it is remote; else the one
 /// connected host; else the user picks among them.
 enum ForwardHostChoice: Equatable {
@@ -197,11 +195,12 @@ extension SessionManager {
                                                               onPane: pane != nil), on: pane)
                     return
                 }
+                // The link first: the notice may be an alert, which waits for the user.
+                NSWorkspace.shared.open(target)
                 if jsonBool(v?["new"]) == true {
                     SessionManager.show(ForwardNotice.opened(host: host, remotePort: f.remotePort, localPort: f.localPort,
                                                              url: link, onPane: pane != nil), on: pane, forward: f)
                 }
-                NSWorkspace.shared.open(target)
             }
         }
     }
