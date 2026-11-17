@@ -339,12 +339,29 @@ final class ForwardsTests: XCTestCase {
         XCTAssertTrue(g.isCurrent("pi", other))
     }
 
+    func testAForwardsLinkIsUsedOnlyWhileItIsOpenOnTheSamePort() {
+        let known = ForwardInfo(json: ["id": 4, "host": "devbox", "remote_port": 8443, "local_port": 18443,
+                                       "url": "https://localhost:18443/app"])!
+        // Still open: its link as it is now.
+        XCTAssertEqual(ForwardInfo.liveLink(of: known, answer: ["id": 4, "host": "devbox", "remote_port": 8443,
+                                                                "local_port": 18443,
+                                                                "url": "https://localhost:18443/admin"]),
+                       "https://localhost:18443/admin")
+        // Closed since: nothing to open or copy.
+        XCTAssertNil(ForwardInfo.liveLink(of: known, answer: ["error": "that forward has closed"]))
+        // Another forward, or the same id on another port: not this one.
+        XCTAssertNil(ForwardInfo.liveLink(of: known, answer: ["id": 5, "host": "devbox", "remote_port": 8443,
+                                                              "local_port": 18443]))
+        XCTAssertNil(ForwardInfo.liveLink(of: known, answer: ["id": 4, "host": "devbox", "remote_port": 8443,
+                                                              "local_port": 18444]))
+    }
+
     func testEveryOpenForwardKeepsCopyLinkAndClose() {
         let f = ForwardInfo(json: ["id": 4, "host": "devbox", "remote_port": 8443, "local_port": 18443,
                                    "url": "https://localhost:18443/app"])!
         let entries = ForwardPicker.manageEntries([f])
         XCTAssertEqual(entries.map(\.title), ["Copy Forward Link devbox:8443", "Close Forward devbox:8443"])
-        XCTAssertEqual(entries[0].action, .copyLink("https://localhost:18443/app"))
+        XCTAssertEqual(entries[0].action, .copyLink(f))
         XCTAssertEqual(entries[1].action, .close(4))
         XCTAssertTrue(ForwardPicker.manageEntries([]).isEmpty)
     }

@@ -3552,14 +3552,20 @@ impl Daemon {
         }
     }
 
-    /// Pastes `text` into `pane` as [`Request::Paste`] does, for `client` (which may have gone
-    /// since it asked): files it uploaded, once they landed.
+    /// Pastes `text` into `pane` as [`Request::Paste`] does, for `client`, unless it has gone
+    /// since it asked: files it uploaded, once they landed.
     pub(crate) fn paste_for(&self, client: u64, pane: PaneId, text: &str) -> Result<(), String> {
-        let asker = self.clients.lock().get(&client).cloned();
+        // A client that went away asked for nothing more (`remove_client` takes it out of the
+        // map before it fails its uploads).
+        let asker = self
+            .clients
+            .lock()
+            .get(&client)
+            .cloned()
+            .filter(|c| !c.gone.load(Ordering::SeqCst))
+            .ok_or("the app sending the files went away")?;
         self.with_input_pane(client, pane, |p, st| {
-            if let Some(c) = &asker {
-                self.used_by(c, st);
-            }
+            self.used_by(&asker, st);
             st.agent.prompt.interrupted();
             st.agent.user_input();
             self.acknowledge_programs(pane, st);

@@ -559,6 +559,7 @@ impl Daemon {
             pane,
             ports,
             complete,
+            ..
         } = event
         else {
             return None;

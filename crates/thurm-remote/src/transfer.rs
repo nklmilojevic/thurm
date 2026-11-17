@@ -270,18 +270,9 @@ pub fn upload(
         };
         // A cancel between files still has to reach the daemon: it ends the batch on this
         // stream, which is aborted unfinished.
-        send(&mut source, &mut writer, cancel, |n| {
+        send_and_finish(&mut source, &mut writer, watch, cancel, |n| {
             p.done += n;
             progress(p);
-        })?;
-        // Waiting for the batch, Cancel aborts the stream instead of cutting it.
-        drop(watch);
-        writer.finish().map_err(|e| {
-            if cancel.is_cancelled() {
-                TransferError::Cancelled
-            } else {
-                TransferError::Remote(e.to_string())
-            }
         })?;
         // Every stream of the batch closes with the same outcome: waiting on the last one is
         // enough, and the others need no connection meanwhile.
@@ -393,6 +384,28 @@ fn send(
             source.name
         )));
     }
+    Ok(())
+}
+
+/// Sends `source` and its `End` with `watch` cutting the connection on Cancel, the `End` too
+/// (a host that stopped reading blocks it as well); then lets the watch go, so a Cancel while
+/// the batch waits aborts the stream rather than cutting it.
+fn send_and_finish(
+    source: &mut Source,
+    writer: &mut StreamWriter,
+    watch: CancelWatch,
+    cancel: &Cancel,
+    sent: impl FnMut(u64),
+) -> Result<(), TransferError> {
+    send(source, writer, cancel, sent)?;
+    writer.finish().map_err(|e| {
+        if cancel.is_cancelled() {
+            TransferError::Cancelled
+        } else {
+            TransferError::Remote(e.to_string())
+        }
+    })?;
+    drop(watch);
     Ok(())
 }
 
@@ -907,5 +920,47 @@ mod tests {
         std::fs::rename(&part, &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"data");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancel_ends_an_end_the_host_stopped_taking() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (socket, daemon) = fake_daemon_then(move |_, _| {
+            let _ = held.recv();
+            Vec::new()
+        });
+        let shutdown = socket.try_clone().unwrap();
+        let (_reader, mut writer) = stream::open_on(socket, "ticket").unwrap();
+        // The host reads nothing: fill the connection until it takes no more.
+        shutdown.set_nonblocking(true).unwrap();
+        let junk = vec![0u8; 64 * 1024];
+        while (&shutdown).write(&junk).is_ok() {}
+        shutdown.set_nonblocking(false).unwrap();
+        let cancel = Cancel::default();
+        let watch = CancelWatch::start(cancel.clone(), shutdown).unwrap();
+        let theirs = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut empty = Source {
+                name: "empty".into(),
+                size: 0,
+                reader: Box::new(std::io::empty()),
+            };
+            let _ = tx.send(send_and_finish(
+                &mut empty,
+                &mut writer,
+                watch,
+                &theirs,
+                |_| {},
+            ));
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        cancel.cancel();
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writing the End stayed blocked after Cancel");
+        assert!(matches!(got, Err(TransferError::Cancelled)), "{got:?}");
+        let _ = release.send(());
+        daemon.join().unwrap();
     }
 }

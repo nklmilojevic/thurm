@@ -381,6 +381,11 @@ enum Call {
         id: u64,
     },
     ForwardList,
+    /// Forward `id` as it is now (as `forward_list` lists it), or an error once it has closed:
+    /// asked before opening or copying a link the app has held on to.
+    ForwardGet {
+        id: u64,
+    },
     /// A `PortsChanged` from `host`'s daemon.
     PortsChanged {
         host: String,
@@ -752,6 +757,9 @@ fn call(c: Call) -> Result<Value, String> {
         }
         Call::ForwardClose { id } => json!(forward_json(&forwards().close(id)?, None)),
         Call::ForwardList => json!(forward_list(forwards())),
+        Call::ForwardGet { id } => {
+            forward_json(&forwards().get(id).ok_or("that forward has closed")?, None)
+        }
         Call::PortsChanged {
             host,
             pane,
@@ -882,8 +890,11 @@ mod tests {
             r#"{"op":"forward_open","host":"pi","url":"http://localhost:5173/","local":5174}"#,
             r#"{"op":"forward_close","id":3}"#,
             r#"{"op":"forward_list"}"#,
+            r#"{"op":"forward_get","id":3}"#,
             r#"{"op":"ports_changed","host":"pi","pane":2,"ports":[{"port":5173,"address":"127.0.0.1","pid":9,"command":"vite"}],"complete":true}"#,
             r#"{"op":"known_ports","host":"pi"}"#,
+            // As the app relays a PortsChanged: with `initial`, a list like any other here.
+            r#"{"op":"ports_changed","host":"pi","pane":2,"ports":[],"complete":true,"initial":true}"#,
             r#"{"op":"ports_snapshot","host":"pi","panes":[{"pane":2,"ports":[],"complete":false}]}"#,
             r#"{"op":"host_disconnected","host":"pi"}"#,
         ] {
