@@ -436,7 +436,7 @@ impl Transfers {
     /// File `index` of batch `serial` arrived whole at its place. When it is the last, types
     /// the batch's paths into its pane.
     fn landed(&self, daemon: &Daemon, serial: u64, index: u32) {
-        let (client, pane, text) = {
+        let (client, pane, paths) = {
             let mut st = self.state.lock();
             let Some(b) = st.batches.get_mut(&serial) else {
                 return;
@@ -454,11 +454,15 @@ impl Transfers {
             let paths: Vec<String> = b
                 .files
                 .values()
-                .map(|f| crate::shell::shell_quote(&f.path.display().to_string()))
+                .map(|f| f.path.display().to_string())
                 .collect();
-            (b.client, b.pane, paths.join(" ") + " ")
+            (b.client, b.pane, paths)
         };
-        let typed = daemon.paste_for(client, pane, &text);
+        let text: Vec<String> = paths.iter().map(|p| crate::shell::shell_quote(p)).collect();
+        let typed = daemon.paste_for(client, pane, &(text.join(" ") + " "));
+        if typed.is_ok() {
+            daemon.files_uploaded(pane, paths);
+        }
         let mut st = self.state.lock();
         if let Some(b) = st.batches.get_mut(&serial) {
             b.pasting = false;

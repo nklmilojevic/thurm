@@ -1395,3 +1395,265 @@ fn an_action_hears_the_selection_the_file_and_the_remote_host() {
     assert!(ctx.get("remote").is_none(), "{ctx}");
     answering.join().unwrap();
 }
+
+/// The next `event` notice called `event`, skipping others.
+fn next_event(rx: &Receiver<(String, Value)>, event: &str) -> Value {
+    loop {
+        let ev = next(rx, notice::EVENT);
+        if ev["event"] == event {
+            return ev;
+        }
+    }
+}
+
+/// A subscriber to `ports_changed` gets the daemon to watch its panes' ports, hears a pane's
+/// list, and can ask for it; files sent to a pane are heard once their paths are typed.
+#[test]
+fn a_subscriber_hears_ports_and_uploaded_files() {
+    use std::io::Write;
+    let has_python = std::process::Command::new("python3")
+        .args(["-c", ""])
+        .status()
+        .is_ok_and(|s| s.success());
+    let env = Env::new("ext-ports");
+    let _d = env.start_with(&[("THURM_PORTS_INTERVAL_MS", Path::new("200"))]);
+    let (c, rx) = ext_client(&env, "listener");
+    call(
+        &c,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed", "files_uploaded"] }),
+    )
+    .unwrap();
+
+    if has_python {
+        let pane = match c
+            .request(Request::CreatePane(CreatePane {
+                command: Some(vec![
+                    "python3".into(),
+                    "-c".into(),
+                    "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print('port=%d' % s.getsockname()[1], flush=True); time.sleep(600)".into(),
+                ]),
+                cwd: Some(env.dir.display().to_string()),
+                ..Default::default()
+            }))
+            .unwrap()
+        {
+            Response::PaneCreated { pane } => pane,
+            other => panic!("{other:?}"),
+        };
+        wait_match(&c, pane, r"port=\d+");
+        let text = capture(&c, pane);
+        let port: u64 = text[text.rfind("port=").unwrap() + 5..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap();
+        let ev = loop {
+            let ev = next_event(&rx, "ports_changed");
+            if ev["id"] == pane {
+                break ev;
+            }
+        };
+        assert_eq!(ev["pane"]["id"], pane);
+        assert!(ev.get("host").is_none(), "{ev}");
+        assert_eq!(ev["ports"][0]["port"], port, "{ev}");
+        assert_eq!(ev["complete"], true);
+        let listed = call(&c, method::PORTS_LIST, json!({ "pane": pane })).unwrap();
+        assert_eq!(listed[0]["pane"], pane);
+        assert_eq!(listed[0]["ports"][0]["port"], port, "{listed}");
+        assert!(call(&c, method::PORTS_LIST, json!({ "pane": 4242 })).is_err());
+    } else {
+        eprintln!("note: no python3 here; ports part skipped");
+    }
+
+    let pane = match c
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "cat > /dev/null".into(),
+            ]),
+            cwd: Some(env.dir.display().to_string()),
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    let ticket = c.upload_begin(pane, "notes.txt", 5, None).unwrap();
+    let (mut r, mut w) = thurm_client::stream::open(&env.socket, &ticket.ticket).unwrap();
+    w.write_all(b"hello").unwrap();
+    w.finish().unwrap();
+    let mut rest = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut r, &mut rest);
+    let ev = next_event(&rx, "files_uploaded");
+    assert_eq!(ev["id"], pane);
+    assert_eq!(ev["pane"]["id"], pane);
+    let path = ev["paths"][0].as_str().unwrap();
+    assert!(path.ends_with("/notes.txt"), "{ev}");
+    assert_eq!(std::fs::read(path).unwrap(), b"hello");
+}
+
+/// An app that forwards, as the Mac app does.
+fn forwarding_app(env: &Env, caps: &[&str]) -> (Arc<Client>, Receiver<(String, Value)>) {
+    let (tx, rx) = unbounded();
+    let c = Client::connect_with(
+        ConnectOptions {
+            socket: env.socket.clone(),
+            spawn_daemon: None,
+            client_name: "app",
+            ui: true,
+        },
+        caps,
+        move |ev| {
+            if let Event::Ext { name, payload } = ev {
+                let _ = tx.send((name, serde_json::from_str(&payload).unwrap()));
+            }
+        },
+        || {},
+    )
+    .unwrap();
+    (c, rx)
+}
+
+/// Forwards live in the app: a plugin's open and close go to it, what it reports is heard
+/// as events, and its forwards close with it.
+#[test]
+fn forwards_go_through_the_app() {
+    let env = Env::new("ext-forwards");
+    let _d = env.start();
+    let (plugin, rx) = ext_client(&env, "plugin");
+    call(
+        &plugin,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["forward_opened", "forward_closed", "ports_changed"] }),
+    )
+    .unwrap();
+
+    // Without an app that forwards, a clear error; an app without the capability is not one.
+    let (_old_app, old_rx) = forwarding_app(&env, &[CAP_EXT, CAP_EXT_UI]);
+    let e = call(
+        &plugin,
+        method::FORWARDS_OPEN,
+        json!({ "host": "devbox", "port": 5173 }),
+    )
+    .unwrap_err();
+    assert!(e.contains("forwards ports"), "{e}");
+    assert!(call(&plugin, method::FORWARDS_LIST, Value::Null).is_err());
+    assert!(
+        old_rx.try_iter().all(|(n, _)| n != notice::UI_REQUEST),
+        "an app without ext-forwards was asked"
+    );
+    // Only the app reports.
+    let e = call(&plugin, method::FORWARDS_REPORT, json!({ "forwards": [] })).unwrap_err();
+    assert!(e.contains("only for the Thurm app"), "{e}");
+
+    let (app, app_rx) = forwarding_app(&env, &[CAP_EXT, CAP_EXT_UI, CAP_EXT_FORWARDS]);
+    assert_eq!(
+        call(&plugin, method::FORWARDS_LIST, Value::Null).unwrap(),
+        json!([])
+    );
+    let opening = std::thread::spawn({
+        let plugin = plugin.clone();
+        move || {
+            call(
+                &plugin,
+                method::FORWARDS_OPEN,
+                json!({ "host": "devbox", "port": 5173, "browse": true }),
+            )
+        }
+    });
+    let req = next(&app_rx, notice::UI_REQUEST);
+    assert_eq!(req["kind"], "forward_open");
+    assert_eq!(req["host"], "devbox");
+    assert_eq!(req["port"], 5173);
+    assert_eq!(req["browse"], true);
+    let forward = json!({
+        "id": 7, "host": "devbox", "remote_port": 5173, "local_port": 5174,
+        "url": "http://localhost:5174/",
+    });
+    let mut answer = forward.clone();
+    answer["new"] = json!(true);
+    call(
+        &app,
+        method::UI_REPLY,
+        json!({ "id": req["id"], "result": answer }),
+    )
+    .unwrap();
+    assert_eq!(opening.join().unwrap().unwrap(), answer);
+
+    call(
+        &app,
+        method::FORWARDS_REPORT,
+        json!({ "forwards": [forward], "change": { "change": "opened", "forward": forward } }),
+    )
+    .unwrap();
+    let opened = next_event(&rx, "forward_opened");
+    assert_eq!(opened["id"], 7);
+    assert_eq!(opened["url"], "http://localhost:5174/");
+    assert_eq!(
+        call(&plugin, method::FORWARDS_LIST, Value::Null).unwrap()[0]["local_port"],
+        5174
+    );
+
+    // Closing goes to the app; what it answers comes back.
+    let closing = std::thread::spawn({
+        let plugin = plugin.clone();
+        move || call(&plugin, method::FORWARDS_CLOSE, json!({ "id": 7 }))
+    });
+    let req = next(&app_rx, notice::UI_REQUEST);
+    assert_eq!(req["kind"], "forward_close");
+    assert_eq!(req["forward"], 7);
+    call(
+        &app,
+        method::UI_REPLY,
+        json!({ "id": req["id"], "error": "no forward 7" }),
+    )
+    .unwrap();
+    assert!(
+        closing
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("no forward 7")
+    );
+
+    // The port went away on the host: closed, and why.
+    call(
+        &app,
+        method::FORWARDS_REPORT,
+        json!({ "forwards": [], "change": { "change": "closed", "forward": forward, "why": "gone" } }),
+    )
+    .unwrap();
+    let closed = next_event(&rx, "forward_closed");
+    assert_eq!(closed["id"], 7);
+    assert_eq!(closed["why"], "gone");
+
+    // A remote host's ports, as the app hears them.
+    call(
+        &app,
+        method::PORTS_REPORT,
+        json!({ "host": "devbox", "pane": 3, "complete": true,
+                "ports": [{ "port": 5173, "address": "127.0.0.1", "pid": 9, "command": "vite" }] }),
+    )
+    .unwrap();
+    let ports = next_event(&rx, "ports_changed");
+    assert_eq!(ports["host"], "devbox");
+    assert_eq!(ports["id"], 3);
+    assert_eq!(ports["ports"][0]["command"], "vite");
+    assert!(ports.get("pane").is_none(), "{ports}");
+
+    // The app quits: its forwards close with it.
+    call(
+        &app,
+        method::FORWARDS_REPORT,
+        json!({ "forwards": [forward] }),
+    )
+    .unwrap();
+    assert_eq!(next_event(&rx, "forward_opened")["id"], 7);
+    drop(app);
+    let closed = next_event(&rx, "forward_closed");
+    assert_eq!(closed["why"], "app");
+}

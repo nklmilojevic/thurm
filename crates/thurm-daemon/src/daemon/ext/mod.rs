@@ -14,11 +14,17 @@ use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use thurm_proto::ext::{self, method, notice};
-use thurm_proto::{CreatePane, Event, PaneId, PaneInfo, Request, Response, ServerMessage};
+use thurm_proto::{
+    CreatePane, Event, PaneId, PaneInfo, PortEntry, Request, Response, ServerMessage,
+};
 
 use super::{Client, Daemon};
 use crate::user_exec;
 use registry::{Provider, Registry};
+
+const PORTS_CHANGED: &str = "ports_changed";
+const FORWARD_OPENED: &str = "forward_opened";
+const FORWARD_CLOSED: &str = "forward_closed";
 
 /// How deep actions may run one another.
 const MAX_DEPTH: u32 = 16;
@@ -42,6 +48,8 @@ pub struct Ext {
     /// client and where its answer goes.
     pending: Mutex<HashMap<u64, Pending>>,
     next: AtomicU64,
+    /// The forwards each app reported last ([`method::FORWARDS_REPORT`]), by client.
+    forwards: Mutex<HashMap<u64, Vec<ext::ForwardInfo>>>,
 }
 
 pub use thurm_proto::ext::method_blocks as blocks;
@@ -60,6 +68,15 @@ fn client_is_tailnet(client: &Client) -> bool {
         .lock()
         .as_ref()
         .is_some_and(|p| p.kind == thurm_proto::PrincipalKind::Tailscale)
+}
+
+/// Refuses `method` unless `client` is the app, which opens forwards.
+fn only_the_app(client: &Client, method: &str) -> Result<(), String> {
+    if client.ext_forwards.load(Ordering::Relaxed) {
+        Ok(())
+    } else {
+        Err(format!("{method} is only for the Thurm app"))
+    }
 }
 
 fn params<T: DeserializeOwned + Default>(v: Value) -> Result<T, String> {
@@ -177,7 +194,14 @@ impl Daemon {
                 Ok(Value::Null)
             }
             method::EVENTS_SUBSCRIBE => {
-                self.ext_registry(client)?.subscribe(client.id, names(&p))?;
+                let names = names(&p);
+                let ports = names.iter().any(|n| n == PORTS_CHANGED);
+                self.ext_registry(client)?.subscribe(client.id, names)?;
+                // Its panes' ports are watched only while someone hears of them; a new
+                // subscriber hears every list there is first.
+                if ports {
+                    self.ports.subscribed(Arc::downgrade(self));
+                }
                 Ok(Value::Null)
             }
             method::EVENTS_UNSUBSCRIBE => {
@@ -263,8 +287,157 @@ impl Daemon {
                 }
                 Ok(Value::Null)
             }
+            method::PORTS_LIST => {
+                let pane = p.get("pane").and_then(Value::as_u64);
+                match self.answer(client, Request::Ports { pane })? {
+                    Response::Ports(list) => Ok(json!(list)),
+                    other => Err(format!("unexpected answer: {other:?}")),
+                }
+            }
+            method::PORTS_REPORT => {
+                only_the_app(client, method)?;
+                let host = str_param(&p, "host")?;
+                let pane = p
+                    .get("pane")
+                    .and_then(Value::as_u64)
+                    .ok_or("missing \"pane\"")?;
+                let ports: Vec<PortEntry> =
+                    serde_json::from_value(p.get("ports").cloned().unwrap_or(json!([])))
+                        .map_err(|e| format!("bad ports: {e}"))?;
+                let complete = p.get("complete").and_then(Value::as_bool).unwrap_or(true);
+                self.emit(
+                    PORTS_CHANGED,
+                    None,
+                    json!({ "host": host, "id": pane, "ports": ports, "complete": complete }),
+                );
+                Ok(Value::Null)
+            }
+            method::FORWARDS_REPORT => {
+                only_the_app(client, method)?;
+                let report: ext::ForwardsReport = params(p)?;
+                self.forwards_reported(client.id, report);
+                Ok(Value::Null)
+            }
+            method::FORWARDS_LIST => {
+                self.forwarding_app()?;
+                let forwards = self.ext.forwards.lock();
+                let mut all: Vec<&ext::ForwardInfo> = forwards.values().flatten().collect();
+                all.sort_by_key(|f| f.id);
+                Ok(json!(all))
+            }
+            method::FORWARDS_OPEN => {
+                let open: ext::ForwardOpen = params(p)?;
+                if open.host.is_empty() || open.port == 0 {
+                    return Err("a host and a port to forward".into());
+                }
+                let app = self.forwarding_app()?;
+                self.ask(&app, client, |id| ext::UiRequest::ForwardOpen { id, open })
+            }
+            method::FORWARDS_CLOSE => {
+                let forward = p
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or("missing \"id\"")?;
+                let app = self.forwarding_app()?;
+                self.ask(&app, client, |id| ext::UiRequest::ForwardClose {
+                    id,
+                    forward,
+                })
+            }
             other => self.plugin_method(client, other, p),
         }
+    }
+
+    /// The app that opens forwards for plugins: the one with a focused pane, else any.
+    fn forwarding_app(&self) -> Result<Arc<Client>, String> {
+        let apps: Vec<Arc<Client>> = self
+            .clients
+            .lock()
+            .values()
+            .filter(|c| c.ext_forwards.load(Ordering::Relaxed) && !c.gone.load(Ordering::SeqCst))
+            .cloned()
+            .collect();
+        let focused = self.focus.lock().focused_clients();
+        apps.iter()
+            .find(|c| focused.contains(&c.id))
+            .or(apps.first())
+            .cloned()
+            .ok_or_else(|| "no Thurm app that forwards ports is open (or it is too old)".into())
+    }
+
+    /// The forwards app `client` has now: the ones that came are `forward_opened`, the ones
+    /// that went `forward_closed`, with why when the report says.
+    fn forwards_reported(&self, client: u64, report: ext::ForwardsReport) {
+        let changed = report.change.get("forward").and_then(|f| f.get("id"));
+        let why = report
+            .change
+            .get("why")
+            .and_then(Value::as_str)
+            .unwrap_or("closed");
+        let old = self
+            .ext
+            .forwards
+            .lock()
+            .insert(client, report.forwards.clone())
+            .unwrap_or_default();
+        for f in old
+            .iter()
+            .filter(|f| !report.forwards.iter().any(|n| n.id == f.id))
+        {
+            let why = if changed.and_then(Value::as_u64) == Some(f.id) {
+                why
+            } else {
+                "closed"
+            };
+            self.forward_event(FORWARD_CLOSED, f, Some(why));
+        }
+        for f in report
+            .forwards
+            .iter()
+            .filter(|f| !old.iter().any(|o| o.id == f.id))
+        {
+            self.forward_event(FORWARD_OPENED, f, None);
+        }
+    }
+
+    fn forward_event(&self, event: &str, f: &ext::ForwardInfo, why: Option<&str>) {
+        let mut extra = json!(f);
+        if let Some(why) = why {
+            extra["why"] = why.into();
+        }
+        self.emit(event, None, extra);
+    }
+
+    /// Whether a subscriber wants its panes' ports watched: one that named `ports_changed`.
+    pub(super) fn ext_watches_ports(&self) -> bool {
+        self.ext.registry.lock().named(PORTS_CHANGED)
+    }
+
+    /// A [`Event::PortsChanged`] of the watch, for the extension API's subscribers.
+    pub(super) fn ext_ports_changed(&self, event: &Event) {
+        if let Event::PortsChanged {
+            pane,
+            ports,
+            complete,
+        } = event
+        {
+            let info = self.pane(*pane).map(|p| p.state.lock().info.clone());
+            self.emit(
+                PORTS_CHANGED,
+                info.as_ref(),
+                json!({ "id": pane, "ports": ports, "complete": complete }),
+            );
+        }
+    }
+
+    /// Files sent to `pane` landed and their paths were typed there.
+    pub(crate) fn files_uploaded(&self, pane: PaneId, paths: Vec<String>) {
+        let info = self.pane(pane).map(|p| p.state.lock().info.clone());
+        self.emit(
+            "files_uploaded",
+            info.as_ref(),
+            json!({ "id": pane, "paths": paths }),
+        );
     }
 
     /// The registry, to add what `client` provides or hears: refused once the client is gone.
@@ -466,6 +639,11 @@ impl Daemon {
     pub(super) fn ext_client_gone(&self, client: u64) {
         // Dropping the senders ends the waits on them.
         self.ext.pending.lock().retain(|_, p| p.to != client);
+        // An app's forwards end with it.
+        let forwards = self.ext.forwards.lock().remove(&client);
+        for f in forwards.iter().flatten() {
+            self.forward_event(FORWARD_CLOSED, f, Some("app"));
+        }
         if self.ext.registry.lock().client_gone(client) {
             self.actions_changed();
         }
@@ -710,15 +888,25 @@ impl Daemon {
         let app = self
             .ui_client()
             .ok_or("no Thurm window is open to ask in (or the app is too old)")?;
+        self.ask(&app, caller, make)
+    }
+
+    /// Sends `make(id)` to `app` and waits for its answer.
+    fn ask(
+        &self,
+        app: &Arc<Client>,
+        caller: &Client,
+        make: impl FnOnce(u64) -> ext::UiRequest,
+    ) -> Result<Value, String> {
         let (id, rx) = self.ext_question(app.id, 0);
         if app.gone.load(Ordering::SeqCst) {
             self.ext.pending.lock().remove(&id);
             return Err("the app went away".into());
         }
-        send_ext(&app, notice::UI_REQUEST, &json!(make(id)));
+        send_ext(app, notice::UI_REQUEST, &json!(make(id)));
         let answer = self.ext_wait(id, &rx, "the app", caller);
         if answer.is_err() {
-            send_ext(&app, notice::UI_CANCEL, &json!({ "id": id }));
+            send_ext(app, notice::UI_CANCEL, &json!({ "id": id }));
         }
         answer
     }

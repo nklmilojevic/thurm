@@ -87,6 +87,7 @@ extension Remotes {
     /// The status callback's report of forwards: every open one, and what changed.
     func forwardsChanged(_ list: [Any], change: [String: Any]?) {
         forwards = list.compactMap { ForwardInfo(json: $0) }
+        Extensions.shared.reportForwards(list, change: change)
         if jsonString(change?["change"]) == "closed", jsonString(change?["why"]) == "gone",
            let f = ForwardInfo(json: change?["forward"]) {
             tlog("forward \(f.host):\(f.remotePort) closed: the port went away")
@@ -166,5 +167,7 @@ extension SessionManager {
         guard host != localHost, let payload, let pane = jsonUInt64(payload["pane"]) else { return }
         _ = Core.shared.remoteCall(["op": "ports_changed", "host": host, "pane": NSNumber(value: pane),
                                     "ports": payload["ports"] ?? [], "complete": payload["complete"] ?? true])
+        Extensions.shared.reportPorts(host: host, pane: pane, ports: payload["ports"] ?? [],
+                                      complete: payload["complete"] ?? true)
     }
 }

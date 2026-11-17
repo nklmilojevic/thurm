@@ -361,6 +361,8 @@ pub struct Client {
     pub ext: AtomicBool,
     /// Shows what plugins ask the user ([`thurm_proto::CAP_EXT_UI`]).
     pub ext_ui: AtomicBool,
+    /// Opens forwards for plugins and reports its own ([`thurm_proto::CAP_EXT_FORWARDS`]).
+    pub ext_forwards: AtomicBool,
     /// Hears which ports panes listen on ([`thurm_proto::CAP_PORT_EVENTS`]).
     pub port_events: AtomicBool,
     /// The plugin this client is the daemon's connection for.
@@ -826,6 +828,7 @@ impl Daemon {
             floating_minimize: AtomicBool::new(false),
             ext: AtomicBool::new(false),
             ext_ui: AtomicBool::new(false),
+            ext_forwards: AtomicBool::new(false),
             port_events: AtomicBool::new(false),
             plugin: Mutex::new(None),
             gone: AtomicBool::new(false),
@@ -2759,6 +2762,10 @@ impl Daemon {
                         .ext_ui
                         .store(local && desktop && app, Ordering::Relaxed);
                 }
+                if has(thurm_proto::CAP_EXT_FORWARDS) {
+                    let trusted = client.ext_ui.load(Ordering::Relaxed);
+                    client.ext_forwards.store(trusted, Ordering::Relaxed);
+                }
                 log::info!(
                     "client {} hello: {name} (protocol {version}{}{}{}{}{})",
                     client.id,
@@ -3876,10 +3883,13 @@ fn command_name(line: &str) -> Option<&str> {
 
 impl crate::ports::Host for Daemon {
     fn wants_ports(&self) -> bool {
-        self.clients
-            .lock()
-            .values()
-            .any(|c| c.port_events.load(Ordering::Relaxed) && !c.gone.load(Ordering::Relaxed))
+        // Not under the clients lock: the registry's is taken alone.
+        self.ext_watches_ports()
+            || self
+                .clients
+                .lock()
+                .values()
+                .any(|c| c.port_events.load(Ordering::Relaxed) && !c.gone.load(Ordering::Relaxed))
     }
 
     fn pane_roots(&self) -> Vec<(PaneId, u32)> {
@@ -3897,6 +3907,7 @@ impl crate::ports::Host for Daemon {
     }
 
     fn send_ports(&self, event: Event) {
+        self.ext_ports_changed(&event);
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
         for c in clients {
             if c.port_events.load(Ordering::Relaxed) {
@@ -4555,6 +4566,7 @@ mod tests {
             floating_minimize: AtomicBool::new(false),
             ext: AtomicBool::new(false),
             ext_ui: AtomicBool::new(false),
+            ext_forwards: AtomicBool::new(false),
             port_events: AtomicBool::new(false),
             plugin: Mutex::new(None),
             gone: AtomicBool::new(false),

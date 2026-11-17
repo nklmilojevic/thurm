@@ -76,6 +76,7 @@ final class Extensions {
         registering = false
         registerAppActions()
         refresh()
+        reportForwards(Core.shared.remoteCall(["op": "forward_list"]) as? [Any] ?? [], change: nil)
     }
 
     /// The connection to this Mac's daemon is gone: its questions go, unanswered, and so do
@@ -321,7 +322,11 @@ final class Extensions {
         case "action.invoke":
             invoke(payload)
         case "ui.request":
-            show(payload)
+            if jsonString(payload["kind"])?.hasPrefix("forward_") == true {
+                forwardRequest(payload)
+            } else {
+                show(payload)
+            }
         case "ui.cancel":
             if let id = jsonUInt64(payload["id"]), let s = shown, s.id == id {
                 shown = nil
@@ -390,6 +395,77 @@ final class Extensions {
             return
         }
         answer(nil)
+    }
+
+    // MARK: Forwards for plugins
+
+    /// Tells this Mac's daemon every open forward, and what changed: its plugins hear of them.
+    /// A daemon from before forwards for plugins refuses it, which changes nothing.
+    func reportForwards(_ list: [Any], change: [String: Any]?) {
+        var params: [String: Any] = ["forwards": list]
+        if let change { params["change"] = change }
+        call("forwards.report", params)
+    }
+
+    /// A remote host's pane listed its ports: this Mac's plugins hear of it (with the host).
+    func reportPorts(host: HostId, pane: UInt64, ports: Any, complete: Any) {
+        guard available else { return }
+        call("ports.report", ["host": host, "pane": NSNumber(value: pane), "ports": ports, "complete": complete])
+    }
+
+    /// Opens or closes a forward a plugin asked for, and answers with it; an open one goes to the
+    /// browser too when the plugin said `browse`.
+    private func forwardRequest(_ req: [String: Any]) {
+        guard let id = jsonUInt64(req["id"]) else { return }
+        let asked = connection
+        let answer = { [weak self] (result: Any, error: String?) in
+            guard let self, self.connection == asked else { return }
+            var reply: [String: Any] = ["id": id, "result": result]
+            if let error { reply["error"] = error }
+            self.call("ui.reply", reply)
+        }
+        let op: [String: Any]
+        switch jsonString(req["kind"]) {
+        case "forward_open":
+            guard let host = jsonString(req["host"]), let port = jsonInt(req["port"]) else {
+                answer(NSNull(), "a host and a port to forward")
+                return
+            }
+            op = ["op": "forward_open", "host": host, "port": port]
+        case "forward_close":
+            guard let forward = jsonUInt64(req["forward"]) else {
+                answer(NSNull(), "a forward to close")
+                return
+            }
+            op = ["op": "forward_close", "id": NSNumber(value: forward)]
+        default:
+            answer(NSNull(), "the app cannot do \(jsonString(req["kind"]) ?? "that")")
+            return
+        }
+        let browse = jsonBool(req["browse"]) == true
+        // Opening connects to the host's daemon first: not on the main thread.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let v = Core.shared.remoteCall(op) as? [String: Any]
+            DispatchQueue.main.async {
+                if let e = jsonString(v?["error"]) {
+                    answer(NSNull(), e)
+                    return
+                }
+                guard let v else {
+                    answer(NSNull(), "the app did not answer")
+                    return
+                }
+                if let f = ForwardInfo(json: v), jsonBool(v["new"]) == true {
+                    SessionManager.shared.currentController?.content.focusedView?.showToast(
+                        ForwardText.toast(host: f.host, remotePort: f.remotePort, localPort: f.localPort),
+                        duration: 4)
+                }
+                if browse, let url = jsonString(v["url"]).flatMap(URL.init(string:)) {
+                    NSWorkspace.shared.open(url)
+                }
+                answer(v, nil)
+            }
+        }
     }
 
     /// Who takes `action` of `item` for `window`, and whether it is of that window: the first

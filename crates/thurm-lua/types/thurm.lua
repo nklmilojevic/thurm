@@ -62,12 +62,40 @@
 ---@field stderr string
 ---@field timed_out boolean
 
+---@class thurm.Port
+---@field port integer
+---@field address string Where it listens: `127.0.0.1`, `::1`, `0.0.0.0`, `::`; empty when the system did not say.
+---@field pid integer
+---@field command string The listening process's command line.
+
+---@class thurm.PanePorts
+---@field pane integer
+---@field ports thurm.Port[]
+---@field complete boolean False when part of the pane's processes could not be read.
+
+---@class thurm.Forward
+---@field id integer
+---@field host string The `[[remote]]` host.
+---@field remote_port integer
+---@field local_port integer The port on this Mac's `127.0.0.1`.
+---@field url string `http://localhost:<local_port>/`.
+---@field new boolean? From `thurm.forward.open`: it was opened now, rather than found open.
+
 ---@class thurm.Timer
 ---@field cancel fun()
 
 ---@class thurm.Event
 ---@field event string Its name.
 ---@field pane thurm.Pane? The pane it is about.
+---@field id integer? The pane's id, where `pane` may be missing (pane_closed, bell, notification, ports_changed, files_uploaded).
+---@field host string? ports_changed of a remote host's pane, and forward events: the `[[remote]]` host.
+---@field ports thurm.Port[]? ports_changed: every port the pane listens on now.
+---@field complete boolean? ports_changed: false when part of the pane's processes could not be read.
+---@field paths string[]? files_uploaded: where the files landed.
+---@field remote_port integer? forward_opened, forward_closed.
+---@field local_port integer? forward_opened, forward_closed.
+---@field url string? forward_opened, forward_closed.
+---@field why string? forward_closed: `closed`, `host`, `gone` (the port went away) or `app` (the app quit).
 
 ---@class thurm
 ---@field plugin string This plugin's name (`init` for init.lua, `script` for `thurm do`).
@@ -115,8 +143,9 @@ function thurm.unbind(key) end
 
 --- Runs `fn` on an event: agent_working, agent_waiting, agent_blocked, agent_finished,
 --- agent_failed, agent_idle, command_finished, pane_exited, pane_created, pane_closed,
---- pane_changed, pane_focused, bell, notification, config_reloaded, a plugin's own
---- (`git.changed`), or `*` for all.
+--- pane_changed, pane_focused, bell, notification, config_reloaded, ports_changed,
+--- files_uploaded, forward_opened, forward_closed, a plugin's own (`git.changed`), or `*` for
+--- all.
 ---@param event string
 ---@param fn fun(ev: thurm.Event)
 function thurm.on(event, fn) end
@@ -173,6 +202,32 @@ function thurm.focus(pane) end
 ---@param opts { match: string?, idle: number?, exit: boolean?, agent: boolean?, timeout: number? }?
 ---@return boolean ok, string? why, integer? exit_code
 function thurm.wait(pane, opts) end
+
+--- The TCP ports a pane's programs listen on, and whether all its processes could be read.
+--- Without a pane, every pane's: `{ pane, ports, complete }` each.
+---@param pane integer
+---@return thurm.Port[] ports, boolean complete
+---@overload fun(): thurm.PanePorts[]
+function thurm.ports(pane) end
+
+thurm.forward = {}
+
+--- Opens a remote host's port on this Mac through the app (or finds the forward that has it);
+--- `browse` opens its URL in the browser too.
+---@param host string The `[[remote]]` host.
+---@param port integer
+---@param opts { browse: boolean? }?
+---@return thurm.Forward
+function thurm.forward.open(host, port, opts) end
+
+--- Closes a forward.
+---@param id integer
+---@return thurm.Forward
+function thurm.forward.close(id) end
+
+--- Every forward the app has open.
+---@return thurm.Forward[]
+function thurm.forward.list() end
 
 thurm.ui = {}
 

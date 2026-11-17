@@ -443,7 +443,7 @@ pub unsafe extern "C" fn thurm_connect(
     unsafe {
         // This Mac's daemon only: what a remote host's plugins ask goes to its own users.
         connect_to(
-            &[thurm_proto::CAP_EXT_UI],
+            &[thurm_proto::CAP_EXT_UI, thurm_proto::CAP_EXT_FORWARDS],
             socket,
             daemon_path,
             client_name,

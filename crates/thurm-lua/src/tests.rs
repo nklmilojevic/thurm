@@ -34,6 +34,19 @@ impl Host for FakeHost {
                 Ok(json!({ "gone": null, "list": [1, null, { "gone": null, "deep": [null, 2] }] }))
             }
             "request" => Ok(json!({ "Panes": [{ "id": 7 }] })),
+            "ports.list" if params["pane"] == 3 => Ok(json!([{
+                "pane": 3,
+                "ports": [{ "port": 5173, "address": "127.0.0.1", "pid": 9, "command": "vite" }],
+                "complete": false,
+            }])),
+            "ports.list" if params["pane"].is_u64() => Ok(json!([])),
+            "ports.list" => Ok(json!([{ "pane": 3, "ports": [], "complete": true }])),
+            "forwards.open" => Ok(json!({
+                "id": 4, "host": params["host"], "remote_port": params["port"],
+                "local_port": 5174, "url": "http://localhost:5174/", "new": params["browse"],
+            })),
+            "forwards.close" => Ok(json!({ "id": params["id"] })),
+            "forwards.list" => Ok(json!([{ "id": 4, "host": "devbox" }])),
             // Answered on the runtime's own thread: it is held up meanwhile.
             "ui.toast" if params["text"] == "stall" => {
                 std::thread::sleep(Duration::from_millis(1500));
@@ -623,4 +636,39 @@ fn only_regular_files_are_opened() {
                 "written": "xy", "count": 1, "missing": true, "mwhy": true, "shebang": "ran" })
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn ports_and_forwards() {
+    let f = fixture();
+    let r = run(
+        &f,
+        r#"
+        local ports, complete = thurm.ports(3)
+        local none, none_complete = thurm.ports(8)
+        local fw = thurm.forward.open("devbox", 5173, { browse = true })
+        local plain = thurm.forward.open("devbox", 8080)
+        return {
+            port = ports[1].port, command = ports[1].command, complete = complete,
+            none = #none, none_complete = none_complete, all = thurm.ports()[1].pane,
+            url = fw.url, new = fw.new, plain_new = plain.new,
+            closed = thurm.forward.close(fw.id).id, listed = thurm.forward.list()[1].host,
+        }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        r,
+        json!({
+            "port": 5173, "command": "vite", "complete": false, "none": 0, "none_complete": true,
+            "all": 3, "url": "http://localhost:5174/", "new": true, "plain_new": false,
+            "closed": 4, "listed": "devbox",
+        })
+    );
+    assert_eq!(
+        next(&f, "forwards.open"),
+        json!({ "host": "devbox", "port": 5173, "browse": true })
+    );
+    let e = run(&f, "thurm.forward.open('devbox', '5173')").unwrap_err();
+    assert!(e.contains("usage: thurm.forward.open"), "{e}");
 }

@@ -93,10 +93,18 @@ for an event about a pane, `pane` (as `thurm info --json` shows it).
 | `pane_focused` | A pane got the keyboard focus in an app |
 | `bell`, `notification` | A program rang the bell, or sent a notification (`title`, `body`); these and `pane_closed` carry the pane's `id`, not `pane` |
 | `config_reloaded` | The configuration was reloaded |
+| `ports_changed` | The TCP ports a pane's programs listen on changed: `ports` (each with `port`, `address`, `pid`, `command`), the whole list, empty once they all went, and `complete` (false when some of the pane's processes could not be read). It carries the pane's `id`, and `pane` while it is there; a remote host's pane has `host` instead of `pane` |
+| `files_uploaded` | Files dropped or pasted on a pane landed and their paths were typed there: `paths`, with the pane's `id` |
+| `forward_opened`, `forward_closed` | The app opened or closed a forward of a remote host's port: `id`, `host`, `remote_port`, `local_port`, `url`; a closed one says `why`: `closed`, `host` (removed or disabled), `gone` (the port went away) or `app` (the app quit) |
 | `NAME.anything` | A plugin's own event, sent with `thurm.emit` |
 | `*` | Every event above |
 
 `[[on]]` hooks run on the first eight, as before.
+
+The daemon looks at its panes' ports only while someone listens: subscribing
+to `ports_changed` by name starts it (`*` alone does not), and the first lists
+come right away. A remote host's ports and the forwards come from the app, so
+a plugin on this Mac hears them while Thurm is open.
 
 ## The Lua API
 
@@ -123,6 +131,8 @@ prints it and exits with 1.
 | `thurm.send(pane, text, {enter})`, `thurm.capture(pane, {lines, scrollback, ansi})` | Types into a pane; reads its screen |
 | `thurm.wait(pane, {match, idle, exit, agent, timeout})` | Waits for the prompt, a regex, quiet, exit or a free agent; `true`, or `false` and why; waiting for `exit`, the exit code is the third value (`true, nil, code`) |
 | `thurm.close(pane)`, `thurm.focus(pane)` | Closes or focuses a pane |
+| `thurm.ports(pane)` | The ports the pane's programs listen on (`port`, `address`, `pid`, `command`), and whether all its processes could be read; without a pane, every pane's as `{pane, ports, complete}` |
+| `thurm.forward.open(host, port, {browse})`, `thurm.forward.close(id)`, `thurm.forward.list()` | Opens a remote host's port on this Mac through the app (or finds the forward that has it), closes one, lists them; a forward has `id`, `host`, `remote_port`, `local_port` and `url`, and `browse` opens the URL too |
 | `thurm.ui.toast(text, pane)` | A short message over a pane |
 | `thurm.ui.pick{title, placeholder, items}` | The user picks an item (a string, or a table with `title` and `detail`); returns it and its index, or `nil` |
 | `thurm.ui.input{title, placeholder, value}`, `thurm.ui.confirm{title, body, ok, cancel}` | A line of text, or yes or no |
@@ -243,6 +253,9 @@ For a whole plugin to start from, see
 in Thurm's repository: an action and a key (⌘Y) that preview a file with
 macOS's Quick Look in a floating pane, drawn with the kitty graphics protocol
 by a small script that ships with it.
+[`examples/plugins/dev-server`](https://github.com/nklmilojevic/thurm/tree/main/examples/plugins/dev-server)
+hears `ports_changed` and opens a dev server in the browser when it starts
+listening, forwarding a remote host's port to this Mac first.
 
 `install` clones the repository into the plugins directory (the name drops a
 `thurm-` prefix; `--name` picks another). `disable` and `enable` change
@@ -320,6 +333,14 @@ JSON.
 | `plugins.list` | | `[{name, kind, state, version, path, error, actions}]` |
 | `plugins.reload`, `plugins.enable`, `plugins.disable`, `plugins.logs` | `{name}` (`lines` for logs) | |
 | `script.run` | `{source, name, args, dir, pane}` | What the script returned |
+| `ports.list` | `{pane}` (every pane without) | `[{pane, ports, complete}]` |
+| `forwards.list` | | `[{id, host, remote_port, local_port, url}]` |
+| `forwards.open` | `{host, port, browse}` | The forward, with `new` when it was opened now |
+| `forwards.close` | `{id}` | The forward |
+| `forwards.report`, `ports.report` | From the app only: its forwards, and a remote host's ports | |
+
+The `forwards` methods need the Thurm app open (forwards live in it); without
+it, or with an app from before them, they fail and say so.
 
 A plugin's actions, keys and subscriptions go away when it stops. The API is
 for clients on the daemon's machine and its plugins: a caller over the tailnet

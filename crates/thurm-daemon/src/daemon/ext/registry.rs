@@ -197,6 +197,11 @@ impl Registry {
         }
     }
 
+    /// Whether a client subscribed to `event` by its name (not only with `*`).
+    pub fn named(&self, event: &str) -> bool {
+        self.subscriptions.values().any(|s| s.contains(event))
+    }
+
     /// The clients that hear `event`.
     pub fn listeners(&self, event: &str) -> Vec<u64> {
         self.subscriptions

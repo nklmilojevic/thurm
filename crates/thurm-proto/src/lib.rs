@@ -116,6 +116,11 @@ pub const CAP_TRANSFER: &str = "transfer";
 /// caller, another user or another program saying so never gets those questions.
 pub const CAP_EXT_UI: &str = "ext-ui";
 
+/// Sent only by an app that opens forwards for plugins ([`ext::UiRequest::ForwardOpen`] and
+/// [`ext::UiRequest::ForwardClose`]) and reports its forwards ([`ext::method::FORWARDS_REPORT`]).
+/// Taken only from a client the daemon takes [`CAP_EXT_UI`] from.
+pub const CAP_EXT_FORWARDS: &str = "ext-forwards";
+
 /// The pane takes the size of the client that used it last (see the daemon's `active_size`)
 /// instead of the last `Resize`.
 pub const CAP_ACTIVE_SIZE: &str = "active-size";

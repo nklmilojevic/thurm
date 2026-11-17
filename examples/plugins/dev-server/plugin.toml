@@ -1,0 +1,3 @@
+version = "0.1.0"
+description = "Open a dev server in the browser when it starts listening, through a forward for a remote host"
+main = "init.lua"
