@@ -102,3 +102,29 @@ fn a_forward_carries_a_bounded_number_of_connections() {
     f.close(fw.id).unwrap();
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn a_host_that_moves_drops_its_connection_and_forwards() {
+    let d = dir("moved");
+    let socket = d.join("d.sock");
+    fakes::daemon(&socket);
+    let theirs = socket.clone();
+    let f = Forwards::new(d.join("forwards.json"), move |_| theirs.clone());
+    f.check("devbox").unwrap();
+    assert!(f.connected("devbox"));
+    let (fw, _) = f.open("devbox", 5175, Some(0)).unwrap();
+    let mut conn = TcpStream::connect(("127.0.0.1", fw.local)).unwrap();
+    conn.write_all(b"ping").unwrap();
+    let mut got = [0u8; 4];
+    conn.read_exact(&mut got).unwrap();
+
+    // Its [[remote]] now points elsewhere: nothing opened for the old destination stays.
+    f.host_moved("devbox");
+    assert!(!f.connected("devbox"));
+    assert!(f.list().is_empty());
+    assert!(
+        ended(&mut conn),
+        "a connection to the old destination outlived the move"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -78,8 +78,8 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    /// Forget what was sent: the next look sends every pane's non-empty list (a new client
-    /// subscribed, and needs them all).
+    /// Forget what was sent (nobody listens any more): the next look sends every pane's
+    /// non-empty list.
     pub fn reset(&mut self) {
         self.panes.clear();
     }
@@ -236,8 +236,10 @@ pub trait Host: Send + Sync + 'static {
     fn wants_ports(&self) -> bool;
     /// Every live pane and its shell's pid.
     fn pane_roots(&self) -> Vec<(PaneId, u32)>;
-    /// Sends `event` to the clients that want port events.
-    fn send_ports(&self, event: Event);
+    /// Sends `event` to the clients that want port events, but those in `except`.
+    fn send_ports(&self, event: Event, except: &[u64]);
+    /// Sends `event` to client `client` alone.
+    fn send_ports_to(&self, client: u64, event: Event);
     fn watcher(&self) -> &Watcher;
 }
 
@@ -245,8 +247,48 @@ pub trait Host: Send + Sync + 'static {
 struct State {
     started: bool,
     poked: bool,
-    /// A client subscribed: send it every list.
-    resync: bool,
+    /// Clients subscribed since the last look: each gets every list, on its own.
+    joined: Vec<u64>,
+}
+
+/// What one look sends: `broadcast` to the clients that had subscribed before it (by the per-pane
+/// rules), and to each of `joined` its own first lists, every pane with ports as seen now. A
+/// client joining doesn't make the others hear a list again, nor sooner than a second after the
+/// last one.
+#[derive(Debug)]
+pub struct Delivery {
+    pub broadcast: Vec<Event>,
+    pub initial: Vec<(u64, Event)>,
+    pub retry: Option<Instant>,
+}
+
+pub fn deliver(
+    tracker: &mut Tracker,
+    now: Instant,
+    seen: HashMap<PaneId, Seen>,
+    joined: &[u64],
+) -> Delivery {
+    let mut first: Vec<(PaneId, Seen)> = seen
+        .iter()
+        .filter(|(_, s)| !s.ports.is_empty())
+        .map(|(p, s)| {
+            let mut s = s.clone();
+            s.ports.sort();
+            s.ports.dedup();
+            (*p, s)
+        })
+        .collect();
+    first.sort_unstable_by_key(|(p, _)| *p);
+    let (broadcast, retry) = tracker.update(now, seen);
+    let initial = joined
+        .iter()
+        .flat_map(|&c| first.iter().map(move |(p, s)| (c, event(*p, s))))
+        .collect();
+    Delivery {
+        broadcast,
+        initial,
+        retry,
+    }
 }
 
 /// The watcher's handle on the daemon.
@@ -266,11 +308,11 @@ impl Watcher {
         }
     }
 
-    /// A client that wants port events connected: start the watcher if it isn't running, and
-    /// send every pane's list again.
-    pub fn subscribed<H: Host>(&self, host: Weak<H>) {
+    /// Client `client`, which wants port events, connected: start the watcher if it isn't
+    /// running, and send that client every pane's list.
+    pub fn subscribed<H: Host>(&self, host: Weak<H>, client: u64) {
         let mut st = self.state.lock();
-        st.resync = true;
+        st.joined.push(client);
         st.poked = true;
         self.wake.notify_all();
         if st.started {
@@ -302,7 +344,7 @@ fn run<H: Host>(host: Weak<H>) {
     loop {
         let Some(h) = host.upgrade() else { return };
         let w = h.watcher();
-        {
+        let joined = {
             let mut st = w.state.lock();
             loop {
                 if !h.wants_ports() {
@@ -323,24 +365,28 @@ fn run<H: Host>(host: Weak<H>) {
                 }
                 w.wake.wait_for(&mut st, next - now);
             }
-            if std::mem::take(&mut st.resync) {
-                tracker.reset();
-            }
-        }
+            std::mem::take(&mut st.joined)
+        };
         let roots = h.pane_roots();
         let changed = match look(&roots) {
             Some(seen) => {
-                let (events, retry) = tracker.update(Instant::now(), seen);
-                let changed = !events.is_empty() || retry.is_some();
-                for ev in events {
-                    h.send_ports(ev);
+                let d = deliver(&mut tracker, Instant::now(), seen, &joined);
+                let changed = !d.broadcast.is_empty() || d.retry.is_some();
+                for ev in d.broadcast {
+                    h.send_ports(ev, &joined);
                 }
+                for (client, ev) in d.initial {
+                    h.send_ports_to(client, ev);
+                }
+                let retry = d.retry;
                 let wait = backoff.looked(changed);
                 next = retry.map_or(Instant::now() + wait, |r| r.min(Instant::now() + wait));
                 changed
             }
-            // A failed look sends nothing; try again at the shortest wait.
+            // A failed look sends nothing; try again at the shortest wait, the clients that
+            // joined still waiting for their lists.
             None => {
+                w.state.lock().joined.extend(joined);
                 backoff.poke();
                 next = Instant::now() + backoff.interval();
                 false
@@ -503,6 +549,50 @@ mod tests {
         assert_eq!(retry, None);
         let (ev, _) = t.update(t0 + PER_PANE * 2, HashMap::new());
         assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn a_client_joining_gets_its_lists_without_repeating_them_to_the_others() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        // Client 1 subscribes; the first look gives it the lists.
+        let d = deliver(
+            &mut t,
+            t0,
+            HashMap::from([(1, seen(&[3000])), (2, seen(&[]))]),
+            &[1],
+        );
+        assert_eq!(
+            d.broadcast.iter().map(ports_of).collect::<Vec<_>>(),
+            [(1, vec![3000], true)]
+        );
+        assert_eq!(d.initial.len(), 1);
+        assert_eq!(d.initial[0].0, 1);
+        assert_eq!(ports_of(&d.initial[0].1), (1, vec![3000], true));
+        // Client 2 joins 300 ms later: it gets the list; nothing goes to everyone again.
+        let d = deliver(
+            &mut t,
+            t0 + Duration::from_millis(300),
+            HashMap::from([(1, seen(&[3000])), (2, seen(&[]))]),
+            &[2],
+        );
+        assert!(d.broadcast.is_empty(), "{:?}", d.broadcast);
+        assert_eq!(
+            d.initial
+                .iter()
+                .map(|(c, e)| (*c, ports_of(e)))
+                .collect::<Vec<_>>(),
+            [(2, (1, vec![3000], true))]
+        );
+        // And the per-pane second still holds for a change right after.
+        let d = deliver(
+            &mut t,
+            t0 + Duration::from_millis(600),
+            HashMap::from([(1, seen(&[3000, 3001]))]),
+            &[],
+        );
+        assert!(d.broadcast.is_empty());
+        assert_eq!(d.retry, Some(t0 + PER_PANE));
     }
 
     #[test]

@@ -599,24 +599,44 @@ pub fn listeners(pids: &[u32]) -> Option<Listening> {
             }
             continue;
         };
-        for fd in fds.flatten() {
-            let Ok(target) = std::fs::read_link(fd.path()) else {
-                continue;
-            };
-            let inode = target
-                .to_str()
-                .and_then(|t| t.strip_prefix("socket:["))
-                .and_then(|t| t.strip_suffix(']'))
-                .and_then(|t| t.parse::<u64>().ok());
-            if let Some(l) = inode.and_then(|i| by_inode.get(&i)) {
-                let list = out.by_pid.entry(pid).or_default();
-                if !list.contains(l) {
-                    list.push(l.clone());
-                }
+        let links = fds.map(|fd| fd.and_then(|fd| std::fs::read_link(fd.path())));
+        let (inodes, partial) = socket_inodes(links);
+        if partial && !gone() {
+            out.unread.insert(pid);
+        }
+        for l in inodes.iter().filter_map(|i| by_inode.get(i)) {
+            let list = out.by_pid.entry(pid).or_default();
+            if !list.contains(l) {
+                list.push(l.clone());
             }
         }
     }
     Some(out)
+}
+
+/// The socket inodes among a process's fd links (`/proc/<pid>/fd/*`), and whether one could not
+/// be read: then what it listens on is only partly known. A link gone meanwhile (the fd closed
+/// between listing and reading) is not such a failure.
+#[cfg(any(target_os = "linux", test))]
+fn socket_inodes(
+    links: impl Iterator<Item = std::io::Result<std::path::PathBuf>>,
+) -> (Vec<u64>, bool) {
+    let mut inodes = Vec::new();
+    let mut partial = false;
+    for link in links {
+        match link {
+            Ok(target) => inodes.extend(
+                target
+                    .to_str()
+                    .and_then(|t| t.strip_prefix("socket:["))
+                    .and_then(|t| t.strip_suffix(']'))
+                    .and_then(|t| t.parse::<u64>().ok()),
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => partial = true,
+        }
+    }
+    (inodes, partial)
 }
 
 /// `(inode, listener)` of each LISTEN socket in a `/proc/net/tcp` or `tcp6` table.
@@ -693,7 +713,53 @@ pub fn listeners(pids: &[u32]) -> Option<Listening> {
     ]))
     .ok()?;
     out.by_pid = parse_lsof_listeners(&String::from_utf8_lossy(&res.stdout));
+    // `lsof` leaves out a process it may not inspect (another user's) without a word, and exits
+    // as it does when nothing listens: ask the system which of them it could not have read.
+    out.unread = pids
+        .iter()
+        .copied()
+        .filter(|&pid| fds_access(pid) == FdAccess::Denied)
+        .collect();
     Some(out)
+}
+
+/// Whether this process may list `pid`'s descriptors.
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FdAccess {
+    Readable,
+    /// Exited: nothing of it to read.
+    Gone,
+    Denied,
+}
+
+#[cfg(target_os = "macos")]
+pub fn fds_access(pid: u32) -> FdAccess {
+    // With no buffer, the size the descriptor list needs: what fails `lsof` fails here too.
+    let n = unsafe {
+        *libc::__error() = 0;
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if n > 0 {
+        return FdAccess::Readable;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => FdAccess::Gone,
+        // A process with no descriptors at all answers 0 without an error.
+        Some(0) | None => FdAccess::Readable,
+        _ => FdAccess::Denied,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn fds_access(_pid: u32) -> FdAccess {
+    FdAccess::Readable
 }
 
 /// `lsof -Fpn` output: `p<pid>` lines, each followed by `n<address>:<port>` lines.
@@ -836,6 +902,62 @@ mod proc_tests {
                 (51236, l(3001, "127.0.0.1"))
             ]
         );
+    }
+
+    #[test]
+    fn an_unreadable_fd_link_makes_a_partial_read() {
+        use std::io::{Error, ErrorKind};
+        let link = |t: &str| Ok(std::path::PathBuf::from(t));
+        // All read: the sockets, complete.
+        let (inodes, partial) = socket_inodes(
+            [
+                link("socket:[41234]"),
+                link("/dev/null"),
+                link("socket:[7]"),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(inodes, [41234, 7]);
+        assert!(!partial);
+        // An fd closed between listing and reading: not a failure.
+        let (inodes, partial) = socket_inodes(
+            [
+                link("socket:[41234]"),
+                Err(Error::from(ErrorKind::NotFound)),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(inodes, [41234]);
+        assert!(!partial);
+        // A link that may not be read: partial, the sockets found kept.
+        let (inodes, partial) = socket_inodes(
+            [
+                Err(Error::from(ErrorKind::PermissionDenied)),
+                link("socket:[41234]"),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(inodes, [41234]);
+        assert!(partial);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn another_users_process_is_unread_not_empty() {
+        let me = std::process::id();
+        assert_eq!(fds_access(me), FdAccess::Readable);
+        assert_eq!(fds_access(999_999), FdAccess::Gone);
+        // launchd is root's: lsof says nothing of it and exits as for "no listeners".
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        assert_eq!(fds_access(1), FdAccess::Denied);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let found = listeners(&[1, me]).expect("a look");
+        assert!(found.unread.contains(&1), "{found:?}");
+        assert!(!found.unread.contains(&me));
+        assert!(found.by_pid[&me].iter().any(|l| l.port == port));
     }
 
     #[test]

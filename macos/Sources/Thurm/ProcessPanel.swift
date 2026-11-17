@@ -133,7 +133,9 @@ final class ProcessPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate, 
         guard r >= 0, r < rows.count, let port = rows[r].ports.first else { return }
         switch ProcessPanel.opening(pane: rows[r].pane, port: port) {
         case .local(let url): NSWorkspace.shared.open(url)
-        case .forward(let host, let port): SessionManager.shared.openForwarded(host: host, port: port)
+        case .forward(let host, let port):
+            // Told on the row's pane, or in an alert when it has no view.
+            SessionManager.shared.openForwarded(host: host, port: port, from: SessionManager.shared.view(for: rows[r].pane))
         }
     }
 
