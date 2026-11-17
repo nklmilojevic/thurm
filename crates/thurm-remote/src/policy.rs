@@ -125,6 +125,18 @@ impl<'a> LocalUrl<'a> {
     }
 }
 
+/// [`link`] when the config can't be read (being rewritten): a remote pane's link to its host's
+/// loopback goes through a forward, as by default, never to this Mac's own port of that number,
+/// a different program. Anything else as with no config.
+pub fn link_without_config(host: Option<&str>, url: &str) -> LinkAction {
+    if host.is_some()
+        && let Some(local) = LocalUrl::parse(url)
+    {
+        return LinkAction::Forward { port: local.port };
+    }
+    link(&Config::default(), host, url)
+}
+
 /// Cmd-click on `url` in a pane of `host`. The URL comes from program output (OSC 8 or text),
 /// so only web and mail links open directly, even in this Mac's panes: other schemes can start
 /// apps (`smb:`, custom handlers) and a `file:` URL can name an app or a `.command` script. A
@@ -278,6 +290,24 @@ clipboard_read = "never"
             link(&c, Some("gone"), "http://localhost:5173"),
             LinkAction::Open
         );
+    }
+
+    #[test]
+    fn with_the_config_unreadable_a_remote_loopback_link_still_forwards() {
+        let r = Some("devbox");
+        assert_eq!(
+            link_without_config(r, "http://localhost:5173/x"),
+            LinkAction::Forward { port: 5173 }
+        );
+        assert_eq!(
+            link_without_config(r, "https://example.com"),
+            LinkAction::Open
+        );
+        assert_eq!(
+            link_without_config(None, "http://localhost:5173"),
+            LinkAction::Open
+        );
+        assert_eq!(link_without_config(r, "vscode://x"), LinkAction::Ask);
     }
 
     #[test]

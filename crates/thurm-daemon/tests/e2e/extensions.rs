@@ -1396,6 +1396,55 @@ fn an_action_hears_the_selection_the_file_and_the_remote_host() {
     answering.join().unwrap();
 }
 
+/// The listener is a python3 program: required, so the ports are always tested.
+fn require_python() {
+    assert!(
+        std::process::Command::new("python3")
+            .args(["-c", ""])
+            .status()
+            .is_ok_and(|s| s.success()),
+        "this test needs python3 (for a listener in a pane)"
+    );
+}
+
+/// A pane whose program listens on a free loopback port, and prints `port=<n>`.
+fn listener_pane(c: &Client, env: &Env) -> PaneId {
+    let r = c
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec![
+                "python3".into(),
+                "-c".into(),
+                "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print('port=%d' % s.getsockname()[1], flush=True); time.sleep(600)".into(),
+            ]),
+            cwd: Some(env.dir.display().to_string()),
+            ..Default::default()
+        }))
+        .unwrap();
+    match r {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Asserts `c` hears no more `ports_changed` than it has: an event of its own, sent now, comes
+/// next (what was sent before it would come first).
+fn no_more_ports(c: &Client, rx: &Receiver<(String, Value)>) {
+    call(
+        c,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["test.sentinel"] }),
+    )
+    .unwrap();
+    call(c, method::EVENTS_EMIT, json!({ "name": "test.sentinel" })).unwrap();
+    loop {
+        let ev = next(rx, notice::EVENT);
+        assert_ne!(ev["event"], "ports_changed", "heard more: {ev}");
+        if ev["event"] == "test.sentinel" {
+            return;
+        }
+    }
+}
+
 /// The next `event` notice called `event`, skipping others.
 fn next_event(rx: &Receiver<(String, Value)>, event: &str) -> Value {
     loop {
@@ -1411,14 +1460,7 @@ fn next_event(rx: &Receiver<(String, Value)>, event: &str) -> Value {
 #[test]
 fn a_subscriber_hears_ports_and_uploaded_files() {
     use std::io::Write;
-    // The listener is a python3 program: required, so the ports are always tested.
-    assert!(
-        std::process::Command::new("python3")
-            .args(["-c", ""])
-            .status()
-            .is_ok_and(|s| s.success()),
-        "this test needs python3 (for a listener in a pane)"
-    );
+    require_python();
     let env = Env::new("ext-ports");
     let _d = env.start_with(&[("THURM_PORTS_INTERVAL_MS", Path::new("200"))]);
     let (c, rx) = ext_client(&env, "listener");
@@ -1430,21 +1472,7 @@ fn a_subscriber_hears_ports_and_uploaded_files() {
     .unwrap();
 
     {
-        let pane = match c
-        .request(Request::CreatePane(CreatePane {
-            command: Some(vec![
-                "python3".into(),
-                "-c".into(),
-                "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print('port=%d' % s.getsockname()[1], flush=True); time.sleep(600)".into(),
-            ]),
-            cwd: Some(env.dir.display().to_string()),
-            ..Default::default()
-        }))
-        .unwrap()
-    {
-        Response::PaneCreated { pane } => pane,
-        other => panic!("{other:?}"),
-    };
+        let pane = listener_pane(&c, &env);
         wait_match(&c, pane, r"port=\d+");
         let text = capture(&c, pane);
         let port: u64 = text[text.rfind("port=").unwrap() + 5..]
@@ -1820,10 +1848,11 @@ fn a_late_subscriber_hears_the_remote_lists_as_initial() {
     assert!(change.get("initial").is_none(), "{change}");
     assert_eq!(change["ports"][1]["port"], 5174, "{change}");
 
-    // The first app quits: the second's lists are the plugins' now, as running already.
+    // The first app quits: the second's lists are the plugins' now. Its list of pane 1 came as
+    // changes (reported without `initial`), and goes to plugins as one.
     drop(first);
     let taken_over = next_event(&rx, "ports_changed");
-    assert_eq!(taken_over["initial"], true, "{taken_over}");
+    assert!(taken_over.get("initial").is_none(), "{taken_over}");
     assert_eq!(taken_over["ports"][1]["port"], 9998, "{taken_over}");
     report(&second, "devbox", 1, json!([]));
     let gone = next_event(&rx, "ports_changed");
@@ -1838,13 +1867,7 @@ fn a_late_subscriber_hears_the_remote_lists_as_initial() {
 /// changes nothing.
 #[test]
 fn a_new_ports_subscriber_alone_gets_every_list_first() {
-    assert!(
-        std::process::Command::new("python3")
-            .args(["-c", ""])
-            .status()
-            .is_ok_and(|s| s.success()),
-        "this test needs python3 (for a listener in a pane)"
-    );
+    require_python();
     let env = Env::new("ext-ports-join");
     let _d = env.start_with(&[("THURM_PORTS_INTERVAL_MS", Path::new("200"))]);
     let (early, early_rx) = ext_client(&env, "early");
@@ -1854,21 +1877,7 @@ fn a_new_ports_subscriber_alone_gets_every_list_first() {
         json!({ "names": ["ports_changed"] }),
     )
     .unwrap();
-    let pane = match early
-        .request(Request::CreatePane(CreatePane {
-            command: Some(vec![
-                "python3".into(),
-                "-c".into(),
-                "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print('port=%d' % s.getsockname()[1], flush=True); time.sleep(600)".into(),
-            ]),
-            cwd: Some(env.dir.display().to_string()),
-            ..Default::default()
-        }))
-        .unwrap()
-    {
-        Response::PaneCreated { pane } => pane,
-        other => panic!("{other:?}"),
-    };
+    let pane = listener_pane(&early, &env);
     let heard = loop {
         let ev = next_event(&early_rx, "ports_changed");
         if ev["id"] == pane {
@@ -1964,6 +1973,7 @@ fn a_lost_host_or_app_ends_its_remote_lists() {
         method::PORTS_REPORT,
         json!({ "host": "devbox", "gone": true }),
     )
+    .map(|answer| assert_eq!(answer, json!({ "heard": true })))
     .unwrap();
     let mut ended: Vec<u64> = (0..2)
         .map(|_| {
@@ -1981,12 +1991,13 @@ fn a_lost_host_or_app_ends_its_remote_lists() {
     assert_eq!(ended, [1, 2]);
 
     // A host the second app lost is not the plugins' news: it does not hold them.
-    call(
+    let answer = call(
         &second,
         method::PORTS_REPORT,
         json!({ "host": "nas", "gone": true }),
     )
     .unwrap();
+    assert_eq!(answer, json!({ "heard": false }));
     // The first quits: pi, which the second doesn't know, ends. nas, which the second has
     // forgotten too, ends; nothing else is said.
     drop(first);
@@ -2001,13 +2012,7 @@ fn a_lost_host_or_app_ends_its_remote_lists() {
         .collect();
     hosts.sort();
     assert_eq!(hosts, ["nas", "pi"]);
-    std::thread::sleep(Duration::from_millis(300));
-    let more: Vec<Value> = rx
-        .try_iter()
-        .filter(|(n, p)| n == notice::EVENT && p["event"] == "ports_changed")
-        .map(|(_, p)| p)
-        .collect();
-    assert!(more.is_empty(), "{more:?}");
+    no_more_ports(&plugin, &rx);
 }
 
 /// A plugin that subscribes while the app's report of a host's list is under way hears that
@@ -2044,26 +2049,14 @@ fn a_report_under_way_does_not_overtake_a_new_subscribers_lists() {
         "a change came before the lists: {first}"
     );
     assert_eq!(first["ports"][0]["port"], 5173);
-    std::thread::sleep(Duration::from_millis(300));
-    let more: Vec<Value> = rx
-        .try_iter()
-        .filter(|(n, p)| n == notice::EVENT && p["event"] == "ports_changed")
-        .map(|(_, p)| p)
-        .collect();
-    assert!(more.is_empty(), "{more:?}");
+    no_more_ports(&plugin, &rx);
 }
 
 /// A plugin that subscribes while a look of the watch is under way hears none of that look's
 /// changes before its own first lists.
 #[test]
 fn a_look_under_way_does_not_reach_a_new_subscriber_first() {
-    assert!(
-        std::process::Command::new("python3")
-            .args(["-c", ""])
-            .status()
-            .is_ok_and(|s| s.success()),
-        "this test needs python3 (for a listener in a pane)"
-    );
+    require_python();
     let env = Env::new("ext-look-race");
     let _d = env.start_with(&[
         ("THURM_PORTS_INTERVAL_MS", Path::new("200")),
@@ -2080,21 +2073,7 @@ fn a_look_under_way_does_not_reach_a_new_subscriber_first() {
     std::thread::sleep(Duration::from_millis(2000));
     // A new pane starts a look (it pokes the watch), whose scan comes once its listener runs;
     // the late plugin subscribes while that look is under way.
-    let pane = match early
-        .request(Request::CreatePane(CreatePane {
-            command: Some(vec![
-                "python3".into(),
-                "-c".into(),
-                "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); time.sleep(600)".into(),
-            ]),
-            cwd: Some(env.dir.display().to_string()),
-            ..Default::default()
-        }))
-        .unwrap()
-    {
-        Response::PaneCreated { pane } => pane,
-        other => panic!("{other:?}"),
-    };
+    let pane = listener_pane(&early, &env);
     std::thread::sleep(Duration::from_millis(100));
     let (late, late_rx) = ext_client(&env, "late");
     call(
@@ -2161,11 +2140,159 @@ fn a_late_subscriber_hears_an_incomplete_empty_remote_list() {
         json!({ "names": ["ports_changed"] }),
     )
     .unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        later_rx
-            .try_iter()
-            .all(|(n, p)| n != notice::EVENT || p["event"] != "ports_changed"),
-        "a forgotten pane was replayed"
+    no_more_ports(&later, &later_rx);
+}
+
+/// When the app that holds plugins' lists quits, the next one's lists go out as they came to it:
+/// running already only when its host said so, a change otherwise, and nothing for a pane it
+/// lists as plugins last heard it.
+#[test]
+fn the_next_apps_lists_keep_what_they_were() {
+    let env = Env::new("ext-remote-takeover");
+    let _d = env.start();
+    let caps = [CAP_EXT, CAP_EXT_UI, CAP_EXT_FORWARDS];
+    let (first, _first_rx) = forwarding_app(&env, &caps);
+    let (second, _second_rx) = forwarding_app(&env, &caps);
+    let (plugin, rx) = ext_client(&env, "plugin");
+    call(
+        &plugin,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    let vite =
+        |port: u16| json!([{ "port": port, "address": "127.0.0.1", "pid": 9, "command": "vite" }]);
+    let report = |app: &Client, pane: u64, ports: Value, initial: bool| {
+        call(
+            app,
+            method::PORTS_REPORT,
+            json!({ "host": "devbox", "pane": pane, "ports": ports, "complete": true, "initial": initial }),
+        )
+        .unwrap()
+    };
+    // Plugins hear the first app's, and the answer says so.
+    assert_eq!(
+        report(&first, 3, vite(9000), true),
+        json!({ "heard": true })
     );
+    assert_eq!(
+        report(&first, 4, vite(7000), false),
+        json!({ "heard": true })
+    );
+    next_event(&rx, "ports_changed");
+    next_event(&rx, "ports_changed");
+    // The second's: a server it heard start in pane 1, pane 2 running as it connected, pane 3 as
+    // the first had it, pane 4 known to listen on nothing. Plugins hear none of it yet, and the
+    // answer says so (the app sends it again as it came, should it connect to the daemon again).
+    assert_eq!(
+        report(&second, 1, vite(5173), false),
+        json!({ "heard": false })
+    );
+    report(&second, 2, vite(8080), true);
+    report(&second, 3, vite(9000), true);
+    report(&second, 4, json!([]), false);
+    // Pane 5: known to listen on nothing, never heard of by plugins: no news.
+    report(&second, 5, json!([]), false);
+    drop(first);
+    let mut heard: Vec<(u64, bool, Value, Value)> = (0..3)
+        .map(|_| {
+            let ev = next_event(&rx, "ports_changed");
+            (
+                ev["id"].as_u64().unwrap(),
+                ev["initial"] == true,
+                ev["complete"].clone(),
+                ev["gone"].clone(),
+            )
+        })
+        .collect();
+    heard.sort_unstable_by_key(|h| h.0);
+    let plain = |id: u64, initial: bool| (id, initial, json!(true), Value::Null);
+    // Pane 4: an empty list the next app knows, not `gone`.
+    assert_eq!(heard, [plain(1, false), plain(2, true), plain(4, false)]);
+    no_more_ports(&plugin, &rx);
+}
+
+/// A pane asked for has a list even when its processes were not looked at: one whose program
+/// ended listens on nothing, and says so as complete.
+#[test]
+fn ports_of_a_pane_not_looked_at_are_its_own() {
+    let env = Env::new("ext-ports-dead");
+    let _d = env.start();
+    let (c, _rx) = ext_client(&env, "plugin");
+    let pane = match c
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]),
+            cwd: Some(env.dir.display().to_string()),
+            hold: true,
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while matches!(
+        c.request(Request::PaneInfo { pane }),
+        Ok(Response::PaneInfo(ref info)) if info.alive
+    ) {
+        assert!(Instant::now() < deadline, "the pane's program did not end");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let list = call(&c, method::PORTS_LIST, json!({ "pane": pane })).unwrap();
+    assert_eq!(
+        list,
+        json!([{ "pane": pane, "ports": [], "complete": true }]),
+        "{list}"
+    );
+}
+
+/// A plugin that subscribes to `ports_changed`, leaves and subscribes again before the watch's
+/// next look gets its first lists once, not once per subscription.
+#[test]
+fn subscribing_again_before_the_look_gets_the_lists_once() {
+    require_python();
+    let env = Env::new("ext-ports-resubscribe");
+    let _d = env.start_with(&[
+        ("THURM_PORTS_INTERVAL_MS", Path::new("200")),
+        ("THURM_PORTS_LOOK_DELAY_MS", Path::new("800")),
+    ]);
+    let (c, rx) = ext_client(&env, "plugin");
+    let pane = listener_pane(&c, &env);
+    wait_match(&c, pane, r"port=\d+");
+    let sub = |names: Value| call(&c, method::EVENTS_SUBSCRIBE, json!({ "names": names })).unwrap();
+    sub(json!(["ports_changed"]));
+    call(
+        &c,
+        method::EVENTS_UNSUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    sub(json!(["ports_changed"]));
+    let first = loop {
+        let ev = next_event(&rx, "ports_changed");
+        if ev["id"] == pane {
+            break ev;
+        }
+    };
+    assert_eq!(first["initial"], true, "{first}");
+    // Two looks later, nothing more of that pane.
+    std::thread::sleep(Duration::from_millis(2200));
+    call(
+        &c,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["test.sentinel"] }),
+    )
+    .unwrap();
+    call(&c, method::EVENTS_EMIT, json!({ "name": "test.sentinel" })).unwrap();
+    loop {
+        let ev = next(&rx, notice::EVENT);
+        assert!(
+            !(ev["event"] == "ports_changed" && ev["id"] == pane),
+            "the first lists came twice: {ev}"
+        );
+        if ev["event"] == "test.sentinel" {
+            break;
+        }
+    }
 }

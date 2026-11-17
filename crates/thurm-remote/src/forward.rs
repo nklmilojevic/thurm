@@ -81,6 +81,15 @@ pub struct KnownPort {
 }
 
 type OnChange = Arc<dyn Fn(Change) + Send + Sync>;
+type Live = Arc<(Mutex<usize>, parking_lot::Condvar)>;
+
+/// What a forward's accept loops share with it: [`Entry`]'s `stop`, `active`, `conns`, `live`.
+struct Shared {
+    stop: Arc<AtomicBool>,
+    active: Arc<AtomicUsize>,
+    conns: Conns,
+    live: Live,
+}
 type Conns = Arc<Mutex<HashMap<u64, TcpStream>>>;
 #[cfg(test)]
 type Hook = Box<dyn Fn() + Send>;
@@ -93,6 +102,8 @@ struct Entry {
     active: Arc<AtomicUsize>,
     /// Those connections' local sockets, shut down when the forward closes.
     conns: Conns,
+    /// Its accept loops still running, each holding a listening socket: closing waits for none.
+    live: Live,
     /// The port was in one of the host's lists at some point: it may close on its own.
     listed: bool,
     /// Since when every complete list of the host has lacked the port.
@@ -130,6 +141,9 @@ struct Inner {
     /// no forward opens for them before such a connection ([`Forwards::host_connected`]).
     /// `u64::MAX` until known ([`Forwards::await_settings`]).
     moving: HashMap<String, u64>,
+    /// Of those, the hosts whose tunnel is making its first connection (just added, or every
+    /// tunnel restarted), not reconnecting to a new address.
+    starting: std::collections::HashSet<String>,
     /// Each host's tunnel (a token per supervisor started), and the newest settings it has
     /// connected with. Reports from a tunnel that has been replaced are not counted.
     tunnels: HashMap<String, (u64, Option<u64>)>,
@@ -148,7 +162,12 @@ impl Inner {
                 "{host} was pointed elsewhere while the forward was opening; open it again"
             ));
         }
-        self.moving.contains_key(host).then(|| {
+        if !self.moving.contains_key(host) {
+            return None;
+        }
+        Some(if self.starting.contains(host) {
+            format!("{host} is still connecting; try again once it is connected")
+        } else {
             format!("{host} is reconnecting to its new address; try again once it is connected")
         })
     }
@@ -169,11 +188,43 @@ pub struct Forwards {
     /// Runs in [`Forwards::open_since`] before it looks for a forward to reuse (tests).
     #[cfg(test)]
     before_reuse: Arc<Mutex<Option<Hook>>>,
+    /// Closing makes no connection to wake the accept loops, as when it can't be made (tests).
+    #[cfg(test)]
+    no_wake: Arc<AtomicBool>,
+}
+
+/// The most open files [`raise_open_file_limit`] asks for (macOS refuses more than `OPEN_MAX`).
+pub const OPEN_FILES: libc::rlim_t = 10_240;
+
+/// Raises this process's soft limit on open files to its hard limit, up to [`OPEN_FILES`]. Each
+/// connection a forward carries holds a few descriptors (the local socket, its clones, the
+/// stream's), and a Mac app starts with a soft limit of 256: a few busy forwards would
+/// otherwise leave the whole app unable to open a file, a terminal or a socket.
+pub fn raise_open_file_limit() {
+    let mut l = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) } != 0 {
+        return;
+    }
+    let want = l.rlim_max.min(OPEN_FILES);
+    if l.rlim_cur < want {
+        l.rlim_cur = want;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &l) } != 0 {
+            log::info!(
+                "cannot raise the open file limit: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 impl Default for Forwards {
-    /// Forwards to the hosts' tunnels, remembering local ports in the state directory.
+    /// Forwards to the hosts' tunnels, remembering local ports in the state directory. The
+    /// process's open file limit is raised for them ([`raise_open_file_limit`]).
     fn default() -> Self {
+        raise_open_file_limit();
         Forwards::new(
             thurm_config::state_dir().join("forwards.json"),
             thurm_config::remote_socket_path,
@@ -199,6 +250,8 @@ impl Forwards {
             before_close: Default::default(),
             #[cfg(test)]
             before_reuse: Default::default(),
+            #[cfg(test)]
+            no_wake: Default::default(),
         }
     }
 
@@ -353,6 +406,7 @@ impl Forwards {
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
         let conns: Conns = Default::default();
+        let live: Live = Default::default();
         let listed = g.hosts.get(host).is_some_and(|h| h.lists(remote_port));
         g.open.insert(
             forward.id,
@@ -361,6 +415,7 @@ impl Forwards {
                 stop: stop.clone(),
                 active: active.clone(),
                 conns: conns.clone(),
+                live: live.clone(),
                 listed,
                 missing_since: None,
             },
@@ -369,11 +424,19 @@ impl Forwards {
         for listener in listeners.all() {
             let me = self.clone();
             let (h, accepting) = (host.to_owned(), forward.clone());
-            let (stop, active, conns) = (stop.clone(), active.clone(), conns.clone());
+            let shared = Shared {
+                stop: stop.clone(),
+                active: active.clone(),
+                conns: conns.clone(),
+                live: live.clone(),
+            };
+            *live.0.lock() += 1;
             let spawned = std::thread::Builder::new()
                 .name(format!("forward-{host}-{remote_port}"))
-                .spawn(move || me.accept_loop(listener, h, accepting, stop, active, conns));
+                .spawn(move || me.accept_loop(listener, h, accepting, shared));
             if let Err(e) = spawned {
+                // Not started: its listener went with the closure.
+                *live.0.lock() -= 1;
                 if let Some(e) = self.inner.lock().open.remove(&forward.id) {
                     stop_listening(&e);
                 }
@@ -405,24 +468,6 @@ impl Forwards {
         }
     }
 
-    /// Forward `id` was opened for `link`: reopening it from a list opens that link. Reported
-    /// as [`Change::Linked`] when it is a new one.
-    pub fn set_link(&self, id: u64, link: &str) {
-        let changed = {
-            let mut g = self.inner.lock();
-            match g.open.get_mut(&id) {
-                Some(e) if e.forward.link.as_deref() != Some(link) => {
-                    e.forward.link = Some(link.to_owned());
-                    Some(e.forward.clone())
-                }
-                _ => None,
-            }
-        };
-        if let Some(forward) = changed {
-            self.changed(Change::Linked { forward });
-        }
-    }
-
     /// Reports what reusing a forward changed, outside the lock.
     fn reused(&self, r: Reused) -> Result<(Forward, bool), String> {
         let (f, linked) = r?;
@@ -447,10 +492,25 @@ impl Forwards {
 
     /// Stops `e`, taken out of the open forwards, and reports it.
     fn closed(&self, e: Entry, why: &str) -> Forward {
+        #[cfg(test)]
+        if self.no_wake.load(Ordering::Relaxed) {
+            e.stop.store(true, Ordering::Release);
+        } else {
+            stop_listening(&e);
+        }
+        #[cfg(not(test))]
         stop_listening(&e);
         for conn in e.conns.lock().values() {
             let _ = conn.shutdown(Shutdown::Both);
         }
+        // Its listeners released before this returns: the port is free again for whoever opens
+        // it next (a forward reopened, `thurm remote forward` run again), not still ours for a
+        // moment.
+        let (count, released) = &*e.live;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut n = count.lock();
+        while *n > 0 && !released.wait_until(&mut n, deadline).timed_out() {}
+        drop(n);
         self.changed(Change::Closed {
             forward: e.forward.clone(),
             why: why.to_owned(),
@@ -466,6 +526,7 @@ impl Forwards {
             let mut g = self.inner.lock();
             *g.epochs.entry(host.to_owned()).or_default() += 1;
             g.moving.insert(host.to_owned(), u64::MAX);
+            g.starting.remove(host);
             g.hosts.remove(host);
             g.controls.remove(host);
             g.open
@@ -499,6 +560,7 @@ impl Forwards {
         g.tunnels.insert(host.to_owned(), (token, None));
         *g.epochs.entry(host.to_owned()).or_default() += 1;
         g.moving.insert(host.to_owned(), 0);
+        g.starting.insert(host.to_owned());
         token
     }
 
@@ -582,33 +644,15 @@ impl Forwards {
         recompute(&mut g, host, now);
     }
 
-    /// The connection to `host` dropped: what its panes listened on is unknown until the next
-    /// [`Forwards::ports_snapshot`]. Its forwards stay, and none of them closes meanwhile.
+    /// The connection to `host` dropped: what its panes listened on is unknown until the lists
+    /// its daemon sends a client that joins the watch (every pane's, `initial`) come in again.
+    /// Its forwards stay, and none of them closes meanwhile.
     pub fn host_disconnected(&self, host: &str) {
         let mut g = self.inner.lock();
         g.hosts.remove(host);
         for e in g.open.values_mut().filter(|e| e.forward.host == host) {
             e.missing_since = None;
         }
-    }
-
-    /// Every pane's list of `host` at once ([`thurm_proto::Response::Ports`], asked for on
-    /// connecting): replaces all that was known of the host, panes gone meanwhile included.
-    pub fn ports_snapshot(&self, host: &str, panes: Vec<thurm_proto::PanePorts>) {
-        self.ports_snapshot_at(Instant::now(), host, panes);
-        self.ensure_sweeping();
-    }
-
-    /// [`Forwards::ports_snapshot`] at `now` (tests).
-    pub fn ports_snapshot_at(&self, now: Instant, host: &str, panes: Vec<thurm_proto::PanePorts>) {
-        let mut g = self.inner.lock();
-        let h = g.hosts.entry(host.to_owned()).or_default();
-        h.panes = panes
-            .into_iter()
-            .filter(|p| !(p.ports.is_empty() && p.complete))
-            .map(|p| (p.pane, (p.ports, p.complete)))
-            .collect();
-        recompute(&mut g, host, now);
     }
 
     /// Closes the forwards whose port has been gone for the grace period with no connection
@@ -675,22 +719,42 @@ impl Forwards {
         }
     }
 
-    fn accept_loop(
-        &self,
-        listener: TcpListener,
-        host: String,
-        forward: Forward,
-        stop: Arc<AtomicBool>,
-        active: Arc<AtomicUsize>,
-        conns: Conns,
-    ) {
+    fn accept_loop(&self, listener: TcpListener, host: String, forward: Forward, shared: Shared) {
+        let Shared {
+            stop,
+            active,
+            conns,
+            live,
+        } = shared;
+        /// Counts this loop out once its listener is closed (declared first, dropped last).
+        struct Out(Live);
+        impl Drop for Out {
+            fn drop(&mut self) {
+                let (count, released) = &*self.0;
+                *count.lock() -= 1;
+                released.notify_all();
+            }
+        }
+        let _out = Out(live);
+        let listener = listener;
+        // Waited on with a timeout, not blocked in: closing stops it within moments even when
+        // the connection that wakes it can't be made (out of descriptors), or accepting fails.
+        let waits = listener.set_nonblocking(true).is_ok();
         static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        for conn in listener.incoming() {
+        loop {
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            let conn = match conn {
-                Ok(c) => c,
+            let conn = match listener.accept() {
+                Ok((c, _)) => {
+                    // Accepted sockets may inherit the listener's non-blocking mode (BSD).
+                    let _ = c.set_nonblocking(false);
+                    c
+                }
+                Err(e) if waits && e.kind() == std::io::ErrorKind::WouldBlock => {
+                    wait_readable(&listener, ACCEPT_TICK);
+                    continue;
+                }
                 Err(e) => {
                     log::warn!("forward {host}:{}: {e}", forward.remote_port);
                     std::thread::sleep(Duration::from_millis(100));
@@ -779,14 +843,35 @@ impl Forwards {
         conn: TcpStream,
         closed: &AtomicBool,
     ) -> Result<(), String> {
-        let ticket = match self.control(host, false).and_then(|c| c.dial_begin(port)) {
-            Ok(t) => t,
-            // The kept connection may be gone (the tunnel reconnected): once more, afresh.
-            Err(_) => self
-                .control(host, true)
-                .and_then(|c| c.dial_begin(port))
-                .map_err(|e| e.to_string())?,
+        // A forward closed (by hand, the sweep, its host moving) between accepting this
+        // connection and here asks nothing of the host: no stream is dialled to its port, on the
+        // old destination or the new one.
+        let gone = || {
+            closed
+                .load(Ordering::Acquire)
+                .then(|| "the forward closed".to_owned())
         };
+        if let Some(why) = gone() {
+            return Err(why);
+        }
+        // Checked again once the connection to the daemon is made (that can take a while), just
+        // before asking it to dial.
+        let dial = |fresh: bool| -> Result<_, String> {
+            let c = self.control(host, fresh).map_err(|e| e.to_string())?;
+            if let Some(why) = gone() {
+                return Err(why);
+            }
+            c.dial_begin(port).map_err(|e| e.to_string())
+        };
+        let ticket = match dial(false) {
+            Ok(t) => t,
+            Err(why) if closed.load(Ordering::Acquire) => return Err(why),
+            // The kept connection may be gone (the tunnel reconnected): once more, afresh.
+            Err(_) => dial(true)?,
+        };
+        if let Some(why) = gone() {
+            return Err(why);
+        }
         let socket = (self.socket_for)(host);
         let (mut down, up) =
             thurm_client::stream::open(&socket, &ticket.ticket).map_err(|e| e.to_string())?;
@@ -848,7 +933,7 @@ fn reuse_locked(
         .open
         .values_mut()
         .find(|e| e.forward.host == host && e.forward.remote_port == remote_port)?;
-    Some(existing(e.forward.clone(), preferred).map(|(_, _)| {
+    Some(may_reuse(&e.forward, preferred).map(|()| {
         let linked = link.is_some_and(|l| e.forward.link.as_deref() != Some(l));
         if let Some(l) = link {
             e.forward.link = Some(l.to_owned());
@@ -857,14 +942,15 @@ fn reuse_locked(
     }))
 }
 
-/// The forward that has the port already, unless another local port was asked for (`0`: any).
-fn existing(f: Forward, preferred: Option<u16>) -> Result<(Forward, bool), String> {
+/// Whether `f`, which has the port already, may serve a request for it: not when another local
+/// port was asked for (`0`: any).
+fn may_reuse(f: &Forward, preferred: Option<u16>) -> Result<(), String> {
     match preferred {
         Some(p) if p != 0 && p != f.local => Err(format!(
             "{}:{} is forwarded to localhost:{} already; close that forward to use {p}",
             f.host, f.remote_port, f.local
         )),
-        _ => Ok((f, false)),
+        _ => Ok(()),
     }
 }
 
@@ -876,6 +962,7 @@ fn settle(g: &mut Inner, host: &str) {
         .is_some_and(|&want| want != u64::MAX && have.is_some_and(|h| h >= want))
     {
         g.moving.remove(host);
+        g.starting.remove(host);
     }
 }
 
@@ -932,10 +1019,32 @@ impl Listeners {
     }
 }
 
+/// How long a port in use is tried again before it counts as taken. A process being started
+/// holds a copy of every socket of this one until it runs its program, which closes them: a
+/// port this process let go of a moment ago (a forward just closed, a check that it is free) can
+/// look taken for that long. A port another program holds stays taken.
+const HELD_BRIEFLY: Duration = Duration::from_millis(200);
+
 /// Listens on `port` (`0`: a free one) of both loopbacks. A link to `localhost` may go to
 /// either, so a port another program holds on `[::1]` is not this forward's: the browser could
-/// reach that program instead. Without IPv6 loopback, `127.0.0.1` alone.
+/// reach that program instead. Without IPv6 loopback, `127.0.0.1` alone. A given port found in
+/// use is tried again for [`HELD_BRIEFLY`].
 fn bind(port: u16) -> std::io::Result<Listeners> {
+    if port == 0 {
+        return bind_once(0);
+    }
+    let deadline = Instant::now() + HELD_BRIEFLY;
+    loop {
+        match bind_once(port) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            done => return done,
+        }
+    }
+}
+
+fn bind_once(port: u16) -> std::io::Result<Listeners> {
     // A free port on 127.0.0.1 may be taken on ::1: another one, a few times.
     let tries = if port == 0 { 16 } else { 1 };
     let mut last = None;
@@ -977,6 +1086,20 @@ fn reserve(active: &AtomicUsize, max: usize) -> bool {
             (n < max).then_some(n + 1)
         })
         .is_ok()
+}
+
+/// How long an accept loop waits for a connection before looking whether its forward closed.
+const ACCEPT_TICK: Duration = Duration::from_millis(200);
+
+/// Waits until `listener` has a connection to accept, or `timeout`.
+fn wait_readable(listener: &TcpListener, timeout: Duration) {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut fd, 1, timeout.as_millis() as libc::c_int) };
 }
 
 /// Stops `e`'s accept loops: the flag, then a connection to each loopback to wake its `accept`
@@ -1072,12 +1195,61 @@ mod tests {
         })
     }
 
-    /// Waits until nothing listens on `port` any more.
-    fn wait_unbound(port: u16) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            assert!(Instant::now() < deadline, "{port} still listening");
-            std::thread::sleep(Duration::from_millis(20));
+    /// A loopback port number nothing listens on now (on 127.0.0.1 or [::1]) and that stays the
+    /// test's to take: outside the ranges the system hands out for port 0 (macOS from 49152,
+    /// Linux 32768-60999), so no listener of another test, here or in a test process running
+    /// beside this one, is given it; from a block of this process's own (by its pid), each
+    /// number at most once. A port merely found free (bound to 0, then let go) may be handed to
+    /// another test's listener before it is used.
+    fn private_port() -> u16 {
+        static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        let base = 21_000 + (std::process::id() % 40) as u16 * 200;
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            assert!(n < 200, "no private port left");
+            let port = base + n;
+            // Probed by connecting, not by listening: a probe listener would be one more socket
+            // on the port for a process being started to hold a copy of. Another program
+            // listening there (some pick ports in this range) answers; skip it.
+            let answers = |addr: std::net::SocketAddr| {
+                TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+            };
+            if !answers((std::net::Ipv4Addr::LOCALHOST, port).into())
+                && !answers((std::net::Ipv6Addr::LOCALHOST, port).into())
+            {
+                return port;
+            }
+        }
+    }
+
+    /// A listener on `addr`, tried again for a while if the port is in use: a process another
+    /// test is starting holds a copy of every socket of this one until it runs its program (the
+    /// standard library forks for a command with its own `PATH`), so a port this process let go
+    /// of a moment ago can look taken for that long.
+    fn listen_soon(addr: impl Into<std::net::SocketAddr>) -> std::io::Result<TcpListener> {
+        let addr = addr.into();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpListener::bind(addr) {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                done => return done,
+            }
+        }
+    }
+
+    /// `port` can be listened on again, on both loopbacks, within moments: nothing of ours holds
+    /// it any more. Only for a [`private_port`]: a port the system handed out may be another
+    /// test's.
+    fn assert_free(port: u16) {
+        let v4 = listen_soon((std::net::Ipv4Addr::LOCALHOST, port));
+        assert!(v4.is_ok(), "127.0.0.1:{port} still taken: {v4:?}");
+        if ipv6_loopback() {
+            let v6 = listen_soon((std::net::Ipv6Addr::LOCALHOST, port));
+            assert!(v6.is_ok(), "[::1]:{port} still taken: {v6:?}");
         }
     }
 
@@ -1121,45 +1293,69 @@ mod tests {
     fn a_forward_takes_the_remote_ports_number_then_remembers_its_own() {
         let dir = tempdir("numbers");
         let f = forwards(&dir);
-        // A free port's number: the forward listens on it. Tests running alongside may take the
-        // port between the probe and the forward; then another one.
-        let (a, free) = (0..20)
-            .find_map(|_| {
-                let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-                let free = probe.local_addr().unwrap().port();
-                drop(probe);
-                let (a, new) = f.open("devbox", free, None).unwrap();
-                assert!(new);
-                if a.local == free {
-                    return Some((a, free));
-                }
-                f.close(a.id).unwrap();
-                None
-            })
-            .expect("a forward on its own port number");
+        // A free port's number: the forward listens on it.
+        let free = private_port();
+        let (a, new) = f.open("devbox", free, None).unwrap();
+        assert!(new);
+        assert_eq!(a.local, free);
         // The same host and port: the same forward.
         let (again, new) = f.open("devbox", free, None).unwrap();
         assert!(!new);
         assert_eq!(again, a);
-        // Another host's same port can't have the number: a free one, remembered.
+        // Another host's same port can't have the number: the one remembered for it.
+        let remembered = private_port();
+        write_json(
+            &dir.join("forwards.json"),
+            &HashMap::from([(key("other", free), remembered)]),
+        )
+        .unwrap();
         let (b, _) = f.open("other", free, None).unwrap();
-        assert_ne!(b.local, free);
-        assert!(b.local >= 1024);
+        assert_eq!(b.local, remembered);
         f.close(b.id).unwrap();
         f.close(a.id).unwrap();
-        wait_unbound(a.local);
-        wait_unbound(b.local);
-        // While `free` is taken by something else, `other` gets the port it had before.
-        let squatter = TcpListener::bind(("127.0.0.1", free)).unwrap();
+        assert_free(a.local);
+        assert_free(b.local);
+        // While `free` is taken by something else, `other` gets that port again.
+        let squatter = listen_soon((std::net::Ipv4Addr::LOCALHOST, free)).unwrap();
         let (b2, _) = f.open("other", free, None).unwrap();
-        assert_eq!(b2.local, b.local);
+        assert_eq!(b2.local, remembered);
         drop(squatter);
+        // With no port remembered for it, a free one, and that one is remembered.
+        let (c, _) = f.open("third", free, None).unwrap();
+        assert!(c.local >= 1024);
+        assert_eq!(f.remembered().get(&key("third", free)), Some(&c.local));
+        f.close(c.id).unwrap();
         // A port asked for that is taken is an error, not another port.
         let held = TcpListener::bind("127.0.0.1:0").unwrap();
         let taken = held.local_addr().unwrap().port();
         assert!(f.open("devbox", 1, Some(taken)).is_err());
         f.close(b2.id).unwrap();
         assert!(f.list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_port_held_for_a_moment_is_still_the_forwards() {
+        let dir = tempdir("held-briefly");
+        let f = forwards(&dir);
+        // Held for a moment (as a process being started holds this one's sockets until it runs
+        // its program): the forward gets the port when it is let go.
+        let port = private_port();
+        let holder = listen_soon((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(holder);
+        });
+        let (fw, _) = f.open("devbox", 7000, Some(port)).unwrap();
+        assert_eq!(fw.local, port);
+        letting_go.join().unwrap();
+        f.close(fw.id).unwrap();
+        // Held for good: refused, after the short wait.
+        let port = private_port();
+        let _holder = listen_soon((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        let started = Instant::now();
+        assert!(f.open("devbox", 7001, Some(port)).is_err());
+        assert!(started.elapsed() >= HELD_BRIEFLY);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1190,11 +1386,11 @@ mod tests {
     fn closing_stops_listening() {
         let dir = tempdir("close");
         let f = forwards(&dir);
-        let (fw, _) = f.open("devbox", 40123, Some(0)).unwrap();
+        let (fw, _) = f.open("devbox", 40123, Some(private_port())).unwrap();
         assert!(TcpStream::connect(("127.0.0.1", fw.local)).is_ok());
         f.close(fw.id).unwrap();
-        // The accept loop returns and drops the listener.
-        wait_unbound(fw.local);
+        // Its listeners are closed by the time `close` returns.
+        assert_free(fw.local);
         assert!(f.close(fw.id).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1316,8 +1512,8 @@ mod tests {
     }
 
     #[test]
-    fn a_reconnected_host_starts_from_its_snapshot() {
-        let dir = tempdir("snapshot");
+    fn a_reconnected_host_starts_from_the_lists_it_sends_a_joiner() {
+        let dir = tempdir("rejoin");
         let f = forwards(&dir);
         let t0 = Instant::now();
         f.ports_changed_at(t0, "devbox", 1, vec![entry(5173)], true);
@@ -1327,24 +1523,11 @@ mod tests {
         f.host_disconnected("devbox");
         assert!(f.known("devbox").is_empty());
         assert!(f.sweep(t0 + GONE_GRACE * 3).is_empty());
-        // Back: pane 1 ended while it was away (no event will ever say so); the snapshot does.
+        // Back: pane 1 ended while it was away (no event will ever say so). The daemon sends
+        // the joining app every pane's list, the empty ones too.
         let t1 = t0 + Duration::from_secs(60);
-        f.ports_snapshot_at(
-            t1,
-            "devbox",
-            vec![
-                thurm_proto::PanePorts {
-                    pane: 2,
-                    ports: vec![entry(8080)],
-                    complete: true,
-                },
-                thurm_proto::PanePorts {
-                    pane: 3,
-                    ports: vec![],
-                    complete: true,
-                },
-            ],
-        );
+        f.ports_changed_at(t1, "devbox", 2, vec![entry(8080)], true);
+        f.ports_changed_at(t1, "devbox", 3, vec![], true);
         assert_eq!(
             f.known("devbox")
                 .iter()
@@ -1366,7 +1549,12 @@ mod tests {
         let f = forwards(&dir);
         let (fw, _) = f.open("devbox", 8443, Some(0)).unwrap();
         assert_eq!(f.list()[0].link, None);
-        f.set_link(fw.id, "https://localhost:8443/app?x=1");
+        // Opened again for a link: the forward there, with that link.
+        let (again, new) = f
+            .open_for("devbox", 8443, None, Some("https://localhost:8443/app?x=1"))
+            .unwrap();
+        assert!(!new);
+        assert_eq!(again.id, fw.id);
         let listed = f.list().remove(0);
         assert_eq!(
             listed.link.as_deref(),
@@ -1436,17 +1624,12 @@ mod tests {
         }
         let dir = tempdir("both");
         let f = forwards(&dir);
-        let (fw, _) = f.open("devbox", 7300, Some(0)).unwrap();
+        let (fw, _) = f.open("devbox", 7300, Some(private_port())).unwrap();
         assert!(TcpStream::connect(("127.0.0.1", fw.local)).is_ok());
         assert!(TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, fw.local)).is_ok());
         f.close(fw.id).unwrap();
-        // Both stop with it.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, fw.local)).is_ok() {
-            assert!(Instant::now() < deadline, "still listening on [::1]");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        wait_unbound(fw.local);
+        // Both stop with it, by the time `close` returns.
+        assert_free(fw.local);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1459,16 +1642,11 @@ mod tests {
         let dir = tempdir("v6-held");
         let f = forwards(&dir);
         // A program on this Mac listening on [::1] only (as a dev server on `localhost` may),
-        // on a port whose 127.0.0.1 is free: a browser trying [::1] first would reach it.
-        let (held, port) = (0..20)
-            .find_map(|_| {
-                let held = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).unwrap();
-                let port = held.local_addr().unwrap().port();
-                TcpListener::bind(("127.0.0.1", port))
-                    .ok()
-                    .map(|_| (held, port))
-            })
-            .expect("a port free on 127.0.0.1 and held on [::1]");
+        // on a port whose 127.0.0.1 is free: a browser trying [::1] first would reach it. The
+        // port is private to this test, so its 127.0.0.1 stays free: what keeps the forward off
+        // it is the listener on [::1] alone.
+        let port = private_port();
+        let held = listen_soon((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
         let (fw, _) = f.open("devbox", port, None).unwrap();
         assert_ne!(fw.local, port, "the forward took a port held on [::1]");
         let e = f.open("other", port, Some(port)).unwrap_err();
@@ -1714,6 +1892,54 @@ mod tests {
         assert_eq!(f.list()[0].link.as_deref(), Some("http://localhost:7800/x"));
         f.close(got.id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_stops_its_listeners_without_the_wake_connection() {
+        let dir = tempdir("no-wake");
+        let f = forwards(&dir);
+        f.no_wake.store(true, Ordering::Relaxed);
+        let port = private_port();
+        let (fw, _) = f.open("devbox", 7350, Some(port)).unwrap();
+        let started = Instant::now();
+        f.close(fw.id).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_free(port);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_host_is_still_connecting_a_moved_one_reconnecting() {
+        let dir = tempdir("messages");
+        let f = forwards(&dir);
+        let tunnel = f.host_started("devbox");
+        let e = f.open("devbox", 7360, Some(0)).unwrap_err();
+        assert!(e.contains("still connecting"), "{e}");
+        f.host_connected("devbox", tunnel, 0);
+        f.host_moved("devbox");
+        let e = f.open("devbox", 7360, Some(0)).unwrap_err();
+        assert!(e.contains("new address"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_open_file_limit_is_raised_for_forwards() {
+        raise_open_file_limit();
+        let mut l = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) }, 0);
+        assert!(
+            l.rlim_cur >= l.rlim_max.min(OPEN_FILES),
+            "{} of {}",
+            l.rlim_cur,
+            l.rlim_max
+        );
     }
 
     #[test]

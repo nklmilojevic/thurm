@@ -10,12 +10,16 @@
 -- Servers already running are left alone: this Mac's when the plugin starts, a remote host's
 -- when Thurm connects to it (its lists then come marked `initial`). A list that could not
 -- read every process keeps the servers it left out: they open again only after a complete
--- list without them.
+-- list without them. A pane first read that way (at load, or as Thurm connects to its host)
+-- may have servers the read missed, which its next complete list shows: that list settles
+-- what runs and opens nothing, even for one that started meanwhile (a tab not opened rather
+-- than one opened twice). A server that shows up in a list that is still incomplete opens.
 --
 -- Settings, in config.toml:
 --
 --   [plugins.settings]
 --   dev-server = { commands = ["vite", "next"] }   -- which listening programs count
+--   dev-server = { retry_seconds = 5 }             -- between tries of a forward that failed
 --
 -- A program counts when a word of its command line is one of `commands`; the default list
 -- has the common ones (vite, next, astro, webpack, rails, uvicorn...).
@@ -27,7 +31,14 @@ local DEFAULT_COMMANDS = {
 }
 
 local commands = {}
-for _, c in ipairs(thurm.settings.commands or DEFAULT_COMMANDS) do
+local wanted = thurm.settings.commands
+if type(wanted) == "string" then
+  wanted = { wanted }
+elseif wanted ~= nil and type(wanted) ~= "table" then
+  thurm.warn("dev-server: commands should be a list of program names; using the default ones")
+  wanted = nil
+end
+for _, c in ipairs(wanted or DEFAULT_COMMANDS) do
   commands[tostring(c)] = true
 end
 
@@ -72,14 +83,36 @@ for _, entry in ipairs(thurm.ports()) do
   end
 end
 
-local function open(host, port)
-  if host then
-    local ok, err = pcall(thurm.forward.open, host, port, { browse = true })
-    if not ok then
-      thurm.warn("cannot forward " .. host .. ":" .. port .. ": " .. tostring(err))
-    end
-  else
+-- A forward that could not be opened (the host's tunnel was down a moment, the app busy) is
+-- tried again a few times while the server is still listed.
+local RETRY_SECONDS = tonumber(thurm.settings.retry_seconds) or 5
+local RETRIES = 3
+-- The try under way for a pane's port (key#port): a later open of it, or the port going away,
+-- ends the tries of an earlier one.
+local tries = {}
+
+local function open(host, port, key, attempt, token)
+  if not host then
     thurm.exec({ "open", "http://localhost:" .. port .. "/" })
+    return
+  end
+  local id = key .. "#" .. port
+  if not token then
+    token = (tries[id] or 0) + 1
+    tries[id] = token
+  end
+  local ok, err = pcall(thurm.forward.open, host, port, { browse = true })
+  if ok then
+    return
+  end
+  attempt = attempt or 1
+  thurm.warn("cannot forward " .. host .. ":" .. port .. ": " .. tostring(err))
+  if attempt < RETRIES then
+    thurm.after(RETRY_SECONDS, function()
+      if tries[id] == token and listed[key] and listed[key][port] then
+        open(host, port, key, attempt + 1, token)
+      end
+    end)
   end
 end
 
@@ -100,10 +133,12 @@ thurm.on("ports_changed", function(ev)
     end
   end
   listed[key] = next(now) and now or nil
-  if unsure[key] then
-    if ev.complete then
-      unsure[key] = nil
-    end
+  -- A pane first read in part: its first complete list may show servers that read missed, and
+  -- settles what runs. Until then, a server an incomplete list shows anew listens for sure (a
+  -- pane with a process this user cannot read, such as a `sudo` one, stays incomplete), and
+  -- opens as usual.
+  if unsure[key] and ev.complete then
+    unsure[key] = nil
     return
   end
   -- A remote host's lists sent as the app connected to it: running already. One that could
@@ -115,9 +150,15 @@ thurm.on("ports_changed", function(ev)
     end
     return
   end
+  -- A port that went: tries of it end (it opens anew if it comes back).
+  for port in pairs(before) do
+    if not now[port] then
+      tries[key .. "#" .. port] = (tries[key .. "#" .. port] or 0) + 1
+    end
+  end
   for port in pairs(now) do
     if not before[port] then
-      open(ev.host, port)
+      open(ev.host, port, key)
     end
   end
 end)

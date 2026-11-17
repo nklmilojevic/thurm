@@ -774,16 +774,12 @@ fn empty_files_count_against_what_is_kept() {
 #[test]
 fn an_upload_leaves_the_disk_files_to_spare() {
     let env = Env::new("transfer-inodes");
-    // 10 000 files must stay; this disk takes 7 more with nothing kept.
-    let _daemon = env.start_with(&[("THURM_TRANSFER_FREE_FILES", Path::new("10007"))]);
+    // 10 000 files must stay; this disk takes 3 more with nothing kept, too few for one upload.
+    let _daemon = env.start_with(&[("THURM_TRANSFER_FREE_FILES", Path::new("10003"))]);
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     let pane = cat_pane(&c, &dir);
-    send(&env, &c, pane, ("a", 0, 1), "a.txt", 1, b"a")
-        .wait_closed()
-        .unwrap();
-    // The first took four (its pane's and batch's directories, the parts one, the file).
-    let e = c.upload_begin(pane, "b.txt", 1, None).unwrap_err();
+    let e = c.upload_begin(pane, "a.txt", 1, None).unwrap_err();
     assert!(e.to_string().contains("too few more files"), "{e}");
 }
 
@@ -1071,4 +1067,452 @@ fn a_download_to_where_nothing_can_be_written_fails_cleanly() {
     )
     .unwrap();
     assert_eq!(std::fs::metadata(&ok).unwrap().len(), 8 << 20);
+}
+
+#[test]
+fn kept_drops_give_back_files_for_the_floor() {
+    let env = Env::new("transfer-inodes-room");
+    // 10 000 files must stay; this disk takes 8 more with nothing kept: one upload's four, and
+    // then not another's until the first gives its own back.
+    let _daemon = env.start_with(&[("THURM_TRANSFER_FREE_FILES", Path::new("10008"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 1, b"a")
+        .wait_closed()
+        .unwrap();
+    let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    send(&env, &c, pane, ("b", 0, 1), "b.txt", 1, b"b")
+        .wait_closed()
+        .unwrap();
+    assert!(!kept.exists());
+    assert!(batches(&env, pane).iter().any(|b| b.join("b.txt").exists()));
+}
+
+#[test]
+fn files_on_their_way_count_before_they_land() {
+    let env = Env::new("transfer-waiting-files");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_WAITING_FILES", Path::new("4"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let panes: Vec<PaneId> = (0..2).map(|_| cat_pane(&c, &dir)).collect();
+    let (other, _orx) = env.connect();
+    // Reserved, none sent yet, in two panes and from two apps.
+    let reserve = |c: &Client, pane, id: &str, index| {
+        c.upload_begin(
+            pane,
+            "f",
+            1,
+            Some(UploadBatch {
+                id: id.into(),
+                index,
+                count: 8,
+            }),
+        )
+    };
+    reserve(&c, panes[0], "x", 0).unwrap();
+    reserve(&c, panes[0], "x", 1).unwrap();
+    reserve(&other, panes[1], "y", 0).unwrap();
+    reserve(&other, panes[1], "y", 1).unwrap();
+    let e = reserve(&c, panes[1], "z", 0).unwrap_err();
+    assert!(e.to_string().contains("not complete yet"), "{e}");
+}
+
+#[test]
+fn a_pane_whose_program_ended_takes_no_files() {
+    let env = Env::new("transfer-dead-pane");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let r = c
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]),
+            cwd: Some(dir.display().to_string()),
+            hold: true,
+            ..Default::default()
+        }))
+        .unwrap();
+    let Response::PaneCreated { pane } = r else {
+        panic!("{r:?}")
+    };
+    eventually(10, "the program did not end", || {
+        !matches!(
+            c.request(Request::PaneInfo { pane }),
+            Ok(Response::PaneInfo(ref info)) if info.alive
+        )
+    });
+    let e = c.upload_begin(pane, "a.txt", 1, None).unwrap_err();
+    assert!(e.to_string().contains("closed"), "{e}");
+}
+
+#[test]
+fn a_download_nobody_answers_gives_its_slot_back() {
+    let env = Env::new("transfer-ack");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_ACK_MS", Path::new("300"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    std::fs::write(dir.join("small.txt"), b"small").unwrap();
+    let pane = cat_pane(&c, &dir);
+    // Four read whole and never answered, their connections held open.
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let info = c.download_begin(pane, "small.txt", None).unwrap();
+        let (mut r, w) = stream::open(&env.socket, info.ticket.as_deref().unwrap()).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        held.push((r, w));
+    }
+    assert!(c.download_begin(pane, "small.txt", None).is_err());
+    eventually(5, "the slots were held for ever", || {
+        c.download_begin(pane, "small.txt", None).is_ok()
+    });
+    drop(held);
+}
+
+#[test]
+fn a_reserved_download_is_written_into_its_own_file_only() {
+    use thurm_remote::transfer::{self, Cancel, Host, TransferError};
+    let env = Env::new("transfer-reserved");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    std::fs::write(dir.join("report.pdf"), b"the report").unwrap();
+    let pane = cat_pane(&c, &dir);
+    let host = Host {
+        client: &c,
+        socket: &env.socket,
+    };
+    let downloads = env.dir.join("downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    // Reserved, then the file is written into it.
+    let reserved = downloads.join("report.pdf");
+    std::fs::File::create_new(&reserved).unwrap();
+    let info = transfer::download_reserved(
+        host,
+        pane,
+        "report.pdf",
+        &reserved,
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(info.name, "report.pdf");
+    assert_eq!(std::fs::read(&reserved).unwrap(), b"the report");
+    // Something else took the name since it was reserved: it is left alone, nothing saved.
+    let taken = downloads.join("taken.pdf");
+    std::fs::File::create_new(&taken).unwrap();
+    std::fs::remove_file(&taken).unwrap();
+    std::fs::write(&taken, b"someone else's").unwrap();
+    let e =
+        transfer::download_reserved(host, pane, "report.pdf", &taken, &Cancel::default(), |_| {})
+            .unwrap_err();
+    assert!(matches!(e, TransferError::Local(_)), "{e}");
+    assert_eq!(std::fs::read(&taken).unwrap(), b"someone else's");
+    // Or a link in its place: not followed.
+    let linked = downloads.join("linked.pdf");
+    std::os::unix::fs::symlink(dir.join("elsewhere"), &linked).unwrap();
+    assert!(
+        transfer::download_reserved(
+            host,
+            pane,
+            "report.pdf",
+            &linked,
+            &Cancel::default(),
+            |_| {}
+        )
+        .is_err()
+    );
+    assert!(!dir.join("elsewhere").exists());
+    // The name taken while the file comes: not reported saved, and what took it stays.
+    std::fs::write(dir.join("big.bin"), vec![1u8; 4 << 20]).unwrap();
+    let moving = downloads.join("moving.bin");
+    std::fs::File::create_new(&moving).unwrap();
+    let mut swapped = false;
+    let e = transfer::download_reserved(host, pane, "big.bin", &moving, &Cancel::default(), |p| {
+        if !swapped && p.done > 0 {
+            swapped = true;
+            std::fs::remove_file(&moving).unwrap();
+            std::fs::write(&moving, b"theirs").unwrap();
+        }
+    })
+    .unwrap_err();
+    assert!(matches!(e, TransferError::Local(_)), "{e}");
+    assert_eq!(std::fs::read(&moving).unwrap(), b"theirs");
+    // A download that fails gives its reservation back.
+    let missing = downloads.join("missing.pdf");
+    std::fs::File::create_new(&missing).unwrap();
+    let e = transfer::download_reserved(
+        host,
+        pane,
+        "nothing-here",
+        &missing,
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(matches!(e, TransferError::NotFound(_)), "{e}");
+    assert!(!missing.exists());
+}
+
+#[test]
+fn a_pane_another_terminal_holds_takes_no_files_from_the_start() {
+    let env = Env::new("transfer-attached");
+    let _daemon = env.start();
+    let (owner, _orx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&owner, &dir);
+    owner
+        .request(Request::AttachTerminal {
+            pane,
+            size: PaneSize::default(),
+        })
+        .unwrap();
+    // Refused before a byte, not once the files have come.
+    let (c, _rx) = env.connect();
+    let e = c.upload_begin(pane, "a.txt", 1, None).unwrap_err();
+    assert!(e.to_string().contains("attached terminal"), "{e}");
+    owner.request(Request::DetachTerminal { pane }).unwrap();
+    c.upload_begin(pane, "a.txt", 1, None).unwrap();
+}
+
+#[test]
+fn a_sender_that_stops_mid_file_is_not_waited_on() {
+    let env = Env::new("transfer-stalled-writer");
+    // Batches are idle after twice the ticket's life (a second at least): 2 s here.
+    let _daemon = env.start_with(&[("THURM_STREAM_TICKET_MS", Path::new("500"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let ticket = c.upload_begin(pane, "slow.bin", 100, None).unwrap();
+    let (r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
+    w.write_all(b"only some").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(r.wait_closed().map_err(|e| e.to_string()));
+    });
+    let closed = rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("the stalled stream was waited on");
+    assert!(closed.is_err(), "{closed:?}");
+    eventually(5, "the stalled batch was kept", || {
+        batches(&env, pane).is_empty()
+    });
+    drop(w);
+}
+
+#[test]
+fn names_a_case_blind_disk_would_take_for_one_are_kept_apart() {
+    let env = Env::new("transfer-case");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let readers: Vec<StreamReader> = [
+        ("Photo.jpg", b"one"),
+        ("photo.jpg", b"two"),
+        (".Done", b"rec"),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (n, d))| send(&env, &c, pane, ("k", i as u32, 3), n, 3, *d))
+    .collect();
+    for r in readers {
+        r.wait_closed().unwrap();
+    }
+    let [batch] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    assert_eq!(std::fs::read(batch.join("Photo.jpg")).unwrap(), b"one");
+    assert_eq!(std::fs::read(batch.join("photo-2.jpg")).unwrap(), b"two");
+    assert_eq!(std::fs::read(batch.join(".Done-2")).unwrap(), b"rec");
+    // The batch's own record is its own.
+    assert!(
+        std::fs::read_to_string(batch.join(".done"))
+            .unwrap()
+            .parse::<u64>()
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_refused_upload_gives_its_ticket_back() {
+    let env = Env::new("transfer-ticket-back");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    // Its batch's directory cannot be made (a file is in its pane's place).
+    std::fs::create_dir_all(env.dir.join("state/drops")).unwrap();
+    std::fs::write(env.dir.join("state/drops").join(pane.to_string()), b"").unwrap();
+    // Retried past the 64 tickets a client may hold, it still says why.
+    for _ in 0..70 {
+        let e = c.upload_begin(pane, "a.txt", 1, None).unwrap_err();
+        assert!(e.to_string().contains("cannot create"), "{e}");
+    }
+}
+
+#[test]
+fn drops_on_their_way_count_toward_the_drops_kept() {
+    let env = Env::new("transfer-max-drops");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_DROPS", Path::new("2"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("k", 0, 1), "kept.txt", 1, b"k")
+        .wait_closed()
+        .unwrap();
+    let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    // One on its way, and then another: three drops on disk would be one too many.
+    let _waiting = send(&env, &c, pane, ("w", 0, 2), "w.txt", 1, b"w");
+    c.upload_begin(pane, "n.txt", 1, None).unwrap();
+    assert!(!kept.exists());
+}
+
+#[test]
+fn a_file_whose_ticket_ran_out_unused_ends_its_batch() {
+    let env = Env::new("transfer-lapsed");
+    // Tickets last 300 ms; batches stall after 2 s.
+    let _daemon = env.start_with(&[("THURM_STREAM_TICKET_MS", Path::new("300"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    // Reserved, its stream never opened.
+    c.upload_begin(
+        pane,
+        "never.txt",
+        1,
+        Some(UploadBatch {
+            id: "n".into(),
+            index: 0,
+            count: 2,
+        }),
+    )
+    .unwrap();
+    let [batch] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    std::thread::sleep(Duration::from_millis(1200));
+    // The next upload looks: the batch is gone before it would have stalled.
+    c.upload_begin(pane, "next.txt", 1, None).unwrap();
+    assert!(!batch.exists());
+}
+
+#[test]
+fn names_a_disk_takes_for_one_by_their_unicode_form_are_kept_apart() {
+    let env = Env::new("transfer-nfd");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    // The same name composed and decomposed: one file on a disk that ignores the form.
+    let readers: Vec<StreamReader> = [("caf\u{e9}.txt", b"nfc"), ("cafe\u{301}.txt", b"nfd")]
+        .iter()
+        .enumerate()
+        .map(|(i, (n, d))| send(&env, &c, pane, ("u", i as u32, 2), n, 3, *d))
+        .collect();
+    for r in readers {
+        r.wait_closed().unwrap();
+    }
+    let [batch] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    let mut kept: Vec<Vec<u8>> = std::fs::read_dir(&batch)
+        .unwrap()
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| std::fs::read(e.path()).unwrap())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, [b"nfc".to_vec(), b"nfd".to_vec()]);
+}
+
+#[test]
+fn downloads_refused_for_their_size_use_up_no_tickets() {
+    use thurm_remote::transfer::{self, Cancel, Host, TransferError};
+    let env = Env::new("transfer-too-large");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    std::fs::write(dir.join("big.bin"), vec![1u8; 100]).unwrap();
+    let pane = cat_pane(&c, &dir);
+    let host = Host {
+        client: &c,
+        socket: &env.socket,
+    };
+    // More than the 64 tickets a client may hold, each refused for its size.
+    for i in 0..70 {
+        let e = transfer::download(
+            host,
+            pane,
+            "big.bin",
+            &dir.join(format!("never-{i}")),
+            None,
+            Some(10),
+            &Cancel::default(),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(e, TransferError::TooLarge { .. }), "{e}");
+    }
+    // The next one is not refused for tickets.
+    c.upload_begin(pane, "a.txt", 1, None).unwrap();
+}
+
+#[test]
+fn a_stream_closed_once_all_is_said_is_no_cancel() {
+    let env = Env::new("transfer-close-ok");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let ticket = c
+        .upload_begin(
+            pane,
+            "one.txt",
+            3,
+            Some(UploadBatch {
+                id: "o".into(),
+                index: 0,
+                count: 2,
+            }),
+        )
+        .unwrap();
+    let (_r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
+    w.write_all(b"one").unwrap();
+    w.finish().unwrap();
+    // The first file's stream closed Ok, its file sent: the batch goes on.
+    w.close(thurm_proto::stream::StreamClose::Ok).unwrap();
+    send(&env, &c, pane, ("o", 1, 2), "two.txt", 3, b"two")
+        .wait_closed()
+        .unwrap();
+    let [batch] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    assert!(batch.join("one.txt").exists() && batch.join("two.txt").exists());
+}
+
+#[test]
+fn drops_are_not_deleted_for_an_upload_they_cannot_make_room_for() {
+    // Permissions do not stop root.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let env = Env::new("transfer-plan-room");
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_MAX_KEPT", Path::new("10")),
+        ("THURM_TRANSFER_BLOCK", Path::new("1")),
+    ]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let other = cat_pane(&c, &dir);
+    // Two kept drops of 5 each (2 bytes, two directories, the record): one cannot be deleted.
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 2, b"aa")
+        .wait_closed()
+        .unwrap();
+    send(&env, &c, other, ("b", 0, 1), "b.txt", 2, b"bb")
+        .wait_closed()
+        .unwrap();
+    let [stuck] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    let [free] = <[PathBuf; 1]>::try_from(batches(&env, other)).unwrap();
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // 5 more and its two directories need 7 freed; the deletable drop frees 5: refused, and
+    // it is not deleted for nothing.
+    let e = c.upload_begin(other, "c.txt", 5, None).unwrap_err();
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(e.to_string().contains("does not fit"), "{e}");
+    assert!(free.join("b.txt").exists());
+    assert!(stuck.join("a.txt").exists());
 }

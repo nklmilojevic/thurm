@@ -15,6 +15,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::{Condvar, Mutex};
@@ -38,9 +39,10 @@ pub const MIN_FREE_FILES: u64 = 10_000;
 /// files until the last arrives.
 pub const MAX_WAITING_BATCHES_PER_CLIENT: usize = 8;
 pub const MAX_WAITING_BATCHES: usize = 32;
-/// Landed files waiting for the rest of their batch, over all: a stream (and a thread) each.
+/// Files of batches not complete yet, over all, whether on their way or landed and waiting for
+/// the rest: each takes a stream (and threads) once sent.
 pub const MAX_WAITING_FILES: usize = 512;
-/// Batches kept, over all panes, however small.
+/// Drops on disk, kept or on their way, over all panes, however small.
 pub const MAX_KEPT_BATCHES: usize = 1024;
 /// What one file or directory takes on disk at least: an empty file is not free. 4 KiB, or
 /// `THURM_TRANSFER_BLOCK` (tests, to count in bytes).
@@ -60,6 +62,8 @@ pub const MAX_KEPT: u64 = 8 << 30;
 pub const KEEP: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often kept uploads are pruned while nothing else asks for it.
 pub const PRUNE_EVERY: Duration = Duration::from_secs(10 * 60);
+/// How long a download that sent its file waits for its caller to say it has it.
+pub const ACK: Duration = Duration::from_secs(30);
 /// Downloads sending at once, per pane.
 pub const MAX_DOWNLOADS_PER_PANE: usize = 4;
 /// The longest file name, in bytes.
@@ -69,6 +73,15 @@ const PARTS: &str = ".parts";
 /// When a batch was complete (milliseconds since the Unix epoch), inside its directory: what it
 /// is aged from, by this daemon and the next.
 const DONE: &str = ".done";
+
+/// A kept batch: since when it is aged, what it takes on disk, and in files.
+#[derive(Clone)]
+struct Kept {
+    since: SystemTime,
+    size: u64,
+    files: u64,
+    dir: PathBuf,
+}
 
 pub struct Transfers {
     root: PathBuf,
@@ -83,6 +96,16 @@ pub struct Transfers {
     /// A pause between a batch's last file landing and its paths being typed:
     /// `THURM_TRANSFER_PASTE_DELAY_MS` (tests), none otherwise.
     paste_delay: Duration,
+    /// [`ACK`], or `THURM_TRANSFER_ACK_MS` (tests).
+    ack: Duration,
+    /// [`MAX_WAITING_FILES`], or `THURM_TRANSFER_MAX_WAITING_FILES` (tests).
+    max_waiting_files: usize,
+    /// [`MAX_KEPT_BATCHES`], or `THURM_TRANSFER_MAX_DROPS` (tests).
+    max_drops: usize,
+    /// How long a stream ticket lasts unused.
+    ticket_ttl: Duration,
+    /// What batches' pulses count from.
+    epoch: Instant,
 }
 
 /// A duration in milliseconds from the environment variable `var`, else `default` (tests).
@@ -98,7 +121,13 @@ struct State {
     batches: HashMap<u64, Batch>,
     next: u64,
     downloads: HashMap<PaneId, usize>,
+    /// The last walk of the kept drops, and when: reused for a moment (the files of one drop
+    /// come one after the other), forgotten whenever the daemon changes a batch or deletes one.
+    kept_seen: Option<(Instant, Vec<Kept>)>,
 }
+
+/// How long a walk of the kept drops is reused.
+const KEPT_FRESH: Duration = Duration::from_secs(1);
 
 struct Batch {
     pane: PaneId,
@@ -113,16 +142,51 @@ struct Batch {
     /// Every file landed and the paths are being typed: it can no longer fail.
     pasting: bool,
     outcome: Option<Result<(), String>>,
-    touched: Instant,
+    /// When anything last happened to it, and whether it is still on its way: shared with its
+    /// receiving streams, which mark it on every frame without the transfers lock.
+    pulse: Arc<Pulse>,
     /// The streams writing a file of the batch now, by its index: shut when the batch fails,
     /// and until they have let go, the batch's directory stays and its bytes count.
     writers: Vec<(u32, UnixStream)>,
+}
+
+/// A batch's last sign of life, kept without the transfers lock: an upload's every frame marks
+/// it, and an admission walking or pruning the kept drops under that lock holds up none of them.
+struct Pulse {
+    /// Milliseconds since `Transfers::epoch`.
+    at: AtomicU64,
+    /// The batch is still on its way (it has not failed).
+    on_way: AtomicBool,
+}
+
+impl Pulse {
+    fn new(epoch: Instant) -> Arc<Pulse> {
+        let p = Arc::new(Pulse {
+            at: AtomicU64::new(0),
+            on_way: AtomicBool::new(true),
+        });
+        p.touch(epoch);
+        p
+    }
+
+    fn touch(&self, epoch: Instant) {
+        self.at
+            .store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How long since it was last marked.
+    fn idle(&self, epoch: Instant) -> Duration {
+        let now = epoch.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.at.load(Ordering::Relaxed)))
+    }
 }
 
 struct Slot {
     path: PathBuf,
     size: u64,
     state: SlotState,
+    /// When its ticket was given: unused past the ticket's life, the file can never come.
+    reserved: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -165,6 +229,17 @@ impl Transfers {
                 .unwrap_or(MAX_KEPT),
             keep: env_ms("THURM_TRANSFER_KEEP_MS", KEEP),
             paste_delay: env_ms("THURM_TRANSFER_PASTE_DELAY_MS", Duration::ZERO),
+            ack: env_ms("THURM_TRANSFER_ACK_MS", ACK),
+            max_waiting_files: std::env::var("THURM_TRANSFER_MAX_WAITING_FILES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MAX_WAITING_FILES),
+            max_drops: std::env::var("THURM_TRANSFER_MAX_DROPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MAX_KEPT_BATCHES),
+            ticket_ttl: crate::streams::ticket_ttl(),
+            epoch: Instant::now(),
         }
     }
 
@@ -174,7 +249,11 @@ impl Transfers {
     pub fn prune(&self) {
         let mut st = self.state.lock();
         self.sweep(&mut st);
-        self.make_room(&st, 0, 0);
+        st.kept_seen = None;
+        let kept = self.kept(&mut st);
+        let busy = st.batches.values().filter(|b| b.busy()).count();
+        self.make_room(kept, busy, 0, 0, 0);
+        st.kept_seen = None;
     }
 
     /// [`thurm_proto::Request::UploadBegin`]: reserves the file's place in its batch and a
@@ -221,16 +300,18 @@ impl Transfers {
             ));
         }
         let incomplete = |b: &&Batch| b.waiting() && !b.pasting;
+        // Every file admitted will hold a stream until its batch is complete: they count from
+        // their reservation, not from when they land.
         let waiting_files = st
             .batches
             .values()
             .filter(incomplete)
-            .flat_map(|b| b.files.values())
-            .filter(|f| f.state == SlotState::Landed)
-            .count();
-        if waiting_files >= MAX_WAITING_FILES {
+            .map(|b| b.files.len())
+            .sum::<usize>();
+        if waiting_files >= self.max_waiting_files {
             return Err(format!(
-                "too many sent files are waiting for the rest of their batch (at most {MAX_WAITING_FILES})"
+                "too many files are on their way in uploads not complete yet (at most {})",
+                self.max_waiting_files
             ));
         }
         let pending: u64 = st
@@ -302,16 +383,21 @@ impl Transfers {
             .saturating_add(dir_cost)
             .saturating_add(pending)
             .saturating_add(MIN_FREE);
-        // A batch's directory, its parts directory, the file and its part.
+        // Drops past their time go first (`kept` deletes them): the space and files they leave
+        // count before any are found missing. What the rest would give back if deleted is what
+        // admitting this file may still take from them.
+        let kept_now = self.kept(&mut st);
+        let recoverable: u64 = kept_now.iter().map(|k| k.size).sum();
+        let recoverable_files: u64 = kept_now.iter().map(|k| k.files).sum();
+        // A new batch's directory and its parts directory, and the file and its part.
+        let files_needed = if existing.is_none() { 4 } else { 2 };
         let files = free_files(&self.root)?;
-        if files < MIN_FREE_FILES + 4 {
-            return Err(format!(
-                "this host's disk can take too few more files ({files} left)"
-            ));
+        let files_short = (MIN_FREE_FILES + files_needed).saturating_sub(files);
+        let too_few_files =
+            |files: u64| format!("this host's disk can take too few more files ({files} left)");
+        if files_short > recoverable_files {
+            return Err(too_few_files(files));
         }
-        // Drops past their time go first (`kept` deletes them): the space they leave counts
-        // before any is found missing.
-        let recoverable: u64 = self.kept(&st).iter().map(|(_, size, _)| size).sum();
         let free = free_space(&self.root)?;
         let short = need.saturating_sub(free);
         let no_space = |free: u64| {
@@ -330,6 +416,7 @@ impl Transfers {
             st.next += 1;
             st.next
         });
+        let claimant = principal.clone();
         let ticket = daemon.streams.reserve(
             Kind::Upload {
                 batch: serial,
@@ -338,10 +425,21 @@ impl Transfers {
             client,
             principal,
         )?;
+        // A refusal from here on gives the ticket back (claimed and dropped): refused uploads
+        // retried do not use up the client's tickets.
+        let release = || {
+            let _ = daemon.streams.claim(&ticket.0, &claimant);
+        };
         // A new batch's directory first: if it cannot be made, nothing kept was deleted for it.
         let created = existing.is_none();
         if created {
-            let dir = self.new_batch_dir(pane)?;
+            let dir = match self.new_batch_dir(pane) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    release();
+                    return Err(e);
+                }
+            };
             st.batches.insert(
                 serial,
                 Batch {
@@ -354,7 +452,7 @@ impl Transfers {
                     names: HashSet::from([PARTS.to_owned(), DONE.to_owned()]),
                     pasting: false,
                     outcome: None,
-                    touched: Instant::now(),
+                    pulse: Pulse::new(self.epoch),
                     writers: Vec::new(),
                 },
             );
@@ -363,11 +461,35 @@ impl Transfers {
             if created && let Some(b) = st.batches.remove(&serial) {
                 remove_batch(&b.dir);
             }
+            release();
         };
         // Only an admitted file makes older drops give way, and only what was deleted counts.
-        if !self.make_room(&st, incoming, short) {
+        // The drops looked at above, not walked again: the new batch is not among them.
+        // Drops on their way count toward the drops kept, this new one included.
+        let busy = st.batches.values().filter(|b| b.busy()).count();
+        let (room, deleted) = self.make_room(kept_now, busy, incoming, short, files_short);
+        // The walk stands for the next file unless something in it went.
+        if deleted {
+            st.kept_seen = None;
+        }
+        if !room {
             undo(&mut st);
             return Err(too_much());
+        }
+        if files_short > 0 {
+            match free_files(&self.root) {
+                // The new batch's two directories are made already: the file and its part remain.
+                Ok(files)
+                    if files >= MIN_FREE_FILES + files_needed - if created { 2 } else { 0 } => {}
+                Ok(files) => {
+                    undo(&mut st);
+                    return Err(too_few_files(files));
+                }
+                Err(e) => {
+                    undo(&mut st);
+                    return Err(e);
+                }
+            }
         }
         if short > 0 {
             let free = match free_space(&self.root) {
@@ -391,9 +513,10 @@ impl Transfers {
                 path: b.dir.join(&name),
                 size,
                 state: SlotState::Reserved,
+                reserved: Instant::now(),
             },
         );
-        b.touched = Instant::now();
+        b.pulse.touch(self.epoch);
         Ok(ticket)
     }
 
@@ -492,9 +615,14 @@ impl Transfers {
         if !b.waiting() || b.pasting {
             return;
         }
+        st.kept_seen = None;
+        let Some(b) = st.batches.get_mut(&serial) else {
+            return;
+        };
         log::info!("upload to pane {} failed: {why}", b.pane);
         b.outcome = Some(Err(why));
-        b.touched = Instant::now();
+        b.pulse.on_way.store(false, Ordering::Relaxed);
+        b.pulse.touch(self.epoch);
         // Streams still writing stop taking bytes now; the directory goes when the last lets go
         // (`writer_done`), its bytes counted until then.
         for (_, socket) in &b.writers {
@@ -511,26 +639,44 @@ impl Transfers {
         let stalled: Vec<u64> = st
             .batches
             .iter()
-            .filter(|(_, b)| b.waiting() && !b.pasting && b.touched.elapsed() > self.idle)
+            .filter(|(_, b)| b.waiting() && !b.pasting && b.pulse.idle(self.epoch) > self.idle)
             .map(|(serial, _)| *serial)
             .collect();
         for serial in stalled {
             self.fail(st, serial, "the upload stalled".into());
         }
+        // A file whose ticket ran out unused can never come (its stream never opened): its
+        // batch goes now, not when it would stall.
+        let lapsed = self.ticket_ttl + Duration::from_millis(200);
+        let never: Vec<u64> = st
+            .batches
+            .iter()
+            .filter(|(_, b)| b.waiting() && !b.pasting)
+            .filter(|(_, b)| {
+                b.files
+                    .values()
+                    .any(|f| f.state == SlotState::Reserved && f.reserved.elapsed() > lapsed)
+            })
+            .map(|(serial, _)| *serial)
+            .collect();
+        for serial in never {
+            self.fail(st, serial, "a file of the upload never came".into());
+        }
         st.batches
-            .retain(|_, b| b.busy() || b.touched.elapsed() <= self.idle);
+            .retain(|_, b| b.busy() || b.pulse.idle(self.epoch) <= self.idle);
     }
 
-    /// Marks batch `serial` as moving; whether it is still on its way (a writer of a failed
-    /// batch stops).
-    fn touch(&self, serial: u64) -> bool {
-        match self.state.lock().batches.get_mut(&serial) {
-            Some(b) => {
-                b.touched = Instant::now();
-                b.waiting()
-            }
-            None => false,
-        }
+    /// Gives a file the name `taken` was refused for (the disk holds a file it takes for the
+    /// same, by case or Unicode form): the next free one in its batch. Its new path, or `None`
+    /// once the batch is gone.
+    fn rename_slot(&self, serial: u64, index: u32, taken: &Path) -> Option<PathBuf> {
+        let mut st = self.state.lock();
+        let b = st.batches.get_mut(&serial)?;
+        let name = taken.file_name()?.to_string_lossy().into_owned();
+        let renamed = unique_name(&mut b.names, &name);
+        let path = b.dir.join(renamed);
+        b.files.get_mut(&index)?.path = path.clone();
+        Some(path)
     }
 
     /// The writer of file `index` of batch `serial` let go: a failed batch's file stops
@@ -541,13 +687,23 @@ impl Transfers {
             return;
         };
         b.writers.retain(|(i, _)| *i != index);
-        if matches!(b.outcome, Some(Err(_))) {
+        // A batch whose last writer left is no longer in use: a walk of the kept drops that
+        // left it out is stale.
+        st.kept_seen = None;
+        let Some(b) = st.batches.get_mut(&serial) else {
+            return;
+        };
+        let failed = matches!(b.outcome, Some(Err(_)));
+        if failed {
             if let Some(f) = b.files.get_mut(&index) {
                 f.state = SlotState::Gone;
             }
             if b.writers.is_empty() {
                 remove_batch(&b.dir);
             }
+        }
+        if failed {
+            st.kept_seen = None;
         }
     }
 
@@ -591,7 +747,19 @@ impl Transfers {
 
     /// The kept batches on disk, oldest first, with their sizes; those past their time
     /// (`keep`) are deleted on the way. Batches in use are left out.
-    fn kept(&self, st: &State) -> Vec<(SystemTime, u64, PathBuf)> {
+    fn kept(&self, st: &mut State) -> Vec<Kept> {
+        if let Some((at, kept)) = &st.kept_seen
+            && at.elapsed() < KEPT_FRESH
+        {
+            return kept.clone();
+        }
+        let kept = self.walk_kept(st);
+        st.kept_seen = Some((Instant::now(), kept.clone()));
+        kept
+    }
+
+    /// [`Transfers::kept`], walking the disk.
+    fn walk_kept(&self, st: &State) -> Vec<Kept> {
         let busy: HashSet<&Path> = st
             .batches
             .values()
@@ -609,46 +777,79 @@ impl Transfers {
                     if busy.contains(dir.as_path()) {
                         continue;
                     }
-                    let since = aged_from(&dir);
-                    let size = dir_size(&dir);
+                    // One pass over it: what it takes, in bytes and files, and when it was last
+                    // written; aged from when it was complete, if it was.
+                    let seen = survey(&dir);
+                    let since = done_at(&dir).unwrap_or(seen.latest);
                     let old = since.elapsed().is_ok_and(|age| age > self.keep);
                     if !(old && remove_batch(&dir)) {
-                        kept.push((since, size, dir));
+                        kept.push(Kept {
+                            since,
+                            size: seen.size,
+                            files: seen.files + 1,
+                            dir,
+                        });
                     }
                 }
                 // Gone once empty (a closed pane's).
                 let _ = std::fs::remove_dir(pane.path());
             }
         }
-        kept.sort_by_key(|(modified, _, _)| *modified);
+        kept.sort_by_key(|k| k.since);
         kept
     }
 
     /// Deletes the oldest kept batches until `incoming` more bytes stay within the kept limit
-    /// and at least `free` bytes were freed. A batch that could not be deleted still counts.
-    /// Whether both hold now.
-    fn make_room(&self, st: &State, incoming: u64, free: u64) -> bool {
-        let kept = self.kept(st);
-        let mut total: u64 = kept.iter().map(|(_, size, _)| size).sum();
-        let mut freed = 0u64;
+    /// and at least `free` bytes and `files` files were freed. A batch that could not be deleted
+    /// still counts. Whether all hold now.
+    /// `busy` drops on their way (on disk, not among `kept`) count toward the drops kept.
+    /// Returns whether all hold now, and whether any was deleted.
+    fn make_room(
+        &self,
+        kept: Vec<Kept>,
+        busy: usize,
+        incoming: u64,
+        free: u64,
+        files: u64,
+    ) -> (bool, bool) {
+        let mut total: u64 = kept.iter().map(|k| k.size).sum();
+        let (mut freed, mut freed_files) = (0u64, 0u64);
         let mut count = kept.len();
-        // Room for one more batch, however small its files.
-        let fits = |total: u64, freed: u64, count: usize| {
+        let fits = |total: u64, freed: u64, freed_files: u64, count: usize| {
             total.saturating_add(incoming) <= self.max_kept
                 && freed >= free
-                && count < MAX_KEPT_BATCHES
+                && freed_files >= files
+                && count + busy <= self.max_drops
         };
-        for (_, size, dir) in kept {
-            if fits(total, freed, count) {
+        // Planned first, oldest first, from the drops that can be deleted: if they are not
+        // enough, nothing is deleted for a file that is refused all the same.
+        let mut doomed = Vec::new();
+        for k in kept {
+            if fits(total, freed, freed_files, count) {
                 break;
             }
-            if remove_batch(&dir) {
-                total = total.saturating_sub(size);
-                freed += size;
+            if deletable(&k.dir) {
+                total = total.saturating_sub(k.size);
+                freed += k.size;
+                freed_files += k.files;
                 count -= 1;
+                doomed.push(k);
             }
         }
-        fits(total, freed, count)
+        if !fits(total, freed, freed_files, count) {
+            return (false, false);
+        }
+        let mut deleted = false;
+        let mut ok = true;
+        for k in doomed {
+            if remove_batch(&k.dir) {
+                deleted = true;
+            } else {
+                // Deletable as far as could be told, and still not deleted: it counts.
+                ok = false;
+            }
+        }
+        (ok, deleted)
     }
 
     /// File `index` of batch `serial` arrived whole at its place. When it is the last, types
@@ -662,13 +863,16 @@ impl Transfers {
             if let Some(f) = b.files.get_mut(&index) {
                 f.state = SlotState::Landed;
             }
-            b.touched = Instant::now();
+            b.pulse.touch(self.epoch);
         }
         if !self.paste_delay.is_zero() {
             std::thread::sleep(self.paste_delay);
         }
-        // Decided and typed under the lock `client_gone` takes: a client that went before the
-        // paths are written fails the batch, and nothing is typed for it.
+        // Decided under the lock `fail` takes: a cancel or a client gone before this point fails
+        // the batch, and nothing is typed. Typed without it (a paste can set off anything,
+        // ending a client, whose uploads then take this lock): once `pasting` is set, a
+        // failure waits for the outcome, and a client leaving waits for the paste
+        // (`Daemon::paste_for`), which refuses one already gone.
         let mut st = self.state.lock();
         let Some(b) = st.batches.get_mut(&serial) else {
             return;
@@ -686,15 +890,18 @@ impl Transfers {
             .collect();
         let quoted: Vec<String> = paths.iter().map(|p| crate::shell::shell_quote(p)).collect();
         let (client, pane, text) = (b.client, b.pane, quoted.join(" ") + " ");
+        drop(st);
         let typed = daemon.paste_for(client, pane, &text);
+        let mut st = self.state.lock();
         let mut uploaded = false;
         if let Some(b) = st.batches.get_mut(&serial) {
             b.pasting = false;
-            b.touched = Instant::now();
+            b.pulse.touch(self.epoch);
             match typed {
                 Ok(()) => {
                     record_done(&b.dir);
                     b.outcome = Some(Ok(()));
+                    st.kept_seen = None;
                     self.changed.notify_all();
                     uploaded = true;
                 }
@@ -718,7 +925,7 @@ impl Transfers {
             if let Some(outcome) = &b.outcome {
                 return outcome.clone();
             }
-            if !b.pasting && b.touched.elapsed() > self.idle {
+            if !b.pasting && b.pulse.idle(self.epoch) > self.idle {
                 self.fail(&mut st, serial, "the upload stalled".into());
                 continue;
             }
@@ -744,9 +951,9 @@ impl Transfers {
                     (None, Some(f)) if f.state == SlotState::Reserved => match writer.try_clone() {
                         Ok(socket) => {
                             f.state = SlotState::Writing;
-                            b.touched = Instant::now();
+                            b.pulse.touch(self.epoch);
                             b.writers.push((index, socket));
-                            Ok((f.path.clone(), f.size))
+                            Ok((f.path.clone(), f.size, b.pulse.clone()))
                         }
                         Err(e) => Err(format!("cannot take the file: {e}")),
                     },
@@ -754,7 +961,7 @@ impl Transfers {
                 },
             }
         };
-        let (path, size) = match slot {
+        let (path, size, pulse) = match slot {
             Ok(slot) => slot,
             Err(e) => return close(&mut writer, StreamClose::Refused(e)),
         };
@@ -763,8 +970,33 @@ impl Transfers {
             .unwrap_or(Path::new("/"))
             .join(PARTS)
             .join(index.to_string());
-        let received = receive(&mut reader, &part, size, || self.touch(serial))
-            .and_then(|()| std::fs::rename(&part, &path).map_err(|e| e.to_string()));
+        // A sender that stops mid-file is not waited on past the batch's idle time.
+        let _ = writer.set_read_timeout(Some(self.idle));
+        let alive = || {
+            pulse.touch(self.epoch);
+            pulse.on_way.load(Ordering::Relaxed)
+        };
+        let received = receive(&mut reader, &part, size, alive).and_then(|()| {
+            // Into its place without replacing anything there: a name the disk takes for one
+            // already kept (case, Unicode form) is numbered on, as names that match are.
+            let mut path = path.clone();
+            for _ in 0..100 {
+                match std::fs::hard_link(&part, &path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&part);
+                        return Ok(());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        path = self
+                            .rename_slot(serial, index, &path)
+                            .ok_or("the upload was cancelled")?;
+                    }
+                    Err(e) => return Err(format!("cannot keep {}: {e}", path.display())),
+                }
+            }
+            Err(format!("no free name for {}", path.display()))
+        });
+        let _ = writer.set_read_timeout(None);
         if received.is_err() {
             let _ = std::fs::remove_file(&part);
         }
@@ -779,7 +1011,11 @@ impl Transfers {
             let watching = std::thread::Builder::new()
                 .name("upload-abort".into())
                 .spawn_scoped(scope, || {
-                    if let Ok(Some(StreamFrame::Close(_))) = stream::read_frame(&mut reader) {
+                    // An abort, not a close a sender may send once all is said: only that ends
+                    // the batch.
+                    if let Ok(Some(StreamFrame::Close(why))) = stream::read_frame(&mut reader)
+                        && why != StreamClose::Ok
+                    {
                         let mut st = self.state.lock();
                         self.fail(&mut st, serial, "the upload was cancelled".into());
                     }
@@ -845,7 +1081,9 @@ impl Transfers {
         if let Err(e) = sent {
             return close(&mut writer, StreamClose::Internal(e));
         }
-        // The caller says it has it all, or gives up.
+        // The caller says it has it all, or gives up; one that says nothing is not waited on
+        // for ever, holding the pane's download slot.
+        let _ = writer.set_read_timeout(Some(self.ack));
         loop {
             match stream::read_frame(&mut reader) {
                 Ok(Some(StreamFrame::End)) => return close(&mut writer, StreamClose::Ok),
@@ -856,6 +1094,31 @@ impl Transfers {
                 }
             }
         }
+    }
+}
+
+/// Lets the daemon hold as many descriptors as its uploads may need: each file of a batch keeps
+/// its stream until the batch is complete, and up to [`MAX_WAITING_FILES`] may wait, beyond the
+/// 256 a process often starts with. The soft limit is raised as far as the hard one allows (at
+/// most 10 240, what macOS takes).
+pub fn raise_fd_limit() {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return;
+    }
+    let wanted = rl.rlim_max.min(10_240);
+    if rl.rlim_cur >= wanted {
+        return;
+    }
+    rl.rlim_cur = wanted;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
+        log::warn!(
+            "cannot raise the open-file limit: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -1080,15 +1343,18 @@ pub fn clean_name(name: &str) -> String {
 }
 
 /// `name`, or with `-2`, `-3`… before its extension when taken; recorded in `taken`.
+///
+/// Names are told apart without regard to case (`taken` holds them lowercased): a host's disk
+/// may not tell `Photo.jpg` from `photo.jpg`, nor `.Done` from the batch's `.done`.
 fn unique_name(taken: &mut HashSet<String>, name: &str) -> String {
     let (stem, ext) = split_ext(name);
     let mut candidate = name.to_owned();
     let mut n = 1u32;
-    while taken.contains(&candidate) {
+    while taken.contains(&candidate.to_lowercase()) {
         n += 1;
         candidate = fit(stem, ext, &format!("-{n}"));
     }
-    taken.insert(candidate.clone());
+    taken.insert(candidate.to_lowercase());
     candidate
 }
 
@@ -1130,37 +1396,86 @@ fn record_done(dir: &Path) {
     }
 }
 
-/// What a kept batch is aged from: when it was complete ([`DONE`]), or, for one that never was
-/// (a daemon stopped while it came) or whose record cannot be read, when anything in it was
-/// last written.
-fn aged_from(dir: &Path) -> SystemTime {
-    let done = std::fs::read_to_string(dir.join(DONE))
+/// When the batch in `dir` was complete ([`DONE`]); `None` for one that never was (a daemon
+/// stopped while it came) or whose record cannot be read: it is aged from its last write.
+fn done_at(dir: &Path) -> Option<SystemTime> {
+    std::fs::read_to_string(dir.join(DONE))
         .ok()
-        .and_then(|t| t.trim().parse::<u64>().ok());
-    match done {
-        Some(ms) => SystemTime::UNIX_EPOCH + Duration::from_millis(ms),
-        None => last_write(dir),
-    }
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
 }
 
-/// The latest modification time of `dir` and of everything in it.
-fn last_write(dir: &Path) -> SystemTime {
-    let own = std::fs::metadata(dir)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return own;
+/// What a directory holds, found in one pass: what it takes on disk (as [`dir_size`] counts),
+/// the files and directories in it, and when it or anything in it was last written.
+struct Survey {
+    size: u64,
+    files: u64,
+    latest: SystemTime,
+}
+
+fn survey(dir: &Path) -> Survey {
+    let mut seen = Survey {
+        size: block(),
+        files: 0,
+        latest: std::fs::metadata(dir)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH),
     };
-    entries.flatten().fold(own, |latest, e| {
-        let t = match e.file_type() {
-            Ok(t) if t.is_dir() => last_write(&e.path()),
-            _ => e
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH),
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return seen;
+    };
+    for e in entries.flatten() {
+        let Ok(m) = e.metadata() else {
+            continue;
         };
-        latest.max(t)
-    })
+        seen.files += 1;
+        if m.is_dir() {
+            let inner = survey(&e.path());
+            seen.size += inner.size;
+            seen.files += inner.files;
+            seen.latest = seen.latest.max(inner.latest);
+        } else {
+            seen.size += file_charge(&e.file_name(), &m);
+            seen.latest = seen
+                .latest
+                .max(m.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        }
+    }
+    seen
+}
+
+/// What a file counts as taking on disk: whole blocks of its length, or what the disk
+/// allocated if more; the completion record, a few bytes, a block.
+fn file_charge(name: &std::ffi::OsStr, m: &std::fs::Metadata) -> u64 {
+    if name == DONE {
+        return block();
+    }
+    // What the disk allocated, when it is more (counted in bytes in tests).
+    let allocated = if block() >= 512 {
+        m.blocks().saturating_mul(512)
+    } else {
+        0
+    };
+    charge(m.len()).max(allocated)
+}
+
+/// Whether this process can delete the batch in `dir`: write and search on it, on every
+/// directory in it, and on the directory holding it.
+fn deletable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let can = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0)
+    };
+    fn dirs_ok(dir: &Path, can: &dyn Fn(&Path) -> bool) -> bool {
+        can(dir)
+            && std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .all(|e| !e.file_type().is_ok_and(|t| t.is_dir()) || dirs_ok(&e.path(), can))
+            })
+    }
+    dir.parent().is_some_and(can) && dirs_ok(dir, &can)
 }
 
 /// Deletes a kept batch; whether it is gone. What could not be deleted is logged and kept.
@@ -1195,17 +1510,8 @@ fn dir_size(dir: &Path) -> u64 {
             let m = e.metadata().ok()?;
             Some(if m.is_dir() {
                 dir_size(&e.path())
-            } else if e.file_name() == DONE {
-                // A few bytes: a block.
-                block()
             } else {
-                // What the disk allocated, when it is more (counted in bytes in tests).
-                let allocated = if block() >= 512 {
-                    m.blocks().saturating_mul(512)
-                } else {
-                    0
-                };
-                charge(m.len()).max(allocated)
+                file_charge(&e.file_name(), &m)
             })
         })
         .sum();
@@ -1295,6 +1601,55 @@ mod tests {
         let dir = t.new_batch_dir(3).unwrap();
         assert!(dir.join(PARTS).is_dir());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn making_room_says_whether_anything_went() {
+        let root = std::env::temp_dir().join(format!("thurm-make-room-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let t = Transfers::new(root.clone());
+        let old = root.join("1/old");
+        std::fs::create_dir_all(&old).unwrap();
+        let kept = || {
+            vec![Kept {
+                since: SystemTime::UNIX_EPOCH,
+                size: 10,
+                files: 1,
+                dir: old.clone(),
+            }]
+        };
+        // Room already: nothing deleted, so a walk of the drops still stands.
+        assert_eq!(t.make_room(kept(), 0, 10, 0, 0), (true, false));
+        assert!(old.exists());
+        // Room only once it goes.
+        assert_eq!(t.make_room(kept(), 0, MAX_KEPT, 0, 0), (true, true));
+        assert!(!old.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn names_differing_only_in_case_are_kept_apart() {
+        let mut taken = HashSet::from([PARTS.to_owned(), DONE.to_owned()]);
+        assert_eq!(unique_name(&mut taken, "Photo.jpg"), "Photo.jpg");
+        assert_eq!(unique_name(&mut taken, "photo.jpg"), "photo-2.jpg");
+        assert_eq!(unique_name(&mut taken, "PHOTO.JPG"), "PHOTO-3.JPG");
+        assert_eq!(unique_name(&mut taken, ".Done"), ".Done-2");
+    }
+
+    #[test]
+    fn the_open_file_limit_is_raised() {
+        raise_fd_limit();
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) }, 0);
+        assert!(
+            rl.rlim_cur >= rl.rlim_max.min(10_240),
+            "{} of {}",
+            rl.rlim_cur,
+            rl.rlim_max
+        );
     }
 
     #[test]

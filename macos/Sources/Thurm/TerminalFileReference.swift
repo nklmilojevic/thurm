@@ -121,7 +121,8 @@ enum TerminalFileReference: Equatable {
             }
             path = parts.path
         case .path(let value):
-            guard !value.contains("://") else { throw FilePreviewError.invalid }
+            // A URL is not a path; an absolute path may hold `://` in a name.
+            guard value.hasPrefix("/") || !value.contains("://") else { throw FilePreviewError.invalid }
             let base = Self.withoutLocationSuffix(value)
             if let colon = base.firstIndex(of: ":"), !base[..<colon].contains("/") {
                 throw FilePreviewError.invalid
@@ -200,13 +201,76 @@ final class RemoteFileCache {
         return name.hasPrefix(".staging-") || (name.hasPrefix(".thurm-") && name.hasSuffix(".part"))
     }
 
-    /// Deletes the downloads in `entry` no fetch is writing (left by a fetch that never ended,
-    /// as in an earlier run); returns the bytes of those that could not be deleted.
+    /// The process a download's file belongs to, from its name (`.staging-<pid>-…`,
+    /// `.thurm-<pid>-<n>.part`); nil for a name without one (an older build's).
+    static func downloadOwner(_ file: URL) -> pid_t? {
+        let name = file.lastPathComponent
+        for prefix in [".staging-", ".thurm-"] where name.hasPrefix(prefix) {
+            let rest = name.dropFirst(prefix.count)
+            return rest.split(separator: "-", maxSplits: 1).first.flatMap { pid_t($0) }
+        }
+        return nil
+    }
+
+    /// Entries this process uses (a copy shown, a download under way), with how many uses: each
+    /// marked on disk with `.use-<pid>`, so another instance sharing the folder leaves it alone.
+    private var uses: [String: Int] = [:]
+
+    private func use(_ entry: URL) {
+        let key = Self.path(entry)
+        if uses[key, default: 0] == 0 {
+            FileManager.default.createFile(atPath: entry.appendingPathComponent(".use-\(getpid())").path,
+                                           contents: nil)
+        }
+        uses[key, default: 0] += 1
+    }
+
+    private func unuse(_ entry: URL) {
+        let key = Self.path(entry)
+        guard let n = uses[key] else { return }
+        if n > 1 {
+            uses[key] = n - 1
+        } else {
+            uses[key] = nil
+            try? FileManager.default.removeItem(at: entry.appendingPathComponent(".use-\(getpid())"))
+        }
+    }
+
+    /// Whether another running process uses `entry`; its marks of ended ones go on the way.
+    private func usedElsewhere(_ entry: URL) -> Bool {
+        let fm = FileManager.default
+        let me = getpid()
+        let marks = ((try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix(".use-") }
+        var other = false
+        for mark in marks {
+            guard let pid = pid_t(mark.lastPathComponent.dropFirst(".use-".count)) else { continue }
+            if pid == me { continue }
+            if Self.running(pid) {
+                other = true
+            } else {
+                try? fm.removeItem(at: mark)
+            }
+        }
+        return other
+    }
+
+    /// Whether process `pid` still runs (one of another user's counts as running).
+    private static func running(_ pid: pid_t) -> Bool {
+        kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    /// Deletes the downloads in `entry` no fetch is writing: this process's, as it writes into
+    /// none of them, and those of a process that has ended (left by an earlier run). Another
+    /// running instance's are its own. Returns the bytes of those left, which still count.
     private func clearStaleDownloads(in entry: URL) -> UInt64 {
         let fm = FileManager.default
+        let me = getpid()
         let files = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: [.fileSizeKey])) ?? []
         return files.filter(Self.isDownload).reduce(UInt64(0)) { left, file in
-            if (try? fm.removeItem(at: file)) != nil { return left }
+            let owner = Self.downloadOwner(file)
+            let stale = owner.map { $0 == me || !Self.running($0) } ?? true
+            if stale, (try? fm.removeItem(at: file)) != nil { return left }
             return left + UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
     }
@@ -251,7 +315,8 @@ final class RemoteFileCache {
     func stage(_ entry: URL) throws -> URL {
         try FileManager.default.createDirectory(at: entry, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-        return entry.appendingPathComponent(".staging-\(UUID().uuidString)")
+        // Named for this process, so another instance sharing the folder leaves it alone.
+        return entry.appendingPathComponent(".staging-\(getpid())-\(UUID().uuidString)")
     }
 
     /// Makes the downloaded `staged` file the copy in use, in a folder of its own under its own
@@ -259,7 +324,9 @@ final class RemoteFileCache {
     /// deleted unless Quick Look shows it; then when it is let go. Returns where the new one is.
     func install(_ entry: URL, staged: URL, name: String, version: String?) throws -> URL {
         let fm = FileManager.default
-        let safe = name.isEmpty || name.contains("/") || name.hasPrefix(".") ? "file" : name
+        // A hidden name (.eslintrc.json) keeps its extension, for Quick Look to know it, but
+        // not its leading dot, which marks the cache's own files.
+        let safe = name.isEmpty || name.contains("/") ? "file" : name.hasPrefix(".") ? "dot" + name : name
         // The old version goes first: whatever fails below, a copy is never paired with a
         // version it is not (no version only means fetching again).
         let versionFile = entry.appendingPathComponent(".version")
@@ -279,8 +346,14 @@ final class RemoteFileCache {
             throw error
         }
         retireCopies(in: entry)
+        // The copy is in place: a version that cannot be recorded only means it is fetched
+        // again next time, not that this fetch failed.
         if let version {
-            try writeText(version, versionFile)
+            do {
+                try writeText(version, versionFile)
+            } catch {
+                tlog("remote preview cache: cannot record the version of \(file.path): \(error)")
+            }
         }
         // Over the limit even with everything else gone (a copy Quick Look still shows, say):
         // the new copy is shown but not kept, and goes once let go.
@@ -293,14 +366,23 @@ final class RemoteFileCache {
 
     /// Deletes the copies in `entry` that are neither in use nor shown.
     private func retireCopies(in entry: URL) {
+        // Another instance may show any of its copies.
+        if usedElsewhere(entry) { return }
         let fm = FileManager.default
-        let inUse = current(entry)?.deletingLastPathComponent().standardizedFileURL
+        let inUse = current(entry).map { Self.path($0.deletingLastPathComponent()) }
+        let shown = Set(held.keys.map { Self.path($0.deletingLastPathComponent()) })
         let copies = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)) ?? []
         for folder in copies where folder.lastPathComponent.hasPrefix("c-") {
-            let folder = folder.standardizedFileURL
-            if folder == inUse || held.keys.contains(where: { $0.deletingLastPathComponent() == folder }) { continue }
+            let path = Self.path(folder)
+            if path == inUse || shown.contains(path) { continue }
             try? fm.removeItem(at: folder)
         }
+    }
+
+    /// `url` as a path to compare: a folder's URL may end in `/` or not, depending on where it
+    /// came from (a listing, or a file's parent), its path never does.
+    private static func path(_ url: URL) -> String {
+        url.standardizedFileURL.path
     }
 
     /// Files Quick Look shows, with how many times: neither pruned nor replaced in place.
@@ -309,13 +391,14 @@ final class RemoteFileCache {
     /// The entry `file` is a copy in, if it is one of the cache's.
     private func entryOf(_ file: URL) -> URL? {
         let entry = file.standardizedFileURL.deletingLastPathComponent().deletingLastPathComponent()
-        return entry.deletingLastPathComponent() == root.standardizedFileURL ? entry : nil
+        return Self.path(entry.deletingLastPathComponent()) == Self.path(root) ? entry : nil
     }
 
     /// Keeps `file` while it is shown (no-op for other files).
     func hold(_ file: URL) {
-        guard entryOf(file) != nil else { return }
+        guard let entry = entryOf(file) else { return }
         held[file.standardizedFileURL, default: 0] += 1
+        use(entry)
     }
 
     /// Quick Look moves from showing `old` to showing `new`: `new` is held before `old` is let
@@ -330,9 +413,17 @@ final class RemoteFileCache {
         let file = file.standardizedFileURL
         guard let entry = entryOf(file), let n = held[file] else { return }
         held[file] = n > 1 ? n - 1 : nil
+        unuse(entry)
         retireCopies(in: entry)
-        prune()
+        // Only what was left over the limit (a shown copy in the way) needs a look now.
+        if overLimit { prune() }
     }
+
+    /// The last prune left more than `maxBytes`.
+    private var overLimit = false
+
+    /// How many times the cache was walked to prune (tests).
+    private(set) var prunes = 0
 
     /// Bytes reserved by downloads under way, by fetch, with the entry each writes to.
     private var reserved: [UUID: (entry: URL, bytes: UInt64)] = [:]
@@ -352,25 +443,25 @@ final class RemoteFileCache {
     /// could not be deleted still counts. Whether it all fits.
     @discardableResult
     func prune(keeping keep: URL? = nil) -> Bool {
+        prunes += 1
         let fm = FileManager.default
-        let busy = Set(held.keys.compactMap(entryOf) + reserved.values.map(\.entry) + [keep].compactMap { $0 })
-            .map(\.standardizedFileURL)
+        let busy = Set((held.keys.compactMap(entryOf) + reserved.values.map(\.entry) + [keep].compactMap { $0 })
+            .map(Self.path))
         let entries = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey]))
             ?? []
         // Copies neither in use nor shown (one not kept, let go) go first, and downloads no
         // fetch is writing; one that cannot be deleted counts.
-        let downloading = Set(reserved.values.map(\.entry.standardizedFileURL))
-        var stale: [URL: UInt64] = [:]
+        let downloading = Set(reserved.values.map { Self.path($0.entry) })
+        var stale: [String: UInt64] = [:]
         for entry in entries {
-            let entry = entry.standardizedFileURL
             retireCopies(in: entry)
-            if !downloading.contains(entry) { stale[entry] = clearStaleDownloads(in: entry) }
+            let path = Self.path(entry)
+            if !downloading.contains(path) { stale[path] = clearStaleDownloads(in: entry) }
         }
         var sized: [(url: URL, date: Date, size: UInt64)] = entries.map { entry in
             let date = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
                 ?? .distantPast
-            let url = entry.standardizedFileURL
-            return (url, date, size(of: entry) + (stale[url] ?? 0))
+            return (entry.standardizedFileURL, date, size(of: entry) + (stale[Self.path(entry)] ?? 0))
         }
         sized.sort { $0.date < $1.date }
         // A download refreshing an entry replaces its copy in use, unless Quick Look shows it:
@@ -383,9 +474,10 @@ final class RemoteFileCache {
             return sum + (r.bytes > replaced ? r.bytes - replaced : 0)
         }
         var total = sized.reduce(UInt64(0)) { $0 + $1.size } + extra
-        for e in sized where total > maxBytes && !busy.contains(e.url) {
+        for e in sized where total > maxBytes && !busy.contains(Self.path(e.url)) && !usedElsewhere(e.url) {
             if (try? fm.removeItem(at: e.url)) != nil { total -= e.size }
         }
+        overLimit = total > maxBytes
         return total <= maxBytes
     }
 
@@ -471,6 +563,7 @@ final class RemoteFileCache {
         do { staged = try stage(entry) } catch { return completion(.failure(error)) }
         let token = UUID()
         reserved[token] = (entry, 0)
+        use(entry)
         var cancel: (() -> Void)?
         var tooMuch = false
         let onProgress: (TransferProgress) -> Void = { [self] p in
@@ -486,6 +579,7 @@ final class RemoteFileCache {
         }
         cancel = download(pane, path, staged, cached?.version, maxBytes, onProgress) { [self] outcome in
             reserved[token] = nil
+            unuse(entry)
             // Given up: its file, however it ended, is not this cache's (a newer fetch's is).
             if abandoned() {
                 try? FileManager.default.removeItem(at: staged)

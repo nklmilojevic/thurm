@@ -6,6 +6,9 @@ use super::*;
 #[derive(Default)]
 struct FakeHost {
     calls: Mutex<Vec<(String, Value)>>,
+    /// Forward opens to the hosts `flaky` and `flaky2` so far: the first of each fails.
+    flaky: std::sync::atomic::AtomicUsize,
+    flaky2: std::sync::atomic::AtomicUsize,
     events: Mutex<Option<Sender<(String, Value)>>>,
 }
 
@@ -49,6 +52,23 @@ impl Host for FakeHost {
                 // Read in part: a server it left out still runs.
                 { "pane": 6, "ports": [], "complete": false },
             ])),
+            // A host whose first forward fails, as when its tunnel is down a moment.
+            "forwards.open"
+                if params["host"] == "flaky"
+                    && self.flaky.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
+            {
+                Err("devbox is not connected".into())
+            }
+            // Another whose first forward fails.
+            "forwards.open"
+                if params["host"] == "flaky2"
+                    && self
+                        .flaky2
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        == 0 =>
+            {
+                Err("devbox is not connected".into())
+            }
             "forwards.open" => Ok(json!({
                 "id": 4, "host": params["host"], "remote_port": params["port"],
                 "local_port": 5174, "url": "http://localhost:5174/", "new": params["browse"],
@@ -668,7 +688,7 @@ fn ports_and_forwards() {
     assert_eq!(
         r,
         json!({
-            "port": 5173, "command": "vite", "complete": false, "none": 0, "none_complete": true,
+            "port": 5173, "command": "vite", "complete": false, "none": 0, "none_complete": false,
             "all": 3, "url": "http://localhost:5174/", "new": true, "plain_new": false,
             "closed": 4, "listed": "devbox",
         })
@@ -697,7 +717,7 @@ fn the_dev_server_example_opens_only_new_servers() {
         include_str!("../../../examples/plugins/dev-server/init.lua"),
         false,
     );
-    s.settings = json!({});
+    s.settings = json!({ "retry_seconds": 0.2 });
     let done = f.rt.load(s);
     assert_eq!(
         done.recv_timeout(Duration::from_secs(20)).unwrap(),
@@ -734,6 +754,9 @@ fn the_dev_server_example_opens_only_new_servers() {
     // again when a complete list has it.
     ports(None, 3, &[4001], false, false);
     ports(None, 3, &[4000, 4001], true, false);
+    // The pane read in part at load stays incomplete (a process this user cannot read): a
+    // server that shows up meanwhile listens for sure, and opens.
+    ports(None, 6, &[4300], false, false);
     // The pane read in part at load: its first complete list says what ran, opening nothing.
     ports(None, 6, &[4100], true, false);
     // The app lost devbox: its lists go; what it lists as the app connects again runs already.
@@ -749,6 +772,13 @@ fn the_dev_server_example_opens_only_new_servers() {
     // A server listening on every address, as macOS says it: a dev server too.
     event(json!({ "event": "ports_changed", "id": 8, "complete": true,
                   "ports": [{ "port": 4200, "address": "*", "pid": 9, "command": "node_modules/.bin/vite" }] }));
+    // A forward that fails once (the host's tunnel down a moment) is tried again while listed.
+    ports(Some("flaky"), 9, &[7000], true, false);
+    // A forward that fails, then its server stops and starts again before the try again: the
+    // restart opens it, and the earlier try does not open it a second time.
+    ports(Some("flaky2"), 10, &[7100], true, false);
+    ports(Some("flaky2"), 10, &[], true, false);
+    ports(Some("flaky2"), 10, &[7100], true, false);
     // 4000 really stops (a complete list) and starts again: news.
     ports(None, 3, &[4001], true, false);
     ports(None, 3, &[4000, 4001], true, false);
@@ -771,8 +801,13 @@ fn the_dev_server_example_opens_only_new_servers() {
         json!(["devbox", 5174, true]),
         json!(["open", "http://localhost:4001/"]),
         json!(["other", 3000, true]),
+        json!(["open", "http://localhost:4300/"]),
         json!(["open", "http://localhost:4200/"]),
+        json!(["flaky", 7000, true]),
+        json!(["flaky2", 7100, true]),
+        json!(["flaky2", 7100, true]),
         json!(["open", "http://localhost:4000/"]),
+        json!(["flaky", 7000, true]),
     ];
     let deadline = Instant::now() + Duration::from_secs(20);
     while opened(&f).len() < want.len() {
@@ -781,4 +816,45 @@ fn the_dev_server_example_opens_only_new_servers() {
     }
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(opened(&f), want);
+}
+
+/// The dev-server example takes `commands` as a list, or one program as a string, and warns of
+/// anything else rather than match nothing.
+#[test]
+fn the_dev_server_example_takes_one_command_as_a_string() {
+    let f = fixture();
+    let event = json!({ "event": "ports_changed", "id": 9, "complete": true,
+        "ports": [{ "port": 4400, "address": "127.0.0.1", "pid": 9, "command": "astro dev" }] });
+    let mut s = spec(
+        7,
+        include_str!("../../../examples/plugins/dev-server/init.lua"),
+        false,
+    );
+    s.settings = json!({ "commands": "astro" });
+    assert_eq!(
+        f.rt.load(s).recv_timeout(Duration::from_secs(20)).unwrap(),
+        Ok(Value::Null)
+    );
+    f.rt.notice(7, notice::EVENT, event.clone());
+    assert_eq!(
+        next(&f, "exec")["argv"],
+        json!(["open", "http://localhost:4400/"])
+    );
+
+    let mut s = spec(
+        8,
+        include_str!("../../../examples/plugins/dev-server/init.lua"),
+        false,
+    );
+    s.settings = json!({ "commands": 5 });
+    assert_eq!(
+        f.rt.load(s).recv_timeout(Duration::from_secs(20)).unwrap(),
+        Ok(Value::Null)
+    );
+    let warned = next(&f, "log");
+    assert_eq!(warned["level"], "warn", "{warned}");
+    assert!(
+        warned["message"].as_str().unwrap().contains("commands"),
+        "{warned}"
+    );
 }

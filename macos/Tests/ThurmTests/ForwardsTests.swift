@@ -175,17 +175,47 @@ final class ForwardsTests: XCTestCase {
         p.listed("devbox", pane: 2, ports: ports([5173]), complete: true)
         p.listed("devbox", pane: 3, ports: ports([8080]), complete: true)
         p.listed("pi", pane: 1, ports: ports([22]), complete: true)
-        // An empty list forgets the pane; the rest is there to send a daemon connected later.
+        // An empty list is kept too: a daemon connected later must hear the servers went.
         p.listed("devbox", pane: 3, ports: [] as [Any], complete: true)
-        XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "pi/1"])
+        XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "devbox/3", "pi/1"])
         // An empty list that could not read every process is kept: servers it missed may run,
         // and a daemon connected later must hear the pane is unsure.
         p.listed("devbox", pane: 4, ports: [] as [Any], complete: false)
-        XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "devbox/4", "pi/1"])
+        XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "devbox/3", "devbox/4", "pi/1"])
         XCTAssertEqual(p.all.first { $0.pane == 4 }.flatMap { jsonBool($0.complete) }, false)
         p.listed("devbox", pane: 4, ports: [] as [Any], complete: true)
         p.disconnected("devbox")
         XCTAssertEqual(p.all.map(\.host), ["pi"])
+    }
+
+    /// Connected again to this Mac's daemon, the app sends its remote lists again: those its
+    /// plugins heard as running already; one they never heard (sent while the daemon was away, or
+    /// taken without being passed on, as a second app's are) as it came, so a server that started
+    /// meanwhile is still news to them. A pane whose servers went is sent again too.
+    func testRemoteListsSentAgainKeepWhatTheDaemonNeverHeard() {
+        let ext = Extensions.shared
+        var daemonUp = true
+        var reported: [[String: Any]] = []
+        ext.portsReported = { reported.append($0); return daemonUp }
+        defer { ext.portsReported = nil }
+        let host = "again-test"
+        defer { ext.remoteHostDisconnected(host) }
+        let list = { (port: Int) -> [[String: Any]] in [["port": port]] }
+        // Heard while the daemon was there: pane 1 running already, pane 2 a change.
+        ext.reportPorts(host: host, pane: 1, ports: list(5173), complete: true, initial: true)
+        ext.reportPorts(host: host, pane: 2, ports: list(8080), complete: true, initial: false)
+        // The daemon goes; pane 3 starts a server, pane 4 is listed as running already.
+        daemonUp = false
+        ext.reportPorts(host: host, pane: 3, ports: list(3000), complete: true, initial: false)
+        ext.reportPorts(host: host, pane: 4, ports: list(9000), complete: true, initial: true)
+        daemonUp = true
+        // Pane 2's server went, heard.
+        ext.reportPorts(host: host, pane: 2, ports: [] as [Any], complete: true, initial: false)
+        reported = []
+        ext.sendRemotePortsAgain()
+        let again = reported.filter { jsonString($0["host"]) == host }
+            .map { "\($0["pane"]!):\(($0["ports"] as? [Any])?.count ?? -1)\(jsonBool($0["initial"]) == true ? "*" : "")" }
+        XCTAssertEqual(again, ["1:1*", "2:0*", "3:1", "4:1*"])
     }
 
     /// Whether a remote list is of servers running already is the host's daemon's to say, by
@@ -197,7 +227,7 @@ final class ForwardsTests: XCTestCase {
     func testOnlyAListTheHostMarkedInitialIsRunningAlready() {
         let ext = Extensions.shared
         var reported: [[String: Any]] = []
-        ext.portsReported = { reported.append($0) }
+        ext.portsReported = { reported.append($0); return true }
         defer { ext.portsReported = nil }
         let host = "initial-test"
         func list(_ pane: Int, _ list: [Int], initial: Bool? = nil) -> [String: Any] {
@@ -217,23 +247,6 @@ final class ForwardsTests: XCTestCase {
         ext.remoteHostDisconnected(host)
     }
 
-    /// A remote list that came while the forwards' own `Ports` request was out is applied to
-    /// them again after its answer; plugins heard it once, as it came.
-    func testAReplayedRemoteListIsNotReportedAgain() {
-        let ext = Extensions.shared
-        var reported: [[String: Any]] = []
-        ext.portsReported = { reported.append($0) }
-        defer { ext.portsReported = nil }
-        let started: [String: Any] = ["pane": 2, "ports": [["port": 5173]], "complete": true]
-        let stopped: [String: Any] = ["pane": 2, "ports": [] as [Any], "complete": true]
-        SessionManager.shared.remotePortsChanged(started, host: "replay-test")
-        SessionManager.shared.remotePortsChanged(stopped, host: "replay-test")
-        // `fetchRemotePorts` after its answer.
-        SessionManager.shared.applyRemotePorts(started, host: "replay-test")
-        SessionManager.shared.applyRemotePorts(stopped, host: "replay-test")
-        XCTAssertEqual(reported.count, 2)
-        XCTAssertEqual(reported.compactMap { ($0["ports"] as? [Any])?.count }, [1, 0])
-    }
     func testAFailureWithoutAPaneIsAnAlert() {
         XCTAssertEqual(ForwardNotice.failure(host: "pi", "pi is not connected", onPane: true),
                        .toast("Could not forward from pi: pi is not connected", copyLink: nil))
@@ -249,53 +262,11 @@ final class ForwardsTests: XCTestCase {
                        .alert("devbox:5173 → localhost:5173", copyLink: url))
     }
 
-    func testEventsDuringAPortsRequestAreAppliedAgainAfterItsReply() {
-        var g = RequestGenerations()
-        // Before any request: nothing is kept.
-        g.event("devbox", ["pane": 1])
-        let gen = g.start("devbox")
-        g.event("devbox", ["pane": 2, "ports": [5173]])
-        g.event("devbox", ["pane": 3])
-        g.event("pi", ["pane": 9])
-        let again = g.finish("devbox", gen)
-        XCTAssertEqual(again?.compactMap { jsonUInt64($0["pane"]) }, [2, 3])
-        // Done: later events apply as they come, and the same reply twice is old.
-        g.event("devbox", ["pane": 4])
-        XCTAssertNil(g.finish("devbox", gen))
-        // A connection dropped while asking: neither its reply nor its events.
-        let dropped = g.start("devbox")
-        g.event("devbox", ["pane": 5])
-        g.invalidate("devbox")
-        XCTAssertNil(g.finish("devbox", dropped))
-        // Asked twice: only the newer request's reply counts.
-        let first = g.start("devbox")
-        let second = g.start("devbox")
-        XCTAssertNil(g.finish("devbox", first))
-        XCTAssertEqual(g.finish("devbox", second)?.count, 0)
-    }
-
     func testForwardPortAsksWhichHostOnlyWhenItCannotTell() {
         XCTAssertEqual(ForwardHostChoice.of(focused: "devbox", connected: ["a", "devbox"]), .host("devbox"))
         XCTAssertEqual(ForwardHostChoice.of(focused: localHost, connected: ["devbox"]), .host("devbox"))
         XCTAssertEqual(ForwardHostChoice.of(focused: localHost, connected: ["a", "devbox"]), .pick(["a", "devbox"]))
         XCTAssertEqual(ForwardHostChoice.of(focused: localHost, connected: []), .none)
-    }
-
-    func testAPortsReplyFromAnOldConnectionIsDropped() {
-        var g = RequestGenerations()
-        // Asked, then the connection drops before the answer: the answer is old.
-        let first = g.start("devbox")
-        XCTAssertTrue(g.isCurrent("devbox", first))
-        g.invalidate("devbox")
-        XCTAssertFalse(g.isCurrent("devbox", first))
-        // Reconnected and asked again: only the newer answer counts, whichever comes last.
-        let second = g.start("devbox")
-        XCTAssertFalse(g.isCurrent("devbox", first))
-        XCTAssertTrue(g.isCurrent("devbox", second))
-        // Hosts are apart.
-        let other = g.start("pi")
-        XCTAssertTrue(g.isCurrent("devbox", second))
-        XCTAssertTrue(g.isCurrent("pi", other))
     }
 
     func testAForwardsLinkIsUsedOnlyWhileItIsOpenOnTheSamePort() {

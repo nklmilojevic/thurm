@@ -231,7 +231,7 @@ private struct HostDetails: View {
                                     .help(f.url)
                                 Button("Copy Link") { SessionManager.copyForwardLink(f) }
                                 Button("Close") {
-                                    _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: f.id)])
+                                    SessionManager.closeForward(f.id)
                                 }
                             }
                         } label: {

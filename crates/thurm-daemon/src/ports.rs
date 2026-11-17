@@ -5,10 +5,11 @@
 //! One thread looks at every pane at once: one process table and one socket listing per look.
 //! It runs only while such a client is connected, looks every 10 s, and doubles the wait while
 //! nothing changes, up to 5 min. A new pane, a command starting or finishing, a
-//! [`thurm_proto::Request::Ports`], or any change brings it back to 10 s.
+//! [`thurm_proto::Request::Ports`], or any change brings it back to 10 s: the next look within
+//! 10 s of the last, not at once. A client that joins gets its lists at once.
 
 use std::collections::HashMap;
-use std::sync::Weak;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -247,6 +248,10 @@ pub trait Host: Send + Sync + 'static {
     /// hear changes like everyone.
     fn served(&self, _joined: &[u64]) {}
     fn watcher(&self) -> &Watcher;
+    /// One look at the system ([`look`]).
+    fn look(&self, roots: &[(PaneId, u32)]) -> Option<HashMap<PaneId, Seen>> {
+        look(roots)
+    }
 }
 
 #[derive(Default)]
@@ -258,8 +263,8 @@ struct State {
 }
 
 /// What one look sends: `broadcast` to the clients that had subscribed before it (by the per-pane
-/// rules, as changes), and to each of `joined` its own first lists, every pane with ports as seen
-/// now, marked `initial`. A
+/// rules, as changes), and to each of `joined` its own first lists, every pane's as seen now
+/// (empty ones too: they are the joiner's whole picture), marked `initial`. A
 /// client joining doesn't make the others hear a list again, nor sooner than a second after the
 /// last one.
 #[derive(Debug)]
@@ -277,7 +282,6 @@ pub fn deliver(
 ) -> Delivery {
     let mut first: Vec<(PaneId, Seen)> = seen
         .iter()
-        .filter(|(_, s)| !s.ports.is_empty())
         .map(|(p, s)| {
             let mut s = s.clone();
             s.ports.sort();
@@ -317,7 +321,8 @@ impl Watcher {
 
     /// Client `client`, which wants port events, connected: start the watcher if it isn't
     /// running, and send that client every pane's list.
-    pub fn subscribed<H: Host>(&self, host: Weak<H>, client: u64) {
+    /// The watcher holds the daemon (which lives as long as the process) for as long as it runs.
+    pub fn subscribed<H: Host>(&self, host: Arc<H>, client: u64) {
         let mut st = self.state.lock();
         st.joined.push(client);
         st.poked = true;
@@ -336,8 +341,22 @@ impl Watcher {
     }
 }
 
-fn look_delay() -> Option<Duration> {
-    std::env::var("THURM_PORTS_LOOK_DELAY_MS")
+/// When to look after a poke: the time already set, if sooner; else the shortest wait after the
+/// last look (now, if there was none yet or it is that long ago).
+fn after_poke(next: Instant, last_look: Option<Instant>, interval: Duration) -> Instant {
+    match last_look {
+        Some(last) => next.min(last + interval),
+        None => next,
+    }
+}
+
+/// Test builds: `var` as a number of milliseconds, for a step that takes a while on purpose (a
+/// look, a report). Release builds never read it.
+pub(crate) fn test_delay(var: &str) -> Option<Duration> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var(var)
         .ok()
         .and_then(|v| v.parse().ok())
         .map(Duration::from_millis)
@@ -356,12 +375,14 @@ fn interval_from(ms: Option<&str>) -> Duration {
         .max(Duration::from_millis(50))
 }
 
-fn run<H: Host>(host: Weak<H>) {
+fn run<H: Host>(h: Arc<H>) {
     let mut tracker = Tracker::default();
     let mut backoff = Backoff::new(min_interval());
     let mut next = Instant::now();
+    let mut last_look: Option<Instant> = None;
+    // Clients whose first look failed: served by the next one, at its time.
+    let mut waiting: Vec<u64> = Vec::new();
     loop {
-        let Some(h) = host.upgrade() else { return };
         let w = h.watcher();
         let joined = {
             let mut st = w.state.lock();
@@ -373,10 +394,18 @@ fn run<H: Host>(host: Weak<H>) {
                     w.wake.wait(&mut st);
                     continue;
                 }
+                // A client that joined waits for its lists: look now.
+                if !st.joined.is_empty() {
+                    break;
+                }
+                // Something that may change ports: the next look comes within the shortest
+                // wait of the last one, not at once (commands run back to back would each make
+                // one).
                 if st.poked {
                     st.poked = false;
                     backoff.poke();
-                    break;
+                    next = after_poke(next, last_look, backoff.interval());
+                    continue;
                 }
                 let now = Instant::now();
                 if now >= next {
@@ -384,14 +413,17 @@ fn run<H: Host>(host: Weak<H>) {
                 }
                 w.wake.wait_for(&mut st, next - now);
             }
-            std::mem::take(&mut st.joined)
+            let mut joined = std::mem::take(&mut waiting);
+            joined.append(&mut st.joined);
+            joined
         };
         // Tests: a look that takes a while, for what happens while it is under way.
-        if let Some(delay) = look_delay() {
+        if let Some(delay) = test_delay("THURM_PORTS_LOOK_DELAY_MS") {
             std::thread::sleep(delay);
         }
         let roots = h.pane_roots();
-        let changed = match look(&roots) {
+        last_look = Some(Instant::now());
+        let changed = match h.look(&roots) {
             Some(seen) => {
                 let d = deliver(&mut tracker, Instant::now(), seen, &joined);
                 let changed = !d.broadcast.is_empty() || d.retry.is_some();
@@ -408,16 +440,16 @@ fn run<H: Host>(host: Weak<H>) {
                 changed
             }
             // A failed look sends nothing; try again at the shortest wait, the clients that
-            // joined still waiting for their lists.
+            // joined still waiting for their lists (not put back with the new joiners: those
+            // are looked at once, and a look failing again would then never wait).
             None => {
-                w.state.lock().joined.extend(joined);
+                waiting = joined;
                 backoff.poke();
                 next = Instant::now() + backoff.interval();
                 false
             }
         };
         log::trace!("ports: looked at {} panes, changed {changed}", roots.len());
-        drop(h);
     }
 }
 
@@ -591,9 +623,14 @@ mod tests {
             d.broadcast.iter().map(ports_of).collect::<Vec<_>>(),
             [(1, vec![3000], true)]
         );
-        assert_eq!(d.initial.len(), 1);
-        assert_eq!(d.initial[0].0, 1);
-        assert_eq!(ports_of(&d.initial[0].1), (1, vec![3000], true));
+        assert_eq!(
+            d.initial
+                .iter()
+                .map(|(c, e)| (*c, ports_of(e)))
+                .collect::<Vec<_>>(),
+            [(1, (1, vec![3000], true)), (1, (2, vec![], true))],
+            "every pane's list, the empty one too"
+        );
         // Client 2 joins 300 ms later: it gets the list; nothing goes to everyone again.
         let d = deliver(
             &mut t,
@@ -607,7 +644,7 @@ mod tests {
                 .iter()
                 .map(|(c, e)| (*c, ports_of(e)))
                 .collect::<Vec<_>>(),
-            [(2, (1, vec![3000], true))]
+            [(2, (1, vec![3000], true)), (2, (2, vec![], true))]
         );
         // And the per-pane second still holds for a change right after.
         let d = deliver(
@@ -618,6 +655,65 @@ mod tests {
         );
         assert!(d.broadcast.is_empty());
         assert_eq!(d.retry, Some(t0 + PER_PANE));
+    }
+
+    /// A daemon whose looks always fail, counting them.
+    struct Failing {
+        watcher: Watcher,
+        looks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Host for Failing {
+        fn wants_ports(&self) -> bool {
+            true
+        }
+        fn pane_roots(&self) -> Vec<(PaneId, u32)> {
+            vec![(1, 1)]
+        }
+        fn send_ports(&self, _: Event, _: &[u64]) {}
+        fn send_ports_to(&self, _: u64, _: Event) {}
+        fn watcher(&self) -> &Watcher {
+            &self.watcher
+        }
+        fn look(&self, _: &[(PaneId, u32)]) -> Option<HashMap<PaneId, Seen>> {
+            self.looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+    }
+
+    #[test]
+    fn a_failing_look_is_not_retried_at_once_for_a_joiner() {
+        let h = Arc::new(Failing {
+            watcher: Watcher::default(),
+            looks: Default::default(),
+        });
+        h.watcher().subscribed(h.clone(), 7);
+        std::thread::sleep(Duration::from_millis(300));
+        // One look for the joiner, then the shortest wait (10 s) before the next.
+        let looks = h.looks.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(looks, 1, "{looks} looks in 300 ms");
+    }
+
+    #[test]
+    fn a_poke_brings_the_next_look_within_the_shortest_wait_not_now() {
+        let t0 = Instant::now();
+        let min = Duration::from_secs(10);
+        // Waiting 5 min after a look at t0: a poke brings it to t0 + 10 s.
+        assert_eq!(
+            after_poke(t0 + Duration::from_secs(300), Some(t0), min),
+            t0 + min
+        );
+        // Already sooner than that: unchanged.
+        let soon = t0 + Duration::from_secs(3);
+        assert_eq!(after_poke(soon, Some(t0), min), soon);
+        // Many pokes in a row (commands back to back) never make it sooner than t0 + 10 s.
+        let mut next = t0 + Duration::from_secs(300);
+        for _ in 0..100 {
+            next = after_poke(next, Some(t0), min);
+        }
+        assert_eq!(next, t0 + min);
+        // No look yet: the first one is not put off.
+        assert_eq!(after_poke(t0, None, min), t0);
     }
 
     #[test]

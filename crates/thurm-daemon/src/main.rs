@@ -211,6 +211,7 @@ fn main() {
     }
     daemon.start_tailnet(tailnet);
     daemon.start_plugins();
+    transfer::raise_fd_limit();
     transfer::start_pruning(&daemon);
 
     {

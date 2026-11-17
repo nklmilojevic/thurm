@@ -135,18 +135,37 @@ struct RemotePorts {
         let pane: UInt64
         let ports: Any
         let complete: Any
+        /// The host's daemon sent it as running already, not as a change.
+        let initial: Bool
+        /// Which report it is, for `delivered`.
+        let seq: Int
+        /// This Mac's daemon passed it on to its plugins (`ports.report` answered `heard`): it
+        /// took a list from an app that does not hold plugins' lists without passing it on.
+        var delivered = false
+
+        /// What it is said as when sent again to a daemon the app connects to: running already
+        /// once plugins heard it (and a new daemon's knew nothing before); else as it came, a
+        /// change they never heard.
+        var initialWhenSentAgain: Bool { delivered || initial }
     }
 
     private var lists: [HostId: [UInt64: Entry]] = [:]
+    private var seq = 0
 
-    /// A pane of `host` listed `ports`: kept as its latest. A complete empty list forgets the
-    /// pane; an incomplete one is kept (servers it could not read may run), to send again.
-    mutating func listed(_ host: HostId, pane: UInt64, ports: Any, complete: Any) {
-        if (ports as? [Any])?.isEmpty ?? false, jsonBool(complete) != false {
-            lists[host]?[pane] = nil
-        } else {
-            lists[host, default: [:]][pane] = Entry(host: host, pane: pane, ports: ports, complete: complete)
-        }
+    /// A pane of `host` listed `ports`: kept as its latest, an empty list too (a daemon this app
+    /// connects to later must hear that the pane's servers went, and an incomplete one that
+    /// servers may run unseen), until the host goes. The number of this report, for `delivered`.
+    @discardableResult
+    mutating func listed(_ host: HostId, pane: UInt64, ports: Any, complete: Any, initial: Bool = false) -> Int {
+        seq += 1
+        lists[host, default: [:]][pane] = Entry(host: host, pane: pane, ports: ports, complete: complete,
+                                                initial: initial, seq: seq)
+        return seq
+    }
+
+    /// This Mac's daemon took report `seq` of `host`'s `pane` (if it is still the latest).
+    mutating func delivered(_ host: HostId, pane: UInt64, seq: Int) {
+        if lists[host]?[pane]?.seq == seq { lists[host]?[pane]?.delivered = true }
     }
 
     /// The connection to `host` is gone: its lists with it.
@@ -195,47 +214,6 @@ enum ForwardNotice: Equatable {
 
 /// The `Ports` request of each host's current connection: a reply to an earlier one (a
 /// connection that dropped meanwhile, or one replaced by a reconnect) is not applied.
-/// While a `Ports` request is out, the `PortsChanged` events that arrive are kept too: the
-/// reply may be older than they are (the daemon looked for it before they were sent), so they
-/// are applied again after it, in the order they came.
-struct RequestGenerations {
-    private var current: [HostId: Int] = [:]
-    private var next = 0
-    private var arrived: [HostId: [[String: Any]]] = [:]
-
-    /// A request goes out on `host`'s connection now; it supersedes any before it.
-    mutating func start(_ host: HostId) -> Int {
-        next += 1
-        current[host] = next
-        arrived[host] = []
-        return next
-    }
-
-    /// `host`'s connection dropped: no reply pending for it applies any more, nor the events
-    /// kept for it.
-    mutating func invalidate(_ host: HostId) {
-        current[host] = nil
-        arrived[host] = nil
-    }
-
-    func isCurrent(_ host: HostId, _ generation: Int) -> Bool {
-        current[host] == generation
-    }
-
-    /// A `PortsChanged` of `host` came: kept while its request is out.
-    mutating func event(_ host: HostId, _ payload: [String: Any]) {
-        if current[host] != nil { arrived[host, default: []].append(payload) }
-    }
-
-    /// The reply to request `generation` came: the events to apply again after it, or nil when
-    /// the reply is old (its connection dropped, or a newer request went out).
-    mutating func finish(_ host: HostId, _ generation: Int) -> [[String: Any]]? {
-        guard current[host] == generation else { return nil }
-        current[host] = nil
-        return arrived.removeValue(forKey: host) ?? []
-    }
-}
-
 /// Which host Forward Port… is for: the focused pane's when it is remote; else the one
 /// connected host; else the user picks among them.
 enum ForwardHostChoice: Equatable {
@@ -473,6 +451,14 @@ extension SessionManager {
         pb.setString(url, forType: .string)
     }
 
+    /// Closes forward `id` off the main thread: closing waits until its listeners are closed,
+    /// which must not hold up the app (the change comes back through the status callback).
+    static func closeForward(_ id: UInt64) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: id)])
+        }
+    }
+
     /// Opens `f`'s link if it is still open.
     static func openForwardLink(_ f: ForwardInfo) {
         guard let link = liveLink(of: f), let url = URL(string: link) else {
@@ -482,43 +468,19 @@ extension SessionManager {
         NSWorkspace.shared.open(url)
     }
 
-    /// `host` connected: every pane's port list at once, so its forwards don't go by lists of
-    /// panes that ended while it was away (no event says so). An older daemon answers an error.
-    func fetchRemotePorts(_ host: HostId) {
-        let generation = Remotes.shared.portsRequests.start(host)
-        Core.shared.requestAsync(object: ["Ports": ["pane": NSNull()]], host: host, timeout: 10) { resp in
-            // From a connection that has dropped (or been replaced) since: what it says is old.
-            guard let arrived = Remotes.shared.portsRequests.finish(host, generation) else { return }
-            guard let v = JSON.variant(resp), v.name == "Ports", let panes = v.payload as? [Any] else { return }
-            _ = Core.shared.remoteCall(["op": "ports_snapshot", "host": host, "panes": panes])
-            // Events that came while it was on its way may be newer than it: again, in order.
-            for payload in arrived { SessionManager.shared.applyRemotePorts(payload, host: host) }
-        }
-    }
-
     /// `host`'s connection dropped: what listens there is unknown until it is back.
     func remotePortsUnknown(_ host: HostId) {
-        Remotes.shared.portsRequests.invalidate(host)
         _ = Core.shared.remoteCall(["op": "host_disconnected", "host": host])
     }
 
     /// A `PortsChanged` from a remote host: its forwards learn whether their port is still there.
     func remotePortsChanged(_ payload: [String: Any]?, host: HostId) {
-        guard host != localHost, let payload else { return }
-        Remotes.shared.portsRequests.event(host, payload)
-        applyRemotePorts(payload, host: host)
-        // Plugins hear it once, as it comes: `fetchRemotePorts` applies it again for the
-        // forwards only. Running already only when the host's daemon says so.
-        if let pane = jsonUInt64(payload["pane"]) {
-            Extensions.shared.reportPorts(host: host, pane: pane, ports: payload["ports"] ?? [],
-                                          complete: payload["complete"] ?? true,
-                                          initial: jsonBool(payload["initial"]) ?? false)
-        }
-    }
-
-    func applyRemotePorts(_ payload: [String: Any], host: HostId) {
-        guard let pane = jsonUInt64(payload["pane"]) else { return }
+        guard host != localHost, let payload, let pane = jsonUInt64(payload["pane"]) else { return }
         _ = Core.shared.remoteCall(["op": "ports_changed", "host": host, "pane": NSNumber(value: pane),
                                     "ports": payload["ports"] ?? [], "complete": payload["complete"] ?? true])
+        // This Mac's plugins hear it too: running already only when the host's daemon says so.
+        Extensions.shared.reportPorts(host: host, pane: pane, ports: payload["ports"] ?? [],
+                                      complete: payload["complete"] ?? true,
+                                      initial: jsonBool(payload["initial"]) ?? false)
     }
 }

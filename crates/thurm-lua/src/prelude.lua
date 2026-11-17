@@ -211,7 +211,8 @@ function thurm.ports(pane)
   end
   local entry = list[1]
   if entry == nil then
-    return {}, true
+    -- Not looked at: nothing is known.
+    return {}, false
   end
   return entry.ports, entry.complete
 end
