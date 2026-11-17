@@ -559,19 +559,19 @@ pub fn download_reserved(
             reserved.display()
         ))
     };
-    // Never through a link put in its place, and only into the empty file reserved.
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(reserved)
-        .map_err(|_| changed())?;
-    let meta = file
-        .metadata()
-        .map_err(|e| TransferError::Local(format!("{}: {e}", reserved.display())))?;
-    if !meta.is_file() || meta.len() != 0 || (meta.dev(), meta.ino()) != ours {
-        return Err(changed());
-    }
     let got = (|| {
+        // Never through a link put in its place, and only into the empty file reserved.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(reserved)
+            .map_err(|_| changed())?;
+        let meta = file
+            .metadata()
+            .map_err(|e| TransferError::Local(format!("{}: {e}", reserved.display())))?;
+        if !meta.is_file() || meta.len() != 0 || (meta.dev(), meta.ino()) != ours {
+            return Err(changed());
+        }
         let info = host.client.download_begin(pane, path, None)?;
         let ticket = info
             .ticket

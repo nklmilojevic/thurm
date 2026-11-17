@@ -1185,6 +1185,14 @@ fn a_download_nobody_answers_gives_its_slot_back() {
     drop(held);
 }
 
+/// Moves the reservation at `path` out of the name's way, still there: a file deleted can
+/// hand its inode number to the next one made (Linux does), which would then pass for it.
+fn set_aside(path: &Path) {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(".aside");
+    std::fs::rename(path, aside).unwrap();
+}
+
 /// Makes `path` as a reservation does (a new empty file), and gives its device and inode.
 fn reserve(path: &Path) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
@@ -1220,7 +1228,7 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
     // it is not the reserved file, so nothing is written into it, and it is left alone.
     let taken = downloads.join("taken.pdf");
     let id = reserve(&taken);
-    std::fs::remove_file(&taken).unwrap();
+    set_aside(&taken);
     std::fs::File::create_new(&taken).unwrap();
     let e = get("report.pdf", &taken, id, &mut |_| {}).unwrap_err();
     assert!(matches!(e, TransferError::Local(_)), "{e}");
@@ -1229,14 +1237,14 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
     // A file with something in it in its place is left alone too.
     let full = downloads.join("full.pdf");
     let id = reserve(&full);
-    std::fs::remove_file(&full).unwrap();
+    set_aside(&full);
     std::fs::write(&full, b"someone else's").unwrap();
     assert!(get("report.pdf", &full, id, &mut |_| {}).is_err());
     assert_eq!(std::fs::read(&full).unwrap(), b"someone else's");
     // Or a link in its place: not followed.
     let linked = downloads.join("linked.pdf");
     let id = reserve(&linked);
-    std::fs::remove_file(&linked).unwrap();
+    set_aside(&linked);
     std::os::unix::fs::symlink(dir.join("elsewhere"), &linked).unwrap();
     assert!(get("report.pdf", &linked, id, &mut |_| {}).is_err());
     assert!(!dir.join("elsewhere").exists());
@@ -1273,6 +1281,16 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
     .unwrap_err();
     assert!(matches!(e, TransferError::Cancelled), "{e}");
     assert!(!cancelled.exists());
+    // Refused before anything is asked of the host, the reservation still its own: given back
+    // too. (Permissions do not stop root.)
+    if unsafe { libc::geteuid() } != 0 {
+        let locked = downloads.join("locked.pdf");
+        let id = reserve(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let e = get("report.pdf", &locked, id, &mut |_| {}).unwrap_err();
+        assert!(matches!(e, TransferError::Local(_)), "{e}");
+        assert!(!locked.exists());
+    }
 }
 
 #[test]
