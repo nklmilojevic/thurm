@@ -796,11 +796,14 @@ impl Transfers {
             .collect();
         let mut kept = Vec::new();
         if let Ok(panes) = std::fs::read_dir(&self.root) {
-            for pane in panes.flatten() {
+            // Only the tree's own directories: a link put in a pane's or a batch's place is not
+            // followed, so nothing outside it is walked or deleted.
+            let is_dir = |e: &std::fs::DirEntry| e.file_type().is_ok_and(|t| t.is_dir());
+            for pane in panes.flatten().filter(is_dir) {
                 let Ok(batches) = std::fs::read_dir(pane.path()) else {
                     continue;
                 };
-                for batch in batches.flatten() {
+                for batch in batches.flatten().filter(is_dir) {
                     let dir = batch.path();
                     if busy.contains(dir.as_path()) {
                         continue;
@@ -1538,13 +1541,21 @@ fn remove_batch(dir: &Path) -> bool {
     }
 }
 
+/// Makes `dir` (and what leads to it) private; `dir` itself must be a directory, not a link to
+/// one: what goes in it stays in the tree.
 fn make_private_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
-        .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)))
+        .and_then(|()| {
+            if std::fs::symlink_metadata(dir)?.is_dir() {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            } else {
+                Err(std::io::Error::other("not a directory"))
+            }
+        })
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))
 }
 
@@ -1591,7 +1602,7 @@ fn count_entries(dir: &Path) -> u64 {
     entries
         .flatten()
         .map(|e| {
-            1 + if e.path().is_dir() {
+            1 + if e.file_type().is_ok_and(|t| t.is_dir()) {
                 count_entries(&e.path())
             } else {
                 0
@@ -1649,6 +1660,39 @@ mod tests {
         let dir = t.new_batch_dir(3).unwrap();
         assert!(dir.join(PARTS).is_dir());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn links_in_the_tree_are_not_followed_to_what_they_point_at() {
+        let base = std::env::temp_dir().join(format!("thurm-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("drops");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("victim")).unwrap();
+        std::fs::write(outside.join("victim/file"), b"keep me").unwrap();
+        std::fs::create_dir_all(root.join("8/old")).unwrap();
+        // A pane's directory, and a batch's, put back as links to a folder elsewhere; and a
+        // kept batch holding a link to itself.
+        std::os::unix::fs::symlink(&outside, root.join("7")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("8/linked")).unwrap();
+        std::os::unix::fs::symlink(".", root.join("8/old/loop")).unwrap();
+        let mut t = Transfers::new(root.clone());
+        t.keep = Duration::ZERO;
+        t.prune();
+        assert_eq!(
+            std::fs::read(outside.join("victim/file")).unwrap(),
+            b"keep me"
+        );
+        assert!(!root.join("8/old").exists());
+        // Nor is a batch made through a pane's directory that is a link.
+        let e = t.new_batch_dir(7).unwrap_err();
+        assert!(e.contains("not a directory"), "{e}");
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            1,
+            "a batch was made outside the tree"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
