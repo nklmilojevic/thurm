@@ -116,20 +116,37 @@ local function open(host, port, key, attempt, token)
   end
 end
 
+-- Ends the tries of a pane's port: a forward tried again later must not open what is no longer
+-- the server it was for.
+local function end_tries(key, port)
+  local id = key .. "#" .. port
+  tries[id] = (tries[id] or 0) + 1
+end
+
 thurm.on("ports_changed", function(ev)
   local key = (ev.host or "") .. "/" .. ev.id
-  -- The app lost the host (or quit): nothing is known of its ports until it is back.
+  local before = listed[key] or {}
+  -- The app lost the host (or quit): nothing is known of its ports until it is back, and what
+  -- was being tried for them ends (when it is back, its lists say what runs already).
   if ev.gone then
+    for port in pairs(before) do
+      end_tries(key, port)
+    end
     listed[key] = nil
     unsure[key] = nil
     return
   end
-  local before = listed[key] or {}
   local now = servers(ev.ports) or {}
   if not ev.complete then
     -- Some processes could not be read: a server missing from this list may still run.
     for port in pairs(before) do
       now[port] = true
+    end
+  end
+  -- A port that went: tries of it end (it opens anew if it comes back), whatever this list is.
+  for port in pairs(before) do
+    if not now[port] then
+      end_tries(key, port)
     end
   end
   listed[key] = next(now) and now or nil
@@ -149,12 +166,6 @@ thurm.on("ports_changed", function(ev)
       unsure[key] = true
     end
     return
-  end
-  -- A port that went: tries of it end (it opens anew if it comes back).
-  for port in pairs(before) do
-    if not now[port] then
-      tries[key .. "#" .. port] = (tries[key .. "#" .. port] or 0) + 1
-    end
   end
   for port in pairs(now) do
     if not before[port] then

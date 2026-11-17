@@ -9,6 +9,7 @@ struct FakeHost {
     /// Forward opens to the hosts `flaky` and `flaky2` so far: the first of each fails.
     flaky: std::sync::atomic::AtomicUsize,
     flaky2: std::sync::atomic::AtomicUsize,
+    flaky3: std::sync::atomic::AtomicUsize,
     events: Mutex<Option<Sender<(String, Value)>>>,
 }
 
@@ -56,6 +57,15 @@ impl Host for FakeHost {
             "forwards.open"
                 if params["host"] == "flaky"
                     && self.flaky.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
+            {
+                Err("devbox is not connected".into())
+            }
+            "forwards.open"
+                if params["host"] == "flaky3"
+                    && self
+                        .flaky3
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        == 0 =>
             {
                 Err("devbox is not connected".into())
             }
@@ -779,6 +789,14 @@ fn the_dev_server_example_opens_only_new_servers() {
     ports(Some("flaky2"), 10, &[7100], true, false);
     ports(Some("flaky2"), 10, &[], true, false);
     ports(Some("flaky2"), 10, &[7100], true, false);
+    // A forward that fails, then the app loses the host and connects again, the server running
+    // already: the earlier try does not open it.
+    ports(Some("flaky3"), 11, &[7200], true, false);
+    event(
+        json!({ "event": "ports_changed", "host": "flaky3", "id": 11, "ports": [],
+                  "complete": false, "gone": true }),
+    );
+    ports(Some("flaky3"), 11, &[7200], true, true);
     // 4000 really stops (a complete list) and starts again: news.
     ports(None, 3, &[4001], true, false);
     ports(None, 3, &[4000, 4001], true, false);
@@ -806,6 +824,7 @@ fn the_dev_server_example_opens_only_new_servers() {
         json!(["flaky", 7000, true]),
         json!(["flaky2", 7100, true]),
         json!(["flaky2", 7100, true]),
+        json!(["flaky3", 7200, true]),
         json!(["open", "http://localhost:4000/"]),
         json!(["flaky", 7000, true]),
     ];
