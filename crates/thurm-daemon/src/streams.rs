@@ -16,6 +16,9 @@ use thurm_proto::stream::{self, MAX_DATA, StreamClose, StreamFrame};
 /// Tickets one client may hold unused.
 pub const MAX_PENDING_PER_CLIENT: usize = 64;
 
+/// Tickets held unused, over all clients.
+pub const MAX_PENDING: usize = 1024;
+
 /// Streams open at once, over all clients.
 pub const MAX_OPEN: usize = 256;
 
@@ -121,6 +124,11 @@ impl Streams {
         let now = Instant::now();
         let mut pending = self.pending.lock();
         pending.retain(|_, r| r.expires > now);
+        if pending.len() >= MAX_PENDING {
+            return Err(format!(
+                "too many streams waiting to open (at most {MAX_PENDING} in all)"
+            ));
+        }
         if pending.values().filter(|r| r.client == client).count() >= MAX_PENDING_PER_CLIENT {
             return Err(format!(
                 "too many streams waiting to open (at most {MAX_PENDING_PER_CLIENT})"
@@ -137,6 +145,12 @@ impl Streams {
             },
         );
         Ok((ticket, self.ttl.as_millis().min(u32::MAX as u128) as u32))
+    }
+
+    /// Forgets the tickets `client` reserved and did not use: a ticket lasts only while the
+    /// connection that reserved it stays open.
+    pub fn client_gone(&self, client: u64) {
+        self.pending.lock().retain(|_, r| r.client != client);
     }
 
     /// Takes the reservation for `ticket`, presented by `principal`. Any attempt uses the ticket
@@ -221,7 +235,22 @@ impl Out {
 
 /// Carries an opened stream: `reader` and `writer` are the connection's two halves (the reader
 /// may hold bytes already read past the `StreamOpen`). Returns once the stream is over.
-pub fn serve<R: Read>(kind: Kind, mut reader: R, writer: UnixStream, _open: OpenStream) {
+pub fn serve<R: Read>(kind: Kind, reader: R, writer: UnixStream, open: OpenStream) {
+    serve_with(kind, reader, writer, open, |name, pump| {
+        std::thread::Builder::new().name(name).spawn(pump)
+    });
+}
+
+type Pump = Box<dyn FnOnce() + Send>;
+
+/// [`serve`], starting the target-to-caller thread with `spawn`.
+fn serve_with<R: Read>(
+    kind: Kind,
+    mut reader: R,
+    writer: UnixStream,
+    _open: OpenStream,
+    spawn: impl FnOnce(String, Pump) -> std::io::Result<std::thread::JoinHandle<()>>,
+) {
     let out = Arc::new(Mutex::new(Out {
         socket: writer,
         sent_end: false,
@@ -248,9 +277,21 @@ pub fn serve<R: Read>(kind: Kind, mut reader: R, writer: UnixStream, _open: Open
     // The target to the caller.
     let up = {
         let out = out.clone();
-        std::thread::Builder::new()
-            .name(format!("stream-{port}"))
-            .spawn(move || pump_target(tcp_rd, &out))
+        spawn(
+            format!("stream-{port}"),
+            Box::new(move || pump_target(tcp_rd, &out)),
+        )
+    };
+    // Without it nothing would ever end the caller's side: say so and stop.
+    let up = match up {
+        Ok(up) => up,
+        Err(e) => {
+            let _ = tcp.shutdown(Shutdown::Both);
+            out.lock().close(StreamClose::Internal(format!(
+                "starting the stream's thread: {e}"
+            )));
+            return;
+        }
     };
     // The caller to the target.
     loop {
@@ -281,9 +322,7 @@ pub fn serve<R: Read>(kind: Kind, mut reader: R, writer: UnixStream, _open: Open
         }
     }
     let _ = tcp.shutdown(Shutdown::Both);
-    if let Ok(up) = up {
-        let _ = up.join();
-    }
+    let _ = up.join();
 }
 
 /// Copies what the target sends into `Data` frames, then `End` (or a close on an error).
@@ -410,6 +449,63 @@ mod tests {
         }
         assert!(s.reserve(Kind::Tcp { port: 1 }, 1, peer(501)).is_err());
         s.reserve(Kind::Tcp { port: 1 }, 2, peer(501)).unwrap();
+    }
+
+    #[test]
+    fn pending_tickets_are_capped_in_all() {
+        let s = Streams::with_ttl(Duration::from_secs(60));
+        let clients = (MAX_PENDING / MAX_PENDING_PER_CLIENT) as u64;
+        for client in 0..clients {
+            for _ in 0..MAX_PENDING_PER_CLIENT {
+                s.reserve(Kind::Tcp { port: 1 }, client, peer(501)).unwrap();
+            }
+        }
+        let e = s
+            .reserve(Kind::Tcp { port: 1 }, clients, peer(501))
+            .unwrap_err();
+        assert!(e.contains("in all"), "{e}");
+        s.client_gone(0);
+        s.reserve(Kind::Tcp { port: 1 }, clients, peer(501))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_gone_client_leaves_no_tickets() {
+        let s = Streams::with_ttl(Duration::from_secs(60));
+        let (mine, _) = s.reserve(Kind::Tcp { port: 1 }, 1, peer(501)).unwrap();
+        let (theirs, _) = s.reserve(Kind::Tcp { port: 1 }, 2, peer(501)).unwrap();
+        s.client_gone(1);
+        assert_eq!(s.pending(), 1);
+        let Err(e) = s.claim(&mine, &peer(501)) else {
+            panic!("a gone client's ticket opened");
+        };
+        assert!(e.contains("unknown or used"), "{e}");
+        s.claim(&theirs, &peer(501)).unwrap();
+    }
+
+    #[test]
+    fn a_stream_whose_thread_cannot_start_closes_with_the_reason() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let s = Streams::with_ttl(Duration::from_secs(60));
+        let (t, _) = s.reserve(Kind::Tcp { port }, 1, peer(501)).unwrap();
+        let (r, open) = s.claim(&t, &peer(501)).unwrap();
+        let (mut caller, daemon) = UnixStream::pair().unwrap();
+        let reader = daemon.try_clone().unwrap();
+        let server = std::thread::spawn(move || {
+            serve_with(r.kind, reader, daemon, open, |_, _| {
+                Err(std::io::Error::other("no threads left"))
+            })
+        });
+        let Some(StreamFrame::Close(StreamClose::Internal(why))) =
+            stream::read_frame(&mut caller).unwrap()
+        else {
+            panic!("no Internal close");
+        };
+        assert!(why.contains("no threads left"), "{why}");
+        assert_eq!(stream::read_frame(&mut caller).unwrap(), None);
+        server.join().unwrap();
+        assert_eq!(s.open.load(Ordering::Acquire), 0);
     }
 
     #[test]
