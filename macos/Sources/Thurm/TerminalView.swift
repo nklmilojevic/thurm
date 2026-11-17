@@ -95,6 +95,9 @@ final class TerminalView: NSView, NSTextInputClient {
     private var lockBadge: NSImageView?
     private var markedLabel: NSTextField?
     private var toastView: NSView?
+    /// The upload under way from this pane, and the toast that shows it.
+    private var uploadID: UInt64?
+    private var uploadToast: (box: NSView, label: NSTextField)?
     private var restoredToastShown = false
     private var progressBar: ProgressBarView?
     private var offlineOverlay: OfflineOverlay?
@@ -1372,6 +1375,13 @@ final class TerminalView: NSView, NSTextInputClient {
     @objc func paste(_ sender: Any?) {
         if isOffline { return }
         let pb = NSPasteboard.general
+        // Files and images copied here go to a remote pane's host as files.
+        if pane.isRemote, Core.shared.canTransfer(pane.host) {
+            switch Self.uploadPlan(pb, pasting: true) {
+            case .none: break
+            case let plan: return startUpload(plan, from: pb)
+            }
+        }
         if pb.string(forType: .string) == nil, pb.availableType(from: [.png, .tiff]) != nil {
             // An image: its file's path (on the pane's host).
             if let path = imagePath(pb), let escaped = shellEscape(path) {
@@ -1412,6 +1422,17 @@ final class TerminalView: NSView, NSTextInputClient {
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         if isOffline { return false }
+        // Files dropped on a remote pane go to its host, and their paths there are typed.
+        if pane.isRemote, Core.shared.canTransfer(pane.host) {
+            switch Self.uploadPlan(sender.draggingPasteboard, pasting: false) {
+            case .none: break
+            case let plan:
+                window?.makeKeyAndOrderFront(nil)
+                window?.makeFirstResponder(self)
+                startUpload(plan, from: sender.draggingPasteboard)
+                return true
+            }
+        }
         guard let text = dropText(sender.draggingPasteboard, materialize: true) else { return false }
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
@@ -1441,6 +1462,132 @@ final class TerminalView: NSView, NSTextInputClient {
         }
         if let text = pb.string(forType: .string), !text.isEmpty { return text }
         return nil
+    }
+
+    /// What a drop or paste on a remote pane sends to its host.
+    enum UploadPlan: Equatable {
+        /// Nothing: text, a link, or nothing usable.
+        case none
+        /// Files on this Mac.
+        case files([URL])
+        /// A folder is among the files: nothing is sent.
+        case folder(String)
+        /// Image data (a screenshot, an image dragged out of a browser).
+        case image
+    }
+
+    /// What `pb` sends to a remote pane's host. A paste with text sends the text instead.
+    static func uploadPlan(_ pb: NSPasteboard, pasting: Bool) -> UploadPlan {
+        let fileOpts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: fileOpts) as? [URL], !urls.isEmpty {
+            for url in urls {
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                    return .folder(url.lastPathComponent)
+                }
+            }
+            return .files(urls)
+        }
+        if pb.availableType(from: [.png, .tiff]) != nil, !pasting || pb.string(forType: .string) == nil {
+            return .image
+        }
+        return .none
+    }
+
+    /// Sends what `plan` names to the pane's host as one batch, with a toast that shows how far
+    /// it got and can cancel it.
+    private func startUpload(_ plan: UploadPlan, from pb: NSPasteboard) {
+        let host = pane.host
+        var files: [(path: String, name: String?)] = []
+        switch plan {
+        case .none:
+            return
+        case .folder(let name):
+            showToast("\(name) is a folder: only files are sent to \(host).", duration: 5)
+            return
+        case .files(let urls):
+            files = urls.map { ($0.path, nil) }
+        case .image:
+            guard let path = Self.saveDroppedImage(pb) else {
+                showToast("Could not read the image.", duration: 5)
+                return
+            }
+            files = [(path, (path as NSString).lastPathComponent)]
+        }
+        if let running = uploadID { Core.shared.cancelTransfer(running) }
+        let what = files.count == 1 ? (files[0].name ?? (files[0].path as NSString).lastPathComponent)
+            : "\(files.count) files"
+        showUploadToast("Sending \(what) to \(host)…")
+        var id: UInt64?
+        id = Core.shared.upload(pane, files: files, onProgress: { [weak self] p in
+            guard let self, self.uploadID == id else { return }
+            self.showUploadToast("Sending \(what) to \(host)… \(Int(p.fraction * 100))%")
+        }, onFinish: { [weak self] outcome in
+            guard let self else { return }
+            if id != nil, self.uploadID != id { return }
+            self.uploadID = nil
+            self.hideUploadToast()
+            if outcome.cancelled {
+                self.showToast("Upload cancelled")
+            } else if outcome.folder {
+                self.showToast("Only files are sent to \(host), not folders.", duration: 5)
+            } else if let e = outcome.error {
+                self.showToast("Could not send \(what) to \(host): \(e)", duration: 6)
+            }
+        })
+        uploadID = id
+        if id == nil { hideUploadToast() }
+    }
+
+    /// The upload toast, made or updated: stays until the upload ends.
+    private func showUploadToast(_ text: String) {
+        if let t = uploadToast, t.box === toastView {
+            t.label.stringValue = text
+            t.label.sizeToFit()
+            t.box.frame.size.width = t.label.frame.width + 90
+            layoutOverlays()
+            return
+        }
+        toastView?.removeFromSuperview()
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(fadeToast), object: nil)
+        let chrome = SessionManager.shared.config.chrome
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        label.textColor = chrome.contentPrimary
+        label.sizeToFit()
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelUpload(_:)))
+        cancel.bezelStyle = .inline
+        cancel.controlSize = .small
+        cancel.font = NSFont.systemFont(ofSize: 11)
+        cancel.sizeToFit()
+        let height = max(label.frame.height, cancel.frame.height) + 8
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: label.frame.width + 90, height: height))
+        box.wantsLayer = true
+        box.layer?.backgroundColor = chrome.surfaceRaised.withAlphaComponent(0.92).cgColor
+        box.layer?.cornerRadius = ChromeRadius.control
+        label.frame.origin = NSPoint(x: 10, y: (height - label.frame.height) / 2)
+        label.autoresizingMask = [.maxXMargin]
+        cancel.frame.origin = NSPoint(x: box.frame.width - cancel.frame.width - 8,
+                                      y: (height - cancel.frame.height) / 2)
+        cancel.autoresizingMask = [.minXMargin]
+        box.addSubview(label)
+        box.addSubview(cancel)
+        addSubview(box)
+        toastView = box
+        uploadToast = (box, label)
+        layoutOverlays()
+    }
+
+    private func hideUploadToast() {
+        if let t = uploadToast, t.box === toastView {
+            toastView?.removeFromSuperview()
+            toastView = nil
+        }
+        uploadToast = nil
+    }
+
+    @objc private func cancelUpload(_ sender: Any?) {
+        if let id = uploadID { Core.shared.cancelTransfer(id) }
     }
 
     /// The pasteboard's image as PNG.
@@ -1878,25 +2025,48 @@ final class TerminalView: NSView, NSTextInputClient {
     var openPreview: ((URL) -> Void)?
 
     private func quickLook(_ request: FilePreviewRequest) {
+        if request.isRemote, Core.shared.canTransfer(pane.host) {
+            return previewRemote(request.reference, cwd: request.cwd)
+        }
         do {
             let url = try request.reference.localFile(cwd: request.cwd, isRemote: request.isRemote)
-            if let openPreview { return openPreview(url) }
-            guard let window, let panel = QLPreviewPanel.shared() else { return }
-            window.makeKeyAndOrderFront(nil)
-            window.makeFirstResponder(self)
-            previewURL = url
-            panel.makeKeyAndOrderFront(nil)
-            panel.updateController()
-            guard panel.currentController as AnyObject? === self else {
-                previewURL = nil
-                if panel.currentController == nil { panel.orderOut(nil) }
-                showToast("Quick Look could not open the preview.", duration: 5)
-                return
-            }
-            panel.reloadData()
+            present(url)
         } catch {
             showToast(error.localizedDescription, duration: 6)
         }
+    }
+
+    /// Fetches a file of this remote pane's host (or finds it cached) and previews it.
+    func previewRemote(_ reference: TerminalFileReference, cwd: String?) {
+        showToast("Fetching the file from \(pane.host)…", duration: 20)
+        RemoteFileCache.shared.fetch(reference, pane: pane, cwd: cwd) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let url):
+                self.removeToast()
+                self.present(url)
+            case .failure(let error):
+                self.showToast(error.localizedDescription, duration: 6)
+            }
+        }
+    }
+
+    /// Shows `url`, a file on this Mac, in Quick Look.
+    private func present(_ url: URL) {
+        if let openPreview { return openPreview(url) }
+        guard let window, let panel = QLPreviewPanel.shared() else { return }
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(self)
+        previewURL = url
+        panel.makeKeyAndOrderFront(nil)
+        panel.updateController()
+        guard panel.currentController as AnyObject? === self else {
+            previewURL = nil
+            if panel.currentController == nil { panel.orderOut(nil) }
+            showToast("Quick Look could not open the preview.", duration: 5)
+            return
+        }
+        panel.reloadData()
     }
 
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {

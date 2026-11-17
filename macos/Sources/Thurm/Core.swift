@@ -22,6 +22,74 @@ final class ConnectionToken {
 
 // C callbacks. They run on a Rust background thread; they must not capture context.
 
+/// How far a transfer got.
+struct TransferProgress: Equatable {
+    var done: UInt64
+    var total: UInt64
+
+    var fraction: Double { total == 0 ? 1 : min(1, Double(done) / Double(total)) }
+}
+
+/// How a transfer ended (`thurm_upload`, `thurm_download`).
+struct TransferOutcome {
+    var error: String?
+    var cancelled = false
+    /// The host's daemon cannot take or send files.
+    var unsupported = false
+    /// A folder was among the files; nothing was sent.
+    var folder = false
+    var notModified = false
+    /// A download's file: its name, path on the host, size and version.
+    var name: String?
+    var path: String?
+    var size: UInt64 = 0
+    var version: String?
+
+    init(error: String? = nil) {
+        self.error = error
+    }
+
+    init(json: [String: Any]) {
+        error = json["error"] as? String
+        cancelled = json["cancelled"] as? Bool ?? false
+        unsupported = json["unsupported"] as? Bool ?? false
+        folder = json["folder"] as? Bool ?? false
+        notModified = json["not_modified"] as? Bool ?? false
+        if let info = json["info"] as? [String: Any] {
+            name = info["name"] as? String
+            path = info["path"] as? String
+            size = (info["size"] as? NSNumber)?.uint64Value ?? 0
+            version = info["version"] as? String
+        }
+    }
+}
+
+private final class TransferBox {
+    let onProgress: (TransferProgress) -> Void
+    let onFinish: (TransferOutcome) -> Void
+
+    init(_ onProgress: @escaping (TransferProgress) -> Void, _ onFinish: @escaping (TransferOutcome) -> Void) {
+        self.onProgress = onProgress
+        self.onFinish = onFinish
+    }
+}
+
+/// Runs on the transfer's thread: progress until the final message, which releases the box.
+private let coreTransferCallback: thurm_transfer_cb = { ctx, json in
+    guard let ctx, let json else { return }
+    let value = JSON.decode(String(cString: json)) as? [String: Any] ?? [:]
+    if value["finished"] as? Bool == true {
+        let box = Unmanaged<TransferBox>.fromOpaque(ctx).takeRetainedValue()
+        let outcome = TransferOutcome(json: value)
+        DispatchQueue.main.async { box.onFinish(outcome) }
+    } else {
+        let box = Unmanaged<TransferBox>.fromOpaque(ctx).takeUnretainedValue()
+        let progress = TransferProgress(done: (value["done"] as? NSNumber)?.uint64Value ?? 0,
+                                        total: (value["total"] as? NSNumber)?.uint64Value ?? 0)
+        DispatchQueue.main.async { box.onProgress(progress) }
+    }
+}
+
 private let coreEventCallback: thurm_event_cb = { ctx, json in
     guard let ctx = ctx, let json = json else { return }
     let token = Unmanaged<ConnectionToken>.fromOpaque(ctx).takeUnretainedValue()
@@ -402,6 +470,71 @@ final class Core {
             thurm_string_free(e)
         }
         return (nil, message)
+    }
+
+    // MARK: File transfers
+
+    /// Whether `host`'s daemon listed `cap` when it connected.
+    func hasCapability(_ host: HostId, _ cap: String) -> Bool {
+        guard let c = clients[host] else { return false }
+        return cap.withCString { thurm_has_capability(c, $0) }
+    }
+
+    /// Whether `host`'s daemon takes and sends files on streams.
+    func canTransfer(_ host: HostId) -> Bool { hasCapability(host, "transfer") }
+
+    /// Sends `files` (local paths, each with the name to send it as, or nil for its own) to
+    /// `pane`'s host as one batch; the daemon types their paths into the pane once all have
+    /// landed. `onProgress` and `onFinish` run on the main thread. Returns the id for
+    /// `cancelTransfer`, or nil when nothing started (`onFinish` has the reason).
+    @discardableResult
+    func upload(_ pane: PaneKey, files: [(path: String, name: String?)],
+                onProgress: @escaping (TransferProgress) -> Void,
+                onFinish: @escaping (TransferOutcome) -> Void) -> UInt64? {
+        guard let c = clients[pane.host] else {
+            onFinish(TransferOutcome(error: "\(pane.host) is not connected"))
+            return nil
+        }
+        let list: [[String: Any]] = files.map { f in
+            var entry: [String: Any] = ["path": f.path]
+            if let name = f.name { entry["name"] = name }
+            return entry
+        }
+        let box = Unmanaged.passRetained(TransferBox(onProgress, onFinish)).toOpaque()
+        let id = JSON.encode(list).withCString { thurm_upload(c, pane.id, $0, coreTransferCallback, box) }
+        return id == 0 ? nil : id
+    }
+
+    /// Fetches the file at `path` as `pane` sees it into `dest`: nothing is written while
+    /// `ifVersion` is still its version (`notModified`), and a file over `maxBytes` (0: any size)
+    /// is refused. Callbacks run on the main thread. Returns the id for `cancelTransfer`.
+    @discardableResult
+    func download(_ pane: PaneKey, path: String, to dest: URL, ifVersion: String? = nil,
+                  maxBytes: UInt64 = 0,
+                  onProgress: @escaping (TransferProgress) -> Void,
+                  onFinish: @escaping (TransferOutcome) -> Void) -> UInt64? {
+        guard let c = clients[pane.host] else {
+            onFinish(TransferOutcome(error: "\(pane.host) is not connected"))
+            return nil
+        }
+        let box = Unmanaged.passRetained(TransferBox(onProgress, onFinish)).toOpaque()
+        let id = path.withCString { p in
+            dest.path.withCString { d in
+                if let ifVersion {
+                    return ifVersion.withCString { v in
+                        thurm_download(c, pane.id, p, d, v, maxBytes, coreTransferCallback, box)
+                    }
+                }
+                return thurm_download(c, pane.id, p, d, nil, maxBytes, coreTransferCallback, box)
+            }
+        }
+        return id == 0 ? nil : id
+    }
+
+    /// Stops an upload (nothing is typed or kept on the host) or a download.
+    func cancelTransfer(_ id: UInt64) {
+        thurm_upload_cancel(id)
+        thurm_download_cancel(id)
     }
 
     // MARK: Remote operations

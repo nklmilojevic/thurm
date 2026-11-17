@@ -283,4 +283,54 @@ final class FilePreviewTests: XCTestCase {
         view.removeFromSuperview()
         XCTAssertFalse(QLPreviewPanel.shared().isVisible)
     }
+    func testRemoteReferencesAreAskedOfTheirHost() throws {
+        XCTAssertEqual(try TerminalFileReference.path("src/main.swift:12:3").remotePaths(),
+                       ["src/main.swift:12:3", "src/main.swift"])
+        XCTAssertEqual(try TerminalFileReference.path("~/notes.md").remotePaths(), ["~/notes.md"])
+        XCTAssertEqual(try TerminalFileReference.path("/etc/hosts").remotePaths(), ["/etc/hosts"])
+        // A file URL printed on the host names the host's file, whatever host it carries.
+        XCTAssertEqual(try TerminalFileReference.fileURL(URL(string: "file://devbox/tmp/My%20Report.pdf")!)
+            .remotePaths(), ["/tmp/My Report.pdf"])
+        for bad in ["~root/x", "sftp://host/tmp/a.pdf", "host:/tmp/a.pdf", "user@host:report.pdf"] {
+            XCTAssertThrowsError(try TerminalFileReference.path(bad).remotePaths(), bad) {
+                XCTAssertEqual($0 as? FilePreviewError, .invalid)
+            }
+        }
+        XCTAssertThrowsError(try TerminalFileReference.fileURL(URL(string: "file:///a.pdf?x=1")!).remotePaths())
+    }
+
+    func testRemoteFilesAreCachedByHostPathAndVersion() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thurm-remote-cache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = RemoteFileCache(root: root, maxBytes: 10)
+        let entry = cache.entry(host: "devbox", path: "a.txt", cwd: "/work")
+        XCTAssertEqual(entry, cache.entry(host: "devbox", path: "/work/a.txt", cwd: "/elsewhere"))
+        XCTAssertNotEqual(entry, cache.entry(host: "other", path: "/work/a.txt", cwd: nil))
+        XCTAssertNotEqual(entry, cache.entry(host: "devbox", path: "a.txt", cwd: "/other"))
+        XCTAssertNil(cache.cached(entry))
+
+        try Data("1234".utf8).write(to: try cache.prepare(entry))
+        let file = try cache.store(entry, name: "a.txt", version: "v1")
+        XCTAssertEqual(file.lastPathComponent, "a.txt")
+        XCTAssertEqual(cache.cached(entry)?.file, file)
+        XCTAssertEqual(cache.cached(entry)?.version, "v1")
+        // A file changing as it was read has no version: it is fetched again next time.
+        let fresh = cache.entry(host: "devbox", path: "/b.log", cwd: nil)
+        try Data("12".utf8).write(to: try cache.prepare(fresh))
+        _ = try cache.store(fresh, name: "b.log", version: nil)
+        XCTAssertNil(cache.cached(fresh))
+        // A name from the host never leaves the entry.
+        let odd = cache.entry(host: "devbox", path: "/c", cwd: nil)
+        try Data("1".utf8).write(to: try cache.prepare(odd))
+        XCTAssertEqual(try cache.store(odd, name: "../../x", version: "v").lastPathComponent, "file")
+
+        // Over the limit, the least recently fetched entries go; the one just stored stays.
+        try FileManager.default.setAttributes([.modificationDate: Date.distantPast], ofItemAtPath: entry.path)
+        let big = cache.entry(host: "devbox", path: "/big", cwd: nil)
+        try Data(repeating: 7, count: 8).write(to: try cache.prepare(big))
+        _ = try cache.store(big, name: "big", version: "v")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: entry.path))
+        XCTAssertNotNil(cache.cached(big))
+    }
 }

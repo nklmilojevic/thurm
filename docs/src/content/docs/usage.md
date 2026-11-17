@@ -192,8 +192,10 @@ such as `report.pdf:42` keep the full filename check.
 Relative paths use the clicked pane's current reported directory when the menu
 opens. Old output does not retain its original directory. Use an absolute path
 if the pane has since changed directory or its directory is unknown.
-Remote panes and file links to other hosts cannot use Quick Look. Copy the file
-to this Mac first. Missing files, unreadable files, folders, and special files
+In a remote pane, Quick Look fetches the file from the host first (see
+[Remote hosts](/remote/#files)). Hosts running an older Thurm, and file links to
+other hosts from this Mac's panes, cannot use Quick Look: copy the file to this
+Mac first. Missing files, unreadable files, folders, and special files
 show a message. In programs that use the mouse, hold Shift when you right-click
 to open the Thurm context menu; Cmd+Option+click works there as it is.
 
@@ -219,6 +221,11 @@ The Option key is not Alt by default. Set `window.option_as_alt` to `left`,
 Thurm can enable Secure Keyboard Entry when it detects a password prompt.
 It releases this protection when the app is not in front. It can also ask before
 a paste with multiple lines when the program does not use bracketed paste mode.
+
+Drop files on a pane to insert their paths, quoted for the shell and separated
+by spaces. A pasted or dropped image is saved to a file first. In a remote pane,
+dropped files, and files copied in Finder and pasted, go to the host, and their
+paths there are inserted (see [Remote hosts](/remote/#files)).
 
 Allow notifications in macOS System Settings to receive agent and command
 notifications. By default, command notifications apply to commands that take at

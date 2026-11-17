@@ -554,19 +554,69 @@ extension SessionManager {
             if alert.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(url) }
         case .copyPath(let path):
             let path = path ?? url.path
+            let transfers = Core.shared.canTransfer(pane.host)
             let alert = NSAlert()
             alert.messageText = "This is a file on \(pane.host)"
-            alert.informativeText = "\(path)\n\nFiles on a remote host are not opened on this Mac."
+            alert.informativeText = transfers
+                ? "\(path)\n\nPreview it or download a copy to this Mac."
+                : "\(path)\n\nFiles on a remote host are not opened on this Mac."
             alert.addButton(withTitle: "Copy Path")
+            if transfers {
+                alert.addButton(withTitle: "Quick Look")
+                alert.addButton(withTitle: "Download")
+            }
             alert.addButton(withTitle: "Cancel")
-            if alert.runModal() == .alertFirstButtonReturn {
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
                 let pb = NSPasteboard.general
                 pb.clearContents()
                 pb.setString(path, forType: .string)
+            case .alertSecondButtonReturn where transfers:
+                view(for: pane)?.previewRemote(.path(path), cwd: panes[pane]?.cwd)
+            case .alertThirdButtonReturn where transfers:
+                downloadRemoteFile(path, from: pane)
+            default:
+                break
             }
         case .ignore:
             break
         }
+    }
+
+    /// Copies the file at `path` on `pane`'s host into ~/Downloads (under a free name), and
+    /// shows it in Finder.
+    func downloadRemoteFile(_ path: String, from pane: PaneKey) {
+        let view = view(for: pane)
+        let fm = FileManager.default
+        let downloads = fm.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        let name = (path as NSString).lastPathComponent
+        let dest = Self.freeName(name.isEmpty ? "file" : name, in: downloads)
+        view?.showToast("Downloading \(name) from \(pane.host)…", duration: 600)
+        Core.shared.download(pane, path: path, to: dest, onProgress: { p in
+            view?.showToast("Downloading \(name) from \(pane.host)… \(Int(p.fraction * 100))%", duration: 600)
+        }, onFinish: { outcome in
+            if let e = outcome.error {
+                view?.showToast("Could not download \(name): \(e)", duration: 6)
+                return
+            }
+            view?.showToast("Downloaded \(dest.lastPathComponent) to Downloads")
+            NSWorkspace.shared.activateFileViewerSelecting([dest])
+        })
+    }
+
+    /// `name` in `dir`, or `name 2`, `name 3`… when taken.
+    static func freeName(_ name: String, in dir: URL) -> URL {
+        let fm = FileManager.default
+        let base = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        var candidate = dir.appendingPathComponent(name)
+        var n = 2
+        while fm.fileExists(atPath: candidate.path) {
+            let numbered = "\(base) \(n)"
+            candidate = dir.appendingPathComponent(ext.isEmpty ? numbered : "\(numbered).\(ext)")
+            n += 1
+        }
+        return candidate
     }
 
     // MARK: Command palette
