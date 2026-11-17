@@ -55,6 +55,10 @@ pub struct Ext {
     /// The remote hosts' port lists each app relayed last ([`method::PORTS_REPORT`]), by
     /// client, host and pane: what a new subscriber is told first.
     remote_ports: Mutex<HashMap<u64, RemoteLists>>,
+    /// Subscribers to `ports_changed` waiting for the look that sends them their first lists:
+    /// until it is done, they hear none of the watch's changes (a look under way when they
+    /// subscribed may have a change they would take for a server just started).
+    ports_joining: Mutex<std::collections::HashSet<u64>>,
 }
 
 /// A remote host's panes' lists: by host and pane, the ports and whether they are complete.
@@ -240,12 +244,24 @@ impl Daemon {
             }
             method::EVENTS_SUBSCRIBE => {
                 let names = names(&p);
+                // The remote lists' lock first (as `ports.report` takes it, before the
+                // registry's), held until the replay below is sent: a report cannot reach a new
+                // subscriber between its registration and its first lists.
+                let all = self.ext.remote_ports.lock();
                 // Only a new subscriber joins: one that has the lists keeps hearing changes.
                 let joins = {
                     let mut reg = self.ext_registry(client)?;
                     let joins = names.iter().any(|n| n == PORTS_CHANGED)
                         && !reg.has(client.id, PORTS_CHANGED);
-                    reg.subscribe(client.id, names)?;
+                    // Waiting for its first lists before it is a listener: no change of a look
+                    // under way reaches it first.
+                    if joins {
+                        self.ext.ports_joining.lock().insert(client.id);
+                    }
+                    if let Err(e) = reg.subscribe(client.id, names) {
+                        self.ext.ports_joining.lock().remove(&client.id);
+                        return Err(e);
+                    }
                     joins
                 };
                 // Its panes' ports are watched only while someone hears of them. A new
@@ -254,12 +270,11 @@ impl Daemon {
                 // gets the lists the app relayed so far, the same way.
                 if joins {
                     self.ports.subscribed(Arc::downgrade(self), client.id);
-                    // Under the lists' lock: a newer list reported meanwhile comes after.
-                    let all = self.ext.remote_ports.lock();
                     for payload in remote_lists(&all, self.forwarding_app_id()) {
                         send_ext(client, notice::EVENT, &payload);
                     }
                 }
+                drop(all);
                 Ok(Value::Null)
             }
             method::EVENTS_UNSUBSCRIBE => {
@@ -385,7 +400,10 @@ impl Daemon {
                 let mut all = self.ext.remote_ports.lock();
                 let lists = all.entry(client.id).or_default();
                 let at = (host.to_owned(), pane);
-                if ports.is_empty() {
+                // An empty list that could not read every process may have missed servers: kept,
+                // so a later subscriber knows the pane is unsure, until a complete one or the
+                // host going says otherwise.
+                if ports.is_empty() && complete {
                     lists.remove(&at);
                 } else {
                     lists.insert(at, (ports.clone(), complete));
@@ -393,6 +411,13 @@ impl Daemon {
                 // Only the app that holds plugins' forwards is heard, as with its forwards.
                 if self.forwarding_app_id() != Some(client.id) {
                     return Ok(Value::Null);
+                }
+                // Tests: a report that takes a while, for what happens while it holds the lock.
+                if let Some(ms) = std::env::var("THURM_EXT_REPORT_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                {
+                    std::thread::sleep(Duration::from_millis(ms));
                 }
                 let mut extra =
                     json!({ "host": host, "id": pane, "ports": ports, "complete": complete });
@@ -532,15 +557,15 @@ impl Daemon {
         let Some(payload) = self.ports_payload(event) else {
             return;
         };
-        // `ports_changed` has no `[[on]]` hooks: only the subscribers hear it.
-        let listeners: Vec<u64> = self
-            .ext
-            .registry
-            .lock()
-            .listeners(PORTS_CHANGED)
+        // `ports_changed` has no `[[on]]` hooks: only the subscribers hear it, but those waiting
+        // for their first lists.
+        let listeners: Vec<u64> = self.ext.registry.lock().listeners(PORTS_CHANGED);
+        let joining = self.ext.ports_joining.lock();
+        let listeners: Vec<u64> = listeners
             .into_iter()
-            .filter(|c| !except.contains(c))
+            .filter(|c| !except.contains(c) && !joining.contains(c))
             .collect();
+        drop(joining);
         self.send_event(&listeners, &payload);
     }
 
@@ -552,6 +577,14 @@ impl Daemon {
         }
         if let Some(payload) = self.ports_payload(event) {
             send_ext(client, notice::EVENT, &payload);
+        }
+    }
+
+    /// The look that sent `joined` their first lists is done: they hear changes now.
+    pub(super) fn ext_ports_served(&self, joined: &[u64]) {
+        let mut joining = self.ext.ports_joining.lock();
+        for c in joined {
+            joining.remove(c);
         }
     }
 
@@ -788,6 +821,7 @@ impl Daemon {
     pub(super) fn ext_client_gone(&self, client: u64) {
         // Dropping the senders ends the waits on them.
         self.ext.pending.lock().retain(|_, p| p.to != client);
+        self.ext.ports_joining.lock().remove(&client);
         // An app's forwards end with it; when it was the first, the next app's are plugins'
         // now.
         let (first, gone, next, next_app) = {

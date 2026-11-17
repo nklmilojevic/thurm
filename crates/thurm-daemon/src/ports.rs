@@ -243,6 +243,9 @@ pub trait Host: Send + Sync + 'static {
     fn send_ports(&self, event: Event, except: &[u64]);
     /// Sends `event` to client `client` alone.
     fn send_ports_to(&self, client: u64, event: Event);
+    /// The look that sent `joined` their first lists (if they had any) is done: from now on they
+    /// hear changes like everyone.
+    fn served(&self, _joined: &[u64]) {}
     fn watcher(&self) -> &Watcher;
 }
 
@@ -333,6 +336,13 @@ impl Watcher {
     }
 }
 
+fn look_delay() -> Option<Duration> {
+    std::env::var("THURM_PORTS_LOOK_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+}
+
 fn min_interval() -> Duration {
     interval_from(std::env::var("THURM_PORTS_INTERVAL_MS").ok().as_deref())
 }
@@ -376,6 +386,10 @@ fn run<H: Host>(host: Weak<H>) {
             }
             std::mem::take(&mut st.joined)
         };
+        // Tests: a look that takes a while, for what happens while it is under way.
+        if let Some(delay) = look_delay() {
+            std::thread::sleep(delay);
+        }
         let roots = h.pane_roots();
         let changed = match look(&roots) {
             Some(seen) => {
@@ -387,6 +401,7 @@ fn run<H: Host>(host: Weak<H>) {
                 for (client, ev) in d.initial {
                     h.send_ports_to(client, ev);
                 }
+                h.served(&joined);
                 let retry = d.retry;
                 let wait = backoff.looked(changed);
                 next = retry.map_or(Instant::now() + wait, |r| r.min(Instant::now() + wait));

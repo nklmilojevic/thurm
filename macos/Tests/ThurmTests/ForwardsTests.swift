@@ -178,6 +178,12 @@ final class ForwardsTests: XCTestCase {
         // An empty list forgets the pane; the rest is there to send a daemon connected later.
         p.listed("devbox", pane: 3, ports: [] as [Any], complete: true)
         XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "pi/1"])
+        // An empty list that could not read every process is kept: servers it missed may run,
+        // and a daemon connected later must hear the pane is unsure.
+        p.listed("devbox", pane: 4, ports: [] as [Any], complete: false)
+        XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "devbox/4", "pi/1"])
+        XCTAssertEqual(p.all.first { $0.pane == 4 }.flatMap { jsonBool($0.complete) }, false)
+        p.listed("devbox", pane: 4, ports: [] as [Any], complete: true)
         p.disconnected("devbox")
         XCTAssertEqual(p.all.map(\.host), ["pi"])
     }

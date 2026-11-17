@@ -746,6 +746,9 @@ fn the_dev_server_example_opens_only_new_servers() {
     // has it, and it ran already.
     ports(Some("nas"), 7, &[], false, true);
     ports(Some("nas"), 7, &[8080], true, false);
+    // A server listening on every address, as macOS says it: a dev server too.
+    event(json!({ "event": "ports_changed", "id": 8, "complete": true,
+                  "ports": [{ "port": 4200, "address": "*", "pid": 9, "command": "node_modules/.bin/vite" }] }));
     // 4000 really stops (a complete list) and starts again: news.
     ports(None, 3, &[4001], true, false);
     ports(None, 3, &[4000, 4001], true, false);
@@ -768,6 +771,7 @@ fn the_dev_server_example_opens_only_new_servers() {
         json!(["devbox", 5174, true]),
         json!(["open", "http://localhost:4001/"]),
         json!(["other", 3000, true]),
+        json!(["open", "http://localhost:4200/"]),
         json!(["open", "http://localhost:4000/"]),
     ];
     let deadline = Instant::now() + Duration::from_secs(20);
