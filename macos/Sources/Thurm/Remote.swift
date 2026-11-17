@@ -445,6 +445,8 @@ final class Remotes {
     static func clipboardWrite(_ pb: NSPasteboard, text: String?, allowed: Bool,
                                put: ((NSPasteboard, String) -> Bool)? = nil) -> Bool {
         guard allowed else { return false }
+        // A pasteboard takes new contents only once cleared, so a copy it then refuses (which
+        // `setString` hardly ever does) leaves it empty; the tool hears it was not done.
         pb.clearContents()
         guard let text else { return true }
         return (put ?? { $0.setString($1, forType: .string) })(pb, text)
@@ -465,7 +467,7 @@ final class Remotes {
         let data: Data?
         switch mime {
         case clipText:
-            // Measured before it is copied out.
+            // The pasteboard hands over the whole string; measured before a second copy is made.
             data = pb.string(forType: .string)
                 .flatMap { $0.utf8.count <= clipMax ? Data($0.utf8) : nil }
         case clipPNG:

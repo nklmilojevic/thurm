@@ -108,8 +108,10 @@ prints there and Thurm opens the host's port on your Mac. Drop or paste files an
 screenshots and they are copied to the host, with their paths typed into the pane.
 Quick Look and download the host's files. On a Linux host without a display,
 `pbcopy`, `xclip` and `wl-paste` in new panes can reach your Mac's clipboard,
-with the same prompt as other clipboard reads, once you install them with the
-Clipboard tools fix of `thurm remote doctor`.
+once you install them with the Clipboard tools fix of `thurm remote doctor`.
+Copies follow `terminal.osc52` on both sides; a paste also needs it set to
+`paste` or `copy-paste` on the host and on your Mac, and then asks like other
+clipboard reads (see [what is checked where](https://docs.thurm.rs/remote/#using-remote-panes)).
 
 You can also hand a local repository to a remote agent. Thurm sends a Git snapshot
 to a separate branch and worktree on the host. The snapshot includes uncommitted

@@ -470,12 +470,12 @@ impl Client {
 }
 
 /// What a queued message costs, for [`Client::queued`]: its output or state bytes, else a
-/// little.
+/// little. Clipboard contents are counted apart ([`Client::clip_queued`]): a large copy on its
+/// way is no sign the client lags behind its panes' output.
 pub fn message_weight(msg: &ServerMessage) -> usize {
     match msg {
         ServerMessage::Event(Event::Output { data, .. }) => data.len(),
         ServerMessage::Event(Event::Attach { state, .. }) => state.len(),
-        msg if clip::clip_weight(msg) > 0 => clip::clip_weight(msg),
         _ => 256,
     }
 }
@@ -2516,16 +2516,30 @@ impl Daemon {
                     Ok(slot) => {
                         let daemon = self.clone();
                         let client = client.clone();
-                        std::thread::spawn(move || {
-                            let (result, held) = daemon.clipboard_ask(client.id, pane, ask);
-                            drop(slot);
-                            if id != 0 {
-                                client.send(ServerMessage::Response { id, result });
-                            }
-                            // Counted in the client's queue from here.
-                            drop(held);
-                        });
-                        return;
+                        let spawned =
+                            std::thread::Builder::new()
+                                .name("clipboard".into())
+                                .spawn(move || {
+                                    let asked =
+                                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                            || daemon.clipboard_ask(client.id, pane, ask),
+                                        ));
+                                    let (result, held) = asked.unwrap_or_else(|_| {
+                                        (Err("the daemon hit an internal error".into()), None)
+                                    });
+                                    drop(slot);
+                                    if id != 0 {
+                                        client.send(ServerMessage::Response { id, result });
+                                    }
+                                    // Counted in the client's queue from here.
+                                    drop(held);
+                                });
+                        // A thread refused: the slot went back with the closure.
+                        if let Err(e) = spawned {
+                            Err(format!("could not start a request thread: {e}"))
+                        } else {
+                            return;
+                        }
                     }
                 }
             }
@@ -4787,6 +4801,31 @@ mod tests {
         assert!(c.backlogged() && !c.caught_up());
         c.queued.store(0, Ordering::Relaxed);
         assert!(!c.backlogged());
+    }
+
+    /// A large copy queued for a client counts against the clipboard bytes held, not its output
+    /// backlog: its panes do not fall back to re-sync because of it.
+    #[test]
+    fn a_large_copy_is_no_output_backlog() {
+        let dir = std::env::temp_dir().join(format!("thurm-clip-backlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (client, _rx) = daemon.add_client();
+        client.send(ServerMessage::Event(Event::ClipboardStore {
+            pane: 1,
+            text: "x".repeat(thurm_proto::CLIP_MAX),
+        }));
+        assert!(!client.backlogged());
+        assert_eq!(
+            client.clip_queued.load(Ordering::SeqCst),
+            thurm_proto::CLIP_MAX
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Clipboard bytes queued for a client are counted until written, and once its writer has

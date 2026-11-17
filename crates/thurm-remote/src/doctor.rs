@@ -92,12 +92,22 @@ const AGENTS: &[Agent] = &[
     },
 ];
 
+/// The clipboard tools the shims are, for the scripts below: [`thurm_proto::CLIP_TOOLS`]
+/// (a test keeps the two the same).
+macro_rules! clip_tools {
+    () => {
+        "pbcopy pbpaste xclip xsel wl-copy wl-paste"
+    };
+}
+
 /// `case` patterns for a link that leads to a Thurm install, current or older: `$C` (the
 /// `thurm` on PATH as found), Thurm's own install, and Nix profiles and store paths. A link to
-/// anything else, even a program named `thurm`, is another program's.
+/// anything else, even a program named `thurm`, is another program's. Thurm's own link in
+/// `~/.local/bin` (the Command-line tool fix) is one too: a shim linked when it was first on
+/// PATH leads there.
 macro_rules! thurm_link_patterns {
     () => {
-        "\"$C\"|\"$TH/.local/share/thurm/bin/thurm\"|\"$HOME/.nix-profile/bin/thurm\"|\"$TH/.nix-profile/bin/thurm\"|/nix/store/*/bin/thurm|/nix/var/nix/profiles/*/bin/thurm|/run/current-system/sw/bin/thurm|/etc/profiles/per-user/*/bin/thurm"
+        "\"$C\"|\"$TH/.local/share/thurm/bin/thurm\"|\"$TH/.local/bin/thurm\"|\"$HOME/.nix-profile/bin/thurm\"|\"$TH/.nix-profile/bin/thurm\"|/nix/store/*/bin/thurm|/nix/var/nix/profiles/*/bin/thurm|/run/current-system/sw/bin/thurm|/etc/profiles/per-user/*/bin/thurm"
     };
 }
 
@@ -118,7 +128,9 @@ const PROBE: &str = concat!(
     "command -v thurm >/dev/null 2>&1 && echo \"hooks=$(HOME=\"$TH\" thurm hooks status --json 2>/dev/null | head -n 1)\"; ",
     "command -v thurm >/dev/null 2>&1 && echo \"skill=$(HOME=\"$TH\" thurm skill status --json 2>/dev/null | head -n 1)\"; ",
     "C=\"$(command -v thurm 2>/dev/null)\"; B=; [ -n \"$C\" ] && B=\"$(readlink -f \"$C\")\"; n=0; o=; ",
-    "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do L=\"$TH/.local/share/thurm/shims/$t\"; ",
+    "for t in ",
+    clip_tools!(),
+    "; do L=\"$TH/.local/share/thurm/shims/$t\"; ",
     "if [ -L \"$L\" ] && [ -n \"$B\" ] && [ \"$(readlink -f \"$L\" 2>/dev/null)\" = \"$B\" ]; then n=$((n+1)); ",
     "elif [ -e \"$L\" ] || [ -L \"$L\" ]; then case \"$(readlink \"$L\" 2>/dev/null)\" in ",
     thurm_link_patterns!(),
@@ -684,14 +696,18 @@ const SHIMS: &str = concat!(
     "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
     "B=\"$(command -v thurm)\" || { echo \"Thurm is not installed\" >&2; exit 3; }; C=\"$B\"; ",
     "R=\"$(readlink -f \"$B\")\"; S=\"$TH/.local/share/thurm/shims\"; ",
-    "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do ",
+    "for t in ",
+    clip_tools!(),
+    "; do ",
     // A link that leads to this thurm, as the probe counts it (a relative one too), is ours.
     "if [ -L \"$S/$t\" ] && [ \"$(readlink -f \"$S/$t\" 2>/dev/null)\" = \"$R\" ]; then :; ",
     "elif [ -e \"$S/$t\" ] || [ -L \"$S/$t\" ]; then case \"$(readlink \"$S/$t\" 2>/dev/null)\" in ",
     thurm_link_patterns!(),
     ") ;; *) echo \"$S/$t is another program; remove it to install the clipboard tools\" >&2; exit 3;; esac; fi; done; ",
     "mkdir -p \"$S\" || exit 1; ",
-    "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do ln -sfn \"$B\" \"$S/$t\" || exit 1; done"
+    "for t in ",
+    clip_tools!(),
+    "; do ln -sfn \"$B\" \"$S/$t\" || exit 1; done"
 );
 
 /// Without a password prompt: logind lets you linger yourself on most distributions, else
@@ -1051,6 +1067,10 @@ mod tests {
         for t in ["xclip", "xsel", "wl-copy", "wl-paste"] {
             std::fs::remove_file(shims.join(t)).unwrap();
         }
+        // A link to Thurm's own ~/.local/bin/thurm, made when that was first on PATH, is
+        // Thurm's: not another program's, and replaced by the fix.
+        symlink(th.join(".local/bin/thurm"), shims.join("xsel")).unwrap();
+        assert!(probe().shims_other.is_empty(), "{:?}", probe().shims_other);
         // A relative link to this thurm counts as installed, and does not stop the fix for
         // the ones missing.
         symlink("../bin/thurm", shims.join("xclip")).unwrap();
@@ -1196,6 +1216,11 @@ mod tests {
         assert!(PROBE.contains(PRELUDE) && PROBE.contains(REMOTE_PATH));
         assert!(HOOKS.contains(REMOTE_PATH));
         assert!(SHIMS.contains(REMOTE_PATH));
+        assert_eq!(
+            clip_tools!(),
+            thurm_proto::CLIP_TOOLS.join(" "),
+            "one list of tools"
+        );
         for t in thurm_proto::CLIP_TOOLS {
             assert!(PROBE.contains(t) && SHIMS.contains(t), "{t}");
         }

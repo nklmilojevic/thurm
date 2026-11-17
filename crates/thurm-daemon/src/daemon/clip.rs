@@ -65,6 +65,10 @@ impl Slots {
         max: usize,
         beside: impl Fn() -> usize,
     ) -> Option<Slot> {
+        // Nothing to hold (a clear, an empty answer): it adds nothing, whatever is held.
+        if n == 0 {
+            return Some(Slot(self.clone(), 0));
+        }
         loop {
             let used = self.0.load(Ordering::SeqCst);
             let total = used.checked_add(beside())?.checked_add(n)?;
@@ -291,7 +295,7 @@ impl Daemon {
                     return Err("the caller disconnected".into());
                 }
             }
-            match answer.recv_timeout((deadline - now).min(Duration::from_millis(50))) {
+            match answer.recv_timeout((deadline - now).min(Duration::from_millis(250))) {
                 Ok(answer) => return answer,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -380,6 +384,12 @@ mod tests {
         drop(held);
         assert!(bytes.take(full, max).is_some(), "given back once sent on");
         assert!(bytes.take(usize::MAX, max).is_none(), "no overflow");
+        // A clear holds nothing: it goes through however much is held.
+        let full = bytes.take(max, max).expect("all of it");
+        assert!(bytes.take(1, max).is_none());
+        assert!(bytes.take(0, max).is_some(), "zero bytes always fit");
+        assert!(bytes.take_beside(0, max, || usize::MAX).is_some());
+        drop(full);
     }
 
     #[test]
