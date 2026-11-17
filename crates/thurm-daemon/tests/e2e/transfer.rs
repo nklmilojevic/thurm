@@ -373,7 +373,7 @@ fn a_file_changed_after_it_was_asked_for_is_not_sent() {
 fn kept_uploads_stay_within_the_limit_batch_and_all() {
     let env = Env::new("transfer-kept");
     let _daemon = env.start_with(&[
-        ("THURM_TRANSFER_MAX_KEPT", Path::new("10")),
+        ("THURM_TRANSFER_MAX_KEPT", Path::new("14")),
         ("THURM_TRANSFER_BLOCK", Path::new("1")),
     ]);
     let (c, _rx) = env.connect();
@@ -383,7 +383,8 @@ fn kept_uploads_stay_within_the_limit_batch_and_all() {
         .wait_closed()
         .unwrap();
     let [first] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
-    // 4 kept and 8 more: the older drop makes room.
+    // A byte a directory and the completion record here, each batch with two directories:
+    // "a" keeps 7, and "b" takes 11 more; the older drop makes room.
     send(&env, &c, pane, ("b", 0, 1), "b.txt", 8, b"bbbbbbbb")
         .wait_closed()
         .unwrap();
@@ -413,7 +414,7 @@ fn kept_uploads_stay_within_the_limit_batch_and_all() {
     }
     assert!(!has("b.txt"));
     drop(first_file);
-    // Beside the 6 bytes of "c", still open, a batch that fits whole goes.
+    // Beside the 9 of "c", still open, a batch that fits whole (5) goes.
     let readers: Vec<StreamReader> = (0..2)
         .map(|i| send(&env, &c, pane, ("d", i, 2), "d.txt", 1, b"d"))
         .collect();
@@ -465,7 +466,7 @@ fn cancelling_after_the_last_bytes_drops_the_batch() {
 fn a_refused_upload_deletes_nothing_kept() {
     let env = Env::new("transfer-refused-keeps");
     let _daemon = env.start_with(&[
-        ("THURM_TRANSFER_MAX_KEPT", Path::new("10")),
+        ("THURM_TRANSFER_MAX_KEPT", Path::new("11")),
         ("THURM_TRANSFER_BLOCK", Path::new("1")),
     ]);
     let (c, _rx) = env.connect();
@@ -475,12 +476,12 @@ fn a_refused_upload_deletes_nothing_kept() {
         .wait_closed()
         .unwrap();
     let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
-    // 11 bytes can never fit in 10: refused, and the kept drop stays.
+    // 11 bytes and their batch's 3 can never fit in 11: refused, and the kept drop stays.
     let e = c.upload_begin(pane, "big.txt", 11, None).unwrap_err();
     assert!(e.to_string().contains("does not fit"), "{e}");
     assert!(kept.join("a.txt").exists());
     // The same for a batch whose files together can never fit (a byte a directory and the
-    // completion record here: the kept drop takes 7).
+    // completion record here: the kept drop takes 7, and "b" with its first file 4).
     let first = send(&env, &c, pane, ("b", 0, 2), "b1.txt", 1, b"b");
     let e = c
         .upload_begin(
@@ -601,7 +602,7 @@ fn a_batch_whose_sender_went_before_its_paste_types_nothing() {
 fn a_reservation_refused_for_its_batch_deletes_nothing_kept() {
     let env = Env::new("transfer-dup-keeps");
     let _daemon = env.start_with(&[
-        ("THURM_TRANSFER_MAX_KEPT", Path::new("10")),
+        ("THURM_TRANSFER_MAX_KEPT", Path::new("11")),
         ("THURM_TRANSFER_BLOCK", Path::new("1")),
     ]);
     let (c, _rx) = env.connect();
@@ -619,7 +620,7 @@ fn a_reservation_refused_for_its_batch_deletes_nothing_kept() {
             count,
         })
     };
-    // 1 byte and its batch's two directories: 3, beside the 7 kept.
+    // 1 byte, its batch's two directories and record: 4, beside the 7 kept.
     c.upload_begin(pane, "b1.txt", 1, batch(0, 2)).unwrap();
     // The same file again, and the batch with another count: each would have needed room the
     // kept drop holds, and is refused without taking it.

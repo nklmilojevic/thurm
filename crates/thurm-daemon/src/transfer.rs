@@ -378,9 +378,18 @@ impl Transfers {
             .flat_map(|b| b.files.values().filter(move |f| b.occupies(f)))
             .map(|f| charge(f.size))
             .sum();
-        // With its directories (the batch's and its parts'), should it be the batch's first.
+        // A batch on its way is not among the drops kept: its directories (its own and its
+        // parts') and the record it leaves once complete count here, beside its files.
+        let on_way = st.batches.values().filter(|b| b.busy()).count() as u64;
+        let on_way_dirs = on_way.saturating_mul(3 * block());
+        // With its directories and its record, should it be the batch's first.
         let dir_cost = if existing.is_none() { 2 * block() } else { 0 };
-        let incoming = active.saturating_add(charge(size)).saturating_add(dir_cost);
+        let record = if existing.is_none() { block() } else { 0 };
+        let incoming = active
+            .saturating_add(on_way_dirs)
+            .saturating_add(charge(size))
+            .saturating_add(dir_cost)
+            .saturating_add(record);
         let too_much = || {
             format!(
                 "{name} does not fit in what this host keeps of sent files ({} MiB)",
