@@ -197,8 +197,12 @@ final class ExtensionsTests: XCTestCase {
     /// a cancel, and an open cancelled before it starts never opens.
     func testACancelledForwardRequestIsNotCarriedOut() {
         let ext = Extensions.shared
-        let saved = ext.remoteCall
-        defer { ext.remoteCall = saved }
+        let saved = (ext.remoteCall, ext.forwardReplies, ext.forwardRequestDone)
+        defer {
+            ext.remoteCall = saved.0
+            ext.forwardReplies = saved.1
+            ext.forwardRequestDone = saved.2
+        }
         let lock = NSLock()
         var calls: [String] = []
         ext.remoteCall = { op in
@@ -207,6 +211,10 @@ final class ExtensionsTests: XCTestCase {
             lock.unlock()
             return ["error": "not in a test"]
         }
+        var replies: [UInt64: [[String: Any]]] = [:]
+        var finished: Set<UInt64> = []
+        ext.forwardReplies = { r in replies[jsonUInt64(r["id"]) ?? 0, default: []].append(r) }
+        ext.forwardRequestDone = { finished.insert($0) }
         func seen() -> [String] {
             lock.lock()
             defer { lock.unlock() }
@@ -215,22 +223,33 @@ final class ExtensionsTests: XCTestCase {
         func event(_ name: String, _ payload: [String: Any]) -> [String: Any] {
             ["name": name, "payload": JSON.encode(payload)]
         }
+        func waitDone(_ id: UInt64) {
+            let deadline = Date().addingTimeInterval(5)
+            while !finished.contains(id), Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+            XCTAssertTrue(finished.contains(id), "request \(id) never finished")
+        }
 
+        // A close is done, and answered, as soon as it is asked: before any cancel of it.
         ext.handle(event("ui.request", ["kind": "forward_close", "id": 901, "forward": 7]))
         XCTAssertEqual(seen(), ["forward_close"], "the close was queued, where a cancel could not stop it")
+        XCTAssertEqual(replies[901]?.count, 1)
         ext.handle(event("ui.cancel", ["id": 901]))
 
+        // An open cancelled before it starts: not started, not answered.
         ext.handle(event("ui.request", ["kind": "forward_open", "id": 902, "host": "devbox", "port": 5173]))
         ext.handle(event("ui.cancel", ["id": 902]))
-        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        waitDone(902)
         XCTAssertEqual(seen(), ["forward_close"], "an open the daemon gave up on was started")
+        XCTAssertNil(replies[902], "a cancelled open was answered")
 
+        // One still waited for: started, and answered (here, with the core's error).
         ext.handle(event("ui.request", ["kind": "forward_open", "id": 903, "host": "devbox", "port": 5173]))
-        let deadline = Date().addingTimeInterval(5)
-        while seen().count < 2, Date() < deadline {
-            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
-        }
+        waitDone(903)
         XCTAssertEqual(seen(), ["forward_close", "forward_open"])
+        XCTAssertEqual(replies[903]?.count, 1)
+        XCTAssertEqual(jsonString(replies[903]?.first?["error"]), "not in a test")
     }
 
     /// A cancel that lands after an open passed its check, before the call does anything: the
@@ -241,8 +260,13 @@ final class ExtensionsTests: XCTestCase {
         // A forward opened for a request still waited for shows a toast, over the app's windows.
         _ = NSApplication.shared
         let ext = Extensions.shared
-        let saved = ext.remoteCall
-        defer { ext.remoteCall = saved }
+        let saved = (ext.remoteCall, ext.forwardReplies, ext.forwardRequestDone)
+        defer {
+            ext.remoteCall = saved.0
+            ext.forwardReplies = saved.1
+            ext.forwardRequestDone = saved.2
+            ext.forwardsNow([])
+        }
         let lock = NSLock()
         var calls: [String] = []
         var cancelOnCall: UInt64?
@@ -266,12 +290,13 @@ final class ExtensionsTests: XCTestCase {
             default: return ["id": 0]
             }
         }
-        func seen() -> [String] {
-            lock.lock()
-            defer { lock.unlock() }
-            return calls
-        }
-        func open(_ id: UInt64, result: [String: Any], cancel: Bool, until count: Int) -> [String] {
+        var replies: [UInt64: [[String: Any]]] = [:]
+        var finished: Set<UInt64> = []
+        ext.forwardReplies = { r in replies[jsonUInt64(r["id"]) ?? 0, default: []].append(r) }
+        ext.forwardRequestDone = { finished.insert($0) }
+        /// Asks for an open and waits until the app is done with it: the calls it made, and what
+        /// the plugin was answered.
+        func open(_ id: UInt64, result: [String: Any], cancel: Bool) -> (calls: [String], replies: [[String: Any]]) {
             lock.lock()
             calls = []
             cancelOnCall = cancel ? id : nil
@@ -280,11 +305,13 @@ final class ExtensionsTests: XCTestCase {
             ext.handle(["name": "ui.request", "payload": JSON.encode(
                 ["kind": "forward_open", "id": id, "host": "undo-test", "port": 5173])])
             let deadline = Date().addingTimeInterval(5)
-            while seen().count < count, Date() < deadline {
-                RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            while !finished.contains(id), Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
             }
-            RunLoop.main.run(until: Date().addingTimeInterval(0.2))
-            return seen()
+            XCTAssertTrue(finished.contains(id), "request \(id) never finished")
+            lock.lock()
+            defer { lock.unlock() }
+            return (calls, replies[id] ?? [])
         }
         let opened: [String: Any] = ["id": 71, "host": "undo-test", "remote_port": 5173, "local_port": 5173,
                                      "url": "http://localhost:5173/", "new": true]
@@ -292,13 +319,22 @@ final class ExtensionsTests: XCTestCase {
         found["id"] = 72
         found["new"] = false
 
-        // Cancelled between the check and the call: the forward it opened is closed again.
-        XCTAssertEqual(open(911, result: opened, cancel: true, until: 2), ["forward_open", "close 71"])
-        // One it only found open is someone else's: it stays.
-        XCTAssertEqual(open(912, result: found, cancel: true, until: 1), ["forward_open"])
-        // Not cancelled: kept (and looked at again, before anything is shown for it).
-        XCTAssertEqual(open(913, result: opened, cancel: false, until: 2), ["forward_open", "forward_get"])
-        ext.forwardsNow([])
+        // Cancelled between the check and the call: the forward it opened is closed again, and
+        // the plugin, which waits no more, is not answered.
+        let cancelled = open(911, result: opened, cancel: true)
+        XCTAssertEqual(cancelled.calls, ["forward_open", "close 71"])
+        XCTAssertEqual(cancelled.replies.count, 0, "a cancelled open was answered: \(cancelled.replies)")
+        // One it only found open is someone else's: it stays. Not answered either.
+        let foundOpen = open(912, result: found, cancel: true)
+        XCTAssertEqual(foundOpen.calls, ["forward_open"])
+        XCTAssertEqual(foundOpen.replies.count, 0, "a cancelled open was answered: \(foundOpen.replies)")
+        // Not cancelled: kept (and looked at again, before anything is shown for it), and answered
+        // with it.
+        let kept = open(913, result: opened, cancel: false)
+        XCTAssertEqual(kept.calls, ["forward_open", "forward_get"])
+        XCTAssertEqual(kept.replies.count, 1)
+        XCTAssertNil(kept.replies.first?["error"])
+        XCTAssertEqual(jsonUInt64((kept.replies.first?["result"] as? [String: Any])?["id"]), 71)
     }
 
     /// An open a plugin asked to browse goes to the browser only while its forward is still open
@@ -307,11 +343,11 @@ final class ExtensionsTests: XCTestCase {
     func testABrowsedForwardIsOpenedOnlyWhileItIsOpen() {
         _ = NSApplication.shared
         let ext = Extensions.shared
-        let saved = (ext.remoteCall, ext.browse)
+        let saved = (ext.remoteCall, ext.browse, ext.forwardReplies)
         defer {
             ext.remoteCall = saved.0
             ext.browse = saved.1
-            ext.forwardReplies = nil
+            ext.forwardReplies = saved.2
             ext.forwardsNow([])
         }
         let opened: [String: Any] = ["id": 81, "host": "browse-test", "remote_port": 5173, "local_port": 5174,

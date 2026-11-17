@@ -61,6 +61,8 @@ final class Extensions {
     var browse: (URL) -> Void = { NSWorkspace.shared.open($0) }
     /// Takes the answers to plugins' forward requests in place of the daemon (tests).
     var forwardReplies: (([String: Any]) -> Void)?
+    /// Told the id of each forward request once the app is done with it, answered or not (tests).
+    var forwardRequestDone: ((UInt64) -> Void)?
 
     // MARK: Calling the daemon
 
@@ -516,6 +518,7 @@ final class Extensions {
         forwardRequests.begin(key, opening: opening)
         let done = { [weak self] (v: [String: Any]?) in
             guard let self else { return }
+            defer { self.forwardRequestDone?(id) }
             // The daemon gave up on it meanwhile: it changes nothing. A forward it opened is
             // closed again once nobody else has it (and both are reported, as every change is).
             let (finish, close) = self.forwardRequests.finish(key, opening: opening, result: v)
