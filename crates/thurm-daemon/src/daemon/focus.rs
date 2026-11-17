@@ -15,6 +15,8 @@ pub struct FocusLog {
     recent: VecDeque<(PaneId, Instant)>,
     /// The pane each client has focused now.
     now: HashMap<u64, PaneId>,
+    /// The client that focused each pane last.
+    last: HashMap<PaneId, u64>,
 }
 
 impl FocusLog {
@@ -25,6 +27,7 @@ impl FocusLog {
             self.recent.push_front((pane, at));
             self.recent.truncate(KEEP);
             self.now.insert(client, pane);
+            self.last.insert(pane, client);
         } else if self.now.get(&client) == Some(&pane) {
             self.now.remove(&client);
         }
@@ -37,6 +40,12 @@ impl FocusLog {
 
     pub fn client_gone(&mut self, client: u64) {
         self.now.remove(&client);
+        self.last.retain(|_, c| *c != client);
+    }
+
+    /// The client that focused `pane` last, if it is still connected.
+    pub fn last_client(&self, pane: PaneId) -> Option<u64> {
+        self.last.get(&pane).copied()
     }
 
     /// The panes that still exist, most recent first.
@@ -113,5 +122,22 @@ mod tests {
         let h = log.history(|_| true, t);
         assert_eq!(h.len(), KEEP);
         assert_eq!(h[0].pane, 39);
+    }
+
+    #[test]
+    fn last_client_per_pane() {
+        let t = Instant::now();
+        let mut log = FocusLog::default();
+        log.focus(1, 10, true, t);
+        log.focus(2, 10, true, t);
+        log.focus(2, 10, false, t);
+        assert_eq!(
+            log.last_client(10),
+            Some(2),
+            "unfocusing keeps who looked last"
+        );
+        assert_eq!(log.last_client(11), None);
+        log.client_gone(2);
+        assert_eq!(log.last_client(10), None);
     }
 }

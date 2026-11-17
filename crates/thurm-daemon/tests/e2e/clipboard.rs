@@ -1,0 +1,267 @@
+//! Clipboard tools in a pane: copies go to the apps, pastes ask the app that last focused the
+//! pane.
+
+use std::io::Write;
+use std::os::unix::net::UnixStream;
+
+use super::*;
+
+/// A pane's clipboard tool: no UI, like `thurm clip`.
+fn tool(env: &Env) -> Arc<Client> {
+    let stream = thurm_client::connect_daemon(&env.socket).unwrap();
+    Client::from_stream(stream, "e2e-clip", false, &[], |_| {}, || {}).expect("connect")
+}
+
+fn get(
+    c: &Arc<Client>,
+    pane: PaneId,
+    mime: &str,
+) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
+    let c = c.clone();
+    let mime = mime.to_owned();
+    std::thread::spawn(
+        move || match c.request(Request::ClipboardGet { pane, mime }) {
+            Ok(Response::ClipboardData { data }) => Ok(data),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.to_string()),
+        },
+    )
+}
+
+/// The next clipboard query on `rx`, skipping other events.
+fn query(rx: &Receiver<Event>) -> Option<(PaneId, u64, String)> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while let Ok(ev) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        if let Event::ClipboardQuery { pane, id, mime } = ev {
+            return Some((pane, id, mime));
+        }
+    }
+    None
+}
+
+fn no_query(rx: &Receiver<Event>) {
+    while let Ok(ev) = rx.recv_timeout(Duration::from_millis(300)) {
+        assert!(!matches!(ev, Event::ClipboardQuery { .. }), "{ev:?}");
+    }
+}
+
+fn focus(c: &Client, pane: PaneId) {
+    c.request(Request::Focus {
+        pane,
+        focused: true,
+    })
+    .unwrap();
+}
+
+fn answer(c: &Client, id: u64, data: Option<Vec<u8>>) -> Result<Response, String> {
+    c.request(Request::ClipboardAnswer { id, data })
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_paste_asks_the_app_that_focused_the_pane_last() {
+    let env = Env::new("clip-route");
+    let _daemon = env.start();
+    let (a, a_rx) = env.connect();
+    let (b, b_rx) = env.connect();
+    let pane = create(&a, &env.dir);
+    let other = create(&a, &env.dir);
+    focus(&a, pane);
+    focus(&b, pane);
+    focus(&a, other);
+    let tool = tool(&env);
+
+    let paste = get(&tool, pane, CLIP_TEXT);
+    let (p, id, mime) = query(&b_rx).expect("b focused the pane last");
+    assert_eq!((p, mime.as_str()), (pane, CLIP_TEXT));
+    no_query(&a_rx);
+    assert!(
+        answer(&a, id, Some(b"not mine".to_vec())).is_err(),
+        "only the app asked answers"
+    );
+    answer(&b, id, Some(b"hello".to_vec())).unwrap();
+    assert_eq!(paste.join().unwrap(), Ok(b"hello".to_vec()));
+    assert!(answer(&b, id, None).is_err(), "answered once");
+
+    // Images come back as they are.
+    let png = vec![0x89, b'P', b'N', b'G', 0, 1, 2, 255];
+    let paste = get(&tool, other, CLIP_PNG);
+    let (_, id, mime) = query(&a_rx).expect("a focused the other pane");
+    assert_eq!(mime, CLIP_PNG);
+    answer(&a, id, Some(png.clone())).unwrap();
+    assert_eq!(paste.join().unwrap(), Ok(png));
+
+    // The app that looked last is gone: another one is asked.
+    drop(b);
+    std::thread::sleep(Duration::from_millis(200));
+    let paste = get(&tool, pane, CLIP_TARGETS);
+    let (_, id, _) = query(&a_rx).expect("falls back to a connected app");
+    answer(&a, id, Some(format!("{CLIP_TEXT}\n").into_bytes())).unwrap();
+    assert_eq!(paste.join().unwrap(), Ok(b"text/plain\n".to_vec()));
+
+    let Err(e) = get(&tool, pane, "image/jpeg").join().unwrap() else {
+        panic!("only text and png");
+    };
+    assert!(e.contains("unsupported"), "{e}");
+    assert!(get(&tool, u64::MAX, CLIP_TEXT).join().unwrap().is_err());
+}
+
+#[test]
+fn a_refusal_reaches_the_tool() {
+    let env = Env::new("clip-deny");
+    let _daemon = env.start();
+    let (app, rx) = env.connect();
+    let pane = create(&app, &env.dir);
+    focus(&app, pane);
+    let tool = tool(&env);
+    let paste = get(&tool, pane, CLIP_TEXT);
+    let (_, id, _) = query(&rx).unwrap();
+    answer(&app, id, None).unwrap();
+    let e = paste.join().unwrap().unwrap_err();
+    assert!(e.contains("not shared"), "{e}");
+}
+
+#[test]
+fn a_paste_gives_up_when_the_app_says_nothing() {
+    let env = Env::new("clip-timeout");
+    let _daemon = env.start_with(&[("THURM_CLIP_TIMEOUT_MS", Path::new("400"))]);
+    let (app, rx) = env.connect();
+    let pane = create(&app, &env.dir);
+    focus(&app, pane);
+    let tool = tool(&env);
+    let started = Instant::now();
+    let paste = get(&tool, pane, CLIP_TEXT);
+    let (_, id, _) = query(&rx).unwrap();
+    let e = paste.join().unwrap().unwrap_err();
+    assert!(e.contains("did not answer"), "{e}");
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert!(
+        answer(&app, id, Some(b"late".to_vec())).is_err(),
+        "too late"
+    );
+}
+
+#[test]
+fn clipboards_over_32_mib_are_refused() {
+    let env = Env::new("clip-cap");
+    let _daemon = env.start();
+    let (app, rx) = env.connect();
+    let pane = create(&app, &env.dir);
+    focus(&app, pane);
+    let tool = tool(&env);
+    let paste = get(&tool, pane, CLIP_PNG);
+    let (_, id, _) = query(&rx).unwrap();
+    assert!(answer(&app, id, Some(vec![0; CLIP_MAX + 1])).is_err());
+    let e = paste.join().unwrap().unwrap_err();
+    assert!(e.contains("32 MiB"), "{e}");
+
+    let e = tool
+        .request(Request::ClipboardSet {
+            pane,
+            text: "x".repeat(CLIP_MAX + 1),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("32 MiB"), "{e}");
+}
+
+#[test]
+fn a_copy_goes_to_the_apps_like_osc_52() {
+    let env = Env::new("clip-copy");
+    let _daemon = env.start();
+    let (app, rx) = env.connect();
+    let pane = create(&app, &env.dir);
+    tool(&env)
+        .request(Request::ClipboardSet {
+            pane,
+            text: "copied".into(),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Event::ClipboardStore { pane: p, text }) => {
+                assert_eq!((p, text.as_str()), (pane, "copied"));
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => panic!("no ClipboardStore"),
+        }
+    }
+    assert!(
+        tool(&env)
+            .request(Request::ClipboardSet {
+                pane: u64::MAX,
+                text: "x".into()
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn older_apps_and_phones_are_never_asked() {
+    let env = Env::new("clip-old");
+    let _daemon = env.start();
+    let (app, _) = env.connect();
+    let pane = create(&app, &env.dir);
+    drop(app);
+    // An app from before clipboard tools: a UI without the capability.
+    let mut old = UnixStream::connect(&env.socket).unwrap();
+    let hello = Request::Hello {
+        client: "e2e-old-app".into(),
+        version: PROTOCOL_VERSION,
+        ui: true,
+        capabilities: vec![CAP_ACTIVE_SIZE.into()],
+    };
+    old.write_all(
+        &codec::encode(&Envelope {
+            id: 1,
+            request: hello,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let focus_old = Request::Focus {
+        pane,
+        focused: true,
+    };
+    old.write_all(
+        &codec::encode(&Envelope {
+            id: 2,
+            request: focus_old,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    // A phone, which says it can (its build has the capability) but is not a desktop UI.
+    let stream = thurm_client::connect_daemon(&env.socket).unwrap();
+    let (tx, phone_rx) = unbounded();
+    let phone = Client::from_stream(
+        stream,
+        "e2e-ios",
+        true,
+        &[CAP_MOBILE],
+        move |ev| {
+            let _ = tx.send(ev);
+        },
+        || {},
+    )
+    .unwrap();
+    focus(&phone, pane);
+    std::thread::sleep(Duration::from_millis(200));
+    let e = get(&tool(&env), pane, CLIP_TEXT)
+        .join()
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("no Thurm app"), "{e}");
+    no_query(&phone_rx);
+    old.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    while let Ok(Some(frame)) = codec::read_frame(&mut old) {
+        let msg: ServerMessage = codec::decode(&frame).unwrap();
+        assert!(
+            !matches!(msg, ServerMessage::Event(Event::ClipboardQuery { .. })),
+            "{msg:?}"
+        );
+    }
+}

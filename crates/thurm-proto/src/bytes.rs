@@ -44,6 +44,25 @@ pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error>
     d.deserialize_byte_buf(Bytes)
 }
 
+/// The same for an `Option<Vec<u8>>`: `#[serde(with = "bytes::option")]`.
+pub mod option {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct BlockRef<'a>(#[serde(serialize_with = "super::serialize")] &'a [u8]);
+
+    #[derive(Deserialize)]
+    struct Block(#[serde(deserialize_with = "super::deserialize")] Vec<u8>);
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        v.as_deref().map(BlockRef).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        Ok(Option::<Block>::deserialize(d)?.map(|b| b.0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};
@@ -53,6 +72,19 @@ mod tests {
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Block(#[serde(with = "super")] Vec<u8>);
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Maybe(#[serde(with = "super::option")] Option<Vec<u8>>);
+
+    #[test]
+    fn optional_bytes_round_trip() {
+        for v in [None, Some(vec![]), Some(vec![0, 7, 255])] {
+            let wire = postcard::to_stdvec(&Maybe(v.clone())).unwrap();
+            assert_eq!(postcard::from_bytes::<Maybe>(&wire).unwrap().0, v);
+            let json = serde_json::to_string(&Maybe(v.clone())).unwrap();
+            assert_eq!(serde_json::from_str::<Maybe>(&json).unwrap().0, v);
+        }
+    }
 
     #[test]
     fn same_postcard_encoding_and_json_round_trip() {

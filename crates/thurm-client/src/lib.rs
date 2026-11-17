@@ -510,6 +510,17 @@ impl Client {
                 "this Thurm daemon has no actions or plugins yet; update Thurm on this host".into(),
             ));
         }
+        if matches!(
+            env.request,
+            Request::ClipboardSet { .. } | Request::ClipboardGet { .. }
+        ) && !matches!(&*self.hello.lock(), Some(Response::Hello { capabilities, .. })
+                if capabilities.iter().any(|c| c == thurm_proto::CAP_CLIP_QUERY))
+        {
+            return Err(ClientError::Daemon(
+                "this Thurm daemon has no clipboard tools yet; restart it with `thurm daemon upgrade`"
+                    .into(),
+            ));
+        }
         let buf = codec::encode(env)?;
         let mut w = match deadline {
             Some(d) => self.writer.try_lock_until(d).ok_or(ClientError::Timeout)?,

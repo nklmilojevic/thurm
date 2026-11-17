@@ -85,6 +85,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_STREAMS,
     CAP_PORTS,
     CAP_TRANSFER,
+    CAP_CLIP_QUERY,
 ];
 
 /// The daemon accepts `SearchPaths` and returns `PathMatches` only for that request.
@@ -178,6 +179,20 @@ pub const CAP_AGENT_ACTIVITY: &str = "agent-activity";
 /// Sent only by remote clients (the iOS app over ssh or the tailnet, the web client): the daemon
 /// deflates the events it sends them, as [`Event::Compressed`] (see [`codec::encode_frame`]).
 pub const CAP_DEFLATE: &str = "deflate";
+
+/// The daemon takes [`Request::ClipboardSet`] and [`Request::ClipboardGet`] from clipboard tools
+/// in its panes. A client that says it answers [`Event::ClipboardQuery`] with
+/// [`Request::ClipboardAnswer`]; the daemon asks only desktop UIs (`ui`, not a phone).
+pub const CAP_CLIP_QUERY: &str = "clip-query";
+
+/// The clipboard types [`Request::ClipboardGet`] reads.
+pub const CLIP_TEXT: &str = "text/plain";
+pub const CLIP_PNG: &str = "image/png";
+/// Not a type: [`Request::ClipboardGet`] with it answers the types the clipboard holds now, one
+/// per line.
+pub const CLIP_TARGETS: &str = "TARGETS";
+/// The most [`Request::ClipboardSet`] and [`Request::ClipboardAnswer`] carry.
+pub const CLIP_MAX: usize = 32 * 1024 * 1024;
 
 /// Environment variable exported into every pane with the pane's id.
 pub const ENV_PANE_ID: &str = "THURM_PANE_ID";
@@ -566,6 +581,27 @@ pub enum Request {
         path: String,
         if_version: Option<String>,
     },
+    /// A clipboard tool in `pane` copies `text` (at most [`CLIP_MAX`] bytes): sent to the apps as
+    /// [`Event::ClipboardStore`], like an OSC 52 copy. Requires [`CAP_CLIP_QUERY`].
+    ClipboardSet {
+        pane: PaneId,
+        text: String,
+    },
+    /// A clipboard tool in `pane` pastes: the daemon asks the desktop UI that last focused the
+    /// pane ([`Event::ClipboardQuery`]) and answers [`Response::ClipboardData`] with what it
+    /// gives, or an error when it refuses or says nothing for 30 s. `mime` is [`CLIP_TEXT`],
+    /// [`CLIP_PNG`] or [`CLIP_TARGETS`]. Requires [`CAP_CLIP_QUERY`].
+    ClipboardGet {
+        pane: PaneId,
+        mime: String,
+    },
+    /// A UI's answer to [`Event::ClipboardQuery`] `id`: the clipboard's contents in the type it
+    /// asked for (at most [`CLIP_MAX`] bytes), or `None` for a refusal or nothing of that type.
+    ClipboardAnswer {
+        id: u64,
+        #[serde(with = "bytes::option")]
+        data: Option<Vec<u8>>,
+    },
 }
 
 /// Where a file of [`Request::UploadBegin`] goes in a batch: the `index`th of `count` files
@@ -707,6 +743,11 @@ pub enum Response {
     },
     Ports(Vec<PanePorts>),
     Download(DownloadInfo),
+    /// The clipboard's contents for [`Request::ClipboardGet`].
+    ClipboardData {
+        #[serde(with = "bytes")]
+        data: Vec<u8>,
+    },
 }
 
 /// A pane that had keyboard focus in a UI (the Mac app, the iOS app).
@@ -863,6 +904,14 @@ pub enum Event {
         pane: PaneId,
         ports: Vec<PortEntry>,
         complete: bool,
+    },
+    /// A clipboard tool in `pane` asks for this Mac's clipboard in `mime` (see
+    /// [`Request::ClipboardGet`]); answer with [`Request::ClipboardAnswer`] `id`. Sent only to a
+    /// desktop UI with [`CAP_CLIP_QUERY`].
+    ClipboardQuery {
+        pane: PaneId,
+        id: u64,
+        mime: String,
     },
 }
 

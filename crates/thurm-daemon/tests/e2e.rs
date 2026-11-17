@@ -46,6 +46,8 @@ mod streams;
 mod ports;
 #[path = "e2e/transfer.rs"]
 mod transfer;
+#[path = "e2e/clipboard.rs"]
+mod clipboard;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -567,7 +569,10 @@ fn title_keeps_a_command_that_did_not_start_the_program() {
 
 /// A copy of sleep named nvim, which Thurm takes for Neovim.
 fn fake_nvim(dir: &Path) -> std::path::PathBuf {
-    let sleep = ["/bin/sleep", "/usr/bin/sleep"].into_iter().find(|p| Path::new(p).exists()).unwrap();
+    let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .unwrap();
     let nvim = dir.join("nvim");
     std::fs::copy(sleep, &nvim).unwrap();
     // A copied system binary runs only signed as itself.

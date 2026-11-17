@@ -3,6 +3,7 @@
 #[path = "active_size.rs"]
 mod active_size;
 mod agent_prompt;
+mod clip;
 pub mod ext;
 mod focus;
 mod layouts;
@@ -383,6 +384,8 @@ pub struct Client {
     /// When the socket last took bytes from the writer: a client it still takes output on is not
     /// gone, though it says nothing (see `mobile_silence`).
     pub last_written: Arc<Mutex<Instant>>,
+    /// Answers clipboard tools' pastes ([`thurm_proto::CAP_CLIP_QUERY`]).
+    pub clip_query: AtomicBool,
 }
 
 impl Client {
@@ -598,6 +601,9 @@ pub struct Daemon {
     ext: ext::Ext,
     /// The plugins and scripts the daemon runs.
     plugins: plugins::Plugins,
+    next_clip: AtomicU64,
+    /// Clipboard tools' pastes waiting for an app's answer.
+    pending_clips: Mutex<HashMap<u64, clip::PendingClip>>,
 }
 
 impl Daemon {
@@ -660,6 +666,8 @@ impl Daemon {
             focus: Mutex::new(focus::FocusLog::default()),
             ext: ext::Ext::default(),
             plugins: plugins::Plugins::default(),
+            next_clip: AtomicU64::new(1),
+            pending_clips: Mutex::new(HashMap::new()),
         });
         daemon.ext_config_applied();
         daemon
@@ -838,6 +846,7 @@ impl Daemon {
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
             last_written: Arc::new(Mutex::new(Instant::now())),
+            clip_query: AtomicBool::new(false),
         });
         self.clients.lock().insert(id, client.clone());
         *self.last_activity.lock() = Instant::now();
@@ -2441,6 +2450,18 @@ impl Daemon {
                 });
                 return;
             }
+            // The app may ask the user first.
+            Request::ClipboardGet { pane, mime } => {
+                let daemon = self.clone();
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    let result = daemon.clipboard_get(client.id, pane, mime);
+                    if id != 0 {
+                        client.send(ServerMessage::Response { id, result });
+                    }
+                });
+                return;
+            }
             // The Tailscale helper can take a while (starting the node, signing out).
             req @ (Request::TailscaleEnable { .. }
             | Request::TailscaleDisable
@@ -2744,6 +2765,9 @@ impl Daemon {
                 if has(thurm_proto::CAP_PORT_EVENTS) {
                     client.port_events.store(true, Ordering::Relaxed);
                     self.ports.subscribed(Arc::downgrade(self));
+                }
+                if has(thurm_proto::CAP_CLIP_QUERY) {
+                    client.clip_query.store(true, Ordering::Relaxed);
                 }
                 // Plugins' questions go only to a desktop app of this user on this machine:
                 // a tailnet caller or a phone saying so is not trusted with them.
@@ -3083,9 +3107,14 @@ impl Daemon {
             Request::Capture { pane, opts } => {
                 self.with_pane(pane, |_, st| Response::Text(st.term.capture(&opts)))
             }
-            Request::Wait { .. } | Request::Explain { .. } | Request::AgentPrompt { .. } => {
+            Request::Wait { .. }
+            | Request::Explain { .. }
+            | Request::AgentPrompt { .. }
+            | Request::ClipboardGet { .. } => {
                 unreachable!("handled in handle()")
             }
+            Request::ClipboardSet { pane, text } => self.clipboard_set(pane, text),
+            Request::ClipboardAnswer { id, data } => self.clipboard_answer(client.id, id, data),
             Request::SetLayout { json } => {
                 serde_json::from_str::<Layout>(&json)
                     .map_err(|e| format!("invalid layout: {e}"))?;
@@ -4576,6 +4605,7 @@ mod tests {
             queued: std::sync::atomic::AtomicUsize::new(0),
             unflushed: std::sync::atomic::AtomicUsize::new(0),
             last_written: Arc::new(Mutex::new(Instant::now())),
+            clip_query: AtomicBool::new(false),
         };
         // A few big outputs are a backlog, not only thousands of messages.
         for _ in 0..70 {
