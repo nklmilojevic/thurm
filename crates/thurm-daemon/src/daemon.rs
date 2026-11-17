@@ -2765,6 +2765,9 @@ impl Daemon {
                 if has(thurm_proto::CAP_EXT_FORWARDS) {
                     let trusted = client.ext_ui.load(Ordering::Relaxed);
                     client.ext_forwards.store(trusted, Ordering::Relaxed);
+                    if trusted {
+                        self.ext_forwarding_app_came(client.id);
+                    }
                 }
                 log::info!(
                     "client {} hello: {name} (protocol {version}{}{}{}{}{})",

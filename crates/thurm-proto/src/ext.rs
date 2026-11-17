@@ -84,15 +84,17 @@ pub mod method {
     /// `{pane?}`: the TCP ports the programs in this daemon's panes (or in `pane`) listen on,
     /// as `[PanePorts]` ([`crate::PanePorts`]).
     pub const PORTS_LIST: &str = "ports.list";
-    /// `{host, pane, ports, complete}`: a remote host's pane listed these ports
-    /// ([`crate::Event::PortsChanged`] from that host's daemon). Only from the app
+    /// `{host, pane, ports, complete, initial?}`: a remote host's pane listed these ports
+    /// ([`crate::Event::PortsChanged`] from that host's daemon); `initial` when they were
+    /// listening already as the app connected to the host. Only from the app
     /// ([`crate::CAP_EXT_FORWARDS`]), which hears them; subscribers hear `ports_changed` with
     /// `host`.
     pub const PORTS_REPORT: &str = "ports.report";
     /// [`super::ForwardsReport`]: the app's forwards now, and what changed. Only from the app
     /// ([`crate::CAP_EXT_FORWARDS`]); subscribers hear `forward_opened` and `forward_closed`.
     pub const FORWARDS_REPORT: &str = "forwards.report";
-    /// The app's forwards: `[ForwardInfo]`. Fails when no app that forwards is connected.
+    /// The forwards of the app that holds plugins' forwards (the one that connected first; ids
+    /// are that app's own): `[ForwardInfo]`. Fails when no app that forwards is connected.
     pub const FORWARDS_LIST: &str = "forwards.list";
     /// [`super::ForwardOpen`]: the app opens a remote host's port on this Mac (or finds the
     /// forward that has it). The result is [`super::ForwardInfo`] with `new`.
@@ -128,11 +130,14 @@ pub mod notice {
 ///
 /// - `ports_changed`: `{id, ports, complete}` ([`crate::PanePorts`]), the whole list of a pane's
 ///   ports (empty once they went), with `pane` while the pane is there. A remote host's pane
-///   (reported by the app) has `host`, and no `pane`. Subscribing to it by name starts the
-///   daemon's watch of its panes' ports.
+///   (reported by the app) has `host`, and no `pane`, and `initial` for the lists it had as the
+///   app connected to it. Subscribing to it by name starts the daemon's watch of its panes'
+///   ports.
 /// - `files_uploaded`: `{id, paths}`, the files sent to a pane, once their paths were typed
 ///   there, with `pane` while it is there.
-/// - `forward_opened` and `forward_closed`: [`ForwardInfo`], as the app reports them;
+/// - `forward_opened` and `forward_closed`: [`ForwardInfo`], as the app that holds plugins'
+///   forwards reports them (the one that connected first; when it quits, the next app's are
+///   heard as opened);
 ///   `forward_closed` with `why`: `closed` (by someone), `host` (removed or disabled), `gone`
 ///   (the port went away) or `app` (the app quit).
 pub const EVENTS: &[&str] = &[

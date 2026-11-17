@@ -1657,3 +1657,90 @@ fn forwards_go_through_the_app() {
     let closed = next_event(&rx, "forward_closed");
     assert_eq!(closed["why"], "app");
 }
+
+/// With two apps that forward, each numbering its own forwards, plugins see only the first
+/// app's: what is listed is what a close reaches. When it quits, the second's take over.
+#[test]
+fn the_first_app_holds_the_forwards() {
+    let env = Env::new("ext-forwards-two");
+    let _d = env.start();
+    let (plugin, rx) = ext_client(&env, "plugin");
+    call(
+        &plugin,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["forward_opened", "forward_closed", "ports_changed"] }),
+    )
+    .unwrap();
+    let caps = [CAP_EXT, CAP_EXT_UI, CAP_EXT_FORWARDS];
+    let (first, first_rx) = forwarding_app(&env, &caps);
+    let (second, second_rx) = forwarding_app(&env, &caps);
+    // Both have a forward numbered 1.
+    let forward = |port: u16| {
+        json!({ "id": 1, "host": "devbox", "remote_port": port, "local_port": port,
+                "url": format!("http://localhost:{port}/") })
+    };
+    call(
+        &second,
+        method::FORWARDS_REPORT,
+        json!({ "forwards": [forward(8080)] }),
+    )
+    .unwrap();
+    call(
+        &first,
+        method::FORWARDS_REPORT,
+        json!({ "forwards": [forward(5173)] }),
+    )
+    .unwrap();
+    let opened = next_event(&rx, "forward_opened");
+    assert_eq!(opened["remote_port"], 5173, "{opened}");
+    let list = call(&plugin, method::FORWARDS_LIST, Value::Null).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list[0]["remote_port"], 5173);
+
+    // A close of what was listed goes to the app it came from, whichever is focused.
+    let closing = std::thread::spawn({
+        let plugin = plugin.clone();
+        move || call(&plugin, method::FORWARDS_CLOSE, json!({ "id": 1 }))
+    });
+    let req = next(&first_rx, notice::UI_REQUEST);
+    assert_eq!(req["kind"], "forward_close");
+    call(
+        &first,
+        method::UI_REPLY,
+        json!({ "id": req["id"], "result": forward(5173) }),
+    )
+    .unwrap();
+    assert_eq!(closing.join().unwrap().unwrap()["remote_port"], 5173);
+    assert!(
+        second_rx.try_iter().all(|(n, _)| n != notice::UI_REQUEST),
+        "the second app was asked"
+    );
+
+    // The first quits: its forward closes, the second's are the plugins' now.
+    drop(first);
+    let closed = next_event(&rx, "forward_closed");
+    assert_eq!(
+        (closed["remote_port"].clone(), closed["why"].clone()),
+        (json!(5173), json!("app"))
+    );
+    let opened = next_event(&rx, "forward_opened");
+    assert_eq!(opened["remote_port"], 8080, "{opened}");
+    let list = call(&plugin, method::FORWARDS_LIST, Value::Null).unwrap();
+    assert_eq!(list[0]["remote_port"], 8080, "{list}");
+
+    // A host's lists as the app connected to it say so.
+    call(
+        &second,
+        method::PORTS_REPORT,
+        json!({ "host": "devbox", "pane": 1, "ports": [], "complete": true, "initial": true }),
+    )
+    .unwrap();
+    assert_eq!(next_event(&rx, "ports_changed")["initial"], true);
+    call(
+        &second,
+        method::PORTS_REPORT,
+        json!({ "host": "devbox", "pane": 1, "ports": [], "complete": true }),
+    )
+    .unwrap();
+    assert!(next_event(&rx, "ports_changed").get("initial").is_none());
+}

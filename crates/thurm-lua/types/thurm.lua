@@ -91,6 +91,7 @@
 ---@field host string? ports_changed of a remote host's pane, and forward events: the `[[remote]]` host.
 ---@field ports thurm.Port[]? ports_changed: every port the pane listens on now.
 ---@field complete boolean? ports_changed: false when part of the pane's processes could not be read.
+---@field initial boolean? ports_changed of a remote host's pane: listening already when the app connected to the host.
 ---@field paths string[]? files_uploaded: where the files landed.
 ---@field remote_port integer? forward_opened, forward_closed.
 ---@field local_port integer? forward_opened, forward_closed.

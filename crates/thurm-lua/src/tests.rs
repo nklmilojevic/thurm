@@ -40,7 +40,11 @@ impl Host for FakeHost {
                 "complete": false,
             }])),
             "ports.list" if params["pane"].is_u64() => Ok(json!([])),
-            "ports.list" => Ok(json!([{ "pane": 3, "ports": [], "complete": true }])),
+            "ports.list" => Ok(json!([{
+                "pane": 3,
+                "ports": [{ "port": 4000, "address": "127.0.0.1", "pid": 9, "command": "node_modules/.bin/vite" }],
+                "complete": true,
+            }])),
             "forwards.open" => Ok(json!({
                 "id": 4, "host": params["host"], "remote_port": params["port"],
                 "local_port": 5174, "url": "http://localhost:5174/", "new": params["browse"],
@@ -671,4 +675,71 @@ fn ports_and_forwards() {
     );
     let e = run(&f, "thurm.forward.open('devbox', '5173')").unwrap_err();
     assert!(e.contains("usage: thurm.forward.open"), "{e}");
+}
+
+/// The example dev-server plugin opens servers that start, never ones that were running: this
+/// Mac's when it loads, nor a remote host's listed as `initial` when the app connects to it,
+/// however late that is.
+#[test]
+fn the_dev_server_example_opens_only_new_servers() {
+    let f = fixture();
+    let mut s = spec(
+        5,
+        include_str!("../../../examples/plugins/dev-server/init.lua"),
+        false,
+    );
+    s.settings = json!({});
+    let done = f.rt.load(s);
+    assert_eq!(
+        done.recv_timeout(Duration::from_secs(20)).unwrap(),
+        Ok(Value::Null)
+    );
+    let vite = |port: u16| json!({ "port": port, "address": "127.0.0.1", "pid": 9, "command": "node_modules/.bin/vite" });
+    let event = |payload: Value| f.rt.notice(5, notice::EVENT, payload);
+    // The lists sent on subscribing: the server this Mac had at load.
+    event(json!({ "event": "ports_changed", "id": 3, "ports": [vite(4000)], "complete": true }));
+    // A host the app connects to after the plugin has long been running.
+    std::thread::sleep(Duration::from_millis(3500));
+    event(
+        json!({ "event": "ports_changed", "host": "devbox", "id": 1, "initial": true,
+                  "ports": [vite(5173)], "complete": true }),
+    );
+    // Then servers start: one more on the host, one more here, one on a host connected before.
+    event(json!({ "event": "ports_changed", "host": "devbox", "id": 1,
+                  "ports": [vite(5173), vite(5174)], "complete": true }));
+    event(
+        json!({ "event": "ports_changed", "id": 3, "ports": [vite(4000), vite(4001)], "complete": true }),
+    );
+    event(
+        json!({ "event": "ports_changed", "host": "other", "id": 2, "ports": [vite(3000)], "complete": true }),
+    );
+    // Not a dev server.
+    event(json!({ "event": "ports_changed", "id": 4, "complete": true,
+                  "ports": [{ "port": 22, "address": "0.0.0.0", "pid": 1, "command": "sshd" }] }));
+    event(json!({ "event": "bell", "id": 0 }));
+    let opened = |f: &Fixture| -> Vec<Value> {
+        f.host
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(m, p)| match m.as_str() {
+                "forwards.open" => Some(json!([p["host"], p["port"], p["browse"]])),
+                "exec" => Some(p["argv"].clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let want = vec![
+        json!(["devbox", 5174, true]),
+        json!(["open", "http://localhost:4001/"]),
+        json!(["other", 3000, true]),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while opened(&f).len() < want.len() {
+        assert!(Instant::now() < deadline, "{:?}", opened(&f));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(opened(&f), want);
 }
