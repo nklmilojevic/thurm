@@ -527,7 +527,7 @@ impl Daemon {
     /// the ones that joined at this look, which get every list on their own
     /// ([`Daemon::ext_ports_to`]).
     pub(super) fn ext_ports_changed(&self, event: &Event, except: &[u64]) {
-        let Some(payload) = self.ports_payload(event, false) else {
+        let Some(payload) = self.ports_payload(event) else {
             return;
         };
         // `ports_changed` has no `[[on]]` hooks: only the subscribers hear it.
@@ -548,18 +548,20 @@ impl Daemon {
         if !self.ext.registry.lock().has(client.id, PORTS_CHANGED) {
             return;
         }
-        if let Some(payload) = self.ports_payload(event, true) {
+        if let Some(payload) = self.ports_payload(event) {
             send_ext(client, notice::EVENT, &payload);
         }
     }
 
-    /// `ports_changed`'s payload for `event`, with `pane` while the pane is there.
-    fn ports_payload(&self, event: &Event, initial: bool) -> Option<Value> {
+    /// `ports_changed`'s payload for `event`, with `pane` while the pane is there, and
+    /// `initial` when the watch sent it as a list of what was listening already as the
+    /// subscriber joined.
+    fn ports_payload(&self, event: &Event) -> Option<Value> {
         let Event::PortsChanged {
             pane,
             ports,
             complete,
-            ..
+            initial,
         } = event
         else {
             return None;
@@ -569,7 +571,7 @@ impl Daemon {
         if let Some(info) = self.pane(*pane).map(|p| p.state.lock().info.clone()) {
             payload["pane"] = serde_json::to_value(info).unwrap_or_default();
         }
-        if initial {
+        if *initial {
             payload["initial"] = true.into();
         }
         Some(payload)

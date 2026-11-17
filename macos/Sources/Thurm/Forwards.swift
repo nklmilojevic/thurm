@@ -119,14 +119,9 @@ struct ForwardRequests {
 }
 
 /// The remote hosts' port lists the app passes on to this Mac's daemon for its plugins
-/// (`ports.report`): the latest of each pane, sent again whenever the app connects to the daemon,
-/// and for each host just connected to, its own answer of what it lists (`initial`: running
-/// already).
-///
-/// While that answer is on its way, the host's lists are held back: some are the lists its
-/// daemon sends a client that joins (running already too), some are changes, and an answer that
-/// comes after a change may be older than it. Once the answer is in, it goes first, as `initial`,
-/// then what was held, in order, as changes, but for lists that only say again what is known.
+/// (`ports.report`): the latest of each pane, sent again whenever the app connects to the
+/// daemon. Whether a list is of servers running already (`initial`) is the host's daemon's to
+/// say: it marks the lists it sends the app as it joins the watch.
 struct RemotePorts {
     struct Entry {
         let host: HostId
@@ -135,84 +130,20 @@ struct RemotePorts {
         let complete: Any
     }
 
-    /// A list to send, and whether it was running already.
-    struct Send {
-        let entry: Entry
-        let initial: Bool
-    }
-
     private var lists: [HostId: [UInt64: Entry]] = [:]
-    /// Hosts whose own answer of what they list is awaited, by the ask's number.
-    private var learning: [HostId: Int] = [:]
-    /// What `learning` hosts listed meanwhile, in order.
-    private var held: [HostId: [Entry]] = [:]
-    private var asks = 0
 
-    /// The app connected to `host`: its lists wait for its answer to ask number (returned)
-    /// `learned`.
-    mutating func connected(_ host: HostId) -> Int {
-        asks += 1
-        learning[host] = asks
-        lists[host] = nil
-        held[host] = nil
-        return asks
+    /// A pane of `host` listed `ports`: kept as its latest; an empty list forgets the pane.
+    mutating func listed(_ host: HostId, pane: UInt64, ports: Any, complete: Any) {
+        if (ports as? [Any])?.isEmpty ?? false {
+            lists[host]?[pane] = nil
+        } else {
+            lists[host, default: [:]][pane] = Entry(host: host, pane: pane, ports: ports, complete: complete)
+        }
     }
 
-    /// The connection to `host` is gone: its lists, its ask and what waited for it with it.
+    /// The connection to `host` is gone: its lists with it.
     mutating func disconnected(_ host: HostId) {
-        learning[host] = nil
         lists[host] = nil
-        held[host] = nil
-    }
-
-    /// A pane of `host` listed `ports` (live, from its daemon): the list to send now, or none
-    /// while the host's answer is awaited (it waits for it).
-    mutating func live(_ host: HostId, pane: UInt64, ports: Any, complete: Any) -> Send? {
-        let e = Entry(host: host, pane: pane, ports: ports, complete: complete)
-        if learning[host] != nil {
-            held[host, default: []].append(e)
-            return nil
-        }
-        keep(e)
-        return Send(entry: e, initial: false)
-    }
-
-    /// Ask `ask` of `host` was answered with `snapshot` (nil: an error, a timeout, a daemon from
-    /// before ports): what to send, in order. Nothing for an ask that is not the one awaited (of
-    /// a connection that went, or that a newer one replaced).
-    mutating func learned(_ host: HostId, ask: Int, snapshot: [Entry]?) -> [Send] {
-        guard learning[host] == ask else { return [] }
-        learning[host] = nil
-        let waited = held.removeValue(forKey: host) ?? []
-        guard let snapshot else {
-            // Nothing to tell changes by. A pane's first list may be the one its daemon sends on
-            // joining: what runs, already. Any list of it after that is a change, unless it only
-            // says that again.
-            var out: [Send] = []
-            var seen: Set<UInt64> = []
-            for e in waited {
-                if seen.insert(e.pane).inserted {
-                    keep(e)
-                    out.append(Send(entry: e, initial: true))
-                } else if !RemotePorts.same(lists[host]?[e.pane], e) {
-                    keep(e)
-                    out.append(Send(entry: e, initial: false))
-                }
-            }
-            return out
-        }
-        var out: [Send] = []
-        for e in snapshot where !RemotePorts.isEmpty(e.ports) {
-            keep(e)
-            out.append(Send(entry: e, initial: true))
-        }
-        for e in waited {
-            let known = lists[host]?[e.pane]
-            if RemotePorts.same(known, e) { continue }
-            keep(e)
-            out.append(Send(entry: e, initial: false))
-        }
-        return out
     }
 
     /// Every list known now, by host and pane.
@@ -220,23 +151,6 @@ struct RemotePorts {
         lists.keys.sorted().flatMap { host in
             (lists[host] ?? [:]).keys.sorted().compactMap { lists[host]?[$0] }
         }
-    }
-
-    /// Keeps `e` as its pane's latest; an empty list forgets the pane.
-    private mutating func keep(_ e: Entry) {
-        if RemotePorts.isEmpty(e.ports) {
-            lists[e.host]?[e.pane] = nil
-        } else {
-            lists[e.host, default: [:]][e.pane] = e
-        }
-    }
-
-    private static func isEmpty(_ ports: Any) -> Bool { (ports as? [Any])?.isEmpty ?? false }
-
-    /// Whether `e` says what `known` (none: no ports) says.
-    private static func same(_ known: Entry?, _ e: Entry) -> Bool {
-        guard let known else { return isEmpty(e.ports) }
-        return (known.ports as AnyObject).isEqual(e.ports) && (known.complete as AnyObject).isEqual(e.complete)
     }
 }
 
@@ -576,10 +490,11 @@ extension SessionManager {
         Remotes.shared.portsRequests.event(host, payload)
         applyRemotePorts(payload, host: host)
         // Plugins hear it once, as it comes: `fetchRemotePorts` applies it again for the
-        // forwards only.
+        // forwards only. Running already only when the host's daemon says so.
         if let pane = jsonUInt64(payload["pane"]) {
             Extensions.shared.reportPorts(host: host, pane: pane, ports: payload["ports"] ?? [],
-                                          complete: payload["complete"] ?? true)
+                                          complete: payload["complete"] ?? true,
+                                          initial: jsonBool(payload["initial"]) ?? false)
         }
     }
 

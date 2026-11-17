@@ -85,8 +85,9 @@ pub mod method {
     /// as `[PanePorts]` ([`crate::PanePorts`]).
     pub const PORTS_LIST: &str = "ports.list";
     /// `{host, pane, ports, complete, initial?}`: a remote host's pane listed these ports
-    /// ([`crate::Event::PortsChanged`] from that host's daemon); `initial` when they were
-    /// listening already as the app connected to the host (or to this daemon). `{host, gone:
+    /// ([`crate::Event::PortsChanged`] from that host's daemon); `initial` when that daemon
+    /// marked it so (sent as the app joined its watch), or the app sends it again to this daemon
+    /// on connecting. `{host, gone:
     /// true}`: the app's connection to the host is gone. The daemon keeps each pane's latest
     /// list for new subscribers, and passes on only the lists of the app that holds plugins'
     /// forwards. Only from the app
@@ -133,8 +134,8 @@ pub mod notice {
 ///
 /// - `ports_changed`: `{id, ports, complete}` ([`crate::PanePorts`]), the whole list of a pane's
 ///   ports (empty once they went), with `pane` while the pane is there. A remote host's pane
-///   (reported by the app) has `host`, and no `pane`, and `initial` for the lists it had as the
-///   app connected to it. Subscribing to it by name starts the daemon's watch of its panes'
+///   (reported by the app) has `host`, and no `pane`, and `initial` for the lists its daemon
+///   sent the app as it joined that daemon's watch. Subscribing to it by name starts the daemon's watch of its panes'
 ///   ports. A new subscriber gets every pane's list first, on its own (the others hear
 ///   nothing again), and the remote hosts' lists known so far, all with `initial`. When the
 ///   app loses a host (or quits), each of its panes heard of gets an empty list, `complete`

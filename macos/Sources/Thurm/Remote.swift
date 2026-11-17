@@ -237,10 +237,7 @@ final class Remotes {
                     connectFailed(host, err)
                 } else {
                     SessionManager.shared.remoteConnected(host)
-                    if Core.shared.isConnected(host) {
-                        connectFailures[host] = nil
-                        Extensions.shared.remoteHostConnected(host)
-                    }
+                    if Core.shared.isConnected(host) { connectFailures[host] = nil }
                 }
             }
         } else {
