@@ -683,9 +683,11 @@ const SHIMS: &str = concat!(
     "TH=\"${THURM_HOME:-$HOME}\"; ",
     "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
     "B=\"$(command -v thurm)\" || { echo \"Thurm is not installed\" >&2; exit 3; }; C=\"$B\"; ",
-    "S=\"$TH/.local/share/thurm/shims\"; ",
+    "R=\"$(readlink -f \"$B\")\"; S=\"$TH/.local/share/thurm/shims\"; ",
     "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do ",
-    "if [ -e \"$S/$t\" ] || [ -L \"$S/$t\" ]; then case \"$(readlink \"$S/$t\" 2>/dev/null)\" in ",
+    // A link that leads to this thurm, as the probe counts it (a relative one too), is ours.
+    "if [ -L \"$S/$t\" ] && [ \"$(readlink -f \"$S/$t\" 2>/dev/null)\" = \"$R\" ]; then :; ",
+    "elif [ -e \"$S/$t\" ] || [ -L \"$S/$t\" ]; then case \"$(readlink \"$S/$t\" 2>/dev/null)\" in ",
     thurm_link_patterns!(),
     ") ;; *) echo \"$S/$t is another program; remove it to install the clipboard tools\" >&2; exit 3;; esac; fi; done; ",
     "mkdir -p \"$S\" || exit 1; ",
@@ -1049,6 +1051,11 @@ mod tests {
         for t in ["xclip", "xsel", "wl-copy", "wl-paste"] {
             std::fs::remove_file(shims.join(t)).unwrap();
         }
+        // A relative link to this thurm counts as installed, and does not stop the fix for
+        // the ones missing.
+        symlink("../bin/thurm", shims.join("xclip")).unwrap();
+        assert_eq!(probe().shims, 1);
+        assert!(probe().shims_other.is_empty());
         let out = run_script(SHIMS, &th);
         assert!(
             out.status.success(),

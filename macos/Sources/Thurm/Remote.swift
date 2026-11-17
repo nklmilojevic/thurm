@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import Network
 import CThurm
 
@@ -462,14 +463,43 @@ final class Remotes {
         let data: Data?
         switch mime {
         case clipText:
-            data = pb.string(forType: .string).map { Data($0.utf8) }
+            // Measured before it is copied out.
+            data = pb.string(forType: .string)
+                .flatMap { $0.utf8.count <= clipMax ? Data($0.utf8) : nil }
         case clipPNG:
-            data = pb.data(forType: .png) ?? pb.data(forType: .tiff)
-                .flatMap { NSBitmapImageRep(data: $0)?.representation(using: .png, properties: [:]) }
+            data = pb.data(forType: .png) ?? pb.data(forType: .tiff).flatMap { pngFromTIFF($0) }
         default:
             data = nil
         }
         return data.flatMap { $0.count <= clipMax ? $0 : nil }
+    }
+
+    /// The largest TIFF a tool's image paste converts, and the most pixels it decodes: 64 MP,
+    /// 256 MiB at four bytes each. Beyond that a paste gets nothing rather than the app holding
+    /// a decoded image of any size.
+    static let clipMaxTIFF = 256 * 1024 * 1024
+    static let clipMaxPixels = 64 * 1024 * 1024
+
+    /// `tiff` as a PNG, for a screenshot's paste: its size and its pixel count (from the file's
+    /// header, nothing decoded) checked first, then converted by ImageIO without keeping the
+    /// decoded image. Nil when either is over its limit, or it is no image.
+    static func pngFromTIFF(_ tiff: Data, maxBytes: Int = clipMaxTIFF, maxPixels: Int = clipMaxPixels) -> Data? {
+        let noCache = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard tiff.count <= maxBytes,
+              let source = CGImageSourceCreateWithData(tiff as CFData, noCache),
+              CGImageSourceGetCount(source) > 0,
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, noCache) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0
+        else { return nil }
+        let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
+        guard !overflow, pixels <= maxPixels else { return nil }
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(out, "public.png" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImageFromSource(dest, source, 0, noCache)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return out as Data
     }
 
     /// OSC 52 write from `host`: follows this Mac's `terminal.osc52`.

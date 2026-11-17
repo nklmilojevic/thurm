@@ -824,6 +824,15 @@ mod tests {
     #[test]
     fn wl_copy() {
         assert_eq!(p("wl-copy", &[]), Ok(copy()));
+        // An explicit empty argument copies empty text; a bare `--` reads standard input.
+        let text = |t: &str| Action::Copy {
+            text: Some(t.into()),
+            trim: false,
+            echo: false,
+        };
+        assert_eq!(p("wl-copy", &[""]), Ok(text("")));
+        assert_eq!(p("wl-copy", &["--", ""]), Ok(text("")));
+        assert_eq!(p("wl-copy", &["--"]), Ok(copy()));
         assert_eq!(
             p("wl-copy", &["-n", "hello", "world"]),
             Ok(Action::Copy {

@@ -1,5 +1,6 @@
 import AppKit
 import CThurm
+import ImageIO
 import XCTest
 @testable import Thurm
 
@@ -155,6 +156,42 @@ final class ClipboardToolsTests: XCTestCase {
         XCTAssertEqual(Remotes.clipboardTypes(pb), ["image/png"])
         let out = Remotes.clipboardData(pb, mime: "image/png")!
         XCTAssertEqual(Array(out.prefix(4)), [0x89, 0x50, 0x4E, 0x47])
+    }
+
+    /// A TIFF whose header claims a huge image (60000 x 60000, 3.6 GB decoded) with almost no
+    /// data behind it, as Deflate lets a blank one be: little-endian, one strip.
+    private func hugeTIFF() -> Data {
+        var d = Data([0x49, 0x49, 42, 0, 8, 0, 0, 0])
+        let entries: [(UInt16, UInt16, UInt32)] = [
+            (256, 4, 60000), (257, 4, 60000), (258, 3, 8), (259, 3, 8), (262, 3, 1),
+            (273, 4, 200), (277, 3, 1), (278, 4, 60000), (279, 4, 64),
+        ]
+        func le<T: FixedWidthInteger>(_ v: T) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        le(UInt16(entries.count))
+        for (tag, type, value) in entries {
+            le(tag); le(type); le(UInt32(1))
+            if type == 3 { le(UInt16(value)); le(UInt16(0)) } else { le(value) }
+        }
+        le(UInt32(0))
+        d.append(Data(count: 200 - d.count + 64))
+        return d
+    }
+
+    /// An image paste does not decode what is too large: the TIFF's header is read for its
+    /// size, and a huge one or one over the byte limit gets nothing.
+    func testOversizedTIFFIsNotDecoded() {
+        // ImageIO reads it as that large, so the limit, not a bad file, refuses it.
+        let source = CGImageSourceCreateWithData(hugeTIFF() as CFData, nil)!
+        let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        XCTAssertEqual(props?[kCGImagePropertyPixelWidth] as? Int, 60000)
+        XCTAssertNil(Remotes.pngFromTIFF(hugeTIFF()), "60000 x 60000 claimed")
+        pb.setData(hugeTIFF(), forType: .tiff)
+        XCTAssertNil(Remotes.clipboardData(pb, mime: "image/png"))
+        let tiff = NSBitmapImageRep(data: png())!.tiffRepresentation!
+        XCTAssertNil(Remotes.pngFromTIFF(tiff, maxPixels: 3), "2 x 2 over a 3-pixel limit")
+        XCTAssertNil(Remotes.pngFromTIFF(tiff, maxBytes: tiff.count - 1))
+        XCTAssertNotNil(Remotes.pngFromTIFF(tiff, maxPixels: 4))
+        XCTAssertNil(Remotes.pngFromTIFF(Data("not an image".utf8)))
     }
 
     func testOnlyTheTypesToolsAskFor() {

@@ -373,7 +373,8 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
   (`xclip -t TARGETS -o`, `wl-paste --list-types`) fails where reads from that
   host are refused (`clipboard_read = "never"`, or pastes off in either
   `terminal.osc52`). Pastes carry text or a PNG image (an agent's image paste
-  works), at most 32 MiB each, and at most 128 MiB at once on its way through
+  works; a screenshot, copied as TIFF, is converted when it is at most 256 MiB
+  and 64 megapixels), at most 32 MiB each, and at most 128 MiB at once on its way through
   the host's daemon or queued there for a program or app that has not read it
   yet (a paste or copy over that is refused, to try again).
   A clear (`xsel --clear`, `wl-copy --clear`) empties
