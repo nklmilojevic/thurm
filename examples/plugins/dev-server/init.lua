@@ -10,7 +10,10 @@
 -- Servers already running are left alone: this Mac's when the plugin starts, a remote host's
 -- when Thurm connects to it (its lists then come marked `initial`). A list that could not
 -- read every process keeps the servers it left out: they open again only after a complete
--- list without them.
+-- list without them. A pane first read that way (at load, or as Thurm connects to its host)
+-- may have servers the read missed, which its next complete list shows: that list settles
+-- what runs and opens nothing, even for one that started meanwhile (a tab not opened rather
+-- than one opened twice).
 --
 -- Settings, in config.toml:
 --

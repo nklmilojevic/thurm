@@ -62,7 +62,28 @@ pub struct Ext {
 }
 
 /// A remote host's panes' lists: by host and pane, the ports and whether they are complete.
-type RemoteLists = std::collections::BTreeMap<(String, u64), (Vec<PortEntry>, bool)>;
+type RemoteLists = std::collections::BTreeMap<(String, u64), RemoteList>;
+
+/// A remote pane's list as its app reported it last.
+#[derive(Clone, PartialEq)]
+struct RemoteList {
+    ports: Vec<PortEntry>,
+    complete: bool,
+    /// Its host's daemon sent it as running already (`initial`), not as a change.
+    initial: bool,
+}
+
+/// `ports_changed` of a remote host's pane, as plugins hear it.
+fn remote_payload(host: &str, pane: u64, list: &RemoteList) -> Value {
+    let mut payload = json!({
+        "event": PORTS_CHANGED, "host": host, "id": pane, "ports": list.ports,
+        "complete": list.complete,
+    });
+    if list.initial {
+        payload["initial"] = true.into();
+    }
+    payload
+}
 
 pub use thurm_proto::ext::method_blocks as blocks;
 
@@ -105,18 +126,35 @@ fn opt_bool(v: &Value, key: &str) -> Result<Option<bool>, String> {
     }
 }
 
-/// The remote lists `app` relayed, as `ports_changed` payloads of servers running already.
+/// The remote lists `app` relayed, as `ports_changed` payloads of servers running already (for
+/// a subscriber that just came: whatever they were, they run now).
 fn remote_lists(all: &HashMap<u64, RemoteLists>, app: Option<u64>) -> Vec<Value> {
     app.and_then(|a| all.get(&a))
         .into_iter()
         .flatten()
-        .map(|((host, pane), (ports, complete))| {
-            json!({
-                "event": PORTS_CHANGED, "host": host, "id": pane, "ports": ports,
-                "complete": complete, "initial": true,
-            })
+        .map(|((host, pane), list)| {
+            remote_payload(
+                host,
+                *pane,
+                &RemoteList {
+                    initial: true,
+                    ..list.clone()
+                },
+            )
         })
         .collect()
+}
+
+/// Test builds: `var` as a number of milliseconds, for a step that takes a while on purpose.
+/// Release builds never read it.
+fn test_delay(var: &str) -> Option<Duration> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
 }
 
 /// Refuses `method` unless `client` is the app, which opens forwards.
@@ -244,10 +282,14 @@ impl Daemon {
             }
             method::EVENTS_SUBSCRIBE => {
                 let names = names(&p);
-                // The remote lists' lock first (as `ports.report` takes it, before the
-                // registry's), held until the replay below is sent: a report cannot reach a new
-                // subscriber between its registration and its first lists.
-                let all = self.ext.remote_ports.lock();
+                // For `ports_changed`, the remote lists' lock first (as `ports.report` takes it,
+                // before the registry's), held until the replay below is sent: a report cannot
+                // reach a new subscriber between its registration and its first lists. Other
+                // subscriptions don't wait on reports.
+                let all = names
+                    .iter()
+                    .any(|n| n == PORTS_CHANGED)
+                    .then(|| self.ext.remote_ports.lock());
                 // Only a new subscriber joins: one that has the lists keeps hearing changes.
                 let joins = {
                     let mut reg = self.ext_registry(client)?;
@@ -268,9 +310,9 @@ impl Daemon {
                 // subscriber joins the watch as a client does: the next look sends it alone
                 // every pane's list (`ext_ports_to`), as running already. Of remote hosts, it
                 // gets the lists the app relayed so far, the same way.
-                if joins {
+                if joins && let Some(all) = &all {
                     self.ports.subscribed(Arc::downgrade(self), client.id);
-                    for payload in remote_lists(&all, self.forwarding_app_id()) {
+                    for payload in remote_lists(all, self.forwarding_app_id()) {
                         send_ext(client, notice::EVENT, &payload);
                     }
                 }
@@ -363,10 +405,23 @@ impl Daemon {
             method::PORTS_LIST => {
                 // No pane is every pane; a pane that is not one is refused, not taken for none.
                 let pane = opt_u64(&p, "pane")?;
-                match self.answer(client, Request::Ports { pane })? {
-                    Response::Ports(list) => Ok(json!(list)),
-                    other => Err(format!("unexpected answer: {other:?}")),
+                let mut list = match self.answer(client, Request::Ports { pane })? {
+                    Response::Ports(list) => list,
+                    other => return Err(format!("unexpected answer: {other:?}")),
+                };
+                // A pane asked for whose processes were not looked at (it has none yet, or no
+                // more) has a list too: empty, and complete only when nothing runs in it.
+                if let Some(p) = pane
+                    && !list.iter().any(|e| e.pane == p)
+                {
+                    let alive = self.pane(p).is_some_and(|x| x.state.lock().info.alive);
+                    list.push(thurm_proto::PanePorts {
+                        pane: p,
+                        ports: Vec::new(),
+                        complete: !alive,
+                    });
                 }
+                Ok(json!(list))
             }
             method::PORTS_REPORT => {
                 only_the_app(client, method)?;
@@ -403,29 +458,26 @@ impl Daemon {
                 // An empty list that could not read every process may have missed servers: kept,
                 // so a later subscriber knows the pane is unsure, until a complete one or the
                 // host going says otherwise.
-                if ports.is_empty() && complete {
+                let list = RemoteList {
+                    ports,
+                    complete,
+                    initial,
+                };
+                if list.ports.is_empty() && complete {
                     lists.remove(&at);
                 } else {
-                    lists.insert(at, (ports.clone(), complete));
+                    lists.insert(at, list.clone());
                 }
                 // Only the app that holds plugins' forwards is heard, as with its forwards.
                 if self.forwarding_app_id() != Some(client.id) {
                     return Ok(Value::Null);
                 }
                 // Tests: a report that takes a while, for what happens while it holds the lock.
-                if let Some(ms) = std::env::var("THURM_EXT_REPORT_DELAY_MS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                {
-                    std::thread::sleep(Duration::from_millis(ms));
+                if let Some(delay) = test_delay("THURM_EXT_REPORT_DELAY_MS") {
+                    std::thread::sleep(delay);
                 }
-                let mut extra =
-                    json!({ "host": host, "id": pane, "ports": ports, "complete": complete });
-                // Listening already when the app connected to the host: not news.
-                if initial {
-                    extra["initial"] = true.into();
-                }
-                self.emit(PORTS_CHANGED, None, extra);
+                // `initial`: listening already when the app connected to the host, not news.
+                self.emit(PORTS_CHANGED, None, remote_payload(host, pane, &list));
                 drop(all);
                 Ok(Value::Null)
             }
@@ -473,10 +525,16 @@ impl Daemon {
     /// `gone` (an incomplete list is otherwise a read that missed some processes).
     fn remote_lists_ended(&self, panes: &[(String, u64)]) {
         for (host, pane) in panes {
-            let payload = json!({
-                "event": PORTS_CHANGED, "host": host, "id": pane, "ports": [], "complete": false,
-                "gone": true,
-            });
+            let mut payload = remote_payload(
+                host,
+                *pane,
+                &RemoteList {
+                    ports: Vec::new(),
+                    complete: false,
+                    initial: false,
+                },
+            );
+            payload["gone"] = true.into();
             self.deliver_event(PORTS_CHANGED, &payload);
         }
     }
@@ -839,13 +897,20 @@ impl Daemon {
             let had = all.remove(&client).unwrap_or_default();
             let next_has = next_app.and_then(|a| all.get(&a));
             let ended: Vec<(String, u64)> = had
-                .into_keys()
-                .filter(|k| first && !next_has.is_some_and(|n| n.contains_key(k)))
+                .keys()
+                .filter(|k| first && !next_has.is_some_and(|n| n.contains_key(*k)))
+                .cloned()
                 .collect();
             self.remote_lists_ended(&ended);
-            // The remote lists heard from now on are that app's: what it had runs already.
-            for payload in remote_lists(&all, next_app) {
-                self.deliver_event(PORTS_CHANGED, &payload);
+            // The remote lists heard from now on are that app's. Plugins heard the first app's:
+            // a pane the next one lists the same is no news; any other list goes as that app
+            // had it, a change or running already, as its host's daemon said.
+            for ((host, pane), list) in next_has.into_iter().flatten() {
+                let heard = had.get(&(host.clone(), *pane));
+                if heard.is_some_and(|h| h.ports == list.ports && h.complete == list.complete) {
+                    continue;
+                }
+                self.deliver_event(PORTS_CHANGED, &remote_payload(host, *pane, list));
             }
         }
         for f in gone.iter().flatten() {

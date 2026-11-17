@@ -336,7 +336,11 @@ impl Watcher {
     }
 }
 
+/// Test builds: a look that takes this long. Release builds never read it.
 fn look_delay() -> Option<Duration> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
     std::env::var("THURM_PORTS_LOOK_DELAY_MS")
         .ok()
         .and_then(|v| v.parse().ok())

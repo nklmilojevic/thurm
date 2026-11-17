@@ -668,7 +668,7 @@ fn ports_and_forwards() {
     assert_eq!(
         r,
         json!({
-            "port": 5173, "command": "vite", "complete": false, "none": 0, "none_complete": true,
+            "port": 5173, "command": "vite", "complete": false, "none": 0, "none_complete": false,
             "all": 3, "url": "http://localhost:5174/", "new": true, "plain_new": false,
             "closed": 4, "listed": "devbox",
         })

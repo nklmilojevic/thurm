@@ -1820,10 +1820,11 @@ fn a_late_subscriber_hears_the_remote_lists_as_initial() {
     assert!(change.get("initial").is_none(), "{change}");
     assert_eq!(change["ports"][1]["port"], 5174, "{change}");
 
-    // The first app quits: the second's lists are the plugins' now, as running already.
+    // The first app quits: the second's lists are the plugins' now. Its list of pane 1 came as
+    // changes (reported without `initial`), and goes to plugins as one.
     drop(first);
     let taken_over = next_event(&rx, "ports_changed");
-    assert_eq!(taken_over["initial"], true, "{taken_over}");
+    assert!(taken_over.get("initial").is_none(), "{taken_over}");
     assert_eq!(taken_over["ports"][1]["port"], 9998, "{taken_over}");
     report(&second, "devbox", 1, json!([]));
     let gone = next_event(&rx, "ports_changed");
@@ -2167,5 +2168,93 @@ fn a_late_subscriber_hears_an_incomplete_empty_remote_list() {
             .try_iter()
             .all(|(n, p)| n != notice::EVENT || p["event"] != "ports_changed"),
         "a forgotten pane was replayed"
+    );
+}
+
+/// When the app that holds plugins' lists quits, the next one's lists go out as they came to it:
+/// running already only when its host said so, a change otherwise, and nothing for a pane it
+/// lists as plugins last heard it.
+#[test]
+fn the_next_apps_lists_keep_what_they_were() {
+    let env = Env::new("ext-remote-takeover");
+    let _d = env.start();
+    let caps = [CAP_EXT, CAP_EXT_UI, CAP_EXT_FORWARDS];
+    let (first, _first_rx) = forwarding_app(&env, &caps);
+    let (second, _second_rx) = forwarding_app(&env, &caps);
+    let (plugin, rx) = ext_client(&env, "plugin");
+    call(
+        &plugin,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    let vite =
+        |port: u16| json!([{ "port": port, "address": "127.0.0.1", "pid": 9, "command": "vite" }]);
+    let report = |app: &Client, pane: u64, ports: Value, initial: bool| {
+        call(
+            app,
+            method::PORTS_REPORT,
+            json!({ "host": "devbox", "pane": pane, "ports": ports, "complete": true, "initial": initial }),
+        )
+        .unwrap();
+    };
+    // Plugins hear the first app's.
+    report(&first, 3, vite(9000), true);
+    next_event(&rx, "ports_changed");
+    // The second's: a server it heard start in pane 1, pane 2 running as it connected, pane 3 as
+    // the first had it.
+    report(&second, 1, vite(5173), false);
+    report(&second, 2, vite(8080), true);
+    report(&second, 3, vite(9000), true);
+    drop(first);
+    let mut heard: Vec<(u64, bool)> = (0..2)
+        .map(|_| {
+            let ev = next_event(&rx, "ports_changed");
+            (ev["id"].as_u64().unwrap(), ev["initial"] == true)
+        })
+        .collect();
+    heard.sort_unstable();
+    assert_eq!(heard, [(1, false), (2, true)]);
+    std::thread::sleep(Duration::from_millis(300));
+    let more: Vec<Value> = rx
+        .try_iter()
+        .filter(|(n, p)| n == notice::EVENT && p["event"] == "ports_changed")
+        .map(|(_, p)| p)
+        .collect();
+    assert!(more.is_empty(), "pane 3 was said again: {more:?}");
+}
+
+/// A pane asked for has a list even when its processes were not looked at: one whose program
+/// ended listens on nothing, and says so as complete.
+#[test]
+fn ports_of_a_pane_not_looked_at_are_its_own() {
+    let env = Env::new("ext-ports-dead");
+    let _d = env.start();
+    let (c, _rx) = ext_client(&env, "plugin");
+    let pane = match c
+        .request(Request::CreatePane(CreatePane {
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]),
+            cwd: Some(env.dir.display().to_string()),
+            hold: true,
+            ..Default::default()
+        }))
+        .unwrap()
+    {
+        Response::PaneCreated { pane } => pane,
+        other => panic!("{other:?}"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while matches!(
+        c.request(Request::PaneInfo { pane }),
+        Ok(Response::PaneInfo(ref info)) if info.alive
+    ) {
+        assert!(Instant::now() < deadline, "the pane's program did not end");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let list = call(&c, method::PORTS_LIST, json!({ "pane": pane })).unwrap();
+    assert_eq!(
+        list,
+        json!([{ "pane": pane, "ports": [], "complete": true }]),
+        "{list}"
     );
 }
