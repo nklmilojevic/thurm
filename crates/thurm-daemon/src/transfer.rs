@@ -36,6 +36,8 @@ pub const MIN_FREE: u64 = 1 << 30;
 pub const MAX_KEPT: u64 = 8 << 30;
 /// How long uploads are kept.
 pub const KEEP: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often kept uploads are pruned while nothing else asks for it.
+pub const PRUNE_EVERY: Duration = Duration::from_secs(10 * 60);
 /// Downloads sending at once, per pane.
 pub const MAX_DOWNLOADS_PER_PANE: usize = 4;
 /// The longest file name, in bytes.
@@ -51,6 +53,16 @@ pub struct Transfers {
     idle: Duration,
     /// [`MAX_KEPT`], or `THURM_TRANSFER_MAX_KEPT` (tests).
     max_kept: u64,
+    /// [`KEEP`], or `THURM_TRANSFER_KEEP_MS` (tests).
+    keep: Duration,
+}
+
+/// A duration in milliseconds from the environment variable `var`, else `default` (tests).
+fn env_ms(var: &str, default: Duration) -> Duration {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(default, Duration::from_millis)
 }
 
 #[derive(Default)]
@@ -106,7 +118,17 @@ impl Transfers {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(MAX_KEPT),
+            keep: env_ms("THURM_TRANSFER_KEEP_MS", KEEP),
         }
+    }
+
+    /// Ends stalled batches and deletes kept uploads past their time or over the limit, those
+    /// left by an earlier daemon included: what keeps uploads within their promise when no
+    /// new one comes.
+    pub fn prune(&self) {
+        let mut st = self.state.lock();
+        self.sweep(&mut st);
+        self.make_room(&st, 0);
     }
 
     /// [`thurm_proto::Request::UploadBegin`]: reserves the file's place in its batch and a
@@ -413,7 +435,7 @@ impl Transfers {
         Err("no free directory name for the upload".into())
     }
 
-    /// Deletes kept batches older than [`KEEP`], then the oldest until `incoming` more bytes
+    /// Deletes kept batches older than [`KEEP`] (`keep`), then the oldest until `incoming` more bytes
     /// stay within the kept limit. Batches on their way are left alone, and a batch that could
     /// not be deleted still counts. Whether `incoming` fits now.
     fn make_room(&self, st: &State, incoming: u64) -> bool {
@@ -439,7 +461,7 @@ impl Transfers {
                         .and_then(|m| m.modified())
                         .unwrap_or(SystemTime::UNIX_EPOCH);
                     let size = dir_size(&dir);
-                    let old = modified.elapsed().is_ok_and(|age| age > KEEP);
+                    let old = modified.elapsed().is_ok_and(|age| age > self.keep);
                     if !(old && remove_batch(&dir)) {
                         kept.push((modified, size, dir));
                     }
@@ -636,6 +658,25 @@ impl Transfers {
                 }
             }
         }
+    }
+}
+
+/// Prunes kept uploads now, and then every [`PRUNE_EVERY`] (`THURM_TRANSFER_PRUNE_MS` in
+/// tests) for as long as the daemon runs.
+pub fn start_pruning(daemon: &Arc<Daemon>) {
+    let every = env_ms("THURM_TRANSFER_PRUNE_MS", PRUNE_EVERY);
+    let weak = Arc::downgrade(daemon);
+    let started = std::thread::Builder::new()
+        .name("transfer-prune".into())
+        .spawn(move || {
+            while let Some(daemon) = weak.upgrade() {
+                daemon.transfers.prune();
+                drop(daemon);
+                std::thread::sleep(every);
+            }
+        });
+    if let Err(e) = started {
+        log::warn!("kept uploads are pruned only when files are sent: {e}");
     }
 }
 
