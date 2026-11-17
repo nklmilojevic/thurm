@@ -309,6 +309,9 @@ impl Transfers {
                 "this host's disk can take too few more files ({files} left)"
             ));
         }
+        // Drops past their time go first (`kept` deletes them): the space they leave counts
+        // before any is found missing.
+        let recoverable: u64 = self.kept(&st).iter().map(|(_, size, _)| size).sum();
         let free = free_space(&self.root)?;
         let short = need.saturating_sub(free);
         let no_space = |free: u64| {
@@ -318,7 +321,7 @@ impl Transfers {
                 MIN_FREE >> 30
             )
         };
-        if short > 0 && self.kept(&st).iter().map(|(_, size, _)| size).sum::<u64>() < short {
+        if short > recoverable {
             return Err(no_space(free));
         }
         // A new batch's number is used up here, whatever follows: a ticket left by a refusal
@@ -816,16 +819,21 @@ impl Transfers {
             }
             *n += 1;
         }
-        let sent = send_file(&mut writer, path, size, stamp);
-        {
-            let mut st = self.state.lock();
-            if let Some(n) = st.downloads.get_mut(&pane) {
-                *n -= 1;
-                if *n == 0 {
-                    st.downloads.remove(&pane);
+        // The slot is the stream's until it ends, its caller's answer awaited included.
+        struct Slot<'a>(&'a Transfers, PaneId);
+        impl Drop for Slot<'_> {
+            fn drop(&mut self) {
+                let mut st = self.0.state.lock();
+                if let Some(n) = st.downloads.get_mut(&self.1) {
+                    *n -= 1;
+                    if *n == 0 {
+                        st.downloads.remove(&self.1);
+                    }
                 }
             }
         }
+        let _slot = Slot(self, pane);
+        let sent = send_file(&mut writer, path, size, stamp);
         if let Err(e) = sent {
             return close(&mut writer, StreamClose::Internal(e));
         }

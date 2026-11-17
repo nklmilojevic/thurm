@@ -799,4 +799,41 @@ final class FilePreviewTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(again).get(), cached.file)
         XCTAssertFalse(FileManager.default.fileExists(atPath: dests[0].path))
     }
+
+    func testDownloadsLeftHalfDoneAreClearedButNotOnesUnderWay() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thurm-stale-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        // An earlier run stopped mid-download, twice.
+        let entry = root.appendingPathComponent("0123", isDirectory: true)
+        try FileManager.default.createDirectory(at: entry, withIntermediateDirectories: true)
+        let staged = entry.appendingPathComponent(".staging-old")
+        let part = entry.appendingPathComponent(".thurm-99-0.part")
+        try Data(repeating: 1, count: 100).write(to: staged)
+        try Data(repeating: 1, count: 100).write(to: part)
+        let cache = RemoteFileCache(root: root, maxBytes: 1 << 20)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staged.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: part.path))
+        // A download under way keeps what it writes, whoever prunes meanwhile.
+        var dests: [URL] = []
+        var finish: [(TransferOutcome) -> Void] = []
+        cache.download = { _, _, dest, _, _, _, done in
+            dests.append(dest)
+            finish.append(done)
+            return {}
+        }
+        cache.fetch(.path("/live.bin"), pane: PaneKey("devbox", 3), cwd: nil) { _ in }
+        try Data("live".utf8).write(to: dests[0])
+        XCTAssertTrue(cache.prune())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dests[0].path))
+        finish[0](outcome(name: "live.bin", version: "v"))
+        // One that cannot be deleted counts against the limit.
+        let small = RemoteFileCache(root: root, maxBytes: 50)
+        let stuck = root.appendingPathComponent("4567", isDirectory: true)
+        try FileManager.default.createDirectory(at: stuck, withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 100).write(to: stuck.appendingPathComponent(".staging-stuck"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: stuck.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stuck.path) }
+        XCTAssertFalse(small.prune(keeping: stuck))
+    }
 }

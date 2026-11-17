@@ -189,6 +189,26 @@ final class RemoteFileCache {
         self.root = root ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(Bundle.main.bundleIdentifier ?? "Thurm", isDirectory: true)
             .appendingPathComponent("remote-files", isDirectory: true)
+        // What an earlier run left half-downloaded goes now, and so does what no longer fits.
+        prune()
+    }
+
+    /// Whether `file` in an entry is a download's: one written to (`.staging-…`), or the part
+    /// the transfer writes beside it (`.thurm-<pid>-<n>.part`).
+    private static func isDownload(_ file: URL) -> Bool {
+        let name = file.lastPathComponent
+        return name.hasPrefix(".staging-") || (name.hasPrefix(".thurm-") && name.hasSuffix(".part"))
+    }
+
+    /// Deletes the downloads in `entry` no fetch is writing (left by a fetch that never ended,
+    /// as in an earlier run); returns the bytes of those that could not be deleted.
+    private func clearStaleDownloads(in entry: URL) -> UInt64 {
+        let fm = FileManager.default
+        let files = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+        return files.filter(Self.isDownload).reduce(UInt64(0)) { left, file in
+            if (try? fm.removeItem(at: file)) != nil { return left }
+            return left + UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
     }
 
     /// Writes a metadata file whole (tests make it fail).
@@ -337,12 +357,20 @@ final class RemoteFileCache {
             .map(\.standardizedFileURL)
         let entries = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey]))
             ?? []
-        // Copies neither in use nor shown (one not kept, let go) go first.
-        for entry in entries { retireCopies(in: entry.standardizedFileURL) }
+        // Copies neither in use nor shown (one not kept, let go) go first, and downloads no
+        // fetch is writing; one that cannot be deleted counts.
+        let downloading = Set(reserved.values.map(\.entry.standardizedFileURL))
+        var stale: [URL: UInt64] = [:]
+        for entry in entries {
+            let entry = entry.standardizedFileURL
+            retireCopies(in: entry)
+            if !downloading.contains(entry) { stale[entry] = clearStaleDownloads(in: entry) }
+        }
         var sized: [(url: URL, date: Date, size: UInt64)] = entries.map { entry in
             let date = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
                 ?? .distantPast
-            return (entry.standardizedFileURL, date, size(of: entry))
+            let url = entry.standardizedFileURL
+            return (url, date, size(of: entry) + (stale[url] ?? 0))
         }
         sized.sort { $0.date < $1.date }
         // A download refreshing an entry replaces its copy in use, unless Quick Look shows it:
