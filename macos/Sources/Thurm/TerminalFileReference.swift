@@ -400,7 +400,12 @@ final class RemoteFileCache {
                 return
             }
             waiter.done(.failure(RemoteFileError.cancelled))
-            if fetch.waiters.isEmpty { fetch.cancel?() }
+            // No one waits: it is given up, and a new request for the file starts afresh rather
+            // than joining a download on its way out.
+            if fetch.waiters.isEmpty {
+                if self?.inFlight[key] === fetch { self?.inFlight[key] = nil }
+                fetch.cancel?()
+            }
         }
         if let running = inFlight[key] {
             running.waiters[id] = (progress, completion)

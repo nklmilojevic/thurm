@@ -745,4 +745,31 @@ final class FilePreviewTests: XCTestCase {
             XCTAssertEqual($0 as? RemoteFileError, .cancelled)
         }
     }
+
+    func testAFileAskedForAgainAfterACancelIsFetchedAfresh() throws {
+        let cache = tempCache()
+        let pane = PaneKey("devbox", 3)
+        var finish: [(TransferOutcome) -> Void] = []
+        var dests: [URL] = []
+        var cancels = 0
+        cache.download = { _, _, dest, _, _, _, done in
+            dests.append(dest)
+            finish.append(done)
+            return { cancels += 1 }
+        }
+        let cancel = cache.fetch(.path("/a.bin"), pane: pane, cwd: nil) { _ in }
+        cancel()
+        XCTAssertEqual(cancels, 1)
+        // Asked for again before the cancelled download has ended: a download of its own.
+        var again: Result<URL, Error>?
+        cache.fetch(.path("/a.bin"), pane: pane, cwd: nil) { again = $0 }
+        XCTAssertEqual(finish.count, 2)
+        var cancelled = TransferOutcome(error: "cancelled")
+        cancelled.cancelled = true
+        finish[0](cancelled)
+        XCTAssertNil(again)
+        try Data("a".utf8).write(to: dests[1])
+        finish[1](outcome(name: "a.bin", version: "v"))
+        XCTAssertEqual(try String(contentsOf: try XCTUnwrap(again).get(), encoding: .utf8), "a")
+    }
 }

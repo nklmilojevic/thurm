@@ -242,7 +242,7 @@ fn names_are_cleaned_and_kept_apart() {
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n != ".parts")
+        .filter(|n| n != ".parts" && n != ".done")
         .collect();
     got.sort();
     assert_eq!(got, ["[2J", "evil-2.txt", "evil.txt"]);
@@ -258,8 +258,8 @@ fn an_upload_that_would_fill_the_disk_is_refused() {
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     let pane = cat_pane(&c, &dir);
-    // 1 GiB must stay free, and the directories count (a byte each here): 74 bytes fit.
-    c.upload_begin(pane, "fits", 74, None).unwrap();
+    // 1 GiB must stay free, and the directories count (a byte each here): 73 bytes fit.
+    c.upload_begin(pane, "fits", 73, None).unwrap();
     let e = c.upload_begin(pane, "too-much", 1000, None).unwrap_err();
     assert!(e.to_string().contains("free space"), "{e}");
     let e = c.upload_begin(pane, "huge", 5 << 30, None).unwrap_err();
@@ -479,14 +479,14 @@ fn a_refused_upload_deletes_nothing_kept() {
     let e = c.upload_begin(pane, "big.txt", 11, None).unwrap_err();
     assert!(e.to_string().contains("does not fit"), "{e}");
     assert!(kept.join("a.txt").exists());
-    // The same for a batch whose files together can never fit (a byte a directory here: the
-    // kept drop takes 6 with its two).
-    let first = send(&env, &c, pane, ("b", 0, 2), "b1.txt", 3, b"bbb");
+    // The same for a batch whose files together can never fit (a byte a directory and the
+    // completion record here: the kept drop takes 7).
+    let first = send(&env, &c, pane, ("b", 0, 2), "b1.txt", 1, b"b");
     let e = c
         .upload_begin(
             pane,
             "b2.txt",
-            7,
+            10,
             Some(UploadBatch {
                 id: "b".into(),
                 index: 1,
@@ -591,8 +591,8 @@ fn a_reservation_refused_for_its_batch_deletes_nothing_kept() {
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     let pane = cat_pane(&c, &dir);
-    // 5 bytes and two directories of a byte each here: 7 kept.
-    send(&env, &c, pane, ("a", 0, 1), "a.txt", 5, b"aaaaa")
+    // 4 bytes, two directories and the completion record of a byte each here: 7 kept.
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 4, b"aaaa")
         .wait_closed()
         .unwrap();
     let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
@@ -603,12 +603,13 @@ fn a_reservation_refused_for_its_batch_deletes_nothing_kept() {
             count,
         })
     };
-    c.upload_begin(pane, "b1.txt", 2, batch(0, 2)).unwrap();
+    // 1 byte and its batch's two directories: 3, beside the 7 kept.
+    c.upload_begin(pane, "b1.txt", 1, batch(0, 2)).unwrap();
     // The same file again, and the batch with another count: each would have needed room the
     // kept drop holds, and is refused without taking it.
-    let e = c.upload_begin(pane, "b1.txt", 2, batch(0, 2)).unwrap_err();
+    let e = c.upload_begin(pane, "b1.txt", 3, batch(0, 2)).unwrap_err();
     assert!(e.to_string().contains("already on its way"), "{e}");
-    let e = c.upload_begin(pane, "b2.txt", 2, batch(1, 3)).unwrap_err();
+    let e = c.upload_begin(pane, "b2.txt", 3, batch(1, 3)).unwrap_err();
     assert!(e.to_string().contains("not 3"), "{e}");
     assert!(kept.join("a.txt").exists());
 }
@@ -661,10 +662,10 @@ fn kept_uploads_expire_without_another_upload() {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("f.txt"), b"x").unwrap();
     }
-    std::fs::File::open(&old)
-        .unwrap()
-        .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
-        .unwrap();
+    set_modified_all(
+        &old,
+        std::time::SystemTime::now() - Duration::from_secs(3600),
+    );
     let _daemon = env.start_with(&[
         ("THURM_TRANSFER_KEEP_MS", Path::new("2000")),
         ("THURM_TRANSFER_PRUNE_MS", Path::new("100")),
@@ -860,4 +861,105 @@ fn cancelling_the_last_file_before_its_paste_types_nothing() {
         batches(&env, pane).is_empty()
     });
     assert_eq!(typed(&c, pane, &dir), "\n");
+}
+
+/// Sets the modification time of `path` (a file or a directory), and of everything in it.
+fn set_modified_all(path: &Path, when: std::time::SystemTime) {
+    if path.is_dir() {
+        for e in std::fs::read_dir(path).unwrap().flatten() {
+            set_modified_all(&e.path(), when);
+        }
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    } else {
+        set_modified(path, when);
+    }
+}
+
+#[test]
+fn a_slow_batch_is_kept_from_when_it_was_complete() {
+    let env = Env::new("transfer-slow");
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_KEEP_MS", Path::new("2000")),
+        ("THURM_TRANSFER_PRUNE_MS", Path::new("100")),
+    ]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    // Its first file, then its second after longer than drops are kept.
+    let first = send(&env, &c, pane, ("s", 0, 2), "one.txt", 3, b"one");
+    std::thread::sleep(Duration::from_millis(2500));
+    let last = send(&env, &c, pane, ("s", 1, 2), "two.txt", 3, b"two");
+    last.wait_closed().unwrap();
+    drop(first);
+    let [batch] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    // Whatever its directory's dates say, it is aged from when it was complete.
+    set_modified_all(
+        &batch,
+        std::time::SystemTime::now() - Duration::from_secs(3600),
+    );
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(batch.join("one.txt").exists() && batch.join("two.txt").exists());
+    eventually(6, "the batch outlived its time", || !batch.exists());
+}
+
+#[test]
+fn drops_left_by_an_earlier_daemon_keep_their_age() {
+    let env = Env::new("transfer-restart");
+    let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let drop_dir = |name: &str| {
+        let dir = env.dir.join("state/drops/9").join(name);
+        std::fs::create_dir_all(dir.join(".parts")).unwrap();
+        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+        dir
+    };
+    // Complete a moment ago, its dates long past.
+    let done = drop_dir("done");
+    std::fs::write(done.join(".done"), now_ms.to_string()).unwrap();
+    set_modified_all(&done, hour_ago);
+    // Never complete: aged from its last write, a moment ago for one, long ago for the other.
+    let partial_fresh = drop_dir("partial-fresh");
+    set_modified_all(&partial_fresh, hour_ago);
+    std::fs::write(partial_fresh.join(".parts/0"), b"part").unwrap();
+    let partial_old = drop_dir("partial-old");
+    set_modified_all(&partial_old, hour_ago);
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_KEEP_MS", Path::new("2000")),
+        ("THURM_TRANSFER_PRUNE_MS", Path::new("100")),
+    ]);
+    eventually(5, "the old partial drop was kept", || !partial_old.exists());
+    assert!(done.exists() && partial_fresh.exists());
+    eventually(6, "the complete drop outlived its time", || !done.exists());
+    eventually(6, "the partial drop outlived its time", || {
+        !partial_fresh.exists()
+    });
+}
+
+#[test]
+fn a_batch_that_cannot_be_made_deletes_nothing_kept() {
+    let env = Env::new("transfer-no-dir");
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_MAX_KEPT", Path::new("10")),
+        ("THURM_TRANSFER_BLOCK", Path::new("1")),
+    ]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let other = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 6, b"aaaaaa")
+        .wait_closed()
+        .unwrap();
+    let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    // The other pane's directory cannot be made (a file is in its place), and admitting its
+    // upload would have needed the kept drop's room.
+    std::fs::write(env.dir.join("state/drops").join(other.to_string()), b"").unwrap();
+    let e = c.upload_begin(other, "b.txt", 6, None).unwrap_err();
+    assert!(e.to_string().contains("cannot create"), "{e}");
+    assert!(kept.join("a.txt").exists());
 }
