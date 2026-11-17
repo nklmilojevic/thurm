@@ -232,6 +232,71 @@ final class ExtensionsTests: XCTestCase {
         }
         XCTAssertEqual(seen(), ["forward_close", "forward_open"])
     }
+
+    /// A cancel that lands after an open passed its check, before the call does anything: the
+    /// call still runs, and what it did is undone. A forward it opened is closed again, nothing
+    /// is answered and no browser opens; one it only found open stays. A close cannot be
+    /// overtaken: it is done on the main thread as it is asked, where cancels are taken too.
+    func testACancelBetweenTheCheckAndTheCallIsUndone() {
+        // A forward opened for a request still waited for shows a toast, over the app's windows.
+        _ = NSApplication.shared
+        let ext = Extensions.shared
+        let saved = ext.remoteCall
+        defer { ext.remoteCall = saved }
+        let lock = NSLock()
+        var calls: [String] = []
+        var cancelOnCall: UInt64?
+        var openResult: [String: Any] = [:]
+        ext.remoteCall = { op in
+            let name = jsonString(op["op"]) ?? ""
+            lock.lock()
+            calls.append(name == "forward_close" ? "close \(jsonUInt64(op["id"]) ?? 0)" : name)
+            let cancel = cancelOnCall
+            let result = openResult
+            lock.unlock()
+            // The check passed; the daemon's cancel reaches the app now, before the open does
+            // anything.
+            if name == "forward_open", let cancel {
+                DispatchQueue.main.sync {
+                    ext.handle(["name": "ui.cancel", "payload": JSON.encode(["id": cancel])])
+                }
+            }
+            return name == "forward_open" ? result : ["id": 0]
+        }
+        func seen() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return calls
+        }
+        func open(_ id: UInt64, result: [String: Any], cancel: Bool, until count: Int) -> [String] {
+            lock.lock()
+            calls = []
+            cancelOnCall = cancel ? id : nil
+            openResult = result
+            lock.unlock()
+            ext.handle(["name": "ui.request", "payload": JSON.encode(
+                ["kind": "forward_open", "id": id, "host": "undo-test", "port": 5173])])
+            let deadline = Date().addingTimeInterval(5)
+            while seen().count < count, Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+            return seen()
+        }
+        let opened: [String: Any] = ["id": 71, "host": "undo-test", "remote_port": 5173, "local_port": 5173,
+                                     "url": "http://localhost:5173/", "new": true]
+        var found = opened
+        found["id"] = 72
+        found["new"] = false
+
+        // Cancelled between the check and the call: the forward it opened is closed again.
+        XCTAssertEqual(open(911, result: opened, cancel: true, until: 2), ["forward_open", "close 71"])
+        // One it only found open is someone else's: it stays.
+        XCTAssertEqual(open(912, result: found, cancel: true, until: 1), ["forward_open"])
+        // Not cancelled: kept.
+        XCTAssertEqual(open(913, result: opened, cancel: false, until: 1), ["forward_open"])
+        ext.forwardsNow([])
+    }
 }
 
 private final class PaneActionView: NSView {

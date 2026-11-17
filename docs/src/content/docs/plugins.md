@@ -349,9 +349,10 @@ close through it; when it quits, its forwards are heard closed and the other's
 opened.
 A `forwards.open` or `forwards.close` whose caller stopped waiting (the plugin
 stopped, or the call timed out) is not carried out if the app hears so before
-it starts; an open that was under way opens no browser, and the app closes
-again the forward it opened for it, unless someone else got that forward
-meanwhile (a plugin that waited, or you opening its link).
+it starts. A close starts as soon as the app has it. An open the app hears of
+once it has started opens no browser, and the app closes again the forward it
+opened for it, unless someone else got that forward meanwhile (a plugin that
+waited, or you opening its link).
 
 A plugin's actions, keys and subscriptions go away when it stops. The API is
 for clients on the daemon's machine and its plugins: a caller over the tailnet

@@ -388,7 +388,8 @@ arrived, the host's daemon types their paths into the pane, quoted and separated
 by spaces, as a paste, so an agent at its prompt gets them as one paste. If a
 file fails or you cancel before every file has arrived, nothing is typed and
 nothing is kept. Pasting copied text pastes the text, even when the app that
-copied it put a file beside it; files copied in Finder are sent. Folders are
+copied it put a file beside it; files copied in Finder are sent once you confirm
+them in the dialog that names them. Folders are
 refused; drop the files in them instead.
 
 Uploads are kept on the host, readable by you only, in Thurm's state directory
@@ -402,8 +403,9 @@ the same. Limits:
 | One file | 4 GiB |
 | Files in one drop | 256 |
 | Files on their way to one pane | 64 |
-| Space left free on the host's disk | 1 GiB: the oldest finished drops give way for it, and an upload that still does not fit is refused |
-| Kept | 24 hours, and 8 GiB in all, drops on their way included: the oldest finished drops go first, and a file that still does not fit is refused |
+| Drops not complete yet | 8 per app, 32 in all, and 512 of their files waiting for the rest |
+| Space left free on the host's disk | 1 GiB, and room for 10 000 more files: the oldest finished drops give way for the space, and an upload that still does not fit is refused |
+| Kept | 24 hours, 8 GiB and 1024 drops in all, drops on their way included (every file and folder counts as 4 KiB at least, an empty one too): the oldest finished drops go first, and a file that still does not fit is refused |
 
 The other way, ⌘⌥-click a path in a remote pane, or right-click it and pick
 **Quick Look**, to preview the host's file here: relative paths use the pane's

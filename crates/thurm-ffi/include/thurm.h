@@ -75,8 +75,9 @@ bool thurm_has_capability(thurm_client *client, const char *cap);
  * capability; macOS only). Each runs on a thread of its own; `cb` gets JSON on that thread:
  * {"done":n,"total":n} as bytes go, then once {"finished":true,"error":null|"...",
  * "cancelled":bool,"unsupported":bool,"folder":bool,"not_found":bool (nothing at a
- * download's path),...}. Both return an id for the cancel
- * calls, or 0 when nothing started (the final callback has come already). */
+ * download's path),...}. Both return an id for the cancel calls, or 0 when nothing started:
+ * then the final callback has already come, on the calling thread, before the return (bad
+ * arguments, or no thread to run on). */
 typedef void (*thurm_transfer_cb)(void *ctx, const char *json);
 
 /* Send files to `pane`'s host as one batch. `files_json`: [{"path":"/local/file"}, or with
@@ -90,7 +91,9 @@ uint64_t thurm_upload(thurm_client *client, thurm_pane_id pane, const char *file
 void thurm_upload_cancel(uint64_t transfer);
 
 /* Fetch the regular file at `path` on `pane`'s host (relative to the pane's directory, `~`
- * for home) into `dest`, written beside it and then moved there. With `if_version` (or NULL)
+ * for home) into `dest`, written beside it and then moved there. Cancelling stops a download
+ * under way and deletes what it wrote beside `dest`, leaving a file already at `dest` as it was;
+ * a download already moved into place stays, and the final callback says it was saved. With `if_version` (or NULL)
  * still the file's version, nothing is written ("not_modified":true). A file over `max_bytes`
  * (0: no limit) is refused. The final callback has "info":{"name","path","size","modified"
  * (ms since 1970),"version"|null}. */

@@ -298,6 +298,13 @@ final class RemoteFileCache {
         held[file.standardizedFileURL, default: 0] += 1
     }
 
+    /// Quick Look moves from showing `old` to showing `new`: `new` is held before `old` is let
+    /// go, so pruning on the way never takes the file about to be shown.
+    func switchHeld(from old: URL?, to new: URL?) {
+        if let new { hold(new) }
+        if let old { release(old) }
+    }
+
     /// Lets `file` go again: a copy no longer in use goes, and what no longer fits is pruned.
     func release(_ file: URL) {
         let file = file.standardizedFileURL
