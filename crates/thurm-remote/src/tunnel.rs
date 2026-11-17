@@ -111,6 +111,10 @@ pub struct Status {
     /// How a tailnet host's connection reached the tailnet, once connected.
     #[serde(default)]
     pub via: Option<Via>,
+    /// Which destination settings the connection was made with: 0 at start, one more each time
+    /// the host's ssh target, socket or tailnet address changes ([`Supervisor::settings`]).
+    #[serde(default)]
+    pub settings: u64,
 }
 
 impl Status {
@@ -137,6 +141,7 @@ impl Status {
             linger: None,
             owner_pid: std::process::id(),
             tunnel_pid: None,
+            settings: 0,
             transport: transport_of(remote),
             via: None,
         }
@@ -252,6 +257,10 @@ struct Inner {
     wake: Mutex<Option<bool>>,
     /// The host or socket was edited: a connected tunnel goes to the old one, replace it.
     reconfigured: AtomicBool,
+    /// Bumped, under the `remote` lock, each time the destination settings change.
+    settings: AtomicU64,
+    /// The `settings` the connection being made (or held) uses.
+    connecting_settings: AtomicU64,
     cond: Condvar,
     stop: AtomicBool,
     listener: Listener,
@@ -279,6 +288,8 @@ impl Supervisor {
             ssh: Mutex::new(ssh),
             wake: Mutex::new(None),
             reconfigured: AtomicBool::new(false),
+            settings: AtomicU64::new(0),
+            connecting_settings: AtomicU64::new(0),
             cond: Condvar::new(),
             stop: AtomicBool::new(false),
             listener: Box::new(listener),
@@ -312,6 +323,12 @@ impl Supervisor {
         self.inner.cond.notify_all();
     }
 
+    /// The destination settings now in force; a status of a connection made with them, or later
+    /// ones, says so in [`Status::settings`].
+    pub fn settings(&self) -> u64 {
+        self.inner.settings.load(Ordering::SeqCst)
+    }
+
     /// Picks up an edited `[[remote]]` entry (the tunnel is replaced when the host or the
     /// socket changed).
     pub fn update(&self, remote: RemoteConfig) -> Result<(), String> {
@@ -322,6 +339,9 @@ impl Supervisor {
             let moved = cur.host != remote.host
                 || cur.socket != remote.socket
                 || cur.tailnet != remote.tailnet;
+            if moved {
+                self.inner.settings.fetch_add(1, Ordering::SeqCst);
+            }
             *cur = remote.clone();
             (changed, moved)
         };
@@ -681,8 +701,14 @@ impl Inner {
     }
 
     fn connect(&self) -> Result<Link, Failure> {
-        // This attempt uses the current settings.
+        // This attempt uses the current settings: those of `settings` now, or (read later, after
+        // another edit) newer ones, never older.
         self.reconfigured.store(false, Ordering::SeqCst);
+        {
+            let _remote = self.remote.lock();
+            self.connecting_settings
+                .store(self.settings.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
         let tailnet = self.remote.lock().tailnet.clone();
         match tailnet {
             Some(t) => self.connect_tailnet(&t).map(Link::Tailnet),
@@ -739,6 +765,7 @@ impl Inner {
         self.set(|s| {
             s.tunnel_pid = None;
             s.phase = Phase::Connected;
+            s.settings = self.connecting_settings.load(Ordering::SeqCst);
             s.message = None;
             s.retry_at = None;
             s.remote_build = Some(build);
@@ -879,6 +906,7 @@ impl Inner {
         self.set(|s| {
             s.tunnel_pid = Some(pid);
             s.phase = Phase::Connected;
+            s.settings = self.connecting_settings.load(Ordering::SeqCst);
             s.message = None;
             s.retry_at = None;
             s.remote_build = Some(build);

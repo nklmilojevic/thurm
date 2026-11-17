@@ -200,24 +200,61 @@ enum ForwardNotice: Equatable {
 
 /// The `Ports` request of each host's current connection: a reply to an earlier one (a
 /// connection that dropped meanwhile, or one replaced by a reconnect) is not applied.
+/// While a `Ports` request is out, the `PortsChanged` events that arrive are kept too: the
+/// reply may be older than they are (the daemon looked for it before they were sent), so they
+/// are applied again after it, in the order they came.
 struct RequestGenerations {
     private var current: [HostId: Int] = [:]
     private var next = 0
+    private var arrived: [HostId: [[String: Any]]] = [:]
 
     /// A request goes out on `host`'s connection now; it supersedes any before it.
     mutating func start(_ host: HostId) -> Int {
         next += 1
         current[host] = next
+        arrived[host] = []
         return next
     }
 
-    /// `host`'s connection dropped: no reply pending for it applies any more.
+    /// `host`'s connection dropped: no reply pending for it applies any more, nor the events
+    /// kept for it.
     mutating func invalidate(_ host: HostId) {
         current[host] = nil
+        arrived[host] = nil
     }
 
     func isCurrent(_ host: HostId, _ generation: Int) -> Bool {
         current[host] == generation
+    }
+
+    /// A `PortsChanged` of `host` came: kept while its request is out.
+    mutating func event(_ host: HostId, _ payload: [String: Any]) {
+        if current[host] != nil { arrived[host, default: []].append(payload) }
+    }
+
+    /// The reply to request `generation` came: the events to apply again after it, or nil when
+    /// the reply is old (its connection dropped, or a newer request went out).
+    mutating func finish(_ host: HostId, _ generation: Int) -> [[String: Any]]? {
+        guard current[host] == generation else { return nil }
+        current[host] = nil
+        return arrived.removeValue(forKey: host) ?? []
+    }
+}
+
+/// Which host Forward Port… is for: the focused pane's when it is remote; else the one
+/// connected host; else the user picks among them.
+enum ForwardHostChoice: Equatable {
+    case host(HostId)
+    case pick([HostId])
+    case none
+
+    static func of(focused: HostId, connected: [HostId]) -> ForwardHostChoice {
+        if focused != localHost { return .host(focused) }
+        switch connected.count {
+        case 0: return .none
+        case 1: return .host(connected[0])
+        default: return .pick(connected)
+        }
     }
 }
 
@@ -351,26 +388,44 @@ extension SessionManager {
         }
     }
 
-    /// The host Forward Port… is for: the focused pane's, else the front window's.
-    var forwardHost: HostId? {
-        let host = currentController.map { $0.focusedPane.host } ?? currentHost
-        if host != localHost { return host }
-        return Core.shared.connectedRemotes.first
+    /// The host Forward Port… is for (`ForwardHostChoice`).
+    var forwardHost: ForwardHostChoice {
+        let focused = currentController.map { $0.focusedPane.host } ?? currentHost
+        return ForwardHostChoice.of(focused: focused, connected: Core.shared.connectedRemotes)
     }
 
-    /// Forward Port…: the focused host's known ports, or a port or link typed in.
+    /// Forward Port…: the host's known ports, or a port or link typed in; first which host, when
+    /// a pane of this Mac has focus and several hosts are connected.
     func showForwardPortPicker() {
-        guard let host = forwardHost else {
+        let source = currentController?.content.focusedView
+        switch forwardHost {
+        case .host(let host):
+            showForwardPortPicker(host: host, source: source)
+        case .pick(let hosts):
+            weak var source = source
+            let items = hosts.map { host in
+                CommandPalette.Item(title: host, detail: "forward one of its ports") {
+                    // After this palette has closed.
+                    DispatchQueue.main.async {
+                        SessionManager.shared.showForwardPortPicker(host: host, source: source)
+                    }
+                }
+            }
+            CommandPalette.shared.show(items: items, over: currentController?.window,
+                                       placeholder: "Forward a port of which host?", footer: "↩ choose")
+        case .none:
             currentController?.content.focusedView?.showToast("No remote host is connected")
-            return
         }
+    }
+
+    private func showForwardPortPicker(host: HostId, source: TerminalView?) {
         let known = (Core.shared.remoteCall(["op": "known_ports", "host": host]) as? [[String: Any]] ?? [])
             .compactMap { k -> (port: Int, command: String)? in
                 guard let p = jsonInt(k["port"]) else { return nil }
                 return (p, jsonString(k["command"]) ?? "")
             }
         let open = Remotes.shared.forwards
-        weak var source = currentController?.content.focusedView
+        weak var source = source
         let items = { (query: String) -> [CommandPalette.Item] in
             ForwardPicker.choices(query: query, host: host, known: known, open: open).map { c in
                 CommandPalette.Item(title: c.title, detail: c.detail) {
@@ -401,9 +456,11 @@ extension SessionManager {
         let generation = Remotes.shared.portsRequests.start(host)
         Core.shared.requestAsync(object: ["Ports": ["pane": NSNull()]], host: host, timeout: 10) { resp in
             // From a connection that has dropped (or been replaced) since: what it says is old.
-            guard Remotes.shared.portsRequests.isCurrent(host, generation) else { return }
+            guard let arrived = Remotes.shared.portsRequests.finish(host, generation) else { return }
             guard let v = JSON.variant(resp), v.name == "Ports", let panes = v.payload as? [Any] else { return }
             _ = Core.shared.remoteCall(["op": "ports_snapshot", "host": host, "panes": panes])
+            // Events that came while it was on its way may be newer than it: again, in order.
+            for payload in arrived { SessionManager.shared.applyRemotePorts(payload, host: host) }
         }
     }
 
@@ -415,7 +472,13 @@ extension SessionManager {
 
     /// A `PortsChanged` from a remote host: its forwards learn whether their port is still there.
     func remotePortsChanged(_ payload: [String: Any]?, host: HostId) {
-        guard host != localHost, let payload, let pane = jsonUInt64(payload["pane"]) else { return }
+        guard host != localHost, let payload else { return }
+        Remotes.shared.portsRequests.event(host, payload)
+        applyRemotePorts(payload, host: host)
+    }
+
+    fileprivate func applyRemotePorts(_ payload: [String: Any], host: HostId) {
+        guard let pane = jsonUInt64(payload["pane"]) else { return }
         _ = Core.shared.remoteCall(["op": "ports_changed", "host": host, "pane": NSNumber(value: pane),
                                     "ports": payload["ports"] ?? [], "complete": payload["complete"] ?? true])
         Extensions.shared.reportPorts(host: host, pane: pane, ports: payload["ports"] ?? [],

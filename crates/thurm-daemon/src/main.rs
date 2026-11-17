@@ -211,6 +211,7 @@ fn main() {
     }
     daemon.start_tailnet(tailnet);
     daemon.start_plugins();
+    transfer::start_pruning(&daemon);
 
     {
         // A few, so one slow repository doesn't hold up every pane's status.

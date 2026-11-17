@@ -527,3 +527,98 @@ fn a_later_file_refused_ends_the_batch_at_once() {
     }
     assert_eq!(typed(&c, pane, &dir), "\n");
 }
+
+#[test]
+fn a_reservation_refused_for_its_batch_deletes_nothing_kept() {
+    let env = Env::new("transfer-dup-keeps");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_KEPT", Path::new("10"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 7, b"aaaaaaa")
+        .wait_closed()
+        .unwrap();
+    let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    let batch = |index, count| {
+        Some(UploadBatch {
+            id: "b".into(),
+            index,
+            count,
+        })
+    };
+    c.upload_begin(pane, "b1.txt", 2, batch(0, 2)).unwrap();
+    // The same file again, and the batch with another count: each would have needed room the
+    // kept drop holds, and is refused without taking it.
+    let e = c.upload_begin(pane, "b1.txt", 2, batch(0, 2)).unwrap_err();
+    assert!(e.to_string().contains("already on its way"), "{e}");
+    let e = c.upload_begin(pane, "b2.txt", 2, batch(1, 3)).unwrap_err();
+    assert!(e.to_string().contains("not 3"), "{e}");
+    assert!(kept.join("a.txt").exists());
+}
+
+#[test]
+fn a_kept_drop_that_cannot_be_deleted_still_counts() {
+    // Permissions do not stop root.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let env = Env::new("transfer-undeletable");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_KEPT", Path::new("10"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 6, b"aaaaaa")
+        .wait_closed()
+        .unwrap();
+    let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // 6 kept that stay, and 6 more: over 10, so refused rather than counted as freed.
+    let e = c.upload_begin(pane, "b.txt", 6, None).unwrap_err();
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(e.to_string().contains("does not fit"), "{e}");
+    assert!(kept.join("a.txt").exists());
+    // Deletable again, it makes room.
+    c.upload_begin(pane, "b.txt", 6, None).unwrap();
+    assert!(!kept.exists());
+}
+
+/// Waits up to `secs` for `done`.
+fn eventually(secs: u64, what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn kept_uploads_expire_without_another_upload() {
+    let env = Env::new("transfer-expire");
+    // Drops an earlier daemon left: one long past its time, one just made.
+    let old = env.dir.join("drops/9/old");
+    let fresh = env.dir.join("drops/9/fresh");
+    for dir in [&old, &fresh] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+    }
+    std::fs::File::open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_KEEP_MS", Path::new("2000")),
+        ("THURM_TRANSFER_PRUNE_MS", Path::new("100")),
+    ]);
+    eventually(5, "the old drop was kept after the start", || !old.exists());
+    assert!(fresh.exists());
+    eventually(5, "the fresh drop outlived its time", || !fresh.exists());
+    // One sent now goes after its time too, with nothing asked of the daemon meanwhile.
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 1, b"a")
+        .wait_closed()
+        .unwrap();
+    let [sent] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    eventually(6, "the sent drop outlived its time", || !sent.exists());
+}

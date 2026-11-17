@@ -354,7 +354,9 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
 
 Drop files on a remote pane, or copy them in Finder and paste, and they go to the
 host. A pasted screenshot or an image dragged out of a browser goes as
-`image-….png`. A toast shows the progress, with **Cancel**. Once every file has
+`image-….png`. A toast shows the progress, with **Cancel**. Files dropped while
+others are on their way wait for them, so paths are typed in the order you
+dropped them. Once every file has
 arrived, the host's daemon types their paths into the pane, quoted and separated
 by spaces, as a paste, so an agent at its prompt gets them as one paste. If a
 file fails or you cancel, nothing is typed and nothing is kept. Folders are
@@ -376,9 +378,10 @@ the same. Limits:
 The other way, ⌘⌥-click a path in a remote pane, or right-click it and pick
 **Quick Look**, to preview the host's file here: relative paths use the pane's
 directory, `~` is your home on the host. A `file://` link offers **Quick Look**
-and **Download** (to `~/Downloads`) beside **Copy Path**. Previewed files are
-kept in the app's caches folder and fetched again only when they changed on the
-host; files over 256 MiB are not previewed. Only regular files are sent, at most
+and **Download** (to `~/Downloads`, with progress and **Cancel**) beside **Copy
+Path**. Previewed files are kept in the app's caches folder and fetched again
+only when they changed on the host. Kept previews and those downloading share
+256 MiB: a preview that does not fit beside the others stops with a message. Only regular files are sent, at most
 four at a time from one pane. A file that changes between the request and the
 end of sending fails instead of arriving mixed; try again.
 
@@ -405,7 +408,9 @@ Mac instead.
 Other ways to open one:
 
 - **Shell › Forward Port…** (⌘⇧P, **Forward Port…**) lists the ports the
-  focused host's panes listen on, and takes a port number or a link.
+  focused host's panes listen on, and takes a port number or a link. With a
+  pane of this Mac focused and more than one host connected, it asks which host
+  first.
 - **Shell › Processes & Ports…**: double-click a remote row with a port.
 - `thurm remote forward devbox 5173` from a terminal, until Ctrl-C.
   `--local PORT` picks the port on the Mac (an error if the port is forwarded to

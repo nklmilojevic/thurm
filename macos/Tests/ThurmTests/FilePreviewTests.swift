@@ -355,7 +355,7 @@ final class FilePreviewTests: XCTestCase {
     func testPreviewsOfAFileOnItsWayShareOneDownload() throws {
         let cache = tempCache()
         var calls: [(dest: URL, done: (TransferOutcome) -> Void)] = []
-        cache.download = { _, _, dest, _, _, done in calls.append((dest, done)) }
+        cache.download = downloads { _, _, dest, _, done in calls.append((dest, done)) }
         let pane = PaneKey("devbox", 3)
         var got: [URL] = []
         for _ in 0..<2 {
@@ -369,7 +369,7 @@ final class FilePreviewTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: got[0], encoding: .utf8), "notes")
         // Once it is in, the next preview asks again, with the version it has.
         var asked: String?
-        cache.download = { _, _, _, version, _, done in
+        cache.download = downloads { _, _, _, version, done in
             asked = version
             var same = TransferOutcome()
             same.notModified = true
@@ -384,7 +384,7 @@ final class FilePreviewTests: XCTestCase {
     func testAFailedRefreshKeepsTheCachedCopy() throws {
         let cache = tempCache()
         let pane = PaneKey("devbox", 3)
-        cache.download = { _, _, dest, _, _, done in
+        cache.download = downloads { _, _, dest, _, done in
             try! Data("old".utf8).write(to: dest)
             done(self.outcome(name: "a.txt", version: "v1"))
         }
@@ -392,7 +392,7 @@ final class FilePreviewTests: XCTestCase {
         cache.fetch(.path("/a.txt"), pane: pane, cwd: nil) { first = try? $0.get() }
         let file = try XCTUnwrap(first)
         // The host's file changed, and the new copy breaks off half way.
-        cache.download = { _, _, dest, _, _, done in
+        cache.download = downloads { _, _, dest, _, done in
             try! Data("ne".utf8).write(to: dest)
             done(TransferOutcome(error: "connection lost"))
         }
@@ -405,15 +405,19 @@ final class FilePreviewTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: entry.path)
             .filter { $0.hasPrefix(".staging") }, [])
         // A whole new copy replaces it, under the host's new name.
-        cache.download = { _, _, dest, _, _, done in
+        cache.download = downloads { _, _, dest, _, done in
             try! Data("new".utf8).write(to: dest)
             done(self.outcome(name: "a.txt", version: "v2"))
         }
         var second: URL?
         cache.fetch(.path("/a.txt"), pane: pane, cwd: nil) { second = try? $0.get() }
-        XCTAssertEqual(second, file)
-        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "new")
+        let replaced = try XCTUnwrap(second)
+        XCTAssertEqual(replaced.lastPathComponent, "a.txt")
+        XCTAssertEqual(try String(contentsOf: replaced, encoding: .utf8), "new")
+        XCTAssertEqual(cache.cached(entry)?.file, replaced)
         XCTAssertEqual(cache.cached(entry)?.version, "v2")
+        // Nothing showed the old copy: it is gone.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
     }
 
     func testOnlyANotFoundPathFallsBackToItsStrippedSuffix() throws {
@@ -421,7 +425,7 @@ final class FilePreviewTests: XCTestCase {
         let pane = PaneKey("devbox", 3)
         var asked: [String] = []
         // The literal `report:12` fails for another reason: `report` is not shown instead.
-        cache.download = { _, path, _, _, _, done in
+        cache.download = downloads { _, path, _, _, done in
             asked.append(path)
             done(TransferOutcome(error: "cannot open report:12: Permission denied"))
         }
@@ -433,7 +437,7 @@ final class FilePreviewTests: XCTestCase {
         }
         // Nothing at `report:12`: then `report`.
         asked = []
-        cache.download = { _, path, dest, _, _, done in
+        cache.download = downloads { _, path, dest, _, done in
             asked.append(path)
             if path == "report:12" {
                 var missing = TransferOutcome(error: "report:12: no such file")
@@ -453,7 +457,7 @@ final class FilePreviewTests: XCTestCase {
         let cache = tempCache(maxBytes: 10)
         let pane = PaneKey("devbox", 3)
         func fetch(_ path: String, bytes: Int) -> URL? {
-            cache.download = { _, _, dest, _, _, done in
+            cache.download = downloads { _, _, dest, _, done in
                 try! Data(repeating: 1, count: bytes).write(to: dest)
                 done(self.outcome(name: (path as NSString).lastPathComponent, version: "v"))
             }
@@ -474,5 +478,95 @@ final class FilePreviewTests: XCTestCase {
         // Files outside the cache are not its to hold.
         cache.hold(URL(fileURLWithPath: "/tmp/elsewhere.txt"))
         cache.release(URL(fileURLWithPath: "/tmp/elsewhere.txt"))
+    }
+
+    /// A stand-in download that cannot be cancelled and reports no progress.
+    private func downloads(
+        _ body: @escaping (PaneKey, String, URL, String?, @escaping (TransferOutcome) -> Void) -> Void
+    ) -> Core.DownloadStarter {
+        { pane, path, dest, version, _, _, done in
+            body(pane, path, dest, version, done)
+            return nil
+        }
+    }
+
+    func testARefreshLeavesTheCopyQuickLookShows() throws {
+        let cache = tempCache()
+        let pane = PaneKey("devbox", 3)
+        func fetch(_ content: String, version: String) -> URL? {
+            cache.download = downloads { _, _, dest, _, done in
+                try! Data(content.utf8).write(to: dest)
+                done(self.outcome(name: "log.txt", version: version))
+            }
+            var got: URL?
+            cache.fetch(.path("/log.txt"), pane: pane, cwd: nil) { got = try? $0.get() }
+            return got
+        }
+        let shown = try XCTUnwrap(fetch("old", version: "v1"))
+        cache.hold(shown)
+        // The host's file changed while Quick Look shows the old copy.
+        let fresh = try XCTUnwrap(fetch("new", version: "v2"))
+        XCTAssertNotEqual(fresh, shown)
+        XCTAssertEqual(try String(contentsOf: shown, encoding: .utf8), "old")
+        XCTAssertEqual(try String(contentsOf: fresh, encoding: .utf8), "new")
+        let entry = cache.entry(host: "devbox", path: "/log.txt", cwd: nil)
+        XCTAssertEqual(cache.cached(entry)?.file, fresh)
+        // Let go, the old copy goes; the new one stays.
+        cache.release(shown)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: shown.path))
+        XCTAssertEqual(try String(contentsOf: fresh, encoding: .utf8), "new")
+    }
+
+    func testDownloadsUnderWayCountAgainstTheLimit() throws {
+        let cache = tempCache(maxBytes: 10)
+        let pane = PaneKey("devbox", 3)
+        var progress: [(TransferProgress) -> Void] = []
+        var finish: [(TransferOutcome) -> Void] = []
+        var dests: [URL] = []
+        var cancels = 0
+        cache.download = { _, _, dest, _, _, onProgress, done in
+            dests.append(dest)
+            progress.append(onProgress)
+            finish.append(done)
+            return { cancels += 1 }
+        }
+        var results: [String: Result<URL, Error>] = [:]
+        cache.fetch(.path("/one.bin"), pane: pane, cwd: nil) { results["one"] = $0 }
+        cache.fetch(.path("/two.bin"), pane: pane, cwd: nil) { results["two"] = $0 }
+        // 8 bytes on their way, then 8 more: the second does not fit beside the first.
+        progress[0](TransferProgress(done: 0, total: 8))
+        XCTAssertEqual(cancels, 0)
+        progress[1](TransferProgress(done: 0, total: 8))
+        XCTAssertEqual(cancels, 1)
+        var cancelled = TransferOutcome(error: "cancelled")
+        cancelled.cancelled = true
+        finish[1](cancelled)
+        XCTAssertThrowsError(try XCTUnwrap(results["two"]).get()) {
+            XCTAssertTrue($0.localizedDescription.contains("no room"), $0.localizedDescription)
+        }
+        try Data(repeating: 1, count: 8).write(to: dests[0])
+        finish[0](outcome(name: "one.bin", version: "v"))
+        XCTAssertNoThrow(try XCTUnwrap(results["one"]).get())
+    }
+
+    func testAnEntryThatCannotBeDeletedStillCounts() throws {
+        let cache = tempCache(maxBytes: 10)
+        let pane = PaneKey("devbox", 3)
+        cache.download = downloads { _, _, dest, _, done in
+            try! Data(repeating: 1, count: 8).write(to: dest)
+            done(self.outcome(name: "a.bin", version: "v"))
+        }
+        var first: URL?
+        cache.fetch(.path("/a.bin"), pane: pane, cwd: nil) { first = try? $0.get() }
+        let copy = try XCTUnwrap(first).deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: copy.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: copy.path) }
+        let entry = cache.entry(host: "devbox", path: "/b.bin", cwd: nil)
+        let staged = try cache.stage(entry)
+        try Data(repeating: 2, count: 8).write(to: staged)
+        _ = try cache.install(entry, staged: staged, name: "b.bin", version: "v")
+        // 16 kept, 8 of them undeletable: over the limit, not counted as freed.
+        XCTAssertFalse(cache.prune(keeping: entry))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(first).path))
     }
 }

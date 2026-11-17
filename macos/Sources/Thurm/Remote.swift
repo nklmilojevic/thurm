@@ -594,28 +594,8 @@ extension SessionManager {
     /// Copies the file at `path` on `pane`'s host into ~/Downloads (under a free name), and
     /// shows it in Finder.
     func downloadRemoteFile(_ path: String, from pane: PaneKey) {
-        let view = view(for: pane)
-        let fm = FileManager.default
-        let downloads = fm.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
-        let name = (path as NSString).lastPathComponent
-        // The name is taken now, so another download or app can't pick it meanwhile; the
-        // download replaces only this placeholder.
-        guard let dest = Self.reserveFreeName(name.isEmpty ? "file" : name, in: downloads) else {
-            view?.showToast("Could not create a file in Downloads.", duration: 6)
-            return
-        }
-        view?.showToast("Downloading \(name) from \(pane.host)…", duration: 600)
-        Core.shared.download(pane, path: path, to: dest, onProgress: { p in
-            view?.showToast("Downloading \(name) from \(pane.host)… \(Int(p.fraction * 100))%", duration: 600)
-        }, onFinish: { outcome in
-            if let e = outcome.error {
-                try? FileManager.default.removeItem(at: dest)
-                view?.showToast("Could not download \(name): \(e)", duration: 6)
-                return
-            }
-            view?.showToast("Downloaded \(dest.lastPathComponent) to Downloads")
-            NSWorkspace.shared.activateFileViewerSelecting([dest])
-        })
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        view(for: pane)?.download(remotePath: path, into: downloads)
     }
 
     /// Creates an empty file `name` in `dir`, or `name 2`, `name 3`… when taken, atomically:
@@ -660,7 +640,7 @@ extension SessionManager {
                 thurm_remote_kick(host, true)
             })
         }
-        if forwardHost != nil {
+        if forwardHost != .none {
             items.append(CommandPalette.Item(title: "Forward Port…", detail: "open a remote host's port on this Mac") {
                 SessionManager.shared.showForwardPortPicker()
             })

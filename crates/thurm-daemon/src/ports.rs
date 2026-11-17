@@ -330,11 +330,16 @@ impl Watcher {
 }
 
 fn min_interval() -> Duration {
-    std::env::var("THURM_PORTS_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    interval_from(std::env::var("THURM_PORTS_INTERVAL_MS").ok().as_deref())
+}
+
+/// The shortest wait between looks, from `THURM_PORTS_INTERVAL_MS` (tests); never under 50 ms,
+/// so a zero there doesn't make the watcher run `ps` and `lsof` back to back.
+fn interval_from(ms: Option<&str>) -> Duration {
+    ms.and_then(|v| v.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(MIN_INTERVAL)
+        .max(Duration::from_millis(50))
 }
 
 fn run<H: Host>(host: Weak<H>) {
@@ -593,6 +598,14 @@ mod tests {
         );
         assert!(d.broadcast.is_empty());
         assert_eq!(d.retry, Some(t0 + PER_PANE));
+    }
+
+    #[test]
+    fn the_watch_never_spins() {
+        assert_eq!(interval_from(None), MIN_INTERVAL);
+        assert_eq!(interval_from(Some("200")), Duration::from_millis(200));
+        assert_eq!(interval_from(Some("0")), Duration::from_millis(50));
+        assert_eq!(interval_from(Some("junk")), MIN_INTERVAL);
     }
 
     #[test]

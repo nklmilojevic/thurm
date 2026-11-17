@@ -113,30 +113,38 @@ struct Source {
     reader: Box<dyn Read + Send>,
 }
 
-fn open_source(upload: &Upload) -> Result<Source, TransferError> {
+/// An [`Upload`] checked before the batch starts: its name and size, with nothing held open,
+/// so a batch of many files needs one descriptor at a time.
+struct Planned<'a> {
+    upload: &'a Upload,
+    name: String,
+    size: u64,
+}
+
+fn shown_and_name(upload: &Upload, path: &Path) -> (String, String) {
+    let shown = path.display().to_string();
+    let name = match upload {
+        Upload::Named { name, .. } => name.clone(),
+        _ => path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| shown.clone()),
+    };
+    (shown, name)
+}
+
+/// Checks `upload` without opening it (a FIFO is not waited on): a folder or anything but a
+/// regular file is refused.
+fn plan(upload: &Upload) -> Result<Planned<'_>, TransferError> {
     match upload {
-        Upload::Data { name, data } => Ok(Source {
+        Upload::Data { name, data } => Ok(Planned {
+            upload,
             name: name.clone(),
             size: data.len() as u64,
-            reader: Box::new(std::io::Cursor::new(data.clone())),
         }),
         Upload::Path(path) | Upload::Named { path, .. } => {
-            let shown = path.display().to_string();
-            let name = match upload {
-                Upload::Named { name, .. } => name.clone(),
-                _ => path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| shown.clone()),
-            };
-            // Without blocking: a FIFO with no writer is refused below, not waited on.
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(path)
-                .map_err(|e| TransferError::Local(format!("{shown}: {e}")))?;
-            let meta = file
-                .metadata()
+            let (shown, name) = shown_and_name(upload, path);
+            let meta = std::fs::metadata(path)
                 .map_err(|e| TransferError::Local(format!("{shown}: {e}")))?;
             if meta.is_dir() {
                 return Err(TransferError::Folder(name));
@@ -146,13 +154,47 @@ fn open_source(upload: &Upload) -> Result<Source, TransferError> {
                     "{shown} is not a regular file"
                 )));
             }
-            Ok(Source {
+            Ok(Planned {
+                upload,
                 name,
                 size: meta.len(),
-                reader: Box::new(file),
             })
         }
     }
+}
+
+/// Opens a planned upload to send it: still a regular file of the size planned.
+fn open_planned(planned: &Planned) -> Result<Source, TransferError> {
+    let path = match planned.upload {
+        Upload::Data { data, .. } => {
+            return Ok(Source {
+                name: planned.name.clone(),
+                size: planned.size,
+                reader: Box::new(std::io::Cursor::new(data.clone())),
+            });
+        }
+        Upload::Path(path) | Upload::Named { path, .. } => path,
+    };
+    let shown = path.display().to_string();
+    // Without blocking: a FIFO put in its place is refused below, not waited on.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| TransferError::Local(format!("{shown}: {e}")))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| TransferError::Local(format!("{shown}: {e}")))?;
+    if !meta.is_file() || meta.len() != planned.size {
+        return Err(TransferError::Local(format!(
+            "{shown} changed since it was chosen"
+        )));
+    }
+    Ok(Source {
+        name: planned.name.clone(),
+        size: planned.size,
+        reader: Box::new(file),
+    })
 }
 
 /// A batch name unlikely to meet another of this client's.
@@ -186,48 +228,49 @@ pub fn upload(
     if files.is_empty() {
         return Ok(());
     }
-    // Every file is checked before the first goes: a folder refuses the batch up front.
-    let mut sources = files
-        .iter()
-        .map(open_source)
-        .collect::<Result<Vec<_>, _>>()?;
-    let count = sources.len() as u32;
+    // Every file is checked before the first goes: a folder refuses the batch up front. Each
+    // is opened only when its turn comes.
+    let planned = files.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
+    let count = planned.len() as u32;
     let id = batch_id();
     let mut p = Progress {
         done: 0,
-        total: sources.iter().map(|s| s.size).sum(),
+        total: planned.iter().map(|s| s.size).sum(),
     };
     progress(p);
     // The last file's stream, sent and finished: kept until the next one opens, so a failure
     // to start that one can still end the batch on the daemon (an aborted stream does; a
     // closed one does not, as the earlier files' streams close).
     let mut last: Option<(StreamReader, StreamWriter)> = None;
-    for (index, source) in sources.iter_mut().enumerate() {
-        let next = host
-            .client
-            .upload_begin(
-                pane,
-                &source.name,
-                source.size,
-                Some(UploadBatch {
-                    id: id.clone(),
-                    index: index as u32,
-                    count,
-                }),
-            )
-            .and_then(|ticket| stream::open(host.socket, &ticket.ticket));
-        let (reader, mut writer) = match next {
-            Ok(opened) => opened,
+    for (index, planned) in planned.iter().enumerate() {
+        let next = open_planned(planned).and_then(|source| {
+            host.client
+                .upload_begin(
+                    pane,
+                    &source.name,
+                    source.size,
+                    Some(UploadBatch {
+                        id: id.clone(),
+                        index: index as u32,
+                        count,
+                    }),
+                )
+                .and_then(|ticket| stream::open(host.socket, &ticket.ticket))
+                .map(|opened| (source, opened))
+                .map_err(TransferError::from)
+        });
+        let (mut source, (reader, mut writer)) = match next {
+            Ok(next) => next,
             Err(e) => {
                 if let Some((_, w)) = last.take() {
                     let _ = w.close(StreamClose::Aborted);
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
         // A cancel between files still has to reach the daemon: it ends the batch on this
         // stream, which is aborted unfinished.
-        send(source, &mut writer, cancel, |n| {
+        send(&mut source, &mut writer, cancel, |n| {
             p.done += n;
             progress(p);
         })?;
@@ -391,7 +434,8 @@ pub fn download(
         .map_err(|e| TransferError::Local(format!("cannot watch the download: {e}")))?;
     let (mut reader, mut writer) = stream::open_on(socket, ticket)?;
     // A read blocks until the host sends; Cancel ends the connection under it.
-    let _watch = CancelWatch::start(cancel.clone(), shutdown);
+    let _watch = CancelWatch::start(cancel.clone(), shutdown)
+        .map_err(|e| TransferError::Local(format!("cannot watch the download for Cancel: {e}")))?;
     let (part, file) = create_part(dest)?;
     let received = receive(&mut reader, file, &part, info.size, cancel, &mut progress);
     if let Err(e) = received {
@@ -422,22 +466,38 @@ struct CancelWatch {
 }
 
 impl CancelWatch {
-    fn start(cancel: Cancel, socket: std::os::unix::net::UnixStream) -> CancelWatch {
+    /// Starts watching; an error when no thread can watch, as Cancel could not stop a read.
+    fn start(
+        cancel: Cancel,
+        socket: std::os::unix::net::UnixStream,
+    ) -> std::io::Result<CancelWatch> {
+        Self::start_with(cancel, socket, |watch| {
+            std::thread::Builder::new()
+                .name("transfer-cancel".into())
+                .spawn(watch)
+        })
+    }
+
+    fn start_with(
+        cancel: Cancel,
+        socket: std::os::unix::net::UnixStream,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> std::io::Result<CancelWatch> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("transfer-cancel".into())
-            .spawn(move || {
-                while !stopped.load(Ordering::SeqCst) {
-                    if cancel.is_cancelled() {
-                        let _ = socket.shutdown(std::net::Shutdown::Both);
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+        let thread = spawn(Box::new(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                if cancel.is_cancelled() {
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
+                    return;
                 }
-            })
-            .ok();
-        CancelWatch { stop, thread }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }))?;
+        Ok(CancelWatch {
+            stop,
+            thread: Some(thread),
+        })
     }
 }
 
@@ -614,7 +674,7 @@ mod tests {
         let dir = temp_dir("stalled");
         let (part, file) = create_part(&dir.join("big.bin")).unwrap();
         let cancel = Cancel::default();
-        let watch = CancelWatch::start(cancel.clone(), shutdown);
+        let watch = CancelWatch::start(cancel.clone(), shutdown).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let theirs = cancel.clone();
         let reading = std::thread::spawn(move || {
@@ -700,8 +760,8 @@ mod tests {
         std::os::unix::fs::symlink(&fifo, &link).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let results = [fifo, link].map(|p| open_source(&Upload::Path(p)).err());
-            let _ = tx.send(results.map(|e| e.map(|e| e.to_string())));
+            let results = [fifo, link].map(|p| plan(&Upload::Path(p)).err().map(|e| e.to_string()));
+            let _ = tx.send(results);
         });
         let results = rx
             .recv_timeout(Duration::from_secs(5))
@@ -728,5 +788,58 @@ mod tests {
         assert_eq!(std::fs::read(&a).unwrap(), b"first");
         assert_eq!(std::fs::read(&b).unwrap(), b"second");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Descriptors this process has open.
+    fn open_fds() -> usize {
+        std::fs::read_dir("/dev/fd").map_or(0, |d| d.count())
+    }
+
+    #[test]
+    fn a_large_batch_is_checked_without_holding_its_files_open() {
+        let dir = temp_dir("many");
+        let uploads: Vec<Upload> = (0..300)
+            .map(|i| {
+                let path = dir.join(format!("f{i}"));
+                std::fs::write(&path, b"x").unwrap();
+                Upload::Path(path)
+            })
+            .collect();
+        let before = open_fds();
+        let planned = uploads
+            .iter()
+            .map(plan)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // Other tests open some meanwhile; a file each would be 300.
+        assert!(open_fds() < before + 50, "{before} -> {}", open_fds());
+        assert_eq!(planned.len(), 300);
+        assert_eq!(planned.iter().map(|p| p.size).sum::<u64>(), 300);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_changed_after_it_was_checked_is_not_sent() {
+        let dir = temp_dir("changed");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, b"short").unwrap();
+        let upload = Upload::Path(path.clone());
+        let planned = plan(&upload).unwrap();
+        std::fs::write(&path, b"longer now").unwrap();
+        let e = open_planned(&planned).err().unwrap();
+        assert!(e.to_string().contains("changed since it was chosen"), "{e}");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(open_planned(&planned).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_thread_to_watch_for_cancel_is_an_error() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let started = CancelWatch::start_with(Cancel::default(), a, |_| {
+            Err(std::io::Error::other("no threads left"))
+        });
+        assert!(started.is_err());
     }
 }
