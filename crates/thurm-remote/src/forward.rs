@@ -889,7 +889,7 @@ fn reuse_locked(
         .open
         .values_mut()
         .find(|e| e.forward.host == host && e.forward.remote_port == remote_port)?;
-    Some(existing(e.forward.clone(), preferred).map(|(_, _)| {
+    Some(may_reuse(&e.forward, preferred).map(|()| {
         let linked = link.is_some_and(|l| e.forward.link.as_deref() != Some(l));
         if let Some(l) = link {
             e.forward.link = Some(l.to_owned());
@@ -898,14 +898,15 @@ fn reuse_locked(
     }))
 }
 
-/// The forward that has the port already, unless another local port was asked for (`0`: any).
-fn existing(f: Forward, preferred: Option<u16>) -> Result<(Forward, bool), String> {
+/// Whether `f`, which has the port already, may serve a request for it: not when another local
+/// port was asked for (`0`: any).
+fn may_reuse(f: &Forward, preferred: Option<u16>) -> Result<(), String> {
     match preferred {
         Some(p) if p != 0 && p != f.local => Err(format!(
             "{}:{} is forwarded to localhost:{} already; close that forward to use {p}",
             f.host, f.remote_port, f.local
         )),
-        _ => Ok((f, false)),
+        _ => Ok(()),
     }
 }
 
