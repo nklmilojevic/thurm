@@ -6,6 +6,8 @@
 mod mobile;
 #[cfg(feature = "desktop")]
 mod remote;
+#[cfg(feature = "desktop")]
+mod transfer;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
@@ -392,6 +394,8 @@ pub struct thurm_client {
     on_event: thurm_event_cb,
     on_frame: thurm_frame_cb,
     ctx: Ctx,
+    /// The daemon's socket when the connection is a plain one: where its streams open.
+    socket: Option<std::path::PathBuf>,
     /// What carries the connection when it is not a plain socket (the iOS app's ssh session);
     /// dropped after `client`.
     _transport: Option<Box<dyn std::any::Any + Send>>,
@@ -519,6 +523,7 @@ unsafe fn connect_to(
         .to_owned();
     let mut capabilities = capabilities.to_vec();
     capabilities.push(thurm_proto::CAP_AGENT_ACTIVITY);
+    let streams_on = socket.clone();
     let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
         Client::connect_with(
             ConnectOptions {
@@ -535,7 +540,10 @@ unsafe fn connect_to(
         .map_err(|e| e.to_string())
     });
     match connected {
-        Ok(client) => client,
+        Ok(client) => {
+            unsafe { (*client).socket = Some(streams_on) };
+            client
+        }
         Err(e) => {
             if !err.is_null() {
                 unsafe { *err = into_c(e) };
@@ -578,6 +586,7 @@ fn new_connection(
         on_event,
         on_frame,
         ctx,
+        socket: None,
         _transport: transport,
     })))
 }
@@ -611,6 +620,18 @@ pub unsafe extern "C" fn thurm_write_temp_file(
         Ok(other) => fail(format!("unexpected response {other:?}")),
         Err(e) => fail(e.to_string()),
     }
+}
+
+/// Whether the daemon listed `cap` (a `CAP_*` name) in its answer to the Hello.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_has_capability(
+    client: *mut thurm_client,
+    cap: *const c_char,
+) -> bool {
+    let (Some(c), Some(cap)) = (unsafe { client_ref(client) }, unsafe { opt_str(cap) }) else {
+        return false;
+    };
+    c.client.has_capability(cap)
 }
 
 /// Re-read this Mac's config into the connection's terminal copies (fonts aside, colors and

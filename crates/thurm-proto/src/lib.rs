@@ -84,6 +84,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_EXT,
     CAP_STREAMS,
     CAP_PORTS,
+    CAP_TRANSFER,
 ];
 
 /// The daemon accepts `SearchPaths` and returns `PathMatches` only for that request.
@@ -104,6 +105,9 @@ pub const CAP_PORTS: &str = "ports";
 /// hosts, `thurm remote forward`): while one is connected, the daemon watches its panes' ports.
 /// Not in [`CAPABILITIES`], so other clients don't start that watch.
 pub const CAP_PORT_EVENTS: &str = "port-events";
+/// The daemon takes files on streams and sends its files back: it answers
+/// [`Request::UploadBegin`] and [`Request::DownloadBegin`]. Implies [`CAP_STREAMS`].
+pub const CAP_TRANSFER: &str = "transfer";
 
 /// Sent only by an app that shows what plugins ask for ([`ext::UiRequest`]: a toast, a picker,
 /// a text field, a confirmation) and answers with [`ext::method::UI_REPLY`]. The daemon takes
@@ -536,6 +540,58 @@ pub enum Request {
     Ports {
         pane: Option<PaneId>,
     },
+    /// Reserve a stream that writes a file of exactly `size` bytes onto the daemon's host for
+    /// `pane`, under the runtime directory. Of `name` only the last component is kept. Once
+    /// every file of `batch` (or this one alone) has landed, the daemon pastes their paths into
+    /// the pane and closes each stream `Ok`; if one fails, the batch is deleted, nothing is
+    /// typed, and every stream closes with the error. Answers [`Response::Ticket`]. Requires
+    /// [`CAP_TRANSFER`].
+    UploadBegin {
+        pane: PaneId,
+        name: String,
+        size: u64,
+        batch: Option<UploadBatch>,
+    },
+    /// Reserve a stream that sends the regular file at `path` on the daemon's host: relative to
+    /// the pane's working directory, `~` for the home directory. With `if_version` equal to the
+    /// file's version, answers `not_modified` and no ticket. Answers [`Response::Download`].
+    /// Requires [`CAP_TRANSFER`].
+    DownloadBegin {
+        pane: PaneId,
+        path: String,
+        if_version: Option<String>,
+    },
+}
+
+/// Where a file of [`Request::UploadBegin`] goes in a batch: the `index`th of `count` files
+/// the client calls `id`. The paths are pasted in `index` order.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct UploadBatch {
+    pub id: String,
+    pub index: u32,
+    pub count: u32,
+}
+
+/// The answer to [`Request::DownloadBegin`].
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DownloadInfo {
+    /// For [`Request::StreamOpen`]; `None` when `not_modified`. The stream sends exactly
+    /// `size` bytes, then `End`.
+    pub ticket: Option<String>,
+    /// How long `ticket` stays valid unused.
+    pub expires_ms: u32,
+    /// The file's name.
+    pub name: String,
+    /// Its absolute path on the daemon's host.
+    pub path: String,
+    pub size: u64,
+    /// Last modified, milliseconds since the Unix epoch.
+    pub modified: u64,
+    /// Changes whenever the file does; `None` when it changed a moment ago (it may be being
+    /// written), so it is not cached by version.
+    pub version: Option<String>,
+    /// `if_version` is the file's version: nothing to send.
+    pub not_modified: bool,
 }
 
 /// How [`Request::OwnPanes`] treats a pane another client holds.
@@ -645,6 +701,7 @@ pub enum Response {
         expires_ms: u32,
     },
     Ports(Vec<PanePorts>),
+    Download(DownloadInfo),
 }
 
 /// A pane that had keyboard focus in a UI (the Mac app, the iOS app).

@@ -24,6 +24,17 @@ pub const MAX_OPEN: usize = 256;
 pub enum Kind {
     /// A TCP port on this host's loopback.
     Tcp { port: u16 },
+    /// A file coming in: the `index`th of an upload batch (`crate::transfer`).
+    Upload { batch: u64, index: u32 },
+    /// A file going out (`crate::transfer`): `path`, which was the file `dev`/`ino` of `size`
+    /// bytes when reserved.
+    Download {
+        pane: u64,
+        path: std::path::PathBuf,
+        size: u64,
+        dev: u64,
+        ino: u64,
+    },
 }
 
 /// A stream reserved by a ticket.
@@ -62,7 +73,7 @@ impl Default for Streams {
 }
 
 /// [`stream::TICKET_TTL_MS`], or `THURM_STREAM_TICKET_MS` (tests).
-fn ticket_ttl() -> Duration {
+pub(crate) fn ticket_ttl() -> Duration {
     let ms = std::env::var("THURM_STREAM_TICKET_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -218,7 +229,11 @@ pub fn serve<R: Read>(kind: Kind, mut reader: R, writer: UnixStream, _open: Open
         got_end: false,
         closed: false,
     }));
-    let Kind::Tcp { port } = kind;
+    let Kind::Tcp { port } = kind else {
+        out.lock()
+            .close(StreamClose::Internal("not a TCP stream".into()));
+        return;
+    };
     let tcp = match dial_loopback(port) {
         Ok(tcp) => tcp,
         Err(e) => {

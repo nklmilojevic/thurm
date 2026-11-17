@@ -42,6 +42,10 @@ pub enum ClientError {
 /// another build).
 pub const UNREADABLE_ANSWER: &str = "the daemon's answer could not be read";
 
+/// What a daemon without [`thurm_proto::CAP_TRANSFER`] is told.
+pub const NO_TRANSFER: &str =
+    "this Thurm daemon cannot take or send files yet; update Thurm on this host";
+
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -633,6 +637,51 @@ impl Client {
         }
         match self.request(Request::DialBegin { port })? {
             Response::Ticket { ticket, expires_ms } => Ok(stream::Ticket { ticket, expires_ms }),
+            _ => Err(ClientError::Daemon(UNREADABLE_ANSWER.into())),
+        }
+    }
+
+    /// Reserves a stream that writes a file of `size` bytes for `pane` on the daemon's host,
+    /// alone or as part of `batch` ([`Request::UploadBegin`]); open it with [`stream::open`]
+    /// before the ticket expires.
+    pub fn upload_begin(
+        &self,
+        pane: thurm_proto::PaneId,
+        name: &str,
+        size: u64,
+        batch: Option<thurm_proto::UploadBatch>,
+    ) -> Result<stream::Ticket, ClientError> {
+        if !self.has_capability(thurm_proto::CAP_TRANSFER) {
+            return Err(ClientError::Daemon(NO_TRANSFER.into()));
+        }
+        match self.request(Request::UploadBegin {
+            pane,
+            name: name.to_owned(),
+            size,
+            batch,
+        })? {
+            Response::Ticket { ticket, expires_ms } => Ok(stream::Ticket { ticket, expires_ms }),
+            _ => Err(ClientError::Daemon(UNREADABLE_ANSWER.into())),
+        }
+    }
+
+    /// Asks for the file at `path` as `pane` sees it ([`Request::DownloadBegin`]): its details,
+    /// and a ticket for a stream sending it unless `if_version` is still its version.
+    pub fn download_begin(
+        &self,
+        pane: thurm_proto::PaneId,
+        path: &str,
+        if_version: Option<&str>,
+    ) -> Result<thurm_proto::DownloadInfo, ClientError> {
+        if !self.has_capability(thurm_proto::CAP_TRANSFER) {
+            return Err(ClientError::Daemon(NO_TRANSFER.into()));
+        }
+        match self.request(Request::DownloadBegin {
+            pane,
+            path: path.to_owned(),
+            if_version: if_version.map(str::to_owned),
+        })? {
+            Response::Download(info) => Ok(info),
             _ => Err(ClientError::Daemon(UNREADABLE_ANSWER.into())),
         }
     }

@@ -554,6 +554,8 @@ pub struct Daemon {
     pub streams: crate::streams::Streams,
     /// Watches the ports panes listen on while a client wants to hear of them.
     pub ports: crate::ports::Watcher,
+    /// Files coming in and going out on streams.
+    pub transfers: crate::transfer::Transfers,
     layout: Mutex<Option<String>>,
     next_pane: AtomicU64,
     next_client: AtomicU64,
@@ -625,6 +627,9 @@ impl Daemon {
             clients: Mutex::new(HashMap::new()),
             streams: Default::default(),
             ports: Default::default(),
+            transfers: crate::transfer::Transfers::new(
+                socket.parent().unwrap_or(Path::new("/tmp")).join("drops"),
+            ),
             layout: Mutex::new(None),
             next_pane: AtomicU64::new(1),
             next_client: AtomicU64::new(1),
@@ -860,6 +865,7 @@ impl Daemon {
             c.gone.store(true, Ordering::SeqCst);
         }
         self.focus.lock().client_gone(id);
+        self.transfers.client_gone(id);
         self.ext_client_gone(id);
         self.plugins_owner_gone(id);
         for p in self.all_panes() {
@@ -3495,7 +3501,60 @@ impl Daemon {
                     .map(|seen| Response::Ports(crate::ports::as_response(seen)))
                     .ok_or_else(|| "could not list the processes".to_owned())
             }
+            Request::UploadBegin {
+                pane,
+                name,
+                size,
+                batch,
+            } => {
+                self.pane(pane)
+                    .ok_or_else(|| format!("no such pane: {pane}"))?;
+                let principal = client.principal.lock().clone().unwrap_or_default();
+                self.transfers
+                    .upload_begin(self, client.id, principal, pane, &name, size, batch)
+                    .map(|(ticket, expires_ms)| Response::Ticket { ticket, expires_ms })
+            }
+            Request::DownloadBegin {
+                pane,
+                path,
+                if_version,
+            } => {
+                let (cwd, pid) =
+                    self.with_pane(pane, |_, st| (st.info.cwd.clone(), st.info.pid))?;
+                let home = pid
+                    .and_then(|pid| procinfo::env_var(pid, "HOME"))
+                    .or_else(|| std::env::var("HOME").ok());
+                let principal = client.principal.lock().clone().unwrap_or_default();
+                self.transfers
+                    .download_begin(
+                        self,
+                        client.id,
+                        principal,
+                        pane,
+                        &path,
+                        cwd.as_deref(),
+                        home.as_deref(),
+                        if_version.as_deref(),
+                    )
+                    .map(Response::Download)
+            }
         }
+    }
+
+    /// Pastes `text` into `pane` as [`Request::Paste`] does, for `client` (which may have gone
+    /// since it asked): files it uploaded, once they landed.
+    pub(crate) fn paste_for(&self, client: u64, pane: PaneId, text: &str) -> Result<(), String> {
+        let asker = self.clients.lock().get(&client).cloned();
+        self.with_input_pane(client, pane, |p, st| {
+            if let Some(c) = &asker {
+                self.used_by(c, st);
+            }
+            st.agent.prompt.interrupted();
+            st.agent.user_input();
+            self.acknowledge_programs(pane, st);
+            self.pane_read(pane);
+            p.write(st.term.paste(text));
+        })
     }
 
     /// [`Request::Ext`]: a method of the extension API, its parameters and result as JSON text.

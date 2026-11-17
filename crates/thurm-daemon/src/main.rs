@@ -20,6 +20,7 @@ mod shell;
 mod streams;
 mod tailnet;
 mod transcript;
+mod transfer;
 mod upgrade;
 mod user_exec;
 

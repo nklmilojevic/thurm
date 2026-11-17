@@ -494,6 +494,116 @@ fn remote_workspace_over_loopback_ssh() {
     down.wait_closed().unwrap();
     echo.join().unwrap();
 
+    // 3c. Files up to the host, typed into the pane once both landed, and one back.
+    use thurm_remote::transfer::{self, Cancel, Downloaded, Host, Upload};
+    let host = Host {
+        client: &c,
+        socket: Path::new(&local),
+    };
+    let up_dir = w.base.join("upload");
+    std::fs::create_dir_all(&up_dir).unwrap();
+    let big: Vec<u8> = (0..700_000).map(|i| (i % 249) as u8).collect();
+    std::fs::write(up_dir.join("one.bin"), &big).unwrap();
+    let files = [
+        Upload::Path(up_dir.join("one.bin")),
+        Upload::Data {
+            name: "two.png".into(),
+            data: b"png".to_vec(),
+        },
+    ];
+    let mut seen = Vec::new();
+    transfer::upload(host, pane, &files, &Cancel::default(), |p| seen.push(p)).unwrap();
+    assert_eq!(
+        seen.last().map(|p| (p.done, p.total)),
+        Some((700_003, 700_003))
+    );
+    // The paths are long: they wrap.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let screen = loop {
+        let screen = match c.request(Request::Capture {
+            pane,
+            opts: CaptureOpts::default(),
+        }) {
+            Ok(Response::Text(t)) => t.replace('\n', ""),
+            other => panic!("{other:?}"),
+        };
+        if screen.contains("two.png") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the paths never showed up: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(screen.contains("one.bin"), "{screen}");
+    c.request(Request::Input {
+        pane,
+        data: b"\x15".to_vec(),
+    })
+    .unwrap();
+    // A folder is refused before anything goes.
+    let e = transfer::upload(
+        host,
+        pane,
+        &[Upload::Path(up_dir.clone())],
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(matches!(e, transfer::TransferError::Folder(_)), "{e}");
+
+    let remote_file = w.base.join("rhome/remote.txt");
+    std::fs::write(&remote_file, &big).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&remote_file)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+    let dest = up_dir.join("back.txt");
+    let remote_path = remote_file.display().to_string();
+    let got = transfer::download(
+        host,
+        pane,
+        &remote_path,
+        &dest,
+        None,
+        None,
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    let Downloaded::Saved(info) = got else {
+        panic!("{got:?}")
+    };
+    assert!(std::fs::read(&dest).unwrap() == big);
+    let again = transfer::download(
+        host,
+        pane,
+        &remote_path,
+        &dest,
+        info.version.as_deref(),
+        None,
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(matches!(again, Downloaded::NotModified(_)), "{again:?}");
+    let e = transfer::download(
+        host,
+        pane,
+        &remote_path,
+        &up_dir.join("never"),
+        None,
+        Some(1000),
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(matches!(e, transfer::TransferError::TooLarge { .. }), "{e}");
+    assert!(!up_dir.join("never").exists());
+
     // 4. `thurm --remote` routes through the app's tunnel.
     let out = cli(&w, &["--remote", "loop", "list"]);
     assert!(

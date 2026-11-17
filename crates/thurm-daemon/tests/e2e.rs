@@ -44,6 +44,8 @@ mod streams;
 
 #[path = "e2e/ports.rs"]
 mod ports;
+#[path = "e2e/transfer.rs"]
+mod transfer;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};

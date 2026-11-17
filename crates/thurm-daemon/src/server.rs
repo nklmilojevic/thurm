@@ -364,7 +364,12 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
     if codec::write_message(&mut &stream, &ok).is_err() {
         return;
     }
-    crate::streams::serve(reservation.kind, reader, stream, open);
+    match reservation.kind {
+        kind @ crate::streams::Kind::Tcp { .. } => {
+            crate::streams::serve(kind, reader, stream, open)
+        }
+        kind => crate::transfer::serve(&daemon, kind, reader, stream, open),
+    }
 }
 
 fn write_msg<W: std::io::Write>(

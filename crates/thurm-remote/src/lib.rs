@@ -12,6 +12,7 @@
 //! - [`pairing`]: the iOS app's pairing code and its device keys on remote hosts.
 //! - [`policy`]: what remote panes may do on this Mac (clipboard, links).
 //! - [`forward`]: a host's ports opened on this Mac's loopback, through its daemon.
+//! - [`transfer`]: files up to a host and back, on streams through its daemon.
 
 pub mod doctor;
 pub mod forward;
@@ -21,6 +22,7 @@ pub mod pairing;
 pub mod policy;
 pub mod ssh;
 pub mod tailnet;
+pub mod transfer;
 pub mod tunnel;
 
 use std::time::Duration;

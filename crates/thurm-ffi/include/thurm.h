@@ -66,6 +66,34 @@ void thurm_disconnect(thurm_client *client);
 char *thurm_write_temp_file(thurm_client *client, const char *name, const uint8_t *data,
                             size_t len, char **err);
 
+/* Whether the daemon listed `cap` (e.g. "transfer") in its answer to the Hello. */
+bool thurm_has_capability(thurm_client *client, const char *cap);
+
+/* Files to and from the connection's host, on streams through its daemon ("transfer"
+ * capability; macOS only). Each runs on a thread of its own; `cb` gets JSON on that thread:
+ * {"done":n,"total":n} as bytes go, then once {"finished":true,"error":null|"...",
+ * "cancelled":bool,"unsupported":bool,"folder":bool,...}. Both return an id for the cancel
+ * calls, or 0 when nothing started (the final callback has come already). */
+typedef void (*thurm_transfer_cb)(void *ctx, const char *json);
+
+/* Send files to `pane`'s host as one batch. `files_json`: [{"path":"/local/file"}, or with
+ * "name" to send it under another name]. Once all have landed, the daemon types their paths
+ * into the pane; if one fails or the upload is cancelled, nothing is typed or kept there. A
+ * folder is refused ("folder":true) before anything is sent. */
+uint64_t thurm_upload(thurm_client *client, thurm_pane_id pane, const char *files_json,
+                      thurm_transfer_cb cb, void *ctx);
+void thurm_upload_cancel(uint64_t transfer);
+
+/* Fetch the regular file at `path` on `pane`'s host (relative to the pane's directory, `~`
+ * for home) into `dest`, written beside it and then moved there. With `if_version` (or NULL)
+ * still the file's version, nothing is written ("not_modified":true). A file over `max_bytes`
+ * (0: no limit) is refused. The final callback has "info":{"name","path","size","modified"
+ * (ms since 1970),"version"|null}. */
+uint64_t thurm_download(thurm_client *client, thurm_pane_id pane, const char *path,
+                        const char *dest, const char *if_version, uint64_t max_bytes,
+                        thurm_transfer_cb cb, void *ctx);
+void thurm_download_cancel(uint64_t transfer);
+
 /* Re-read this Mac's config into the connection's terminal copies. The local daemon's
  * "ConfigReloaded" does this for its own connection; call it for remote connections. */
 void thurm_reload_engine(thurm_client *client);
