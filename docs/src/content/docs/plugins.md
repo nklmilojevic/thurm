@@ -93,7 +93,7 @@ for an event about a pane, `pane` (as `thurm info --json` shows it).
 | `pane_focused` | A pane got the keyboard focus in an app |
 | `bell`, `notification` | A program rang the bell, or sent a notification (`title`, `body`); these and `pane_closed` carry the pane's `id`, not `pane` |
 | `config_reloaded` | The configuration was reloaded |
-| `ports_changed` | The TCP ports a pane's programs listen on changed: `ports` (each with `port`, `address`, `pid`, `command`), the whole list, empty once they all went, and `complete` (false when some of the pane's processes could not be read). It carries the pane's `id`, and `pane` while it is there; a remote host's pane has `host` instead of `pane`, and `initial` for lists of servers that were running already: those the host had when the app connected to it, and those a plugin is sent when it subscribes |
+| `ports_changed` | The TCP ports a pane's programs listen on changed: `ports` (each with `port`, `address`, `pid`, `command`), the whole list, empty once they all went, and `complete` (false when some of the pane's processes could not be read). It carries the pane's `id`, and `pane` while it is there; a remote host's pane has `host` instead of `pane`, and `initial` marks lists of servers that were running already: those a plugin is sent when it subscribes, and those a host had when the app connected to it |
 | `files_uploaded` | Files dropped or pasted on a pane landed and their paths were typed there: `paths`, with the pane's `id` |
 | `forward_opened`, `forward_closed` | The app opened or closed a forward of a remote host's port: `id`, `host`, `remote_port`, `local_port`, `url`; a closed one says `why`: `closed`, `host` (removed or disabled), `gone` (the port went away) or `app` (the app quit) |
 | `NAME.anything` | A plugin's own event, sent with `thurm.emit` |
@@ -102,9 +102,10 @@ for an event about a pane, `pane` (as `thurm info --json` shows it).
 `[[on]]` hooks run on the first eight, as before.
 
 The daemon looks at its panes' ports only while someone listens: subscribing
-to `ports_changed` by name starts it (`*` alone does not), and the first lists
-come right away, with the remote hosts' lists the app passed on so far (marked
-`initial`). A remote host's ports and the forwards come from the app, so
+to `ports_changed` by name starts it (`*` alone does not). A plugin that
+subscribes gets every pane's list first, on its own and marked `initial`, with
+the remote hosts' lists the app passed on so far; the others hear nothing
+again. A remote host's ports and the forwards come from the app, so
 a plugin on this Mac hears them while Thurm is open.
 
 ## The Lua API
