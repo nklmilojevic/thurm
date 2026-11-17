@@ -601,7 +601,10 @@ mod tests {
                 let entries = new_path.split(':').filter(|e| *e == s).count();
                 // fish spells it `.` when it reads PATH: the same directory.
                 assert_eq!(
-                    new_path.split(':').filter(|e| e.is_empty() || *e == ".").count(),
+                    new_path
+                        .split(':')
+                        .filter(|e| e.is_empty() || *e == ".")
+                        .count(),
                     1,
                     "{shell:?}: the empty entry kept: {new_path}"
                 );
