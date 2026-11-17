@@ -302,10 +302,13 @@ final class RemoteFileCache {
         return FileManager.default.fileExists(atPath: file.path) ? file : nil
     }
 
-    /// The cached copy in `entry` and the version it is, if any.
+    /// The cached copy in `entry` and the version it is, if any. The version is kept in the
+    /// copy's own folder, written before the copy is put in use: whichever copy `.current`
+    /// names, its version is its own, even when two app instances install at once.
     func cached(_ entry: URL) -> (file: URL, version: String)? {
         guard let file = current(entry),
-              let version = try? String(contentsOf: entry.appendingPathComponent(".version"), encoding: .utf8)
+              let version = try? String(contentsOf: file.deletingLastPathComponent()
+                  .appendingPathComponent(".version"), encoding: .utf8)
         else { return nil }
         return (file, version)
     }
@@ -327,39 +330,36 @@ final class RemoteFileCache {
         // A hidden name (.eslintrc.json) keeps its extension, for Quick Look to know it, but
         // not its leading dot, which marks the cache's own files.
         let safe = name.isEmpty || name.contains("/") ? "file" : name.hasPrefix(".") ? "dot" + name : name
-        // The old version goes first: whatever fails below, a copy is never paired with a
-        // version it is not (no version only means fetching again).
-        let versionFile = entry.appendingPathComponent(".version")
-        do {
-            try fm.removeItem(at: versionFile)
-        } catch CocoaError.fileNoSuchFile {
-        }
         let copy = "c-\(UUID().uuidString)"
         let folder = entry.appendingPathComponent(copy, isDirectory: true)
         try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let file = folder.appendingPathComponent(safe)
         do {
             try fm.moveItem(at: staged, to: file)
+        } catch {
+            try? fm.removeItem(at: folder)
+            throw error
+        }
+        // Its version beside it, before it is in use: a version that cannot be recorded only
+        // means it is fetched again next time, not that this fetch failed.
+        if let version {
+            do {
+                try writeText(version, folder.appendingPathComponent(".version"))
+            } catch {
+                tlog("remote preview cache: cannot record the version of \(file.path): \(error)")
+            }
+        }
+        do {
             try writeText("\(copy)/\(safe)", entry.appendingPathComponent(".current"))
         } catch {
             try? fm.removeItem(at: folder)
             throw error
         }
         retireCopies(in: entry)
-        // The copy is in place: a version that cannot be recorded only means it is fetched
-        // again next time, not that this fetch failed.
-        if let version {
-            do {
-                try writeText(version, versionFile)
-            } catch {
-                tlog("remote preview cache: cannot record the version of \(file.path): \(error)")
-            }
-        }
         // Over the limit even with everything else gone (a copy Quick Look still shows, say):
         // the new copy is shown but not kept, and goes once let go.
         if !prune(keeping: entry) {
             try? fm.removeItem(at: entry.appendingPathComponent(".current"))
-            try? fm.removeItem(at: versionFile)
         }
         return file
     }
@@ -434,7 +434,10 @@ final class RemoteFileCache {
         let copies = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)) ?? []
         return copies.filter { $0.lastPathComponent.hasPrefix("c-") }.reduce(UInt64(0)) { sum, folder in
             let files = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey])) ?? []
-            return files.reduce(sum) { $0 + UInt64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+            // The copy, not its version beside it (a few bytes).
+            return files.filter { !$0.lastPathComponent.hasPrefix(".") }.reduce(sum) {
+                $0 + UInt64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            }
         }
     }
 

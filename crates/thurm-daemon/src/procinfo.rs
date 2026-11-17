@@ -442,7 +442,8 @@ pub fn listening_ports(pids: &[u32]) -> std::collections::HashMap<u32, Vec<u16>>
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Listener {
     pub port: u16,
-    /// `127.0.0.1`, `::1`, `0.0.0.0`, `::`, `*` (any, as `lsof` says), or another address.
+    /// `127.0.0.1`, `::1`, `0.0.0.0`, `::`, or another address, spelled alike on Linux and
+    /// macOS.
     pub address: String,
 }
 
@@ -667,7 +668,7 @@ pub fn listeners(pids: &[u32]) -> Option<Listening> {
         "-a",
         "-iTCP",
         "-sTCP:LISTEN",
-        "-Fpn",
+        "-Fptn",
         "-p",
         &list,
     ]))
@@ -675,9 +676,11 @@ pub fn listeners(pids: &[u32]) -> Option<Listening> {
     out.by_pid = parse_lsof_listeners(&String::from_utf8_lossy(&res.stdout));
     // `lsof` leaves out a process it may not inspect (another user's) without a word, and exits
     // as it does when nothing listens: ask the system which of them it could not have read.
+    // Only those it said nothing of: one it listed was read.
     out.unread = pids
         .iter()
         .copied()
+        .filter(|pid| !out.by_pid.contains_key(pid))
         .filter(|&pid| fds_access(pid) == FdAccess::Denied)
         .collect();
     Some(out)
@@ -727,18 +730,27 @@ pub fn fds_access(_pid: u32) -> FdAccess {
 fn parse_lsof_listeners(text: &str) -> std::collections::HashMap<u32, Vec<Listener>> {
     let mut map: std::collections::HashMap<u32, Vec<Listener>> = Default::default();
     let mut current = 0u32;
+    let mut ipv6 = false;
     for line in text.lines() {
         if let Some(pid) = line.strip_prefix('p') {
             current = pid.parse().unwrap_or(0);
+        } else if line.starts_with('f') {
+            ipv6 = false;
+        } else if let Some(kind) = line.strip_prefix('t') {
+            ipv6 = kind == "IPv6";
         } else if let Some(name) = line.strip_prefix('n')
             && let Some((addr, port)) = name.rsplit_once(':')
             && let Ok(port) = port.parse::<u16>()
         {
             let addr = addr.trim_start_matches('[').trim_end_matches(']');
-            let l = Listener {
-                port,
-                address: addr.to_owned(),
+            // Spelled as the Linux tables have it: `*` is the family's any-address, and an
+            // IPv4 address mapped into IPv6 is the IPv4 one.
+            let address = match addr {
+                "*" if ipv6 => "::".to_owned(),
+                "*" => "0.0.0.0".to_owned(),
+                a => a.strip_prefix("::ffff:").unwrap_or(a).to_owned(),
             };
+            let l = Listener { port, address };
             let list = map.entry(current).or_default();
             if !list.contains(&l) {
                 list.push(l);
@@ -1097,14 +1109,19 @@ mod proc_tests {
 
     #[test]
     fn listener_addresses_from_lsof() {
-        let out = "p100\nn127.0.0.1:5173\nn[::1]:5173\np200\nn*:8080\nn*:8080\n";
+        let out = "p100\nf3\ntIPv4\nn127.0.0.1:5173\nf4\ntIPv6\nn[::1]:5173\n\
+                   p200\nf3\ntIPv4\nn*:8080\nf4\ntIPv6\nn*:8080\nf5\ntIPv6\nn[::ffff:127.0.0.1]:9000\n";
         let map = parse_lsof_listeners(out);
         let l = |port: u16, address: &str| Listener {
             port,
             address: address.into(),
         };
         assert_eq!(map[&100], vec![l(5173, "127.0.0.1"), l(5173, "::1")]);
-        assert_eq!(map[&200], vec![l(8080, "*")]);
+        // As /proc/net/tcp{,6} spell them on Linux.
+        assert_eq!(
+            map[&200],
+            vec![l(8080, "0.0.0.0"), l(8080, "::"), l(9000, "127.0.0.1")]
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -232,6 +232,13 @@ pub fn upload(
     }
     // Every file is checked before the first goes: a folder refuses the batch up front. Each
     // is opened only when its turn comes.
+    // More than a batch holds is refused before any file goes, not at the first one over.
+    if files.len() > thurm_proto::MAX_UPLOAD_BATCH as usize {
+        return Err(TransferError::Local(format!(
+            "at most {} files are sent at once",
+            thurm_proto::MAX_UPLOAD_BATCH
+        )));
+    }
     let planned = files.iter().map(plan).collect::<Result<Vec<_>, _>>()?;
     let count = planned.len() as u32;
     let id = batch_id();
@@ -529,15 +536,21 @@ pub fn download_reserved(
     pane: PaneId,
     path: &str,
     reserved: &Path,
+    identity: (u64, u64),
     cancel: &Cancel,
     mut progress: impl FnMut(Progress),
 ) -> Result<DownloadInfo, TransferError> {
     use std::os::unix::fs::MetadataExt;
-    if !host.client.has_capability(CAP_TRANSFER) {
-        // Nothing came: the reservation goes, if it is still the empty file made for it.
-        if std::fs::symlink_metadata(reserved).is_ok_and(|m| m.is_file() && m.len() == 0) {
+    // The reservation is the file made for it (`identity`: its device and inode, taken when
+    // it was made), not whatever has its name now: only that file is written or deleted.
+    let ours = identity;
+    let give_back = || {
+        if std::fs::symlink_metadata(reserved).is_ok_and(|m| (m.dev(), m.ino()) == ours) {
             let _ = std::fs::remove_file(reserved);
         }
+    };
+    if !host.client.has_capability(CAP_TRANSFER) {
+        give_back();
         return Err(TransferError::Unsupported);
     }
     let changed = || {
@@ -555,16 +568,9 @@ pub fn download_reserved(
     let meta = file
         .metadata()
         .map_err(|e| TransferError::Local(format!("{}: {e}", reserved.display())))?;
-    if !meta.is_file() || meta.len() != 0 {
+    if !meta.is_file() || meta.len() != 0 || (meta.dev(), meta.ino()) != ours {
         return Err(changed());
     }
-    let ours = (meta.dev(), meta.ino());
-    // On a failure, the reserved file goes, but only if the name still holds it.
-    let give_back = || {
-        if std::fs::symlink_metadata(reserved).is_ok_and(|m| (m.dev(), m.ino()) == ours) {
-            let _ = std::fs::remove_file(reserved);
-        }
-    };
     let got = (|| {
         let info = host.client.download_begin(pane, path, None)?;
         let ticket = info

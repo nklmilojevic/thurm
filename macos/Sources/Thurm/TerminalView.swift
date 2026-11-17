@@ -1690,10 +1690,11 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Downloads the file at `path` on this pane's host into `dir` (`~/Downloads`) under a
     /// free name, reserved now so nothing else takes it, with progress and Cancel in the toast.
     /// Shows the file in Finder when done.
-    func download(remotePath path: String, into dir: URL, start: Core.DownloadStarter = Core.startReservedDownload,
+    func download(remotePath path: String, into dir: URL,
+                  start: Core.ReservedDownloadStarter = Core.startReservedDownload,
                   reveal: @escaping (URL) -> Void = { NSWorkspace.shared.activateFileViewerSelecting([$0]) }) {
         let name = (path as NSString).lastPathComponent
-        guard let dest = SessionManager.reserveFreeName(name.isEmpty ? "file" : name, in: dir) else {
+        guard let reservation = SessionManager.reserveFreeName(name.isEmpty ? "file" : name, in: dir) else {
             showToast("Could not create a file in \(dir.lastPathComponent).", duration: 6)
             return
         }
@@ -1702,7 +1703,8 @@ final class TerminalView: NSView, NSTextInputClient {
         beginTransfer(item)
         var finished = false
         var started = false
-        let cancel = start(pane, path, dest, nil, 0, { [weak self] p in
+        let dest = reservation.url
+        let cancel = start(pane, path, reservation, { [weak self] p in
             guard !finished else { return }
             self?.updateTransfer(item, "Downloading \(name) from \(host)… \(Int(p.fraction * 100))%")
         }, { [weak self] outcome in
@@ -1711,8 +1713,8 @@ final class TerminalView: NSView, NSTextInputClient {
             if outcome.error != nil {
                 // The reserved file went with it, if the name still held it (the download sees
                 // to that: it is the one that can tell it is still ours). One that never
-                // started (no connection) leaves it here, just made: it goes now.
-                if !started { try? FileManager.default.removeItem(at: dest) }
+                // started (no connection) leaves it here: it goes now, if it is still the one.
+                if !started { reservation.release() }
                 if outcome.cancelled {
                     self?.showToast("Download of \(name) cancelled")
                 } else if let e = outcome.error {
