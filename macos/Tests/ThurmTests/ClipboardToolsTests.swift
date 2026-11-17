@@ -144,6 +144,19 @@ final class ClipboardToolsTests: XCTestCase {
 
     /// A host gets one clipboard question on screen at a time, and it goes before the daemon
     /// stops waiting for its answer.
+    /// A question answered after its time, as when another modal kept it covered, allows and
+    /// saves nothing: the daemon has stopped waiting for it.
+    func testALateAnswerIsADeny() {
+        let deadline = Date()
+        let before = deadline.addingTimeInterval(-1), after = deadline.addingTimeInterval(1)
+        XCTAssertEqual(Remotes.questionAnswer(.alertFirstButtonReturn, deadline: deadline, now: before), .once)
+        XCTAssertEqual(Remotes.questionAnswer(.alertSecondButtonReturn, deadline: deadline, now: before), .always)
+        XCTAssertEqual(Remotes.questionAnswer(.alertThirdButtonReturn, deadline: deadline, now: before), .deny)
+        XCTAssertEqual(Remotes.questionAnswer(.alertFirstButtonReturn, deadline: deadline, now: after), .deny)
+        XCTAssertEqual(Remotes.questionAnswer(.alertSecondButtonReturn, deadline: deadline, now: after), .deny)
+        XCTAssertEqual(Remotes.questionAnswer(.abort, deadline: deadline, now: before), .deny)
+    }
+
     func testQuestionsDoNotStackOrOutliveTheirRequest() {
         var gate = Remotes.AskGate()
         XCTAssertTrue(gate.begin("devbox"))

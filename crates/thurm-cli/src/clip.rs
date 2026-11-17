@@ -188,8 +188,8 @@ pub fn parse(
         }
         "xclip" => {
             let (mut out, mut target, mut echo, mut trim) = (false, None, false, false);
-            // xclip's own default is PRIMARY.
-            let mut clipboard = false;
+            // xclip's own default is PRIMARY; the last -selection given is the one it uses.
+            let mut selection: Option<String> = None;
             // A copy that should go away (after some pastes, a time or one paste): not done here.
             let mut expires = None;
             while let Some(a) = it.next() {
@@ -201,15 +201,7 @@ pub fn parse(
                     Some("target") => target = Some(operand(&mut it, "xclip", a)?.clone()),
                     // Only the clipboard: PRIMARY or SECONDARY is not this Mac's clipboard, and
                     // must not be written over it or read from it.
-                    Some("selection") => {
-                        let sel = operand(&mut it, "xclip", a)?;
-                        clipboard = !sel.is_empty() && "clipboard".starts_with(sel.as_str());
-                        if !clipboard {
-                            return Err(format!(
-                                "xclip: only -selection clipboard is supported, not {sel}"
-                            ));
-                        }
-                    }
+                    Some("selection") => selection = Some(operand(&mut it, "xclip", a)?.clone()),
                     // Another X server's clipboard: not this Mac's, refused rather than served.
                     Some("display") => {
                         let display = operand(&mut it, "xclip", a)?;
@@ -237,10 +229,19 @@ pub fn parse(
                     _ => return Err(format!("xclip: unknown option {a}")),
                 }
             }
-            if !clipboard {
-                return Err(
-                    "xclip: only -selection clipboard is supported (the default is PRIMARY)".into(),
-                );
+            match selection.as_deref() {
+                Some(sel) if !sel.is_empty() && "clipboard".starts_with(sel) => {}
+                Some(sel) => {
+                    return Err(format!(
+                        "xclip: only -selection clipboard is supported, not {sel}"
+                    ));
+                }
+                None => {
+                    return Err(
+                        "xclip: only -selection clipboard is supported (the default is PRIMARY)"
+                            .into(),
+                    );
+                }
             }
             if let (false, Some(opt)) = (out, expires) {
                 return Err(format!(
@@ -772,9 +773,18 @@ mod tests {
             &["-selection", "secondary", "-i"],
             &["-selection", "s", "-o"],
             &["-selection", "bogus"],
+            &["-selection", "clipboard", "-selection", "primary", "-o"],
         ] {
             assert!(p("xclip", args).is_err(), "xclip {args:?}");
         }
+        // The last -selection is the one xclip uses.
+        assert_eq!(
+            p(
+                "xclip",
+                &["-selection", "primary", "-selection", "clipboard", "-o"]
+            ),
+            Ok(paste(CLIP_TEXT))
+        );
         for sel in ["c", "cl", "clip", "clipboard"] {
             assert_eq!(
                 p("xclip", &["-selection", sel, "-o"]),

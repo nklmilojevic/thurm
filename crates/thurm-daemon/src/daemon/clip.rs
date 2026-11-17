@@ -144,13 +144,15 @@ fn answer_timeout() -> Duration {
 
 impl Daemon {
     /// Checks a tool's request and takes a slot for it, on the reader's thread: what is refused
-    /// here gets its answer without a thread being made.
+    /// here gets its answer without a thread being made. A copy's text takes its share of
+    /// [`max_held`] here too, before a thread holds it: returned beside the slot, it is held
+    /// until the text is queued for the app.
     pub(super) fn clipboard_admit(
         &self,
         caller: &Client,
         pane: PaneId,
         ask: &Ask,
-    ) -> Result<Slot, String> {
+    ) -> Result<(Slot, Option<Slot>), String> {
         // A clipboard tool runs in a pane, a process of this user on this machine: a phone or
         // a tailnet caller reading or writing the clipboard through a pane is not one.
         if !caller.is_local_peer() || caller.mobile.load(Ordering::Relaxed) {
@@ -192,9 +194,15 @@ impl Daemon {
             }
         }
         self.pane(pane).ok_or("no such pane")?;
-        self.clip_slots
+        let slot = self
+            .clip_slots
             .take(1, MAX_PENDING)
-            .ok_or_else(|| "too many clipboard requests are waiting".into())
+            .ok_or("too many clipboard requests are waiting")?;
+        let bytes = match ask {
+            Ask::Write(Some(text)) => Some(self.clip_held_bytes(text.len())?),
+            _ => None,
+        };
+        Ok((slot, bytes))
     }
 
     /// Clipboard bytes queued for clients and not written yet.
@@ -250,16 +258,24 @@ impl Daemon {
         caller: u64,
         pane: PaneId,
         ask: Ask,
+        bytes: Option<Slot>,
     ) -> (Result<Response, String>, Option<Slot>) {
         let write = matches!(ask, Ask::Write(_));
-        match self.clipboard_ask_held(caller, pane, ask) {
+        match self.clipboard_ask_held(caller, pane, ask, bytes) {
             Ok(_) if write => (Ok(Response::Ok), None),
             Ok((data, held)) => (Ok(Response::ClipboardData { data }), Some(held)),
             Err(e) => (Err(e), None),
         }
     }
 
-    fn clipboard_ask_held(&self, caller: u64, pane: PaneId, ask: Ask) -> Result<Held, String> {
+    /// `bytes`: a copy's share of [`max_held`], from [`Daemon::clipboard_admit`].
+    fn clipboard_ask_held(
+        &self,
+        caller: u64,
+        pane: PaneId,
+        ask: Ask,
+        bytes: Option<Slot>,
+    ) -> Result<Held, String> {
         self.pane(pane).ok_or("no such pane")?;
         let ui = self.clipboard_ui(pane)?;
         let id = self.next_clip.fetch_add(1, Ordering::Relaxed);
@@ -291,30 +307,25 @@ impl Daemon {
                 },
             );
         }
-        let sent = match ask {
+        match ask {
             Ask::Paste(mime) => {
                 ui.send(ServerMessage::Event(Event::ClipboardQuery {
                     pane,
                     id,
                     mime,
                 }));
-                Ok(())
             }
             // Held until queued for the app, where its queue counts it.
-            Ask::Write(text) => self
-                .clip_held_bytes(text.as_ref().map_or(0, String::len))
-                .map(|_held| {
-                    ui.send(ServerMessage::Event(Event::ClipboardWrite {
-                        pane,
-                        id,
-                        text,
-                    }))
-                }),
-        };
-        match sent {
-            Err(e) => Err(e),
-            Ok(()) => self.wait_answer(caller, ui.id, answer),
+            Ask::Write(text) => {
+                ui.send(ServerMessage::Event(Event::ClipboardWrite {
+                    pane,
+                    id,
+                    text,
+                }));
+                drop(bytes);
+            }
         }
+        self.wait_answer(caller, ui.id, answer)
     }
 
     fn wait_answer(
@@ -413,7 +424,49 @@ pub(super) fn shares_clipboard(c: &Client) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use super::{Slots, pick_ui};
+    use super::{Ask, MAX_HELD, Slots, pick_ui};
+
+    /// A copy's text takes its share of the held bytes when it is admitted, before a thread
+    /// holds it, and gives it back when that is dropped: pipelined copies cannot hold more.
+    #[test]
+    fn a_copy_takes_its_bytes_when_admitted() {
+        use std::sync::atomic::AtomicBool;
+        let dir = std::env::temp_dir().join(format!("thurm-clip-admit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = super::Daemon::new(
+            thurm_config::Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let pane = daemon
+            .create_pane(
+                thurm_proto::CreatePane {
+                    command: Some(vec!["cat".into()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let (client, _rx) = daemon.add_client();
+        let copy = Ask::Write(Some("x".repeat(thurm_proto::CLIP_MAX)));
+        let admitted: Vec<_> = (0..MAX_HELD / thurm_proto::CLIP_MAX)
+            .map(|_| daemon.clipboard_admit(&client, pane, &copy).unwrap())
+            .collect();
+        assert!(admitted.iter().all(|(_, bytes)| bytes.is_some()));
+        let Err(e) = daemon.clipboard_admit(&client, pane, &copy) else {
+            panic!("admitted past the held bytes");
+        };
+        assert!(e.contains("too much clipboard data"), "{e}");
+        let (_, bytes) = daemon
+            .clipboard_admit(&client, pane, &Ask::Write(None))
+            .unwrap();
+        assert!(bytes.is_none(), "a clear holds no text");
+        drop(admitted);
+        assert!(daemon.clipboard_admit(&client, pane, &copy).is_ok());
+        daemon.close_pane(pane);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_pending_request_goes_however_its_wait_ends() {

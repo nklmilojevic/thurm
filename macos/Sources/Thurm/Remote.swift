@@ -406,15 +406,16 @@ final class Remotes {
             }
             RunLoop.main.add(timer, forMode: .modalPanel)
             defer { timer.invalidate() }
-            switch alert.runModal() {
-            case .alertFirstButtonReturn:
+            let deadline = Date().addingTimeInterval(Self.askTimeout)
+            switch Self.questionAnswer(alert.runModal(), deadline: deadline) {
+            case .once:
                 return true
-            case .alertSecondButtonReturn:
+            case .always:
                 if let e = (Core.shared.remoteCall(["op": "allow_clipboard", "name": key.host]) as? [String: Any])?["error"] {
                     tlog("could not save the clipboard permission: \(e)")
                 }
                 return true
-            default:
+            case .deny:
                 return false
             }
         case .deny:
@@ -425,6 +426,22 @@ final class Remotes {
     /// How long a clipboard question stays up: less than the 30 s a host's daemon waits for the
     /// answer, so it is never answered after nobody waits for it.
     static let askTimeout: TimeInterval = 25
+
+    /// What the user answered a clipboard question with.
+    enum QuestionAnswer: Equatable { case once, always, deny }
+
+    /// The answer `response` gives, taken at `now`: a Deny once `deadline` has passed, whichever
+    /// button it was. A question kept up behind another modal past its time is answered for a
+    /// request the daemon has given up on, and must not allow, or save, anything.
+    static func questionAnswer(_ response: NSApplication.ModalResponse, deadline: Date,
+                               now: Date = Date()) -> QuestionAnswer {
+        guard now <= deadline else { return .deny }
+        switch response {
+        case .alertFirstButtonReturn: return .once
+        case .alertSecondButtonReturn: return .always
+        default: return .deny
+        }
+    }
 
     /// Ends the modal session of `window`, once it is the one in front.
     private static func abortWhenFront(_ window: NSWindow) {

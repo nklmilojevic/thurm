@@ -2515,7 +2515,7 @@ impl Daemon {
                 };
                 match self.clipboard_admit(client, pane, &ask) {
                     Err(e) => Err(e),
-                    Ok(slot) => {
+                    Ok((slot, bytes)) => {
                         let daemon = self.clone();
                         let client = client.clone();
                         let spawned =
@@ -2524,7 +2524,7 @@ impl Daemon {
                                 .spawn(move || {
                                     let asked =
                                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                            || daemon.clipboard_ask(client.id, pane, ask),
+                                            || daemon.clipboard_ask(client.id, pane, ask, bytes),
                                         ));
                                     let (result, held) = asked.unwrap_or_else(|_| {
                                         (Err("the daemon hit an internal error".into()), None)

@@ -777,10 +777,14 @@ fn clipboard_tools_come_first_after_the_startup_files() {
         let rc = format!("PS1='$ '\nexport PATH=\"{entries}\"\n{set_display}");
         std::fs::write(home.join(".zshrc"), format!("{zsh_opts}{rc}")).unwrap();
         std::fs::write(home.join(".bashrc"), &rc).unwrap();
+        // The integration goes in through XDG_DATA_DIRS, which this machine's system-wide fish
+        // setup may replace before fish reads it: then it is loaded here, as fish would have, so
+        // the fish cases run everywhere fish is. Loaded already, it does nothing a second time.
         std::fs::write(
             home.join(".config/fish/config.fish"),
             format!(
-                "set -gx PATH {:?} . {:?} {s:?} {s:?} $PATH {s:?}\n{}function fish_prompt; echo -n '$ '; end\n",
+                "source $THURM_SHELL_INTEGRATION/fish/vendor_conf.d/thurm.fish\n\
+                 set -gx PATH {:?} . {:?} {s:?} {s:?} $PATH {s:?}\n{}function fish_prompt; echo -n '$ '; end\n",
                 real.display().to_string(),
                 lookalike.display().to_string(),
                 if display { "set -gx DISPLAY :9\n" } else { "" },
@@ -823,11 +827,11 @@ fn clipboard_tools_come_first_after_the_startup_files() {
         };
         // Not waiting for a prompt: system-wide startup files may give it any look. A line
         // typed now waits for the shell, which runs it after its first prompt.
-        if name == "fish" && !fish_integration_loaded(&c, pane) {
-            // The integration goes in through XDG_DATA_DIRS, which another system-wide fish
-            // setup may replace before fish reads it: nothing of Thurm's runs there.
-            eprintln!("skipping fish: this machine's fish setup does not load the integration");
-            continue;
+        if name == "fish" {
+            assert!(
+                fish_integration_loaded(&c, pane),
+                "the integration did not load in fish"
+            );
         }
         // With a display, the real xclip, and the shims off PATH.
         let first = if display { &real } else { &shims };
@@ -864,6 +868,15 @@ fn clipboard_tools_come_first_after_the_startup_files() {
     assert!(
         tested.iter().any(|s| s != "fish"),
         "no zsh or bash to test with: {shells:?}"
+    );
+    assert_eq!(
+        tested.iter().filter(|s| *s == "fish").count(),
+        if shells.iter().any(|s| s.ends_with("/fish")) {
+            2
+        } else {
+            0
+        },
+        "each fish case ran"
     );
 }
 
