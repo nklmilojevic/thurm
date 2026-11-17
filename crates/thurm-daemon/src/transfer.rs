@@ -811,8 +811,16 @@ impl Transfers {
             .unwrap_or(Path::new("/"))
             .join(PARTS)
             .join(index.to_string());
-        let received = receive(&mut reader, &part, size, || self.touch(serial))
-            .and_then(|()| std::fs::rename(&part, &path).map_err(|e| e.to_string()));
+        // A sender that stops mid-file is not waited on past the batch's idle time.
+        let _ = writer.set_read_timeout(Some(self.idle));
+        // Into its place without replacing anything there: a name the disk takes for another
+        // (case, normalization) fails the file rather than losing one.
+        let received = receive(&mut reader, &part, size, || self.touch(serial)).and_then(|()| {
+            std::fs::hard_link(&part, &path)
+                .and_then(|()| std::fs::remove_file(&part))
+                .map_err(|e| format!("cannot keep {}: {e}", path.display()))
+        });
+        let _ = writer.set_read_timeout(None);
         if received.is_err() {
             let _ = std::fs::remove_file(&part);
         }
@@ -906,6 +914,31 @@ impl Transfers {
                 }
             }
         }
+    }
+}
+
+/// Lets the daemon hold as many descriptors as its uploads may need: each file of a batch keeps
+/// its stream until the batch is complete, and up to [`MAX_WAITING_FILES`] may wait, beyond the
+/// 256 a process often starts with. The soft limit is raised as far as the hard one allows (at
+/// most 10 240, what macOS takes).
+pub fn raise_fd_limit() {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return;
+    }
+    let wanted = rl.rlim_max.min(10_240);
+    if rl.rlim_cur >= wanted {
+        return;
+    }
+    rl.rlim_cur = wanted;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } != 0 {
+        log::warn!(
+            "cannot raise the open-file limit: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -1130,15 +1163,18 @@ pub fn clean_name(name: &str) -> String {
 }
 
 /// `name`, or with `-2`, `-3`… before its extension when taken; recorded in `taken`.
+///
+/// Names are told apart without regard to case (`taken` holds them lowercased): a host's disk
+/// may not tell `Photo.jpg` from `photo.jpg`, nor `.Done` from the batch's `.done`.
 fn unique_name(taken: &mut HashSet<String>, name: &str) -> String {
     let (stem, ext) = split_ext(name);
     let mut candidate = name.to_owned();
     let mut n = 1u32;
-    while taken.contains(&candidate) {
+    while taken.contains(&candidate.to_lowercase()) {
         n += 1;
         candidate = fit(stem, ext, &format!("-{n}"));
     }
-    taken.insert(candidate.clone());
+    taken.insert(candidate.to_lowercase());
     candidate
 }
 
@@ -1345,6 +1381,31 @@ mod tests {
         let dir = t.new_batch_dir(3).unwrap();
         assert!(dir.join(PARTS).is_dir());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn names_differing_only_in_case_are_kept_apart() {
+        let mut taken = HashSet::from([PARTS.to_owned(), DONE.to_owned()]);
+        assert_eq!(unique_name(&mut taken, "Photo.jpg"), "Photo.jpg");
+        assert_eq!(unique_name(&mut taken, "photo.jpg"), "photo-2.jpg");
+        assert_eq!(unique_name(&mut taken, "PHOTO.JPG"), "PHOTO-3.JPG");
+        assert_eq!(unique_name(&mut taken, ".Done"), ".Done-2");
+    }
+
+    #[test]
+    fn the_open_file_limit_is_raised() {
+        raise_fd_limit();
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) }, 0);
+        assert!(
+            rl.rlim_cur >= rl.rlim_max.min(10_240),
+            "{} of {}",
+            rl.rlim_cur,
+            rl.rlim_max
+        );
     }
 
     #[test]

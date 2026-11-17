@@ -1274,3 +1274,60 @@ fn a_pane_another_terminal_holds_takes_no_files_from_the_start() {
     owner.request(Request::DetachTerminal { pane }).unwrap();
     c.upload_begin(pane, "a.txt", 1, None).unwrap();
 }
+
+#[test]
+fn a_sender_that_stops_mid_file_is_not_waited_on() {
+    let env = Env::new("transfer-stalled-writer");
+    // Batches are idle after twice the ticket's life (a second at least): 2 s here.
+    let _daemon = env.start_with(&[("THURM_STREAM_TICKET_MS", Path::new("500"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let ticket = c.upload_begin(pane, "slow.bin", 100, None).unwrap();
+    let (r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
+    w.write_all(b"only some").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(r.wait_closed().map_err(|e| e.to_string()));
+    });
+    let closed = rx
+        .recv_timeout(Duration::from_secs(8))
+        .expect("the stalled stream was waited on");
+    assert!(closed.is_err(), "{closed:?}");
+    eventually(5, "the stalled batch was kept", || {
+        batches(&env, pane).is_empty()
+    });
+    drop(w);
+}
+
+#[test]
+fn names_a_case_blind_disk_would_take_for_one_are_kept_apart() {
+    let env = Env::new("transfer-case");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let readers: Vec<StreamReader> = [
+        ("Photo.jpg", b"one"),
+        ("photo.jpg", b"two"),
+        (".Done", b"rec"),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (n, d))| send(&env, &c, pane, ("k", i as u32, 3), n, 3, *d))
+    .collect();
+    for r in readers {
+        r.wait_closed().unwrap();
+    }
+    let [batch] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    assert_eq!(std::fs::read(batch.join("Photo.jpg")).unwrap(), b"one");
+    assert_eq!(std::fs::read(batch.join("photo-2.jpg")).unwrap(), b"two");
+    assert_eq!(std::fs::read(batch.join(".Done-2")).unwrap(), b"rec");
+    // The batch's own record is its own.
+    assert!(
+        std::fs::read_to_string(batch.join(".done"))
+            .unwrap()
+            .parse::<u64>()
+            .is_ok()
+    );
+}
