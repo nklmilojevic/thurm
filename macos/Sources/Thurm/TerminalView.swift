@@ -1699,6 +1699,7 @@ final class TerminalView: NSView, NSTextInputClient {
         let item = PaneTransfer(text: "Downloading \(name) from \(host)…")
         beginTransfer(item)
         var finished = false
+        var started = false
         let cancel = start(pane, path, dest, nil, 0, { [weak self] p in
             guard !finished else { return }
             self?.updateTransfer(item, "Downloading \(name) from \(host)… \(Int(p.fraction * 100))%")
@@ -1707,7 +1708,9 @@ final class TerminalView: NSView, NSTextInputClient {
             self?.endTransfer(item)
             if outcome.error != nil {
                 // The reserved file went with it, if the name still held it (the download sees
-                // to that: it is the one that can tell it is still ours).
+                // to that: it is the one that can tell it is still ours). One that never
+                // started (no connection) leaves it here, just made: it goes now.
+                if !started { try? FileManager.default.removeItem(at: dest) }
                 if outcome.cancelled {
                     self?.showToast("Download of \(name) cancelled")
                 } else if let e = outcome.error {
@@ -1718,6 +1721,7 @@ final class TerminalView: NSView, NSTextInputClient {
             self?.showToast("Downloaded \(dest.lastPathComponent) to \(dir.lastPathComponent)")
             reveal(dest)
         })
+        started = cancel != nil
         item.cancel = cancel ?? {}
     }
 

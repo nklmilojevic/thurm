@@ -909,4 +909,25 @@ final class FilePreviewTests: XCTestCase {
         XCTAssertEqual(cache.prunes, walked + 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: shown.path))
     }
+
+    func testAnEntryAnotherInstanceUsesIsNotPruned() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thurm-uses-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func entry(_ name: String, usedBy pid: pid_t) throws -> URL {
+            let e = root.appendingPathComponent(name, isDirectory: true)
+            let copy = e.appendingPathComponent("c-1", isDirectory: true)
+            try FileManager.default.createDirectory(at: copy, withIntermediateDirectories: true)
+            try Data(repeating: 1, count: 8).write(to: copy.appendingPathComponent("f"))
+            try "c-1/f".write(to: e.appendingPathComponent(".current"), atomically: true, encoding: .utf8)
+            FileManager.default.createFile(atPath: e.appendingPathComponent(".use-\(pid)").path, contents: nil)
+            return e
+        }
+        // One used by a running instance (the test runner's parent), one by an ended one.
+        let live = try entry("aaaa", usedBy: getppid())
+        let gone = try entry("bbbb", usedBy: 99999999)
+        _ = RemoteFileCache(root: root, maxBytes: 4)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: live.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: gone.path))
+    }
 }

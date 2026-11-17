@@ -2948,16 +2948,7 @@ impl Daemon {
             }
             Request::Paste { pane, text } => {
                 self.with_input_pane(client.id, pane, |p, st| {
-                    self.used_by(client, st);
-                    if !text.is_empty() {
-                        st.agent.prompt.interrupted();
-                    }
-                    st.agent.user_input();
-                    self.acknowledge_programs(pane, st);
-                    if !text.is_empty() {
-                        self.pane_read(pane);
-                    }
-                    p.write(st.term.paste(&text));
+                    self.paste_text(client, pane, p, st, &text)
                 })?;
                 Ok(Response::Ok)
             }
@@ -3590,14 +3581,24 @@ impl Daemon {
             if !st.info.alive {
                 return Err("This terminal has closed.".to_owned());
             }
-            self.used_by(&asker, st);
-            st.agent.prompt.interrupted();
-            st.agent.user_input();
-            self.acknowledge_programs(pane, st);
-            self.pane_read(pane);
-            p.write(st.term.paste(text));
+            self.paste_text(&asker, pane, p, st, text);
             Ok(())
         })?
+    }
+
+    /// Types `text` into pane `pane` as a paste for `client`: what [`Request::Paste`] and the
+    /// paste of uploaded files' paths both do.
+    fn paste_text(&self, client: &Client, pane: PaneId, p: &Arc<Pane>, st: &mut PaneState, text: &str) {
+        self.used_by(client, st);
+        if !text.is_empty() {
+            st.agent.prompt.interrupted();
+        }
+        st.agent.user_input();
+        self.acknowledge_programs(pane, st);
+        if !text.is_empty() {
+            self.pane_read(pane);
+        }
+        p.write(st.term.paste(text));
     }
 
     /// [`Request::Ext`]: a method of the extension API, its parameters and result as JSON text.

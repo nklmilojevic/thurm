@@ -108,10 +108,10 @@ impl From<ClientError> for TransferError {
 }
 
 /// An [`Upload`] opened to read.
-struct Source {
+struct Source<'a> {
     name: String,
     size: u64,
-    reader: Box<dyn Read + Send>,
+    reader: Box<dyn Read + Send + 'a>,
 }
 
 /// An [`Upload`] checked before the batch starts: its name and size, with nothing held open,
@@ -165,13 +165,14 @@ fn plan(upload: &Upload) -> Result<Planned<'_>, TransferError> {
 }
 
 /// Opens a planned upload to send it: still a regular file of the size planned.
-fn open_planned(planned: &Planned) -> Result<Source, TransferError> {
+fn open_planned<'a>(planned: &Planned<'a>) -> Result<Source<'a>, TransferError> {
     let path = match planned.upload {
+        // Read where they are, not copied.
         Upload::Data { data, .. } => {
             return Ok(Source {
                 name: planned.name.clone(),
                 size: planned.size,
-                reader: Box::new(std::io::Cursor::new(data.clone())),
+                reader: Box::new(std::io::Cursor::new(data.as_slice())),
             });
         }
         Upload::Path(path) | Upload::Named { path, .. } => path,
@@ -244,6 +245,12 @@ pub fn upload(
     // closed one does not, as the earlier files' streams close).
     let mut last: Option<(StreamReader, StreamWriter, UnixStream)> = None;
     for (index, planned) in planned.iter().enumerate() {
+        if cancel.is_cancelled() {
+            if let Some((_, w, h)) = last.take() {
+                abort(w, &h);
+            }
+            return Err(TransferError::Cancelled);
+        }
         let next = open_planned(planned).and_then(|source| {
             host.client
                 .upload_begin(
@@ -308,10 +315,25 @@ fn open_watched(
             .map_err(|e| TransferError::Local(format!("cannot watch the transfer: {e}")))
     };
     let (shutdown, handle) = (clone()?, clone()?);
-    let (reader, writer) = stream::open_on(conn, ticket)?;
+    open_watched_on(conn, shutdown, handle, ticket, cancel)
+}
+
+/// [`open_watched`] on a connection made: watched from before the handshake, so Cancel stops a
+/// daemon slow to open the stream too.
+fn open_watched_on(
+    conn: UnixStream,
+    shutdown: UnixStream,
+    handle: UnixStream,
+    ticket: &str,
+    cancel: &Cancel,
+) -> Result<(StreamReader, StreamWriter, CancelWatch, UnixStream), TransferError> {
     let watch = CancelWatch::start(cancel.clone(), shutdown)
         .map_err(|e| TransferError::Local(format!("cannot watch the transfer for Cancel: {e}")))?;
-    Ok((reader, writer, watch, handle))
+    match stream::open_on(conn, ticket) {
+        Ok((reader, writer)) => Ok((reader, writer, watch, handle)),
+        Err(_) if cancel.is_cancelled() => Err(TransferError::Cancelled),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// How long an abort may wait for a host that stopped reading before the connection is cut.
@@ -380,7 +402,7 @@ fn wait_cancellable(
 /// Copies `source` to `writer`, checking `cancel` between frames; drops (aborts) nothing
 /// itself: on an error the caller's writer goes unfinished.
 fn send(
-    source: &mut Source,
+    source: &mut Source<'_>,
     writer: &mut StreamWriter,
     cancel: &Cancel,
     mut sent: impl FnMut(u64),
@@ -428,7 +450,7 @@ fn send(
 /// bounds ([`abort`]) rather than leaving it to a writer's drop, which would wait on a host
 /// that stopped reading.
 fn send_one(
-    source: &mut Source,
+    source: &mut Source<'_>,
     mut writer: StreamWriter,
     watch: CancelWatch,
     handle: &UnixStream,
@@ -448,7 +470,7 @@ fn send_one(
 /// (a host that stopped reading blocks it as well); then lets the watch go, so a Cancel while
 /// the batch waits aborts the stream rather than cutting it.
 fn send_and_finish(
-    source: &mut Source,
+    source: &mut Source<'_>,
     writer: &mut StreamWriter,
     watch: CancelWatch,
     cancel: &Cancel,
@@ -512,6 +534,10 @@ pub fn download_reserved(
 ) -> Result<DownloadInfo, TransferError> {
     use std::os::unix::fs::MetadataExt;
     if !host.client.has_capability(CAP_TRANSFER) {
+        // Nothing came: the reservation goes, if it is still the empty file made for it.
+        if std::fs::symlink_metadata(reserved).is_ok_and(|m| m.is_file() && m.len() == 0) {
+            let _ = std::fs::remove_file(reserved);
+        }
         return Err(TransferError::Unsupported);
     }
     let changed = || {
@@ -1206,5 +1232,27 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn cancel_stops_a_stream_the_daemon_is_slow_to_open() {
+        // The daemon end reads the handshake and answers nothing.
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let shutdown = ours.try_clone().unwrap();
+        let handle = ours.try_clone().unwrap();
+        let cancel = Cancel::default();
+        let theirs_cancel = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got = open_watched_on(ours, shutdown, handle, "ticket", &theirs_cancel);
+            let _ = tx.send(got.err().map(|e| matches!(e, TransferError::Cancelled)));
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        cancel.cancel();
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Cancel did not stop the handshake");
+        assert_eq!(got, Some(true));
+        drop(theirs);
     }
 }

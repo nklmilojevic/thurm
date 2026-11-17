@@ -212,6 +212,49 @@ final class RemoteFileCache {
         return nil
     }
 
+    /// Entries this process uses (a copy shown, a download under way), with how many uses: each
+    /// marked on disk with `.use-<pid>`, so another instance sharing the folder leaves it alone.
+    private var uses: [String: Int] = [:]
+
+    private func use(_ entry: URL) {
+        let key = Self.path(entry)
+        if uses[key, default: 0] == 0 {
+            FileManager.default.createFile(atPath: entry.appendingPathComponent(".use-\(getpid())").path,
+                                           contents: nil)
+        }
+        uses[key, default: 0] += 1
+    }
+
+    private func unuse(_ entry: URL) {
+        let key = Self.path(entry)
+        guard let n = uses[key] else { return }
+        if n > 1 {
+            uses[key] = n - 1
+        } else {
+            uses[key] = nil
+            try? FileManager.default.removeItem(at: entry.appendingPathComponent(".use-\(getpid())"))
+        }
+    }
+
+    /// Whether another running process uses `entry`; its marks of ended ones go on the way.
+    private func usedElsewhere(_ entry: URL) -> Bool {
+        let fm = FileManager.default
+        let me = getpid()
+        let marks = ((try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix(".use-") }
+        var other = false
+        for mark in marks {
+            guard let pid = pid_t(mark.lastPathComponent.dropFirst(".use-".count)) else { continue }
+            if pid == me { continue }
+            if Self.running(pid) {
+                other = true
+            } else {
+                try? fm.removeItem(at: mark)
+            }
+        }
+        return other
+    }
+
     /// Whether process `pid` still runs (one of another user's counts as running).
     private static func running(_ pid: pid_t) -> Bool {
         kill(pid, 0) == 0 || errno == EPERM
@@ -315,6 +358,8 @@ final class RemoteFileCache {
 
     /// Deletes the copies in `entry` that are neither in use nor shown.
     private func retireCopies(in entry: URL) {
+        // Another instance may show any of its copies.
+        if usedElsewhere(entry) { return }
         let fm = FileManager.default
         let inUse = current(entry).map { Self.path($0.deletingLastPathComponent()) }
         let shown = Set(held.keys.map { Self.path($0.deletingLastPathComponent()) })
@@ -343,8 +388,9 @@ final class RemoteFileCache {
 
     /// Keeps `file` while it is shown (no-op for other files).
     func hold(_ file: URL) {
-        guard entryOf(file) != nil else { return }
+        guard let entry = entryOf(file) else { return }
         held[file.standardizedFileURL, default: 0] += 1
+        use(entry)
     }
 
     /// Quick Look moves from showing `old` to showing `new`: `new` is held before `old` is let
@@ -359,6 +405,7 @@ final class RemoteFileCache {
         let file = file.standardizedFileURL
         guard let entry = entryOf(file), let n = held[file] else { return }
         held[file] = n > 1 ? n - 1 : nil
+        unuse(entry)
         retireCopies(in: entry)
         // Only what was left over the limit (a shown copy in the way) needs a look now.
         if overLimit { prune() }
@@ -419,7 +466,7 @@ final class RemoteFileCache {
             return sum + (r.bytes > replaced ? r.bytes - replaced : 0)
         }
         var total = sized.reduce(UInt64(0)) { $0 + $1.size } + extra
-        for e in sized where total > maxBytes && !busy.contains(Self.path(e.url)) {
+        for e in sized where total > maxBytes && !busy.contains(Self.path(e.url)) && !usedElsewhere(e.url) {
             if (try? fm.removeItem(at: e.url)) != nil { total -= e.size }
         }
         overLimit = total > maxBytes
@@ -508,6 +555,7 @@ final class RemoteFileCache {
         do { staged = try stage(entry) } catch { return completion(.failure(error)) }
         let token = UUID()
         reserved[token] = (entry, 0)
+        use(entry)
         var cancel: (() -> Void)?
         var tooMuch = false
         let onProgress: (TransferProgress) -> Void = { [self] p in
@@ -523,6 +571,7 @@ final class RemoteFileCache {
         }
         cancel = download(pane, path, staged, cached?.version, maxBytes, onProgress) { [self] outcome in
             reserved[token] = nil
+            unuse(entry)
             // Given up: its file, however it ended, is not this cache's (a newer fetch's is).
             if abandoned() {
                 try? FileManager.default.removeItem(at: staged)

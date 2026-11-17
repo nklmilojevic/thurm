@@ -15,6 +15,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::{Condvar, Mutex};
@@ -103,6 +104,8 @@ pub struct Transfers {
     max_drops: usize,
     /// How long a stream ticket lasts unused.
     ticket_ttl: Duration,
+    /// What batches' pulses count from.
+    epoch: Instant,
 }
 
 /// A duration in milliseconds from the environment variable `var`, else `default` (tests).
@@ -139,10 +142,43 @@ struct Batch {
     /// Every file landed and the paths are being typed: it can no longer fail.
     pasting: bool,
     outcome: Option<Result<(), String>>,
-    touched: Instant,
+    /// When anything last happened to it, and whether it is still on its way: shared with its
+    /// receiving streams, which mark it on every frame without the transfers lock.
+    pulse: Arc<Pulse>,
     /// The streams writing a file of the batch now, by its index: shut when the batch fails,
     /// and until they have let go, the batch's directory stays and its bytes count.
     writers: Vec<(u32, UnixStream)>,
+}
+
+/// A batch's last sign of life, kept without the transfers lock: an upload's every frame marks
+/// it, and an admission walking or pruning the kept drops under that lock holds up none of them.
+struct Pulse {
+    /// Milliseconds since `Transfers::epoch`.
+    at: AtomicU64,
+    /// The batch is still on its way (it has not failed).
+    on_way: AtomicBool,
+}
+
+impl Pulse {
+    fn new(epoch: Instant) -> Arc<Pulse> {
+        let p = Arc::new(Pulse {
+            at: AtomicU64::new(0),
+            on_way: AtomicBool::new(true),
+        });
+        p.touch(epoch);
+        p
+    }
+
+    fn touch(&self, epoch: Instant) {
+        self.at
+            .store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How long since it was last marked.
+    fn idle(&self, epoch: Instant) -> Duration {
+        let now = epoch.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.at.load(Ordering::Relaxed)))
+    }
 }
 
 struct Slot {
@@ -203,6 +239,7 @@ impl Transfers {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(MAX_KEPT_BATCHES),
             ticket_ttl: crate::streams::ticket_ttl(),
+            epoch: Instant::now(),
         }
     }
 
@@ -415,7 +452,7 @@ impl Transfers {
                     names: HashSet::from([PARTS.to_owned(), DONE.to_owned()]),
                     pasting: false,
                     outcome: None,
-                    touched: Instant::now(),
+                    pulse: Pulse::new(self.epoch),
                     writers: Vec::new(),
                 },
             );
@@ -479,7 +516,7 @@ impl Transfers {
                 reserved: Instant::now(),
             },
         );
-        b.touched = Instant::now();
+        b.pulse.touch(self.epoch);
         Ok(ticket)
     }
 
@@ -584,7 +621,8 @@ impl Transfers {
         };
         log::info!("upload to pane {} failed: {why}", b.pane);
         b.outcome = Some(Err(why));
-        b.touched = Instant::now();
+        b.pulse.on_way.store(false, Ordering::Relaxed);
+        b.pulse.touch(self.epoch);
         // Streams still writing stop taking bytes now; the directory goes when the last lets go
         // (`writer_done`), its bytes counted until then.
         for (_, socket) in &b.writers {
@@ -601,7 +639,7 @@ impl Transfers {
         let stalled: Vec<u64> = st
             .batches
             .iter()
-            .filter(|(_, b)| b.waiting() && !b.pasting && b.touched.elapsed() > self.idle)
+            .filter(|(_, b)| b.waiting() && !b.pasting && b.pulse.idle(self.epoch) > self.idle)
             .map(|(serial, _)| *serial)
             .collect();
         for serial in stalled {
@@ -625,19 +663,20 @@ impl Transfers {
             self.fail(st, serial, "a file of the upload never came".into());
         }
         st.batches
-            .retain(|_, b| b.busy() || b.touched.elapsed() <= self.idle);
+            .retain(|_, b| b.busy() || b.pulse.idle(self.epoch) <= self.idle);
     }
 
-    /// Marks batch `serial` as moving; whether it is still on its way (a writer of a failed
-    /// batch stops).
-    fn touch(&self, serial: u64) -> bool {
-        match self.state.lock().batches.get_mut(&serial) {
-            Some(b) => {
-                b.touched = Instant::now();
-                b.waiting()
-            }
-            None => false,
-        }
+    /// Gives a file the name `taken` was refused for (the disk holds a file it takes for the
+    /// same, by case or Unicode form): the next free one in its batch. Its new path, or `None`
+    /// once the batch is gone.
+    fn rename_slot(&self, serial: u64, index: u32, taken: &Path) -> Option<PathBuf> {
+        let mut st = self.state.lock();
+        let b = st.batches.get_mut(&serial)?;
+        let name = taken.file_name()?.to_string_lossy().into_owned();
+        let renamed = unique_name(&mut b.names, &name);
+        let path = b.dir.join(renamed);
+        b.files.get_mut(&index)?.path = path.clone();
+        Some(path)
     }
 
     /// The writer of file `index` of batch `serial` let go: a failed batch's file stops
@@ -802,7 +841,7 @@ impl Transfers {
             if let Some(f) = b.files.get_mut(&index) {
                 f.state = SlotState::Landed;
             }
-            b.touched = Instant::now();
+            b.pulse.touch(self.epoch);
         }
         if !self.paste_delay.is_zero() {
             std::thread::sleep(self.paste_delay);
@@ -833,7 +872,7 @@ impl Transfers {
         let mut st = self.state.lock();
         if let Some(b) = st.batches.get_mut(&serial) {
             b.pasting = false;
-            b.touched = Instant::now();
+            b.pulse.touch(self.epoch);
             match typed {
                 Ok(()) => {
                     record_done(&b.dir);
@@ -856,7 +895,7 @@ impl Transfers {
             if let Some(outcome) = &b.outcome {
                 return outcome.clone();
             }
-            if !b.pasting && b.touched.elapsed() > self.idle {
+            if !b.pasting && b.pulse.idle(self.epoch) > self.idle {
                 self.fail(&mut st, serial, "the upload stalled".into());
                 continue;
             }
@@ -882,9 +921,9 @@ impl Transfers {
                     (None, Some(f)) if f.state == SlotState::Reserved => match writer.try_clone() {
                         Ok(socket) => {
                             f.state = SlotState::Writing;
-                            b.touched = Instant::now();
+                            b.pulse.touch(self.epoch);
                             b.writers.push((index, socket));
-                            Ok((f.path.clone(), f.size))
+                            Ok((f.path.clone(), f.size, b.pulse.clone()))
                         }
                         Err(e) => Err(format!("cannot take the file: {e}")),
                     },
@@ -892,7 +931,7 @@ impl Transfers {
                 },
             }
         };
-        let (path, size) = match slot {
+        let (path, size, pulse) = match slot {
             Ok(slot) => slot,
             Err(e) => return close(&mut writer, StreamClose::Refused(e)),
         };
@@ -903,12 +942,29 @@ impl Transfers {
             .join(index.to_string());
         // A sender that stops mid-file is not waited on past the batch's idle time.
         let _ = writer.set_read_timeout(Some(self.idle));
-        // Into its place without replacing anything there: a name the disk takes for another
-        // (case, normalization) fails the file rather than losing one.
-        let received = receive(&mut reader, &part, size, || self.touch(serial)).and_then(|()| {
-            std::fs::hard_link(&part, &path)
-                .and_then(|()| std::fs::remove_file(&part))
-                .map_err(|e| format!("cannot keep {}: {e}", path.display()))
+        let alive = || {
+            pulse.touch(self.epoch);
+            pulse.on_way.load(Ordering::Relaxed)
+        };
+        let received = receive(&mut reader, &part, size, alive).and_then(|()| {
+            // Into its place without replacing anything there: a name the disk takes for one
+            // already kept (case, Unicode form) is numbered on, as names that match are.
+            let mut path = path.clone();
+            for _ in 0..100 {
+                match std::fs::hard_link(&part, &path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&part);
+                        return Ok(());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        path = self
+                            .rename_slot(serial, index, &path)
+                            .ok_or("the upload was cancelled")?;
+                    }
+                    Err(e) => return Err(format!("cannot keep {}: {e}", path.display())),
+                }
+            }
+            Err(format!("no free name for {}", path.display()))
         });
         let _ = writer.set_read_timeout(None);
         if received.is_err() {

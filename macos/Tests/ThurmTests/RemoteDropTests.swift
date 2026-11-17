@@ -363,6 +363,16 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertNil(view.shownTransfer)
     }
 
+    func testADownloadThatNeverStartedLeavesNoReservation() throws {
+        let (view, _) = remotePane()
+        view.download(remotePath: "/srv/x.bin", into: dir, start: { _, _, _, _, _, _, done in
+            done(TransferOutcome(error: "devbox is not connected"))
+            return nil
+        }) { _ in }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("x.bin").path))
+        XCTAssertEqual(view.shownMessage, "Could not download x.bin: devbox is not connected")
+    }
+
     func testAFolderOrAnOlderHostSendsNothing() throws {
         let folder = dir.appendingPathComponent("folder", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

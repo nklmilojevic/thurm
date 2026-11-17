@@ -1392,3 +1392,30 @@ fn a_file_whose_ticket_ran_out_unused_ends_its_batch() {
     c.upload_begin(pane, "next.txt", 1, None).unwrap();
     assert!(!batch.exists());
 }
+
+#[test]
+fn names_a_disk_takes_for_one_by_their_unicode_form_are_kept_apart() {
+    let env = Env::new("transfer-nfd");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    // The same name composed and decomposed: one file on a disk that ignores the form.
+    let readers: Vec<StreamReader> = [("caf\u{e9}.txt", b"nfc"), ("cafe\u{301}.txt", b"nfd")]
+        .iter()
+        .enumerate()
+        .map(|(i, (n, d))| send(&env, &c, pane, ("u", i as u32, 2), n, 3, *d))
+        .collect();
+    for r in readers {
+        r.wait_closed().unwrap();
+    }
+    let [batch] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    let mut kept: Vec<Vec<u8>> = std::fs::read_dir(&batch)
+        .unwrap()
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| std::fs::read(e.path()).unwrap())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, [b"nfc".to_vec(), b"nfd".to_vec()]);
+}
