@@ -20,7 +20,8 @@ if status is-interactive; and not set -q __thurm_fish_loaded
         set -gx PATH $PATH $THURM_BIN_DIR
     end
     # Clipboard tools that reach the app's clipboard: first on PATH at the first prompt, once
-    # config.fish (which runs after this file) has made its changes.
+    # config.fish (which runs after this file) has made its changes; off it when that set a
+    # display.
     if set -q THURM_CLIP_SHIMS
         function __thurm_clip_shims --on-event fish_prompt
             functions -e __thurm_clip_shims
@@ -29,7 +30,10 @@ if status is-interactive; and not set -q __thurm_fish_loaded
             for p in $PATH
                 test "$p" = "$THURM_CLIP_SHIMS"; or set -a rest $p
             end
-            set -gx PATH $THURM_CLIP_SHIMS $rest
+            if test -z "$DISPLAY$WAYLAND_DISPLAY"
+                set -p rest $THURM_CLIP_SHIMS
+            end
+            set -gx PATH $rest
         end
     end
 

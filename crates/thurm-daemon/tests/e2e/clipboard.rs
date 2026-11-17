@@ -455,7 +455,9 @@ fn clipboard_tools_come_first_after_the_startup_files() {
         .map(|p| p.display().to_string())
         .collect();
     // zsh twice: GLOB_SUBST changes how it reads a substituted value in a pattern.
-    let cases: Vec<(&String, &str)> = shells
+    // zsh twice more: GLOB_SUBST changes how it reads a substituted value in a pattern. And
+    // each shell once with a startup file that sets a display: its own tools then work.
+    let cases: Vec<(&String, &str, bool)> = shells
         .iter()
         .flat_map(|sh| {
             let opts: &[&str] = if sh.ends_with("/zsh") {
@@ -463,11 +465,13 @@ fn clipboard_tools_come_first_after_the_startup_files() {
             } else {
                 &[""]
             };
-            opts.iter().map(move |o| (sh, *o))
+            opts.iter()
+                .map(move |o| (sh, *o, false))
+                .chain([(sh, "", true)])
         })
         .collect();
     let mut tested: Vec<String> = Vec::new();
-    for (i, (shell, zsh_opts)) in cases.into_iter().enumerate() {
+    for (i, (shell, zsh_opts, display)) in cases.into_iter().enumerate() {
         let name = shell.rsplit('/').next().unwrap();
         let env = Env::new(&format!("clip-path-{name}-{i}"));
         let home = env.dir.join("home");
@@ -496,15 +500,17 @@ fn clipboard_tools_come_first_after_the_startup_files() {
             lookalike.display(),
             s = shims.display()
         );
-        let rc = format!("PS1='$ '\nexport PATH=\"{entries}\"\n");
+        let set_display = if display { "export DISPLAY=:9\n" } else { "" };
+        let rc = format!("PS1='$ '\nexport PATH=\"{entries}\"\n{set_display}");
         std::fs::write(home.join(".zshrc"), format!("{zsh_opts}{rc}")).unwrap();
         std::fs::write(home.join(".bashrc"), &rc).unwrap();
         std::fs::write(
             home.join(".config/fish/config.fish"),
             format!(
-                "set -gx PATH {:?} {:?} {s:?} {s:?} $PATH {s:?}\nfunction fish_prompt; echo -n '$ '; end\n",
+                "set -gx PATH {:?} {:?} {s:?} {s:?} $PATH {s:?}\n{}function fish_prompt; echo -n '$ '; end\n",
                 real.display().to_string(),
                 lookalike.display().to_string(),
+                if display { "set -gx DISPLAY :9\n" } else { "" },
                 s = shims.display().to_string()
             ),
         )
@@ -550,7 +556,9 @@ fn clipboard_tools_come_first_after_the_startup_files() {
             eprintln!("skipping fish: this machine's fish setup does not load the integration");
             continue;
         }
-        let first = regex_escape(&shims.join("xclip").display().to_string());
+        // With a display, the real xclip, and the shims off PATH.
+        let first = if display { &real } else { &shims };
+        let first = regex_escape(&first.join("xclip").display().to_string());
         send_until(&c, pane, b"command -v xclip\r", &format!("(?m)^{first}$"));
         let kept = regex_escape(&lookalike.join("lookalike-tool").display().to_string());
         send_until(
@@ -559,12 +567,17 @@ fn clipboard_tools_come_first_after_the_startup_files() {
             b"command -v lookalike-tool\r",
             &format!("(?m)^{kept}$"),
         );
-        // Once on PATH: the line counts the entries with `s*x`, which only the shims' has.
+        // Once on PATH (none with a display): the line counts the entries with `s*x`, which
+        // only the shims' has.
         send_until(
             &c,
             pane,
             b"sh -c 'echo SHIMS-$(echo \"$PATH\" | tr : \"\\n\" | grep -cF \"s*x\")'\r",
-            "(?m)^SHIMS-1$",
+            if display {
+                "(?m)^SHIMS-0$"
+            } else {
+                "(?m)^SHIMS-1$"
+            },
         );
         tested.push(name.to_owned());
     }

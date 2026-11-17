@@ -355,9 +355,10 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
   doctor's **Clipboard tools** fix has linked them. New panes whose
   environment has no `DISPLAY` or `WAYLAND_DISPLAY` (the daemon's, with the
   host's `[terminal.env]` and what the client passes on top) have them first
-  on `PATH`, ahead of a `PATH` set in `[terminal.env]`, and again after the
-  login shell's profile, for a pane that runs a command as for a shell. What is
-  checked, and where:
+  on `PATH`, ahead of a `PATH` set in `[terminal.env]`. After the shell's
+  startup files (for a pane that runs a command as for a shell), they are put
+  first again, or taken off `PATH` when those files set a display, whose own
+  tools then work. What is checked, and where:
 
   | | On the host (its daemon) | On this Mac (the app) |
   | --- | --- | --- |
@@ -533,12 +534,18 @@ same from a terminal.
 Remote hosts are assumed to be yours and single-user. Even so, they cannot
 reach the Mac's disk, clipboard, or credentials without you doing something:
 
-- **Clipboard reads (OSC 52 and clipboard tools).** Every read from a remote
-  pane asks: "devbox wants to read your clipboard — Allow Once / Always for
-  devbox / Deny". "Always" writes `clipboard_read = "always"` to the host's
-  `[[remote]]`. Your `terminal.osc52` setting caps every host, and the host's
-  own `terminal.osc52` can only be stricter.
-- **Clipboard writes** follow your `terminal.osc52` setting, and the host's.
+- **Clipboard reads (OSC 52 and clipboard tools).** A remote pane's read
+  follows the host's `clipboard_read`: with `ask` (the default) every OSC 52
+  read and every paste asks "devbox wants to read your clipboard — Allow Once /
+  Always for devbox / Deny"; with `always` they go ahead without asking
+  ("Always" writes that to the host's `[[remote]]`); with `never` they are
+  refused. Listing the clipboard's types (`xclip -t TARGETS -o`,
+  `wl-paste --list-types`) never asks: it says whether there is text or an
+  image, not what, and is refused wherever reads are. Your `terminal.osc52`
+  setting caps every host, and the host's own `terminal.osc52` can only be
+  stricter.
+- **Clipboard writes** (a copy, or a clipboard tool's clear) follow your
+  `terminal.osc52` setting, and the host's.
 - **Links.** ⌘-click opens `http` and `https` links from remote panes (a link
   to the host's `localhost` through a forward, see [Ports](#ports)), asks for
   other schemes, and never opens `file://` links (they are paths on the host):

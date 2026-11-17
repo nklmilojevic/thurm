@@ -171,7 +171,7 @@ fn spawn_options_with(
             .map(|a| shell_quote(a))
             .collect::<Vec<_>>()
             .join(" ");
-        let line = exec_line(&shell, &line, shims);
+        let line = exec_line(&line, shims);
         return SpawnOptions {
             program: shell,
             args: vec!["-l".into(), "-c".into(), line],
@@ -306,21 +306,26 @@ fn add_clip_shims(
     true
 }
 
-/// The `-c` line a pane's explicit command runs with in `shell`: `exec` of it, with the
-/// clipboard tools (`shims`) put first on PATH again after the login shell's profile, which
-/// may set PATH anew. A shell whose syntax is not known here gets the plain `exec`.
-fn exec_line(shell: &str, line: &str, shims: bool) -> String {
-    let name = shell.rsplit('/').next().unwrap_or(shell);
-    let first = match name {
-        _ if !shims => "",
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "yash" => {
-            "PATH=\"$THURM_CLIP_SHIMS:$PATH\"; export PATH; "
-        }
-        "fish" => "set -gx PATH $THURM_CLIP_SHIMS $PATH; ",
-        "csh" | "tcsh" => "setenv PATH \"${THURM_CLIP_SHIMS}:${PATH}\"; ",
-        _ => "",
-    };
-    format!("{first}exec {line}")
+/// What a pane's command runs through when the clipboard tools apply, after the login shell's
+/// profile (which may set PATH or a display anew): the shims leave PATH, and come back first
+/// only while there is no display. POSIX sh, so the same in every user shell; no single quote.
+const CLIP_SHIMS_SH: &str = concat!(
+    "set -f; p=; IFS=:; ",
+    "for d in $PATH; do [ \"$d\" = \"$THURM_CLIP_SHIMS\" ] || p=\"$p${p:+:}$d\"; done; ",
+    "unset IFS; set +f; ",
+    "[ -n \"$DISPLAY$WAYLAND_DISPLAY\" ] || p=\"$THURM_CLIP_SHIMS${p:+:}$p\"; ",
+    "PATH=$p; export PATH; exec \"$@\"",
+);
+
+/// The `-c` line a pane's explicit command runs with in the user's shell: `exec` of it, through
+/// [`CLIP_SHIMS_SH`] when the clipboard tools apply (`shims`). Single-quoted, the step reads the
+/// same to sh, bash, zsh, fish and csh, which quote `line` as POSIX sh does already.
+fn exec_line(line: &str, shims: bool) -> String {
+    if shims {
+        format!("exec /bin/sh -c '{CLIP_SHIMS_SH}' sh {line}")
+    } else {
+        format!("exec {line}")
+    }
 }
 
 /// Directory holding the `thurm` CLI next to this daemon (`Thurm.app/Contents/Helpers`).
@@ -531,16 +536,13 @@ mod tests {
     #[test]
     fn an_explicit_command_puts_the_tools_first_after_the_profile() {
         let o = with_shims(Some(vec!["xclip".into(), "-o".into()]), &[], &[], &[]);
-        assert!(o.args[2].ends_with("exec xclip -o"), "{:?}", o.args);
-        assert_eq!(exec_line("/bin/bash", "x", false), "exec x");
-        assert_eq!(
-            exec_line("/usr/bin/nu", "x", true),
-            "exec x",
-            "unknown syntax"
-        );
-        // Run by each shell there is, with a PATH that has another xclip first.
+        assert!(o.args[2].ends_with("' sh xclip -o"), "{:?}", o.args);
+        assert_eq!(exec_line("x", false), "exec x");
+        assert!(!CLIP_SHIMS_SH.contains('\''), "single-quoted as a whole");
+        // Run by each shell there is, with another xclip first on PATH, the shims twice in it,
+        // and with and without a display the profile would have set.
         let dir = std::env::temp_dir().join(format!("thurm-exec-line-{}", std::process::id()));
-        let (shims, real) = (dir.join("shims"), dir.join("real"));
+        let (shims, real) = (dir.join("shi*ms"), dir.join("real"));
         for d in [&shims, &real] {
             std::fs::create_dir_all(d).unwrap();
             let tool = d.join("xclip");
@@ -548,39 +550,68 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let path = format!(
+            "{r}:{s}:{s}:/usr/bin:/bin",
+            r = real.display(),
+            s = shims.display()
+        );
+        let line = exec_line(
+            &["/bin/sh", "-c", "command -v xclip; echo \"$PATH\""]
+                .map(shell_quote)
+                .join(" "),
+            true,
+        );
         let mut ran = 0;
-        for shell in [
-            "/bin/sh",
-            "/bin/bash",
-            "/bin/zsh",
-            "/usr/bin/zsh",
-            "/bin/dash",
-        ]
-        .into_iter()
-        .map(String::from)
-        .chain(["fish", "tcsh", "csh"].iter().filter_map(|n| {
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .map(|d| d.join(n))
-                .find(|p| p.is_file())
-                .map(|p| p.display().to_string())
-        }))
-        .filter(|s| Path::new(s).is_file())
+        for shell in ["sh", "bash", "zsh", "dash", "fish", "tcsh", "csh"]
+            .iter()
+            .filter_map(|n| {
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                    .chain([PathBuf::from("/bin")])
+                    .map(|d| d.join(n))
+                    .find(|p| p.is_file())
+            })
         {
-            let line = exec_line(&shell, "/bin/sh -c 'command -v xclip'", true);
-            let out = std::process::Command::new(&shell)
-                .args(["-c", &line])
-                .env_clear()
-                .env("PATH", format!("{}:/usr/bin:/bin", real.display()))
-                .env("THURM_CLIP_SHIMS", &shims)
-                .env("HOME", &dir)
-                .output()
-                .unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout).trim(),
-                shims.join("xclip").display().to_string(),
-                "{shell}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            for display in [
+                None,
+                Some(("DISPLAY", ":9")),
+                Some(("WAYLAND_DISPLAY", "w-0")),
+            ] {
+                let mut cmd = std::process::Command::new(&shell);
+                cmd.args(["-c", &line])
+                    .env_clear()
+                    .env("PATH", &path)
+                    .env("THURM_CLIP_SHIMS", &shims)
+                    .env("HOME", &dir)
+                    .env("ZDOTDIR", &dir)
+                    // As under a login shell that set up a NixOS or nix-darwin environment:
+                    // their system files otherwise set PATH anew for every shell.
+                    .env("__NIX_DARWIN_SET_ENVIRONMENT_DONE", "1")
+                    .env("__NIXOS_SET_ENVIRONMENT_DONE", "1");
+                if let Some((k, v)) = display {
+                    cmd.env(k, v);
+                }
+                let out = cmd.output().unwrap();
+                let out = String::from_utf8_lossy(&out.stdout).into_owned();
+                let mut lines = out.lines();
+                let (found, new_path) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+                let s = shims.display().to_string();
+                let entries = new_path.split(':').filter(|e| *e == s).count();
+                if display.is_none() {
+                    assert_eq!(
+                        found,
+                        shims.join("xclip").display().to_string(),
+                        "{shell:?}"
+                    );
+                    assert_eq!(entries, 1, "{shell:?}: once on PATH: {new_path}");
+                } else {
+                    assert_eq!(
+                        found,
+                        real.join("xclip").display().to_string(),
+                        "{shell:?} {display:?}"
+                    );
+                    assert_eq!(entries, 0, "{shell:?} {display:?}: off PATH: {new_path}");
+                }
+            }
             ran += 1;
         }
         assert!(ran > 0, "no shell to run the line with");

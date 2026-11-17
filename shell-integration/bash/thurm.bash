@@ -29,7 +29,7 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
     export PATH="$PATH:$THURM_BIN_DIR"
   fi
   # Clipboard tools that reach the app's clipboard: first on PATH, after the startup files
-  # above made their changes.
+  # above made their changes; off it when those set a display, whose own tools then work.
   if [[ -n "${THURM_CLIP_SHIMS-}" ]]; then
     _thurm_p=":$PATH:"
     # Again until none is left: two entries side by side share the colon between them.
@@ -38,7 +38,10 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
     done
     _thurm_p=${_thurm_p#:}
     _thurm_p=${_thurm_p%:}
-    export PATH="$THURM_CLIP_SHIMS${_thurm_p:+:$_thurm_p}"
+    if [[ -z "${DISPLAY-}${WAYLAND_DISPLAY-}" ]]; then
+      _thurm_p="$THURM_CLIP_SHIMS${_thurm_p:+:$_thurm_p}"
+    fi
+    export PATH="$_thurm_p"
     builtin unset _thurm_p
   fi
 
