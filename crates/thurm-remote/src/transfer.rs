@@ -982,16 +982,57 @@ pub fn copy_from(
         }
     };
     let (part, file) = create_part(&dest).map_err(refuse)?;
-    let local = |e: std::io::Error| TransferError::Local(format!("{}: {e}", dest.display()));
+    // The part itself, kept beside the handle that writes it: its bits are set through it, and
+    // it tells whether the part's name is still this file.
+    let ours = match file.try_clone() {
+        Ok(ours) => ours,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(refuse(TransferError::Local(format!(
+                "{}: {e}",
+                part.display()
+            ))));
+        }
+    };
     let placed = fetch_into(host, ticket, file, &part, info.size, cancel, &mut progress)
-        .and_then(|()| {
-            std::fs::set_permissions(&part, std::os::unix::fs::PermissionsExt::from_mode(mode))
-                .map_err(local)
-        })
-        .and_then(|()| place_copy(&part, &dest, replace));
-    // Moved into place, the part's name is gone; linked there, or failed, it is not.
-    let _ = std::fs::remove_file(&part);
+        .and_then(|()| land_copy(&part, &ours, &dest, mode, replace));
+    // Moved into place, the part's name is gone; linked there, or failed, it is not. Only
+    // while the name is still this copy's file: what someone put in its place is theirs.
+    if names(&part, &ours) {
+        let _ = std::fs::remove_file(&part);
+    }
     placed.map(|()| (dest, info.size))
+}
+
+/// Whether `path` is still the name of `file` (not a link, nor another file, put in its place).
+fn names(path: &Path, file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::symlink_metadata(path), file.metadata()) {
+        (Ok(at), Ok(ours)) => at.is_file() && (at.dev(), at.ino()) == (ours.dev(), ours.ino()),
+        _ => false,
+    }
+}
+
+/// Gives the whole file `ours`, written as `part`, the permission bits `mode` and puts it at
+/// `dest` ([`place_copy`]). The bits are set through the open file, not its name: in a folder
+/// others can change, the name may lead elsewhere by now, and a file of the user's must not get
+/// these bits in its place. A part whose name is no longer this file is not placed.
+fn land_copy(
+    part: &Path,
+    ours: &File,
+    dest: &Path,
+    mode: u32,
+    replace: bool,
+) -> Result<(), TransferError> {
+    ours.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))
+        .map_err(|e| TransferError::Local(format!("{}: {e}", dest.display())))?;
+    if !names(part, ours) {
+        return Err(TransferError::Local(format!(
+            "{} was changed while the file was written; nothing was copied",
+            part.display()
+        )));
+    }
+    place_copy(part, dest, replace)
 }
 
 /// Puts the whole file `part` at `dest`. With `replace`, over a regular file there, and only
@@ -1353,6 +1394,52 @@ mod tests {
         };
         let (_, mode) = open_planned_with_mode(&plan(&data).unwrap()).unwrap();
         assert_eq!(mode, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_in_a_parts_place_gets_neither_the_copys_bits_nor_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("copy-swap");
+        let dest = dir.join("dest.txt");
+        let private = dir.join("private.key");
+        std::fs::write(&private, b"secret").unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // The part's name leads to a private file of the user's by the time the copy is whole.
+        let (part, mut file) = create_part(&dest).unwrap();
+        file.write_all(b"new").unwrap();
+        std::fs::remove_file(&part).unwrap();
+        std::os::unix::fs::symlink(&private, &part).unwrap();
+        let e = land_copy(&part, &file, &dest, 0o644, true).unwrap_err();
+        assert!(e.to_string().contains("was changed while"), "{e}");
+        assert_eq!(
+            mode(&private),
+            0o600,
+            "the link's target got the copy's bits"
+        );
+        assert_eq!(std::fs::read(&private).unwrap(), b"secret");
+        assert!(!dest.exists());
+        // Not this copy's to remove.
+        assert!(!names(&part, &file));
+        std::fs::remove_file(&part).unwrap();
+
+        // Another file under the part's name is no more this copy's than a link.
+        let (part, file) = create_part(&dest).unwrap();
+        std::fs::remove_file(&part).unwrap();
+        std::fs::write(&part, b"theirs").unwrap();
+        assert!(land_copy(&part, &file, &dest, 0o644, false).is_err());
+        assert!(!dest.exists() && !names(&part, &file));
+        std::fs::remove_file(&part).unwrap();
+
+        // Left alone, the part lands with the bits asked for.
+        let (part, mut file) = create_part(&dest).unwrap();
+        file.write_all(b"new").unwrap();
+        assert!(names(&part, &file));
+        land_copy(&part, &file, &dest, 0o640, false).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert_eq!(mode(&dest), 0o640);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
