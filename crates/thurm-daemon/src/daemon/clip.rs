@@ -130,7 +130,10 @@ impl Daemon {
                 (Err(e.clone()), Err(e))
             }
             Some(d) => (Ok(d), Ok(Response::Ok)),
-            None => (Err("the clipboard was not shared".into()), Ok(Response::Ok)),
+            None => (
+                Err("the clipboard has nothing of that type, or was not shared".into()),
+                Ok(Response::Ok),
+            ),
         };
         let _ = request.reply.try_send(answer);
         result

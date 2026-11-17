@@ -73,6 +73,7 @@ selected host's checklist with a **Fix** button for each problem.
 | Claude Code | Runs the official installer (`https://claude.ai/install.sh`), after asking |
 | Claude Code sign-in | Opens a tab running `claude` on the host, to sign in (Linux hosts) |
 | Claude Code / Codex hooks | Installs them for exact agent status |
+| Clipboard tools | Links `pbcopy`, `pbpaste`, `xclip`, `xsel`, `wl-copy` and `wl-paste` to `thurm` in `~/.local/share/thurm/shims`, after asking (Linux hosts) |
 
 A fix that needs you at the host (a password, a sign-in) runs over `ssh -t`:
 in a tab of this Mac from the app, in your terminal from `thurm remote doctor
@@ -349,6 +350,15 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
   meanwhile close with a notice; panes the host has that the layout doesn't know
   open as new tabs.
 - **Files.** See [Files](#files).
+- **Clipboard tools.** Programs on a Linux host that call `pbcopy`, `pbpaste`,
+  `xclip`, `xsel`, `wl-copy` or `wl-paste` reach this Mac's clipboard once the
+  doctor's **Clipboard tools** fix has linked them. New panes on a host
+  without `DISPLAY` or `WAYLAND_DISPLAY` have them first on `PATH`. A copy
+  follows your `terminal.osc52` setting, and a paste asks like an OSC 52 read
+  (`clipboard_read`). Pastes carry text or a PNG image (an agent's image paste
+  works), at most 32 MiB; listing the types (`xclip -t TARGETS -o`,
+  `wl-paste --list-types`) asks nothing. `thurm clip copy` and `thurm clip
+  paste [--type image/png]` do the same on any host.
 
 ## Files
 
@@ -484,10 +494,10 @@ same from a terminal.
 Remote hosts are assumed to be yours and single-user. Even so, they cannot
 reach the Mac's disk, clipboard, or credentials without you doing something:
 
-- **Clipboard reads (OSC 52).** Every read from a remote pane asks: "devbox
-  wants to read your clipboard — Allow Once / Always for devbox / Deny".
-  "Always" writes `clipboard_read = "always"` to the host's `[[remote]]`. Your
-  `terminal.osc52` setting caps every host.
+- **Clipboard reads (OSC 52 and clipboard tools).** Every read from a remote
+  pane asks: "devbox wants to read your clipboard — Allow Once / Always for
+  devbox / Deny". "Always" writes `clipboard_read = "always"` to the host's
+  `[[remote]]`. Your `terminal.osc52` setting caps every host.
 - **Clipboard writes** follow your `terminal.osc52` setting.
 - **Links.** ⌘-click opens `http` and `https` links from remote panes (a link
   to the host's `localhost` through a forward, see [Ports](#ports)), asks for
