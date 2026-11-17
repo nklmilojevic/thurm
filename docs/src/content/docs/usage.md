@@ -224,7 +224,8 @@ a paste with multiple lines when the program does not use bracketed paste mode.
 
 Drop files on a pane to insert their paths, quoted for the shell and separated
 by spaces. A pasted or dropped image is saved to a file first. In a remote pane,
-dropped files, and files copied in Finder and pasted (once you confirm), go to the host, and their
+dropped files, and files copied in Finder and sent with **Send Copied Files** in the pane's
+context menu (once you confirm), go to the host, and their
 paths there are inserted (see [Remote hosts](/remote/#files)).
 
 Allow notifications in macOS System Settings to receive agent and command

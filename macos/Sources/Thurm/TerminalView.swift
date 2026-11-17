@@ -1394,7 +1394,7 @@ final class TerminalView: NSView, NSTextInputClient {
             return false
         }
         window?.makeFirstResponder(self)
-        Core.shared.paste(pane, text: text)
+        type(text)
         return true
     }
 
@@ -1407,6 +1407,15 @@ final class TerminalView: NSView, NSTextInputClient {
 
     /// Where remote previews are fetched and kept (tests use their own).
     var previewCache = RemoteFileCache.shared
+
+    /// Takes what a paste or drop types into the pane, in place of sending it (tests).
+    var pasteText: ((String) -> Void)?
+
+    /// Types `text` into the pane as a paste.
+    private func type(_ text: String) {
+        if let pasteText { return pasteText(text) }
+        Core.shared.paste(pane, text: text)
+    }
 
     /// Asks whether to send pasted files to the host (tests answer for the user).
     var confirmSend: (([URL], HostId) -> Bool)?
@@ -1470,12 +1479,12 @@ final class TerminalView: NSView, NSTextInputClient {
         if pb.string(forType: .string) == nil, pb.availableType(from: [.png, .tiff]) != nil {
             // An image: its file's path (on the pane's host).
             if let path = imagePath(pb), let escaped = shellEscape(path) {
-                Core.shared.paste(pane, text: escaped + " ")
+                type(escaped + " ")
             }
             return
         }
         guard let text = pb.string(forType: .string), !text.isEmpty, pasteConfirmed(text) else { return }
-        Core.shared.paste(pane, text: text)
+        type(text)
     }
 
     /// `confirm_multiline_paste`: several lines into a program without bracketed paste would
@@ -1522,7 +1531,7 @@ final class TerminalView: NSView, NSTextInputClient {
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
         guard pasteConfirmed(text) else { return false }
-        Core.shared.paste(pane, text: text)
+        type(text)
         return true
     }
 
@@ -1561,15 +1570,15 @@ final class TerminalView: NSView, NSTextInputClient {
         case image
     }
 
-    /// What `pb` sends to a remote pane's host. A paste with text sends the text instead: any
-    /// app may put a file's address beside the text it copied, and pasting that text must not
-    /// send the file. Files copied in Finder still go (their text is just their names).
+    /// What `pb` sends to a remote pane's host. A paste with text pastes the text, whatever
+    /// else is there: any app may put a file's address beside the text it copied, and nothing
+    /// on the pasteboard tells such a file from one the user meant to send. Files copied with
+    /// their names as text (Finder's) go with **Send Copied Files**, asked for by name.
     static func uploadPlan(_ pb: NSPasteboard, pasting: Bool) -> UploadPlan {
         let fileOpts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
         let urls = pb.readObjects(forClasses: [NSURL.self], options: fileOpts) as? [URL] ?? []
         if pasting, let text = pb.string(forType: .string),
-           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           !Self.namesOnly(text, urls) {
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return .none
         }
         if !urls.isEmpty {
@@ -1587,14 +1596,30 @@ final class TerminalView: NSView, NSTextInputClient {
         return .none
     }
 
-    /// Whether `text` is nothing but the names (or paths) of `urls`, one a line, in order: what
-    /// Finder puts beside files it copies.
-    static func namesOnly(_ text: String, _ urls: [URL]) -> Bool {
-        let lines = text.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        guard !urls.isEmpty, lines.count == urls.count else { return false }
-        return zip(lines, urls).allSatisfy { $0 == $1.lastPathComponent || $0 == $1.path }
+    /// **Send Copied Files**: the files on the pasteboard go to the host, asked for by name,
+    /// its text aside. What a user picks to send files they copied, where a paste pastes text.
+    @objc func sendCopiedFiles(_ sender: Any?) {
+        sendCopiedFiles(from: NSPasteboard.general)
+    }
+
+    func sendCopiedFiles(from pb: NSPasteboard) {
+        guard !isOffline, hostTakesFiles else { return }
+        switch Self.uploadPlan(pb, pasting: false) {
+        case .files(let urls):
+            if (confirmSend ?? Self.askToSend)(urls, pane.host) {
+                startUpload(.files(urls), from: pb)
+            }
+        case .folder(let name):
+            startUpload(.folder(name), from: pb)
+        case .image, .none:
+            showToast("No files were copied.")
+        }
+    }
+
+    /// Whether `pb` has files to send to the host (for **Send Copied Files**).
+    static func hasCopiedFiles(_ pb: NSPasteboard) -> Bool {
+        let fileOpts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        return !((pb.readObjects(forClasses: [NSURL.self], options: fileOpts) as? [URL]) ?? []).isEmpty
     }
 
     /// Sends what `plan` names to the pane's host as one batch, with a toast that shows how far
@@ -2188,6 +2213,11 @@ final class TerminalView: NSView, NSTextInputClient {
         copyItem.target = self
         let pasteItem = menu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "")
         pasteItem.target = self
+        if hostTakesFiles, Self.hasCopiedFiles(NSPasteboard.general) {
+            let sendItem = menu.addItem(withTitle: "Send Copied Files to \(pane.host)…",
+                                        action: #selector(sendCopiedFiles(_:)), keyEquivalent: "")
+            sendItem.target = self
+        }
         let pathItem = menu.addItem(withTitle: "Insert Path…", action: #selector(insertPath(_:)), keyEquivalent: "")
         pathItem.target = self
         menu.addItem(NSMenuItem.separator())

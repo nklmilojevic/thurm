@@ -260,7 +260,7 @@ pub fn upload(
                 .and_then(|ticket| open_watched(host.socket, &ticket.ticket, cancel))
                 .map(|opened| (source, opened))
         });
-        let (mut source, (reader, mut writer, watch, handle)) = match next {
+        let (mut source, (reader, writer, watch, handle)) = match next {
             Ok(next) => next,
             Err(e) => {
                 if let Some((_, w, handle)) = last.take() {
@@ -271,10 +271,21 @@ pub fn upload(
         };
         // A cancel between files still has to reach the daemon: it ends the batch on this
         // stream, which is aborted unfinished.
-        send_and_finish(&mut source, &mut writer, watch, cancel, |n| {
+        let sent = send_one(&mut source, writer, watch, &handle, cancel, |n| {
             p.done += n;
             progress(p);
-        })?;
+        });
+        let writer = match sent {
+            Ok(writer) => writer,
+            // This stream was aborted; the last one is too, so the batch ends now whichever
+            // the daemon hears first.
+            Err(e) => {
+                if let Some((_, w, h)) = last.take() {
+                    abort(w, &h);
+                }
+                return Err(e);
+            }
+        };
         // Every stream of the batch closes with the same outcome: waiting on the last one is
         // enough, and the others need no connection meanwhile.
         last = Some((reader, writer, handle));
@@ -413,6 +424,26 @@ fn send(
     Ok(())
 }
 
+/// Sends `source` on its stream ([`send_and_finish`]); if that fails, aborts the stream within
+/// bounds ([`abort`]) rather than leaving it to a writer's drop, which would wait on a host
+/// that stopped reading.
+fn send_one(
+    source: &mut Source,
+    mut writer: StreamWriter,
+    watch: CancelWatch,
+    handle: &UnixStream,
+    cancel: &Cancel,
+    sent: impl FnMut(u64),
+) -> Result<StreamWriter, TransferError> {
+    match send_and_finish(source, &mut writer, watch, cancel, sent) {
+        Ok(()) => Ok(writer),
+        Err(e) => {
+            abort(writer, handle);
+            Err(e)
+        }
+    }
+}
+
 /// Sends `source` and its `End` with `watch` cutting the connection on Cancel, the `End` too
 /// (a host that stopped reading blocks it as well); then lets the watch go, so a Cancel while
 /// the batch waits aborts the stream rather than cutting it.
@@ -497,12 +528,19 @@ pub fn download(
         .as_deref()
         .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
     // A read blocks until the host sends; Cancel ends the connection under it.
-    let (mut reader, mut writer, _watch, _handle) = open_watched(host.socket, ticket, cancel)?;
+    // Where it goes first: a destination that cannot be written fails before any stream.
     let (part, file) = create_part(dest)?;
+    let (mut reader, mut writer, _watch, handle) = match open_watched(host.socket, ticket, cancel) {
+        Ok(opened) => opened,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+    };
     let received = receive(&mut reader, file, &part, info.size, cancel, &mut progress);
     if let Err(e) = received {
         let _ = std::fs::remove_file(&part);
-        let _ = writer.close(StreamClose::Aborted);
+        abort(writer, &handle);
         return Err(e);
     }
     let closed = writer
@@ -1028,6 +1066,47 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("Cancel stayed stuck on the abort");
         assert!(matches!(got, Err(TransferError::Cancelled)), "{got:?}");
+        let _ = release.send(());
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_file_failing_to_read_ends_its_stream_even_if_the_host_stopped_reading() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (socket, daemon) = fake_daemon_then(move |_, _| {
+            let _ = held.recv();
+            Vec::new()
+        });
+        let shutdown = socket.try_clone().unwrap();
+        let handle = socket.try_clone().unwrap();
+        let fill = socket.try_clone().unwrap();
+        let (_reader, writer) = stream::open_on(socket, "ticket").unwrap();
+        fill.set_nonblocking(true).unwrap();
+        let junk = vec![0u8; 64 * 1024];
+        while (&fill).write(&junk).is_ok() {}
+        fill.set_nonblocking(false).unwrap();
+        let cancel = Cancel::default();
+        let watch = CancelWatch::start(cancel.clone(), shutdown).unwrap();
+        struct Unreadable;
+        impl Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("the disk went away"))
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut source = Source {
+                name: "gone.txt".into(),
+                size: 10,
+                reader: Box::new(Unreadable),
+            };
+            let got = send_one(&mut source, writer, watch, &handle, &cancel, |_| {});
+            let _ = tx.send(got.err().map(|e| e.to_string()));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("aborting the stream stayed blocked");
+        assert!(got.is_some_and(|e| e.contains("the disk went away")));
         let _ = release.send(());
         daemon.join().unwrap();
     }

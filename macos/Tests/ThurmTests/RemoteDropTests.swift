@@ -40,6 +40,8 @@ final class RemoteDropTests: XCTestCase {
         var cancels = 0
         /// Pasted files asked about, and the answer.
         var asked: [[String]] = []
+        /// What was typed into the pane.
+        var typed: [String] = []
         var answer = true
 
         func upload(_ pane: PaneKey, _ files: [(path: String, name: String?)],
@@ -76,6 +78,7 @@ final class RemoteDropTests: XCTestCase {
         view.transfersFiles = takesFiles
         let fake = FakeTransfers()
         view.uploader = fake.upload
+        view.pasteText = { fake.typed.append($0) }
         view.confirmSend = { urls, _ in
             fake.asked.append(urls.map(\.path))
             return fake.answer
@@ -198,13 +201,26 @@ final class RemoteDropTests: XCTestCase {
         pb.writeObjects([secret] as [NSURL])
         pb.setString("make test", forType: .string)
         view.paste(from: pb)
+        XCTAssertEqual(fake.typed, ["make test"])
         XCTAssertEqual(fake.started, [])
-        // Finder's copy of files has their names as its text: the files go.
+        XCTAssertEqual(fake.asked, [])
+        // Text that names the file beside it is no different: nothing on the pasteboard says
+        // who put the file there. The text is pasted.
+        pb.clearContents()
+        pb.writeObjects([secret] as [NSURL])
+        pb.setString("id_ed25519", forType: .string)
+        view.paste(from: pb)
+        XCTAssertEqual(fake.typed, ["make test", "id_ed25519"])
+        XCTAssertEqual(fake.started, [])
+        XCTAssertEqual(fake.asked, [])
+        // Files copied in Finder go when asked for: Send Copied Files, naming them.
         let copied = [try file("one.txt"), try file("two.txt")]
         pb.clearContents()
         pb.writeObjects(copied as [NSURL])
         pb.setString("one.txt\rtwo.txt", forType: .string)
-        view.paste(from: pb)
+        XCTAssertTrue(TerminalView.hasCopiedFiles(pb))
+        view.sendCopiedFiles(from: pb)
+        XCTAssertEqual(fake.asked, [copied.map(\.path)])
         XCTAssertEqual(fake.started, [copied.map(\.path)])
     }
 
@@ -340,8 +356,11 @@ final class RemoteDropTests: XCTestCase {
         pb.clearContents()
         pb.writeObjects([try file("two.txt")] as [NSURL])
         let (older, olderFake) = remotePane(takesFiles: false)
-        _ = older.performDragOperation(FakeDrag(pb))
+        XCTAssertTrue(older.performDragOperation(FakeDrag(pb)))
         XCTAssertEqual(olderFake.started, [])
+        // As before: the dropped file's path here is typed.
+        let path = dir.appendingPathComponent("two.txt").path
+        XCTAssertEqual(olderFake.typed, [path.contains(" ") ? "'\(path)' " : path + " "])
     }
 
     func testDroppedFilesArePlannedInOrder() throws {

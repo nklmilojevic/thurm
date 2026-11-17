@@ -963,3 +963,112 @@ fn a_batch_that_cannot_be_made_deletes_nothing_kept() {
     assert!(e.to_string().contains("cannot create"), "{e}");
     assert!(kept.join("a.txt").exists());
 }
+
+#[test]
+fn drops_past_their_time_make_room_at_once() {
+    let env = Env::new("transfer-expired-room");
+    // 10 bytes over the floor with nothing kept, a byte a directory and record here.
+    let _daemon = env.start_with(&[
+        ("THURM_TRANSFER_FREE_BYTES", Path::new("1073741834")),
+        ("THURM_TRANSFER_BLOCK", Path::new("1")),
+    ]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 6, b"aaaaaa")
+        .wait_closed()
+        .unwrap();
+    let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    // It is past its time, and holds the room the next one needs.
+    std::fs::write(kept.join(".done"), "1000").unwrap();
+    send(&env, &c, pane, ("b", 0, 1), "b.txt", 6, b"bbbbbb")
+        .wait_closed()
+        .unwrap();
+    assert!(!kept.exists());
+}
+
+#[test]
+fn a_download_keeps_its_slot_until_its_stream_ends() {
+    let env = Env::new("transfer-download-slots");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    std::fs::write(dir.join("small.txt"), b"small").unwrap();
+    let pane = cat_pane(&c, &dir);
+    // Four sent whole, their callers never saying they have them.
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let info = c.download_begin(pane, "small.txt", None).unwrap();
+        let (mut r, w) = stream::open(&env.socket, info.ticket.as_deref().unwrap()).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"small");
+        held.push((r, w));
+    }
+    let e = c.download_begin(pane, "small.txt", None).unwrap_err();
+    assert!(e.to_string().contains("too many downloads"), "{e}");
+    // One answered, its slot is free again.
+    let (r, mut w) = held.pop().unwrap();
+    w.finish().unwrap();
+    r.wait_closed().unwrap();
+    eventually(5, "the slot was not freed", || {
+        c.download_begin(pane, "small.txt", None).is_ok()
+    });
+    drop(held);
+}
+
+#[test]
+fn a_download_to_where_nothing_can_be_written_fails_cleanly() {
+    use thurm_remote::transfer::{self, Cancel, Host, TransferError};
+    let env = Env::new("transfer-no-dest");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    // Larger than what a connection holds: a stream left sending it would block.
+    std::fs::write(dir.join("big.bin"), vec![7u8; 8 << 20]).unwrap();
+    let pane = cat_pane(&c, &dir);
+    let host = Host {
+        client: &c,
+        socket: &env.socket,
+    };
+    let dest = dir.join("missing/big.bin");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let socket = env.socket.clone();
+    let c2 = c.clone();
+    std::thread::spawn(move || {
+        let host = Host {
+            client: &c2,
+            socket: &socket,
+        };
+        let got = transfer::download(
+            host,
+            pane,
+            "big.bin",
+            &dest,
+            None,
+            None,
+            &Cancel::default(),
+            |_| {},
+        );
+        let _ = tx.send(got);
+    });
+    let got = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the failed download did not come back");
+    assert!(matches!(got, Err(TransferError::Local(_))), "{got:?}");
+    // Nothing is left where it would have gone, and the next download goes.
+    assert!(!dir.join("missing").exists());
+    let ok = dir.join("big-copy.bin");
+    transfer::download(
+        host,
+        pane,
+        "big.bin",
+        &ok,
+        None,
+        None,
+        &Cancel::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(std::fs::metadata(&ok).unwrap().len(), 8 << 20);
+}

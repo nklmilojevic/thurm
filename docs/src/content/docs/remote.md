@@ -352,17 +352,18 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
 
 ## Files
 
-Drop files on a remote pane, or copy them in Finder and paste, and they go to the
-host. A pasted screenshot or an image dragged out of a browser goes as
+Drop files on a remote pane, or copy them in Finder and pick **Send Copied Files to
+devbox…** in the pane's context menu, and they go to the host. A pasted screenshot or an image dragged out of a browser goes as
 `image-….png`. A toast shows the progress, with **Cancel**. Files dropped while
 others are on their way wait for them, so paths are typed in the order you
 dropped them. Once every file has
 arrived, the host's daemon types their paths into the pane, quoted and separated
 by spaces, as a paste, so an agent at its prompt gets them as one paste. If a
 file fails or you cancel before every file has arrived, nothing is typed and
-nothing is kept. Pasting copied text pastes the text, even when the app that
-copied it put a file beside it; files copied in Finder are sent once you confirm
-them in the dialog that names them. Folders are
+nothing is kept. Copied files are sent once you confirm them in the dialog that
+names them. Pasting pastes text whenever there is some, even when the app that
+copied it put a file beside it: Finder's copies carry their names as text, so
+pasting them pastes the names. Folders are
 refused; drop the files in them instead.
 
 Uploads are kept on the host, readable by you only, in Thurm's state directory
