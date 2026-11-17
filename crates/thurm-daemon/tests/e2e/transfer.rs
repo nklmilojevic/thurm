@@ -72,7 +72,7 @@ fn send(
 
 /// The batch directories under the daemon's drops for `pane`.
 fn batches(env: &Env, pane: PaneId) -> Vec<PathBuf> {
-    let dir = env.dir.join("drops").join(pane.to_string());
+    let dir = env.dir.join("state/drops").join(pane.to_string());
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -136,7 +136,7 @@ fn a_batch_lands_and_its_paths_are_typed_in_order() {
         assert_eq!(mode(path), 0o600);
     }
     assert_eq!(mode(&batch), 0o700);
-    assert_eq!(mode(&env.dir.join("drops")), 0o700);
+    assert_eq!(mode(&env.dir.join("state/drops")), 0o700);
     let line = format!(
         "{} '{}' {} \n",
         expected[0].display(),
@@ -595,8 +595,8 @@ fn eventually(secs: u64, what: &str, done: impl Fn() -> bool) {
 fn kept_uploads_expire_without_another_upload() {
     let env = Env::new("transfer-expire");
     // Drops an earlier daemon left: one long past its time, one just made.
-    let old = env.dir.join("drops/9/old");
-    let fresh = env.dir.join("drops/9/fresh");
+    let old = env.dir.join("state/drops/9/old");
+    let fresh = env.dir.join("state/drops/9/fresh");
     for dir in [&old, &fresh] {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("f.txt"), b"x").unwrap();
@@ -621,4 +621,71 @@ fn kept_uploads_expire_without_another_upload() {
         .unwrap();
     let [sent] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
     eventually(6, "the sent drop outlived its time", || !sent.exists());
+}
+
+#[test]
+fn kept_drops_make_room_for_the_free_space_floor() {
+    let env = Env::new("transfer-floor");
+    // 1 GiB must stay free; this disk has 10 bytes more than that with nothing kept.
+    let _daemon = env.start_with(&[("THURM_TRANSFER_FREE_BYTES", Path::new("1073741834"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 6, b"aaaaaa")
+        .wait_closed()
+        .unwrap();
+    let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    // 20 bytes would not fit even with the kept drop gone: refused, and it stays.
+    let e = c.upload_begin(pane, "big.txt", 20, None).unwrap_err();
+    assert!(e.to_string().contains("not enough free space"), "{e}");
+    assert!(kept.join("a.txt").exists());
+    // 6 fit once it goes: it goes.
+    send(&env, &c, pane, ("b", 0, 1), "b.txt", 6, b"bbbbbb")
+        .wait_closed()
+        .unwrap();
+    assert!(!kept.exists());
+}
+
+#[test]
+fn a_failed_batch_stops_its_writers_and_leaves_nothing() {
+    let env = Env::new("transfer-writers");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let batch = |index| {
+        Some(UploadBatch {
+            id: "w".into(),
+            index,
+            count: 2,
+        })
+    };
+    // The first file half sent, its stream left open.
+    let t0 = c.upload_begin(pane, "big.bin", 1 << 20, batch(0)).unwrap();
+    let (r0, mut w0) = stream::open(&env.socket, &t0.ticket).unwrap();
+    w0.write_all(&vec![7u8; 4096]).unwrap();
+    eventually(5, "the first bytes did not arrive", || {
+        batches(&env, pane)
+            .first()
+            .is_some_and(|b| std::fs::metadata(b.join(".parts/0")).is_ok_and(|m| m.len() == 4096))
+    });
+    // The second is aborted: the batch fails, and the first stream ends without waiting for
+    // more of its bytes.
+    let t1 = c.upload_begin(pane, "small.bin", 1, batch(1)).unwrap();
+    let (r1, w1) = stream::open(&env.socket, &t1.ticket).unwrap();
+    w1.close(thurm_proto::stream::StreamClose::Aborted).unwrap();
+    assert!(r1.wait_closed().is_err());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(r0.wait_closed().map_err(|e| e.to_string()));
+    });
+    let closed = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the failed batch's writer kept taking bytes");
+    assert!(closed.is_err(), "{closed:?}");
+    // More bytes go nowhere.
+    let _ = w0.write_all(&vec![7u8; 1 << 16]);
+    eventually(5, "the failed batch was kept", || {
+        batches(&env, pane).is_empty()
+    });
 }

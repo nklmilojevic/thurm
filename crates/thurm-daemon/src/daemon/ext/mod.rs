@@ -78,6 +78,20 @@ fn client_is_tailnet(client: &Client) -> bool {
         .is_some_and(|p| p.kind == thurm_proto::PrincipalKind::Tailscale)
 }
 
+/// The remote lists `app` relayed, as `ports_changed` payloads of servers running already.
+fn remote_lists(all: &HashMap<u64, RemoteLists>, app: Option<u64>) -> Vec<Value> {
+    app.and_then(|a| all.get(&a))
+        .into_iter()
+        .flatten()
+        .map(|((host, pane), (ports, complete))| {
+            json!({
+                "event": PORTS_CHANGED, "host": host, "id": pane, "ports": ports,
+                "complete": complete, "initial": true,
+            })
+        })
+        .collect()
+}
+
 /// Refuses `method` unless `client` is the app, which opens forwards.
 fn only_the_app(client: &Client, method: &str) -> Result<(), String> {
     if client.ext_forwards.load(Ordering::Relaxed) {
@@ -217,7 +231,9 @@ impl Daemon {
                 // gets the lists the app relayed so far, the same way.
                 if joins {
                     self.ports.subscribed(Arc::downgrade(self), client.id);
-                    for payload in self.remote_lists(self.forwarding_app_id()) {
+                    // Under the lists' lock: a newer list reported meanwhile comes after.
+                    let all = self.ext.remote_ports.lock();
+                    for payload in remote_lists(&all, self.forwarding_app_id()) {
                         send_ext(client, notice::EVENT, &payload);
                     }
                 }
@@ -318,9 +334,12 @@ impl Daemon {
                 let host = str_param(&p, "host")?;
                 // The app's connection to the host is gone: what it listed is not known now.
                 // Plugins that heard its lists hear them end: nothing is known of them now.
+                // The lists are kept and sent under their lock: what plugins hear of a pane is in
+                // the order it was kept, whoever sends it (a report, a replay).
                 if p.get("gone").and_then(Value::as_bool) == Some(true) {
+                    let mut all = self.ext.remote_ports.lock();
                     let mut ended = Vec::new();
-                    if let Some(lists) = self.ext.remote_ports.lock().get_mut(&client.id) {
+                    if let Some(lists) = all.get_mut(&client.id) {
                         lists.retain(|(h, pane), _| {
                             if h == host {
                                 ended.push((h.clone(), *pane));
@@ -341,15 +360,13 @@ impl Daemon {
                     serde_json::from_value(p.get("ports").cloned().unwrap_or(json!([])))
                         .map_err(|e| format!("bad ports: {e}"))?;
                 let complete = p.get("complete").and_then(Value::as_bool).unwrap_or(true);
-                {
-                    let mut all = self.ext.remote_ports.lock();
-                    let lists = all.entry(client.id).or_default();
-                    let at = (host.to_owned(), pane);
-                    if ports.is_empty() {
-                        lists.remove(&at);
-                    } else {
-                        lists.insert(at, (ports.clone(), complete));
-                    }
+                let mut all = self.ext.remote_ports.lock();
+                let lists = all.entry(client.id).or_default();
+                let at = (host.to_owned(), pane);
+                if ports.is_empty() {
+                    lists.remove(&at);
+                } else {
+                    lists.insert(at, (ports.clone(), complete));
                 }
                 // Only the app that holds plugins' forwards is heard, as with its forwards.
                 if self.forwarding_app_id() != Some(client.id) {
@@ -362,6 +379,7 @@ impl Daemon {
                     extra["initial"] = true.into();
                 }
                 self.emit(PORTS_CHANGED, None, extra);
+                drop(all);
                 Ok(Value::Null)
             }
             method::FORWARDS_REPORT => {
@@ -404,21 +422,6 @@ impl Daemon {
     /// The app that holds plugins' forwards, connected or leaving now.
     fn forwarding_app_id(&self) -> Option<u64> {
         self.ext.forwards.lock().keys().min().copied()
-    }
-
-    /// The remote lists `app` relayed, as `ports_changed` payloads of servers running already.
-    fn remote_lists(&self, app: Option<u64>) -> Vec<Value> {
-        let all = self.ext.remote_ports.lock();
-        app.and_then(|a| all.get(&a))
-            .into_iter()
-            .flatten()
-            .map(|((host, pane), (ports, complete))| {
-                json!({
-                    "event": PORTS_CHANGED, "host": host, "id": pane, "ports": ports,
-                    "complete": complete, "initial": true,
-                })
-            })
-            .collect()
     }
 
     /// Remote panes whose lists plugins heard and nobody keeps up now (the app lost the host,
@@ -772,24 +775,26 @@ impl Daemon {
             (first, gone, next, next_app)
         };
         // The panes only the app that held plugins' lists knew of: no one tells of them now.
-        let ended: Vec<(String, u64)> = {
+        // Under the lists' lock, as their reports: the next app's newer lists come after.
+        {
             let mut all = self.ext.remote_ports.lock();
             let had = all.remove(&client).unwrap_or_default();
             let next_has = next_app.and_then(|a| all.get(&a));
-            had.into_keys()
+            let ended: Vec<(String, u64)> = had
+                .into_keys()
                 .filter(|k| first && !next_has.is_some_and(|n| n.contains_key(k)))
-                .collect()
-        };
-        self.remote_lists_ended(&ended);
+                .collect();
+            self.remote_lists_ended(&ended);
+            // The remote lists heard from now on are that app's: what it had runs already.
+            for payload in remote_lists(&all, next_app) {
+                self.deliver_event(PORTS_CHANGED, &payload);
+            }
+        }
         for f in gone.iter().flatten() {
             self.forward_event(FORWARD_CLOSED, f, Some("app"));
         }
         for f in next.iter().flatten() {
             self.forward_event(FORWARD_OPENED, f, None);
-        }
-        // The remote lists heard from now on are that app's: what it had is running already.
-        for payload in self.remote_lists(next_app) {
-            self.deliver_event(PORTS_CHANGED, &payload);
         }
         if self.ext.registry.lock().client_gone(client) {
             self.actions_changed();

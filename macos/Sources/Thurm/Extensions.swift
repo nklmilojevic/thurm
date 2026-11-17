@@ -423,13 +423,18 @@ final class Extensions {
     }
 
     /// A remote host's pane listed its ports: this Mac's plugins hear of it (with the host).
-    /// `initial`: they were listening already when the app connected to the host, as is every
-    /// list relayed before `remoteHostConnected` has the host's own answer. Kept, for a daemon
-    /// the app connects to later: sent while it is not connected, it is lost.
-    func reportPorts(host: HostId, pane: UInt64, ports: Any, complete: Any, initial: Bool = false) {
-        remotePorts.listed(host, pane: pane, ports: ports, complete: complete)
-        sendPorts(host: host, pane: pane, ports: ports, complete: complete,
-                  initial: initial || remotePorts.isLearning(host))
+    /// While the app waits for the host's own answer of what it lists (`remoteHostConnected`),
+    /// the list waits too (`RemotePorts`). Kept, for a daemon the app connects to later: sent
+    /// while it is not connected, it is lost.
+    func reportPorts(host: HostId, pane: UInt64, ports: Any, complete: Any) {
+        if let send = remotePorts.live(host, pane: pane, ports: ports, complete: complete) {
+            sendPorts(send)
+        }
+    }
+
+    private func sendPorts(_ send: RemotePorts.Send) {
+        let e = send.entry
+        sendPorts(host: e.host, pane: e.pane, ports: e.ports, complete: e.complete, initial: send.initial)
     }
 
     private func sendPorts(host: HostId, pane: UInt64, ports: Any, complete: Any, initial: Bool) {
@@ -439,18 +444,24 @@ final class Extensions {
         call("ports.report", params)
     }
 
-    /// The app connected to `host`: its panes' ports now go to plugins as `initial`, so a
-    /// server that was running already is not taken for one that just started.
+    /// The app connected to `host`: what it lists now goes to plugins as `initial`, so a server
+    /// that was running already is not taken for one that just started; what changes after, as
+    /// changes.
     func remoteHostConnected(_ host: HostId) {
         let ask = remotePorts.connected(host)
         Core.shared.requestAsync(object: ["Ports": ["pane": NSNull()]], host: host, timeout: 10) { [weak self] resp in
-            // Not an answer of a connection that is gone since, or was replaced.
-            guard let self, self.remotePorts.learned(host, ask: ask) else { return }
+            guard let self else { return }
             // A daemon from before ports answers with an error: it sends no lists either.
-            for entry in (resp as? [String: Any])?["Ports"] as? [[String: Any]] ?? [] {
-                guard let pane = jsonUInt64(entry["pane"]) else { continue }
-                self.reportPorts(host: host, pane: pane, ports: entry["ports"] ?? [],
-                                 complete: entry["complete"] ?? true, initial: true)
+            let snapshot = ((resp as? [String: Any])?["Ports"] as? [[String: Any]]).map { panes in
+                panes.compactMap { entry -> RemotePorts.Entry? in
+                    guard let pane = jsonUInt64(entry["pane"]) else { return nil }
+                    return RemotePorts.Entry(host: host, pane: pane, ports: entry["ports"] ?? [],
+                                             complete: entry["complete"] ?? true)
+                }
+            }
+            // Nothing for an answer of a connection that is gone since, or was replaced.
+            for send in self.remotePorts.learned(host, ask: ask, snapshot: snapshot) {
+                self.sendPorts(send)
             }
         }
     }

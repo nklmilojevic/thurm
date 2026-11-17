@@ -139,10 +139,40 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: dest.path))
         XCTAssertNil(view.shownTransfer)
         XCTAssertEqual(revealed, [])
-        // One that finishes is shown in Finder.
+        // One that finishes is shown in Finder, with what was saved in it.
         view.download(remotePath: "/srv/big.iso", into: dir, start: fake.download) { revealed.append($0) }
+        try Data("iso bytes".utf8).write(to: URL(fileURLWithPath: fake.started[1][1]))
         fake.finish[1](TransferOutcome())
         XCTAssertEqual(revealed, [dest])
+        XCTAssertEqual(try String(contentsOf: dest, encoding: .utf8), "iso bytes")
+    }
+
+    func testATransfersCancelComesBackAfterAnotherToast() throws {
+        let (view, _) = remotePane()
+        pb.clearContents()
+        pb.writeObjects([try file("a.txt")] as [NSURL])
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        // A message comes and goes, and the transfer reports nothing more.
+        view.showToast("Session restored", duration: 0.05)
+        XCTAssertNil(view.shownTransfer)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.6))
+        XCTAssertEqual(view.shownTransfer, "Sending a.txt to devbox…")
+    }
+
+    func testAPastedOrDroppedImageIsSentAsAFile() throws {
+        let (view, fake) = remotePane()
+        pb.clearContents()
+        pb.setData(png, forType: .png)
+        view.paste(from: pb)
+        XCTAssertEqual(fake.started.count, 1)
+        fake.finish[0](TransferOutcome())
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        XCTAssertEqual(fake.started.count, 2)
+        for batch in fake.started {
+            XCTAssertEqual(batch.count, 1)
+            XCTAssertTrue(batch[0].hasSuffix(".png"), batch[0])
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: batch[0])), png)
+        }
     }
 
     func testAFolderOrAnOlderHostSendsNothing() throws {
@@ -208,6 +238,12 @@ final class RemoteDropTests: XCTestCase {
         _ = try file("Makefile")
         XCTAssertEqual(SessionManager.reserveFreeName("Makefile", in: dir)?.lastPathComponent, "Makefile 2")
         XCTAssertNil(SessionManager.reserveFreeName("x", in: dir.appendingPathComponent("missing")))
+        // A name as long as names go is shortened to make room for its number.
+        let long = String(repeating: "l", count: 251) + ".txt"
+        XCTAssertEqual(SessionManager.reserveFreeName(long, in: dir)?.lastPathComponent, long)
+        let numbered = try XCTUnwrap(SessionManager.reserveFreeName(long, in: dir)).lastPathComponent
+        XCTAssertEqual(numbered.utf8.count, 255)
+        XCTAssertTrue(numbered.hasSuffix(" 2.txt"), numbered)
     }
 }
 

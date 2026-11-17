@@ -166,31 +166,82 @@ final class ForwardsTests: XCTestCase {
         XCTAssertEqual(r.finish(key(2, 2), opening: nil, result: opened(7)).0, .answer)
     }
 
+    private func ports(_ list: [Int]) -> [[String: Any]] { list.map { ["port": $0] } }
+
+    /// What `sends` says, as `host/pane:ports` with `*` for initial.
+    private func said(_ sends: [RemotePorts.Send]) -> [String] {
+        sends.map { s in
+            let list = (s.entry.ports as? [[String: Any]] ?? []).compactMap { jsonInt($0["port"]) }
+            return "\(s.entry.host)/\(s.entry.pane):\(list.map(String.init).joined(separator: ","))\(s.initial ? "*" : "")"
+        }
+    }
+
+    private func live(_ p: inout RemotePorts, _ host: HostId, _ pane: UInt64, _ list: [Int]) -> RemotePorts.Send? {
+        p.live(host, pane: pane, ports: ports(list), complete: true)
+    }
+
+    private func entry(_ host: HostId, _ pane: UInt64, _ list: [Int]) -> RemotePorts.Entry {
+        RemotePorts.Entry(host: host, pane: pane, ports: ports(list), complete: true)
+    }
+
     func testRemotePortsAreKeptAndTheirAskEndsWithTheConnection() {
         var p = RemotePorts()
         let ask = p.connected("devbox")
-        XCTAssertTrue(p.isLearning("devbox"))
-        p.listed("devbox", pane: 2, ports: [["port": 5173]], complete: true)
-        p.listed("devbox", pane: 3, ports: [["port": 8080]], complete: true)
-        p.listed("pi", pane: 1, ports: [["port": 22]], complete: true)
+        XCTAssertEqual(said(p.learned("devbox", ask: ask, snapshot: [entry("devbox", 2, [5173]), entry("devbox", 3, [])])),
+                       ["devbox/2:5173*"])
+        XCTAssertEqual(live(&p, "pi", 1, [22]).map { said([$0]) }, ["pi/1:22"])
+        _ = live(&p, "devbox", 3, [8080])
         // An empty list forgets the pane; the rest is there to send a daemon connected later.
-        p.listed("devbox", pane: 3, ports: [] as [Any], complete: true)
+        _ = live(&p, "devbox", 3, [])
         XCTAssertEqual(p.all.map { "\($0.host)/\($0.pane)" }, ["devbox/2", "pi/1"])
 
-        // The host goes before its answer comes: the late answer is not taken, its lists go.
+        // The host goes before its next answer comes: that late answer, and what waited for it,
+        // are not taken; its lists go.
+        let late = p.connected("devbox")
+        XCTAssertNil(live(&p, "devbox", 2, [5173]))
         p.disconnected("devbox")
-        XCTAssertFalse(p.isLearning("devbox"))
-        XCTAssertFalse(p.learned("devbox", ask: ask))
+        XCTAssertEqual(p.learned("devbox", ask: late, snapshot: [entry("devbox", 2, [5173])]).count, 0)
         XCTAssertEqual(p.all.map(\.host), ["pi"])
+        // Live again, nothing waits.
+        XCTAssertNotNil(live(&p, "devbox", 2, [5173]))
 
-        // Connected again: only the newest ask's answer counts, once.
+        // Connected again twice: only the newest ask's answer counts, once.
         let old = p.connected("devbox")
         let new = p.connected("devbox")
-        XCTAssertFalse(p.learned("devbox", ask: old))
-        XCTAssertTrue(p.isLearning("devbox"))
-        XCTAssertTrue(p.learned("devbox", ask: new))
-        XCTAssertFalse(p.isLearning("devbox"))
-        XCTAssertFalse(p.learned("devbox", ask: new))
+        XCTAssertEqual(p.learned("devbox", ask: old, snapshot: [entry("devbox", 2, [1])]).count, 0)
+        XCTAssertEqual(said(p.learned("devbox", ask: new, snapshot: [entry("devbox", 2, [5173])])), ["devbox/2:5173*"])
+        XCTAssertEqual(p.learned("devbox", ask: new, snapshot: [entry("devbox", 2, [5173])]).count, 0)
+    }
+
+    /// A server that starts while the host's answer is on its way is a change, not one that
+    /// was running already; the lists the host's daemon sends on joining say nothing new.
+    func testAPortThatStartsWhileTheAnswerIsOnItsWayIsNews() {
+        var p = RemotePorts()
+        let ask = p.connected("devbox")
+        // The join's lists (as the answer will say), then a server starting in pane 2.
+        XCTAssertNil(live(&p, "devbox", 1, [5173]))
+        XCTAssertNil(live(&p, "devbox", 2, [8080]))
+        let sends = p.learned("devbox", ask: ask, snapshot: [entry("devbox", 1, [5173])])
+        XCTAssertEqual(said(sends), ["devbox/1:5173*", "devbox/2:8080"])
+    }
+
+    /// An answer older than a change that came meanwhile does not undo it: the change goes after
+    /// it, whatever it said.
+    func testAnOlderAnswerDoesNotOverwriteALiveList() {
+        var p = RemotePorts()
+        let ask = p.connected("devbox")
+        // Pane 1's server stopped and pane 2's started before the answer (taken earlier) came.
+        XCTAssertNil(live(&p, "devbox", 1, []))
+        XCTAssertNil(live(&p, "devbox", 2, [9000, 9001]))
+        let sends = p.learned("devbox", ask: ask,
+                              snapshot: [entry("devbox", 1, [5173]), entry("devbox", 2, [9000])])
+        XCTAssertEqual(said(sends), ["devbox/1:5173*", "devbox/2:9000*", "devbox/1:", "devbox/2:9000,9001"])
+        XCTAssertEqual(p.all.map { "\($0.pane)" }, ["2"])
+
+        // No answer at all (an error, a timeout): what came meanwhile is what runs.
+        let failed = p.connected("pi")
+        XCTAssertNil(live(&p, "pi", 4, [3000]))
+        XCTAssertEqual(said(p.learned("pi", ask: failed, snapshot: nil)), ["pi/4:3000*"])
     }
     func testAFailureWithoutAPaneIsAnAlert() {
         XCTAssertEqual(ForwardNotice.failure(host: "pi", "pi is not connected", onPane: true),

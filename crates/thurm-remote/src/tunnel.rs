@@ -257,14 +257,24 @@ struct Inner {
     wake: Mutex<Option<bool>>,
     /// The host or socket was edited: a connected tunnel goes to the old one, replace it.
     reconfigured: AtomicBool,
-    /// Bumped, under the `remote` lock, each time the destination settings change.
+    /// Bumped, under the `remote` lock, each time the destination settings change; `ssh` is
+    /// replaced under that lock too, so the three always describe the same destination.
     settings: AtomicU64,
-    /// The `settings` the connection being made (or held) uses.
-    connecting_settings: AtomicU64,
+    /// The destination the connection being made (or held) uses, taken whole by `connect`.
+    connecting: Mutex<Option<Destination>>,
     cond: Condvar,
     stop: AtomicBool,
     listener: Listener,
     write_state: bool,
+}
+
+/// Where one connection attempt goes, read at once ([`Inner::destination`]).
+#[derive(Clone, Debug)]
+struct Destination {
+    settings: u64,
+    ssh: Ssh,
+    socket: Option<String>,
+    tailnet: Option<String>,
 }
 
 /// Keeps one host's tunnel up on a background thread.
@@ -289,7 +299,7 @@ impl Supervisor {
             wake: Mutex::new(None),
             reconfigured: AtomicBool::new(false),
             settings: AtomicU64::new(0),
-            connecting_settings: AtomicU64::new(0),
+            connecting: Mutex::new(None),
             cond: Condvar::new(),
             stop: AtomicBool::new(false),
             listener: Box::new(listener),
@@ -334,20 +344,24 @@ impl Supervisor {
     pub fn update(&self, remote: RemoteConfig) -> Result<(), String> {
         let ssh = Ssh::new(&remote.host)?;
         let (changed, moved) = {
+            // The ssh target, the remote entry and the settings number change together, under
+            // the lock `connect` takes its destination under: a connection never pairs the new
+            // number with the old target.
             let mut cur = self.inner.remote.lock();
             let changed = *cur != remote;
             let moved = cur.host != remote.host
                 || cur.socket != remote.socket
                 || cur.tailnet != remote.tailnet;
             if moved {
+                let mut current = self.inner.ssh.lock();
+                let extra = current.extra.clone();
+                *current = Ssh { extra, ..ssh };
                 self.inner.settings.fetch_add(1, Ordering::SeqCst);
             }
             *cur = remote.clone();
             (changed, moved)
         };
         if moved {
-            let extra = self.inner.ssh.lock().extra.clone();
-            *self.inner.ssh.lock() = Ssh { extra, ..ssh };
             {
                 let mut status = self.inner.status.lock();
                 status.transport = transport_of(&remote);
@@ -700,19 +714,31 @@ impl Inner {
         w.take().unwrap_or(false)
     }
 
-    fn connect(&self) -> Result<Link, Failure> {
-        // This attempt uses the current settings: those of `settings` now, or (read later, after
-        // another edit) newer ones, never older.
-        self.reconfigured.store(false, Ordering::SeqCst);
-        {
-            let _remote = self.remote.lock();
-            self.connecting_settings
-                .store(self.settings.load(Ordering::SeqCst), Ordering::SeqCst);
+    /// The destination now: its ssh target, socket, tailnet address and settings number, all
+    /// read under the one lock `update` changes them under.
+    fn destination(&self) -> Destination {
+        let remote = self.remote.lock();
+        Destination {
+            settings: self.settings.load(Ordering::SeqCst),
+            ssh: self.ssh.lock().clone(),
+            socket: remote.socket.clone(),
+            tailnet: remote.tailnet.clone(),
         }
-        let tailnet = self.remote.lock().tailnet.clone();
-        match tailnet {
-            Some(t) => self.connect_tailnet(&t).map(Link::Tailnet),
-            None => self.connect_ssh().map(Link::Ssh),
+    }
+
+    /// The settings number of the destination the current connection was made with.
+    fn connected_settings(&self) -> u64 {
+        self.connecting.lock().as_ref().map_or(0, |d| d.settings)
+    }
+
+    fn connect(&self) -> Result<Link, Failure> {
+        // This attempt uses one destination throughout, and its status says which.
+        self.reconfigured.store(false, Ordering::SeqCst);
+        let dest = self.destination();
+        *self.connecting.lock() = Some(dest.clone());
+        match &dest.tailnet {
+            Some(t) => self.connect_tailnet(t).map(Link::Tailnet),
+            None => self.connect_ssh(&dest).map(Link::Ssh),
         }
     }
 
@@ -765,7 +791,7 @@ impl Inner {
         self.set(|s| {
             s.tunnel_pid = None;
             s.phase = Phase::Connected;
-            s.settings = self.connecting_settings.load(Ordering::SeqCst);
+            s.settings = self.connected_settings();
             s.message = None;
             s.retry_at = None;
             s.remote_build = Some(build);
@@ -814,8 +840,13 @@ impl Inner {
 
     /// Starts the host's daemon over ssh, for a tailnet host whose listener answers for it.
     fn start_daemon_over_ssh(&self) -> Result<(), String> {
-        let ssh = self.ssh.lock().clone();
-        let configured = self.remote.lock().socket.clone();
+        // The host of the connection being made, not one the settings were changed to since.
+        let dest = self
+            .connecting
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.destination());
+        let (ssh, configured) = (dest.ssh, dest.socket);
         let host = probe(&ssh).map_err(|e| e.to_string())?;
         let socket = configured
             .or(host.info.map(|i| i.socket))
@@ -823,9 +854,9 @@ impl Inner {
         start_daemon(&ssh, &socket).map_err(|e| e.to_string())
     }
 
-    fn connect_ssh(&self) -> Result<Tunnel, Failure> {
-        let ssh = self.ssh.lock().clone();
-        let configured_socket = self.remote.lock().socket.clone();
+    fn connect_ssh(&self, dest: &Destination) -> Result<Tunnel, Failure> {
+        let ssh = dest.ssh.clone();
+        let configured_socket = dest.socket.clone();
         crate::ssh::prepare_dir().map_err(|e| Failure::Attention(e.to_string()))?;
         let effective = ssh.effective_config()?;
         crate::ssh::check_forwards(&effective).map_err(Failure::Attention)?;
@@ -906,7 +937,7 @@ impl Inner {
         self.set(|s| {
             s.tunnel_pid = Some(pid);
             s.phase = Phase::Connected;
-            s.settings = self.connecting_settings.load(Ordering::SeqCst);
+            s.settings = self.connected_settings();
             s.message = None;
             s.retry_at = None;
             s.remote_build = Some(build);
@@ -1120,6 +1151,52 @@ mod fakes;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_destination_never_pairs_new_settings_with_the_old_target() {
+        // Turned off: the supervisor makes no connection, and only the settings move.
+        let remote = |host: &str| RemoteConfig {
+            name: "flip".into(),
+            host: host.into(),
+            socket: None,
+            enabled: false,
+            clipboard_read: Default::default(),
+            tailnet: None,
+            forward_links: true,
+        };
+        let sup = Supervisor::start(remote("me@one"), Ssh::new("me@one").unwrap(), false, |_| {});
+        let inner = sup.inner.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (inner, stop) = (inner.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut seen = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let d = inner.destination();
+                    // Even settings numbers are "one", odd ones "two" (each update flips).
+                    let want = if d.settings % 2 == 0 {
+                        "me@one"
+                    } else {
+                        "me@two"
+                    };
+                    assert_eq!(
+                        d.ssh.target, want,
+                        "settings {} with {}",
+                        d.settings, d.ssh.target
+                    );
+                    seen += 1;
+                }
+                seen
+            })
+        };
+        for i in 0..20_000 {
+            let host = if i % 2 == 0 { "me@two" } else { "me@one" };
+            sup.update(remote(host)).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0);
+        assert_eq!(sup.settings(), 20_000);
+    }
 
     /// A scratch directory short enough for socket paths.
     fn scratch(name: &str) -> PathBuf {

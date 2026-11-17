@@ -639,9 +639,9 @@ impl Daemon {
             clients: Mutex::new(HashMap::new()),
             streams: Default::default(),
             ports: Default::default(),
-            transfers: crate::transfer::Transfers::new(
-                socket.parent().unwrap_or(Path::new("/tmp")).join("drops"),
-            ),
+            // On the state directory's disk: the socket's runtime directory is often a small
+            // memory-backed one.
+            transfers: crate::transfer::Transfers::new(state_dir.join("drops")),
             layout: Mutex::new(None),
             next_pane: AtomicU64::new(1),
             next_client: AtomicU64::new(1),
