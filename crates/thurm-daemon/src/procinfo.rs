@@ -590,14 +590,15 @@ impl ProcFs for RealProc {
     }
 }
 
-/// Whether a failed read means the process may not be read (another user's, a namespace the
-/// daemon can't see), so what it listens on is unknown. Any other failure means it, or the
-/// descriptor, has gone: a process that exited (a zombie not reaped yet has `/proc/<pid>`, but
-/// no network tables and no descriptors), or a descriptor closed between listing and reading.
-/// That is not an unreadable process, and its ports are none.
+/// Whether a failed read means the process, or the descriptor, has gone: `ENOENT` (a process
+/// that exited; a zombie not reaped yet still has `/proc/<pid>`, but no network tables and no
+/// descriptors; or a descriptor closed between listing and reading) or `ESRCH`. Its ports are
+/// then none. Any other failure (refused, out of descriptors, an I/O error) leaves what it
+/// listens on unknown: the process is unread, and its pane's list incomplete, so a failed look
+/// never reads as a port gone.
 #[cfg(any(target_os = "linux", test))]
-fn denied(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::PermissionDenied
+fn gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -612,12 +613,18 @@ fn listeners_in(pids: &[u32], fs: &impl ProcFs) -> Listening {
         let by_inode = match cached {
             Some(t) => t,
             None => {
-                let tables: Result<Vec<String>, std::io::Error> =
-                    ["tcp", "tcp6"].iter().map(|t| fs.table(pid, t)).collect();
-                let tables = match tables {
+                // `tcp` says whether the process is there. A missing `tcp6` beside it is a
+                // kernel without IPv6: no sockets there, not a process gone.
+                let tables = match fs
+                    .table(pid, "tcp")
+                    .and_then(|v4| match fs.table(pid, "tcp6") {
+                        Ok(v6) => Ok(vec![v4, v6]),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![v4]),
+                        Err(e) => Err(e),
+                    }) {
                     Ok(t) => t,
                     Err(e) => {
-                        if denied(&e) {
+                        if !gone(&e) {
                             out.unread.insert(pid);
                         }
                         continue;
@@ -644,7 +651,7 @@ fn listeners_in(pids: &[u32], fs: &impl ProcFs) -> Listening {
         let links = match fs.fd_links(pid) {
             Ok(l) => l,
             Err(e) => {
-                if denied(&e) {
+                if !gone(&e) {
                     out.unread.insert(pid);
                 }
                 continue;
@@ -664,10 +671,9 @@ fn listeners_in(pids: &[u32], fs: &impl ProcFs) -> Listening {
     out
 }
 
-/// The socket inodes among a process's fd links (`/proc/<pid>/fd/*`), and whether one may not be
-/// read: then what it listens on is only partly known. A link that failed otherwise has gone
-/// (its descriptor closed between listing and reading, or the process exited): not a partial
-/// read ([`denied`]).
+/// The socket inodes among a process's fd links (`/proc/<pid>/fd/*`), and whether one could not
+/// be read: then what it listens on is only partly known. A link that has gone (its descriptor
+/// closed between listing and reading, or the process exited) is not a partial read ([`gone`]).
 #[cfg(any(target_os = "linux", test))]
 fn socket_inodes(
     links: impl Iterator<Item = std::io::Result<std::path::PathBuf>>,
@@ -683,8 +689,8 @@ fn socket_inodes(
                     .and_then(|t| t.strip_suffix(']'))
                     .and_then(|t| t.parse::<u64>().ok()),
             ),
-            Err(e) if denied(&e) => partial = true,
-            Err(_) => {}
+            Err(e) if gone(&e) => {}
+            Err(_) => partial = true,
         }
     }
     (inodes, partial)
@@ -991,9 +997,22 @@ mod proc_tests {
         assert_eq!(inodes, [41234]);
         assert!(partial);
         // Gone with its process (ESRCH): not partial either.
-        let (_, partial) =
-            socket_inodes([Err(Error::from_raw_os_error(3)), link("socket:[1]")].into_iter());
+        let (_, partial) = socket_inodes(
+            [
+                Err(Error::from_raw_os_error(libc::ESRCH)),
+                link("socket:[1]"),
+            ]
+            .into_iter(),
+        );
         assert!(!partial);
+        // A passing failure (out of descriptors, an I/O error): unknown, so partial.
+        for errno in [libc::EMFILE, libc::EIO] {
+            let (inodes, partial) = socket_inodes(
+                [link("socket:[1]"), Err(Error::from_raw_os_error(errno))].into_iter(),
+            );
+            assert_eq!(inodes, [1]);
+            assert!(partial, "errno {errno}");
+        }
     }
 
     /// A pid's fd links (each a target or its read's error), or the error listing them gives.
@@ -1004,6 +1023,18 @@ mod proc_tests {
     struct FakeProc {
         tables: std::collections::HashMap<u32, Result<String, std::io::ErrorKind>>,
         fds: std::collections::HashMap<u32, FakeFds>,
+        /// An OS error (errno) reading the pid's tables, or listing its descriptors.
+        raw_tables: std::collections::HashMap<u32, i32>,
+        raw_fds: std::collections::HashMap<u32, i32>,
+        /// Pids whose kernel has no IPv6: no `tcp6` table.
+        no_tcp6: std::collections::HashSet<u32>,
+    }
+
+    /// `e` again, its OS error code kept.
+    fn again(e: &std::io::Error) -> std::io::Error {
+        e.raw_os_error()
+            .map(std::io::Error::from_raw_os_error)
+            .unwrap_or_else(|| e.kind().into())
     }
 
     impl ProcFs for FakeProc {
@@ -1013,6 +1044,12 @@ mod proc_tests {
         }
 
         fn table(&self, pid: u32, name: &str) -> std::io::Result<String> {
+            if let Some(&errno) = self.raw_tables.get(&pid) {
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+            if name == "tcp6" && self.no_tcp6.contains(&pid) {
+                return Err(std::io::ErrorKind::NotFound.into());
+            }
             match self.tables.get(&pid) {
                 Some(Ok(t)) if name == "tcp" => Ok(t.clone()),
                 Some(Ok(_)) => Ok(HEADER.into()),
@@ -1022,12 +1059,15 @@ mod proc_tests {
         }
 
         fn fd_links(&self, pid: u32) -> std::io::Result<Vec<std::io::Result<std::path::PathBuf>>> {
+            if let Some(&errno) = self.raw_fds.get(&pid) {
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
             match self.fds.get(&pid) {
                 Some(Ok(links)) => Ok(links
                     .iter()
                     .map(|l| match l {
                         Ok(t) => Ok(std::path::PathBuf::from(t)),
-                        Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+                        Err(e) => Err(again(e)),
                     })
                     .collect()),
                 Some(Err(k)) => Err((*k).into()),
@@ -1046,7 +1086,7 @@ mod proc_tests {
     }
 
     #[test]
-    fn only_a_refused_read_makes_a_process_unread() {
+    fn only_a_process_gone_is_not_unread() {
         use std::io::ErrorKind::{NotFound, PermissionDenied};
         let esrch = || std::io::Error::from_raw_os_error(3);
         let mut fs = FakeProc::default();
@@ -1084,11 +1124,28 @@ mod proc_tests {
         // 17: no listening socket in its namespace, descriptors refused: it listens on none.
         fs.tables.insert(17, Ok(HEADER.into()));
         fs.fds.insert(17, Err(PermissionDenied));
+        // 18, 19, 20: a passing failure (out of descriptors, an I/O error) at the table, the fd
+        // directory, a link: unknown, not gone.
+        let emfile = || std::io::Error::from_raw_os_error(libc::EMFILE);
+        let eio = || std::io::Error::from_raw_os_error(libc::EIO);
+        fs.raw_tables.insert(18, libc::EMFILE);
+        fs.tables.insert(19, Ok(listening(9200, 700)));
+        fs.raw_fds.insert(19, libc::EIO);
+        fs.tables.insert(20, Ok(listening(9300, 800)));
+        fs.fds
+            .insert(20, Ok(vec![Ok("socket:[800]"), Err(emfile()), Err(eio())]));
+        // 21: gone between its table and its descriptors (ESRCH).
+        fs.tables.insert(21, Ok(listening(9400, 900)));
+        fs.raw_fds.insert(21, libc::ESRCH);
+        // 22: a kernel without IPv6 (no tcp6 table): its IPv4 listener, complete.
+        fs.tables.insert(22, Ok(listening(9500, 1000)));
+        fs.no_tcp6.insert(22);
+        fs.fds.insert(22, Ok(vec![Ok("socket:[1000]")]));
 
-        let found = listeners_in(&[10, 11, 12, 13, 14, 15, 16, 17], &fs);
+        let found = listeners_in(&[10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22], &fs);
         let mut unread: Vec<u32> = found.unread.iter().copied().collect();
         unread.sort();
-        assert_eq!(unread, [14, 15, 16]);
+        assert_eq!(unread, [14, 15, 16, 18, 19, 20]);
         let port = |pid| {
             found
                 .by_pid
@@ -1109,6 +1166,11 @@ mod proc_tests {
         assert_eq!(port(11), None);
         assert_eq!(port(12), None);
         assert_eq!(port(17), None);
+        assert_eq!(
+            port(22),
+            Some(vec![9500]),
+            "IPv4 listeners on a kernel without IPv6"
+        );
     }
 
     #[cfg(target_os = "macos")]
