@@ -316,7 +316,9 @@ const CLIP_SHIMS_SH: &str = concat!(
     "if [ $n = 0 ]; then p=$d; else p=\"$p:$d\"; fi; n=1; done; ",
     "unset IFS; set +f; case $PATH in *:) p=\"$p:\";; esac; ",
     "if [ -z \"$DISPLAY$WAYLAND_DISPLAY\" ]; then ",
-    "if [ $n = 0 ]; then p=$THURM_CLIP_SHIMS; else p=\"$THURM_CLIP_SHIMS:$p\"; fi; fi; ",
+    "if [ $n = 0 ]; then p=$THURM_CLIP_SHIMS; else p=\"$THURM_CLIP_SHIMS:$p\"; fi; ",
+    // With a display and nothing but the shims on PATH, PATH stays: an empty one finds nothing.
+    "elif [ $n = 0 ]; then p=$PATH; fi; ",
     "PATH=$p; export PATH; exec \"$@\"",
 );
 
@@ -534,6 +536,38 @@ mod tests {
             Some("/s"),
             "DISPLAY emptied in the config"
         );
+    }
+
+    /// With a display and nothing but the shims on PATH, the step leaves PATH as it was: an
+    /// empty one would find no command at all.
+    #[test]
+    fn the_step_never_leaves_path_empty() {
+        let line = exec_line(
+            &["/bin/sh", "-c", "printf %s \"$PATH\""]
+                .map(shell_quote)
+                .join(" "),
+            true,
+        );
+        for (path, display, expected) in [
+            ("/s", ":0", "/s"),
+            ("/s:/s", "", "/s"),
+            ("/s:/a", ":0", "/a"),
+            ("/s", "", "/s"),
+        ] {
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", &line])
+                .env_clear()
+                .env("PATH", path)
+                .env("DISPLAY", display)
+                .env("THURM_CLIP_SHIMS", "/s")
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                expected,
+                "{path} {display:?}"
+            );
+        }
     }
 
     #[test]

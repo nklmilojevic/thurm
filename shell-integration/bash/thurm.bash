@@ -45,6 +45,9 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
       else
         _thurm_p=$THURM_CLIP_SHIMS
       fi
+    elif [[ -z "$_thurm_p" && ":$PATH:" != *"::"* ]]; then
+      # A display, and nothing but the shims on PATH: PATH stays, an empty one finds nothing.
+      _thurm_p=$PATH
     fi
     export PATH="$_thurm_p"
     builtin unset _thurm_p

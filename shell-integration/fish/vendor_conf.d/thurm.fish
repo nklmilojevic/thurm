@@ -31,9 +31,12 @@ if status is-interactive; and not set -q __thurm_fish_loaded
                 test "$p" = "$THURM_CLIP_SHIMS"; or set -a rest $p
             end
             if test -z "$DISPLAY$WAYLAND_DISPLAY"
-                set -p rest $THURM_CLIP_SHIMS
+                set -gx PATH $THURM_CLIP_SHIMS $rest
+            else if set -q rest[1]
+                # With a display and nothing but the shims on PATH, PATH stays: empty, it
+                # finds nothing.
+                set -gx PATH $rest
             end
-            set -gx PATH $rest
         end
     end
 

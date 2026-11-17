@@ -105,6 +105,10 @@ final class ClipboardToolsTests: XCTestCase {
         XCTAssertTrue(Remotes.clipboardWrite(pb, text: nil, allowed: true))
         XCTAssertEqual(Remotes.clipboardTypes(pb), [])
         XCTAssertEqual(Remotes.clipboardData(pb, mime: "text/plain"), Data(), "no text: empty")
+        // Copying empty text clears: no text type listed that a paste would then not have.
+        pb.setString("before", forType: .string)
+        XCTAssertTrue(Remotes.clipboardWrite(pb, text: "", allowed: true))
+        XCTAssertEqual(Remotes.clipboardTypes(pb), [])
         // The pasteboard refusing the text is no copy: the tool must hear so.
         XCTAssertFalse(Remotes.clipboardWrite(pb, text: "x", allowed: true, put: { _, _ in false }))
     }

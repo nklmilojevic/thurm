@@ -487,7 +487,8 @@ final class Remotes {
         // A pasteboard takes new contents only once cleared, so a copy it then refuses (which
         // `setString` hardly ever does) leaves it empty; the tool hears it was not done.
         pb.clearContents()
-        guard let text else { return true }
+        // Empty text is a clear: no text type left that a type listing would show.
+        guard let text, !text.isEmpty else { return true }
         return (put ?? { $0.setString($1, forType: .string) })(pb, text)
     }
 

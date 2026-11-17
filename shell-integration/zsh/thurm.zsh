@@ -63,8 +63,13 @@ _thurm_precmd_last() {
   if [[ -n "${THURM_CLIP_SHIMS-}" ]]; then
     # The directory as text: quoted for a pattern, read as one even under GLOB_SUBST.
     # Quoted, so empty entries (the current directory) stay where they were.
-    path=("${(@)path:#${~${(b)THURM_CLIP_SHIMS}}}")
-    [[ -z "${DISPLAY-}${WAYLAND_DISPLAY-}" ]] && path=("$THURM_CLIP_SHIMS" "${(@)path}")
+    local -a _thurm_rest=("${(@)path:#${~${(b)THURM_CLIP_SHIMS}}}")
+    if [[ -z "${DISPLAY-}${WAYLAND_DISPLAY-}" ]]; then
+      path=("$THURM_CLIP_SHIMS" "${(@)_thurm_rest}")
+    elif (( ${#_thurm_rest} )); then
+      # With a display and nothing but the shims on PATH, PATH stays: empty, it finds nothing.
+      path=("${(@)_thurm_rest}")
+    fi
     export PATH
   fi
   _thurm_precmd
