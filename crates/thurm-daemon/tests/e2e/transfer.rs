@@ -1355,16 +1355,34 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
     .unwrap_err();
     assert!(matches!(e, TransferError::Cancelled), "{e}");
     assert!(std::fs::read(&shared).unwrap().ends_with(b"theirs"));
-    // Refused before anything is asked of the host, the reservation still its own: given back
-    // too. (Permissions do not stop root.)
-    if unsafe { libc::geteuid() } != 0 {
-        let locked = downloads.join("locked.pdf");
-        let id = reserve(&locked);
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o400)).unwrap();
-        let e = get("report.pdf", &locked, id, &mut |_| {}).unwrap_err();
-        assert!(matches!(e, TransferError::Local(_)), "{e}");
-        assert!(!locked.exists());
-    }
+    // The reserved file overwritten in place while the download comes, at its very size: the
+    // download went to a file of its own, so what is in the name stays theirs, untouched.
+    let overwritten = downloads.join("overwritten.bin");
+    let id = reserve(&overwritten);
+    let theirs = vec![2u8; 4 << 20];
+    let mut wrote = false;
+    let e = get("big.bin", &overwritten, id, &mut |p| {
+        if p.done > 0 && !wrote {
+            wrote = true;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&overwritten)
+                .unwrap()
+                .write_all(&theirs)
+                .unwrap();
+        }
+    })
+    .unwrap_err();
+    assert!(matches!(e, TransferError::Local(_)), "{e}");
+    assert!(std::fs::read(&overwritten).unwrap() == theirs);
+    // No file a download wrote into is left beside the names.
+    let left: Vec<_> = std::fs::read_dir(&downloads)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|n| n.to_string_lossy().ends_with(".part"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
 }
 
 #[test]

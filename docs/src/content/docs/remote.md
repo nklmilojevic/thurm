@@ -361,7 +361,8 @@ arrived, the host's daemon types their paths into the pane, quoted and separated
 by spaces, as a paste, so an agent at its prompt gets them as one paste. If a
 file fails or you cancel before every file has arrived, nothing is typed and
 nothing is kept. Dropped and copied files are sent once you confirm them in the
-dialog that names them. Pasting pastes text whenever there is some, even when the app that
+dialog that names them; a pasted screenshot or a dragged image, which is no file
+of this Mac's, is sent without asking. Pasting pastes text whenever there is some, even when the app that
 copied it put a file beside it: Finder's copies carry their names as text, so
 pasting them pastes the names. Folders are
 refused; drop the files in them instead.
@@ -542,8 +543,9 @@ reach the Mac's disk, clipboard, or credentials without you doing something:
   Mac as they are.
 - **Files.** Only files you paste, drop, or send with **Send Copied Files** go to the
   host, and only the files you preview or download come back. A download into
-  `~/Downloads` is written into the name it reserved, never over a file that took
-  that name meanwhile.
+  `~/Downloads` is written into a file of its own and then put in the name it
+  reserved, only while that name still holds the empty file reserved: a file that
+  took the name, or was written into it, stays as it is.
 - **Over Tailscale.** The host admits this Mac by its Tailscale identity. On
   this Mac, the tunnel's socket and Thurm's dial socket (next to the daemon's)
   are yours alone, and the dial socket reaches tailnet devices only.

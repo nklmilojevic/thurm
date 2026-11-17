@@ -102,13 +102,12 @@ uint64_t thurm_download(thurm_client *client, thurm_pane_id pane, const char *pa
 void thurm_download_cancel(uint64_t transfer);
 
 /* Like thurm_download, into `reserved`: an empty file the caller made (O_EXCL) to hold the
- * name in a folder others may write to, with the `device` and `inode` it had when made (only
- * that file is written into or deleted, whatever takes its name). The file is written into that very file, never
- * renamed over its name: if the name holds anything else by then (the file replaced, removed,
- * or no longer empty), nothing is saved and what is there is left alone. A failed or cancelled
- * download deletes the reserved file if it is still the one and holds no more than the
- * download wrote into it (a file another writer filled is left alone). Cancel with
- * thurm_download_cancel. */
+ * name in a folder others may write to, with the `device` and `inode` it had when made. The
+ * file is written beside it, into a file of its own, then exchanged with the reserved file in
+ * one step, kept only if what came out of the name is the reserved file, still empty (else
+ * put back): a name taken or a reserved file written into meanwhile is left as it is, and
+ * nothing is saved. A failed or cancelled download deletes the reserved file if it is still
+ * the one and still empty. Cancel with thurm_download_cancel. */
 uint64_t thurm_download_reserved(thurm_client *client, thurm_pane_id pane, const char *path,
                                  const char *reserved, uint64_t device, uint64_t inode,
                                  thurm_transfer_cb cb, void *ctx);

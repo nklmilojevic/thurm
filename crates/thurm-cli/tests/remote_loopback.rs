@@ -536,7 +536,10 @@ fn remote_workspace_over_loopback_ssh() {
         );
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert!(screen.contains("one.bin"), "{screen}");
+    // In the batch's order.
+    let one = screen.find("one.bin").expect(&screen);
+    let two = screen.find("two.png").expect(&screen);
+    assert!(one < two, "{screen}");
     c.request(Request::Input {
         pane,
         data: b"\x15".to_vec(),

@@ -535,10 +535,10 @@ final class Core {
     }
 
     /// Fetches the file at `path` as `pane` sees it into `reserved`, an empty file made to hold
-    /// the name: written into that file, never renamed over the name, so a file that took the
-    /// name meanwhile is left alone (the download fails). A failed download deletes the reserved
-    /// file if it is still the one and holds no more than the download wrote into it.
-    /// Callbacks on the main thread; returns the id for
+    /// the name: written beside it, then put in its place in one step only while it is still
+    /// that empty file, so a file that took the name or was written into meanwhile is left
+    /// alone (the download fails). A failed download deletes the reserved file if it is still
+    /// the one and still empty. Callbacks on the main thread; returns the id for
     /// `cancelTransfer`.
     @discardableResult
     func downloadReserved(_ pane: PaneKey, path: String, into reserved: Reservation,

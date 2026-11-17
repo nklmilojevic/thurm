@@ -367,13 +367,33 @@ fn wait_cancellable(
     handle: UnixStream,
     cancel: &Cancel,
 ) -> Result<(), TransferError> {
+    wait_cancellable_with(reader, writer, handle, cancel, |wait| {
+        std::thread::Builder::new()
+            .name("upload-wait".into())
+            .spawn(wait)
+    })
+}
+
+/// [`wait_cancellable`], its waiting thread started by `spawn` (tests).
+fn wait_cancellable_with(
+    reader: StreamReader,
+    writer: StreamWriter,
+    handle: UnixStream,
+    cancel: &Cancel,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> Result<(), TransferError> {
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("upload-wait".into())
-        .spawn(move || {
-            let _ = tx.send(reader.wait_closed());
-        })
-        .map_err(|e| TransferError::Local(format!("cannot wait for the upload: {e}")))?;
+    let started = spawn(Box::new(move || {
+        let _ = tx.send(reader.wait_closed());
+    }));
+    // Without a way to hear its outcome the upload is reported failed: it must be, on the host
+    // too, or its paths would be typed all the same.
+    if let Err(e) = started {
+        abort(writer, &handle);
+        return Err(TransferError::Local(format!(
+            "cannot wait for the upload: {e}"
+        )));
+    }
     let mut writer = Some(writer);
     let mut aborted: Option<std::time::Instant> = None;
     loop {
@@ -526,12 +546,13 @@ pub enum Downloaded {
 }
 
 /// Fetches the file at `path`, as `pane` sees it, into `reserved`: an empty file the caller
-/// made to hold the name (in a folder others write to, like Downloads). The file goes into that
-/// very file, never by a rename over its name: if something else took the name since (the
-/// reserved file is gone, replaced, or no longer empty), the download is refused and what is
-/// there is left alone. A download that fails or is cancelled deletes the reserved file, if it
-/// is still the one and holds no more than this download wrote into it: one another writer
-/// filled is left alone.
+/// made to hold the name (in a folder others write to, like Downloads). The file is written
+/// beside it, into a new file of its own that nothing else writes, and then exchanged with the
+/// reserved file in one step; what came out of the name must be the reserved file, still empty,
+/// or it is put back at once. So if something else took the name since, or wrote into the
+/// reserved file, the download is refused, what is there is left alone, and nothing of anyone
+/// else's is mixed into a download reported saved. A download that fails or is cancelled
+/// deletes the reserved file, if it is still the one and still empty.
 pub fn download_reserved(
     host: Host,
     pane: PaneId,
@@ -543,21 +564,16 @@ pub fn download_reserved(
 ) -> Result<DownloadInfo, TransferError> {
     use std::os::unix::fs::MetadataExt;
     // The reservation is the file made for it (`identity`: its device and inode, taken when
-    // it was made), not whatever has its name now: only that file is written or deleted.
+    // it was made), not whatever has its name now, and only while nothing was written into it.
     let ours = identity;
-    // What this download wrote into it: the reservation is given back only while it holds
-    // that and nothing else (empty, before any byte came).
-    let written = std::cell::Cell::new(0u64);
+    let ours_and_empty = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == ours && m.len() == 0)
+    };
     let give_back = || {
-        if std::fs::symlink_metadata(reserved)
-            .is_ok_and(|m| (m.dev(), m.ino()) == ours && m.len() == written.get())
-        {
+        if ours_and_empty(reserved) {
             let _ = std::fs::remove_file(reserved);
         }
-    };
-    let mut progress = |p: Progress| {
-        written.set(p.done);
-        progress(p);
     };
     if !host.client.has_capability(CAP_TRANSFER) {
         give_back();
@@ -570,16 +586,7 @@ pub fn download_reserved(
         ))
     };
     let got = (|| {
-        // Never through a link put in its place, and only into the empty file reserved.
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(reserved)
-            .map_err(|_| changed())?;
-        let meta = file
-            .metadata()
-            .map_err(|e| TransferError::Local(format!("{}: {e}", reserved.display())))?;
-        if !meta.is_file() || meta.len() != 0 || (meta.dev(), meta.ino()) != ours {
+        if !ours_and_empty(reserved) {
             return Err(changed());
         }
         let info = host.client.download_begin(pane, path, None)?;
@@ -587,7 +594,8 @@ pub fn download_reserved(
             .ticket
             .as_deref()
             .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
-        fetch_into(
+        let (part, file) = create_part(reserved)?;
+        let fetched = fetch_into(
             host,
             ticket,
             file,
@@ -595,21 +603,63 @@ pub fn download_reserved(
             info.size,
             cancel,
             &mut progress,
-        )?;
-        // The name still holds what was written, and only that: one taken meanwhile (the file
-        // replaced or moved while it came) keeps what is there, and so does the file written
-        // into by another as well; this download is not reported saved in either.
-        if !std::fs::symlink_metadata(reserved)
-            .is_ok_and(|m| (m.dev(), m.ino()) == ours && m.len() == info.size)
-        {
-            return Err(changed());
+        );
+        // Into the name only in place of the empty file reserved: exchanged with it, and what
+        // came out checked. Anything else is put back where it was, never deleted.
+        let mut part_is_ours = true;
+        let installed = fetched.and_then(|()| {
+            exchange(&part, reserved).map_err(|_| changed())?;
+            if ours_and_empty(&part) {
+                return Ok(());
+            }
+            if exchange(&part, reserved).is_err() {
+                part_is_ours = false;
+                return Err(TransferError::Local(format!(
+                    "{} changed since it was reserved; what was there is at {}",
+                    reserved.display(),
+                    part.display()
+                )));
+            }
+            Err(changed())
+        });
+        if part_is_ours {
+            let _ = std::fs::remove_file(&part);
         }
-        Ok(info)
+        installed.map(|()| info)
     })();
     if got.is_err() {
         give_back();
     }
     got
+}
+
+/// Exchanges the files named `a` and `b` in one step: each name then holds the other's file.
+fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+    let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+    #[cfg(target_os = "linux")]
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    let r = {
+        let _ = (&a, &b);
+        return Err(std::io::ErrorKind::Unsupported.into());
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Fetches the file at `path`, as `pane` sees it, into `dest` (written beside it first, then
@@ -960,6 +1010,37 @@ mod tests {
         });
         let got = wait_cancellable(reader, writer, handle, &cancel);
         assert!(matches!(got, Err(TransferError::Cancelled)), "{got:?}");
+        assert_eq!(
+            daemon.join().unwrap(),
+            [
+                StreamFrame::Data(b"all of it".to_vec()),
+                StreamFrame::End,
+                StreamFrame::Close(StreamClose::Aborted)
+            ]
+        );
+    }
+
+    #[test]
+    fn no_thread_to_wait_for_the_outcome_aborts_the_batch() {
+        // What reaches the daemon; the app does not stay for an answer.
+        let (socket, daemon) = fake_daemon_then(|r, _| {
+            let mut seen = Vec::new();
+            while let Ok(Some(frame)) = thurm_proto::stream::read_frame(r) {
+                seen.push(frame);
+            }
+            seen
+        });
+        let handle = socket.try_clone().unwrap();
+        let (reader, mut writer) = stream::open_on(socket, "ticket").unwrap();
+        writer.write_all(b"all of it").unwrap();
+        writer.finish().unwrap();
+        let got = wait_cancellable_with(reader, writer, handle, &Cancel::default(), |_| {
+            Err(std::io::Error::other("no threads left"))
+        });
+        assert!(
+            matches!(&got, Err(TransferError::Local(why)) if why.contains("no threads left")),
+            "{got:?}"
+        );
         assert_eq!(
             daemon.join().unwrap(),
             [
