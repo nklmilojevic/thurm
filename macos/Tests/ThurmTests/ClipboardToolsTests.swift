@@ -92,12 +92,47 @@ final class ClipboardToolsTests: XCTestCase {
         }
     }
 
-    /// After a clear, listing the types finds none: not even empty text.
-    func testAClearLeavesNoType() {
-        pb.setString("secret", forType: .string)
-        Remotes.clearClipboard(pb)
+    /// A copy or a clear is done only when allowed, and says whether it was; a clear leaves no
+    /// type, not even empty text.
+    func testWritesAreDoneOnlyWhenAllowed() {
+        pb.setString("before", forType: .string)
+        XCTAssertFalse(Remotes.clipboardWrite(pb, text: "x", allowed: false))
+        XCTAssertFalse(Remotes.clipboardWrite(pb, text: nil, allowed: false))
+        XCTAssertEqual(pb.string(forType: .string), "before", "refused: unchanged")
+        XCTAssertTrue(Remotes.clipboardWrite(pb, text: "copied", allowed: true))
+        XCTAssertEqual(pb.string(forType: .string), "copied")
+        XCTAssertTrue(Remotes.clipboardWrite(pb, text: nil, allowed: true))
         XCTAssertEqual(Remotes.clipboardTypes(pb), [])
         XCTAssertNil(Remotes.clipboardData(pb, mime: "text/plain"))
+    }
+
+    /// This Mac's `terminal.osc52` decides whether a remote host's tool may write the clipboard:
+    /// `paste` and `disabled` refuse it, so the tool is told rather than seeing it succeed.
+    func testThisMacsOSC52DecidesToolWrites() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thurm-clip-write-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let saved = ProcessInfo.processInfo.environment["THURM_CONFIG_DIR"]
+        setenv("THURM_CONFIG_DIR", dir.path, 1)
+        defer {
+            if let saved { setenv("THURM_CONFIG_DIR", saved, 1) } else { unsetenv("THURM_CONFIG_DIR") }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        func allowed(osc52: String) throws -> Bool {
+            try "[terminal]\nosc52 = \"\(osc52)\"\n[[remote]]\nname = \"devbox\"\nhost = \"devbox\"\n"
+                .write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+            guard let raw = thurm_remote_call(#"{"op":"clipboard_write","host":"devbox"}"#) else { return false }
+            defer { thurm_string_free(raw) }
+            return JSON.decode(String(cString: raw)) as? String == "allow"
+        }
+        pb.setString("before", forType: .string)
+        for osc52 in ["paste", "disabled"] {
+            XCTAssertFalse(Remotes.clipboardWrite(pb, text: nil, allowed: try allowed(osc52: osc52)), osc52)
+            XCTAssertEqual(pb.string(forType: .string), "before", osc52)
+        }
+        for osc52 in ["copy", "copy-paste"] {
+            XCTAssertTrue(Remotes.clipboardWrite(pb, text: osc52, allowed: try allowed(osc52: osc52)), osc52)
+        }
     }
 
     func testAnEmptyClipboardHasNothing() {

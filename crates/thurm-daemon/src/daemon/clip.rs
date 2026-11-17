@@ -1,18 +1,20 @@
 //! Clipboard tools in a pane (`thurm clip`, and `pbcopy`, `xclip`... run as it) reach the
-//! clipboard of the app showing the pane: a copy goes out like an OSC 52 one, a paste asks the
-//! desktop UI that last focused the pane and waits for its answer.
+//! clipboard of the app showing the pane: the daemon asks the desktop UI that last focused the
+//! pane to paste ([`Event::ClipboardQuery`]) or to copy or clear ([`Event::ClipboardWrite`]),
+//! and waits for its answer, so a tool hears whether it was done.
 
 use super::*;
 
-/// How long a paste waits for the app: long enough for the user to answer its question.
+/// How long a tool waits for the app: long enough for the user to answer its question.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// At most this many pastes wait at once.
+/// At most this many tools wait at once.
 const MAX_PENDING: usize = 64;
 
-/// At most this many bytes of clipboard contents are held at once, on their way between the
-/// app and the tools (answers) or from a tool to the apps (copies): four of the largest. Without
-/// it, 64 pastes answered with 32 MiB images each held 2 GiB.
+/// At most this many bytes of clipboard contents are held at once: answers and copies on their
+/// way, and what is still queued for a client that has not read it yet (see
+/// [`clip_weight`]): four of the largest. Without it, 64 pastes answered with 32 MiB images held
+/// 2 GiB, and a client that does not read could have more queued for it without end.
 const MAX_HELD: usize = 4 * thurm_proto::CLIP_MAX;
 
 /// [`MAX_HELD`], or `THURM_CLIP_HELD_BYTES` (tests).
@@ -23,9 +25,25 @@ pub(super) fn max_held() -> usize {
         .unwrap_or(MAX_HELD)
 }
 
-/// A bounded amount in use: the pastes waiting now (each on a thread of its own: a slot is
-/// taken before the thread is made, so a client sending pastes without waiting for answers
-/// cannot make more threads), or the clipboard bytes held.
+/// The clipboard contents `msg` carries, for [`Client::clip_queued`]: counted while it is
+/// queued for the client, until its writer has written or dropped it.
+pub fn clip_weight(msg: &ServerMessage) -> usize {
+    match msg {
+        ServerMessage::Event(Event::ClipboardStore { text, .. }) => text.len(),
+        ServerMessage::Event(Event::ClipboardWrite { text, .. }) => {
+            text.as_ref().map_or(0, String::len)
+        }
+        ServerMessage::Response {
+            result: Ok(Response::ClipboardData { data }),
+            ..
+        } => data.len(),
+        _ => 0,
+    }
+}
+
+/// A bounded amount in use: the tools waiting now (each on a thread of its own: a slot is taken
+/// before the thread is made, so a client sending requests without waiting for answers cannot
+/// make more threads), or the clipboard bytes held on their way.
 #[derive(Default)]
 pub(super) struct Slots(std::sync::atomic::AtomicUsize);
 
@@ -35,12 +53,32 @@ pub(super) struct Slot(Arc<Slots>, usize);
 impl Slots {
     /// Takes `n` of at most `max`, or nothing when that much is not free.
     fn take(self: &Arc<Self>, n: usize, max: usize) -> Option<Slot> {
-        self.0
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                used.checked_add(n).filter(|u| *u <= max)
-            })
-            .ok()
-            .map(|_| Slot(self.clone(), n))
+        self.take_beside(n, max, || 0)
+    }
+
+    /// Takes `n` of at most `max` less what `beside` holds besides. What is taken is read
+    /// before `beside`, so a hold moving from here to there (taken, queued, given back) is
+    /// counted twice at worst, never missed.
+    fn take_beside(
+        self: &Arc<Self>,
+        n: usize,
+        max: usize,
+        beside: impl Fn() -> usize,
+    ) -> Option<Slot> {
+        loop {
+            let used = self.0.load(Ordering::SeqCst);
+            let total = used.checked_add(beside())?.checked_add(n)?;
+            if total > max {
+                return None;
+            }
+            if self
+                .0
+                .compare_exchange(used, used + n, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(Slot(self.clone(), n));
+            }
+        }
     }
 }
 
@@ -50,12 +88,23 @@ impl Drop for Slot {
     }
 }
 
-/// An answer's contents, with the share of [`MAX_HELD`] they take until sent on.
+/// What a tool asks of the app.
+pub(super) enum Ask {
+    /// The clipboard in this type ([`Request::ClipboardGet`]).
+    Paste(String),
+    /// Copy this text, or clear the clipboard ([`Request::ClipboardSet`],
+    /// [`Request::ClipboardClear`]).
+    Write(Option<String>),
+}
+
+/// An answer's contents, with the share of [`MAX_HELD`] they take until queued.
 type Held = (Vec<u8>, Slot);
 
 pub(super) struct PendingClip {
     ui: u64,
     reply: Sender<Result<Held, String>>,
+    /// What the tool hears when the app answers `None`.
+    refused: &'static str,
 }
 
 /// [`ANSWER_TIMEOUT`], or `THURM_CLIP_TIMEOUT_MS` (tests).
@@ -68,49 +117,67 @@ fn answer_timeout() -> Duration {
 }
 
 impl Daemon {
-    /// As for an OSC 52 copy: this host's config can turn copies (and clears) off.
-    fn clipboard_writes(&self) -> Result<(), String> {
-        if matches!(
-            self.config.read().terminal.osc52,
-            thurm_config::Osc52Mode::Copy | thurm_config::Osc52Mode::CopyPaste
-        ) {
-            Ok(())
-        } else {
-            Err("copies to the clipboard are off on this host (terminal.osc52)".into())
-        }
-    }
-
-    pub(super) fn clipboard_set(&self, pane: PaneId, text: String) -> Result<Response, String> {
-        self.clipboard_writes()?;
-        if text.len() > thurm_proto::CLIP_MAX {
-            return Err("the text is larger than 32 MiB".into());
+    /// Checks a tool's request and takes a slot for it, on the reader's thread: what is refused
+    /// here gets its answer without a thread being made.
+    pub(super) fn clipboard_admit(&self, pane: PaneId, ask: &Ask) -> Result<Slot, String> {
+        let osc52 = self.config.read().terminal.osc52;
+        use thurm_config::Osc52Mode::{Copy, CopyPaste, Paste};
+        match ask {
+            // As for an OSC 52 read: this host's config can turn them off, the type list too.
+            Ask::Paste(mime) => {
+                if !matches!(osc52, Paste | CopyPaste) {
+                    return Err(
+                        "pastes from the clipboard are off on this host (terminal.osc52)".into(),
+                    );
+                }
+                if ![
+                    thurm_proto::CLIP_TEXT,
+                    thurm_proto::CLIP_PNG,
+                    thurm_proto::CLIP_TARGETS,
+                ]
+                .contains(&mime.as_str())
+                {
+                    return Err(format!("unsupported clipboard type {mime}"));
+                }
+            }
+            // As for an OSC 52 copy, and a clear with it.
+            Ask::Write(text) => {
+                if !matches!(osc52, Copy | CopyPaste) {
+                    return Err(
+                        "copies to the clipboard are off on this host (terminal.osc52)".into(),
+                    );
+                }
+                if text
+                    .as_ref()
+                    .is_some_and(|t| t.len() > thurm_proto::CLIP_MAX)
+                {
+                    return Err("the text is larger than 32 MiB".into());
+                }
+            }
         }
         self.pane(pane).ok_or("no such pane")?;
-        // Held while it is copied out to every app.
-        let _held = self.clip_held_bytes(text.len())?;
-        self.broadcast(Event::ClipboardStore { pane, text }, true);
-        Ok(Response::Ok)
+        self.clip_slots
+            .take(1, MAX_PENDING)
+            .ok_or_else(|| "too many clipboard requests are waiting".into())
     }
 
-    /// Empties the clipboard: [`Event::ClipboardClear`] to the UIs that take it, which an
-    /// older app does not (it gets nothing, as a copy it could not store).
-    pub(super) fn clipboard_clear(&self, pane: PaneId) -> Result<Response, String> {
-        self.clipboard_writes()?;
-        self.pane(pane).ok_or("no such pane")?;
-        let uis: Vec<_> = self
-            .clients
+    /// Clipboard bytes queued for clients and not written yet.
+    fn clip_queued(&self) -> usize {
+        self.clients
             .lock()
             .values()
-            .filter(|c| c.ui.load(Ordering::Relaxed) && c.clip_query.load(Ordering::Relaxed))
-            .cloned()
-            .collect();
-        if uis.is_empty() {
-            return Err("no Thurm app that can clear its clipboard is connected".into());
-        }
-        for ui in uis {
-            ui.send(ServerMessage::Event(Event::ClipboardClear { pane }));
-        }
-        Ok(Response::Ok)
+            .map(|c| c.clip_queued.load(Ordering::SeqCst))
+            .sum()
+    }
+
+    /// Takes `n` bytes of [`max_held`] for clipboard contents on their way, beside what is
+    /// queued for clients already.
+    fn clip_held_bytes(&self, n: usize) -> Result<Slot, String> {
+        self.clip_bytes
+            .take_beside(n, max_held(), || self.clip_queued())
+            .ok_or_else(|| {
+                "too much clipboard data is on its way already; try again in a moment".into()
+            })
     }
 
     /// The desktop UI to ask about `pane` (see [`pick_ui`]).
@@ -130,105 +197,108 @@ impl Daemon {
         pick_ui(last, &candidates).and_then(|id| clients.get(&id).cloned())
     }
 
-    /// Checks a paste and takes a slot for it, on the reader's thread: what is refused here
-    /// gets its answer without a thread being made.
-    pub(super) fn clipboard_admit(&self, pane: PaneId, mime: &str) -> Result<Slot, String> {
-        // As for an OSC 52 read: this host's config can turn them off, the type list too.
-        if !matches!(
-            self.config.read().terminal.osc52,
-            thurm_config::Osc52Mode::Paste | thurm_config::Osc52Mode::CopyPaste
-        ) {
-            return Err("pastes from the clipboard are off on this host (terminal.osc52)".into());
-        }
-        if ![
-            thurm_proto::CLIP_TEXT,
-            thurm_proto::CLIP_PNG,
-            thurm_proto::CLIP_TARGETS,
-        ]
-        .contains(&mime)
-        {
-            return Err(format!("unsupported clipboard type {mime}"));
-        }
-        self.pane(pane).ok_or("no such pane")?;
-        self.clip_slots
-            .take(1, MAX_PENDING)
-            .ok_or_else(|| "too many clipboard requests are waiting".into())
-    }
-
-    /// Takes `n` bytes of [`max_held`] for clipboard contents on their way.
-    fn clip_held_bytes(&self, n: usize) -> Result<Slot, String> {
-        self.clip_bytes.take(n, max_held()).ok_or_else(|| {
-            "too much clipboard data is on its way already; try again in a moment".into()
-        })
-    }
-
-    /// A paste [`Daemon::clipboard_admit`] let through: asks the app and waits for it. The
-    /// [`Slot`] with an answer holds its bytes' share until the response is sent.
-    pub(super) fn clipboard_get(
+    /// A request [`Daemon::clipboard_admit`] let through: asks the app and waits for it. The
+    /// [`Slot`] with a paste's answer holds its bytes until the response is queued, where
+    /// [`Client::clip_queued`] counts them on.
+    pub(super) fn clipboard_ask(
         &self,
         caller: u64,
         pane: PaneId,
-        mime: String,
+        ask: Ask,
     ) -> (Result<Response, String>, Option<Slot>) {
-        match self.clipboard_get_held(caller, pane, mime) {
+        let write = matches!(ask, Ask::Write(_));
+        match self.clipboard_ask_held(caller, pane, ask) {
+            Ok(_) if write => (Ok(Response::Ok), None),
             Ok((data, held)) => (Ok(Response::ClipboardData { data }), Some(held)),
             Err(e) => (Err(e), None),
         }
     }
 
-    fn clipboard_get_held(&self, caller: u64, pane: PaneId, mime: String) -> Result<Held, String> {
-        if ![
-            thurm_proto::CLIP_TEXT,
-            thurm_proto::CLIP_PNG,
-            thurm_proto::CLIP_TARGETS,
-        ]
-        .contains(&mime.as_str())
-        {
-            return Err(format!("unsupported clipboard type {mime}"));
-        }
+    fn clipboard_ask_held(&self, caller: u64, pane: PaneId, ask: Ask) -> Result<Held, String> {
         self.pane(pane).ok_or("no such pane")?;
         let ui = self
             .clipboard_ui(pane)
             .ok_or("no Thurm app that can share its clipboard is connected")?;
         let id = self.next_clip.fetch_add(1, Ordering::Relaxed);
+        let refused = match ask {
+            Ask::Paste(_) => "the clipboard has nothing of that type, or was not shared",
+            Ask::Write(_) => {
+                "the Thurm app did not take it: this Mac's terminal.osc52 does not allow copies \
+                 from this host"
+            }
+        };
         let (reply, answer) = crossbeam_channel::bounded(1);
         {
             let mut pending = self.pending_clips.lock();
             if pending.len() >= MAX_PENDING {
                 return Err("too many clipboard requests are waiting".into());
             }
-            pending.insert(id, PendingClip { ui: ui.id, reply });
+            pending.insert(
+                id,
+                PendingClip {
+                    ui: ui.id,
+                    reply,
+                    refused,
+                },
+            );
         }
-        ui.send(ServerMessage::Event(Event::ClipboardQuery {
-            pane,
-            id,
-            mime,
-        }));
-        let deadline = Instant::now() + answer_timeout();
-        let result = loop {
-            let now = Instant::now();
-            if now >= deadline {
-                break Err("the Thurm app did not answer in time".to_string());
+        let sent = match ask {
+            Ask::Paste(mime) => {
+                ui.send(ServerMessage::Event(Event::ClipboardQuery {
+                    pane,
+                    id,
+                    mime,
+                }));
+                Ok(())
             }
-            {
-                let clients = self.clients.lock();
-                if !clients.contains_key(&ui.id) {
-                    break Err("the Thurm app disconnected".into());
-                }
-                if !clients.contains_key(&caller) {
-                    break Err("the caller disconnected".into());
-                }
-            }
-            match answer.recv_timeout((deadline - now).min(Duration::from_millis(50))) {
-                Ok(answer) => break answer,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    break Err("the clipboard request was dropped".into());
-                }
-            }
+            // Held until queued for the app, where its queue counts it.
+            Ask::Write(text) => self
+                .clip_held_bytes(text.as_ref().map_or(0, String::len))
+                .map(|_held| {
+                    ui.send(ServerMessage::Event(Event::ClipboardWrite {
+                        pane,
+                        id,
+                        text,
+                    }))
+                }),
+        };
+        let result = match sent {
+            Err(e) => Err(e),
+            Ok(()) => self.wait_answer(caller, ui.id, answer),
         };
         self.pending_clips.lock().remove(&id);
         result
+    }
+
+    fn wait_answer(
+        &self,
+        caller: u64,
+        ui: u64,
+        answer: crossbeam_channel::Receiver<Result<Held, String>>,
+    ) -> Result<Held, String> {
+        let deadline = Instant::now() + answer_timeout();
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err("the Thurm app did not answer in time".to_string());
+            }
+            {
+                let clients = self.clients.lock();
+                if !clients.contains_key(&ui) {
+                    return Err("the Thurm app disconnected".into());
+                }
+                if !clients.contains_key(&caller) {
+                    return Err("the caller disconnected".into());
+                }
+            }
+            match answer.recv_timeout((deadline - now).min(Duration::from_millis(50))) {
+                Ok(answer) => return answer,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err("the clipboard request was dropped".into());
+                }
+            }
+        }
     }
 
     pub(super) fn clipboard_answer(
@@ -237,14 +307,16 @@ impl Daemon {
         id: u64,
         data: Option<Vec<u8>>,
     ) -> Result<Response, String> {
-        let mut pending = self.pending_clips.lock();
-        let request = pending
-            .get(&id)
-            .ok_or("the clipboard request is no longer waiting")?;
-        if request.ui != client {
-            return Err("only the app that was asked can answer".into());
-        }
-        let request = pending.remove(&id).unwrap();
+        let request = {
+            let mut pending = self.pending_clips.lock();
+            let request = pending
+                .get(&id)
+                .ok_or("the clipboard request is no longer waiting")?;
+            if request.ui != client {
+                return Err("only the app that was asked can answer".into());
+            }
+            pending.remove(&id).unwrap()
+        };
         let (answer, result) = match data {
             Some(d) if d.len() > thurm_proto::CLIP_MAX => {
                 let e = "the clipboard is larger than 32 MiB".to_string();
@@ -254,10 +326,7 @@ impl Daemon {
                 Ok(held) => (Ok((d, held)), Ok(Response::Ok)),
                 Err(e) => (Err(e.clone()), Err(e)),
             },
-            None => (
-                Err("the clipboard has nothing of that type, or was not shared".into()),
-                Ok(Response::Ok),
-            ),
+            None => (Err(request.refused.to_string()), Ok(Response::Ok)),
         };
         let _ = request.reply.try_send(answer);
         result

@@ -2136,8 +2136,13 @@ mod tests {
             "as the header documents it"
         );
         assert_eq!(
-            serde_json::to_string(&Event::ClipboardClear { pane: 1 }).unwrap(),
-            r#"{"ClipboardClear":{"pane":1}}"#
+            serde_json::to_string(&Event::ClipboardWrite {
+                pane: 1,
+                id: 7,
+                text: None
+            })
+            .unwrap(),
+            r#"{"ClipboardWrite":{"pane":1,"id":7,"text":null}}"#
         );
     }
 }

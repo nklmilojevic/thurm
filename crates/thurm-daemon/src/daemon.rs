@@ -3,7 +3,7 @@
 #[path = "active_size.rs"]
 mod active_size;
 mod agent_prompt;
-mod clip;
+pub mod clip;
 pub mod ext;
 mod focus;
 mod layouts;
@@ -388,6 +388,9 @@ pub struct Client {
     pub clip_query: AtomicBool,
     /// That client is this daemon's own app (see `ext::peer_is_our_app`): asked before others.
     pub clip_verified: AtomicBool,
+    /// Clipboard bytes queued in `tx` (see [`clip::clip_weight`]); the writer subtracts what it
+    /// wrote. Counted against the clipboard data the daemon holds at once.
+    pub clip_queued: std::sync::atomic::AtomicUsize,
 }
 
 impl Client {
@@ -420,9 +423,12 @@ impl Client {
         };
         self.queued
             .fetch_add(message_weight(&msg), Ordering::Relaxed);
+        let clip = clip::clip_weight(&msg);
+        self.clip_queued.fetch_add(clip, Ordering::SeqCst);
         self.unflushed.fetch_add(1, Ordering::AcqRel);
         if self.tx.send(msg).is_err() {
             self.queued.store(0, Ordering::Relaxed);
+            self.clip_queued.fetch_sub(clip, Ordering::SeqCst);
             self.unflushed.store(0, Ordering::Release);
         }
     }
@@ -445,6 +451,7 @@ pub fn message_weight(msg: &ServerMessage) -> usize {
     match msg {
         ServerMessage::Event(Event::Output { data, .. }) => data.len(),
         ServerMessage::Event(Event::Attach { state, .. }) => state.len(),
+        msg if clip::clip_weight(msg) > 0 => clip::clip_weight(msg),
         _ => 256,
     }
 }
@@ -862,6 +869,7 @@ impl Daemon {
             last_written: Arc::new(Mutex::new(Instant::now())),
             clip_query: AtomicBool::new(false),
             clip_verified: AtomicBool::new(false),
+            clip_queued: std::sync::atomic::AtomicUsize::new(0),
         });
         self.clients.lock().insert(id, client.clone());
         *self.last_activity.lock() = Instant::now();
@@ -2469,24 +2477,34 @@ impl Daemon {
                 });
                 return;
             }
-            // The app may ask the user first.
-            // Admitted (a slot taken) before its thread is made.
-            Request::ClipboardGet { pane, mime } => match self.clipboard_admit(pane, &mime) {
-                Err(e) => Err(e),
-                Ok(slot) => {
-                    let daemon = self.clone();
-                    let client = client.clone();
-                    std::thread::spawn(move || {
-                        let (result, held) = daemon.clipboard_get(client.id, pane, mime);
-                        drop(slot);
-                        if id != 0 {
-                            client.send(ServerMessage::Response { id, result });
-                        }
-                        drop(held);
-                    });
-                    return;
+            // The app may ask the user first. Admitted (a slot taken) before the thread.
+            req @ (Request::ClipboardGet { .. }
+            | Request::ClipboardSet { .. }
+            | Request::ClipboardClear { .. }) => {
+                let (pane, ask) = match req {
+                    Request::ClipboardGet { pane, mime } => (pane, clip::Ask::Paste(mime)),
+                    Request::ClipboardSet { pane, text } => (pane, clip::Ask::Write(Some(text))),
+                    Request::ClipboardClear { pane } => (pane, clip::Ask::Write(None)),
+                    _ => unreachable!(),
+                };
+                match self.clipboard_admit(pane, &ask) {
+                    Err(e) => Err(e),
+                    Ok(slot) => {
+                        let daemon = self.clone();
+                        let client = client.clone();
+                        std::thread::spawn(move || {
+                            let (result, held) = daemon.clipboard_ask(client.id, pane, ask);
+                            drop(slot);
+                            if id != 0 {
+                                client.send(ServerMessage::Response { id, result });
+                            }
+                            // Counted in the client's queue from here.
+                            drop(held);
+                        });
+                        return;
+                    }
                 }
-            },
+            }
             // The Tailscale helper can take a while (starting the node, signing out).
             req @ (Request::TailscaleEnable { .. }
             | Request::TailscaleDisable
@@ -3144,11 +3162,11 @@ impl Daemon {
             Request::Wait { .. }
             | Request::Explain { .. }
             | Request::AgentPrompt { .. }
-            | Request::ClipboardGet { .. } => {
+            | Request::ClipboardGet { .. }
+            | Request::ClipboardSet { .. }
+            | Request::ClipboardClear { .. } => {
                 unreachable!("handled in handle()")
             }
-            Request::ClipboardSet { pane, text } => self.clipboard_set(pane, text),
-            Request::ClipboardClear { pane } => self.clipboard_clear(pane),
             Request::ClipboardAnswer { id, data } => self.clipboard_answer(client.id, id, data),
             Request::SetLayout { json } => {
                 serde_json::from_str::<Layout>(&json)
@@ -4729,6 +4747,7 @@ mod tests {
             last_written: Arc::new(Mutex::new(Instant::now())),
             clip_query: AtomicBool::new(false),
             clip_verified: AtomicBool::new(false),
+            clip_queued: std::sync::atomic::AtomicUsize::new(0),
         };
         // A few big outputs are a backlog, not only thousands of messages.
         for _ in 0..70 {

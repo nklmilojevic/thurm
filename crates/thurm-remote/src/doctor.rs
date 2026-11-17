@@ -605,6 +605,16 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
         // An older `thurm` does not act as the tools it would be linked as.
         c.state = State::Skip;
         c.detail = "needs this build of Thurm".into();
+    } else if let Some(build) = plan
+        .daemon
+        .as_ref()
+        .filter(|d| d.running)
+        .map(|d| d.build.as_deref().unwrap_or("another build"))
+        .filter(|b| !install::same_build(thurm_proto::BUILD, b))
+    {
+        // An older daemon starts panes without the tools on PATH, installed or not.
+        c.state = State::Skip;
+        c.detail = format!("the daemon there runs {build}: upgrade it first (Daemon above)");
     } else if !probe.shims_other.is_empty() {
         // Not Thurm's to replace: the fix would refuse too.
         c.state = State::Warn;
@@ -930,6 +940,25 @@ mod tests {
         assert_eq!(state(&c, "clipboard"), State::Warn);
         let c = checks("pi", &plan(true), &parse("shims=6\n"));
         assert_eq!(state(&c, "clipboard"), State::Ok);
+        // This thurm installed, but an older daemon still runs: its panes would not have them.
+        let mut old = plan(true);
+        old.daemon.as_mut().unwrap().build = Some("0.0.1+1.abcdef0".into());
+        for shims in ["shims=0\n", "shims=6\n"] {
+            let c = checks("pi", &old, &parse(shims));
+            let clip = c.iter().find(|c| c.id == "clipboard").unwrap();
+            assert_eq!(clip.state, State::Skip, "{shims}");
+            assert!(
+                clip.fix.is_none(),
+                "not offered until the daemon is upgraded"
+            );
+            assert!(clip.detail.contains("upgrade it first"), "{}", clip.detail);
+        }
+        // A daemon that is not running starts as this build.
+        old.daemon.as_mut().unwrap().running = false;
+        assert_eq!(
+            state(&checks("pi", &old, &parse("shims=0\n")), "clipboard"),
+            State::Warn
+        );
         assert_eq!(
             state(&checks("pi", &plan(false), &parse("")), "clipboard"),
             State::Skip

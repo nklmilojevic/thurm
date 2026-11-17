@@ -176,79 +176,6 @@ fn clipboards_over_32_mib_are_refused() {
     assert!(e.contains("32 MiB"), "{e}");
 }
 
-#[test]
-fn a_copy_goes_to_the_apps_like_osc_52() {
-    let env = clip_env("clip-copy", "copy-paste");
-    let _daemon = env.start();
-    let (app, rx) = env.connect();
-    let pane = create(&app, &env.dir);
-    tool(&env)
-        .request(Request::ClipboardSet {
-            pane,
-            text: "copied".into(),
-        })
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Event::ClipboardStore { pane: p, text }) => {
-                assert_eq!((p, text.as_str()), (pane, "copied"));
-                break;
-            }
-            Ok(_) => {}
-            Err(_) => panic!("no ClipboardStore"),
-        }
-    }
-    assert!(
-        tool(&env)
-            .request(Request::ClipboardSet {
-                pane: u64::MAX,
-                text: "x".into()
-            })
-            .is_err()
-    );
-}
-
-#[test]
-fn this_hosts_osc52_setting_applies_to_clipboard_tools() {
-    for (osc52, copy, paste) in [
-        ("disabled", false, false),
-        ("copy", true, false),
-        ("paste", false, true),
-        ("copy-paste", true, true),
-    ] {
-        let env = clip_env(&format!("clip-osc52-{osc52}"), osc52);
-        let _daemon = env.start();
-        let (app, rx) = env.connect();
-        let pane = create(&app, &env.dir);
-        focus(&app, pane);
-        let tool = tool(&env);
-        let copied = tool.request(Request::ClipboardSet {
-            pane,
-            text: "x".into(),
-        });
-        assert_eq!(copied.is_ok(), copy, "{osc52}: {copied:?}");
-        let cleared = tool.request(Request::ClipboardClear { pane });
-        assert_eq!(
-            cleared.is_ok(),
-            copy,
-            "a clear is a copy: {osc52}: {cleared:?}"
-        );
-        for mime in [CLIP_TEXT, CLIP_TARGETS] {
-            let paste_thread = get(&tool, pane, mime);
-            if paste {
-                let (_, id, _) = query(&rx).expect("asked");
-                answer(&app, id, Some(b"y".to_vec())).unwrap();
-                assert!(paste_thread.join().unwrap().is_ok(), "{osc52} {mime}");
-            } else {
-                let e = paste_thread.join().unwrap().unwrap_err();
-                assert!(e.contains("terminal.osc52"), "{osc52} {mime}: {e}");
-                no_query(&rx);
-            }
-        }
-    }
-}
-
 /// A client sending pastes without waiting for answers gets the ones over the limit refused at
 /// once, and the app is asked only for those let through.
 #[test]
@@ -309,69 +236,134 @@ fn a_flood_of_pastes_is_bounded() {
     no_query(&rx);
 }
 
-/// A clear goes to the apps as a clear, not as empty text, and never to an older app.
-#[test]
-fn a_clear_empties_the_clipboard() {
-    let env = clip_env("clip-clear", "copy-paste");
-    let _daemon = env.start();
-    let (app, rx) = env.connect();
-    let pane = create(&app, &env.dir);
-    tool(&env)
-        .request(Request::ClipboardClear { pane })
-        .unwrap();
+/// Runs `req` from `c` on a thread of its own: a tool waiting for the app's answer.
+fn ask(c: &Arc<Client>, req: Request) -> std::thread::JoinHandle<Result<Response, String>> {
+    let c = c.clone();
+    std::thread::spawn(move || c.request(req).map_err(|e| e.to_string()))
+}
+
+/// The next copy or clear the app is asked to do, skipping other events.
+fn write_of(rx: &Receiver<Event>) -> Option<(PaneId, u64, Option<String>)> {
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Event::ClipboardClear { pane: p }) => {
-                assert_eq!(p, pane);
-                break;
-            }
-            Ok(Event::ClipboardStore { text, .. }) => panic!("stored {text:?} instead"),
-            Ok(_) => {}
-            Err(_) => panic!("no ClipboardClear"),
+    while let Ok(ev) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        match ev {
+            Event::ClipboardWrite { pane, id, text } => return Some((pane, id, text)),
+            Event::ClipboardStore { text, .. } => panic!("stored {text:?} with no answer"),
+            _ => {}
         }
     }
-    assert!(
-        tool(&env)
-            .request(Request::ClipboardClear { pane: u64::MAX })
-            .is_err()
-    );
-    drop(app);
-    // Only an app from before clipboard tools is left: it is sent nothing, and the tool hears.
-    let mut old = UnixStream::connect(&env.socket).unwrap();
-    let hello = Request::Hello {
-        client: "e2e-old-app".into(),
-        version: PROTOCOL_VERSION,
-        ui: true,
-        capabilities: vec![CAP_ACTIVE_SIZE.into()],
-    };
-    old.write_all(
-        &codec::encode(&Envelope {
-            id: 1,
-            request: hello,
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    let e = tool(&env)
-        .request(Request::ClipboardClear { pane })
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("no Thurm app"), "{e}");
-    old.set_read_timeout(Some(Duration::from_millis(300)))
-        .unwrap();
-    while let Ok(Some(frame)) = codec::read_frame(&mut old) {
-        let msg: ServerMessage = codec::decode(&frame).unwrap();
+    None
+}
+
+fn nothing_asked(rx: &Receiver<Event>) {
+    while let Ok(ev) = rx.recv_timeout(Duration::from_millis(300)) {
         assert!(
-            !matches!(msg, ServerMessage::Event(Event::ClipboardClear { .. })),
-            "{msg:?}"
+            !matches!(
+                ev,
+                Event::ClipboardQuery { .. }
+                    | Event::ClipboardWrite { .. }
+                    | Event::ClipboardStore { .. }
+            ),
+            "{ev:?}"
         );
     }
 }
 
+/// A copy and a clear go to the app that focused the pane last, and the tool hears whether that
+/// app took them: this Mac's own policy may refuse what the host allows.
+#[test]
+fn copies_and_clears_are_answered_by_the_app() {
+    let env = clip_env("clip-copy", "copy-paste");
+    let _daemon = env.start();
+    let (a, a_rx) = env.connect();
+    let (b, b_rx) = env.connect();
+    let pane = create(&a, &env.dir);
+    focus(&a, pane);
+    focus(&b, pane);
+    let tool = tool(&env);
+    for (req, text) in [
+        (
+            Request::ClipboardSet {
+                pane,
+                text: "copied".into(),
+            },
+            Some("copied".to_string()),
+        ),
+        (Request::ClipboardClear { pane }, None),
+    ] {
+        let done = ask(&tool, req.clone());
+        let (p, id, asked) = write_of(&b_rx).expect("b focused the pane last");
+        assert_eq!((p, asked), (pane, text.clone()));
+        answer(&b, id, Some(Vec::new())).unwrap();
+        assert!(matches!(done.join().unwrap(), Ok(Response::Ok)));
+
+        let refused = ask(&tool, req);
+        let (_, id, _) = write_of(&b_rx).unwrap();
+        answer(&b, id, None).unwrap();
+        let e = refused.join().unwrap().unwrap_err();
+        assert!(e.contains("terminal.osc52"), "{text:?}: {e}");
+    }
+    nothing_asked(&a_rx);
+    for req in [
+        Request::ClipboardSet {
+            pane: u64::MAX,
+            text: "x".into(),
+        },
+        Request::ClipboardClear { pane: u64::MAX },
+    ] {
+        assert!(tool.request(req).is_err());
+    }
+}
+
+#[test]
+fn this_hosts_osc52_setting_applies_to_clipboard_tools() {
+    for (osc52, copy, paste) in [
+        ("disabled", false, false),
+        ("copy", true, false),
+        ("paste", false, true),
+        ("copy-paste", true, true),
+    ] {
+        let env = clip_env(&format!("clip-osc52-{osc52}"), osc52);
+        let _daemon = env.start();
+        let (app, rx) = env.connect();
+        let pane = create(&app, &env.dir);
+        focus(&app, pane);
+        let tool = tool(&env);
+        for req in [
+            Request::ClipboardSet {
+                pane,
+                text: "x".into(),
+            },
+            Request::ClipboardClear { pane },
+        ] {
+            let done = ask(&tool, req);
+            if copy {
+                let (_, id, _) = write_of(&rx).expect("asked");
+                answer(&app, id, Some(Vec::new())).unwrap();
+                assert!(done.join().unwrap().is_ok(), "{osc52}");
+            } else {
+                let e = done.join().unwrap().unwrap_err();
+                assert!(e.contains("terminal.osc52"), "{osc52}: {e}");
+                nothing_asked(&rx);
+            }
+        }
+        for mime in [CLIP_TEXT, CLIP_TARGETS] {
+            let paste_thread = get(&tool, pane, mime);
+            if paste {
+                let (_, id, _) = query(&rx).expect("asked");
+                answer(&app, id, Some(b"y".to_vec())).unwrap();
+                assert!(paste_thread.join().unwrap().is_ok(), "{osc52} {mime}");
+            } else {
+                let e = paste_thread.join().unwrap().unwrap_err();
+                assert!(e.contains("terminal.osc52"), "{osc52} {mime}: {e}");
+                no_query(&rx);
+            }
+        }
+    }
+}
+
 /// Clipboard contents on their way through the daemon are bounded in all: an answer or a copy
-/// over what is left is refused, and what was held is given back once sent on.
+/// over what is left is refused, and what was held is given back once written.
 #[test]
 fn clipboard_data_held_at_once_is_bounded() {
     let env = clip_env("clip-held", "copy-paste");
@@ -403,11 +395,115 @@ fn clipboard_data_held_at_once_is_bounded() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("too much clipboard data"), "{e}");
-    tool.request(Request::ClipboardSet {
-        pane,
-        text: "x".repeat(1000),
-    })
-    .unwrap();
+    let done = ask(
+        &tool,
+        Request::ClipboardSet {
+            pane,
+            text: "x".repeat(1000),
+        },
+    );
+    let (_, id, _) = write_of(&rx).unwrap();
+    answer(&app, id, Some(Vec::new())).unwrap();
+    assert!(matches!(done.join().unwrap(), Ok(Response::Ok)));
+}
+
+/// A raw connection that says Hello and then sends `requests`, reading nothing back.
+fn stalled(env: &Env, ui: bool, requests: Vec<Request>) -> UnixStream {
+    let mut s = UnixStream::connect(&env.socket).unwrap();
+    let hello = Request::Hello {
+        client: "e2e-stalled".into(),
+        version: PROTOCOL_VERSION,
+        ui,
+        capabilities: CAPABILITIES.iter().map(|c| (*c).to_owned()).collect(),
+    };
+    for (id, request) in std::iter::once(hello).chain(requests).enumerate() {
+        s.write_all(
+            &codec::encode(&Envelope {
+                id: id as u64 + 1,
+                request,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    s
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// Pastes answered for a tool that does not read them stay counted until written: past the
+/// limit, more answers are refused, though each one is queued as soon as it arrives.
+#[test]
+fn answers_queued_for_a_tool_that_does_not_read_are_bounded() {
+    let env = clip_env("clip-stalled-tool", "copy-paste");
+    let held = (3 * MIB).to_string();
+    let _daemon = env.start_with(&[("THURM_CLIP_HELD_BYTES", Path::new(&held))]);
+    let (app, rx) = env.connect();
+    let pane = create(&app, &env.dir);
+    focus(&app, pane);
+    let gets = (0..5)
+        .map(|_| Request::ClipboardGet {
+            pane,
+            mime: CLIP_PNG.into(),
+        })
+        .collect();
+    let _tool = stalled(&env, false, gets);
+    let mut taken = 0;
+    for _ in 0..5 {
+        let (_, id, _) = query(&rx).expect("asked");
+        if answer(&app, id, Some(vec![7; MIB])).is_ok() {
+            taken += 1;
+        }
+        // Let the waiting thread queue it for the tool.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(taken, 3, "3 MiB queued for a tool that reads none of it");
+}
+
+/// Copies queued for an app that does not read them stay counted: past the limit, a tool's copy
+/// is refused at once instead of queued.
+#[test]
+fn copies_queued_for_an_app_that_does_not_read_are_bounded() {
+    let env = clip_env("clip-stalled-app", "copy-paste");
+    let held = (3 * MIB).to_string();
+    let _daemon = env.start_with(&[
+        ("THURM_CLIP_HELD_BYTES", Path::new(&held)),
+        ("THURM_CLIP_TIMEOUT_MS", Path::new("300")),
+    ]);
+    let tool = tool(&env);
+    let pane = create(&tool, &env.dir);
+    let _app = stalled(
+        &env,
+        true,
+        vec![Request::Focus {
+            pane,
+            focused: true,
+        }],
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    for i in 0..3 {
+        let e = tool
+            .request(Request::ClipboardSet {
+                pane,
+                text: "c".repeat(MIB),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("did not answer"), "copy {i}: {e}");
+    }
+    let started = Instant::now();
+    let e = tool
+        .request(Request::ClipboardSet {
+            pane,
+            text: "c".repeat(MIB),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("too much clipboard data"), "{e}");
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "refused at once"
+    );
 }
 
 #[test]

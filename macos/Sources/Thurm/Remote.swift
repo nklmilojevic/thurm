@@ -429,9 +429,22 @@ final class Remotes {
     /// The most a clipboard tool gets (the daemon refuses more).
     static let clipMax = 32 * 1024 * 1024
 
-    /// A clipboard tool's clear: nothing left, no empty text a later paste would find.
-    static func clearClipboard(_ pb: NSPasteboard) {
+    /// A clipboard tool's copy (`text`) or clear (nil) from `key`'s pane: done when this Mac's
+    /// policy lets that host write its clipboard (``clipboardWriteAllowed``), and answered
+    /// either way, so the tool hears whether it was.
+    func clipboardWrite(_ key: PaneKey, id: UInt64, text: String?) {
+        let done = Self.clipboardWrite(NSPasteboard.general, text: text,
+                                       allowed: clipboardWriteAllowed(key.host))
+        Core.shared.clipboardAnswer(host: key.host, id: id, data: done ? Data() : nil)
+    }
+
+    /// Puts `text` on `pb`, or clears it when nil (nothing left, no empty text a later paste
+    /// would find), if `allowed`. Whether it did.
+    static func clipboardWrite(_ pb: NSPasteboard, text: String?, allowed: Bool) -> Bool {
+        guard allowed else { return false }
         pb.clearContents()
+        if let text { pb.setString(text, forType: .string) }
+        return true
     }
 
     /// The types a clipboard tool can paste from `pb`, without reading them: a large or lazily

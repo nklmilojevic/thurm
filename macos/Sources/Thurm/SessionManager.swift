@@ -1398,10 +1398,9 @@ final class SessionManager: NSObject, CoreDelegate {
                 pb.clearContents()
                 pb.setString(text, forType: .string)
             }
-        case "ClipboardClear":
-            // A clipboard tool's clear: a copy of nothing, under the same policy.
-            if Remotes.shared.clipboardWriteAllowed(host) {
-                Remotes.clearClipboard(NSPasteboard.general)
+        case "ClipboardWrite":
+            if let key, let id = jsonUInt64(dict?["id"]) {
+                Remotes.shared.clipboardWrite(key, id: id, text: jsonString(dict?["text"]))
             }
         case "ClipboardRequest":
             if let id = key { Remotes.shared.clipboardRequest(id) }

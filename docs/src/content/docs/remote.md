@@ -73,7 +73,7 @@ selected host's checklist with a **Fix** button for each problem.
 | Claude Code | Runs the official installer (`https://claude.ai/install.sh`), after asking |
 | Claude Code sign-in | Opens a tab running `claude` on the host, to sign in (Linux hosts) |
 | Claude Code / Codex hooks | Installs them for exact agent status |
-| Clipboard tools | Links `pbcopy`, `pbpaste`, `xclip`, `xsel`, `wl-copy` and `wl-paste` to `thurm` in `~/.local/share/thurm/shims`, after asking (Linux hosts); other programs already there are left alone and reported |
+| Clipboard tools | Links `pbcopy`, `pbpaste`, `xclip`, `xsel`, `wl-copy` and `wl-paste` to `thurm` in `~/.local/share/thurm/shims`, after asking (Linux hosts whose daemon runs this build); other programs already there are left alone and reported |
 
 A fix that needs you at the host (a password, a sign-in) runs over `ssh -t`:
 in a tab of this Mac from the app, in your terminal from `thurm remote doctor
@@ -367,12 +367,15 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
   | List the types | as a paste | as a paste, but never asks |
 
   These are the checks an OSC 52 copy or read gets, and both sides must allow
-  it. A refused paste or listing fails the tool; listing the types
+  it. A copy, clear or paste goes to the Thurm app that last showed the pane,
+  which answers it, so the tool hears whether it was done: anything refused,
+  on the host or on this Mac, fails the tool. Listing the types
   (`xclip -t TARGETS -o`, `wl-paste --list-types`) fails where reads from that
   host are refused (`clipboard_read = "never"`, or pastes off in either
   `terminal.osc52`). Pastes carry text or a PNG image (an agent's image paste
-  works), at most 32 MiB each, and at most 128 MiB on its way through the
-  host's daemon at once (a paste or copy over that is refused, to try again).
+  works), at most 32 MiB each, and at most 128 MiB at once on its way through
+  the host's daemon or queued there for a program or app that has not read it
+  yet (a paste or copy over that is refused, to try again).
   A clear (`xsel --clear`, `wl-copy --clear`) empties
   the clipboard, leaving no type. Options the tools cannot honour here are
   refused rather than ignored: a copy meant to go away (`xclip -loops`,

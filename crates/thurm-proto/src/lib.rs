@@ -184,9 +184,10 @@ pub const CAP_AGENT_ACTIVITY: &str = "agent-activity";
 /// deflates the events it sends them, as [`Event::Compressed`] (see [`codec::encode_frame`]).
 pub const CAP_DEFLATE: &str = "deflate";
 
-/// The daemon takes [`Request::ClipboardSet`] and [`Request::ClipboardGet`] from clipboard tools
-/// in its panes. A client that says it answers [`Event::ClipboardQuery`] with
-/// [`Request::ClipboardAnswer`]; the daemon asks only desktop UIs (`ui`, not a phone).
+/// The daemon takes [`Request::ClipboardSet`], [`Request::ClipboardGet`] and
+/// [`Request::ClipboardClear`] from clipboard tools in its panes. A client that says it answers
+/// [`Event::ClipboardQuery`] and [`Event::ClipboardWrite`] with [`Request::ClipboardAnswer`]; the
+/// daemon asks only desktop UIs (`ui`, not a phone).
 pub const CAP_CLIP_QUERY: &str = "clip-query";
 
 /// The clipboard types [`Request::ClipboardGet`] reads.
@@ -592,8 +593,10 @@ pub enum Request {
         path: String,
         if_version: Option<String>,
     },
-    /// A clipboard tool in `pane` copies `text` (at most [`CLIP_MAX`] bytes): sent to the apps as
-    /// [`Event::ClipboardStore`], like an OSC 52 copy. Requires [`CAP_CLIP_QUERY`].
+    /// A clipboard tool in `pane` copies `text` (at most [`CLIP_MAX`] bytes): the daemon hands it
+    /// to the desktop UI that last focused the pane ([`Event::ClipboardWrite`]) and answers Ok
+    /// once that UI took it, or an error when it refused or said nothing for 30 s. Requires
+    /// [`CAP_CLIP_QUERY`].
     ClipboardSet {
         pane: PaneId,
         text: String,
@@ -608,14 +611,14 @@ pub enum Request {
     },
     /// A UI's answer to [`Event::ClipboardQuery`] `id`: the clipboard's contents in the type it
     /// asked for (at most [`CLIP_MAX`] bytes), or `None` for a refusal or nothing of that type.
+    /// To [`Event::ClipboardWrite`] `id`: `Some` (empty) once done, `None` when refused.
     ClipboardAnswer {
         id: u64,
         #[serde(with = "bytes::option")]
         data: Option<Vec<u8>>,
     },
-    /// A clipboard tool in `pane` empties the clipboard (`xsel --clear`, `wl-copy --clear`): sent
-    /// to the apps as [`Event::ClipboardClear`], under the same rules as a copy. Requires
-    /// [`CAP_CLIP_QUERY`].
+    /// A clipboard tool in `pane` empties the clipboard (`xsel --clear`, `wl-copy --clear`): as
+    /// [`Request::ClipboardSet`], with nothing to store. Requires [`CAP_CLIP_QUERY`].
     ClipboardClear {
         pane: PaneId,
     },
@@ -936,11 +939,15 @@ pub enum Event {
         id: u64,
         mime: String,
     },
-    /// A clipboard tool in `pane` empties the clipboard ([`Request::ClipboardClear`]): the app
-    /// clears it, leaving no type at all, as it would store a copy. Sent only to UIs with
+    /// A clipboard tool in `pane` copies `text` ([`Request::ClipboardSet`]), or empties the
+    /// clipboard when `None` ([`Request::ClipboardClear`], leaving no type at all): the UI does
+    /// so if its policy lets the pane's host write its clipboard, and answers with
+    /// [`Request::ClipboardAnswer`] `id` either way. Sent only to a desktop UI with
     /// [`CAP_CLIP_QUERY`].
-    ClipboardClear {
+    ClipboardWrite {
         pane: PaneId,
+        id: u64,
+        text: Option<String>,
     },
 }
 
