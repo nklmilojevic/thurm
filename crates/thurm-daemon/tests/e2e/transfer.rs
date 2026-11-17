@@ -551,12 +551,28 @@ fn a_later_file_refused_ends_the_batch_at_once() {
         socket: &env.socket,
     };
     let files = [Upload::Path(small), Upload::Path(huge)];
-    let e = transfer::upload(host, pane2, &files, &Cancel::default(), |_| {}).unwrap_err();
+    // The first file's bytes seen on the host before the second is asked for, so the batch
+    // that goes is one that was there.
+    let mut seen = None;
+    let e = transfer::upload(host, pane2, &files, &Cancel::default(), |p| {
+        if p.done == 5 && seen.is_none() {
+            eventually(5, "the first file did not arrive", || {
+                batches(&env, pane2).first().is_some_and(|b| {
+                    std::fs::metadata(b.join(".parts/0")).is_ok_and(|m| m.len() == 5)
+                })
+            });
+            seen = batches(&env, pane2).into_iter().next();
+        }
+    })
+    .unwrap_err();
     assert!(
         matches!(&e, TransferError::Remote(why) if why.contains("too large")),
         "{e}"
     );
-    eventually(5, "the batch was kept", || batches(&env, pane2).is_empty());
+    let seen = seen.expect("the first file was never sent whole");
+    eventually(5, "the batch was kept", || !seen.exists());
+    assert!(batches(&env, pane2).is_empty());
+    assert_eq!(typed(&c2, pane2, &dir), "\n");
 }
 
 #[test]
@@ -1583,6 +1599,47 @@ fn a_download_answered_with_anything_but_its_end_still_gives_its_slot_back() {
     assert!(c.download_begin(pane, "small.txt", None).is_err());
     // Within the deadline, whatever they send.
     eventually(2, "the slots were held by sending", || {
+        c.download_begin(pane, "small.txt", None).is_ok()
+    });
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    for t in tricklers {
+        t.join().unwrap();
+    }
+}
+
+#[test]
+fn a_download_answered_by_a_frame_that_never_ends_still_gives_its_slot_back() {
+    let env = Env::new("transfer-ack-partial");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_ACK_MS", Path::new("400"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    std::fs::write(dir.join("small.txt"), b"small").unwrap();
+    let pane = cat_pane(&c, &dir);
+    // Four read whole, their callers starting a frame of 1000 bytes and sending it a byte at a
+    // time, each well within the deadline, the whole far beyond it.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tricklers = Vec::new();
+    for _ in 0..4 {
+        let info = c.download_begin(pane, "small.txt", None).unwrap();
+        let socket = std::os::unix::net::UnixStream::connect(&env.socket).unwrap();
+        let mut w = socket.try_clone().unwrap();
+        let (mut r, _framed) = stream::open_on(socket, info.ticket.as_deref().unwrap()).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        w.write_all(&1000u32.to_le_bytes()).unwrap();
+        let stop = stop.clone();
+        tricklers.push(std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if w.write_all(&[0]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            drop((r, _framed));
+        }));
+    }
+    assert!(c.download_begin(pane, "small.txt", None).is_err());
+    eventually(2, "the slots were held by a frame never finished", || {
         c.download_begin(pane, "small.txt", None).is_ok()
     });
     stop.store(true, std::sync::atomic::Ordering::SeqCst);

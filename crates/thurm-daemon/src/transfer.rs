@@ -1089,23 +1089,45 @@ impl Transfers {
         }
         // The caller says it has it all, or gives up; one that says nothing is not waited on
         // for ever, holding the pane's download slot, nor one that keeps sending something
-        // else: the wait has one deadline, not one per frame.
-        let deadline = Instant::now() + self.ack;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() || writer.set_read_timeout(Some(left)).is_err() {
-                let _ = writer.shutdown(std::net::Shutdown::Both);
-                return;
-            }
-            match stream::read_frame(&mut reader) {
-                Ok(Some(StreamFrame::End)) => return close(&mut writer, StreamClose::Ok),
-                Ok(Some(StreamFrame::Data(_))) => {}
-                Ok(Some(StreamFrame::Close(_))) | Ok(None) | Err(_) => {
-                    let _ = writer.shutdown(std::net::Shutdown::Both);
-                    return;
+        // else, a frame at a time or a byte at a time: the wait has one deadline, not one per
+        // frame or per read.
+        let ended = {
+            let mut until = Until {
+                inner: &mut reader,
+                socket: &writer,
+                deadline: Instant::now() + self.ack,
+            };
+            loop {
+                match stream::read_frame(&mut until) {
+                    Ok(Some(StreamFrame::Data(_))) => {}
+                    other => break matches!(other, Ok(Some(StreamFrame::End))),
                 }
             }
+        };
+        if ended {
+            close(&mut writer, StreamClose::Ok);
+        } else {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
         }
+    }
+}
+
+/// Reads from `inner` only until `deadline`, however the bytes trickle in: each read waits on
+/// `socket` (the one `inner` reads) for no more than what is left.
+struct Until<'a, R> {
+    inner: R,
+    socket: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl<R: Read> Read for Until<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.socket.set_read_timeout(Some(left))?;
+        self.inner.read(buf)
     }
 }
 
