@@ -545,22 +545,20 @@ pub fn download_reserved(
             .ticket
             .as_deref()
             .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
-        let (mut reader, mut writer, _watch, handle) = open_watched(host.socket, ticket, cancel)?;
-        if let Err(e) = receive(
-            &mut reader,
+        fetch_into(
+            host,
+            ticket,
             file,
             reserved,
             info.size,
             cancel,
             &mut progress,
-        ) {
-            abort(writer, &handle);
-            return Err(e);
+        )?;
+        // The name still holds what was written: one taken meanwhile (the file replaced or
+        // moved while it came) keeps what is there, and this download is not saved over it.
+        if !std::fs::symlink_metadata(reserved).is_ok_and(|m| (m.dev(), m.ino()) == ours) {
+            return Err(changed());
         }
-        writer
-            .finish()
-            .map_err(|e| TransferError::Remote(e.to_string()))
-            .and_then(|()| wait(reader, cancel))?;
         Ok(info)
     })();
     if got.is_err() {
@@ -603,24 +601,7 @@ pub fn download(
     // A read blocks until the host sends; Cancel ends the connection under it.
     // Where it goes first: a destination that cannot be written fails before any stream.
     let (part, file) = create_part(dest)?;
-    let (mut reader, mut writer, _watch, handle) = match open_watched(host.socket, ticket, cancel) {
-        Ok(opened) => opened,
-        Err(e) => {
-            let _ = std::fs::remove_file(&part);
-            return Err(e);
-        }
-    };
-    let received = receive(&mut reader, file, &part, info.size, cancel, &mut progress);
-    if let Err(e) = received {
-        let _ = std::fs::remove_file(&part);
-        abort(writer, &handle);
-        return Err(e);
-    }
-    let closed = writer
-        .finish()
-        .map_err(|e| TransferError::Remote(e.to_string()))
-        .and_then(|()| wait(reader, cancel));
-    if let Err(e) = closed {
+    if let Err(e) = fetch_into(host, ticket, file, &part, info.size, cancel, &mut progress) {
         let _ = std::fs::remove_file(&part);
         return Err(e);
     }
@@ -629,6 +610,29 @@ pub fn download(
         TransferError::Local(format!("{}: {e}", dest.display()))
     })?;
     Ok(Downloaded::Saved(info))
+}
+
+/// Opens the stream `ticket` reserved and writes the `size` bytes it sends into `file` (`shown`
+/// in errors), Cancel cutting it short; a failed receive aborts the stream within bounds.
+/// Leaves cleaning up `file` to the caller, who alone knows what it is.
+fn fetch_into(
+    host: Host,
+    ticket: &str,
+    file: File,
+    shown: &Path,
+    size: u64,
+    cancel: &Cancel,
+    progress: &mut impl FnMut(Progress),
+) -> Result<(), TransferError> {
+    let (mut reader, mut writer, _watch, handle) = open_watched(host.socket, ticket, cancel)?;
+    if let Err(e) = receive(&mut reader, file, shown, size, cancel, progress) {
+        abort(writer, &handle);
+        return Err(e);
+    }
+    writer
+        .finish()
+        .map_err(|e| TransferError::Remote(e.to_string()))
+        .and_then(|()| wait(reader, cancel))
 }
 
 /// Shuts a stream's connection down once `cancel` is set, until dropped: a read blocked on a

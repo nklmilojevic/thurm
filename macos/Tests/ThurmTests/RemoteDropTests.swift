@@ -348,6 +348,21 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertEqual(entries.filter { $0.contains(".staging") }, [])
     }
 
+    func testAnErrorStaysItsTimeWhileTheNextTransferGoes() throws {
+        let (view, fake) = remotePane()
+        pb.clearContents()
+        pb.writeObjects([try file("a.txt")] as [NSURL])
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        pb.clearContents()
+        pb.writeObjects([try file("b.txt")] as [NSURL])
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        // The first fails; the second starts and reports progress at once.
+        fake.finish[0](TransferOutcome(error: "the host's disk is full"))
+        fake.progress[1](TransferProgress(done: 1, total: 2))
+        XCTAssertEqual(view.shownMessage, "Could not send a.txt to devbox: the host's disk is full")
+        XCTAssertNil(view.shownTransfer)
+    }
+
     func testAFolderOrAnOlderHostSendsNothing() throws {
         let folder = dir.appendingPathComponent("folder", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

@@ -566,18 +566,21 @@ final class Core {
                                  _ onProgress: @escaping (TransferProgress) -> Void,
                                  _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)?
 
+    /// What cancels transfer `id`, if it started.
+    private static func cancelling(_ id: UInt64?) -> (() -> Void)? {
+        id.map { id in { Core.shared.cancelTransfer(id) } }
+    }
+
     static let startDownload: DownloadStarter = { pane, path, dest, ifVersion, maxBytes, onProgress, onFinish in
-        let id = Core.shared.download(pane, path: path, to: dest, ifVersion: ifVersion, maxBytes: maxBytes,
-                                      onProgress: onProgress, onFinish: onFinish)
-        return id.map { id in { Core.shared.cancelTransfer(id) } }
+        cancelling(Core.shared.download(pane, path: path, to: dest, ifVersion: ifVersion, maxBytes: maxBytes,
+                                        onProgress: onProgress, onFinish: onFinish))
     }
 
     /// Starts a download into a reserved file (`downloadReserved`; the version and size limit
     /// do not apply), returning what cancels it.
     static let startReservedDownload: DownloadStarter = { pane, path, reserved, _, _, onProgress, onFinish in
-        let id = Core.shared.downloadReserved(pane, path: path, into: reserved,
-                                              onProgress: onProgress, onFinish: onFinish)
-        return id.map { id in { Core.shared.cancelTransfer(id) } }
+        cancelling(Core.shared.downloadReserved(pane, path: path, into: reserved,
+                                                onProgress: onProgress, onFinish: onFinish))
     }
 
     /// Starts an upload of one batch (`upload`), returning what cancels it; tests stand in for it.
@@ -586,8 +589,7 @@ final class Core {
                                _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)?
 
     static let startUpload: UploadStarter = { pane, files, onProgress, onFinish in
-        let id = Core.shared.upload(pane, files: files, onProgress: onProgress, onFinish: onFinish)
-        return id.map { id in { Core.shared.cancelTransfer(id) } }
+        cancelling(Core.shared.upload(pane, files: files, onProgress: onProgress, onFinish: onFinish))
     }
 
     // MARK: Remote operations

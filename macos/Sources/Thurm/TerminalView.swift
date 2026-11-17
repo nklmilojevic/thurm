@@ -1737,11 +1737,23 @@ final class TerminalView: NSView, NSTextInputClient {
         refreshTransferToast()
     }
 
-    /// The first transfer, and how many more, or no toast once none is left.
+    /// The first transfer, and how many more, or no toast once none is left. A message shown
+    /// meanwhile (an error, a result) stays its time: the transfer comes back once it is gone
+    /// (`removeToast`).
     private func refreshTransferToast() {
         guard let first = transfers.first else { return hideTransferToast() }
+        if let shown = toastView, shown !== transferToast?.box {
+            transferToast?.label.stringValue = first.text
+            return
+        }
         let more = transfers.count - 1
         showTransferToast(more > 0 ? "\(first.text) (\(more) more)" : first.text)
+    }
+
+    /// The message a toast shows now, other than the transfer toast's.
+    var shownMessage: String? {
+        guard let shown = toastView, shown !== transferToast?.box else { return nil }
+        return shown.subviews.compactMap { ($0 as? NSTextField)?.stringValue }.first
     }
 
     /// Whether the transfer toast, with its Cancel, is showing, and what it says.

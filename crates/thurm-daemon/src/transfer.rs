@@ -194,7 +194,8 @@ impl Transfers {
     pub fn prune(&self) {
         let mut st = self.state.lock();
         self.sweep(&mut st);
-        self.make_room(&st, 0, 0, 0);
+        let kept = self.kept(&st);
+        self.make_room(kept, 0, 0, 0);
     }
 
     /// [`thurm_proto::Request::UploadBegin`]: reserves the file's place in its batch and a
@@ -392,7 +393,8 @@ impl Transfers {
             }
         };
         // Only an admitted file makes older drops give way, and only what was deleted counts.
-        if !self.make_room(&st, incoming, short, files_short) {
+        // The drops looked at above, not walked again: the new batch is not among them.
+        if !self.make_room(kept_now, incoming, short, files_short) {
             undo(&mut st);
             return Err(too_much());
         }
@@ -675,8 +677,7 @@ impl Transfers {
     /// Deletes the oldest kept batches until `incoming` more bytes stay within the kept limit
     /// and at least `free` bytes and `files` files were freed. A batch that could not be deleted
     /// still counts. Whether all hold now.
-    fn make_room(&self, st: &State, incoming: u64, free: u64, files: u64) -> bool {
-        let kept = self.kept(st);
+    fn make_room(&self, kept: Vec<Kept>, incoming: u64, free: u64, files: u64) -> bool {
         let mut total: u64 = kept.iter().map(|k| k.size).sum();
         let (mut freed, mut freed_files) = (0u64, 0u64);
         let mut count = kept.len();
@@ -717,8 +718,11 @@ impl Transfers {
         if !self.paste_delay.is_zero() {
             std::thread::sleep(self.paste_delay);
         }
-        // Decided and typed under the lock `client_gone` takes: a client that went before the
-        // paths are written fails the batch, and nothing is typed for it.
+        // Decided under the lock `fail` takes: a cancel or a client gone before this point fails
+        // the batch, and nothing is typed. Typed without it (a paste can set off anything,
+        // ending a client, whose uploads then take this lock): once `pasting` is set, a
+        // failure waits for the outcome, and a client leaving waits for the paste
+        // (`Daemon::paste_for`), which refuses one already gone.
         let mut st = self.state.lock();
         let Some(b) = st.batches.get_mut(&serial) else {
             return;
@@ -735,7 +739,9 @@ impl Transfers {
             .map(|f| crate::shell::shell_quote(&f.path.display().to_string()))
             .collect();
         let (client, pane, text) = (b.client, b.pane, paths.join(" ") + " ");
+        drop(st);
         let typed = daemon.paste_for(client, pane, &text);
+        let mut st = self.state.lock();
         if let Some(b) = st.batches.get_mut(&serial) {
             b.pasting = false;
             b.touched = Instant::now();

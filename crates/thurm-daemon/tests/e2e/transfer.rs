@@ -1223,6 +1223,21 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
         .is_err()
     );
     assert!(!dir.join("elsewhere").exists());
+    // The name taken while the file comes: not reported saved, and what took it stays.
+    std::fs::write(dir.join("big.bin"), vec![1u8; 4 << 20]).unwrap();
+    let moving = downloads.join("moving.bin");
+    std::fs::File::create_new(&moving).unwrap();
+    let mut swapped = false;
+    let e = transfer::download_reserved(host, pane, "big.bin", &moving, &Cancel::default(), |p| {
+        if !swapped && p.done > 0 {
+            swapped = true;
+            std::fs::remove_file(&moving).unwrap();
+            std::fs::write(&moving, b"theirs").unwrap();
+        }
+    })
+    .unwrap_err();
+    assert!(matches!(e, TransferError::Local(_)), "{e}");
+    assert_eq!(std::fs::read(&moving).unwrap(), b"theirs");
     // A download that fails gives its reservation back.
     let missing = downloads.join("missing.pdf");
     std::fs::File::create_new(&missing).unwrap();
