@@ -31,7 +31,14 @@ local DEFAULT_COMMANDS = {
 }
 
 local commands = {}
-for _, c in ipairs(thurm.settings.commands or DEFAULT_COMMANDS) do
+local wanted = thurm.settings.commands
+if type(wanted) == "string" then
+  wanted = { wanted }
+elseif wanted ~= nil and type(wanted) ~= "table" then
+  thurm.warn("dev-server: commands should be a list of program names; using the default ones")
+  wanted = nil
+end
+for _, c in ipairs(wanted or DEFAULT_COMMANDS) do
   commands[tostring(c)] = true
 end
 

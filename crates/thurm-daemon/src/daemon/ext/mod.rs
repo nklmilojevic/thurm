@@ -518,6 +518,10 @@ impl Daemon {
         if joins && let Some(all) = &all {
             if queue {
                 self.ports.subscribed(Arc::downgrade(self), client.id);
+            } else {
+                // Still queued from before: the watch may have gone to sleep meanwhile (nobody
+                // listened); wake it to serve the queue.
+                self.ports.poke();
             }
             for payload in remote_lists(all, self.forwarding_app_id()) {
                 send_ext(client, notice::EVENT, &payload);

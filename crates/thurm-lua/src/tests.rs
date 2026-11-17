@@ -817,3 +817,44 @@ fn the_dev_server_example_opens_only_new_servers() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(opened(&f), want);
 }
+
+/// The dev-server example takes `commands` as a list, or one program as a string, and warns of
+/// anything else rather than match nothing.
+#[test]
+fn the_dev_server_example_takes_one_command_as_a_string() {
+    let f = fixture();
+    let event = json!({ "event": "ports_changed", "id": 9, "complete": true,
+        "ports": [{ "port": 4400, "address": "127.0.0.1", "pid": 9, "command": "astro dev" }] });
+    let mut s = spec(
+        7,
+        include_str!("../../../examples/plugins/dev-server/init.lua"),
+        false,
+    );
+    s.settings = json!({ "commands": "astro" });
+    assert_eq!(
+        f.rt.load(s).recv_timeout(Duration::from_secs(20)).unwrap(),
+        Ok(Value::Null)
+    );
+    f.rt.notice(7, notice::EVENT, event.clone());
+    assert_eq!(
+        next(&f, "exec")["argv"],
+        json!(["open", "http://localhost:4400/"])
+    );
+
+    let mut s = spec(
+        8,
+        include_str!("../../../examples/plugins/dev-server/init.lua"),
+        false,
+    );
+    s.settings = json!({ "commands": 5 });
+    assert_eq!(
+        f.rt.load(s).recv_timeout(Duration::from_secs(20)).unwrap(),
+        Ok(Value::Null)
+    );
+    let warned = next(&f, "log");
+    assert_eq!(warned["level"], "warn", "{warned}");
+    assert!(
+        warned["message"].as_str().unwrap().contains("commands"),
+        "{warned}"
+    );
+}

@@ -88,7 +88,7 @@
 ---@field event string Its name.
 ---@field pane thurm.Pane? The pane it is about.
 ---@field id integer? The pane's id, where `pane` may be missing (pane_closed, bell, notification, ports_changed, files_uploaded); in forward_opened and forward_closed, the forward's (as `thurm.forward.close` takes it), not a pane's.
----@field host string? ports_changed of a remote host's pane, and forward events: the `[[remote]]` host.
+---@field host string? ports_changed of a remote host's pane (whose `id` is then that host's, not one `thurm.ports` takes), and forward events: the `[[remote]]` host.
 ---@field ports thurm.Port[]? ports_changed: every port the pane listens on now.
 ---@field complete boolean? ports_changed: false when part of the pane's processes could not be read (servers may be left out), or with `gone`.
 ---@field gone boolean? ports_changed of a remote host's pane: the app lost the host (or quit); nothing is known of its ports.
@@ -206,7 +206,7 @@ function thurm.focus(pane) end
 function thurm.wait(pane, opts) end
 
 --- The TCP ports a pane's programs listen on, and whether all its processes could be read.
---- Without a pane, every pane's: `{ pane, ports, complete }` each.
+--- Without a pane, every pane's: `{ pane, ports, complete }` each. This Mac's panes only.
 ---@param pane integer
 ---@return thurm.Port[] ports, boolean complete
 ---@overload fun(): thurm.PanePorts[]
