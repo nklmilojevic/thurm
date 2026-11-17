@@ -356,8 +356,10 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
 
 A dev server on the host prints `http://localhost:5173`. That is the host's
 port 5173, not the Mac's. ⌘-click the link and Thurm opens the host's port on
-this Mac first: it listens on `127.0.0.1:5173` (or another free port, kept for
-next time), carries each connection to the host's daemon, which connects to
+this Mac first: it listens on port 5173 of this Mac's loopback, `127.0.0.1` and
+`[::1]` both, so `localhost` reaches it whichever address the browser tries
+(another free port when 5173 is taken on either, kept for next time), carries
+each connection to the host's daemon, which connects to
 port 5173 on the host's own loopback, and opens the link pointed at it. The
 first time, a toast says where it went (`devbox:5173 → localhost:5173`), with
 **Copy Link**. Links to `localhost`, `127.0.0.1`, `[::1]` and `0.0.0.0` are
@@ -471,8 +473,8 @@ reach the Mac's disk, clipboard, or credentials without you doing something:
 - **Ports.** The Mac only ever connects out to the host: a forward is a
   connection through the daemon's socket, and the host never reaches a port of
   the Mac. Forwards open only when you ask for one, and closing one ends its
-  connections. A forward listens on `127.0.0.1` only, so other machines can't
-  use it, but loopback has no notion of users: any program on this Mac, run by
+  connections. A forward listens on loopback only (`127.0.0.1` and `[::1]`), so
+  other machines can't use it, but loopback has no notion of users: any program on this Mac, run by
   any account logged in to it, can connect to an open forward and reach the
   host's port as you, the same as with `ssh -L`. On a Mac other people use, keep
   forwards to services that trust their loopback (no password of their own)

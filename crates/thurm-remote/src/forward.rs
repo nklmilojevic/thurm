@@ -61,6 +61,10 @@ pub enum Change {
     Opened {
         forward: Forward,
     },
+    /// Opened again, for another link ([`Forward::link`]).
+    Linked {
+        forward: Forward,
+    },
     /// `why`: `closed` (by the user), `host` (removed or disabled), `gone` (the port went away).
     Closed {
         forward: Forward,
@@ -214,21 +218,35 @@ impl Forwards {
     /// Opens `host`'s `remote_port` on this Mac, or returns the forward that has it already
     /// (`false`: not new). The local port is `preferred` when given (an error if it is taken),
     /// else the remote port's number, else the port remembered for it, else a free one; never
-    /// below 1024 unless the remote port is.
+    /// below 1024 unless the remote port is. The port is this Mac's on both loopbacks
+    /// (`127.0.0.1` and `[::1]`, where the system has IPv6), so `localhost` reaches the forward
+    /// whichever address a browser tries first.
     pub fn open(
         &self,
         host: &str,
         remote_port: u16,
         preferred: Option<u16>,
     ) -> Result<(Forward, bool), String> {
+        self.open_for(host, remote_port, preferred, None)
+    }
+
+    /// Like [`Forwards::open`], for `link` (the URL it opens at): the forward lists it from the
+    /// first change it reports, and an existing one takes it as its link.
+    pub fn open_for(
+        &self,
+        host: &str,
+        remote_port: u16,
+        preferred: Option<u16>,
+        link: Option<&str>,
+    ) -> Result<(Forward, bool), String> {
         if remote_port == 0 {
             return Err("port 0 is not a port to forward".into());
         }
         if let Some(f) = self.find(host, remote_port) {
-            return existing(f, preferred);
+            return self.reuse(f, preferred, link);
         }
-        let listener = match preferred {
-            Some(p) => bind(p).map_err(|e| format!("cannot listen on 127.0.0.1:{p}: {e}"))?,
+        let listeners = match preferred {
+            Some(p) => bind(p).map_err(|e| format!("cannot listen on localhost:{p}: {e}"))?,
             None => {
                 let remembered = self.remembered().get(&key(host, remote_port)).copied();
                 [Some(remote_port), remembered]
@@ -237,10 +255,10 @@ impl Forwards {
                     .filter(|&p| p >= 1024 || p == remote_port)
                     .find_map(|p| bind(p).ok())
                     .map_or_else(|| bind(0), Ok)
-                    .map_err(|e| format!("cannot listen on 127.0.0.1: {e}"))?
+                    .map_err(|e| format!("cannot listen on localhost: {e}"))?
             }
         };
-        let local = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let local = listeners.port;
         let mut g = self.inner.lock();
         // Another thread may have opened it meanwhile; theirs stands.
         if let Some(e) = g
@@ -248,7 +266,9 @@ impl Forwards {
             .values()
             .find(|e| e.forward.host == host && e.forward.remote_port == remote_port)
         {
-            return existing(e.forward.clone(), preferred);
+            let f = e.forward.clone();
+            drop(g);
+            return self.reuse(f, preferred, link);
         }
         g.next_id += 1;
         let forward = Forward {
@@ -256,7 +276,7 @@ impl Forwards {
             host: host.to_owned(),
             remote_port,
             local,
-            link: None,
+            link: link.map(str::to_owned),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
@@ -274,14 +294,19 @@ impl Forwards {
             },
         );
         drop(g);
-        let me = self.clone();
-        let (h, accepting) = (host.to_owned(), forward.clone());
-        let spawned = std::thread::Builder::new()
-            .name(format!("forward-{host}-{remote_port}"))
-            .spawn(move || me.accept_loop(listener, h, accepting, stop, active, conns));
-        if let Err(e) = spawned {
-            self.inner.lock().open.remove(&forward.id);
-            return Err(format!("cannot start the forward: {e}"));
+        for listener in listeners.all() {
+            let me = self.clone();
+            let (h, accepting) = (host.to_owned(), forward.clone());
+            let (stop, active, conns) = (stop.clone(), active.clone(), conns.clone());
+            let spawned = std::thread::Builder::new()
+                .name(format!("forward-{host}-{remote_port}"))
+                .spawn(move || me.accept_loop(listener, h, accepting, stop, active, conns));
+            if let Err(e) = spawned {
+                if let Some(e) = self.inner.lock().open.remove(&forward.id) {
+                    stop_listening(&e);
+                }
+                return Err(format!("cannot start the forward: {e}"));
+            }
         }
         self.remember(host, remote_port, local);
         self.changed(Change::Opened {
@@ -308,11 +333,38 @@ impl Forwards {
         }
     }
 
-    /// Forward `id` was opened for `link`: reopening it from a list opens that link.
+    /// Forward `id` was opened for `link`: reopening it from a list opens that link. Reported
+    /// as [`Change::Linked`] when it is a new one.
     pub fn set_link(&self, id: u64, link: &str) {
-        if let Some(e) = self.inner.lock().open.get_mut(&id) {
-            e.forward.link = Some(link.to_owned());
+        let changed = {
+            let mut g = self.inner.lock();
+            match g.open.get_mut(&id) {
+                Some(e) if e.forward.link.as_deref() != Some(link) => {
+                    e.forward.link = Some(link.to_owned());
+                    Some(e.forward.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(forward) = changed {
+            self.changed(Change::Linked { forward });
         }
+    }
+
+    /// The forward that has the port already, unless another local port was asked for; opened
+    /// again for `link`, it takes that link.
+    fn reuse(
+        &self,
+        f: Forward,
+        preferred: Option<u16>,
+        link: Option<&str>,
+    ) -> Result<(Forward, bool), String> {
+        let (mut f, new) = existing(f, preferred)?;
+        if let Some(link) = link {
+            self.set_link(f.id, link);
+            f.link = Some(link.to_owned());
+        }
+        Ok((f, new))
     }
 
     fn find(&self, host: &str, remote_port: u16) -> Option<Forward> {
@@ -473,7 +525,7 @@ impl Forwards {
         active: Arc<AtomicUsize>,
         conns: Conns,
     ) {
-        let mut next_conn = 0u64;
+        static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         for conn in listener.incoming() {
             if stop.load(Ordering::Acquire) {
                 return;
@@ -499,8 +551,7 @@ impl Forwards {
             let Ok(registered) = conn.try_clone() else {
                 continue;
             };
-            next_conn += 1;
-            let conn_id = next_conn;
+            let conn_id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
             conns.lock().insert(conn_id, registered);
             active.fetch_add(1, Ordering::AcqRel);
             // Closed between the accept and here: end it as `close_why` ended the others.
@@ -636,17 +687,62 @@ fn write_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     })
 }
 
-fn bind(port: u16) -> std::io::Result<TcpListener> {
-    TcpListener::bind(("127.0.0.1", port))
+/// A forward's listening sockets: `127.0.0.1`, and `[::1]` on the same port where the system
+/// has IPv6 loopback.
+struct Listeners {
+    port: u16,
+    v4: TcpListener,
+    v6: Option<TcpListener>,
 }
 
-/// Stops `e`'s accept loop: the flag, then a connection to wake its `accept`.
+impl Listeners {
+    fn all(self) -> impl Iterator<Item = TcpListener> {
+        std::iter::once(self.v4).chain(self.v6)
+    }
+}
+
+/// Listens on `port` (`0`: a free one) of both loopbacks. A link to `localhost` may go to
+/// either, so a port another program holds on `[::1]` is not this forward's: the browser could
+/// reach that program instead. Without IPv6 loopback, `127.0.0.1` alone.
+fn bind(port: u16) -> std::io::Result<Listeners> {
+    // A free port on 127.0.0.1 may be taken on ::1: another one, a few times.
+    let tries = if port == 0 { 16 } else { 1 };
+    let mut last = None;
+    for _ in 0..tries {
+        let v4 = TcpListener::bind(("127.0.0.1", port))?;
+        let port = v4.local_addr()?.port();
+        match TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)) {
+            Ok(v6) => {
+                return Ok(Listeners {
+                    port,
+                    v4,
+                    v6: Some(v6),
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                last = Some(std::io::Error::new(
+                    e.kind(),
+                    format!("port {port} is taken on [::1]"),
+                ));
+            }
+            // No IPv6 loopback: `localhost` resolves to 127.0.0.1 alone.
+            Err(_) => return Ok(Listeners { port, v4, v6: None }),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::ErrorKind::AddrInUse.into()))
+}
+
+/// Stops `e`'s accept loops: the flag, then a connection to each loopback to wake its `accept`
+/// (one with nothing listening is refused at once).
 fn stop_listening(e: &Entry) {
     e.stop.store(true, Ordering::Release);
-    let _ = TcpStream::connect_timeout(
-        &([127, 0, 0, 1], e.forward.local).into(),
-        Duration::from_secs(1),
-    );
+    let addrs: [std::net::SocketAddr; 2] = [
+        (std::net::Ipv4Addr::LOCALHOST, e.forward.local).into(),
+        (std::net::Ipv6Addr::LOCALHOST, e.forward.local).into(),
+    ];
+    for addr in addrs {
+        let _ = TcpStream::connect_timeout(&addr, Duration::from_secs(1));
+    }
 }
 
 /// Carries `conn` both ways over a stream until both directions end. Once `closed` is set (the
@@ -1034,6 +1130,104 @@ mod tests {
             format!("https://localhost:{}/app?x=1", listed.local)
         );
         f.close(fw.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_first_change_lists_the_link_a_forward_opens_at() {
+        let dir = tempdir("opened-link");
+        let f = forwards(&dir);
+        // What a listener of changes reads from the list as each change arrives.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (theirs, list) = (seen.clone(), f.clone());
+        f.on_change(move |c| {
+            let links: Vec<Option<String>> = list.list().into_iter().map(|f| f.link).collect();
+            theirs.lock().push((c, links));
+        });
+        let link = "https://localhost:8443/app";
+        let (fw, new) = f.open_for("devbox", 8443, Some(0), Some(link)).unwrap();
+        assert!(new);
+        assert_eq!(fw.link.as_deref(), Some(link));
+        {
+            let log = seen.lock();
+            assert_eq!(log.len(), 1);
+            assert!(
+                matches!(&log[0].0, Change::Opened { forward } if forward.link.as_deref() == Some(link))
+            );
+            assert_eq!(log[0].1, vec![Some(link.to_owned())]);
+        }
+        // Opened again for the same link: nothing new to say.
+        let (again, new) = f.open_for("devbox", 8443, None, Some(link)).unwrap();
+        assert!(!new);
+        assert_eq!(again, fw);
+        assert_eq!(seen.lock().len(), 1);
+        // For another link: the forward takes it, and says so.
+        let other = "https://localhost:8443/admin";
+        let (again, _) = f.open_for("devbox", 8443, None, Some(other)).unwrap();
+        assert_eq!(again.link.as_deref(), Some(other));
+        {
+            let log = seen.lock();
+            assert_eq!(log.len(), 2);
+            assert!(
+                matches!(&log[1].0, Change::Linked { forward } if forward.link.as_deref() == Some(other))
+            );
+            assert_eq!(log[1].1, vec![Some(other.to_owned())]);
+        }
+        f.close(fw.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn ipv6_loopback() -> bool {
+        TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_ok()
+    }
+
+    #[test]
+    fn a_forward_listens_on_both_loopbacks() {
+        if !ipv6_loopback() {
+            eprintln!("note: no IPv6 loopback here; skipped");
+            return;
+        }
+        let dir = tempdir("both");
+        let f = forwards(&dir);
+        let (fw, _) = f.open("devbox", 7300, Some(0)).unwrap();
+        assert!(TcpStream::connect(("127.0.0.1", fw.local)).is_ok());
+        assert!(TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, fw.local)).is_ok());
+        f.close(fw.id).unwrap();
+        // Both stop with it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, fw.local)).is_ok() {
+            assert!(Instant::now() < deadline, "still listening on [::1]");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        wait_unbound(fw.local);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_port_another_program_holds_on_ipv6_is_not_taken() {
+        if !ipv6_loopback() {
+            eprintln!("note: no IPv6 loopback here; skipped");
+            return;
+        }
+        let dir = tempdir("v6-held");
+        let f = forwards(&dir);
+        // A program on this Mac listening on [::1] only (as a dev server on `localhost` may),
+        // on a port whose 127.0.0.1 is free: a browser trying [::1] first would reach it.
+        let (held, port) = (0..20)
+            .find_map(|_| {
+                let held = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).unwrap();
+                let port = held.local_addr().unwrap().port();
+                TcpListener::bind(("127.0.0.1", port))
+                    .ok()
+                    .map(|_| (held, port))
+            })
+            .expect("a port free on 127.0.0.1 and held on [::1]");
+        let (fw, _) = f.open("devbox", port, None).unwrap();
+        assert_ne!(fw.local, port, "the forward took a port held on [::1]");
+        let e = f.open("other", port, Some(port)).unwrap_err();
+        assert!(e.contains("[::1]"), "{e}");
+        f.close(fw.id).unwrap();
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
