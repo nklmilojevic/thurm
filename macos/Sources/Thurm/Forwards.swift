@@ -176,8 +176,21 @@ struct RemotePorts {
         learning[host] = nil
         let waited = held.removeValue(forKey: host) ?? []
         guard let snapshot else {
-            // Nothing to tell changes by: what came meanwhile is what runs, already.
-            return waited.map { keep($0); return Send(entry: $0, initial: true) }
+            // Nothing to tell changes by. A pane's first list may be the one its daemon sends on
+            // joining: what runs, already. Any list of it after that is a change, unless it only
+            // says that again.
+            var out: [Send] = []
+            var seen: Set<UInt64> = []
+            for e in waited {
+                if seen.insert(e.pane).inserted {
+                    keep(e)
+                    out.append(Send(entry: e, initial: true))
+                } else if !RemotePorts.same(lists[host]?[e.pane], e) {
+                    keep(e)
+                    out.append(Send(entry: e, initial: false))
+                }
+            }
+            return out
         }
         var out: [Send] = []
         for e in snapshot where !RemotePorts.isEmpty(e.ports) {
@@ -526,13 +539,17 @@ extension SessionManager {
         guard host != localHost, let payload else { return }
         Remotes.shared.portsRequests.event(host, payload)
         applyRemotePorts(payload, host: host)
+        // Plugins hear it once, as it comes: `fetchRemotePorts` applies it again for the
+        // forwards only.
+        if let pane = jsonUInt64(payload["pane"]) {
+            Extensions.shared.reportPorts(host: host, pane: pane, ports: payload["ports"] ?? [],
+                                          complete: payload["complete"] ?? true)
+        }
     }
 
-    fileprivate func applyRemotePorts(_ payload: [String: Any], host: HostId) {
+    func applyRemotePorts(_ payload: [String: Any], host: HostId) {
         guard let pane = jsonUInt64(payload["pane"]) else { return }
         _ = Core.shared.remoteCall(["op": "ports_changed", "host": host, "pane": NSNumber(value: pane),
                                     "ports": payload["ports"] ?? [], "complete": payload["complete"] ?? true])
-        Extensions.shared.reportPorts(host: host, pane: pane, ports: payload["ports"] ?? [],
-                                      complete: payload["complete"] ?? true)
     }
 }

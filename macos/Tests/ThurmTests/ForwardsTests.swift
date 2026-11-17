@@ -243,6 +243,38 @@ final class ForwardsTests: XCTestCase {
         XCTAssertNil(live(&p, "pi", 4, [3000]))
         XCTAssertEqual(said(p.learned("pi", ask: failed, snapshot: nil)), ["pi/4:3000*"])
     }
+
+    /// No answer (an error, a timeout): a pane's first list may be its daemon's on joining, but
+    /// what that pane lists after it is a change, not a server running already.
+    func testWithoutAnAnswerALaterListIsStillAChange() {
+        var p = RemotePorts()
+        let ask = p.connected("pi")
+        XCTAssertNil(live(&p, "pi", 4, [3000]))
+        XCTAssertNil(live(&p, "pi", 4, [3000, 3001]))
+        XCTAssertNil(live(&p, "pi", 4, [3000, 3001]))
+        XCTAssertNil(live(&p, "pi", 5, [22]))
+        XCTAssertNil(live(&p, "pi", 4, []))
+        XCTAssertEqual(said(p.learned("pi", ask: ask, snapshot: nil)),
+                       ["pi/4:3000*", "pi/4:3000,3001", "pi/5:22*", "pi/4:"])
+    }
+
+    /// A remote list that came while the forwards' own `Ports` request was out is applied to
+    /// them again after its answer; plugins heard it once, as it came.
+    func testAReplayedRemoteListIsNotReportedAgain() {
+        let ext = Extensions.shared
+        var reported: [[String: Any]] = []
+        ext.portsReported = { reported.append($0) }
+        defer { ext.portsReported = nil }
+        let started: [String: Any] = ["pane": 2, "ports": [["port": 5173]], "complete": true]
+        let stopped: [String: Any] = ["pane": 2, "ports": [] as [Any], "complete": true]
+        SessionManager.shared.remotePortsChanged(started, host: "replay-test")
+        SessionManager.shared.remotePortsChanged(stopped, host: "replay-test")
+        // `fetchRemotePorts` after its answer.
+        SessionManager.shared.applyRemotePorts(started, host: "replay-test")
+        SessionManager.shared.applyRemotePorts(stopped, host: "replay-test")
+        XCTAssertEqual(reported.count, 2)
+        XCTAssertEqual(reported.compactMap { ($0["ports"] as? [Any])?.count }, [1, 0])
+    }
     func testAFailureWithoutAPaneIsAnAlert() {
         XCTAssertEqual(ForwardNotice.failure(host: "pi", "pi is not connected", onPane: true),
                        .toast("Could not forward from pi: pi is not connected", copyLink: nil))

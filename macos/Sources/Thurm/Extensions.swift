@@ -441,8 +441,15 @@ final class Extensions {
         var params: [String: Any] = ["host": host, "pane": NSNumber(value: pane), "ports": ports,
                                      "complete": complete]
         if initial { params["initial"] = true }
+        if let portsReported {
+            portsReported(params)
+            return
+        }
         call("ports.report", params)
     }
+
+    /// Takes the `ports.report`s in place of the daemon (tests).
+    var portsReported: (([String: Any]) -> Void)?
 
     /// The app connected to `host`: what it lists now goes to plugins as `initial`, so a server
     /// that was running already is not taken for one that just started; what changes after, as

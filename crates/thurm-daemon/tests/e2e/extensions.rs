@@ -1467,6 +1467,12 @@ fn a_subscriber_hears_ports_and_uploaded_files() {
         assert_eq!(listed[0]["pane"], pane);
         assert_eq!(listed[0]["ports"][0]["port"], port, "{listed}");
         assert!(call(&c, method::PORTS_LIST, json!({ "pane": 4242 })).is_err());
+        // A pane that is not one is refused, not taken for every pane.
+        for bad in [json!(-1), json!("3"), json!(1.5), json!(true)] {
+            let e = call(&c, method::PORTS_LIST, json!({ "pane": bad })).unwrap_err();
+            assert!(e.contains("not an id"), "{bad}: {e}");
+        }
+        assert!(call(&c, method::PORTS_LIST, json!({ "pane": null })).is_ok());
     }
 
     let pane = match c
@@ -1646,6 +1652,20 @@ fn forwards_go_through_the_app() {
     assert_eq!(ports["id"], 3);
     assert_eq!(ports["ports"][0]["command"], "vite");
     assert!(ports.get("pane").is_none(), "{ports}");
+    // Values that are not what they name are refused, not taken for a default.
+    for bad in [
+        json!({ "host": "devbox", "pane": -3, "ports": [] }),
+        json!({ "host": "devbox", "pane": 3, "ports": [], "complete": "false" }),
+        json!({ "host": "devbox", "pane": 3, "ports": [], "initial": 1 }),
+        json!({ "host": "devbox", "gone": "yes" }),
+    ] {
+        assert!(
+            call(&app, method::PORTS_REPORT, bad.clone()).is_err(),
+            "{bad} was taken"
+        );
+    }
+    let e = call(&plugin, method::FORWARDS_CLOSE, json!({ "id": -7 })).unwrap_err();
+    assert!(e.contains("not an id"), "{e}");
 
     // The app quits: its forwards close with it.
     call(

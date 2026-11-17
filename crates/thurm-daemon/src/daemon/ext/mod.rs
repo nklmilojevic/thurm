@@ -78,6 +78,29 @@ fn client_is_tailnet(client: &Client) -> bool {
         .is_some_and(|p| p.kind == thurm_proto::PrincipalKind::Tailscale)
 }
 
+/// `key` of `v` as an unsigned integer (an id): none when absent or null, refused when it is
+/// anything else (`-1`, `"3"`), rather than taken for none.
+fn opt_u64(v: &Value, key: &str) -> Result<Option<u64>, String> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => x
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("bad {key:?}: {x} is not an id")),
+    }
+}
+
+/// `key` of `v` as a boolean: none when absent or null, refused when it is anything else.
+fn opt_bool(v: &Value, key: &str) -> Result<Option<bool>, String> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => x
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("bad {key:?}: {x} is not true or false")),
+    }
+}
+
 /// The remote lists `app` relayed, as `ports_changed` payloads of servers running already.
 fn remote_lists(all: &HashMap<u64, RemoteLists>, app: Option<u64>) -> Vec<Value> {
     app.and_then(|a| all.get(&a))
@@ -323,7 +346,8 @@ impl Daemon {
                 Ok(Value::Null)
             }
             method::PORTS_LIST => {
-                let pane = p.get("pane").and_then(Value::as_u64);
+                // No pane is every pane; a pane that is not one is refused, not taken for none.
+                let pane = opt_u64(&p, "pane")?;
                 match self.answer(client, Request::Ports { pane })? {
                     Response::Ports(list) => Ok(json!(list)),
                     other => Err(format!("unexpected answer: {other:?}")),
@@ -336,7 +360,7 @@ impl Daemon {
                 // Plugins that heard its lists hear them end: nothing is known of them now.
                 // The lists are kept and sent under their lock: what plugins hear of a pane is in
                 // the order it was kept, whoever sends it (a report, a replay).
-                if p.get("gone").and_then(Value::as_bool) == Some(true) {
+                if opt_bool(&p, "gone")? == Some(true) {
                     let mut all = self.ext.remote_ports.lock();
                     let mut ended = Vec::new();
                     if let Some(lists) = all.get_mut(&client.id) {
@@ -352,14 +376,12 @@ impl Daemon {
                     }
                     return Ok(Value::Null);
                 }
-                let pane = p
-                    .get("pane")
-                    .and_then(Value::as_u64)
-                    .ok_or("missing \"pane\"")?;
+                let pane = opt_u64(&p, "pane")?.ok_or("missing \"pane\"")?;
                 let ports: Vec<PortEntry> =
                     serde_json::from_value(p.get("ports").cloned().unwrap_or(json!([])))
                         .map_err(|e| format!("bad ports: {e}"))?;
-                let complete = p.get("complete").and_then(Value::as_bool).unwrap_or(true);
+                let complete = opt_bool(&p, "complete")?.unwrap_or(true);
+                let initial = opt_bool(&p, "initial")? == Some(true);
                 let mut all = self.ext.remote_ports.lock();
                 let lists = all.entry(client.id).or_default();
                 let at = (host.to_owned(), pane);
@@ -375,7 +397,7 @@ impl Daemon {
                 let mut extra =
                     json!({ "host": host, "id": pane, "ports": ports, "complete": complete });
                 // Listening already when the app connected to the host: not news.
-                if p.get("initial").and_then(Value::as_bool) == Some(true) {
+                if initial {
                     extra["initial"] = true.into();
                 }
                 self.emit(PORTS_CHANGED, None, extra);
@@ -405,10 +427,7 @@ impl Daemon {
                 self.ask(&app, client, |id| ext::UiRequest::ForwardOpen { id, open })
             }
             method::FORWARDS_CLOSE => {
-                let forward = p
-                    .get("id")
-                    .and_then(Value::as_u64)
-                    .ok_or("missing \"id\"")?;
+                let forward = opt_u64(&p, "id")?.ok_or("missing \"id\"")?;
                 let app = self.forwarding_app()?;
                 self.ask(&app, client, |id| ext::UiRequest::ForwardClose {
                     id,

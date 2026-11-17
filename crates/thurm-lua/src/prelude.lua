@@ -203,6 +203,8 @@ end
 -- Ports and forwards --------------------------------------------------------------------------
 
 function thurm.ports(pane)
+  check(pane == nil or (math.type(pane) == "integer" and pane >= 0),
+    "usage: thurm.ports(pane) with a pane id, or thurm.ports() for every pane")
   local list = call("ports.list", { pane = pane })
   if pane == nil then
     return list
