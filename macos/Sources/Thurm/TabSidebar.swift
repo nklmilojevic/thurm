@@ -83,10 +83,17 @@ final class SidebarGroup {
         self.host = host
     }
 
+    /// Listed without its header: its rows stand in its parent's place. A host's only
+    /// workspace, or the one host the list is narrowed to (the top of the sidebar names it).
+    var headless = false
+
     /// What the outline lists under it.
     var children: [AnyObject] {
-        host == nil ? boxes : subgroups + (newWorkspace.map { [$0] } ?? [])
+        host == nil ? boxes : subgroups.flatMap(\.shown) + (newWorkspace.map { [$0] } ?? [])
     }
+
+    /// What stands for it in its parent: itself, or without a header what it lists.
+    var shown: [AnyObject] { headless ? children : [self] }
 
     /// Itself and the groups under it, headers first.
     var flattened: [SidebarGroup] { [self] + subgroups.flatMap(\.flattened) }
@@ -147,7 +154,12 @@ enum SidebarHosts {
 
 final class TabBox {
     var tab: SidebarTab
-    init(_ tab: SidebarTab) { self.tab = tab }
+    /// The group it is listed under, also when that group shows no header.
+    weak var group: SidebarGroup?
+    init(_ tab: SidebarTab, group: SidebarGroup? = nil) {
+        self.tab = tab
+        self.group = group
+    }
 }
 
 /// Split view hosting the sidebar next to the tab's split tree.
@@ -318,6 +330,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     }
     /// Headers only when there is more than one group.
     private var showHeaders = false
+    /// What the outline lists at its top level.
+    private var rootItems: [AnyObject] = []
     /// Where the window's workspace runs ("This Mac" or the host); click for the workspace picker.
     private let workspaceButton = NSButton(title: "", target: nil, action: nil)
     private let hostIcon = NSImageView()
@@ -458,20 +472,35 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
 
     /// The top row: where the window's workspace runs, and the hosts button (hidden while there
     /// is no other host to list and the list by host is off).
+    /// Listed by host, it names what is listed (every host, or the one host and its state) and
+    /// opens the hosts choice in place of the workspace picker, as every workspace is listed.
     private func syncTopRow(_ shown: Workspace?, config: AppConfig) {
-        let host = shown?.host ?? controller?.host ?? localHost
-        let place = SidebarHosts.title(host)
-        if workspaceButton.title != place { workspaceButton.title = place }
-        let tip = shown.map { "Workspace \($0.name) · Workspaces (⌘⇧O)" } ?? "Workspaces (⌘⇧O)"
+        var title: String, symbol: String, tip: String, action: Selector
+        if config.sidebarByHost {
+            let sm = SessionManager.shared
+            let hosts = SidebarHosts.hosts(remotes: config.remoteNames, workspaceHosts: sm.workspaces.map(\.host))
+            let only = SidebarHosts.effectiveFilter(config.sidebarHost, hosts: hosts)
+            title = only.map(SidebarHosts.title) ?? "All Hosts"
+            if let state = only.flatMap(Self.hostState) { title += " · \(state)" }
+            symbol = only.map { $0 == localHost ? "laptopcomputer" : "globe" } ?? "square.stack.3d.up"
+            tip = "Hosts"
+            action = #selector(showHostsPopover(_:))
+        } else {
+            let host = shown?.host ?? controller?.host ?? localHost
+            title = SidebarHosts.title(host)
+            symbol = host == localHost ? "laptopcomputer" : "globe"
+            tip = shown.map { "Workspace \($0.name) · Workspaces (⌘⇧O)" } ?? "Workspaces (⌘⇧O)"
+            action = #selector(showWorkspaceMenu(_:))
+        }
+        if workspaceButton.title != title { workspaceButton.title = title }
         if workspaceButton.toolTip != tip { workspaceButton.toolTip = tip }
-        let symbol = host == localHost ? "laptopcomputer" : "globe"
+        workspaceButton.action = action
         if hostIcon.image?.accessibilityDescription != symbol {
             hostIcon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol)
         }
-        hostsButton.isHidden = config.remoteNames.isEmpty && !config.sidebarByHost
-        let filled = config.sidebarByHost ? "square.stack.3d.up.fill" : "square.stack.3d.up"
-        if hostsButton.image?.accessibilityDescription != filled {
-            hostsButton.image = NSImage(systemSymbolName: filled, accessibilityDescription: filled)
+        hostsButton.isHidden = config.remoteNames.isEmpty || config.sidebarByHost
+        if hostsButton.image == nil {
+            hostsButton.image = NSImage(systemSymbolName: "square.stack.3d.up", accessibilityDescription: "Hosts")
         }
     }
 
@@ -744,6 +773,13 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         return g
     }
 
+    /// A workspace's name under its host's header: without the host's name in front, which
+    /// names the workspaces made on a remote host after its first ("devbox-quiet-otter").
+    static func nameUnderHost(_ ws: Workspace) -> String {
+        guard ws.isRemote, ws.name.hasPrefix(ws.host + "-"), ws.name.count > ws.host.count + 1 else { return ws.name }
+        return String(ws.name.dropFirst(ws.host.count + 1))
+    }
+
     /// A host's state on its header in the list by host: nil while it is connected.
     static func hostState(_ host: HostId) -> String? {
         guard host != localHost, !Core.shared.isConnected(host) else { return nil }
@@ -786,7 +822,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         // Every workspace listed: this window's tabs under its workspace (under its host, the
         // workspace's name is enough).
         let other = config.sidebarByHost
-            ? SidebarGroup(name: shownWorkspace?.name ?? "Tabs", key: shownWorkspace.map(Self.collapseKey))
+            ? SidebarGroup(name: shownWorkspace.map(Self.nameUnderHost) ?? "Tabs", key: shownWorkspace.map(Self.collapseKey))
             : config.sidebarAllWorkspaces
             ? SidebarGroup(name: shownWorkspace.map(Self.heading) ?? "Tabs", key: shownWorkspace.map(Self.collapseKey))
             : SidebarGroup(name: "Terminals")
@@ -834,9 +870,17 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                 g.state = section.state
                 g.subgroups = section.workspaces.compactMap { id -> SidebarGroup? in
                     if id == shownWorkspace?.id { return other }
-                    return sm.workspace(id).map { Self.workspaceGroup($0, name: $0.name, info: panes, config: config) }
+                    return sm.workspace(id).map {
+                        Self.workspaceGroup($0, name: Self.nameUnderHost($0), info: panes, config: config)
+                    }
                 }.filter { !$0.tabs.isEmpty }
                 if section.offersNewWorkspace { g.newWorkspace = NewWorkspaceBox(host: section.host) }
+                // A host's only workspace needs no name of its own, nor its first one named after
+                // it (a remote host's first workspace is); nor the one host listed.
+                if let first = g.subgroups.first, g.subgroups.count == 1 || first.name == section.host {
+                    first.headless = true
+                }
+                g.headless = hostFilter != nil
                 order.append(g)
             }
         } else if config.sidebarAllWorkspaces {
@@ -860,7 +904,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         // A host's header stays without rows: it shows the host's state, or offers a workspace.
         order.removeAll { $0.host == nil && $0.tabs.isEmpty }
         let all = order.flatMap(\.flattened), leaves = all.filter { $0.host == nil }
-        let names = all.map { [$0.key, $0.name, $0.state ?? "", $0.newWorkspace?.host ?? ""] }
+        let names = all.map { [$0.key, $0.name, $0.state ?? "", $0.newWorkspace?.host ?? "", $0.headless ? "-" : ""] }
         let tabs = leaves.map(\.tabs)
         let theme = SessionManager.shared.config.theme
         if let s = shown, s.names == names, s.theme == theme,
@@ -890,18 +934,19 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             }
         } else {
             shown = (names, tabs, theme)
-            for g in leaves { g.boxes = g.tabs.map(TabBox.init) }
+            for g in leaves { g.boxes = g.tabs.map { TabBox($0, group: g) } }
             groups = order
             // Every workspace listed: each under its name, also when the others have no tabs to
             // show. The activity list: each status under its name, also when it is the only one.
             showHeaders = config.sidebarActiveOnly || config.sidebarAllWorkspaces || config.sidebarByHost
                 || groups.count > 1 || groups.first?.key == Self.pinnedKey
+            rootItems = showHeaders ? groups.flatMap(\.shown) : groups.first?.boxes ?? []
             outline.reloadData()
             // Every group open first, so a workspace under a collapsed host keeps its own state.
-            let collapsed = Self.collapsed
+            let collapsed = Self.collapsed, headed = all.filter { !$0.headless }
             restoringExpansion = true
-            for g in all { outline.expandItem(g) }
-            for g in all.reversed() where collapsed.contains(g.key) { outline.collapseItem(g) }
+            for g in headed { outline.expandItem(g) }
+            for g in headed.reversed() where collapsed.contains(g.key) { outline.collapseItem(g) }
             restoringExpansion = false
         }
         // Select the row of this window's tab, also when the rows are unchanged: a click on
@@ -944,18 +989,13 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     // MARK: NSOutlineViewDataSource
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
-        if item == nil {
-            return showHeaders ? groups.count : groups.first?.boxes.count ?? 0
-        }
+        if item == nil { return rootItems.count }
         if let g = item as? SidebarGroup { return g.children.count }
         return 0
     }
 
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
-        if item == nil {
-            if showHeaders { return groups[index] }
-            return groups[0].boxes[index]
-        }
+        if item == nil { return rootItems[index] }
         return (item as! SidebarGroup).children[index]
     }
 
@@ -1026,13 +1066,25 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     }
 
     private func allowsDrop(_ moving: NSWindow, into item: Any?, at index: Int) -> Bool {
-        let group = item as? SidebarGroup
-        // A host's header lists workspaces, not tabs.
-        if group?.host != nil { return false }
+        guard let (group, index) = dropTarget(item, at: index) else { return false }
         let own = group?.boxes.prefix { $0.tab.controller?.window.map(ownsTab) == true }.count ?? 0
         return Self.allowsDrop(into: group, at: index,
                                pinned: (moving.windowController as? TerminalWindowController)?.pinned == true,
                                ownPinnedRows: own)
+    }
+
+    /// The group a drop between rows under `item` goes into, and where among its rows: the
+    /// item itself, or the group whose rows are listed there without a header (nil: the one
+    /// list without headers). A host's header lists workspaces, not tabs: no drop there.
+    private func dropTarget(_ item: Any?, at index: Int) -> (group: SidebarGroup?, index: Int)? {
+        if let g = item as? SidebarGroup, g.host == nil { return (g, index) }
+        if item == nil, !showHeaders { return (nil, index) }
+        guard index != NSOutlineViewDropOnItemIndex else { return nil }
+        let items = (item as? SidebarGroup)?.children ?? rootItems
+        let near = [index - 1, index].lazy.compactMap { items.indices.contains($0) ? items[$0] as? TabBox : nil }.first
+        guard let g = near?.group, let start = items.firstIndex(where: { ($0 as? TabBox)?.group === g })
+        else { return nil }
+        return (g, index - start)
     }
 
     private func workspaceGroup(at item: Any?) -> SidebarGroup? {
@@ -1054,9 +1106,10 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             DispatchQueue.main.async { SessionManager.shared.moveTab(c, to: ws) }
             return true
         }
-        guard allowsDrop(moving, into: item, at: index), let group = controller?.window?.tabGroup else { return false }
+        guard allowsDrop(moving, into: item, at: index), let group = controller?.window?.tabGroup,
+              let (target, index) = dropTarget(item, at: index) else { return false }
         // Rows of the drop's group in order, and the tab that ends up right after the dropped one.
-        let rows: [TabBox] = (item as? SidebarGroup)?.boxes ?? (showHeaders ? [] : groups.first?.boxes ?? [])
+        let rows: [TabBox] = target?.boxes ?? (showHeaders ? [] : groups.first?.boxes ?? [])
         let all = rows.compactMap { $0.tab.controller?.window }.filter(ownsTab)
         let windows = all.filter { $0 !== moving }
         // `index` counts the dragged row too when it comes from above the drop point.
@@ -1361,12 +1414,13 @@ final class SidebarHeadingView: NSView {
             left += Self.hostLabelOffset
         }
         let size = label.intrinsicContentSize
-        var right = bounds.width - 12
+        var right = bounds.width - 8
         if let detail {
-            let d = detail.intrinsicContentSize
-            let w = min(d.width, max(0, (right - left) / 2))
+            // The host's name first; its state takes what is left.
+            let d = detail.cell?.cellSize ?? detail.intrinsicContentSize
+            let w = min(ceil(d.width) + 1, max(0, right - left - ceil(size.width) - 8))
             detail.frame = NSRect(x: right - w, y: ((bounds.height - d.height) / 2).rounded(), width: w, height: d.height)
-            right -= w + 6
+            right -= w + 8
         }
         label.frame = NSRect(x: left, y: ((bounds.height - size.height) / 2).rounded(),
                              width: max(0, right - left), height: size.height)

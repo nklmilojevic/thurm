@@ -153,15 +153,20 @@ final class ActivityListViewTests: XCTestCase {
         XCTAssertEqual(listed(outline), rows)
         XCTAssertEqual((outline.item(atRow: 7) as? SidebarGroup)?.state, Remotes.shared.phaseLabel("devbox"))
         XCTAssertEqual(outline.selectedRow, 2)
+        // The top names what is listed, and offers the hosts, not the workspace picker.
         let title = try XCTUnwrap(sidebar.view.subviews.compactMap { $0 as? NSButton }.first)
-        XCTAssertEqual(title.title, "This Mac")
+        XCTAssertEqual(title.title, "All Hosts")
+        XCTAssertEqual(title.action, NSSelectorFromString("showHostsPopover:"))
 
+        // Narrowed to one host, the top names it (and its state), and the list has no header for it.
         manager.config.sidebarHost = "devbox"
         sidebar.reload()
-        XCTAssertEqual(listed(outline), ["devbox"])
+        XCTAssertEqual(listed(outline), [])
+        XCTAssertEqual(title.title, "devbox · \(Remotes.shared.phaseLabel("devbox"))")
         manager.config.sidebarHost = localHost
         sidebar.reload()
-        XCTAssertEqual(listed(outline), Array(rows.dropLast()))
+        XCTAssertEqual(listed(outline), Array(rows.dropFirst().dropLast()))
+        XCTAssertEqual(title.title, "This Mac")
         manager.config.sidebarHost = nil
         sidebar.reload()
 
@@ -172,6 +177,23 @@ final class ActivityListViewTests: XCTestCase {
         let other = try self.outline(try XCTUnwrap(shown.sidebar))
         XCTAssertEqual(listed(other), rows)
         XCTAssertEqual(other.selectedRow, 6)
+    }
+
+    /// A host's only workspace is listed without a header of its name; off, the top names
+    /// where the workspace runs and opens the workspace picker.
+    func testByHostListsAHostsOnlyWorkspaceWithoutItsName() throws {
+        let first = try tabs()
+        manager.workspaces.removeAll { $0.name == "api" }
+        let sidebar = try XCTUnwrap(first.sidebar)
+        sidebar.reload()
+        let outline = try outline(sidebar)
+        let title = try XCTUnwrap(sidebar.view.subviews.compactMap { $0 as? NSButton }.first)
+        XCTAssertEqual(title.title, "This Mac")
+        XCTAssertEqual(title.action, NSSelectorFromString("showWorkspaceMenu:"))
+        manager.config.sidebarByHost = true
+        sidebar.reload()
+        XCTAssertEqual(listed(outline), ["This Mac", "tab", "tab", "tab"])
+        XCTAssertEqual(outline.selectedRow, 1)
     }
 
     func testActiveOnlyListsAgentsByStatusFromEveryWorkspace() throws {

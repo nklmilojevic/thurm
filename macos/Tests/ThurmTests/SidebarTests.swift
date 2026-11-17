@@ -128,6 +128,26 @@ final class SidebarTests: XCTestCase {
         XCTAssertEqual(TabSidebarViewController.heading(Workspace(id: 2, name: "api", host: "devbox")), "api (devbox)")
     }
 
+    /// A host's header keeps its state whole beside a short name.
+    func testHostHeadingShowsItsWholeState() {
+        let heading = SidebarHeadingView("offbox", symbol: "globe", detail: "reconnecting")
+        heading.frame = NSRect(x: 0, y: 0, width: 220, height: SidebarHeadingView.hostHeight)
+        heading.layoutSubtreeIfNeeded()
+        let detail = heading.subviews.compactMap { $0 as? NSTextField }.first { $0.stringValue == "reconnecting" }!
+        XCTAssertGreaterThanOrEqual(detail.frame.width, detail.cell!.cellSize.width)
+        XCTAssertLessThanOrEqual(heading.label.frame.maxX, detail.frame.minX)
+    }
+
+    /// Under its host's header, a workspace goes without the host's name in front.
+    func testWorkspaceNameUnderItsHost() {
+        let name = { TabSidebarViewController.nameUnderHost(Workspace(id: 1, name: $0, host: $1)) }
+        XCTAssertEqual(name("devbox-quiet-otter", "devbox"), "quiet-otter")
+        XCTAssertEqual(name("devbox", "devbox"), "devbox")
+        XCTAssertEqual(name("devbox-", "devbox"), "devbox-")
+        XCTAssertEqual(name("api", "devbox"), "api")
+        XCTAssertEqual(name("local-thing", localHost), "local-thing")
+    }
+
     /// A tab is active while an agent in any of its panes isn't idle, or it shows progress.
     func testActiveTabs() {
         let shell = PaneKey.local(1), agent = PaneKey.local(2)
