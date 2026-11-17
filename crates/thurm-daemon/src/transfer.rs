@@ -74,6 +74,7 @@ const PARTS: &str = ".parts";
 const DONE: &str = ".done";
 
 /// A kept batch: since when it is aged, what it takes on disk, and in files.
+#[derive(Clone)]
 struct Kept {
     since: SystemTime,
     size: u64,
@@ -113,7 +114,13 @@ struct State {
     batches: HashMap<u64, Batch>,
     next: u64,
     downloads: HashMap<PaneId, usize>,
+    /// The last walk of the kept drops, and when: reused for a moment (the files of one drop
+    /// come one after the other), forgotten whenever the daemon changes a batch or deletes one.
+    kept_seen: Option<(Instant, Vec<Kept>)>,
 }
+
+/// How long a walk of the kept drops is reused.
+const KEPT_FRESH: Duration = Duration::from_secs(1);
 
 struct Batch {
     pane: PaneId,
@@ -194,8 +201,10 @@ impl Transfers {
     pub fn prune(&self) {
         let mut st = self.state.lock();
         self.sweep(&mut st);
-        let kept = self.kept(&st);
+        st.kept_seen = None;
+        let kept = self.kept(&mut st);
         self.make_room(kept, 0, 0, 0);
+        st.kept_seen = None;
     }
 
     /// [`thurm_proto::Request::UploadBegin`]: reserves the file's place in its batch and a
@@ -328,7 +337,7 @@ impl Transfers {
         // Drops past their time go first (`kept` deletes them): the space and files they leave
         // count before any are found missing. What the rest would give back if deleted is what
         // admitting this file may still take from them.
-        let kept_now = self.kept(&st);
+        let kept_now = self.kept(&mut st);
         let recoverable: u64 = kept_now.iter().map(|k| k.size).sum();
         let recoverable_files: u64 = kept_now.iter().map(|k| k.files).sum();
         // A new batch's directory and its parts directory, and the file and its part.
@@ -358,6 +367,7 @@ impl Transfers {
             st.next += 1;
             st.next
         });
+        let claimant = principal.clone();
         let ticket = daemon.streams.reserve(
             Kind::Upload {
                 batch: serial,
@@ -366,10 +376,21 @@ impl Transfers {
             client,
             principal,
         )?;
+        // A refusal from here on gives the ticket back (claimed and dropped): refused uploads
+        // retried do not use up the client's tickets.
+        let release = || {
+            let _ = daemon.streams.claim(&ticket.0, &claimant);
+        };
         // A new batch's directory first: if it cannot be made, nothing kept was deleted for it.
         let created = existing.is_none();
         if created {
-            let dir = self.new_batch_dir(pane)?;
+            let dir = match self.new_batch_dir(pane) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    release();
+                    return Err(e);
+                }
+            };
             st.batches.insert(
                 serial,
                 Batch {
@@ -391,10 +412,13 @@ impl Transfers {
             if created && let Some(b) = st.batches.remove(&serial) {
                 remove_batch(&b.dir);
             }
+            release();
         };
         // Only an admitted file makes older drops give way, and only what was deleted counts.
         // The drops looked at above, not walked again: the new batch is not among them.
-        if !self.make_room(kept_now, incoming, short, files_short) {
+        let room = self.make_room(kept_now, incoming, short, files_short);
+        st.kept_seen = None;
+        if !room {
             undo(&mut st);
             return Err(too_much());
         }
@@ -536,6 +560,10 @@ impl Transfers {
         if !b.waiting() || b.pasting {
             return;
         }
+        st.kept_seen = None;
+        let Some(b) = st.batches.get_mut(&serial) else {
+            return;
+        };
         log::info!("upload to pane {} failed: {why}", b.pane);
         b.outcome = Some(Err(why));
         b.touched = Instant::now();
@@ -585,13 +613,17 @@ impl Transfers {
             return;
         };
         b.writers.retain(|(i, _)| *i != index);
-        if matches!(b.outcome, Some(Err(_))) {
+        let failed = matches!(b.outcome, Some(Err(_)));
+        if failed {
             if let Some(f) = b.files.get_mut(&index) {
                 f.state = SlotState::Gone;
             }
             if b.writers.is_empty() {
                 remove_batch(&b.dir);
             }
+        }
+        if failed {
+            st.kept_seen = None;
         }
     }
 
@@ -635,7 +667,19 @@ impl Transfers {
 
     /// The kept batches on disk, oldest first, with their sizes; those past their time
     /// (`keep`) are deleted on the way. Batches in use are left out.
-    fn kept(&self, st: &State) -> Vec<Kept> {
+    fn kept(&self, st: &mut State) -> Vec<Kept> {
+        if let Some((at, kept)) = &st.kept_seen
+            && at.elapsed() < KEPT_FRESH
+        {
+            return kept.clone();
+        }
+        let kept = self.walk_kept(st);
+        st.kept_seen = Some((Instant::now(), kept.clone()));
+        kept
+    }
+
+    /// [`Transfers::kept`], walking the disk.
+    fn walk_kept(&self, st: &State) -> Vec<Kept> {
         let busy: HashSet<&Path> = st
             .batches
             .values()
@@ -749,6 +793,7 @@ impl Transfers {
                 Ok(()) => {
                     record_done(&b.dir);
                     b.outcome = Some(Ok(()));
+                    st.kept_seen = None;
                     self.changed.notify_all();
                 }
                 Err(e) => self.fail(&mut st, serial, e),

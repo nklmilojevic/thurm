@@ -861,4 +861,52 @@ final class FilePreviewTests: XCTestCase {
         cache.release(respelled)
         XCTAssertFalse(FileManager.default.fileExists(atPath: shown.path))
     }
+
+    func testAnotherRunningInstancesDownloadIsLeftAlone() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thurm-owner-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entry = root.appendingPathComponent("89ab", isDirectory: true)
+        try FileManager.default.createDirectory(at: entry, withIntermediateDirectories: true)
+        // The test runner's parent runs; a pid this high does not.
+        let live = entry.appendingPathComponent(".staging-\(getppid())-x")
+        let livePart = entry.appendingPathComponent(".thurm-\(getppid())-0.part")
+        let dead = entry.appendingPathComponent(".staging-99999999-x")
+        let mine = entry.appendingPathComponent(".staging-\(getpid())-x")
+        for f in [live, livePart, dead, mine] { try Data("x".utf8).write(to: f) }
+        XCTAssertEqual(RemoteFileCache.downloadOwner(live), getppid())
+        _ = RemoteFileCache(root: root)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: live.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: livePart.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dead.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: mine.path))
+    }
+
+    func testLettingAPreviewGoWalksTheCacheOnlyWhenOverItsLimit() throws {
+        let cache = tempCache(maxBytes: 10)
+        let pane = PaneKey("devbox", 3)
+        func fetch(_ path: String, bytes: Int) -> URL? {
+            cache.download = downloads { _, _, dest, _, done in
+                try! Data(repeating: 1, count: bytes).write(to: dest)
+                done(self.outcome(name: (path as NSString).lastPathComponent, version: "v"))
+            }
+            var got: URL?
+            cache.fetch(.path(path), pane: pane, cwd: nil) { got = try? $0.get() }
+            return got
+        }
+        let small = try XCTUnwrap(fetch("/small.bin", bytes: 2))
+        cache.hold(small)
+        let before = cache.prunes
+        cache.release(small)
+        XCTAssertEqual(cache.prunes, before)
+        // Over the limit with a shown copy in the way: letting it go prunes.
+        let shown = try XCTUnwrap(fetch("/a.bin", bytes: 8))
+        cache.hold(shown)
+        let other = try XCTUnwrap(fetch("/b.bin", bytes: 8))
+        cache.hold(other)
+        let walked = cache.prunes
+        cache.release(shown)
+        XCTAssertEqual(cache.prunes, walked + 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: shown.path))
+    }
 }

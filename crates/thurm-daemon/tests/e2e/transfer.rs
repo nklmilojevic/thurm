@@ -1331,3 +1331,20 @@ fn names_a_case_blind_disk_would_take_for_one_are_kept_apart() {
             .is_ok()
     );
 }
+
+#[test]
+fn a_refused_upload_gives_its_ticket_back() {
+    let env = Env::new("transfer-ticket-back");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    // Its batch's directory cannot be made (a file is in its pane's place).
+    std::fs::create_dir_all(env.dir.join("state/drops")).unwrap();
+    std::fs::write(env.dir.join("state/drops").join(pane.to_string()), b"").unwrap();
+    // Retried past the 64 tickets a client may hold, it still says why.
+    for _ in 0..70 {
+        let e = c.upload_begin(pane, "a.txt", 1, None).unwrap_err();
+        assert!(e.to_string().contains("cannot create"), "{e}");
+    }
+}

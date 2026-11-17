@@ -201,13 +201,33 @@ final class RemoteFileCache {
         return name.hasPrefix(".staging-") || (name.hasPrefix(".thurm-") && name.hasSuffix(".part"))
     }
 
-    /// Deletes the downloads in `entry` no fetch is writing (left by a fetch that never ended,
-    /// as in an earlier run); returns the bytes of those that could not be deleted.
+    /// The process a download's file belongs to, from its name (`.staging-<pid>-…`,
+    /// `.thurm-<pid>-<n>.part`); nil for a name without one (an older build's).
+    static func downloadOwner(_ file: URL) -> pid_t? {
+        let name = file.lastPathComponent
+        for prefix in [".staging-", ".thurm-"] where name.hasPrefix(prefix) {
+            let rest = name.dropFirst(prefix.count)
+            return rest.split(separator: "-", maxSplits: 1).first.flatMap { pid_t($0) }
+        }
+        return nil
+    }
+
+    /// Whether process `pid` still runs (one of another user's counts as running).
+    private static func running(_ pid: pid_t) -> Bool {
+        kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    /// Deletes the downloads in `entry` no fetch is writing: this process's, as it writes into
+    /// none of them, and those of a process that has ended (left by an earlier run). Another
+    /// running instance's are its own. Returns the bytes of those left, which still count.
     private func clearStaleDownloads(in entry: URL) -> UInt64 {
         let fm = FileManager.default
+        let me = getpid()
         let files = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: [.fileSizeKey])) ?? []
         return files.filter(Self.isDownload).reduce(UInt64(0)) { left, file in
-            if (try? fm.removeItem(at: file)) != nil { return left }
+            let owner = Self.downloadOwner(file)
+            let stale = owner.map { $0 == me || !Self.running($0) } ?? true
+            if stale, (try? fm.removeItem(at: file)) != nil { return left }
             return left + UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
     }
@@ -252,7 +272,8 @@ final class RemoteFileCache {
     func stage(_ entry: URL) throws -> URL {
         try FileManager.default.createDirectory(at: entry, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-        return entry.appendingPathComponent(".staging-\(UUID().uuidString)")
+        // Named for this process, so another instance sharing the folder leaves it alone.
+        return entry.appendingPathComponent(".staging-\(getpid())-\(UUID().uuidString)")
     }
 
     /// Makes the downloaded `staged` file the copy in use, in a folder of its own under its own
@@ -339,8 +360,15 @@ final class RemoteFileCache {
         guard let entry = entryOf(file), let n = held[file] else { return }
         held[file] = n > 1 ? n - 1 : nil
         retireCopies(in: entry)
-        prune()
+        // Only what was left over the limit (a shown copy in the way) needs a look now.
+        if overLimit { prune() }
     }
+
+    /// The last prune left more than `maxBytes`.
+    private var overLimit = false
+
+    /// How many times the cache was walked to prune (tests).
+    private(set) var prunes = 0
 
     /// Bytes reserved by downloads under way, by fetch, with the entry each writes to.
     private var reserved: [UUID: (entry: URL, bytes: UInt64)] = [:]
@@ -360,6 +388,7 @@ final class RemoteFileCache {
     /// could not be deleted still counts. Whether it all fits.
     @discardableResult
     func prune(keeping keep: URL? = nil) -> Bool {
+        prunes += 1
         let fm = FileManager.default
         let busy = Set((held.keys.compactMap(entryOf) + reserved.values.map(\.entry) + [keep].compactMap { $0 })
             .map(Self.path))
@@ -393,6 +422,7 @@ final class RemoteFileCache {
         for e in sized where total > maxBytes && !busy.contains(Self.path(e.url)) {
             if (try? fm.removeItem(at: e.url)) != nil { total -= e.size }
         }
+        overLimit = total > maxBytes
         return total <= maxBytes
     }
 
