@@ -796,7 +796,8 @@ pub enum Event {
     },
     /// The ports `pane`'s programs listen on: the whole list, at most one event a second per
     /// pane. `complete` is false when part of its process tree could not be read. A pane whose
-    /// first list is empty sends nothing; one that exits sends an empty list. Sent only to
+    /// first list is empty and complete sends nothing; one that exits sends an empty complete
+    /// list, unless that is all it ever said. Sent only to
     /// clients with [`CAP_PORT_EVENTS`].
     ///
     /// `initial`: a list sent to a client as it joins the watch, one for every pane (empty ones

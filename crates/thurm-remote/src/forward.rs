@@ -818,12 +818,15 @@ impl Forwards {
         // the connection that wakes it can't be made (out of descriptors), or accepting fails.
         let waits = listener.set_nonblocking(true).is_ok();
         static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // Accepting failing over and over (out of descriptors) is said once, not every time.
+        let mut failing = false;
         loop {
             if stop.load(Ordering::Acquire) {
                 return;
             }
             let conn = match listener.accept() {
                 Ok((c, _)) => {
+                    failing = false;
                     // Accepted sockets may inherit the listener's non-blocking mode (BSD).
                     let _ = c.set_nonblocking(false);
                     c
@@ -833,7 +836,10 @@ impl Forwards {
                     continue;
                 }
                 Err(e) => {
-                    log::warn!("forward {host}:{}: {e}", forward.remote_port);
+                    if !failing {
+                        log::warn!("forward {host}:{}: {e}", forward.remote_port);
+                    }
+                    failing = true;
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }

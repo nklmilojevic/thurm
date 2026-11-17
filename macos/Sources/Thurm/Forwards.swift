@@ -71,8 +71,6 @@ enum ForwardNotice: Equatable {
     }
 }
 
-/// The `Ports` request of each host's current connection: a reply to an earlier one (a
-/// connection that dropped meanwhile, or one replaced by a reconnect) is not applied.
 /// Which host Forward Port… is for: the focused pane's when it is remote; else the one
 /// connected host; else the user picks among them.
 enum ForwardHostChoice: Equatable {
