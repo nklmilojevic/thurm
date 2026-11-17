@@ -501,7 +501,7 @@ pub fn run_as_tool(argv0: &std::ffi::OsStr, args: Vec<std::ffi::OsString>) -> Op
                 std::io::stdout().is_terminal(),
             )
         })
-        .and_then(|action| perform(action).map_err(|e| e.to_string()));
+        .and_then(|action| perform(action, empty_is_nothing(name)).map_err(|e| e.to_string()));
     Some(match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -516,21 +516,24 @@ pub fn run(cmd: ClipCmd, remote: bool) -> Result<ExitCode, Box<dyn std::error::E
     if remote {
         return Err("clip works on this pane's own clipboard; drop --remote".into());
     }
-    perform(match cmd {
-        ClipCmd::Copy => Action::Copy {
-            text: None,
-            trim: false,
-            echo: false,
-        },
-        ClipCmd::Paste { mime: m } => match mime(&m)? {
-            t if t == CLIP_TARGETS => Action::Types { xclip: false },
-            t => Action::Paste {
-                mime: t,
-                newline: false,
+    perform(
+        match cmd {
+            ClipCmd::Copy => Action::Copy {
+                text: None,
+                trim: false,
+                echo: false,
             },
+            ClipCmd::Paste { mime: m } => match mime(&m)? {
+                t if t == CLIP_TARGETS => Action::Types { xclip: false },
+                t => Action::Paste {
+                    mime: t,
+                    newline: false,
+                },
+            },
+            ClipCmd::Clear => Action::Clear,
         },
-        ClipCmd::Clear => Action::Clear,
-    })?;
+        false,
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -588,18 +591,39 @@ fn copy_then_echo(
     Ok(())
 }
 
-fn perform(action: Action) -> Result<(), Box<dyn std::error::Error>> {
+/// Whether `tool` fails on empty text, as xclip and wl-paste do ("nothing is copied"), where
+/// pbpaste and xsel print nothing and succeed.
+fn empty_is_nothing(tool: &str) -> bool {
+    matches!(tool, "xclip" | "wl-paste")
+}
+
+/// What a text paste prints: `data`, or an error when it is empty and `tool` says so for that.
+fn pasted_text(data: Vec<u8>, empty_fails: bool) -> Result<Vec<u8>, String> {
+    if data.is_empty() && empty_fails {
+        Err("nothing to paste: the clipboard has no text".into())
+    } else {
+        Ok(data)
+    }
+}
+
+fn perform(action: Action, empty_fails: bool) -> Result<(), Box<dyn std::error::Error>> {
     if let Action::PasteThenCopy { trim } = action {
         // The copy goes ahead though the paste failed (a refused read), as xsel's does.
-        let pasted = perform(Action::Paste {
-            mime: CLIP_TEXT.into(),
-            newline: false,
-        });
-        let copied = perform(Action::Copy {
-            text: None,
-            trim,
-            echo: false,
-        });
+        let pasted = perform(
+            Action::Paste {
+                mime: CLIP_TEXT.into(),
+                newline: false,
+            },
+            empty_fails,
+        );
+        let copied = perform(
+            Action::Copy {
+                text: None,
+                trim,
+                echo: false,
+            },
+            empty_fails,
+        );
         return pasted.and(copied);
     }
     let mut out = std::io::stdout().lock();
@@ -624,6 +648,9 @@ fn perform(action: Action) -> Result<(), Box<dyn std::error::Error>> {
         }
         Action::Paste { mime, newline } => {
             let mut data = get(pane()?, &mime)?;
+            if mime == CLIP_TEXT {
+                data = pasted_text(data, empty_fails)?;
+            }
             if newline && !data.ends_with(b"\n") {
                 data.push(b'\n');
             }
@@ -981,6 +1008,26 @@ mod tests {
             Ok(Action::PasteThenCopy { trim: false })
         );
         assert!(p("xsel", &["-q"]).is_err());
+    }
+
+    /// An empty clipboard: pbpaste and xsel print nothing and succeed, xclip and wl-paste say
+    /// there is nothing, as each does.
+    #[test]
+    fn empty_text_per_tool() {
+        for tool in ["pbpaste", "xsel"] {
+            assert_eq!(
+                pasted_text(Vec::new(), empty_is_nothing(tool)),
+                Ok(Vec::new()),
+                "{tool}"
+            );
+        }
+        for tool in ["xclip", "wl-paste"] {
+            assert!(
+                pasted_text(Vec::new(), empty_is_nothing(tool)).is_err(),
+                "{tool}"
+            );
+        }
+        assert_eq!(pasted_text(b"x".to_vec(), true), Ok(b"x".to_vec()));
     }
 
     #[test]

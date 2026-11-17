@@ -104,7 +104,7 @@ final class ClipboardToolsTests: XCTestCase {
         XCTAssertEqual(pb.string(forType: .string), "copied")
         XCTAssertTrue(Remotes.clipboardWrite(pb, text: nil, allowed: true))
         XCTAssertEqual(Remotes.clipboardTypes(pb), [])
-        XCTAssertNil(Remotes.clipboardData(pb, mime: "text/plain"))
+        XCTAssertEqual(Remotes.clipboardData(pb, mime: "text/plain"), Data(), "no text: empty")
         // The pasteboard refusing the text is no copy: the tool must hear so.
         XCTAssertFalse(Remotes.clipboardWrite(pb, text: "x", allowed: true, put: { _, _ in false }))
     }
@@ -150,9 +150,10 @@ final class ClipboardToolsTests: XCTestCase {
         XCTAssertLessThan(Remotes.askTimeout, 30, "the daemon waits 30 s for the answer")
     }
 
+    /// An empty clipboard pastes empty text, as pbpaste does on a Mac (no error), and no image.
     func testAnEmptyClipboardHasNothing() {
         XCTAssertEqual(Remotes.clipboardTypes(pb), [])
-        XCTAssertNil(Remotes.clipboardData(pb, mime: "text/plain"))
+        XCTAssertEqual(Remotes.clipboardData(pb, mime: "text/plain"), Data())
         XCTAssertNil(Remotes.clipboardData(pb, mime: "image/png"))
     }
 

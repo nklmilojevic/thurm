@@ -647,7 +647,17 @@ pub unsafe extern "C" fn thurm_clipboard_answer(
         return;
     };
     let data = (!data.is_null()).then(|| unsafe { std::slice::from_raw_parts(data, len) }.to_vec());
-    let _ = c.client.send(Request::ClipboardAnswer { id, data });
+    // Up to 32 MiB over a tunnel that may be slow: written on a thread of its own, so the
+    // caller (the app's main thread) does not wait for it.
+    let client = c.client.clone();
+    let sent = std::thread::Builder::new()
+        .name("clipboard-answer".into())
+        .spawn(move || {
+            let _ = client.send(Request::ClipboardAnswer { id, data });
+        });
+    if let Err(e) = sent {
+        log::warn!("cannot send a clipboard answer: {e}");
+    }
 }
 
 /// Re-read this Mac's config into the connection's terminal copies (fonts aside, colors and

@@ -500,15 +500,16 @@ final class Remotes {
         return types
     }
 
-    /// `pb`'s contents as `mime`: UTF-8 text, or a PNG (converted from TIFF, as screenshots
-    /// copy). Nil when it holds none, or more than ``clipMax``.
+    /// `pb`'s contents as `mime`: UTF-8 text (empty when there is none), or a PNG (converted from
+    /// TIFF, as screenshots copy). Nil for an image when it holds none, or more than ``clipMax``.
     static func clipboardData(_ pb: NSPasteboard, mime: String) -> Data? {
         let data: Data?
         switch mime {
         case clipText:
             // The pasteboard hands over the whole string; measured before a second copy is made.
-            data = pb.string(forType: .string)
-                .flatMap { $0.utf8.count <= clipMax ? Data($0.utf8) : nil }
+            // No text is empty text, as pbpaste prints nothing and succeeds on a Mac.
+            let text = pb.string(forType: .string) ?? ""
+            data = text.utf8.count <= clipMax ? Data(text.utf8) : nil
         case clipPNG:
             data = pb.data(forType: .png) ?? pb.data(forType: .tiff).flatMap { pngFromTIFF($0) }
         default:
