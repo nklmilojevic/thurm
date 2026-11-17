@@ -165,7 +165,12 @@ thurm --remote devbox agents                    # agents running on devbox
 thurm --remote devbox launch claude             # start one there (its own presets)
 thurm --remote devbox wait --pane 3 --agent-done --timeout 1800
 thurm --remote devbox capture --pane 3 -n 80
+thurm remote ports devbox                       # ports the programs in its panes listen on
+thurm remote forward devbox 5173 --no-open      # open that port on this machine; prints the URL, runs until interrupted
 ```
+
+A `localhost` URL a program on the host prints is the host's port, not this machine's: reach
+it through `thurm remote forward`, in a pane of its own (it stays in the foreground).
 
 `thurm handoff --remote devbox --preset claude` gives the current repository to an agent there
 (through git, in its own worktree); committed results come back as
