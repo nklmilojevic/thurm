@@ -11,6 +11,7 @@ mod daemon;
 mod git;
 mod path_search;
 mod persist;
+mod ports;
 mod procinfo;
 mod pty;
 mod push;

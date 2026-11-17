@@ -793,20 +793,35 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Input goes nowhere while the pane's host is disconnected.
     var isOffline: Bool { offlineOverlay != nil }
 
-    /// Small transient message at the bottom of the pane.
-    func showToast(_ text: String, duration: TimeInterval = 2.5) {
+    /// Small transient message at the bottom of the pane, with a button when `action` is given
+    /// (its title and what it does).
+    func showToast(_ text: String, duration: TimeInterval = 2.5, action: (String, () -> Void)? = nil) {
         toastView?.removeFromSuperview()
         let label = NSTextField(labelWithString: text)
         label.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         let chrome = SessionManager.shared.config.chrome
         label.textColor = chrome.contentPrimary
         label.sizeToFit()
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: label.frame.width + 20, height: label.frame.height + 8))
+        var button: NSButton?
+        if let (title, run) = action {
+            let b = ToastButton(title: title, run: run)
+            b.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            b.contentTintColor = chrome.accent
+            b.sizeToFit()
+            button = b
+        }
+        let extra = button.map { $0.frame.width + 8 } ?? 0
+        let height = max(label.frame.height, button?.frame.height ?? 0) + 8
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: label.frame.width + 20 + extra, height: height))
         box.wantsLayer = true
         box.layer?.backgroundColor = chrome.surfaceRaised.withAlphaComponent(0.92).cgColor
         box.layer?.cornerRadius = ChromeRadius.control
-        label.frame.origin = NSPoint(x: 10, y: 4)
+        label.frame.origin = NSPoint(x: 10, y: (height - label.frame.height) / 2)
         box.addSubview(label)
+        if let button {
+            button.frame.origin = NSPoint(x: label.frame.maxX + 8, y: (height - button.frame.height) / 2)
+            box.addSubview(button)
+        }
         box.alphaValue = 0
         addSubview(box)
         toastView = box
@@ -818,6 +833,24 @@ final class TerminalView: NSView, NSTextInputClient {
         }
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(fadeToast), object: nil)
         perform(#selector(fadeToast), with: nil, afterDelay: duration)
+    }
+
+    /// A borderless button in a toast that runs a closure.
+    private final class ToastButton: NSButton {
+        private let run: () -> Void
+
+        init(title: String, run: @escaping () -> Void) {
+            self.run = run
+            super.init(frame: .zero)
+            self.title = title
+            isBordered = false
+            target = self
+            action = #selector(clicked)
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+        @objc private func clicked() { run() }
     }
 
     @objc private func fadeToast() {

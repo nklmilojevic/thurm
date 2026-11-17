@@ -11,8 +11,10 @@
 //! - [`handoff`]: giving a local repository to a remote agent through git.
 //! - [`pairing`]: the iOS app's pairing code and its device keys on remote hosts.
 //! - [`policy`]: what remote panes may do on this Mac (clipboard, links).
+//! - [`forward`]: a host's ports opened on this Mac's loopback, through its daemon.
 
 pub mod doctor;
+pub mod forward;
 pub mod handoff;
 pub mod install;
 pub mod pairing;

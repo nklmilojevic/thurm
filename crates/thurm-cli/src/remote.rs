@@ -169,6 +169,7 @@ pub fn add(o: AddOptions) -> R {
         enabled: true,
         clipboard_read: ClipboardRead::Ask,
         tailnet: None,
+        forward_links: true,
     };
     let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
     println!("Added [[remote]] {} to {}", o.name, file.display());
@@ -210,6 +211,7 @@ fn add_tailnet(o: &AddOptions, tailnet: &str) -> R {
         enabled: true,
         clipboard_read: ClipboardRead::Ask,
         tailnet: Some(checked.url.clone()),
+        forward_links: true,
     };
     let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
     println!("Added [[remote]] {} to {}", o.name, file.display());
@@ -785,7 +787,156 @@ pub fn handoff_cmd(o: HandoffOptions, json: bool) -> R {
 }
 
 /// `thurm remote-info` (hidden): what the app's install check reads over ssh.
+/// `thurm remote ports NAME`: each pane's listening ports and what listens.
+pub fn ports_cmd(name: &str, json: bool) -> R {
+    let c = connect_remote(name)?;
+    if !c.has_capability(thurm_proto::CAP_PORTS) {
+        return Err(format!(
+            "Thurm on {name} is too old to list ports; `thurm remote install {name}`"
+        )
+        .into());
+    }
+    let Response::Ports(list) = c.request(Request::Ports { pane: None })? else {
+        return Err("unexpected answer from the daemon".into());
+    };
+    if json {
+        println!("{}", serde_json::to_string(&ports_json(&list))?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    print!("{}", ports_table(&list));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn ports_json(list: &[thurm_proto::PanePorts]) -> serde_json::Value {
+    serde_json::json!(
+        list.iter()
+            .map(|p| serde_json::json!({
+                "pane": p.pane,
+                "complete": p.complete,
+                "ports": p.ports,
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+fn ports_table(list: &[thurm_proto::PanePorts]) -> String {
+    let rows: Vec<_> = list
+        .iter()
+        .flat_map(|p| p.ports.iter().map(move |e| (p.pane, e)))
+        .collect();
+    if rows.is_empty() {
+        return "no ports\n".into();
+    }
+    let mut out = format!(
+        "{:<6} {:<6} {:<16} {:<8} COMMAND\n",
+        "PANE", "PORT", "ADDRESS", "PID"
+    );
+    for (pane, e) in rows {
+        let command: String = e.command.chars().take(80).collect();
+        out.push_str(&format!(
+            "{:<6} {:<6} {:<16} {:<8} {command}\n",
+            pane, e.port, e.address, e.pid
+        ));
+    }
+    if list.iter().any(|p| !p.complete) {
+        out.push_str("(some processes could not be read: their ports are not listed)\n");
+    }
+    out
+}
+
+/// `thurm remote forward NAME PORT|URL`: opens the port here until interrupted.
+pub fn forward_cmd(name: &str, target: &str, local: Option<u16>, open: bool, json: bool) -> R {
+    let (port, url) = match target.parse::<u16>() {
+        Ok(p) if p > 0 => (p, None),
+        _ => {
+            let u = thurm_remote::policy::LocalUrl::parse(target).ok_or_else(|| {
+                format!("{target} is neither a port nor a link to {name}'s localhost")
+            })?;
+            (u.port, Some(target))
+        }
+    };
+    connect_remote(name)?;
+    let forwards = thurm_remote::forward::Forwards::default();
+    forwards.check(name)?;
+    let (fw, _) = forwards.open(name, port, local)?;
+    let url = url
+        .and_then(|u| thurm_remote::forward::rewrite(u, fw.local))
+        .unwrap_or_else(|| format!("http://localhost:{}/", fw.local));
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "host": name, "remote_port": port, "local_port": fw.local, "url": url,
+            })
+        );
+    } else {
+        println!("{url}");
+        eprintln!("{name}:{port} → localhost:{} (Ctrl-C to stop)", fw.local);
+    }
+    let _ = std::io::stdout().flush();
+    if open {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        if let Err(e) = std::process::Command::new(opener)
+            .arg(&url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            eprintln!("could not open {url}: {e}");
+        }
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register(sig, stop.clone())?;
+    }
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let _ = forwards.close(fw.id);
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn remote_info() -> R {
     println!("{}", serde_json::to_string(&ThurmInfo::current())?);
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thurm_proto::{PanePorts, PortEntry};
+
+    #[test]
+    fn ports_print_as_a_table() {
+        let entry = |port, pid, command: &str| PortEntry {
+            port,
+            address: "127.0.0.1".into(),
+            pid,
+            command: command.into(),
+        };
+        let list = vec![
+            PanePorts {
+                pane: 3,
+                ports: vec![entry(5173, 812, "node vite")],
+                complete: true,
+            },
+            PanePorts {
+                pane: 7,
+                ports: vec![],
+                complete: false,
+            },
+        ];
+        let t = ports_table(&list);
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].starts_with("PANE   PORT"), "{t}");
+        assert!(lines[1].starts_with("3      5173   127.0.0.1"), "{t}");
+        assert!(lines[1].ends_with("node vite"), "{t}");
+        assert!(t.contains("could not be read"), "{t}");
+        assert_eq!(ports_table(&[]), "no ports\n");
+        assert_eq!(ports_json(&list)[0]["ports"][0]["port"], 5173);
+    }
 }

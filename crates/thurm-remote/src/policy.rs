@@ -60,12 +60,82 @@ pub enum LinkAction {
     },
     /// Not a URL at all.
     Ignore,
+    /// A web link to the remote host's own loopback (`localhost`, `127.0.0.1`, `[::1]`,
+    /// `0.0.0.0`): open it through a forward of `port` to this Mac.
+    Forward {
+        port: u16,
+    },
+}
+
+/// An `http`/`https` URL to a loopback host, split for rewriting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalUrl<'a> {
+    /// Lowercase.
+    pub scheme: String,
+    /// `user:pass@`, or empty.
+    pub userinfo: &'a str,
+    /// As written (`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`).
+    pub host: &'a str,
+    /// The port written, or the scheme's.
+    pub port: u16,
+    /// Path, query and fragment, as written.
+    pub rest: &'a str,
+}
+
+impl<'a> LocalUrl<'a> {
+    /// `url` if it is a web link to a loopback host.
+    pub fn parse(url: &'a str) -> Option<LocalUrl<'a>> {
+        let (scheme, after) = url.split_once("://")?;
+        let scheme = scheme.to_ascii_lowercase();
+        let default = match scheme.as_str() {
+            "http" => 80,
+            "https" => 443,
+            _ => return None,
+        };
+        let end = after.find(['/', '?', '#']).unwrap_or(after.len());
+        let (authority, rest) = after.split_at(end);
+        let (userinfo, hostport) = match authority.rfind('@') {
+            Some(i) => authority.split_at(i + 1),
+            None => ("", authority),
+        };
+        let (host, port) = if hostport.starts_with('[') {
+            let close = hostport.find(']')?;
+            let (h, p) = hostport.split_at(close + 1);
+            (h, p.strip_prefix(':'))
+        } else {
+            match hostport.rsplit_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (hostport, None),
+            }
+        };
+        let port = match port {
+            None | Some("") => default,
+            Some(p) => p.parse::<u16>().ok().filter(|&p| p != 0)?,
+        };
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || matches!(host, "127.0.0.1" | "[::1]" | "0.0.0.0");
+        loopback.then_some(LocalUrl {
+            scheme,
+            userinfo,
+            host,
+            port,
+            rest,
+        })
+    }
 }
 
 /// Cmd-click on `url` in a pane of `host`. The URL comes from program output (OSC 8 or text),
 /// so only web and mail links open directly, even in this Mac's panes: other schemes can start
-/// apps (`smb:`, custom handlers) and a `file:` URL can name an app or a `.command` script.
-pub fn link(host: Option<&str>, url: &str) -> LinkAction {
+/// apps (`smb:`, custom handlers) and a `file:` URL can name an app or a `.command` script. A
+/// web link to a remote host's own loopback opens through a forward, unless that host has
+/// `forward_links = false`.
+pub fn link(cfg: &Config, host: Option<&str>, url: &str) -> LinkAction {
+    if let Some(h) = host
+        && cfg.remote(h).is_some_and(|r| r.forward_links)
+        && let Some(local) = LocalUrl::parse(url)
+    {
+        return LinkAction::Forward { port: local.port };
+    }
     let Some((scheme, rest)) = url.split_once(':') else {
         return LinkAction::Ignore;
     };
@@ -176,7 +246,43 @@ clipboard_read = "never"
     }
 
     #[test]
+    fn loopback_links_from_remote_panes_forward() {
+        let c = cfg("copy", HOSTS);
+        let r = Some("devbox");
+        let fwd = |port| LinkAction::Forward { port };
+        assert_eq!(link(&c, r, "http://localhost:5173/x?y#z"), fwd(5173));
+        assert_eq!(link(&c, r, "HTTPS://LOCALHOST:8443"), fwd(8443));
+        assert_eq!(link(&c, r, "http://127.0.0.1:3000"), fwd(3000));
+        assert_eq!(link(&c, r, "http://[::1]:4000/"), fwd(4000));
+        assert_eq!(link(&c, r, "http://0.0.0.0:8000"), fwd(8000));
+        assert_eq!(link(&c, r, "http://localhost/"), fwd(80));
+        assert_eq!(link(&c, r, "https://localhost"), fwd(443));
+        assert_eq!(link(&c, r, "http://me:pw@localhost:9000/a"), fwd(9000));
+        // Not loopback, or not a web link.
+        assert_eq!(
+            link(&c, r, "http://localhost.example.com:80"),
+            LinkAction::Open
+        );
+        assert_eq!(link(&c, r, "http://127.0.0.2:80"), LinkAction::Open);
+        assert_eq!(link(&c, r, "ftp://localhost:21"), LinkAction::Ask);
+        assert_eq!(link(&c, r, "http://localhost:99999"), LinkAction::Open);
+        // This Mac's panes, a host that said no, a host the config no longer lists.
+        assert_eq!(link(&c, None, "http://localhost:5173"), LinkAction::Open);
+        let off = cfg(
+            "copy",
+            "[[remote]]\nname = \"devbox\"\nhost = \"devbox\"\nforward_links = false\n",
+        );
+        assert_eq!(link(&off, r, "http://localhost:5173"), LinkAction::Open);
+        assert_eq!(
+            link(&c, Some("gone"), "http://localhost:5173"),
+            LinkAction::Open
+        );
+    }
+
+    #[test]
     fn links_from_remote_panes() {
+        let c = cfg("copy", HOSTS);
+        let link = |h: Option<&str>, u: &str| link(&c, h, u);
         let r = Some("devbox");
         assert_eq!(link(r, "https://example.com/x"), LinkAction::Open);
         assert_eq!(link(r, "HTTP://example.com"), LinkAction::Open);

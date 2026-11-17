@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thurm_config::Config;
 use thurm_remote::doctor;
+use thurm_remote::forward::{self, Forwards};
 use thurm_remote::handoff::{self, Registry, SshHost};
 use thurm_remote::install::{self, Method};
 use thurm_remote::tunnel::{Supervisor, Transport};
@@ -27,6 +28,44 @@ struct Manager {
 }
 
 static MANAGER: Mutex<Option<Manager>> = Mutex::new(None);
+
+/// Where forward changes are reported: the status callback, kept apart from `MANAGER` because
+/// closing forwards happens under its lock (`sync`).
+static FORWARD_CB: Mutex<Option<(thurm_remote_status_cb, Ctx)>> = Mutex::new(None);
+
+/// This app's forwards ([`forward`]).
+fn forwards() -> &'static Forwards {
+    static FORWARDS: std::sync::OnceLock<Forwards> = std::sync::OnceLock::new();
+    FORWARDS.get_or_init(|| {
+        let f = Forwards::default();
+        let me = f.clone();
+        f.on_change(move |change| {
+            let report = json!({ "forwards": forward_list(&me), "change": change });
+            if let Some((cb, ctx)) = *FORWARD_CB.lock() {
+                emit(cb, ctx, &report.to_string());
+            }
+        });
+        f
+    })
+}
+
+/// Every forward, with the URL it opens at.
+fn forward_list(f: &Forwards) -> Vec<Value> {
+    f.list().iter().map(|fw| forward_json(fw, None)).collect()
+}
+
+fn forward_json(fw: &forward::Forward, url: Option<&str>) -> Value {
+    let url = url
+        .and_then(|u| forward::rewrite(u, fw.local))
+        .unwrap_or_else(|| format!("http://localhost:{}/", fw.local));
+    json!({
+        "id": fw.id,
+        "host": fw.host,
+        "remote_port": fw.remote_port,
+        "local_port": fw.local,
+        "url": url,
+    })
+}
 
 /// Whether `socket` is the local end of a tailnet host's tunnel, a relay (see
 /// `thurm_remote::tunnel`) rather than an ssh forward.
@@ -55,6 +94,13 @@ fn sync(m: &mut Manager) {
         .iter()
         .map(|r| (r.name.clone(), r.clone()))
         .collect();
+    let enabled: Vec<&str> = cfg
+        .remote
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.name.as_str())
+        .collect();
+    forwards().retain_hosts(&enabled);
     let gone: Vec<String> = m
         .supervisors
         .keys()
@@ -116,6 +162,7 @@ fn stop_later(supervisors: Vec<Supervisor>) {
 /// on every change (on a background thread). Calling it again replaces the callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_remotes_start(on_status: thurm_remote_status_cb, ctx: *mut c_void) {
+    *FORWARD_CB.lock() = Some((on_status, Ctx(ctx)));
     let mut g = MANAGER.lock();
     if let Some(m) = g.as_mut() {
         m.cb = on_status;
@@ -147,6 +194,7 @@ pub extern "C" fn thurm_remotes_sync() {
 pub extern "C" fn thurm_remotes_stop() {
     let taken = MANAGER.lock().take();
     drop(taken);
+    *FORWARD_CB.lock() = None;
 }
 
 /// Retry `name` (NULL: every host) now. With `restart`, check a connected tunnel and replace
@@ -277,6 +325,35 @@ enum Call {
     /// Whether this Mac's `thurm` is found, and speaks our protocol, from the environment sshd
     /// gives a login (Pair iPhone's check of the command-line tool).
     LocalProbe,
+    /// Opens `host`'s `port` here (or the port of `url`, a link to its loopback), or returns
+    /// the forward that has it: `{id, host, remote_port, local_port, url, new}`, `url` being
+    /// `url` rewritten to the forward. Connects to the host's daemon first; call it off the
+    /// main thread.
+    ForwardOpen {
+        host: String,
+        #[serde(default)]
+        port: Option<u16>,
+        #[serde(default)]
+        url: Option<String>,
+        /// The local port to listen on; else the remote port's number when free.
+        #[serde(default)]
+        local: Option<u16>,
+    },
+    ForwardClose {
+        id: u64,
+    },
+    ForwardList,
+    /// A `PortsChanged` from `host`'s daemon.
+    PortsChanged {
+        host: String,
+        pane: u64,
+        ports: Vec<thurm_proto::PortEntry>,
+        complete: bool,
+    },
+    /// The ports `host`'s panes listen on, as its last `PortsChanged` said.
+    KnownPorts {
+        host: String,
+    },
 }
 
 /// Runs scripts with the local `/bin/sh` in the PATH sshd gives a login, so the probe sees what
@@ -413,6 +490,7 @@ fn call(c: Call) -> Result<Value, String> {
                 enabled: true,
                 clipboard_read: thurm_config::ClipboardRead::Ask,
                 tailnet: None,
+                forward_links: true,
             };
             thurm_config::edit_remotes(|t| thurm_config::with_remote_added(t, &entry))?;
             if let Some(m) = MANAGER.lock().as_mut() {
@@ -483,7 +561,10 @@ fn call(c: Call) -> Result<Value, String> {
             let cfg = Config::load().unwrap_or_default();
             json!(policy::clipboard_write(&cfg, host.as_deref()))
         }
-        Call::Link { host, url } => json!(policy::link(host.as_deref(), &url)),
+        Call::Link { host, url } => {
+            let cfg = Config::load().unwrap_or_default();
+            json!(policy::link(&cfg, host.as_deref(), &url))
+        }
         Call::HandoffPrepare { host, path, branch } => {
             let h = handoff::prepare_registered(
                 &host_for(&host)?,
@@ -573,6 +654,41 @@ fn call(c: Call) -> Result<Value, String> {
             let (_, ssh) = ssh_for(&name)?;
             json!(pairing::devices(&ssh).map_err(|e| e.to_string())?)
         }
+        Call::ForwardOpen {
+            host,
+            port,
+            url,
+            local,
+        } => {
+            remote(&host)?;
+            let port = match (port, url.as_deref()) {
+                (Some(p), _) => p,
+                (None, Some(u)) => {
+                    policy::LocalUrl::parse(u)
+                        .ok_or_else(|| format!("{u} is not a link to {host}'s localhost"))?
+                        .port
+                }
+                (None, None) => return Err("a port or a URL to forward".into()),
+            };
+            let f = forwards();
+            f.check(&host)?;
+            let (fw, new) = f.open(&host, port, local)?;
+            let mut v = forward_json(&fw, url.as_deref());
+            v["new"] = json!(new);
+            v
+        }
+        Call::ForwardClose { id } => json!(forward_json(&forwards().close(id)?, None)),
+        Call::ForwardList => json!(forward_list(forwards())),
+        Call::PortsChanged {
+            host,
+            pane,
+            ports,
+            complete,
+        } => {
+            forwards().ports_changed(&host, pane, ports, complete);
+            json!("Ok")
+        }
+        Call::KnownPorts { host } => json!(forwards().known(&host)),
         Call::LocalProbe => {
             let host = thurm_remote::probe(&LocalShell).map_err(|e| e.to_string())?;
             json!({
@@ -591,7 +707,7 @@ fn remote_setting_literal(key: &str, value: &serde_json::Value) -> Result<String
             thurm_remote::ssh::validate_target(s.trim())?;
             Ok(json!(s.trim()).to_string())
         }
-        ("enabled", serde_json::Value::Bool(b)) => Ok(b.to_string()),
+        ("enabled" | "forward_links", serde_json::Value::Bool(b)) => Ok(b.to_string()),
         ("tailnet", serde_json::Value::String(s)) => {
             thurm_config::parse_remote_tailnet(s)?;
             Ok(json!(s.trim()).to_string())
@@ -627,6 +743,7 @@ fn add_tailnet(name: String, target: String, tailnet: &str) -> Result<Value, Str
         enabled: true,
         clipboard_read: thurm_config::ClipboardRead::Ask,
         tailnet: Some(checked.url.clone()),
+        forward_links: true,
     };
     thurm_config::edit_remotes(|t| thurm_config::with_remote_added(t, &entry))?;
     if let Some(m) = MANAGER.lock().as_mut() {
@@ -680,6 +797,12 @@ mod tests {
             r#"{"op":"revoke_device","name":"pi","device":"iPhone"}"#,
             r#"{"op":"paired_devices","name":"pi"}"#,
             r#"{"op":"local_probe"}"#,
+            r#"{"op":"forward_open","host":"pi","port":5173}"#,
+            r#"{"op":"forward_open","host":"pi","url":"http://localhost:5173/","local":5174}"#,
+            r#"{"op":"forward_close","id":3}"#,
+            r#"{"op":"forward_list"}"#,
+            r#"{"op":"ports_changed","host":"pi","pane":2,"ports":[{"port":5173,"address":"127.0.0.1","pid":9,"command":"vite"}],"complete":true}"#,
+            r#"{"op":"known_ports","host":"pi"}"#,
         ] {
             serde_json::from_str::<Call>(s).unwrap_or_else(|e| panic!("{s}: {e}"));
         }
@@ -720,6 +843,10 @@ mod tests {
         assert!(remote_setting_literal("host", &json!(1)).is_err());
         assert!(remote_setting_literal("clipboard_read", &json!("maybe")).is_err());
         assert!(remote_setting_literal("enabled", &json!("yes")).is_err());
+        assert_eq!(
+            remote_setting_literal("forward_links", &json!(false)).unwrap(),
+            "false"
+        );
         assert!(remote_setting_literal("name", &json!("x")).is_err());
         assert_eq!(
             remote_setting_literal("tailnet", &json!("wss://bastion.tail1234.ts.net")).unwrap(),

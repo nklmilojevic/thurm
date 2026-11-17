@@ -486,16 +486,20 @@ pub unsafe extern "C" fn thurm_connect_socket(
 /// What a connection to `socket` says in `Hello` besides the build's capabilities. A tailnet
 /// relay splices the bytes unchanged, so the daemon gets this Mac's capabilities as they are, and
 /// it asks for deflated events there. An ssh tunnel compresses on its own (`Compression=yes`), so
-/// it isn't asked twice.
+/// it isn't asked twice. The desktop app hears a remote host's ports, to forward them.
 fn remote_capabilities(socket: &Path) -> &'static [&'static str] {
     #[cfg(feature = "desktop")]
     {
         if remote::is_tailnet_socket(socket) {
-            return &[thurm_proto::CAP_DEFLATE];
+            return &[thurm_proto::CAP_DEFLATE, thurm_proto::CAP_PORT_EVENTS];
         }
+        &[thurm_proto::CAP_PORT_EVENTS]
     }
-    let _ = socket;
-    &[]
+    #[cfg(not(feature = "desktop"))]
+    {
+        let _ = socket;
+        &[]
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

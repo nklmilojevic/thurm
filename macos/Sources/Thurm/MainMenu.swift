@@ -362,6 +362,7 @@ enum MainMenu {
         menu.addItem(item("Command Palette…", #selector(AppDelegate.showCommandPalette(_:)), "p", [.command, .shift],
                           name: "command_palette"))
         menu.addItem(item("Processes & Ports…", #selector(AppDelegate.showProcesses(_:)), name: "processes"))
+        menu.addItem(item("Forward Port…", #selector(AppDelegate.forwardPort(_:)), name: "forward_port"))
         let commands = item("Commands", nil)
         commands.submenu = commandsMenu
         commands.isHidden = commandsMenu.items.isEmpty

@@ -145,6 +145,7 @@ the defaults alone.
 | `copy_pane_id` | Shell > Copy Pane ID |
 | `command_palette` | Shell > Command Palette… |
 | `processes` | Shell > Processes & Ports… |
+| `forward_port` | Shell > Forward Port… |
 | `close_pane` | Shell > Close Pane |
 | `close_tab` | Shell > Close Tab |
 | `copy` | Edit > Copy |

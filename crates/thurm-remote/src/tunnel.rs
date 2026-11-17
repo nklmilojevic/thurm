@@ -1183,6 +1183,7 @@ mod tests {
             enabled: true,
             clipboard_read: Default::default(),
             tailnet: None,
+            forward_links: true,
         };
         let s = Status::new(&r);
         let json = serde_json::to_string(&s).unwrap();

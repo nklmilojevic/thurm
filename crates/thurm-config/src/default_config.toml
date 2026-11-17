@@ -382,3 +382,4 @@ animation_duration = 0.2
 # socket = "/run/user/1000/thurm-1000/thurmd.sock"   # optional; discovered otherwise
 # enabled = true
 # clipboard_read = "ask"   # OSC 52 reads by remote programs: "ask", "always" or "never"
+# forward_links = true     # open its localhost links through a forward to this Mac

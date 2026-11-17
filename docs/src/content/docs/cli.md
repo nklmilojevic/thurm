@@ -98,6 +98,8 @@ Use `thurm COMMAND --help` for the full argument list.
 | `whoami` | Show who the daemon sees on this connection |
 | `remote add\|list\|remove\|status\|install` | Manage remote hosts; see [Remote workspaces](/remote/) |
 | `remote doctor [NAME]` | Check what a host needs and offer fixes; `--fix`, `--yes` |
+| `remote ports NAME` | The ports programs in the host's panes listen on |
+| `remote forward NAME PORT\|URL` | Open the host's port on this machine until interrupted, and print its URL; `--local PORT`, `--no-open`; see [Ports](/remote/#ports) |
 | `handoff` | Hand the repository to a remote agent; `--remote NAME`, `--preset`, `--branch agent/NAME`, `--list`, `--fetch ID`, `--cleanup ID` |
 
 `--hold` keeps a pane open after its command exits. Use `--` before a command
