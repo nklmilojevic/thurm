@@ -44,6 +44,7 @@ fn finished(error: Option<&TransferError>) -> serde_json::Value {
         "cancelled": matches!(error, Some(TransferError::Cancelled)),
         "unsupported": matches!(error, Some(TransferError::Unsupported)),
         "folder": matches!(error, Some(TransferError::Folder(_))),
+        "not_found": matches!(error, Some(TransferError::NotFound(_))),
         "error": error.map(|e| e.to_string()),
     })
 }

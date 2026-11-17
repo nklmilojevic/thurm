@@ -53,6 +53,17 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertEqual(uploads(), [urls.map(\.path), urls.map(\.path)])
     }
 
+    func testAnotherToastDoesNotTakeTheUploadsCancelAway() {
+        let (view, _) = remotePane()
+        view.showUploadToast("Sending 3 files to devbox…")
+        view.showToast("Session restored", duration: 0.05)
+        // Its fade has begun, and its removal is due, when the next progress comes.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.08))
+        view.showUploadToast("Sending 3 files to devbox… 40%")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.6))
+        XCTAssertTrue(view.showsUploadToast)
+    }
+
     func testAFolderOrAnOlderHostSendsNothing() throws {
         let folder = dir.appendingPathComponent("folder", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

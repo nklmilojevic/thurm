@@ -415,4 +415,64 @@ final class FilePreviewTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "new")
         XCTAssertEqual(cache.cached(entry)?.version, "v2")
     }
+
+    func testOnlyANotFoundPathFallsBackToItsStrippedSuffix() throws {
+        let cache = tempCache()
+        let pane = PaneKey("devbox", 3)
+        var asked: [String] = []
+        // The literal `report:12` fails for another reason: `report` is not shown instead.
+        cache.download = { _, path, _, _, _, done in
+            asked.append(path)
+            done(TransferOutcome(error: "cannot open report:12: Permission denied"))
+        }
+        var result: Result<URL, Error>?
+        cache.fetch(.path("report:12"), pane: pane, cwd: "/work") { result = $0 }
+        XCTAssertEqual(asked, ["report:12"])
+        XCTAssertThrowsError(try XCTUnwrap(result).get()) {
+            XCTAssertEqual($0.localizedDescription, "cannot open report:12: Permission denied")
+        }
+        // Nothing at `report:12`: then `report`.
+        asked = []
+        cache.download = { _, path, dest, _, _, done in
+            asked.append(path)
+            if path == "report:12" {
+                var missing = TransferOutcome(error: "report:12: no such file")
+                missing.notFound = true
+                return done(missing)
+            }
+            try! Data("r".utf8).write(to: dest)
+            done(self.outcome(name: "report", version: "v"))
+        }
+        result = nil
+        cache.fetch(.path("report:12"), pane: pane, cwd: "/work") { result = $0 }
+        XCTAssertEqual(asked, ["report:12", "report"])
+        XCTAssertEqual(try XCTUnwrap(result).get().lastPathComponent, "report")
+    }
+
+    func testAFileShownInQuickLookIsNotPruned() throws {
+        let cache = tempCache(maxBytes: 10)
+        let pane = PaneKey("devbox", 3)
+        func fetch(_ path: String, bytes: Int) -> URL? {
+            cache.download = { _, _, dest, _, _, done in
+                try! Data(repeating: 1, count: bytes).write(to: dest)
+                done(self.outcome(name: (path as NSString).lastPathComponent, version: "v"))
+            }
+            var got: URL?
+            cache.fetch(.path(path), pane: pane, cwd: nil) { got = try? $0.get() }
+            return got
+        }
+        let shown = try XCTUnwrap(fetch("/first.bin", bytes: 8))
+        cache.hold(shown)
+        // A second preview over the limit leaves the one on screen.
+        let second = try XCTUnwrap(fetch("/second.bin", bytes: 8))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: shown.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: second.path))
+        // Let go, it is pruned.
+        cache.release(shown)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: shown.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: second.path))
+        // Files outside the cache are not its to hold.
+        cache.hold(URL(fileURLWithPath: "/tmp/elsewhere.txt"))
+        cache.release(URL(fileURLWithPath: "/tmp/elsewhere.txt"))
+    }
 }

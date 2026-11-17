@@ -185,12 +185,19 @@ impl Transfers {
             .map(|f| f.size)
             .sum();
         let incoming = active.saturating_add(size);
-        let kept = self.make_room(&st, incoming);
-        if kept.saturating_add(incoming) > self.max_kept {
-            return Err(format!(
+        let too_much = || {
+            format!(
                 "{name} does not fit in what this host keeps of sent files ({} MiB)",
                 self.max_kept >> 20
-            ));
+            )
+        };
+        // Refused before anything kept is deleted for it.
+        if incoming > self.max_kept {
+            return Err(too_much());
+        }
+        let kept = self.make_room(&st, incoming);
+        if kept.saturating_add(incoming) > self.max_kept {
+            return Err(too_much());
         }
         let existing = id.as_ref().and_then(|id| {
             st.batches
@@ -279,7 +286,12 @@ impl Transfers {
         if_version: Option<&str>,
     ) -> Result<DownloadInfo, String> {
         let abs = resolve(path, cwd, home)?;
-        let file = open_nonblocking(&abs).map_err(|e| format!("cannot open {path}: {e}"))?;
+        let file = open_nonblocking(&abs).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                format!("{path}: {}", thurm_proto::DOWNLOAD_NOT_FOUND)
+            }
+            _ => format!("cannot open {path}: {e}"),
+        })?;
         let meta = file
             .metadata()
             .map_err(|e| format!("cannot read {path}: {e}"))?;

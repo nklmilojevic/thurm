@@ -240,7 +240,30 @@ final class RemoteFileCache {
         return file
     }
 
-    /// Forgets the least recently fetched entries until the rest fit in `maxBytes`.
+    /// Entries a Quick Look panel shows a file of, with how many: pruning leaves them alone.
+    private var held: [URL: Int] = [:]
+
+    /// The entry `file` is kept in, if it is one of the cache's.
+    private func entryOf(_ file: URL) -> URL? {
+        let entry = file.deletingLastPathComponent().standardizedFileURL
+        return entry.deletingLastPathComponent() == root.standardizedFileURL ? entry : nil
+    }
+
+    /// Keeps `file`'s entry from being pruned while it is shown (no-op for other files).
+    func hold(_ file: URL) {
+        guard let entry = entryOf(file) else { return }
+        held[entry, default: 0] += 1
+    }
+
+    /// Lets `file`'s entry go again, and prunes what no longer fits.
+    func release(_ file: URL) {
+        guard let entry = entryOf(file), let n = held[entry] else { return }
+        held[entry] = n > 1 ? n - 1 : nil
+        prune()
+    }
+
+    /// Forgets the least recently fetched entries until the rest fit in `maxBytes`; held entries
+    /// and `keep` stay.
     func prune(keeping keep: URL? = nil) {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.contentModificationDateKey, .totalFileAllocatedSizeKey, .fileSizeKey]
@@ -257,7 +280,8 @@ final class RemoteFileCache {
         }
         sized.sort { $0.date < $1.date }
         var total = sized.reduce(UInt64(0)) { $0 + $1.size }
-        for e in sized where total > maxBytes && e.url.standardizedFileURL != keep?.standardizedFileURL {
+        for e in sized where total > maxBytes && e.url.standardizedFileURL != keep?.standardizedFileURL
+            && held[e.url.standardizedFileURL] == nil {
             try? fm.removeItem(at: e.url)
             total -= e.size
         }
@@ -313,6 +337,9 @@ final class RemoteFileCache {
             if let error = outcome.error {
                 try? FileManager.default.removeItem(at: staged)
                 if outcome.unsupported { return completion(.failure(FilePreviewError.remote)) }
+                // Only a path with nothing at it falls back to the one without its `:line`
+                // suffix: any other failure is this file's, and another file is not shown for it.
+                guard outcome.notFound else { return completion(.failure(RemoteFileError.failed(error))) }
                 return fetch(paths.dropFirst(), pane: pane, cwd: cwd, firstError: firstError ?? error,
                              completion: completion)
             }

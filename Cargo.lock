@@ -2597,6 +2597,7 @@ dependencies = [
  "thurm-ffi",
  "thurm-lua",
  "thurm-proto",
+ "thurm-remote",
  "thurm-term",
  "ureq",
 ]
