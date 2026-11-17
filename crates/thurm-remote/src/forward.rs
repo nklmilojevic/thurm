@@ -655,6 +655,26 @@ impl Forwards {
         }
     }
 
+    /// `host`'s panes are exactly `panes` (as its daemon listed them on connecting): the lists
+    /// of panes not among them are dropped, and every forward of the host is looked at again.
+    /// A host with no pane left sends a joining client no list at all, so without this a forward
+    /// listed before a reconnect would never close on its own.
+    pub fn host_panes(&self, host: &str, panes: &[PaneId]) {
+        self.host_panes_at(Instant::now(), host, panes);
+        self.ensure_sweeping();
+    }
+
+    /// [`Forwards::host_panes`] at `now` (tests).
+    pub fn host_panes_at(&self, now: Instant, host: &str, panes: &[PaneId]) {
+        let mut g = self.inner.lock();
+        g.hosts
+            .entry(host.to_owned())
+            .or_default()
+            .panes
+            .retain(|p, _| panes.contains(p));
+        recompute(&mut g, host, now);
+    }
+
     /// Closes the forwards whose port has been gone for the grace period with no connection
     /// open; the ones closed.
     pub fn sweep(&self, now: Instant) -> Vec<Forward> {
@@ -1940,6 +1960,48 @@ mod tests {
             l.rlim_cur,
             l.rlim_max
         );
+    }
+
+    #[test]
+    fn a_host_back_with_no_pane_lets_its_forwards_close() {
+        let dir = tempdir("no-panes");
+        let f = forwards(&dir);
+        let t0 = Instant::now();
+        f.ports_changed_at(t0, "devbox", 1, vec![entry(5173)], true);
+        let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+        // Away; its last pane closed meanwhile. Back with no pane: no list will ever come.
+        f.host_disconnected("devbox");
+        let t1 = t0 + Duration::from_secs(60);
+        f.host_panes_at(t1, "devbox", &[]);
+        assert!(
+            f.sweep(t1 + GONE_GRACE - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(f.sweep(t1 + GONE_GRACE), vec![fw]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_host_back_keeps_the_lists_of_its_panes_and_drops_the_others() {
+        let dir = tempdir("some-panes");
+        let f = forwards(&dir);
+        let t0 = Instant::now();
+        let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+        // Lists of panes 2 and 3 (the joiner's lists came first); the host has pane 2 only.
+        f.ports_changed_at(t0, "devbox", 2, vec![entry(5173)], true);
+        f.ports_changed_at(t0, "devbox", 3, vec![entry(9000)], true);
+        f.host_panes_at(t0, "devbox", &[2]);
+        assert_eq!(
+            f.known("devbox")
+                .iter()
+                .map(|k| k.entry.port)
+                .collect::<Vec<_>>(),
+            [5173]
+        );
+        // Pane 2 still lists the forward's port: no clock.
+        assert!(f.sweep(t0 + GONE_GRACE * 3).is_empty());
+        f.close(fw.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

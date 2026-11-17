@@ -460,6 +460,12 @@ enum Call {
     HostDisconnected {
         host: String,
     },
+    /// `host`'s panes on connecting (`ListPanes`): lists of others are dropped, and its
+    /// forwards are looked at again, a host with no pane included.
+    HostPanes {
+        host: String,
+        panes: Vec<u64>,
+    },
 }
 
 /// The port `forward_open` forwards for `host`: `port`, or `url`'s. Only a configured host that
@@ -828,6 +834,10 @@ fn call(c: Call) -> Result<Value, String> {
             forwards().host_disconnected(&host);
             json!("Ok")
         }
+        Call::HostPanes { host, panes } => {
+            forwards().host_panes(&host, &panes);
+            json!("Ok")
+        }
         Call::LocalProbe => {
             let host = thurm_remote::probe(&LocalShell).map_err(|e| e.to_string())?;
             json!({
@@ -946,6 +956,8 @@ mod tests {
             // As the app relays a PortsChanged: with `initial`, a list like any other here.
             r#"{"op":"ports_changed","host":"pi","pane":2,"ports":[],"complete":true,"initial":true}"#,
             r#"{"op":"host_disconnected","host":"pi"}"#,
+            r#"{"op":"host_panes","host":"pi","panes":[]}"#,
+            r#"{"op":"host_panes","host":"pi","panes":[2,3]}"#,
         ] {
             serde_json::from_str::<Call>(s).unwrap_or_else(|e| panic!("{s}: {e}"));
         }

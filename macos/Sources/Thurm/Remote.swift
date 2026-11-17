@@ -458,6 +458,10 @@ extension SessionManager {
         }
         Remotes.shared.pendingCloses[host] = stillPending.isEmpty ? nil : stillPending
         let infos = fetched.filter { !isClosed($0) }
+        // Its forwards learn which panes it has: a host back with no pane sends no port list,
+        // and a forward listed before would otherwise never close on its own.
+        _ = Core.shared.remoteCall(["op": "host_panes", "host": host,
+                                    "panes": infos.map { NSNumber(value: $0.id) }])
         let listed = Set(infos.map(\.key))
         for key in panes.keys where key.host == host && !listed.contains(key) {
             panes.removeValue(forKey: key)
