@@ -1260,6 +1260,52 @@ fn a_download_into_a_folder_takes_a_free_name_and_touches_nothing_there() {
     // A name that would leave the folder is not taken.
     let (_, saved) = get("report.pdf", "../escape.pdf").unwrap();
     assert_eq!(saved, downloads.join("file"));
+    // Its private folder's name pointed elsewhere before the file goes in: the file it was
+    // written to goes in all the same, and nothing elsewhere is taken or touched.
+    let elsewhere = env.dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("part"), b"theirs").unwrap();
+    let moved = env.dir.join("moved");
+    let mut pointed = false;
+    let (_, saved) = transfer::download_to_folder(
+        host,
+        pane,
+        "report.pdf",
+        &downloads,
+        "pointed.pdf",
+        &Cancel::default(),
+        |p| {
+            if p.total > 0 && p.done == p.total && !pointed {
+                pointed = true;
+                let private = std::fs::read_dir(&downloads)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.path())
+                    .find(|p| {
+                        p.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".thurm-")
+                    })
+                    .unwrap();
+                std::fs::rename(&private, &moved).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, &private).unwrap();
+            }
+        },
+    )
+    .unwrap();
+    assert!(pointed);
+    assert_eq!(saved, downloads.join("pointed.pdf"));
+    assert_eq!(std::fs::read(&saved).unwrap(), b"the report");
+    assert_eq!(std::fs::read(elsewhere.join("part")).unwrap(), b"theirs");
+    // The link left in its place is not the folder made, so it stays; so does the folder.
+    for link in std::fs::read_dir(&downloads).unwrap().flatten() {
+        if link.file_name().to_string_lossy().starts_with(".thurm-") {
+            assert!(link.file_type().unwrap().is_symlink());
+            std::fs::remove_file(link.path()).unwrap();
+        }
+    }
+    assert!(moved.is_dir());
     // A download that fails, or is cancelled, leaves nothing.
     let before: std::collections::BTreeSet<_> = std::fs::read_dir(&downloads)
         .unwrap()

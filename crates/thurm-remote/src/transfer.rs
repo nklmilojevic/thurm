@@ -559,7 +559,6 @@ pub fn download_to_folder(
     cancel: &Cancel,
     mut progress: impl FnMut(Progress),
 ) -> Result<(DownloadInfo, PathBuf), TransferError> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if !host.client.has_capability(CAP_TRANSFER) {
         return Err(TransferError::Unsupported);
     }
@@ -570,32 +569,30 @@ pub fn download_to_folder(
     };
     let shown = dir.join(name);
     let local = |e: std::io::Error| TransferError::Local(format!("{}: {e}", shown.display()));
-    // Made new, readable by this user only: nothing else is in it.
-    let private = loop {
-        let private = dir.join(format!(".thurm-{}", batch_id()));
-        match std::fs::DirBuilder::new().mode(0o700).create(&private) {
-            Ok(()) => break private,
+    // `dir`, and the private folder made in it, held open: everything after is done through
+    // them, not their names, which another writer could point elsewhere meanwhile.
+    let folder =
+        Dir::open(dir).map_err(|e| TransferError::Local(format!("{}: {e}", dir.display())))?;
+    let (private_name, private) = loop {
+        let private_name = format!(".thurm-{}", batch_id());
+        match folder.make_private(&private_name) {
+            Ok(private) => break (private_name, private),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(TransferError::Local(format!("{}: {e}", dir.display()))),
         }
     };
-    let part = private.join("part");
     let got = (|| {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&part)
-            .map_err(local)?;
-        let made = file.metadata().map(|m| (m.dev(), m.ino())).map_err(local)?;
+        let file = private.create_new("part").map_err(local)?;
+        let made = file_id(&file.metadata().map_err(local)?);
         let info = host.client.download_begin(pane, path, None)?;
         let ticket = info
             .ticket
             .as_deref()
             .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
         fetch_into(host, ticket, file, &shown, info.size, cancel, &mut progress)?;
-        if !std::fs::symlink_metadata(&part)
-            .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == made && m.len() == info.size)
+        if !private
+            .stat("part")
+            .is_ok_and(|(id, kind, len)| id == made && kind == libc::S_IFREG && len == info.size)
         {
             return Err(TransferError::Local(format!(
                 "{} changed while it came; nothing was saved",
@@ -604,11 +601,16 @@ pub fn download_to_folder(
         }
         // Into `dir` under the first of its names that is free, taken in the same step.
         for n in 1..=10_000 {
-            let dest = dir.join(numbered(name, n));
-            match rename_noreplace(&part, &dest) {
-                Ok(()) => return Ok((info, dest)),
+            let dest = numbered(name, n);
+            match private.rename_noreplace("part", &folder, &dest) {
+                Ok(()) => return Ok((info, dir.join(dest))),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(TransferError::Local(format!("{}: {e}", dest.display()))),
+                Err(e) => {
+                    return Err(TransferError::Local(format!(
+                        "{}: {e}",
+                        dir.join(dest).display()
+                    )));
+                }
             }
         }
         Err(TransferError::Local(format!(
@@ -616,10 +618,168 @@ pub fn download_to_folder(
             dir.display()
         )))
     })();
-    // The private folder goes, with the file in it if it was not saved.
-    let _ = std::fs::remove_file(&part);
-    let _ = std::fs::remove_dir(&private);
+    // The file, if it was not saved, and then the private folder, while its name is still the
+    // folder made (empty, it is all that goes).
+    private.unlink("part");
+    if let Ok(ours) = private.id() {
+        folder.remove_dir_if(&private_name, ours);
+    }
     got
+}
+
+fn file_id(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+
+/// A folder held open, so what is done in it is done there whatever its name comes to name.
+struct Dir(std::os::fd::OwnedFd);
+
+impl Dir {
+    fn c(name: &str) -> std::io::Result<std::ffi::CString> {
+        Ok(std::ffi::CString::new(name)?)
+    }
+
+    fn check(r: libc::c_int) -> std::io::Result<libc::c_int> {
+        if r < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(r)
+        }
+    }
+
+    fn open(path: &Path) -> std::io::Result<Dir> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let p = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let fd = Self::check(unsafe {
+            libc::open(
+                p.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        })?;
+        Ok(Dir(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn raw(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        self.0.as_raw_fd()
+    }
+
+    /// Makes the folder `name` here, readable by this user only, and holds it open: the one
+    /// made, as long as it is a folder of this user's, private, when opened.
+    fn make_private(&self, name: &str) -> std::io::Result<Dir> {
+        use std::os::fd::FromRawFd;
+        let n = Self::c(name)?;
+        Self::check(unsafe { libc::mkdirat(self.raw(), n.as_ptr(), 0o700) })?;
+        let fd = Self::check(unsafe {
+            libc::openat(
+                self.raw(),
+                n.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        })?;
+        let dir = Dir(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        Self::check(unsafe { libc::fstat(dir.raw(), &mut st) })?;
+        if st.st_uid != unsafe { libc::getuid() } || st.st_mode & 0o777 != 0o700 {
+            return Err(std::io::Error::other(
+                "the folder made for the download was replaced",
+            ));
+        }
+        Ok(dir)
+    }
+
+    fn id(&self) -> std::io::Result<(u64, u64)> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        Self::check(unsafe { libc::fstat(self.raw(), &mut st) })?;
+        #[allow(clippy::unnecessary_cast)]
+        Ok((st.st_dev as u64, st.st_ino as u64))
+    }
+
+    /// A new file `name` here for this user only, never through a link.
+    fn create_new(&self, name: &str) -> std::io::Result<File> {
+        use std::os::fd::FromRawFd;
+        let n = Self::c(name)?;
+        let fd = Self::check(unsafe {
+            libc::openat(
+                self.raw(),
+                n.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        })?;
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// What `name` here is, not following a link: its device and inode, kind, and length.
+    fn stat(&self, name: &str) -> std::io::Result<((u64, u64), libc::mode_t, u64)> {
+        let n = Self::c(name)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        Self::check(unsafe {
+            libc::fstatat(self.raw(), n.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+        })?;
+        #[allow(clippy::unnecessary_cast)]
+        Ok((
+            (st.st_dev as u64, st.st_ino as u64),
+            st.st_mode & libc::S_IFMT,
+            st.st_size as u64,
+        ))
+    }
+
+    fn unlink(&self, name: &str) {
+        if let Ok(n) = Self::c(name) {
+            unsafe { libc::unlinkat(self.raw(), n.as_ptr(), 0) };
+        }
+    }
+
+    /// Removes the empty folder `name` here only while the name is the folder `ours`.
+    fn remove_dir_if(&self, name: &str, ours: (u64, u64)) {
+        if self
+            .stat(name)
+            .is_ok_and(|(id, kind, _)| id == ours && kind == libc::S_IFDIR)
+            && let Ok(n) = Self::c(name)
+        {
+            unsafe { libc::unlinkat(self.raw(), n.as_ptr(), libc::AT_REMOVEDIR) };
+        }
+    }
+
+    /// Gives `name` here the name `to` in `dest` only if nothing has that name, in one step.
+    fn rename_noreplace(&self, name: &str, dest: &Dir, to: &str) -> std::io::Result<()> {
+        let (a, b) = (Self::c(name)?, Self::c(to)?);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let r = unsafe {
+            libc::renameatx_np(
+                self.raw(),
+                a.as_ptr(),
+                dest.raw(),
+                b.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        // The system call itself: not every C library has a wrapper for it (musl's older ones).
+        #[cfg(target_os = "linux")]
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                self.raw(),
+                a.as_ptr(),
+                dest.raw(),
+                b.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+        let r = {
+            let _ = (&a, &b, dest);
+            return Err(std::io::ErrorKind::Unsupported.into());
+        };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
 }
 
 /// `name`, numbered `n` past the first (`a 2.txt`, as Finder names copies), within the 255
@@ -649,37 +809,6 @@ fn numbered(name: &str, n: u32) -> String {
         stem.pop();
     }
     stem + &tail
-}
-
-/// Gives `a`'s file the name `b` only if nothing has that name, in one step.
-fn rename_noreplace(a: &Path, b: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
-    let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_EXCL) };
-    // The system call itself: not every C library has a wrapper for it (musl's older ones).
-    #[cfg(target_os = "linux")]
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            a.as_ptr(),
-            libc::AT_FDCWD,
-            b.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
-    let r = {
-        let _ = (&a, &b);
-        return Err(std::io::ErrorKind::Unsupported.into());
-    };
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 /// Fetches the file at `path`, as `pane` sees it, into `dest` (written beside it first, then
