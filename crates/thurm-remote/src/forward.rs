@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use thurm_client::proto::stream::Loopback;
 use thurm_client::{Client, ClientError, ConnectOptions};
 use thurm_proto::{PaneId, PortEntry};
 
@@ -47,6 +48,11 @@ pub struct Forward {
     /// The `[[remote]]` name.
     pub host: String,
     pub remote_port: u16,
+    /// The host's loopback address it connects to: `V6` when opened for a link to `[::1]`,
+    /// `V4` for one to `127.0.0.1`, else `Any` (`127.0.0.1`, then `[::1]`). A link to one
+    /// address never reuses the forward of another.
+    #[serde(default, skip_serializing_if = "Loopback::is_any")]
+    pub at: Loopback,
     /// The port on this Mac's `127.0.0.1`.
     pub local: u16,
     /// The link it was last opened for (`https://localhost:8443/app`), to open it again as such.
@@ -362,6 +368,7 @@ impl Forwards {
         if remote_port == 0 {
             return Err("port 0 is not a port to forward".into());
         }
+        let at = loopback_of(link);
         #[cfg(test)]
         if let Some(hook) = self.before_reuse.lock().as_ref() {
             hook();
@@ -371,7 +378,7 @@ impl Forwards {
             if let Some(why) = g.refuses(host, since) {
                 return Err(why);
             }
-            if let Some(reused) = reuse_locked(&mut g, host, remote_port, preferred, link) {
+            if let Some(reused) = reuse_locked(&mut g, host, remote_port, at, preferred, link) {
                 drop(g);
                 return self.reused(reused);
             }
@@ -382,7 +389,10 @@ impl Forwards {
                 // The remote port's own number is tried once (it is often this Mac's own dev
                 // server's), the one remembered for it a moment longer (so the URL stays the same
                 // after a close and reopen; see `bind`).
-                let remembered = self.remembered().get(&key(host, remote_port)).copied();
+                let remembered = self
+                    .remembered()
+                    .get(&key_at(host, remote_port, at))
+                    .copied();
                 bind_once(remote_port)
                     .ok()
                     .or_else(|| {
@@ -403,7 +413,7 @@ impl Forwards {
         }
         // Another thread may have opened it meanwhile; theirs stands (and the listeners bound
         // here close).
-        if let Some(reused) = reuse_locked(&mut g, host, remote_port, preferred, link) {
+        if let Some(reused) = reuse_locked(&mut g, host, remote_port, at, preferred, link) {
             drop(g);
             return self.reused(reused);
         }
@@ -412,6 +422,7 @@ impl Forwards {
             id: g.next_id,
             host: host.to_owned(),
             remote_port,
+            at,
             local,
             link: link.map(str::to_owned),
         };
@@ -455,7 +466,7 @@ impl Forwards {
                 return Err(format!("cannot start the forward: {e}"));
             }
         }
-        self.remember(host, remote_port, local);
+        self.remember(host, remote_port, at, local);
         self.changed(Change::Opened {
             forward: forward.clone(),
         });
@@ -692,12 +703,11 @@ impl Forwards {
         complete: bool,
     ) {
         let mut g = self.inner.lock();
-        let h = g.hosts.entry(host.to_owned()).or_default();
-        if ports.is_empty() && complete {
-            h.panes.remove(&pane);
-        } else {
-            h.panes.insert(pane, (ports, complete));
-        }
+        g.hosts
+            .entry(host.to_owned())
+            .or_default()
+            .panes
+            .insert(pane, (ports, complete));
         recompute(&mut g, host, now);
     }
 
@@ -713,7 +723,8 @@ impl Forwards {
     }
 
     /// `host`'s panes are exactly `panes` (as its daemon listed them on connecting): the lists
-    /// of panes not among them are dropped, and every forward of the host is looked at again.
+    /// of panes not among them are dropped, a pane whose first list has not come yet counts as
+    /// unread (no clock until it comes), and every forward of the host is looked at again.
     /// A host with no pane left sends a joining client no list at all, so without this a forward
     /// listed before a reconnect would never close on its own.
     pub fn host_panes(&self, host: &str, panes: &[PaneId]) {
@@ -724,11 +735,11 @@ impl Forwards {
     /// [`Forwards::host_panes`] at `now` (tests).
     pub fn host_panes_at(&self, now: Instant, host: &str, panes: &[PaneId]) {
         let mut g = self.inner.lock();
-        g.hosts
-            .entry(host.to_owned())
-            .or_default()
-            .panes
-            .retain(|p, _| panes.contains(p));
+        let h = g.hosts.entry(host.to_owned()).or_default();
+        h.panes.retain(|p, _| panes.contains(p));
+        for &p in panes {
+            h.panes.entry(p).or_insert_with(|| (Vec::new(), false));
+        }
         recompute(&mut g, host, now);
     }
 
@@ -879,15 +890,13 @@ impl Forwards {
                 continue;
             }
             let me = self.clone();
-            let (host, port) = (host.clone(), forward.remote_port);
+            let (host, port, target) = (host.clone(), forward.remote_port, forward.clone());
             let (theirs_active, theirs_conns, theirs_stop) =
                 (active.clone(), conns.clone(), stop.clone());
             let spawned = std::thread::Builder::new()
                 .name(format!("forward-{host}-{port}-conn"))
                 .spawn(move || {
-                    if let Err(e) =
-                        me.carry(&host, port, conn, &theirs_stop, &theirs_conns, conn_id)
-                    {
+                    if let Err(e) = me.carry(&target, conn, &theirs_stop, &theirs_conns, conn_id) {
                         log::info!("forward {host}:{port}: {e}");
                     }
                     theirs_conns.lock().remove(&conn_id);
@@ -935,16 +944,16 @@ impl Forwards {
         Ok(c)
     }
 
-    /// One connection to the forward: a stream to `port` on `host`, spliced both ways.
+    /// One connection to `forward`: a stream to its port on its host, spliced both ways.
     fn carry(
         &self,
-        host: &str,
-        port: u16,
+        forward: &Forward,
         conn: TcpStream,
         closed: &AtomicBool,
         conns: &Conns,
         conn_id: u64,
     ) -> Result<(), String> {
+        let (host, port) = (forward.host.as_str(), forward.remote_port);
         // A forward closed (by hand, the sweep, its host moving) between accepting this
         // connection and here asks nothing of the host: no stream is dialled to its port, on the
         // old destination or the new one.
@@ -963,7 +972,7 @@ impl Forwards {
             if let Some(why) = gone() {
                 return Err(why);
             }
-            c.dial_begin(port).map_err(|e| e.to_string())
+            c.dial_at(port, forward.at).map_err(|e| e.to_string())
         };
         let ticket = match dial(false) {
             Ok(t) => t,
@@ -1001,9 +1010,9 @@ impl Forwards {
             .unwrap_or_default()
     }
 
-    /// Keeps `local` as the port for (`host`, `remote_port`), so a URL stays the same between
-    /// runs. Best effort.
-    fn remember(&self, host: &str, remote_port: u16, local: u16) {
+    /// Keeps `local` as the port for (`host`, `remote_port`, `at`), so a URL stays the same
+    /// between runs. Best effort.
+    fn remember(&self, host: &str, remote_port: u16, at: Loopback, local: u16) {
         if let Some(dir) = self.remembered.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
         {
@@ -1022,7 +1031,7 @@ impl Forwards {
                 }
             };
         let mut all = self.remembered();
-        if all.insert(key(host, remote_port), local) == Some(local) {
+        if all.insert(key_at(host, remote_port, at), local) == Some(local) {
             return;
         }
         if let Err(e) = write_json(&self.remembered, &all) {
@@ -1041,13 +1050,13 @@ fn reuse_locked(
     g: &mut Inner,
     host: &str,
     remote_port: u16,
+    at: Loopback,
     preferred: Option<u16>,
     link: Option<&str>,
 ) -> Option<Reused> {
-    let e = g
-        .open
-        .values_mut()
-        .find(|e| e.forward.host == host && e.forward.remote_port == remote_port)?;
+    let e = g.open.values_mut().find(|e| {
+        e.forward.host == host && e.forward.remote_port == remote_port && e.forward.at == at
+    })?;
     Some(may_reuse(&e.forward, preferred).map(|()| {
         let linked = link.is_some_and(|l| e.forward.link.as_deref() != Some(l));
         if let Some(l) = link {
@@ -1101,6 +1110,28 @@ fn recompute(g: &mut Inner, host: &str, now: Instant) {
 
 fn key(host: &str, port: u16) -> String {
     format!("{host}:{port}")
+}
+
+/// [`key`] for a forward to one loopback address.
+fn key_at(host: &str, port: u16, at: Loopback) -> String {
+    match at {
+        Loopback::Any => key(host, port),
+        Loopback::V4 => format!("{host}:{port}/v4"),
+        Loopback::V6 => format!("{host}:{port}/v6"),
+    }
+}
+
+/// The host's loopback address `link` names: `[::1]` and `127.0.0.1` one each, `localhost`
+/// and `0.0.0.0` (or no link) either.
+fn loopback_of(link: Option<&str>) -> Loopback {
+    match link
+        .and_then(crate::policy::LocalUrl::parse)
+        .map(|u| u.host)
+    {
+        Some("[::1]") => Loopback::V6,
+        Some("127.0.0.1") => Loopback::V4,
+        _ => Loopback::Any,
+    }
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
@@ -1939,7 +1970,7 @@ mod tests {
         let all: Vec<std::thread::JoinHandle<()>> = (0..16u16)
             .map(|i| {
                 let f = forwards(&dir);
-                std::thread::spawn(move || f.remember("devbox", 9000 + i, 20000 + i))
+                std::thread::spawn(move || f.remember("devbox", 9000 + i, Loopback::Any, 20000 + i))
             })
             .collect();
         for t in all {
@@ -2096,6 +2127,45 @@ mod tests {
         // Pane 2 still lists the forward's port: no clock.
         assert!(f.sweep(t0 + GONE_GRACE * 3).is_empty());
         f.close(fw.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_host_back_waits_for_its_live_panes_first_lists() {
+        let dir = tempdir("unread-panes");
+        let f = forwards(&dir);
+        let t0 = Instant::now();
+        f.ports_changed_at(t0, "devbox", 2, vec![entry(5173)], true);
+        let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+        f.host_disconnected("devbox");
+        // Back with pane 2, whose first list is late: what it listens on is unknown, no clock.
+        let t1 = t0 + Duration::from_secs(60);
+        f.host_panes_at(t1, "devbox", &[2]);
+        assert!(f.sweep(t1 + GONE_GRACE * 3).is_empty());
+        // Its list comes without the port: now the clock starts.
+        let t2 = t1 + GONE_GRACE * 3;
+        f.ports_changed_at(t2, "devbox", 2, vec![], true);
+        assert!(
+            f.sweep(t2 + GONE_GRACE - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(f.sweep(t2 + GONE_GRACE), vec![fw]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_first_list_before_the_pane_set_still_counts() {
+        let dir = tempdir("list-first");
+        let f = forwards(&dir);
+        let t0 = Instant::now();
+        f.ports_changed_at(t0, "devbox", 2, vec![entry(5173)], true);
+        let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+        f.host_disconnected("devbox");
+        // Back: pane 2's first list (empty) comes before the app has listed the host's panes.
+        let t1 = t0 + Duration::from_secs(60);
+        f.ports_changed_at(t1, "devbox", 2, vec![], true);
+        f.host_panes_at(t1, "devbox", &[2]);
+        assert_eq!(f.sweep(t1 + GONE_GRACE), vec![fw]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

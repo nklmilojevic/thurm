@@ -25,6 +25,24 @@ pub const MAX_FRAME: usize = MAX_DATA + 64;
 /// How long a ticket stays valid unless used.
 pub const TICKET_TTL_MS: u32 = 60_000;
 
+/// Which of the daemon host's loopback addresses a stream connects to.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Loopback {
+    /// `127.0.0.1`, then `[::1]`.
+    #[default]
+    Any,
+    /// `127.0.0.1` only.
+    V4,
+    /// `[::1]` only.
+    V6,
+}
+
+impl Loopback {
+    pub fn is_any(&self) -> bool {
+        *self == Loopback::Any
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum StreamFrame {
     /// Bytes, at most [`MAX_DATA`].

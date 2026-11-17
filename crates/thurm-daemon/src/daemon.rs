@@ -3505,6 +3505,16 @@ impl Daemon {
                     .map(|seen| Response::Ports(crate::ports::as_response(seen)))
                     .ok_or_else(|| "could not list the processes".to_owned())
             }
+            Request::DialAt { port, at } => {
+                let principal = client.principal.lock().clone().unwrap_or_default();
+                self.streams
+                    .reserve(
+                        crate::streams::Kind::TcpAt { port, at },
+                        client.id,
+                        principal,
+                    )
+                    .map(|(ticket, expires_ms)| Response::Ticket { ticket, expires_ms })
+            }
             Request::UploadBegin {
                 pane,
                 name,

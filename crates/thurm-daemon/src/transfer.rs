@@ -1206,7 +1206,7 @@ pub fn serve<R: Read + Send>(
             size,
             stamp,
         } => t.serve_download(pane, &path, size, stamp, reader, writer),
-        Kind::Tcp { .. } => close(
+        Kind::Tcp { .. } | Kind::TcpAt { .. } => close(
             &mut writer,
             StreamClose::Internal("not a file stream".into()),
         ),

@@ -365,7 +365,7 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
         return;
     }
     match reservation.kind {
-        kind @ crate::streams::Kind::Tcp { .. } => {
+        kind @ (crate::streams::Kind::Tcp { .. } | crate::streams::Kind::TcpAt { .. }) => {
             crate::streams::serve(kind, reader, stream, open)
         }
         kind => crate::transfer::serve(&daemon, kind, reader, stream, open),

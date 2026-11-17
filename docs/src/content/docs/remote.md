@@ -408,7 +408,10 @@ port 5173 on the host's own loopback, and opens the link pointed at it. The
 first time, a toast on that pane says where it went (`devbox:5173 →
 localhost:5173`), with **Copy Link**; an alert does when the pane is gone by then,
 or when there was none (Forward Port… with no window open). Links to `localhost`, `127.0.0.1`, `[::1]` and `0.0.0.0` are
-forwarded; set `forward_links = false` in the host's `[[remote]]` (or turn off
+forwarded. The host's daemon connects to `127.0.0.1`, then `[::1]`; a link to
+`127.0.0.1` or `[::1]` reaches that address only, through a forward of its own,
+so two programs on the same port, one per address, each open as linked (a
+daemon older than this build tries both for those too). Set `forward_links = false` in the host's `[[remote]]` (or turn off
 **Open localhost links through a forward** in its details) to open them on the
 Mac instead.
 
