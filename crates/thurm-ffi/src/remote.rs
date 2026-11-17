@@ -109,12 +109,31 @@ fn emit(cb: thurm_remote_status_cb, ctx: Ctx, json: &str) {
 
 /// Starts or stops supervisors so they match the config's enabled remotes; updates changed
 /// ones.
-fn sync(m: &mut Manager) {
-    let cfg = Config::load().unwrap_or_default();
-    let wanted: HashMap<String, thurm_config::RemoteConfig> = cfg
+/// Brings `f` in line with the config: closes the forwards of a host pointed elsewhere (before
+/// its tunnel moves) and of a host removed or turned off, and remembers where each host points.
+/// A config that could not be read changes nothing: an empty list in its place would close
+/// every forward, though no host went anywhere.
+fn reconcile_forwards(
+    f: &Forwards,
+    destinations: &mut HashMap<String, Destination>,
+    cfg: Result<&Config, String>,
+) {
+    let cfg = match cfg {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("forwards kept as they are: the config could not be read: {e}");
+            return;
+        }
+    };
+    // Before the supervisors move their tunnels: a forward opened for the old destination must
+    // not start reaching the new one.
+    for name in moved(destinations, cfg) {
+        f.host_moved(&name);
+    }
+    *destinations = cfg
         .remote
         .iter()
-        .map(|r| (r.name.clone(), r.clone()))
+        .map(|r| (r.name.clone(), destination(r)))
         .collect();
     let enabled: Vec<&str> = cfg
         .remote
@@ -122,17 +141,22 @@ fn sync(m: &mut Manager) {
         .filter(|r| r.enabled)
         .map(|r| r.name.as_str())
         .collect();
-    // Before the supervisors move their tunnels: a forward opened for the old destination must
-    // not start reaching the new one.
-    for name in moved(&m.destinations, &cfg) {
-        forwards().host_moved(&name);
-    }
-    m.destinations = cfg
+    f.retain_hosts(&enabled);
+}
+
+fn sync(m: &mut Manager) {
+    let loaded = Config::load();
+    reconcile_forwards(
+        forwards(),
+        &mut m.destinations,
+        loaded.as_ref().map_err(|e| e.to_string()),
+    );
+    let cfg = loaded.unwrap_or_default();
+    let wanted: HashMap<String, thurm_config::RemoteConfig> = cfg
         .remote
         .iter()
-        .map(|r| (r.name.clone(), destination(r)))
+        .map(|r| (r.name.clone(), r.clone()))
         .collect();
-    forwards().retain_hosts(&enabled);
     let gone: Vec<String> = m
         .supervisors
         .keys()
@@ -915,6 +939,35 @@ mod tests {
         })
         .unwrap_err();
         assert!(e.contains("not a Thurm device key"), "{e}");
+    }
+
+    #[test]
+    fn an_unreadable_config_closes_no_forward() {
+        let dir = std::env::temp_dir().join(format!("thurm-ffi-reconcile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = Forwards::new(dir.join("forwards.json"), dir_socket);
+        let (fw, _) = f.open("devbox", 7000, Some(0)).unwrap();
+        let on = Config::parse("[[remote]]\nname = \"devbox\"\nhost = \"a\"\n").unwrap();
+        let mut destinations = HashMap::new();
+        reconcile_forwards(&f, &mut destinations, Ok(&on));
+        assert_eq!(f.list(), vec![fw.clone()]);
+        // The config can't be read for a moment (being rewritten): nothing changes.
+        reconcile_forwards(&f, &mut destinations, Err("expected `=`".into()));
+        assert_eq!(f.list(), vec![fw.clone()]);
+        assert!(
+            destinations.contains_key("devbox"),
+            "where hosts point is kept"
+        );
+        // Read again, without the host: its forward closes.
+        let none = Config::parse("").unwrap();
+        reconcile_forwards(&f, &mut destinations, Ok(&none));
+        assert!(f.list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn dir_socket(host: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("/nonexistent/{host}.sock"))
     }
 
     #[test]

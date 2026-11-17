@@ -346,6 +346,14 @@ extension SessionManager {
         pb.setString(url, forType: .string)
     }
 
+    /// Closes forward `id` off the main thread: closing waits until its listeners are closed,
+    /// which must not hold up the app (the change comes back through the status callback).
+    static func closeForward(_ id: UInt64) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: id)])
+        }
+    }
+
     /// Opens `f`'s link if it is still open.
     static func openForwardLink(_ f: ForwardInfo) {
         guard let link = liveLink(of: f), let url = URL(string: link) else {

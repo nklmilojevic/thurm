@@ -786,7 +786,6 @@ pub fn handoff_cmd(o: HandoffOptions, json: bool) -> R {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `thurm remote-info` (hidden): what the app's install check reads over ssh.
 /// `thurm remote ports NAME`: each pane's listening ports and what listens.
 pub fn ports_cmd(name: &str, json: bool) -> R {
     let c = connect_remote(name)?;
@@ -913,6 +912,7 @@ pub fn forward_cmd(name: &str, target: &str, local: Option<u16>, open: bool, jso
     Ok(ExitCode::SUCCESS)
 }
 
+/// `thurm remote-info` (hidden): what the app's install check reads over ssh.
 pub fn remote_info() -> R {
     println!("{}", serde_json::to_string(&ThurmInfo::current())?);
     Ok(ExitCode::SUCCESS)

@@ -214,3 +214,71 @@ fn a_dropped_connection_is_not_taken_for_a_live_host() {
     f.check("devbox").unwrap();
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A daemon that answers Hello after `delay` and counts the dials it is asked for.
+fn slow_daemon(path: PathBuf, delay: Duration) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use thurm_proto::{Envelope, Request, Response, ServerMessage, codec};
+    let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = dials.clone();
+    let ln = UnixListener::bind(&path).unwrap();
+    std::thread::spawn(move || {
+        for conn in ln.incoming() {
+            let Ok(mut conn) = conn else { return };
+            let counted = counted.clone();
+            std::thread::spawn(move || {
+                while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut conn) {
+                    let result = match env.request {
+                        Request::Hello { .. } => {
+                            std::thread::sleep(delay);
+                            Ok(Response::Hello {
+                                version: thurm_proto::PROTOCOL_VERSION,
+                                daemon_pid: std::process::id(),
+                                restored: false,
+                                build: thurm_proto::BUILD.into(),
+                                capabilities: thurm_proto::CAPABILITIES
+                                    .iter()
+                                    .map(|c| (*c).to_owned())
+                                    .collect(),
+                            })
+                        }
+                        Request::DialBegin { port } => {
+                            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(Response::Ticket {
+                                ticket: format!("ticket-{port}"),
+                                expires_ms: 60_000,
+                            })
+                        }
+                        _ => Ok(Response::Ok),
+                    };
+                    let msg = ServerMessage::Response { id: env.id, result };
+                    if codec::write_message(&mut conn, &msg).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    dials
+}
+
+#[test]
+fn a_connection_to_a_closed_forward_asks_the_host_for_nothing() {
+    let d = dir("no-dial");
+    let socket = d.join("slow.sock");
+    let dials = slow_daemon(socket.clone(), Duration::from_millis(400));
+    let theirs = socket.clone();
+    let f = Forwards::new(d.join("forwards.json"), move |_| theirs.clone());
+    let (fw, _) = f.open("devbox", 5176, Some(0)).unwrap();
+    // A connection comes in; while its worker still waits for the daemon, the forward closes.
+    let _conn = TcpStream::connect(("127.0.0.1", fw.local)).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    f.close(fw.id).unwrap();
+    // Well after the daemon answered: it was never asked to dial the port.
+    std::thread::sleep(Duration::from_millis(900));
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a closed forward dialled the host"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

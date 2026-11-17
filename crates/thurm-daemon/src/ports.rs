@@ -8,7 +8,7 @@
 //! [`thurm_proto::Request::Ports`], or any change brings it back to 10 s.
 
 use std::collections::HashMap;
-use std::sync::Weak;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -314,7 +314,8 @@ impl Watcher {
 
     /// Client `client`, which wants port events, connected: start the watcher if it isn't
     /// running, and send that client every pane's list.
-    pub fn subscribed<H: Host>(&self, host: Weak<H>, client: u64) {
+    /// The watcher holds the daemon (which lives as long as the process) for as long as it runs.
+    pub fn subscribed<H: Host>(&self, host: Arc<H>, client: u64) {
         let mut st = self.state.lock();
         st.joined.push(client);
         st.poked = true;
@@ -346,12 +347,11 @@ fn interval_from(ms: Option<&str>) -> Duration {
         .max(Duration::from_millis(50))
 }
 
-fn run<H: Host>(host: Weak<H>) {
+fn run<H: Host>(h: Arc<H>) {
     let mut tracker = Tracker::default();
     let mut backoff = Backoff::new(min_interval());
     let mut next = Instant::now();
     loop {
-        let Some(h) = host.upgrade() else { return };
         let w = h.watcher();
         let joined = {
             let mut st = w.state.lock();
@@ -402,7 +402,6 @@ fn run<H: Host>(host: Weak<H>) {
             }
         };
         log::trace!("ports: looked at {} panes, changed {changed}", roots.len());
-        drop(h);
     }
 }
 
