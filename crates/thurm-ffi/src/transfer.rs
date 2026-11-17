@@ -163,7 +163,8 @@ pub extern "C" fn thurm_upload_cancel(id: u64) {
     cancel(id);
 }
 
-/// Fetches the file at `path` (as `pane` sees it) into `dest`. With `if_version` (or NULL)
+/// Fetches the file at `path` (as `pane` sees it) into `dest`, replacing what is there (use
+/// `thurm_download_reserved` for a name others may take). With `if_version` (or NULL)
 /// still the file's version, writes nothing (`"not_modified": true`). A file over `max_bytes`
 /// (0 for no limit) is refused. The final callback carries `"info"`: the file's `name`, `path`,
 /// `size`, `modified` and `version`. Returns the transfer's id, or 0 when it could not start

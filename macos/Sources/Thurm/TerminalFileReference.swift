@@ -295,13 +295,20 @@ final class RemoteFileCache {
     /// Deletes the copies in `entry` that are neither in use nor shown.
     private func retireCopies(in entry: URL) {
         let fm = FileManager.default
-        let inUse = current(entry)?.deletingLastPathComponent().standardizedFileURL
+        let inUse = current(entry).map { Self.path($0.deletingLastPathComponent()) }
+        let shown = Set(held.keys.map { Self.path($0.deletingLastPathComponent()) })
         let copies = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)) ?? []
         for folder in copies where folder.lastPathComponent.hasPrefix("c-") {
-            let folder = folder.standardizedFileURL
-            if folder == inUse || held.keys.contains(where: { $0.deletingLastPathComponent() == folder }) { continue }
+            let path = Self.path(folder)
+            if path == inUse || shown.contains(path) { continue }
             try? fm.removeItem(at: folder)
         }
+    }
+
+    /// `url` as a path to compare: a folder's URL may end in `/` or not, depending on where it
+    /// came from (a listing, or a file's parent), its path never does.
+    private static func path(_ url: URL) -> String {
+        url.standardizedFileURL.path
     }
 
     /// Files Quick Look shows, with how many times: neither pruned nor replaced in place.
@@ -310,7 +317,7 @@ final class RemoteFileCache {
     /// The entry `file` is a copy in, if it is one of the cache's.
     private func entryOf(_ file: URL) -> URL? {
         let entry = file.standardizedFileURL.deletingLastPathComponent().deletingLastPathComponent()
-        return entry.deletingLastPathComponent() == root.standardizedFileURL ? entry : nil
+        return Self.path(entry.deletingLastPathComponent()) == Self.path(root) ? entry : nil
     }
 
     /// Keeps `file` while it is shown (no-op for other files).
@@ -354,24 +361,23 @@ final class RemoteFileCache {
     @discardableResult
     func prune(keeping keep: URL? = nil) -> Bool {
         let fm = FileManager.default
-        let busy = Set(held.keys.compactMap(entryOf) + reserved.values.map(\.entry) + [keep].compactMap { $0 })
-            .map(\.standardizedFileURL)
+        let busy = Set((held.keys.compactMap(entryOf) + reserved.values.map(\.entry) + [keep].compactMap { $0 })
+            .map(Self.path))
         let entries = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey]))
             ?? []
         // Copies neither in use nor shown (one not kept, let go) go first, and downloads no
         // fetch is writing; one that cannot be deleted counts.
-        let downloading = Set(reserved.values.map(\.entry.standardizedFileURL))
-        var stale: [URL: UInt64] = [:]
+        let downloading = Set(reserved.values.map { Self.path($0.entry) })
+        var stale: [String: UInt64] = [:]
         for entry in entries {
-            let entry = entry.standardizedFileURL
             retireCopies(in: entry)
-            if !downloading.contains(entry) { stale[entry] = clearStaleDownloads(in: entry) }
+            let path = Self.path(entry)
+            if !downloading.contains(path) { stale[path] = clearStaleDownloads(in: entry) }
         }
         var sized: [(url: URL, date: Date, size: UInt64)] = entries.map { entry in
             let date = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
                 ?? .distantPast
-            let url = entry.standardizedFileURL
-            return (url, date, size(of: entry) + (stale[url] ?? 0))
+            return (entry.standardizedFileURL, date, size(of: entry) + (stale[Self.path(entry)] ?? 0))
         }
         sized.sort { $0.date < $1.date }
         // A download refreshing an entry replaces its copy in use, unless Quick Look shows it:
@@ -384,7 +390,7 @@ final class RemoteFileCache {
             return sum + (r.bytes > replaced ? r.bytes - replaced : 0)
         }
         var total = sized.reduce(UInt64(0)) { $0 + $1.size } + extra
-        for e in sized where total > maxBytes && !busy.contains(e.url) {
+        for e in sized where total > maxBytes && !busy.contains(Self.path(e.url)) {
             if (try? fm.removeItem(at: e.url)) != nil { total -= e.size }
         }
         return total <= maxBytes

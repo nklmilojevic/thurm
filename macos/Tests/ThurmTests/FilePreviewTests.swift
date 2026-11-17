@@ -838,4 +838,27 @@ final class FilePreviewTests: XCTestCase {
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stuck.path) }
         XCTAssertFalse(small.prune(keeping: stuck))
     }
+
+    func testAShownCopyIsKnownWhateverItsFolderURLLooksLike() throws {
+        let cache = tempCache()
+        let pane = PaneKey("devbox", 3)
+        func fetch(_ content: String, version: String) -> URL? {
+            cache.download = downloads { _, _, dest, _, done in
+                try! Data(content.utf8).write(to: dest)
+                done(self.outcome(name: "log.txt", version: version))
+            }
+            var got: URL?
+            cache.fetch(.path("/log.txt"), pane: pane, cwd: nil) { got = try? $0.get() }
+            return got
+        }
+        let shown = try XCTUnwrap(fetch("old", version: "v1"))
+        // Held under a URL spelled another way: through its folder with a trailing slash.
+        let respelled = URL(fileURLWithPath: shown.deletingLastPathComponent().path + "/", isDirectory: true)
+            .appendingPathComponent(shown.lastPathComponent)
+        cache.hold(respelled)
+        _ = try XCTUnwrap(fetch("new", version: "v2"))
+        XCTAssertEqual(try String(contentsOf: shown, encoding: .utf8), "old")
+        cache.release(respelled)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: shown.path))
+    }
 }

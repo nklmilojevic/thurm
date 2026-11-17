@@ -89,7 +89,8 @@ uint64_t thurm_upload(thurm_client *client, thurm_pane_id pane, const char *file
 void thurm_upload_cancel(uint64_t transfer);
 
 /* Fetch the regular file at `path` on `pane`'s host (relative to the pane's directory, `~`
- * for home) into `dest`, written beside it and then moved there. Cancelling stops a download
+ * for home) into `dest`, written beside it and then moved there, replacing whatever `dest` is
+ * (for a destination the caller owns; see thurm_download_reserved for one others may take). Cancelling stops a download
  * under way and deletes what it wrote beside `dest`, leaving a file already at `dest` as it was;
  * a download already moved into place stays, and the final callback says it was saved. With `if_version` (or NULL)
  * still the file's version, nothing is written ("not_modified":true). A file over `max_bytes`

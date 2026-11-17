@@ -568,7 +568,8 @@ pub fn download_reserved(
 }
 
 /// Fetches the file at `path`, as `pane` sees it, into `dest` (written beside it first, then
-/// moved into place). With `if_version` still the file's version, writes nothing. A file over
+/// moved into place, replacing whatever `dest` is: for a destination this caller owns, like a
+/// cache's; [`download_reserved`] saves into a name others may take). With `if_version` still the file's version, writes nothing. A file over
 /// `max_bytes` is refused before anything is sent.
 #[allow(clippy::too_many_arguments)]
 pub fn download(
@@ -638,7 +639,8 @@ fn fetch_into(
 /// Shuts a stream's connection down once `cancel` is set, until dropped: a read blocked on a
 /// host that stopped sending then returns.
 struct CancelWatch {
-    stop: Arc<AtomicBool>,
+    /// Dropped to stop the watch at once (its thread waits on the other end).
+    stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -660,19 +662,22 @@ impl CancelWatch {
         socket: std::os::unix::net::UnixStream,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
     ) -> std::io::Result<CancelWatch> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let thread = spawn(Box::new(move || {
-            while !stopped.load(Ordering::SeqCst) {
+            loop {
                 if cancel.is_cancelled() {
                     let _ = socket.shutdown(std::net::Shutdown::Both);
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Woken at once when the watch is dropped, not at its next look at `cancel`.
+                match stopped.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => return,
+                }
             }
         }))?;
         Ok(CancelWatch {
-            stop,
+            stop: Some(stop),
             thread: Some(thread),
         })
     }
@@ -680,7 +685,7 @@ impl CancelWatch {
 
 impl Drop for CancelWatch {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        drop(self.stop.take());
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -1186,5 +1191,20 @@ mod tests {
         assert!(got.is_some_and(|e| e.contains("the disk went away")));
         let _ = release.send(());
         daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_watch_stops_at_once() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let watch = CancelWatch::start(Cancel::default(), a).unwrap();
+        // Let its thread settle into its wait.
+        std::thread::sleep(Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        drop(watch);
+        assert!(
+            started.elapsed() < Duration::from_millis(25),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

@@ -3517,8 +3517,10 @@ impl Daemon {
                 batch,
             } => {
                 // Its paths go to the program in the pane: a pane whose program ended (held
-                // open) takes no files.
-                if !self.with_pane(pane, |_, st| st.info.alive)? {
+                // open) takes no files,
+                // nor one whose input another client's attached terminal holds: refused now, not
+                // when the files have come and their paths cannot be typed.
+                if !self.with_input_pane(client.id, pane, |_, st| st.info.alive)? {
                     return Err("This terminal has closed.".into());
                 }
                 let principal = client.principal.lock().clone().unwrap_or_default();

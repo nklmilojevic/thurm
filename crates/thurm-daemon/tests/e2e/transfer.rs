@@ -1253,3 +1253,24 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
     assert!(matches!(e, TransferError::NotFound(_)), "{e}");
     assert!(!missing.exists());
 }
+
+#[test]
+fn a_pane_another_terminal_holds_takes_no_files_from_the_start() {
+    let env = Env::new("transfer-attached");
+    let _daemon = env.start();
+    let (owner, _orx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&owner, &dir);
+    owner
+        .request(Request::AttachTerminal {
+            pane,
+            size: PaneSize::default(),
+        })
+        .unwrap();
+    // Refused before a byte, not once the files have come.
+    let (c, _rx) = env.connect();
+    let e = c.upload_begin(pane, "a.txt", 1, None).unwrap_err();
+    assert!(e.to_string().contains("attached terminal"), "{e}");
+    owner.request(Request::DetachTerminal { pane }).unwrap();
+    c.upload_begin(pane, "a.txt", 1, None).unwrap();
+}
