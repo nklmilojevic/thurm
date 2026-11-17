@@ -104,8 +104,13 @@ thurm.on("ports_changed", function(ev)
     end
     return
   end
-  -- A remote host's lists sent as the app connected to it: running already.
+  -- A remote host's lists sent as the app connected to it: running already. One that could
+  -- not read every process may have missed some: the pane's first complete list settles what
+  -- runs, as for a pane read in part at load.
   if ev.initial and ev.host then
+    if not ev.complete then
+      unsure[key] = true
+    end
     return
   end
   for port in pairs(now) do

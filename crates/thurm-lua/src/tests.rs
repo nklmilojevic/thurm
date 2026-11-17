@@ -742,6 +742,10 @@ fn the_dev_server_example_opens_only_new_servers() {
                   "complete": false, "gone": true }),
     );
     ports(Some("devbox"), 1, &[5173, 5174], true, true);
+    // A host the app connects to whose first read missed a server: its first complete list
+    // has it, and it ran already.
+    ports(Some("nas"), 7, &[], false, true);
+    ports(Some("nas"), 7, &[8080], true, false);
     // 4000 really stops (a complete list) and starts again: news.
     ports(None, 3, &[4001], true, false);
     ports(None, 3, &[4000, 4001], true, false);
