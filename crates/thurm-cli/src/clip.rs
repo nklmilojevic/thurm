@@ -576,7 +576,8 @@ fn get(pane: PaneId, mime: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
 }
 
 /// Copies `text` (one trailing newline dropped with `trim`) through `set`, then, with `echo`
-/// (`xclip -f`), writes what was copied to `out`: nothing when the copy failed.
+/// (`xclip -f`), writes the input as it came, before any trim, to `out`: nothing when the copy
+/// failed.
 fn copy_then_echo(
     mut text: String,
     trim: bool,
@@ -584,10 +585,10 @@ fn copy_then_echo(
     set: impl FnOnce(String) -> Result<(), Box<dyn std::error::Error>>,
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let copied = echo.then(|| text.clone());
     if trim && text.ends_with('\n') {
         text.pop();
     }
-    let copied = echo.then(|| text.clone());
     set(text)?;
     if let Some(t) = copied {
         out.write_all(t.as_bytes())?;
@@ -910,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_echoes_only_what_was_copied() {
+    fn the_filter_echoes_the_input_once_it_is_copied() {
         let mut out = Vec::new();
         let failed = super::copy_then_echo(
             "hi\n".into(),
@@ -935,7 +936,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(copied.as_deref(), Some("hi"));
-        assert_eq!(out, b"hi", "the text that was copied, trimmed");
+        assert_eq!(
+            out, b"hi\n",
+            "the input as it came, as xclip -f -r echoes it"
+        );
 
         let mut out = Vec::new();
         super::copy_then_echo("x".into(), false, false, |_| Ok(()), &mut out).unwrap();
