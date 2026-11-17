@@ -644,7 +644,9 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
             label: "Install".into(),
             confirm: Some(format!(
                 "Programs in new panes on {name} will copy to and paste from this Mac's \
-                 clipboard through {tools}, as the clipboard settings for {name} allow."
+                 clipboard through {tools}, as the clipboard settings for {name} allow: in \
+                 bash, zsh and fish with Thurm's shell integration, and in panes that run a \
+                 command."
             )),
         });
     }

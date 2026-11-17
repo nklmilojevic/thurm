@@ -655,6 +655,25 @@ pub struct DownloadInfo {
     pub not_modified: bool,
 }
 
+impl Request {
+    /// A clipboard tool's own request: [`Request::ClipboardGet`], [`Request::ClipboardSet`] or
+    /// [`Request::ClipboardClear`].
+    pub fn is_clipboard_tool(&self) -> bool {
+        matches!(
+            self,
+            Request::ClipboardGet { .. }
+                | Request::ClipboardSet { .. }
+                | Request::ClipboardClear { .. }
+        )
+    }
+
+    /// Carries clipboard contents, up to [`CLIP_MAX`]: a tool's request, or an app's
+    /// [`Request::ClipboardAnswer`].
+    pub fn carries_clipboard(&self) -> bool {
+        self.is_clipboard_tool() || matches!(self, Request::ClipboardAnswer { .. })
+    }
+}
+
 /// How [`Request::OwnPanes`] treats a pane another client holds.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OwnMode {

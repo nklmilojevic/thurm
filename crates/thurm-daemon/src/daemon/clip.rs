@@ -123,6 +123,15 @@ pub(super) struct PendingClip {
     refused: &'static str,
 }
 
+/// Removes request `.1` from the pending ones when dropped.
+struct PendingGuard<'a>(&'a Mutex<HashMap<u64, PendingClip>>, u64);
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.lock().remove(&self.1);
+    }
+}
+
 /// [`ANSWER_TIMEOUT`], or `THURM_CLIP_TIMEOUT_MS` (tests).
 fn answer_timeout() -> Duration {
     std::env::var("THURM_CLIP_TIMEOUT_MS")
@@ -248,6 +257,9 @@ impl Daemon {
             }
         };
         let (reply, answer) = crossbeam_channel::bounded(1);
+        // Taken out of the pending requests however this ends, a panic included: one left
+        // behind would hold one of MAX_PENDING for good.
+        let _pending = PendingGuard(&self.pending_clips, id);
         {
             let mut pending = self.pending_clips.lock();
             if pending.len() >= MAX_PENDING {
@@ -286,7 +298,6 @@ impl Daemon {
             Err(e) => Err(e),
             Ok(()) => self.wait_answer(caller, ui.id, answer),
         };
-        self.pending_clips.lock().remove(&id);
         result
     }
 
@@ -370,6 +381,54 @@ mod tests {
     use std::sync::Arc;
 
     use super::{Slots, pick_ui};
+
+    #[test]
+    fn a_pending_request_goes_however_its_wait_ends() {
+        let pending = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let (reply, _answer) = crossbeam_channel::bounded(1);
+        pending.lock().insert(
+            7,
+            super::PendingClip {
+                ui: 1,
+                reply,
+                refused: "",
+            },
+        );
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = super::PendingGuard(&pending, 7);
+            panic!("the wait failed");
+        }));
+        assert!(waited.is_err());
+        assert!(pending.lock().is_empty(), "not left holding a slot");
+    }
+
+    #[test]
+    fn the_tools_requests_are_one_list() {
+        use thurm_proto::Request;
+        for req in [
+            Request::ClipboardGet {
+                pane: 1,
+                mime: "text/plain".into(),
+            },
+            Request::ClipboardSet {
+                pane: 1,
+                text: String::new(),
+            },
+            Request::ClipboardClear { pane: 1 },
+            Request::ClipboardAnswer { id: 1, data: None },
+            Request::ListPanes,
+        ] {
+            assert_eq!(
+                super::Ask::of(req.clone()).is_ok(),
+                req.is_clipboard_tool(),
+                "{req:?}"
+            );
+            assert_eq!(
+                req.carries_clipboard(),
+                req.is_clipboard_tool() || matches!(req, Request::ClipboardAnswer { .. })
+            );
+        }
+    }
 
     #[test]
     fn slots_are_bounded_and_given_back() {

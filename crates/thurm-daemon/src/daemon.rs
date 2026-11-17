@@ -2502,9 +2502,7 @@ impl Daemon {
                 return;
             }
             // The app may ask the user first. Admitted (a slot taken) before the thread.
-            req @ (Request::ClipboardGet { .. }
-            | Request::ClipboardSet { .. }
-            | Request::ClipboardClear { .. }) => {
+            req if req.is_clipboard_tool() => {
                 let Ok((pane, ask)) = clip::Ask::of(req) else {
                     unreachable!("a clipboard request")
                 };
@@ -3194,14 +3192,13 @@ impl Daemon {
             Request::Capture { pane, opts } => {
                 self.with_pane(pane, |_, st| Response::Text(st.term.capture(&opts)))
             }
-            Request::Wait { .. }
-            | Request::Explain { .. }
-            | Request::AgentPrompt { .. }
-            | Request::ClipboardGet { .. }
-            | Request::ClipboardSet { .. }
-            | Request::ClipboardClear { .. } => {
+            Request::Wait { .. } | Request::Explain { .. } | Request::AgentPrompt { .. } => {
                 unreachable!("handled in handle()")
             }
+            // Spelt out, so a clipboard request added later is a compile error here.
+            Request::ClipboardGet { .. }
+            | Request::ClipboardSet { .. }
+            | Request::ClipboardClear { .. } => unreachable!("handled in handle()"),
             Request::ClipboardAnswer { id, data } => self.clipboard_answer(client.id, id, data),
             Request::SetLayout { json } => {
                 serde_json::from_str::<Layout>(&json)

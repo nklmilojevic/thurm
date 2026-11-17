@@ -526,6 +526,10 @@ fn clipboard_requests_are_not_taken_through_request() {
             text: "x".into(),
         },
         Request::ClipboardClear { pane },
+        Request::ClipboardAnswer {
+            id: 1,
+            data: Some(vec![0; 16]),
+        },
     ] {
         let e = plugin
             .request(Request::Ext {

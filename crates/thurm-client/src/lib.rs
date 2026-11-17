@@ -510,12 +510,8 @@ impl Client {
                 "this Thurm daemon has no actions or plugins yet; update Thurm on this host".into(),
             ));
         }
-        if matches!(
-            env.request,
-            Request::ClipboardSet { .. }
-                | Request::ClipboardGet { .. }
-                | Request::ClipboardClear { .. }
-        ) && !matches!(&*self.hello.lock(), Some(Response::Hello { capabilities, .. })
+        if env.request.is_clipboard_tool()
+            && !matches!(&*self.hello.lock(), Some(Response::Hello { capabilities, .. })
                 if capabilities.iter().any(|c| c == thurm_proto::CAP_CLIP_QUERY))
         {
             return Err(ClientError::Daemon(

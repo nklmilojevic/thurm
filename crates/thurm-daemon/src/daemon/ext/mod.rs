@@ -191,17 +191,11 @@ impl Daemon {
                 if matches!(req, Request::Hello { .. } | Request::Ext { .. }) {
                     return Err("not through `request`".into());
                 }
-                // A clipboard tool's requests carry up to 32 MiB both ways, which JSON would make
-                // many times that, past the daemon's bound on clipboard data: sent as themselves.
-                if matches!(
-                    req,
-                    Request::ClipboardGet { .. }
-                        | Request::ClipboardSet { .. }
-                        | Request::ClipboardClear { .. }
-                ) {
+                // Clipboard requests carry up to 32 MiB, which JSON would make many times that,
+                // past the daemon's bound on clipboard data: sent as themselves.
+                if req.carries_clipboard() {
                     return Err(
-                        "not through `request`: send ClipboardGet, ClipboardSet or ClipboardClear \
-                         as requests of their own"
+                        "not through `request`: send clipboard requests as requests of their own"
                             .into(),
                     );
                 }
@@ -684,9 +678,7 @@ impl Daemon {
             }
             // Refused by the `request` method before this; anything else asking gets an error,
             // not dispatch's unreachable arm.
-            Request::ClipboardGet { .. }
-            | Request::ClipboardSet { .. }
-            | Request::ClipboardClear { .. } => {
+            req if req.carries_clipboard() => {
                 Err("clipboard requests are answered only as requests of their own".into())
             }
             other => self.dispatch(client, other),
