@@ -391,7 +391,8 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
   the clipboard, leaving no type. Options the tools cannot honour here are
   refused rather than ignored: a copy meant to go away (`xclip -loops`,
   `-wait`, `-sensitive`, `xsel --selectionTimeout`, `wl-copy --paste-once`),
-  `xsel --append`, `--follow` and `--exchange`, and a pasteboard or format
+  `xsel --append`, `--follow` and `--exchange`, another X server
+  (`xclip -display`, `xsel --display`), and a pasteboard or format
   other than the general one and text (`pbcopy -pboard find`,
   `pbpaste -Prefer rtf`). `thurm clip copy`, `thurm clip paste [--type image/png]` and
   `thurm clip clear` do the same on any host; on this Mac's own panes only

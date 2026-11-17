@@ -210,8 +210,10 @@ pub fn parse(
                             ));
                         }
                     }
+                    // Another X server's clipboard: not this Mac's, refused rather than served.
                     Some("display") => {
-                        operand(&mut it, "xclip", a)?;
+                        let display = operand(&mut it, "xclip", a)?;
+                        return Err(format!("xclip: -display {display} is not supported"));
                     }
                     Some(opt @ ("loops" | "wait")) => {
                         if operand(&mut it, "xclip", a)? != "0" {
@@ -280,7 +282,9 @@ pub fn parse(
                         "primary" => 'p',
                         "secondary" => 's',
                         "keep" | "nodetach" | "verbose" | "zeroflush" => 'n',
-                        "logfile" | "display" | "window-name" => 'l',
+                        "logfile" | "window-name" => 'l',
+                        // Another X server's selections: not this Mac's clipboard.
+                        "display" => return Err("xsel: --display is not supported".into()),
                         "selectionTimeout" => 't',
                         "help" | "version" => 'h',
                         _ => return Err(format!("xsel: unknown option {a}")),
@@ -1028,6 +1032,17 @@ mod tests {
             );
         }
         assert_eq!(pasted_text(b"x".to_vec(), true), Ok(b"x".to_vec()));
+    }
+
+    /// A tool told to use another X server is refused, not given this Mac's clipboard.
+    #[test]
+    fn another_display_is_refused() {
+        for args in [&["-display", ":1", "-o"][..], &["-d", ":1", "-i"]] {
+            let e = xc(args).expect_err(&format!("{args:?}"));
+            assert!(e.contains("not supported"), "{args:?}: {e}");
+        }
+        let e = p("xsel", &["-b", "--display", ":1", "-o"]).unwrap_err();
+        assert!(e.contains("not supported"), "{e}");
     }
 
     #[test]
