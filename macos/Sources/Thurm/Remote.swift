@@ -480,34 +480,18 @@ final class Remotes {
 
     /// Puts `text` on `pb` (through `put`, `setString` but in tests), or clears it when nil
     /// (nothing left, no empty text a later paste would find), if `allowed`. Whether it did: a
-    /// copy the pasteboard refused is not one, and leaves `pb` holding what it held before.
+    /// copy the pasteboard refused is not one.
     static func clipboardWrite(_ pb: NSPasteboard, text: String?, allowed: Bool,
                                put: ((NSPasteboard, String) -> Bool)? = nil) -> Bool {
         guard allowed else { return false }
+        // A pasteboard takes new contents only once cleared, so a copy it then refuses (which
+        // `setString` hardly ever does) leaves it empty; the tool hears it was not done. What it
+        // held is not read beforehand to put back: a host allowed to write the clipboard is not
+        // one allowed to make the app fetch every item on it.
+        pb.clearContents()
         // Empty text is a clear: no text type left that a type listing would show.
-        guard let text, !text.isEmpty else {
-            pb.clearContents()
-            return true
-        }
-        // A pasteboard takes new contents only once cleared, so what it held is kept to put
-        // back should it refuse the copy (which `setString` hardly ever does).
-        let before = pasteboardCopy(pb)
-        pb.clearContents()
-        if (put ?? { $0.setString($1, forType: .string) })(pb, text) { return true }
-        pb.clearContents()
-        if !before.isEmpty { pb.writeObjects(before) }
-        return false
-    }
-
-    /// `pb`'s items with each of their types, as new items it can be given back.
-    static func pasteboardCopy(_ pb: NSPasteboard) -> [NSPasteboardItem] {
-        (pb.pasteboardItems ?? []).map { item in
-            let copy = NSPasteboardItem()
-            for type in item.types {
-                if let data = item.data(forType: type) { copy.setData(data, forType: type) }
-            }
-            return copy
-        }
+        guard let text, !text.isEmpty else { return true }
+        return (put ?? { $0.setString($1, forType: .string) })(pb, text)
     }
 
     /// The types a clipboard tool can paste from `pb`, without reading them: a large or lazily

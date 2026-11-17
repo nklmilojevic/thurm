@@ -3130,9 +3130,12 @@ impl Daemon {
                         }
                         p.write(b);
                     }
-                    self.focus
-                        .lock()
-                        .focus(client.id, pane, focused, Instant::now());
+                    let mut log = self.focus.lock();
+                    log.focus(client.id, pane, focused, Instant::now());
+                    if focused && clip::shares_clipboard(client) {
+                        log.shown_by(client.id, pane);
+                    }
+                    drop(log);
                     // Looking at a finished agent acknowledges it (Done → Idle).
                     if focused {
                         self.emit("pane_focused", Some(&st.info), serde_json::json!({}));

@@ -109,16 +109,8 @@ final class ClipboardToolsTests: XCTestCase {
         pb.setString("before", forType: .string)
         XCTAssertTrue(Remotes.clipboardWrite(pb, text: "", allowed: true))
         XCTAssertEqual(Remotes.clipboardTypes(pb), [])
-        // The pasteboard refusing the text is no copy: the tool must hear so, and what the
-        // clipboard held stays, every type of it.
-        let item = NSPasteboardItem()
-        item.setString("kept", forType: .string)
-        item.setData(Data([1, 2, 3]), forType: NSPasteboard.PasteboardType("com.example.kept"))
-        pb.clearContents()
-        pb.writeObjects([item])
+        // The pasteboard refusing the text is no copy: the tool must hear so.
         XCTAssertFalse(Remotes.clipboardWrite(pb, text: "x", allowed: true, put: { _, _ in false }))
-        XCTAssertEqual(pb.string(forType: .string), "kept")
-        XCTAssertEqual(pb.data(forType: NSPasteboard.PasteboardType("com.example.kept")), Data([1, 2, 3]))
     }
 
     /// This Mac's `terminal.osc52` decides whether a remote host's tool may write the clipboard:

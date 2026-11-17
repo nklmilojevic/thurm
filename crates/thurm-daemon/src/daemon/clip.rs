@@ -222,12 +222,7 @@ impl Daemon {
         let clients = self.clients.lock();
         let candidates: Vec<(u64, bool)> = clients
             .values()
-            .filter(|c| {
-                c.ui.load(Ordering::Relaxed)
-                    && !c.mobile.load(Ordering::Relaxed)
-                    && c.clip_query.load(Ordering::Relaxed)
-                    && !c.gone.load(Ordering::Relaxed)
-            })
+            .filter(|c| shares_clipboard(c) && !c.gone.load(Ordering::Relaxed))
             .map(|c| (c.id, c.clip_verified.load(Ordering::Relaxed)))
             .collect();
         // A daemon that can tell its own app asks only that: another client saying it is a UI
@@ -404,6 +399,14 @@ fn pick_ui(last: Option<u64>, candidates: &[(u64, bool)], only_verified: bool) -
         (None, [only]) => Some(*only),
         (None, _) => None,
     }
+}
+
+/// Whether `c` is a desktop UI a clipboard tool's request may go to: an app with
+/// `clip-query`, not a phone.
+pub(super) fn shares_clipboard(c: &Client) -> bool {
+    c.ui.load(Ordering::Relaxed)
+        && !c.mobile.load(Ordering::Relaxed)
+        && c.clip_query.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

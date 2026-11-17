@@ -377,7 +377,8 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
   These are the checks an OSC 52 copy or read gets, and both sides must allow
   it. A copy, clear or paste goes to the Thurm app that last showed the pane
   (the only one connected, if none has; with several and none of them, the
-  tool asks you to show the pane in one), which answers it, so the tool hears
+  tool asks you to show the pane in one; a phone or an app without clipboard
+  tools showing it since changes nothing), which answers it, so the tool hears
   whether it was done: anything refused,
   on the host or on this Mac, fails the tool. Listing the types
   (`xclip -selection clipboard -t TARGETS -o`, `wl-paste --list-types`) fails where reads from that

@@ -582,14 +582,9 @@ fn a_phone_cannot_use_the_tools_requests() {
     nothing_asked(&rx);
 }
 
-#[test]
-fn older_apps_and_phones_are_never_asked() {
-    let env = clip_env("clip-old", "copy-paste");
-    let _daemon = env.start();
-    let (app, _) = env.connect();
-    let pane = create(&app, &env.dir);
-    drop(app);
-    // An app from before clipboard tools: a UI without the capability.
+/// An app from before clipboard tools, a UI without the capability, that focuses `pane`. Raw:
+/// [`Client`] would add the capabilities of this build.
+fn old_app(env: &Env, pane: PaneId) -> UnixStream {
     let mut old = UnixStream::connect(&env.socket).unwrap();
     let hello = Request::Hello {
         client: "e2e-old-app".into(),
@@ -617,6 +612,17 @@ fn older_apps_and_phones_are_never_asked() {
         .unwrap(),
     )
     .unwrap();
+    old
+}
+
+#[test]
+fn older_apps_and_phones_are_never_asked() {
+    let env = clip_env("clip-old", "copy-paste");
+    let _daemon = env.start();
+    let (app, _) = env.connect();
+    let pane = create(&app, &env.dir);
+    drop(app);
+    let mut old = old_app(&env, pane);
     // A phone, which says it can (its build has the capability) but is not a desktop UI.
     let stream = thurm_client::connect_daemon(&env.socket).unwrap();
     let (tx, phone_rx) = unbounded();
@@ -638,16 +644,70 @@ fn older_apps_and_phones_are_never_asked() {
         .unwrap()
         .unwrap_err();
     assert!(e.contains("no Thurm app"), "{e}");
-    no_query(&phone_rx);
+    // Nor are copies and clears, which go out as another event.
+    for req in [
+        Request::ClipboardSet {
+            pane,
+            text: "copied".into(),
+        },
+        Request::ClipboardClear { pane },
+    ] {
+        let e = ask(&tool(&env), req).join().unwrap().unwrap_err();
+        assert!(e.contains("no Thurm app"), "{e}");
+    }
+    nothing_asked(&phone_rx);
     old.set_read_timeout(Some(Duration::from_millis(300)))
         .unwrap();
     while let Ok(Some(frame)) = codec::read_frame(&mut old) {
         let msg: ServerMessage = codec::decode(&frame).unwrap();
         assert!(
-            !matches!(msg, ServerMessage::Event(Event::ClipboardQuery { .. })),
+            !matches!(
+                msg,
+                ServerMessage::Event(
+                    Event::ClipboardQuery { .. }
+                        | Event::ClipboardWrite { .. }
+                        | Event::ClipboardStore { .. }
+                )
+            ),
             "{msg:?}"
         );
     }
+}
+
+/// A phone or an app from before clipboard tools looking at the pane after the desktop app did
+/// leaves that app the one asked: neither of them could be.
+#[test]
+fn a_phone_or_older_app_looking_last_leaves_the_app_asked() {
+    let env = clip_env("clip-not-last", "copy-paste");
+    let _daemon = env.start();
+    let (a, a_rx) = env.connect();
+    let (b, b_rx) = env.connect();
+    let pane = create(&a, &env.dir);
+    focus(&a, pane);
+    focus(&b, pane);
+    let (tx, phone_rx) = unbounded();
+    let phone = Client::from_stream(
+        thurm_client::connect_daemon(&env.socket).unwrap(),
+        "e2e-ios",
+        true,
+        &[CAP_MOBILE],
+        move |ev| {
+            let _ = tx.send(ev);
+        },
+        || {},
+    )
+    .unwrap();
+    focus(&phone, pane);
+    let _old = old_app(&env, pane);
+    std::thread::sleep(Duration::from_millis(200));
+    let paste = get(&tool(&env), pane, CLIP_TEXT);
+    let Some((_, id, _)) = query(&b_rx) else {
+        panic!("b is still the app that looked last: {:?}", paste.join());
+    };
+    answer(&b, id, Some(b"from b".to_vec())).unwrap();
+    assert_eq!(paste.join().unwrap(), Ok(b"from b".to_vec()));
+    no_query(&a_rx);
+    nothing_asked(&phone_rx);
 }
 
 /// The clipboard tools stay first on PATH though the user's startup files put another `xclip`
