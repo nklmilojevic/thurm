@@ -194,7 +194,7 @@ pub struct Forwards {
 }
 
 /// The most open files [`raise_open_file_limit`] asks for (macOS refuses more than `OPEN_MAX`).
-pub const OPEN_FILES: u64 = 10_240;
+pub const OPEN_FILES: libc::rlim_t = 10_240;
 
 /// Raises this process's soft limit on open files to its hard limit, up to [`OPEN_FILES`]. Each
 /// connection a forward carries holds a few descriptors (the local socket, its clones, the
@@ -208,7 +208,7 @@ pub fn raise_open_file_limit() {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) } != 0 {
         return;
     }
-    let want = (l.rlim_max as u64).min(OPEN_FILES) as libc::rlim_t;
+    let want = l.rlim_max.min(OPEN_FILES);
     if l.rlim_cur < want {
         l.rlim_cur = want;
         if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &l) } != 0 {
@@ -1935,7 +1935,7 @@ mod tests {
         };
         assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) }, 0);
         assert!(
-            l.rlim_cur as u64 >= (l.rlim_max as u64).min(OPEN_FILES),
+            l.rlim_cur >= l.rlim_max.min(OPEN_FILES),
             "{} of {}",
             l.rlim_cur,
             l.rlim_max
