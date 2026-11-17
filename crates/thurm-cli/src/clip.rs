@@ -471,19 +471,33 @@ pub fn list_types(answer: &str, xclip: bool) -> String {
     out.iter().map(|t| format!("{t}\n")).collect()
 }
 
+/// The tool's arguments as text, refused when one is not UTF-8, as text on standard input is:
+/// `wl-copy` would copy a replacement character in place of its bytes.
+fn utf8_args(args: Vec<std::ffi::OsString>) -> Result<Vec<String>, String> {
+    args.into_iter()
+        .map(|a| {
+            a.into_string()
+                .map_err(|_| "only UTF-8 arguments are supported".to_string())
+        })
+        .collect()
+}
+
 /// `thurm` run as one of [`CLIP_TOOLS`]: `None` when `argv0` names none of them.
-pub fn run_as_tool(argv0: &str, args: &[String]) -> Option<ExitCode> {
+pub fn run_as_tool(argv0: &std::ffi::OsStr, args: Vec<std::ffi::OsString>) -> Option<ExitCode> {
     let name = std::path::Path::new(argv0).file_name()?.to_str()?;
     if !CLIP_TOOLS.contains(&name) {
         return None;
     }
-    let done = parse(
-        name,
-        args,
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-    )
-    .and_then(|action| perform(action).map_err(|e| e.to_string()));
+    let done = utf8_args(args)
+        .and_then(|args| {
+            parse(
+                name,
+                &args,
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            )
+        })
+        .and_then(|action| perform(action).map_err(|e| e.to_string()));
     Some(match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -959,6 +973,18 @@ mod tests {
             Ok(Action::PasteThenCopy { trim: false })
         );
         assert!(p("xsel", &["-q"]).is_err());
+    }
+
+    #[test]
+    fn arguments_must_be_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![0xff]);
+        let e = utf8_args(vec!["--".into(), bad]).unwrap_err();
+        assert!(e.contains("UTF-8"), "{e}");
+        assert_eq!(
+            utf8_args(vec!["-n".into(), "héllo".into()]),
+            Ok(vec!["-n".to_string(), "héllo".to_string()])
+        );
     }
 
     #[test]

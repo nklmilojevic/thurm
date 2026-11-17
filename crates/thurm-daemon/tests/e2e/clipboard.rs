@@ -671,10 +671,11 @@ fn clipboard_tools_come_first_after_the_startup_files() {
             std::fs::write(&tool, "#!/bin/sh\n").unwrap();
             std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        // The user's startup files put another xclip first, keep the look-alike directory,
-        // and name the shims twice side by side and once more further down.
+        // The user's startup files put another xclip first, keep the look-alike directory and
+        // an empty entry (the current directory), and name the shims twice side by side and
+        // once more further down.
         let entries = format!(
-            "{}:{}:{s}:{s}:$PATH:{s}",
+            "{}::{}:{s}:{s}:$PATH:{s}",
             real.display(),
             lookalike.display(),
             s = shims.display()
@@ -686,7 +687,7 @@ fn clipboard_tools_come_first_after_the_startup_files() {
         std::fs::write(
             home.join(".config/fish/config.fish"),
             format!(
-                "set -gx PATH {:?} {:?} {s:?} {s:?} $PATH {s:?}\n{}function fish_prompt; echo -n '$ '; end\n",
+                "set -gx PATH {:?} . {:?} {s:?} {s:?} $PATH {s:?}\n{}function fish_prompt; echo -n '$ '; end\n",
                 real.display().to_string(),
                 lookalike.display().to_string(),
                 if display { "set -gx DISPLAY :9\n" } else { "" },
@@ -757,6 +758,13 @@ fn clipboard_tools_come_first_after_the_startup_files() {
             } else {
                 "(?m)^SHIMS-1$"
             },
+        );
+        // The empty entry (fish spells it `.`) is still there.
+        send_until(
+            &c,
+            pane,
+            b"sh -c 'case \":$PATH:\" in *::*|*:.:*) echo EMPTY-$((1))KEPT;; *) echo EMPTY-LOST;; esac'\r",
+            "(?m)^EMPTY-1KEPT$",
         );
         tested.push(name.to_owned());
     }

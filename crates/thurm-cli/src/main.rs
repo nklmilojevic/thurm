@@ -610,10 +610,10 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
-    let mut args = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
+    let mut args = std::env::args_os();
     if let Some(argv0) = args.next() {
-        let rest: Vec<String> = args.collect();
-        if let Some(code) = clip::run_as_tool(&argv0, &rest) {
+        let rest: Vec<std::ffi::OsString> = args.collect();
+        if let Some(code) = clip::run_as_tool(&argv0, rest) {
             return code;
         }
     }

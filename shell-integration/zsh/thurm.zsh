@@ -62,8 +62,9 @@ _thurm_precmd_last() {
   # (which run after this file) have made their changes; off it when those set a display.
   if [[ -n "${THURM_CLIP_SHIMS-}" ]]; then
     # The directory as text: quoted for a pattern, read as one even under GLOB_SUBST.
-    path=(${path:#${~${(b)THURM_CLIP_SHIMS}}})
-    [[ -z "${DISPLAY-}${WAYLAND_DISPLAY-}" ]] && path=("$THURM_CLIP_SHIMS" $path)
+    # Quoted, so empty entries (the current directory) stay where they were.
+    path=("${(@)path:#${~${(b)THURM_CLIP_SHIMS}}}")
+    [[ -z "${DISPLAY-}${WAYLAND_DISPLAY-}" ]] && path=("$THURM_CLIP_SHIMS" "${(@)path}")
     export PATH
   fi
   _thurm_precmd

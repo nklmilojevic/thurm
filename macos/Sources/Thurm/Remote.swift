@@ -401,7 +401,11 @@ final class Remotes {
             alert.addButton(withTitle: "Always for \(key.host)")
             alert.addButton(withTitle: "Deny")
             // Gone before the daemon stops waiting for the answer: unanswered, it is a Deny.
-            let timer = Timer(timeInterval: Self.askTimeout, repeats: false) { _ in NSApp.abortModal() }
+            // Only this alert's own session is ended: while another modal is on top of it, the
+            // timer tries again until it is the one in front.
+            let timer = Timer(timeInterval: Self.askTimeout, repeats: false) { _ in
+                Self.abortWhenFront(alert.window)
+            }
             RunLoop.main.add(timer, forMode: .modalPanel)
             defer { timer.invalidate() }
             switch alert.runModal() {
@@ -423,6 +427,18 @@ final class Remotes {
     /// How long a clipboard question stays up: less than the 30 s a host's daemon waits for the
     /// answer, so it is never answered after nobody waits for it.
     static let askTimeout: TimeInterval = 25
+
+    /// Ends the modal session of `window`, once it is the one in front.
+    private static func abortWhenFront(_ window: NSWindow) {
+        // Answered or closed meanwhile: nothing to end.
+        guard window.isVisible, NSApp.modalWindow != nil else { return }
+        if NSApp.modalWindow === window {
+            NSApp.abortModal()
+            return
+        }
+        let retry = Timer(timeInterval: 0.5, repeats: false) { _ in abortWhenFront(window) }
+        RunLoop.main.add(retry, forMode: .modalPanel)
+    }
 
     /// The hosts with a question on screen.
     struct AskGate {

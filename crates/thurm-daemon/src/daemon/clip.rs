@@ -237,7 +237,11 @@ impl Daemon {
             .ok_or("no Thurm app that can share its clipboard is connected")?;
         let id = self.next_clip.fetch_add(1, Ordering::Relaxed);
         let refused = match ask {
-            Ask::Paste(_) => "the clipboard has nothing of that type, or was not shared",
+            // The app answers only yes or no: every reason for a no is named.
+            Ask::Paste(_) => {
+                "the clipboard was not shared: it has nothing of that type, or the Thurm app \
+                 refused, or is still asking about an earlier read from this host"
+            }
             Ask::Write(_) => {
                 "the Thurm app did not take it: this Mac's terminal.osc52 does not allow copies \
                  from this host"
