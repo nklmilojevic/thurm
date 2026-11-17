@@ -100,6 +100,7 @@ Use `thurm COMMAND --help` for the full argument list.
 | `remote doctor [NAME]` | Check what a host needs and offer fixes; `--fix`, `--yes` |
 | `remote ports NAME` | The ports programs in the host's panes listen on |
 | `remote forward NAME PORT\|URL` | Open the host's port on this machine until interrupted, and print its URL; `--local PORT`, `--no-open`; see [Ports](/remote/#ports) |
+| `clip copy\|paste` | Copy standard input to, or paste from, the clipboard of the Thurm app showing this pane, also on a remote host; `paste --type image/png`; see [Using remote panes](/remote/#using-remote-panes) |
 | `handoff` | Hand the repository to a remote agent; `--remote NAME`, `--preset`, `--branch agent/NAME`, `--list`, `--fetch ID`, `--cleanup ID` |
 
 `--hold` keeps a pane open after its command exits. Use `--` before a command

@@ -103,6 +103,13 @@ or quits Thurm. The app reconnects when the host becomes available.
 Thurm uses the system SSH client and your SSH configuration. It does not require
 a separate Thurm account or relay service. Agent forwarding is disabled.
 
+A remote pane works like a local one. ⌘-click a `localhost` link a dev server
+prints there and Thurm opens the host's port on your Mac. Drop or paste files and
+screenshots and they are copied to the host, with their paths typed into the pane.
+Quick Look and download the host's files. On a Linux host, `pbcopy`, `xclip` and
+`wl-paste` can reach your Mac's clipboard, with the same prompt as other
+clipboard reads.
+
 You can also hand a local repository to a remote agent. Thurm sends a Git snapshot
 to a separate branch and worktree on the host. The snapshot includes uncommitted
 changes and untracked files, but excludes ignored files. Your local working tree,
