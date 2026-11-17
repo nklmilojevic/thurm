@@ -139,7 +139,7 @@ pub mod notice {
 ///   ports. A new subscriber gets every pane's list first, on its own (the others hear
 ///   nothing again), and the remote hosts' lists known so far, all with `initial`. When the
 ///   app loses a host (or quits), each of its panes heard of gets an empty list, `complete`
-///   false.
+///   false, with `gone`.
 /// - `files_uploaded`: `{id, paths}`, the files sent to a pane, once their paths were typed
 ///   there, with `pane` while it is there.
 /// - `forward_opened` and `forward_closed`: [`ForwardInfo`], as the app that holds plugins'

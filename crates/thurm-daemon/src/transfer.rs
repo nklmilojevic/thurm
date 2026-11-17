@@ -66,6 +66,9 @@ pub const MAX_DOWNLOADS_PER_PANE: usize = 4;
 const NAME_MAX: usize = 255;
 /// Where files are written until whole, inside a batch's directory.
 const PARTS: &str = ".parts";
+/// When a batch was complete (milliseconds since the Unix epoch), inside its directory: what it
+/// is aged from, by this daemon and the next.
+const DONE: &str = ".done";
 
 pub struct Transfers {
     root: PathBuf,
@@ -280,8 +283,9 @@ impl Transfers {
             .flat_map(|b| b.files.values().filter(move |f| b.occupies(f)))
             .map(|f| charge(f.size))
             .sum();
-        // With its directory, should it be the batch's first.
-        let incoming = active.saturating_add(charge(size)).saturating_add(block());
+        // With its directories (the batch's and its parts'), should it be the batch's first.
+        let dir_cost = if existing.is_none() { 2 * block() } else { 0 };
+        let incoming = active.saturating_add(charge(size)).saturating_add(dir_cost);
         let too_much = || {
             format!(
                 "{name} does not fit in what this host keeps of sent files ({} MiB)",
@@ -295,7 +299,7 @@ impl Transfers {
         // can, and only once the file is admitted.
         make_private_dir(&self.root)?;
         let need = charge(size)
-            .saturating_add(block())
+            .saturating_add(dir_cost)
             .saturating_add(pending)
             .saturating_add(MIN_FREE);
         // A batch's directory, its parts directory, the file and its part.
@@ -331,17 +335,9 @@ impl Transfers {
             client,
             principal,
         )?;
-        // Only an admitted file makes older drops give way, and only what was deleted counts.
-        if !self.make_room(&st, incoming, short) {
-            return Err(too_much());
-        }
-        if short > 0 {
-            let free = free_space(&self.root)?;
-            if free < need {
-                return Err(no_space(free));
-            }
-        }
-        if existing.is_none() {
+        // A new batch's directory first: if it cannot be made, nothing kept was deleted for it.
+        let created = existing.is_none();
+        if created {
             let dir = self.new_batch_dir(pane)?;
             st.batches.insert(
                 serial,
@@ -352,13 +348,37 @@ impl Transfers {
                     dir,
                     count,
                     files: BTreeMap::new(),
-                    names: HashSet::from([PARTS.to_owned()]),
+                    names: HashSet::from([PARTS.to_owned(), DONE.to_owned()]),
                     pasting: false,
                     outcome: None,
                     touched: Instant::now(),
                     writers: Vec::new(),
                 },
             );
+        }
+        let undo = |st: &mut State| {
+            if created && let Some(b) = st.batches.remove(&serial) {
+                remove_batch(&b.dir);
+            }
+        };
+        // Only an admitted file makes older drops give way, and only what was deleted counts.
+        if !self.make_room(&st, incoming, short) {
+            undo(&mut st);
+            return Err(too_much());
+        }
+        if short > 0 {
+            let free = match free_space(&self.root) {
+                Ok(free) => free,
+                Err(e) => {
+                    undo(&mut st);
+                    return Err(e);
+                }
+            };
+            // The new batch's directories are on the disk already.
+            if free.saturating_add(dir_cost) < need {
+                undo(&mut st);
+                return Err(no_space(free));
+            }
         }
         let b = st.batches.get_mut(&serial).expect("batch just found");
         let name = unique_name(&mut b.names, &clean_name(name));
@@ -586,14 +606,11 @@ impl Transfers {
                     if busy.contains(dir.as_path()) {
                         continue;
                     }
-                    let modified = batch
-                        .metadata()
-                        .and_then(|m| m.modified())
-                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    let since = aged_from(&dir);
                     let size = dir_size(&dir);
-                    let old = modified.elapsed().is_ok_and(|age| age > self.keep);
+                    let old = since.elapsed().is_ok_and(|age| age > self.keep);
                     if !(old && remove_batch(&dir)) {
-                        kept.push((modified, size, dir));
+                        kept.push((since, size, dir));
                     }
                 }
                 // Gone once empty (a closed pane's).
@@ -673,6 +690,7 @@ impl Transfers {
             b.touched = Instant::now();
             match typed {
                 Ok(()) => {
+                    record_done(&b.dir);
                     b.outcome = Some(Ok(()));
                     self.changed.notify_all();
                     uploaded = true;
@@ -1084,6 +1102,59 @@ fn fit(stem: &str, ext: &str, suffix: &str) -> String {
     format!("{}{suffix}{ext}", &stem[..end])
 }
 
+/// Records that the batch in `dir` is complete now ([`DONE`]), for as long as it is kept.
+fn record_done(dir: &Path) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dir.join(DONE))
+        .and_then(|mut f| {
+            f.write_all(now.to_string().as_bytes())?;
+            f.sync_all()
+        });
+    if let Err(e) = written {
+        log::warn!("{}: cannot record when it was complete: {e}", dir.display());
+    }
+}
+
+/// What a kept batch is aged from: when it was complete ([`DONE`]), or, for one that never was
+/// (a daemon stopped while it came) or whose record cannot be read, when anything in it was
+/// last written.
+fn aged_from(dir: &Path) -> SystemTime {
+    let done = std::fs::read_to_string(dir.join(DONE))
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok());
+    match done {
+        Some(ms) => SystemTime::UNIX_EPOCH + Duration::from_millis(ms),
+        None => last_write(dir),
+    }
+}
+
+/// The latest modification time of `dir` and of everything in it.
+fn last_write(dir: &Path) -> SystemTime {
+    let own = std::fs::metadata(dir)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return own;
+    };
+    entries.flatten().fold(own, |latest, e| {
+        let t = match e.file_type() {
+            Ok(t) if t.is_dir() => last_write(&e.path()),
+            _ => e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+        };
+        latest.max(t)
+    })
+}
+
 /// Deletes a kept batch; whether it is gone. What could not be deleted is logged and kept.
 fn remove_batch(dir: &Path) -> bool {
     match std::fs::remove_dir_all(dir) {
@@ -1116,6 +1187,9 @@ fn dir_size(dir: &Path) -> u64 {
             let m = e.metadata().ok()?;
             Some(if m.is_dir() {
                 dir_size(&e.path())
+            } else if e.file_name() == DONE {
+                // A few bytes: a block.
+                block()
             } else {
                 // What the disk allocated, when it is more (counted in bytes in tests).
                 let allocated = if block() >= 512 {
@@ -1239,7 +1313,7 @@ mod tests {
 
     #[test]
     fn colliding_names_get_a_number() {
-        let mut taken = HashSet::from([PARTS.to_owned()]);
+        let mut taken = HashSet::from([PARTS.to_owned(), DONE.to_owned()]);
         assert_eq!(unique_name(&mut taken, "a.txt"), "a.txt");
         assert_eq!(unique_name(&mut taken, "a.txt"), "a-2.txt");
         assert_eq!(unique_name(&mut taken, "a.txt"), "a-3.txt");

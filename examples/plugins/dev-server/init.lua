@@ -8,7 +8,9 @@
 --
 -- A port opens once while it is listed: a server that stops and starts again opens again.
 -- Servers already running are left alone: this Mac's when the plugin starts, a remote host's
--- when Thurm connects to it (its lists then come marked `initial`).
+-- when Thurm connects to it (its lists then come marked `initial`). A list that could not
+-- read every process keeps the servers it left out: they open again only after a complete
+-- list without them.
 --
 -- Settings, in config.toml:
 --
@@ -54,10 +56,18 @@ local function servers(ports)
 end
 
 -- What each pane listed last: host/pane -> { [port] = true }. This Mac's panes are read
--- before subscribing: the lists the daemon sends then are the same, not news.
+-- before subscribing: what runs then is left alone. The first lists the subscription brings
+-- (marked `initial`) are checked against it, so a server that started in between opens.
 local listed = {}
+-- Panes whose read was not complete (some processes could not be read): a server it missed
+-- would look new later. Their first complete list settles what runs, and opens nothing.
+local unsure = {}
 for _, entry in ipairs(thurm.ports()) do
-  listed["/" .. entry.pane] = servers(entry.ports)
+  local key = "/" .. entry.pane
+  listed[key] = servers(entry.ports)
+  if not entry.complete then
+    unsure[key] = true
+  end
 end
 
 local function open(host, port)
@@ -73,13 +83,32 @@ end
 
 thurm.on("ports_changed", function(ev)
   local key = (ev.host or "") .. "/" .. ev.id
-  local before = listed[key] or {}
-  local now = servers(ev.ports)
-  listed[key] = now
-  if ev.initial then
+  -- The app lost the host (or quit): nothing is known of its ports until it is back.
+  if ev.gone then
+    listed[key] = nil
+    unsure[key] = nil
     return
   end
-  for port in pairs(now or {}) do
+  local before = listed[key] or {}
+  local now = servers(ev.ports) or {}
+  if not ev.complete then
+    -- Some processes could not be read: a server missing from this list may still run.
+    for port in pairs(before) do
+      now[port] = true
+    end
+  end
+  listed[key] = next(now) and now or nil
+  if unsure[key] then
+    if ev.complete then
+      unsure[key] = nil
+    end
+    return
+  end
+  -- A remote host's lists sent as the app connected to it: running already.
+  if ev.initial and ev.host then
+    return
+  end
+  for port in pairs(now) do
     if not before[port] then
       open(ev.host, port)
     end
