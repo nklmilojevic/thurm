@@ -800,6 +800,33 @@ fn an_upload_leaves_the_disk_files_to_spare() {
 }
 
 #[test]
+fn a_panes_first_upload_counts_every_file_it_makes() {
+    // A pane's first upload makes its pane's directory, the batch's two, the file and its
+    // part, and the batch's record of being complete: six. Five more is one too few.
+    let env = Env::new("transfer-inodes-first");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_FREE_FILES", Path::new("10005"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let e = c.upload_begin(pane, "a.txt", 1, None).unwrap_err();
+    assert!(e.to_string().contains("too few more files"), "{e}");
+    assert!(batches(&env, pane).is_empty());
+}
+
+#[test]
+fn a_panes_first_upload_takes_the_last_files_above_the_floor() {
+    let env = Env::new("transfer-inodes-exact");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_FREE_FILES", Path::new("10006"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 1, b"a")
+        .wait_closed()
+        .unwrap();
+    assert!(batches(&env, pane).iter().any(|b| b.join("a.txt").exists()));
+}
+
+#[test]
 fn batches_left_incomplete_are_capped() {
     let env = Env::new("transfer-waiting");
     let _daemon = env.start();
@@ -1088,8 +1115,8 @@ fn a_download_to_where_nothing_can_be_written_fails_cleanly() {
 #[test]
 fn kept_drops_give_back_files_for_the_floor() {
     let env = Env::new("transfer-inodes-room");
-    // 10 000 files must stay; this disk takes 8 more with nothing kept: one upload's four, and
-    // then not another's until the first gives its own back.
+    // 10 000 files must stay; this disk takes 8 more with nothing kept: the pane's first
+    // upload's six, and then not another's five until the first gives its own back.
     let _daemon = env.start_with(&[("THURM_TRANSFER_FREE_FILES", Path::new("10008"))]);
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);

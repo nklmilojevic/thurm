@@ -403,8 +403,14 @@ impl Transfers {
         let kept_now = self.kept(&mut st);
         let recoverable: u64 = kept_now.iter().map(|k| k.size).sum();
         let recoverable_files: u64 = kept_now.iter().map(|k| k.files).sum();
-        // A new batch's directory and its parts directory, and the file and its part.
-        let files_needed = if existing.is_none() { 4 } else { 2 };
+        // A new batch's directory and its parts directory (and its pane's, for the pane's first),
+        // and its record of being complete; the file and its part.
+        let new_dirs = if existing.is_none() {
+            2 + u64::from(std::fs::symlink_metadata(self.root.join(pane.to_string())).is_err())
+        } else {
+            0
+        };
+        let files_needed = new_dirs + u64::from(existing.is_none()) + 2;
         let files = free_files(&self.root)?;
         let files_short = (MIN_FREE_FILES + files_needed).saturating_sub(files);
         let too_few_files =
@@ -492,9 +498,8 @@ impl Transfers {
         }
         if files_short > 0 {
             match free_files(&self.root) {
-                // The new batch's two directories are made already: the file and its part remain.
-                Ok(files)
-                    if files >= MIN_FREE_FILES + files_needed - if created { 2 } else { 0 } => {}
+                // The new batch's directories are made already: the rest remain.
+                Ok(files) if files >= MIN_FREE_FILES + files_needed - new_dirs => {}
                 Ok(files) => {
                     undo(&mut st);
                     return Err(too_few_files(files));
