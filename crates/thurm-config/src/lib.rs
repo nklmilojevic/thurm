@@ -3158,6 +3158,23 @@ clipboard_read = "always"
         assert!(!dir.starts_with("/tmp"), "{}", dir.display());
     }
 
+    /// The dev-server example's settings, copied as they are into config.toml, load.
+    #[test]
+    fn the_dev_server_example_settings_load() {
+        let example = include_str!("../../../examples/plugins/dev-server/init.lua");
+        let toml: String = example
+            .lines()
+            .skip_while(|l| l.trim() != "--   [plugins.settings]")
+            .take_while(|l| l.starts_with("--   "))
+            .map(|l| format!("{}\n", &l[5..]))
+            .collect();
+        assert!(toml.starts_with("[plugins.settings]"), "{toml}");
+        let cfg = Config::parse_strict(&toml).unwrap();
+        let s = &cfg.plugins.settings["dev-server"];
+        assert!(s.get("commands").is_some(), "{s}");
+        assert!(s.get("retry_seconds").is_some(), "{s}");
+    }
+
     #[test]
     fn colors() {
         assert_eq!(parse_color("#ff8800"), Some(0xff8800));

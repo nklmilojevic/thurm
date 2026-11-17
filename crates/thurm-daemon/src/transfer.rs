@@ -378,9 +378,18 @@ impl Transfers {
             .flat_map(|b| b.files.values().filter(move |f| b.occupies(f)))
             .map(|f| charge(f.size))
             .sum();
-        // With its directories (the batch's and its parts'), should it be the batch's first.
+        // A batch on its way is not among the drops kept: its directories (its own and its
+        // parts') and the record it leaves once complete count here, beside its files.
+        let on_way = st.batches.values().filter(|b| b.busy()).count() as u64;
+        let on_way_dirs = on_way.saturating_mul(3 * block());
+        // With its directories and its record, should it be the batch's first.
         let dir_cost = if existing.is_none() { 2 * block() } else { 0 };
-        let incoming = active.saturating_add(charge(size)).saturating_add(dir_cost);
+        let record = if existing.is_none() { block() } else { 0 };
+        let incoming = active
+            .saturating_add(on_way_dirs)
+            .saturating_add(charge(size))
+            .saturating_add(dir_cost)
+            .saturating_add(record);
         let too_much = || {
             format!(
                 "{name} does not fit in what this host keeps of sent files ({} MiB)",
@@ -403,8 +412,14 @@ impl Transfers {
         let kept_now = self.kept(&mut st);
         let recoverable: u64 = kept_now.iter().map(|k| k.size).sum();
         let recoverable_files: u64 = kept_now.iter().map(|k| k.files).sum();
-        // A new batch's directory and its parts directory, and the file and its part.
-        let files_needed = if existing.is_none() { 4 } else { 2 };
+        // A new batch's directory and its parts directory (and its pane's, for the pane's first),
+        // and its record of being complete; the file and its part.
+        let new_dirs = if existing.is_none() {
+            2 + u64::from(std::fs::symlink_metadata(self.root.join(pane.to_string())).is_err())
+        } else {
+            0
+        };
+        let files_needed = new_dirs + u64::from(existing.is_none()) + 2;
         let files = free_files(&self.root)?;
         let files_short = (MIN_FREE_FILES + files_needed).saturating_sub(files);
         let too_few_files =
@@ -492,9 +507,8 @@ impl Transfers {
         }
         if files_short > 0 {
             match free_files(&self.root) {
-                // The new batch's two directories are made already: the file and its part remain.
-                Ok(files)
-                    if files >= MIN_FREE_FILES + files_needed - if created { 2 } else { 0 } => {}
+                // The new batch's directories are made already: the rest remain.
+                Ok(files) if files >= MIN_FREE_FILES + files_needed - new_dirs => {}
                 Ok(files) => {
                     undo(&mut st);
                     return Err(too_few_files(files));
@@ -782,11 +796,14 @@ impl Transfers {
             .collect();
         let mut kept = Vec::new();
         if let Ok(panes) = std::fs::read_dir(&self.root) {
-            for pane in panes.flatten() {
+            // Only the tree's own directories: a link put in a pane's or a batch's place is not
+            // followed, so nothing outside it is walked or deleted.
+            let is_dir = |e: &std::fs::DirEntry| e.file_type().is_ok_and(|t| t.is_dir());
+            for pane in panes.flatten().filter(is_dir) {
                 let Ok(batches) = std::fs::read_dir(pane.path()) else {
                     continue;
                 };
-                for batch in batches.flatten() {
+                for batch in batches.flatten().filter(is_dir) {
                     let dir = batch.path();
                     if busy.contains(dir.as_path()) {
                         continue;
@@ -1097,23 +1114,45 @@ impl Transfers {
         }
         // The caller says it has it all, or gives up; one that says nothing is not waited on
         // for ever, holding the pane's download slot, nor one that keeps sending something
-        // else: the wait has one deadline, not one per frame.
-        let deadline = Instant::now() + self.ack;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() || writer.set_read_timeout(Some(left)).is_err() {
-                let _ = writer.shutdown(std::net::Shutdown::Both);
-                return;
-            }
-            match stream::read_frame(&mut reader) {
-                Ok(Some(StreamFrame::End)) => return close(&mut writer, StreamClose::Ok),
-                Ok(Some(StreamFrame::Data(_))) => {}
-                Ok(Some(StreamFrame::Close(_))) | Ok(None) | Err(_) => {
-                    let _ = writer.shutdown(std::net::Shutdown::Both);
-                    return;
+        // else, a frame at a time or a byte at a time: the wait has one deadline, not one per
+        // frame or per read.
+        let ended = {
+            let mut until = Until {
+                inner: &mut reader,
+                socket: &writer,
+                deadline: Instant::now() + self.ack,
+            };
+            loop {
+                match stream::read_frame(&mut until) {
+                    Ok(Some(StreamFrame::Data(_))) => {}
+                    other => break matches!(other, Ok(Some(StreamFrame::End))),
                 }
             }
+        };
+        if ended {
+            close(&mut writer, StreamClose::Ok);
+        } else {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
         }
+    }
+}
+
+/// Reads from `inner` only until `deadline`, however the bytes trickle in: each read waits on
+/// `socket` (the one `inner` reads) for no more than what is left.
+struct Until<'a, R> {
+    inner: R,
+    socket: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl<R: Read> Read for Until<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.socket.set_read_timeout(Some(left))?;
+        self.inner.read(buf)
     }
 }
 
@@ -1178,7 +1217,7 @@ pub fn serve<R: Read + Send>(
             size,
             stamp,
         } => t.serve_download(pane, &path, size, stamp, reader, writer),
-        Kind::Tcp { .. } => close(
+        Kind::Tcp { .. } | Kind::TcpAt { .. } => close(
             &mut writer,
             StreamClose::Internal("not a file stream".into()),
         ),
@@ -1510,13 +1549,21 @@ fn remove_batch(dir: &Path) -> bool {
     }
 }
 
+/// Makes `dir` (and what leads to it) private; `dir` itself must be a directory, not a link to
+/// one: what goes in it stays in the tree.
 fn make_private_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
-        .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)))
+        .and_then(|()| {
+            if std::fs::symlink_metadata(dir)?.is_dir() {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            } else {
+                Err(std::io::Error::other("not a directory"))
+            }
+        })
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))
 }
 
@@ -1563,7 +1610,7 @@ fn count_entries(dir: &Path) -> u64 {
     entries
         .flatten()
         .map(|e| {
-            1 + if e.path().is_dir() {
+            1 + if e.file_type().is_ok_and(|t| t.is_dir()) {
                 count_entries(&e.path())
             } else {
                 0
@@ -1621,6 +1668,39 @@ mod tests {
         let dir = t.new_batch_dir(3).unwrap();
         assert!(dir.join(PARTS).is_dir());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn links_in_the_tree_are_not_followed_to_what_they_point_at() {
+        let base = std::env::temp_dir().join(format!("thurm-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("drops");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("victim")).unwrap();
+        std::fs::write(outside.join("victim/file"), b"keep me").unwrap();
+        std::fs::create_dir_all(root.join("8/old")).unwrap();
+        // A pane's directory, and a batch's, put back as links to a folder elsewhere; and a
+        // kept batch holding a link to itself.
+        std::os::unix::fs::symlink(&outside, root.join("7")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("8/linked")).unwrap();
+        std::os::unix::fs::symlink(".", root.join("8/old/loop")).unwrap();
+        let mut t = Transfers::new(root.clone());
+        t.keep = Duration::ZERO;
+        t.prune();
+        assert_eq!(
+            std::fs::read(outside.join("victim/file")).unwrap(),
+            b"keep me"
+        );
+        assert!(!root.join("8/old").exists());
+        // Nor is a batch made through a pane's directory that is a link.
+        let e = t.new_batch_dir(7).unwrap_err();
+        assert!(e.contains("not a directory"), "{e}");
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            1,
+            "a batch was made outside the tree"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

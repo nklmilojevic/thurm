@@ -814,6 +814,12 @@ fn the_dev_server_example_opens_only_new_servers() {
             })
             .collect()
     };
+    // Each event's handler runs on its own and waits on its calls: opens of different servers
+    // may reach the host in either order. What counts is which open, and how many times.
+    let sorted = |mut v: Vec<Value>| {
+        v.sort_by_key(|x| x.to_string());
+        v
+    };
     let want = vec![
         json!(["open", "http://localhost:4002/"]),
         json!(["devbox", 5174, true]),
@@ -834,7 +840,7 @@ fn the_dev_server_example_opens_only_new_servers() {
         std::thread::sleep(Duration::from_millis(50));
     }
     std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(opened(&f), want);
+    assert_eq!(sorted(opened(&f)), sorted(want));
 }
 
 /// The dev-server example takes `commands` as a list, or one program as a string, and warns of

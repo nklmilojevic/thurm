@@ -1,6 +1,7 @@
 //! What programs in remote panes may do on this Mac. Enforced by the app on top of whatever
 //! the remote daemon's own config allows, so a remote config can only be stricter.
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thurm_config::{ClipboardRead, Config, Osc52Mode};
 
@@ -135,6 +136,34 @@ pub fn link_without_config(host: Option<&str>, url: &str) -> LinkAction {
         return LinkAction::Forward { port: local.port };
     }
     link(&Config::default(), host, url)
+}
+
+/// [`link`] against the config as last read: with the file unreadable (being rewritten), the
+/// last one that loaded still decides, so a host's `forward_links = false` holds meanwhile.
+#[derive(Default)]
+pub struct Links {
+    last: Mutex<Option<Config>>,
+}
+
+impl Links {
+    pub const fn new() -> Links {
+        Links {
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Cmd-click on `url` in a pane of `host`, with `loaded` the config as read now (`None`:
+    /// unreadable). With none ever read, [`link_without_config`].
+    pub fn link(&self, loaded: Option<Config>, host: Option<&str>, url: &str) -> LinkAction {
+        let mut last = self.last.lock();
+        if let Some(cfg) = loaded {
+            *last = Some(cfg);
+        }
+        match last.as_ref() {
+            Some(cfg) => link(cfg, host, url),
+            None => link_without_config(host, url),
+        }
+    }
 }
 
 /// Cmd-click on `url` in a pane of `host`. The URL comes from program output (OSC 8 or text),
@@ -308,6 +337,35 @@ clipboard_read = "never"
             LinkAction::Open
         );
         assert_eq!(link_without_config(r, "vscode://x"), LinkAction::Ask);
+    }
+
+    #[test]
+    fn with_the_config_unreadable_the_last_one_read_decides() {
+        let r = Some("devbox");
+        let links = Links::new();
+        // Never read: as by default.
+        assert_eq!(
+            links.link(None, r, "http://localhost:5173"),
+            LinkAction::Forward { port: 5173 }
+        );
+        let off = cfg(
+            "copy",
+            "[[remote]]\nname = \"devbox\"\nhost = \"devbox\"\nforward_links = false\n",
+        );
+        assert_eq!(
+            links.link(Some(off), r, "http://localhost:5173"),
+            LinkAction::Open
+        );
+        // Being rewritten: the host still said no.
+        assert_eq!(
+            links.link(None, r, "http://localhost:5173"),
+            LinkAction::Open
+        );
+        // Read again with the setting back on.
+        assert_eq!(
+            links.link(Some(cfg("copy", HOSTS)), r, "http://localhost:5173"),
+            LinkAction::Forward { port: 5173 }
+        );
     }
 
     #[test]

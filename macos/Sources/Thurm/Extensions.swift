@@ -53,6 +53,8 @@ final class Extensions {
     private var activeObserver: NSObjectProtocol?
     /// Forwards being opened or closed for plugins, and who has which.
     private var forwardRequests = ForwardRequests()
+    /// Abandoned forwards being closed: an open of their host waits for them.
+    let forwardCloses = ForwardCloses()
     /// Remote hosts' port lists, passed on to plugins.
     private var remotePorts = RemotePorts()
     /// The Rust core's `thurm_remote_call` (a stand-in in tests). Called on any thread.
@@ -478,22 +480,25 @@ final class Extensions {
 
     /// The user's open finished: they have that forward now.
     func userOpenedForward(_ host: HostId, result: [String: Any]?) {
-        closeAbandoned(forwardRequests.userOpened(host, result: result))
+        closeAbandoned(forwardRequests.userOpened(host, result: result), of: host)
     }
 
     /// The forwards open now (the status callback's report).
     func forwardsNow(_ ids: Set<UInt64>) { forwardRequests.forwardsNow(ids) }
 
-    /// Closes forwards opened for plugins' requests nobody waits for and nobody else has. Off
-    /// the main thread: a close waits for the forward's listeners to let go (up to two seconds).
-    /// An open that starts meanwhile and is handed one of them finds it closed when it checks it
-    /// (`forward_get`) before using it, and says so.
-    private func closeAbandoned(_ ids: [UInt64]) {
+    /// Closes forwards of `host` opened for plugins' requests nobody waits for and nobody else
+    /// has. Off the main thread: a close waits for the forward's listeners to let go (up to two
+    /// seconds). An open of `host` asked for meanwhile starts once they are closed
+    /// (`forwardCloses`): it would be handed one of them, and then lose it.
+    private func closeAbandoned(_ ids: [UInt64], of host: HostId) {
         let call = remoteCall
+        let closes = forwardCloses
         for id in ids {
             tlog("closing forward \(id): the plugin that asked for it no longer waits")
+            closes.begin(host)
             DispatchQueue.global(qos: .utility).async {
                 _ = call(["op": "forward_close", "id": NSNumber(value: id)])
+                closes.end(host)
             }
         }
     }
@@ -542,7 +547,7 @@ final class Extensions {
             // The daemon gave up on it meanwhile: it changes nothing. A forward it opened is
             // closed again once nobody else has it (and both are reported, as every change is).
             let (finish, close) = self.forwardRequests.finish(key, opening: opening, result: v)
-            self.closeAbandoned(close)
+            if let opening { self.closeAbandoned(close, of: opening) }
             guard finish == .answer else { return }
             if let e = jsonString(v?["error"]) {
                 answer(NSNull(), e)
@@ -590,7 +595,9 @@ final class Extensions {
         // daemon has not given up on it before it starts. A cancel that comes after that check
         // (the call cannot be held back without holding up the main thread) is undone in `done`:
         // the forward the call opened is closed again.
+        let closes = forwardCloses
         DispatchQueue.global(qos: .userInitiated).async {
+            if let opening { closes.wait(opening) }
             let live = DispatchQueue.main.sync { self.forwardRequests.isLive(key) }
             let v = live ? call(op) as? [String: Any] : nil
             DispatchQueue.main.async { done(v) }

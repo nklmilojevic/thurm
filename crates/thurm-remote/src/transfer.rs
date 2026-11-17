@@ -367,13 +367,33 @@ fn wait_cancellable(
     handle: UnixStream,
     cancel: &Cancel,
 ) -> Result<(), TransferError> {
+    wait_cancellable_with(reader, writer, handle, cancel, |wait| {
+        std::thread::Builder::new()
+            .name("upload-wait".into())
+            .spawn(wait)
+    })
+}
+
+/// [`wait_cancellable`], its waiting thread started by `spawn` (tests).
+fn wait_cancellable_with(
+    reader: StreamReader,
+    writer: StreamWriter,
+    handle: UnixStream,
+    cancel: &Cancel,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> Result<(), TransferError> {
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("upload-wait".into())
-        .spawn(move || {
-            let _ = tx.send(reader.wait_closed());
-        })
-        .map_err(|e| TransferError::Local(format!("cannot wait for the upload: {e}")))?;
+    let started = spawn(Box::new(move || {
+        let _ = tx.send(reader.wait_closed());
+    }));
+    // Without a way to hear its outcome the upload is reported failed: it must be, on the host
+    // too, or its paths would be typed all the same.
+    if let Err(e) = started {
+        abort(writer, &handle);
+        return Err(TransferError::Local(format!(
+            "cannot wait for the upload: {e}"
+        )));
+    }
     let mut writer = Some(writer);
     let mut aborted: Option<std::time::Instant> = None;
     loop {
@@ -525,83 +545,275 @@ pub enum Downloaded {
     Saved(DownloadInfo),
 }
 
-/// Fetches the file at `path`, as `pane` sees it, into `reserved`: an empty file the caller
-/// made to hold the name (in a folder others write to, like Downloads). The file goes into that
-/// very file, never by a rename over its name: if something else took the name since (the
-/// reserved file is gone, replaced, or no longer empty), the download is refused and what is
-/// there is left alone. A download that fails or is cancelled deletes the reserved file, if it
-/// is still the one.
-pub fn download_reserved(
+/// Fetches the file at `path`, as `pane` sees it, into the folder `dir` (one others write to,
+/// like Downloads) as `name`, or `name 2`, `name 3`… when that is taken. The file is written in
+/// a new private folder of its own inside `dir`, then moved into `dir` by a rename that never
+/// replaces anything: no file already in `dir` is written into, moved or deleted, whatever
+/// else writes there meanwhile. Returns the file's details and where it was saved.
+pub fn download_to_folder(
     host: Host,
     pane: PaneId,
     path: &str,
-    reserved: &Path,
-    identity: (u64, u64),
+    dir: &Path,
+    name: &str,
     cancel: &Cancel,
     mut progress: impl FnMut(Progress),
-) -> Result<DownloadInfo, TransferError> {
-    use std::os::unix::fs::MetadataExt;
-    // The reservation is the file made for it (`identity`: its device and inode, taken when
-    // it was made), not whatever has its name now: only that file is written or deleted.
-    let ours = identity;
-    let give_back = || {
-        if std::fs::symlink_metadata(reserved).is_ok_and(|m| (m.dev(), m.ino()) == ours) {
-            let _ = std::fs::remove_file(reserved);
-        }
-    };
+) -> Result<(DownloadInfo, PathBuf), TransferError> {
     if !host.client.has_capability(CAP_TRANSFER) {
-        give_back();
         return Err(TransferError::Unsupported);
     }
-    let changed = || {
-        TransferError::Local(format!(
-            "{} changed since it was reserved; nothing was saved over it",
-            reserved.display()
-        ))
+    let name = if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        "file"
+    } else {
+        name
     };
-    // Never through a link put in its place, and only into the empty file reserved.
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(reserved)
-        .map_err(|_| changed())?;
-    let meta = file
-        .metadata()
-        .map_err(|e| TransferError::Local(format!("{}: {e}", reserved.display())))?;
-    if !meta.is_file() || meta.len() != 0 || (meta.dev(), meta.ino()) != ours {
-        return Err(changed());
-    }
+    let shown = dir.join(name);
+    let local = |e: std::io::Error| TransferError::Local(format!("{}: {e}", shown.display()));
+    // `dir`, and the private folder made in it, held open: everything after is done through
+    // them, not their names, which another writer could point elsewhere meanwhile.
+    let folder =
+        Dir::open(dir).map_err(|e| TransferError::Local(format!("{}: {e}", dir.display())))?;
+    let (private_name, private) = loop {
+        let private_name = format!(".thurm-{}", batch_id());
+        match folder.make_private(&private_name) {
+            Ok(private) => break (private_name, private),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(TransferError::Local(format!("{}: {e}", dir.display()))),
+        }
+    };
     let got = (|| {
+        let file = private.create_new("part").map_err(local)?;
+        let made = file_id(&file.metadata().map_err(local)?);
         let info = host.client.download_begin(pane, path, None)?;
         let ticket = info
             .ticket
             .as_deref()
             .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
-        fetch_into(
-            host,
-            ticket,
-            file,
-            reserved,
-            info.size,
-            cancel,
-            &mut progress,
-        )?;
-        // The name still holds what was written: one taken meanwhile (the file replaced or
-        // moved while it came) keeps what is there, and this download is not saved over it.
-        if !std::fs::symlink_metadata(reserved).is_ok_and(|m| (m.dev(), m.ino()) == ours) {
-            return Err(changed());
+        fetch_into(host, ticket, file, &shown, info.size, cancel, &mut progress)?;
+        if !private
+            .stat("part")
+            .is_ok_and(|(id, kind, len)| id == made && kind == libc::S_IFREG && len == info.size)
+        {
+            return Err(TransferError::Local(format!(
+                "{} changed while it came; nothing was saved",
+                shown.display()
+            )));
         }
-        Ok(info)
+        // Into `dir` under the first of its names that is free, taken in the same step.
+        for n in 1..=10_000 {
+            let dest = numbered(name, n);
+            match private.rename_noreplace("part", &folder, &dest) {
+                Ok(()) => return Ok((info, dir.join(dest))),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(TransferError::Local(format!(
+                        "{}: {e}",
+                        dir.join(dest).display()
+                    )));
+                }
+            }
+        }
+        Err(TransferError::Local(format!(
+            "no free name for {name} in {}",
+            dir.display()
+        )))
     })();
-    if got.is_err() {
-        give_back();
+    // The file, if it was not saved, and then the private folder, while its name is still the
+    // folder made (empty, it is all that goes).
+    private.unlink("part");
+    if let Ok(ours) = private.id() {
+        folder.remove_dir_if(&private_name, ours);
     }
     got
 }
 
+fn file_id(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+
+/// A folder held open, so what is done in it is done there whatever its name comes to name.
+struct Dir(std::os::fd::OwnedFd);
+
+impl Dir {
+    fn c(name: &str) -> std::io::Result<std::ffi::CString> {
+        Ok(std::ffi::CString::new(name)?)
+    }
+
+    fn check(r: libc::c_int) -> std::io::Result<libc::c_int> {
+        if r < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(r)
+        }
+    }
+
+    fn open(path: &Path) -> std::io::Result<Dir> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let p = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let fd = Self::check(unsafe {
+            libc::open(
+                p.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        })?;
+        Ok(Dir(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn raw(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        self.0.as_raw_fd()
+    }
+
+    /// Makes the folder `name` here, readable by this user only, and holds it open: the one
+    /// made, as long as it is a folder of this user's, private, when opened.
+    fn make_private(&self, name: &str) -> std::io::Result<Dir> {
+        use std::os::fd::FromRawFd;
+        let n = Self::c(name)?;
+        Self::check(unsafe { libc::mkdirat(self.raw(), n.as_ptr(), 0o700) })?;
+        let fd = Self::check(unsafe {
+            libc::openat(
+                self.raw(),
+                n.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        })?;
+        let dir = Dir(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        Self::check(unsafe { libc::fstat(dir.raw(), &mut st) })?;
+        if st.st_uid != unsafe { libc::getuid() } || st.st_mode & 0o777 != 0o700 {
+            return Err(std::io::Error::other(
+                "the folder made for the download was replaced",
+            ));
+        }
+        Ok(dir)
+    }
+
+    fn id(&self) -> std::io::Result<(u64, u64)> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        Self::check(unsafe { libc::fstat(self.raw(), &mut st) })?;
+        #[allow(clippy::unnecessary_cast)]
+        Ok((st.st_dev as u64, st.st_ino as u64))
+    }
+
+    /// A new file `name` here for this user only, never through a link.
+    fn create_new(&self, name: &str) -> std::io::Result<File> {
+        use std::os::fd::FromRawFd;
+        let n = Self::c(name)?;
+        let fd = Self::check(unsafe {
+            libc::openat(
+                self.raw(),
+                n.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        })?;
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// What `name` here is, not following a link: its device and inode, kind, and length.
+    fn stat(&self, name: &str) -> std::io::Result<((u64, u64), libc::mode_t, u64)> {
+        let n = Self::c(name)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        Self::check(unsafe {
+            libc::fstatat(self.raw(), n.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+        })?;
+        #[allow(clippy::unnecessary_cast)]
+        Ok((
+            (st.st_dev as u64, st.st_ino as u64),
+            st.st_mode & libc::S_IFMT,
+            st.st_size as u64,
+        ))
+    }
+
+    fn unlink(&self, name: &str) {
+        if let Ok(n) = Self::c(name) {
+            unsafe { libc::unlinkat(self.raw(), n.as_ptr(), 0) };
+        }
+    }
+
+    /// Removes the empty folder `name` here only while the name is the folder `ours`.
+    fn remove_dir_if(&self, name: &str, ours: (u64, u64)) {
+        if self
+            .stat(name)
+            .is_ok_and(|(id, kind, _)| id == ours && kind == libc::S_IFDIR)
+            && let Ok(n) = Self::c(name)
+        {
+            unsafe { libc::unlinkat(self.raw(), n.as_ptr(), libc::AT_REMOVEDIR) };
+        }
+    }
+
+    /// Gives `name` here the name `to` in `dest` only if nothing has that name, in one step.
+    fn rename_noreplace(&self, name: &str, dest: &Dir, to: &str) -> std::io::Result<()> {
+        let (a, b) = (Self::c(name)?, Self::c(to)?);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let r = unsafe {
+            libc::renameatx_np(
+                self.raw(),
+                a.as_ptr(),
+                dest.raw(),
+                b.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        // The system call itself: not every C library has a wrapper for it (musl's older ones).
+        #[cfg(target_os = "linux")]
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                self.raw(),
+                a.as_ptr(),
+                dest.raw(),
+                b.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+        let r = {
+            let _ = (&a, &b, dest);
+            return Err(std::io::ErrorKind::Unsupported.into());
+        };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+/// `name`, numbered `n` past the first (`a 2.txt`, as Finder names copies), within the 255
+/// bytes a name may take: the part before the extension is cut, by whole characters, to make
+/// room, and an extension too long by itself is cut too, keeping a character before it.
+fn numbered(name: &str, n: u32) -> String {
+    let (base, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i + 1..]),
+        _ => (name, ""),
+    };
+    let number = if n == 1 {
+        String::new()
+    } else {
+        format!(" {n}")
+    };
+    let mut ext = ext.to_owned();
+    while !ext.is_empty() && 1 + number.len() + 1 + ext.len() > 255 {
+        ext.pop();
+    }
+    let tail = if ext.is_empty() {
+        number
+    } else {
+        format!("{number}.{ext}")
+    };
+    let mut stem = if base.is_empty() { "file" } else { base }.to_owned();
+    while stem.len() + tail.len() > 255 && !stem.is_empty() {
+        stem.pop();
+    }
+    stem + &tail
+}
+
 /// Fetches the file at `path`, as `pane` sees it, into `dest` (written beside it first, then
 /// moved into place, replacing whatever `dest` is: for a destination this caller owns, like a
-/// cache's; [`download_reserved`] saves into a name others may take). With `if_version` still the file's version, writes nothing. A file over
+/// cache's; [`download_to_folder`] saves into a folder others write to). With `if_version` still the file's version, writes nothing. A file over
 /// `max_bytes` is refused before anything is sent.
 #[allow(clippy::too_many_arguments)]
 pub fn download(
@@ -947,6 +1159,67 @@ mod tests {
         });
         let got = wait_cancellable(reader, writer, handle, &cancel);
         assert!(matches!(got, Err(TransferError::Cancelled)), "{got:?}");
+        assert_eq!(
+            daemon.join().unwrap(),
+            [
+                StreamFrame::Data(b"all of it".to_vec()),
+                StreamFrame::End,
+                StreamFrame::Close(StreamClose::Aborted)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_taken_name_is_numbered_within_what_names_take() {
+        assert_eq!(numbered("a.txt", 1), "a.txt");
+        assert_eq!(numbered("a.txt", 2), "a 2.txt");
+        assert_eq!(numbered("Makefile", 2), "Makefile 2");
+        assert_eq!(numbered(".bashrc", 3), ".bashrc 3");
+        assert_eq!(numbered("a.tar.gz", 2), "a.tar 2.gz");
+        // A name as long as names go is cut to make room for its number.
+        let long = "l".repeat(251) + ".txt";
+        assert_eq!(numbered(&long, 1), long);
+        let second = numbered(&long, 2);
+        assert_eq!(second.len(), 255);
+        assert!(second.ends_with(" 2.txt"), "{second}");
+        // By whole characters.
+        let wide = "é".repeat(125) + ".txt";
+        let second = numbered(&wide, 2);
+        assert!(
+            second.len() <= 255 && second.ends_with(" 2.txt"),
+            "{second}"
+        );
+        // So is an extension as long as names go, a character kept before it.
+        let long_ext = "a.".to_owned() + &"e".repeat(253);
+        assert_eq!(numbered(&long_ext, 1), long_ext);
+        let second = numbered(&long_ext, 2);
+        assert!(
+            second.len() <= 255 && second.starts_with("a 2."),
+            "{second}"
+        );
+    }
+
+    #[test]
+    fn no_thread_to_wait_for_the_outcome_aborts_the_batch() {
+        // What reaches the daemon; the app does not stay for an answer.
+        let (socket, daemon) = fake_daemon_then(|r, _| {
+            let mut seen = Vec::new();
+            while let Ok(Some(frame)) = thurm_proto::stream::read_frame(r) {
+                seen.push(frame);
+            }
+            seen
+        });
+        let handle = socket.try_clone().unwrap();
+        let (reader, mut writer) = stream::open_on(socket, "ticket").unwrap();
+        writer.write_all(b"all of it").unwrap();
+        writer.finish().unwrap();
+        let got = wait_cancellable_with(reader, writer, handle, &Cancel::default(), |_| {
+            Err(std::io::Error::other("no threads left"))
+        });
+        assert!(
+            matches!(&got, Err(TransferError::Local(why)) if why.contains("no threads left")),
+            "{got:?}"
+        );
         assert_eq!(
             daemon.join().unwrap(),
             [

@@ -25,6 +25,10 @@ pub fn rt() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Every stream the stand-in daemons were asked to dial: the port, and the loopback address.
+pub static DIALS: std::sync::Mutex<Vec<(u16, thurm_proto::stream::Loopback)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// A stand-in daemon on `path`: answers Hello on every connection, then whatever else with Ok;
 /// a `StreamOpen` makes its connection an echoing stream.
 pub fn daemon(path: &Path) {
@@ -46,10 +50,23 @@ pub fn daemon(path: &Path) {
                                 .map(|c| (*c).to_owned())
                                 .collect(),
                         }),
-                        Request::DialBegin { port } => Ok(Response::Ticket {
-                            ticket: format!("ticket-{port}"),
-                            expires_ms: 60_000,
-                        }),
+                        Request::DialBegin { port } => {
+                            DIALS
+                                .lock()
+                                .unwrap()
+                                .push((port, thurm_proto::stream::Loopback::Any));
+                            Ok(Response::Ticket {
+                                ticket: format!("ticket-{port}"),
+                                expires_ms: 60_000,
+                            })
+                        }
+                        Request::DialAt { port, at } => {
+                            DIALS.lock().unwrap().push((port, at));
+                            Ok(Response::Ticket {
+                                ticket: format!("ticket-{port}-{at:?}"),
+                                expires_ms: 60_000,
+                            })
+                        }
                         _ => Ok(Response::Ok),
                     };
                     let msg = ServerMessage::Response { id: env.id, result };

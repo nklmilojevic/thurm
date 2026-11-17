@@ -336,6 +336,19 @@ final class FilePreviewTests: XCTestCase {
         let kept = try cache.install(dotted, staged: stagedDotted, name: ".eslintrc.json", version: "v")
         XCTAssertEqual(kept.lastPathComponent, "dot.eslintrc.json")
         XCTAssertEqual(cache.cached(dotted)?.file, kept)
+        // A hidden name as long as a name may be: cut to fit with its prefix, extension kept.
+        let roomy = tempCache()
+        let longName = "." + String(repeating: "é", count: 124) + ".json"
+        XCTAssertEqual(longName.utf8.count, 254)
+        let long = roomy.entry(host: "devbox", path: "/" + longName, cwd: nil)
+        let stagedLong = try roomy.stage(long)
+        try Data("{}".utf8).write(to: stagedLong)
+        let longKept = try roomy.install(long, staged: stagedLong, name: longName, version: "v")
+        let shown = longKept.lastPathComponent.precomposedStringWithCanonicalMapping
+        XCTAssertLessThanOrEqual(shown.utf8.count, 255)
+        XCTAssertTrue(shown.hasPrefix("dot."))
+        XCTAssertTrue(shown.hasSuffix(".json"))
+        XCTAssertEqual(roomy.cached(long)?.file, longKept)
 
         // Over the limit, the least recently fetched entries go; the one just stored stays.
         try FileManager.default.setAttributes([.modificationDate: Date.distantPast], ofItemAtPath: entry.path)
@@ -637,6 +650,33 @@ final class FilePreviewTests: XCTestCase {
         XCTAssertEqual(cancels, 1)
     }
 
+    func testARefreshDoesNotTakeThePlaceOfACopyAnotherInstanceShows() throws {
+        let cache = tempCache(maxBytes: 10)
+        let pane = PaneKey("devbox", 3)
+        var progress: [(TransferProgress) -> Void] = []
+        var finish: [(TransferOutcome) -> Void] = []
+        var dests: [URL] = []
+        var cancels = 0
+        cache.download = { _, _, dest, _, _, onProgress, done in
+            dests.append(dest)
+            progress.append(onProgress)
+            finish.append(done)
+            return { cancels += 1 }
+        }
+        cache.fetch(.path("/big.bin"), pane: pane, cwd: nil) { _ in }
+        progress.last!(TransferProgress(done: 0, total: 8))
+        try Data(repeating: 1, count: 8).write(to: dests.last!)
+        finish.last!(outcome(name: "big.bin", version: "v1"))
+        // Another running instance (the test runner's parent) shows the copy: it stays, so
+        // the refresh's 8 come on top of it, over 10.
+        let entry = cache.entry(host: "devbox", path: "/big.bin", cwd: nil)
+        FileManager.default.createFile(atPath: entry.appendingPathComponent(".use-\(getppid())").path,
+                                       contents: nil)
+        cache.fetch(.path("/big.bin"), pane: pane, cwd: nil) { _ in }
+        progress.last!(TransferProgress(done: 0, total: 8))
+        XCTAssertEqual(cancels, 1)
+    }
+
     func testAFailedVersionWriteNeverPairsANewCopyWithTheOldVersion() throws {
         let cache = tempCache()
         let entry = cache.entry(host: "devbox", path: "/a.txt", cwd: nil)
@@ -884,13 +924,24 @@ final class FilePreviewTests: XCTestCase {
         let livePart = entry.appendingPathComponent(".thurm-\(getppid())-0.part")
         let dead = entry.appendingPathComponent(".staging-99999999-x")
         let mine = entry.appendingPathComponent(".staging-\(getpid())-x")
-        for f in [live, livePart, dead, mine] { try Data("x".utf8).write(to: f) }
+        // Made before the running process by that number started: an ended one's, its number
+        // used again since.
+        let reused = entry.appendingPathComponent(".staging-\(getppid())-old")
+        let reusedPart = entry.appendingPathComponent(".thurm-\(getppid())-1.part")
+        for f in [live, livePart, dead, mine, reused, reusedPart] { try Data("x".utf8).write(to: f) }
+        let started = try XCTUnwrap(RemoteFileCache.startTime(getppid()))
+        for f in [reused, reusedPart] {
+            try FileManager.default.setAttributes([.creationDate: started.addingTimeInterval(-3600)],
+                                                  ofItemAtPath: f.path)
+        }
         XCTAssertEqual(RemoteFileCache.downloadOwner(live), getppid())
         _ = RemoteFileCache(root: root)
         XCTAssertTrue(FileManager.default.fileExists(atPath: live.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: livePart.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: dead.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: mine.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: reused.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: reusedPart.path))
     }
 
     func testLettingAPreviewGoWalksTheCacheOnlyWhenOverItsLimit() throws {
