@@ -1373,10 +1373,23 @@ final class TerminalView: NSView, NSTextInputClient {
     }
 
     @objc func paste(_ sender: Any?) {
+        paste(from: NSPasteboard.general)
+    }
+
+    /// Whether this pane's host takes files (tests set it).
+    var transfersFiles: Bool?
+
+    /// Takes the files an upload would send, in order, in place of sending them (tests).
+    var uploadFiles: (([(path: String, name: String?)]) -> Void)?
+
+    private var hostTakesFiles: Bool {
+        pane.isRemote && (transfersFiles ?? Core.shared.canTransfer(pane.host))
+    }
+
+    func paste(from pb: NSPasteboard) {
         if isOffline { return }
-        let pb = NSPasteboard.general
         // Files and images copied here go to a remote pane's host as files.
-        if pane.isRemote, Core.shared.canTransfer(pane.host) {
+        if hostTakesFiles {
             switch Self.uploadPlan(pb, pasting: true) {
             case .none: break
             case let plan: return startUpload(plan, from: pb)
@@ -1423,7 +1436,7 @@ final class TerminalView: NSView, NSTextInputClient {
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         if isOffline { return false }
         // Files dropped on a remote pane go to its host, and their paths there are typed.
-        if pane.isRemote, Core.shared.canTransfer(pane.host) {
+        if hostTakesFiles {
             switch Self.uploadPlan(sender.draggingPasteboard, pasting: false) {
             case .none: break
             case let plan:
@@ -1514,6 +1527,7 @@ final class TerminalView: NSView, NSTextInputClient {
             }
             files = [(path, (path as NSString).lastPathComponent)]
         }
+        if let uploadFiles { return uploadFiles(files) }
         if let running = uploadID { Core.shared.cancelTransfer(running) }
         let what = files.count == 1 ? (files[0].name ?? (files[0].path as NSString).lastPathComponent)
             : "\(files.count) files"

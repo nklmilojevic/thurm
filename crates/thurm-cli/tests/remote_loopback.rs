@@ -561,6 +561,8 @@ fn remote_workspace_over_loopback_ssh() {
         .unwrap()
         .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
         .unwrap();
+    // Changed (its change time) a moment ago, a file has no version yet.
+    std::thread::sleep(Duration::from_millis(1100));
     let dest = up_dir.join("back.txt");
     let remote_path = remote_file.display().to_string();
     let got = transfer::download(
