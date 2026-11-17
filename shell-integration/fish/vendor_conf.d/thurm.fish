@@ -19,6 +19,10 @@ if status is-interactive; and not set -q __thurm_fish_loaded
     if set -q THURM_BIN_DIR; and not contains -- $THURM_BIN_DIR $PATH
         set -gx PATH $PATH $THURM_BIN_DIR
     end
+    # Clipboard tools that reach the app's clipboard, first again after the startup files.
+    if set -q THURM_CLIP_SHIMS; and not contains -- $THURM_CLIP_SHIMS $PATH
+        set -gx PATH $THURM_CLIP_SHIMS $PATH
+    end
 
     function __thurm_prompt --on-event fish_prompt
         printf '\e]7;file://%s%s\a' $hostname (string escape --style=url -- $PWD)

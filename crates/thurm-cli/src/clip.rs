@@ -6,10 +6,9 @@ use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use clap::Subcommand;
-use thurm_proto::{CLIP_MAX, CLIP_PNG, CLIP_TARGETS, CLIP_TEXT, PaneId, Request, Response};
-
-/// The tools `thurm` stands in for, by the name it is run as.
-pub const TOOLS: &[&str] = &["pbcopy", "pbpaste", "xclip", "xsel", "wl-copy", "wl-paste"];
+use thurm_proto::{
+    CLIP_MAX, CLIP_PNG, CLIP_TARGETS, CLIP_TEXT, CLIP_TOOLS, PaneId, Request, Response,
+};
 
 #[derive(Subcommand)]
 pub enum ClipCmd {
@@ -314,10 +313,10 @@ pub fn list_types(answer: &str, xclip: bool) -> String {
     out.iter().map(|t| format!("{t}\n")).collect()
 }
 
-/// `thurm` run as one of [`TOOLS`]: `None` when `argv0` names none of them.
+/// `thurm` run as one of [`CLIP_TOOLS`]: `None` when `argv0` names none of them.
 pub fn run_as_tool(argv0: &str, args: &[String]) -> Option<ExitCode> {
     let name = std::path::Path::new(argv0).file_name()?.to_str()?;
-    if !TOOLS.contains(&name) {
+    if !CLIP_TOOLS.contains(&name) {
         return None;
     }
     let done = parse(name, args, std::io::stdin().is_terminal())
@@ -598,7 +597,7 @@ mod tests {
 
     #[test]
     fn only_tool_names_switch_modes() {
-        for t in TOOLS {
+        for t in CLIP_TOOLS {
             assert!(parse(t, &[], false).is_ok(), "{t}");
         }
         assert!(parse("thurm", &[], false).is_err());

@@ -193,6 +193,13 @@ pub const CLIP_PNG: &str = "image/png";
 pub const CLIP_TARGETS: &str = "TARGETS";
 /// The most [`Request::ClipboardSet`] and [`Request::ClipboardAnswer`] carry.
 pub const CLIP_MAX: usize = 32 * 1024 * 1024;
+/// The clipboard tools `thurm` stands in for when run under their name.
+pub const CLIP_TOOLS: &[&str] = &["pbcopy", "pbpaste", "xclip", "xsel", "wl-copy", "wl-paste"];
+/// Where `thurm remote doctor` links [`CLIP_TOOLS`] to `thurm`, under the home directory.
+pub const CLIP_SHIMS_DIR: &str = ".local/share/thurm/shims";
+/// Environment variable with that directory, in panes that have it first on `PATH`: the shell
+/// integration keeps it there.
+pub const ENV_CLIP_SHIMS: &str = "THURM_CLIP_SHIMS";
 
 /// Environment variable exported into every pane with the pane's id.
 pub const ENV_PANE_ID: &str = "THURM_PANE_ID";

@@ -108,6 +108,7 @@ const PROBE: &str = concat!(
     "{ [ -f \"${CLAUDE_CONFIG_DIR:-$TH/.claude}/.credentials.json\" ] || [ -n \"$ANTHROPIC_API_KEY\" ]; } && echo claude_login=1; ",
     "command -v thurm >/dev/null 2>&1 && echo \"hooks=$(HOME=\"$TH\" thurm hooks status --json 2>/dev/null | head -n 1)\"; ",
     "command -v thurm >/dev/null 2>&1 && echo \"skill=$(HOME=\"$TH\" thurm skill status --json 2>/dev/null | head -n 1)\"; ",
+    "n=0; for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do [ -L \"$TH/.local/share/thurm/shims/$t\" ] && n=$((n+1)); done; echo \"shims=$n\"; ",
     "true"
 );
 
@@ -124,6 +125,8 @@ struct Probe {
     hooks: Vec<Value>,
     /// `thurm skill status --json` there (empty from a Thurm without `thurm skill`).
     skill: Vec<Value>,
+    /// How many of the clipboard tools are linked in `~/.local/share/thurm/shims`.
+    shims: usize,
 }
 
 fn parse(out: &str) -> Probe {
@@ -139,6 +142,7 @@ fn parse(out: &str) -> Probe {
             "link" => p.link = true,
             "curl" => p.curl = true,
             "claude_login" => p.claude_login = true,
+            "shims" => p.shims = v.parse().unwrap_or(0),
             "hooks" => {
                 p.hooks = serde_json::from_str::<Vec<Value>>(v).unwrap_or_default();
             }
@@ -563,6 +567,38 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
         }
         out.push(c);
     }
+
+    // Clipboard tools in panes there (opt-in): pbcopy, xclip and the rest reach this Mac's
+    // clipboard on a host without a display (see the daemon's `clip_shims`).
+    let tools = thurm_proto::CLIP_TOOLS.join(", ");
+    let mut c = check(
+        "clipboard",
+        "Clipboard tools",
+        State::Ok,
+        format!("{tools} reach this Mac's clipboard"),
+    );
+    if !thurm_there {
+        c.state = State::Skip;
+        c.detail = "needs Thurm".into();
+    } else if host.os != "Linux" {
+        c.state = State::Skip;
+        c.detail = "the host's own clipboard tools work there".into();
+    } else if !plan.installed {
+        // An older `thurm` does not act as the tools it would be linked as.
+        c.state = State::Skip;
+        c.detail = "needs this build of Thurm".into();
+    } else if probe.shims < thurm_proto::CLIP_TOOLS.len() {
+        c.state = State::Warn;
+        c.detail = format!("not installed: {tools} in panes there do not reach this Mac");
+        c.fix = Some(Fix {
+            label: "Install".into(),
+            confirm: Some(format!(
+                "Programs in new panes on {name} will copy to and paste from this Mac's \
+                 clipboard through {tools}, as the clipboard settings for {name} allow."
+            )),
+        });
+    }
+    out.push(c);
     out
 }
 
@@ -603,6 +639,17 @@ const LINK: &str = concat!(
     "[ -x \"$B\" ] || { echo \"Thurm is not installed\" >&2; exit 3; }; ",
     "[ ! -e \"$L\" ] || [ -L \"$L\" ] || { echo \"$L is another file\" >&2; exit 3; }; ",
     "mkdir -p \"$TH/.local/bin\" && ln -sfn \"$B\" \"$L\""
+);
+
+/// Links the clipboard tools to `thurm` in the shims directory, leaving other files alone.
+const SHIMS: &str = concat!(
+    "TH=\"${THURM_HOME:-$HOME}\"; ",
+    "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
+    "B=\"$(command -v thurm)\" || { echo \"Thurm is not installed\" >&2; exit 3; }; ",
+    "S=\"$TH/.local/share/thurm/shims\"; mkdir -p \"$S\" || exit 1; ",
+    "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do ",
+    "[ ! -e \"$S/$t\" ] || [ -L \"$S/$t\" ] || { echo \"$S/$t is another file\" >&2; exit 3; }; ",
+    "ln -sfn \"$B\" \"$S/$t\" || exit 1; done"
 );
 
 /// Without a password prompt: logind lets you linger yourself on most distributions, else
@@ -688,6 +735,13 @@ pub fn fix(
             let out = ssh.run(SKILL, &[], None, Duration::from_secs(30))?;
             Ok(out.trim().to_owned())
         }
+        "clipboard" => ssh
+            .run(SHIMS, &[], None, Duration::from_secs(30))
+            .map(|_| "linked; new panes there have them".into())
+            .map_err(|e| match e {
+                SshError::Remote { stderr, .. } => FixError::Failed(stderr.trim().to_owned()),
+                e => FixError::Ssh(e),
+            }),
         _ => {
             if let Some(kind) = id.strip_prefix("hooks.") {
                 let agent = AGENTS
@@ -822,7 +876,7 @@ mod tests {
     fn a_ready_host() {
         let out = concat!(
             "user=me\nlocalbin=1\nlink=1\nagent_claude=/usr/bin/claude\nclaude_login=1\n",
-            "hooks=[{\"agent\":\"claude\",\"installed\":6,\"total\":6}]\n"
+            "hooks=[{\"agent\":\"claude\",\"installed\":6,\"total\":6}]\nshims=6\n"
         );
         let mut pl = plan(true);
         pl.host.linger = Some("yes".into());
@@ -832,6 +886,30 @@ mod tests {
         };
         assert!(r.healthy(), "{:#?}", r.checks);
         assert!(r.checks.iter().all(|c| c.fix.is_none()));
+    }
+
+    #[test]
+    fn clipboard_tools_are_offered_on_linux_hosts() {
+        let c = checks("pi", &plan(true), &parse("user=me\nshims=0\n"));
+        let clip = c.iter().find(|c| c.id == "clipboard").unwrap();
+        assert_eq!(clip.state, State::Warn);
+        let fix = clip.fix.as_ref().unwrap();
+        assert!(fix.confirm.is_some(), "asked before installing");
+        // Some links missing: offered again.
+        let c = checks("pi", &plan(true), &parse("shims=5\n"));
+        assert_eq!(state(&c, "clipboard"), State::Warn);
+        let c = checks("pi", &plan(true), &parse("shims=6\n"));
+        assert_eq!(state(&c, "clipboard"), State::Ok);
+        assert_eq!(
+            state(&checks("pi", &plan(false), &parse("")), "clipboard"),
+            State::Skip
+        );
+        let mut mac = plan(true);
+        mac.host.os = "Darwin".into();
+        assert_eq!(
+            state(&checks("pi", &mac, &parse("")), "clipboard"),
+            State::Skip
+        );
     }
 
     #[test]
@@ -952,10 +1030,16 @@ mod tests {
 
     #[test]
     fn scripts_are_safe_to_quote() {
-        for s in [PROBE, LINK, LINGER, HOOKS, AGENT_INSTALL] {
+        for s in [PROBE, LINK, LINGER, HOOKS, AGENT_INSTALL, SHIMS] {
             crate::ssh::quote(s).unwrap_or_else(|e| panic!("{e}"));
         }
         assert!(PROBE.contains(PRELUDE) && PROBE.contains(REMOTE_PATH));
         assert!(HOOKS.contains(REMOTE_PATH));
+        assert!(SHIMS.contains(REMOTE_PATH));
+        for t in thurm_proto::CLIP_TOOLS {
+            assert!(PROBE.contains(t) && SHIMS.contains(t), "{t}");
+        }
+        assert!(PROBE.contains(thurm_proto::CLIP_SHIMS_DIR));
+        assert!(SHIMS.contains(thurm_proto::CLIP_SHIMS_DIR));
     }
 }

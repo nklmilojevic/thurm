@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use thurm_config::{Config, Osc52Mode};
-use thurm_proto::{ENV_PANE_ID, ENV_SOCKET, PaneId, PaneSize};
+use thurm_proto::{ENV_CLIP_SHIMS, ENV_PANE_ID, ENV_SOCKET, PaneId, PaneSize};
 
 use crate::pty::SpawnOptions;
 
@@ -134,6 +134,18 @@ pub fn spawn_options(l: PaneLaunch<'_>) -> SpawnOptions {
     if let Some(dir) = cli_dir() {
         env.push(("THURM_BIN_DIR".into(), dir.display().to_string()));
     }
+    if let Some(dir) = clip_shims(
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        cfg!(target_os = "linux"),
+        ["DISPLAY", "WAYLAND_DISPLAY"]
+            .iter()
+            .any(|v| std::env::var_os(v).is_some_and(|d| !d.is_empty())),
+    ) {
+        let dir = dir.display().to_string();
+        let path = std::env::var("PATH").unwrap_or_default();
+        env.push(("PATH".into(), format!("{dir}:{path}")));
+        env.push((ENV_CLIP_SHIMS.into(), dir));
+    }
     for (k, v) in &cfg.terminal.env {
         env.push((k.clone(), v.clone()));
     }
@@ -250,6 +262,13 @@ pub fn spawn_options(l: PaneLaunch<'_>) -> SpawnOptions {
     }
 }
 
+/// The clipboard tools `thurm remote doctor` installed under `home`, for panes on a Linux host
+/// without a display of its own: there `xclip` and the rest reach the app's clipboard instead.
+fn clip_shims(home: Option<&Path>, linux: bool, display: bool) -> Option<PathBuf> {
+    let dir = home?.join(thurm_proto::CLIP_SHIMS_DIR);
+    (linux && !display && dir.is_dir()).then_some(dir)
+}
+
 /// Directory holding the `thurm` CLI next to this daemon (`Thurm.app/Contents/Helpers`).
 /// The shell integration appends it to PATH so agents in panes can drive the terminal.
 pub fn cli_dir() -> Option<PathBuf> {
@@ -354,5 +373,26 @@ mod tests {
             .env
             .insert("TERM_FEATURES".into(), String::new());
         assert_eq!(last(&env_of(&cfg), "TERM_FEATURES"), Some(""));
+    }
+
+    #[test]
+    fn clipboard_tools_only_on_a_linux_host_without_a_display() {
+        let home = std::env::temp_dir().join(format!("thurm-shims-{}", std::process::id()));
+        assert_eq!(clip_shims(Some(&home), true, false), None, "not installed");
+        let dir = home.join(thurm_proto::CLIP_SHIMS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(clip_shims(Some(&home), true, false), Some(dir));
+        assert_eq!(
+            clip_shims(Some(&home), true, true),
+            None,
+            "X11 or Wayland there"
+        );
+        assert_eq!(
+            clip_shims(Some(&home), false, false),
+            None,
+            "macOS has pbcopy"
+        );
+        assert_eq!(clip_shims(None, true, false), None);
+        let _ = std::fs::remove_dir_all(home);
     }
 }
