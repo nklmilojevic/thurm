@@ -134,7 +134,7 @@ prints it and exits with 1.
 | `thurm.wait(pane, {match, idle, exit, agent, timeout})` | Waits for the prompt, a regex, quiet, exit or a free agent; `true`, or `false` and why; waiting for `exit`, the exit code is the third value (`true, nil, code`) |
 | `thurm.close(pane)`, `thurm.focus(pane)` | Closes or focuses a pane |
 | `thurm.ports(pane)` | The ports the pane's programs listen on (`port`, `address`, `pid`, `command`), and whether all its processes could be read; without a pane, every pane's as `{pane, ports, complete}` |
-| `thurm.forward.open(host, port, {browse})`, `thurm.forward.close(id)`, `thurm.forward.list()` | Opens a remote host's port on this Mac through the app (or finds the forward that has it), closes one, lists them; a forward has `id`, `host`, `remote_port`, `local_port` and `url`, and `browse` opens the URL too |
+| `thurm.forward.open(host, port, {browse})`, `thurm.forward.close(id)`, `thurm.forward.list()` | Opens a remote host's port on this Mac through the app (or finds the forward that has it), closes one, lists them; a forward has `id`, `host`, `remote_port`, `local_port` and `url`, and `browse` opens the URL too. A forward that closed before the app could use it (its port went away) is an error, and nothing is opened |
 | `thurm.ui.toast(text, pane)` | A short message over a pane |
 | `thurm.ui.pick{title, placeholder, items}` | The user picks an item (a string, or a table with `title` and `detail`); returns it and its index, or `nil` |
 | `thurm.ui.input{title, placeholder, value}`, `thurm.ui.confirm{title, body, ok, cancel}` | A line of text, or yes or no |

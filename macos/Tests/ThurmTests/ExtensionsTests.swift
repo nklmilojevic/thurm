@@ -261,7 +261,10 @@ final class ExtensionsTests: XCTestCase {
                     ext.handle(["name": "ui.cancel", "payload": JSON.encode(["id": cancel])])
                 }
             }
-            return name == "forward_open" ? result : ["id": 0]
+            switch name {
+            case "forward_open", "forward_get": return result
+            default: return ["id": 0]
+            }
         }
         func seen() -> [String] {
             lock.lock()
@@ -293,9 +296,64 @@ final class ExtensionsTests: XCTestCase {
         XCTAssertEqual(open(911, result: opened, cancel: true, until: 2), ["forward_open", "close 71"])
         // One it only found open is someone else's: it stays.
         XCTAssertEqual(open(912, result: found, cancel: true, until: 1), ["forward_open"])
-        // Not cancelled: kept.
-        XCTAssertEqual(open(913, result: opened, cancel: false, until: 1), ["forward_open"])
+        // Not cancelled: kept (and looked at again, before anything is shown for it).
+        XCTAssertEqual(open(913, result: opened, cancel: false, until: 2), ["forward_open", "forward_get"])
         ext.forwardsNow([])
+    }
+
+    /// An open a plugin asked to browse goes to the browser only while its forward is still open
+    /// on the same local port, as the app found it: one that closed meanwhile may have left the
+    /// port to another program. The plugin then hears it closed, and nothing is opened.
+    func testABrowsedForwardIsOpenedOnlyWhileItIsOpen() {
+        _ = NSApplication.shared
+        let ext = Extensions.shared
+        let saved = (ext.remoteCall, ext.browse)
+        defer {
+            ext.remoteCall = saved.0
+            ext.browse = saved.1
+            ext.forwardReplies = nil
+            ext.forwardsNow([])
+        }
+        let opened: [String: Any] = ["id": 81, "host": "browse-test", "remote_port": 5173, "local_port": 5174,
+                                     "url": "http://localhost:5174/app", "new": true]
+        let lock = NSLock()
+        var now: Any = ["error": "no forward 81"]
+        ext.remoteCall = { op in
+            lock.lock()
+            defer { lock.unlock() }
+            return jsonString(op["op"]) == "forward_get" ? now : opened
+        }
+        var browsed: [String] = []
+        var replies: [[String: Any]] = []
+        ext.browse = { browsed.append($0.absoluteString) }
+        ext.forwardReplies = { replies.append($0) }
+        func open(_ id: UInt64, while state: Any) {
+            lock.lock()
+            now = state
+            lock.unlock()
+            replies = []
+            ext.handle(["name": "ui.request", "payload": JSON.encode(
+                ["kind": "forward_open", "id": id, "host": "browse-test", "port": 5173, "browse": true])])
+            let deadline = Date().addingTimeInterval(5)
+            while replies.isEmpty, Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            }
+        }
+        // Closed before the app could use it: not browsed, and the plugin hears why.
+        open(921, while: ["error": "no forward 81"])
+        XCTAssertEqual(browsed, [])
+        XCTAssertTrue((jsonString(replies.first?["error"]) ?? "").contains("closed"), "\(replies)")
+        // Open again under the same id, on another local port: not the one it answered.
+        var moved = opened
+        moved["local_port"] = 6000
+        open(922, while: moved)
+        XCTAssertEqual(browsed, [])
+        XCTAssertNotNil(jsonString(replies.first?["error"]))
+        // Still open: browsed at the link it asked for, and answered.
+        open(923, while: opened)
+        XCTAssertEqual(browsed, ["http://localhost:5174/app"])
+        XCTAssertNil(replies.first?["error"])
+        XCTAssertEqual(jsonUInt64((replies.first?["result"] as? [String: Any])?["id"]), 81)
     }
 }
 

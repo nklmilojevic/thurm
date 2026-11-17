@@ -214,7 +214,8 @@ function thurm.ports(pane) end
 thurm.forward = {}
 
 --- Opens a remote host's port on this Mac through the app (or finds the forward that has it);
---- `browse` opens its URL in the browser too.
+--- `browse` opens its URL in the browser too. Raises an error, opening nothing, when the
+--- forward closed before the app could use it.
 ---@param host string The `[[remote]]` host.
 ---@param port integer
 ---@param opts { browse: boolean? }?
