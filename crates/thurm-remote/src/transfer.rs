@@ -640,9 +640,11 @@ fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
     let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+    // The system call itself: not every C library has a wrapper for it (musl's older ones).
     #[cfg(target_os = "linux")]
     let r = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             a.as_ptr(),
             libc::AT_FDCWD,
