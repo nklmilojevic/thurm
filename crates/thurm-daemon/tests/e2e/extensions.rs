@@ -1902,3 +1902,88 @@ fn a_new_ports_subscriber_alone_gets_every_list_first() {
         "the late subscriber heard the list twice"
     );
 }
+
+/// A host the app lost, or an app that quit, leaves no lists standing: each of their panes a
+/// plugin heard of gets an empty list, not complete. Panes the next app knows are its to tell.
+#[test]
+fn a_lost_host_or_app_ends_its_remote_lists() {
+    let env = Env::new("ext-remote-ports-end");
+    let _d = env.start();
+    let caps = [CAP_EXT, CAP_EXT_UI, CAP_EXT_FORWARDS];
+    let (first, _first_rx) = forwarding_app(&env, &caps);
+    let (second, _second_rx) = forwarding_app(&env, &caps);
+    let (plugin, rx) = ext_client(&env, "plugin");
+    call(
+        &plugin,
+        method::EVENTS_SUBSCRIBE,
+        json!({ "names": ["ports_changed"] }),
+    )
+    .unwrap();
+    let vite =
+        |port: u16| json!([{ "port": port, "address": "127.0.0.1", "pid": 9, "command": "vite" }]);
+    let report = |app: &Client, host: &str, pane: u64, ports: Value| {
+        call(
+            app,
+            method::PORTS_REPORT,
+            json!({ "host": host, "pane": pane, "ports": ports, "complete": true }),
+        )
+        .unwrap();
+    };
+    report(&first, "devbox", 1, vite(5173));
+    report(&first, "devbox", 2, vite(5174));
+    report(&first, "pi", 3, vite(3000));
+    report(&first, "nas", 4, vite(8080));
+    report(&second, "nas", 4, vite(8080));
+    for _ in 0..4 {
+        next_event(&rx, "ports_changed");
+    }
+
+    // The app lost devbox: both its panes end, pi stands.
+    call(
+        &first,
+        method::PORTS_REPORT,
+        json!({ "host": "devbox", "gone": true }),
+    )
+    .unwrap();
+    let mut ended: Vec<u64> = (0..2)
+        .map(|_| {
+            let ev = next_event(&rx, "ports_changed");
+            assert_eq!(ev["host"], "devbox", "{ev}");
+            assert_eq!(
+                (ev["ports"].clone(), ev["complete"].clone()),
+                (json!([]), json!(false))
+            );
+            ev["id"].as_u64().unwrap()
+        })
+        .collect();
+    ended.sort_unstable();
+    assert_eq!(ended, [1, 2]);
+
+    // A host the second app lost is not the plugins' news: it does not hold them.
+    call(
+        &second,
+        method::PORTS_REPORT,
+        json!({ "host": "nas", "gone": true }),
+    )
+    .unwrap();
+    // The first quits: pi, which the second doesn't know, ends. nas, which the second has
+    // forgotten too, ends; nothing else is said.
+    drop(first);
+    let mut hosts: Vec<String> = (0..2)
+        .map(|_| {
+            let ev = next_event(&rx, "ports_changed");
+            assert_eq!(ev["ports"], json!([]), "{ev}");
+            assert_eq!(ev["complete"], false, "{ev}");
+            ev["host"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    hosts.sort();
+    assert_eq!(hosts, ["nas", "pi"]);
+    std::thread::sleep(Duration::from_millis(300));
+    let more: Vec<Value> = rx
+        .try_iter()
+        .filter(|(n, p)| n == notice::EVENT && p["event"] == "ports_changed")
+        .map(|(_, p)| p)
+        .collect();
+    assert!(more.is_empty(), "{more:?}");
+}

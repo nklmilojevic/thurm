@@ -64,6 +64,9 @@ struct ForwardRequests {
 
     mutating func cancel(_ key: Key) { live.remove(key) }
 
+    /// Whether request `key` is still waited for (an open checks before it starts).
+    func isLive(_ key: Key) -> Bool { live.contains(key) }
+
     /// The connection to the daemon changed: none of its requests is waited for any more.
     mutating func cancelAll() { live.removeAll() }
 

@@ -192,6 +192,46 @@ final class ExtensionsTests: XCTestCase {
         XCTAssertNil(Extensions.target(for: #selector(PaneActionView.splitForTest(_:)),
                                        item: item, in: nil))
     }
+    /// A plugin's forward request the daemon gave up on (`ui.cancel`) is not carried out once
+    /// the app has seen the cancel: a close is done as soon as it is asked, never queued behind
+    /// a cancel, and an open cancelled before it starts never opens.
+    func testACancelledForwardRequestIsNotCarriedOut() {
+        let ext = Extensions.shared
+        let saved = ext.remoteCall
+        defer { ext.remoteCall = saved }
+        let lock = NSLock()
+        var calls: [String] = []
+        ext.remoteCall = { op in
+            lock.lock()
+            calls.append(jsonString(op["op"]) ?? "")
+            lock.unlock()
+            return ["error": "not in a test"]
+        }
+        func seen() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return calls
+        }
+        func event(_ name: String, _ payload: [String: Any]) -> [String: Any] {
+            ["name": name, "payload": JSON.encode(payload)]
+        }
+
+        ext.handle(event("ui.request", ["kind": "forward_close", "id": 901, "forward": 7]))
+        XCTAssertEqual(seen(), ["forward_close"], "the close was queued, where a cancel could not stop it")
+        ext.handle(event("ui.cancel", ["id": 901]))
+
+        ext.handle(event("ui.request", ["kind": "forward_open", "id": 902, "host": "devbox", "port": 5173]))
+        ext.handle(event("ui.cancel", ["id": 902]))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        XCTAssertEqual(seen(), ["forward_close"], "an open the daemon gave up on was started")
+
+        ext.handle(event("ui.request", ["kind": "forward_open", "id": 903, "host": "devbox", "port": 5173]))
+        let deadline = Date().addingTimeInterval(5)
+        while seen().count < 2, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        XCTAssertEqual(seen(), ["forward_close", "forward_open"])
+    }
 }
 
 private final class PaneActionView: NSView {
