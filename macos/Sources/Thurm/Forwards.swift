@@ -24,33 +24,143 @@ struct ForwardInfo: Equatable {
     }
 }
 
-/// The forward requests of plugins the app is carrying out, by the daemon's id for each. One
-/// the daemon gave up on (`ui.cancel`: its caller went away or waited too long), or one of a
-/// connection that is gone, must change nothing once it finishes.
+/// The forward requests of plugins the app is carrying out, and who still has which forward.
+///
+/// A request the daemon gave up on (`ui.cancel`: its caller went away or waited too long), or
+/// one of a connection to the daemon that is gone, must change nothing once it finishes: a
+/// forward it opened is closed again, unless someone else has it. Forwards are shared (an open
+/// of a host's port that has one gets that one, `new` false), so whoever got it since, a plugin
+/// that waited or the user, keeps it; and while another open of that host is under way, the
+/// close waits for it to say what it got.
 struct ForwardRequests {
+    /// A request, by the daemon connection it came on and the daemon's id for it: a daemon
+    /// started again numbers its requests from 1 again.
+    struct Key: Hashable {
+        let connection: Int
+        let id: UInt64
+    }
+
     enum Finish: Equatable {
         /// Still asked for: answer it, and open the browser if it said so.
         case answer
-        /// Nobody waits for it: show and open nothing, and close the forward it opened, if any.
-        case abandoned(close: UInt64?)
+        /// Nobody waits for it: show and open nothing.
+        case abandoned
     }
 
-    private var live: Set<UInt64> = []
+    private var live: Set<Key> = []
+    /// Opens under way (a plugin's or the user's), by host.
+    private var opening: [HostId: Int] = [:]
+    /// Forwards handed to someone who waited for them.
+    private var held: Set<UInt64> = []
+    /// Forwards opened for a request nobody waits for, by host, while another open of that host
+    /// is under way.
+    private var orphans: [UInt64: HostId] = [:]
 
-    mutating func begin(_ id: UInt64) { live.insert(id) }
+    /// A plugin's request; `opening` is the host it opens a forward of (none for a close).
+    mutating func begin(_ key: Key, opening host: HostId?) {
+        live.insert(key)
+        if let host { opening[host, default: 0] += 1 }
+    }
 
-    mutating func cancel(_ id: UInt64) { live.remove(id) }
+    mutating func cancel(_ key: Key) { live.remove(key) }
 
     /// The connection to the daemon changed: none of its requests is waited for any more.
     mutating func cancelAll() { live.removeAll() }
 
-    /// Request `id` finished with `result` (`forward_open`'s or `forward_close`'s).
-    mutating func finish(_ id: UInt64, result: [String: Any]?) -> Finish {
-        if live.remove(id) != nil { return .answer }
-        // Only a forward opened for it goes again: one it found open was someone else's.
-        guard let r = result, jsonString(r["error"]) == nil, jsonBool(r["new"]) == true,
-              let forward = jsonUInt64(r["id"]) else { return .abandoned(close: nil) }
-        return .abandoned(close: forward)
+    /// The user opens a forward of `host`.
+    mutating func userOpens(_ host: HostId) { opening[host, default: 0] += 1 }
+
+    /// The user's open of `host` finished with `result`; the forwards to close now.
+    mutating func userOpened(_ host: HostId, result: [String: Any]?) -> [UInt64] {
+        settle(host, waited: true, result: result)
+    }
+
+    /// Request `key` finished with `result` (`forward_open`'s, of `host`, or `forward_close`'s):
+    /// whether to answer it, and the forwards to close now.
+    mutating func finish(_ key: Key, opening host: HostId?, result: [String: Any]?) -> (Finish, close: [UInt64]) {
+        let waited = live.remove(key) != nil
+        guard let host else { return (waited ? .answer : .abandoned, []) }
+        return (waited ? .answer : .abandoned, settle(host, waited: waited, result: result))
+    }
+
+    /// The forwards open now: the others are no one's any more.
+    mutating func forwardsNow(_ ids: Set<UInt64>) {
+        held.formIntersection(ids)
+        orphans = orphans.filter { ids.contains($0.key) }
+    }
+
+    private mutating func settle(_ host: HostId, waited: Bool, result: [String: Any]?) -> [UInt64] {
+        if let n = opening[host] { opening[host] = n > 1 ? n - 1 : nil }
+        if let r = result, jsonString(r["error"]) == nil, let forward = jsonUInt64(r["id"]) {
+            if waited {
+                held.insert(forward)
+                orphans[forward] = nil
+            } else if jsonBool(r["new"]) == true, !held.contains(forward) {
+                orphans[forward] = host
+            }
+        }
+        guard opening[host] == nil else { return [] }
+        let close = orphans.filter { $0.value == host }.map(\.key).sorted()
+        for id in close { orphans[id] = nil }
+        return close
+    }
+}
+
+/// The remote hosts' port lists the app passes on to this Mac's daemon for its plugins
+/// (`ports.report`): the latest of each pane, sent again whenever the app connects to the daemon,
+/// and for each host just connected to, the ask for what it listed already (`initial`).
+struct RemotePorts {
+    struct Entry {
+        let host: HostId
+        let pane: UInt64
+        let ports: Any
+        let complete: Any
+    }
+
+    private var lists: [HostId: [UInt64: Entry]] = [:]
+    /// Hosts whose own answer of what they list is awaited, by the ask's number.
+    private var learning: [HostId: Int] = [:]
+    private var asks = 0
+
+    /// The app connected to `host`: what it lists until `learned` was listening already. The
+    /// number of the ask.
+    mutating func connected(_ host: HostId) -> Int {
+        asks += 1
+        learning[host] = asks
+        lists[host] = nil
+        return asks
+    }
+
+    /// The connection to `host` is gone: its lists and its ask with it.
+    mutating func disconnected(_ host: HostId) {
+        learning[host] = nil
+        lists[host] = nil
+    }
+
+    func isLearning(_ host: HostId) -> Bool { learning[host] != nil }
+
+    /// Ask `ask` of `host` was answered: whether it is still the one awaited (not one of a
+    /// connection that went, or that a newer one replaced).
+    mutating func learned(_ host: HostId, ask: Int) -> Bool {
+        guard learning[host] == ask else { return false }
+        learning[host] = nil
+        return true
+    }
+
+    /// A pane of `host` listed `ports`; an empty list forgets it.
+    mutating func listed(_ host: HostId, pane: UInt64, ports: Any, complete: Any) {
+        if (ports as? [Any])?.isEmpty ?? false {
+            lists[host]?[pane] = nil
+        } else {
+            lists[host, default: [:]][pane] = Entry(host: host, pane: pane, ports: ports, complete: complete)
+        }
+    }
+
+    /// Every list known now, by host and pane.
+    var all: [Entry] {
+        lists.keys.sorted().flatMap { host in
+            (lists[host] ?? [:]).keys.sorted().compactMap { lists[host]?[$0] }
+        }
     }
 }
 
@@ -152,6 +262,7 @@ extension Remotes {
     /// The status callback's report of forwards: every open one, and what changed.
     func forwardsChanged(_ list: [Any], change: [String: Any]?) {
         forwards = list.compactMap { ForwardInfo(json: $0) }
+        Extensions.shared.forwardsNow(Set(forwards.map(\.id)))
         Extensions.shared.reportForwards(list, change: change)
         if jsonString(change?["change"]) == "closed", jsonString(change?["why"]) == "gone",
            let f = ForwardInfo(json: change?["forward"]) {
@@ -168,9 +279,12 @@ extension SessionManager {
         var call: [String: Any] = ["op": "forward_open", "host": host]
         if let port { call["port"] = port }
         if let url { call["url"] = url }
+        Extensions.shared.userOpensForward(host)
         DispatchQueue.global(qos: .userInitiated).async {
             let v = Core.shared.remoteCall(call) as? [String: Any]
             DispatchQueue.main.async {
+                // The user has it now: a plugin's abandoned open of it is not closed under them.
+                Extensions.shared.userOpenedForward(host, result: v)
                 let view = SessionManager.shared.currentController?.content.focusedView
                 if let e = jsonString(v?["error"]) {
                     switch ForwardFailure.report(host: host, e, hasView: view != nil) {

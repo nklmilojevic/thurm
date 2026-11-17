@@ -52,7 +52,13 @@ pub struct Ext {
     /// ([`method::FORWARDS_REPORT`]). Its ids are that app's own: plugins see only the first
     /// app's (see [`Daemon::forwarding_app`]).
     forwards: Mutex<HashMap<u64, Vec<ext::ForwardInfo>>>,
+    /// The remote hosts' port lists each app relayed last ([`method::PORTS_REPORT`]), by
+    /// client, host and pane: what a new subscriber is told first.
+    remote_ports: Mutex<HashMap<u64, RemoteLists>>,
 }
+
+/// A remote host's panes' lists: by host and pane, the ports and whether they are complete.
+type RemoteLists = std::collections::BTreeMap<(String, u64), (Vec<PortEntry>, bool)>;
 
 pub use thurm_proto::ext::method_blocks as blocks;
 
@@ -200,9 +206,13 @@ impl Daemon {
                 let ports = names.iter().any(|n| n == PORTS_CHANGED);
                 self.ext_registry(client)?.subscribe(client.id, names)?;
                 // Its panes' ports are watched only while someone hears of them; a new
-                // subscriber hears every list there is first.
+                // subscriber hears every list there is first. Of remote hosts, the lists the
+                // app relayed so far, as running already.
                 if ports {
                     self.ports.subscribed(Arc::downgrade(self));
+                    for payload in self.remote_lists(self.forwarding_app_id()) {
+                        send_ext(client, notice::EVENT, &payload);
+                    }
                 }
                 Ok(Value::Null)
             }
@@ -299,6 +309,13 @@ impl Daemon {
             method::PORTS_REPORT => {
                 only_the_app(client, method)?;
                 let host = str_param(&p, "host")?;
+                // The app's connection to the host is gone: what it listed is not known now.
+                if p.get("gone").and_then(Value::as_bool) == Some(true) {
+                    if let Some(lists) = self.ext.remote_ports.lock().get_mut(&client.id) {
+                        lists.retain(|(h, _), _| h != host);
+                    }
+                    return Ok(Value::Null);
+                }
                 let pane = p
                     .get("pane")
                     .and_then(Value::as_u64)
@@ -307,6 +324,20 @@ impl Daemon {
                     serde_json::from_value(p.get("ports").cloned().unwrap_or(json!([])))
                         .map_err(|e| format!("bad ports: {e}"))?;
                 let complete = p.get("complete").and_then(Value::as_bool).unwrap_or(true);
+                {
+                    let mut all = self.ext.remote_ports.lock();
+                    let lists = all.entry(client.id).or_default();
+                    let at = (host.to_owned(), pane);
+                    if ports.is_empty() {
+                        lists.remove(&at);
+                    } else {
+                        lists.insert(at, (ports.clone(), complete));
+                    }
+                }
+                // Only the app that holds plugins' forwards is heard, as with its forwards.
+                if self.forwarding_app_id() != Some(client.id) {
+                    return Ok(Value::Null);
+                }
                 let mut extra =
                     json!({ "host": host, "id": pane, "ports": ports, "complete": complete });
                 // Listening already when the app connected to the host: not news.
@@ -351,6 +382,26 @@ impl Daemon {
             }
             other => self.plugin_method(client, other, p),
         }
+    }
+
+    /// The app that holds plugins' forwards, connected or leaving now.
+    fn forwarding_app_id(&self) -> Option<u64> {
+        self.ext.forwards.lock().keys().min().copied()
+    }
+
+    /// The remote lists `app` relayed, as `ports_changed` payloads of servers running already.
+    fn remote_lists(&self, app: Option<u64>) -> Vec<Value> {
+        let all = self.ext.remote_ports.lock();
+        app.and_then(|a| all.get(&a))
+            .into_iter()
+            .flatten()
+            .map(|((host, pane), (ports, complete))| {
+                json!({
+                    "event": PORTS_CHANGED, "host": host, "id": pane, "ports": ports,
+                    "complete": complete, "initial": true,
+                })
+            })
+            .collect()
     }
 
     /// An app that forwards connected ([`thurm_proto::CAP_EXT_FORWARDS`]).
@@ -650,22 +701,24 @@ impl Daemon {
         self.ext.pending.lock().retain(|_, p| p.to != client);
         // An app's forwards end with it; when it was the first, the next app's are plugins'
         // now.
-        let (gone, next) = {
+        let (gone, next, next_app) = {
             let mut forwards = self.ext.forwards.lock();
             let first = forwards.keys().min() == Some(&client);
             let gone = forwards.remove(&client).filter(|_| first);
-            let next = forwards
-                .keys()
-                .min()
-                .and_then(|id| forwards.get(id).cloned())
-                .filter(|_| first);
-            (gone, next)
+            let next_app = forwards.keys().min().copied().filter(|_| first);
+            let next = next_app.and_then(|id| forwards.get(&id).cloned());
+            (gone, next, next_app)
         };
+        self.ext.remote_ports.lock().remove(&client);
         for f in gone.iter().flatten() {
             self.forward_event(FORWARD_CLOSED, f, Some("app"));
         }
         for f in next.iter().flatten() {
             self.forward_event(FORWARD_OPENED, f, None);
+        }
+        // The remote lists heard from now on are that app's: what it had is running already.
+        for payload in self.remote_lists(next_app) {
+            self.deliver_event(PORTS_CHANGED, &payload);
         }
         if self.ext.registry.lock().client_gone(client) {
             self.actions_changed();

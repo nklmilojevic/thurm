@@ -216,6 +216,7 @@ final class Core {
         guard let c = clients.removeValue(forKey: host) else { return }
         epochs[host] = (epochs[host] ?? 0) + 1 // late events from the old connection are ignored
         thurm_disconnect(c)
+        if host != localHost { Extensions.shared.remoteHostDisconnected(host) }
     }
 
     func disconnectAll() {
