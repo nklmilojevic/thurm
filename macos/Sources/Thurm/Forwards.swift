@@ -163,9 +163,15 @@ struct RemotePorts {
         return seq
     }
 
-    /// This Mac's daemon took report `seq` of `host`'s `pane` (if it is still the latest).
+    /// This Mac's daemon passed report `seq` of `host`'s `pane` on to plugins (if it is still the
+    /// latest). An empty, complete one is all said then, and goes: a closed pane's would pile up.
     mutating func delivered(_ host: HostId, pane: UInt64, seq: Int) {
-        if lists[host]?[pane]?.seq == seq { lists[host]?[pane]?.delivered = true }
+        guard let e = lists[host]?[pane], e.seq == seq else { return }
+        if (e.ports as? [Any])?.isEmpty ?? false, jsonBool(e.complete) != false {
+            lists[host]?[pane] = nil
+        } else {
+            lists[host]?[pane]?.delivered = true
+        }
     }
 
     /// The connection to `host` is gone: its lists with it.

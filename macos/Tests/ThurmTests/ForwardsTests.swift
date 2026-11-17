@@ -191,7 +191,8 @@ final class ForwardsTests: XCTestCase {
     /// Connected again to this Mac's daemon, the app sends its remote lists again: those its
     /// plugins heard as running already; one they never heard (sent while the daemon was away, or
     /// taken without being passed on, as a second app's are) as it came, so a server that started
-    /// meanwhile is still news to them. A pane whose servers went is sent again too.
+    /// meanwhile is still news to them. A pane whose servers went while the daemon was away is
+    /// sent again too; one whose going plugins heard is not kept.
     func testRemoteListsSentAgainKeepWhatTheDaemonNeverHeard() {
         let ext = Extensions.shared
         var daemonUp = true
@@ -204,18 +205,20 @@ final class ForwardsTests: XCTestCase {
         // Heard while the daemon was there: pane 1 running already, pane 2 a change.
         ext.reportPorts(host: host, pane: 1, ports: list(5173), complete: true, initial: true)
         ext.reportPorts(host: host, pane: 2, ports: list(8080), complete: true, initial: false)
+        ext.reportPorts(host: host, pane: 5, ports: list(5000), complete: true, initial: false)
         // The daemon goes; pane 3 starts a server, pane 4 is listed as running already.
         daemonUp = false
         ext.reportPorts(host: host, pane: 3, ports: list(3000), complete: true, initial: false)
         ext.reportPorts(host: host, pane: 4, ports: list(9000), complete: true, initial: true)
+        ext.reportPorts(host: host, pane: 5, ports: [] as [Any], complete: true, initial: false)
         daemonUp = true
-        // Pane 2's server went, heard.
+        // Pane 2's server went, heard: that is all there is to say of it, and it is not kept.
         ext.reportPorts(host: host, pane: 2, ports: [] as [Any], complete: true, initial: false)
         reported = []
         ext.sendRemotePortsAgain()
         let again = reported.filter { jsonString($0["host"]) == host }
             .map { "\($0["pane"]!):\(($0["ports"] as? [Any])?.count ?? -1)\(jsonBool($0["initial"]) == true ? "*" : "")" }
-        XCTAssertEqual(again, ["1:1*", "2:0*", "3:1", "4:1*"])
+        XCTAssertEqual(again, ["1:1*", "3:1", "4:1*", "5:0"])
     }
 
     /// Whether a remote list is of servers running already is the host's daemon's to say, by

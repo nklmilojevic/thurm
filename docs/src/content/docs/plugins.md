@@ -104,7 +104,8 @@ for an event about a pane, `pane` (as `thurm info --json` shows it).
 The daemon looks at its panes' ports only while someone listens: subscribing
 to `ports_changed` by name starts it (`*` alone does not). A plugin that
 subscribes gets every pane's list first (an empty one too), on its own and marked `initial`, with
-the remote hosts' lists the app passed on so far; the others hear nothing
+the remote hosts' lists the app passed on so far (a remote pane plugins
+already heard listen on nothing is left out); the others hear nothing
 again. A remote host's ports and the forwards come from the app, so
 a plugin on this Mac hears them while Thurm is open.
 
@@ -134,7 +135,7 @@ prints it and exits with 1.
 | `thurm.wait(pane, {match, idle, exit, agent, timeout})` | Waits for the prompt, a regex, quiet, exit or a free agent; `true`, or `false` and why; waiting for `exit`, the exit code is the third value (`true, nil, code`) |
 | `thurm.close(pane)`, `thurm.focus(pane)` | Closes or focuses a pane |
 | `thurm.ports(pane)` | The ports the pane's programs listen on (`port`, `address`, `pid`, `command`), and whether all its processes could be read; without a pane, every pane's as `{pane, ports, complete}`. This Mac's panes only: a remote host's pane is known by its `ports_changed` (its `id` is that host's, with `host`) |
-| `thurm.forward.open(host, port, {browse})`, `thurm.forward.close(id)`, `thurm.forward.list()` | Opens a remote host's port on this Mac through the app (or finds the forward that has it), closes one, lists them; a forward has `id`, `host`, `remote_port`, `local_port` and `url`, and `browse` opens the URL too. A forward that closed (its port went away), or moved to another local port, before the app could use it is an error, and nothing is opened |
+| `thurm.forward.open(host, port, {browse})`, `thurm.forward.close(id)`, `thurm.forward.list()` | Opens a remote host's port on this Mac through the app (or finds the forward that has it), closes one, lists them; a forward has `id`, `host`, `remote_port`, `local_port` and `url` (the link it was last opened for, on its local port), and `browse` opens the URL too. A forward that closed (its port went away), or moved to another local port, before the app could use it is an error, and nothing is opened |
 | `thurm.ui.toast(text, pane)` | A short message over a pane |
 | `thurm.ui.pick{title, placeholder, items}` | The user picks an item (a string, or a table with `title` and `detail`); returns it and its index, or `nil` |
 | `thurm.ui.input{title, placeholder, value}`, `thurm.ui.confirm{title, body, ok, cancel}` | A line of text, or yes or no |
