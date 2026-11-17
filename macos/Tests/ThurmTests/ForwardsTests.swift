@@ -64,4 +64,21 @@ final class ForwardsTests: XCTestCase {
         let link = ForwardPicker.choices(query: "http://localhost:3000/", host: "devbox", known: [], open: [])
         XCTAssertEqual(link.map(\.target), [.url("http://localhost:3000/")])
     }
+
+    func testAFailureWithoutAPaneIsAnAlert() {
+        XCTAssertEqual(ForwardFailure.report(host: "pi", "pi is not connected", hasView: true),
+                       .toast("Could not forward from pi: pi is not connected"))
+        XCTAssertEqual(ForwardFailure.report(host: "pi", "pi is not connected", hasView: false),
+                       .alert("Could not forward from pi: pi is not connected"))
+    }
+
+    func testEveryOpenForwardKeepsCopyLinkAndClose() {
+        let f = ForwardInfo(json: ["id": 4, "host": "devbox", "remote_port": 8443, "local_port": 18443,
+                                   "url": "https://localhost:18443/app"])!
+        let entries = ForwardPicker.manageEntries([f])
+        XCTAssertEqual(entries.map(\.title), ["Copy Forward Link devbox:8443", "Close Forward devbox:8443"])
+        XCTAssertEqual(entries[0].action, .copyLink("https://localhost:18443/app"))
+        XCTAssertEqual(entries[1].action, .close(4))
+        XCTAssertTrue(ForwardPicker.manageEntries([]).isEmpty)
+    }
 }
