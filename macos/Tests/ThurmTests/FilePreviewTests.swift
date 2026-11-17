@@ -772,4 +772,31 @@ final class FilePreviewTests: XCTestCase {
         finish[1](outcome(name: "a.bin", version: "v"))
         XCTAssertEqual(try String(contentsOf: try XCTUnwrap(again).get(), encoding: .utf8), "a")
     }
+
+    func testAnAbandonedDownloadThatEndsLateLeavesTheNewerCopy() throws {
+        let cache = tempCache()
+        let pane = PaneKey("devbox", 3)
+        var finish: [(TransferOutcome) -> Void] = []
+        var dests: [URL] = []
+        cache.download = { _, _, dest, _, _, _, done in
+            dests.append(dest)
+            finish.append(done)
+            return {}
+        }
+        let cancel = cache.fetch(.path("/a.txt"), pane: pane, cwd: nil) { _ in }
+        cancel()
+        var again: Result<URL, Error>?
+        cache.fetch(.path("/a.txt"), pane: pane, cwd: nil) { again = $0 }
+        // The new fetch is in first; the given-up one, too late to stop, ends whole after it.
+        try Data("new".utf8).write(to: dests[1])
+        finish[1](outcome(name: "a.txt", version: "v2"))
+        try Data("old".utf8).write(to: dests[0])
+        finish[0](outcome(name: "a.txt", version: "v1"))
+        let entry = cache.entry(host: "devbox", path: "/a.txt", cwd: nil)
+        let cached = try XCTUnwrap(cache.cached(entry))
+        XCTAssertEqual(cached.version, "v2")
+        XCTAssertEqual(try String(contentsOf: cached.file, encoding: .utf8), "new")
+        XCTAssertEqual(try XCTUnwrap(again).get(), cached.file)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dests[0].path))
+    }
 }
