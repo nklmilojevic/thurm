@@ -34,6 +34,7 @@ fn next_ports(
                 pane: p,
                 ports,
                 complete,
+                ..
             } if p == pane => return Some((ports, complete)),
             _ => {}
         }
@@ -150,4 +151,65 @@ fn ports_of_an_unknown_pane_are_an_error() {
     let (c, _rx) = env.connect();
     let e = c.request(Request::Ports { pane: Some(4242) }).unwrap_err();
     assert!(e.to_string().contains("no such pane"), "{e}");
+}
+
+/// The next `PortsChanged` for `pane`, with whether it was an initial list.
+fn next_marked(rx: &Receiver<Event>, pane: PaneId, timeout: Duration) -> Option<(Vec<u16>, bool)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        if let Event::PortsChanged {
+            pane: p,
+            ports,
+            initial,
+            ..
+        } = rx.recv_timeout(left).ok()?
+            && p == pane
+        {
+            return Some((ports.iter().map(|e| e.port).collect(), initial));
+        }
+    }
+}
+
+#[test]
+fn a_joining_client_is_told_what_listens_already_as_initial() {
+    if !has_python() {
+        eprintln!("note: no python3 here; skipped");
+        return;
+    }
+    let env = Env::new("ports-initial");
+    let _daemon = env.start_with(&[("THURM_PORTS_INTERVAL_MS", Path::new("200"))]);
+    let (first, first_rx) = subscriber(&env);
+    let pane = create(&first, &env.dir);
+    wait_match(&first, pane, r"\$");
+    let port = listen_in(&first, pane);
+    // The client watching already hears the server start: a change.
+    let (ports, initial) = next_marked(&first_rx, pane, Duration::from_secs(15)).expect("a change");
+    assert!(ports.contains(&port));
+    assert!(!initial, "a server starting was marked initial");
+
+    // A client that joins now is told it was listening already.
+    let (_second, second_rx) = subscriber(&env);
+    let (ports, initial) =
+        next_marked(&second_rx, pane, Duration::from_secs(15)).expect("its first list");
+    assert!(ports.contains(&port));
+    assert!(initial, "a joiner's first list was not marked initial");
+    // The first client hears nothing of the join.
+    assert!(
+        next_marked(&first_rx, pane, Duration::from_millis(800)).is_none(),
+        "the join was broadcast"
+    );
+
+    // The server stops: a change for both, initial for neither.
+    first
+        .request(Request::Input {
+            pane,
+            data: b"\x03".to_vec(),
+        })
+        .unwrap();
+    for rx in [&first_rx, &second_rx] {
+        let (ports, initial) = next_marked(rx, pane, Duration::from_secs(15)).expect("the stop");
+        assert!(ports.is_empty(), "{ports:?}");
+        assert!(!initial);
+    }
 }
