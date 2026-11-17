@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use thurm_proto::Principal;
-use thurm_proto::stream::{self, MAX_DATA, StreamClose, StreamFrame};
+use thurm_proto::stream::{self, Loopback, MAX_DATA, StreamClose, StreamFrame};
 
 /// Tickets one client may hold unused.
 pub const MAX_PENDING_PER_CLIENT: usize = 64;
@@ -27,6 +27,8 @@ pub const MAX_OPEN: usize = 256;
 pub enum Kind {
     /// A TCP port on this host's loopback.
     Tcp { port: u16 },
+    /// A TCP port on one of this host's loopback addresses.
+    TcpAt { port: u16, at: Loopback },
 }
 
 /// A stream reserved by a ticket.
@@ -247,8 +249,11 @@ fn serve_with<R: Read>(
         got_end: false,
         closed: false,
     }));
-    let Kind::Tcp { port } = kind;
-    let tcp = match dial_loopback(port) {
+    let (port, at) = match kind {
+        Kind::Tcp { port } => (port, Loopback::Any),
+        Kind::TcpAt { port, at } => (port, at),
+    };
+    let tcp = match dial_loopback(port, at) {
         Ok(tcp) => tcp,
         Err(e) => {
             out.lock().close(StreamClose::Refused(e));
@@ -340,12 +345,16 @@ fn pump_target(mut tcp: TcpStream, out: &Mutex<Out>) {
     }
 }
 
-/// Connects to `port` on IPv4 loopback, then IPv6 loopback. Never another address.
-fn dial_loopback(port: u16) -> Result<TcpStream, String> {
-    let addrs: [SocketAddr; 2] = [
-        (std::net::Ipv4Addr::LOCALHOST, port).into(),
-        (std::net::Ipv6Addr::LOCALHOST, port).into(),
-    ];
+/// Connects to `port` on the loopback address `at` (`Any`: IPv4, then IPv6). Never another
+/// address.
+fn dial_loopback(port: u16, at: Loopback) -> Result<TcpStream, String> {
+    let v4: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+    let v6: SocketAddr = (std::net::Ipv6Addr::LOCALHOST, port).into();
+    let addrs = match at {
+        Loopback::Any => vec![v4, v6],
+        Loopback::V4 => vec![v4],
+        Loopback::V6 => vec![v6],
+    };
     let mut last = None;
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
@@ -467,6 +476,30 @@ mod tests {
         };
         assert!(e.contains("unknown or used"), "{e}");
         s.claim(&theirs, &peer(501)).unwrap();
+    }
+
+    #[test]
+    fn a_dial_to_one_loopback_reaches_only_that_one() {
+        // Two programs on the same port, one per loopback address.
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let Ok(v6) = std::net::TcpListener::bind(("::1", port)) else {
+            return; // No IPv6 here, or the port is taken there.
+        };
+        let peer_of = |at| dial_loopback(port, at).unwrap().peer_addr().unwrap();
+        assert!(peer_of(Loopback::V6).is_ipv6());
+        assert!(peer_of(Loopback::V4).is_ipv4());
+        assert!(peer_of(Loopback::Any).is_ipv4());
+        // Nothing on IPv6: a dial to it is refused, not sent to the IPv4 one.
+        drop(v6);
+        assert!(dial_loopback(port, Loopback::V6).is_err());
+        assert!(
+            dial_loopback(port, Loopback::Any)
+                .unwrap()
+                .peer_addr()
+                .unwrap()
+                .is_ipv4()
+        );
     }
 
     #[test]

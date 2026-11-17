@@ -84,6 +84,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_EXT,
     CAP_STREAMS,
     CAP_PORTS,
+    CAP_DIAL_AT,
 ];
 
 /// The daemon accepts `SearchPaths` and returns `PathMatches` only for that request.
@@ -99,6 +100,9 @@ pub const CAP_STREAMS: &str = "streams";
 
 /// The daemon answers [`Request::Ports`]: the TCP ports the programs in its panes listen on.
 pub const CAP_PORTS: &str = "ports";
+
+/// The daemon answers [`Request::DialAt`]: a stream to one loopback address of its choosing.
+pub const CAP_DIAL_AT: &str = "dial-at";
 
 /// Sent only by a client that wants [`Event::PortsChanged`] (the Mac app's connections to remote
 /// hosts, `thurm remote forward`): while one is connected, the daemon watches its panes' ports.
@@ -535,6 +539,12 @@ pub enum Request {
     /// [`Response::Ports`]. Requires [`CAP_PORTS`].
     Ports {
         pane: Option<PaneId>,
+    },
+    /// [`Request::DialBegin`] to `port` on the loopback address `at` only (`Any`: as
+    /// `DialBegin`). Requires [`CAP_DIAL_AT`].
+    DialAt {
+        port: u16,
+        at: stream::Loopback,
     },
 }
 

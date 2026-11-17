@@ -708,10 +708,10 @@ fn call(c: Call) -> Result<Value, String> {
             let cfg = Config::load().unwrap_or_default();
             json!(policy::clipboard_write(&cfg, host.as_deref()))
         }
-        Call::Link { host, url } => match Config::load() {
-            Ok(cfg) => json!(policy::link(&cfg, host.as_deref(), &url)),
-            Err(_) => json!(policy::link_without_config(host.as_deref(), &url)),
-        },
+        Call::Link { host, url } => {
+            static LINKS: policy::Links = policy::Links::new();
+            json!(LINKS.link(Config::load().ok(), host.as_deref(), &url))
+        }
         Call::HandoffPrepare { host, path, branch } => {
             let h = handoff::prepare_registered(
                 &host_for(&host)?,
@@ -1198,6 +1198,7 @@ mod tests {
             id: 1,
             host: "devbox".into(),
             remote_port: 8443,
+            at: Default::default(),
             local: 18443,
             link: None,
         };
