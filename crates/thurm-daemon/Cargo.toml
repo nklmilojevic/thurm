@@ -34,6 +34,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 thurm-ffi = { path = "../thurm-ffi" }
+thurm-remote = { path = "../thurm-remote" }
 serde_json.workspace = true
 thurm-client.workspace = true
 crossbeam-channel.workspace = true

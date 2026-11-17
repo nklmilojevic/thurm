@@ -193,10 +193,35 @@ final class ForwardsTests: XCTestCase {
         XCTAssertFalse(p.learned("devbox", ask: new))
     }
     func testAFailureWithoutAPaneIsAnAlert() {
-        XCTAssertEqual(ForwardFailure.report(host: "pi", "pi is not connected", hasView: true),
-                       .toast("Could not forward from pi: pi is not connected"))
-        XCTAssertEqual(ForwardFailure.report(host: "pi", "pi is not connected", hasView: false),
-                       .alert("Could not forward from pi: pi is not connected"))
+        XCTAssertEqual(ForwardNotice.failure(host: "pi", "pi is not connected", onPane: true),
+                       .toast("Could not forward from pi: pi is not connected", copyLink: nil))
+        XCTAssertEqual(ForwardNotice.failure(host: "pi", "pi is not connected", onPane: false),
+                       .alert("Could not forward from pi: pi is not connected", copyLink: nil))
+    }
+
+    func testAFirstForwardWithoutAPaneIsAnAlertWithItsLink() {
+        let url = "http://localhost:5173/"
+        XCTAssertEqual(ForwardNotice.opened(host: "devbox", remotePort: 5173, localPort: 5173, url: url, onPane: true),
+                       .toast("devbox:5173 → localhost:5173", copyLink: url))
+        XCTAssertEqual(ForwardNotice.opened(host: "devbox", remotePort: 5173, localPort: 5173, url: url, onPane: false),
+                       .alert("devbox:5173 → localhost:5173", copyLink: url))
+    }
+
+    func testAPortsReplyFromAnOldConnectionIsDropped() {
+        var g = RequestGenerations()
+        // Asked, then the connection drops before the answer: the answer is old.
+        let first = g.start("devbox")
+        XCTAssertTrue(g.isCurrent("devbox", first))
+        g.invalidate("devbox")
+        XCTAssertFalse(g.isCurrent("devbox", first))
+        // Reconnected and asked again: only the newer answer counts, whichever comes last.
+        let second = g.start("devbox")
+        XCTAssertFalse(g.isCurrent("devbox", first))
+        XCTAssertTrue(g.isCurrent("devbox", second))
+        // Hosts are apart.
+        let other = g.start("pi")
+        XCTAssertTrue(g.isCurrent("devbox", second))
+        XCTAssertTrue(g.isCurrent("pi", other))
     }
 
     func testEveryOpenForwardKeepsCopyLinkAndClose() {

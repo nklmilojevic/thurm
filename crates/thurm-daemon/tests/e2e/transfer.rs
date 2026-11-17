@@ -298,7 +298,10 @@ fn a_file_downloads_and_is_not_sent_again_unchanged() {
     let e = c.download_begin(pane, ".", None).unwrap_err();
     assert!(e.to_string().contains("not a regular file"), "{e}");
     let e = c.download_begin(pane, "missing", None).unwrap_err();
-    assert!(e.to_string().contains("cannot open"), "{e}");
+    // Nothing there says so in a way a client can tell from other failures.
+    assert!(e.to_string().ends_with(DOWNLOAD_NOT_FOUND), "{e}");
+    let e = c.download_begin(pane, "data.bin/inside", None).unwrap_err();
+    assert!(e.to_string().ends_with(DOWNLOAD_NOT_FOUND), "{e}");
 }
 
 /// Writes `data` to `path`, modified a minute ago, and waits out the second after its change
@@ -449,5 +452,78 @@ fn cancelling_after_the_last_bytes_drops_the_batch() {
     let e = r.wait_closed().unwrap_err().to_string();
     assert!(e.contains("cancelled"), "{e}");
     assert!(batches(&env, pane).is_empty());
+    assert_eq!(typed(&c, pane, &dir), "\n");
+}
+
+#[test]
+fn a_refused_upload_deletes_nothing_kept() {
+    let env = Env::new("transfer-refused-keeps");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_KEPT", Path::new("10"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 4, b"aaaa")
+        .wait_closed()
+        .unwrap();
+    let [kept] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    // 11 bytes can never fit in 10: refused, and the kept drop stays.
+    let e = c.upload_begin(pane, "big.txt", 11, None).unwrap_err();
+    assert!(e.to_string().contains("does not fit"), "{e}");
+    assert!(kept.join("a.txt").exists());
+    // The same for a batch whose files together can never fit.
+    let first = send(&env, &c, pane, ("b", 0, 2), "b1.txt", 6, b"bbbbbb");
+    let e = c
+        .upload_begin(
+            pane,
+            "b2.txt",
+            6,
+            Some(UploadBatch {
+                id: "b".into(),
+                index: 1,
+                count: 2,
+            }),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("does not fit"), "{e}");
+    assert!(kept.join("a.txt").exists());
+    drop(first);
+}
+
+#[test]
+fn a_later_file_refused_ends_the_batch_at_once() {
+    use thurm_remote::transfer::{self, Cancel, Host, TransferError, Upload};
+    let env = Env::new("transfer-later-refused");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let small = dir.join("small.txt");
+    std::fs::write(&small, b"small").unwrap();
+    // Over the 4 GiB a file may be, without taking the space.
+    let huge = dir.join("huge.bin");
+    std::fs::File::create(&huge)
+        .unwrap()
+        .set_len(5 << 30)
+        .unwrap();
+    let host = Host {
+        client: &c,
+        socket: &env.socket,
+    };
+    let files = [Upload::Path(small), Upload::Path(huge)];
+    let e = transfer::upload(host, pane, &files, &Cancel::default(), |_| {}).unwrap_err();
+    assert!(
+        matches!(&e, TransferError::Remote(why) if why.contains("too large")),
+        "{e}"
+    );
+    // The first file landed; the batch goes now, not when it would have stalled.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !batches(&env, pane).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the batch was kept: {:?}",
+            batches(&env, pane)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(typed(&c, pane, &dir), "\n");
 }

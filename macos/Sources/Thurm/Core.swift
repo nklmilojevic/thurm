@@ -38,6 +38,8 @@ struct TransferOutcome {
     var unsupported = false
     /// A folder was among the files; nothing was sent.
     var folder = false
+    /// Nothing is at the download's path (as opposed to any other failure).
+    var notFound = false
     var notModified = false
     /// A download's file: its name, path on the host, size and version.
     var name: String?
@@ -54,6 +56,7 @@ struct TransferOutcome {
         cancelled = json["cancelled"] as? Bool ?? false
         unsupported = json["unsupported"] as? Bool ?? false
         folder = json["folder"] as? Bool ?? false
+        notFound = json["not_found"] as? Bool ?? false
         notModified = json["not_modified"] as? Bool ?? false
         if let info = json["info"] as? [String: Any] {
             name = info["name"] as? String

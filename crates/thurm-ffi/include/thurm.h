@@ -72,7 +72,8 @@ bool thurm_has_capability(thurm_client *client, const char *cap);
 /* Files to and from the connection's host, on streams through its daemon ("transfer"
  * capability; macOS only). Each runs on a thread of its own; `cb` gets JSON on that thread:
  * {"done":n,"total":n} as bytes go, then once {"finished":true,"error":null|"...",
- * "cancelled":bool,"unsupported":bool,"folder":bool,...}. Both return an id for the cancel
+ * "cancelled":bool,"unsupported":bool,"folder":bool,"not_found":bool (nothing at a
+ * download's path),...}. Both return an id for the cancel
  * calls, or 0 when nothing started (the final callback has come already). */
 typedef void (*thurm_transfer_cb)(void *ctx, const char *json);
 

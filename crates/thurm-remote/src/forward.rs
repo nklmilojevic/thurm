@@ -82,6 +82,8 @@ pub struct KnownPort {
 
 type OnChange = Arc<dyn Fn(Change) + Send + Sync>;
 type Conns = Arc<Mutex<HashMap<u64, TcpStream>>>;
+#[cfg(test)]
+type Hook = Box<dyn Fn() + Send>;
 type SocketFor = Arc<dyn Fn(&str) -> PathBuf + Send + Sync>;
 
 struct Entry {
@@ -133,6 +135,9 @@ pub struct Forwards {
     on_change: Arc<Mutex<Option<OnChange>>>,
     grace: Duration,
     max_connections: usize,
+    /// Runs in [`Forwards::sweep`] between finding forwards due and closing them (tests).
+    #[cfg(test)]
+    before_close: Arc<Mutex<Option<Hook>>>,
 }
 
 impl Default for Forwards {
@@ -159,6 +164,8 @@ impl Forwards {
             on_change: Default::default(),
             grace: GONE_GRACE,
             max_connections: MAX_CONNECTIONS,
+            #[cfg(test)]
+            before_close: Default::default(),
         }
     }
 
@@ -386,6 +393,11 @@ impl Forwards {
     /// access of programs connected already.
     fn close_why(&self, id: u64, why: &str) -> Option<Forward> {
         let e = self.inner.lock().open.remove(&id)?;
+        Some(self.closed(e, why))
+    }
+
+    /// Stops `e`, taken out of the open forwards, and reports it.
+    fn closed(&self, e: Entry, why: &str) -> Forward {
         stop_listening(&e);
         for conn in e.conns.lock().values() {
             let _ = conn.shutdown(Shutdown::Both);
@@ -394,7 +406,31 @@ impl Forwards {
             forward: e.forward.clone(),
             why: why.to_owned(),
         });
-        Some(e.forward)
+        e.forward
+    }
+
+    /// `host` points somewhere else now (its ssh target, socket or tailnet address changed):
+    /// its forwards close, and its kept connection and port lists are forgotten, so nothing
+    /// opened for the old destination reaches the new one. New forwards open on demand.
+    pub fn host_moved(&self, host: &str) {
+        let ids: Vec<u64> = {
+            let mut g = self.inner.lock();
+            g.hosts.remove(host);
+            g.controls.remove(host);
+            g.open
+                .values()
+                .filter(|e| e.forward.host == host)
+                .map(|e| e.forward.id)
+                .collect()
+        };
+        for id in ids {
+            self.close_why(id, "host");
+        }
+    }
+
+    /// Whether a connection to `host`'s daemon is kept.
+    pub fn connected(&self, host: &str) -> bool {
+        self.inner.lock().controls.contains_key(host)
     }
 
     /// Closes the forwards of hosts not in `hosts` (removed or disabled), and forgets their
@@ -473,20 +509,38 @@ impl Forwards {
     /// Closes the forwards whose port has been gone for the grace period with no connection
     /// open; the ones closed.
     pub fn sweep(&self, now: Instant) -> Vec<Forward> {
-        let due: Vec<u64> = self
+        let due = |e: &Entry| {
+            e.missing_since.is_some_and(|t| now >= t + self.grace)
+                && e.active.load(Ordering::Acquire) == 0
+        };
+        let ids: Vec<u64> = self
             .inner
             .lock()
             .open
             .values()
-            .filter(|e| {
-                e.missing_since.is_some_and(|t| now >= t + self.grace)
-                    && e.active.load(Ordering::Acquire) == 0
-            })
+            .filter(|e| due(e))
             .map(|e| e.forward.id)
             .collect();
-        due.into_iter()
-            .filter_map(|id| self.close_why(id, "gone"))
-            .collect()
+        #[cfg(test)]
+        if let Some(hook) = self.before_close.lock().as_ref() {
+            hook();
+        }
+        let mut closed = Vec::new();
+        for id in ids {
+            // Again, under the lock that removes it and that registers connections: the port
+            // may be back, or a connection accepted, since the forward was found due.
+            let e = {
+                let mut g = self.inner.lock();
+                match g.open.get(&id) {
+                    Some(e) if due(e) => g.open.remove(&id),
+                    _ => None,
+                }
+            };
+            if let Some(e) = e {
+                closed.push(self.closed(e, "gone"));
+            }
+        }
+        closed
     }
 
     /// Runs [`Forwards::sweep`] every second while a forward waits to close.
@@ -538,25 +592,33 @@ impl Forwards {
                     continue;
                 }
             };
-            // Any program on this machine can connect: a bounded number get a worker each.
-            if active.load(Ordering::Acquire) >= self.max_connections {
-                log::info!(
-                    "forward {host}:{}: {} connections open, refusing another",
-                    forward.remote_port,
-                    self.max_connections
-                );
-                let _ = conn.shutdown(Shutdown::Both);
-                continue;
-            }
             let Ok(registered) = conn.try_clone() else {
                 continue;
             };
             let conn_id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
-            conns.lock().insert(conn_id, registered);
-            active.fetch_add(1, Ordering::AcqRel);
-            // Closed between the accept and here: end it as `close_why` ended the others.
-            if stop.load(Ordering::Acquire) {
+            // Registered under the lock that closes forwards: a forward closed (or swept) meanwhile
+            // takes no more connections, and one with a connection is not swept.
+            let admitted = {
+                let g = self.inner.lock();
+                if !g.open.contains_key(&forward.id) {
+                    None
+                } else if !reserve(&active, self.max_connections) {
+                    // Any program on this machine can connect: a bounded number get a worker
+                    // each, counted across both loopbacks' listeners.
+                    log::info!(
+                        "forward {host}:{}: {} connections open, refusing another",
+                        forward.remote_port,
+                        self.max_connections
+                    );
+                    None
+                } else {
+                    conns.lock().insert(conn_id, registered);
+                    Some(())
+                }
+            };
+            if admitted.is_none() {
                 let _ = conn.shutdown(Shutdown::Both);
+                continue;
             }
             let me = self.clone();
             let (host, port) = (host.clone(), forward.remote_port);
@@ -730,6 +792,16 @@ fn bind(port: u16) -> std::io::Result<Listeners> {
         }
     }
     Err(last.unwrap_or_else(|| std::io::ErrorKind::AddrInUse.into()))
+}
+
+/// Takes a connection slot of `active` if fewer than `max` are taken: one atomic step, so the
+/// listeners of both loopbacks never admit more than `max` between them.
+fn reserve(active: &AtomicUsize, max: usize) -> bool {
+    active
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < max).then_some(n + 1)
+        })
+        .is_ok()
 }
 
 /// Stops `e`'s accept loops: the flag, then a connection to each loopback to wake its `accept`
@@ -1240,6 +1312,76 @@ mod tests {
         assert!(forwardable(cfg.remote("on").unwrap()).is_ok());
         let e = forwardable(cfg.remote("off").unwrap()).unwrap_err();
         assert!(e.contains("turned off"), "{e}");
+    }
+
+    #[test]
+    fn a_swept_forward_is_checked_again_before_it_closes() {
+        let dir = tempdir("sweep-race");
+        let f = forwards(&dir);
+        let t0 = Instant::now();
+        f.ports_changed_at(t0, "devbox", 1, vec![entry(5173)], true);
+        let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+        f.ports_changed_at(t0, "devbox", 1, vec![], true);
+        // Found due, then the port comes back before the close: it stays.
+        let back = f.clone();
+        *f.before_close.lock() = Some(Box::new(move || {
+            back.ports_changed_at(t0, "devbox", 1, vec![entry(5173)], true)
+        }));
+        assert!(f.sweep(t0 + GONE_GRACE).is_empty());
+        assert_eq!(f.list().len(), 1);
+        // Found due, then a connection is taken before the close: it stays too.
+        f.ports_changed_at(t0, "devbox", 1, vec![], true);
+        let busy = f.clone();
+        let id = fw.id;
+        *f.before_close.lock() = Some(Box::new(move || {
+            let g = busy.inner.lock();
+            assert!(reserve(&g.open[&id].active, MAX_CONNECTIONS));
+        }));
+        assert!(f.sweep(t0 + GONE_GRACE).is_empty());
+        assert_eq!(f.list().len(), 1);
+        // Nothing in between: it closes.
+        *f.before_close.lock() = None;
+        f.inner.lock().open[&id]
+            .active
+            .fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(f.sweep(t0 + GONE_GRACE), vec![fw]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_connection_cap_holds_against_racing_listeners() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(32));
+        let admitted: usize = (0..32)
+            .map(|_| {
+                let (active, start) = (active.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    (0..100).filter(|_| reserve(&active, 10)).count()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .sum();
+        assert_eq!(admitted, 10);
+        assert_eq!(active.load(Ordering::Acquire), 10);
+    }
+
+    #[test]
+    fn a_moved_host_loses_its_forwards_and_its_connection() {
+        let dir = tempdir("moved");
+        let f = forwards(&dir);
+        let (a, _) = f.open("devbox", 7400, Some(0)).unwrap();
+        let (b, _) = f.open("pi", 7400, Some(0)).unwrap();
+        f.ports_changed_at(Instant::now(), "devbox", 1, vec![entry(7400)], true);
+        f.host_moved("devbox");
+        assert_eq!(f.list(), vec![b.clone()]);
+        assert!(f.close(a.id).is_err());
+        assert!(f.known("devbox").is_empty());
+        assert!(!f.connected("devbox"));
+        f.close(b.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

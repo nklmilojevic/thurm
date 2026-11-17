@@ -25,6 +25,25 @@ struct Manager {
     supervisors: HashMap<String, Supervisor>,
     cb: thurm_remote_status_cb,
     ctx: Ctx,
+    /// Where each `[[remote]]` pointed at the last sync.
+    destinations: HashMap<String, Destination>,
+}
+
+/// Where a `[[remote]]` reaches its daemon: its ssh target, socket and tailnet address. A host
+/// whose destination changes under the same name is another machine to its forwards.
+type Destination = (String, Option<String>, Option<String>);
+
+fn destination(r: &thurm_config::RemoteConfig) -> Destination {
+    (r.host.clone(), r.socket.clone(), r.tailnet.clone())
+}
+
+/// The hosts of `cfg` that point elsewhere than they did in `before`.
+fn moved(before: &HashMap<String, Destination>, cfg: &Config) -> Vec<String> {
+    cfg.remote
+        .iter()
+        .filter(|r| before.get(&r.name).is_some_and(|d| *d != destination(r)))
+        .map(|r| r.name.clone())
+        .collect()
 }
 
 static MANAGER: Mutex<Option<Manager>> = Mutex::new(None);
@@ -103,6 +122,16 @@ fn sync(m: &mut Manager) {
         .filter(|r| r.enabled)
         .map(|r| r.name.as_str())
         .collect();
+    // Before the supervisors move their tunnels: a forward opened for the old destination must
+    // not start reaching the new one.
+    for name in moved(&m.destinations, &cfg) {
+        forwards().host_moved(&name);
+    }
+    m.destinations = cfg
+        .remote
+        .iter()
+        .map(|r| (r.name.clone(), destination(r)))
+        .collect();
     forwards().retain_hosts(&enabled);
     let gone: Vec<String> = m
         .supervisors
@@ -179,6 +208,7 @@ pub unsafe extern "C" fn thurm_remotes_start(on_status: thurm_remote_status_cb, 
         supervisors: HashMap::new(),
         cb: on_status,
         ctx: Ctx(ctx),
+        destinations: HashMap::new(),
     };
     sync(&mut m);
     *g = Some(m);
@@ -857,6 +887,45 @@ mod tests {
         })
         .unwrap_err();
         assert!(e.contains("not a Thurm device key"), "{e}");
+    }
+
+    #[test]
+    fn a_host_pointed_elsewhere_has_moved() {
+        let cfg = |devbox: &str| {
+            Config::parse(&format!(
+                "[[remote]]\nname = \"devbox\"\n{devbox}\n[[remote]]\nname = \"pi\"\nhost = \"pi\"\n"
+            ))
+            .unwrap()
+        };
+        let before: HashMap<String, Destination> = cfg("host = \"a\"")
+            .remote
+            .iter()
+            .map(|r| (r.name.clone(), destination(r)))
+            .collect();
+        // Settings that keep the destination: not moved.
+        assert!(
+            moved(
+                &before,
+                &cfg("host = \"a\"\nforward_links = false\nclipboard_read = \"never\"")
+            )
+            .is_empty()
+        );
+        assert!(moved(&before, &cfg("host = \"a\"\nenabled = false")).is_empty());
+        // Another ssh target, socket or tailnet address under the same name: moved.
+        assert_eq!(moved(&before, &cfg("host = \"b\"")), ["devbox"]);
+        assert_eq!(
+            moved(&before, &cfg("host = \"a\"\nsocket = \"/run/x.sock\"")),
+            ["devbox"]
+        );
+        assert_eq!(
+            moved(
+                &before,
+                &cfg("host = \"a\"\ntailnet = \"wss://devbox.tail1.ts.net/v1/connect\"")
+            ),
+            ["devbox"]
+        );
+        // A host added since: nothing to move.
+        assert!(moved(&HashMap::new(), &cfg("host = \"b\"")).is_empty());
     }
 
     #[test]

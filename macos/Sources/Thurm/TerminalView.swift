@@ -76,7 +76,14 @@ final class TerminalView: NSView, NSTextInputClient {
     private var lastMouseLocation: NSPoint?
     private var hoverLink: UInt16 = 0
     private var hoverSpan: (row: Int, start: Int, end: Int)?
-    private var previewURL: URL?
+    private var previewURL: URL? {
+        // A remote file stays in the cache while Quick Look shows it.
+        didSet {
+            guard previewURL != oldValue else { return }
+            if let oldValue { RemoteFileCache.shared.release(oldValue) }
+            if let previewURL { RemoteFileCache.shared.hold(previewURL) }
+        }
+    }
     private weak var previewPanel: QLPreviewPanel?
 
     // Animation state.
@@ -1553,9 +1560,19 @@ final class TerminalView: NSView, NSTextInputClient {
         if id == nil { hideUploadToast() }
     }
 
-    /// The upload toast, made or updated: stays until the upload ends.
-    private func showUploadToast(_ text: String) {
+    /// Whether the upload's toast, with its Cancel, is showing.
+    var showsUploadToast: Bool {
+        guard let t = uploadToast else { return false }
+        return t.box === toastView && t.box.superview === self && t.box.alphaValue > 0
+    }
+
+    /// The upload toast, made or updated: stays until the upload ends. A transient toast shown
+    /// meanwhile must not take it down with its fade.
+    func showUploadToast(_ text: String) {
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(fadeToast), object: nil)
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(removeToast), object: nil)
         if let t = uploadToast, t.box === toastView {
+            t.box.alphaValue = 1
             t.label.stringValue = text
             t.label.sizeToFit()
             t.box.frame.size.width = t.label.frame.width + 90
@@ -1563,7 +1580,6 @@ final class TerminalView: NSView, NSTextInputClient {
             return
         }
         toastView?.removeFromSuperview()
-        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(fadeToast), object: nil)
         let chrome = SessionManager.shared.config.chrome
         let label = NSTextField(labelWithString: text)
         label.font = NSFont.systemFont(ofSize: 11, weight: .medium)
