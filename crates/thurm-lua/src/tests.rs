@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 /// Forward opens to the host `flaky` so far (the first fails).
 static FLAKY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FLAKY2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 use super::*;
 
@@ -56,6 +57,13 @@ impl Host for FakeHost {
             "forwards.open"
                 if params["host"] == "flaky"
                     && FLAKY.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
+            {
+                Err("devbox is not connected".into())
+            }
+            // Another whose first forward fails.
+            "forwards.open"
+                if params["host"] == "flaky2"
+                    && FLAKY2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
             {
                 Err("devbox is not connected".into())
             }
@@ -764,6 +772,11 @@ fn the_dev_server_example_opens_only_new_servers() {
                   "ports": [{ "port": 4200, "address": "*", "pid": 9, "command": "node_modules/.bin/vite" }] }));
     // A forward that fails once (the host's tunnel down a moment) is tried again while listed.
     ports(Some("flaky"), 9, &[7000], true, false);
+    // A forward that fails, then its server stops and starts again before the try again: the
+    // restart opens it, and the earlier try does not open it a second time.
+    ports(Some("flaky2"), 10, &[7100], true, false);
+    ports(Some("flaky2"), 10, &[], true, false);
+    ports(Some("flaky2"), 10, &[7100], true, false);
     // 4000 really stops (a complete list) and starts again: news.
     ports(None, 3, &[4001], true, false);
     ports(None, 3, &[4000, 4001], true, false);
@@ -789,6 +802,8 @@ fn the_dev_server_example_opens_only_new_servers() {
         json!(["open", "http://localhost:4300/"]),
         json!(["open", "http://localhost:4200/"]),
         json!(["flaky", 7000, true]),
+        json!(["flaky2", 7100, true]),
+        json!(["flaky2", 7100, true]),
         json!(["open", "http://localhost:4000/"]),
         json!(["flaky", 7000, true]),
     ];

@@ -85,8 +85,10 @@ fn ports_changed(id: u64, ports: &[PortEntry], complete: bool, initial: bool) ->
 }
 
 /// `ports_changed` of a remote host's pane.
-fn remote_payload(host: &str, pane: u64, list: &RemoteList) -> Value {
-    let mut payload = ports_changed(pane, &list.ports, list.complete, list.initial);
+/// `ports_changed` of remote `host`'s `pane`; `initial` as given (what its daemon said, or that
+/// a new subscriber hears it as running already).
+fn remote_payload(host: &str, pane: u64, list: &RemoteList, initial: bool) -> Value {
+    let mut payload = ports_changed(pane, &list.ports, list.complete, initial);
     payload["host"] = host.into();
     payload
 }
@@ -138,11 +140,7 @@ fn remote_lists(all: &HashMap<u64, RemoteLists>, app: Option<u64>) -> Vec<Value>
     app.and_then(|a| all.get(&a))
         .into_iter()
         .flatten()
-        .map(|((host, pane), list)| {
-            let mut payload = ports_changed(*pane, &list.ports, list.complete, true);
-            payload["host"] = host.as_str().into();
-            payload
-        })
+        .map(|((host, pane), list)| remote_payload(host, *pane, list, true))
         .collect()
 }
 
@@ -269,48 +267,15 @@ impl Daemon {
                 }
                 Ok(Value::Null)
             }
-            method::EVENTS_SUBSCRIBE => {
-                let names = names(&p);
-                // For `ports_changed`, the remote lists' lock first (as `ports.report` takes it,
-                // before the registry's), held until the replay below is sent: a report cannot
-                // reach a new subscriber between its registration and its first lists. Other
-                // subscriptions don't wait on reports.
-                let all = names
-                    .iter()
-                    .any(|n| n == PORTS_CHANGED)
-                    .then(|| self.ext.remote_ports.lock());
-                // Only a new subscriber joins: one that has the lists keeps hearing changes.
-                let joins = {
-                    let mut reg = self.ext_registry(client)?;
-                    let joins = names.iter().any(|n| n == PORTS_CHANGED)
-                        && !reg.has(client.id, PORTS_CHANGED);
-                    // Waiting for its first lists before it is a listener: no change of a look
-                    // under way reaches it first.
-                    if joins {
-                        self.ext.ports_joining.lock().insert(client.id);
-                    }
-                    if let Err(e) = reg.subscribe(client.id, names) {
-                        self.ext.ports_joining.lock().remove(&client.id);
-                        return Err(e);
-                    }
-                    joins
-                };
-                // Its panes' ports are watched only while someone hears of them. A new
-                // subscriber joins the watch as a client does: the next look sends it alone
-                // every pane's list that has ports (`ext_ports_to`), as running already. Of
-                // remote hosts, it
-                // gets the lists the app relayed so far, the same way.
-                if joins && let Some(all) = &all {
-                    self.ports.subscribed(Arc::downgrade(self), client.id);
-                    for payload in remote_lists(all, self.forwarding_app_id()) {
-                        send_ext(client, notice::EVENT, &payload);
-                    }
-                }
-                drop(all);
-                Ok(Value::Null)
-            }
+            method::EVENTS_SUBSCRIBE => self.ext_subscribe(client, names(&p)),
             method::EVENTS_UNSUBSCRIBE => {
-                self.ext.registry.lock().unsubscribe(client.id, &names(&p));
+                let names = names(&p);
+                let stops_ports = names.is_empty() || names.iter().any(|n| n == PORTS_CHANGED);
+                self.ext.registry.lock().unsubscribe(client.id, &names);
+                // No longer waiting for first lists it will not hear.
+                if stops_ports {
+                    self.ext.ports_joining.lock().remove(&client.id);
+                }
                 Ok(Value::Null)
             }
             method::EVENTS_EMIT => {
@@ -467,7 +432,11 @@ impl Daemon {
                     std::thread::sleep(delay);
                 }
                 // `initial`: listening already when the app connected to the host, not news.
-                self.emit(PORTS_CHANGED, None, remote_payload(host, pane, &list));
+                self.emit(
+                    PORTS_CHANGED,
+                    None,
+                    remote_payload(host, pane, &list, list.initial),
+                );
                 drop(all);
                 Ok(Value::Null)
             }
@@ -505,6 +474,48 @@ impl Daemon {
         }
     }
 
+    /// `events.subscribe`: `client` hears `names` from now on.
+    ///
+    /// Locks, always in this order: the remote lists' (`ports.report` takes it first too), the
+    /// registry's, then `ports_joining`. For `ports_changed`, the remote lists' lock is held from
+    /// before the registration until the replay is sent, so a report cannot reach a new
+    /// subscriber between the two; other subscriptions don't wait on reports.
+    fn ext_subscribe(
+        self: &Arc<Self>,
+        client: &Arc<Client>,
+        names: Vec<String>,
+    ) -> Result<Value, String> {
+        let ports = names.iter().any(|n| n == PORTS_CHANGED);
+        let all = ports.then(|| self.ext.remote_ports.lock());
+        // Only a new subscriber joins: one that has the lists keeps hearing changes.
+        let joins = {
+            let mut reg = self.ext_registry(client)?;
+            let joins = ports && !reg.has(client.id, PORTS_CHANGED);
+            // Waiting for its first lists before it is a listener: no change of a look under way
+            // reaches it first.
+            if joins {
+                self.ext.ports_joining.lock().insert(client.id);
+            }
+            if let Err(e) = reg.subscribe(client.id, names) {
+                self.ext.ports_joining.lock().remove(&client.id);
+                return Err(e);
+            }
+            joins
+        };
+        // Its panes' ports are watched only while someone hears of them. A new subscriber joins
+        // the watch as a client does: the next look sends it alone the list of every pane with
+        // ports (`ext_ports_to`), as running already. Of remote hosts, it gets the lists the app
+        // relayed so far, the same way.
+        if joins && let Some(all) = &all {
+            self.ports.subscribed(Arc::downgrade(self), client.id);
+            for payload in remote_lists(all, self.forwarding_app_id()) {
+                send_ext(client, notice::EVENT, &payload);
+            }
+        }
+        drop(all);
+        Ok(Value::Null)
+    }
+
     /// The app that holds plugins' forwards, connected or leaving now.
     fn forwarding_app_id(&self) -> Option<u64> {
         self.ext.forwards.lock().keys().min().copied()
@@ -523,6 +534,7 @@ impl Daemon {
                     complete: false,
                     initial: false,
                 },
+                false,
             );
             payload["gone"] = true.into();
             self.deliver_event(PORTS_CHANGED, &payload);
@@ -898,7 +910,10 @@ impl Daemon {
                 if heard.is_some_and(|h| h.ports == list.ports && h.complete == list.complete) {
                     continue;
                 }
-                self.deliver_event(PORTS_CHANGED, &remote_payload(host, *pane, list));
+                self.deliver_event(
+                    PORTS_CHANGED,
+                    &remote_payload(host, *pane, list, list.initial),
+                );
             }
         }
         for f in gone.iter().flatten() {

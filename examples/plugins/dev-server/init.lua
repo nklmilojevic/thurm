@@ -80,11 +80,19 @@ end
 -- tried again a few times while the server is still listed.
 local RETRY_SECONDS = tonumber(thurm.settings.retry_seconds) or 5
 local RETRIES = 3
+-- The try under way for a pane's port (key#port): a later open of it, or the port going away,
+-- ends the tries of an earlier one.
+local tries = {}
 
-local function open(host, port, key, attempt)
+local function open(host, port, key, attempt, token)
   if not host then
     thurm.exec({ "open", "http://localhost:" .. port .. "/" })
     return
+  end
+  local id = key .. "#" .. port
+  if not token then
+    token = (tries[id] or 0) + 1
+    tries[id] = token
   end
   local ok, err = pcall(thurm.forward.open, host, port, { browse = true })
   if ok then
@@ -94,8 +102,8 @@ local function open(host, port, key, attempt)
   thurm.warn("cannot forward " .. host .. ":" .. port .. ": " .. tostring(err))
   if attempt < RETRIES then
     thurm.after(RETRY_SECONDS, function()
-      if listed[key] and listed[key][port] then
-        open(host, port, key, attempt + 1)
+      if tries[id] == token and listed[key] and listed[key][port] then
+        open(host, port, key, attempt + 1, token)
       end
     end)
   end
@@ -134,6 +142,12 @@ thurm.on("ports_changed", function(ev)
       unsure[key] = true
     end
     return
+  end
+  -- A port that went: tries of it end (it opens anew if it comes back).
+  for port in pairs(before) do
+    if not now[port] then
+      tries[key .. "#" .. port] = (tries[key .. "#" .. port] or 0) + 1
+    end
   end
   for port in pairs(now) do
     if not before[port] then
