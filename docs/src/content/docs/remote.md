@@ -364,7 +364,7 @@ Launch presets in a remote workspace (⌘⇧P, ⌘⇧A) are the host's.
   the `PATH` they are given. Only the clipboard selection is this Mac's
   clipboard: PRIMARY and SECONDARY are refused, and with them xclip's and
   xsel's default (use `xclip -selection clipboard`, `xsel -b`). Text is UTF-8:
-  another charset, or X11's `STRING`, is refused. What is checked, and where:
+  another charset, or X11's `STRING` (`xclip -noutf8`), is refused. What is checked, and where:
 
   | | On the host (its daemon) | On this Mac (the app) |
   | --- | --- | --- |

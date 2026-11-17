@@ -219,7 +219,11 @@ pub fn parse(
                         }
                     }
                     Some("sensitive") => expires = Some("sensitive"),
-                    Some("quiet" | "silent" | "verbose" | "noutf8") => {}
+                    Some("quiet" | "silent" | "verbose") => {}
+                    // xclip's STRING (Latin-1) target: the app has UTF-8 text only.
+                    Some("noutf8") => {
+                        return Err("xclip: -noutf8 is not supported: text is UTF-8".into());
+                    }
                     Some("help" | "version") => {
                         return Ok(Action::Help(
                             "xclip (thurm): -i | -o [-selection c] [-t TYPE] [-f] [-r]",
@@ -800,6 +804,10 @@ mod tests {
             assert!(mime(t).is_err(), "{t}");
         }
         assert!(xc(&["-o", "-t", "text/plain;charset=iso-8859-1"]).is_err());
+        for args in [&["-noutf8"][..], &["-o", "-noutf8"], &["-i", "-noutf8"]] {
+            let e = xc(args).expect_err(&format!("{args:?}"));
+            assert!(e.contains("-noutf8"), "{args:?}: {e}");
+        }
         assert!(p("wl-paste", &["-t", "STRING"]).is_err());
         assert!(p("wl-copy", &["--type", "text/plain;charset=latin1"]).is_err());
     }
