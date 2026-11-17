@@ -65,6 +65,29 @@ struct RemoteStatus {
     }
 }
 
+/// What a cmd-click on a link does, as `policy::link` answers.
+enum LinkAction: Equatable {
+    case open
+    /// Through a forward of `port` from the pane's host.
+    case forward(port: Int?)
+    case reveal(path: String?)
+    case ask
+    case copyPath(path: String?)
+    case ignore
+
+    init(json: Any?) {
+        let d = json as? [String: Any]
+        switch jsonString(d?["action"]) {
+        case "open": self = .open
+        case "forward": self = .forward(port: jsonInt(d?["port"]))
+        case "reveal": self = .reveal(path: jsonString(d?["path"]))
+        case "ask": self = .ask
+        case "copy_path": self = .copyPath(path: jsonString(d?["path"]))
+        default: self = .ignore
+        }
+    }
+}
+
 /// A handoff (`thurm handoff`), as the registry keeps it.
 struct HandoffInfo {
     var id: String
@@ -127,6 +150,8 @@ final class Remotes {
         }
     }
     private(set) var handoffs: [String: HandoffInfo] = [:]
+    /// Every open forward (`forwardsChanged`).
+    var forwards: [ForwardInfo] = []
     /// The last fetch of a handoff failed (shown on its tab until the next one succeeds).
     var handoffErrors: [String: String] = [:]
 
@@ -196,6 +221,10 @@ final class Remotes {
     // MARK: Tunnel state
 
     fileprivate func statusChanged(_ json: Any?) {
+        if let d = json as? [String: Any], let list = d["forwards"] as? [Any] {
+            forwardsChanged(list, change: d["change"] as? [String: Any])
+            return
+        }
         guard let s = RemoteStatus(json: json) else { return }
         let before = statuses[s.name]
         statuses[s.name] = s
@@ -504,26 +533,27 @@ extension SessionManager {
 
     /// Cmd-click on a link (`policy::link`): web and mail links open; other schemes ask; file://
     /// paths are revealed in Finder for this Mac's panes, and offered for copying for a remote
-    /// pane (they are the host's), never opened.
+    /// pane (they are the host's), never opened. A remote pane's link to its own localhost opens
+    /// through a forward of that port.
     func openLink(_ url: URL, from pane: PaneKey, in window: NSWindow?) {
         var call: [String: Any] = ["op": "link", "url": url.absoluteString]
         if pane.isRemote { call["host"] = pane.host }
-        let v = Core.shared.remoteCall(call) as? [String: Any]
-        switch jsonString(v?["action"]) {
-        case "open":
+        switch LinkAction(json: Core.shared.remoteCall(call)) {
+        case .open:
             NSWorkspace.shared.open(url)
-        case "reveal":
-            let path = jsonString(v?["path"]) ?? url.path
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-        case "ask":
+        case .forward:
+            openForwarded(host: pane.host, url: url.absoluteString)
+        case .reveal(let path):
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path ?? url.path)])
+        case .ask:
             let alert = NSAlert()
             alert.messageText = pane.isRemote ? "Open this link from \(pane.host)?" : "Open this link?"
             alert.informativeText = url.absoluteString
             alert.addButton(withTitle: "Open")
             alert.addButton(withTitle: "Cancel")
             if alert.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(url) }
-        case "copy_path":
-            let path = jsonString(v?["path"]) ?? url.path
+        case .copyPath(let path):
+            let path = path ?? url.path
             let alert = NSAlert()
             alert.messageText = "This is a file on \(pane.host)"
             alert.informativeText = "\(path)\n\nFiles on a remote host are not opened on this Mac."
@@ -534,7 +564,7 @@ extension SessionManager {
                 pb.clearContents()
                 pb.setString(path, forType: .string)
             }
-        default:
+        case .ignore:
             break
         }
     }
@@ -561,6 +591,17 @@ extension SessionManager {
         for host in config.remoteNames where !Core.shared.isConnected(host) {
             items.append(CommandPalette.Item(title: "Reconnect to \(host)", detail: Remotes.shared.phaseLabel(host)) {
                 thurm_remote_kick(host, true)
+            })
+        }
+        if forwardHost != nil {
+            items.append(CommandPalette.Item(title: "Forward Port…", detail: "open a remote host's port on this Mac") {
+                SessionManager.shared.showForwardPortPicker()
+            })
+        }
+        for f in Remotes.shared.forwards {
+            items.append(CommandPalette.Item(title: "Close Forward \(f.host):\(f.remotePort)",
+                                             detail: "localhost:\(f.localPort)") {
+                _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: f.id)])
             })
         }
         if !config.remoteNames.isEmpty {

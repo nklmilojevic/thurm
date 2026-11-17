@@ -230,6 +230,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         RemoteHosts.shared.show()
     }
 
+    @objc func forwardPort(_ sender: Any?) {
+        SessionManager.shared.showForwardPortPicker()
+    }
+
     @objc func showProcesses(_ sender: Any?) {
         ProcessPanel.shared.show()
     }
@@ -334,6 +338,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         if menuItem.action == #selector(tabForward(_:)) {
             return SessionManager.shared.canGoForwardInTabHistory
+        }
+        if menuItem.action == #selector(forwardPort(_:)) {
+            return SessionManager.shared.forwardHost != nil
         }
         if menuItem.action == #selector(renameWorkspace(_:)) || menuItem.action == #selector(closeWorkspace(_:)) {
             return SessionManager.shared.currentWorkspace != nil

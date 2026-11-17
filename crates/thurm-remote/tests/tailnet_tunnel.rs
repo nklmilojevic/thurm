@@ -53,6 +53,7 @@ fn remote(name: &str, tailnet: &str) -> RemoteConfig {
         enabled: true,
         clipboard_read: Default::default(),
         tailnet: Some(tailnet.into()),
+        forward_links: true,
     }
 }
 

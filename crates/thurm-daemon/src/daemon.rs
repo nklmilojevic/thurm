@@ -361,6 +361,8 @@ pub struct Client {
     pub ext: AtomicBool,
     /// Shows what plugins ask the user ([`thurm_proto::CAP_EXT_UI`]).
     pub ext_ui: AtomicBool,
+    /// Hears which ports panes listen on ([`thurm_proto::CAP_PORT_EVENTS`]).
+    pub port_events: AtomicBool,
     /// The plugin this client is the daemon's connection for.
     pub plugin: Mutex<Option<String>>,
     /// Removed from the daemon: nothing it asks takes effect any more.
@@ -550,6 +552,8 @@ pub struct Daemon {
     clients: Mutex<HashMap<u64, Arc<Client>>>,
     /// Byte streams: tickets not yet used, and the count open.
     pub streams: crate::streams::Streams,
+    /// Watches the ports panes listen on while a client wants to hear of them.
+    pub ports: crate::ports::Watcher,
     layout: Mutex<Option<String>>,
     next_pane: AtomicU64,
     next_client: AtomicU64,
@@ -620,6 +624,7 @@ impl Daemon {
             panes: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             streams: Default::default(),
+            ports: Default::default(),
             layout: Mutex::new(None),
             next_pane: AtomicU64::new(1),
             next_client: AtomicU64::new(1),
@@ -707,6 +712,7 @@ impl Daemon {
             // Phones with the app open take the pane's notices down themselves.
             Event::PaneRead { pane } => self.push.read(*pane, &open()),
             Event::PaneClosed { pane } => {
+                self.ports.poke();
                 // Its notices would open nothing.
                 self.unread.lock().remove(pane);
                 self.push.read(*pane, &open());
@@ -717,6 +723,7 @@ impl Daemon {
             Event::PaneExited { pane, .. } => {
                 self.unread.lock().remove(pane);
                 self.push.read(*pane, &open());
+                self.ports.poke();
             }
             _ => {}
         }
@@ -814,6 +821,7 @@ impl Daemon {
             floating_minimize: AtomicBool::new(false),
             ext: AtomicBool::new(false),
             ext_ui: AtomicBool::new(false),
+            port_events: AtomicBool::new(false),
             plugin: Mutex::new(None),
             gone: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),
@@ -1054,6 +1062,7 @@ impl Daemon {
         });
         self.panes.lock().insert(id, pane.clone());
         self.session_dirty.store(true, Ordering::Relaxed);
+        self.ports.poke();
 
         spawn_writer(id, writer, input_rx);
         if read {
@@ -1401,12 +1410,14 @@ impl Daemon {
                         }
                     }
                     TermEvent::CommandStart => {
+                        self.ports.poke();
                         st.info.at_prompt = false;
                         st.command_started = Some(Instant::now());
                         info_changed = true;
                     }
                     TermEvent::CommandLine(c) => st.command_line = Some(c),
                     TermEvent::CommandFinished(code) => {
+                        self.ports.poke();
                         st.info.last_exit_status = code;
                         info_changed = true;
                         let started = st.command_started.take();
@@ -2518,6 +2529,7 @@ impl Daemon {
             slow @ (Request::Complete { .. }
             | Request::SearchPaths { .. }
             | Request::Processes { .. }
+            | Request::Ports { .. }
             | Request::ApplyLayout { .. }) => {
                 let daemon = self.clone();
                 let client = client.clone();
@@ -2719,6 +2731,10 @@ impl Daemon {
                 }
                 if has(thurm_proto::CAP_EXT) {
                     client.ext.store(true, Ordering::Relaxed);
+                }
+                if has(thurm_proto::CAP_PORT_EVENTS) {
+                    client.port_events.store(true, Ordering::Relaxed);
+                    self.ports.subscribed(Arc::downgrade(self));
                 }
                 // Plugins' questions go only to a desktop app of this user on this machine:
                 // a tailnet caller or a phone saying so is not trusted with them.
@@ -3463,6 +3479,22 @@ impl Daemon {
             Request::StreamOpen { .. } => {
                 Err("StreamOpen is only the first request after Hello on a new connection".into())
             }
+            Request::Ports { pane } => {
+                self.ports.poke();
+                let roots: Vec<(PaneId, u32)> = crate::ports::Host::pane_roots(&**self)
+                    .into_iter()
+                    .filter(|(id, _)| pane.is_none_or(|p| p == *id))
+                    .collect();
+                if let Some(p) = pane
+                    && roots.is_empty()
+                    && self.pane(p).is_none()
+                {
+                    return Err(format!("no such pane: {p}"));
+                }
+                crate::ports::look(&roots)
+                    .map(|seen| Response::Ports(crate::ports::as_response(seen)))
+                    .ok_or_else(|| "could not list the processes".to_owned())
+            }
         }
     }
 
@@ -3781,6 +3813,42 @@ fn command_name(line: &str) -> Option<&str> {
                 .is_some_and(|(k, _)| !k.is_empty() && !k.contains('/'))
         })
         .map(command_word)
+}
+
+impl crate::ports::Host for Daemon {
+    fn wants_ports(&self) -> bool {
+        self.clients
+            .lock()
+            .values()
+            .any(|c| c.port_events.load(Ordering::Relaxed) && !c.gone.load(Ordering::Relaxed))
+    }
+
+    fn pane_roots(&self) -> Vec<(PaneId, u32)> {
+        self.all_panes()
+            .iter()
+            .filter_map(|p| {
+                let st = p.state.lock();
+                if st.info.alive && !st.closed {
+                    Some((p.id, st.info.pid?))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn send_ports(&self, event: Event) {
+        let clients: Vec<_> = self.clients.lock().values().cloned().collect();
+        for c in clients {
+            if c.port_events.load(Ordering::Relaxed) {
+                c.send(ServerMessage::Event(event.clone()));
+            }
+        }
+    }
+
+    fn watcher(&self) -> &crate::ports::Watcher {
+        &self.ports
+    }
 }
 
 /// Whether the shell's command line `line` runs `word` (a title's command).
@@ -4428,6 +4496,7 @@ mod tests {
             floating_minimize: AtomicBool::new(false),
             ext: AtomicBool::new(false),
             ext_ui: AtomicBool::new(false),
+            port_events: AtomicBool::new(false),
             plugin: Mutex::new(None),
             gone: AtomicBool::new(false),
             deflate: Arc::new(AtomicBool::new(false)),

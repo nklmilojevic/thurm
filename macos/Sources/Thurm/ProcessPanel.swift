@@ -1,8 +1,8 @@
 import AppKit
 
 /// Shell > Processes & Ports: what runs in every pane and which TCP ports it listens on (dev
-/// servers, databases), like tty7's process panel. Click a row to focus its pane; double-click
-/// one with a port to open http://localhost:PORT.
+/// servers, databases). Click a row to focus its pane; double-click one with a port to open
+/// http://localhost:PORT, through a forward for a remote host's.
 final class ProcessPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
     static let shared = ProcessPanel()
 
@@ -130,10 +130,22 @@ final class ProcessPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate, 
 
     @objc private func doubleClicked(_ sender: Any?) {
         let r = table.clickedRow
-        // A remote host's ports are not on this Mac's localhost.
-        guard r >= 0, r < rows.count, !rows[r].pane.isRemote, let port = rows[r].ports.first,
-              let url = URL(string: "http://localhost:\(port)") else { return }
-        NSWorkspace.shared.open(url)
+        guard r >= 0, r < rows.count, let port = rows[r].ports.first else { return }
+        switch ProcessPanel.opening(pane: rows[r].pane, port: port) {
+        case .local(let url): NSWorkspace.shared.open(url)
+        case .forward(let host, let port): SessionManager.shared.openForwarded(host: host, port: port)
+        }
+    }
+
+    /// How a row's port opens: this Mac's on its localhost; a remote host's through a forward.
+    enum Opening: Equatable {
+        case local(URL)
+        case forward(host: HostId, port: Int)
+    }
+
+    static func opening(pane: PaneKey, port: Int) -> Opening {
+        if pane.isRemote { return .forward(host: pane.host, port: port) }
+        return .local(URL(string: "http://localhost:\(port)")!)
     }
 
     func windowWillClose(_ notification: Notification) {

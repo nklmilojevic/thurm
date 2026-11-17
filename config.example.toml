@@ -339,4 +339,5 @@ web = false
 # socket = "/run/user/1000/thurm-1000/thurmd.sock"   # discovered when unset
 # enabled = true
 # clipboard_read = "ask"   # "ask", "always" or "never"
+# forward_links = true     # cmd-click on a localhost link forwards that port here
 # tailnet = "wss://devbox.YOUR-TAILNET.ts.net/v1/connect"   # over Tailscale instead of ssh

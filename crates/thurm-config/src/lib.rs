@@ -149,6 +149,10 @@ pub struct RemoteConfig {
     /// installing, the doctor and handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tailnet: Option<String>,
+    /// Cmd-click on a `localhost` link in this host's panes opens it through a forward of that
+    /// port to this Mac, instead of this Mac's own port.
+    #[serde(default = "default_true")]
+    pub forward_links: bool,
 }
 
 /// Where a `[[remote]]`'s `tailnet` points.
@@ -1958,6 +1962,9 @@ pub fn with_remote_added(text: &str, remote: &RemoteConfig) -> Result<String, St
             ClipboardRead::Ask => "ask",
         });
     }
+    if !remote.forward_links {
+        t["forward_links"] = toml_edit::value(false);
+    }
     tables.push(t);
     let out = doc.to_string();
     check_edit(text, &out)?;
@@ -2335,6 +2342,7 @@ clipboard_read = "always"
             enabled: true,
             clipboard_read: ClipboardRead::Ask,
             tailnet: None,
+            forward_links: true,
         };
         let added = with_remote_added(text, &r).unwrap();
         assert!(added.starts_with("# my config") && added.contains("# big"));
@@ -2361,6 +2369,7 @@ clipboard_read = "always"
             enabled: true,
             clipboard_read: ClipboardRead::Ask,
             tailnet: Some("wss://bastion.tail1234.ts.net/v1/connect".into()),
+            forward_links: true,
         };
         let added = with_remote_added("", &r).unwrap();
         assert!(added.contains("tailnet = \"wss://bastion.tail1234.ts.net/v1/connect\""));

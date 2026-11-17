@@ -83,6 +83,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_PATH_SEARCH,
     CAP_EXT,
     CAP_STREAMS,
+    CAP_PORTS,
 ];
 
 /// The daemon accepts `SearchPaths` and returns `PathMatches` only for that request.
@@ -95,6 +96,14 @@ pub const CAP_EXT: &str = "ext";
 /// The daemon carries byte streams on a second connection ([`stream`]): it answers
 /// [`Request::DialBegin`] and takes [`Request::StreamOpen`].
 pub const CAP_STREAMS: &str = "streams";
+
+/// The daemon answers [`Request::Ports`]: the TCP ports the programs in its panes listen on.
+pub const CAP_PORTS: &str = "ports";
+
+/// Sent only by a client that wants [`Event::PortsChanged`] (the Mac app's connections to remote
+/// hosts, `thurm remote forward`): while one is connected, the daemon watches its panes' ports.
+/// Not in [`CAPABILITIES`], so other clients don't start that watch.
+pub const CAP_PORT_EVENTS: &str = "port-events";
 
 /// Sent only by an app that shows what plugins ask for ([`ext::UiRequest`]: a toast, a picker,
 /// a text field, a confirmation) and answers with [`ext::method::UI_REPLY`]. The daemon takes
@@ -522,6 +531,11 @@ pub enum Request {
     StreamOpen {
         ticket: String,
     },
+    /// The ports `pane`'s programs listen on (`None`: every pane's). Answers
+    /// [`Response::Ports`]. Requires [`CAP_PORTS`].
+    Ports {
+        pane: Option<PaneId>,
+    },
 }
 
 /// How [`Request::OwnPanes`] treats a pane another client holds.
@@ -630,6 +644,7 @@ pub enum Response {
         ticket: String,
         expires_ms: u32,
     },
+    Ports(Vec<PanePorts>),
 }
 
 /// A pane that had keyboard focus in a UI (the Mac app, the iOS app).
@@ -777,6 +792,15 @@ pub enum Event {
     Ext {
         name: String,
         payload: String,
+    },
+    /// The ports `pane`'s programs listen on changed: the whole list, at most one event a second
+    /// per pane. `complete` is false when part of its process tree could not be read. A pane
+    /// whose first list is empty sends nothing; one that exits sends an empty list. Sent only to
+    /// clients with [`CAP_PORT_EVENTS`].
+    PortsChanged {
+        pane: PaneId,
+        ports: Vec<PortEntry>,
+        complete: bool,
     },
 }
 
@@ -953,6 +977,27 @@ pub struct ProcEntry {
     pub command: String,
     /// TCP ports it listens on.
     pub ports: Vec<u16>,
+}
+
+/// The ports a pane's programs listen on ([`Request::Ports`]).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PanePorts {
+    pub pane: PaneId,
+    pub ports: Vec<PortEntry>,
+    /// False when part of the pane's process tree could not be read.
+    pub complete: bool,
+}
+
+/// A TCP port a program in a pane listens on.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PortEntry {
+    pub port: u16,
+    /// The address it listens on: `127.0.0.1`, `::1`, `0.0.0.0`, `::`, or another; empty when
+    /// the system did not say.
+    pub address: String,
+    pub pid: u32,
+    /// The listening process's command line.
+    pub command: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]

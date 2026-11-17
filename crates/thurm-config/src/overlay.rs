@@ -399,6 +399,7 @@ mod tests {
             enabled: true,
             clipboard_read: crate::ClipboardRead::Ask,
             tailnet: None,
+            forward_links: true,
         }
     }
 

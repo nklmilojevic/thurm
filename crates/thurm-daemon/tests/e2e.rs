@@ -42,6 +42,9 @@ mod extensions;
 #[path = "e2e/streams.rs"]
 mod streams;
 
+#[path = "e2e/ports.rs"]
+mod ports;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;

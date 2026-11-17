@@ -125,6 +125,22 @@ enum RemoteCmd {
         #[arg(long, short = 'y', requires = "fix")]
         yes: bool,
     },
+    /// The TCP ports programs in a host's panes listen on.
+    Ports { name: String },
+    /// Open a host's port on this machine (127.0.0.1) until interrupted, and print its URL.
+    Forward {
+        name: String,
+        /// The host's port, or a link to its localhost (`http://localhost:5173/app`).
+        #[arg(value_name = "PORT|URL")]
+        target: String,
+        /// The local port (default: the host's port number when free, else one remembered or
+        /// free).
+        #[arg(long, value_name = "PORT")]
+        local: Option<u16>,
+        /// Print the URL without opening it in the browser.
+        #[arg(long)]
+        no_open: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -982,6 +998,13 @@ fn run(cli: Cli) -> R {
             RemoteCmd::Doctor { name, fix, yes } => {
                 remote::doctor_cmd(name.as_deref(), fix, yes.then_some(true), json)
             }
+            RemoteCmd::Ports { name } => remote::ports_cmd(&name, json),
+            RemoteCmd::Forward {
+                name,
+                target,
+                local,
+                no_open,
+            } => remote::forward_cmd(&name, &target, local, !no_open, json),
         },
         Cmd::Handoff {
             preset,
