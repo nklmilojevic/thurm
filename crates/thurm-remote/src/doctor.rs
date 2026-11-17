@@ -92,6 +92,15 @@ const AGENTS: &[Agent] = &[
     },
 ];
 
+/// `case` patterns for a link that leads to a Thurm install, current or older: `$C` (the
+/// `thurm` on PATH as found), Thurm's own install, and Nix profiles and store paths. A link to
+/// anything else, even a program named `thurm`, is another program's.
+macro_rules! thurm_link_patterns {
+    () => {
+        "\"$C\"|\"$TH/.local/share/thurm/bin/thurm\"|\"$HOME/.nix-profile/bin/thurm\"|\"$TH/.nix-profile/bin/thurm\"|/nix/store/*/bin/thurm|/nix/var/nix/profiles/*/bin/thurm|/run/current-system/sw/bin/thurm|/etc/profiles/per-user/*/bin/thurm"
+    };
+}
+
 /// Everything besides the install plan: PATH link, agents, sign-in, hooks and the skill. Agents are also
 /// looked up through the login shell (npm and bun install into places a plain ssh command
 /// does not have on PATH), except under `THURM_BASE_PATH` (the loopback tests).
@@ -108,10 +117,12 @@ const PROBE: &str = concat!(
     "{ [ -f \"${CLAUDE_CONFIG_DIR:-$TH/.claude}/.credentials.json\" ] || [ -n \"$ANTHROPIC_API_KEY\" ]; } && echo claude_login=1; ",
     "command -v thurm >/dev/null 2>&1 && echo \"hooks=$(HOME=\"$TH\" thurm hooks status --json 2>/dev/null | head -n 1)\"; ",
     "command -v thurm >/dev/null 2>&1 && echo \"skill=$(HOME=\"$TH\" thurm skill status --json 2>/dev/null | head -n 1)\"; ",
-    "B=\"$(command -v thurm 2>/dev/null)\"; [ -n \"$B\" ] && B=\"$(readlink -f \"$B\")\"; n=0; o=; ",
+    "C=\"$(command -v thurm 2>/dev/null)\"; B=; [ -n \"$C\" ] && B=\"$(readlink -f \"$C\")\"; n=0; o=; ",
     "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do L=\"$TH/.local/share/thurm/shims/$t\"; ",
     "if [ -L \"$L\" ] && [ -n \"$B\" ] && [ \"$(readlink -f \"$L\" 2>/dev/null)\" = \"$B\" ]; then n=$((n+1)); ",
-    "elif { [ -e \"$L\" ] || [ -L \"$L\" ]; } && [ \"$(basename \"$(readlink \"$L\" 2>/dev/null)x\")\" != thurmx ]; then o=\"$o $t\"; fi; done; ",
+    "elif [ -e \"$L\" ] || [ -L \"$L\" ]; then case \"$(readlink \"$L\" 2>/dev/null)\" in ",
+    thurm_link_patterns!(),
+    ") ;; *) o=\"$o $t\";; esac; fi; done; ",
     "echo \"shims=$n\"; echo \"shims_other=${o# }\"; ",
     "true"
 );
@@ -656,16 +667,17 @@ const LINK: &str = concat!(
     "mkdir -p \"$TH/.local/bin\" && ln -sfn \"$B\" \"$L\""
 );
 
-/// Links the clipboard tools to `thurm` in the shims directory. Replaces only links to a
-/// `thurm` (an older install's); anything else there is refused before a link changes.
+/// Links the clipboard tools to `thurm` in the shims directory. Replaces only links to a Thurm
+/// install (`thurm_link_patterns`); anything else there is refused before a link changes.
 const SHIMS: &str = concat!(
     "TH=\"${THURM_HOME:-$HOME}\"; ",
     "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
-    "B=\"$(command -v thurm)\" || { echo \"Thurm is not installed\" >&2; exit 3; }; ",
+    "B=\"$(command -v thurm)\" || { echo \"Thurm is not installed\" >&2; exit 3; }; C=\"$B\"; ",
     "S=\"$TH/.local/share/thurm/shims\"; ",
     "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do ",
     "if [ -e \"$S/$t\" ] || [ -L \"$S/$t\" ]; then case \"$(readlink \"$S/$t\" 2>/dev/null)\" in ",
-    "thurm|*/thurm) ;; *) echo \"$S/$t is another program; remove it to install the clipboard tools\" >&2; exit 3;; esac; fi; done; ",
+    thurm_link_patterns!(),
+    ") ;; *) echo \"$S/$t is another program; remove it to install the clipboard tools\" >&2; exit 3;; esac; fi; done; ",
     "mkdir -p \"$S\" || exit 1; ",
     "for t in pbcopy pbpaste xclip xsel wl-copy wl-paste; do ln -sfn \"$B\" \"$S/$t\" || exit 1; done"
 );
@@ -967,11 +979,16 @@ mod tests {
         std::fs::create_dir_all(&shims).unwrap();
         let probe = || parse(&String::from_utf8_lossy(&run_script(PROBE, &th).stdout));
 
-        // Six links, none to this thurm: dangling, an older install's, other programs.
-        symlink(th.join("gone/thurm"), shims.join("pbcopy")).unwrap();
-        symlink("/opt/old/bin/thurm", shims.join("pbpaste")).unwrap();
+        // Six links, none to this thurm: older installs' (dangling now), and other programs,
+        // one of them named thurm.
+        symlink(th.join(".nix-profile/bin/thurm"), shims.join("pbcopy")).unwrap();
+        symlink(
+            "/nix/store/0000-thurm-0.1.0/bin/thurm",
+            shims.join("pbpaste"),
+        )
+        .unwrap();
         symlink("/bin/sh", shims.join("xclip")).unwrap();
-        symlink("/bin/sh", shims.join("xsel")).unwrap();
+        symlink("/opt/other/bin/thurm", shims.join("xsel")).unwrap();
         symlink("/bin/sh", shims.join("wl-copy")).unwrap();
         std::fs::write(shims.join("wl-paste"), "mine").unwrap();
         let p = probe();
@@ -990,8 +1007,13 @@ mod tests {
             "another program's link is kept"
         );
         assert_eq!(
+            std::fs::read_link(shims.join("xsel")).unwrap(),
+            Path::new("/opt/other/bin/thurm"),
+            "another program named thurm is kept too"
+        );
+        assert_eq!(
             std::fs::read_link(shims.join("pbcopy")).unwrap(),
-            th.join("gone/thurm"),
+            th.join(".nix-profile/bin/thurm"),
             "nothing changes while anything is refused"
         );
 

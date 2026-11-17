@@ -412,10 +412,11 @@ final class Remotes {
     /// The most a clipboard tool gets (the daemon refuses more).
     static let clipMax = 32 * 1024 * 1024
 
-    /// The types a clipboard tool can paste from `pb`.
+    /// The types a clipboard tool can paste from `pb`, without reading them: a large or lazily
+    /// provided clipboard is fetched only for a paste the user allowed.
     static func clipboardTypes(_ pb: NSPasteboard) -> [String] {
         var types: [String] = []
-        if pb.string(forType: .string) != nil { types.append(clipText) }
+        if pb.availableType(from: [.string]) != nil { types.append(clipText) }
         if pb.availableType(from: [.png, .tiff]) != nil { types.append(clipPNG) }
         return types
     }

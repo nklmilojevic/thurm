@@ -606,6 +606,8 @@ pub struct Daemon {
     next_clip: AtomicU64,
     /// Clipboard tools' pastes waiting for an app's answer.
     pending_clips: Mutex<HashMap<u64, clip::PendingClip>>,
+    /// The pastes on threads of their own, at most `clip::MAX_PENDING`.
+    clip_slots: Arc<clip::Slots>,
 }
 
 impl Daemon {
@@ -670,6 +672,7 @@ impl Daemon {
             plugins: plugins::Plugins::default(),
             next_clip: AtomicU64::new(1),
             pending_clips: Mutex::new(HashMap::new()),
+            clip_slots: Arc::default(),
         });
         daemon.ext_config_applied();
         daemon
@@ -2456,17 +2459,22 @@ impl Daemon {
                 return;
             }
             // The app may ask the user first.
-            Request::ClipboardGet { pane, mime } => {
-                let daemon = self.clone();
-                let client = client.clone();
-                std::thread::spawn(move || {
-                    let result = daemon.clipboard_get(client.id, pane, mime);
-                    if id != 0 {
-                        client.send(ServerMessage::Response { id, result });
-                    }
-                });
-                return;
-            }
+            // Admitted (a slot taken) before its thread is made.
+            Request::ClipboardGet { pane, mime } => match self.clipboard_admit(pane, &mime) {
+                Err(e) => Err(e),
+                Ok(slot) => {
+                    let daemon = self.clone();
+                    let client = client.clone();
+                    std::thread::spawn(move || {
+                        let result = daemon.clipboard_get(client.id, pane, mime);
+                        drop(slot);
+                        if id != 0 {
+                            client.send(ServerMessage::Response { id, result });
+                        }
+                    });
+                    return;
+                }
+            },
             // The Tailscale helper can take a while (starting the node, signing out).
             req @ (Request::TailscaleEnable { .. }
             | Request::TailscaleDisable

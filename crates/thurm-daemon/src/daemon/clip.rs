@@ -10,6 +10,31 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// At most this many pastes wait at once.
 const MAX_PENDING: usize = 64;
 
+/// The pastes waiting now, each on a thread of its own: a slot is taken before the thread is
+/// made, so a client sending pastes without waiting for answers cannot make more threads.
+#[derive(Default)]
+pub(super) struct Slots(std::sync::atomic::AtomicUsize);
+
+/// One of [`Slots`], given back when dropped.
+pub(super) struct Slot(Arc<Slots>);
+
+impl Slots {
+    fn take(self: &Arc<Self>, max: usize) -> Option<Slot> {
+        self.0
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Slot(self.clone()))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub(super) struct PendingClip {
     ui: u64,
     reply: Sender<Result<Vec<u8>, String>>,
@@ -26,6 +51,13 @@ fn answer_timeout() -> Duration {
 
 impl Daemon {
     pub(super) fn clipboard_set(&self, pane: PaneId, text: String) -> Result<Response, String> {
+        // As for an OSC 52 copy: this host's config can turn them off.
+        if !matches!(
+            self.config.read().terminal.osc52,
+            thurm_config::Osc52Mode::Copy | thurm_config::Osc52Mode::CopyPaste
+        ) {
+            return Err("copies to the clipboard are off on this host (terminal.osc52)".into());
+        }
         if text.len() > thurm_proto::CLIP_MAX {
             return Err("the text is larger than 32 MiB".into());
         }
@@ -51,6 +83,32 @@ impl Daemon {
         pick_ui(last, &candidates).and_then(|id| clients.get(&id).cloned())
     }
 
+    /// Checks a paste and takes a slot for it, on the reader's thread: what is refused here
+    /// gets its answer without a thread being made.
+    pub(super) fn clipboard_admit(&self, pane: PaneId, mime: &str) -> Result<Slot, String> {
+        // As for an OSC 52 read: this host's config can turn them off, the type list too.
+        if !matches!(
+            self.config.read().terminal.osc52,
+            thurm_config::Osc52Mode::Paste | thurm_config::Osc52Mode::CopyPaste
+        ) {
+            return Err("pastes from the clipboard are off on this host (terminal.osc52)".into());
+        }
+        if ![
+            thurm_proto::CLIP_TEXT,
+            thurm_proto::CLIP_PNG,
+            thurm_proto::CLIP_TARGETS,
+        ]
+        .contains(&mime)
+        {
+            return Err(format!("unsupported clipboard type {mime}"));
+        }
+        self.pane(pane).ok_or("no such pane")?;
+        self.clip_slots
+            .take(MAX_PENDING)
+            .ok_or_else(|| "too many clipboard requests are waiting".into())
+    }
+
+    /// A paste [`Daemon::clipboard_admit`] let through: asks the app and waits for it.
     pub(super) fn clipboard_get(
         &self,
         caller: u64,
@@ -155,7 +213,19 @@ fn pick_ui(last: Option<u64>, candidates: &[(u64, bool)]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::pick_ui;
+    use std::sync::Arc;
+
+    use super::{Slots, pick_ui};
+
+    #[test]
+    fn slots_are_bounded_and_given_back() {
+        let slots = Arc::new(Slots::default());
+        let held: Vec<_> = (0..3).map(|_| slots.take(3).expect("free")).collect();
+        assert!(slots.take(3).is_none(), "all taken");
+        drop(held);
+        let again: Vec<_> = (0..3).map(|_| slots.take(3).expect("given back")).collect();
+        assert_eq!(again.len(), 3);
+    }
 
     #[test]
     fn the_app_that_looked_last_is_asked() {

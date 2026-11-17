@@ -29,6 +29,26 @@ final class ClipboardToolsTests: XCTestCase {
         XCTAssertNil(Remotes.clipboardData(pb, mime: "image/png"))
     }
 
+    /// Listing the types must not fetch them: a lazy provider is asked only for a paste.
+    func testListingTypesReadsNothing() {
+        final class Provider: NSObject, NSPasteboardItemDataProvider {
+            var asked = 0
+            func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem,
+                            provideDataForType type: NSPasteboard.PasteboardType) {
+                asked += 1
+                item.setString("lazy", forType: type)
+            }
+        }
+        let provider = Provider()
+        let item = NSPasteboardItem()
+        item.setDataProvider(provider, forTypes: [.string])
+        pb.writeObjects([item])
+        XCTAssertEqual(Remotes.clipboardTypes(pb), ["text/plain"])
+        XCTAssertEqual(provider.asked, 0, "the types are listed without fetching the text")
+        XCTAssertEqual(Remotes.clipboardData(pb, mime: "text/plain"), Data("lazy".utf8))
+        XCTAssertEqual(provider.asked, 1)
+    }
+
     func testAnEmptyClipboardHasNothing() {
         XCTAssertEqual(Remotes.clipboardTypes(pb), [])
         XCTAssertNil(Remotes.clipboardData(pb, mime: "text/plain"))

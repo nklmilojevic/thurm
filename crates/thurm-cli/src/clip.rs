@@ -92,6 +92,19 @@ fn xclip_opt(arg: &str) -> Option<&'static str> {
     Some(if name == "s" { "selection" } else { first })
 }
 
+/// The value of option `opt`: the next argument, unless there is none or it is another option
+/// (`xclip -selection -o` must not take `-o` for the selection and then copy).
+fn operand<'a>(
+    it: &mut std::slice::Iter<'a, String>,
+    tool: &str,
+    opt: &str,
+) -> Result<&'a String, String> {
+    match it.as_slice().first() {
+        Some(v) if !v.starts_with('-') => Ok(it.next().expect("peeked")),
+        _ => Err(format!("{tool}: {opt} needs a value")),
+    }
+}
+
 /// Parses the arguments `tool` was run with (without its name).
 pub fn parse(tool: &str, args: &[String], stdin_tty: bool) -> Result<Action, String> {
     let mut it = args.iter();
@@ -113,12 +126,10 @@ pub fn parse(tool: &str, args: &[String], stdin_tty: bool) -> Result<Action, Str
                     Some("out") => out = true,
                     Some("filter") => echo = true,
                     Some("rmlastnl") => trim = true,
-                    Some("target") => {
-                        target = Some(it.next().ok_or("xclip: -target needs a type")?.clone())
-                    }
+                    Some("target") => target = Some(operand(&mut it, "xclip", a)?.clone()),
                     // Every selection is this Mac's one clipboard.
                     Some("selection" | "loops" | "display" | "wait") => {
-                        it.next();
+                        operand(&mut it, "xclip", a)?;
                     }
                     Some("quiet" | "silent" | "verbose" | "noutf8" | "sensitive") => {}
                     Some("help" | "version") => {
@@ -174,7 +185,7 @@ pub fn parse(tool: &str, args: &[String], stdin_tty: bool) -> Result<Action, Str
                         'c' | 'd' => clear = true,
                         'b' | 'p' | 's' | 'k' | 'x' | 'n' | 'v' | 'z' | 'a' | 'f' => {}
                         'l' | 't' | 'w' => {
-                            it.next();
+                            operand(&mut it, "xsel", a)?;
                         }
                         'h' => return Ok(Action::Help("xsel (thurm): -b [-i | -o | -c]")),
                         _ => return Err(format!("xsel: unknown option -{f}")),
@@ -213,13 +224,13 @@ pub fn parse(tool: &str, args: &[String], stdin_tty: bool) -> Result<Action, Str
                     "-o" | "--paste-once" | "-f" | "--foreground" | "-p" | "--primary"
                     | "--regular" => {}
                     "-t" | "--type" => {
-                        let t = mime(it.next().ok_or("wl-copy: --type needs a type")?)?;
+                        let t = mime(operand(&mut it, "wl-copy", a)?)?;
                         if t != CLIP_TEXT {
                             return Err("wl-copy: only text can be copied to the clipboard".into());
                         }
                     }
                     "-s" | "--seat" => {
-                        it.next();
+                        operand(&mut it, "wl-copy", a)?;
                     }
                     "-h" | "--help" | "-v" | "--version" => {
                         return Ok(Action::Help("wl-copy (thurm): [-n] [TEXT...] or stdin"));
@@ -256,11 +267,9 @@ pub fn parse(tool: &str, args: &[String], stdin_tty: bool) -> Result<Action, Str
                     "-n" | "--no-newline" => newline = false,
                     "-l" | "--list-types" => list = true,
                     "-p" | "--primary" => {}
-                    "-t" | "--type" => {
-                        target = Some(it.next().ok_or("wl-paste: --type needs a type")?.clone())
-                    }
+                    "-t" | "--type" => target = Some(operand(&mut it, "wl-paste", a)?.clone()),
                     "-s" | "--seat" => {
-                        it.next();
+                        operand(&mut it, "wl-paste", a)?;
                     }
                     "-w" | "--watch" => return Err("wl-paste: --watch is not supported".into()),
                     "-h" | "--help" | "-v" | "--version" => {
@@ -386,24 +395,46 @@ fn get(pane: PaneId, mime: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
     }
 }
 
+/// Copies `text` (one trailing newline dropped with `trim`) through `set`, then, with `echo`
+/// (`xclip -f`), writes what was copied to `out`: nothing when the copy failed.
+fn copy_then_echo(
+    mut text: String,
+    trim: bool,
+    echo: bool,
+    set: impl FnOnce(String) -> Result<(), Box<dyn std::error::Error>>,
+    out: &mut impl Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if trim && text.ends_with('\n') {
+        text.pop();
+    }
+    let copied = echo.then(|| text.clone());
+    set(text)?;
+    if let Some(t) = copied {
+        out.write_all(t.as_bytes())?;
+    }
+    Ok(())
+}
+
 fn perform(action: Action) -> Result<(), Box<dyn std::error::Error>> {
     let mut out = std::io::stdout().lock();
     match action {
         Action::Help(usage) => writeln!(out, "{usage}")?,
         Action::Copy { text, trim, echo } => {
             let pane = pane()?;
-            let mut text = match text {
+            let text = match text {
                 Some(t) => t,
                 None => read_stdin()?,
             };
-            if echo {
-                out.write_all(text.as_bytes())?;
-            }
-            if trim && text.ends_with('\n') {
-                text.pop();
-            }
-            let c = crate::connect(false)?;
-            c.request(Request::ClipboardSet { pane, text })?;
+            copy_then_echo(
+                text,
+                trim,
+                echo,
+                |text| {
+                    crate::connect(false)?.request(Request::ClipboardSet { pane, text })?;
+                    Ok(())
+                },
+                &mut out,
+            )?;
         }
         Action::Paste { mime, newline } => {
             let mut data = get(pane()?, &mime)?;
@@ -493,6 +524,65 @@ mod tests {
         assert!(p("xclip", &["-t"]).is_err());
         assert!(p("xclip", &["file.txt"]).is_err());
         assert!(p("xclip", &["-bogus"]).is_err());
+    }
+
+    #[test]
+    fn options_without_their_value_are_refused() {
+        for (tool, args) in [
+            ("xclip", &["-selection"][..]),
+            ("xclip", &["-selection", "-o"]),
+            ("xclip", &["-display"]),
+            ("xclip", &["-loops", "-i"]),
+            ("xclip", &["-o", "-t"]),
+            ("xclip", &["-t", "-o"]),
+            ("xsel", &["-l"]),
+            ("xsel", &["--logfile", "-o"]),
+            ("xsel", &["-bt", "-o"]),
+            ("wl-copy", &["--type"]),
+            ("wl-copy", &["-t", "-n"]),
+            ("wl-copy", &["--seat", "-n"]),
+            ("wl-paste", &["--type", "-n"]),
+            ("wl-paste", &["-s"]),
+        ] {
+            let e = p(tool, args).expect_err(&format!("{tool} {args:?}"));
+            assert!(e.contains("needs a value"), "{tool} {args:?}: {e}");
+        }
+        assert_eq!(p("xclip", &["-selection", "c", "-o"]), Ok(paste(CLIP_TEXT)));
+        assert_eq!(p("xsel", &["-l", "/tmp/log", "-o"]), Ok(paste(CLIP_TEXT)));
+        assert_eq!(p("wl-paste", &["-s", "seat0"]).map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn the_filter_echoes_only_what_was_copied() {
+        let mut out = Vec::new();
+        let failed = super::copy_then_echo(
+            "hi\n".into(),
+            true,
+            true,
+            |_| Err("refused".into()),
+            &mut out,
+        );
+        assert!(failed.is_err());
+        assert!(out.is_empty(), "a failed copy echoes nothing");
+
+        let mut copied = None;
+        super::copy_then_echo(
+            "hi\n".into(),
+            true,
+            true,
+            |t| {
+                copied = Some(t);
+                Ok(())
+            },
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(copied.as_deref(), Some("hi"));
+        assert_eq!(out, b"hi", "the text that was copied, trimmed");
+
+        let mut out = Vec::new();
+        super::copy_then_echo("x".into(), false, false, |_| Ok(()), &mut out).unwrap();
+        assert!(out.is_empty(), "no echo without -f");
     }
 
     #[test]

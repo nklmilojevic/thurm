@@ -45,6 +45,17 @@ fn no_query(rx: &Receiver<Event>) {
     }
 }
 
+/// An `Env` whose daemon has `terminal.osc52 = osc52`: copies and pastes need it to allow them.
+fn clip_env(name: &str, osc52: &str) -> Env {
+    let env = Env::new(name);
+    std::fs::write(
+        env.dir.join("config/config.toml"),
+        format!("[terminal]\nshell = [\"/bin/sh\"]\nosc52 = \"{osc52}\"\n"),
+    )
+    .unwrap();
+    env
+}
+
 fn focus(c: &Client, pane: PaneId) {
     c.request(Request::Focus {
         pane,
@@ -60,7 +71,7 @@ fn answer(c: &Client, id: u64, data: Option<Vec<u8>>) -> Result<Response, String
 
 #[test]
 fn a_paste_asks_the_app_that_focused_the_pane_last() {
-    let env = Env::new("clip-route");
+    let env = clip_env("clip-route", "copy-paste");
     let _daemon = env.start();
     let (a, a_rx) = env.connect();
     let (b, b_rx) = env.connect();
@@ -108,7 +119,7 @@ fn a_paste_asks_the_app_that_focused_the_pane_last() {
 
 #[test]
 fn a_refusal_reaches_the_tool() {
-    let env = Env::new("clip-deny");
+    let env = clip_env("clip-deny", "copy-paste");
     let _daemon = env.start();
     let (app, rx) = env.connect();
     let pane = create(&app, &env.dir);
@@ -123,7 +134,7 @@ fn a_refusal_reaches_the_tool() {
 
 #[test]
 fn a_paste_gives_up_when_the_app_says_nothing() {
-    let env = Env::new("clip-timeout");
+    let env = clip_env("clip-timeout", "copy-paste");
     let _daemon = env.start_with(&[("THURM_CLIP_TIMEOUT_MS", Path::new("400"))]);
     let (app, rx) = env.connect();
     let pane = create(&app, &env.dir);
@@ -143,7 +154,7 @@ fn a_paste_gives_up_when_the_app_says_nothing() {
 
 #[test]
 fn clipboards_over_32_mib_are_refused() {
-    let env = Env::new("clip-cap");
+    let env = clip_env("clip-cap", "copy-paste");
     let _daemon = env.start();
     let (app, rx) = env.connect();
     let pane = create(&app, &env.dir);
@@ -167,7 +178,7 @@ fn clipboards_over_32_mib_are_refused() {
 
 #[test]
 fn a_copy_goes_to_the_apps_like_osc_52() {
-    let env = Env::new("clip-copy");
+    let env = clip_env("clip-copy", "copy-paste");
     let _daemon = env.start();
     let (app, rx) = env.connect();
     let pane = create(&app, &env.dir);
@@ -199,8 +210,102 @@ fn a_copy_goes_to_the_apps_like_osc_52() {
 }
 
 #[test]
+fn this_hosts_osc52_setting_applies_to_clipboard_tools() {
+    for (osc52, copy, paste) in [
+        ("disabled", false, false),
+        ("copy", true, false),
+        ("paste", false, true),
+        ("copy-paste", true, true),
+    ] {
+        let env = clip_env(&format!("clip-osc52-{osc52}"), osc52);
+        let _daemon = env.start();
+        let (app, rx) = env.connect();
+        let pane = create(&app, &env.dir);
+        focus(&app, pane);
+        let tool = tool(&env);
+        let copied = tool.request(Request::ClipboardSet {
+            pane,
+            text: "x".into(),
+        });
+        assert_eq!(copied.is_ok(), copy, "{osc52}: {copied:?}");
+        for mime in [CLIP_TEXT, CLIP_TARGETS] {
+            let paste_thread = get(&tool, pane, mime);
+            if paste {
+                let (_, id, _) = query(&rx).expect("asked");
+                answer(&app, id, Some(b"y".to_vec())).unwrap();
+                assert!(paste_thread.join().unwrap().is_ok(), "{osc52} {mime}");
+            } else {
+                let e = paste_thread.join().unwrap().unwrap_err();
+                assert!(e.contains("terminal.osc52"), "{osc52} {mime}: {e}");
+                no_query(&rx);
+            }
+        }
+    }
+}
+
+/// A client sending pastes without waiting for answers gets the ones over the limit refused at
+/// once, and the app is asked only for those let through.
+#[test]
+fn a_flood_of_pastes_is_bounded() {
+    let env = clip_env("clip-flood", "copy-paste");
+    let _daemon = env.start_with(&[("THURM_CLIP_TIMEOUT_MS", Path::new("20000"))]);
+    let (app, rx) = env.connect();
+    let pane = create(&app, &env.dir);
+    focus(&app, pane);
+    let mut s = UnixStream::connect(&env.socket).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let hello = Request::Hello {
+        client: "e2e-flood".into(),
+        version: PROTOCOL_VERSION,
+        ui: false,
+        capabilities: CAPABILITIES.iter().map(|c| (*c).to_owned()).collect(),
+    };
+    let mut frames = codec::encode(&Envelope {
+        id: 1,
+        request: hello,
+    })
+    .unwrap();
+    const SENT: u64 = 200;
+    for id in 2..2 + SENT {
+        frames.extend(
+            codec::encode(&Envelope {
+                id,
+                request: Request::ClipboardGet {
+                    pane,
+                    mime: CLIP_TEXT.into(),
+                },
+            })
+            .unwrap(),
+        );
+    }
+    let started = Instant::now();
+    s.write_all(&frames).unwrap();
+    let mut refused = 0;
+    while refused < SENT - 64 {
+        let frame = codec::read_frame(&mut s).unwrap().expect("daemon closed");
+        if let ServerMessage::Response { result: Err(e), .. } = codec::decode(&frame).unwrap() {
+            assert!(e.contains("too many"), "{e}");
+            refused += 1;
+        }
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "refused at once, not after the answer timeout"
+    );
+    let mut asked = 0;
+    while query(&rx).is_some() {
+        asked += 1;
+        if asked == 64 {
+            break;
+        }
+    }
+    assert_eq!(asked, 64);
+    no_query(&rx);
+}
+
+#[test]
 fn older_apps_and_phones_are_never_asked() {
-    let env = Env::new("clip-old");
+    let env = clip_env("clip-old", "copy-paste");
     let _daemon = env.start();
     let (app, _) = env.connect();
     let pane = create(&app, &env.dir);
