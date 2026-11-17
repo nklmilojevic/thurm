@@ -25,6 +25,21 @@ use thurm_proto::{PaneId, PortEntry};
 /// How long a forward outlives its port's disappearance from every complete list.
 pub const GONE_GRACE: Duration = Duration::from_secs(30);
 
+/// The most connections one forward carries at once; more are closed as they arrive.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// Whether `r` may have forwards: a host that is turned off has none.
+pub fn forwardable(r: &thurm_config::RemoteConfig) -> Result<(), String> {
+    if r.enabled {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is turned off (enabled = false in its [[remote]])",
+            r.name
+        ))
+    }
+}
+
 /// An open forward.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Forward {
@@ -34,6 +49,9 @@ pub struct Forward {
     pub remote_port: u16,
     /// The port on this Mac's `127.0.0.1`.
     pub local: u16,
+    /// The link it was last opened for (`https://localhost:8443/app`), to open it again as such.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 /// What changed, for whoever shows forwards.
@@ -59,6 +77,7 @@ pub struct KnownPort {
 }
 
 type OnChange = Arc<dyn Fn(Change) + Send + Sync>;
+type Conns = Arc<Mutex<HashMap<u64, TcpStream>>>;
 type SocketFor = Arc<dyn Fn(&str) -> PathBuf + Send + Sync>;
 
 struct Entry {
@@ -66,6 +85,8 @@ struct Entry {
     stop: Arc<AtomicBool>,
     /// Connections being carried now.
     active: Arc<AtomicUsize>,
+    /// Those connections' local sockets, shut down when the forward closes.
+    conns: Conns,
     /// The port was in one of the host's lists at some point: it may close on its own.
     listed: bool,
     /// Since when every complete list of the host has lacked the port.
@@ -107,6 +128,7 @@ pub struct Forwards {
     socket_for: SocketFor,
     on_change: Arc<Mutex<Option<OnChange>>>,
     grace: Duration,
+    max_connections: usize,
 }
 
 impl Default for Forwards {
@@ -132,7 +154,14 @@ impl Forwards {
             socket_for: Arc::new(socket_for),
             on_change: Default::default(),
             grace: GONE_GRACE,
+            max_connections: MAX_CONNECTIONS,
         }
+    }
+
+    /// Like [`Forwards::new`], carrying at most `n` connections per forward (tests).
+    pub fn with_max_connections(mut self, n: usize) -> Forwards {
+        self.max_connections = n;
+        self
     }
 
     /// Like [`Forwards::new`], closing forwards `grace` after their port went away (tests).
@@ -196,7 +225,7 @@ impl Forwards {
             return Err("port 0 is not a port to forward".into());
         }
         if let Some(f) = self.find(host, remote_port) {
-            return Ok((f, false));
+            return existing(f, preferred);
         }
         let listener = match preferred {
             Some(p) => bind(p).map_err(|e| format!("cannot listen on 127.0.0.1:{p}: {e}"))?,
@@ -219,7 +248,7 @@ impl Forwards {
             .values()
             .find(|e| e.forward.host == host && e.forward.remote_port == remote_port)
         {
-            return Ok((e.forward.clone(), false));
+            return existing(e.forward.clone(), preferred);
         }
         g.next_id += 1;
         let forward = Forward {
@@ -227,9 +256,11 @@ impl Forwards {
             host: host.to_owned(),
             remote_port,
             local,
+            link: None,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
+        let conns: Conns = Default::default();
         let listed = g.hosts.get(host).is_some_and(|h| h.lists(remote_port));
         g.open.insert(
             forward.id,
@@ -237,6 +268,7 @@ impl Forwards {
                 forward: forward.clone(),
                 stop: stop.clone(),
                 active: active.clone(),
+                conns: conns.clone(),
                 listed,
                 missing_since: None,
             },
@@ -246,7 +278,7 @@ impl Forwards {
         let (h, accepting) = (host.to_owned(), forward.clone());
         let spawned = std::thread::Builder::new()
             .name(format!("forward-{host}-{remote_port}"))
-            .spawn(move || me.accept_loop(listener, h, accepting, stop, active));
+            .spawn(move || me.accept_loop(listener, h, accepting, stop, active, conns));
         if let Err(e) = spawned {
             self.inner.lock().open.remove(&forward.id);
             return Err(format!("cannot start the forward: {e}"));
@@ -276,6 +308,13 @@ impl Forwards {
         }
     }
 
+    /// Forward `id` was opened for `link`: reopening it from a list opens that link.
+    pub fn set_link(&self, id: u64, link: &str) {
+        if let Some(e) = self.inner.lock().open.get_mut(&id) {
+            e.forward.link = Some(link.to_owned());
+        }
+    }
+
     fn find(&self, host: &str, remote_port: u16) -> Option<Forward> {
         self.inner
             .lock()
@@ -291,9 +330,14 @@ impl Forwards {
             .ok_or_else(|| format!("no forward {id}"))
     }
 
+    /// Stops accepting and ends every connection the forward carries: closing it revokes the
+    /// access of programs connected already.
     fn close_why(&self, id: u64, why: &str) -> Option<Forward> {
         let e = self.inner.lock().open.remove(&id)?;
         stop_listening(&e);
+        for conn in e.conns.lock().values() {
+            let _ = conn.shutdown(Shutdown::Both);
+        }
         self.changed(Change::Closed {
             forward: e.forward.clone(),
             why: why.to_owned(),
@@ -342,16 +386,36 @@ impl Forwards {
         } else {
             h.panes.insert(pane, (ports, complete));
         }
-        let Inner { open, hosts, .. } = &mut *g;
-        let h = &hosts[host];
-        for e in open.values_mut().filter(|e| e.forward.host == host) {
-            if h.lists(e.forward.remote_port) {
-                e.listed = true;
-                e.missing_since = None;
-            } else if e.listed && h.all_complete() {
-                e.missing_since.get_or_insert(now);
-            }
+        recompute(&mut g, host, now);
+    }
+
+    /// The connection to `host` dropped: what its panes listened on is unknown until the next
+    /// [`Forwards::ports_snapshot`]. Its forwards stay, and none of them closes meanwhile.
+    pub fn host_disconnected(&self, host: &str) {
+        let mut g = self.inner.lock();
+        g.hosts.remove(host);
+        for e in g.open.values_mut().filter(|e| e.forward.host == host) {
+            e.missing_since = None;
         }
+    }
+
+    /// Every pane's list of `host` at once ([`thurm_proto::Response::Ports`], asked for on
+    /// connecting): replaces all that was known of the host, panes gone meanwhile included.
+    pub fn ports_snapshot(&self, host: &str, panes: Vec<thurm_proto::PanePorts>) {
+        self.ports_snapshot_at(Instant::now(), host, panes);
+        self.ensure_sweeping();
+    }
+
+    /// [`Forwards::ports_snapshot`] at `now` (tests).
+    pub fn ports_snapshot_at(&self, now: Instant, host: &str, panes: Vec<thurm_proto::PanePorts>) {
+        let mut g = self.inner.lock();
+        let h = g.hosts.entry(host.to_owned()).or_default();
+        h.panes = panes
+            .into_iter()
+            .filter(|p| !(p.ports.is_empty() && p.complete))
+            .map(|p| (p.pane, (p.ports, p.complete)))
+            .collect();
+        recompute(&mut g, host, now);
     }
 
     /// Closes the forwards whose port has been gone for the grace period with no connection
@@ -407,7 +471,9 @@ impl Forwards {
         forward: Forward,
         stop: Arc<AtomicBool>,
         active: Arc<AtomicUsize>,
+        conns: Conns,
     ) {
+        let mut next_conn = 0u64;
         for conn in listener.incoming() {
             if stop.load(Ordering::Acquire) {
                 return;
@@ -420,23 +486,43 @@ impl Forwards {
                     continue;
                 }
             };
+            // Any program on this machine can connect: a bounded number get a worker each.
+            if active.load(Ordering::Acquire) >= self.max_connections {
+                log::info!(
+                    "forward {host}:{}: {} connections open, refusing another",
+                    forward.remote_port,
+                    self.max_connections
+                );
+                let _ = conn.shutdown(Shutdown::Both);
+                continue;
+            }
+            let Ok(registered) = conn.try_clone() else {
+                continue;
+            };
+            next_conn += 1;
+            let conn_id = next_conn;
+            conns.lock().insert(conn_id, registered);
             active.fetch_add(1, Ordering::AcqRel);
+            // Closed between the accept and here: end it as `close_why` ended the others.
+            if stop.load(Ordering::Acquire) {
+                let _ = conn.shutdown(Shutdown::Both);
+            }
             let me = self.clone();
-            let (host, port, active) = (host.clone(), forward.remote_port, active.clone());
+            let (host, port) = (host.clone(), forward.remote_port);
+            let (theirs_active, theirs_conns, theirs_stop) =
+                (active.clone(), conns.clone(), stop.clone());
             let spawned = std::thread::Builder::new()
                 .name(format!("forward-{host}-{port}-conn"))
                 .spawn(move || {
-                    if let Err(e) = me.carry(&host, port, conn) {
+                    if let Err(e) = me.carry(&host, port, conn, &theirs_stop) {
                         log::info!("forward {host}:{port}: {e}");
                     }
-                    active.fetch_sub(1, Ordering::AcqRel);
+                    theirs_conns.lock().remove(&conn_id);
+                    theirs_active.fetch_sub(1, Ordering::AcqRel);
                 });
             if spawned.is_err() {
-                self.inner
-                    .lock()
-                    .open
-                    .get(&forward.id)
-                    .map(|e| e.active.fetch_sub(1, Ordering::AcqRel));
+                conns.lock().remove(&conn_id);
+                active.fetch_sub(1, Ordering::AcqRel);
             }
         }
     }
@@ -464,7 +550,13 @@ impl Forwards {
     }
 
     /// One connection to the forward: a stream to `port` on `host`, spliced both ways.
-    fn carry(&self, host: &str, port: u16, conn: TcpStream) -> Result<(), String> {
+    fn carry(
+        &self,
+        host: &str,
+        port: u16,
+        conn: TcpStream,
+        closed: &AtomicBool,
+    ) -> Result<(), String> {
         let ticket = match self.control(host, false).and_then(|c| c.dial_begin(port)) {
             Ok(t) => t,
             // The kept connection may be gone (the tunnel reconnected): once more, afresh.
@@ -474,10 +566,10 @@ impl Forwards {
                 .map_err(|e| e.to_string())?,
         };
         let socket = (self.socket_for)(host);
-        let (mut down, mut up) =
+        let (mut down, up) =
             thurm_client::stream::open(&socket, &ticket.ticket).map_err(|e| e.to_string())?;
         let _ = conn.set_nodelay(true);
-        splice(conn, &mut down, &mut up)
+        splice(conn, &mut down, up, closed)
     }
 
     fn remembered(&self) -> HashMap<String, u16> {
@@ -496,6 +588,35 @@ impl Forwards {
         }
         if let Err(e) = write_json(&self.remembered, &all) {
             log::info!("cannot remember the forward's port: {e}");
+        }
+    }
+}
+
+/// The forward that has the port already, unless another local port was asked for (`0`: any).
+fn existing(f: Forward, preferred: Option<u16>) -> Result<(Forward, bool), String> {
+    match preferred {
+        Some(p) if p != 0 && p != f.local => Err(format!(
+            "{}:{} is forwarded to localhost:{} already; close that forward to use {p}",
+            f.host, f.remote_port, f.local
+        )),
+        _ => Ok((f, false)),
+    }
+}
+
+/// Whether each of `host`'s forwards is listed, and since when every complete list has lacked
+/// it. Absent from a set of lists that is not complete, a port may still be there: no clock.
+fn recompute(g: &mut Inner, host: &str, now: Instant) {
+    let Inner { open, hosts, .. } = g;
+    let empty = HostPorts::default();
+    let h = hosts.get(host).unwrap_or(&empty);
+    for e in open.values_mut().filter(|e| e.forward.host == host) {
+        if h.lists(e.forward.remote_port) {
+            e.listed = true;
+            e.missing_since = None;
+        } else if e.listed && h.all_complete() {
+            e.missing_since.get_or_insert(now);
+        } else {
+            e.missing_since = None;
         }
     }
 }
@@ -528,11 +649,14 @@ fn stop_listening(e: &Entry) {
     );
 }
 
-/// Carries `conn` both ways over a stream until both directions end.
+/// Carries `conn` both ways over a stream until both directions end. Once `closed` is set (the
+/// forward closed, which shuts `conn` down), the stream is aborted rather than finished, so the
+/// host's end goes too.
 fn splice(
     conn: TcpStream,
     down: &mut thurm_client::stream::StreamReader,
-    up: &mut thurm_client::stream::StreamWriter,
+    mut up: thurm_client::stream::StreamWriter,
+    closed: &AtomicBool,
 ) -> Result<(), String> {
     let mut from_tcp = conn.try_clone().map_err(|e| e.to_string())?;
     let to_tcp = conn;
@@ -540,7 +664,11 @@ fn splice(
         let upward = s.spawn(move || -> std::io::Result<()> {
             let mut buf = vec![0u8; thurm_proto::stream::MAX_DATA];
             loop {
+                // An error drops `up` unfinished, which aborts the stream.
                 let n = from_tcp.read(&mut buf)?;
+                if closed.load(Ordering::Acquire) {
+                    return up.close(thurm_proto::stream::StreamClose::Aborted);
+                }
                 if n == 0 {
                     return up.finish();
                 }
@@ -650,13 +778,22 @@ mod tests {
     fn a_forward_takes_the_remote_ports_number_then_remembers_its_own() {
         let dir = tempdir("numbers");
         let f = forwards(&dir);
-        // Find a free port, then hold it so the forward can't have its own number.
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let free = probe.local_addr().unwrap().port();
-        drop(probe);
-        let (a, new) = f.open("devbox", free, None).unwrap();
-        assert!(new);
-        assert_eq!(a.local, free);
+        // A free port's number: the forward listens on it. Tests running alongside may take the
+        // port between the probe and the forward; then another one.
+        let (a, free) = (0..20)
+            .find_map(|_| {
+                let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+                let free = probe.local_addr().unwrap().port();
+                drop(probe);
+                let (a, new) = f.open("devbox", free, None).unwrap();
+                assert!(new);
+                if a.local == free {
+                    return Some((a, free));
+                }
+                f.close(a.id).unwrap();
+                None
+            })
+            .expect("a forward on its own port number");
         // The same host and port: the same forward.
         let (again, new) = f.open("devbox", free, None).unwrap();
         assert!(!new);
@@ -783,6 +920,132 @@ mod tests {
             .fetch_sub(1, Ordering::AcqRel);
         assert_eq!(f.sweep(t0 + GONE_GRACE), vec![fw]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_explicit_local_port_is_not_swapped_for_the_existing_one() {
+        let dir = tempdir("preferred");
+        let f = forwards(&dir);
+        let (fw, _) = f.open("devbox", 7200, Some(0)).unwrap();
+        // The same ask, or any port: the forward there is.
+        assert_eq!(f.open("devbox", 7200, None).unwrap(), (fw.clone(), false));
+        assert_eq!(
+            f.open("devbox", 7200, Some(0)).unwrap(),
+            (fw.clone(), false)
+        );
+        assert_eq!(
+            f.open("devbox", 7200, Some(fw.local)).unwrap(),
+            (fw.clone(), false)
+        );
+        // Another port asked for: an error naming the one in use, not that one quietly.
+        let other = if fw.local == 65535 {
+            65534
+        } else {
+            fw.local + 1
+        };
+        let e = f.open("devbox", 7200, Some(other)).unwrap_err();
+        assert!(e.contains(&format!("localhost:{}", fw.local)), "{e}");
+        f.close(fw.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_incomplete_list_stops_the_clock() {
+        let dir = tempdir("incomplete");
+        let f = forwards(&dir);
+        let t0 = Instant::now();
+        f.ports_changed_at(t0, "devbox", 1, vec![entry(5173)], true);
+        let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+        // Gone from a complete list: the clock starts.
+        f.ports_changed_at(t0, "devbox", 1, vec![], true);
+        // Then a list that could not be read whole: the port may still be there.
+        f.ports_changed_at(t0 + Duration::from_secs(1), "devbox", 2, vec![], false);
+        assert!(f.sweep(t0 + GONE_GRACE * 3).is_empty());
+        // Complete again and still gone: the clock starts over from there.
+        let t1 = t0 + GONE_GRACE * 3;
+        f.ports_changed_at(t1, "devbox", 2, vec![], true);
+        assert!(
+            f.sweep(t1 + GONE_GRACE - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(f.sweep(t1 + GONE_GRACE), vec![fw]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reconnected_host_starts_from_its_snapshot() {
+        let dir = tempdir("snapshot");
+        let f = forwards(&dir);
+        let t0 = Instant::now();
+        f.ports_changed_at(t0, "devbox", 1, vec![entry(5173)], true);
+        f.ports_changed_at(t0, "devbox", 2, vec![entry(8080)], true);
+        let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+        // The connection drops: nothing is known of the host's ports, and nothing closes.
+        f.host_disconnected("devbox");
+        assert!(f.known("devbox").is_empty());
+        assert!(f.sweep(t0 + GONE_GRACE * 3).is_empty());
+        // Back: pane 1 ended while it was away (no event will ever say so); the snapshot does.
+        let t1 = t0 + Duration::from_secs(60);
+        f.ports_snapshot_at(
+            t1,
+            "devbox",
+            vec![
+                thurm_proto::PanePorts {
+                    pane: 2,
+                    ports: vec![entry(8080)],
+                    complete: true,
+                },
+                thurm_proto::PanePorts {
+                    pane: 3,
+                    ports: vec![],
+                    complete: true,
+                },
+            ],
+        );
+        assert_eq!(
+            f.known("devbox")
+                .iter()
+                .map(|k| k.entry.port)
+                .collect::<Vec<_>>(),
+            [8080]
+        );
+        assert!(
+            f.sweep(t1 + GONE_GRACE - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(f.sweep(t1 + GONE_GRACE), vec![fw]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forward_keeps_the_link_it_was_opened_for() {
+        let dir = tempdir("link");
+        let f = forwards(&dir);
+        let (fw, _) = f.open("devbox", 8443, Some(0)).unwrap();
+        assert_eq!(f.list()[0].link, None);
+        f.set_link(fw.id, "https://localhost:8443/app?x=1");
+        let listed = f.list().remove(0);
+        assert_eq!(
+            listed.link.as_deref(),
+            Some("https://localhost:8443/app?x=1")
+        );
+        assert_eq!(
+            rewrite(listed.link.as_deref().unwrap(), listed.local).unwrap(),
+            format!("https://localhost:{}/app?x=1", listed.local)
+        );
+        f.close(fw.id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_turned_off_host_has_no_forwards() {
+        let cfg = thurm_config::Config::parse(
+            "[[remote]]\nname = \"on\"\nhost = \"a\"\n[[remote]]\nname = \"off\"\nhost = \"b\"\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(forwardable(cfg.remote("on").unwrap()).is_ok());
+        let e = forwardable(cfg.remote("off").unwrap()).unwrap_err();
+        assert!(e.contains("turned off"), "{e}");
     }
 
     #[test]

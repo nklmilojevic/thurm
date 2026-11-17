@@ -36,6 +36,18 @@ enum ForwardText {
     }
 }
 
+/// How a forward's failure reaches the user: a toast on the focused pane, or an alert when no
+/// pane is there to show one (Forward Port… with no terminal window open).
+enum ForwardFailure: Equatable {
+    case toast(String)
+    case alert(String)
+
+    static func report(host: HostId, _ why: String, hasView: Bool) -> ForwardFailure {
+        let text = ForwardText.failure(host: host, why)
+        return hasView ? .toast(text) : .alert(text)
+    }
+}
+
 /// What Forward Port… offers for what was typed: the typed port or link first, then the ports
 /// the host's panes listen on.
 enum ForwardPicker {
@@ -57,6 +69,29 @@ enum ForwardPicker {
         let lower = q.lowercased()
         if lower.hasPrefix("http://") || lower.hasPrefix("https://") { return .url(q) }
         return nil
+    }
+
+    enum Manage: Equatable {
+        case copyLink(String)
+        case close(UInt64)
+    }
+
+    struct Entry: Equatable {
+        let title: String
+        let detail: String
+        let action: Manage
+    }
+
+    /// The command palette's entries for open forwards: Copy Link (the toast's lasts only
+    /// seconds, mostly spent in the browser) and Close, for each.
+    static func manageEntries(_ forwards: [ForwardInfo]) -> [Entry] {
+        forwards.flatMap { f -> [Entry] in
+            let name = "\(f.host):\(f.remotePort)"
+            return [
+                Entry(title: "Copy Forward Link \(name)", detail: f.url, action: .copyLink(f.url)),
+                Entry(title: "Close Forward \(name)", detail: "localhost:\(f.localPort)", action: .close(f.id)),
+            ]
+        }
     }
 
     /// `known`: (port, command) of the host's panes, by port.
@@ -107,17 +142,20 @@ extension SessionManager {
             DispatchQueue.main.async {
                 let view = SessionManager.shared.currentController?.content.focusedView
                 if let e = jsonString(v?["error"]) {
-                    view?.showToast(ForwardText.failure(host: host, e), duration: 6)
+                    switch ForwardFailure.report(host: host, e, hasView: view != nil) {
+                    case .toast(let text):
+                        view?.showToast(text, duration: 6)
+                    case .alert(let text):
+                        let alert = NSAlert()
+                        alert.messageText = text
+                        alert.runModal()
+                    }
                     return
                 }
                 guard let f = ForwardInfo(json: v), let target = URL(string: f.url) else { return }
                 if jsonBool(v?["new"]) == true {
                     view?.showToast(ForwardText.toast(host: host, remotePort: f.remotePort, localPort: f.localPort),
-                                    duration: 6, action: ("Copy Link", {
-                                        let pb = NSPasteboard.general
-                                        pb.clearContents()
-                                        pb.setString(f.url, forType: .string)
-                                    }))
+                                    duration: 6, action: ("Copy Link", { SessionManager.copyForwardLink(f.url) }))
                 }
                 NSWorkspace.shared.open(target)
             }
@@ -159,6 +197,26 @@ extension SessionManager {
                                    onQuery: { query in
                                        CommandPalette.shared.updateSearch(items: items(query), hint: hint)
                                    })
+    }
+
+    static func copyForwardLink(_ url: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(url, forType: .string)
+    }
+
+    /// `host` connected: every pane's port list at once, so its forwards don't go by lists of
+    /// panes that ended while it was away (no event says so). An older daemon answers an error.
+    func fetchRemotePorts(_ host: HostId) {
+        Core.shared.requestAsync(object: ["Ports": ["pane": NSNull()]], host: host, timeout: 10) { resp in
+            guard let v = JSON.variant(resp), v.name == "Ports", let panes = v.payload as? [Any] else { return }
+            _ = Core.shared.remoteCall(["op": "ports_snapshot", "host": host, "panes": panes])
+        }
+    }
+
+    /// `host`'s connection dropped: what listens there is unknown until it is back.
+    func remotePortsUnknown(_ host: HostId) {
+        _ = Core.shared.remoteCall(["op": "host_disconnected", "host": host])
     }
 
     /// A `PortsChanged` from a remote host: its forwards learn whether their port is still there.

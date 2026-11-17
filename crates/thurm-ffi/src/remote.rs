@@ -54,8 +54,11 @@ fn forward_list(f: &Forwards) -> Vec<Value> {
     f.list().iter().map(|fw| forward_json(fw, None)).collect()
 }
 
+/// The forward's JSON for the app; `url` the link it opens at: `url` (the link it was just
+/// opened for) or the one it was last opened for, rewritten to it; else its root over http.
 fn forward_json(fw: &forward::Forward, url: Option<&str>) -> Value {
     let url = url
+        .or(fw.link.as_deref())
         .and_then(|u| forward::rewrite(u, fw.local))
         .unwrap_or_else(|| format!("http://localhost:{}/", fw.local));
     json!({
@@ -354,6 +357,36 @@ enum Call {
     KnownPorts {
         host: String,
     },
+    /// `host`'s answer to `Ports` on connecting: every pane's list, replacing what was known.
+    PortsSnapshot {
+        host: String,
+        panes: Vec<thurm_proto::PanePorts>,
+    },
+    /// The connection to `host` dropped: its port lists are unknown until the next snapshot.
+    HostDisconnected {
+        host: String,
+    },
+}
+
+/// The port `forward_open` forwards for `host`: `port`, or `url`'s. Only a configured host that
+/// is turned on has forwards.
+fn forward_port(
+    cfg: &Config,
+    host: &str,
+    port: Option<u16>,
+    url: Option<&str>,
+) -> Result<u16, String> {
+    let r = cfg
+        .remote(host)
+        .ok_or_else(|| format!("no remote named {host:?}"))?;
+    forward::forwardable(r)?;
+    match (port, url) {
+        (Some(p), _) => Ok(p),
+        (None, Some(u)) => Ok(policy::LocalUrl::parse(u)
+            .ok_or_else(|| format!("{u} is not a link to {host}'s localhost"))?
+            .port),
+        (None, None) => Err("a port or a URL to forward".into()),
+    }
 }
 
 /// Runs scripts with the local `/bin/sh` in the PATH sshd gives a login, so the probe sees what
@@ -660,19 +693,14 @@ fn call(c: Call) -> Result<Value, String> {
             url,
             local,
         } => {
-            remote(&host)?;
-            let port = match (port, url.as_deref()) {
-                (Some(p), _) => p,
-                (None, Some(u)) => {
-                    policy::LocalUrl::parse(u)
-                        .ok_or_else(|| format!("{u} is not a link to {host}'s localhost"))?
-                        .port
-                }
-                (None, None) => return Err("a port or a URL to forward".into()),
-            };
+            let cfg = Config::load().map_err(|e| e.to_string())?;
+            let port = forward_port(&cfg, &host, port, url.as_deref())?;
             let f = forwards();
             f.check(&host)?;
             let (fw, new) = f.open(&host, port, local)?;
+            if let Some(u) = &url {
+                f.set_link(fw.id, u);
+            }
             let mut v = forward_json(&fw, url.as_deref());
             v["new"] = json!(new);
             v
@@ -689,6 +717,14 @@ fn call(c: Call) -> Result<Value, String> {
             json!("Ok")
         }
         Call::KnownPorts { host } => json!(forwards().known(&host)),
+        Call::PortsSnapshot { host, panes } => {
+            forwards().ports_snapshot(&host, panes);
+            json!("Ok")
+        }
+        Call::HostDisconnected { host } => {
+            forwards().host_disconnected(&host);
+            json!("Ok")
+        }
         Call::LocalProbe => {
             let host = thurm_remote::probe(&LocalShell).map_err(|e| e.to_string())?;
             json!({
@@ -803,6 +839,8 @@ mod tests {
             r#"{"op":"forward_list"}"#,
             r#"{"op":"ports_changed","host":"pi","pane":2,"ports":[{"port":5173,"address":"127.0.0.1","pid":9,"command":"vite"}],"complete":true}"#,
             r#"{"op":"known_ports","host":"pi"}"#,
+            r#"{"op":"ports_snapshot","host":"pi","panes":[{"pane":2,"ports":[],"complete":false}]}"#,
+            r#"{"op":"host_disconnected","host":"pi"}"#,
         ] {
             serde_json::from_str::<Call>(s).unwrap_or_else(|e| panic!("{s}: {e}"));
         }
@@ -821,6 +859,45 @@ mod tests {
         })
         .unwrap_err();
         assert!(e.contains("not a Thurm device key"), "{e}");
+    }
+
+    #[test]
+    fn forwards_only_for_hosts_that_are_on() {
+        let cfg = Config::parse(
+            "[[remote]]\nname = \"on\"\nhost = \"a\"\n[[remote]]\nname = \"off\"\nhost = \"b\"\nenabled = false\n",
+        )
+        .unwrap();
+        assert_eq!(forward_port(&cfg, "on", Some(5173), None), Ok(5173));
+        assert_eq!(
+            forward_port(&cfg, "on", None, Some("https://localhost:8443/x")),
+            Ok(8443)
+        );
+        let e = forward_port(&cfg, "off", Some(5173), None).unwrap_err();
+        assert!(e.contains("turned off"), "{e}");
+        assert!(forward_port(&cfg, "gone", Some(5173), None).is_err());
+        assert!(forward_port(&cfg, "on", None, Some("https://example.com")).is_err());
+        assert!(forward_port(&cfg, "on", None, None).is_err());
+    }
+
+    #[test]
+    fn a_listed_forward_opens_at_the_link_it_was_opened_for() {
+        let mut fw = forward::Forward {
+            id: 1,
+            host: "devbox".into(),
+            remote_port: 8443,
+            local: 18443,
+            link: None,
+        };
+        assert_eq!(forward_json(&fw, None)["url"], "http://localhost:18443/");
+        fw.link = Some("https://localhost:8443/app".into());
+        assert_eq!(
+            forward_json(&fw, None)["url"],
+            "https://localhost:18443/app"
+        );
+        assert_eq!(
+            forward_json(&fw, Some("http://127.0.0.1:8443/b"))["url"],
+            "http://127.0.0.1:18443/b"
+        );
     }
 
     #[test]

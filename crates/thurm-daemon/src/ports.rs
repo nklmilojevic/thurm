@@ -102,6 +102,16 @@ impl Tracker {
             .collect();
         gone.sort_unstable();
         for pane in gone {
+            let known = &self.panes[&pane];
+            // Its empty list too waits for the second to pass; the pane stays known till then.
+            if !known.sent.ports.is_empty()
+                && let Some(at) = known.sent_at
+                && now < at + PER_PANE
+            {
+                let when = at + PER_PANE;
+                retry = Some(retry.map_or(when, |r| r.min(when)));
+                continue;
+            }
             let known = self.panes.remove(&pane).expect("listed");
             if !known.sent.ports.is_empty() && known.sent_at.is_some() {
                 events.push(Event::PortsChanged {
@@ -469,6 +479,30 @@ mod tests {
             [(1, vec![3000, 3001, 3002], true)]
         );
         assert_eq!(retry, None);
+    }
+
+    #[test]
+    fn a_pane_gone_within_the_second_says_so_after_it() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        let (ev, _) = t.update(t0, HashMap::from([(1, seen(&[3000]))]));
+        assert_eq!(
+            ev.iter().map(ports_of).collect::<Vec<_>>(),
+            [(1, vec![3000], true)]
+        );
+        // Gone 300 ms later: held back, with a time to look again.
+        let (ev, retry) = t.update(t0 + Duration::from_millis(300), HashMap::new());
+        assert!(ev.is_empty(), "{ev:?}");
+        assert_eq!(retry, Some(t0 + PER_PANE));
+        // Then its empty list, once.
+        let (ev, retry) = t.update(t0 + PER_PANE, HashMap::new());
+        assert_eq!(
+            ev.iter().map(ports_of).collect::<Vec<_>>(),
+            [(1, vec![], true)]
+        );
+        assert_eq!(retry, None);
+        let (ev, _) = t.update(t0 + PER_PANE * 2, HashMap::new());
+        assert!(ev.is_empty());
     }
 
     #[test]
