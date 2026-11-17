@@ -7,6 +7,7 @@
 mod agent;
 mod agent_prompt;
 mod attach;
+mod clip;
 mod events;
 mod ext;
 mod hook_pgrp;
@@ -599,9 +600,23 @@ enum Cmd {
         agent: Option<String>,
         event: Option<String>,
     },
+    /// Copy to and paste from the clipboard of the Thurm app showing this pane (also on a
+    /// remote host). Run as pbcopy, pbpaste, xclip, xsel, wl-copy or wl-paste, thurm acts as
+    /// that tool (see `thurm remote doctor`).
+    Clip {
+        #[command(subcommand)]
+        action: clip::ClipCmd,
+    },
 }
 
 fn main() -> ExitCode {
+    let mut args = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
+    if let Some(argv0) = args.next() {
+        let rest: Vec<String> = args.collect();
+        if let Some(code) = clip::run_as_tool(&argv0, &rest) {
+            return code;
+        }
+    }
     // Thurm's own Tab completion asks `THURM_COMPLETE=fish thurm -- thurm <words>` (see
     // completions/thurm.json); answers and exits when that is set.
     clap_complete::CompleteEnv::with_factory(Cli::command)
@@ -959,6 +974,7 @@ fn run(cli: Cli) -> R {
             action: tailscale::TailscaleCmd::Nc { host, port },
         } => tailscale::nc(&host, port),
         Cmd::Attach { pane } => attach::run(pane, remote.as_deref(), json),
+        Cmd::Clip { action } => clip::run(action, remote.is_some()),
         Cmd::SocketPath => {
             println!("{}", thurm_config::socket_path().display());
             Ok(ExitCode::SUCCESS)
@@ -2220,6 +2236,7 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool, remote: Option<&str>) -> R {
         | Cmd::AgentHook { .. }
         | Cmd::Hooks { .. }
         | Cmd::Skill { .. }
+        | Cmd::Clip { .. }
         | Cmd::Theme { spec: None } => unreachable!(),
     }
     Ok(ExitCode::SUCCESS)
