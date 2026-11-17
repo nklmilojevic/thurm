@@ -668,6 +668,12 @@ impl Daemon {
                 self.wait_agent_prompt(client.id, pane, ticket)
                     .map(Response::AgentPrompt)
             }
+            req @ (Request::ClipboardGet { .. }
+            | Request::ClipboardSet { .. }
+            | Request::ClipboardClear { .. }) => match super::clip::Ask::of(req) {
+                Ok((pane, ask)) => self.clipboard_request(client.id, pane, ask),
+                Err(_) => unreachable!("a clipboard request"),
+            },
             other => self.dispatch(client, other),
         }
     }

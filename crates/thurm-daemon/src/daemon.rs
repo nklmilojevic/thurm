@@ -2505,11 +2505,8 @@ impl Daemon {
             req @ (Request::ClipboardGet { .. }
             | Request::ClipboardSet { .. }
             | Request::ClipboardClear { .. }) => {
-                let (pane, ask) = match req {
-                    Request::ClipboardGet { pane, mime } => (pane, clip::Ask::Paste(mime)),
-                    Request::ClipboardSet { pane, text } => (pane, clip::Ask::Write(Some(text))),
-                    Request::ClipboardClear { pane } => (pane, clip::Ask::Write(None)),
-                    _ => unreachable!(),
+                let Ok((pane, ask)) = clip::Ask::of(req) else {
+                    unreachable!("a clipboard request")
                 };
                 match self.clipboard_admit(pane, &ask) {
                     Err(e) => Err(e),

@@ -138,6 +138,18 @@ final class ClipboardToolsTests: XCTestCase {
         }
     }
 
+    /// A host gets one clipboard question on screen at a time, and it goes before the daemon
+    /// stops waiting for its answer.
+    func testQuestionsDoNotStackOrOutliveTheirRequest() {
+        var gate = Remotes.AskGate()
+        XCTAssertTrue(gate.begin("devbox"))
+        XCTAssertFalse(gate.begin("devbox"), "a second read meanwhile is refused")
+        XCTAssertTrue(gate.begin("pi"), "another host asks on its own")
+        gate.end("devbox")
+        XCTAssertTrue(gate.begin("devbox"))
+        XCTAssertLessThan(Remotes.askTimeout, 30, "the daemon waits 30 s for the answer")
+    }
+
     func testAnEmptyClipboardHasNothing() {
         XCTAssertEqual(Remotes.clipboardTypes(pb), [])
         XCTAssertNil(Remotes.clipboardData(pb, mime: "text/plain"))

@@ -310,10 +310,13 @@ fn add_clip_shims(
 /// profile (which may set PATH or a display anew): the shims leave PATH, and come back first
 /// only while there is no display. POSIX sh, so the same in every user shell; no single quote.
 const CLIP_SHIMS_SH: &str = concat!(
-    "set -f; p=; IFS=:; ",
-    "for d in $PATH; do [ \"$d\" = \"$THURM_CLIP_SHIMS\" ] || p=\"$p${p:+:}$d\"; done; ",
-    "unset IFS; set +f; ",
-    "[ -n \"$DISPLAY$WAYLAND_DISPLAY\" ] || p=\"$THURM_CLIP_SHIMS${p:+:}$p\"; ",
+    // Rebuilt entry by entry, empty ones (the current directory) kept where they were.
+    "set -f; p=; n=0; IFS=:; ",
+    "for d in $PATH; do [ \"$d\" = \"$THURM_CLIP_SHIMS\" ] && continue; ",
+    "if [ $n = 0 ]; then p=$d; else p=\"$p:$d\"; fi; n=1; done; ",
+    "unset IFS; set +f; case $PATH in *:) p=\"$p:\";; esac; ",
+    "if [ -z \"$DISPLAY$WAYLAND_DISPLAY\" ]; then ",
+    "if [ $n = 0 ]; then p=$THURM_CLIP_SHIMS; else p=\"$THURM_CLIP_SHIMS:$p\"; fi; fi; ",
     "PATH=$p; export PATH; exec \"$@\"",
 );
 
@@ -551,7 +554,7 @@ mod tests {
             std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let path = format!(
-            "{r}:{s}:{s}:/usr/bin:/bin",
+            ":{r}:{s}:{s}:/usr/bin:/bin",
             r = real.display(),
             s = shims.display()
         );
@@ -596,6 +599,12 @@ mod tests {
                 let (found, new_path) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
                 let s = shims.display().to_string();
                 let entries = new_path.split(':').filter(|e| *e == s).count();
+                // fish spells it `.` when it reads PATH: the same directory.
+                assert_eq!(
+                    new_path.split(':').filter(|e| e.is_empty() || *e == ".").count(),
+                    1,
+                    "{shell:?}: the empty entry kept: {new_path}"
+                );
                 if display.is_none() {
                     assert_eq!(
                         found,

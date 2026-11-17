@@ -127,6 +127,9 @@ private let remoteStatusCallback: thurm_remote_status_cb = { _, json in
 final class Remotes {
     static let shared = Remotes()
 
+    /// The hosts whose clipboard question is on screen: one at a time each.
+    private var asking = AskGate()
+
     private(set) var statuses: [HostId: RemoteStatus] = [:]
     /// Agent presets of each connected host (its own config decides what runs there).
     var presets: [HostId: [AgentPreset]] = [:]
@@ -386,6 +389,10 @@ final class Remotes {
         case .allow:
             return true
         case .ask:
+            // One question on screen per host: another read from it meanwhile is refused, not
+            // stacked behind it.
+            guard asking.begin(key.host) else { return false }
+            defer { asking.end(key.host) }
             let alert = NSAlert()
             alert.messageText = "\(key.host) wants to read your clipboard"
             alert.informativeText = "A program in a pane on \(key.host) asked for the contents of this Mac's "
@@ -393,6 +400,10 @@ final class Remotes {
             alert.addButton(withTitle: "Allow Once")
             alert.addButton(withTitle: "Always for \(key.host)")
             alert.addButton(withTitle: "Deny")
+            // Gone before the daemon stops waiting for the answer: unanswered, it is a Deny.
+            let timer = Timer(timeInterval: Self.askTimeout, repeats: false) { _ in NSApp.abortModal() }
+            RunLoop.main.add(timer, forMode: .modalPanel)
+            defer { timer.invalidate() }
             switch alert.runModal() {
             case .alertFirstButtonReturn:
                 return true
@@ -407,6 +418,20 @@ final class Remotes {
         case .deny:
             return false
         }
+    }
+
+    /// How long a clipboard question stays up: less than the 30 s a host's daemon waits for the
+    /// answer, so it is never answered after nobody waits for it.
+    static let askTimeout: TimeInterval = 25
+
+    /// The hosts with a question on screen.
+    struct AskGate {
+        private(set) var open: Set<HostId> = []
+
+        /// Whether `host` may ask now: not while its last question is still up.
+        mutating func begin(_ host: HostId) -> Bool { open.insert(host).inserted }
+
+        mutating func end(_ host: HostId) { open.remove(host) }
     }
 
     /// A clipboard tool in `key`'s pane (pbpaste, xclip -o, wl-paste) asks for this Mac's
