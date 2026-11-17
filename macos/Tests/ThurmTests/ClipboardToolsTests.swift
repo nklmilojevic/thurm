@@ -159,11 +159,19 @@ final class ClipboardToolsTests: XCTestCase {
 
     func testQuestionsDoNotStackOrOutliveTheirRequest() {
         var gate = Remotes.AskGate()
-        XCTAssertTrue(gate.begin("devbox"))
-        XCTAssertFalse(gate.begin("devbox"), "a second read meanwhile is refused")
-        XCTAssertTrue(gate.begin("pi"), "another host asks on its own")
-        gate.end("devbox")
-        XCTAssertTrue(gate.begin("devbox"))
+        let first = gate.begin("devbox")
+        XCTAssertNotNil(first)
+        XCTAssertNil(gate.begin("devbox"), "a second read meanwhile is refused")
+        XCTAssertNotNil(gate.begin("pi"), "another host asks on its own")
+        // Expired, though still on screen behind another modal: the host may ask again.
+        gate.end("devbox", first!)
+        let second = gate.begin("devbox")
+        XCTAssertNotNil(second)
+        // The expired one closing at last does not end the turn of the one after it.
+        gate.end("devbox", first!)
+        XCTAssertNil(gate.begin("devbox"), "the later question still holds the turn")
+        gate.end("devbox", second!)
+        XCTAssertNotNil(gate.begin("devbox"))
         XCTAssertLessThan(Remotes.askTimeout, 30, "the daemon waits 30 s for the answer")
     }
 

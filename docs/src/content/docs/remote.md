@@ -564,7 +564,8 @@ reach the Mac's disk, clipboard, or credentials without you doing something:
   Always for devbox / Deny" (one question per host at a time: another read
   meanwhile is refused, and a question left unanswered closes after 25
   seconds as Deny: an answer given later, as to one another window kept
-  covered, is a Deny too, and saves nothing); with `always` they go ahead without asking
+  covered, is a Deny too, and saves nothing, and from then on that host may
+  ask again); with `always` they go ahead without asking
   ("Always" writes that to the host's `[[remote]]`); with `never` they are
   refused. Listing the clipboard's types (`xclip -selection clipboard -t TARGETS -o`,
   `wl-paste --list-types`) never asks: it says whether there is text or an

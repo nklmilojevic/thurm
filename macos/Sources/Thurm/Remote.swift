@@ -389,8 +389,8 @@ final class Remotes {
         case .ask:
             // One question on screen per host: another read from it meanwhile is refused, not
             // stacked behind it.
-            guard asking.begin(key.host) else { return false }
-            defer { asking.end(key.host) }
+            guard let token = asking.begin(key.host) else { return false }
+            defer { asking.end(key.host, token) }
             let alert = NSAlert()
             alert.messageText = "\(key.host) wants to read your clipboard"
             alert.informativeText = "A program in a pane on \(key.host) asked for the contents of this Mac's "
@@ -400,8 +400,10 @@ final class Remotes {
             alert.addButton(withTitle: "Deny")
             // Gone before the daemon stops waiting for the answer: unanswered, it is a Deny.
             // Only this alert's own session is ended: while another modal is on top of it, the
-            // timer tries again until it is the one in front.
-            let timer = Timer(timeInterval: Self.askTimeout, repeats: false) { _ in
+            // timer tries again until it is the one in front. Expired, it no longer holds the
+            // host's turn, so a later read from that host can ask though it is still up.
+            let timer = Timer(timeInterval: Self.askTimeout, repeats: false) { [weak self] _ in
+                self?.asking.end(key.host, token)
                 Self.abortWhenFront(alert.window)
             }
             RunLoop.main.add(timer, forMode: .modalPanel)
@@ -455,14 +457,25 @@ final class Remotes {
         RunLoop.main.add(retry, forMode: .modalPanel)
     }
 
-    /// The hosts with a question on screen.
+    /// The hosts with a live question on screen: one each. A question's turn ends when it is
+    /// answered or when it expires, whichever comes first; its token makes sure the end of an
+    /// expired one never ends the turn of a question asked after it.
     struct AskGate {
-        private(set) var open: Set<HostId> = []
+        private(set) var open: [HostId: UInt64] = [:]
+        private var next: UInt64 = 0
 
-        /// Whether `host` may ask now: not while its last question is still up.
-        mutating func begin(_ host: HostId) -> Bool { open.insert(host).inserted }
+        /// A token for `host`'s question, or nil while its last one is still live.
+        mutating func begin(_ host: HostId) -> UInt64? {
+            guard open[host] == nil else { return nil }
+            next += 1
+            open[host] = next
+            return next
+        }
 
-        mutating func end(_ host: HostId) { open.remove(host) }
+        /// The question `token` is answered or expired: `host` may ask again.
+        mutating func end(_ host: HostId, _ token: UInt64) {
+            if open[host] == token { open[host] = nil }
+        }
     }
 
     /// A clipboard tool in `key`'s pane (pbpaste, xclip -o, wl-paste) asks for this Mac's
