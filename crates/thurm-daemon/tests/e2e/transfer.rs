@@ -497,35 +497,78 @@ fn a_later_file_refused_ends_the_batch_at_once() {
     let (c, _rx) = env.connect();
     let dir = work_dir(&env);
     let pane = cat_pane(&c, &dir);
+    let batch = |index| {
+        Some(UploadBatch {
+            id: "r".into(),
+            index,
+            count: 2,
+        })
+    };
+    // The first file sent and landed, its stream kept as a sender keeps it.
+    let ticket = c.upload_begin(pane, "small.txt", 5, batch(0)).unwrap();
+    let (r0, mut w0) = stream::open(&env.socket, &ticket.ticket).unwrap();
+    w0.write_all(b"small").unwrap();
+    w0.finish().unwrap();
+    eventually(5, "the first file did not land", || {
+        batches(&env, pane)
+            .first()
+            .is_some_and(|b| b.join("small.txt").exists())
+    });
+    let [landed] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    // The second is refused; the sender aborts the first stream, and the batch goes now, not
+    // when it would have stalled.
+    let e = c
+        .upload_begin(pane, "huge.bin", 5 << 30, batch(1))
+        .unwrap_err();
+    assert!(e.to_string().contains("too large"), "{e}");
+    w0.close(thurm_proto::stream::StreamClose::Aborted).unwrap();
+    assert!(r0.wait_closed().is_err());
+    eventually(5, "the landed batch was kept", || !landed.exists());
+    assert_eq!(typed(&c, pane, &dir), "\n");
+
+    // `upload` does the same on its own: a refused later file leaves nothing.
     let small = dir.join("small.txt");
     std::fs::write(&small, b"small").unwrap();
-    // Over the 4 GiB a file may be, without taking the space.
     let huge = dir.join("huge.bin");
     std::fs::File::create(&huge)
         .unwrap()
         .set_len(5 << 30)
         .unwrap();
+    let (c2, _rx2) = env.connect();
+    let pane2 = cat_pane(&c2, &dir);
     let host = Host {
-        client: &c,
+        client: &c2,
         socket: &env.socket,
     };
     let files = [Upload::Path(small), Upload::Path(huge)];
-    let e = transfer::upload(host, pane, &files, &Cancel::default(), |_| {}).unwrap_err();
+    let e = transfer::upload(host, pane2, &files, &Cancel::default(), |_| {}).unwrap_err();
     assert!(
         matches!(&e, TransferError::Remote(why) if why.contains("too large")),
         "{e}"
     );
-    // The first file landed; the batch goes now, not when it would have stalled.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !batches(&env, pane).is_empty() {
-        assert!(
-            Instant::now() < deadline,
-            "the batch was kept: {:?}",
-            batches(&env, pane)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(typed(&c, pane, &dir), "\n");
+    eventually(5, "the batch was kept", || batches(&env, pane2).is_empty());
+}
+
+#[test]
+fn a_batch_whose_sender_went_before_its_paste_types_nothing() {
+    let env = Env::new("transfer-gone-before-paste");
+    // Time between the last file landing and the paste, for the sender to go in.
+    let _daemon = env.start_with(&[("THURM_TRANSFER_PASTE_DELAY_MS", Path::new("500"))]);
+    let (keeper, _krx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&keeper, &dir);
+    let (c, _rx) = env.connect();
+    let r = send(&env, &c, pane, ("p", 0, 1), "one.txt", 3, b"one");
+    eventually(5, "the file did not land", || {
+        batches(&env, pane)
+            .first()
+            .is_some_and(|b| b.join("one.txt").exists())
+    });
+    drop(c);
+    let e = r.wait_closed().unwrap_err().to_string();
+    assert!(e.contains("went away"), "{e}");
+    eventually(5, "the batch was kept", || batches(&env, pane).is_empty());
+    assert_eq!(typed(&keeper, pane, &dir), "\n");
 }
 
 #[test]

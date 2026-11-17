@@ -107,7 +107,9 @@ final class TerminalView: NSView, NSTextInputClient {
     private var transferToast: (box: NSView, label: NSTextField)?
     /// Batches waiting for the one being sent: each goes when the one before it ends, so their
     /// paths are typed in the order they were dropped.
-    private var uploadQueue: [(files: [(path: String, name: String?)], what: String, item: PaneTransfer)] = []
+    /// `owned`: a file made here for the batch (a pasted image), deleted when the batch ends.
+    private var uploadQueue: [(files: [(path: String, name: String?)], what: String, item: PaneTransfer,
+                               owned: URL?)] = []
     private var uploading = false
     private var restoredToastShown = false
     private var progressBar: ProgressBarView?
@@ -1502,10 +1504,18 @@ final class TerminalView: NSView, NSTextInputClient {
         case image
     }
 
-    /// What `pb` sends to a remote pane's host. A paste with text sends the text instead.
+    /// What `pb` sends to a remote pane's host. A paste with text sends the text instead: any
+    /// app may put a file's address beside the text it copied, and pasting that text must not
+    /// send the file. Files copied in Finder still go (their text is just their names).
     static func uploadPlan(_ pb: NSPasteboard, pasting: Bool) -> UploadPlan {
         let fileOpts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
-        if let urls = pb.readObjects(forClasses: [NSURL.self], options: fileOpts) as? [URL], !urls.isEmpty {
+        let urls = pb.readObjects(forClasses: [NSURL.self], options: fileOpts) as? [URL] ?? []
+        if pasting, let text = pb.string(forType: .string),
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !Self.namesOnly(text, urls) {
+            return .none
+        }
+        if !urls.isEmpty {
             for url in urls {
                 var isDir: ObjCBool = false
                 if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
@@ -1520,11 +1530,22 @@ final class TerminalView: NSView, NSTextInputClient {
         return .none
     }
 
+    /// Whether `text` is nothing but the names (or paths) of `urls`, one a line, in order: what
+    /// Finder puts beside files it copies.
+    static func namesOnly(_ text: String, _ urls: [URL]) -> Bool {
+        let lines = text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard !urls.isEmpty, lines.count == urls.count else { return false }
+        return zip(lines, urls).allSatisfy { $0 == $1.lastPathComponent || $0 == $1.path }
+    }
+
     /// Sends what `plan` names to the pane's host as one batch, with a toast that shows how far
     /// it got and can cancel it.
     private func startUpload(_ plan: UploadPlan, from pb: NSPasteboard) {
         let host = pane.host
         var files: [(path: String, name: String?)] = []
+        var owned: URL?
         switch plan {
         case .none:
             return
@@ -1539,6 +1560,7 @@ final class TerminalView: NSView, NSTextInputClient {
                 return
             }
             files = [(path, (path as NSString).lastPathComponent)]
+            owned = URL(fileURLWithPath: path)
         }
         let what = files.count == 1 ? (files[0].name ?? (files[0].path as NSString).lastPathComponent)
             : "\(files.count) files"
@@ -1547,10 +1569,11 @@ final class TerminalView: NSView, NSTextInputClient {
         item.cancel = { [weak self, weak item] in
             guard let self, let item else { return }
             self.uploadQueue.removeAll { $0.item === item }
+            if let owned { try? FileManager.default.removeItem(at: owned) }
             self.endTransfer(item)
             self.showToast("Upload of \(what) cancelled")
         }
-        uploadQueue.append((files, what, item))
+        uploadQueue.append((files, what, item, owned))
         beginTransfer(item)
         sendNextUpload()
     }
@@ -1558,7 +1581,7 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Starts the first waiting batch, unless one is being sent.
     private func sendNextUpload() {
         guard !uploading, !uploadQueue.isEmpty else { return }
-        let (files, what, item) = uploadQueue.removeFirst()
+        let (files, what, item, owned) = uploadQueue.removeFirst()
         let host = pane.host
         uploading = true
         var finished = false
@@ -1568,6 +1591,8 @@ final class TerminalView: NSView, NSTextInputClient {
             self?.updateTransfer(item, "Sending \(what) to \(host)… \(Int(p.fraction * 100))%")
         }, { [weak self] outcome in
             finished = true
+            // The image made for it is on the host now, or not wanted.
+            if let owned { try? FileManager.default.removeItem(at: owned) }
             guard let self else { return }
             self.endTransfer(item)
             if outcome.cancelled {

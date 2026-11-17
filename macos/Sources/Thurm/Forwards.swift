@@ -22,6 +22,15 @@ struct ForwardInfo: Equatable {
         localPort = local
         url = jsonString(d["url"]) ?? "http://localhost:\(local)/"
     }
+
+    /// `known`'s link, if `answer` (to `forward_get`) says that forward is still open on the
+    /// same local port: a forward that closed since may have left its port to another program.
+    static func liveLink(of known: ForwardInfo, answer: Any?) -> String? {
+        guard let now = ForwardInfo(json: answer), now.id == known.id, now.localPort == known.localPort else {
+            return nil
+        }
+        return now.url
+    }
 }
 
 /// The forward requests of plugins the app is carrying out, and who still has which forward.
@@ -110,14 +119,9 @@ struct ForwardRequests {
 }
 
 /// The remote hosts' port lists the app passes on to this Mac's daemon for its plugins
-/// (`ports.report`): the latest of each pane, sent again whenever the app connects to the daemon,
-/// and for each host just connected to, its own answer of what it lists (`initial`: running
-/// already).
-///
-/// While that answer is on its way, the host's lists are held back: some are the lists its
-/// daemon sends a client that joins (running already too), some are changes, and an answer that
-/// comes after a change may be older than it. Once the answer is in, it goes first, as `initial`,
-/// then what was held, in order, as changes, but for lists that only say again what is known.
+/// (`ports.report`): the latest of each pane, sent again whenever the app connects to the
+/// daemon. Whether a list is of servers running already (`initial`) is the host's daemon's to
+/// say: it marks the lists it sends the app as it joins the watch.
 struct RemotePorts {
     struct Entry {
         let host: HostId
@@ -126,71 +130,20 @@ struct RemotePorts {
         let complete: Any
     }
 
-    /// A list to send, and whether it was running already.
-    struct Send {
-        let entry: Entry
-        let initial: Bool
-    }
-
     private var lists: [HostId: [UInt64: Entry]] = [:]
-    /// Hosts whose own answer of what they list is awaited, by the ask's number.
-    private var learning: [HostId: Int] = [:]
-    /// What `learning` hosts listed meanwhile, in order.
-    private var held: [HostId: [Entry]] = [:]
-    private var asks = 0
 
-    /// The app connected to `host`: its lists wait for its answer to ask number (returned)
-    /// `learned`.
-    mutating func connected(_ host: HostId) -> Int {
-        asks += 1
-        learning[host] = asks
-        lists[host] = nil
-        held[host] = nil
-        return asks
+    /// A pane of `host` listed `ports`: kept as its latest; an empty list forgets the pane.
+    mutating func listed(_ host: HostId, pane: UInt64, ports: Any, complete: Any) {
+        if (ports as? [Any])?.isEmpty ?? false {
+            lists[host]?[pane] = nil
+        } else {
+            lists[host, default: [:]][pane] = Entry(host: host, pane: pane, ports: ports, complete: complete)
+        }
     }
 
-    /// The connection to `host` is gone: its lists, its ask and what waited for it with it.
+    /// The connection to `host` is gone: its lists with it.
     mutating func disconnected(_ host: HostId) {
-        learning[host] = nil
         lists[host] = nil
-        held[host] = nil
-    }
-
-    /// A pane of `host` listed `ports` (live, from its daemon): the list to send now, or none
-    /// while the host's answer is awaited (it waits for it).
-    mutating func live(_ host: HostId, pane: UInt64, ports: Any, complete: Any) -> Send? {
-        let e = Entry(host: host, pane: pane, ports: ports, complete: complete)
-        if learning[host] != nil {
-            held[host, default: []].append(e)
-            return nil
-        }
-        keep(e)
-        return Send(entry: e, initial: false)
-    }
-
-    /// Ask `ask` of `host` was answered with `snapshot` (nil: an error, a timeout, a daemon from
-    /// before ports): what to send, in order. Nothing for an ask that is not the one awaited (of
-    /// a connection that went, or that a newer one replaced).
-    mutating func learned(_ host: HostId, ask: Int, snapshot: [Entry]?) -> [Send] {
-        guard learning[host] == ask else { return [] }
-        learning[host] = nil
-        let waited = held.removeValue(forKey: host) ?? []
-        guard let snapshot else {
-            // Nothing to tell changes by: what came meanwhile is what runs, already.
-            return waited.map { keep($0); return Send(entry: $0, initial: true) }
-        }
-        var out: [Send] = []
-        for e in snapshot where !RemotePorts.isEmpty(e.ports) {
-            keep(e)
-            out.append(Send(entry: e, initial: true))
-        }
-        for e in waited {
-            let known = lists[host]?[e.pane]
-            if RemotePorts.same(known, e) { continue }
-            keep(e)
-            out.append(Send(entry: e, initial: false))
-        }
-        return out
     }
 
     /// Every list known now, by host and pane.
@@ -198,23 +151,6 @@ struct RemotePorts {
         lists.keys.sorted().flatMap { host in
             (lists[host] ?? [:]).keys.sorted().compactMap { lists[host]?[$0] }
         }
-    }
-
-    /// Keeps `e` as its pane's latest; an empty list forgets the pane.
-    private mutating func keep(_ e: Entry) {
-        if RemotePorts.isEmpty(e.ports) {
-            lists[e.host]?[e.pane] = nil
-        } else {
-            lists[e.host, default: [:]][e.pane] = e
-        }
-    }
-
-    private static func isEmpty(_ ports: Any) -> Bool { (ports as? [Any])?.isEmpty ?? false }
-
-    /// Whether `e` says what `known` (none: no ports) says.
-    private static func same(_ known: Entry?, _ e: Entry) -> Bool {
-        guard let known else { return isEmpty(e.ports) }
-        return (known.ports as AnyObject).isEqual(e.ports) && (known.complete as AnyObject).isEqual(e.complete)
     }
 }
 
@@ -333,7 +269,7 @@ enum ForwardPicker {
     }
 
     enum Manage: Equatable {
-        case copyLink(String)
+        case copyLink(ForwardInfo)
         case close(UInt64)
     }
 
@@ -349,7 +285,7 @@ enum ForwardPicker {
         forwards.flatMap { f -> [Entry] in
             let name = "\(f.host):\(f.remotePort)"
             return [
-                Entry(title: "Copy Forward Link \(name)", detail: f.url, action: .copyLink(f.url)),
+                Entry(title: "Copy Forward Link \(name)", detail: f.url, action: .copyLink(f)),
                 Entry(title: "Close Forward \(name)", detail: "localhost:\(f.localPort)", action: .close(f.id)),
             ]
         }
@@ -413,29 +349,37 @@ extension SessionManager {
                     SessionManager.show(ForwardNotice.failure(host: host, e, onPane: pane != nil), on: pane)
                     return
                 }
-                guard let f = ForwardInfo(json: v), let target = URL(string: f.url) else { return }
+                guard let f = ForwardInfo(json: v) else { return }
+                // Closed in the meantime (a move, the sweep): its port is no longer ours to open.
+                guard let link = SessionManager.liveLink(of: f), let target = URL(string: link) else {
+                    SessionManager.show(ForwardNotice.failure(host: host, "the forward closed before it opened",
+                                                              onPane: pane != nil), on: pane)
+                    return
+                }
                 if jsonBool(v?["new"]) == true {
                     SessionManager.show(ForwardNotice.opened(host: host, remotePort: f.remotePort, localPort: f.localPort,
-                                                             url: f.url, onPane: pane != nil), on: pane)
+                                                             url: link, onPane: pane != nil), on: pane, forward: f)
                 }
                 NSWorkspace.shared.open(target)
             }
         }
     }
 
-    private static func show(_ notice: ForwardNotice, on pane: TerminalView?) {
+    /// `forward`: the one Copy Link copies, checked again when it is clicked.
+    private static func show(_ notice: ForwardNotice, on pane: TerminalView?, forward: ForwardInfo? = nil) {
         switch notice {
         case .toast(let text, let link):
-            pane?.showToast(text, duration: 6, action: link.map { url in ("Copy Link", { copyForwardLink(url) }) })
+            let copy = forward.flatMap { f in link.map { _ in ("Copy Link", { copyForwardLink(f) }) } }
+            pane?.showToast(text, duration: 6, action: copy)
         case .alert(let text, let link):
             let alert = NSAlert()
             alert.messageText = text
             alert.addButton(withTitle: "OK")
-            if let link {
+            if let link, forward != nil {
                 alert.informativeText = link
                 alert.addButton(withTitle: "Copy Link")
             }
-            if alert.runModal() == .alertSecondButtonReturn, let link { copyForwardLink(link) }
+            if alert.runModal() == .alertSecondButtonReturn, let forward { copyForwardLink(forward) }
         }
     }
 
@@ -495,10 +439,29 @@ extension SessionManager {
                                    })
     }
 
-    static func copyForwardLink(_ url: String) {
+    /// `f`'s link as it is now, or nil once it has closed (`forward_get`).
+    static func liveLink(of f: ForwardInfo) -> String? {
+        ForwardInfo.liveLink(of: f, answer: Core.shared.remoteCall(["op": "forward_get", "id": NSNumber(value: f.id)]))
+    }
+
+    /// Copies `f`'s link if it is still open; a list or a toast may show one that closed since.
+    static func copyForwardLink(_ f: ForwardInfo) {
+        guard let url = liveLink(of: f) else {
+            NSSound.beep()
+            return
+        }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(url, forType: .string)
+    }
+
+    /// Opens `f`'s link if it is still open.
+    static func openForwardLink(_ f: ForwardInfo) {
+        guard let link = liveLink(of: f), let url = URL(string: link) else {
+            NSSound.beep()
+            return
+        }
+        NSWorkspace.shared.open(url)
     }
 
     /// `host` connected: every pane's port list at once, so its forwards don't go by lists of
@@ -526,13 +489,18 @@ extension SessionManager {
         guard host != localHost, let payload else { return }
         Remotes.shared.portsRequests.event(host, payload)
         applyRemotePorts(payload, host: host)
+        // Plugins hear it once, as it comes: `fetchRemotePorts` applies it again for the
+        // forwards only. Running already only when the host's daemon says so.
+        if let pane = jsonUInt64(payload["pane"]) {
+            Extensions.shared.reportPorts(host: host, pane: pane, ports: payload["ports"] ?? [],
+                                          complete: payload["complete"] ?? true,
+                                          initial: jsonBool(payload["initial"]) ?? false)
+        }
     }
 
-    fileprivate func applyRemotePorts(_ payload: [String: Any], host: HostId) {
+    func applyRemotePorts(_ payload: [String: Any], host: HostId) {
         guard let pane = jsonUInt64(payload["pane"]) else { return }
         _ = Core.shared.remoteCall(["op": "ports_changed", "host": host, "pane": NSNumber(value: pane),
                                     "ports": payload["ports"] ?? [], "complete": payload["complete"] ?? true])
-        Extensions.shared.reportPorts(host: host, pane: pane, ports: payload["ports"] ?? [],
-                                      complete: payload["complete"] ?? true)
     }
 }

@@ -81,8 +81,10 @@ typedef void (*thurm_transfer_cb)(void *ctx, const char *json);
 
 /* Send files to `pane`'s host as one batch. `files_json`: [{"path":"/local/file"}, or with
  * "name" to send it under another name]. Once all have landed, the daemon types their paths
- * into the pane; if one fails or the upload is cancelled, nothing is typed or kept there. A
- * folder is refused ("folder":true) before anything is sent. */
+ * into the pane; if one fails, nothing is typed or kept there. A cancel that reaches the
+ * daemon before the batch is complete does the same; once the paths are typed it is too late,
+ * and the final callback says the upload went ("error":null). A folder is refused
+ * ("folder":true) before anything is sent. */
 uint64_t thurm_upload(thurm_client *client, thurm_pane_id pane, const char *files_json,
                       thurm_transfer_cb cb, void *ctx);
 void thurm_upload_cancel(uint64_t transfer);

@@ -237,10 +237,7 @@ final class Remotes {
                     connectFailed(host, err)
                 } else {
                     SessionManager.shared.remoteConnected(host)
-                    if Core.shared.isConnected(host) {
-                        connectFailures[host] = nil
-                        Extensions.shared.remoteHostConnected(host)
-                    }
+                    if Core.shared.isConnected(host) { connectFailures[host] = nil }
                 }
             }
         } else {
@@ -678,9 +675,13 @@ extension SessionManager {
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
         for n in 1...10_000 {
-            // Shortened before its number and extension to stay within 255 bytes.
-            let tail = (n == 1 ? "" : " \(n)") + (ext.isEmpty ? "" : ".\(ext)")
-            var stem = base
+            // Shortened before its number and extension to stay within 255 bytes; an extension
+            // that alone is too long is shortened too, leaving a byte of the name before it.
+            let number = n == 1 ? "" : " \(n)"
+            var ext = ext
+            while !ext.isEmpty, 1 + number.utf8.count + 1 + ext.utf8.count > 255 { ext.removeLast() }
+            let tail = number + (ext.isEmpty ? "" : ".\(ext)")
+            var stem = base.isEmpty ? "file" : base
             while stem.utf8.count + tail.utf8.count > 255, !stem.isEmpty { stem.removeLast() }
             let numbered = stem + tail
             let candidate = dir.appendingPathComponent(numbered)
@@ -726,7 +727,7 @@ extension SessionManager {
         for entry in ForwardPicker.manageEntries(Remotes.shared.forwards) {
             items.append(CommandPalette.Item(title: entry.title, detail: entry.detail) {
                 switch entry.action {
-                case .copyLink(let url): SessionManager.copyForwardLink(url)
+                case .copyLink(let f): SessionManager.copyForwardLink(f)
                 case .close(let id): _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: id)])
                 }
             })

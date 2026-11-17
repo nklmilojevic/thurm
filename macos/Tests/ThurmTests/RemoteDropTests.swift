@@ -164,15 +164,75 @@ final class RemoteDropTests: XCTestCase {
         pb.clearContents()
         pb.setData(png, forType: .png)
         view.paste(from: pb)
-        XCTAssertEqual(fake.started.count, 1)
-        fake.finish[0](TransferOutcome())
         XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
-        XCTAssertEqual(fake.started.count, 2)
-        for batch in fake.started {
+        // The second waits for the first; each is the image as a PNG file while it is sent.
+        for i in 0..<2 {
+            XCTAssertEqual(fake.started.count, i + 1)
+            let batch = fake.started[i]
             XCTAssertEqual(batch.count, 1)
             XCTAssertTrue(batch[0].hasSuffix(".png"), batch[0])
             XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: batch[0])), png)
+            fake.finish[i](TransferOutcome())
         }
+    }
+
+    func testPastedTextIsPastedEvenWithAFileBesideIt() throws {
+        let secret = try file("id_ed25519")
+        let (view, fake) = remotePane()
+        // An app copied some text and put a file's address beside it.
+        pb.clearContents()
+        pb.writeObjects([secret] as [NSURL])
+        pb.setString("make test", forType: .string)
+        view.paste(from: pb)
+        XCTAssertEqual(fake.started, [])
+        // Finder's copy of files has their names as its text: the files go.
+        let copied = [try file("one.txt"), try file("two.txt")]
+        pb.clearContents()
+        pb.writeObjects(copied as [NSURL])
+        pb.setString("one.txt\rtwo.txt", forType: .string)
+        view.paste(from: pb)
+        XCTAssertEqual(fake.started, [copied.map(\.path)])
+    }
+
+    func testAnImageMadeForAnUploadGoesWhenTheUploadEnds() throws {
+        let (view, fake) = remotePane()
+        pb.clearContents()
+        pb.setData(png, forType: .png)
+        view.paste(from: pb)
+        view.paste(from: pb)
+        let first = fake.started[0][0]
+        XCTAssertTrue(FileManager.default.fileExists(atPath: first))
+        fake.finish[0](TransferOutcome())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: first))
+        // The second waited, then went; cancelled, its image goes too.
+        let second = fake.started[1][0]
+        var cancelled = TransferOutcome(error: "cancelled")
+        cancelled.cancelled = true
+        fake.finish[1](cancelled)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: second))
+        // One cancelled while waiting is not sent, and its image goes.
+        let user = try file("mine.txt")
+        pb.clearContents()
+        pb.writeObjects([user] as [NSURL])
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        pb.clearContents()
+        pb.setData(png, forType: .png)
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        let waiting = try FileManager.default.contentsOfDirectory(
+            at: FileManager.default.temporaryDirectory.appendingPathComponent("thurm-drops"),
+            includingPropertiesForKeys: [.creationDateKey]
+        ).max { a, b in
+            let da = (try? a.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            return da < db
+        }
+        let image = try XCTUnwrap(waiting)
+        fake.finish[2](TransferOutcome())
+        XCTAssertEqual(fake.started.count, 4)
+        fake.finish[3](cancelled)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: image.path))
+        // A file of the user's is never deleted.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: user.path))
     }
 
     func testAFolderOrAnOlderHostSendsNothing() throws {
@@ -244,6 +304,14 @@ final class RemoteDropTests: XCTestCase {
         let numbered = try XCTUnwrap(SessionManager.reserveFreeName(long, in: dir)).lastPathComponent
         XCTAssertEqual(numbered.utf8.count, 255)
         XCTAssertTrue(numbered.hasSuffix(" 2.txt"), numbered)
+        // So is an extension as long as names go.
+        let longExt = "a." + String(repeating: "e", count: 253)
+        let first2 = try XCTUnwrap(SessionManager.reserveFreeName(longExt, in: dir)).lastPathComponent
+        XCTAssertEqual(first2, longExt)
+        let second2 = try XCTUnwrap(SessionManager.reserveFreeName(longExt, in: dir)).lastPathComponent
+        XCTAssertNotEqual(second2, first2)
+        XCTAssertLessThanOrEqual(second2.utf8.count, 255)
+        XCTAssertTrue(second2.hasPrefix("a 2."), second2)
     }
 }
 

@@ -383,7 +383,9 @@ others are on their way wait for them, so paths are typed in the order you
 dropped them. Once every file has
 arrived, the host's daemon types their paths into the pane, quoted and separated
 by spaces, as a paste, so an agent at its prompt gets them as one paste. If a
-file fails or you cancel, nothing is typed and nothing is kept. Folders are
+file fails or you cancel before every file has arrived, nothing is typed and
+nothing is kept. Pasting copied text pastes the text, even when the app that
+copied it put a file beside it; files copied in Finder are sent. Folders are
 refused; drop the files in them instead.
 
 Uploads are kept on the host, readable by you only, in Thurm's state directory
@@ -446,7 +448,9 @@ Nothing is forwarded until you do one of these: a port that merely opens on the
 host stays there, and a host that is turned off gets no forwards. The host's
 details in **Thurm › Remotes…** list its forwards, with **Open** (the link it
 was opened for), **Copy Link** and **Close**; ⌘⇧P has **Copy Forward Link** and
-**Close Forward** for each too. Closing a forward also ends the connections it
+**Close Forward** for each too. Each checks first that the forward is still open
+on the same port: one that has closed meanwhile is neither opened nor copied (its
+port may be another program's by then). Closing a forward also ends the connections it
 carries. A forward also closes when the host is removed or turned off, and when
 the port has been gone from every pane of the host for 30 seconds with no
 connection open (while part of a host's processes can't be read, or the host is

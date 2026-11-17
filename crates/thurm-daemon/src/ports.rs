@@ -118,6 +118,7 @@ impl Tracker {
                     pane,
                     ports: Vec::new(),
                     complete: true,
+                    initial: false,
                 });
             }
         }
@@ -130,7 +131,7 @@ impl Tracker {
                 None => {
                     let send = !s.ports.is_empty();
                     if send {
-                        events.push(event(pane, &s));
+                        events.push(event(pane, &s, false));
                     }
                     self.panes.insert(
                         pane,
@@ -154,7 +155,7 @@ impl Tracker {
                         retry = Some(retry.map_or(when, |r| r.min(when)));
                         continue;
                     }
-                    events.push(event(pane, &s));
+                    events.push(event(pane, &s, false));
                     k.sent = s;
                     k.sent_at = Some(now);
                 }
@@ -164,11 +165,13 @@ impl Tracker {
     }
 }
 
-fn event(pane: PaneId, s: &Seen) -> Event {
+/// `pane`'s list `s`: a change, or (`initial`) what a joining client is told is there already.
+fn event(pane: PaneId, s: &Seen, initial: bool) -> Event {
     Event::PortsChanged {
         pane,
         ports: s.ports.clone(),
         complete: s.complete,
+        initial,
     }
 }
 
@@ -252,7 +255,8 @@ struct State {
 }
 
 /// What one look sends: `broadcast` to the clients that had subscribed before it (by the per-pane
-/// rules), and to each of `joined` its own first lists, every pane with ports as seen now. A
+/// rules, as changes), and to each of `joined` its own first lists, every pane with ports as seen
+/// now, marked `initial`. A
 /// client joining doesn't make the others hear a list again, nor sooner than a second after the
 /// last one.
 #[derive(Debug)]
@@ -282,7 +286,7 @@ pub fn deliver(
     let (broadcast, retry) = tracker.update(now, seen);
     let initial = joined
         .iter()
-        .flat_map(|&c| first.iter().map(move |(p, s)| (c, event(*p, s))))
+        .flat_map(|&c| first.iter().map(move |(p, s)| (c, event(*p, s, true))))
         .collect();
     Delivery {
         broadcast,
@@ -428,6 +432,7 @@ mod tests {
                 pane,
                 ports,
                 complete,
+                ..
             } => (*pane, ports.iter().map(|p| p.port).collect(), *complete),
             other => panic!("{other:?}"),
         }
@@ -606,6 +611,60 @@ mod tests {
         assert_eq!(interval_from(Some("200")), Duration::from_millis(200));
         assert_eq!(interval_from(Some("0")), Duration::from_millis(50));
         assert_eq!(interval_from(Some("junk")), MIN_INTERVAL);
+    }
+
+    fn initial_of(ev: &Event) -> bool {
+        match ev {
+            Event::PortsChanged { initial, .. } => *initial,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_a_joiners_first_lists_are_initial() {
+        let t0 = Instant::now();
+        let mut t = Tracker::default();
+        // Client 1 joins: its lists are what was there; the broadcast to others is a change.
+        let d = deliver(
+            &mut t,
+            t0,
+            HashMap::from([(1, seen(&[3000])), (2, seen(&[4000]))]),
+            &[1],
+        );
+        assert!(
+            d.initial.iter().all(|(_, e)| initial_of(e)),
+            "{:?}",
+            d.initial
+        );
+        assert_eq!(d.initial.len(), 2);
+        assert!(
+            d.broadcast.iter().all(|e| !initial_of(e)),
+            "{:?}",
+            d.broadcast
+        );
+        // Client 2 joins later: initial lists for it alone, nothing to the others.
+        let d = deliver(
+            &mut t,
+            t0 + PER_PANE,
+            HashMap::from([(1, seen(&[3000])), (2, seen(&[4000]))]),
+            &[2],
+        );
+        assert!(d.broadcast.is_empty());
+        assert!(d.initial.iter().all(|(c, e)| *c == 2 && initial_of(e)));
+        // Then a change, and a pane that goes: never initial, for anyone.
+        let d = deliver(
+            &mut t,
+            t0 + PER_PANE * 2,
+            HashMap::from([(1, seen(&[3000, 3001]))]),
+            &[],
+        );
+        assert!(d.initial.is_empty());
+        assert_eq!(d.broadcast.len(), 2);
+        assert!(
+            d.broadcast.iter().all(|e| !initial_of(e)),
+            "{:?}",
+            d.broadcast
+        );
     }
 
     #[test]

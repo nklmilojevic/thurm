@@ -1,6 +1,6 @@
 //! Files to and from this host on byte streams ([`thurm_proto::CAP_TRANSFER`]).
 //!
-//! Uploads land in `<runtime>/drops/<pane>/<batch>/<name>`, written under `.parts/` and moved
+//! Uploads land in `<state>/drops/<pane>/<batch>/<name>`, written under `.parts/` and moved
 //! into place once exactly the size announced has arrived. When the last file of a batch lands,
 //! the daemon pastes their paths into the pane (bracketed paste applies) and only then closes
 //! the batch's streams `Ok`. A file that fails, or the client going away, deletes the batch and
@@ -55,6 +55,9 @@ pub struct Transfers {
     max_kept: u64,
     /// [`KEEP`], or `THURM_TRANSFER_KEEP_MS` (tests).
     keep: Duration,
+    /// A pause between a batch's last file landing and its paths being typed:
+    /// `THURM_TRANSFER_PASTE_DELAY_MS` (tests), none otherwise.
+    paste_delay: Duration,
 }
 
 /// A duration in milliseconds from the environment variable `var`, else `default` (tests).
@@ -136,6 +139,7 @@ impl Transfers {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(MAX_KEPT),
             keep: env_ms("THURM_TRANSFER_KEEP_MS", KEEP),
+            paste_delay: env_ms("THURM_TRANSFER_PASTE_DELAY_MS", Duration::ZERO),
         }
     }
 
@@ -551,7 +555,7 @@ impl Transfers {
     /// File `index` of batch `serial` arrived whole at its place. When it is the last, types
     /// the batch's paths into its pane.
     fn landed(&self, daemon: &Daemon, serial: u64, index: u32) {
-        let (client, pane, paths) = {
+        {
             let mut st = self.state.lock();
             let Some(b) = st.batches.get_mut(&serial) else {
                 return;
@@ -560,25 +564,31 @@ impl Transfers {
                 f.state = SlotState::Landed;
             }
             b.touched = Instant::now();
-            let all = b.files.len() == b.count as usize
-                && b.files.values().all(|f| f.state == SlotState::Landed);
-            if !all || !b.waiting() {
-                return;
-            }
-            b.pasting = true;
-            let paths: Vec<String> = b
-                .files
-                .values()
-                .map(|f| f.path.display().to_string())
-                .collect();
-            (b.client, b.pane, paths)
-        };
-        let text: Vec<String> = paths.iter().map(|p| crate::shell::shell_quote(p)).collect();
-        let typed = daemon.paste_for(client, pane, &(text.join(" ") + " "));
-        if typed.is_ok() {
-            daemon.files_uploaded(pane, paths);
         }
+        if !self.paste_delay.is_zero() {
+            std::thread::sleep(self.paste_delay);
+        }
+        // Decided and typed under the lock `client_gone` takes: a client that went before the
+        // paths are written fails the batch, and nothing is typed for it.
         let mut st = self.state.lock();
+        let Some(b) = st.batches.get_mut(&serial) else {
+            return;
+        };
+        let all = b.files.len() == b.count as usize
+            && b.files.values().all(|f| f.state == SlotState::Landed);
+        if !all || !b.waiting() || b.pasting {
+            return;
+        }
+        b.pasting = true;
+        let paths: Vec<String> = b
+            .files
+            .values()
+            .map(|f| f.path.display().to_string())
+            .collect();
+        let quoted: Vec<String> = paths.iter().map(|p| crate::shell::shell_quote(p)).collect();
+        let (client, pane, text) = (b.client, b.pane, quoted.join(" ") + " ");
+        let typed = daemon.paste_for(client, pane, &text);
+        let mut uploaded = false;
         if let Some(b) = st.batches.get_mut(&serial) {
             b.pasting = false;
             b.touched = Instant::now();
@@ -586,9 +596,15 @@ impl Transfers {
                 Ok(()) => {
                     b.outcome = Some(Ok(()));
                     self.changed.notify_all();
+                    uploaded = true;
                 }
                 Err(e) => self.fail(&mut st, serial, e),
             }
+        }
+        drop(st);
+        // Only once the paths were typed: a batch that failed, or whose sender left, is not.
+        if uploaded {
+            daemon.files_uploaded(pane, paths);
         }
     }
 

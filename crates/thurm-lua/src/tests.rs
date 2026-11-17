@@ -675,6 +675,11 @@ fn ports_and_forwards() {
     );
     let e = run(&f, "thurm.forward.open('devbox', '5173')").unwrap_err();
     assert!(e.contains("usage: thurm.forward.open"), "{e}");
+    // A pane that is not one is refused, not taken for every pane.
+    for bad in ["-1", "'3'", "1.5"] {
+        let e = run(&f, &format!("return thurm.ports({bad})")).unwrap_err();
+        assert!(e.contains("usage: thurm.ports"), "{bad}: {e}");
+    }
 }
 
 /// The example dev-server plugin opens servers that start, never ones that were running: this
