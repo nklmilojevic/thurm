@@ -206,24 +206,35 @@ final class RemoteFileCache {
         return (file, version)
     }
 
-    /// The file named `name` (on the host) to download into `entry`; `entry` is emptied first.
-    func prepare(_ entry: URL) throws -> URL {
-        let fm = FileManager.default
-        try? fm.removeItem(at: entry)
-        try fm.createDirectory(at: entry, withIntermediateDirectories: true,
-                               attributes: [.posixPermissions: 0o700])
-        return entry.appendingPathComponent(".download")
+    /// A new file in `entry` (made if needed) for one download to write: the cached copy, if
+    /// any, stays as it is until `install` replaces it.
+    func stage(_ entry: URL) throws -> URL {
+        try FileManager.default.createDirectory(at: entry, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        return entry.appendingPathComponent(".staging-\(UUID().uuidString)")
     }
 
-    /// Moves the downloaded file to its own name and records its version (none: fetched again
-    /// next time). Returns where it is.
-    func store(_ entry: URL, name: String, version: String?) throws -> URL {
+    /// Puts the downloaded `staged` file in place of the cached copy under its own name and
+    /// records its version (none: fetched again next time). The old copy goes only once the
+    /// new one is there. Returns where it is.
+    func install(_ entry: URL, staged: URL, name: String, version: String?) throws -> URL {
+        let fm = FileManager.default
         let safe = name.isEmpty || name.contains("/") || name.hasPrefix(".") ? "file" : name
         let file = entry.appendingPathComponent(safe)
-        try FileManager.default.moveItem(at: entry.appendingPathComponent(".download"), to: file)
+        let old = (try? String(contentsOf: entry.appendingPathComponent(".name"), encoding: .utf8))
+            .flatMap { $0.isEmpty || $0.contains("/") ? nil : entry.appendingPathComponent($0) }
+        if fm.fileExists(atPath: file.path) {
+            _ = try fm.replaceItemAt(file, withItemAt: staged)
+        } else {
+            try fm.moveItem(at: staged, to: file)
+        }
+        if let old, old.lastPathComponent != safe { try? fm.removeItem(at: old) }
         try safe.write(to: entry.appendingPathComponent(".name"), atomically: true, encoding: .utf8)
+        let versionFile = entry.appendingPathComponent(".version")
         if let version {
-            try version.write(to: entry.appendingPathComponent(".version"), atomically: true, encoding: .utf8)
+            try version.write(to: versionFile, atomically: true, encoding: .utf8)
+        } else {
+            try? fm.removeItem(at: versionFile)
         }
         prune(keeping: entry)
         return file
@@ -252,13 +263,36 @@ final class RemoteFileCache {
         }
     }
 
+    /// Downloads `path` as `pane` sees it to `dest` unless `ifVersion` is still its version, at
+    /// most `maxBytes` (`Core.download`; tests stand in for it). `completion` on the main thread.
+    typealias Downloader = (_ pane: PaneKey, _ path: String, _ dest: URL, _ ifVersion: String?,
+                            _ maxBytes: UInt64, _ completion: @escaping (TransferOutcome) -> Void) -> Void
+
+    var download: Downloader = { pane, path, dest, ifVersion, maxBytes, completion in
+        Core.shared.download(pane, path: path, to: dest, ifVersion: ifVersion, maxBytes: maxBytes,
+                             onProgress: { _ in }, onFinish: completion)
+    }
+
+    /// Fetches under way, by the entry of their first path, with everyone waiting on each.
+    private var inFlight: [URL: [(Result<URL, Error>) -> Void]] = [:]
+
     /// Fetches `reference`, as `pane` sees it, into the cache (or finds it there unchanged);
-    /// `completion` runs on the main thread.
+    /// `completion` runs on the main thread. A fetch of a file already on its way waits for that
+    /// one instead of starting another. Main thread only.
     func fetch(_ reference: TerminalFileReference, pane: PaneKey, cwd: String?,
                completion: @escaping (Result<URL, Error>) -> Void) {
         let paths: [String]
         do { paths = try reference.remotePaths() } catch { return completion(.failure(error)) }
-        fetch(paths[...], pane: pane, cwd: cwd, firstError: nil, completion: completion)
+        let key = entry(host: pane.host, path: paths[0], cwd: cwd)
+        if inFlight[key] != nil {
+            inFlight[key]?.append(completion)
+            return
+        }
+        inFlight[key] = [completion]
+        fetch(paths[...], pane: pane, cwd: cwd, firstError: nil) { [self] result in
+            let waiting = inFlight.removeValue(forKey: key) ?? []
+            for done in waiting { done(result) }
+        }
     }
 
     private func fetch(_ paths: ArraySlice<String>, pane: PaneKey, cwd: String?, firstError: String?,
@@ -268,38 +302,27 @@ final class RemoteFileCache {
         }
         let entry = self.entry(host: pane.host, path: path, cwd: cwd)
         let cached = cached(entry)
-        let dest: URL
-        if cached == nil {
-            do { dest = try prepare(entry) } catch { return completion(.failure(error)) }
-        } else {
-            dest = entry.appendingPathComponent(".download")
-        }
-        Core.shared.download(pane, path: path, to: dest, ifVersion: cached?.version, maxBytes: maxBytes,
-                             onProgress: { _ in }) { [self] outcome in
+        let staged: URL
+        do { staged = try stage(entry) } catch { return completion(.failure(error)) }
+        download(pane, path, staged, cached?.version, maxBytes) { [self] outcome in
             if outcome.notModified, let cached {
+                try? FileManager.default.removeItem(at: staged)
                 try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: entry.path)
                 return completion(.success(cached.file))
             }
             if let error = outcome.error {
+                try? FileManager.default.removeItem(at: staged)
                 if outcome.unsupported { return completion(.failure(FilePreviewError.remote)) }
                 return fetch(paths.dropFirst(), pane: pane, cwd: cwd, firstError: firstError ?? error,
                              completion: completion)
             }
             do {
-                if cached != nil { _ = try prepareKeepingDownload(entry) }
-                completion(.success(try store(entry, name: outcome.name ?? "file", version: outcome.version)))
+                completion(.success(try install(entry, staged: staged, name: outcome.name ?? "file",
+                                                version: outcome.version)))
             } catch {
+                try? FileManager.default.removeItem(at: staged)
                 completion(.failure(error))
             }
-        }
-    }
-
-    /// Empties `entry` but for the file just downloaded into it.
-    private func prepareKeepingDownload(_ entry: URL) throws {
-        let fm = FileManager.default
-        for f in try fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)
-            where f.lastPathComponent != ".download" {
-            try fm.removeItem(at: f)
         }
     }
 }

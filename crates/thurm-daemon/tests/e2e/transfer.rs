@@ -271,14 +271,7 @@ fn a_file_downloads_and_is_not_sent_again_unchanged() {
     let dir = work_dir(&env);
     let data: Vec<u8> = (0..200_000).map(|i| (i % 241) as u8).collect();
     let file = dir.join("data.bin");
-    std::fs::write(&file, &data).unwrap();
-    let old = std::time::SystemTime::now() - Duration::from_secs(60);
-    std::fs::File::options()
-        .write(true)
-        .open(&file)
-        .unwrap()
-        .set_modified(old)
-        .unwrap();
+    write_settled(&file, &data);
     let pane = cat_pane(&c, &dir);
 
     let info = c.download_begin(pane, "data.bin", None).unwrap();
@@ -306,4 +299,155 @@ fn a_file_downloads_and_is_not_sent_again_unchanged() {
     assert!(e.to_string().contains("not a regular file"), "{e}");
     let e = c.download_begin(pane, "missing", None).unwrap_err();
     assert!(e.to_string().contains("cannot open"), "{e}");
+}
+
+/// Writes `data` to `path`, modified a minute ago, and waits out the second after its change
+/// time in which it has no version.
+fn write_settled(path: &Path, data: &[u8]) {
+    std::fs::write(path, data).unwrap();
+    set_modified(path, std::time::SystemTime::now() - Duration::from_secs(60));
+    std::thread::sleep(Duration::from_millis(1100));
+}
+
+fn set_modified(path: &Path, when: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+#[test]
+fn a_file_rewritten_with_its_old_modification_time_is_sent_again() {
+    let env = Env::new("transfer-ctime");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let file = dir.join("same.txt");
+    write_settled(&file, b"before");
+    let pane = cat_pane(&c, &dir);
+    let first = c.download_begin(pane, "same.txt", None).unwrap();
+    let version = first.version.clone().unwrap();
+    let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+    // Same length, same modification time: only the change time tells.
+    std::fs::write(&file, b"after!").unwrap();
+    set_modified(&file, modified);
+    std::thread::sleep(Duration::from_millis(1100));
+    let again = c.download_begin(pane, "same.txt", Some(&version)).unwrap();
+    assert!(!again.not_modified, "{again:?}");
+    assert!(again.ticket.is_some());
+    assert_ne!(again.version.as_deref(), Some(version.as_str()));
+}
+
+#[test]
+fn a_file_changed_after_it_was_asked_for_is_not_sent() {
+    let env = Env::new("transfer-changed");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let file = dir.join("moving.txt");
+    write_settled(&file, b"version one");
+    let pane = cat_pane(&c, &dir);
+    let info = c.download_begin(pane, "moving.txt", None).unwrap();
+    // Edited in place, to the same length, before the stream opens.
+    std::fs::write(&file, b"version two").unwrap();
+    let (mut r, mut w) = stream::open(&env.socket, info.ticket.as_deref().unwrap()).unwrap();
+    let mut got = Vec::new();
+    let e = r.read_to_end(&mut got).unwrap_err();
+    assert!(
+        e.to_string().contains("changed since it was asked for"),
+        "{e}"
+    );
+    assert!(got.is_empty());
+    let _ = w.finish();
+}
+
+#[test]
+fn kept_uploads_stay_within_the_limit_batch_and_all() {
+    let env = Env::new("transfer-kept");
+    let _daemon = env.start_with(&[("THURM_TRANSFER_MAX_KEPT", Path::new("10"))]);
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    send(&env, &c, pane, ("a", 0, 1), "a.txt", 4, b"aaaa")
+        .wait_closed()
+        .unwrap();
+    let [first] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    // 4 kept and 8 more: the older drop makes room.
+    send(&env, &c, pane, ("b", 0, 1), "b.txt", 8, b"bbbbbbbb")
+        .wait_closed()
+        .unwrap();
+    assert!(!first.exists());
+    // One batch whose files together are over the limit is refused at the file that does not
+    // fit, before any of its bytes.
+    let first_file = send(&env, &c, pane, ("c", 0, 2), "c1.txt", 6, b"cccccc");
+    let e = c
+        .upload_begin(
+            pane,
+            "c2.txt",
+            6,
+            Some(UploadBatch {
+                id: "c".into(),
+                index: 1,
+                count: 2,
+            }),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("does not fit"), "{e}");
+    // "c" took the room the kept "b" held.
+    let has = |name: &str| batches(&env, pane).iter().any(|b| b.join(name).exists());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !has("c1.txt") {
+        assert!(Instant::now() < deadline, "c1.txt did not land");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!has("b.txt"));
+    drop(first_file);
+    // Beside the 6 bytes of "c", still open, a batch that fits whole goes.
+    let readers: Vec<StreamReader> = (0..2)
+        .map(|i| send(&env, &c, pane, ("d", i, 2), "d.txt", 2, b"dd"))
+        .collect();
+    for r in readers {
+        r.wait_closed().unwrap();
+    }
+    assert!(has("d.txt") && has("d-2.txt") && has("c1.txt"));
+}
+
+#[test]
+fn cancelling_after_the_last_bytes_drops_the_batch() {
+    let env = Env::new("transfer-abort");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let ticket = c
+        .upload_begin(
+            pane,
+            "one.txt",
+            3,
+            Some(UploadBatch {
+                id: "x".into(),
+                index: 0,
+                count: 2,
+            }),
+        )
+        .unwrap();
+    let (r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
+    w.write_all(b"one").unwrap();
+    w.finish().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while batches(&env, pane)
+        .first()
+        .is_none_or(|b| !b.join("one.txt").exists())
+    {
+        assert!(Instant::now() < deadline, "the file did not land");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Everything sent and finished, the batch waiting for its second file: Cancel.
+    w.close(thurm_proto::stream::StreamClose::Aborted).unwrap();
+    let e = r.wait_closed().unwrap_err().to_string();
+    assert!(e.contains("cancelled"), "{e}");
+    assert!(batches(&env, pane).is_empty());
+    assert_eq!(typed(&c, pane, &dir), "\n");
 }

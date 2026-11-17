@@ -26,14 +26,13 @@ pub enum Kind {
     Tcp { port: u16 },
     /// A file coming in: the `index`th of an upload batch (`crate::transfer`).
     Upload { batch: u64, index: u32 },
-    /// A file going out (`crate::transfer`): `path`, which was the file `dev`/`ino` of `size`
-    /// bytes when reserved.
+    /// A file going out (`crate::transfer`): `path`, of `size` bytes, whose metadata
+    /// (`crate::transfer::stamp`) was `stamp` when reserved.
     Download {
         pane: u64,
         path: std::path::PathBuf,
         size: u64,
-        dev: u64,
-        ino: u64,
+        stamp: u64,
     },
 }
 

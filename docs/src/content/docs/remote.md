@@ -371,7 +371,7 @@ the same. Limits:
 | Files in one drop | 256 |
 | Files on their way to one pane | 64 |
 | Space left free on the host's disk | 1 GiB, or the upload is refused |
-| Kept | 24 hours, and 8 GiB in all (the oldest drops go first) |
+| Kept | 24 hours, and 8 GiB in all, drops on their way included: the oldest finished drops go first, and a file that still does not fit is refused |
 
 The other way, ⌘⌥-click a path in a remote pane, or right-click it and pick
 **Quick Look**, to preview the host's file here: relative paths use the pane's
@@ -379,7 +379,8 @@ directory, `~` is your home on the host. A `file://` link offers **Quick Look**
 and **Download** (to `~/Downloads`) beside **Copy Path**. Previewed files are
 kept in the app's caches folder and fetched again only when they changed on the
 host; files over 256 MiB are not previewed. Only regular files are sent, at most
-four at a time from one pane.
+four at a time from one pane. A file that changes between the request and the
+end of sending fails instead of arriving mixed; try again.
 
 A host running an older Thurm keeps the earlier behavior: a pasted or dropped
 image is written to a private file on the host and its path pasted; other files

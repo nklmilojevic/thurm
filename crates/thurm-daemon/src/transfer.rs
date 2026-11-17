@@ -49,6 +49,8 @@ pub struct Transfers {
     changed: Condvar,
     /// A batch nothing happened to for this long has stalled (a ticket never used).
     idle: Duration,
+    /// [`MAX_KEPT`], or `THURM_TRANSFER_MAX_KEPT` (tests).
+    max_kept: u64,
 }
 
 #[derive(Default)]
@@ -100,6 +102,10 @@ impl Transfers {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
             idle: crate::streams::ticket_ttl().max(Duration::from_secs(1)) * 2,
+            max_kept: std::env::var("THURM_TRANSFER_MAX_KEPT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MAX_KEPT),
         }
     }
 
@@ -169,6 +175,23 @@ impl Transfers {
                 MIN_FREE >> 30
             ));
         }
+        // Everything on its way or landed in a batch still open counts, with this file, against
+        // what is kept: older drops make room, and what cannot fit is refused before a byte.
+        let active: u64 = st
+            .batches
+            .values()
+            .filter(|b| b.waiting() || b.pasting)
+            .flat_map(|b| b.files.values())
+            .map(|f| f.size)
+            .sum();
+        let incoming = active.saturating_add(size);
+        let kept = self.make_room(&st, incoming);
+        if kept.saturating_add(incoming) > self.max_kept {
+            return Err(format!(
+                "{name} does not fit in what this host keeps of sent files ({} MiB)",
+                self.max_kept >> 20
+            ));
+        }
         let existing = id.as_ref().and_then(|id| {
             st.batches
                 .iter()
@@ -181,7 +204,6 @@ impl Transfers {
             Some((_, Some(Ok(())))) => return Err("that batch was already sent".into()),
             Some((serial, None)) => serial,
             None => {
-                self.make_room(&st, size);
                 let dir = self.new_batch_dir(pane)?;
                 st.next += 1;
                 let serial = st.next;
@@ -293,8 +315,7 @@ impl Transfers {
                 pane,
                 path: abs,
                 size: info.size,
-                dev: meta.dev(),
-                ino: meta.ino(),
+                stamp: stamp(&meta),
             },
             client,
             principal,
@@ -387,8 +408,9 @@ impl Transfers {
     }
 
     /// Deletes kept batches older than [`KEEP`], then the oldest until `incoming` more bytes
-    /// stay within [`MAX_KEPT`]. Batches on their way are left alone.
-    fn make_room(&self, st: &State, incoming: u64) {
+    /// stay within the kept limit. Batches on their way are left alone. Returns the bytes
+    /// still kept by decided batches.
+    fn make_room(&self, st: &State, incoming: u64) -> u64 {
         let busy: HashSet<&Path> = st
             .batches
             .values()
@@ -397,7 +419,7 @@ impl Transfers {
             .collect();
         let mut kept = Vec::new();
         let Ok(panes) = std::fs::read_dir(&self.root) else {
-            return;
+            return 0;
         };
         for pane in panes.flatten() {
             let Ok(batches) = std::fs::read_dir(pane.path()) else {
@@ -425,12 +447,13 @@ impl Transfers {
         kept.sort_by_key(|(modified, _, _)| *modified);
         let mut total: u64 = kept.iter().map(|(_, size, _)| size).sum();
         for (_, size, dir) in kept {
-            if total.saturating_add(incoming) <= MAX_KEPT {
+            if total.saturating_add(incoming) <= self.max_kept {
                 break;
             }
             let _ = std::fs::remove_dir_all(&dir);
             total = total.saturating_sub(size);
         }
+        total
     }
 
     /// File `index` of batch `serial` arrived whole at its place. When it is the last, types
@@ -495,7 +518,7 @@ impl Transfers {
         }
     }
 
-    fn serve_upload<R: Read>(
+    fn serve_upload<R: Read + Send>(
         &self,
         daemon: &Daemon,
         serial: u64,
@@ -541,10 +564,21 @@ impl Transfers {
                 self.fail(&mut st, serial, e);
             }
         }
-        match self.outcome(serial) {
-            Ok(()) => close(&mut writer, StreamClose::Ok),
-            Err(e) => close(&mut writer, StreamClose::Internal(e)),
-        }
+        // While the batch waits, the sender may still give up: an abort on this stream ends the
+        // batch. A connection that merely closes does not (the sender only waits on its last
+        // file's stream).
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                if let Ok(Some(StreamFrame::Close(_))) = stream::read_frame(&mut reader) {
+                    let mut st = self.state.lock();
+                    self.fail(&mut st, serial, "the upload was cancelled".into());
+                }
+            });
+            match self.outcome(serial) {
+                Ok(()) => close(&mut writer, StreamClose::Ok),
+                Err(e) => close(&mut writer, StreamClose::Internal(e)),
+            }
+        });
     }
 
     fn serve_download<R: Read>(
@@ -552,7 +586,7 @@ impl Transfers {
         pane: PaneId,
         path: &Path,
         size: u64,
-        (dev, ino): (u64, u64),
+        stamp: u64,
         mut reader: R,
         mut writer: UnixStream,
     ) {
@@ -570,7 +604,7 @@ impl Transfers {
             }
             *n += 1;
         }
-        let sent = send_file(&mut writer, path, size, (dev, ino));
+        let sent = send_file(&mut writer, path, size, stamp);
         {
             let mut st = self.state.lock();
             if let Some(n) = st.downloads.get_mut(&pane) {
@@ -598,7 +632,7 @@ impl Transfers {
 }
 
 /// Carries an opened upload or download stream (see [`crate::streams::serve`] for TCP).
-pub fn serve<R: Read>(
+pub fn serve<R: Read + Send>(
     daemon: &Arc<Daemon>,
     kind: Kind,
     reader: R,
@@ -612,9 +646,8 @@ pub fn serve<R: Read>(
             pane,
             path,
             size,
-            dev,
-            ino,
-        } => t.serve_download(pane, &path, size, (dev, ino), reader, writer),
+            stamp,
+        } => t.serve_download(pane, &path, size, stamp, reader, writer),
         Kind::Tcp { .. } => close(
             &mut writer,
             StreamClose::Internal("not a file stream".into()),
@@ -666,17 +699,14 @@ fn receive<R: Read>(
     }
 }
 
-/// Sends the `size` bytes of `path`, still the file `dev`/`ino`, then `End`.
-fn send_file(
-    writer: &mut UnixStream,
-    path: &Path,
-    size: u64,
-    (dev, ino): (u64, u64),
-) -> Result<(), String> {
+/// Sends the `size` bytes of `path`, then `End`: only while it is the file stamped `expected`
+/// when asked for, before and after it is read, so new bytes never go out under the old
+/// version.
+fn send_file(writer: &mut UnixStream, path: &Path, size: u64, expected: u64) -> Result<(), String> {
     let file =
         open_nonblocking(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let meta = file.metadata().map_err(|e| e.to_string())?;
-    if !meta.is_file() || meta.dev() != dev || meta.ino() != ino {
+    if !meta.is_file() || stamp(&meta) != expected {
         return Err(format!("{} changed since it was asked for", path.display()));
     }
     let mut file = file.take(size);
@@ -697,6 +727,10 @@ fn send_file(
             "{} got shorter while it was sent ({sent} of {size} bytes)",
             path.display()
         ));
+    }
+    let after = file.get_ref().metadata().map_err(|e| e.to_string())?;
+    if stamp(&after) != expected {
+        return Err(format!("{} changed while it was sent", path.display()));
     }
     stream::write_frame(writer, &StreamFrame::End).map_err(|e| e.to_string())
 }
@@ -743,17 +777,9 @@ fn modified_ms(meta: &std::fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Device, inode, size and modification time, hashed; `None` when the file changed in the last
-/// second (another write may follow within the clock's resolution).
-fn version(meta: &std::fs::Metadata) -> Option<String> {
-    let recent = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_none_or(|age| age < Duration::from_secs(1));
-    if recent {
-        return None;
-    }
+/// The file's device, inode, size, modification and change times, hashed. A write changes the
+/// change time even when the modification time is set back afterwards.
+pub(crate) fn stamp(meta: &std::fs::Metadata) -> u64 {
     // FNV-1a: stable across builds, unlike the standard library's hasher.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for word in [
@@ -762,13 +788,33 @@ fn version(meta: &std::fs::Metadata) -> Option<String> {
         meta.len(),
         meta.mtime() as u64,
         meta.mtime_nsec() as u64,
+        meta.ctime() as u64,
+        meta.ctime_nsec() as u64,
     ] {
         for b in word.to_le_bytes() {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
     }
-    Some(format!("{h:016x}"))
+    h
+}
+
+/// [`stamp`] as a version; `None` when the file was modified or changed in the last second
+/// (another write may follow within the clock's resolution).
+fn version(meta: &std::fs::Metadata) -> Option<String> {
+    let changed = SystemTime::UNIX_EPOCH
+        + Duration::new(
+            meta.ctime().max(0) as u64,
+            meta.ctime_nsec().clamp(0, 999_999_999) as u32,
+        );
+    let recent = [meta.modified().ok(), Some(changed)].into_iter().any(|t| {
+        t.and_then(|t| t.elapsed().ok())
+            .is_none_or(|age| age < Duration::from_secs(1))
+    });
+    if recent {
+        return None;
+    }
+    Some(format!("{:016x}", stamp(meta)))
 }
 
 /// The name a file gets: its last path component without control characters, at most

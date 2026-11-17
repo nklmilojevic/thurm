@@ -310,27 +310,109 @@ final class FilePreviewTests: XCTestCase {
         XCTAssertNotEqual(entry, cache.entry(host: "devbox", path: "a.txt", cwd: "/other"))
         XCTAssertNil(cache.cached(entry))
 
-        try Data("1234".utf8).write(to: try cache.prepare(entry))
-        let file = try cache.store(entry, name: "a.txt", version: "v1")
+        let stagedEntry = try cache.stage(entry)
+        try Data("1234".utf8).write(to: stagedEntry)
+        let file = try cache.install(entry, staged: stagedEntry, name: "a.txt", version: "v1")
         XCTAssertEqual(file.lastPathComponent, "a.txt")
         XCTAssertEqual(cache.cached(entry)?.file, file)
         XCTAssertEqual(cache.cached(entry)?.version, "v1")
         // A file changing as it was read has no version: it is fetched again next time.
         let fresh = cache.entry(host: "devbox", path: "/b.log", cwd: nil)
-        try Data("12".utf8).write(to: try cache.prepare(fresh))
-        _ = try cache.store(fresh, name: "b.log", version: nil)
+        let stagedFresh = try cache.stage(fresh)
+        try Data("12".utf8).write(to: stagedFresh)
+        _ = try cache.install(fresh, staged: stagedFresh, name: "b.log", version: nil)
         XCTAssertNil(cache.cached(fresh))
         // A name from the host never leaves the entry.
         let odd = cache.entry(host: "devbox", path: "/c", cwd: nil)
-        try Data("1".utf8).write(to: try cache.prepare(odd))
-        XCTAssertEqual(try cache.store(odd, name: "../../x", version: "v").lastPathComponent, "file")
+        let stagedOdd = try cache.stage(odd)
+        try Data("1".utf8).write(to: stagedOdd)
+        XCTAssertEqual(try cache.install(odd, staged: stagedOdd, name: "../../x", version: "v").lastPathComponent, "file")
 
         // Over the limit, the least recently fetched entries go; the one just stored stays.
         try FileManager.default.setAttributes([.modificationDate: Date.distantPast], ofItemAtPath: entry.path)
         let big = cache.entry(host: "devbox", path: "/big", cwd: nil)
-        try Data(repeating: 7, count: 8).write(to: try cache.prepare(big))
-        _ = try cache.store(big, name: "big", version: "v")
+        let stagedBig = try cache.stage(big)
+        try Data(repeating: 7, count: 8).write(to: stagedBig)
+        _ = try cache.install(big, staged: stagedBig, name: "big", version: "v")
         XCTAssertFalse(FileManager.default.fileExists(atPath: entry.path))
         XCTAssertNotNil(cache.cached(big))
+    }
+
+    private func tempCache(maxBytes: UInt64 = 1 << 20) -> RemoteFileCache {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thurm-remote-cache-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return RemoteFileCache(root: root, maxBytes: maxBytes)
+    }
+
+    private func outcome(name: String, version: String?) -> TransferOutcome {
+        var o = TransferOutcome()
+        o.name = name
+        o.version = version
+        return o
+    }
+
+    func testPreviewsOfAFileOnItsWayShareOneDownload() throws {
+        let cache = tempCache()
+        var calls: [(dest: URL, done: (TransferOutcome) -> Void)] = []
+        cache.download = { _, _, dest, _, _, done in calls.append((dest, done)) }
+        let pane = PaneKey("devbox", 3)
+        var got: [URL] = []
+        for _ in 0..<2 {
+            cache.fetch(.path("notes.md"), pane: pane, cwd: "/work") { got.append(try! $0.get()) }
+        }
+        XCTAssertEqual(calls.count, 1)
+        try Data("notes".utf8).write(to: calls[0].dest)
+        calls[0].done(outcome(name: "notes.md", version: "v1"))
+        XCTAssertEqual(got.count, 2)
+        XCTAssertEqual(got[0], got[1])
+        XCTAssertEqual(try String(contentsOf: got[0], encoding: .utf8), "notes")
+        // Once it is in, the next preview asks again, with the version it has.
+        var asked: String?
+        cache.download = { _, _, _, version, _, done in
+            asked = version
+            var same = TransferOutcome()
+            same.notModified = true
+            done(same)
+        }
+        var again: URL?
+        cache.fetch(.path("notes.md"), pane: pane, cwd: "/work") { again = try? $0.get() }
+        XCTAssertEqual(asked, "v1")
+        XCTAssertEqual(again, got[0])
+    }
+
+    func testAFailedRefreshKeepsTheCachedCopy() throws {
+        let cache = tempCache()
+        let pane = PaneKey("devbox", 3)
+        cache.download = { _, _, dest, _, _, done in
+            try! Data("old".utf8).write(to: dest)
+            done(self.outcome(name: "a.txt", version: "v1"))
+        }
+        var first: URL?
+        cache.fetch(.path("/a.txt"), pane: pane, cwd: nil) { first = try? $0.get() }
+        let file = try XCTUnwrap(first)
+        // The host's file changed, and the new copy breaks off half way.
+        cache.download = { _, _, dest, _, _, done in
+            try! Data("ne".utf8).write(to: dest)
+            done(TransferOutcome(error: "connection lost"))
+        }
+        var failed: Result<URL, Error>?
+        cache.fetch(.path("/a.txt"), pane: pane, cwd: nil) { failed = $0 }
+        XCTAssertThrowsError(try XCTUnwrap(failed).get())
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "old")
+        let entry = cache.entry(host: "devbox", path: "/a.txt", cwd: nil)
+        XCTAssertEqual(cache.cached(entry)?.version, "v1")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: entry.path)
+            .filter { $0.hasPrefix(".staging") }, [])
+        // A whole new copy replaces it, under the host's new name.
+        cache.download = { _, _, dest, _, _, done in
+            try! Data("new".utf8).write(to: dest)
+            done(self.outcome(name: "a.txt", version: "v2"))
+        }
+        var second: URL?
+        cache.fetch(.path("/a.txt"), pane: pane, cwd: nil) { second = try? $0.get() }
+        XCTAssertEqual(second, file)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "new")
+        XCTAssertEqual(cache.cached(entry)?.version, "v2")
     }
 }

@@ -4,6 +4,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -119,8 +120,12 @@ fn open_source(upload: &Upload) -> Result<Source, TransferError> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| shown.clone()),
             };
-            let file =
-                File::open(path).map_err(|e| TransferError::Local(format!("{shown}: {e}")))?;
+            // Without blocking: a FIFO with no writer is refused below, not waited on.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .map_err(|e| TransferError::Local(format!("{shown}: {e}")))?;
             let meta = file
                 .metadata()
                 .map_err(|e| TransferError::Local(format!("{shown}: {e}")))?;
@@ -210,8 +215,48 @@ pub fn upload(
         // enough, and the others need no connection meanwhile.
         last = Some((reader, writer));
     }
-    let (reader, _writer) = last.expect("at least one file");
-    wait(reader, cancel)
+    let (reader, writer) = last.expect("at least one file");
+    wait_cancellable(reader, writer, cancel)
+}
+
+/// Waits for the batch's outcome on its last stream, everything sent. A cancel meanwhile
+/// aborts the stream, which ends the batch on the daemon unless it is typing the paths
+/// already; the daemon's answer then says which.
+fn wait_cancellable(
+    reader: StreamReader,
+    writer: StreamWriter,
+    cancel: &Cancel,
+) -> Result<(), TransferError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("upload-wait".into())
+        .spawn(move || {
+            let _ = tx.send(reader.wait_closed());
+        })
+        .map_err(|e| TransferError::Local(format!("cannot wait for the upload: {e}")))?;
+    let mut writer = Some(writer);
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => {
+                return Err(if writer.is_none() || cancel.is_cancelled() {
+                    TransferError::Cancelled
+                } else {
+                    remote_error(&e)
+                });
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if cancel.is_cancelled()
+                    && let Some(w) = writer.take()
+                {
+                    let _ = w.close(StreamClose::Aborted);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(TransferError::Remote("the upload's stream ended".into()));
+            }
+        }
+    }
 }
 
 /// Copies `source` to `writer`, checking `cancel` between frames; drops (aborts) nothing
@@ -317,8 +362,8 @@ pub fn download(
         .as_deref()
         .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
     let (mut reader, mut writer) = stream::open(host.socket, ticket)?;
-    let part = part_path(dest);
-    let received = receive(&mut reader, &part, info.size, cancel, &mut progress);
+    let (part, file) = create_part(dest)?;
+    let received = receive(&mut reader, file, &part, info.size, cancel, &mut progress);
     if let Err(e) = received {
         let _ = std::fs::remove_file(&part);
         let _ = writer.close(StreamClose::Aborted);
@@ -339,24 +384,42 @@ pub fn download(
     Ok(Downloaded::Saved(info))
 }
 
-/// Where `dest` is written until whole.
-fn part_path(dest: &Path) -> PathBuf {
+/// A new file beside `dest` that this download alone writes until whole: two downloads to
+/// the same place never share one.
+fn create_part(dest: &Path) -> Result<(PathBuf, File), TransferError> {
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = dest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    dest.with_file_name(format!(".{name}.{}.part", std::process::id()))
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let part = dest.with_file_name(format!(".{name}.{}-{n}.part", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&part)
+        {
+            Ok(file) => return Ok((part, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(TransferError::Local(format!("{}: {e}", part.display())));
+            }
+        }
+    }
 }
 
 fn receive(
     reader: &mut StreamReader,
+    mut file: File,
     part: &Path,
     size: u64,
     cancel: &Cancel,
     progress: &mut impl FnMut(Progress),
 ) -> Result<(), TransferError> {
     let local = |e: std::io::Error| TransferError::Local(format!("{}: {e}", part.display()));
-    let mut file = File::create(part).map_err(local)?;
     let mut buf = vec![0u8; MAX_DATA];
     let mut p = Progress {
         done: 0,
@@ -389,4 +452,145 @@ fn receive(
         )));
     }
     file.sync_all().map_err(local)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    use thurm_proto::stream::StreamFrame;
+    use thurm_proto::{
+        CAP_ACTIVE_SIZE, CAP_STREAMS, Envelope, PROTOCOL_VERSION, Request, Response, ServerMessage,
+        codec,
+    };
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("thurm-transfer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A daemon's end of a stream: answers the Hello and the StreamOpen, then the frames it
+    /// gets until a `Close`, which it answers with `answer`.
+    fn fake_daemon(answer: StreamClose) -> (UnixStream, std::thread::JoinHandle<Vec<StreamFrame>>) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let daemon = std::thread::spawn(move || {
+            let mut r = std::io::BufReader::new(theirs.try_clone().unwrap());
+            let mut w = theirs;
+            for _ in 0..2 {
+                let frame = codec::read_frame(&mut r).unwrap().unwrap();
+                let env: Envelope = codec::decode(&frame).unwrap();
+                let result = match env.request {
+                    Request::Hello { .. } => Response::Hello {
+                        version: PROTOCOL_VERSION,
+                        daemon_pid: 1,
+                        restored: false,
+                        build: "fixture".into(),
+                        capabilities: vec![
+                            CAP_ACTIVE_SIZE.into(),
+                            CAP_STREAMS.into(),
+                            CAP_TRANSFER.into(),
+                        ],
+                    },
+                    _ => Response::Ok,
+                };
+                let msg = ServerMessage::Response {
+                    id: env.id,
+                    result: Ok(result),
+                };
+                codec::write_message(&mut w, &msg).unwrap();
+            }
+            let mut seen = Vec::new();
+            while let Ok(Some(frame)) = thurm_proto::stream::read_frame(&mut r) {
+                let done = matches!(frame, StreamFrame::Close(_));
+                seen.push(frame);
+                if done {
+                    thurm_proto::stream::write_frame(&mut w, &StreamFrame::Close(answer)).unwrap();
+                    break;
+                }
+            }
+            seen
+        });
+        (ours, daemon)
+    }
+
+    #[test]
+    fn cancelling_while_the_batch_waits_aborts_its_stream() {
+        let (socket, daemon) =
+            fake_daemon(StreamClose::Internal("the upload was cancelled".into()));
+        let (reader, mut writer) = stream::open_on(socket, "ticket").unwrap();
+        writer.write_all(b"all of it").unwrap();
+        writer.finish().unwrap();
+        let cancel = Cancel::default();
+        let later = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            later.cancel();
+        });
+        let got = wait_cancellable(reader, writer, &cancel);
+        assert!(matches!(got, Err(TransferError::Cancelled)), "{got:?}");
+        assert_eq!(
+            daemon.join().unwrap(),
+            [
+                StreamFrame::Data(b"all of it".to_vec()),
+                StreamFrame::End,
+                StreamFrame::Close(StreamClose::Aborted)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cancel_too_late_reports_what_the_daemon_did() {
+        // The daemon was typing the paths already: it closes Ok, and the upload went.
+        let (socket, daemon) = fake_daemon(StreamClose::Ok);
+        let (reader, mut writer) = stream::open_on(socket, "ticket").unwrap();
+        writer.finish().unwrap();
+        let cancel = Cancel::default();
+        cancel.cancel();
+        assert!(wait_cancellable(reader, writer, &cancel).is_ok());
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_waiting_for_a_writer() {
+        let dir = temp_dir("fifo");
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let results = [fifo, link].map(|p| open_source(&Upload::Path(p)).err());
+            let _ = tx.send(results.map(|e| e.map(|e| e.to_string())));
+        });
+        let results = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("opening a FIFO blocked");
+        for e in results {
+            assert!(
+                e.as_deref()
+                    .is_some_and(|e| e.contains("not a regular file")),
+                "{e:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn each_download_writes_a_part_of_its_own() {
+        let dir = temp_dir("parts");
+        let dest = dir.join("same.txt");
+        let (a, mut fa) = create_part(&dest).unwrap();
+        let (b, mut fb) = create_part(&dest).unwrap();
+        assert_ne!(a, b);
+        fa.write_all(b"first").unwrap();
+        fb.write_all(b"second").unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
