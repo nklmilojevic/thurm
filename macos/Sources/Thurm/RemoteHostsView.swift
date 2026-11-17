@@ -228,10 +228,10 @@ private struct HostDetails: View {
                         LabeledContent {
                             HStack(spacing: 10) {
                                 Button("Open") {
-                                    if let url = URL(string: "http://localhost:\(f.localPort)/") {
-                                        NSWorkspace.shared.open(url)
-                                    }
+                                    if let url = URL(string: f.url) { NSWorkspace.shared.open(url) }
                                 }
+                                .help(f.url)
+                                Button("Copy Link") { SessionManager.copyForwardLink(f.url) }
                                 Button("Close") {
                                     _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: f.id)])
                                 }

@@ -257,3 +257,27 @@ fn pending_tickets_are_capped_per_client() {
     let (other, _rx) = env.connect();
     other.dial_begin(1).unwrap();
 }
+
+#[test]
+fn a_ticket_goes_with_the_connection_that_reserved_it() {
+    let env = Env::new("streams-gone");
+    let _daemon = env.start();
+    let (c, rx) = env.connect();
+    // Fresh tickets: one that won't open can only have gone with its connection.
+    let tickets: Vec<_> = (0..64).map(|_| c.dial_begin(1).unwrap().ticket).collect();
+    drop(c);
+    drop(rx);
+    // The daemon notices the connection closing on its own time; until then a ticket opens
+    // (onto a port nobody listens on).
+    for ticket in &tickets {
+        match stream::open(&env.socket, ticket) {
+            Ok(_) => std::thread::sleep(Duration::from_millis(50)),
+            Err(ClientError::Daemon(e)) => {
+                assert!(e.contains("unknown or used"), "{e}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("the tickets outlived their connection");
+}

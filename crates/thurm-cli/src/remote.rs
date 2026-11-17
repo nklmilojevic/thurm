@@ -824,8 +824,14 @@ fn ports_table(list: &[thurm_proto::PanePorts]) -> String {
         .iter()
         .flat_map(|p| p.ports.iter().map(move |e| (p.pane, e)))
         .collect();
+    let partial = "(some processes could not be read: their ports are not listed)\n";
+    let incomplete = list.iter().any(|p| !p.complete);
     if rows.is_empty() {
-        return "no ports\n".into();
+        return if incomplete {
+            format!("no ports\n{partial}")
+        } else {
+            "no ports\n".into()
+        };
     }
     let mut out = format!(
         "{:<6} {:<6} {:<16} {:<8} COMMAND\n",
@@ -838,10 +844,15 @@ fn ports_table(list: &[thurm_proto::PanePorts]) -> String {
             pane, e.port, e.address, e.pid
         ));
     }
-    if list.iter().any(|p| !p.complete) {
-        out.push_str("(some processes could not be read: their ports are not listed)\n");
+    if incomplete {
+        out.push_str(partial);
     }
     out
+}
+
+/// Whether `thurm remote forward` opens the browser: not with `--no-open`, nor with `--json`.
+fn opens_browser(open: bool, json: bool) -> bool {
+    open && !json
 }
 
 /// `thurm remote forward NAME PORT|URL`: opens the port here until interrupted.
@@ -855,6 +866,7 @@ pub fn forward_cmd(name: &str, target: &str, local: Option<u16>, open: bool, jso
             (u.port, Some(target))
         }
     };
+    thurm_remote::forward::forwardable(&remote_config(name)?)?;
     connect_remote(name)?;
     let forwards = thurm_remote::forward::Forwards::default();
     forwards.check(name)?;
@@ -874,7 +886,8 @@ pub fn forward_cmd(name: &str, target: &str, local: Option<u16>, open: bool, jso
         eprintln!("{name}:{port} → localhost:{} (Ctrl-C to stop)", fw.local);
     }
     let _ = std::io::stdout().flush();
-    if open {
+    // JSON is for scripts: they open what they want themselves.
+    if opens_browser(open, json) {
         let opener = if cfg!(target_os = "macos") {
             "open"
         } else {
@@ -911,6 +924,14 @@ mod tests {
     use thurm_proto::{PanePorts, PortEntry};
 
     #[test]
+    fn json_output_opens_no_browser() {
+        assert!(opens_browser(true, false));
+        assert!(!opens_browser(true, true));
+        assert!(!opens_browser(false, false));
+        assert!(!opens_browser(false, true));
+    }
+
+    #[test]
     fn ports_print_as_a_table() {
         let entry = |port, pid, command: &str| PortEntry {
             port,
@@ -937,6 +958,16 @@ mod tests {
         assert!(lines[1].ends_with("node vite"), "{t}");
         assert!(t.contains("could not be read"), "{t}");
         assert_eq!(ports_table(&[]), "no ports\n");
+        // Nothing found where something could not be read: not a plain "no ports".
+        let unread = [PanePorts {
+            pane: 7,
+            ports: vec![],
+            complete: false,
+        }];
+        assert_eq!(
+            ports_table(&unread),
+            "no ports\n(some processes could not be read: their ports are not listed)\n"
+        );
         assert_eq!(ports_json(&list)[0]["ports"][0]["port"], 5173);
     }
 }

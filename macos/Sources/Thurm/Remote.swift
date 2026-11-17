@@ -258,6 +258,7 @@ final class Remotes {
     /// `host`'s connection dropped (the daemon went away or the tunnel did).
     func connectionLost(_ host: HostId) {
         Core.shared.disconnect(host)
+        SessionManager.shared.remotePortsUnknown(host)
         updateOverlays(host)
         syncCountdown()
         SessionManager.shared.refreshSidebars()
@@ -270,6 +271,7 @@ final class Remotes {
     /// this build cannot talk to would loop on the main thread.
     func connectFailed(_ host: HostId, _ why: String) {
         Core.shared.disconnect(host)
+        SessionManager.shared.remotePortsUnknown(host)
         let failures = (connectFailures[host] ?? 0) + 1
         connectFailures[host] = failures
         let delay = min(60, pow(2, Double(failures - 1)))
@@ -499,6 +501,7 @@ extension SessionManager {
                 "\(gone) \(gone == 1 ? "pane" : "panes") on \(host) ended while it was away", duration: 5)
         }
         runPendingHandoffCleanups(host)
+        fetchRemotePorts(host)
         refreshSidebars()
         updateDockBadge()
         for c in liveControllers { c.updateTitle() }
@@ -657,10 +660,12 @@ extension SessionManager {
                 SessionManager.shared.showForwardPortPicker()
             })
         }
-        for f in Remotes.shared.forwards {
-            items.append(CommandPalette.Item(title: "Close Forward \(f.host):\(f.remotePort)",
-                                             detail: "localhost:\(f.localPort)") {
-                _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: f.id)])
+        for entry in ForwardPicker.manageEntries(Remotes.shared.forwards) {
+            items.append(CommandPalette.Item(title: entry.title, detail: entry.detail) {
+                switch entry.action {
+                case .copyLink(let url): SessionManager.copyForwardLink(url)
+                case .close(let id): _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: id)])
+                }
             })
         }
         if !config.remoteNames.isEmpty {

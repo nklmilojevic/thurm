@@ -695,7 +695,8 @@ pub enum Response {
     PanesWithActivity(Vec<PaneActivity>),
     PaneActivity(PaneActivity),
     PathMatches(PathMatches),
-    /// A reserved stream: `ticket` for [`Request::StreamOpen`], valid for `expires_ms`.
+    /// A reserved stream: `ticket` for [`Request::StreamOpen`], valid for `expires_ms` and
+    /// while the connection that reserved it stays open.
     Ticket {
         ticket: String,
         expires_ms: u32,
