@@ -1269,6 +1269,14 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
     std::fs::write(&full, b"someone else's").unwrap();
     assert!(get("report.pdf", &full, id, &mut |_| {}).is_err());
     assert_eq!(std::fs::read(&full).unwrap(), b"someone else's");
+    // The reserved file itself, written into by another before the download opens it: not
+    // written over, nor deleted.
+    let filled = downloads.join("filled.pdf");
+    let id = reserve(&filled);
+    std::fs::write(&filled, b"written in place").unwrap();
+    let e = get("report.pdf", &filled, id, &mut |_| {}).unwrap_err();
+    assert!(matches!(e, TransferError::Local(_)), "{e}");
+    assert_eq!(std::fs::read(&filled).unwrap(), b"written in place");
     // Or a link in its place: not followed.
     let linked = downloads.join("linked.pdf");
     let id = reserve(&linked);
@@ -1309,6 +1317,27 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
     .unwrap_err();
     assert!(matches!(e, TransferError::Cancelled), "{e}");
     assert!(!cancelled.exists());
+    // Written into by another while it comes, then cancelled: what is there is not only this
+    // download's, and stays.
+    let shared = downloads.join("shared.bin");
+    let id = reserve(&shared);
+    let cancel = Cancel::default();
+    let stop = cancel.clone();
+    let mut appended = false;
+    let e = transfer::download_reserved(host, pane, "big.bin", &shared, id, &cancel, |p| {
+        if p.done > 0 && !appended {
+            appended = true;
+            let mut other = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&shared)
+                .unwrap();
+            other.write_all(b"theirs").unwrap();
+            stop.cancel();
+        }
+    })
+    .unwrap_err();
+    assert!(matches!(e, TransferError::Cancelled), "{e}");
+    assert!(std::fs::read(&shared).unwrap().ends_with(b"theirs"));
     // Refused before anything is asked of the host, the reservation still its own: given back
     // too. (Permissions do not stop root.)
     if unsafe { libc::geteuid() } != 0 {

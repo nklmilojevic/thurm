@@ -238,7 +238,8 @@ fn saved(info: &thurm_proto::DownloadInfo) -> serde_json::Value {
 /// Fetches the file at `path` (as `pane` sees it) into `reserved`, the empty file the caller
 /// made to hold the name, whose `device` and `inode` it took then: written into that very file, never renamed over it. If the name
 /// holds something else by then, nothing is saved and it is left alone; a failed or cancelled
-/// download deletes the reserved file if it is still there. Cancel with
+/// download deletes the reserved file if it is still the one and holds no more than the
+/// download wrote into it (a file another writer filled is left alone). Cancel with
 /// `thurm_download_cancel`. Returns the transfer's id, or 0 when it could not start (the final
 /// callback then came on the calling thread, before this returns).
 #[unsafe(no_mangle)]

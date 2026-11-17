@@ -104,6 +104,25 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertEqual(fake.started, [urls.map(\.path), urls.map(\.path)])
     }
 
+    func testDroppedFilesGoOnlyOnceAskedEvenBesideWhatTheDragShows() throws {
+        // A drag from another app: text it shows, and a file's address beside it.
+        let secret = try file("id_ed25519")
+        pb.clearContents()
+        pb.declareTypes([.string, .fileURL], owner: nil)
+        pb.setString("a picture", forType: .string)
+        pb.setString(secret.absoluteString, forType: .fileURL)
+        let (view, fake) = remotePane()
+        fake.answer = false
+        XCTAssertFalse(view.performDragOperation(FakeDrag(pb)))
+        XCTAssertEqual(fake.asked, [[secret.path]])
+        XCTAssertTrue(fake.started.isEmpty)
+        XCTAssertTrue(fake.typed.isEmpty)
+        // Confirmed, it goes.
+        fake.answer = true
+        XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        XCTAssertEqual(fake.started, [[secret.path]])
+    }
+
     func testASecondDropWaitsForTheFirstInsteadOfCancellingIt() throws {
         let first = [try file("a.txt")]
         let second = [try file("b.txt"), try file("c.txt")]
@@ -284,14 +303,15 @@ final class RemoteDropTests: XCTestCase {
         fake.answer = true
         view.paste(from: pb)
         XCTAssertEqual(fake.started, [files.map(\.path)])
-        // A drop is its own consent; a pasted image names no file of this Mac.
+        // A drop asks too; a pasted image names no file of this Mac.
         fake.finish[0](TransferOutcome())
         XCTAssertTrue(view.performDragOperation(FakeDrag(pb)))
+        XCTAssertEqual(fake.asked.count, 3)
         fake.finish[1](TransferOutcome())
         pb.clearContents()
         pb.setData(png, forType: .png)
         view.paste(from: pb)
-        XCTAssertEqual(fake.asked.count, 2)
+        XCTAssertEqual(fake.asked.count, 3)
         XCTAssertEqual(fake.started.count, 3)
     }
 
@@ -406,6 +426,14 @@ final class RemoteDropTests: XCTestCase {
         XCTAssertFalse(taken.held)
         taken.release()
         XCTAssertTrue(FileManager.default.fileExists(atPath: taken.url.path))
+        // Still the file made for it, but written into by another: it stays, with what it holds.
+        let filled = try XCTUnwrap(SessionManager.reserveFreeName("filled.bin", in: dir))
+        let handle = try FileHandle(forWritingTo: filled.url)
+        try handle.write(contentsOf: Data("theirs".utf8))
+        try handle.close()
+        XCTAssertTrue(filled.held)
+        filled.release()
+        XCTAssertEqual(try Data(contentsOf: filled.url), Data("theirs".utf8))
         // A download that never starts gives back its name the same way.
         let (view, _) = remotePane()
         view.download(remotePath: "/srv/other.bin", into: dir, start: { _, _, reserved, _, done in

@@ -106,7 +106,8 @@ void thurm_download_cancel(uint64_t transfer);
  * that file is written into or deleted, whatever takes its name). The file is written into that very file, never
  * renamed over its name: if the name holds anything else by then (the file replaced, removed,
  * or no longer empty), nothing is saved and what is there is left alone. A failed or cancelled
- * download deletes the reserved file if it is still the one. Cancel with
+ * download deletes the reserved file if it is still the one and holds no more than the
+ * download wrote into it (a file another writer filled is left alone). Cancel with
  * thurm_download_cancel. */
 uint64_t thurm_download_reserved(thurm_client *client, thurm_pane_id pane, const char *path,
                                  const char *reserved, uint64_t device, uint64_t inode,

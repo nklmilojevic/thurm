@@ -1118,9 +1118,10 @@ struct Reservation: Equatable {
         return lstat(url.path, &st) == 0 && UInt64(st.st_dev) == device && UInt64(st.st_ino) == inode
     }
 
-    /// Gives the name back: deletes the file made for it, if the name still holds it, and
-    /// leaves whatever else has taken it.
+    /// Gives the name back: deletes the file made for it, if the name still holds it and it is
+    /// still empty, and leaves whatever else has taken it or been written into it.
     func release() {
-        if held { unlink(url.path) }
+        var st = stat()
+        if held, lstat(url.path, &st) == 0, st.st_size == 0 { unlink(url.path) }
     }
 }

@@ -530,7 +530,8 @@ pub enum Downloaded {
 /// very file, never by a rename over its name: if something else took the name since (the
 /// reserved file is gone, replaced, or no longer empty), the download is refused and what is
 /// there is left alone. A download that fails or is cancelled deletes the reserved file, if it
-/// is still the one.
+/// is still the one and holds no more than this download wrote into it: one another writer
+/// filled is left alone.
 pub fn download_reserved(
     host: Host,
     pane: PaneId,
@@ -544,10 +545,19 @@ pub fn download_reserved(
     // The reservation is the file made for it (`identity`: its device and inode, taken when
     // it was made), not whatever has its name now: only that file is written or deleted.
     let ours = identity;
+    // What this download wrote into it: the reservation is given back only while it holds
+    // that and nothing else (empty, before any byte came).
+    let written = std::cell::Cell::new(0u64);
     let give_back = || {
-        if std::fs::symlink_metadata(reserved).is_ok_and(|m| (m.dev(), m.ino()) == ours) {
+        if std::fs::symlink_metadata(reserved)
+            .is_ok_and(|m| (m.dev(), m.ino()) == ours && m.len() == written.get())
+        {
             let _ = std::fs::remove_file(reserved);
         }
+    };
+    let mut progress = |p: Progress| {
+        written.set(p.done);
+        progress(p);
     };
     if !host.client.has_capability(CAP_TRANSFER) {
         give_back();
