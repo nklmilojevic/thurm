@@ -103,13 +103,13 @@ pub(super) enum Ask {
 }
 
 impl Ask {
-    /// The pane and what a clipboard tool's request asks; any other request back as it was.
-    pub(super) fn of(req: Request) -> Result<(PaneId, Ask), Request> {
+    /// The pane and what a clipboard tool's request asks; `None` for any other request.
+    pub(super) fn of(req: Request) -> Option<(PaneId, Ask)> {
         match req {
-            Request::ClipboardGet { pane, mime } => Ok((pane, Ask::Paste(mime))),
-            Request::ClipboardSet { pane, text } => Ok((pane, Ask::Write(Some(text)))),
-            Request::ClipboardClear { pane } => Ok((pane, Ask::Write(None))),
-            other => Err(other),
+            Request::ClipboardGet { pane, mime } => Some((pane, Ask::Paste(mime))),
+            Request::ClipboardSet { pane, text } => Some((pane, Ask::Write(Some(text)))),
+            Request::ClipboardClear { pane } => Some((pane, Ask::Write(None))),
+            _ => None,
         }
     }
 }
@@ -449,7 +449,7 @@ mod tests {
             Request::ListPanes,
         ] {
             assert_eq!(
-                super::Ask::of(req.clone()).is_ok(),
+                super::Ask::of(req.clone()).is_some(),
                 req.is_clipboard_tool(),
                 "{req:?}"
             );

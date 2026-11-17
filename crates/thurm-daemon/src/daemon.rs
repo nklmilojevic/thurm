@@ -2509,7 +2509,7 @@ impl Daemon {
             }
             // The app may ask the user first. Admitted (a slot taken) before the thread.
             req if req.is_clipboard_tool() => {
-                let Ok((pane, ask)) = clip::Ask::of(req) else {
+                let Some((pane, ask)) = clip::Ask::of(req) else {
                     unreachable!("a clipboard request")
                 };
                 match self.clipboard_admit(client, pane, &ask) {
