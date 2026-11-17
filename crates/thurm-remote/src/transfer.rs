@@ -571,9 +571,9 @@ pub fn download_reserved(
             .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == ours && m.len() == 0)
     };
     let give_back = || {
-        if ours_and_empty(reserved) {
-            let _ = std::fs::remove_file(reserved);
-        }
+        let _ = remove_if(reserved, |m| {
+            m.is_file() && (m.dev(), m.ino()) == ours && m.len() == 0
+        });
     };
     if !host.client.has_capability(CAP_TRANSFER) {
         give_back();
@@ -595,6 +595,16 @@ pub fn download_reserved(
             .as_deref()
             .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
         let (part, file) = create_part(reserved)?;
+        // The download's own file, known by its device and inode too: its name is in a folder
+        // others write to.
+        let staging = file
+            .metadata()
+            .map(|m| (m.dev(), m.ino()))
+            .map_err(|e| TransferError::Local(format!("{}: {e}", part.display())))?;
+        let is_staging = |p: &Path, len: u64| {
+            std::fs::symlink_metadata(p)
+                .is_ok_and(|m| m.is_file() && (m.dev(), m.ino()) == staging && m.len() == len)
+        };
         let fetched = fetch_into(
             host,
             ticket,
@@ -605,26 +615,36 @@ pub fn download_reserved(
             &mut progress,
         );
         // Into the name only in place of the empty file reserved: exchanged with it, and what
-        // came out checked. Anything else is put back where it was, never deleted.
-        let mut part_is_ours = true;
+        // came out checked. Anything else is put back, while the name still holds the download,
+        // and never deleted.
         let installed = fetched.and_then(|()| {
+            if !is_staging(&part, info.size) {
+                return Err(TransferError::Local(format!(
+                    "{} was replaced while the download came; nothing was saved",
+                    part.display()
+                )));
+            }
             exchange(&part, reserved).map_err(|_| changed())?;
             if ours_and_empty(&part) {
                 return Ok(());
             }
-            if exchange(&part, reserved).is_err() {
-                part_is_ours = false;
-                return Err(TransferError::Local(format!(
-                    "{} changed since it was reserved; what was there is at {}",
-                    reserved.display(),
-                    part.display()
-                )));
+            if is_staging(reserved, info.size) && exchange(&part, reserved).is_ok() {
+                return Err(changed());
             }
-            Err(changed())
+            Err(TransferError::Local(format!(
+                "{} changed since it was reserved; what was there is at {}",
+                reserved.display(),
+                part.display()
+            )))
         });
-        if part_is_ours {
-            let _ = std::fs::remove_file(&part);
-        }
+        // Only the download's own file goes, or, once it is saved, the empty reservation it
+        // took the place of.
+        let saved = installed.is_ok();
+        let _ = remove_if(&part, |m| {
+            m.is_file()
+                && ((m.dev(), m.ino()) == staging
+                    || (saved && (m.dev(), m.ino()) == ours && m.len() == 0))
+        });
         installed.map(|()| info)
     })();
     if got.is_err() {
@@ -633,13 +653,54 @@ pub fn download_reserved(
     got
 }
 
+/// Deletes the file named `path` only if `ours` takes it for this download's: it is moved in
+/// one step to a name of its own and looked at there, so a file put in its place meanwhile is
+/// never what is deleted. Anything else goes back, never over a file that took the name since;
+/// if it cannot, it stays where it was moved, which is returned.
+fn remove_if(path: &Path, ours: impl Fn(&std::fs::Metadata) -> bool) -> Result<(), PathBuf> {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| ours(&m)) {
+        return Ok(());
+    }
+    let aside = loop {
+        let aside = path.with_file_name(format!(".thurm-{}.gone", batch_id()));
+        if std::fs::symlink_metadata(&aside).is_err() {
+            break aside;
+        }
+    };
+    if rename_with(path, &aside, Rename::NoReplace).is_err() {
+        return Ok(());
+    }
+    if std::fs::symlink_metadata(&aside).is_ok_and(|m| ours(&m)) {
+        let _ = std::fs::remove_file(&aside);
+        return Ok(());
+    }
+    rename_with(&aside, path, Rename::NoReplace).map_err(|_| aside)
+}
+
 /// Exchanges the files named `a` and `b` in one step: each name then holds the other's file.
 fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    rename_with(a, b, Rename::Exchange)
+}
+
+enum Rename {
+    /// Each name takes the other's file.
+    Exchange,
+    /// `a`'s file takes the name `b` only if nothing has it.
+    NoReplace,
+}
+
+fn rename_with(a: &Path, b: &Path, how: Rename) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
     let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+    let r = {
+        let flags = match how {
+            Rename::Exchange => libc::RENAME_SWAP,
+            Rename::NoReplace => libc::RENAME_EXCL,
+        };
+        unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), flags) }
+    };
     // The system call itself: not every C library has a wrapper for it (musl's older ones).
     #[cfg(target_os = "linux")]
     let r = unsafe {
@@ -649,12 +710,15 @@ fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
             a.as_ptr(),
             libc::AT_FDCWD,
             b.as_ptr(),
-            libc::RENAME_EXCHANGE,
+            match how {
+                Rename::Exchange => libc::RENAME_EXCHANGE,
+                Rename::NoReplace => libc::RENAME_NOREPLACE,
+            },
         )
     };
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
     let r = {
-        let _ = (&a, &b);
+        let _ = (&a, &b, how);
         return Err(std::io::ErrorKind::Unsupported.into());
     };
     if r == 0 {

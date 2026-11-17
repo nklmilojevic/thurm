@@ -1375,12 +1375,39 @@ fn a_reserved_download_is_written_into_its_own_file_only() {
     .unwrap_err();
     assert!(matches!(e, TransferError::Local(_)), "{e}");
     assert!(std::fs::read(&overwritten).unwrap() == theirs);
+    // The download's own file replaced under its name before it goes in: what replaced it is
+    // neither put in the reserved name nor deleted.
+    let swapped = downloads.join("swapped.bin");
+    let id = reserve(&swapped);
+    let mut replaced = None;
+    let e = get("big.bin", &swapped, id, &mut |p| {
+        if p.total > 0 && p.done == p.total && replaced.is_none() {
+            let part = std::fs::read_dir(&downloads)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.to_string_lossy().ends_with(".part"))
+                .unwrap();
+            std::fs::remove_file(&part).unwrap();
+            std::fs::write(&part, b"theirs").unwrap();
+            replaced = Some(part);
+        }
+    })
+    .unwrap_err();
+    assert!(matches!(e, TransferError::Local(_)), "{e}");
+    let replaced = replaced.unwrap();
+    assert_eq!(std::fs::read(&replaced).unwrap(), b"theirs");
+    assert!(!swapped.exists());
+    std::fs::remove_file(&replaced).unwrap();
     // No file a download wrote into is left beside the names.
     let left: Vec<_> = std::fs::read_dir(&downloads)
         .unwrap()
         .flatten()
         .map(|e| e.file_name())
-        .filter(|n| n.to_string_lossy().ends_with(".part"))
+        .filter(|n| {
+            let n = n.to_string_lossy();
+            n.ends_with(".part") || n.ends_with(".gone")
+        })
         .collect();
     assert!(left.is_empty(), "{left:?}");
 }
