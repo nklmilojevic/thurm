@@ -879,6 +879,8 @@ final class TerminalView: NSView, NSTextInputClient {
     @objc private func removeToast() {
         toastView?.removeFromSuperview()
         toastView = nil
+        // A transfer under way comes back with its Cancel once the message is gone.
+        if !transfers.isEmpty { refreshTransferToast() }
     }
 
     /// "Restored" toast for panes that survived a daemon restart / reboot.

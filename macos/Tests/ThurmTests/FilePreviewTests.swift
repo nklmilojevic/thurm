@@ -431,7 +431,7 @@ final class FilePreviewTests: XCTestCase {
         }
         var result: Result<URL, Error>?
         cache.fetch(.path("report:12"), pane: pane, cwd: "/work") { result = $0 }
-        XCTAssertEqual(asked, ["report:12"])
+        XCTAssertEqual(asked, ["/work/report:12"])
         XCTAssertThrowsError(try XCTUnwrap(result).get()) {
             XCTAssertEqual($0.localizedDescription, "cannot open report:12: Permission denied")
         }
@@ -439,7 +439,7 @@ final class FilePreviewTests: XCTestCase {
         asked = []
         cache.download = downloads { _, path, dest, _, done in
             asked.append(path)
-            if path == "report:12" {
+            if path == "/work/report:12" {
                 var missing = TransferOutcome(error: "report:12: no such file")
                 missing.notFound = true
                 return done(missing)
@@ -449,7 +449,7 @@ final class FilePreviewTests: XCTestCase {
         }
         result = nil
         cache.fetch(.path("report:12"), pane: pane, cwd: "/work") { result = $0 }
-        XCTAssertEqual(asked, ["report:12", "report"])
+        XCTAssertEqual(asked, ["/work/report:12", "/work/report"])
         XCTAssertEqual(try XCTUnwrap(result).get().lastPathComponent, "report")
     }
 
@@ -568,5 +568,80 @@ final class FilePreviewTests: XCTestCase {
         // 16 kept, 8 of them undeletable: over the limit, not counted as freed.
         XCTAssertFalse(cache.prune(keeping: entry))
         XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(first).path))
+    }
+
+    func testARelativePathIsTheDirectoryTheClickHad() throws {
+        let cache = tempCache()
+        let pane = PaneKey("devbox", 3)
+        var asked: [String] = []
+        cache.download = downloads { _, path, dest, _, done in
+            asked.append(path)
+            try! Data("n".utf8).write(to: dest)
+            done(self.outcome(name: "notes.md", version: "v"))
+        }
+        // The pane may be elsewhere by the time the host is asked: the clicked directory goes.
+        cache.fetch(.path("notes.md"), pane: pane, cwd: "/work") { _ in }
+        cache.fetch(.path("~/todo.txt"), pane: pane, cwd: "/work") { _ in }
+        cache.fetch(.path("/etc/hosts"), pane: pane, cwd: nil) { _ in }
+        XCTAssertEqual(asked, ["/work/notes.md", "~/todo.txt", "/etc/hosts"])
+        var result: Result<URL, Error>?
+        cache.fetch(.path("notes.md"), pane: pane, cwd: nil) { result = $0 }
+        XCTAssertThrowsError(try XCTUnwrap(result).get()) {
+            XCTAssertEqual($0 as? FilePreviewError, .noDirectory)
+        }
+        XCTAssertEqual(asked.count, 3)
+    }
+
+    func testARefreshTakesItsOldCopysPlaceUnlessItIsShown() throws {
+        let cache = tempCache(maxBytes: 10)
+        let pane = PaneKey("devbox", 3)
+        var progress: [(TransferProgress) -> Void] = []
+        var finish: [(TransferOutcome) -> Void] = []
+        var dests: [URL] = []
+        var cancels = 0
+        cache.download = { _, _, dest, _, _, onProgress, done in
+            dests.append(dest)
+            progress.append(onProgress)
+            finish.append(done)
+            return { cancels += 1 }
+        }
+        var got: [URL] = []
+        func fetchAndFinish(_ content: UInt8, version: String) {
+            cache.fetch(.path("/big.bin"), pane: pane, cwd: nil) { if let u = try? $0.get() { got.append(u) } }
+            progress.last!(TransferProgress(done: 0, total: 8))
+            try! Data(repeating: content, count: 8).write(to: dests.last!)
+            finish.last!(outcome(name: "big.bin", version: version))
+        }
+        fetchAndFinish(1, version: "v1")
+        // 8 kept and 8 more for its refresh, over 10: but the new copy replaces the old.
+        fetchAndFinish(2, version: "v2")
+        XCTAssertEqual(cancels, 0)
+        XCTAssertEqual(got.count, 2)
+        XCTAssertEqual(try Data(contentsOf: got[1]), Data(repeating: 2, count: 8))
+        // Shown in Quick Look, the old copy stays, and both do not fit.
+        cache.hold(got[1])
+        cache.fetch(.path("/big.bin"), pane: pane, cwd: nil) { _ in }
+        progress.last!(TransferProgress(done: 0, total: 8))
+        XCTAssertEqual(cancels, 1)
+    }
+
+    func testAFailedVersionWriteNeverPairsANewCopyWithTheOldVersion() throws {
+        let cache = tempCache()
+        let entry = cache.entry(host: "devbox", path: "/a.txt", cwd: nil)
+        let first = try cache.stage(entry)
+        try Data("old".utf8).write(to: first)
+        _ = try cache.install(entry, staged: first, name: "a.txt", version: "v1")
+        // The disk fills as the new version is written.
+        cache.writeText = { text, url in
+            if url.lastPathComponent == ".version" { throw CocoaError(.fileWriteOutOfSpace) }
+            try text.write(to: url, atomically: true, encoding: .utf8)
+        }
+        let second = try cache.stage(entry)
+        try Data("new".utf8).write(to: second)
+        XCTAssertThrowsError(try cache.install(entry, staged: second, name: "a.txt", version: "v2"))
+        if let cached = cache.cached(entry) {
+            XCTAssertFalse(cached.version == "v1" && (try? String(contentsOf: cached.file, encoding: .utf8)) == "new")
+        }
+        XCTAssertNil(cache.cached(entry))
     }
 }

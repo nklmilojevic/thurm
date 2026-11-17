@@ -255,11 +255,11 @@ pub fn upload(
                         count,
                     }),
                 )
-                .and_then(|ticket| stream::open(host.socket, &ticket.ticket))
-                .map(|opened| (source, opened))
                 .map_err(TransferError::from)
+                .and_then(|ticket| open_watched(host.socket, &ticket.ticket, cancel))
+                .map(|opened| (source, opened))
         });
-        let (mut source, (reader, mut writer)) = match next {
+        let (mut source, (reader, mut writer, watch)) = match next {
             Ok(next) => next,
             Err(e) => {
                 if let Some((_, w)) = last.take() {
@@ -274,15 +274,39 @@ pub fn upload(
             p.done += n;
             progress(p);
         })?;
-        writer
-            .finish()
-            .map_err(|e| TransferError::Remote(e.to_string()))?;
+        // Waiting for the batch, Cancel aborts the stream instead of cutting it.
+        drop(watch);
+        writer.finish().map_err(|e| {
+            if cancel.is_cancelled() {
+                TransferError::Cancelled
+            } else {
+                TransferError::Remote(e.to_string())
+            }
+        })?;
         // Every stream of the batch closes with the same outcome: waiting on the last one is
         // enough, and the others need no connection meanwhile.
         last = Some((reader, writer));
     }
     let (reader, writer) = last.expect("at least one file");
     wait_cancellable(reader, writer, cancel)
+}
+
+/// Opens the stream `ticket` reserved, with a watch that cuts its connection once `cancel` is
+/// set: a read or write blocked on a host that stopped then returns.
+fn open_watched(
+    socket: &Path,
+    ticket: &str,
+    cancel: &Cancel,
+) -> Result<(StreamReader, StreamWriter, CancelWatch), TransferError> {
+    let conn =
+        thurm_client::connect_daemon(socket).map_err(|e| ClientError::Connect(e.to_string()))?;
+    let shutdown = conn
+        .try_clone()
+        .map_err(|e| TransferError::Local(format!("cannot watch the transfer: {e}")))?;
+    let (reader, writer) = stream::open_on(conn, ticket)?;
+    let watch = CancelWatch::start(cancel.clone(), shutdown)
+        .map_err(|e| TransferError::Local(format!("cannot watch the transfer for Cancel: {e}")))?;
+    Ok((reader, writer, watch))
 }
 
 /// Waits for the batch's outcome on its last stream, everything sent. A cancel meanwhile
@@ -351,9 +375,15 @@ fn send(
                 source.name
             )));
         }
-        writer
-            .write_all(&buf[..n])
-            .map_err(|e| TransferError::Remote(e.to_string()))?;
+        // A host that stopped taking bytes blocks this write; Cancel cuts the connection under
+        // it (see `open_watched`).
+        writer.write_all(&buf[..n]).map_err(|e| {
+            if cancel.is_cancelled() {
+                TransferError::Cancelled
+            } else {
+                TransferError::Remote(e.to_string())
+            }
+        })?;
         done += n as u64;
         sent(n as u64);
     }
@@ -427,15 +457,8 @@ pub fn download(
         .ticket
         .as_deref()
         .ok_or_else(|| TransferError::Remote("the daemon sent no ticket".into()))?;
-    let socket = thurm_client::connect_daemon(host.socket)
-        .map_err(|e| ClientError::Connect(e.to_string()))?;
-    let shutdown = socket
-        .try_clone()
-        .map_err(|e| TransferError::Local(format!("cannot watch the download: {e}")))?;
-    let (mut reader, mut writer) = stream::open_on(socket, ticket)?;
     // A read blocks until the host sends; Cancel ends the connection under it.
-    let _watch = CancelWatch::start(cancel.clone(), shutdown)
-        .map_err(|e| TransferError::Local(format!("cannot watch the download for Cancel: {e}")))?;
+    let (mut reader, mut writer, _watch) = open_watched(host.socket, ticket, cancel)?;
     let (part, file) = create_part(dest)?;
     let received = receive(&mut reader, file, &part, info.size, cancel, &mut progress);
     if let Err(e) = received {
@@ -515,13 +538,10 @@ impl Drop for CancelWatch {
 fn create_part(dest: &Path) -> Result<(PathBuf, File), TransferError> {
     use std::sync::atomic::AtomicU64;
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let name = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // A short name of its own: `dest`'s may already be as long as names go.
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let part = dest.with_file_name(format!(".{name}.{}-{n}.part", std::process::id()));
+        let part = dest.with_file_name(format!(".thurm-{}-{n}.part", std::process::id()));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -841,5 +861,51 @@ mod tests {
             Err(std::io::Error::other("no threads left"))
         });
         assert!(started.is_err());
+    }
+
+    #[test]
+    fn cancel_ends_an_upload_the_host_stopped_taking() {
+        // The host takes nothing after the handshake, the connection held open.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (socket, daemon) = fake_daemon_then(move |_, _| {
+            let _ = held.recv();
+            Vec::new()
+        });
+        let shutdown = socket.try_clone().unwrap();
+        let (_reader, mut writer) = stream::open_on(socket, "ticket").unwrap();
+        let cancel = Cancel::default();
+        let watch = CancelWatch::start(cancel.clone(), shutdown).unwrap();
+        let theirs = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let data = vec![1u8; 16 << 20];
+            let mut source = Source {
+                name: "big".into(),
+                size: data.len() as u64,
+                reader: Box::new(std::io::Cursor::new(data)),
+            };
+            let _ = tx.send(send(&mut source, &mut writer, &theirs, |_| {}));
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        cancel.cancel();
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the write stayed blocked after Cancel");
+        assert!(matches!(got, Err(TransferError::Cancelled)), "{got:?}");
+        drop(watch);
+        let _ = release.send(());
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_name_as_long_as_names_go_downloads() {
+        let dir = temp_dir("long-name");
+        let dest = dir.join(format!("{}.txt", "n".repeat(251)));
+        std::fs::write(&dest, b"").unwrap();
+        let (part, mut file) = create_part(&dest).unwrap();
+        file.write_all(b"data").unwrap();
+        std::fs::rename(&part, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"data");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
