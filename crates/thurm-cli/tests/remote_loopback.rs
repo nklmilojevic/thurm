@@ -643,6 +643,45 @@ fn remote_workspace_over_loopback_ssh() {
     );
     let copied: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(copied[0]["bytes"], 10, "{copied}");
+    // Where the file landed in the folder, not the folder that was named.
+    let landed = |name: &str| {
+        let at = std::fs::canonicalize(cp_dir.join("there"))
+            .unwrap()
+            .join(name);
+        format!("loop:{}", at.display())
+    };
+    let to = |v: &serde_json::Value| {
+        let (host, path) = v["to"].as_str().unwrap().split_once(':').unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        format!("{host}:{}", path.display())
+    };
+    assert_eq!(to(&copied[0]), landed("note.txt"), "{copied}");
+    // Several files into the folder: each with its own place.
+    let (one, two) = (cp_dir.join("one.txt"), cp_dir.join("two.txt"));
+    std::fs::write(&one, "1").unwrap();
+    std::fs::write(&two, "22").unwrap();
+    let out = cli(
+        &w,
+        &[
+            "cp",
+            one.to_str().unwrap(),
+            two.to_str().unwrap(),
+            &there,
+            "--json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let copied: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        (to(&copied[0]), to(&copied[1])),
+        (landed("one.txt"), landed("two.txt")),
+        "{copied}"
+    );
+    assert_eq!(copied[1]["bytes"], 2, "{copied}");
     assert_eq!(
         std::fs::read_to_string(cp_dir.join("there/note.txt")).unwrap(),
         "copied-42\n"

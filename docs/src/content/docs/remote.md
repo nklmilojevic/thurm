@@ -475,7 +475,7 @@ Only regular files are copied, each at most 4 GiB, and one side of every copy is
 this Mac: to copy between two hosts, copy to this Mac first. A name before a
 colon that is not one of your hosts is an error unless a file of that name
 exists here; write `./name:with-colon` for such a file. With `--json`, the files
-copied are printed as `[{from, to, bytes}]`. Thurm must be connected to the
+copied are printed as `[{from, to, bytes}]`, `to` being where each file landed. Thurm must be connected to the
 host, and the host needs a Thurm daemon of this version or later.
 
 ## Ports

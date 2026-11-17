@@ -77,14 +77,16 @@ fn a_forward_counts_its_connections_and_tells_of_changes() {
     let theirs = socket.clone();
     let f = Forwards::new(d.join("forwards.json"), move |_| theirs.clone());
     f.check("devbox").unwrap();
-    let told = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let heard = told.clone();
-    f.on_connections(move || {
-        heard.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    });
     let (fw, _) = f.open("devbox", 5173, Some(0)).unwrap();
+    // What each notice found the forward carrying, in the order they came.
+    let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (heard, counted, id) = (told.clone(), f.clone(), fw.id);
+    f.on_connections(move || {
+        let now = counted.connections().get(&id).copied();
+        heard.lock().unwrap().push(now);
+    });
     assert_eq!(f.connections().get(&fw.id), Some(&0));
-    assert_eq!(told.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(told.lock().unwrap().is_empty());
 
     let roundtrip = |conn: &mut TcpStream| {
         conn.write_all(b"ping").unwrap();
@@ -103,19 +105,22 @@ fn a_forward_counts_its_connections_and_tells_of_changes() {
             std::thread::sleep(Duration::from_millis(20));
         }
     };
+    // A notice that found both: those of the two coming have all been sent by then, or are
+    // this one.
     until("the connections were not told of", &|| {
-        told.load(std::sync::atomic::Ordering::SeqCst) >= 1
+        told.lock().unwrap().last() == Some(&Some(2))
     });
     // Two that came together are told of together, not one by one.
-    assert!(told.load(std::sync::atomic::Ordering::SeqCst) <= 2);
+    assert!(told.lock().unwrap().len() <= 2);
 
-    let before = told.load(std::sync::atomic::Ordering::SeqCst);
     drop(one);
     until("a connection that ended is still counted", &|| {
         f.connections().get(&fw.id) == Some(&1)
     });
+    // Only a notice sent for the connection that ended finds one left: a late one for the two
+    // that came would have found two.
     until("the connection that ended was not told of", &|| {
-        told.load(std::sync::atomic::Ordering::SeqCst) > before
+        told.lock().unwrap().last() == Some(&Some(1))
     });
     f.close(fw.id).unwrap();
     assert!(

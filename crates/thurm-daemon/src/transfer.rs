@@ -567,6 +567,7 @@ impl Transfers {
         cwd: Option<&str>,
         home: Option<&str>,
         if_version: Option<&str>,
+        max_size: Option<u64>,
     ) -> Result<DownloadInfo, String> {
         let abs = resolve(path, cwd, home)?;
         let file = open_nonblocking(&abs).map_err(|e| match e.kind() {
@@ -580,6 +581,13 @@ impl Transfers {
             .map_err(|e| format!("cannot read {path}: {e}"))?;
         if !meta.is_file() {
             return Err(format!("{path} is not a regular file"));
+        }
+        // Before any stream is reserved: a file over the limit is not sent at all.
+        if let Some(max) = max_size.filter(|max| meta.len() > *max) {
+            return Err(format!(
+                "{path} is too large to send (at most {} GiB)",
+                max >> 30
+            ));
         }
         let info = DownloadInfo {
             ticket: None,
@@ -636,7 +644,7 @@ impl Transfers {
         mode: u32,
         replace: bool,
         home: Option<&str>,
-    ) -> Result<(String, u32), String> {
+    ) -> Result<(String, u32, String), String> {
         if size > MAX_FILE {
             return Err(format!(
                 "{name} is too large to send (at most {} GiB)",
@@ -644,6 +652,7 @@ impl Transfers {
             ));
         }
         let dest = copy_dest(path, name, home)?;
+        let shown = dest.display().to_string();
         match std::fs::symlink_metadata(&dest) {
             Ok(m) if !m.is_file() => {
                 return Err(format!(
@@ -663,20 +672,23 @@ impl Transfers {
         if free_space(dir)? < size {
             return Err(format!("not enough space in {} for {name}", dir.display()));
         }
-        daemon.streams.reserve(
-            Kind::Put {
-                path: dest,
-                size,
-                mode: mode & 0o777,
-                replace,
-            },
-            client,
-            principal,
-        )
+        daemon
+            .streams
+            .reserve(
+                Kind::Put {
+                    path: dest,
+                    size,
+                    mode: mode & 0o777,
+                    replace,
+                },
+                client,
+                principal,
+            )
+            .map(|(ticket, expires_ms)| (ticket, expires_ms, shown))
     }
 
     /// [`thurm_proto::Request::CopyFrom`]: as a download, of a path that is the daemon's
-    /// user's own rather than a pane's.
+    /// user's own rather than a pane's, and of a file no larger than a copy the other way takes.
     pub fn copy_from_begin(
         &self,
         daemon: &Daemon,
@@ -685,7 +697,17 @@ impl Transfers {
         path: &str,
         home: Option<&str>,
     ) -> Result<DownloadInfo, String> {
-        self.download_begin(daemon, client, principal, NO_PANE, path, home, home, None)
+        self.download_begin(
+            daemon,
+            client,
+            principal,
+            NO_PANE,
+            path,
+            home,
+            home,
+            None,
+            Some(MAX_FILE),
+        )
     }
 
     /// Writes the stream's file beside `path`, then moves it there.
@@ -698,18 +720,28 @@ impl Transfers {
         mut reader: R,
         mut writer: UnixStream,
     ) {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = path.parent().unwrap_or(Path::new("/"));
-        let part = dir.join(format!(
-            ".thurm-{}-{}.part",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        // A part of this copy's own making: a name that is taken (a part left by a daemon
+        // that had this one's process id, a file put there by someone) is another's, neither
+        // written into nor removed.
+        let (part, mut file) = match create_part(path) {
+            Ok(made) => made,
+            Err(e) => return close(&mut writer, StreamClose::Internal(e)),
+        };
         // A sender that stops mid-file is not waited on for ever.
         let _ = writer.set_read_timeout(Some(self.idle));
-        let placed = receive(&mut reader, &part, size, || true).and_then(|()| {
-            std::fs::set_permissions(&part, std::fs::Permissions::from_mode(mode))
-                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        let placed = receive_into(&mut reader, &mut file, &part, size, || true).and_then(|()| {
+            let unwritable = |e: std::io::Error| format!("cannot write {}: {e}", path.display());
+            // Through the file that was written, not its name: in a folder others can change,
+            // the name may lead elsewhere by now, and a file of the user's must not get these
+            // bits in its place.
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(unwritable)?;
+            if !names(&part, &file) {
+                return Err(format!(
+                    "{} was changed while the file was written; nothing was copied",
+                    part.display()
+                ));
+            }
             if replace {
                 // Only a regular file gives way, as when the copy was asked for: a folder or a
                 // link put there since is kept.
@@ -735,8 +767,11 @@ impl Transfers {
             }
         });
         let _ = writer.set_read_timeout(None);
-        // Moved into place, the part's name is gone; linked there, or failed, it is not.
-        let _ = std::fs::remove_file(&part);
+        // Moved into place, the part's name is gone; linked there, or failed, it is not. Only
+        // while the name is still this copy's file: what someone put in its place is theirs.
+        if names(&part, &file) {
+            let _ = std::fs::remove_file(&part);
+        }
         match placed {
             Ok(()) => close(&mut writer, StreamClose::Ok),
             Err(e) => close(&mut writer, StreamClose::Internal(e)),
@@ -1367,7 +1402,7 @@ fn receive<R: Read>(
     reader: &mut R,
     part: &Path,
     size: u64,
-    mut progress: impl FnMut() -> bool,
+    progress: impl FnMut() -> bool,
 ) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -1375,6 +1410,46 @@ fn receive<R: Read>(
         .mode(0o600)
         .open(part)
         .map_err(|e| format!("cannot write {}: {e}", part.display()))?;
+    receive_into(reader, &mut file, part, size, progress)
+}
+
+/// A new private file beside `dest` for a copy to write until whole, under a name no file has:
+/// one that is taken is left as it is and the next tried.
+fn create_part(dest: &Path) -> Result<(PathBuf, File), String> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..1000 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let part = dest.with_file_name(format!(".thurm-{}-{n}.part", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&part)
+        {
+            Ok(file) => return Ok((part, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("cannot write {}: {e}", part.display())),
+        }
+    }
+    Err(format!("no free name beside {}", dest.display()))
+}
+
+/// Whether `path` is still the name of `file` (not a link, nor another file, put in its place).
+fn names(path: &Path, file: &File) -> bool {
+    match (std::fs::symlink_metadata(path), file.metadata()) {
+        (Ok(at), Ok(ours)) => at.is_file() && (at.dev(), at.ino()) == (ours.dev(), ours.ino()),
+        _ => false,
+    }
+}
+
+/// Writes the stream's data to `file` (`part` in errors) until `End`: exactly `size` bytes.
+fn receive_into<R: Read>(
+    reader: &mut R,
+    file: &mut File,
+    part: &Path,
+    size: u64,
+    mut progress: impl FnMut() -> bool,
+) -> Result<(), String> {
     let mut written = 0u64;
     loop {
         match stream::read_frame(reader) {

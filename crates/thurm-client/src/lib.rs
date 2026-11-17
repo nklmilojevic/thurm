@@ -717,7 +717,8 @@ impl Client {
 
 impl Client {
     /// Reserves a stream that writes a file of `size` bytes at `path` on the daemon's host
-    /// ([`Request::CopyTo`]); open it with [`stream::open`] before the ticket expires.
+    /// ([`Request::CopyTo`]); open it with [`stream::open`] before the ticket expires. Also
+    /// where the file goes there.
     pub fn copy_to_begin(
         &self,
         path: &str,
@@ -725,7 +726,7 @@ impl Client {
         size: u64,
         mode: u32,
         replace: bool,
-    ) -> Result<stream::Ticket, ClientError> {
+    ) -> Result<(stream::Ticket, String), ClientError> {
         if !self.has_capability(thurm_proto::CAP_COPY) {
             return Err(ClientError::Daemon(NO_COPY.into()));
         }
@@ -736,7 +737,11 @@ impl Client {
             mode,
             replace,
         })? {
-            Response::Ticket { ticket, expires_ms } => Ok(stream::Ticket { ticket, expires_ms }),
+            Response::CopyTicket {
+                ticket,
+                expires_ms,
+                path,
+            } => Ok((stream::Ticket { ticket, expires_ms }, path)),
             _ => Err(ClientError::Daemon(UNREADABLE_ANSWER.into())),
         }
     }

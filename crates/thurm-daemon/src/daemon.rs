@@ -3681,6 +3681,7 @@ impl Daemon {
                         cwd.as_deref(),
                         home.as_deref(),
                         if_version.as_deref(),
+                        None,
                     )
                     .map(Response::Download)
             }
@@ -3705,7 +3706,11 @@ impl Daemon {
                         replace,
                         home.as_deref(),
                     )
-                    .map(|(ticket, expires_ms)| Response::Ticket { ticket, expires_ms })
+                    .map(|(ticket, expires_ms, path)| Response::CopyTicket {
+                        ticket,
+                        expires_ms,
+                        path,
+                    })
             }
             Request::CopyFrom { path } => {
                 let home = std::env::var("HOME").ok();

@@ -643,7 +643,7 @@ pub enum Request {
     /// `name`, of which only the last component is kept. The folder it goes in must be there.
     /// The file is written beside its place and moved there once whole, with the permission
     /// bits `mode`; one already there is replaced only with `replace`, and only a regular file
-    /// is. The stream closes `Ok` once the file is in place. Answers [`Response::Ticket`].
+    /// is. The stream closes `Ok` once the file is in place. Answers [`Response::CopyTicket`].
     /// Requires [`CAP_COPY`].
     CopyTo {
         path: String,
@@ -653,8 +653,8 @@ pub enum Request {
         replace: bool,
     },
     /// Reserve a stream that sends the regular file at `path` on the daemon's host, read as
-    /// [`Request::CopyTo`] reads its own. Answers [`Response::Download`]. Requires
-    /// [`CAP_COPY`].
+    /// [`Request::CopyTo`] reads its own; a file larger than one `CopyTo` takes is refused.
+    /// Answers [`Response::Download`]. Requires [`CAP_COPY`].
     CopyFrom {
         path: String,
     },
@@ -826,6 +826,13 @@ pub enum Response {
     ClipboardData {
         #[serde(with = "bytes")]
         data: Vec<u8>,
+    },
+    /// The answer to [`Request::CopyTo`]: a [`Response::Ticket`], and `path`, where the file
+    /// goes on the daemon's host (inside the folder named, under its own name).
+    CopyTicket {
+        ticket: String,
+        expires_ms: u32,
+        path: String,
     },
 }
 

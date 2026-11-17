@@ -263,9 +263,10 @@ fn one(
                 client: &client,
                 socket: &socket,
             };
-            let bytes = transfer::copy_to(at, src, path, force, cancel, progress)
+            // Where it landed, not the folder that was named.
+            let (landed, bytes) = transfer::copy_to(at, src, path, force, cancel, progress)
                 .map_err(|e| said(host, e))?;
-            Ok((copy.to.to_string(), bytes))
+            Ok((format!("{host}:{landed}"), bytes))
         }
         (Place::Remote { host, path }, Place::Local(dest)) => {
             let (client, socket) = hosts.get(host)?;

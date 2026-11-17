@@ -1757,13 +1757,17 @@ fn a_file_is_copied_to_a_named_path_and_back() {
 
     // Into a folder under its own name; `~` and relative paths are under the home directory.
     let mut seen = Vec::new();
-    let sent = transfer::copy_to(host, &src, "inbox", false, &cancel, |p| seen.push(p)).unwrap();
+    let (at, sent) =
+        transfer::copy_to(host, &src, "inbox", false, &cancel, |p| seen.push(p)).unwrap();
     assert_eq!(sent, data.len() as u64);
+    // Where it landed is told: the file in the folder, not the folder that was named.
+    assert_eq!(Path::new(&at), home.join("inbox/data.bin"));
     assert_eq!(seen.last().map(|p| (p.done, p.total)), Some((sent, sent)));
     let landed = home.join("inbox/data.bin");
     assert!(std::fs::read(&landed).unwrap() == data);
     assert_eq!(mode(&landed), 0o640, "the file keeps its permission bits");
-    to("~/inbox/named.bin", false).unwrap();
+    let (at, _) = to("~/inbox/named.bin", false).unwrap();
+    assert_eq!(Path::new(&at), home.join("inbox/named.bin"));
     assert!(std::fs::read(home.join("inbox/named.bin")).unwrap() == data);
     let abs = dir.join("abs.bin");
     to(&abs.display().to_string(), false).unwrap();
@@ -1795,7 +1799,7 @@ fn a_file_is_copied_to_a_named_path_and_back() {
     assert_eq!(names, ["data.bin", "data.bin.d", "link", "named.bin"]);
 
     // A copy that says more than it sends leaves nothing.
-    let ticket = c
+    let (ticket, _) = c
         .copy_to_begin("inbox/short.bin", "short.bin", 10, 0o644, false)
         .unwrap();
     let (r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
@@ -1840,4 +1844,109 @@ fn a_file_is_copied_to_a_named_path_and_back() {
         2,
         "a part was left"
     );
+}
+
+/// A copy's part is its own: a file that has the name it would take is neither written into nor
+/// removed, and a link put in a part's place while its file comes changes nothing it leads to.
+#[test]
+fn a_copy_touches_no_file_but_its_own_part() {
+    let env = Env::new("transfer-copy-part");
+    let home = env.dir.join("home");
+    let inbox = home.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let daemon = env.start_with(&[("HOME", &home)]);
+    let (c, _rx) = env.connect();
+    let pid = daemon.child.id();
+
+    // The name the daemon's first part would take is another's file.
+    let theirs = inbox.join(format!(".thurm-{pid}-0.part"));
+    std::fs::write(&theirs, b"theirs").unwrap();
+    let put = |name: &str, data: &[u8]| {
+        let (ticket, _) = c
+            .copy_to_begin("inbox", name, data.len() as u64, 0o644, false)
+            .unwrap();
+        let (r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
+        w.write_all(data).unwrap();
+        w.finish().unwrap();
+        r.wait_closed()
+    };
+    put("a.txt", b"first").unwrap();
+    assert_eq!(std::fs::read(inbox.join("a.txt")).unwrap(), b"first");
+    assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs");
+    // A copy that fails leaves it too.
+    let (ticket, _) = c.copy_to_begin("inbox", "b.txt", 10, 0o644, false).unwrap();
+    let (r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
+    w.write_all(b"12345").unwrap();
+    w.finish().unwrap();
+    assert!(r.wait_closed().is_err());
+    assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs");
+    std::fs::remove_file(&theirs).unwrap();
+
+    // A private file of the user's, and a copy whose part is swapped for a link to it while
+    // its bytes come: the file keeps its bits and its bytes, and nothing is copied.
+    let private = home.join("private.key");
+    std::fs::write(&private, b"secret").unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let parts = || -> Vec<PathBuf> {
+        std::fs::read_dir(&inbox)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "part"))
+            .collect()
+    };
+    let (ticket, _) = c.copy_to_begin("inbox", "c.txt", 10, 0o644, false).unwrap();
+    let (r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
+    w.write_all(b"12345").unwrap();
+    w.flush().unwrap();
+    eventually(10, "the copy's part did not appear", || {
+        parts()
+            .first()
+            .is_some_and(|p| std::fs::metadata(p).is_ok_and(|m| m.len() == 5))
+    });
+    let part = parts().remove(0);
+    std::fs::remove_file(&part).unwrap();
+    std::os::unix::fs::symlink(&private, &part).unwrap();
+    w.write_all(b"67890").unwrap();
+    w.finish().unwrap();
+    let e = r.wait_closed().unwrap_err();
+    assert!(e.to_string().contains("was changed while"), "{e}");
+    assert_eq!(
+        mode(&private),
+        0o600,
+        "the link's target got the copy's bits"
+    );
+    assert_eq!(std::fs::read(&private).unwrap(), b"secret");
+    assert!(!inbox.join("c.txt").exists());
+    // The link is whoever's put it there: not the daemon's to remove.
+    assert!(std::fs::symlink_metadata(&part).unwrap().is_symlink());
+}
+
+/// A file larger than a copy takes is not sent by one either; a pane's download of it is as
+/// before.
+#[test]
+fn a_copy_from_the_host_keeps_to_the_size_a_copy_takes() {
+    let env = Env::new("transfer-copy-size");
+    let home = env.dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let _daemon = env.start_with(&[("HOME", &home)]);
+    let (c, _rx) = env.connect();
+    // Sparse: its size without its bytes.
+    let limit = 4u64 << 30;
+    let file = std::fs::File::create(home.join("huge.img")).unwrap();
+    file.set_len(limit + 1).unwrap();
+    std::fs::File::create(home.join("full.img"))
+        .unwrap()
+        .set_len(limit)
+        .unwrap();
+
+    let e = c.copy_from_begin("huge.img").unwrap_err();
+    assert!(e.to_string().contains("too large to send"), "{e}");
+    // Refused before any stream was reserved, and a file of just the limit is sent.
+    let info = c.copy_from_begin("full.img").unwrap();
+    assert_eq!(info.size, limit);
+    assert!(info.ticket.is_some());
+    let pane = cat_pane(&c, &home);
+    let info = c.download_begin(pane, "huge.img", None).unwrap();
+    assert_eq!(info.size, limit + 1);
+    assert!(info.ticket.is_some());
 }
