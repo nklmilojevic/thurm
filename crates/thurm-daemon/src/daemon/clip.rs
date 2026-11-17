@@ -216,8 +216,8 @@ impl Daemon {
             })
     }
 
-    /// The desktop UI to ask about `pane` (see [`pick_ui`]).
-    fn clipboard_ui(&self, pane: PaneId) -> Option<Arc<Client>> {
+    /// The desktop UI to ask about `pane` (see [`pick_ui`]), or why there is none.
+    fn clipboard_ui(&self, pane: PaneId) -> Result<Arc<Client>, String> {
         let last = self.focus.lock().last_client(pane);
         let clients = self.clients.lock();
         let candidates: Vec<(u64, bool)> = clients
@@ -233,7 +233,18 @@ impl Daemon {
         // A daemon that can tell its own app asks only that: another client saying it is a UI
         // is never asked, the app connected or not.
         let only_verified = ext::verifies_its_app();
-        pick_ui(last, &candidates, only_verified).and_then(|id| clients.get(&id).cloned())
+        match pick_ui(last, &candidates, only_verified) {
+            Some(id) => clients
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| "the Thurm app left".into()),
+            None if candidates.len() > 1 && !only_verified => Err(
+                "more than one Thurm app is connected and none has shown this pane since: \
+                 show it in the one whose clipboard to use"
+                    .into(),
+            ),
+            None => Err("no Thurm app that can share its clipboard is connected".into()),
+        }
     }
 
     /// A request [`Daemon::clipboard_admit`] let through: asks the app and waits for it. The
@@ -255,9 +266,7 @@ impl Daemon {
 
     fn clipboard_ask_held(&self, caller: u64, pane: PaneId, ask: Ask) -> Result<Held, String> {
         self.pane(pane).ok_or("no such pane")?;
-        let ui = self
-            .clipboard_ui(pane)
-            .ok_or("no Thurm app that can share its clipboard is connected")?;
+        let ui = self.clipboard_ui(pane)?;
         let id = self.next_clip.fetch_add(1, Ordering::Relaxed);
         let refused = match ask {
             // The app answers only yes or no: every reason for a no is named.
@@ -378,14 +387,23 @@ impl Daemon {
 
 /// Of the desktop UIs that can answer (`candidates`: id, and whether it is verified as this
 /// daemon's own app, see `ext::peer_is_our_app`), the one to ask: the one that focused the pane
-/// `last`, else the first. A verified app goes before every other client, so another program
-/// saying it is a UI cannot take the app's questions; a daemon that cannot verify its app (on a
-/// remote host, reached through ssh or the tailnet) verifies none and goes by focus alone.
+/// `last`, else the only one there is: with several and none of them the last to show the pane,
+/// none, rather than the clipboard of a Mac the user is not at. A verified app goes before every
+/// other client, so another program saying it is a UI cannot take the app's questions; a daemon
+/// that cannot verify its app (on a remote host, reached through ssh or the tailnet) verifies
+/// none and goes by focus alone.
 fn pick_ui(last: Option<u64>, candidates: &[(u64, bool)], only_verified: bool) -> Option<u64> {
     let any_verified = only_verified || candidates.iter().any(|&(_, v)| v);
-    let eligible = |&&(_, v): &&(u64, bool)| v || !any_verified;
-    last.filter(|id| candidates.iter().filter(eligible).any(|(c, _)| c == id))
-        .or_else(|| candidates.iter().filter(eligible).map(|&(id, _)| id).min())
+    let eligible: Vec<u64> = candidates
+        .iter()
+        .filter(|&&(_, v)| v || !any_verified)
+        .map(|&(id, _)| id)
+        .collect();
+    match (last.filter(|id| eligible.contains(id)), eligible.as_slice()) {
+        (Some(id), _) => Some(id),
+        (None, [only]) => Some(*only),
+        (None, _) => None,
+    }
 }
 
 #[cfg(test)]
@@ -482,7 +500,14 @@ mod tests {
     #[test]
     fn the_app_that_looked_last_is_asked() {
         assert_eq!(pick_ui(Some(3), &[(2, false), (3, false)], false), Some(3));
-        assert_eq!(pick_ui(None, &[(3, false), (2, false)], false), Some(2));
+        assert_eq!(pick_ui(None, &[(2, false)], false), Some(2), "the only one");
+        // Several and none showed the pane: not one picked at random, maybe another Mac's.
+        assert_eq!(pick_ui(None, &[(3, false), (2, false)], false), None);
+        assert_eq!(
+            pick_ui(Some(9), &[(3, false), (2, false)], false),
+            None,
+            "gone"
+        );
         assert_eq!(
             pick_ui(Some(9), &[(3, false)], false),
             Some(3),
@@ -506,7 +531,8 @@ mod tests {
         assert_eq!(pick_ui(Some(5), &[(2, true), (5, false)], false), Some(2));
         assert_eq!(
             pick_ui(Some(5), &[(2, true), (4, true), (5, false)], false),
-            Some(2)
+            None,
+            "two verified, neither the last"
         );
         assert_eq!(
             pick_ui(Some(4), &[(2, true), (4, true), (5, false)], false),
