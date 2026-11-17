@@ -126,6 +126,7 @@ prints it and exits with 1.
 | `thurm.ui.toast(text, pane)` | A short message over a pane |
 | `thurm.ui.pick{title, placeholder, items}` | The user picks an item (a string, or a table with `title` and `detail`); returns it and its index, or `nil` |
 | `thurm.ui.input{title, placeholder, value}`, `thurm.ui.confirm{title, body, ok, cancel}` | A line of text, or yes or no |
+| `thurm.ui.mount(slot, id, view)`, `thurm.ui.unmount(id)` | Shows a view of your own in the window, or takes it down; see [Views in the window](#views-in-the-window) |
 | `thurm.exec(argv, {cwd, env, stdin, timeout})` | Runs a program to its end through your login shell; `ok`, `code`, `stdout`, `stderr`, `timed_out`. A string runs with `sh -c` |
 | `thurm.after(s, fn)`, `thurm.every(s, fn)`, `thurm.sleep(s)` | Timers; the first two return a handle with `cancel()` (a plugin may have 4096 set at a time) |
 | `thurm.fail(message)` | Stops with a message for the user, without the file and line an error adds |
@@ -171,6 +172,71 @@ regular files only (a FIFO or device could hold up every plugin), and there
 is no stdin to read. Code that
 runs for 5 seconds without waiting is stopped, and a plugin may use at most
 256 MiB (a script, 64 MiB).
+
+## Views in the window
+
+A plugin can draw in the window itself. Thurm has a few **slots**, places over
+the corners of a tab, and a plugin **mounts** a view in one. A view is a small
+tree of plain nodes (boxes, text, icons and images) that the plugin builds as
+a table, and the app lays it out. What the view shows and how it looks is up
+to the plugin: Thurm only places it, routes its clicks and shows its popovers.
+
+```lua
+-- A box in the bottom right corner, with a popover and a click.
+thurm.ui.mount("window.bottom_trailing", "build", {
+  type = "row", fill = "#1e1e1ee6", corner = 20, padding = 8, spacing = 8,
+  children = {
+    { type = "icon", symbol = "hammer.fill" },
+    { type = "text", text = "Build passing", weight = "medium" },
+  },
+  action = { name = "build.refresh" },
+  popover = {
+    type = "column", spacing = 4,
+    children = {
+      { type = "text", text = "main · 2 minutes ago", color = "secondary" },
+      { type = "text", text = "Click to refresh." },
+    },
+  },
+})
+```
+
+Mounting the same `id` again replaces the view in its place, so a plugin
+updates it by mounting it again. Views in one slot line up side by side, in
+the order they were first mounted. `thurm.ui.unmount(id)` takes a view down,
+and a plugin's views go when it stops, is disabled or is reloaded.
+`thurm.ui.mount` returns whether an app that draws views is connected.
+
+| Slot | Where |
+| --- | --- |
+| `window.bottom_trailing` | The bottom right corner of a tab, below the minimized cards and notices |
+| `window.bottom_leading` | The bottom left corner of a tab |
+| `window.top_trailing` | The top right corner of a tab, below the pane headers |
+
+| Node `type` | Draws |
+| --- | --- |
+| `row`, `column`, `stack` | Its `children` side by side, one above another, or on top of each other, placed by `align` (`center`, `top`, `bottom`, `leading`, `trailing`, `top_leading`, `top_trailing`, `bottom_leading`, `bottom_trailing`); `spacing` apart |
+| `text` | `text`, at `size` points, in `weight` (`regular`, `medium`, `bold`) and `color`; on one line, unless it has a `width` to wrap in |
+| `icon` | The SF Symbol named `symbol`, at `size` points, in `color` |
+| `image` | A PNG, base64 in `image`: anything else the plugin draws itself |
+| `spacer` | Room that grows in a row or a column |
+
+Any node can also have `width` and `height` (its content placed in them by
+`align`), `padding`, a `fill` color with a
+`corner` radius, a `border` color, a `tooltip`, an `action` (`{name, args}`,
+run when the node is clicked, for the focused pane), a `popover` (a view
+shown next to it while the pointer is over it) and a `menu` that a right click
+opens: items with a `title`, an `action` and `checked` for a check mark, and
+an empty item for a separator. A right click on a view without a menu opens
+nothing. Colors are `primary`,
+`secondary`, `accent` (the theme's), or `#rrggbb` and `#rrggbbaa`. A type the
+app does not know draws nothing.
+
+A view has at most 512 nodes and menu items, nests at most 16 deep and is at most 512 KiB as
+JSON, and a plugin has at most 16 views mounted. `size`, `width`, `height` and
+`corner` go up to 480 points, `spacing` and `padding` up to 48, and an image
+is drawn from at most 512 pixels on a side. A view out of these bounds, or in
+an unknown slot, is refused with an error. Only the app reads the views
+plugins mount; another plugin cannot. Views show on the Mac app.
 
 ## Scripts
 
@@ -315,13 +381,15 @@ JSON.
 | `ui.toast` | `{text, pane}` | |
 | `ui.pick` | `{title, placeholder, items: [{id, title, detail}]}` | `{index, id}` or null |
 | `ui.input`, `ui.confirm` | `{title, placeholder, value}`, `{title, body, ok, cancel}` | The text or null; true or false |
+| `ui.mount` | `{slot, id, view}`; see [Views in the window](#views-in-the-window) | `{shown}` |
+| `ui.unmount` | `{id}` | |
 | `exec` | `{argv, cwd, env, stdin, timeout_ms}` | `{ok, code, signal, stdout, stderr, timed_out}` |
 | `log` | `{level, message}` | |
 | `plugins.list` | | `[{name, kind, state, version, path, error, actions}]` |
 | `plugins.reload`, `plugins.enable`, `plugins.disable`, `plugins.logs` | `{name}` (`lines` for logs) | |
 | `script.run` | `{source, name, args, dir, pane}` | What the script returned |
 
-A plugin's actions, keys and subscriptions go away when it stops. The API is
+A plugin's actions, keys, subscriptions and views go away when it stops. The API is
 for clients on the daemon's machine and its plugins: a caller over the tailnet
 may only read `actions.list` and `plugins.list`. The app's Secure Keyboard
 Entry switch is never offered as an action.

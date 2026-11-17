@@ -208,6 +208,16 @@ function thurm.ui.toast(text, pane)
   call("ui.toast", { text = tostring(text), pane = pane })
 end
 
+function thurm.ui.mount(slot, id, view)
+  check(type(slot) == "string" and type(id) == "string" and type(view) == "table",
+    "usage: thurm.ui.mount(\"window.bottom_trailing\", \"my-view\", { type = \"text\", text = \"hi\" })")
+  return call("ui.mount", { slot = slot, id = id, view = view }).shown
+end
+
+function thurm.ui.unmount(id)
+  call("ui.unmount", { id = id })
+end
+
 function thurm.ui.pick(opts)
   check(type(opts) == "table" and type(opts.items) == "table",
     "usage: thurm.ui.pick{ title = \"...\", items = { \"a\", { title = \"b\", detail = \"...\" } } }")

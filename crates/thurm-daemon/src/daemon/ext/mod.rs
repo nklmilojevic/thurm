@@ -42,6 +42,9 @@ pub struct Ext {
     /// client and where its answer goes.
     pending: Mutex<HashMap<u64, Pending>>,
     next: AtomicU64,
+    /// Views clients mounted in the window, in the order they were first mounted, with the
+    /// client each belongs to.
+    views: Mutex<Vec<ext::MountedView>>,
 }
 
 pub use thurm_proto::ext::method_blocks as blocks;
@@ -209,6 +212,17 @@ impl Daemon {
                 let text = str_param(&p, "text")?.to_owned();
                 let pane = p.get("pane").and_then(Value::as_u64);
                 self.toast(text, pane);
+                Ok(Value::Null)
+            }
+            method::UI_MOUNT => {
+                let mount: ext::Mount = params(p)?;
+                mount.check()?;
+                self.mount_view(client, mount)?;
+                Ok(json!({ "shown": self.ui_client().is_some() }))
+            }
+            method::UI_UNMOUNT => {
+                let id = str_param(&p, "id")?;
+                self.unmount_views(|v| v.client == client.id && v.id == id);
                 Ok(Value::Null)
             }
             method::UI_PICK => {
@@ -462,13 +476,75 @@ impl Daemon {
         }
     }
 
-    /// Forgets what `client` provided, heard and was asked.
+    /// Forgets what `client` provided, heard, was asked and showed.
     pub(super) fn ext_client_gone(&self, client: u64) {
         // Dropping the senders ends the waits on them.
         self.ext.pending.lock().retain(|_, p| p.to != client);
         if self.ext.registry.lock().client_gone(client) {
             self.actions_changed();
         }
+        self.unmount_views(|v| v.client == client);
+    }
+
+    /// Shows `mount` for `client`, replacing its view of the same id. Refused once the client
+    /// is gone (checked under the views' lock, which its removal takes after setting `gone`).
+    fn mount_view(&self, client: &Client, mount: ext::Mount) -> Result<(), String> {
+        self.change_views(|views| {
+            if client.gone.load(Ordering::SeqCst) {
+                return Err("this client was disconnected".into());
+            }
+            let view = ext::MountedView {
+                client: client.id,
+                id: mount.id,
+                slot: mount.slot,
+                view: mount.view,
+            };
+            let mine = views.iter().filter(|v| v.client == client.id).count();
+            match views
+                .iter_mut()
+                .find(|v| v.client == client.id && v.id == view.id)
+            {
+                Some(old) => *old = view,
+                None if mine >= ext::MAX_VIEWS => {
+                    return Err(format!("at most {} views at a time", ext::MAX_VIEWS));
+                }
+                None => views.push(view),
+            }
+            Ok(true)
+        })
+    }
+
+    /// Takes down the views `gone` picks.
+    fn unmount_views(&self, gone: impl Fn(&ext::MountedView) -> bool) {
+        let _ = self.change_views(|views| {
+            let before = views.len();
+            views.retain(|v| !gone(v));
+            Ok(views.len() != before)
+        });
+    }
+
+    /// Changes the views with `f` and, when it says they changed, sends them to the apps that
+    /// draw them, under the same lock: notices go out in the order the changes were made.
+    fn change_views(
+        &self,
+        f: impl FnOnce(&mut Vec<ext::MountedView>) -> Result<bool, String>,
+    ) -> Result<(), String> {
+        let mut views = self.ext.views.lock();
+        if f(&mut views)? {
+            let notice = json!({ "views": *views });
+            self.notify_clients(
+                |c| c.ext_ui.load(Ordering::Relaxed),
+                notice::VIEWS_CHANGED,
+                &notice,
+            );
+        }
+        Ok(())
+    }
+
+    /// Sends `client` the views mounted now, as it starts drawing them.
+    pub(super) fn send_views(&self, client: &Client) {
+        let views = self.ext.views.lock();
+        send_ext(client, notice::VIEWS_CHANGED, &json!({ "views": *views }));
     }
 
     /// The config's `[[commands]]` as actions; called whenever the config is applied.
@@ -480,11 +556,17 @@ impl Daemon {
 
     /// Tells the clients that use the extension API to read the actions again.
     fn actions_changed(&self) {
+        self.notify_clients(
+            |c| c.ext.load(Ordering::Relaxed),
+            notice::ACTIONS_CHANGED,
+            &json!({}),
+        );
+    }
+
+    fn notify_clients(&self, to: impl Fn(&Client) -> bool, name: &str, payload: &Value) {
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
-        for c in clients {
-            if c.ext.load(Ordering::Relaxed) {
-                send_ext(&c, notice::ACTIONS_CHANGED, &json!({}));
-            }
+        for c in clients.iter().filter(|c| to(c)) {
+            send_ext(c, name, payload);
         }
     }
 

@@ -2733,6 +2733,9 @@ impl Daemon {
                     client
                         .ext_ui
                         .store(local && desktop && app, Ordering::Relaxed);
+                    if local && desktop && app {
+                        self.send_views(client);
+                    }
                 }
                 log::info!(
                     "client {} hello: {name} (protocol {version}{}{}{}{}{})",

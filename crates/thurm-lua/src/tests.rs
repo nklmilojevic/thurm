@@ -39,6 +39,7 @@ impl Host for FakeHost {
                 std::thread::sleep(Duration::from_millis(1500));
                 Ok(Value::Null)
             }
+            "ui.mount" => Ok(json!({ "shown": true })),
             _ => Ok(Value::Null),
         }
     }
@@ -623,4 +624,31 @@ fn only_regular_files_are_opened() {
                 "written": "xy", "count": 1, "missing": true, "mwhy": true, "shebang": "ran" })
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_plugin_mounts_and_unmounts_a_view() {
+    let f = fixture();
+    let r = run(
+        &f,
+        r##"
+        local shown = thurm.ui.mount("window.bottom_trailing", "usage", {
+          type = "stack", fill = "#202020",
+          children = { { type = "icon", symbol = "sparkle" } },
+          action = { name = "usage.refresh" },
+        })
+        thurm.ui.unmount("usage")
+        return shown
+        "##,
+    )
+    .unwrap();
+    assert_eq!(r, json!(true));
+    let mount = next(&f, "ui.mount");
+    assert_eq!(mount["slot"], "window.bottom_trailing");
+    assert_eq!(mount["id"], "usage");
+    assert_eq!(mount["view"]["children"][0]["symbol"], "sparkle");
+    assert_eq!(mount["view"]["action"]["name"], "usage.refresh");
+    assert_eq!(next(&f, "ui.unmount"), json!({ "id": "usage" }));
+    let e = run(&f, "thurm.ui.mount('window.bottom_trailing', 'x')").unwrap_err();
+    assert!(e.contains("usage: thurm.ui.mount"), "{e}");
 }

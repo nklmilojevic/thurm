@@ -89,6 +89,7 @@ final class Extensions {
         actions = []
         bindings = []
         appActions = []
+        PluginViews.shared.apply([])
         if had { SessionManager.shared.applyKeys() }
     }
 
@@ -320,6 +321,8 @@ final class Extensions {
             }
         case "action.invoke":
             invoke(payload)
+        case "ui.views.changed":
+            PluginViews.shared.apply(PluginViews.decode(payload["views"]))
         case "ui.request":
             show(payload)
         case "ui.cancel":

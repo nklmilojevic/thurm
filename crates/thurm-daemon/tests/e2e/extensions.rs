@@ -1395,3 +1395,56 @@ fn an_action_hears_the_selection_the_file_and_the_remote_host() {
     assert!(ctx.get("remote").is_none(), "{ctx}");
     answering.join().unwrap();
 }
+
+#[test]
+fn a_plugin_mounts_views_the_app_draws_until_the_plugin_leaves() {
+    let env = Env::new("ext-views");
+    let _d = env.start();
+    let (_app, app_rx) = app_client(&env);
+    assert_eq!(next(&app_rx, notice::VIEWS_CHANGED)["views"], json!([]));
+    let (plugin, plugin_rx) = ext_client(&env, "plugin");
+    let mount = |id: &str, view: Value| {
+        call(
+            &plugin,
+            method::UI_MOUNT,
+            json!({ "id": id, "slot": "window.bottom_trailing", "view": view }),
+        )
+    };
+    let views = || next(&app_rx, notice::VIEWS_CHANGED)["views"].clone();
+
+    let view = json!({ "type": "stack", "children": [{ "type": "icon", "symbol": "sparkle" }] });
+    assert_eq!(mount("usage", view).unwrap(), json!({ "shown": true }));
+    let shown = views();
+    assert_eq!(shown[0]["id"], "usage");
+    assert_eq!(shown[0]["slot"], "window.bottom_trailing");
+    assert_eq!(shown[0]["view"]["children"][0]["symbol"], "sparkle");
+
+    // The same id replaces the view in its place; another id lines up after it.
+    let text = json!({ "type": "text", "text": "hi" });
+    mount("usage", text.clone()).unwrap();
+    views();
+    mount("clock", text).unwrap();
+    let shown = views();
+    assert_eq!(shown[0]["view"]["type"], "text");
+    assert_eq!(shown[1]["id"], "clock");
+    assert!(mount("x", json!({ "type": "icon", "size": 1_000_000 })).is_err());
+
+    call(&plugin, method::UI_UNMOUNT, json!({ "id": "clock" })).unwrap();
+    assert_eq!(views().as_array().unwrap().len(), 1);
+
+    // An app that connects gets them at once; plugins never hear them.
+    let (_late, late_rx) = app_client(&env);
+    assert_eq!(
+        next(&late_rx, notice::VIEWS_CHANGED)["views"][0]["id"],
+        "usage"
+    );
+    assert!(
+        plugin_rx
+            .try_iter()
+            .all(|(n, _)| n != notice::VIEWS_CHANGED)
+    );
+
+    // A plugin that stops takes its views with it.
+    drop(plugin);
+    assert_eq!(views(), json!([]));
+}

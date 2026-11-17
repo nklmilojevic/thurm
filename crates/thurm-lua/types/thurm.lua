@@ -181,6 +181,39 @@ thurm.ui = {}
 ---@param pane integer?
 function thurm.ui.toast(text, pane) end
 
+---@class thurm.ViewNode
+---@field type "row"|"column"|"stack"|"text"|"icon"|"image"|"spacer"
+---@field children thurm.ViewNode[]?
+---@field text string?
+---@field symbol string? An SF Symbol name, for `icon`
+---@field image string? A PNG, base64, for `image`
+---@field color string? `primary`, `secondary`, `accent` or `#rrggbb[aa]`
+---@field size number?
+---@field weight "regular"|"medium"|"bold"?
+---@field width number?
+---@field height number?
+---@field spacing number?
+---@field padding number?
+---@field align string? Where a `stack` puts its children: `center`, `top_trailing`, ...
+---@field fill string? A color behind the node
+---@field corner number? The fill's and border's corner radius
+---@field border string? A color around the node
+---@field tooltip string?
+---@field action { name: string, args: any }? Run when the node is clicked
+---@field popover thurm.ViewNode? Shown next to the node while the pointer is over it
+---@field menu { title: string?, action: { name: string, args: any }?, checked: boolean? }[]? Opened by a right click; an item with neither title nor action is a separator
+
+--- Shows a view in the window until it is unmounted or the plugin stops; mounting the same id
+--- again replaces it. True when an app that draws views is connected.
+---@param slot "window.bottom_trailing"|"window.bottom_leading"|"window.top_trailing"
+---@param id string
+---@param view thurm.ViewNode
+---@return boolean shown
+function thurm.ui.mount(slot, id, view) end
+
+---@param id string
+function thurm.ui.unmount(id) end
+
 --- The user picks an item; returns it and its index, or nil when cancelled.
 ---@generic T
 ---@param opts { title: string?, placeholder: string?, items: T[] }
