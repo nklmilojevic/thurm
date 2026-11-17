@@ -291,6 +291,8 @@ final class FilePreviewTests: XCTestCase {
         // A file URL printed on the host names the host's file, whatever host it carries.
         XCTAssertEqual(try TerminalFileReference.fileURL(URL(string: "file://devbox/tmp/My%20Report.pdf")!)
             .remotePaths(), ["/tmp/My Report.pdf"])
+        // An absolute path may hold `://` in a name; a URL is still no path.
+        XCTAssertEqual(try TerminalFileReference.path("/tmp/a://b").remotePaths(), ["/tmp/a://b"])
         for bad in ["~root/x", "sftp://host/tmp/a.pdf", "host:/tmp/a.pdf", "user@host:report.pdf"] {
             XCTAssertThrowsError(try TerminalFileReference.path(bad).remotePaths(), bad) {
                 XCTAssertEqual($0 as? FilePreviewError, .invalid)
@@ -327,6 +329,13 @@ final class FilePreviewTests: XCTestCase {
         let stagedOdd = try cache.stage(odd)
         try Data("1".utf8).write(to: stagedOdd)
         XCTAssertEqual(try cache.install(odd, staged: stagedOdd, name: "../../x", version: "v").lastPathComponent, "file")
+        // A hidden name keeps its extension, for Quick Look to know what it is.
+        let dotted = cache.entry(host: "devbox", path: "/.eslintrc.json", cwd: nil)
+        let stagedDotted = try cache.stage(dotted)
+        try Data("{}".utf8).write(to: stagedDotted)
+        let kept = try cache.install(dotted, staged: stagedDotted, name: ".eslintrc.json", version: "v")
+        XCTAssertEqual(kept.lastPathComponent, "dot.eslintrc.json")
+        XCTAssertEqual(cache.cached(dotted)?.file, kept)
 
         // Over the limit, the least recently fetched entries go; the one just stored stays.
         try FileManager.default.setAttributes([.modificationDate: Date.distantPast], ofItemAtPath: entry.path)
@@ -641,7 +650,9 @@ final class FilePreviewTests: XCTestCase {
         }
         let second = try cache.stage(entry)
         try Data("new".utf8).write(to: second)
-        XCTAssertThrowsError(try cache.install(entry, staged: second, name: "a.txt", version: "v2"))
+        // The copy is in and shown; only its version is not recorded, so it is fetched again.
+        let installed = try cache.install(entry, staged: second, name: "a.txt", version: "v2")
+        XCTAssertEqual(try String(contentsOf: installed, encoding: .utf8), "new")
         if let cached = cache.cached(entry) {
             XCTAssertFalse(cached.version == "v1" && (try? String(contentsOf: cached.file, encoding: .utf8)) == "new")
         }
@@ -835,5 +846,97 @@ final class FilePreviewTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: stuck.path)
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stuck.path) }
         XCTAssertFalse(small.prune(keeping: stuck))
+    }
+
+    func testAShownCopyIsKnownWhateverItsFolderURLLooksLike() throws {
+        let cache = tempCache()
+        let pane = PaneKey("devbox", 3)
+        func fetch(_ content: String, version: String) -> URL? {
+            cache.download = downloads { _, _, dest, _, done in
+                try! Data(content.utf8).write(to: dest)
+                done(self.outcome(name: "log.txt", version: version))
+            }
+            var got: URL?
+            cache.fetch(.path("/log.txt"), pane: pane, cwd: nil) { got = try? $0.get() }
+            return got
+        }
+        let shown = try XCTUnwrap(fetch("old", version: "v1"))
+        // Held under a URL spelled another way: through its folder with a trailing slash.
+        let respelled = URL(fileURLWithPath: shown.deletingLastPathComponent().path + "/", isDirectory: true)
+            .appendingPathComponent(shown.lastPathComponent)
+        cache.hold(respelled)
+        _ = try XCTUnwrap(fetch("new", version: "v2"))
+        XCTAssertEqual(try String(contentsOf: shown, encoding: .utf8), "old")
+        cache.release(respelled)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: shown.path))
+    }
+
+    func testAnotherRunningInstancesDownloadIsLeftAlone() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thurm-owner-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entry = root.appendingPathComponent("89ab", isDirectory: true)
+        try FileManager.default.createDirectory(at: entry, withIntermediateDirectories: true)
+        // The test runner's parent runs; a pid this high does not.
+        let live = entry.appendingPathComponent(".staging-\(getppid())-x")
+        let livePart = entry.appendingPathComponent(".thurm-\(getppid())-0.part")
+        let dead = entry.appendingPathComponent(".staging-99999999-x")
+        let mine = entry.appendingPathComponent(".staging-\(getpid())-x")
+        for f in [live, livePart, dead, mine] { try Data("x".utf8).write(to: f) }
+        XCTAssertEqual(RemoteFileCache.downloadOwner(live), getppid())
+        _ = RemoteFileCache(root: root)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: live.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: livePart.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dead.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: mine.path))
+    }
+
+    func testLettingAPreviewGoWalksTheCacheOnlyWhenOverItsLimit() throws {
+        let cache = tempCache(maxBytes: 10)
+        let pane = PaneKey("devbox", 3)
+        func fetch(_ path: String, bytes: Int) -> URL? {
+            cache.download = downloads { _, _, dest, _, done in
+                try! Data(repeating: 1, count: bytes).write(to: dest)
+                done(self.outcome(name: (path as NSString).lastPathComponent, version: "v"))
+            }
+            var got: URL?
+            cache.fetch(.path(path), pane: pane, cwd: nil) { got = try? $0.get() }
+            return got
+        }
+        let small = try XCTUnwrap(fetch("/small.bin", bytes: 2))
+        cache.hold(small)
+        let before = cache.prunes
+        cache.release(small)
+        XCTAssertEqual(cache.prunes, before)
+        // Over the limit with a shown copy in the way: letting it go prunes.
+        let shown = try XCTUnwrap(fetch("/a.bin", bytes: 8))
+        cache.hold(shown)
+        let other = try XCTUnwrap(fetch("/b.bin", bytes: 8))
+        cache.hold(other)
+        let walked = cache.prunes
+        cache.release(shown)
+        XCTAssertEqual(cache.prunes, walked + 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: shown.path))
+    }
+
+    func testAnEntryAnotherInstanceUsesIsNotPruned() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("thurm-uses-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func entry(_ name: String, usedBy pid: pid_t) throws -> URL {
+            let e = root.appendingPathComponent(name, isDirectory: true)
+            let copy = e.appendingPathComponent("c-1", isDirectory: true)
+            try FileManager.default.createDirectory(at: copy, withIntermediateDirectories: true)
+            try Data(repeating: 1, count: 8).write(to: copy.appendingPathComponent("f"))
+            try "c-1/f".write(to: e.appendingPathComponent(".current"), atomically: true, encoding: .utf8)
+            FileManager.default.createFile(atPath: e.appendingPathComponent(".use-\(pid)").path, contents: nil)
+            return e
+        }
+        // One used by a running instance (the test runner's parent), one by an ended one.
+        let live = try entry("aaaa", usedBy: getppid())
+        let gone = try entry("bbbb", usedBy: 99999999)
+        _ = RemoteFileCache(root: root, maxBytes: 4)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: live.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: gone.path))
     }
 }

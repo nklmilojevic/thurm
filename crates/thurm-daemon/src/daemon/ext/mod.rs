@@ -517,7 +517,7 @@ impl Daemon {
         // relayed so far, the same way.
         if joins && let Some(all) = &all {
             if queue {
-                self.ports.subscribed(Arc::downgrade(self), client.id);
+                self.ports.subscribed(self.clone(), client.id);
             } else {
                 // Still queued from before: the watch may have gone to sleep meanwhile (nobody
                 // listened); wake it to serve the queue.

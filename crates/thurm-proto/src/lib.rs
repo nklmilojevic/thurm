@@ -865,9 +865,10 @@ pub enum Event {
     /// first list is empty sends nothing; one that exits sends an empty list. Sent only to
     /// clients with [`CAP_PORT_EVENTS`].
     ///
-    /// `initial`: a list sent to a client as it joins the watch, one per pane with ports, of what
-    /// was listening already then, not a change. Every later event is a change (`false`), and
-    /// clients that had joined before never get an `initial` one.
+    /// `initial`: a list sent to a client as it joins the watch, one for every pane (empty ones
+    /// too), of what was listening already then, not a change: together they are the client's
+    /// whole picture. Every later event is a change (`false`), and clients that had joined
+    /// before never get an `initial` one.
     PortsChanged {
         pane: PaneId,
         ports: Vec<PortEntry>,

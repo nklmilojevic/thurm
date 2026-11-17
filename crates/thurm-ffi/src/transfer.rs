@@ -163,7 +163,8 @@ pub extern "C" fn thurm_upload_cancel(id: u64) {
     cancel(id);
 }
 
-/// Fetches the file at `path` (as `pane` sees it) into `dest`. With `if_version` (or NULL)
+/// Fetches the file at `path` (as `pane` sees it) into `dest`, replacing what is there (use
+/// `thurm_download_reserved` for a name others may take). With `if_version` (or NULL)
 /// still the file's version, writes nothing (`"not_modified": true`). A file over `max_bytes`
 /// (0 for no limit) is refused. The final callback carries `"info"`: the file's `name`, `path`,
 /// `size`, `modified` and `version`. Returns the transfer's id, or 0 when it could not start
@@ -214,18 +215,65 @@ pub unsafe extern "C" fn thurm_download(
             progress(cb, ctx),
         );
         match got {
-            Ok(Downloaded::Saved(info)) | Ok(Downloaded::NotModified(info)) => {
-                let mut done = finished(None);
-                done["not_modified"] = json!(info.not_modified);
-                done["info"] = json!({
-                    "name": info.name,
-                    "path": info.path,
-                    "size": info.size,
-                    "modified": info.modified,
-                    "version": info.version,
-                });
-                done
-            }
+            Ok(Downloaded::Saved(info)) | Ok(Downloaded::NotModified(info)) => saved(&info),
+            Err(e) => finished(Some(&e)),
+        }
+    })
+}
+
+/// The final callback of a download that ended well, with what it fetched.
+fn saved(info: &thurm_proto::DownloadInfo) -> serde_json::Value {
+    let mut done = finished(None);
+    done["not_modified"] = json!(info.not_modified);
+    done["info"] = json!({
+        "name": info.name,
+        "path": info.path,
+        "size": info.size,
+        "modified": info.modified,
+        "version": info.version,
+    });
+    done
+}
+
+/// Fetches the file at `path` (as `pane` sees it) into `reserved`, an empty file the caller
+/// made to hold the name: written into that very file, never renamed over it. If the name
+/// holds something else by then, nothing is saved and it is left alone; a failed or cancelled
+/// download deletes the reserved file if it is still there. Cancel with
+/// `thurm_download_cancel`. Returns the transfer's id, or 0 when it could not start (the final
+/// callback then came on the calling thread, before this returns).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_download_reserved(
+    client: *mut thurm_client,
+    pane: u64,
+    path: *const c_char,
+    reserved: *const c_char,
+    cb: thurm_transfer_cb,
+    ctx: *mut c_void,
+) -> u64 {
+    let ctx = Ctx(ctx);
+    let fail = |e: String| {
+        report(cb, ctx, finished(Some(&TransferError::Local(e))));
+        0
+    };
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return fail("not connected".into());
+    };
+    let (Some(path), Some(reserved)) = (unsafe { opt_str(path) }, unsafe { opt_str(reserved) })
+    else {
+        return fail("no path".into());
+    };
+    let (path, reserved) = (path.to_owned(), PathBuf::from(reserved));
+    let (client, socket) = match host_of(c) {
+        Ok(h) => h,
+        Err(e) => return fail(e),
+    };
+    start(cb, ctx, move |cancel| {
+        let host = Host {
+            client: &client,
+            socket: &socket,
+        };
+        match transfer::download_reserved(host, pane, &path, &reserved, cancel, progress(cb, ctx)) {
+            Ok(info) => saved(&info),
             Err(e) => finished(Some(&e)),
         }
     })

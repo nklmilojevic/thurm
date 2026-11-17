@@ -535,6 +535,26 @@ final class Core {
         return id == 0 ? nil : id
     }
 
+    /// Fetches the file at `path` as `pane` sees it into `reserved`, an empty file made to hold
+    /// the name: written into that file, never renamed over the name, so a file that took the
+    /// name meanwhile is left alone (the download fails). A failed download deletes the reserved
+    /// file if it is still the one. Callbacks on the main thread; returns the id for
+    /// `cancelTransfer`.
+    @discardableResult
+    func downloadReserved(_ pane: PaneKey, path: String, into reserved: URL,
+                          onProgress: @escaping (TransferProgress) -> Void,
+                          onFinish: @escaping (TransferOutcome) -> Void) -> UInt64? {
+        guard let c = clients[pane.host] else {
+            onFinish(TransferOutcome(error: "\(pane.host) is not connected"))
+            return nil
+        }
+        let box = Unmanaged.passRetained(TransferBox(onProgress, onFinish)).toOpaque()
+        let id = path.withCString { p in
+            reserved.path.withCString { r in thurm_download_reserved(c, pane.id, p, r, coreTransferCallback, box) }
+        }
+        return id == 0 ? nil : id
+    }
+
     /// Stops an upload (nothing is typed or kept on the host) or a download.
     func cancelTransfer(_ id: UInt64) {
         thurm_upload_cancel(id)
@@ -547,10 +567,21 @@ final class Core {
                                  _ onProgress: @escaping (TransferProgress) -> Void,
                                  _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)?
 
+    /// What cancels transfer `id`, if it started.
+    private static func cancelling(_ id: UInt64?) -> (() -> Void)? {
+        id.map { id in { Core.shared.cancelTransfer(id) } }
+    }
+
     static let startDownload: DownloadStarter = { pane, path, dest, ifVersion, maxBytes, onProgress, onFinish in
-        let id = Core.shared.download(pane, path: path, to: dest, ifVersion: ifVersion, maxBytes: maxBytes,
-                                      onProgress: onProgress, onFinish: onFinish)
-        return id.map { id in { Core.shared.cancelTransfer(id) } }
+        cancelling(Core.shared.download(pane, path: path, to: dest, ifVersion: ifVersion, maxBytes: maxBytes,
+                                        onProgress: onProgress, onFinish: onFinish))
+    }
+
+    /// Starts a download into a reserved file (`downloadReserved`; the version and size limit
+    /// do not apply), returning what cancels it.
+    static let startReservedDownload: DownloadStarter = { pane, path, reserved, _, _, onProgress, onFinish in
+        cancelling(Core.shared.downloadReserved(pane, path: path, into: reserved,
+                                                onProgress: onProgress, onFinish: onFinish))
     }
 
     /// Starts an upload of one batch (`upload`), returning what cancels it; tests stand in for it.
@@ -559,8 +590,7 @@ final class Core {
                                _ onFinish: @escaping (TransferOutcome) -> Void) -> (() -> Void)?
 
     static let startUpload: UploadStarter = { pane, files, onProgress, onFinish in
-        let id = Core.shared.upload(pane, files: files, onProgress: onProgress, onFinish: onFinish)
-        return id.map { id in { Core.shared.cancelTransfer(id) } }
+        cancelling(Core.shared.upload(pane, files: files, onProgress: onProgress, onFinish: onFinish))
     }
 
     // MARK: Remote operations

@@ -152,8 +152,6 @@ final class Remotes {
     private(set) var handoffs: [String: HandoffInfo] = [:]
     /// Every open forward (`forwardsChanged`).
     var forwards: [ForwardInfo] = []
-    /// The `Ports` request of each host's connection (`fetchRemotePorts`).
-    var portsRequests = RequestGenerations()
     /// The last fetch of a handoff failed (shown on its tab until the next one succeeds).
     var handoffErrors: [String: String] = [:]
 
@@ -503,7 +501,6 @@ extension SessionManager {
                 "\(gone) \(gone == 1 ? "pane" : "panes") on \(host) ended while it was away", duration: 5)
         }
         runPendingHandoffCleanups(host)
-        fetchRemotePorts(host)
         refreshSidebars()
         updateDockBadge()
         for c in liveControllers { c.updateTitle() }
@@ -611,7 +608,7 @@ extension SessionManager {
             while stem.utf8.count + tail.utf8.count > 255, !stem.isEmpty { stem.removeLast() }
             let numbered = stem + tail
             let candidate = dir.appendingPathComponent(numbered)
-            let fd = open(candidate.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o644)
+            let fd = open(candidate.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
             if fd >= 0 {
                 close(fd)
                 return candidate
@@ -654,7 +651,7 @@ extension SessionManager {
             items.append(CommandPalette.Item(title: entry.title, detail: entry.detail) {
                 switch entry.action {
                 case .copyLink(let f): SessionManager.copyForwardLink(f)
-                case .close(let id): _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: id)])
+                case .close(let id): SessionManager.closeForward(id)
                 }
             })
         }

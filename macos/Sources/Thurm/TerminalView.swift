@@ -858,7 +858,9 @@ final class TerminalView: NSView, NSTextInputClient {
             ctx.timingFunction = Motion.timingFunction
             box.animator().alphaValue = 1
         }
+        // An earlier toast's fade and removal, still due, are not this one's.
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(fadeToast), object: nil)
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(removeToast), object: nil)
         perform(#selector(fadeToast), with: nil, afterDelay: duration)
     }
 
@@ -1406,7 +1408,8 @@ final class TerminalView: NSView, NSTextInputClient {
     var transfersFiles: Bool?
 
     /// Where remote previews are fetched and kept (tests use their own).
-    var previewCache = RemoteFileCache.shared
+    /// Taken on first use: a pane that never previews a remote file never opens the cache.
+    lazy var previewCache = RemoteFileCache.shared
 
     /// Takes what a paste or drop types into the pane, in place of sending it (tests).
     var pasteText: ((String) -> Void)?
@@ -1687,7 +1690,7 @@ final class TerminalView: NSView, NSTextInputClient {
     /// Downloads the file at `path` on this pane's host into `dir` (`~/Downloads`) under a
     /// free name, reserved now so nothing else takes it, with progress and Cancel in the toast.
     /// Shows the file in Finder when done.
-    func download(remotePath path: String, into dir: URL, start: Core.DownloadStarter = Core.startDownload,
+    func download(remotePath path: String, into dir: URL, start: Core.DownloadStarter = Core.startReservedDownload,
                   reveal: @escaping (URL) -> Void = { NSWorkspace.shared.activateFileViewerSelecting([$0]) }) {
         let name = (path as NSString).lastPathComponent
         guard let dest = SessionManager.reserveFreeName(name.isEmpty ? "file" : name, in: dir) else {
@@ -1698,6 +1701,7 @@ final class TerminalView: NSView, NSTextInputClient {
         let item = PaneTransfer(text: "Downloading \(name) from \(host)…")
         beginTransfer(item)
         var finished = false
+        var started = false
         let cancel = start(pane, path, dest, nil, 0, { [weak self] p in
             guard !finished else { return }
             self?.updateTransfer(item, "Downloading \(name) from \(host)… \(Int(p.fraction * 100))%")
@@ -1705,8 +1709,10 @@ final class TerminalView: NSView, NSTextInputClient {
             finished = true
             self?.endTransfer(item)
             if outcome.error != nil {
-                // The reserved name goes with a download that did not finish.
-                try? FileManager.default.removeItem(at: dest)
+                // The reserved file went with it, if the name still held it (the download sees
+                // to that: it is the one that can tell it is still ours). One that never
+                // started (no connection) leaves it here, just made: it goes now.
+                if !started { try? FileManager.default.removeItem(at: dest) }
                 if outcome.cancelled {
                     self?.showToast("Download of \(name) cancelled")
                 } else if let e = outcome.error {
@@ -1717,6 +1723,7 @@ final class TerminalView: NSView, NSTextInputClient {
             self?.showToast("Downloaded \(dest.lastPathComponent) to \(dir.lastPathComponent)")
             reveal(dest)
         })
+        started = cancel != nil
         item.cancel = cancel ?? {}
     }
 
@@ -1737,11 +1744,23 @@ final class TerminalView: NSView, NSTextInputClient {
         refreshTransferToast()
     }
 
-    /// The first transfer, and how many more, or no toast once none is left.
+    /// The first transfer, and how many more, or no toast once none is left. A message shown
+    /// meanwhile (an error, a result) stays its time: the transfer comes back once it is gone
+    /// (`removeToast`).
     private func refreshTransferToast() {
         guard let first = transfers.first else { return hideTransferToast() }
+        if let shown = toastView, shown !== transferToast?.box {
+            transferToast?.label.stringValue = first.text
+            return
+        }
         let more = transfers.count - 1
         showTransferToast(more > 0 ? "\(first.text) (\(more) more)" : first.text)
+    }
+
+    /// The message a toast shows now, other than the transfer toast's.
+    var shownMessage: String? {
+        guard let shown = toastView, shown !== transferToast?.box else { return nil }
+        return shown.subviews.compactMap { ($0 as? NSTextField)?.stringValue }.first
     }
 
     /// Whether the transfer toast, with its Cancel, is showing, and what it says.
