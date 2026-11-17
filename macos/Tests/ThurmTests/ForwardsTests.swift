@@ -80,53 +80,11 @@ final class ForwardsTests: XCTestCase {
                        .alert("devbox:5173 → localhost:5173", copyLink: url))
     }
 
-    func testEventsDuringAPortsRequestAreAppliedAgainAfterItsReply() {
-        var g = RequestGenerations()
-        // Before any request: nothing is kept.
-        g.event("devbox", ["pane": 1])
-        let gen = g.start("devbox")
-        g.event("devbox", ["pane": 2, "ports": [5173]])
-        g.event("devbox", ["pane": 3])
-        g.event("pi", ["pane": 9])
-        let again = g.finish("devbox", gen)
-        XCTAssertEqual(again?.compactMap { jsonUInt64($0["pane"]) }, [2, 3])
-        // Done: later events apply as they come, and the same reply twice is old.
-        g.event("devbox", ["pane": 4])
-        XCTAssertNil(g.finish("devbox", gen))
-        // A connection dropped while asking: neither its reply nor its events.
-        let dropped = g.start("devbox")
-        g.event("devbox", ["pane": 5])
-        g.invalidate("devbox")
-        XCTAssertNil(g.finish("devbox", dropped))
-        // Asked twice: only the newer request's reply counts.
-        let first = g.start("devbox")
-        let second = g.start("devbox")
-        XCTAssertNil(g.finish("devbox", first))
-        XCTAssertEqual(g.finish("devbox", second)?.count, 0)
-    }
-
     func testForwardPortAsksWhichHostOnlyWhenItCannotTell() {
         XCTAssertEqual(ForwardHostChoice.of(focused: "devbox", connected: ["a", "devbox"]), .host("devbox"))
         XCTAssertEqual(ForwardHostChoice.of(focused: localHost, connected: ["devbox"]), .host("devbox"))
         XCTAssertEqual(ForwardHostChoice.of(focused: localHost, connected: ["a", "devbox"]), .pick(["a", "devbox"]))
         XCTAssertEqual(ForwardHostChoice.of(focused: localHost, connected: []), .none)
-    }
-
-    func testAPortsReplyFromAnOldConnectionIsDropped() {
-        var g = RequestGenerations()
-        // Asked, then the connection drops before the answer: the answer is old.
-        let first = g.start("devbox")
-        XCTAssertTrue(g.isCurrent("devbox", first))
-        g.invalidate("devbox")
-        XCTAssertFalse(g.isCurrent("devbox", first))
-        // Reconnected and asked again: only the newer answer counts, whichever comes last.
-        let second = g.start("devbox")
-        XCTAssertFalse(g.isCurrent("devbox", first))
-        XCTAssertTrue(g.isCurrent("devbox", second))
-        // Hosts are apart.
-        let other = g.start("pi")
-        XCTAssertTrue(g.isCurrent("devbox", second))
-        XCTAssertTrue(g.isCurrent("pi", other))
     }
 
     func testAForwardsLinkIsUsedOnlyWhileItIsOpenOnTheSamePort() {

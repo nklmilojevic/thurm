@@ -2753,7 +2753,7 @@ impl Daemon {
                 }
                 if has(thurm_proto::CAP_PORT_EVENTS) {
                     client.port_events.store(true, Ordering::Relaxed);
-                    self.ports.subscribed(Arc::downgrade(self), client.id);
+                    self.ports.subscribed(self.clone(), client.id);
                 }
                 // Plugins' questions go only to a desktop app of this user on this machine:
                 // a tailnet caller or a phone saying so is not trusted with them.

@@ -421,7 +421,8 @@ Other ways to open one:
 - **Shell › Processes & Ports…**: double-click a remote row with a port.
 - `thurm remote forward devbox 5173` from a terminal, until Ctrl-C.
   `--local PORT` picks the port on the Mac (an error if the port is forwarded to
-  another one already), `--no-open` only prints the URL, and so does `--json`.
+  another one already), `--no-open` only prints the URL, and `--json` prints
+  `{host, remote_port, local_port, url}` without opening it.
   `thurm remote ports devbox` lists what listens there.
 
 Nothing is forwarded until you do one of these: a port that merely opens on the
