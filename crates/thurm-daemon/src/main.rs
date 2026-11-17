@@ -16,6 +16,7 @@ mod pty;
 mod push;
 mod server;
 mod shell;
+mod streams;
 mod tailnet;
 mod transcript;
 mod upgrade;

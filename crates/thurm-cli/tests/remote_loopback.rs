@@ -468,6 +468,31 @@ fn remote_workspace_over_loopback_ssh() {
     .unwrap();
     wait_screen(&c, pane, "remote-42");
 
+    // 3b. A byte stream through the tunnel, on a connection of its own: the "host" dials a
+    //     port on its loopback (this machine's, here).
+    let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    let echo = std::thread::spawn(move || {
+        let (mut conn, _) = echo.accept().unwrap();
+        let mut rd = conn.try_clone().unwrap();
+        std::io::copy(&mut rd, &mut conn).unwrap();
+        conn.shutdown(std::net::Shutdown::Write).unwrap();
+    });
+    let ticket = c.dial_begin(echo_port).unwrap();
+    let (mut down, mut up) = thurm_client::stream::open(Path::new(&local), &ticket.ticket).unwrap();
+    let sent: Vec<u8> = (0..2 * 1024 * 1024 + 5).map(|i| (i % 253) as u8).collect();
+    let mine = sent.clone();
+    let writer = std::thread::spawn(move || {
+        std::io::Write::write_all(&mut up, &mine).unwrap();
+        up.finish().unwrap();
+    });
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(&mut down, &mut got).unwrap();
+    writer.join().unwrap();
+    assert!(got == sent, "{} bytes back of {}", got.len(), sent.len());
+    down.wait_closed().unwrap();
+    echo.join().unwrap();
+
     // 4. `thurm --remote` routes through the app's tunnel.
     let out = cli(&w, &["--remote", "loop", "list"]);
     assert!(

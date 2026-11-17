@@ -39,6 +39,9 @@ mod ui_layout;
 #[path = "e2e/extensions.rs"]
 mod extensions;
 
+#[path = "e2e/streams.rs"]
+mod streams;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;

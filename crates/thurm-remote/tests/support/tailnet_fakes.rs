@@ -25,7 +25,8 @@ pub fn rt() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// A stand-in daemon on `path`: answers Hello on every connection, then whatever else with Ok.
+/// A stand-in daemon on `path`: answers Hello on every connection, then whatever else with Ok;
+/// a `StreamOpen` makes its connection an echoing stream.
 pub fn daemon(path: &Path) {
     let ln = UnixListener::bind(path).unwrap();
     std::thread::spawn(move || {
@@ -33,6 +34,7 @@ pub fn daemon(path: &Path) {
             let Ok(mut conn) = conn else { break };
             std::thread::spawn(move || {
                 while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut conn) {
+                    let stream = matches!(env.request, Request::StreamOpen { .. });
                     let result = match env.request {
                         Request::Hello { .. } => Ok(Response::Hello {
                             version: thurm_proto::PROTOCOL_VERSION,
@@ -44,16 +46,45 @@ pub fn daemon(path: &Path) {
                                 .map(|c| (*c).to_owned())
                                 .collect(),
                         }),
+                        Request::DialBegin { port } => Ok(Response::Ticket {
+                            ticket: format!("ticket-{port}"),
+                            expires_ms: 60_000,
+                        }),
                         _ => Ok(Response::Ok),
                     };
                     let msg = ServerMessage::Response { id: env.id, result };
                     if codec::write_message(&mut conn, &msg).is_err() {
                         break;
                     }
+                    if stream {
+                        echo_stream(&mut conn);
+                        break;
+                    }
                 }
             });
         }
     });
+}
+
+/// A stream the stand-in daemon opened: sends back each frame's data, and ends when the caller
+/// does.
+fn echo_stream(conn: &mut UnixStream) {
+    use thurm_proto::stream::{StreamClose, StreamFrame, read_frame, write_frame};
+    while let Ok(Some(frame)) = read_frame(conn) {
+        match frame {
+            StreamFrame::Data(_) => {
+                if write_frame(conn, &frame).is_err() {
+                    return;
+                }
+            }
+            StreamFrame::End => {
+                let _ = write_frame(conn, &StreamFrame::End);
+                let _ = write_frame(conn, &StreamFrame::Close(StreamClose::Ok));
+                return;
+            }
+            StreamFrame::Close(_) => return,
+        }
+    }
 }
 
 /// How the gateway answers: relays to the daemon, or refuses with an HTTP status and text (403

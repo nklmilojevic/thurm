@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use thurm_proto::codec;
-use thurm_proto::{Envelope, ServerMessage};
+use thurm_proto::{Envelope, Request, Response, ServerMessage};
 
 use crate::daemon::Daemon;
 
@@ -255,6 +255,11 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
     let mut first_frame = first_frame;
     let mut frames = Frames::default();
     let mut silence_limited = false;
+    // A connection whose first request is Hello and whose second is a valid StreamOpen
+    // becomes that stream.
+    let mut requests = 0u32;
+    let mut hello_first = false;
+    let mut opened = None;
     loop {
         // A phone that stopped talking (suspended, out of range) is gone: it pings while open.
         if !silence_limited && client.mobile.load(Ordering::Relaxed) {
@@ -269,7 +274,33 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
         };
         match frame {
             Ok(Some(frame)) => match codec::decode::<Envelope>(&frame) {
-                Ok(env) => daemon.handle(&client, env.id, env.request),
+                Ok(env) => {
+                    requests += 1;
+                    if requests == 1 {
+                        hello_first = matches!(env.request, Request::Hello { .. });
+                    }
+                    if let Request::StreamOpen { ticket } = &env.request
+                        && requests == 2
+                        && hello_first
+                    {
+                        let principal = client.principal.lock().clone().unwrap_or_default();
+                        match daemon.streams.claim(ticket, &principal) {
+                            Ok(claimed) => {
+                                opened = Some((env.id, claimed));
+                                break;
+                            }
+                            Err(e) => {
+                                log::info!("client {}: stream refused: {e}", client.id);
+                                client.send(ServerMessage::Response {
+                                    id: env.id,
+                                    result: Err(e),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    daemon.handle(&client, env.id, env.request)
+                }
                 // A request this daemon doesn't know (a newer client): answer it with an
                 // error, and keep the connection (the next frame is intact).
                 Err(e) => match codec::envelope_id(&frame) {
@@ -314,11 +345,26 @@ fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) {
             }
         }
     }
-    daemon.remove_client(client.id);
+    let id = client.id;
+    daemon.remove_client(id);
     drop(client);
+    // The writer sends what was queued (the Hello's answer) and ends: the stream's frames go
+    // after it, on the socket itself.
     if let Ok(w) = writer {
         let _ = w.join();
     }
+    let Some((request, (reservation, open))) = opened else {
+        return;
+    };
+    log::info!("client {id} is a stream to {:?}", reservation.kind);
+    let ok = ServerMessage::Response {
+        id: request,
+        result: Ok(Response::Ok),
+    };
+    if codec::write_message(&mut &stream, &ok).is_err() {
+        return;
+    }
+    crate::streams::serve(reservation.kind, reader, stream, open);
 }
 
 fn write_msg<W: std::io::Write>(

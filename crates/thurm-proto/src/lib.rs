@@ -10,6 +10,7 @@ pub mod bytes;
 pub mod codec;
 pub mod ext;
 pub mod layout;
+pub mod stream;
 pub mod tailnet;
 pub mod template;
 
@@ -81,6 +82,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAP_PANE_OWNER,
     CAP_PATH_SEARCH,
     CAP_EXT,
+    CAP_STREAMS,
 ];
 
 /// The daemon accepts `SearchPaths` and returns `PathMatches` only for that request.
@@ -89,6 +91,10 @@ pub const CAP_PATH_SEARCH: &str = "path-search";
 /// The daemon answers [`Request::Ext`], the extension API (see [`ext`]): actions, plugins,
 /// scripts. A client that says it decodes [`Event::Ext`].
 pub const CAP_EXT: &str = "ext";
+
+/// The daemon carries byte streams on a second connection ([`stream`]): it answers
+/// [`Request::DialBegin`] and takes [`Request::StreamOpen`].
+pub const CAP_STREAMS: &str = "streams";
 
 /// Sent only by an app that shows what plugins ask for ([`ext::UiRequest`]: a toast, a picker,
 /// a text field, a confirmation) and answers with [`ext::method::UI_REPLY`]. The daemon takes
@@ -504,6 +510,18 @@ pub enum Request {
         method: String,
         params: String,
     },
+    /// Reserve a stream to TCP `port` on the daemon's host, loopback only (`127.0.0.1`, then
+    /// `[::1]`). Answers [`Response::Ticket`] for [`Request::StreamOpen`]. Requires
+    /// [`CAP_STREAMS`].
+    DialBegin {
+        port: u16,
+    },
+    /// Valid only as the first request after `Hello` on a new connection: turns it into the
+    /// stream `ticket` reserved, for the principal that reserved it. Answers Ok, after which
+    /// both sides send only [`stream::StreamFrame`]s. A ticket is used up by any attempt.
+    StreamOpen {
+        ticket: String,
+    },
 }
 
 /// How [`Request::OwnPanes`] treats a pane another client holds.
@@ -607,6 +625,11 @@ pub enum Response {
     PanesWithActivity(Vec<PaneActivity>),
     PaneActivity(PaneActivity),
     PathMatches(PathMatches),
+    /// A reserved stream: `ticket` for [`Request::StreamOpen`], valid for `expires_ms`.
+    Ticket {
+        ticket: String,
+        expires_ms: u32,
+    },
 }
 
 /// A pane that had keyboard focus in a UI (the Mac app, the iOS app).

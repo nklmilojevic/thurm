@@ -1,6 +1,7 @@
 //! A `[[remote]]` with `tailnet`, end to end but for Tailscale (see `support/tailnet_fakes.rs`):
 //! the supervisor relays its local socket over the stand-ins.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -111,6 +112,50 @@ fn connects_through_the_dial_socket_and_relays() {
     wait_for(&sup, |s| {
         s.phase == Phase::Reconnecting && s.message.is_some()
     });
+}
+
+#[test]
+fn a_stream_goes_through_the_relay_on_its_own_connection() {
+    let d = stand_in_daemon("stream");
+    dial_socket();
+    let (port, _stop) = gateway(d, None);
+    let sup = start(remote(
+        "stream",
+        &format!("ws://127.0.0.1:{port}/v1/connect"),
+    ));
+    wait_for(&sup, |s| s.phase == Phase::Connected);
+    let local = thurm_config::remote_socket_path("stream");
+    let c = thurm_client::Client::connect(
+        thurm_client::ConnectOptions {
+            socket: local.clone(),
+            spawn_daemon: None,
+            client_name: "tailnet-stream",
+            ui: false,
+        },
+        |_| {},
+        || {},
+    )
+    .unwrap();
+    let ticket = c.dial_begin(8080).unwrap();
+    assert_eq!(ticket.ticket, "ticket-8080");
+    let (mut r, mut w) = thurm_client::stream::open(&local, &ticket.ticket).unwrap();
+    // More than one frame, and bytes of every value: the relay passes frames as they are.
+    let sent: Vec<u8> = (0..3 * 1024 * 1024 + 17).map(|i| (i % 256) as u8).collect();
+    let mine = sent.clone();
+    let writer = std::thread::spawn(move || {
+        w.write_all(&mine).unwrap();
+        w.finish().unwrap();
+    });
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    writer.join().unwrap();
+    assert!(got == sent, "{} bytes back of {}", got.len(), sent.len());
+    r.wait_closed().unwrap();
+    // The control connection goes on beside it.
+    assert!(matches!(
+        c.request(thurm_proto::Request::ListPanes),
+        Ok(thurm_proto::Response::Ok)
+    ));
 }
 
 #[test]

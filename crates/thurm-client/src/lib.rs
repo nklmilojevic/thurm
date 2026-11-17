@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Sender, bounded};
 use parking_lot::Mutex;
 
+pub mod stream;
+
 pub use thurm_proto as proto;
 use thurm_proto::{Envelope, Event, PROTOCOL_VERSION, Request, Response, ServerMessage, codec};
 
@@ -607,6 +609,32 @@ impl Client {
     /// Fire and forget (id 0: the daemon sends no response).
     pub fn send(&self, request: Request) -> Result<(), ClientError> {
         self.write(&Envelope { id: 0, request })
+    }
+
+    /// The daemon's capabilities, from its answer to the Hello.
+    pub fn capabilities(&self) -> Vec<String> {
+        match &*self.hello.lock() {
+            Some(Response::Hello { capabilities, .. }) => capabilities.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether the daemon listed `cap` in its answer to the Hello.
+    pub fn has_capability(&self, cap: &str) -> bool {
+        matches!(&*self.hello.lock(), Some(Response::Hello { capabilities, .. })
+            if capabilities.iter().any(|c| c == cap))
+    }
+
+    /// Reserves a stream to TCP `port` on the daemon's host (loopback); open it with
+    /// [`stream::open`] before the ticket expires.
+    pub fn dial_begin(&self, port: u16) -> Result<stream::Ticket, ClientError> {
+        if !self.has_capability(thurm_proto::CAP_STREAMS) {
+            return Err(ClientError::Daemon(stream::NO_STREAMS.into()));
+        }
+        match self.request(Request::DialBegin { port })? {
+            Response::Ticket { ticket, expires_ms } => Ok(stream::Ticket { ticket, expires_ms }),
+            _ => Err(ClientError::Daemon(UNREADABLE_ANSWER.into())),
+        }
     }
 }
 

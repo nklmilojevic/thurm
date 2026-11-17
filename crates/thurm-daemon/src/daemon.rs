@@ -548,6 +548,8 @@ pub struct Daemon {
     program_defs: RwLock<Vec<ProgramDef>>,
     panes: Mutex<HashMap<PaneId, Arc<Pane>>>,
     clients: Mutex<HashMap<u64, Arc<Client>>>,
+    /// Byte streams: tickets not yet used, and the count open.
+    pub streams: crate::streams::Streams,
     layout: Mutex<Option<String>>,
     next_pane: AtomicU64,
     next_client: AtomicU64,
@@ -617,6 +619,7 @@ impl Daemon {
             config: RwLock::new(config),
             panes: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
+            streams: Default::default(),
             layout: Mutex::new(None),
             next_pane: AtomicU64::new(1),
             next_client: AtomicU64::new(1),
@@ -3450,6 +3453,16 @@ impl Daemon {
             }
             Request::RunCommand { name, pane } => self.run_command(&name, pane),
             Request::Ext { method, params } => self.ext_request(client, &method, &params),
+            Request::DialBegin { port } => {
+                let principal = client.principal.lock().clone().unwrap_or_default();
+                self.streams
+                    .reserve(crate::streams::Kind::Tcp { port }, client.id, principal)
+                    .map(|(ticket, expires_ms)| Response::Ticket { ticket, expires_ms })
+            }
+            // Taken by the connection's reader (`server::handle_client`) when it may be.
+            Request::StreamOpen { .. } => {
+                Err("StreamOpen is only the first request after Hello on a new connection".into())
+            }
         }
     }
 
