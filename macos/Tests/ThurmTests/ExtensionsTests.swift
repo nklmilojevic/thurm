@@ -469,6 +469,15 @@ final class ExtensionsTests: XCTestCase {
         }
         XCTAssertEqual(ended(), 2)
     }
+
+    /// On connecting, the app tells the daemon its forwards only from a list it read: a failed
+    /// read (the core answers an error object) is not taken for "no forwards".
+    func testOnlyAForwardListReadIsReported() {
+        XCTAssertNil(Extensions.forwardList(["error": "not set up"]))
+        XCTAssertNil(Extensions.forwardList(nil))
+        XCTAssertEqual(Extensions.forwardList([] as [Any])?.count, 0)
+        XCTAssertEqual(Extensions.forwardList([["id": 1]] as [Any])?.count, 1)
+    }
 }
 
 private final class PaneActionView: NSView {

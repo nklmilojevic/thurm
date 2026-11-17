@@ -2,7 +2,8 @@ import AppKit
 
 // Forwards: a remote host's TCP port opened on this Mac's loopback (Rust:
 // crates/thurm-remote/src/forward.rs). A `localhost` link in a remote pane, a remote row of
-// Processes & Ports, or Forward Port… opens one; nothing is forwarded without such an action.
+// Processes & Ports, Forward Port…, or a plugin's request (`thurm.forward.open`: code the user
+// installed) opens one; nothing is forwarded without one of those.
 
 /// An open forward, as `forward_list` and the status callback report it.
 struct ForwardInfo: Equatable {

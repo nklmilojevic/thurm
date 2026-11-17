@@ -88,7 +88,10 @@ final class Extensions {
         registering = false
         registerAppActions()
         refresh()
-        reportForwards(Core.shared.remoteCall(["op": "forward_list"]) as? [Any] ?? [], change: nil)
+        // Only a list read: one that failed would say this app has no forwards.
+        if let list = Extensions.forwardList(Core.shared.remoteCall(["op": "forward_list"])) {
+            reportForwards(list, change: nil)
+        }
         sendRemotePortsAgain()
     }
 
@@ -457,6 +460,9 @@ final class Extensions {
             }
         }
     }
+
+    /// The core's `forward_list` answer, if it is a list (an error answers an object).
+    static func forwardList(_ answer: Any?) -> [Any]? { answer as? [Any] }
 
     /// Takes the `ports.report`s in place of the daemon (tests): whether plugins heard it.
     var portsReported: (([String: Any]) -> Bool)?

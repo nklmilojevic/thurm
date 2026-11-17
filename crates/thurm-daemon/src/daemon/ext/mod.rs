@@ -413,6 +413,11 @@ impl Daemon {
                 let complete = opt_bool(&p, "complete")?.unwrap_or(true);
                 let initial = opt_bool(&p, "initial")? == Some(true);
                 let mut all = self.ext.remote_ports.lock();
+                // Not for an app that went: its lists went with it (`ext_client_gone`, which takes
+                // this lock after the flag is set), and none are made for it again.
+                if client.gone.load(Ordering::SeqCst) {
+                    return Err("this client was disconnected".into());
+                }
                 let lists = all.entry(client.id).or_default();
                 let at = (host.to_owned(), pane);
                 // An empty list that could not read every process may have missed servers: kept,
@@ -423,18 +428,19 @@ impl Daemon {
                     complete,
                     initial,
                 };
-                // Not for an app that went: its lists went with it (`ext_client_gone`, which takes
-                // this lock after the flag is set).
-                if client.gone.load(Ordering::SeqCst) {
-                    return Err("this client was disconnected".into());
-                }
                 let holder = self.forwarding_app_id() == Some(client.id);
                 // Kept even when empty for another app: one that takes over lists what it knows,
                 // an empty pane too, rather than leave plugins guessing (a pane it never listed is
                 // `gone`). The holder's empty pane is dropped once plugins heard it (a closed
                 // pane's would pile up): what it said is all there is to say.
+                // A pane plugins never heard listen on anything, still listening on nothing: no news
+                // (as many come as the app connects to a host: a list for each of its panes).
+                let unheard = !lists.contains_key(&at);
                 if holder && list.is_known_empty() {
                     lists.remove(&at);
+                    if unheard {
+                        return Ok(json!({ "heard": true }));
+                    }
                 } else {
                     lists.insert(at, list.clone());
                 }
