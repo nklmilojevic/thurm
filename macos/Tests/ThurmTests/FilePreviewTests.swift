@@ -924,13 +924,24 @@ final class FilePreviewTests: XCTestCase {
         let livePart = entry.appendingPathComponent(".thurm-\(getppid())-0.part")
         let dead = entry.appendingPathComponent(".staging-99999999-x")
         let mine = entry.appendingPathComponent(".staging-\(getpid())-x")
-        for f in [live, livePart, dead, mine] { try Data("x".utf8).write(to: f) }
+        // Made before the running process by that number started: an ended one's, its number
+        // used again since.
+        let reused = entry.appendingPathComponent(".staging-\(getppid())-old")
+        let reusedPart = entry.appendingPathComponent(".thurm-\(getppid())-1.part")
+        for f in [live, livePart, dead, mine, reused, reusedPart] { try Data("x".utf8).write(to: f) }
+        let started = try XCTUnwrap(RemoteFileCache.startTime(getppid()))
+        for f in [reused, reusedPart] {
+            try FileManager.default.setAttributes([.creationDate: started.addingTimeInterval(-3600)],
+                                                  ofItemAtPath: f.path)
+        }
         XCTAssertEqual(RemoteFileCache.downloadOwner(live), getppid())
         _ = RemoteFileCache(root: root)
         XCTAssertTrue(FileManager.default.fileExists(atPath: live.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: livePart.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: dead.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: mine.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: reused.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: reusedPart.path))
     }
 
     func testLettingAPreviewGoWalksTheCacheOnlyWhenOverItsLimit() throws {

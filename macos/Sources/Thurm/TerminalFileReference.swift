@@ -246,7 +246,7 @@ final class RemoteFileCache {
         for mark in marks {
             guard let pid = pid_t(mark.lastPathComponent.dropFirst(".use-".count)) else { continue }
             if pid == me { continue }
-            if Self.running(pid) {
+            if Self.running(pid, madeAfter: mark) {
                 other = true
             } else {
                 try? fm.removeItem(at: mark)
@@ -260,16 +260,36 @@ final class RemoteFileCache {
         kill(pid, 0) == 0 || errno == EPERM
     }
 
+    /// Whether the process that made `file`, `pid`, still runs: a process by that number that
+    /// started after the file was made is another one, the number used again.
+    static func running(_ pid: pid_t, madeAfter file: URL) -> Bool {
+        guard running(pid) else { return false }
+        guard let started = startTime(pid),
+              let made = (try? file.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+        else { return true }
+        return started <= made.addingTimeInterval(1)
+    }
+
+    /// When process `pid` started, if it can be told.
+    static func startTime(_ pid: pid_t) -> Date? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        let t = info.kp_proc.p_un.__p_starttime
+        return Date(timeIntervalSince1970: Double(t.tv_sec) + Double(t.tv_usec) / 1_000_000)
+    }
+
     /// Deletes the downloads in `entry` no fetch is writing: this process's, as it writes into
-    /// none of them, and those of a process that has ended (left by an earlier run). Another
-    /// running instance's are its own. Returns the bytes of those left, which still count.
+    /// none of them, and those of a process that has ended (left by an earlier run), its number
+    /// taken since by another or not. Another running instance's are its own. Returns the bytes of those left, which still count.
     private func clearStaleDownloads(in entry: URL) -> UInt64 {
         let fm = FileManager.default
         let me = getpid()
         let files = (try? fm.contentsOfDirectory(at: entry, includingPropertiesForKeys: [.fileSizeKey])) ?? []
         return files.filter(Self.isDownload).reduce(UInt64(0)) { left, file in
             let owner = Self.downloadOwner(file)
-            let stale = owner.map { $0 == me || !Self.running($0) } ?? true
+            let stale = owner.map { $0 == me || !Self.running($0, madeAfter: file) } ?? true
             if stale, (try? fm.removeItem(at: file)) != nil { return left }
             return left + UInt64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
