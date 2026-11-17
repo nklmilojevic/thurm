@@ -616,6 +616,13 @@ pub fn download(
         return Ok(Downloaded::NotModified(info));
     }
     if let Some(max) = max_bytes.filter(|max| info.size > *max) {
+        // Its ticket is used up (opened and dropped at once) rather than left to lapse, where
+        // it would count against this client's tickets for a minute.
+        if let Some(ticket) = info.ticket.as_deref()
+            && let Ok(opened) = stream::open(host.socket, ticket)
+        {
+            drop(opened);
+        }
         return Err(TransferError::TooLarge {
             size: info.size,
             max,

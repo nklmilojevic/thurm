@@ -367,6 +367,11 @@ pub struct Client {
     pub plugin: Mutex<Option<String>>,
     /// Removed from the daemon: nothing it asks takes effect any more.
     pub gone: AtomicBool,
+    /// Held while the client is taken out of the daemon, and while files are pasted for it
+    /// (`paste_for`): a client that went away never has paths typed after it left. Its own, so
+    /// one client's paste holds up no other's leaving; reentrant, as what a paste sets off may
+    /// end a plugin's client on the same thread.
+    pub exit: parking_lot::ReentrantMutex<()>,
     /// A remote client that takes deflated events ([`thurm_proto::CAP_DEFLATE`]). Shared with the
     /// client's writer thread, which encodes what it sends.
     pub deflate: Arc<AtomicBool>,
@@ -556,10 +561,6 @@ pub struct Daemon {
     pub ports: crate::ports::Watcher,
     /// Files coming in and going out on streams.
     pub transfers: crate::transfer::Transfers,
-    /// Held while a client is taken out of `clients`, and while files are pasted for one
-    /// (`paste_for`): a client that went away never has paths typed after it left. Reentrant:
-    /// what a paste sets off may end a plugin's client on the same thread.
-    client_exit: parking_lot::ReentrantMutex<()>,
     layout: Mutex<Option<String>>,
     next_pane: AtomicU64,
     next_client: AtomicU64,
@@ -634,7 +635,6 @@ impl Daemon {
             // On the state directory's disk: the socket's runtime directory is often a small
             // memory-backed one.
             transfers: crate::transfer::Transfers::new(state_dir.join("drops")),
-            client_exit: parking_lot::ReentrantMutex::new(()),
             layout: Mutex::new(None),
             next_pane: AtomicU64::new(1),
             next_client: AtomicU64::new(1),
@@ -834,6 +834,7 @@ impl Daemon {
             port_events: AtomicBool::new(false),
             plugin: Mutex::new(None),
             gone: AtomicBool::new(false),
+            exit: parking_lot::ReentrantMutex::new(()),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),
@@ -866,11 +867,11 @@ impl Daemon {
     pub fn remove_client(self: &Arc<Self>, id: u64) {
         log::info!("client {id} gone");
         // Before its registrations go: one it is making now sees the flag (see `ext_registry`).
-        {
-            let _exit = self.client_exit.lock();
-            if let Some(c) = self.clients.lock().remove(&id) {
-                c.gone.store(true, Ordering::SeqCst);
-            }
+        let leaving = self.clients.lock().get(&id).cloned();
+        if let Some(c) = leaving {
+            let _exit = c.exit.lock();
+            self.clients.lock().remove(&id);
+            c.gone.store(true, Ordering::SeqCst);
         }
         self.focus.lock().client_gone(id);
         self.transfers.client_gone(id);
@@ -3564,17 +3565,14 @@ impl Daemon {
         text: &str,
         between: impl FnOnce(),
     ) -> Result<(), String> {
-        // The client stays from this check through the write: `remove_client` waits.
-        let _exit = self.client_exit.lock();
-        // A client that went away asked for nothing more (`remove_client` takes it out of the
-        // map before it fails its uploads).
-        let asker = self
-            .clients
-            .lock()
-            .get(&client)
-            .cloned()
-            .filter(|c| !c.gone.load(Ordering::SeqCst))
-            .ok_or("the app sending the files went away")?;
+        let gone = || "the app sending the files went away".to_owned();
+        let asker = self.clients.lock().get(&client).cloned().ok_or_else(gone)?;
+        // The client stays from this check through the write: `remove_client` waits for it. A
+        // client that went away asked for nothing more (it is marked before its uploads fail).
+        let _exit = asker.exit.lock();
+        if asker.gone.load(Ordering::SeqCst) {
+            return Err(gone());
+        }
         between();
         self.with_input_pane(client, pane, |p, st| {
             // A program that ended while its files came has nothing to type them to.
@@ -3588,7 +3586,14 @@ impl Daemon {
 
     /// Types `text` into pane `pane` as a paste for `client`: what [`Request::Paste`] and the
     /// paste of uploaded files' paths both do.
-    fn paste_text(&self, client: &Client, pane: PaneId, p: &Arc<Pane>, st: &mut PaneState, text: &str) {
+    fn paste_text(
+        &self,
+        client: &Client,
+        pane: PaneId,
+        p: &Arc<Pane>,
+        st: &mut PaneState,
+        text: &str,
+    ) {
         self.used_by(client, st);
         if !text.is_empty() {
             st.agent.prompt.interrupted();
@@ -4664,6 +4669,7 @@ mod tests {
             port_events: AtomicBool::new(false),
             plugin: Mutex::new(None),
             gone: AtomicBool::new(false),
+            exit: parking_lot::ReentrantMutex::new(()),
             deflate: Arc::new(AtomicBool::new(false)),
             principal: Mutex::new(None),
             name: Mutex::new(String::new()),

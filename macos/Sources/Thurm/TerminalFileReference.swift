@@ -344,8 +344,14 @@ final class RemoteFileCache {
             throw error
         }
         retireCopies(in: entry)
+        // The copy is in place: a version that cannot be recorded only means it is fetched
+        // again next time, not that this fetch failed.
         if let version {
-            try writeText(version, versionFile)
+            do {
+                try writeText(version, versionFile)
+            } catch {
+                tlog("remote preview cache: cannot record the version of \(file.path): \(error)")
+            }
         }
         // Over the limit even with everything else gone (a copy Quick Look still shows, say):
         // the new copy is shown but not kept, and goes once let go.

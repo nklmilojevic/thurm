@@ -643,7 +643,9 @@ final class FilePreviewTests: XCTestCase {
         }
         let second = try cache.stage(entry)
         try Data("new".utf8).write(to: second)
-        XCTAssertThrowsError(try cache.install(entry, staged: second, name: "a.txt", version: "v2"))
+        // The copy is in and shown; only its version is not recorded, so it is fetched again.
+        let installed = try cache.install(entry, staged: second, name: "a.txt", version: "v2")
+        XCTAssertEqual(try String(contentsOf: installed, encoding: .utf8), "new")
         if let cached = cache.cached(entry) {
             XCTAssertFalse(cached.version == "v1" && (try? String(contentsOf: cached.file, encoding: .utf8)) == "new")
         }

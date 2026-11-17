@@ -771,15 +771,16 @@ impl Transfers {
                     if busy.contains(dir.as_path()) {
                         continue;
                     }
-                    let since = aged_from(&dir);
-                    let size = dir_size(&dir);
+                    // One pass over it: what it takes, in bytes and files, and when it was last
+                    // written; aged from when it was complete, if it was.
+                    let seen = survey(&dir);
+                    let since = done_at(&dir).unwrap_or(seen.latest);
                     let old = since.elapsed().is_ok_and(|age| age > self.keep);
                     if !(old && remove_batch(&dir)) {
-                        let files = count_entries(&dir) + 1;
                         kept.push(Kept {
                             since,
-                            size,
-                            files,
+                            size: seen.size,
+                            files: seen.files + 1,
                             dir,
                         });
                     }
@@ -981,7 +982,11 @@ impl Transfers {
             let watching = std::thread::Builder::new()
                 .name("upload-abort".into())
                 .spawn_scoped(scope, || {
-                    if let Ok(Some(StreamFrame::Close(_))) = stream::read_frame(&mut reader) {
+                    // An abort, not a close a sender may send once all is said: only that ends
+                    // the batch.
+                    if let Ok(Some(StreamFrame::Close(why))) = stream::read_frame(&mut reader)
+                        && why != StreamClose::Ok
+                    {
                         let mut st = self.state.lock();
                         self.fail(&mut st, serial, "the upload was cancelled".into());
                     }
@@ -1362,37 +1367,67 @@ fn record_done(dir: &Path) {
     }
 }
 
-/// What a kept batch is aged from: when it was complete ([`DONE`]), or, for one that never was
-/// (a daemon stopped while it came) or whose record cannot be read, when anything in it was
-/// last written.
-fn aged_from(dir: &Path) -> SystemTime {
-    let done = std::fs::read_to_string(dir.join(DONE))
+/// When the batch in `dir` was complete ([`DONE`]); `None` for one that never was (a daemon
+/// stopped while it came) or whose record cannot be read: it is aged from its last write.
+fn done_at(dir: &Path) -> Option<SystemTime> {
+    std::fs::read_to_string(dir.join(DONE))
         .ok()
-        .and_then(|t| t.trim().parse::<u64>().ok());
-    match done {
-        Some(ms) => SystemTime::UNIX_EPOCH + Duration::from_millis(ms),
-        None => last_write(dir),
-    }
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
 }
 
-/// The latest modification time of `dir` and of everything in it.
-fn last_write(dir: &Path) -> SystemTime {
-    let own = std::fs::metadata(dir)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return own;
+/// What a directory holds, found in one pass: what it takes on disk (as [`dir_size`] counts),
+/// the files and directories in it, and when it or anything in it was last written.
+struct Survey {
+    size: u64,
+    files: u64,
+    latest: SystemTime,
+}
+
+fn survey(dir: &Path) -> Survey {
+    let mut seen = Survey {
+        size: block(),
+        files: 0,
+        latest: std::fs::metadata(dir)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH),
     };
-    entries.flatten().fold(own, |latest, e| {
-        let t = match e.file_type() {
-            Ok(t) if t.is_dir() => last_write(&e.path()),
-            _ => e
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH),
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return seen;
+    };
+    for e in entries.flatten() {
+        let Ok(m) = e.metadata() else {
+            continue;
         };
-        latest.max(t)
-    })
+        seen.files += 1;
+        if m.is_dir() {
+            let inner = survey(&e.path());
+            seen.size += inner.size;
+            seen.files += inner.files;
+            seen.latest = seen.latest.max(inner.latest);
+        } else {
+            seen.size += file_charge(&e.file_name(), &m);
+            seen.latest = seen
+                .latest
+                .max(m.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        }
+    }
+    seen
+}
+
+/// What a file counts as taking on disk: whole blocks of its length, or what the disk
+/// allocated if more; the completion record, a few bytes, a block.
+fn file_charge(name: &std::ffi::OsStr, m: &std::fs::Metadata) -> u64 {
+    if name == DONE {
+        return block();
+    }
+    // What the disk allocated, when it is more (counted in bytes in tests).
+    let allocated = if block() >= 512 {
+        m.blocks().saturating_mul(512)
+    } else {
+        0
+    };
+    charge(m.len()).max(allocated)
 }
 
 /// Deletes a kept batch; whether it is gone. What could not be deleted is logged and kept.
@@ -1427,17 +1462,8 @@ fn dir_size(dir: &Path) -> u64 {
             let m = e.metadata().ok()?;
             Some(if m.is_dir() {
                 dir_size(&e.path())
-            } else if e.file_name() == DONE {
-                // A few bytes: a block.
-                block()
             } else {
-                // What the disk allocated, when it is more (counted in bytes in tests).
-                let allocated = if block() >= 512 {
-                    m.blocks().saturating_mul(512)
-                } else {
-                    0
-                };
-                charge(m.len()).max(allocated)
+                file_charge(&e.file_name(), &m)
             })
         })
         .sum();

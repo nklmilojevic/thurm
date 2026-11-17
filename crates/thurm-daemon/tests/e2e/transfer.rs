@@ -1419,3 +1419,66 @@ fn names_a_disk_takes_for_one_by_their_unicode_form_are_kept_apart() {
     kept.sort();
     assert_eq!(kept, [b"nfc".to_vec(), b"nfd".to_vec()]);
 }
+
+#[test]
+fn downloads_refused_for_their_size_use_up_no_tickets() {
+    use thurm_remote::transfer::{self, Cancel, Host, TransferError};
+    let env = Env::new("transfer-too-large");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    std::fs::write(dir.join("big.bin"), vec![1u8; 100]).unwrap();
+    let pane = cat_pane(&c, &dir);
+    let host = Host {
+        client: &c,
+        socket: &env.socket,
+    };
+    // More than the 64 tickets a client may hold, each refused for its size.
+    for i in 0..70 {
+        let e = transfer::download(
+            host,
+            pane,
+            "big.bin",
+            &dir.join(format!("never-{i}")),
+            None,
+            Some(10),
+            &Cancel::default(),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(e, TransferError::TooLarge { .. }), "{e}");
+    }
+    // The next one is not refused for tickets.
+    c.upload_begin(pane, "a.txt", 1, None).unwrap();
+}
+
+#[test]
+fn a_stream_closed_once_all_is_said_is_no_cancel() {
+    let env = Env::new("transfer-close-ok");
+    let _daemon = env.start();
+    let (c, _rx) = env.connect();
+    let dir = work_dir(&env);
+    let pane = cat_pane(&c, &dir);
+    let ticket = c
+        .upload_begin(
+            pane,
+            "one.txt",
+            3,
+            Some(UploadBatch {
+                id: "o".into(),
+                index: 0,
+                count: 2,
+            }),
+        )
+        .unwrap();
+    let (_r, mut w) = stream::open(&env.socket, &ticket.ticket).unwrap();
+    w.write_all(b"one").unwrap();
+    w.finish().unwrap();
+    // The first file's stream closed Ok, its file sent: the batch goes on.
+    w.close(thurm_proto::stream::StreamClose::Ok).unwrap();
+    send(&env, &c, pane, ("o", 1, 2), "two.txt", 3, b"two")
+        .wait_closed()
+        .unwrap();
+    let [batch] = <[PathBuf; 1]>::try_from(batches(&env, pane)).unwrap();
+    assert!(batch.join("one.txt").exists() && batch.join("two.txt").exists());
+}
