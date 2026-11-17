@@ -154,7 +154,9 @@ pub unsafe extern "C" fn thurm_upload(
     })
 }
 
-/// Stops upload `id`: nothing it sent is kept, and nothing is typed.
+/// Stops upload `id`: nothing it sent is kept, and nothing is typed, if the daemon hears it
+/// before the batch is complete. Once the paths are typed it is too late; the final callback
+/// says what happened.
 #[unsafe(no_mangle)]
 pub extern "C" fn thurm_upload_cancel(id: u64) {
     cancel(id);

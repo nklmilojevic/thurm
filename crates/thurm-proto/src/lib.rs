@@ -545,7 +545,7 @@ pub enum Request {
         pane: Option<PaneId>,
     },
     /// Reserve a stream that writes a file of exactly `size` bytes onto the daemon's host for
-    /// `pane`, under the runtime directory. Of `name` only the last component is kept. Once
+    /// `pane`, under the daemon's state directory. Of `name` only the last component is kept. Once
     /// every file of `batch` (or this one alone) has landed, the daemon pastes their paths into
     /// the pane and closes each stream `Ok`; if one fails, the batch is deleted, nothing is
     /// typed, and every stream closes with the error. Answers [`Response::Ticket`]. Requires

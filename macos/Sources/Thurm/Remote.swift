@@ -601,9 +601,13 @@ extension SessionManager {
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
         for n in 1...10_000 {
-            // Shortened before its number and extension to stay within 255 bytes.
-            let tail = (n == 1 ? "" : " \(n)") + (ext.isEmpty ? "" : ".\(ext)")
-            var stem = base
+            // Shortened before its number and extension to stay within 255 bytes; an extension
+            // that alone is too long is shortened too, leaving a byte of the name before it.
+            let number = n == 1 ? "" : " \(n)"
+            var ext = ext
+            while !ext.isEmpty, 1 + number.utf8.count + 1 + ext.utf8.count > 255 { ext.removeLast() }
+            let tail = number + (ext.isEmpty ? "" : ".\(ext)")
+            var stem = base.isEmpty ? "file" : base
             while stem.utf8.count + tail.utf8.count > 255, !stem.isEmpty { stem.removeLast() }
             let numbered = stem + tail
             let candidate = dir.appendingPathComponent(numbered)

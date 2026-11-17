@@ -359,7 +359,9 @@ others are on their way wait for them, so paths are typed in the order you
 dropped them. Once every file has
 arrived, the host's daemon types their paths into the pane, quoted and separated
 by spaces, as a paste, so an agent at its prompt gets them as one paste. If a
-file fails or you cancel, nothing is typed and nothing is kept. Folders are
+file fails or you cancel before every file has arrived, nothing is typed and
+nothing is kept. Pasting copied text pastes the text, even when the app that
+copied it put a file beside it; files copied in Finder are sent. Folders are
 refused; drop the files in them instead.
 
 Uploads are kept on the host, readable by you only, in Thurm's state directory

@@ -467,8 +467,9 @@ final class FilePreviewTests: XCTestCase {
         }
         let shown = try XCTUnwrap(fetch("/first.bin", bytes: 8))
         cache.hold(shown)
-        // A second preview over the limit leaves the one on screen.
+        // A second preview over the limit leaves the one on screen (and is itself shown).
         let second = try XCTUnwrap(fetch("/second.bin", bytes: 8))
+        cache.hold(second)
         XCTAssertTrue(FileManager.default.fileExists(atPath: shown.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: second.path))
         // Let go, it is pruned.
@@ -565,9 +566,11 @@ final class FilePreviewTests: XCTestCase {
         let staged = try cache.stage(entry)
         try Data(repeating: 2, count: 8).write(to: staged)
         _ = try cache.install(entry, staged: staged, name: "b.bin", version: "v")
-        // 16 kept, 8 of them undeletable: over the limit, not counted as freed.
-        XCTAssertFalse(cache.prune(keeping: entry))
+        // 8 undeletable and 8 new, over 10: the undeletable copy is not counted as freed, so
+        // the new one is not kept.
+        XCTAssertNil(cache.cached(entry))
         XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(first).path))
+        XCTAssertTrue(cache.prune())
     }
 
     func testARelativePathIsTheDirectoryTheClickHad() throws {
@@ -643,5 +646,41 @@ final class FilePreviewTests: XCTestCase {
             XCTAssertFalse(cached.version == "v1" && (try? String(contentsOf: cached.file, encoding: .utf8)) == "new")
         }
         XCTAssertNil(cache.cached(entry))
+    }
+
+    func testACopyOverTheLimitIsShownButNotKept() throws {
+        let cache = tempCache(maxBytes: 10)
+        let pane = PaneKey("devbox", 3)
+        var progress: [(TransferProgress) -> Void] = []
+        var finish: [(TransferOutcome) -> Void] = []
+        var dests: [URL] = []
+        cache.download = { _, _, dest, _, _, onProgress, done in
+            dests.append(dest)
+            progress.append(onProgress)
+            finish.append(done)
+            return {}
+        }
+        var got: [URL] = []
+        cache.fetch(.path("/big.bin"), pane: pane, cwd: nil) { if let u = try? $0.get() { got.append(u) } }
+        progress[0](TransferProgress(done: 0, total: 8))
+        try Data(repeating: 1, count: 8).write(to: dests[0])
+        finish[0](outcome(name: "big.bin", version: "v1"))
+        // A refresh fits in place of the old copy, but Quick Look shows that copy before the new
+        // one is in: both cannot stay.
+        cache.fetch(.path("/big.bin"), pane: pane, cwd: nil) { if let u = try? $0.get() { got.append(u) } }
+        progress[1](TransferProgress(done: 0, total: 8))
+        cache.hold(got[0])
+        try Data(repeating: 2, count: 8).write(to: dests[1])
+        finish[1](outcome(name: "big.bin", version: "v2"))
+        XCTAssertEqual(try Data(contentsOf: got[1]), Data(repeating: 2, count: 8))
+        let entry = cache.entry(host: "devbox", path: "/big.bin", cwd: nil)
+        XCTAssertNil(cache.cached(entry))
+        cache.hold(got[1])
+        // Let go, neither is kept past the limit.
+        cache.release(got[0])
+        cache.release(got[1])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: got[0].path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: got[1].path))
+        XCTAssertTrue(cache.prune())
     }
 }

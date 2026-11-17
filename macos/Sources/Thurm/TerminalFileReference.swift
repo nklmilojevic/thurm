@@ -262,7 +262,12 @@ final class RemoteFileCache {
         if let version {
             try writeText(version, versionFile)
         }
-        prune(keeping: entry)
+        // Over the limit even with everything else gone (a copy Quick Look still shows, say):
+        // the new copy is shown but not kept, and goes once let go.
+        if !prune(keeping: entry) {
+            try? fm.removeItem(at: entry.appendingPathComponent(".current"))
+            try? fm.removeItem(at: versionFile)
+        }
         return file
     }
 
@@ -325,6 +330,8 @@ final class RemoteFileCache {
             .map(\.standardizedFileURL)
         let entries = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey]))
             ?? []
+        // Copies neither in use nor shown (one not kept, let go) go first.
+        for entry in entries { retireCopies(in: entry.standardizedFileURL) }
         var sized: [(url: URL, date: Date, size: UInt64)] = entries.map { entry in
             let date = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
                 ?? .distantPast
