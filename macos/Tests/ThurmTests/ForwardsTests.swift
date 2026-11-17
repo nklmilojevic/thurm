@@ -64,4 +64,40 @@ final class ForwardsTests: XCTestCase {
         let link = ForwardPicker.choices(query: "http://localhost:3000/", host: "devbox", known: [], open: [])
         XCTAssertEqual(link.map(\.target), [.url("http://localhost:3000/")])
     }
+
+    func testAForwardRequestTheDaemonGaveUpOnChangesNothing() {
+        let opened: [String: Any] = ["id": 7, "host": "devbox", "remote_port": 5173, "local_port": 5173,
+                                     "url": "http://localhost:5173/", "new": true]
+        var found = opened
+        found["new"] = false
+        var r = ForwardRequests()
+
+        // Still waited for: answered.
+        r.begin(1)
+        XCTAssertEqual(r.finish(1, result: opened), .answer)
+
+        // Cancelled while opening: the forward it opened is closed again.
+        r.begin(2)
+        r.cancel(2)
+        XCTAssertEqual(r.finish(2, result: opened), .abandoned(close: 7))
+        // One it found open already was not its own to close; nor is anything after a failure.
+        r.begin(3)
+        r.cancel(3)
+        XCTAssertEqual(r.finish(3, result: found), .abandoned(close: nil))
+        r.begin(4)
+        r.cancel(4)
+        XCTAssertEqual(r.finish(4, result: ["error": "devbox is not connected"]), .abandoned(close: nil))
+        XCTAssertEqual(r.finish(5, result: nil), .abandoned(close: nil))
+
+        // A new connection to the daemon: the old one's requests are no one's.
+        r.begin(6)
+        r.begin(8)
+        r.cancelAll()
+        XCTAssertEqual(r.finish(6, result: opened), .abandoned(close: 7))
+        // A cancel of another request leaves this one alone; an id answers once.
+        r.begin(9)
+        r.cancel(10)
+        XCTAssertEqual(r.finish(9, result: opened), .answer)
+        XCTAssertEqual(r.finish(9, result: opened), .abandoned(close: 7))
+    }
 }

@@ -235,7 +235,10 @@ final class Remotes {
                     connectFailed(host, err)
                 } else {
                     SessionManager.shared.remoteConnected(host)
-                    if Core.shared.isConnected(host) { connectFailures[host] = nil }
+                    if Core.shared.isConnected(host) {
+                        connectFailures[host] = nil
+                        Extensions.shared.remoteHostConnected(host)
+                    }
                 }
             }
         } else {
@@ -638,12 +641,18 @@ extension SessionManager {
         let fm = FileManager.default
         let downloads = fm.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
         let name = (path as NSString).lastPathComponent
-        let dest = Self.freeName(name.isEmpty ? "file" : name, in: downloads)
+        // The name is taken now, so another download or app can't pick it meanwhile; the
+        // download replaces only this placeholder.
+        guard let dest = Self.reserveFreeName(name.isEmpty ? "file" : name, in: downloads) else {
+            view?.showToast("Could not create a file in Downloads.", duration: 6)
+            return
+        }
         view?.showToast("Downloading \(name) from \(pane.host)…", duration: 600)
         Core.shared.download(pane, path: path, to: dest, onProgress: { p in
             view?.showToast("Downloading \(name) from \(pane.host)… \(Int(p.fraction * 100))%", duration: 600)
         }, onFinish: { outcome in
             if let e = outcome.error {
+                try? FileManager.default.removeItem(at: dest)
                 view?.showToast("Could not download \(name): \(e)", duration: 6)
                 return
             }
@@ -652,19 +661,22 @@ extension SessionManager {
         })
     }
 
-    /// `name` in `dir`, or `name 2`, `name 3`… when taken.
-    static func freeName(_ name: String, in dir: URL) -> URL {
-        let fm = FileManager.default
+    /// Creates an empty file `name` in `dir`, or `name 2`, `name 3`… when taken, atomically:
+    /// two callers never get the same one. Nil when none can be created.
+    static func reserveFreeName(_ name: String, in dir: URL) -> URL? {
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
-        var candidate = dir.appendingPathComponent(name)
-        var n = 2
-        while fm.fileExists(atPath: candidate.path) {
-            let numbered = "\(base) \(n)"
-            candidate = dir.appendingPathComponent(ext.isEmpty ? numbered : "\(numbered).\(ext)")
-            n += 1
+        for n in 1...10_000 {
+            let numbered = n == 1 ? name : (ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)")
+            let candidate = dir.appendingPathComponent(numbered)
+            let fd = open(candidate.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o644)
+            if fd >= 0 {
+                close(fd)
+                return candidate
+            }
+            if errno != EEXIST { return nil }
         }
-        return candidate
+        return nil
     }
 
     // MARK: Command palette

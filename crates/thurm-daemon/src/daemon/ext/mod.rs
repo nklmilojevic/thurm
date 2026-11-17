@@ -48,7 +48,9 @@ pub struct Ext {
     /// client and where its answer goes.
     pending: Mutex<HashMap<u64, Pending>>,
     next: AtomicU64,
-    /// The forwards each app reported last ([`method::FORWARDS_REPORT`]), by client.
+    /// Every app that forwards (by client), with the forwards it reported last
+    /// ([`method::FORWARDS_REPORT`]). Its ids are that app's own: plugins see only the first
+    /// app's (see [`Daemon::forwarding_app`]).
     forwards: Mutex<HashMap<u64, Vec<ext::ForwardInfo>>>,
 }
 
@@ -305,11 +307,13 @@ impl Daemon {
                     serde_json::from_value(p.get("ports").cloned().unwrap_or(json!([])))
                         .map_err(|e| format!("bad ports: {e}"))?;
                 let complete = p.get("complete").and_then(Value::as_bool).unwrap_or(true);
-                self.emit(
-                    PORTS_CHANGED,
-                    None,
-                    json!({ "host": host, "id": pane, "ports": ports, "complete": complete }),
-                );
+                let mut extra =
+                    json!({ "host": host, "id": pane, "ports": ports, "complete": complete });
+                // Listening already when the app connected to the host: not news.
+                if p.get("initial").and_then(Value::as_bool) == Some(true) {
+                    extra["initial"] = true.into();
+                }
+                self.emit(PORTS_CHANGED, None, extra);
                 Ok(Value::Null)
             }
             method::FORWARDS_REPORT => {
@@ -319,11 +323,12 @@ impl Daemon {
                 Ok(Value::Null)
             }
             method::FORWARDS_LIST => {
-                self.forwarding_app()?;
+                let app = self.forwarding_app()?;
                 let forwards = self.ext.forwards.lock();
-                let mut all: Vec<&ext::ForwardInfo> = forwards.values().flatten().collect();
-                all.sort_by_key(|f| f.id);
-                Ok(json!(all))
+                let mut list: Vec<&ext::ForwardInfo> =
+                    forwards.get(&app.id).into_iter().flatten().collect();
+                list.sort_by_key(|f| f.id);
+                Ok(json!(list))
             }
             method::FORWARDS_OPEN => {
                 let open: ext::ForwardOpen = params(p)?;
@@ -348,25 +353,25 @@ impl Daemon {
         }
     }
 
-    /// The app that opens forwards for plugins: the one with a focused pane, else any.
+    /// An app that forwards connected ([`thurm_proto::CAP_EXT_FORWARDS`]).
+    pub(super) fn ext_forwarding_app_came(&self, client: u64) {
+        self.ext.forwards.lock().entry(client).or_default();
+    }
+
+    /// The app that holds plugins' forwards: the one that connected first, for as long as it
+    /// stays. Each app numbers its own forwards, so listing, opening, closing and the forward
+    /// events all go by this one app's; another app's are heard once it is the first.
     fn forwarding_app(&self) -> Result<Arc<Client>, String> {
-        let apps: Vec<Arc<Client>> = self
-            .clients
-            .lock()
-            .values()
-            .filter(|c| c.ext_forwards.load(Ordering::Relaxed) && !c.gone.load(Ordering::SeqCst))
-            .cloned()
-            .collect();
-        let focused = self.focus.lock().focused_clients();
-        apps.iter()
-            .find(|c| focused.contains(&c.id))
-            .or(apps.first())
-            .cloned()
+        let first = self.ext.forwards.lock().keys().min().copied();
+        first
+            .and_then(|id| self.clients.lock().get(&id).cloned())
+            .filter(|c| !c.gone.load(Ordering::SeqCst))
             .ok_or_else(|| "no Thurm app that forwards ports is open (or it is too old)".into())
     }
 
-    /// The forwards app `client` has now: the ones that came are `forward_opened`, the ones
-    /// that went `forward_closed`, with why when the report says.
+    /// The forwards app `client` has now. Of the first app's, the ones that came are
+    /// `forward_opened`, the ones that went `forward_closed`, with why when the report says;
+    /// another app's are only kept.
     fn forwards_reported(&self, client: u64, report: ext::ForwardsReport) {
         let changed = report.change.get("forward").and_then(|f| f.get("id"));
         let why = report
@@ -374,12 +379,16 @@ impl Daemon {
             .get("why")
             .and_then(Value::as_str)
             .unwrap_or("closed");
-        let old = self
-            .ext
-            .forwards
-            .lock()
-            .insert(client, report.forwards.clone())
-            .unwrap_or_default();
+        let old = {
+            let mut forwards = self.ext.forwards.lock();
+            let old = forwards
+                .insert(client, report.forwards.clone())
+                .unwrap_or_default();
+            if forwards.keys().min() != Some(&client) {
+                return;
+            }
+            old
+        };
         for f in old
             .iter()
             .filter(|f| !report.forwards.iter().any(|n| n.id == f.id))
@@ -639,10 +648,24 @@ impl Daemon {
     pub(super) fn ext_client_gone(&self, client: u64) {
         // Dropping the senders ends the waits on them.
         self.ext.pending.lock().retain(|_, p| p.to != client);
-        // An app's forwards end with it.
-        let forwards = self.ext.forwards.lock().remove(&client);
-        for f in forwards.iter().flatten() {
+        // An app's forwards end with it; when it was the first, the next app's are plugins'
+        // now.
+        let (gone, next) = {
+            let mut forwards = self.ext.forwards.lock();
+            let first = forwards.keys().min() == Some(&client);
+            let gone = forwards.remove(&client).filter(|_| first);
+            let next = forwards
+                .keys()
+                .min()
+                .and_then(|id| forwards.get(id).cloned())
+                .filter(|_| first);
+            (gone, next)
+        };
+        for f in gone.iter().flatten() {
             self.forward_event(FORWARD_CLOSED, f, Some("app"));
+        }
+        for f in next.iter().flatten() {
+            self.forward_event(FORWARD_OPENED, f, None);
         }
         if self.ext.registry.lock().client_gone(client) {
             self.actions_changed();

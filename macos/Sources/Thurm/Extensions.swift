@@ -51,6 +51,8 @@ final class Extensions {
     /// brings the app forward (the Dock icon bounces for it), not before.
     private var pending: [String: Any]?
     private var activeObserver: NSObjectProtocol?
+    /// Forwards being opened or closed for plugins.
+    private var forwardRequests = ForwardRequests()
 
     // MARK: Calling the daemon
 
@@ -96,6 +98,7 @@ final class Extensions {
     private func invalidateQuestions() {
         connection += 1
         pending = nil
+        forwardRequests.cancelAll()
         if let s = shown {
             shown = nil
             s.dismiss()
@@ -335,6 +338,7 @@ final class Extensions {
             if let id = jsonUInt64(payload["id"]), let p = pending, jsonUInt64(p["id"]) == id {
                 pending = nil
             }
+            if let id = jsonUInt64(payload["id"]) { forwardRequests.cancel(id) }
         default:
             break
         }
@@ -408,9 +412,37 @@ final class Extensions {
     }
 
     /// A remote host's pane listed its ports: this Mac's plugins hear of it (with the host).
-    func reportPorts(host: HostId, pane: UInt64, ports: Any, complete: Any) {
+    /// `initial`: they were listening already when the app connected to the host, as is every
+    /// list relayed before `remoteHostConnected` has the host's own answer.
+    func reportPorts(host: HostId, pane: UInt64, ports: Any, complete: Any, initial: Bool = false) {
         guard available else { return }
-        call("ports.report", ["host": host, "pane": NSNumber(value: pane), "ports": ports, "complete": complete])
+        var params: [String: Any] = ["host": host, "pane": NSNumber(value: pane), "ports": ports,
+                                     "complete": complete]
+        if initial || learningPorts[host] != nil { params["initial"] = true }
+        call("ports.report", params)
+    }
+
+    /// Hosts the app connected to whose ports it is still asking for, by the ask's number: what
+    /// they list meanwhile was listening before (the daemon there sends every list on connect).
+    private var learningPorts: [HostId: Int] = [:]
+    private var learnings = 0
+
+    /// The app connected to `host`: its panes' ports now go to plugins as `initial`, so a
+    /// server that was running already is not taken for one that just started.
+    func remoteHostConnected(_ host: HostId) {
+        learnings += 1
+        let ask = learnings
+        learningPorts[host] = ask
+        Core.shared.requestAsync(object: ["Ports": ["pane": NSNull()]], host: host, timeout: 10) { [weak self] resp in
+            guard let self, self.learningPorts[host] == ask else { return }
+            // A daemon from before ports answers with an error: it sends no lists either.
+            for entry in (resp as? [String: Any])?["Ports"] as? [[String: Any]] ?? [] {
+                guard let pane = jsonUInt64(entry["pane"]) else { continue }
+                self.reportPorts(host: host, pane: pane, ports: entry["ports"] ?? [],
+                                 complete: entry["complete"] ?? true, initial: true)
+            }
+            self.learningPorts[host] = nil
+        }
     }
 
     /// Opens or closes a forward a plugin asked for, and answers with it; an open one goes to the
@@ -443,10 +475,22 @@ final class Extensions {
             return
         }
         let browse = jsonBool(req["browse"]) == true
+        forwardRequests.begin(id)
         // Opening connects to the host's daemon first: not on the main thread.
         DispatchQueue.global(qos: .userInitiated).async {
             let v = Core.shared.remoteCall(op) as? [String: Any]
             DispatchQueue.main.async {
+                // The daemon gave up on it meanwhile: it changes nothing. A forward it opened is
+                // closed again (and both are reported, as every change is).
+                if case .abandoned(let close) = self.forwardRequests.finish(id, result: v) {
+                    if let close {
+                        tlog("closing forward \(close): the plugin that asked for it no longer waits")
+                        DispatchQueue.global(qos: .utility).async {
+                            _ = Core.shared.remoteCall(["op": "forward_close", "id": NSNumber(value: close)])
+                        }
+                    }
+                    return
+                }
                 if let e = jsonString(v?["error"]) {
                     answer(NSNull(), e)
                     return

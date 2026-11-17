@@ -7,7 +7,8 @@
 --   thurm reload
 --
 -- A port opens once while it is listed: a server that stops and starts again opens again.
--- Servers already running when the plugin starts are left alone.
+-- Servers already running are left alone: this Mac's when the plugin starts, a remote host's
+-- when Thurm connects to it (its lists then come marked `initial`).
 --
 -- Settings, in config.toml:
 --
@@ -41,13 +42,23 @@ local function is_dev_server(command)
   return false
 end
 
--- What each pane listed last: host/pane -> { [port] = true }.
+-- The dev servers' ports in a list: { [port] = true }, or nil for none.
+local function servers(ports)
+  local found = {}
+  for _, p in ipairs(ports) do
+    if LOCAL[p.address] and is_dev_server(p.command) then
+      found[p.port] = true
+    end
+  end
+  return next(found) and found or nil
+end
+
+-- What each pane listed last: host/pane -> { [port] = true }. This Mac's panes are read
+-- before subscribing: the lists the daemon sends then are the same, not news.
 local listed = {}
--- The first lists come right after the plugin starts: they are servers already running.
-local ready = false
-thurm.after(3, function()
-  ready = true
-end)
+for _, entry in ipairs(thurm.ports()) do
+  listed["/" .. entry.pane] = servers(entry.ports)
+end
 
 local function open(host, port)
   if host then
@@ -63,14 +74,14 @@ end
 thurm.on("ports_changed", function(ev)
   local key = (ev.host or "") .. "/" .. ev.id
   local before = listed[key] or {}
-  local now = {}
-  for _, p in ipairs(ev.ports) do
-    if LOCAL[p.address] and is_dev_server(p.command) then
-      now[p.port] = true
-      if ready and not before[p.port] then
-        open(ev.host, p.port)
-      end
+  local now = servers(ev.ports)
+  listed[key] = now
+  if ev.initial then
+    return
+  end
+  for port in pairs(now or {}) do
+    if not before[port] then
+      open(ev.host, port)
     end
   end
-  listed[key] = next(now) and now or nil
 end)
