@@ -72,13 +72,23 @@ final class SidebarHostsPopover: NSObject, NSPopoverDelegate {
     }
 }
 
-private final class HostsListController: NSViewController {
+/// The popover's list: as tall as its rows, but no taller than `maxHeight`, past which it
+/// scrolls, so every host stays within reach however many there are.
+final class HostsListController: NSViewController {
     private let rows: [SidebarHostsPopover.Row]
     private let choose: (SidebarHostsPopover.Choice) -> Void
+    private let maxHeight: CGFloat
 
-    init(rows: [SidebarHostsPopover.Row], choose: @escaping (SidebarHostsPopover.Choice) -> Void) {
+    /// Most of the screen's height, leaving room for the window's top above the popover.
+    static var screenMaxHeight: CGFloat {
+        ((NSScreen.main?.visibleFrame.height ?? 800) * 0.6).rounded(.down)
+    }
+
+    init(rows: [SidebarHostsPopover.Row], maxHeight: CGFloat = HostsListController.screenMaxHeight,
+         choose: @escaping (SidebarHostsPopover.Choice) -> Void) {
         self.rows = rows
         self.choose = choose
+        self.maxHeight = maxHeight
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -105,8 +115,24 @@ private final class HostsListController: NSViewController {
                 line.widthAnchor.constraint(equalToConstant: 236).isActive = true
             }
         }
-        view = stack
+        let size = stack.fittingSize
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: size.width, height: min(size.height, maxHeight)))
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        // Flipped, so the list opens at its first row.
+        let list = TopDownView(frame: NSRect(origin: .zero, size: size))
+        stack.frame = list.bounds
+        stack.autoresizingMask = [.width, .height]
+        list.addSubview(stack)
+        scroll.documentView = list
+        view = scroll
+        preferredContentSize = scroll.frame.size
     }
+}
+
+private final class TopDownView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 /// One choice: icon, title, the host's state, and a checkmark on the current one.

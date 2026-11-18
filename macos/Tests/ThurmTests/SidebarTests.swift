@@ -298,6 +298,33 @@ final class SidebarHostsTests: XCTestCase {
         XCTAssertEqual(rows.map(\.checked), [false, true, false, false])
     }
 
+    /// Past its height limit, the hosts list scrolls to its last host; a short list is as tall
+    /// as its rows.
+    func testPopoverListScrollsPastItsHeight() throws {
+        let hosts = [localHost] + (1...40).map { "host\($0)" }
+        let rows = SidebarHostsPopover.rows(byHost: true, filter: nil, allWorkspaces: false, hosts: hosts) { _ in nil }
+        let long = HostsListController(rows: rows, maxHeight: 300) { _ in }
+        let scroll = try XCTUnwrap(long.view as? NSScrollView)
+        XCTAssertEqual(scroll.frame.height, 300)
+        XCTAssertEqual(long.preferredContentSize.height, 300)
+        scroll.layoutSubtreeIfNeeded()
+        let list = try XCTUnwrap(scroll.documentView)
+        XCTAssertGreaterThan(list.frame.height, CGFloat(rows.count) * 26)
+        let stack = try XCTUnwrap(list.subviews.first as? NSStackView)
+        let frame = { (v: NSView) in v.convert(v.bounds, to: scroll.contentView) }
+        let first = try XCTUnwrap(stack.arrangedSubviews.first), last = try XCTUnwrap(stack.arrangedSubviews.last)
+        // It opens at the first row, and scrolls to the last.
+        XCTAssertTrue(scroll.contentView.bounds.contains(frame(first)))
+        XCTAssertFalse(scroll.contentView.bounds.contains(frame(last)))
+        XCTAssertTrue(last.scrollToVisible(last.bounds))
+        XCTAssertTrue(scroll.contentView.bounds.contains(frame(last)))
+
+        let short = HostsListController(rows: Array(rows.prefix(3)), maxHeight: 300) { _ in }
+        let fitted = try XCTUnwrap(short.view as? NSScrollView)
+        XCTAssertLessThan(fitted.frame.height, 300)
+        XCTAssertEqual(fitted.frame.height, try XCTUnwrap(fitted.documentView).fittingSize.height, accuracy: 1)
+    }
+
     /// The popover names a host's state as its sidebar header does.
     func testPopoverStateMatchesTheHeader() {
         let manager = SessionManager.shared
