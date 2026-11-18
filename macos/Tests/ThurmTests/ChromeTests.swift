@@ -81,4 +81,62 @@ final class ChromeTests: XCTestCase {
         XCTAssertTrue(gutter.contains(CGPoint(x: 360, y: 20)), "outside both cards")
         XCTAssertTrue(gutter.contains(CGPoint(x: 11, y: 11)), "a card's rounded corner")
     }
+
+    private func assertRGB(_ c: ChromeRGBA, _ rgb: UInt32, _ what: String, file: StaticString = #filePath,
+                           line: UInt = #line) {
+        let want = ChromeRGBA(rgb)
+        for (got, expected, channel) in [(c.red, want.red, "red"), (c.green, want.green, "green"),
+                                         (c.blue, want.blue, "blue")] {
+            XCTAssertEqual(got * 255, expected * 255, accuracy: 1, "\(what) \(channel)", file: file, line: line)
+        }
+    }
+
+    /// Catppuccin Mocha: the background raised a step and kept in its hue, then lifted while the
+    /// window is key, with a lighter outline and no shadow.
+    func testSelectedPillOnDarkTheme() {
+        let c = ChromeColors(background: 0x1e1e2e, foreground: 0xcdd6f4, cursor: 0xf5e0dc, palette: [],
+                             isDark: true)
+        assertRGB(c.selectedInactive, 0x2f2f3f, "inactive")
+        assertRGB(c.selected, 0x47475f, "selected")
+        for color in [c.selectedInactive, c.selected, c.selectedStroke] {
+            XCTAssertEqual(color.red, color.green, accuracy: 0.5 / 255, "hue kept")
+            XCTAssertEqual(color.alpha, 1)
+        }
+        XCTAssertEqual(c.selectedStroke.red, c.selected.red + 0.1, accuracy: 1e-9)
+        XCTAssertEqual(c.selectedStroke.blue, c.selected.blue + 0.1, accuracy: 1e-9)
+        XCTAssertNil(c.selectedShadow)
+    }
+
+    /// A light theme: the raised background without the dark themes' lift, the same while the
+    /// window is not key, outlined and shadowed in the text color.
+    func testSelectedPillOnLightTheme() {
+        let c = ChromeColors(background: 0xeff1f5, foreground: 0x4c4f69, cursor: 0xdc8a78, palette: [],
+                             isDark: false)
+        let raised = ChromeColors.raised(0xeff1f5, isDark: false, p3: false)
+        XCTAssertEqual(c.selected, raised)
+        XCTAssertEqual(c.selectedInactive, raised)
+        XCTAssertGreaterThan(c.selected.red + c.selected.green + c.selected.blue,
+                             c.surface.red + c.surface.green + c.surface.blue)
+        let dark = ChromeColors(background: 0xeff1f5, foreground: 0x4c4f69, cursor: 0xdc8a78, palette: [],
+                                isDark: true)
+        XCTAssertNotEqual(c.selected, dark.selected)
+        XCTAssertEqual(c.selectedStroke, ChromeRGBA(0x4c4f69, alpha: 0.1))
+        XCTAssertEqual(c.selectedShadow, ChromeRGBA(0x4c4f69))
+    }
+
+    /// Components read as Display P3 come back as P3: a near-grey background lands where the
+    /// sRGB reading does.
+    func testSelectedPillInDisplayP3() {
+        for bg: UInt32 in [0x1e1e22, 0x2a2a2a, 0xf0f0ee] {
+            for dark in [true, false] {
+                let p3 = ChromeColors(background: bg, foreground: 0xcccccc, cursor: 0xcccccc, palette: [],
+                                      isDark: dark, p3: true)
+                let srgb = ChromeColors(background: bg, foreground: 0xcccccc, cursor: 0xcccccc, palette: [],
+                                        isDark: dark)
+                let want = UInt32((srgb.selected.red * 255).rounded()) << 16
+                    | UInt32((srgb.selected.green * 255).rounded()) << 8 | UInt32((srgb.selected.blue * 255).rounded())
+                assertRGB(p3.selected, want, String(format: "%06x dark: %d", bg, dark ? 1 : 0))
+            }
+        }
+    }
 }

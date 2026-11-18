@@ -1523,18 +1523,28 @@ final class SidebarRowView: NSTableRowView {
         didSet { if isSelected != oldValue { needsDisplay = true } }
     }
 
+    private let keyRedraw = KeyWindowRedraw()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // The light themes' shadow falls below the row.
+        clipsToBounds = false
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        keyRedraw.track(self) { [weak self] in self?.isSelected == true }
+    }
+
     override func drawBackground(in dirtyRect: NSRect) {
         super.drawBackground(in: dirtyRect)
         guard isSelected else { return }
-        let chrome = SessionManager.shared.config.chrome
-        let rect = bounds.insetBy(dx: 10, dy: 1)
-        let r = rect.height / 2
-        let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: r - 0.5, yRadius: r - 0.5)
-        chrome.controlSelected.setFill()
-        path.fill()
-        chrome.stroke.setStroke()
-        path.lineWidth = ChromeStroke.width
-        path.stroke()
+        SessionManager.shared.config.chrome.drawSelectionPill(in: bounds.insetBy(dx: 10, dy: 1),
+                                                              key: window?.isKeyWindow == true)
     }
 
     override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
