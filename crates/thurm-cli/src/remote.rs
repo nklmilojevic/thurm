@@ -330,6 +330,11 @@ pub fn edit(name: &str, ssh: &str) -> R {
     remote_config(name)?;
     let target = ssh.trim();
     Ssh::new(target)?;
+    let candidate = Candidate {
+        ssh_target: Some(target.to_owned()),
+        ..Default::default()
+    };
+    add::check_edit(name, &candidate, &Config::load()?.remote).map_err(failed)?;
     let literal = serde_json::to_string(target)?;
     thurm_config::edit_remotes(|text| {
         thurm_config::with_remote_setting(text, name, "host", &literal)

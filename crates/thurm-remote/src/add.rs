@@ -261,6 +261,8 @@ fn timed_out(text: &str) -> bool {
         "timed out",
         "timeout",
         "did not finish within",
+        // thurm-tailnet-client's handshake deadline.
+        "no answer within",
         "would block",
         "temporarily unavailable",
     ]
@@ -444,6 +446,17 @@ pub fn check_new(
     }
 }
 
+/// Refuses giving saved host `name` a destination (`candidate`, an ssh target or a tailnet
+/// address) that another saved host has, as [`check_new`] refuses adding it.
+pub fn check_edit(
+    name: &str,
+    candidate: &Candidate,
+    saved: &[RemoteConfig],
+) -> Result<(), AddError> {
+    let others: Vec<RemoteConfig> = saved.iter().filter(|r| r.name != name).cloned().collect();
+    check_new(name, candidate, &others)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +608,39 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_cannot_point_at_another_saved_host() {
+        let list = vec![
+            saved("devbox", "me@devbox", None, None),
+            saved(
+                "bastion",
+                "",
+                Some("wss://bastion.tail1.ts.net/v1/connect"),
+                None,
+            ),
+        ];
+        let ssh = |t: &str| Candidate {
+            ssh_target: Some(t.into()),
+            ..Default::default()
+        };
+        // bastion, added over the tailnet, can't take devbox's ssh target.
+        assert!(matches!(
+            check_edit("bastion", &ssh("me@devbox"), &list),
+            Err(AddError::SameHost { name, other }) if name == "bastion" && other == "devbox"
+        ));
+        // Its own target, kept or set again, is no clash; nor is a new one.
+        assert!(check_edit("devbox", &ssh("me@devbox"), &list).is_ok());
+        assert!(check_edit("bastion", &ssh("me@bastion"), &list).is_ok());
+        let tailnet = Candidate {
+            tailnet: Some("bastion.tail1.ts.net".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            check_edit("devbox", &tailnet, &list),
+            Err(AddError::SameHost { other, .. }) if other == "bastion"
+        ));
+    }
+
+    #[test]
     fn ssh_failures_each_have_their_sentence() {
         let kind = |e: SshError| classify_ssh("me@devbox", &e).kind();
         assert_eq!(
@@ -678,6 +724,13 @@ mod tests {
                 url: a.into(),
                 detail: "Resource temporarily unavailable (os error 35)".into()
             }),
+            "timeout"
+        );
+        // thurm-tailnet-client's handshake deadline, as it words it.
+        assert_eq!(
+            kind(CheckError::Open(OpenError::Connect(
+                ConnectError::Unreachable("no answer within 8 seconds".into())
+            ))),
             "timeout"
         );
         assert_eq!(

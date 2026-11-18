@@ -358,7 +358,12 @@ enum Call {
         name: String,
         address: String,
     },
-    /// Whether `name` was just added, so the app opens a first workspace on it; true once.
+    /// Whether `name` was just added, so the app opens a first workspace on it; the mark stays
+    /// until `take_added`.
+    Added {
+        name: String,
+    },
+    /// Whether `name` was just added, forgetting it: true once.
     TakeAdded {
         name: String,
     },
@@ -649,9 +654,12 @@ fn call(c: Call) -> Result<Value, String> {
                 Err(Refused::Other(e)) => return Err(e),
             }
         }
+        Call::Added { name } => json!(thurm_config::remote_added(&name)),
         Call::TakeAdded { name } => json!(thurm_config::take_remote_added(&name)),
         Call::Remove { name } => {
             thurm_config::edit_remotes(|t| thurm_config::with_remote_removed(t, &name))?;
+            // A host saved later under this name wasn't just added.
+            thurm_config::take_remote_added(&name);
             if let Some(m) = MANAGER.lock().as_mut() {
                 sync(m);
             }
@@ -659,6 +667,10 @@ fn call(c: Call) -> Result<Value, String> {
         }
         Call::Set { name, key, value } => {
             let literal = remote_setting_literal(&key, &value)?;
+            if let Some(candidate) = destination_candidate(&key, &value) {
+                let cfg = Config::load().map_err(|e| e.to_string())?;
+                add::check_edit(&name, &candidate, &cfg.remote).map_err(|e| e.to_string())?;
+            }
             thurm_config::edit_remotes(|t| {
                 thurm_config::with_remote_setting(t, &name, &key, &literal)
             })?;
@@ -894,6 +906,23 @@ fn remote_setting_literal(key: &str, value: &serde_json::Value) -> Result<String
     }
 }
 
+/// The destination that setting `key` to `value` gives a `[[remote]]`, to check that no other
+/// saved host has it: an ssh target or a tailnet address.
+fn destination_candidate(key: &str, value: &serde_json::Value) -> Option<add::Candidate> {
+    let s = value.as_str().map(str::trim).filter(|s| !s.is_empty())?;
+    match key {
+        "host" => Some(add::Candidate {
+            ssh_target: Some(s.to_owned()),
+            ..Default::default()
+        }),
+        "tailnet" => Some(add::Candidate {
+            tailnet: Some(s.to_owned()),
+            ..Default::default()
+        }),
+        _ => None,
+    }
+}
+
 /// Why an add was refused: a failure `add` describes, or anything else.
 enum Refused {
     Add(add::AddError),
@@ -1025,6 +1054,7 @@ mod tests {
             r#"{"op":"handoff_list"}"#,
             r#"{"op":"add","name":"pi","address":"me@pi"}"#,
             r#"{"op":"add","name":"bastion","address":"bastion.tail1234.ts.net"}"#,
+            r#"{"op":"added","name":"pi"}"#,
             r#"{"op":"take_added","name":"pi"}"#,
             r#"{"op":"doctor","name":"pi","bins":null}"#,
             r#"{"op":"doctor_fix","name":"pi","id":"hooks.claude","bins":null}"#,
@@ -1303,6 +1333,18 @@ mod tests {
             forward_json(&fw, Some("http://127.0.0.1:8443/b"))["url"],
             "http://127.0.0.1:18443/b"
         );
+    }
+
+    #[test]
+    fn destinations_are_checked_against_other_hosts() {
+        let host = destination_candidate("host", &json!(" me@pi ")).unwrap();
+        assert_eq!(host.ssh_target.as_deref(), Some("me@pi"));
+        let tailnet = destination_candidate("tailnet", &json!("pi.tail1.ts.net")).unwrap();
+        assert_eq!(tailnet.tailnet.as_deref(), Some("pi.tail1.ts.net"));
+        // No ssh target, and the other settings, point at no host.
+        assert_eq!(destination_candidate("host", &json!(" ")), None);
+        assert_eq!(destination_candidate("enabled", &json!(false)), None);
+        assert_eq!(destination_candidate("clipboard_read", &json!("ask")), None);
     }
 
     #[test]

@@ -436,6 +436,8 @@ impl Supervisor {
                 status.transport = transport_of(&remote);
                 status.host = remote.host;
                 status.via = None;
+                // The old destination's daemon; the next connection says the new one's.
+                status.daemon_id = None;
             }
             self.inner.reconfigured.store(true, Ordering::SeqCst);
         }
@@ -1281,6 +1283,34 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         assert!(reader.join().unwrap() > 0);
         assert_eq!(sup.settings(), 20_000);
+    }
+
+    #[test]
+    fn a_moved_host_forgets_the_old_daemon() {
+        use thurm_config::ClipboardRead;
+        let remote = |host: &str, clipboard_read: ClipboardRead| RemoteConfig {
+            name: "moved".into(),
+            host: host.into(),
+            socket: None,
+            enabled: false,
+            clipboard_read,
+            tailnet: None,
+            forward_links: true,
+            daemon_id: None,
+        };
+        let sup = Supervisor::start(
+            remote("me@one", ClipboardRead::Ask),
+            Some(Ssh::new("me@one").unwrap()),
+            false,
+            |_| {},
+        );
+        sup.inner.status.lock().daemon_id = Some("aaaa".into());
+        // Another setting: still the same daemon.
+        sup.update(remote("me@one", ClipboardRead::Always)).unwrap();
+        assert_eq!(sup.status().daemon_id.as_deref(), Some("aaaa"));
+        // Another destination: not known until it connects.
+        sup.update(remote("me@two", ClipboardRead::Always)).unwrap();
+        assert_eq!(sup.status().daemon_id, None);
     }
 
     /// A scratch directory short enough for socket paths.

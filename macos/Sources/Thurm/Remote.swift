@@ -708,10 +708,14 @@ extension SessionManager {
                 "\(gone) \(gone == 1 ? "pane" : "panes") on \(host) ended while it was away", duration: 5)
         }
         // Just added (here or with `thurm remote add`) and empty: a first workspace on it, so it
-        // shows in the sidebar. Taken once: an empty host that connects again gets none.
-        if (Core.shared.remoteCall(["op": "take_added", "name": host]) as? Bool) == true,
-           infos.isEmpty, !workspaces.contains(where: { $0.host == host }) {
-            openFirstWorkspace(on: host)
+        // shows in the sidebar. Taken once it has its shell, or once the host shows it has
+        // panes or a workspace already: an empty host that connects again gets none, and one
+        // whose first shell couldn't be made gets another try.
+        if (Core.shared.remoteCall(["op": "added", "name": host]) as? Bool) == true {
+            let empty = infos.isEmpty && !workspaces.contains(where: { $0.host == host })
+            if !empty || openFirstWorkspace(on: host) {
+                _ = Core.shared.remoteCall(["op": "take_added", "name": host])
+            }
         }
         runPendingHandoffCleanups(host)
         refreshSidebars()
@@ -721,12 +725,13 @@ extension SessionManager {
     }
 
     /// A new workspace on `host` with one shell, left in the background: the window in front
-    /// keeps what it shows.
-    private func openFirstWorkspace(on host: HostId) {
+    /// keeps what it shows. False when the host made no shell.
+    private func openFirstWorkspace(on host: HostId) -> Bool {
         let size = currentController.map { gridSize(forPoints: $0.content.bounds.size) }
             ?? (cols: config.columns, rows: config.rows)
-        guard let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, host: host) else { return }
+        guard let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, host: host) else { return false }
         adoptRemotePanes([pane], host: host)
+        return true
     }
 
     /// Opens `keys` (all on `host`) as tabs of the host's workspace, shown or not.

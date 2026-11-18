@@ -1529,6 +1529,11 @@ pub fn mark_remote_added(name: &str) -> std::io::Result<()> {
     std::fs::write(path, b"")
 }
 
+/// Whether `name` was just added, keeping the mark.
+pub fn remote_added(name: &str) -> bool {
+    remote_added_path(name).exists()
+}
+
 /// Whether `name` was just added, forgetting it: true once.
 pub fn take_remote_added(name: &str) -> bool {
     std::fs::remove_file(remote_added_path(name)).is_ok()
