@@ -314,7 +314,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     /// mostly changes nothing the sidebar shows.
     private var shown: (names: [[String]], tabs: [[SidebarTab]], theme: Theme)?
 
-    private let outline = NSOutlineView()
+    private let outline = SidebarOutlineView()
     private let dropLine: NSView = {
         let line = NSView()
         line.wantsLayer = true
@@ -372,6 +372,10 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         outline.delegate = self
         outline.target = self
         outline.action = #selector(rowClicked(_:))
+        outline.activate = { [weak self] in
+            guard let self, self.outline.selectedRow >= 0 else { return }
+            self.activate(row: self.outline.selectedRow)
+        }
         outline.menu = rowMenu()
         outline.registerForDraggedTypes([Self.dragType])
         outline.setDraggingSourceOperationMask(.move, forLocal: true)
@@ -597,6 +601,13 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         let sm = SessionManager.shared
         var agents = sm.agentPanes(first: controller).filter { $0.agent.status != .idle }
         if let only { agents = agents.filter { $0.pane.host == only } }
+        if sm.config.sidebarByHost {
+            // As in the list by host: a host that is not connected lists nothing but the
+            // workspace this window shows, as what it last reported is stale.
+            agents = agents.filter { a in
+                Self.hostState(a.pane.host) == nil || (a.hidden?.id ?? a.controller?.workspaceID) == shown?.id
+            }
+        }
         if sm.config.sidebarAllWorkspaces || sm.config.sidebarByHost {
             // By host when listed by host, then by workspace in the tab list's order, so a
             // switch moves none.
@@ -876,11 +887,12 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                 }.filter { !$0.tabs.isEmpty }
                 if section.offersNewWorkspace { g.newWorkspace = NewWorkspaceBox(host: section.host) }
                 // A host's only workspace needs no name of its own, nor its first one named after
-                // it (a remote host's first workspace is); nor the one host listed.
+                // it (a remote host's first workspace is); nor the one host listed, unless nothing
+                // is under it: its header then is its only row, with its state.
                 if let first = g.subgroups.first, g.subgroups.count == 1 || first.name == section.host {
                     first.headless = true
                 }
-                g.headless = hostFilter != nil
+                g.headless = hostFilter != nil && (!g.subgroups.isEmpty || g.newWorkspace != nil)
                 order.append(g)
             }
         } else if config.sidebarAllWorkspaces {
@@ -954,7 +966,10 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         // An agent row goes before its tab's row (a pinned tab's, say): it is the pane in focus.
         let selected = (0..<outline.numberOfRows).filter { (outline.item(atRow: $0) as? TabBox)?.tab.selected == true }
         let current = selected.first { (outline.item(atRow: $0) as? TabBox)?.tab.pane != nil } ?? selected.first
-        if let row = current, outline.selectedRow != row {
+        // Not while the keyboard is on the new-workspace row, which Return then opens.
+        let onNewWorkspace = outline.window?.firstResponder === outline
+            && outline.selectedRow >= 0 && outline.item(atRow: outline.selectedRow) is NewWorkspaceBox
+        if let row = current, outline.selectedRow != row, !onNewWorkspace {
             outline.selectRowIndexes([row], byExtendingSelection: false)
         }
     }
@@ -1136,12 +1151,13 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         item is SidebarGroup
     }
 
+    /// A tab, or the new-workspace row, so the keyboard reaches it (Return opens it).
     func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
-        item is TabBox
+        item is TabBox || item is NewWorkspaceBox
     }
 
     func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
-        item is TabBox ? SidebarRowView() : nil
+        item is TabBox || item is NewWorkspaceBox ? SidebarRowView() : nil
     }
 
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
@@ -1155,7 +1171,11 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             guard let host = g.host else { return SidebarHeadingView(g.name) }
             return SidebarHeadingView(g.name, symbol: host == localHost ? "laptopcomputer" : "globe", detail: g.state)
         }
-        if let box = item as? NewWorkspaceBox { return NewWorkspaceRowView(box.title) }
+        if let box = item as? NewWorkspaceBox {
+            let view = NewWorkspaceRowView(box.title)
+            view.press = { SessionManager.shared.newWorkspace(host: box.host) }
+            return view
+        }
         guard let box = item as? TabBox else { return nil }
         let cell = outlineView.makeView(withIdentifier: TabRowView.identifier, owner: nil) as? TabRowView
             ?? TabRowView()
@@ -1168,8 +1188,12 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     // MARK: Actions
 
     @objc private func rowClicked(_ sender: Any?) {
+        activate(row: outline.clickedRow >= 0 ? outline.clickedRow : outline.selectedRow)
+    }
+
+    /// A row clicked, or chosen with the keyboard: its tab, agent or new workspace comes forward.
+    private func activate(row: Int) {
         TabHoverCard.shared.dismiss()
-        let row = outline.clickedRow >= 0 ? outline.clickedRow : outline.selectedRow
         if row >= 0, let box = outline.item(atRow: row) as? NewWorkspaceBox {
             SessionManager.shared.newWorkspace(host: box.host)
             return
@@ -1433,6 +1457,8 @@ final class NewWorkspaceRowView: NSView {
     static let height: CGFloat = 28
     private let icon = NSImageView()
     private let label: NSTextField
+    /// Opens the workspace: VoiceOver's press, as the row is a button to it.
+    var press: (() -> Void)?
 
     init(_ title: String) {
         label = NSTextField(labelWithString: title)
@@ -1455,6 +1481,12 @@ final class NewWorkspaceRowView: NSView {
         fatalError("init(coder:) is not supported")
     }
 
+    override func accessibilityPerformPress() -> Bool {
+        guard let press else { return false }
+        press()
+        return true
+    }
+
     override func layout() {
         super.layout()
         var table = superview
@@ -1466,6 +1498,21 @@ final class NewWorkspaceRowView: NSView {
         let size = label.intrinsicContentSize
         label.frame = NSRect(x: left + 22, y: ((bounds.height - size.height) / 2).rounded(),
                              width: max(0, bounds.width - left - 34), height: size.height)
+    }
+}
+
+/// The sidebar's outline: Return, Enter or Space opens the selected row, as a click does.
+final class SidebarOutlineView: NSOutlineView {
+    var activate: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let keys: Set<UInt16> = [36, 76, 49] // Return, keypad Enter, Space
+        if keys.contains(event.keyCode), event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            .subtracting([.numericPad, .function]).isEmpty, selectedRow >= 0, let activate {
+            activate()
+            return
+        }
+        super.keyDown(with: event)
     }
 }
 
