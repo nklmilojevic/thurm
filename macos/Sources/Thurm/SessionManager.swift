@@ -1043,7 +1043,8 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         if byHost, host != config.sidebarHost {
             let value = host ?? ""
-            let resp = Core.shared.request(object: ["SetSetting": ["key": "window.sidebar_host", "value": "\"\(value)\""]])
+            let resp = Core.shared.request(object: ["SetSetting": ["key": "window.sidebar_host",
+                                                                   "value": Self.tomlString(value)]])
             sidebarHostOverride = JSON.variant(resp)?.name == "Text" ? nil : value
             if sidebarHostOverride != nil {
                 config.sidebarHost = host
@@ -1051,6 +1052,24 @@ final class SessionManager: NSObject, CoreDelegate {
             }
         }
         if changed { applyConfigToUI() }
+    }
+
+    /// `s` as a TOML basic string, the value `SetSetting` parses: quotes, backslashes and
+    /// control characters escaped, so any host name saves as itself.
+    static func tomlString(_ s: String) -> String {
+        var out = "\""
+        for u in s.unicodeScalars {
+            switch u {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            case _ where u.value < 0x20 || u.value == 0x7F: out += String(format: "\\u%04X", u.value)
+            default: out.unicodeScalars.append(u)
+            }
+        }
+        return out + "\""
     }
 
     // MARK: - Config and fonts

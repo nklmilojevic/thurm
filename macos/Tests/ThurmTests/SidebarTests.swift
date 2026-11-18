@@ -242,6 +242,13 @@ final class SidebarHostsTests: XCTestCase {
     }
 
     /// Narrowed to one host, only it is listed; a host that is gone means every host.
+    /// The chosen host is saved as a TOML string whatever its name.
+    func testHostSavesAsATOMLString() {
+        XCTAssertEqual(SessionManager.tomlString("devbox"), #""devbox""#)
+        XCTAssertEqual(SessionManager.tomlString(""), #""""#)
+        XCTAssertEqual(SessionManager.tomlString("dev\"box\\x\u{1}\n"), #""dev\"box\\x\u0001\n""#)
+    }
+
     func testFilterToOneHost() {
         XCTAssertEqual(sections(shown: 1, filter: "devbox").map(\.host), ["devbox"])
         XCTAssertEqual(sections(shown: 1, filter: localHost).map(\.workspaces), [[1, 3]])

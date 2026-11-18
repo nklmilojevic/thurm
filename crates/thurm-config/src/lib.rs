@@ -2682,6 +2682,10 @@ clipboard_read = "always"
         let window = Config::parse(&out).unwrap().window;
         assert!(window.sidebar_by_host);
         assert_eq!(window.sidebar_host, "devbox");
+        // As the Mac app escapes a host name (`SessionManager.tomlString`).
+        let out = with_setting(&out, "window.sidebar_host", r#""dev\"box\\x\u0001""#).unwrap();
+        let window = Config::parse(&out).unwrap().window;
+        assert_eq!(window.sidebar_host, "dev\"box\\x\u{1}");
         let window = Config::parse(&out).unwrap().window;
         assert!(!window.sidebar_usage_claude && !window.sidebar_usage_codex, "opt-in");
         let out = with_setting(&out, "window.sidebar_usage_codex", "true").unwrap();
