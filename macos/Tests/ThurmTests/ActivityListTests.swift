@@ -223,6 +223,17 @@ final class ActivityListViewTests: XCTestCase {
         sidebar.reload()
         XCTAssertEqual(listed(outline), ["This Mac", "tab", "tab", "tab"])
         XCTAssertEqual(outline.selectedRow, 1)
+
+        // A filter naming a host that is gone lists every host, This Mac under its header, also
+        // when it is the only host left.
+        manager.config.sidebarHost = "gone"
+        sidebar.reload()
+        XCTAssertEqual(listed(outline), ["This Mac", "tab", "tab", "tab"])
+        XCTAssertEqual(title.title, "All Hosts")
+        manager.config.sidebarHost = localHost
+        sidebar.reload()
+        XCTAssertEqual(listed(outline), ["tab", "tab", "tab"])
+        XCTAssertEqual(title.title, "This Mac")
     }
 
     /// A window showing a workspace on a host that is not connected: that workspace's tabs and

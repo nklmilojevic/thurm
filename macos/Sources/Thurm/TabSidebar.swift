@@ -876,7 +876,11 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
                                                  workspaces: sm.workspaces.map { ($0.id, $0.host) },
                                                  shown: shownWorkspace?.id, filter: config.sidebarHost,
                                                  state: Self.hostState)
-            if sections.count == 1, config.sidebarHost != nil { hostFilter = sections.first?.host }
+            // The one host listed, as the top of the sidebar names it: none for a host that is gone,
+            // also when This Mac is the only host left.
+            hostFilter = SidebarHosts.effectiveFilter(config.sidebarHost,
+                                                      hosts: SidebarHosts.hosts(remotes: config.remoteNames,
+                                                                                workspaceHosts: sm.workspaces.map(\.host)))
             if shownWorkspace == nil { order.append(other) }
             for section in sections {
                 let g = SidebarGroup(name: SidebarHosts.title(section.host), key: "host:\(section.host)",
