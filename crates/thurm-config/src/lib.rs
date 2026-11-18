@@ -152,7 +152,8 @@ pub struct RemoteConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tailnet: Option<String>,
     /// The daemon's identifier as it was when the host was added, to refuse adding the same
-    /// daemon under a second name.
+    /// daemon under a second name. Dropped when the host's `host`, `tailnet` or `socket` is
+    /// changed ([`with_remote_setting`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_id: Option<String>,
     /// Cmd-click on a `localhost` link in this host's panes opens it through a forward of that
@@ -2092,6 +2093,17 @@ pub fn with_remote_setting(
                 .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
         })
         .ok_or_else(|| format!("no remote named {name:?}"))?;
+    // Another destination: the daemon recorded when it was added may not be the one there, so
+    // it is forgotten; the next connection says which daemon is (see `saved_daemon_id`).
+    let old = table
+        .get(key)
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or("");
+    if matches!(key, "host" | "tailnet" | "socket")
+        && old.trim() != value.as_str().unwrap_or("").trim()
+    {
+        table.remove("daemon_id");
+    }
     table[key] = toml_edit::Item::Value(value);
     let out = doc.to_string();
     check_edit(text, &out)?;
@@ -2494,6 +2506,30 @@ clipboard_read = "always"
         let cfg = Config::parse(&with_ssh).unwrap();
         assert_eq!(cfg.remote[0].ssh_target(), Some("me@bastion"));
         assert_eq!(cfg.remote[0].tailnet, r.tailnet);
+        // A new destination forgets the daemon recorded at the old one; the next connection
+        // says which it is. Another setting, or the same destination again, keeps it.
+        assert_eq!(cfg.remote[0].daemon_id, None);
+        for (key, value) in [
+            ("enabled", "false"),
+            ("clipboard_read", "\"always\""),
+            ("tailnet", "\"wss://bastion.tail2177a1.ts.net/v1/connect\""),
+            ("host", "\"\""),
+        ] {
+            let kept = with_remote_setting(&added, "bastion", key, value).unwrap();
+            let id = Config::parse(&kept).unwrap().remote[0].daemon_id.clone();
+            assert_eq!(id.as_deref(), Some("0123abcd"), "{key}");
+        }
+        for (key, value) in [
+            ("tailnet", "\"wss://other.tail2177a1.ts.net/v1/connect\""),
+            ("socket", "\"/run/t.sock\""),
+        ] {
+            let moved = with_remote_setting(&added, "bastion", key, value).unwrap();
+            assert_eq!(
+                Config::parse(&moved).unwrap().remote[0].daemon_id,
+                None,
+                "{key}"
+            );
+        }
         // Neither an ssh target nor a tailnet address: nothing to reach it with.
         let e = Config::parse("[[remote]]\nname = \"c\"\n").unwrap_err();
         assert!(e.to_string().contains("needs a host"), "{e}");
