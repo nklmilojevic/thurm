@@ -791,9 +791,12 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         return String(ws.name.dropFirst(ws.host.count + 1))
     }
 
+    /// Whether the daemon is connected to a remote host (replaced in tests).
+    static var isConnected: (HostId) -> Bool = { Core.shared.isConnected($0) }
+
     /// A host's state on its header in the list by host: nil while it is connected.
     static func hostState(_ host: HostId) -> String? {
-        guard host != localHost, !Core.shared.isConnected(host) else { return nil }
+        guard host != localHost, !isConnected(host) else { return nil }
         guard SessionManager.shared.config.remoteNames.contains(host) else { return "not configured" }
         return Remotes.shared.phaseLabel(host)
     }
@@ -1440,9 +1443,11 @@ final class SidebarHeadingView: NSView {
         let size = label.intrinsicContentSize
         var right = bounds.width - 8
         if let detail {
-            // The host's name first; its state takes what is left.
+            // The host's state whole when it fits beside the name; else it keeps up to half the
+            // row and the name is cut short, so a long name never hides the state.
             let d = detail.cell?.cellSize ?? detail.intrinsicContentSize
-            let w = min(ceil(d.width) + 1, max(0, right - left - ceil(size.width) - 8))
+            let room = max(0, right - left - 8)
+            let w = min(ceil(d.width) + 1, max(room - ceil(size.width), (room / 2).rounded(.down)))
             detail.frame = NSRect(x: right - w, y: ((bounds.height - d.height) / 2).rounded(), width: w, height: d.height)
             right -= w + 8
         }

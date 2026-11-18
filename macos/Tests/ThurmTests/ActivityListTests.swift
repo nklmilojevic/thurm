@@ -98,6 +98,7 @@ final class ActivityListViewTests: XCTestCase {
         manager.config = savedConfig
         manager.workspaces = savedWorkspaces
         manager.panes = savedPanes
+        TabSidebarViewController.isConnected = { Core.shared.isConnected($0) }
         Remotes.shared.pendingCloses = [:]
         super.tearDown()
     }
@@ -182,6 +183,31 @@ final class ActivityListViewTests: XCTestCase {
         XCTAssertEqual(other.selectedRow, 6)
     }
 
+    /// A click on a tab of a connected remote host switches to its workspace, and the window it
+    /// comes into lists the same hosts with that tab selected.
+    func testByHostClickOnARemoteTabKeepsTheList() throws {
+        let first = try tabs()
+        let remote = manager.makeWorkspace(name: "far", host: "devbox")
+        remote.hiddenTabs = [TabLayout(title: nil, root: .pane(PaneKey("devbox", 9)), focused: 9, zoomed: nil)]
+        manager.config.remoteNames = ["devbox"]
+        manager.config.sidebarByHost = true
+        TabSidebarViewController.isConnected = { $0 == "devbox" }
+        let sidebar = try XCTUnwrap(first.sidebar)
+        sidebar.reload()
+        let outline = try outline(sidebar)
+        let rows = ["This Mac", "main", "tab", "tab", "tab", "api", "tab", "devbox", "tab"]
+        XCTAssertEqual(listed(outline), rows)
+        XCTAssertNil((outline.item(atRow: 7) as? SidebarGroup)?.state)
+
+        click(8, in: outline)
+        let shown = try XCTUnwrap(manager.controllerShowing(remote))
+        controllers += manager.group(of: shown).filter { c in !controllers.contains { $0 === c } }
+        XCTAssertEqual(shown.focusedPane, PaneKey("devbox", 9))
+        let other = try self.outline(try XCTUnwrap(shown.sidebar))
+        XCTAssertEqual(listed(other), rows)
+        XCTAssertEqual(other.selectedRow, 8)
+    }
+
     /// A host's only workspace is listed without a header of its name; off, the top names
     /// where the workspace runs and opens the workspace picker.
     func testByHostListsAHostsOnlyWorkspaceWithoutItsName() throws {
@@ -239,22 +265,24 @@ final class ActivityListViewTests: XCTestCase {
         manager.config.sidebarActiveOnly = false
         sidebar.reload()
 
-        // The new-workspace row: selectable, and Return or VoiceOver's press opens a workspace.
+        // The new-workspace row: selectable, and Return or VoiceOver's press on the row the
+        // outline shows opens a workspace on its host.
         let row = try XCTUnwrap(outline.item(atRow: 1) as? NewWorkspaceBox)
         XCTAssertTrue(sidebar.outlineView(outline, shouldSelectItem: row))
-        let view = try XCTUnwrap(sidebar.outlineView(outline, viewFor: nil, item: row) as? NewWorkspaceRowView)
+        let view = try XCTUnwrap(outline.view(atColumn: 0, row: 1, makeIfNecessary: true) as? NewWorkspaceRowView)
         XCTAssertEqual(view.accessibilityRole(), .button)
-        var pressed = false
-        view.press = { pressed = true }
-        XCTAssertTrue(view.accessibilityPerformPress())
-        XCTAssertTrue(pressed)
 
         outline.selectRowIndexes([1], byExtendingSelection: false)
-        let count = manager.workspaces.count
+        var count = manager.workspaces.count
         let enter = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
                                                    windowNumber: 0, context: nil, characters: "\r",
                                                    charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
         outline.keyDown(with: enter)
+        XCTAssertEqual(manager.workspaces.count, count + 1)
+        XCTAssertEqual(manager.workspaces.last?.host, localHost)
+
+        count = manager.workspaces.count
+        XCTAssertTrue(view.accessibilityPerformPress())
         XCTAssertEqual(manager.workspaces.count, count + 1)
         XCTAssertEqual(manager.workspaces.last?.host, localHost)
         for shown in manager.liveControllers where !controllers.contains(where: { $0 === shown }) {

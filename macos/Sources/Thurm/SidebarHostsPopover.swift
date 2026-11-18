@@ -36,6 +36,12 @@ final class SidebarHostsPopover: NSObject, NSPopoverDelegate {
         return rows
     }
 
+    /// A host's state on its row: the sidebar header's ("connecting", "not configured", …), or
+    /// "connected"; none for This Mac.
+    static func state(_ host: HostId) -> String? {
+        host == localHost ? nil : TabSidebarViewController.hostState(host) ?? "connected"
+    }
+
     private var popover: NSPopover?
 
     func toggle(relativeTo view: NSView) {
@@ -47,9 +53,7 @@ final class SidebarHostsPopover: NSObject, NSPopoverDelegate {
         let config = sm.config
         let hosts = SidebarHosts.hosts(remotes: config.remoteNames, workspaceHosts: sm.workspaces.map(\.host))
         let rows = Self.rows(byHost: config.sidebarByHost, filter: config.sidebarHost,
-                             allWorkspaces: config.sidebarAllWorkspaces, hosts: hosts) { host in
-            host == localHost ? nil : Remotes.shared.phaseLabel(host)
-        }
+                             allWorkspaces: config.sidebarAllWorkspaces, hosts: hosts, state: Self.state)
         let p = NSPopover()
         p.behavior = .transient
         p.animates = false

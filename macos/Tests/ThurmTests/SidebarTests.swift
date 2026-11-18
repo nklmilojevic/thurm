@@ -138,6 +138,18 @@ final class SidebarTests: XCTestCase {
         XCTAssertLessThanOrEqual(heading.label.frame.maxX, detail.frame.minX)
     }
 
+    /// A name as wide as the sidebar leaves the state half the row, and is cut short itself.
+    func testHostHeadingKeepsItsStateBesideALongName() {
+        let heading = SidebarHeadingView(String(repeating: "devbox-", count: 12), symbol: "globe",
+                                         detail: "needs attention")
+        heading.frame = NSRect(x: 0, y: 0, width: 220, height: SidebarHeadingView.hostHeight)
+        heading.layoutSubtreeIfNeeded()
+        let detail = heading.subviews.compactMap { $0 as? NSTextField }.first { $0.stringValue == "needs attention" }!
+        XCTAssertGreaterThanOrEqual(detail.frame.width, min(detail.cell!.cellSize.width, 80))
+        XCTAssertLessThan(heading.label.frame.width, heading.label.intrinsicContentSize.width)
+        XCTAssertLessThanOrEqual(heading.label.frame.maxX, detail.frame.minX)
+    }
+
     /// Under its host's header, a workspace goes without the host's name in front.
     func testWorkspaceNameUnderItsHost() {
         let name = { TabSidebarViewController.nameUnderHost(Workspace(id: 1, name: $0, host: $1)) }
@@ -284,6 +296,20 @@ final class SidebarHostsTests: XCTestCase {
         XCTAssertEqual(rows.map(\.checked), [false, false, false, true])
         rows = SidebarHostsPopover.rows(byHost: true, filter: "gone", allWorkspaces: false, hosts: hosts, state: state)
         XCTAssertEqual(rows.map(\.checked), [false, true, false, false])
+    }
+
+    /// The popover names a host's state as its sidebar header does.
+    func testPopoverStateMatchesTheHeader() {
+        let manager = SessionManager.shared
+        let saved = (manager.config, TabSidebarViewController.isConnected)
+        defer { (manager.config, TabSidebarViewController.isConnected) = saved }
+        manager.config.remoteNames = ["devbox", "up"]
+        TabSidebarViewController.isConnected = { $0 == "up" }
+        XCTAssertNil(SidebarHostsPopover.state(localHost))
+        XCTAssertEqual(SidebarHostsPopover.state("up"), "connected")
+        XCTAssertEqual(SidebarHostsPopover.state("devbox"), TabSidebarViewController.hostState("devbox"))
+        XCTAssertEqual(SidebarHostsPopover.state("gone"), "not configured")
+        XCTAssertEqual(TabSidebarViewController.hostState("gone"), "not configured")
     }
 }
 
