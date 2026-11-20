@@ -216,7 +216,7 @@ jobs:
           key: web
       # wasm-bindgen and wasm-opt from the flake's nixpkgs: the dev shell's versions, the
       # wasm-bindgen one being the version thurm-web pins.
-      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
