@@ -32,7 +32,7 @@ dirs = "7"
 flate2 = "1"
 png = "0.18"
 base64 = "0.23"
-qrcode = { version = "0.14", default-features = false }
+qrcode = { version = "0.15", default-features = false, features = ["std"] }
 regex = "1"
 libc = "0.2"
 parking_lot = "0.13"
