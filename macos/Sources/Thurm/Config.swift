@@ -169,6 +169,8 @@ final class AppConfig {
     var mouseNavigationButtons = true
     /// `window.sidebar_usage_claude` / `_codex`: whose subscription limits show below the tabs.
     var sidebarUsage: Set<UsageProvider> = []
+    /// `window.sidebar_usage_show`: whether those limits count what is left or what is used.
+    var sidebarUsageShow = UsageShow.left
 
     // [cursor]
     var cursorBlink = false
@@ -369,6 +371,7 @@ final class AppConfig {
             if let host = jsonString(w["sidebar_host"]) { sidebarHost = host.isEmpty ? nil : host }
             sidebarActiveOnly = jsonBool(w["sidebar_active_only"]) ?? sidebarActiveOnly
             mouseNavigationButtons = jsonBool(w["mouse_navigation_buttons"]) ?? mouseNavigationButtons
+            if let s = jsonString(w["sidebar_usage_show"]).flatMap(UsageShow.init(rawValue:)) { sidebarUsageShow = s }
             for p in UsageProvider.allCases {
                 if let on = jsonBool(w["sidebar_usage_\(p.rawValue)"]) {
                     if on { sidebarUsage.insert(p) } else { sidebarUsage.remove(p) }

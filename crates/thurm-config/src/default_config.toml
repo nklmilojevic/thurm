@@ -95,12 +95,15 @@ sidebar_host = ""
 # reporting progress, and the selected tab when its focused pane has no agent row. The filter
 # button next to the sidebar button, View > Only Active Tabs.
 sidebar_active_only = false
-# Show what is left of a subscription's limits (the 5-hour and weekly windows) at the bottom of
-# the sidebar. View > Usage Limits in Sidebar.
+# Show a subscription's limits (the 5-hour and weekly windows) at the bottom of the sidebar.
+# View > Usage Limits in Sidebar.
 # Claude Code: read from Anthropic with Claude Code's sign-in.
 sidebar_usage_claude = false
 # Codex: read from its latest session log.
 sidebar_usage_codex = false
+# Whether those limits count what is left of each window or what is used, as Claude Code's
+# /usage does: "left" or "used".
+sidebar_usage_show = "left"   # left | used
 # The mouse's back and forward buttons go back and forward through the tabs visited, as
 # Window > Back / Forward do, even while a program uses the mouse. Off, the program gets them.
 mouse_navigation_buttons = true

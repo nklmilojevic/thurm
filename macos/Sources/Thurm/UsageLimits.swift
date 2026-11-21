@@ -20,6 +20,11 @@ enum UsageProvider: String, CaseIterable {
     }
 }
 
+/// `window.sidebar_usage_show`: what the sidebar counts for each window.
+enum UsageShow: String {
+    case left, used
+}
+
 /// One rate-limit window: Claude's and Codex's 5-hour and weekly limits.
 struct UsageWindow: Equatable {
     var minutes: Int
@@ -47,6 +52,12 @@ struct UsageWindow: Equatable {
     func leftPercent(at now: Date) -> Double {
         if let resetsAt, resetsAt <= now { return 100 }
         return min(100, max(0, 100 - usedPercent))
+    }
+
+    /// What is used, 0…100: none of it once the window has reset.
+    func usedPercent(at now: Date) -> Double {
+        if let resetsAt, resetsAt <= now { return 0 }
+        return min(100, max(0, usedPercent))
     }
 }
 
@@ -400,7 +411,7 @@ private extension Data {
 
 // MARK: - Sidebar
 
-/// The bottom of the sidebar: a row per provider, a ring and what is left for each window.
+/// The bottom of the sidebar: a row per provider, a ring and a percentage for each window.
 final class UsagePanel: NSView {
     private let separator = NSBox()
     private let stack = NSStackView()
@@ -449,7 +460,8 @@ final class UsagePanel: NSView {
     func reload() {
         let config = SessionManager.shared.config
         let now = Date()
-        let models = Self.models(selected: config.sidebarUsage, reports: UsageLimits.shared.reports, now: now)
+        let models = Self.models(selected: config.sidebarUsage, reports: UsageLimits.shared.reports, now: now,
+                                 show: config.sidebarUsageShow)
         guard models != shown || config.theme != themed else { return }
         shown = models
         themed = config.theme
@@ -464,9 +476,10 @@ final class UsagePanel: NSView {
     /// A row for every chosen provider, also before its first read and when it has nothing to
     /// show, so there is a row to explain why and to click.
     static func models(selected: Set<UsageProvider>, reports: [UsageProvider: UsageReport],
-                       now: Date) -> [UsageRowModel] {
+                       now: Date, show: UsageShow = .left) -> [UsageRowModel] {
         UsageProvider.allCases.filter(selected.contains).map { p in
-            UsageRowModel(provider: p, report: reports[p] ?? UsageReport(windows: [], updated: nil), now: now)
+            UsageRowModel(provider: p, report: reports[p] ?? UsageReport(windows: [], updated: nil), now: now,
+                          show: show)
         }
     }
 }
@@ -476,6 +489,11 @@ struct UsageRowModel: Equatable {
     struct Gauge: Equatable {
         var label: String
         var left: Int
+        var used = 0
+        var show: UsageShow = .left
+
+        /// The number the row shows: what is left, or what is used.
+        var shown: Int { show == .used ? used : left }
     }
 
     var provider: UsageProvider
@@ -483,17 +501,20 @@ struct UsageRowModel: Equatable {
     var stale: Bool
     var tooltip: String
 
-    init(provider: UsageProvider, report: UsageReport, now: Date) {
+    init(provider: UsageProvider, report: UsageReport, now: Date, show: UsageShow = .left) {
         self.provider = provider
-        gauges = report.windows.map { Gauge(label: $0.label, left: Int($0.leftPercent(at: now).rounded(.down))) }
+        gauges = report.windows.map {
+            Gauge(label: $0.label, left: Int($0.leftPercent(at: now).rounded(.down)),
+                  used: Int($0.usedPercent(at: now).rounded(.down)), show: show)
+        }
         stale = report.problem != nil
         var lines = [provider.name]
         let time = DateFormatter()
         time.doesRelativeDateFormatting = true
         time.dateStyle = .short
         time.timeStyle = .short
-        for w in report.windows {
-            var line = "\(w.title): \(Int(w.leftPercent(at: now).rounded(.down)))% left"
+        for (w, g) in zip(report.windows, gauges) {
+            var line = "\(w.title): \(g.shown)% \(show.rawValue)"
             if let r = w.resetsAt, r > now { line += ", resets \(time.string(from: r))" }
             lines.append(line)
         }
@@ -521,11 +542,11 @@ private final class UsageRow: NSStackView {
         }
         for (i, g) in model.gauges.enumerated() {
             let color = model.stale ? chrome.contentDisabled : Self.color(left: g.left, chrome: chrome)
-            let ring = UsageRing(left: CGFloat(g.left) / 100, color: color, track: chrome.divider)
+            let ring = UsageRing(fill: CGFloat(g.shown) / 100, color: color, track: chrome.divider)
             addArrangedSubview(ring)
-            let label = Self.text("\(g.label) \(g.left)%", color: model.stale ? chrome.contentDisabled
+            let label = Self.text("\(g.label) \(g.shown)%", color: model.stale ? chrome.contentDisabled
                                     : g.left < 25 ? color : chrome.contentSecondary)
-            label.setAccessibilityLabel("\(model.provider.name) \(g.label): \(g.left)% left")
+            label.setAccessibilityLabel("\(model.provider.name) \(g.label): \(g.shown)% \(g.show.rawValue)")
             addArrangedSubview(label)
             if i < model.gauges.count - 1 { setCustomSpacing(10, after: label) }
         }
@@ -547,14 +568,14 @@ private final class UsageRow: NSStackView {
     }
 }
 
-/// A ring filled clockwise from the top by what is left.
+/// A ring filled clockwise from the top by the share the row shows.
 final class UsageRing: NSView {
-    let left: CGFloat
+    let fill: CGFloat
     private let color: NSColor
     private let track: NSColor
 
-    init(left: CGFloat, color: NSColor, track: NSColor) {
-        self.left = min(1, max(0, left))
+    init(fill: CGFloat, color: NSColor, track: NSColor) {
+        self.fill = min(1, max(0, fill))
         self.color = color
         self.track = track
         super.init(frame: NSRect(x: 0, y: 0, width: 11, height: 11))
@@ -576,9 +597,9 @@ final class UsageRing: NSView {
         let full = NSBezierPath(ovalIn: rect)
         full.lineWidth = width
         full.stroke()
-        guard left > 0 else { return }
+        guard fill > 0 else { return }
         let arc = NSBezierPath()
-        arc.appendArc(withCenter: center, radius: radius, startAngle: 90, endAngle: 90 - 360 * left, clockwise: true)
+        arc.appendArc(withCenter: center, radius: radius, startAngle: 90, endAngle: 90 - 360 * fill, clockwise: true)
         arc.lineWidth = width
         arc.lineCapStyle = .round
         color.setStroke()
