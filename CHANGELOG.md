@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.26.1 - 2026-11-22
+
+This release updates the embedded thurm skill guide for coding agents. The guide now shows how to delegate work to subagents.
+
+### Other changes
+
+- The skill guide now tells you to launch worker agents interactively, not in print mode (`-p`). Pass non-trivial task briefs through a file path.
+- The skill guide now describes a parallel subagent workflow. Each task uses one `git worktree` and one background tab.
+- The skill guide now explains first-run folder-trust prompts. It also warns that `thurm wait --agent-free` can return immediately while a pane shows `NeedsInput`.
+- The skill guide now lists managed hooks for Claude Code, Codex, Pi, and Antigravity (`agy`). It also documents `programs[0].message` in `thurm info --pane ID --json` and `thurm wall --on`.
+
 ## v0.26.0 - 2026-11-22
 
 This release adds Pi and Antigravity CLI (`agy`) support to Thurm. Thurm now tracks the session state of both agents.
