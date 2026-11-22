@@ -35,21 +35,41 @@ fn ancestry(mut pid: u32) -> Vec<Proc> {
     out
 }
 
-/// The controlling terminal the agent itself runs on.
+/// The controlling terminal the agent runs on: the outermost terminal in `chain`, walking past
+/// any outer PTY proxy layer (`atuin`, `script`, and shells) that has no non-shell, non-proxy
+/// process of its own.
 ///
-/// Picking the nearest ancestor on a terminal that is neither a shell wrapper nor a PTY proxy
-/// (`atuin`, `script`) stays on the inner terminal behind a pane PTY proxy, while skipping
-/// hook-only child PTYs (whether the hook shares that child PTY or detached from it) and a
-/// `script` process an agent used to create one.
+/// Starting from the outside skips any child PTY created for the hook — regardless of what
+/// launched it (`sh`, `script`, `timeout`, ...) and whether the hook stayed on that child PTY
+/// or detached from it — while stepping past pane PTY proxies like `atuin` and `script`.
 fn agent_tdev(chain: &[Proc]) -> Option<u32> {
-    if let Some(td) = chain
-        .iter()
-        .skip(1)
-        .find_map(|p| (!p.shell && !p.proxy).then_some(p.tdev).flatten())
-    {
-        return Some(td);
+    let mut tdevs = Vec::new();
+    for p in chain.iter().rev() {
+        if let Some(td) = p.tdev
+            && !tdevs.contains(&td)
+        {
+            tdevs.push(td);
+        }
     }
-    chain.iter().find_map(|p| p.tdev)
+    let last = *tdevs.last()?;
+    for &td in &tdevs {
+        if td == last {
+            return Some(td);
+        }
+        let mut has_proxy = false;
+        let mut only_shell_or_proxy = true;
+        for p in chain.iter().filter(|p| p.tdev == Some(td)) {
+            has_proxy |= p.proxy;
+            if !p.shell && !p.proxy {
+                only_shell_or_proxy = false;
+                break;
+            }
+        }
+        if !(has_proxy && only_shell_or_proxy) {
+            return Some(td);
+        }
+    }
+    Some(last)
 }
 
 fn pick(chain: &[Proc], own: u32) -> u32 {
@@ -63,13 +83,14 @@ fn pick(chain: &[Proc], own: u32) -> u32 {
     let Some(first) = on_tty.first() else {
         return own;
     };
-    // Hook ran detached (`setsid`, no terminal) or in a child PTY: pick the nearest
-    // non-wrapper ancestor on the agent's terminal (skipping `sh -c` or `script` that
-    // launched the hook), else the nearest ancestor on it.
+    // Hook ran detached (`setsid`, no terminal) or in a child PTY: prefer a non-wrapper
+    // foreground ancestor on the agent's terminal, else the nearest non-wrapper ancestor
+    // (skipping `sh -c` or `script` that launched the hook), else the nearest ancestor on it.
     if chain.first().and_then(|p| p.tdev) != Some(agent_tdev) {
         return on_tty
             .iter()
-            .find(|p| !p.shell && !p.proxy)
+            .find(|p| p.tpgid == Some(p.pgid) && !p.shell && !p.proxy)
+            .or_else(|| on_tty.iter().find(|p| !p.shell && !p.proxy))
             .map_or(first.pgid, |p| p.pgid);
     }
     // Hook shares the agent's terminal and is already in its foreground group.
@@ -318,6 +339,40 @@ mod tests {
             p(2, Some(PANE_TTY), Some(2), true),
         ];
         assert_eq!(pick(&proxied_bg, 30), 10);
+    }
+
+    #[test]
+    fn non_shell_child_pty_launcher_resolves_to_agent() {
+        // Non-shell launcher (e.g. `timeout`) running the hook inside a child PTY.
+        let chain = vec![
+            p(30, Some(CHILD_TTY), Some(30), false),
+            p(30, Some(CHILD_TTY), Some(30), false),
+            p(10, Some(PANE_TTY), Some(10), false),
+            p(5, Some(PANE_TTY), Some(10), true),
+        ];
+        assert_eq!(pick(&chain, 30), 10);
+
+        // Same behind a pane PTY proxy (`atuin`), even if `thurm` also detached from the child PTY.
+        let proxied_detached = vec![
+            p(40, None, None, false),
+            p(30, Some(CHILD_TTY), Some(30), false),
+            p(10, Some(PROXY_TTY), Some(10), false),
+            p(5, Some(PROXY_TTY), Some(10), true),
+            proxy(2, Some(PANE_TTY), Some(2)),
+            p(2, Some(PANE_TTY), Some(2), true),
+        ];
+        assert_eq!(pick(&proxied_detached, 40), 10);
+
+        // Non-shell launcher in a background group on the agent's terminal spawning a child PTY.
+        let launcher_on_agent_tty = vec![
+            p(30, Some(CHILD_TTY), Some(30), false),
+            p(20, Some(PROXY_TTY), Some(10), false),
+            p(10, Some(PROXY_TTY), Some(10), false),
+            p(5, Some(PROXY_TTY), Some(10), true),
+            proxy(2, Some(PANE_TTY), Some(2)),
+            p(2, Some(PANE_TTY), Some(2), true),
+        ];
+        assert_eq!(pick(&launcher_on_agent_tty, 30), 10);
     }
 
     #[test]
