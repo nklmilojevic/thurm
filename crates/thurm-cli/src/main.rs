@@ -690,7 +690,9 @@ fn agent_hook(agent: Option<String>, event: Option<String>) {
     );
     if event == "session-start" {
         // The agent adds a SessionStart hook's output to the session's context.
-        let context = skill::session_context(pane, skill::cli_off_path().as_deref());
+        let session_titles = thurm_config::Config::load().map_or(true, |c| c.agents.session_titles);
+        let name_session = session_titles && def.is_none_or(|a| !a.native_titles);
+        let context = skill::session_context(pane, skill::cli_off_path().as_deref(), name_session);
         let output = match def {
             Some(a) => a.session_output(&context),
             None => context,

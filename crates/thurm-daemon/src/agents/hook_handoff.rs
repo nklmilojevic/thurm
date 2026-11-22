@@ -28,6 +28,8 @@ pub struct HookHandoff {
     transcript: Option<String>,
     pgrp: u32,
     birth: u64,
+    #[serde(default)]
+    session_title: Option<String>,
 }
 
 impl AgentTracker {
@@ -53,6 +55,7 @@ impl AgentTracker {
                 .map(str::to_owned),
             pgrp,
             birth: crate::procinfo::process_birth(pgrp)?,
+            session_title: self.session_title.clone(),
         })
     }
 
@@ -68,6 +71,7 @@ impl AgentTracker {
             t.take_interrupted();
             t
         });
+        self.session_title = saved.session_title;
         self.hook = Some(HookState {
             kind: saved.kind,
             name: saved.name,

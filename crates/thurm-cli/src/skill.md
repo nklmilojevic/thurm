@@ -143,6 +143,7 @@ when the user has `ai.enabled = true`.
 thurm agents                         # panes running Claude Code, Codex, Pi, Antigravity, ...
 thurm presets                        # configured agent launch presets
 thurm launch claude --split right    # start a preset in a split
+thurm agent title "Fix login bug"    # set this agent session's title (empty to clear)
 thurm wall --on                      # view all active agents in the window in one grid tab (--off: put back)
 ```
 

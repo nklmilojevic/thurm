@@ -1117,7 +1117,7 @@ impl Daemon {
                 size_held_by: None,
                 size_claimed_by: None,
                 size_requested_by: Vec::new(),
-                agent: AgentTracker::default(),
+                agent: AgentTracker::with_titles(self.config.read().agents.session_titles),
                 osc_cwd: p.osc_cwd,
                 command_started: None,
                 command_line: None,
@@ -1863,10 +1863,14 @@ impl Daemon {
         }
         let tail = agents::tail(screen, 20);
         let title = st.term.title().map(str::to_owned);
-        for want in st
-            .agent
-            .ai_wants(cfg.titles(), cfg.status(), &tail, title.as_deref())
-        {
+        let cwd = st.info.cwd.clone();
+        for want in st.agent.ai_wants(
+            cfg.titles(),
+            cfg.status(),
+            &tail,
+            title.as_deref(),
+            cwd.as_deref(),
+        ) {
             let job = match want {
                 AiWant::Title { prompt } => AiJob::Title {
                     pane,
@@ -2359,6 +2363,7 @@ impl Daemon {
                             st.agent.restore_report_handoff(report);
                         }
                         if let Some(hook) = p.agent_hook {
+                            st.agent.titles = self.config.read().agents.session_titles;
                             st.agent.restore_hook_handoff(hook);
                         }
                         if let Some(prompt) = p.agent_prompt {
@@ -3406,7 +3411,7 @@ impl Daemon {
                         st.info.agent = st.agent.state().cloned();
                     }
                     st.agent.saw_foreground(st.pty.foreground_pgrp());
-                    if st.agent.public_report_active() {
+                    if st.agent.public_report_active() && event != "session-title" {
                         return;
                     }
                     st.agent
@@ -3414,7 +3419,9 @@ impl Daemon {
                     st.agent.titles = titles;
                     // Hooks without a path (Notification) keep following the current file.
                     // Followed even without titles: it is where interrupts show up.
-                    if transcript_path.is_some() || event == "session-start" {
+                    if event != "session-title"
+                        && (transcript_path.is_some() || event == "session-start" || agent == "agy")
+                    {
                         st.agent.read_transcript(transcript_path.as_deref());
                     }
                     if let Some(new) = st.agent.refresh() {
@@ -3913,12 +3920,14 @@ impl Daemon {
         *self.program_defs.write() = cfg.program_defs();
         self.push.set_enabled(!cfg.push.relay.is_empty());
         self.tailnet.configure(&cfg.tailscale);
+        let session_titles = cfg.agents.session_titles;
         *self.config.write() = cfg;
         self.ext_config_applied();
         let engine = self.engine.read().clone();
         for pane in self.all_panes() {
             let mut st = pane.state.lock();
             st.term.set_config(engine.clone());
+            st.agent.titles = session_titles;
             drop(st);
         }
         self.broadcast(Event::ConfigReloaded, false);

@@ -17,6 +17,13 @@ pub enum AgentCmd {
     Report(ReportArgs),
     /// End reporting for a process instance.
     Release(ReleaseArgs),
+    /// Set the current agent session's title (empty text clears it).
+    Title {
+        #[arg(long)]
+        pane: Option<PaneId>,
+        /// Session title (omit to clear).
+        text: Vec<String>,
+    },
 }
 
 #[derive(Args)]
@@ -107,6 +114,19 @@ pub fn run(c: &Client, action: AgentCmd, json: bool) -> crate::R {
                 owner_pid: args.owner_pid,
                 instance: args.instance,
                 sequence: args.sequence,
+            }
+        }
+        AgentCmd::Title { pane, text } => {
+            let title = text.join(" ");
+            let title = title.trim();
+            Request::AgentHook {
+                pane: crate::current_pane(pane)?,
+                agent: String::new(),
+                event: "session-title".into(),
+                session_id: None,
+                message: (!title.is_empty()).then(|| title.to_owned()),
+                transcript_path: None,
+                pgrp: None,
             }
         }
     };
@@ -203,5 +223,17 @@ mod tests {
             ])
             .is_ok()
         );
+        assert!(
+            crate::Cli::try_parse_from([
+                "thurm",
+                "agent",
+                "title",
+                "--pane",
+                "7",
+                "Fix login redirect",
+            ])
+            .is_ok()
+        );
+        assert!(crate::Cli::try_parse_from(["thurm", "agent", "title"]).is_ok());
     }
 }

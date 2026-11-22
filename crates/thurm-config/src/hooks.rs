@@ -40,6 +40,9 @@ pub struct HookAgent {
     /// Whether the SessionStart hook injects its context as JSON (`additionalContext`)
     /// instead of plain text.
     pub context_json: bool,
+    /// Whether the agent automatically generates session titles on its own (so Thurm does not
+    /// need to ask the agent to name the session at SessionStart).
+    pub native_titles: bool,
 }
 
 pub const AGENTS: &[HookAgent] = &[
@@ -51,6 +54,7 @@ pub const AGENTS: &[HookAgent] = &[
         settings: claude_settings,
         permission: claude_permission,
         context_json: false,
+        native_titles: true,
     },
     HookAgent {
         kind: "codex",
@@ -60,6 +64,7 @@ pub const AGENTS: &[HookAgent] = &[
         settings: codex_settings,
         permission: no_permission,
         context_json: false,
+        native_titles: false,
     },
     HookAgent {
         kind: "pi",
@@ -69,6 +74,7 @@ pub const AGENTS: &[HookAgent] = &[
         settings: pi_settings,
         permission: no_permission,
         context_json: false,
+        native_titles: false,
     },
     HookAgent {
         kind: "agy",
@@ -78,6 +84,7 @@ pub const AGENTS: &[HookAgent] = &[
         settings: agy_settings,
         permission: no_permission,
         context_json: false,
+        native_titles: true,
     },
 ];
 
@@ -679,6 +686,7 @@ mod tests {
             settings,
             permission,
             context_json: false,
+            native_titles: false,
         };
         assert_eq!(
             agent.settings_path(),
