@@ -37,33 +37,23 @@ fn ancestry(mut pid: u32) -> Vec<Proc> {
 
 /// The controlling terminal the agent itself runs on.
 ///
-/// Walking bottom-up (rather than taking the outermost ancestor's terminal) stays on the inner
-/// terminal when a PTY proxy (`atuin`, `script`) sits between the pane and the shell, while
-/// still stepping out of a child PTY an agent spawned only to run the hook.
-fn agent_tdev(chain: &[Proc], own: u32) -> Option<u32> {
-    let first = chain.first()?;
-    let Some(hook_tdev) = first.tdev else {
-        return chain.iter().skip(1).find_map(|p| p.tdev);
-    };
-    let hook_only_tty = chain
+/// Picking the nearest ancestor on a terminal that is neither a shell wrapper nor a PTY proxy
+/// (`atuin`, `script`) stays on the inner terminal behind a pane PTY proxy, while skipping
+/// hook-only child PTYs (whether the hook shares that child PTY or detached from it) and a
+/// `script` process an agent used to create one.
+fn agent_tdev(chain: &[Proc]) -> Option<u32> {
+    if let Some(td) = chain
         .iter()
         .skip(1)
-        .filter(|p| p.tdev == Some(hook_tdev))
-        .all(|p| p.shell && p.pgid == own);
-    if hook_only_tty
-        && let Some(parent) = chain
-            .iter()
-            .skip(1)
-            .find(|p| p.tdev.is_some_and(|t| t != hook_tdev))
-        && !parent.proxy
+        .find_map(|p| (!p.shell && !p.proxy).then_some(p.tdev).flatten())
     {
-        return parent.tdev;
+        return Some(td);
     }
-    Some(hook_tdev)
+    chain.iter().find_map(|p| p.tdev)
 }
 
 fn pick(chain: &[Proc], own: u32) -> u32 {
-    let Some(agent_tdev) = agent_tdev(chain, own) else {
+    let Some(agent_tdev) = agent_tdev(chain) else {
         return own;
     };
     let on_tty: Vec<&Proc> = chain
@@ -73,27 +63,35 @@ fn pick(chain: &[Proc], own: u32) -> u32 {
     let Some(first) = on_tty.first() else {
         return own;
     };
-    // Hook ran detached (`setsid`, no terminal) or in a child PTY: the nearest ancestor on the
-    // agent's terminal is the agent.
+    // Hook ran detached (`setsid`, no terminal) or in a child PTY: pick the nearest
+    // non-wrapper ancestor on the agent's terminal (skipping `sh -c` or `script` that
+    // launched the hook), else the nearest ancestor on it.
     if chain.first().and_then(|p| p.tdev) != Some(agent_tdev) {
-        return first.pgid;
+        return on_tty
+            .iter()
+            .find(|p| !p.shell && !p.proxy)
+            .map_or(first.pgid, |p| p.pgid);
     }
     // Hook shares the agent's terminal and is already in its foreground group.
     if first.tpgid == Some(first.pgid) {
         return first.pgid;
     }
-    // Hook ran in a background group on the agent's terminal (`setpgid(0, 0)`): if a non-shell
-    // ancestor holds the terminal's foreground, that is the agent that spawned it.
-    if let Some(fg) = on_tty.iter().find(|p| p.tpgid == Some(p.pgid) && !p.shell) {
+    // Hook ran in a background group on the agent's terminal (`setpgid(0, 0)`): if a non-shell,
+    // non-proxy ancestor holds the terminal's foreground, that is the agent that spawned it.
+    if let Some(fg) = on_tty
+        .iter()
+        .find(|p| p.tpgid == Some(p.pgid) && !p.shell && !p.proxy)
+    {
         return fg.pgid;
     }
-    // Backgrounded agent: if every ancestor sharing the hook's own group is a shell wrapper
-    // (`sh -c` under `setpgid`), the agent is the next group up on the agent's terminal.
+    // Backgrounded agent: if every ancestor sharing the hook's own group is a wrapper
+    // (`sh -c` or `script` under `setpgid`), the agent is the next group up on the agent's
+    // terminal.
     let wrapper_group = on_tty
         .iter()
         .skip(1)
         .filter(|p| p.pgid == own)
-        .all(|p| p.shell);
+        .all(|p| p.shell || p.proxy);
     if wrapper_group && let Some(parent) = on_tty.iter().find(|p| p.pgid != own) {
         return parent.pgid;
     }
@@ -271,6 +269,55 @@ mod tests {
             p(5, Some(PANE_TTY), Some(10), true),
         ];
         assert_eq!(pick(&chain, 30), 10);
+    }
+
+    #[test]
+    fn detached_hook_under_child_pty_resolves_to_agent() {
+        // Agent runs a hook shell in a child PTY, and that hook starts `thurm` with `setsid`.
+        let chain = vec![
+            p(40, None, None, false),
+            p(30, Some(CHILD_TTY), Some(30), true),
+            p(10, Some(PANE_TTY), Some(10), false),
+            p(5, Some(PANE_TTY), Some(10), true),
+        ];
+        assert_eq!(pick(&chain, 40), 10);
+
+        // Same when the shell itself runs behind a pane PTY proxy (`atuin`).
+        let proxied = vec![
+            p(40, None, None, false),
+            p(30, Some(CHILD_TTY), Some(30), true),
+            p(10, Some(PROXY_TTY), Some(10), false),
+            p(5, Some(PROXY_TTY), Some(10), true),
+            proxy(2, Some(PANE_TTY), Some(2)),
+            p(2, Some(PANE_TTY), Some(2), true),
+        ];
+        assert_eq!(pick(&proxied, 40), 10);
+    }
+
+    #[test]
+    fn script_launched_child_pty_hook_resolves_to_agent() {
+        // Agent invokes its hook through `script` to give the hook a child PTY.
+        let chain = vec![
+            p(30, Some(CHILD_TTY), Some(30), false),
+            p(30, Some(CHILD_TTY), Some(30), true),
+            proxy(20, Some(PANE_TTY), Some(10)),
+            p(10, Some(PANE_TTY), Some(10), false),
+            p(5, Some(PANE_TTY), Some(10), true),
+        ];
+        assert_eq!(pick(&chain, 30), 10);
+
+        // Same behind a pane PTY proxy (`atuin`), even if `script` runs in its own group while
+        // the agent is backgrounded.
+        let proxied_bg = vec![
+            p(30, Some(CHILD_TTY), Some(30), false),
+            p(30, Some(CHILD_TTY), Some(30), true),
+            proxy(20, Some(PROXY_TTY), Some(5)),
+            p(10, Some(PROXY_TTY), Some(5), false),
+            p(5, Some(PROXY_TTY), Some(5), true),
+            proxy(2, Some(PANE_TTY), Some(2)),
+            p(2, Some(PANE_TTY), Some(2), true),
+        ];
+        assert_eq!(pick(&proxied_bg, 30), 10);
     }
 
     #[test]
