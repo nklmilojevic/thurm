@@ -352,7 +352,12 @@ impl AgentTracker {
                 self.prompt.started();
                 h.status = AgentStatus::Working;
                 h.message = None;
-                h.turn_started.get_or_insert_with(Instant::now);
+                // Antigravity's PreInvocation fires before every model call in a turn.
+                if kind == "agy" {
+                    h.turn_started.get_or_insert_with(Instant::now);
+                } else {
+                    h.turn_started = Some(Instant::now());
+                }
                 self.ai.turn_seen = true;
                 // The message is the prompt here: the first one names the session.
                 if self.ai.prompt.is_none() {
@@ -1846,6 +1851,23 @@ mod tests {
                 .outcome(token, tracker.state().unwrap().status)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn prompt_submit_resets_turn_clock_except_for_repeated_antigravity_invocations() {
+        let past = Instant::now() - Duration::from_secs(5);
+
+        let mut claude = AgentTracker::default();
+        claude.apply_hook(Some(1), "claude", "Claude Code", "prompt-submit", None, None);
+        claude.hook.as_mut().unwrap().turn_started = Some(past);
+        claude.apply_hook(Some(1), "claude", "Claude Code", "prompt-submit", None, None);
+        assert!(claude.hook.as_ref().unwrap().turn_started.unwrap() > past);
+
+        let mut agy = AgentTracker::default();
+        agy.apply_hook(Some(1), "agy", "Antigravity", "prompt-submit", None, None);
+        agy.hook.as_mut().unwrap().turn_started = Some(past);
+        agy.apply_hook(Some(1), "agy", "Antigravity", "prompt-submit", None, None);
+        assert_eq!(agy.hook.as_ref().unwrap().turn_started, Some(past));
     }
 
     #[test]

@@ -86,6 +86,10 @@ export default function (pi) {
     ).trim();
   });
 
+  pi.on("session_info_changed", async (_event, ctx) => {
+    void enqueue("session-info", sessionPayload(ctx));
+  });
+
   pi.on("before_agent_start", async (event, ctx) => {
     working = true;
     const prompt =

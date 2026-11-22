@@ -91,6 +91,7 @@ pub const AGY_EVENTS: &[(&str, &str)] = &[
 /// Pi extension event → our event name.
 pub const PI_EVENTS: &[(&str, &str)] = &[
     ("session_start", "session-start"),
+    ("session_info_changed", "session-info"),
     ("before_agent_start", "prompt-submit"),
     ("ui_prompt_start", "notification"),
     ("ui_prompt_end", "tool-complete"),
@@ -152,7 +153,10 @@ impl HookAgent {
                         .is_none()
                         && dirs_home().join(".pi").is_dir())
             }
-            HookFormat::AntigravityHooks => dirs_home().join(".gemini/antigravity-cli").is_dir(),
+            HookFormat::AntigravityHooks => {
+                dirs_home().join(".gemini/antigravity-cli").is_dir()
+                    || dirs_home().join(".gemini/antigravity").is_dir()
+            }
         }
     }
 
@@ -411,15 +415,16 @@ fn write_pi_extension(agent: &HookAgent, path: &Path, install: bool) -> Result<W
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(io(e)),
     };
+    if existed && !is_ours_pi_extension(&current) {
+        let verb = if install { "replacing" } else { "removing" };
+        return Err(format!(
+            "{} exists and isn't Thurm's; not {verb} it",
+            path.display()
+        ));
+    }
     if !install {
         if !existed {
             return Ok(Written::Unchanged);
-        }
-        if !current.is_empty() && !is_ours_pi_extension(&current) {
-            return Err(format!(
-                "{} exists and isn't Thurm's; not removing it",
-                path.display()
-            ));
         }
         std::fs::remove_file(path).map_err(io)?;
         return Ok(Written::Changed);
@@ -785,7 +790,7 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(write_at(pi, &path, false).unwrap(), Written::Unchanged);
 
-        // A user's own thurm.js without our marker is left untouched.
+        // A user's own thurm.js without our marker is left untouched (including zero-byte files).
         std::fs::write(&path, "export default function () {}\n").unwrap();
         assert!(write_at(pi, &path, true).is_err());
         assert!(write_at(pi, &path, false).is_err());
@@ -793,6 +798,11 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "export default function () {}\n"
         );
+        std::fs::write(&path, "").unwrap();
+        assert!(write_at(pi, &path, true).is_err());
+        assert!(write_at(pi, &path, false).is_err());
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
