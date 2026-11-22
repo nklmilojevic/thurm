@@ -276,7 +276,7 @@ fn hooks_missing() -> bool {
 
 /// What an agent is told when its session starts in a Thurm pane (the SessionStart hook's
 /// output, which supported agents add to the session's context).
-pub fn session_context(pane: PaneId, cli: Option<&Path>) -> String {
+pub fn session_context(pane: PaneId, cli: Option<&Path>, name_session: bool) -> String {
     let mut out = format!(
         "You're running in a Thurm terminal pane.\n\n\
          ```text\nTHURM_PANE_ID={pane}\n```\n\n\
@@ -285,6 +285,14 @@ pub fn session_context(pane: PaneId, cli: Option<&Path>) -> String {
          commands in their own pane, read other panes' output, and wait for commands or other \
          agents. The thurm skill has the guide; if it isn't installed, run `thurm skill show`.\n"
     );
+    if name_session {
+        out.push_str(
+            "\nName this session once the user's first request identifies the work: run \
+             `thurm agent title \"<short title>\"` (2 to 5 words naming the task, e.g. \
+             `\"Fix login redirect\"`) without waiting to be asked. Skip greetings or vague \
+             messages, and update it if the task changes.\n",
+        );
+    }
     if let Some(cli) = cli {
         out.push_str(&format!(
             "\n`thurm` isn't on PATH here: run it as `{}`.\n",
@@ -442,11 +450,18 @@ mod tests {
 
     #[test]
     fn session_context_names_the_pane() {
-        let text = session_context(42, None);
+        let text = session_context(42, None, false);
         assert!(text.contains("THURM_PANE_ID=42"));
         assert!(text.contains("thurm skill show"));
+        assert!(!text.contains("thurm agent title"));
         assert!(!text.contains("isn't on PATH"));
-        let text = session_context(42, Some(Path::new("/opt/Thurm.app/Contents/Helpers/thurm")));
+        let named = session_context(42, None, true);
+        assert!(named.contains("thurm agent title"));
+        let text = session_context(
+            42,
+            Some(Path::new("/opt/Thurm.app/Contents/Helpers/thurm")),
+            false,
+        );
         assert!(text.contains("`/opt/Thurm.app/Contents/Helpers/thurm`"));
     }
 }

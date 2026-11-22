@@ -1,26 +1,36 @@
-//! Session titles and interrupts from Claude Code transcripts.
+//! Session titles and interrupts from agent transcripts and metadata files.
 //!
-//! Claude Code names every session: it appends `{"type":"ai-title","aiTitle":…}` lines to the
-//! session's JSONL transcript (and `{"type":"custom-title","customTitle":…}` for `/rename`).
-//! Pressing Esc mid-turn fires no hook, but appends a user entry with an
-//! `interruptedMessageId` ("[Request interrupted by user]").
-//! Hooks hand us the transcript path; we follow the file incrementally so each poll only
-//! reads what was appended since the last one.
+//! - Claude Code appends `{"type":"ai-title","aiTitle":…}` and
+//!   `{"type":"custom-title","customTitle":…}` lines to the session's JSONL transcript, and
+//!   records user interrupts as a user entry with `interruptedMessageId`.
+//! - Pi appends `{"type":"session_info","name":…}` to its JSONL transcript when named.
+//! - Antigravity (`agy`) writes generated and renamed titles as `title:"…"` in
+//!   `<app_data_dir>/annotations/<conversationId>.pbtxt`.
+//!
+//! Hooks hand us the transcript path (and session id); we follow JSONL files incrementally and
+//! re-read `.pbtxt` files when their metadata changes.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
 /// Longest title we keep, in characters.
 const MAX_TITLE: usize = 60;
+/// Maximum bytes read from a `.pbtxt` annotation file.
+const MAX_PBTXT_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct TitleReader {
     path: PathBuf,
-    /// Bytes consumed so far (always at a line boundary).
+    /// Bytes consumed so far (JSONL: at a line boundary; `.pbtxt`: last read size).
     offset: u64,
+    /// Last observed mtime for rewritten files (`.pbtxt`).
+    modified: Option<SystemTime>,
+    /// Whether a `.pbtxt` file has been read at least once.
+    pbtxt_read: bool,
     custom: Option<String>,
     ai: Option<String>,
     /// The user interrupted a turn since the last [`TitleReader::take_interrupted`].
@@ -44,23 +54,64 @@ enum Entry {
     },
 }
 
+/// Path to Antigravity's per-conversation annotation file (`annotations/<conversationId>.pbtxt`),
+/// derived from the hook's `transcriptPath` (parent of `brain/`) or `~/.gemini/antigravity-cli`.
+pub fn agy_annotation_path(
+    transcript_path: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<PathBuf> {
+    let id = session_id?.trim();
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return None;
+    }
+    let app_dir = transcript_path
+        .and_then(|p| {
+            Path::new(p)
+                .ancestors()
+                .find(|a| a.file_name().and_then(|n| n.to_str()) == Some("brain"))
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+        .or_else(default_agy_app_dir)?;
+    Some(app_dir.join("annotations").join(format!("{id}.pbtxt")))
+}
+
+fn default_agy_app_dir() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let cli = home.join(".gemini/antigravity-cli");
+    if cli.is_dir() {
+        return Some(cli);
+    }
+    let app = home.join(".gemini/antigravity");
+    if app.is_dir() {
+        return Some(app);
+    }
+    Some(cli)
+}
+
 impl TitleReader {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             offset: 0,
+            modified: None,
+            pbtxt_read: false,
             custom: None,
             ai: None,
             interrupted: false,
         }
     }
 
-    pub fn is(&self, path: &str) -> bool {
-        self.path.as_os_str() == path
+    pub fn is(&self, path: &Path) -> bool {
+        self.path == path
     }
 
-    pub fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn is_pbtxt(&self) -> bool {
+        self.path.extension().and_then(|e| e.to_str()) == Some("pbtxt")
     }
 
     /// The session's title: the user's `/rename` name, else the generated one.
@@ -73,8 +124,40 @@ impl TitleReader {
         std::mem::take(&mut self.interrupted)
     }
 
-    /// Read what was appended since the last call. A partial last line is left for next time.
+    /// Read what changed since the last call. A partial last JSONL line is left for next time.
     pub fn poll(&mut self) {
+        let Ok(meta) = std::fs::metadata(&self.path) else {
+            return;
+        };
+        let len = meta.len();
+        if self.is_pbtxt() {
+            let modified = meta.modified().ok();
+            // Skip re-reading a settled `.pbtxt` whose size and mtime haven't moved; re-read
+            // files touched within the last 2 s so same-length renames inside one mtime tick
+            // are still picked up.
+            if self.pbtxt_read
+                && self.offset == len
+                && self.modified == modified
+                && modified.is_some_and(|m| m.elapsed().is_ok_and(|e| e > Duration::from_secs(2)))
+            {
+                return;
+            }
+            let Ok(f) = File::open(&self.path) else {
+                return;
+            };
+            let mut text = String::new();
+            if f.take(MAX_PBTXT_BYTES).read_to_string(&mut text).is_err() {
+                return;
+            }
+            self.offset = len;
+            self.modified = modified;
+            self.pbtxt_read = true;
+            self.ai = parse_pbtxt_title(&text);
+            return;
+        }
+        if len == self.offset {
+            return;
+        }
         let Ok(mut f) = File::open(&self.path) else {
             return;
         };
@@ -123,8 +206,106 @@ impl TitleReader {
     }
 }
 
+/// Extract `title:"…"` from a protobuf text-format annotation file.
+fn parse_pbtxt_title(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let rest = line.trim_start();
+        let Some(rest) = rest.strip_prefix("title") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(raw) = unescape_pbtxt_string(rest) else {
+            continue;
+        };
+        return clean(&raw);
+    }
+    None
+}
+
+/// Parse one double-quoted protobuf text-format string literal (with standard C/octal escapes).
+fn unescape_pbtxt_string(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return String::from_utf8(out).ok(),
+            b'\\' => {
+                i += 1;
+                let &esc = bytes.get(i)?;
+                match esc {
+                    b'"' | b'\'' | b'\\' => {
+                        out.push(esc);
+                        i += 1;
+                    }
+                    b'n' => {
+                        out.push(b'\n');
+                        i += 1;
+                    }
+                    b'r' => {
+                        out.push(b'\r');
+                        i += 1;
+                    }
+                    b't' => {
+                        out.push(b'\t');
+                        i += 1;
+                    }
+                    b'0'..=b'7' => {
+                        let mut val = 0u16;
+                        for _ in 0..3 {
+                            match bytes.get(i) {
+                                Some(&d @ b'0'..=b'7') => {
+                                    val = (val << 3) | u16::from(d - b'0');
+                                    i += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        out.push(val as u8);
+                    }
+                    b'x' | b'X' => {
+                        i += 1;
+                        let mut val = 0u8;
+                        let mut digits = 0;
+                        while digits < 2 {
+                            match bytes.get(i).and_then(|&b| (b as char).to_digit(16)) {
+                                Some(d) => {
+                                    val = (val << 4) | (d as u8);
+                                    i += 1;
+                                    digits += 1;
+                                }
+                                None => break,
+                            }
+                        }
+                        if digits == 0 {
+                            return None;
+                        }
+                        out.push(val);
+                    }
+                    other => {
+                        out.push(other);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 /// One line, trimmed, control characters dropped, capped at [`MAX_TITLE`].
-fn clean(title: &str) -> Option<String> {
+pub(crate) fn clean(title: &str) -> Option<String> {
     let t: String = title
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -242,6 +423,46 @@ mod tests {
         assert!(r.take_interrupted());
         assert!(!r.take_interrupted(), "reported once");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reads_and_updates_pbtxt_annotations() {
+        let path =
+            std::env::temp_dir().join(format!("thurm-annotation-{}.pbtxt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut r = TitleReader::new(&path);
+        r.poll();
+        assert_eq!(r.title(), None);
+
+        std::fs::write(&path, "title:\"Fix \\\"quoted\\\" \\303\\251 title\"\n").unwrap();
+        r.poll();
+        assert_eq!(r.title(), Some("Fix \"quoted\" é title"));
+
+        // Same-length in-place rename is picked up immediately.
+        std::fs::write(&path, "title:\"Rename A\"\n").unwrap();
+        r.poll();
+        assert_eq!(r.title(), Some("Rename A"));
+        std::fs::write(&path, "title:\"Rename B\"\n").unwrap();
+        r.poll();
+        assert_eq!(r.title(), Some("Rename B"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn derives_agy_annotation_path_from_transcript() {
+        let p = agy_annotation_path(
+            Some("/tmp/antigravity-cli/brain/abc-123/.system_generated/logs/transcript.jsonl"),
+            Some("abc-123"),
+        );
+        assert_eq!(
+            p,
+            Some(PathBuf::from(
+                "/tmp/antigravity-cli/annotations/abc-123.pbtxt"
+            ))
+        );
+        assert_eq!(agy_annotation_path(None, Some("../escape")), None);
+        assert_eq!(agy_annotation_path(None, Some("")), None);
     }
 
     #[test]

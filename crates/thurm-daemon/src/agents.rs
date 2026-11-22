@@ -42,6 +42,8 @@ pub struct AgentTracker {
     title_spun: Option<(Option<u32>, String)>,
     /// Show the transcript's session title as the topic (`agents.session_titles`).
     pub titles: bool,
+    /// Session title reported directly by the agent (`thurm agent title`).
+    session_title: Option<String>,
     /// Bumped whenever the agent or its status changes: what the model said about one
     /// status (a request, a finished turn) must not stick to the next.
     episode: u64,
@@ -120,6 +122,13 @@ struct HookState {
 }
 
 impl AgentTracker {
+    pub fn with_titles(titles: bool) -> Self {
+        Self {
+            titles,
+            ..Self::default()
+        }
+    }
+
     pub fn state(&self) -> Option<&AgentState> {
         self.current.as_ref()
     }
@@ -225,6 +234,7 @@ impl AgentTracker {
         status: bool,
         tail: &str,
         program_title: Option<&str>,
+        cwd: Option<&str>,
     ) -> Vec<AiWant> {
         let Some(state) = self.current.as_ref().filter(|_| !self.from_program) else {
             return Vec::new();
@@ -237,7 +247,7 @@ impl AgentTracker {
             && !self.ai.title_pending
             && self.ai.title_attempts < 3
             && state.status != AgentStatus::Working
-            && generic_title(program_title, state)
+            && generic_title(program_title, state, cwd)
         {
             self.ai.title_pending = true;
             self.ai.title_attempts += 1;
@@ -305,9 +315,14 @@ impl AgentTracker {
         session_id: Option<String>,
         message: Option<String>,
     ) {
+        if event == "session-title" {
+            self.session_title = message.as_deref().and_then(crate::transcript::clean);
+            return;
+        }
         if matches!(event, "session-start" | "session-end") {
             self.prompt.reset();
             self.session_started = true;
+            self.session_title = None;
         }
         if event == "session-end" {
             self.hook = None;
@@ -403,16 +418,24 @@ impl AgentTracker {
         }
     }
 
-    /// Follow the hooked session's transcript for its title (`None` stops showing it).
+    /// Follow the hooked session's transcript or metadata file for its title (`None` stops
+    /// showing it).
     pub fn read_transcript(&mut self, path: Option<&str>) {
         let Some(h) = &mut self.hook else { return };
-        let Some(path) = path else {
-            h.transcript = None;
+        let resolved = if h.kind == "agy" {
+            crate::transcript::agy_annotation_path(path, h.session_id.as_deref())
+        } else {
+            path.map(std::path::PathBuf::from)
+        };
+        let Some(target) = resolved else {
+            if path.is_none() {
+                h.transcript = None;
+            }
             return;
         };
         // A new path means a new session (`/clear`, `/resume`): its own title.
-        if !h.transcript.as_ref().is_some_and(|t| t.is(path)) {
-            h.transcript = Some(TitleReader::new(path));
+        if !h.transcript.as_ref().is_some_and(|t| t.is(&target)) {
+            h.transcript = Some(TitleReader::new(target));
         }
         if let Some(t) = &mut h.transcript {
             t.poll();
@@ -421,18 +444,21 @@ impl AgentTracker {
         }
     }
 
-    /// Esc fires no hook: a turn the user interrupted only shows up in the transcript.
-    fn check_interrupt(&mut self) {
+    /// Poll the hooked session's transcript/metadata file for new titles (generated
+    /// asynchronously or via `/rename`) and, while working, Esc interrupts.
+    fn poll_transcript(&mut self) {
         let Some(h) = &mut self.hook else { return };
-        if h.status != AgentStatus::Working {
+        if !self.titles && h.status != AgentStatus::Working {
             return;
         }
         let Some(t) = &mut h.transcript else { return };
         t.poll();
-        if t.take_interrupted() {
+        if h.status == AgentStatus::Working && t.take_interrupted() {
             h.status = AgentStatus::Idle;
             h.message = None;
             h.turn_started = None;
+        } else {
+            t.take_interrupted();
         }
     }
 
@@ -517,10 +543,16 @@ impl AgentTracker {
         state
     }
 
-    /// What the model added: a title when the agent gave none, the current episode's detail.
+    /// What the agent or model added: a title when the transcript gave none, the current
+    /// episode's detail.
     fn with_ai(&self, mut state: AgentState) -> AgentState {
         if state.topic.is_none() {
-            state.topic = self.ai.topic.clone();
+            state.topic = self
+                .session_title
+                .as_ref()
+                .filter(|_| self.titles)
+                .cloned()
+                .or_else(|| self.ai.topic.clone());
         }
         // Computed before `set` bumps the episode: the status tells a new one apart.
         if let Some((episode, status, text)) = &self.ai.detail
@@ -611,7 +643,7 @@ impl AgentTracker {
         idle: Duration,
         idle_after: Duration,
     ) -> Option<Option<AgentState>> {
-        self.check_interrupt();
+        self.poll_transcript();
         self.fg_pgrp = fg.map(|p| p.pid);
         let def = fg.and_then(|p| defs.iter().find(|d| d.matches(&p.name, &p.argv)));
         // Hooked agent running under a process name we don't know (a wrapper, `node …`):
@@ -700,6 +732,7 @@ impl AgentTracker {
             // The next agent here is a new session.
             if self.current.is_some() {
                 self.ai = AiNotes::default();
+                self.session_title = None;
             }
             // The hooked agent left the foreground: its session is over for this pane, but
             // keep the id for resume until another agent reports.
@@ -750,11 +783,59 @@ fn is_idle_reminder(message: &str) -> bool {
         .contains("waiting for your input")
 }
 
-/// Whether the title the agent set says nothing about the session ("✳ Claude Code", none).
-pub fn generic_title(title: Option<&str>, agent: &AgentState) -> bool {
+/// Whether the title the pane shows says nothing about the session ("✳ Claude Code",
+/// shell-set "agy ~/d/p/thurm", Pi's untitled "π - thurm", none).
+pub fn generic_title(title: Option<&str>, agent: &AgentState, cwd: Option<&str>) -> bool {
     let Some(t) = title else { return true };
     let t = t.trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
-    t.is_empty() || t.eq_ignore_ascii_case(&agent.name) || t.eq_ignore_ascii_case(&agent.kind)
+    if t.is_empty()
+        || t.eq_ignore_ascii_case(&agent.name)
+        || t.eq_ignore_ascii_case(&agent.kind)
+        || (agent.kind == "pi" && t == "π")
+    {
+        return true;
+    }
+    // Pi sets `π - <cwdBasename>` when unnamed, vs `π - <sessionName> - <cwdBasename>` when named.
+    if agent.kind == "pi"
+        && let Some(rest) = t
+            .strip_prefix("π - ")
+            .or_else(|| strip_prefix_ignore_ascii_case(t, "pi - "))
+        && !rest.contains(" - ")
+    {
+        return true;
+    }
+    // Shells like fish set `<command> <cwd>` (e.g. `agy ~/d/p/thurm`, `pi ~/d/p/thurm`) and
+    // agents that don't overwrite the window title leave it there.
+    let rest = strip_prefix_ignore_ascii_case(t, &agent.kind)
+        .or_else(|| strip_prefix_ignore_ascii_case(t, &agent.name))
+        .and_then(|r| {
+            let trimmed = r.trim_start();
+            (trimmed.len() < r.len()).then_some(trimmed)
+        });
+    if let Some(rest) = rest {
+        if rest.is_empty()
+            || rest == "~"
+            || rest == "."
+            || rest == ".."
+            || rest.starts_with("~/")
+            || rest.starts_with('/')
+        {
+            return true;
+        }
+        if let Some(cwd) = cwd {
+            let base = cwd.rsplit('/').find(|s| !s.is_empty()).unwrap_or(cwd);
+            if rest == cwd || rest == base {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
 }
 
 pub fn screen_hash(text: &str) -> u64 {
@@ -1374,7 +1455,7 @@ mod tests {
         let codex = proc("codex");
         t.update(&defs, Some(&codex), "> ", quiet, idle_after);
         // Nothing typed yet: the welcome screen names no task.
-        assert!(t.ai_wants(true, false, "> ", None).is_empty());
+        assert!(t.ai_wants(true, false, "> ", None, None).is_empty());
         t.user_input();
         t.update(
             &defs,
@@ -1384,20 +1465,23 @@ mod tests {
             idle_after,
         );
         // Not while the turn runs.
-        assert!(t.ai_wants(true, false, "", None).is_empty());
+        assert!(t.ai_wants(true, false, "", None, None).is_empty());
         t.update(&defs, Some(&codex), "> done", quiet, idle_after);
         // The agent's own title names the task: nothing to add.
-        assert!(t.ai_wants(true, false, "", Some("⠋ Fix login")).is_empty());
+        assert!(
+            t.ai_wants(true, false, "", Some("⠋ Fix login"), None)
+                .is_empty()
+        );
         assert_eq!(
-            t.ai_wants(true, false, "", Some("codex")),
+            t.ai_wants(true, false, "", Some("codex"), None),
             vec![AiWant::Title { prompt: None }]
         );
         // Asked once.
-        assert!(t.ai_wants(true, false, "", None).is_empty());
+        assert!(t.ai_wants(true, false, "", None, None).is_empty());
         t.set_ai_topic(Some("Fix login bug".into()));
         let s = t.refresh().unwrap().unwrap();
         assert_eq!(s.topic.as_deref(), Some("Fix login bug"));
-        assert!(t.ai_wants(true, false, "", None).is_empty());
+        assert!(t.ai_wants(true, false, "", None, None).is_empty());
         // A new agent session starts without it.
         t.update(&defs, Some(&proc("zsh")), "", quiet, idle_after);
         let s = t.update(&defs, Some(&codex), "> ", quiet, idle_after);
@@ -1427,14 +1511,14 @@ mod tests {
         t.apply_hook(Some(1), "codex", "Codex", "stop", None, None);
         t.refresh();
         assert_eq!(
-            t.ai_wants(true, false, "", None),
+            t.ai_wants(true, false, "", None, None),
             vec![AiWant::Title {
                 prompt: Some("add CSV export".into())
             }]
         );
         // No task seen: tried again after the next turn.
         t.set_ai_topic(None);
-        assert!(t.ai_wants(true, false, "", None).is_empty());
+        assert!(t.ai_wants(true, false, "", None, None).is_empty());
         t.apply_hook(
             Some(1),
             "codex",
@@ -1447,7 +1531,7 @@ mod tests {
         t.refresh();
         // The first prompt still names the session.
         assert_eq!(
-            t.ai_wants(true, false, "", None),
+            t.ai_wants(true, false, "", None, None),
             vec![AiWant::Title {
                 prompt: Some("add CSV export".into())
             }]
@@ -1471,7 +1555,7 @@ mod tests {
         assert_eq!(t.state().unwrap().message, None);
 
         // The model and the status check use the same current activity.
-        let wants = t.ai_wants(false, true, completed, None);
+        let wants = t.ai_wants(false, true, completed, None, None);
         let [AiWant::Status { hash }] = wants[..] else {
             panic!("{wants:?}")
         };
@@ -1510,24 +1594,24 @@ mod tests {
         let screen = "Run `cargo test`? Press y to allow, n to deny";
         let s = t.update(&defs, Some(&codex), screen, quiet, idle_after);
         assert_eq!(s.unwrap().unwrap().status, AgentStatus::Idle);
-        let wants = t.ai_wants(false, true, screen, None);
+        let wants = t.ai_wants(false, true, screen, None, None);
         let [AiWant::Status { hash }] = wants[..] else {
             panic!("{wants:?}")
         };
         assert_eq!(hash, screen_hash(screen));
         // Once per screen.
-        assert!(t.ai_wants(false, true, screen, None).is_empty());
+        assert!(t.ai_wants(false, true, screen, None, None).is_empty());
         t.set_ai_waiting(hash, true);
         let s = t.update(&defs, Some(&codex), screen, quiet, idle_after);
         assert_eq!(s.unwrap().unwrap().status, AgentStatus::NeedsInput);
         // Another screen: back to the patterns, and a new question.
         let s = t.update(&defs, Some(&codex), "> ", quiet, idle_after);
         assert_eq!(s.unwrap().unwrap().status, AgentStatus::Idle);
-        assert_eq!(t.ai_wants(false, true, "> ", None).len(), 1);
+        assert_eq!(t.ai_wants(false, true, "> ", None, None).len(), 1);
         // Off: never asked.
         let mut t = AgentTracker::default();
         t.update(&defs, Some(&codex), screen, quiet, idle_after);
-        assert!(t.ai_wants(false, false, screen, None).is_empty());
+        assert!(t.ai_wants(false, false, screen, None, None).is_empty());
     }
 
     #[test]
@@ -1708,11 +1792,11 @@ mod tests {
 
     #[test]
     fn generic_titles() {
-        let a = AgentState {
+        let agent = |kind: &str, name: &str| AgentState {
             updated_at_ms: None,
             status_since_ms: None,
-            name: "Claude Code".into(),
-            kind: "claude".into(),
+            name: name.into(),
+            kind: kind.into(),
             status: AgentStatus::Idle,
             session_id: None,
             message: None,
@@ -1722,10 +1806,38 @@ mod tests {
             topic: None,
             permission: None,
         };
-        assert!(generic_title(None, &a));
-        assert!(generic_title(Some("✳ Claude Code"), &a));
-        assert!(generic_title(Some("claude"), &a));
-        assert!(!generic_title(Some("✳ Fix login bug"), &a));
+        let claude = agent("claude", "Claude Code");
+        assert!(generic_title(None, &claude, None));
+        assert!(generic_title(Some("✳ Claude Code"), &claude, None));
+        assert!(generic_title(Some("claude"), &claude, None));
+        assert!(!generic_title(Some("✳ Fix login bug"), &claude, None));
+
+        // Shell-set `<cmd> <cwd>` titles (fish) are generic.
+        let agy = agent("agy", "Antigravity");
+        assert!(generic_title(Some("agy ~/d/p/thurm"), &agy, None));
+        assert!(generic_title(Some("agy /Users/me/thurm"), &agy, None));
+        assert!(generic_title(Some("agy ~"), &agy, None));
+        assert!(generic_title(
+            Some("agy thurm"),
+            &agy,
+            Some("/Users/me/thurm")
+        ));
+        assert!(!generic_title(
+            Some("agy Fix login bug"),
+            &agy,
+            Some("/Users/me/thurm")
+        ));
+
+        // Pi's untitled `π - <cwd>` vs named `π - <session> - <cwd>`.
+        let pi = agent("pi", "Pi");
+        assert!(generic_title(Some("π"), &pi, None));
+        assert!(generic_title(Some("π - thurm"), &pi, None));
+        assert!(generic_title(Some("pi ~/d/p/thurm"), &pi, None));
+        assert!(!generic_title(
+            Some("π - Fix login bug - thurm"),
+            &pi,
+            Some("/Users/me/thurm")
+        ));
     }
 
     #[test]
@@ -1913,6 +2025,164 @@ mod tests {
         assert_eq!(h.status, AgentStatus::Idle);
         assert_eq!(h.message, None);
         assert_eq!(h.session_id.as_deref(), Some("/tmp/s.jsonl"));
+    }
+
+    #[test]
+    fn agy_annotation_titles_update_while_working_and_idle() {
+        let defs = thurm_config::builtin_agents();
+        let root = std::env::temp_dir().join(format!("thurm-agy-ann-{}", std::process::id()));
+        let ann_dir = root.join("annotations");
+        let transcript = root.join("brain/conv-1/.system_generated/logs/transcript.jsonl");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&ann_dir).unwrap();
+
+        let mut t = AgentTracker {
+            titles: true,
+            ..Default::default()
+        };
+        let agy = proc("agy");
+        let idle_after = Duration::from_millis(1500);
+        let quiet = Duration::from_secs(5);
+
+        t.saw_foreground(Some(1));
+        t.apply_hook(
+            Some(1),
+            "agy",
+            "Antigravity",
+            "session-start",
+            Some("conv-1".into()),
+            None,
+        );
+        t.read_transcript(Some(transcript.to_str().unwrap()));
+        t.update(&defs, Some(&agy), "", quiet, idle_after);
+        assert_eq!(t.state().unwrap().topic, None);
+
+        // Antigravity writes the annotation file after the session starts (even while idle/done).
+        let ann = ann_dir.join("conv-1.pbtxt");
+        std::fs::write(&ann, "title:\"Fix tab session names\"\n").unwrap();
+        let next = t.update(&defs, Some(&agy), "", quiet, idle_after);
+        assert_eq!(
+            next.unwrap().unwrap().topic.as_deref(),
+            Some("Fix tab session names")
+        );
+
+        // Renaming updates the topic without needing another hook.
+        std::fs::write(&ann, "title:\"Renamed session\"\n").unwrap();
+        let next = t.update(&defs, Some(&agy), "", quiet, idle_after);
+        assert_eq!(
+            next.unwrap().unwrap().topic.as_deref(),
+            Some("Renamed session")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_title_hook_sets_clears_and_yields_to_transcript() {
+        let defs = thurm_config::builtin_agents();
+        let path = std::env::temp_dir().join(format!(
+            "thurm-pi-session-title-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "").unwrap();
+
+        let mut t = AgentTracker {
+            titles: true,
+            ..Default::default()
+        };
+        let pi = proc("pi");
+        let idle_after = Duration::from_millis(1500);
+        let quiet = Duration::from_secs(5);
+
+        t.saw_foreground(Some(1));
+        t.apply_hook(
+            Some(1),
+            "pi",
+            "Pi",
+            "session-start",
+            Some(path.to_string_lossy().into_owned()),
+            None,
+        );
+        t.read_transcript(Some(path.to_str().unwrap()));
+        t.update(&defs, Some(&pi), "", quiet, idle_after);
+        assert_eq!(t.state().unwrap().topic, None);
+
+        // Agent names itself via `thurm agent title` without disturbing hook state.
+        t.apply_hook(
+            None,
+            "",
+            "",
+            "session-title",
+            None,
+            Some("Fix login redirect".into()),
+        );
+        let next = t.refresh().unwrap().unwrap();
+        assert_eq!(next.topic.as_deref(), Some("Fix login redirect"));
+        assert_eq!(next.kind, "pi");
+        assert!(next.hooked);
+
+        // Updating works immediately.
+        t.apply_hook(
+            None,
+            "",
+            "",
+            "session-title",
+            None,
+            Some("Add redirect tests".into()),
+        );
+        assert_eq!(
+            t.refresh().unwrap().unwrap().topic.as_deref(),
+            Some("Add redirect tests")
+        );
+
+        // An explicit `/name` in Pi's transcript takes precedence.
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_info\",\"id\":\"a\",\"name\":\"Manual name\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            t.update(&defs, Some(&pi), "", quiet, idle_after)
+                .unwrap()
+                .unwrap()
+                .topic
+                .as_deref(),
+            Some("Manual name")
+        );
+
+        // Clearing `/name` falls back to the agent-reported session title; clearing that removes it.
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_info\",\"id\":\"b\",\"name\":\"\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            t.update(&defs, Some(&pi), "", quiet, idle_after)
+                .unwrap()
+                .unwrap()
+                .topic
+                .as_deref(),
+            Some("Add redirect tests")
+        );
+        t.apply_hook(None, "", "", "session-title", None, None);
+        assert_eq!(t.refresh().unwrap().unwrap().topic, None);
+
+        // Exiting the agent clears any remaining session title.
+        t.apply_hook(
+            None,
+            "",
+            "",
+            "session-title",
+            None,
+            Some("Temporary title".into()),
+        );
+        t.refresh();
+        t.update(&defs, Some(&proc("fish")), "", quiet, idle_after);
+        let next = t.update(&defs, Some(&pi), "", quiet, idle_after);
+        assert_eq!(next.unwrap().unwrap().topic, None);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
