@@ -703,10 +703,12 @@ fn agent_hook(agent: Option<String>, event: Option<String>) {
         pane,
         agent,
         event,
-        session_id: field("session_id"),
+        session_id: field("session_id").or_else(|| field("conversationId")),
         // The prompt, on prompt-submit: it names the session when the agent doesn't.
-        message: field("message").or_else(|| field("prompt")),
-        transcript_path: field("transcript_path"),
+        message: field("message")
+            .or_else(|| field("prompt"))
+            .or_else(|| field("lastUserInput")),
+        transcript_path: field("transcript_path").or_else(|| field("transcriptPath")),
         pgrp: Some(hook_pgrp::agent_pgrp()),
     });
 }
@@ -729,7 +731,7 @@ fn hooks_cmd(action: &str, only: Option<&str>, json: bool) -> R {
     let mut seen = 0;
     for agent in agents {
         let path = agent.settings_path();
-        let present = path.parent().is_some_and(|d| d.is_dir());
+        let present = agent.is_present();
         // Without --agent, skip agents that aren't installed (no config directory).
         if only.is_none() && !present && !(json && action == "status") {
             continue;
@@ -773,7 +775,7 @@ fn hooks_cmd(action: &str, only: Option<&str>, json: bool) -> R {
     if seen == 0 {
         // Nothing was said otherwise: an agent that never ran has no config directory yet.
         eprintln!(
-            "thurm: no agent found (no ~/.claude or ~/.codex); run the agent once, or pass --agent claude"
+            "thurm: no agent found (no ~/.claude, ~/.codex, ~/.pi or ~/.gemini/antigravity-cli); run the agent once, or pass --agent claude"
         );
         return Ok(ExitCode::FAILURE);
     }

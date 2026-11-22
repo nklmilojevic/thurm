@@ -34,6 +34,8 @@ enum Entry {
     AiTitle { ai_title: String },
     #[serde(rename = "custom-title", rename_all = "camelCase")]
     CustomTitle { custom_title: String },
+    #[serde(rename = "session_info")]
+    SessionInfo { name: Option<String> },
     #[serde(rename = "user", rename_all = "camelCase")]
     User {
         interrupted_message_id: Option<serde::de::IgnoredAny>,
@@ -102,12 +104,15 @@ impl TitleReader {
     fn consume(&mut self, line: &[u8]) {
         // Most lines are large messages; only parse the ones that can be titles or interrupts.
         let has = |needle: &[u8]| line.windows(needle.len()).any(|w| w == needle);
-        if !has(b"-title\"") && !has(b"\"interruptedMessageId\"") {
+        if !has(b"-title\"") && !has(b"\"session_info\"") && !has(b"\"interruptedMessageId\"") {
             return;
         }
         match serde_json::from_slice::<Entry>(line) {
             Ok(Entry::AiTitle { ai_title }) => self.ai = clean(&ai_title).or(self.ai.take()),
             Ok(Entry::CustomTitle { custom_title }) => self.custom = clean(&custom_title),
+            Ok(Entry::SessionInfo { name }) => {
+                self.custom = name.as_deref().and_then(clean);
+            }
             // A subagent's interrupt does not end the main turn.
             Ok(Entry::User {
                 interrupted_message_id: Some(_),
@@ -188,6 +193,20 @@ mod tests {
         );
         r.poll();
         assert_eq!(r.title(), Some("auth work"));
+
+        // Pi's session_info updates or clears the custom title.
+        append(
+            &path,
+            "{\"type\":\"session_info\",\"id\":\"a\",\"name\":\"Refactor auth\"}\n",
+        );
+        r.poll();
+        assert_eq!(r.title(), Some("Refactor auth"));
+        append(
+            &path,
+            "{\"type\":\"session_info\",\"id\":\"b\",\"name\":\"\"}\n",
+        );
+        r.poll();
+        assert_eq!(r.title(), Some("Other"));
 
         // Truncation restarts from the top.
         std::fs::write(&path, "{\"type\":\"ai-title\",\"aiTitle\":\"New\"}\n").unwrap();

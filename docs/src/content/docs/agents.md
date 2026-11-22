@@ -22,25 +22,30 @@ or add support for another agent.
 
 ## Install hooks
 
-Claude Code and Codex hooks provide turn completion events and session IDs.
-Check and install them with:
+Claude Code, Codex, Pi, and Antigravity (`agy`) hooks provide turn completion
+events and session IDs. Check and install them with:
 
 ```sh
 thurm hooks status
 thurm hooks install --agent claude
 thurm hooks install --agent codex
+thurm hooks install --agent pi
+thurm hooks install --agent agy
 ```
 
-These commands change the agent configuration files. Without `--agent`, Thurm
-selects supported agents whose configuration directories exist. Use
-`thurm hooks uninstall --agent codex` or `--agent claude` to remove Thurm hooks.
-Run agents inside Thurm so their processes inherit `THURM_PANE_ID`.
+These commands change the agent configuration files (for Pi, Thurm installs an
+extension at `~/.pi/agent/extensions/thurm.js`; for Antigravity, Thurm adds a
+`"thurm"` hook group in `~/.gemini/config/hooks.json`). Without `--agent`,
+Thurm selects supported agents whose configuration directories exist. Use
+`thurm hooks uninstall --agent claude`, `--agent codex`, `--agent pi`, or
+`--agent agy` to remove Thurm hooks. Run agents inside Thurm so their processes
+inherit `THURM_PANE_ID`.
 
-You rarely need to run these yourself. When Thurm launches `claude` or `codex`
-and its hooks are missing, the daemon adds them first, keeping a backup of the
-file (`settings.json.thurm-backup`). This includes agents installed after
-Thurm, on this Mac or on a remote host. Set `agents.install_hooks = false` to
-turn it off.
+You rarely need to run these yourself. When Thurm launches `claude`, `codex`,
+`pi`, or `agy` and its hooks are missing, the daemon adds them first, keeping a
+backup of JSON settings files (`settings.json.thurm-backup` or
+`hooks.json.thurm-backup`). This includes agents installed after Thurm, on this
+Mac or on a remote host. Set `agents.install_hooks = false` to turn it off.
 
 When a session starts, the hook also tells the agent which pane it runs in and
 that the `thurm` CLI can drive Thurm.
@@ -52,7 +57,7 @@ screen information, which cannot provide the same completion signal.
 ## Resume and fork
 
 With hooks and a known session ID, use `thurm fork --split right` from a Claude
-Code or Codex pane to create a separate branch of the agent session.
+Code, Codex, or Pi pane to create a separate branch of the agent session.
 Use `--pane ID` to select another source pane. Without `--split`, the fork
 opens in a new tab. The installed agent must support its configured fork command.
 
@@ -97,8 +102,9 @@ read their output, and wait for commands and other agents. Install it with:
 thurm skill setup
 ```
 
-It goes to `~/.claude/skills/thurm` for Claude Code, and to
-`~/.agents/skills/thurm` for Codex, OpenCode and Pi. The skill only tells the
+It goes to `~/.claude/skills/thurm` for Claude Code, `~/.agents/skills/thurm`
+for Codex, OpenCode and Pi, and `~/.gemini/config/skills/thurm` for
+Antigravity. The skill only tells the
 agent to run `thurm skill show`, which prints the guide for the installed
 version, so upgrading Thurm updates it. `thurm skill status` shows where it is
 installed, `thurm skill remove` removes it, and **Thurm > Integrations** does

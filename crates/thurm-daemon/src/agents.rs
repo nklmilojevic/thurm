@@ -352,7 +352,7 @@ impl AgentTracker {
                 self.prompt.started();
                 h.status = AgentStatus::Working;
                 h.message = None;
-                h.turn_started = Some(Instant::now());
+                h.turn_started.get_or_insert_with(Instant::now);
                 self.ai.turn_seen = true;
                 // The message is the prompt here: the first one names the session.
                 if self.ai.prompt.is_none() {
