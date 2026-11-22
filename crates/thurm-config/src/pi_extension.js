@@ -127,8 +127,7 @@ export default function (pi) {
   });
 
   pi.on("ui_prompt_end", async (_event, ctx) => {
-    if (!working) return;
-    void enqueue("tool-complete", sessionPayload(ctx));
+    void enqueue(working ? "tool-complete" : "idle", sessionPayload(ctx));
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {

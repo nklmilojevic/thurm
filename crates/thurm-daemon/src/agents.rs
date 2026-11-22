@@ -368,6 +368,10 @@ impl AgentTracker {
                 h.status = AgentStatus::Working;
                 h.message = None;
             }
+            "idle" => {
+                h.status = AgentStatus::Idle;
+                h.message = None;
+            }
             // Claude Code's reminder after a minute of idling asks for nothing.
             "notification" if message.as_deref().is_some_and(is_idle_reminder) => {
                 if h.status != AgentStatus::Done {
@@ -1858,9 +1862,23 @@ mod tests {
         let past = Instant::now() - Duration::from_secs(5);
 
         let mut claude = AgentTracker::default();
-        claude.apply_hook(Some(1), "claude", "Claude Code", "prompt-submit", None, None);
+        claude.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "prompt-submit",
+            None,
+            None,
+        );
         claude.hook.as_mut().unwrap().turn_started = Some(past);
-        claude.apply_hook(Some(1), "claude", "Claude Code", "prompt-submit", None, None);
+        claude.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "prompt-submit",
+            None,
+            None,
+        );
         assert!(claude.hook.as_ref().unwrap().turn_started.unwrap() > past);
 
         let mut agy = AgentTracker::default();
@@ -1868,6 +1886,33 @@ mod tests {
         agy.hook.as_mut().unwrap().turn_started = Some(past);
         agy.apply_hook(Some(1), "agy", "Antigravity", "prompt-submit", None, None);
         assert_eq!(agy.hook.as_ref().unwrap().turn_started, Some(past));
+    }
+
+    #[test]
+    fn idle_hook_clears_needs_input_without_resetting_session() {
+        let mut t = AgentTracker::default();
+        t.apply_hook(
+            Some(1),
+            "pi",
+            "Pi",
+            "session-start",
+            Some("/tmp/s.jsonl".into()),
+            None,
+        );
+        t.apply_hook(
+            Some(1),
+            "pi",
+            "Pi",
+            "notification",
+            None,
+            Some("Pick one".into()),
+        );
+        assert_eq!(t.hook.as_ref().unwrap().status, AgentStatus::NeedsInput);
+        t.apply_hook(Some(1), "pi", "Pi", "idle", None, None);
+        let h = t.hook.as_ref().unwrap();
+        assert_eq!(h.status, AgentStatus::Idle);
+        assert_eq!(h.message, None);
+        assert_eq!(h.session_id.as_deref(), Some("/tmp/s.jsonl"));
     }
 
     #[test]
