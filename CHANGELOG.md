@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.27.0 - 2026-11-22
+
+This release gives automatic session titles to Pi and Antigravity sessions. Titles work with and without on-device AI.
+
+### New features
+
+- The new `thurm agent title` command sets the title of the current session. Pi and Codex use it to name their session once the task is clear.
+
+### Fixes
+
+- Pi and Antigravity (`agy`) sessions now get automatic titles. Agent hooks also match the foreground agent behind PTY proxies such as `atuin` and `script`.
+
 ## v0.26.1 - 2026-11-22
 
 This release updates the embedded thurm skill guide for coding agents. The guide now shows how to delegate work to subagents.
