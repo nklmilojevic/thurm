@@ -423,7 +423,18 @@ impl AgentTracker {
     pub fn read_transcript(&mut self, path: Option<&str>) {
         let Some(h) = &mut self.hook else { return };
         let resolved = if h.kind == "agy" {
-            crate::transcript::agy_annotation_path(path, h.session_id.as_deref())
+            // A pathless follow-up hook (`PreInvocation`/`Stop`) must not replace a reader
+            // resolved from a non-default app-data directory with the default HOME fallback.
+            if path.is_none()
+                && let Some(id) = h.session_id.as_deref().map(str::trim).filter(|id| {
+                    !id.is_empty() && !id.contains('/') && !id.contains('\\') && !id.contains("..")
+                })
+                && let Some(dir) = h.transcript.as_ref().and_then(|t| t.path().parent())
+            {
+                Some(dir.join(format!("{id}.pbtxt")))
+            } else {
+                crate::transcript::agy_annotation_path(path, h.session_id.as_deref())
+            }
         } else {
             path.map(std::path::PathBuf::from)
         };
@@ -2072,6 +2083,37 @@ mod tests {
         assert_eq!(
             next.unwrap().unwrap().topic.as_deref(),
             Some("Renamed session")
+        );
+
+        // A pathless Stop hook keeps the custom app-data reader instead of falling back to HOME.
+        t.apply_hook(Some(1), "agy", "Antigravity", "stop", None, None);
+        t.read_transcript(None);
+        assert_eq!(
+            t.refresh().unwrap().unwrap().topic.as_deref(),
+            Some("Renamed session")
+        );
+        std::fs::write(&ann, "title:\"Updated after stop\"\n").unwrap();
+        let next = t.update(&defs, Some(&agy), "", quiet, idle_after);
+        assert_eq!(
+            next.unwrap().unwrap().topic.as_deref(),
+            Some("Updated after stop")
+        );
+
+        // A pathless hook carrying a new conversation id switches to that conversation's annotation.
+        let ann2 = ann_dir.join("conv-2.pbtxt");
+        std::fs::write(&ann2, "title:\"Second conversation\"\n").unwrap();
+        t.apply_hook(
+            Some(1),
+            "agy",
+            "Antigravity",
+            "session-start",
+            Some("conv-2".into()),
+            None,
+        );
+        t.read_transcript(None);
+        assert_eq!(
+            t.refresh().unwrap().unwrap().topic.as_deref(),
+            Some("Second conversation")
         );
 
         let _ = std::fs::remove_dir_all(&root);
