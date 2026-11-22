@@ -1,18 +1,36 @@
 //! `thurm hooks`: install the agent hooks that report status to Thurm (`thurm agent-hook`).
 //!
 //! Claude Code (`settings.json`) and Codex (`~/.codex/hooks.json`) share one hook-map format;
-//! each of our entries runs `thurm agent-hook <agent> <event>` and is a no-op outside Thurm
-//! panes, so the same config works in any terminal.
+//! Pi loads a standalone extension (`~/.pi/agent/extensions/thurm.js`); Antigravity CLI uses
+//! named hooks in `~/.gemini/config/hooks.json`. Each runs `thurm agent-hook <agent> <event>`
+//! and is a no-op outside Thurm panes, so the same config works in any terminal.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
+
+/// How an agent stores Thurm's hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookFormat {
+    /// JSON hook map (`settings.json` / `hooks.json`).
+    JsonMap,
+    /// Standalone Pi extension (`~/.pi/agent/extensions/thurm.js`).
+    PiExtension,
+    /// Named hooks map (`~/.gemini/config/hooks.json`, with flat entries for non-tool events).
+    AntigravityHooks,
+}
+
+/// The Pi extension file installed into `~/.pi/agent/extensions/thurm.js`.
+pub const PI_EXTENSION: &str = include_str!("pi_extension.js");
+const PI_MARKER: &str = "// thurm-pi-extension:";
 
 /// An agent whose hooks we manage.
 pub struct HookAgent {
     /// Agent kind as the daemon knows it ("claude").
     pub kind: &'static str,
     pub name: &'static str,
+    /// How hooks are persisted in [`Self::settings_path`].
+    pub format: HookFormat,
     /// Hook events it supports → our event names.
     pub events: &'static [(&'static str, &'static str)],
     /// Resolves the file that holds this agent's hooks.
@@ -28,6 +46,7 @@ pub const AGENTS: &[HookAgent] = &[
     HookAgent {
         kind: "claude",
         name: "Claude Code",
+        format: HookFormat::JsonMap,
         events: CLAUDE_EVENTS,
         settings: claude_settings,
         permission: claude_permission,
@@ -36,11 +55,48 @@ pub const AGENTS: &[HookAgent] = &[
     HookAgent {
         kind: "codex",
         name: "Codex",
+        format: HookFormat::JsonMap,
         events: CODEX_EVENTS,
         settings: codex_settings,
         permission: no_permission,
         context_json: false,
     },
+    HookAgent {
+        kind: "pi",
+        name: "Pi",
+        format: HookFormat::PiExtension,
+        events: PI_EVENTS,
+        settings: pi_settings,
+        permission: no_permission,
+        context_json: false,
+    },
+    HookAgent {
+        kind: "agy",
+        name: "Antigravity",
+        format: HookFormat::AntigravityHooks,
+        events: AGY_EVENTS,
+        settings: agy_settings,
+        permission: no_permission,
+        context_json: false,
+    },
+];
+
+/// Antigravity CLI hook event → our event name (all non-tool events, flat entry shape).
+pub const AGY_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "session-start"),
+    ("PreInvocation", "prompt-submit"),
+    ("Stop", "stop"),
+];
+
+/// Pi extension event → our event name.
+pub const PI_EVENTS: &[(&str, &str)] = &[
+    ("session_start", "session-start"),
+    ("session_info_changed", "session-info"),
+    ("before_agent_start", "prompt-submit"),
+    ("ui_prompt_start", "notification"),
+    ("ui_prompt_end", "tool-complete"),
+    ("agent_settled", "stop"),
+    ("session_shutdown", "session-end"),
 ];
 
 /// Codex only has these (no notification / tool events).
@@ -86,9 +142,32 @@ impl HookAgent {
         (self.settings)()
     }
 
+    /// Whether this agent's configuration directory exists on this machine.
+    pub fn is_present(&self) -> bool {
+        match self.format {
+            HookFormat::JsonMap => self.settings_path().parent().is_some_and(Path::is_dir),
+            HookFormat::PiExtension => {
+                pi_agent_dir().is_dir()
+                    || (std::env::var_os("PI_CODING_AGENT_DIR")
+                        .filter(|d| !d.is_empty())
+                        .is_none()
+                        && dirs_home().join(".pi").is_dir())
+            }
+            HookFormat::AntigravityHooks => {
+                dirs_home().join(".gemini/antigravity-cli").is_dir()
+                    || dirs_home().join(".gemini/antigravity").is_dir()
+            }
+        }
+    }
+
     /// What the SessionStart hook prints for the agent to add `context` to the session.
     pub fn session_output(&self, context: &str) -> String {
-        if self.context_json {
+        if self.format == HookFormat::AntigravityHooks {
+            json!({
+                "injectSteps": [{ "systemMessage": { "systemMessage": context } }]
+            })
+            .to_string()
+        } else if self.context_json {
             json!({ "hookSpecificOutput": { "additionalContext": context } }).to_string()
         } else {
             context.to_owned()
@@ -127,6 +206,18 @@ fn codex_settings() -> PathBuf {
     config_dir("CODEX_HOME", ".codex").join("hooks.json")
 }
 
+fn pi_agent_dir() -> PathBuf {
+    config_dir("PI_CODING_AGENT_DIR", ".pi/agent")
+}
+
+fn pi_settings() -> PathBuf {
+    pi_agent_dir().join("extensions").join("thurm.js")
+}
+
+fn agy_settings() -> PathBuf {
+    dirs_home().join(".gemini/config/hooks.json")
+}
+
 /// Claude Code signals a permission prompt as a notification with this type.
 fn claude_permission(payload: &Value) -> bool {
     payload.get("notification_type").and_then(Value::as_str) == Some("permission_prompt")
@@ -157,9 +248,71 @@ fn is_ours(hook: &Value, kind: &str) -> bool {
         .is_some_and(|c| c.contains("thurm") && c.contains(&format!("agent-hook {kind}")))
 }
 
+fn is_ours_pi_extension(content: &str) -> bool {
+    content.contains(PI_MARKER)
+}
+
+fn apply_antigravity(agent: &HookAgent, settings: &str, install: bool) -> Result<String, String> {
+    let mut root: Value = if settings.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(settings).map_err(|e| format!("hooks.json: {e}"))?
+    };
+    let obj = root.as_object_mut().ok_or("hooks.json is not an object")?;
+    if install {
+        let group = obj
+            .entry("thurm")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or("\"thurm\" in hooks.json is not an object")?;
+        for (native, ours) in agent.events {
+            let list = group
+                .entry(*native)
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or_else(|| format!("thurm.{native} is not an array"))?;
+            list.retain(|h| !is_ours(h, agent.kind));
+            list.push(json!({
+                "type": "command",
+                "command": command(agent.kind, ours),
+                "timeout": 5
+            }));
+        }
+    } else if let Some(group) = obj.get_mut("thurm").and_then(Value::as_object_mut) {
+        for (native, _) in agent.events {
+            if let Some(list) = group.get_mut(*native).and_then(Value::as_array_mut) {
+                list.retain(|h| !is_ours(h, agent.kind));
+                if list.is_empty() {
+                    group.remove(*native);
+                }
+            }
+        }
+        if group.is_empty() {
+            obj.remove("thurm");
+        }
+    }
+    let mut out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    out.push('\n');
+    Ok(out)
+}
+
 /// `settings` (the file's text, empty if missing) with our hooks added (`install`) or
 /// removed. Other settings and other hooks are left alone.
 pub fn apply(agent: &HookAgent, settings: &str, install: bool) -> Result<String, String> {
+    if agent.format == HookFormat::PiExtension {
+        if !settings.is_empty() && !is_ours_pi_extension(settings) {
+            let verb = if install { "replacing" } else { "removing" };
+            return Err(format!("thurm.js exists and isn't Thurm's; not {verb} it"));
+        }
+        return Ok(if install {
+            PI_EXTENSION.to_owned()
+        } else {
+            String::new()
+        });
+    }
+    if agent.format == HookFormat::AntigravityHooks {
+        return apply_antigravity(agent, settings, install);
+    }
     let mut root: Value = if settings.trim().is_empty() {
         json!({})
     } else {
@@ -208,9 +361,27 @@ pub fn apply(agent: &HookAgent, settings: &str, install: bool) -> Result<String,
 
 /// How many of our hook events `settings` has.
 pub fn installed(agent: &HookAgent, settings: &str) -> usize {
+    if agent.format == HookFormat::PiExtension {
+        return if settings == PI_EXTENSION {
+            agent.events.len()
+        } else {
+            0
+        };
+    }
     let Ok(root) = serde_json::from_str::<Value>(settings) else {
         return 0;
     };
+    if agent.format == HookFormat::AntigravityHooks {
+        return agent
+            .events
+            .iter()
+            .filter(|(e, _)| {
+                root.pointer(&format!("/thurm/{e}"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|l| l.iter().any(|x| is_ours(x, agent.kind)))
+            })
+            .count();
+    }
     agent
         .events
         .iter()
@@ -236,19 +407,55 @@ pub enum Written {
     Changed,
 }
 
-/// Adds (`install`) or removes our hooks in `agent`'s file at `path`, keeping a one-time backup
-/// of what was there (`*.json.thurm-backup`) and replacing the file atomically.
-pub fn write_at(agent: &HookAgent, path: &Path, install: bool) -> Result<Written, String> {
+fn write_pi_extension(agent: &HookAgent, path: &Path, install: bool) -> Result<Written, String> {
+    let io = |e: std::io::Error| format!("{}: {e}", path.display());
+    let existed = path.exists() || std::fs::symlink_metadata(path).is_ok();
     let current = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Err(e) => return Err(io(e)),
+    };
+    if existed && !is_ours_pi_extension(&current) {
+        let verb = if install { "replacing" } else { "removing" };
+        return Err(format!(
+            "{} exists and isn't Thurm's; not {verb} it",
+            path.display()
+        ));
+    }
+    if !install {
+        if !existed {
+            return Ok(Written::Unchanged);
+        }
+        std::fs::remove_file(path).map_err(io)?;
+        return Ok(Written::Changed);
+    }
+    let updated = apply(agent, &current, true).map_err(|e| format!("{}: {e}", path.display()))?;
+    if updated == current {
+        return Ok(Written::Unchanged);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(io)?;
+    }
+    crate::replace_file(path, updated.as_bytes()).map_err(io)?;
+    Ok(Written::Changed)
+}
+
+/// Adds (`install`) or removes our hooks in `agent`'s file at `path`, keeping a one-time backup
+/// of what was there (`*.json.thurm-backup`) and replacing the file atomically.
+pub fn write_at(agent: &HookAgent, path: &Path, install: bool) -> Result<Written, String> {
+    if agent.format == HookFormat::PiExtension {
+        return write_pi_extension(agent, path, install);
+    }
+    let io = |e: std::io::Error| format!("{}: {e}", path.display());
+    let current = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(io(e)),
     };
     let updated = apply(agent, &current, install)?;
     if updated == current {
         return Ok(Written::Unchanged);
     }
-    let io = |e: std::io::Error| format!("{}: {e}", path.display());
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(io)?;
     }
@@ -410,6 +617,14 @@ mod tests {
             agent_for_command(&cmd(&["/opt/bin/codex"])).map(|a| a.kind),
             Some("codex")
         );
+        assert_eq!(
+            agent_for_command(&cmd(&["pi", "--continue"])).map(|a| a.kind),
+            Some("pi")
+        );
+        assert_eq!(
+            agent_for_command(&cmd(&["agy", "--continue"])).map(|a| a.kind),
+            Some("agy")
+        );
         assert!(agent_for_command(&cmd(&["bash"])).is_none());
         assert!(agent_for_command(&[]).is_none());
     }
@@ -459,6 +674,7 @@ mod tests {
         let agent = HookAgent {
             kind: "example",
             name: "Example",
+            format: HookFormat::JsonMap,
             events: EVENTS,
             settings,
             permission,
@@ -492,5 +708,101 @@ mod tests {
         assert!(reports_turns("claude"));
         assert!(reports_turns("codex"));
         assert!(reports_turns("pi"));
+        assert!(reports_turns("agy"));
+    }
+
+    #[test]
+    fn antigravity_hooks_use_flat_named_entries_and_inject_steps() {
+        let agy = AGENTS.iter().find(|a| a.kind == "agy").unwrap();
+        let existing = r#"{
+  "my-linter": {
+    "PostToolUse": [
+      { "matcher": "run_command", "hooks": [{ "type": "command", "command": "./lint.sh" }] }
+    ]
+  }
+}"#;
+        let once = apply(agy, existing, true).unwrap();
+        let twice = apply(agy, &once, true).unwrap();
+        assert_eq!(once, twice);
+        assert_eq!(installed(agy, &once), AGY_EVENTS.len());
+        let v: Value = serde_json::from_str(&once).unwrap();
+        // Existing user hook stays untouched.
+        assert_eq!(
+            v["my-linter"]["PostToolUse"][0]["matcher"],
+            json!("run_command")
+        );
+        // Non-tool events use flat command objects directly (not nested under `hooks`).
+        let pre = &v["thurm"]["PreInvocation"][0];
+        assert_eq!(pre["type"], json!("command"));
+        assert!(
+            pre["command"]
+                .as_str()
+                .unwrap()
+                .contains("agent-hook agy prompt-submit")
+        );
+        assert!(pre.get("hooks").is_none());
+
+        // SessionStart output uses Antigravity's injectSteps contract.
+        let out: Value = serde_json::from_str(&agy.session_output("in pane 3")).unwrap();
+        assert_eq!(
+            out.pointer("/injectSteps/0/systemMessage/systemMessage"),
+            Some(&json!("in pane 3"))
+        );
+
+        // Uninstall removes only our "thurm" hook group.
+        let removed = apply(agy, &once, false).unwrap();
+        assert_eq!(installed(agy, &removed), 0);
+        let v: Value = serde_json::from_str(&removed).unwrap();
+        assert!(v.get("thurm").is_none());
+        assert!(v.get("my-linter").is_some());
+    }
+
+    #[test]
+    fn pi_extension_install_upgrade_remove_and_protect_other() {
+        let pi = AGENTS.iter().find(|a| a.kind == "pi").unwrap();
+        let dir = std::env::temp_dir().join(format!("thurm-pi-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("extensions/thurm.js");
+
+        // Fresh install creates directories and writes the extension.
+        assert_eq!(installed(pi, ""), 0);
+        assert!(ensure_at(pi, &path).unwrap());
+        assert!(!ensure_at(pi, &path).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(installed(pi, &text), PI_EVENTS.len());
+        assert!(text.contains(PI_MARKER));
+
+        // Outdated version of our extension is replaced.
+        std::fs::write(
+            &path,
+            "// thurm-pi-extension: 0\nexport default () => {};\n",
+        )
+        .unwrap();
+        assert_eq!(installed(pi, &std::fs::read_to_string(&path).unwrap()), 0);
+        assert!(ensure_at(pi, &path).unwrap());
+        assert_eq!(
+            installed(pi, &std::fs::read_to_string(&path).unwrap()),
+            PI_EVENTS.len()
+        );
+
+        // Uninstall removes the file completely and is idempotent.
+        assert_eq!(write_at(pi, &path, false).unwrap(), Written::Changed);
+        assert!(!path.exists());
+        assert_eq!(write_at(pi, &path, false).unwrap(), Written::Unchanged);
+
+        // A user's own thurm.js without our marker is left untouched (including zero-byte files).
+        std::fs::write(&path, "export default function () {}\n").unwrap();
+        assert!(write_at(pi, &path, true).is_err());
+        assert!(write_at(pi, &path, false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "export default function () {}\n"
+        );
+        std::fs::write(&path, "").unwrap();
+        assert!(write_at(pi, &path, true).is_err());
+        assert!(write_at(pi, &path, false).is_err());
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

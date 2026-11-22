@@ -17,22 +17,22 @@ pub const STUB: &str = include_str!("../../../skills/thurm/SKILL.md");
 pub enum SkillCmd {
     /// Print the guide the skill gives agents.
     Show,
-    /// Install the skill for every agent found: Claude Code (~/.claude/skills), and Codex,
-    /// OpenCode and Pi (~/.agents/skills).
+    /// Install the skill for every agent found: Claude Code (~/.claude/skills), Codex,
+    /// OpenCode and Pi (~/.agents/skills), and Antigravity (~/.gemini/config/skills).
     Setup {
-        /// Only this agent (claude, agents).
+        /// Only this agent (claude, agents, agy).
         #[arg(long)]
         agent: Option<String>,
     },
     /// Remove the skill from agents.
     Remove {
-        /// Only this agent (claude, agents).
+        /// Only this agent (claude, agents, agy).
         #[arg(long)]
         agent: Option<String>,
     },
     /// Where the skill is installed, and whether it is current.
     Status {
-        /// Only this agent (claude, agents).
+        /// Only this agent (claude, agents, agy).
         #[arg(long)]
         agent: Option<String>,
     },
@@ -63,6 +63,13 @@ fn targets(home: &Path, claude_dir: Option<PathBuf>) -> Vec<Target> {
             name: "Codex, OpenCode, Pi",
             path: home.join(".agents/skills/thurm"),
             present: agents.iter().any(|d| home.join(d).is_dir()),
+        },
+        Target {
+            kind: "agy",
+            name: "Antigravity",
+            path: home.join(".gemini/config/skills/thurm"),
+            present: home.join(".gemini/antigravity-cli").is_dir()
+                || home.join(".gemini/antigravity").is_dir(),
         },
     ]
 }
@@ -191,14 +198,14 @@ pub fn run(cmd: SkillCmd, json: bool) -> crate::R {
     };
     if only.is_some() && chosen.is_empty() {
         return Err(format!(
-            "unknown agent {:?} (claude, agents)",
+            "unknown agent {:?} (claude, agents, agy)",
             only.unwrap_or_default()
         )
         .into());
     }
     if chosen.is_empty() {
         eprintln!(
-            "thurm: no agent found (no ~/.claude, ~/.agents or ~/.codex); run the agent once, \
+            "thurm: no agent found (no ~/.claude, ~/.agents, ~/.codex, ~/.pi or ~/.gemini/antigravity-cli); run the agent once, \
              or pass --agent claude"
         );
         return Ok(std::process::ExitCode::FAILURE);
@@ -261,7 +268,7 @@ pub fn run(cmd: SkillCmd, json: bool) -> crate::R {
 fn hooks_missing() -> bool {
     hooks::AGENTS.iter().any(|a| {
         let path = a.settings_path();
-        path.parent().is_some_and(Path::is_dir)
+        a.is_present()
             && hooks::installed(a, &std::fs::read_to_string(&path).unwrap_or_default())
                 < a.events.len()
     })

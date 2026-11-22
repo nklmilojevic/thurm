@@ -9,6 +9,8 @@ enum PaneIcon: Equatable {
     case program(ProgramMatch?)
     case claude
     case codex
+    case pi
+    case agy
     /// Any other coding agent.
     case agent
 
@@ -16,6 +18,8 @@ enum PaneIcon: Equatable {
         switch info?.agent?.kind.lowercased() {
         case "claude"?: self = .claude
         case "codex"?: self = .codex
+        case "pi"?: self = .pi
+        case "agy"?: self = .agy
         case .some: self = .agent
         case .none: self = info?.hasRunningProcess == true ? .program(info?.program) : .shell
         }
@@ -31,7 +35,7 @@ enum PaneIcon: Equatable {
             image = Self.drawn(size) { rect in
                 Self.prompt(in: rect, lineWidth: max(1.2, size / 9)).stroke()
             }
-        case .claude, .codex:
+        case .claude, .codex, .pi, .agy:
             image = Self.drawn(size) { rect in Self.logo(self, in: rect).fill() }
         case .program(let p?) where Self.mark(p) != nil:
             image = Self.drawn(size) { rect in Self.mark(p)?.fill(in: rect) }
@@ -56,6 +60,8 @@ enum PaneIcon: Equatable {
             switch self {
             case .claude: (fill, ink) = (NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1), .white)
             case .codex: (fill, ink) = (.white, .black)
+            case .pi: (fill, ink) = (NSColor(srgbRed: 0.14, green: 0.58, blue: 0.53, alpha: 1), .white)
+            case .agy: (fill, ink) = (NSColor(srgbRed: 0.18, green: 0.45, blue: 0.92, alpha: 1), .white)
             case .agent: (fill, ink) = (NSColor(srgbRed: 0.35, green: 0.38, blue: 0.9, alpha: 1), .white)
             case .program(let p?):
                 (fill, ink) = (p.color.map { colorFromRGB($0) } ?? NSColor(white: 0.1, alpha: 1),
@@ -77,7 +83,7 @@ enum PaneIcon: Equatable {
                     Self.symbol(symbolName, in: inner, color: ink)
                 }
             case .shell, .program: Self.prompt(in: inner, lineWidth: max(1, size / 14)).stroke()
-            case .claude, .codex: Self.logo(self, in: inner).fill()
+            case .claude, .codex, .pi, .agy: Self.logo(self, in: inner).fill()
             case .agent: Self.symbol("sparkle", in: inner, color: ink)
             }
             return true
@@ -208,7 +214,15 @@ enum PaneIcon: Equatable {
 
     /// The agent's mark (24x24 SVG paths), scaled into `rect`.
     private static func logo(_ icon: PaneIcon, in rect: NSRect) -> NSBezierPath {
-        let path = parse(icon == .claude ? claudePath : openAIPath)
+        let pathData: String
+        switch icon {
+        case .claude: pathData = claudePath
+        case .codex: pathData = openAIPath
+        case .pi: pathData = piPath
+        case .agy: pathData = agyPath
+        default: pathData = openAIPath
+        }
+        let path = parse(pathData)
         path.windingRule = .evenOdd
         var t = AffineTransform(translationByX: rect.minX, byY: rect.minY)
         t.scale(rect.width / 24)
@@ -245,6 +259,22 @@ enum PaneIcon: Equatable {
 
     /// OpenAI's mark (Codex), from LobeHub Icons (MIT), arcs flattened to curves.
     private static let openAIPath = "M9.205 8.658L9.205 6.398C9.205 6.208 9.277 6.065 9.443 5.97L13.986 3.354C14.605 2.997 15.342 2.831 16.103 2.831C18.957 2.831 20.765 5.043 20.765 7.397C20.765 7.564 20.765 7.754 20.741 7.944L16.031 5.185C15.903 5.104 15.755 5.06 15.603 5.06C15.451 5.06 15.303 5.104 15.175 5.185L9.205 8.658ZM19.814 17.458L19.814 12.06C19.814 11.727 19.671 11.49 19.385 11.323L13.415 7.85L15.365 6.732C15.436 6.686 15.518 6.661 15.603 6.661C15.688 6.661 15.77 6.686 15.841 6.732L20.384 9.349C21.693 10.109 22.573 11.727 22.573 13.297C22.573 15.105 21.503 16.77 19.813 17.46ZM7.802 12.703L5.852 11.561C5.685 11.466 5.613 11.323 5.613 11.133L5.613 5.899C5.613 3.354 7.563 1.427 10.204 1.427C11.204 1.427 12.131 1.76 12.916 2.355L8.23 5.067C7.945 5.233 7.802 5.471 7.802 5.804L7.802 12.702ZM12 15.128L9.205 13.558L9.205 10.228L12 8.658L14.795 10.228L14.795 13.558L12 15.128ZM13.796 22.358C12.796 22.358 11.869 22.026 11.084 21.431L15.77 18.719C16.055 18.553 16.198 18.315 16.198 17.982L16.198 11.084L18.172 12.226C18.339 12.321 18.41 12.464 18.41 12.654L18.41 17.887C18.41 20.432 16.436 22.359 13.796 22.359ZM8.159 17.055L3.615 14.438C2.307 13.677 1.427 12.06 1.427 10.49C1.424 9.598 1.687 8.725 2.183 7.984C2.679 7.242 3.385 6.665 4.21 6.327L4.21 11.75C4.21 12.083 4.353 12.321 4.638 12.488L10.585 15.937L8.635 17.055C8.564 17.102 8.482 17.126 8.397 17.126C8.312 17.126 8.23 17.102 8.159 17.055ZM7.897 20.955C5.209 20.955 3.235 18.934 3.235 16.436C3.235 16.246 3.259 16.056 3.282 15.866L7.968 18.576C8.254 18.743 8.539 18.743 8.824 18.576L14.794 15.128L14.794 17.388C14.794 17.578 14.724 17.721 14.557 17.816L10.014 20.432C9.395 20.789 8.658 20.955 7.897 20.955ZM13.796 23.785C14.705 23.785 15.601 23.577 16.417 23.176C17.233 22.776 17.946 22.194 18.502 21.475C19.057 20.756 19.441 19.919 19.623 19.029C22.287 18.339 24 15.84 24 13.296C24 11.631 23.287 10.014 22.002 8.848C22.121 8.348 22.192 7.849 22.192 7.35C22.192 3.949 19.433 1.403 16.246 1.403C15.604 1.403 14.986 1.498 14.366 1.713C13.816 1.172 13.167 0.743 12.453 0.449C11.74 0.155 10.976 0.003 10.205 0C9.296 -0 8.399 0.208 7.584 0.609C6.768 1.009 6.055 1.591 5.499 2.311C4.943 3.03 4.56 3.867 4.378 4.757C1.713 5.447 0 7.945 0 10.49C0 12.156 0.713 13.773 1.998 14.938C1.879 15.438 1.808 15.938 1.808 16.437C1.808 19.838 4.567 22.383 7.754 22.383C8.396 22.383 9.014 22.288 9.634 22.074C10.184 22.615 10.834 23.045 11.547 23.338C12.261 23.632 13.024 23.784 13.796 23.787Z"
+
+    /// Pi's mark (π) in a 24x24 viewBox.
+    private static let piPath =
+        "M2.5 7.5C2.5 5.4 4.0 4.5 6.2 4.5L21.5 4.5L21.5 7.5L17.3 7.5L17.3 15.6" +
+        "C17.3 16.9 18.0 17.5 19.2 17.5C19.8 17.5 20.4 17.3 20.9 17.0L21.5 19.5" +
+        "C20.6 20.1 19.5 20.4 18.2 20.4C15.5 20.4 14.1 18.8 14.1 15.8L14.1 7.5" +
+        "L9.7 7.5L9.3 13.8C9.1 16.8 8.3 18.8 6.8 20.3L4.0 18.7" +
+        "C5.3 17.4 6.0 15.7 6.2 13.2L6.6 7.5L5.4 7.5C4.6 7.5 4.1 7.9 3.8 8.6L2.5 7.5Z"
+
+    /// Antigravity's mark (ascending arch A) in a 24x24 viewBox.
+    private static let agyPath =
+        "M12.0 2.8C13.6 2.8 14.7 3.8 15.6 5.6L21.0 17.6C21.8 19.3 20.9 20.8 19.1 20.8" +
+        "L16.9 20.8C15.8 20.8 15.1 20.2 14.7 19.2C13.9 17.3 13.0 16.0 12.0 16.0" +
+        "C11.0 16.0 10.1 17.3 9.3 19.2C8.9 20.2 8.2 20.8 7.1 20.8L4.9 20.8" +
+        "C3.1 20.8 2.2 19.3 3.0 17.6L8.4 5.6C9.3 3.8 10.4 2.8 12.0 2.8Z" +
+        "M12.0 7.6L9.8 13.0C10.5 12.6 11.2 12.4 12.0 12.4C12.8 12.4 13.5 12.6 14.2 13.0L12.0 7.6Z"
 }
 
 private extension NSBezierPath {

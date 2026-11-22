@@ -90,6 +90,16 @@ const AGENTS: &[Agent] = &[
         name: "Codex",
         installer: None,
     },
+    Agent {
+        kind: "pi",
+        name: "Pi",
+        installer: None,
+    },
+    Agent {
+        kind: "agy",
+        name: "Antigravity",
+        installer: None,
+    },
 ];
 
 /// The clipboard tools the shims are, for the scripts below: [`thurm_proto::CLIP_TOOLS`]
@@ -121,7 +131,7 @@ const PROBE: &str = concat!(
     "[ -d \"$TH/.local/bin\" ] && echo localbin=1; ",
     "L=\"$TH/.local/bin/thurm\"; { [ -L \"$L\" ] || [ -x \"$L\" ]; } && echo link=1; ",
     "command -v curl >/dev/null 2>&1 && echo curl=1; ",
-    "for a in claude codex; do p=\"$(command -v \"$a\" 2>/dev/null)\"; ",
+    "for a in claude codex pi agy; do p=\"$(command -v \"$a\" 2>/dev/null)\"; ",
     "if [ -z \"$p\" ] && [ -z \"$THURM_BASE_PATH\" ]; then p=\"$(\"${SHELL:-sh}\" -lc \"command -v $a\" </dev/null 2>/dev/null | grep ^/ | tail -n 1)\"; fi; ",
     "echo \"agent_$a=$p\"; done; ",
     "{ [ -f \"${CLAUDE_CONFIG_DIR:-$TH/.claude}/.credentials.json\" ] || [ -n \"$ANTHROPIC_API_KEY\" ]; } && echo claude_login=1; ",
@@ -568,7 +578,7 @@ fn checks(name: &str, plan: &Plan, probe: &Probe) -> Vec<Check> {
     }
 
     // The skill that teaches agents to drive Thurm there: for the agents found above, or ones
-    // `thurm skill status` found (OpenCode and Pi are not probed for).
+    // `thurm skill status` found (OpenCode is not probed for).
     let skill_target = probe
         .skill
         .iter()
