@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.26.0 - 2026-11-22
+
+This release adds Pi and Antigravity CLI (`agy`) support to Thurm. Thurm now tracks the session state of both agents.
+
+### New features
+
+- Thurm adds managed hooks, skills, and pane icons for Pi and Antigravity. You can fork and restore Pi sessions, and restore `agy` conversations.
+
 ## v0.25.0 - 2026-11-18
 
 Thurm 0.24.0 opens remote dev servers on this Mac and copies files to and from remote hosts. It also adds a sidebar list of tabs for every host.
