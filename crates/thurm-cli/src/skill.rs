@@ -275,7 +275,7 @@ fn hooks_missing() -> bool {
 }
 
 /// What an agent is told when its session starts in a Thurm pane (the SessionStart hook's
-/// output, which Claude Code and Codex add to the session's context).
+/// output, which supported agents add to the session's context).
 pub fn session_context(pane: PaneId, cli: Option<&Path>) -> String {
     let mut out = format!(
         "You're running in a Thurm terminal pane.\n\n\
