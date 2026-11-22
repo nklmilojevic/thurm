@@ -121,9 +121,9 @@ To stop a program: `thurm send-keys --pane "$id" C-c`, then capture the pane or 
 | `thurm wait --pane ID --agent-waiting` | the agent in that pane is asking for input |
 
 Always pass `--timeout SECS` so you never hang. Exit status 124 is a timeout, 2 means the pane
-exited while waiting for something else. `--agent-free` returns immediately if the agent is
-already `Idle`, `Done`, or `NeedsInput`, so after launching an agent check that it entered
-`Working` before waiting. To follow several panes at once,
+exited while waiting for something else. `--agent-free` returns immediately whenever the agent is
+not `Working` (for example `Idle`, `Done`, or `NeedsInput`), so after launching an agent check
+that it entered `Working` before waiting. To follow several panes at once,
 `thurm events --filter PaneInfo,PaneExited` streams their state as JSON Lines.
 
 ## Read output
@@ -150,10 +150,12 @@ Status is `Working`, `Idle`, `NeedsInput` (a permission prompt or question) or `
 turn nobody has looked at yet). Without hooks it is inferred from the screen; with managed hooks
 (`thurm hooks install`: Claude Code, Codex, Pi, and Antigravity (`agy`)) the agent reports status
 directly, which is exact and also gives `Done` transitions and session ids. `thurm info --pane ID
---json` includes `agent.status`, `agent.topic`, and any structured status message under
-`programs[0].message`. `thurm hooks status` checks what is installed; don't run `thurm hooks
-install` without asking the user, since it edits agent config files (`~/.claude/settings.json`,
-`~/.codex/hooks.json`, `~/.pi/agent/extensions/thurm.js`, `~/.gemini/config/hooks.json`).
+--json` includes `agent.status`, `agent.topic`, and `programs` (OSC 7501 status records ordered
+least recently updated first; select the relevant record by `app`, `state`, or `id` to read its
+`message` rather than assuming index 0). `thurm hooks status` checks what is installed; don't run
+`thurm hooks install` without asking the user, since it edits agent config files
+(`~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.pi/agent/extensions/thurm.js`,
+`~/.gemini/config/hooks.json`).
 
 `thurm fork --split right` starts a copy of the current Claude Code, Codex, or Pi session next to
 it (needs hooks).
@@ -166,8 +168,8 @@ it (needs hooks).
   blank while running and prevents Thurm from tracking `Working` / `NeedsInput` / `Done`.
 - **Use a brief file for non-trivial tasks.** Write the full task brief to a file (or scratch
   path) and pass a short initial prompt pointing at it (for example `-i "Read <path> and
-  execute..."` or `thurm send --pane ID --paste`), instead of cramming multi-kilobyte prompts into
-  argv or pasting huge blocks into the TUI.
+  execute..."` or `thurm send --pane ID --paste "Read <path> and execute..."`), instead of
+  cramming multi-kilobyte prompts into argv or pasting huge blocks into the TUI.
 - For a single follow-up turn in an existing agent pane, you can also use
   `thurm send --pane ID --paste "..."` followed by `thurm wait --pane ID --agent-done --timeout 1800`
   (or `thurm agent prompt --pane ID "..." --wait --timeout 1800`), then read the result with
@@ -177,8 +179,9 @@ it (needs hooks).
 
 To fan out independent tasks across tabs without workers colliding on files or git state:
 
-1. **Isolate each task** in its own `git worktree` and branch
-   (`git worktree add -b <branch> <worktree-dir> main`).
+1. **Isolate each task** in its own `git worktree` and branch based on the existing branch or
+   commit the task should build on (`git worktree add -b <branch> <worktree-dir> <base-ref>`, for
+   example `HEAD` or the repository's default branch).
 2. **Open one background tab per worker** with an interactive agent command:
    ```sh
    id=$(thurm new-tab --background --cwd <worktree-dir> --title "<task>" -- \
@@ -191,9 +194,15 @@ To fan out independent tasks across tabs without workers colliding on files or g
    `thurm events --filter PaneInfo,PaneExited`) so you review each worker as soon as it finishes
    instead of waiting for the slowest one. Use `thurm wall --on` when the user wants to watch all
    active agents together.
-5. **Inspect, follow up, and clean up:** check `git -C <worktree-dir> status` / `diff` and
+5. **Review and integrate:** inspect `git -C <worktree-dir> status` / `diff` and
    `thurm capture --pane "$id"`, send follow-ups with `thurm send --pane "$id" "..."` if needed,
-   and `thurm close "$id"` when done.
+   then commit approved changes (if uncommitted) and integrate the branch into the target branch
+   (merge, cherry-pick, or open a PR), resolving any conflicts before considering the task
+   complete.
+6. **Clean up:** close the worker pane (`thurm close "$id"`), remove the finished worktree
+   (`git worktree remove <worktree-dir>` — inspect or save any uncommitted changes rather than
+   forcing removal), and delete the worker branch (`git branch -d <branch>`) once it is no longer
+   needed.
 
 ### First-run prompts and `NeedsInput`
 
@@ -202,14 +211,14 @@ commonly pauses right away in `NeedsInput` on a first-run folder-trust prompt (f
 `"Yes, I trust this folder"`).
 
 - **Don't start `--agent-free` before `Working`.** `thurm wait --agent-free` returns immediately
-  while a pane is `NeedsInput` (or `Idle`). Check `thurm agents` / `thurm capture --pane ID` right
-  after launch and confirm the worker is `Working` before starting `--agent-free`.
+  while a pane is not `Working` (including `NeedsInput` or `Idle`). Check `thurm agents` /
+  `thurm capture --pane ID` right after launch and confirm the worker is `Working` before starting
+  `--agent-free`.
 - **Handle trust and permission prompts deliberately.** Inspect the paused pane with
   `thurm capture --pane ID`. If it is a folder-trust prompt for a worktree of the user's
-  already-trusted repository, ask the user to confirm — or confirm with
-  `thurm send-keys --pane ID Enter` only when the user has explicitly authorized trusting those
-  worktrees or asked you to drive them. Never blindly confirm unknown permission or security
-  prompts.
+  already-trusted repository, confirm with `thurm send-keys --pane ID Enter` only when the user
+  has explicitly authorized trusting those worktrees; otherwise ask the user to confirm first.
+  Never blindly confirm unknown permission or security prompts.
 
 ## Remote hosts
 
