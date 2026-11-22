@@ -6,7 +6,7 @@
 //! pane's terminal that spawned the hook.
 
 /// One process: its parent, its group, its controlling terminal (`tdev` and foreground `tpgid`),
-/// and whether it is a shell wrapper.
+/// and whether it is a shell wrapper or a PTY proxy (`atuin`, `script`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Proc {
     ppid: u32,
@@ -14,9 +14,10 @@ struct Proc {
     tdev: Option<u32>,
     tpgid: Option<u32>,
     shell: bool,
+    proxy: bool,
 }
 
-/// The agent's group: that of the agent on the pane's terminal, else this process' own.
+/// The agent's group: that of the agent on its controlling terminal, else this process' own.
 /// Whether it is in the foreground doesn't matter: a backgrounded agent's shell is, and is
 /// farther up.
 pub fn agent_pgrp() -> u32 {
@@ -34,32 +35,60 @@ fn ancestry(mut pid: u32) -> Vec<Proc> {
     out
 }
 
+/// The controlling terminal the agent itself runs on.
+///
+/// Walking bottom-up (rather than taking the outermost ancestor's terminal) stays on the inner
+/// terminal when a PTY proxy (`atuin`, `script`) sits between the pane and the shell, while
+/// still stepping out of a child PTY an agent spawned only to run the hook.
+fn agent_tdev(chain: &[Proc], own: u32) -> Option<u32> {
+    let first = chain.first()?;
+    let Some(hook_tdev) = first.tdev else {
+        return chain.iter().skip(1).find_map(|p| p.tdev);
+    };
+    let hook_only_tty = chain
+        .iter()
+        .skip(1)
+        .filter(|p| p.tdev == Some(hook_tdev))
+        .all(|p| p.shell && p.pgid == own);
+    if hook_only_tty
+        && let Some(parent) = chain
+            .iter()
+            .skip(1)
+            .find(|p| p.tdev.is_some_and(|t| t != hook_tdev))
+        && !parent.proxy
+    {
+        return parent.tdev;
+    }
+    Some(hook_tdev)
+}
+
 fn pick(chain: &[Proc], own: u32) -> u32 {
-    // The pane's terminal is the outermost (highest) ancestor's controlling terminal: `thurmd`
-    // and init have none, whereas an agent may spawn hooks in a child PTY of its own.
-    let Some(pane_tdev) = chain.iter().rev().find_map(|p| p.tdev) else {
+    let Some(agent_tdev) = agent_tdev(chain, own) else {
         return own;
     };
-    let on_tty: Vec<&Proc> = chain.iter().filter(|p| p.tdev == Some(pane_tdev)).collect();
+    let on_tty: Vec<&Proc> = chain
+        .iter()
+        .filter(|p| p.tdev == Some(agent_tdev))
+        .collect();
     let Some(first) = on_tty.first() else {
         return own;
     };
     // Hook ran detached (`setsid`, no terminal) or in a child PTY: the nearest ancestor on the
-    // pane's terminal is the agent.
-    if chain.first().and_then(|p| p.tdev) != Some(pane_tdev) {
+    // agent's terminal is the agent.
+    if chain.first().and_then(|p| p.tdev) != Some(agent_tdev) {
         return first.pgid;
     }
-    // Hook shares the pane's terminal and is already in its foreground group.
+    // Hook shares the agent's terminal and is already in its foreground group.
     if first.tpgid == Some(first.pgid) {
         return first.pgid;
     }
-    // Hook ran in a background group on the pane's terminal (`setpgid(0, 0)`): if a non-shell
+    // Hook ran in a background group on the agent's terminal (`setpgid(0, 0)`): if a non-shell
     // ancestor holds the terminal's foreground, that is the agent that spawned it.
     if let Some(fg) = on_tty.iter().find(|p| p.tpgid == Some(p.pgid) && !p.shell) {
         return fg.pgid;
     }
     // Backgrounded agent: if every ancestor sharing the hook's own group is a shell wrapper
-    // (`sh -c` under `setpgid`), the agent is the next group up on the pane's terminal.
+    // (`sh -c` under `setpgid`), the agent is the next group up on the agent's terminal.
     let wrapper_group = on_tty
         .iter()
         .skip(1)
@@ -93,6 +122,11 @@ fn is_shell_name(name: &str) -> bool {
     )
 }
 
+fn is_proxy_name(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    matches!(base, "atuin" | "script")
+}
+
 #[cfg(target_os = "macos")]
 fn proc_info(pid: u32) -> Option<Proc> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -124,6 +158,7 @@ fn proc_info(pid: u32) -> Option<Proc> {
         tdev: has_tty.then_some(info.e_tdev),
         tpgid: has_tty.then_some(info.e_tpgid),
         shell: is_shell_name(&comm),
+        proxy: is_proxy_name(&comm),
     })
 }
 
@@ -145,6 +180,7 @@ fn proc_info(pid: u32) -> Option<Proc> {
         tdev: has_tty.then_some(tty_nr as u32),
         tpgid: has_tty.then_some(tpgid as u32),
         shell: is_shell_name(comm),
+        proxy: is_proxy_name(comm),
     })
 }
 
@@ -158,6 +194,7 @@ mod tests {
     use super::*;
 
     const PANE_TTY: u32 = 100;
+    const PROXY_TTY: u32 = 150;
     const CHILD_TTY: u32 = 200;
 
     fn p(pgid: u32, tdev: Option<u32>, tpgid: Option<u32>, shell: bool) -> Proc {
@@ -167,6 +204,14 @@ mod tests {
             tdev,
             tpgid,
             shell,
+            proxy: false,
+        }
+    }
+
+    fn proxy(pgid: u32, tdev: Option<u32>, tpgid: Option<u32>) -> Proc {
+        Proc {
+            proxy: true,
+            ..p(pgid, tdev, tpgid, false)
         }
     }
 
@@ -226,6 +271,52 @@ mod tests {
             p(5, Some(PANE_TTY), Some(10), true),
         ];
         assert_eq!(pick(&chain, 30), 10);
+    }
+
+    #[test]
+    fn pty_proxy_between_pane_and_shell_resolves_to_inner_agent() {
+        // login + atuin on PANE_TTY (group 2), fish (5) + agent (10) on PROXY_TTY.
+        let outer = [
+            p(10, Some(PROXY_TTY), Some(10), false),
+            p(5, Some(PROXY_TTY), Some(10), true),
+            proxy(2, Some(PANE_TTY), Some(2)),
+            p(2, Some(PANE_TTY), Some(2), true),
+        ];
+
+        // Detached hook (Claude Code).
+        let mut detached = vec![p(30, None, None, false), p(30, None, None, true)];
+        detached.extend_from_slice(&outer);
+        assert_eq!(pick(&detached, 30), 10);
+
+        // setpgid hook on PROXY_TTY (Antigravity).
+        let mut setpgid = vec![
+            p(30, Some(PROXY_TTY), Some(10), false),
+            p(30, Some(PROXY_TTY), Some(10), true),
+        ];
+        setpgid.extend_from_slice(&outer);
+        assert_eq!(pick(&setpgid, 30), 10);
+
+        // Child-PTY hook under agent (Antigravity / wrapper PTY).
+        let mut child_pty = vec![
+            p(30, Some(CHILD_TTY), Some(30), false),
+            p(30, Some(CHILD_TTY), Some(30), true),
+        ];
+        child_pty.extend_from_slice(&outer);
+        assert_eq!(pick(&child_pty, 30), 10);
+
+        // Same-group hook (Pi).
+        let mut same_group = vec![p(10, Some(PROXY_TTY), Some(10), false)];
+        same_group.extend_from_slice(&outer);
+        assert_eq!(pick(&same_group, 10), 10);
+
+        // Manual invocation from a shell behind atuin does not jump up to atuin.
+        let manual = vec![
+            p(5, Some(PROXY_TTY), Some(5), false),
+            p(5, Some(PROXY_TTY), Some(5), true),
+            proxy(2, Some(PANE_TTY), Some(2)),
+            p(2, Some(PANE_TTY), Some(2), true),
+        ];
+        assert_eq!(pick(&manual, 5), 5);
     }
 
     #[test]
