@@ -5,8 +5,10 @@
 //! PTY, so the hook's own group is not always the agent's. The agent is the process group on the
 //! pane's terminal that spawned the hook.
 
+use thurm_config::AgentDef;
+
 /// One process: its parent, its group, its controlling terminal (`tdev` and foreground `tpgid`),
-/// and whether it is a shell wrapper or a PTY proxy (`atuin`, `script`).
+/// and whether it is a shell wrapper, a PTY proxy (`atuin`, `script`), or the reporting agent.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Proc {
     ppid: u32,
@@ -15,20 +17,36 @@ struct Proc {
     tpgid: Option<u32>,
     shell: bool,
     proxy: bool,
+    agent: bool,
 }
 
 /// The agent's group: that of the agent on its controlling terminal, else this process' own.
 /// Whether it is in the foreground doesn't matter: a backgrounded agent's shell is, and is
 /// farther up.
-pub fn agent_pgrp() -> u32 {
+pub fn agent_pgrp(agent_kind: &str) -> u32 {
     let own = unsafe { libc::getpgrp() } as u32;
-    pick(&ancestry(std::process::id()), own)
+    let def = agent_def(agent_kind);
+    pick(&ancestry(std::process::id(), agent_kind, def.as_ref()), own)
 }
 
-fn ancestry(mut pid: u32) -> Vec<Proc> {
+fn agent_def(kind: &str) -> Option<AgentDef> {
+    if kind.is_empty() {
+        return None;
+    }
+    let defs = thurm_config::Config::load()
+        .map(|c| c.agent_defs())
+        .unwrap_or_else(|_| thurm_config::builtin_agents());
+    defs.into_iter().find(|d| d.kind == kind)
+}
+
+fn ancestry(mut pid: u32, agent_kind: &str, def: Option<&AgentDef>) -> Vec<Proc> {
+    let self_pid = pid;
     let mut out = Vec::new();
     while pid > 1 && out.len() < 64 {
-        let Some(p) = proc_info(pid) else { break };
+        let check_agent = pid != self_pid;
+        let Some(p) = proc_info(pid, check_agent.then_some((agent_kind, def))) else {
+            break;
+        };
         out.push(p);
         pid = p.ppid;
     }
@@ -83,13 +101,19 @@ fn pick(chain: &[Proc], own: u32) -> u32 {
     let Some(first) = on_tty.first() else {
         return own;
     };
-    // Hook ran detached (`setsid`, no terminal) or in a child PTY: prefer a non-wrapper
-    // foreground ancestor on the agent's terminal, else the nearest non-wrapper ancestor
-    // (skipping `sh -c` or `script` that launched the hook), else the nearest ancestor on it.
+    // Hook ran detached (`setsid`, no terminal) or in a child PTY: prefer the nearest
+    // recognized agent ancestor on the agent's terminal, then a foreground non-wrapper
+    // ancestor (for a launcher sitting in front of an unrecognized agent), then the nearest
+    // non-wrapper ancestor (skipping `sh -c` or `script`), else the nearest ancestor on it.
     if chain.first().and_then(|p| p.tdev) != Some(agent_tdev) {
         return on_tty
             .iter()
-            .find(|p| p.tpgid == Some(p.pgid) && !p.shell && !p.proxy)
+            .find(|p| p.agent)
+            .or_else(|| {
+                on_tty
+                    .iter()
+                    .find(|p| p.tpgid == Some(p.pgid) && !p.shell && !p.proxy)
+            })
             .or_else(|| on_tty.iter().find(|p| !p.shell && !p.proxy))
             .map_or(first.pgid, |p| p.pgid);
     }
@@ -97,8 +121,11 @@ fn pick(chain: &[Proc], own: u32) -> u32 {
     if first.tpgid == Some(first.pgid) {
         return first.pgid;
     }
-    // Hook ran in a background group on the agent's terminal (`setpgid(0, 0)`): if a non-shell,
-    // non-proxy ancestor holds the terminal's foreground, that is the agent that spawned it.
+    // Hook ran in a background group on the agent's terminal (`setpgid(0, 0)`): prefer a
+    // recognized agent ancestor, else a non-shell, non-proxy ancestor holding the foreground.
+    if let Some(agent) = on_tty.iter().skip(1).find(|p| p.agent) {
+        return agent.pgid;
+    }
     if let Some(fg) = on_tty
         .iter()
         .find(|p| p.tpgid == Some(p.pgid) && !p.shell && !p.proxy)
@@ -146,8 +173,97 @@ fn is_proxy_name(name: &str) -> bool {
     matches!(base, "atuin" | "script")
 }
 
+fn matches_agent(
+    pid: u32,
+    comm: &str,
+    shell: bool,
+    proxy: bool,
+    target: Option<(&str, Option<&AgentDef>)>,
+) -> bool {
+    if shell || proxy {
+        return false;
+    }
+    let Some((kind, def)) = target else {
+        return false;
+    };
+    let base = comm.rsplit('/').next().unwrap_or(comm);
+    if let Some(def) = def {
+        if def.matches(base, &[]) {
+            return true;
+        }
+        let argv = proc_argv(pid).unwrap_or_default();
+        return def.matches(base, &argv);
+    }
+    !kind.is_empty() && base == kind
+}
+
 #[cfg(target_os = "macos")]
-fn proc_info(pid: u32) -> Option<Proc> {
+fn proc_argv(pid: u32) -> Option<Vec<String>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    unsafe {
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+    }
+    let mut buf = vec![0u8; size];
+    unsafe {
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+    }
+    buf.truncate(size);
+    if buf.len() < 4 {
+        return None;
+    }
+    let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?) as usize;
+    let mut rest = &buf[4..];
+    let end = rest.iter().position(|&b| b == 0)?;
+    rest = &rest[end..];
+    let start = rest.iter().position(|&b| b != 0)?;
+    rest = &rest[start..];
+    Some(
+        rest.split(|&b| b == 0)
+            .take(argc)
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn proc_argv(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect(),
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn proc_argv(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn proc_info(pid: u32, target: Option<(&str, Option<&AgentDef>)>) -> Option<Proc> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as i32;
     let n = unsafe {
@@ -171,18 +287,21 @@ fn proc_info(pid: u32) -> Option<Proc> {
         .map(|&c| c as u8)
         .collect();
     let comm = String::from_utf8_lossy(&comm_bytes);
+    let shell = is_shell_name(&comm);
+    let proxy = is_proxy_name(&comm);
     Some(Proc {
         ppid: info.pbi_ppid,
         pgid: info.pbi_pgid,
         tdev: has_tty.then_some(info.e_tdev),
         tpgid: has_tty.then_some(info.e_tpgid),
-        shell: is_shell_name(&comm),
-        proxy: is_proxy_name(&comm),
+        shell,
+        proxy,
+        agent: matches_agent(pid, &comm, shell, proxy, target),
     })
 }
 
 #[cfg(target_os = "linux")]
-fn proc_info(pid: u32) -> Option<Proc> {
+fn proc_info(pid: u32, target: Option<(&str, Option<&AgentDef>)>) -> Option<Proc> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let open = stat.find('(')?;
     let close = stat.rfind(')')?;
@@ -193,18 +312,21 @@ fn proc_info(pid: u32) -> Option<Proc> {
     let tty_nr = num(4)?;
     let tpgid = num(5)?;
     let has_tty = tty_nr != 0 && tpgid > 0;
+    let shell = is_shell_name(comm);
+    let proxy = is_proxy_name(comm);
     Some(Proc {
         ppid: num(1)? as u32,
         pgid: num(2)? as u32,
         tdev: has_tty.then_some(tty_nr as u32),
         tpgid: has_tty.then_some(tpgid as u32),
-        shell: is_shell_name(comm),
-        proxy: is_proxy_name(comm),
+        shell,
+        proxy,
+        agent: matches_agent(pid, comm, shell, proxy, target),
     })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn proc_info(_pid: u32) -> Option<Proc> {
+fn proc_info(_pid: u32, _target: Option<(&str, Option<&AgentDef>)>) -> Option<Proc> {
     None
 }
 
@@ -224,12 +346,20 @@ mod tests {
             tpgid,
             shell,
             proxy: false,
+            agent: false,
         }
     }
 
     fn proxy(pgid: u32, tdev: Option<u32>, tpgid: Option<u32>) -> Proc {
         Proc {
             proxy: true,
+            ..p(pgid, tdev, tpgid, false)
+        }
+    }
+
+    fn agent(pgid: u32, tdev: Option<u32>, tpgid: Option<u32>) -> Proc {
+        Proc {
+            agent: true,
             ..p(pgid, tdev, tpgid, false)
         }
     }
@@ -441,6 +571,34 @@ mod tests {
     }
 
     #[test]
+    fn backgrounded_agent_beats_foreground_non_shell_parent() {
+        // A foreground non-shell launcher (group 5, e.g. `timeout`) spawned an agent in
+        // background group 10; detached, child-PTY, and setpgid hooks all resolve to 10.
+        let detached = vec![
+            p(30, None, None, false),
+            agent(10, Some(PANE_TTY), Some(5)),
+            p(5, Some(PANE_TTY), Some(5), false),
+        ];
+        assert_eq!(pick(&detached, 30), 10);
+
+        let child_pty = vec![
+            p(30, Some(CHILD_TTY), Some(30), false),
+            p(30, Some(CHILD_TTY), Some(30), true),
+            agent(10, Some(PANE_TTY), Some(5)),
+            p(5, Some(PANE_TTY), Some(5), false),
+        ];
+        assert_eq!(pick(&child_pty, 30), 10);
+
+        let setpgid = vec![
+            p(30, Some(PANE_TTY), Some(5), false),
+            p(30, Some(PANE_TTY), Some(5), true),
+            agent(10, Some(PANE_TTY), Some(5)),
+            p(5, Some(PANE_TTY), Some(5), false),
+        ];
+        assert_eq!(pick(&setpgid, 30), 10);
+    }
+
+    #[test]
     fn no_terminal_anywhere_falls_back_to_the_own_group() {
         assert_eq!(pick(&[p(30, None, None, false)], 30), 30);
         assert_eq!(pick(&[], 30), 30);
@@ -448,7 +606,7 @@ mod tests {
 
     #[test]
     fn reads_this_process() {
-        let me = proc_info(std::process::id()).expect("own process info");
+        let me = proc_info(std::process::id(), None).expect("own process info");
         assert_eq!(me.pgid, unsafe { libc::getpgrp() } as u32);
     }
 }
