@@ -701,6 +701,7 @@ fn agent_hook(agent: Option<String>, event: Option<String>) {
         let _ = std::io::stdout().flush();
     }
     let Ok(c) = connect(false) else { return };
+    let pgrp = hook_pgrp::agent_pgrp(&agent);
     let _ = c.request(Request::AgentHook {
         pane,
         agent,
@@ -711,7 +712,7 @@ fn agent_hook(agent: Option<String>, event: Option<String>) {
             .or_else(|| field("prompt"))
             .or_else(|| field("lastUserInput")),
         transcript_path: field("transcript_path").or_else(|| field("transcriptPath")),
-        pgrp: Some(hook_pgrp::agent_pgrp()),
+        pgrp: Some(pgrp),
     });
 }
 
