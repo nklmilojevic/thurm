@@ -756,7 +756,7 @@ impl Default for TerminalConfig {
             osc52: Osc52Mode::Copy,
             kitty_keyboard: true,
             kitty_graphics: true,
-            image_memory_mib: 320,
+            image_memory_mib: if cfg!(target_os = "ios") { 64 } else { 320 },
             word_separators: ",│`|:\"' ()[]{}<>\t".into(),
             copy_on_select: false,
             scroll_multiplier: 3.0,

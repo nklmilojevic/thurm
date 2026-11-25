@@ -1637,6 +1637,23 @@ mod encoding {
             kitty(&named(NamedKey::Escape, mods::NUM_LOCK), D),
             "\x1b[27;129u"
         );
+        // iOS UIKey / latched Shift can pass the already-shifted punctuation or letter as `code`
+        // alongside SHIFT, or pass `shifted = Some('!')` with `code = '1'` and empty `text`.
+        assert_eq!(kitty(&ch('!', mods::SHIFT, "!"), D), "!");
+        assert_eq!(kitty(&ch('?', mods::SHIFT, "?"), D), "?");
+        assert_eq!(kitty(&ch('A', mods::SHIFT, "A"), D), "A");
+        assert_eq!(legacy(&ch('!', mods::SHIFT, "!")), b"!");
+        let mut shifted_only = ch('1', mods::SHIFT, "");
+        shifted_only.shifted = Some('!');
+        assert_eq!(kitty(&shifted_only, D), "!");
+        assert_eq!(legacy(&shifted_only), b"!");
+        assert_eq!(kitty(&shifted_only, D | ALL | ALTERNATES), "\x1b[49:33;2u");
+        // Shift+Space is not shifted punctuation; Ctrl+Shift preserves Shift.
+        assert_eq!(kitty(&ch(' ', mods::SHIFT, " "), D), "\x1b[32;2u");
+        assert_eq!(
+            kitty(&ch('/', mods::CTRL | mods::SHIFT, ""), D),
+            "\x1b[47;6u"
+        );
     }
 
     #[test]

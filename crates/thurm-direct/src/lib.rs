@@ -101,6 +101,8 @@ impl From<SessionError> for DirectError {
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
+/// Happy Eyeballs stagger between resolved addresses when dialing multiple candidates.
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 /// How long ending the server waits for shells still starting (an ssh connection and a mosh
 /// bootstrap, each with its own timeout).
 const CREATING_TIMEOUT: Duration = Duration::from_secs(60);
@@ -125,11 +127,43 @@ pub struct Direct {
 
 impl Direct {
     /// Every mosh session moves to a new socket at once (the network changed, or the app came
-    /// back from the background).
+    /// back from the background). Re-resolves DNS for hostnames so Wi-Fi IPv4 <-> cellular
+    /// NAT64 IPv6 transitions update the peer address.
     pub fn wake(&self) {
-        for pane in self.inner.panes.lock().values() {
-            if let Backend::Mosh { session, .. } = &pane.lock().backend {
-                session.wake();
+        if self.inner.target.host.parse::<IpAddr>().is_ok() {
+            for pane in self.inner.panes.lock().values() {
+                if let Backend::Mosh { session, .. } = &pane.lock().backend {
+                    session.wake();
+                }
+            }
+            return;
+        }
+        let inner = self.inner.clone();
+        let spawned = std::thread::Builder::new()
+            .name("thurm-direct-wake".into())
+            .spawn(move || {
+                let current_ip = inner.session.lock().ip;
+                let resolved_ip = resolve_addrs(&inner.target.host, inner.target.port)
+                    .ok()
+                    .and_then(|addrs| pick_wake_ip(current_ip, &addrs));
+                if let Some(ip) = resolved_ip {
+                    inner.session.lock().ip = ip;
+                }
+                let panes: Vec<_> = inner.panes.lock().values().cloned().collect();
+                for pane in panes {
+                    if let Backend::Mosh { session, .. } = &pane.lock().backend {
+                        match resolved_ip {
+                            Some(ip) if ip != current_ip => session.wake_at(ip),
+                            _ => session.wake(),
+                        }
+                    }
+                }
+            });
+        if spawned.is_err() {
+            for pane in self.inner.panes.lock().values() {
+                if let Backend::Mosh { session, .. } = &pane.lock().backend {
+                    session.wake();
+                }
             }
         }
     }
@@ -155,8 +189,12 @@ pub fn serve(
     let inner = Arc::new(Inner {
         target,
         key,
-        ip,
-        session: Mutex::new(Some(Arc::new(session))),
+        session: Mutex::new(SessionSlot {
+            current: Some(Arc::new(session)),
+            ip,
+            connecting: false,
+        }),
+        session_ready: Condvar::new(),
         panes: Mutex::new(HashMap::new()),
         next_pane: AtomicU64::new(1),
         closed: AtomicBool::new(false),
@@ -173,18 +211,94 @@ pub fn serve(
     Ok((ours, Direct { inner }))
 }
 
-/// Connects over ssh to the first of the host's addresses that answers. The address is kept:
-/// mosh-server listens on the address the ssh connection reached (`-s`), so mosh goes there.
+/// Deduplicates resolved addresses and interleaves address families (RFC 8305 Happy Eyeballs),
+/// preserving the OS's preferred family for the first entry.
+fn interleave_addrs(raw: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut unique = Vec::with_capacity(raw.len());
+    for a in raw {
+        if !unique.contains(&a) {
+            unique.push(a);
+        }
+    }
+    let Some(&first) = unique.first() else {
+        return unique;
+    };
+    let (mut primary, mut secondary): (Vec<SocketAddr>, Vec<SocketAddr>) = unique
+        .into_iter()
+        .partition(|a| a.is_ipv6() == first.is_ipv6());
+    let mut out = Vec::with_capacity(primary.len() + secondary.len());
+    let mut p = primary.drain(..);
+    let mut s = secondary.drain(..);
+    loop {
+        match (p.next(), s.next()) {
+            (Some(a), Some(b)) => {
+                out.push(a);
+                out.push(b);
+            }
+            (Some(a), None) => out.push(a),
+            (None, Some(b)) => out.push(b),
+            (None, None) => break,
+        }
+    }
+    out
+}
+
+fn resolve_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, DirectError> {
+    let raw: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| DirectError::Failed(format!("{host}: {e}")))?
+        .collect();
+    Ok(interleave_addrs(raw))
+}
+
+/// Picks the best peer IP on network wake: keep `current` if still advertised, else prefer the
+/// same address family (mosh-server binds the family it started on), else fall back to another
+/// family (e.g. Wi-Fi IPv4 -> cellular NAT64 IPv6).
+fn pick_wake_ip(current: IpAddr, addrs: &[SocketAddr]) -> Option<IpAddr> {
+    if addrs.iter().any(|a| a.ip() == current) {
+        return Some(current);
+    }
+    if let Some(same_family) = addrs.iter().find(|a| a.is_ipv4() == current.is_ipv4()) {
+        return Some(same_family.ip());
+    }
+    addrs.first().map(SocketAddr::ip)
+}
+
+/// Wraps `DeviceKey` across concurrent Happy Eyeballs dials so only one winning connection
+/// invokes `sign()` (preventing duplicate Face ID prompts) and losers abort before signing.
+struct RacingKey {
+    inner: Arc<dyn DeviceKey>,
+    sign_gate: Arc<Mutex<()>>,
+    won: Arc<AtomicBool>,
+}
+
+impl DeviceKey for RacingKey {
+    fn public_sec1(&self) -> Vec<u8> {
+        self.inner.public_sec1()
+    }
+
+    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let _guard = self.sign_gate.lock();
+        if self.won.load(Ordering::Acquire) {
+            return Err("cancelled".into());
+        }
+        self.inner.sign(data)
+    }
+}
+
+/// Connects over ssh by racing the host's resolved addresses (Happy Eyeballs). The winning
+/// address is kept: mosh-server listens on the address the ssh connection reached (`-s`), so
+/// mosh goes there.
 fn connect(
     target: &DirectTarget,
     key: &Arc<dyn DeviceKey>,
 ) -> Result<(Session, IpAddr), DirectError> {
-    let addrs: Vec<SocketAddr> = (target.host.as_str(), target.port)
-        .to_socket_addrs()
-        .map_err(|e| DirectError::Failed(format!("{}: {e}", target.host)))?
-        .collect();
-    let mut last = DirectError::Failed(format!("{}: no address", target.host));
-    for addr in addrs {
+    let addrs = resolve_addrs(&target.host, target.port)?;
+    if addrs.is_empty() {
+        return Err(DirectError::Failed(format!("{}: no address", target.host)));
+    }
+    if addrs.len() == 1 {
+        let addr = addrs[0];
         let t = Target {
             host: addr.ip().to_string(),
             port: target.port,
@@ -192,10 +306,89 @@ fn connect(
             host_keys: target.host_keys.clone(),
             socket: None,
         };
-        match Session::connect_checked(&t, key.clone(), CONNECT_TIMEOUT) {
-            Ok(s) => return Ok((s, addr.ip())),
-            Err(SessionError::Ssh(e)) => last = DirectError::Failed(e.to_string()),
-            Err(e) => return Err(e.into()),
+        return match Session::connect_checked(&t, key.clone(), CONNECT_TIMEOUT) {
+            Ok(s) => Ok((s, addr.ip())),
+            Err(e) => Err(e.into()),
+        };
+    }
+
+    let won = Arc::new(AtomicBool::new(false));
+    let sign_gate = Arc::new(Mutex::new(()));
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(Session, IpAddr), SessionError>>();
+    let mut in_flight = 0usize;
+    let mut last = DirectError::Failed(format!("{}: no address", target.host));
+
+    let spawn_one = |addr: SocketAddr| -> bool {
+        let t = Target {
+            host: addr.ip().to_string(),
+            port: target.port,
+            user: target.user.clone(),
+            host_keys: target.host_keys.clone(),
+            socket: None,
+        };
+        let key: Arc<dyn DeviceKey> = Arc::new(RacingKey {
+            inner: key.clone(),
+            sign_gate: sign_gate.clone(),
+            won: won.clone(),
+        });
+        let tx = tx.clone();
+        let won = won.clone();
+        std::thread::Builder::new()
+            .name("thurm-direct-dial".into())
+            .spawn(move || match Session::connect_checked(&t, key, CONNECT_TIMEOUT) {
+                Ok(session) => {
+                    if won.swap(true, Ordering::AcqRel) {
+                        session.disconnect();
+                        return;
+                    }
+                    if let Err(std::sync::mpsc::SendError(Ok((session, _)))) =
+                        tx.send(Ok((session, addr.ip())))
+                    {
+                        session.disconnect();
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            })
+            .is_ok()
+    };
+
+    let mut idx = 0;
+    while idx < addrs.len() {
+        if spawn_one(addrs[idx]) {
+            in_flight += 1;
+        }
+        idx += 1;
+        if idx < addrs.len() {
+            match rx.recv_timeout(HAPPY_EYEBALLS_DELAY) {
+                Ok(Ok(pair)) => return Ok(pair),
+                Ok(Err(SessionError::Ssh(e))) => {
+                    in_flight = in_flight.saturating_sub(1);
+                    last = DirectError::Failed(e.to_string());
+                }
+                Ok(Err(e)) => {
+                    won.store(true, Ordering::Release);
+                    return Err(e.into());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        }
+    }
+    drop(tx);
+    while in_flight > 0 {
+        match rx.recv() {
+            Ok(Ok(pair)) => return Ok(pair),
+            Ok(Err(SessionError::Ssh(e))) => {
+                in_flight -= 1;
+                last = DirectError::Failed(e.to_string());
+            }
+            Ok(Err(e)) => {
+                won.store(true, Ordering::Release);
+                return Err(e.into());
+            }
+            Err(_) => break,
         }
     }
     Err(last)
@@ -329,11 +522,17 @@ fn new_terminal(size: PaneSize) -> Terminal {
     term
 }
 
+struct SessionSlot {
+    current: Option<Arc<Session>>,
+    ip: IpAddr,
+    connecting: bool,
+}
+
 struct Inner {
     target: DirectTarget,
     key: Arc<dyn DeviceKey>,
-    ip: IpAddr,
-    session: Mutex<Option<Arc<Session>>>,
+    session: Mutex<SessionSlot>,
+    session_ready: Condvar,
     panes: Mutex<HashMap<PaneId, Arc<Mutex<Pane>>>>,
     next_pane: AtomicU64,
     /// The app closed its end: shells that finish starting now end at once.
@@ -378,25 +577,59 @@ impl Inner {
         self.panes.lock().get(&id).cloned()
     }
 
-    /// The ssh session, connecting again when it has gone away (the app was suspended).
-    fn session(&self) -> Result<Arc<Session>, String> {
-        let mut s = self.session.lock();
-        if let Some(session) = s.as_ref().filter(|s| !s.is_closed()) {
-            return Ok(session.clone());
+    /// The ssh session and its current IP, reconnecting (with fresh DNS resolution and Happy
+    /// Eyeballs) when it has gone away. Never holds `self.session` across the network dial, so
+    /// `close()` and `shutdown()` never stall on a 20s reconnect.
+    fn session(&self) -> Result<(Arc<Session>, IpAddr), String> {
+        let mut slot = self.session.lock();
+        loop {
+            if let Some(session) = slot.current.as_ref().filter(|s| !s.is_closed()) {
+                return Ok((session.clone(), slot.ip));
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return Err("the connection is closing".into());
+            }
+            if slot.connecting {
+                self.session_ready.wait(&mut slot);
+                continue;
+            }
+            slot.connecting = true;
+            drop(slot);
+            struct ConnectingGuard<'a> {
+                inner: &'a Inner,
+                armed: bool,
+            }
+            impl Drop for ConnectingGuard<'_> {
+                fn drop(&mut self) {
+                    if self.armed {
+                        let mut slot = self.inner.session.lock();
+                        slot.connecting = false;
+                        self.inner.session_ready.notify_all();
+                    }
+                }
+            }
+            let mut guard = ConnectingGuard {
+                inner: self,
+                armed: true,
+            };
+            let res = connect(&self.target, &self.key);
+            let mut slot = self.session.lock();
+            slot.connecting = false;
+            guard.armed = false;
+            match res {
+                Ok((s, ip)) => {
+                    let s = Arc::new(s);
+                    slot.current = Some(s.clone());
+                    slot.ip = ip;
+                    self.session_ready.notify_all();
+                    return Ok((s, ip));
+                }
+                Err(e) => {
+                    self.session_ready.notify_all();
+                    return Err(e.to_string());
+                }
+            }
         }
-        let t = Target {
-            host: self.ip.to_string(),
-            port: self.target.port,
-            user: self.target.user.clone(),
-            host_keys: self.target.host_keys.clone(),
-            socket: None,
-        };
-        let session = Arc::new(
-            Session::connect_checked(&t, self.key.clone(), CONNECT_TIMEOUT)
-                .map_err(|e| e.to_string())?,
-        );
-        *s = Some(session.clone());
-        Ok(session)
     }
 
     fn run(self: Arc<Self>, mut reader: UnixStream) {
@@ -430,6 +663,7 @@ impl Inner {
     /// those still starting included (they end themselves once started, seeing `closed`).
     fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        self.session_ready.notify_all();
         {
             let deadline = Instant::now() + CREATING_TIMEOUT;
             let mut creating = self.creating.lock();
@@ -445,7 +679,7 @@ impl Inner {
             .filter_map(|p| end_backend(std::mem::replace(&mut p.lock().backend, Backend::Ended)))
             .collect();
         drop(panes);
-        if let Some(session) = self.session.lock().take() {
+        if let Some(session) = self.session.lock().current.take() {
             kill(&session, &pids);
             session.disconnect();
         }
@@ -587,7 +821,13 @@ impl Inner {
         if let Some(pid) = end_backend(backend) {
             // Over the session there is now: reconnecting would hold up this request (the
             // server exits by itself after its timeout).
-            if let Some(s) = self.session.lock().clone().filter(|s| !s.is_closed()) {
+            if let Some(s) = self
+                .session
+                .lock()
+                .current
+                .clone()
+                .filter(|s| !s.is_closed())
+            {
                 std::thread::spawn(move || kill(&s, &[pid]));
             }
         }
@@ -600,7 +840,7 @@ impl Inner {
         }
         let id = self.next_pane.fetch_add(1, Ordering::Relaxed);
         let size = req.size;
-        let session = self.session()?;
+        let (session, ip) = self.session()?;
         let pane = Arc::new(Mutex::new(Pane {
             id,
             term: new_terminal(size),
@@ -614,9 +854,9 @@ impl Inner {
         let started = match self.target.mode {
             Mode::Ssh => self.start_ssh(&session, &pane, size),
             Mode::MoshOnly => self
-                .start_mosh(&session, &pane, size)
+                .start_mosh(&session, ip, &pane, size)
                 .map_err(|e| e.to_string()),
-            Mode::Mosh => match self.start_mosh(&session, &pane, size) {
+            Mode::Mosh => match self.start_mosh(&session, ip, &pane, size) {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     let note = format!("\x1b[2m[mosh: {e}; using ssh]\x1b[0m\r\n");
@@ -685,6 +925,7 @@ impl Inner {
     fn start_mosh(
         self: &Arc<Self>,
         session: &Session,
+        ip: IpAddr,
         pane: &Arc<Mutex<Pane>>,
         size: PaneSize,
     ) -> Result<(), BootstrapError> {
@@ -701,7 +942,7 @@ impl Inner {
         let initial = p.term.serialize_state();
         let started = MoshSession::start(
             self.mosh_rt.as_ref().expect("the mosh runtime").handle(),
-            SocketAddr::new(self.ip, connect.port),
+            SocketAddr::new(ip, connect.port),
             connect.key,
             (size.cols, size.rows),
             move |ev| {

@@ -55,11 +55,21 @@ fn http_server(rt: &Runtime, response: &'static str) -> String {
     format!("ws://{addr}/v1/connect")
 }
 
+fn open_test(url: &str, timeout: Duration) -> Result<(UnixStream, Session), ConnectError> {
+    open_with(
+        url,
+        Limits {
+            connect: timeout,
+            ..LIMITS
+        },
+    )
+}
+
 #[test]
 fn relays_bytes_both_ways() {
     let server = server_rt();
     let url = echo_server(&server);
-    let (mut stream, _session) = open(&url, CONNECT_TIMEOUT).unwrap();
+    let (mut stream, _session) = open_test(&url, CONNECT_TIMEOUT).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -73,7 +83,7 @@ fn relays_bytes_both_ways() {
 fn dropping_the_session_closes_the_stream() {
     let server = server_rt();
     let url = echo_server(&server);
-    let (mut stream, session) = open(&url, CONNECT_TIMEOUT).unwrap();
+    let (mut stream, session) = open_test(&url, CONNECT_TIMEOUT).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -90,7 +100,7 @@ fn a_refused_account_says_so() {
         "HTTP/1.1 403 Forbidden\r\nContent-Length: 50\r\nConnection: close\r\n\r\n\
          forbidden: other@example.com is not the node owner",
     );
-    match open(&url, CONNECT_TIMEOUT) {
+    match open_test(&url, CONNECT_TIMEOUT) {
         Err(ConnectError::Forbidden(body)) => {
             assert!(body.contains("other@example.com"), "{body}")
         }
@@ -106,7 +116,7 @@ fn a_daemon_that_is_down_says_so() {
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
     assert!(matches!(
-        open(&url, CONNECT_TIMEOUT),
+        open_test(&url, CONNECT_TIMEOUT),
         Err(ConnectError::DaemonUnavailable)
     ));
 }
@@ -117,7 +127,7 @@ fn a_silent_address_times_out_quickly() {
     let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("ws://{}/v1/connect", ln.local_addr().unwrap());
     let started = Instant::now();
-    let r = open(&url, Duration::from_millis(500));
+    let r = open_test(&url, Duration::from_millis(500));
     assert!(
         matches!(r, Err(ConnectError::Unreachable(_))),
         "{:?}",
@@ -133,12 +143,77 @@ fn only_websocket_urls() {
         open("https://mac.tail1234.ts.net/v1/connect", CONNECT_TIMEOUT),
         Err(ConnectError::BadUrl(_))
     ));
+    // Cleartext ws:// is rejected by open() and connect(), even on a Tailscale IP.
+    for ws in [
+        "ws://127.0.0.1:7297/v1/connect",
+        "ws://100.64.0.7:7297/v1/connect",
+        "ws://host.tail1234.ts.net:7297/v1/connect",
+    ] {
+        assert!(
+            matches!(open(ws, CONNECT_TIMEOUT), Err(ConnectError::BadUrl(_))),
+            "{ws}"
+        );
+        assert!(
+            matches!(
+                connect(ws, "test", &[], |_| {}, || {}),
+                Err(ConnectError::BadUrl(_))
+            ),
+            "{ws}"
+        );
+    }
+}
+
+#[test]
+fn plain_tailnet_allows_only_ws_tailscale_ip_literals() {
+    for ok in [
+        "ws://100.64.0.1:7297/v1/connect",
+        "ws://100.100.100.100:7297/v1/connect",
+        "ws://100.127.255.254:7297/v1/connect",
+        "ws://[fd7a:115c:a1e0::1]:7297/v1/connect",
+        "ws://[fd7a:115c:a1e0:ab12::42]/v1/connect",
+    ] {
+        assert!(check_plain_tailnet_url(ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        "wss://100.64.0.1/v1/connect",
+        "wss://host.tail1234.ts.net/v1/connect",
+        "ws://100.63.255.255:7297/v1/connect",
+        "ws://100.128.0.0:7297/v1/connect",
+        "ws://127.0.0.1:7297/v1/connect",
+        "ws://192.168.1.10:7297/v1/connect",
+        "ws://[::1]:7297/v1/connect",
+        "ws://[fe80::1]:7297/v1/connect",
+        "ws://[fd7a:115c:a1e1::1]:7297/v1/connect",
+        "ws://host.tail1234.ts.net:7297/v1/connect",
+        "ws://100.64.0.1@evil.example:7297/v1/connect",
+        "http://100.64.0.1:7297/v1/connect",
+    ] {
+        assert!(
+            matches!(
+                open_plain(bad, CONNECT_TIMEOUT),
+                Err(ConnectError::BadUrl(_))
+            ),
+            "{bad}"
+        );
+        assert!(
+            matches!(
+                connect_plain(bad, "test", &[], |_| {}, || {}),
+                Err(ConnectError::BadUrl(_))
+            ),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
 fn errors_tell_what_to_check() {
     let e = ConnectError::Unreachable("connection refused".into()).to_string();
     assert!(e.contains("Tailscale connected on this device"), "{e}");
+    assert!(!e.contains("Mac"), "error should be host-neutral: {e}");
+    let f = ConnectError::Forbidden("denied".into()).to_string();
+    assert!(!f.contains("Mac"), "error should be host-neutral: {f}");
+    let u = ConnectError::DaemonUnavailable.to_string();
+    assert!(!u.contains("Mac"), "error should be host-neutral: {u}");
 }
 
 /// A WebSocket server that upgrades and then neither reads nor writes, holding the connection.

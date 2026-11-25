@@ -63,6 +63,11 @@ thurm_client *thurm_connect_socket(const char *socket, const char *daemon_path,
 /* Close the connection. Panes keep running inside the daemon. */
 void thurm_disconnect(thurm_client *client);
 
+/* Optional teardown hook for `ctx`, invoked once when the last reference holding `ctx`
+ * (including background reader and sync-flush tasks) drops. Safe to call with NULL. */
+typedef void (*thurm_ctx_drop_cb)(void *ctx);
+void thurm_client_set_ctx_drop(thurm_client *client, thurm_ctx_drop_cb on_drop);
+
 /* Write `data` to a new file (0600) in the daemon's runtime directory, on the daemon's machine,
  * and return its path (NULL with `err` set on failure). An image pasted into a remote pane goes
  * over like this, and the program gets a path it can read. Free the result. */
@@ -411,6 +416,15 @@ typedef struct {
 bool thurm_grid_lock(thurm_client *client, thurm_pane_id pane, thurm_grid_info *info,
                      const thurm_cell **cells);
 
+/* Like thurm_grid_lock, for callers sharing a pane across multiple readers (e.g. a main
+ * terminal view and a miniature tile): pass the `generation` this reader last drew (or 0 on
+ * its first lock). If frames were skipped or another reader already consumed dirty bits since
+ * `last_generation`, `info->dirty_rows` is returned as UINT64_MAX and `info->shift` as 0 so
+ * this reader repaints every row instead of missing changes. Must be paired with
+ * thurm_grid_unlock(). */
+bool thurm_grid_lock_for(thurm_client *client, thurm_pane_id pane, uint64_t last_generation,
+                         thurm_grid_info *info, const thurm_cell **cells);
+
 /* While locked: the full grapheme cluster at (row, col) when it has combining characters
  * (emoji ZWJ sequences, accents), else NULL. */
 const char *thurm_grid_cluster(thurm_client *client, thurm_pane_id pane, uint16_t row,
@@ -599,9 +613,10 @@ typedef struct {
  *   {"host":"mac.tailnet.ts.net","port":22,"user":"me","host_keys":["SHA256:..."],
  *    "socket":null}
  * Blocks while connecting: call it off the main thread. Returns NULL on failure with `err`
- * set (free it): JSON {"kind","message"}, `kind` being "key_rejected" (the host does not have
- * the device's key yet), "not_installed" (no thurm there) or "failed". Otherwise a client used
- * like thurm_connect's. thurm_disconnect also closes the ssh session. */
+ * set (free it): JSON {"kind","message","fingerprint"?}, `kind` being "key_rejected" (the host
+ * does not have the device's key yet), "not_installed" (no thurm there), "host_key_changed"
+ * (with "fingerprint" set to the key the host presented), "protocol_mismatch" or "failed".
+ * Otherwise a client used like thurm_connect's. thurm_disconnect also closes the ssh session. */
 thurm_client *thurm_ssh_connect(const char *target_json, thurm_device_key key,
                                 const char *client_name, thurm_event_cb on_event,
                                 thurm_frame_cb on_frame, void *ctx, char **err);
@@ -611,7 +626,8 @@ thurm_client *thurm_ssh_connect(const char *target_json, thurm_device_key key,
 char *thurm_ssh_authorized_key(thurm_device_key key, const char *comment);
 
 /* Connect to a daemon served over Tailscale as a mobile client. `url` is the pairing code's
- * tailnet address, wss://<device>.<tailnet>.ts.net/v1/connect; the phone's Tailscale app
+ * tailnet address, strictly `wss://<device>.<tailnet>.ts.net/v1/connect` (cleartext `ws://` is
+ * rejected; use thurm_tailnet_connect_plain for Tailscale IP literals); the phone's Tailscale app
  * carries it, and the daemon admits this device by its Tailscale account. Blocks for at most a
  * few seconds (an unreachable address fails fast, to fall back to ssh): call it off the main
  * thread. Returns NULL on failure with `err` set (free it); otherwise a client used like
@@ -619,6 +635,13 @@ char *thurm_ssh_authorized_key(thurm_device_key key, const char *comment);
 thurm_client *thurm_tailnet_connect(const char *url, const char *client_name,
                                     thurm_event_cb on_event, thurm_frame_cb on_frame, void *ctx,
                                     char **err);
+
+/* Like thurm_tailnet_connect, for a daemon's plain listener over the system Tailscale VPN.
+ * Strictly requires a `ws://` URL whose host is a Tailscale IP literal (IPv4 CGNAT
+ * 100.64.0.0/10 or IPv6 ULA fd7a:115c:a1e0::/48); hostnames and non-tailnet IPs are rejected. */
+thurm_client *thurm_tailnet_connect_plain(const char *url, const char *client_name,
+                                          thurm_event_cb on_event, thurm_frame_cb on_frame,
+                                          void *ctx, char **err);
 
 /* Like thurm_tailnet_connect, over `fd`: a stream socket the app already connected to the
  * daemon's device on port 443 with Tailscale embedded in the app (TailscaleKit's

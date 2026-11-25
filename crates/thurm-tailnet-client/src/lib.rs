@@ -51,17 +51,17 @@ impl std::fmt::Display for ConnectError {
             ConnectError::BadUrl(e) => write!(f, "not a Thurm tailnet address: {e}"),
             ConnectError::Unreachable(e) => write!(
                 f,
-                "can't reach the Mac over Tailscale ({e}): is Tailscale connected on this device, \
-                 and is Serve over Tailscale on on the Mac?"
+                "can't reach the host over Tailscale ({e}): is Tailscale connected on this \
+                 device, and is Serve over Tailscale on on the host?"
             ),
             ConnectError::Forbidden(e) => write!(
                 f,
-                "the Mac doesn't let this device's Tailscale account in: {e}"
+                "the host doesn't let this device's Tailscale account in: {e}"
             ),
             ConnectError::DaemonUnavailable => {
                 write!(
                     f,
-                    "the Mac answered over Tailscale, but Thurm's daemon isn't running there"
+                    "the host answered over Tailscale, but Thurm's daemon isn't running there"
                 )
             }
             ConnectError::Protocol(e) => write!(f, "{e}"),
@@ -106,8 +106,8 @@ const LIMITS: Limits = Limits {
     silent: SILENT_LIMIT,
 };
 
-/// Connects to the daemon at `url` and says Hello (with `capabilities`, e.g. `CAP_MOBILE`),
-/// within [`CONNECT_TIMEOUT`] in all.
+/// Connects to the daemon at `url` (`wss://` only) and says Hello (with `capabilities`, e.g.
+/// `CAP_MOBILE`), within [`CONNECT_TIMEOUT`] in all.
 pub fn connect(
     url: &str,
     client_name: &str,
@@ -115,6 +115,28 @@ pub fn connect(
     on_event: impl Fn(Event) + Send + 'static,
     on_disconnect: impl FnOnce() + Send + 'static,
 ) -> Result<Remote, ConnectError> {
+    check_wss_url(url)?;
+    connect_with(
+        url,
+        client_name,
+        capabilities,
+        LIMITS,
+        on_event,
+        on_disconnect,
+    )
+}
+
+/// Connects to a daemon's plain tailnet listener over the device's system Tailscale VPN.
+/// Strictly requires `ws://` and a Tailscale IP literal host (`100.64.0.0/10` IPv4 CGNAT or
+/// `fd7a:115c:a1e0::/48` IPv6 ULA) so cleartext daemon traffic never leaves the tailnet.
+pub fn connect_plain(
+    url: &str,
+    client_name: &str,
+    capabilities: &[&str],
+    on_event: impl Fn(Event) + Send + 'static,
+    on_disconnect: impl FnOnce() + Send + 'static,
+) -> Result<Remote, ConnectError> {
+    check_plain_tailnet_url(url)?;
     connect_with(
         url,
         client_name,
@@ -220,9 +242,23 @@ fn hello(
     Ok(Remote { client, session })
 }
 
-/// Opens the WebSocket at `url` and relays it to one end of a socket pair, returned with the
-/// session that keeps the relay running.
+/// Opens the `wss://` WebSocket at `url` and relays it to one end of a socket pair, returned with
+/// the session that keeps the relay running.
 pub fn open(url: &str, timeout: Duration) -> Result<(UnixStream, Session), ConnectError> {
+    check_wss_url(url)?;
+    open_with(
+        url,
+        Limits {
+            connect: timeout,
+            ..LIMITS
+        },
+    )
+}
+
+/// Opens a plain `ws://` WebSocket to a Tailscale IP literal (`100.64.0.0/10` or
+/// `fd7a:115c:a1e0::/48`) and relays it to one end of a socket pair.
+pub fn open_plain(url: &str, timeout: Duration) -> Result<(UnixStream, Session), ConnectError> {
+    check_plain_tailnet_url(url)?;
     open_with(
         url,
         Limits {
@@ -254,6 +290,78 @@ fn check_url(url: &str) -> Result<(), ConnectError> {
     } else {
         Err(ConnectError::BadUrl(url.to_owned()))
     }
+}
+
+fn check_wss_url(url: &str) -> Result<(), ConnectError> {
+    if url.starts_with("wss://") {
+        Ok(())
+    } else {
+        Err(ConnectError::BadUrl(format!(
+            "{url}: expected a wss:// address"
+        )))
+    }
+}
+
+/// Extracts the bare host (without brackets or port) from a `ws://` URL, rejecting userinfo (`@`).
+fn extract_ws_host(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("ws://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let (host, tail) = after_open.split_once(']')?;
+        if !tail.is_empty() {
+            let port = tail.strip_prefix(':')?;
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+        }
+        (!host.is_empty()).then_some(host)
+    } else {
+        let host = match authority.rsplit_once(':') {
+            Some((h, port)) => {
+                if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                h
+            }
+            None => authority,
+        };
+        (!host.is_empty()).then_some(host)
+    }
+}
+
+fn is_tailnet_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && (64..=127).contains(&b)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+    }
+}
+
+fn check_plain_tailnet_url(url: &str) -> Result<(), ConnectError> {
+    let host = extract_ws_host(url).ok_or_else(|| {
+        ConnectError::BadUrl(format!(
+            "{url}: plain tailnet connect requires a ws:// URL with a Tailscale IP literal"
+        ))
+    })?;
+    let ip: std::net::IpAddr = host.parse().map_err(|_| {
+        ConnectError::BadUrl(format!(
+            "{url}: plain tailnet connect requires a Tailscale IP literal host"
+        ))
+    })?;
+    if !is_tailnet_ip(ip) {
+        return Err(ConnectError::BadUrl(format!(
+            "{url}: {ip} is not a Tailscale IP address"
+        )));
+    }
+    Ok(())
 }
 
 fn runtime() -> Result<Session, ConnectError> {

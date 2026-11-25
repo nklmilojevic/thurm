@@ -3,7 +3,7 @@
 //! it hears from, which is how a session survives changing networks and the app's suspension.
 
 use std::io;
-use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -55,7 +55,7 @@ pub enum MoshEvent {
 
 enum Cmd {
     Event(UserEvent),
-    Wake,
+    Wake(Option<IpAddr>),
     Close,
 }
 
@@ -128,7 +128,13 @@ impl MoshSession {
 
     /// The network may have changed (or the app woke up): move to a new socket and say hello.
     pub fn wake(&self) {
-        let _ = self.tx.send(Cmd::Wake);
+        let _ = self.tx.send(Cmd::Wake(None));
+    }
+
+    /// Like [`wake`], also updating the peer IP address (e.g. Wi-Fi IPv4 <-> cellular NAT64 IPv6)
+    /// if a fresh socket can be opened to it.
+    pub fn wake_at(&self, ip: IpAddr) {
+        let _ = self.tx.send(Cmd::Wake(Some(ip)));
     }
 
     pub fn close(&self) {
@@ -179,8 +185,28 @@ impl Driver {
                 cmd = rx.recv() => match cmd {
                     None | Some(Cmd::Close) => return,
                     Some(Cmd::Event(ev)) => self.engine.push(ev),
-                    Some(Cmd::Wake) => {
-                        self.resocket();
+                    Some(Cmd::Wake(ip)) => {
+                        if let Some(ip) = ip {
+                            let next = SocketAddr::new(ip, self.addr.port());
+                            if next != self.addr {
+                                match socket_for(next) {
+                                    Ok(s) => {
+                                        self.addr = next;
+                                        self.socket = s;
+                                        self.assembly = Assembly::default();
+                                        self.last_resocket = Instant::now();
+                                    }
+                                    Err(e) => {
+                                        log::debug!("mosh: new socket for {next}: {e}");
+                                        self.resocket();
+                                    }
+                                }
+                            } else {
+                                self.resocket();
+                            }
+                        } else {
+                            self.resocket();
+                        }
                         self.engine.force_send();
                     }
                 },

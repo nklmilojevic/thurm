@@ -618,3 +618,42 @@ fn a_shell_exiting_before_its_pane_has_it_closes_it() {
     assert!(created.is_err(), "{created:?}");
     assert!(app.panes().is_empty());
 }
+
+#[test]
+fn interleaves_resolved_address_families_and_deduplicates() {
+    let v6_a: SocketAddr = "[2001:db8::1]:22".parse().unwrap();
+    let v6_b: SocketAddr = "[2001:db8::2]:22".parse().unwrap();
+    let v4_a: SocketAddr = "192.0.2.1:22".parse().unwrap();
+    let v4_b: SocketAddr = "192.0.2.2:22".parse().unwrap();
+    assert_eq!(
+        interleave_addrs(vec![v6_a, v6_a, v6_b, v4_a, v4_b, v4_a]),
+        vec![v6_a, v4_a, v6_b, v4_b]
+    );
+    assert_eq!(
+        interleave_addrs(vec![v4_a, v4_b, v6_a]),
+        vec![v4_a, v6_a, v4_b]
+    );
+}
+
+#[test]
+fn pick_wake_ip_prefers_current_then_same_family_then_nat64() {
+    let v4_a: SocketAddr = "192.0.2.1:22".parse().unwrap();
+    let v4_b: SocketAddr = "192.0.2.2:22".parse().unwrap();
+    let v6_nat64: SocketAddr = "[64:ff9b::192.0.2.1]:22".parse().unwrap();
+    // Keeps current IP even if IPv6 is first in the new DNS answer.
+    assert_eq!(
+        pick_wake_ip(v4_a.ip(), &[v6_nat64, v4_a]),
+        Some(v4_a.ip())
+    );
+    // Prefers same family when host's IPv4 moved.
+    assert_eq!(
+        pick_wake_ip(v4_a.ip(), &[v6_nat64, v4_b]),
+        Some(v4_b.ip())
+    );
+    // Falls over to NAT64 IPv6 when IPv4 disappears on cellular.
+    assert_eq!(
+        pick_wake_ip(v4_a.ip(), &[v6_nat64]),
+        Some(v6_nat64.ip())
+    );
+    assert_eq!(pick_wake_ip(v4_a.ip(), &[]), None);
+}

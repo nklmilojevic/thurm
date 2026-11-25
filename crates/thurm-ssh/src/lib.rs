@@ -266,7 +266,18 @@ impl Session {
     pub fn open_socket(&self, path: &str) -> Result<UnixStream, SshError> {
         let channel = self
             .rt
-            .block_on(self.handle.channel_open_direct_streamlocal(path))
+            .block_on(async {
+                tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    self.handle.channel_open_direct_streamlocal(path),
+                )
+                .await
+            })
+            .map_err(|_| {
+                SshError::Transient(format!(
+                    "ssh: timed out opening daemon socket {path}"
+                ))
+            })?
             .map_err(|e| {
                 SshError::Attention(format!(
                     "the host refused to forward {path}: {e} (sshd needs \
@@ -450,9 +461,14 @@ async fn replied(ch: &mut russh::Channel<client::Msg>) -> Result<bool, russh::Er
     Err(russh::Error::Disconnect)
 }
 
+/// Default timeout for SSH connect, authentication, and forwarding channel open.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Maximum time to wait for the daemon's Hello response once the socket channel is open.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// The host did not accept the device's key, in the words the app shows.
 const KEY_REJECTED: &str = "the host did not accept this device's key; add it from the Mac \
-     (Thurm › Remotes… › Pair iPhone)";
+     (Settings › Remotes › Pair iPhone)";
 
 /// Why [`Session::connect_checked`] failed.
 #[derive(Debug)]
@@ -546,6 +562,8 @@ impl Shell {
 #[derive(Debug)]
 pub enum ConnectError {
     Ssh(SshError),
+    /// The host showed a key that does not match the pinned fingerprints from pairing.
+    HostKeyChanged(String),
     /// The host does not accept the device's key yet: add it on the Mac, then try again.
     KeyRejected,
     /// No `thurm` on the host: install it from the Mac.
@@ -557,6 +575,11 @@ impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnectError::Ssh(e) => write!(f, "{e}"),
+            ConnectError::HostKeyChanged(seen) => write!(
+                f,
+                "the host's key ({seen}) is not the one paired with this device; \
+                 pair the host again if it was reinstalled"
+            ),
             ConnectError::KeyRejected => f.write_str(KEY_REJECTED),
             ConnectError::NotInstalled => f.write_str(
                 "Thurm's command-line tool is not installed on this host; on a Mac, use Thurm › \
@@ -583,6 +606,7 @@ pub const MOBILE_CAPABILITIES: &[&str] = &[
     thurm_proto::CAP_MOBILE,
     thurm_proto::CAP_PANE_PAGER,
     thurm_proto::CAP_AGENT_ACTIVITY,
+    thurm_proto::CAP_PENDING_PROMPT,
     thurm_proto::CAP_DEFLATE,
 ];
 
@@ -595,11 +619,13 @@ pub fn connect(
     on_event: impl Fn(Event) + Send + 'static,
     on_disconnect: impl FnOnce() + Send + 'static,
 ) -> Result<Remote, ConnectError> {
-    let session =
-        Session::connect_checked(target, key, Duration::from_secs(20)).map_err(|e| match e {
-            SessionError::KeyRejected => ConnectError::KeyRejected,
-            e => ConnectError::Ssh(e.into_ssh()),
-        })?;
+    let session = Session::connect_checked(target, key, CONNECT_TIMEOUT).map_err(|e| match e {
+        SessionError::KeyRejected => ConnectError::KeyRejected,
+        SessionError::HostKeyChanged(seen) | SessionError::UnknownHostKey(seen) => {
+            ConnectError::HostKeyChanged(seen)
+        }
+        e => ConnectError::Ssh(e.into_ssh()),
+    })?;
     let host = thurm_remote::probe(&session).map_err(ConnectError::Ssh)?;
     let socket = match (&target.socket, &host.info) {
         (Some(s), _) => s.clone(),
@@ -608,11 +634,12 @@ pub fn connect(
     };
     thurm_remote::start_daemon(&session, &socket).map_err(ConnectError::Ssh)?;
     let stream = session.open_socket(&socket).map_err(ConnectError::Ssh)?;
-    let client = Client::from_stream(
+    let client = Client::from_stream_timeout(
         stream,
         client_name,
         false,
         MOBILE_CAPABILITIES,
+        Some(HELLO_TIMEOUT),
         on_event,
         on_disconnect,
     )
