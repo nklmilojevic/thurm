@@ -3729,6 +3729,7 @@ impl Daemon {
             Request::DaemonId => thurm_config::daemon_id()
                 .map(Response::Text)
                 .map_err(|e| format!("the daemon's identifier: {e}")),
+            Request::GetPendingPrompt { .. } => Ok(Response::PendingPrompt(None)),
         }
     }
 
