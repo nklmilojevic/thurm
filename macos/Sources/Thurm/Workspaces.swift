@@ -262,8 +262,11 @@ extension SessionManager {
                         in c: TerminalWindowController?, reveal: Bool) -> Bool {
         guard let ws = workspaces.first(where: { $0.hiddenTabs.contains { $0.root.panes.contains(target) } }),
               let i = ws.hiddenTabs.firstIndex(where: { $0.root.panes.contains(target) }) else { return false }
-        ws.hiddenTabs[i].root = SplitNode(layout: ws.hiddenTabs[i].root)
-            .inserting(pane, at: target, direction: direction, share: share ?? 0.5).layoutNode
+        var root = SplitNode(layout: ws.hiddenTabs[i].root)
+            .inserting(pane, at: target, direction: direction, share: share ?? 0.5)
+        if share == nil && config.autoBalance { root = root.equalized() }
+        ws.hiddenTabs[i].root = root.layoutNode
+        ws.hiddenTabs[i].zoomed = nil
         if reveal {
             ws.hiddenTabs[i].focused = pane.id
             ws.hiddenSelectedTab = i
