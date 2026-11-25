@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.28.0 - 2026-11-25
+
+This release makes the macOS app switch workspaces and tabs faster. It also adds icons for remote hosts and fixes LAN access on macOS.
+
+### New features
+
+- You can set an icon for each remote host with the `icon` field in `[[remote]]`. When you click an agent notification, Thurm focuses the correct pane in All Hosts mode.
+- Thurm switches workspaces and tabs faster in the macOS app. `Cmd+1…9` now switches to tabs across all workspaces in All Hosts and All Workspaces views.
+
+### Fixes
+
+- Connections from Thurm shells to LAN hosts no longer fail with `No route to host` on macOS 15 and 26. The `thurmd` daemon now runs in a helper app that macOS can grant local network access.
+
 ## v0.27.0 - 2026-11-22
 
 This release gives automatic session titles to Pi and Antigravity sessions. Titles work with and without on-device AI.
