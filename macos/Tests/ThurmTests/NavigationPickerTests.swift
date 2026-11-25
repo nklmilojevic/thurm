@@ -246,4 +246,30 @@ final class NavigationPickerTests: XCTestCase {
         XCTAssertEqual(c.focusedPane, floating)
         XCTAssertTrue(c.content.visiblePaneIds.contains(floating))
     }
+
+    func testParkedSourceTabWinsOverPaneMovedIntoOldWindow() throws {
+        let first = PaneKey.local(61), second = PaneKey.local(62), other = PaneKey.local(63)
+        for p in [first, second, other] { addPane(p) }
+        let savedSidebarTabs = manager.config.sidebarTabs
+        manager.config.sidebarTabs = true
+        defer { manager.config.sidebarTabs = savedSidebarTabs }
+
+        let ws1 = manager.makeWorkspace(name: "Source")
+        let ws2 = manager.makeWorkspace(name: "Target")
+        ws2.hiddenTabs = [TabLayout(title: "Other", root: .pane(other), focused: other.id, zoomed: nil)]
+
+        let c = tab([first, second], in: ws1, title: "Pair")
+        let picked = try target(.tab([first, second]))
+        // Park ws1 (switching the single window to ws2), then move `first` into ws2's window
+        // while `second` stays in the parked source tab in ws1.
+        manager.switchWorkspace(in: c, to: ws2)
+        ws1.retainHiddenPanes { $0 != first }
+        c.insertTab(TabItem(root: .leaf(first), focused: first, zoomed: nil, title: "Moved"), select: false)
+
+        manager.activateNavigationTarget(picked, from: c)
+
+        XCTAssertEqual(c.workspaceID, ws1.id)
+        XCTAssertEqual(c.focusedPane, second)
+        XCTAssertTrue(c.window?.firstResponder === c.content.focusedView)
+    }
 }

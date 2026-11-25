@@ -1340,10 +1340,10 @@ final class SessionManager: NSObject, CoreDelegate {
         updateSecureInput()
     }
 
-    /// Converts live windows cleanly between single-window hosted tabs (`sidebarTabs == true`)
-    /// and native `NSWindowTabGroup` tabs (`sidebarTabs == false`) without losing any tabs,
-    /// splits, floating panes, titles, pins, or selection.
-    func reconcileTabStyleMode() {
+    /// Converts multi-tab live windows cleanly between single-window hosted tabs
+    /// (`sidebarTabs == true`) and native `NSWindowTabGroup` tabs (`sidebarTabs == false`)
+    /// before `applyConfigToUI()` applies `applyTabStyle()` to every remaining window.
+    private func reconcileTabStyleMode() {
         if config.sidebarTabs {
             var groups: [[TerminalWindowController]] = []
             for c in regularControllers where c.window != nil && !groups.contains(where: { $0.contains { $0 === c } }) {

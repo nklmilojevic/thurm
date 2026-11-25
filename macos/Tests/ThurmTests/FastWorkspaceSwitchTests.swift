@@ -501,13 +501,29 @@ final class FastWorkspaceSwitchTests: XCTestCase {
         XCTAssertTrue(window.firstResponder === c.content.focusedView,
                       "cold switch to remote workspace must focus the remote terminal view")
 
-        // Simulate AppKit's NSTableView.mouseDown reclaiming first responder onto the sidebar
-        // outline after activating a non-draggable row (e.g. a remote/other workspace tab).
+        // Dispatch a synthetic mouse-down event through SidebarOutlineView.mouseDown(with:) on a
+        // non-draggable tab row while the outline holds first responder; the override must restore
+        // first responder to the active terminal once super.mouseDown returns.
+        let nonDraggableRow = try XCTUnwrap((0..<outline.numberOfRows).first { row in
+            (outline.item(atRow: row) as? TabBox)?.tab.hidden != nil
+        })
+        let rowRect = outline.rect(ofRow: nonDraggableRow)
+        let windowPoint = outline.convert(NSPoint(x: rowRect.midX, y: rowRect.midY), to: nil)
+        let now = ProcessInfo.processInfo.systemUptime
+        let down = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseDown, location: windowPoint,
+                                                    modifierFlags: [], timestamp: now,
+                                                    windowNumber: window.windowNumber, context: nil,
+                                                    eventNumber: 1, clickCount: 1, pressure: 1))
+        let up = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseUp, location: windowPoint,
+                                                  modifierFlags: [], timestamp: now + 0.01,
+                                                  windowNumber: window.windowNumber, context: nil,
+                                                  eventNumber: 2, clickCount: 1, pressure: 0))
         XCTAssertTrue(window.makeFirstResponder(outline))
         XCTAssertTrue(window.firstResponder === outline)
-        outline.onMouseDownFinished?()
+        NSApp.postEvent(up, atStart: false)
+        outline.mouseDown(with: down)
         XCTAssertTrue(window.firstResponder === c.content.focusedView,
-                      "post-mouseDown hook must restore first responder from sidebar outline to active terminal")
+                      "SidebarOutlineView.mouseDown(with:) must restore first responder from sidebar outline to active terminal")
 
         // Keyboard focus on the sidebar (without mouseDown) stays untouched so Return/Space works.
         XCTAssertTrue(window.makeFirstResponder(outline))
@@ -639,5 +655,90 @@ final class FastWorkspaceSwitchTests: XCTestCase {
         XCTAssertEqual(c.workspaceID, ws1.id)
         XCTAssertEqual(c.content.focusedPane, pane(1))
         XCTAssertTrue(window.firstResponder === c.content.focusedView)
+    }
+
+    func testBackgroundTabLayoutDoesNotInheritSelectedTabHandoffOrWallMetadata() throws {
+        let wsA = manager.makeWorkspace(name: "alpha")
+        let wsB = manager.makeWorkspace(name: "beta")
+        wsB.hiddenTabs = [TabLayout(title: "b", root: .pane(pane(99)), focused: 99, zoomed: nil)]
+        for id: UInt64 in [1, 2, 99] {
+            manager.panes[pane(id)] = PaneInfo(json: ["id": id, "title": "p\(id)"])
+        }
+
+        let special = TabItem(root: .leaf(pane(1)), focused: pane(1), zoomed: nil, title: "special")
+        special.handoffID = "handoff-42"
+        special.wall = [WallOrigin(index: 0, after: nil,
+                                   tab: TabLayout(title: "origin", root: .pane(pane(1)), focused: 1, zoomed: nil))]
+        special.pinned = true
+        let ordinary = TabItem(root: .leaf(pane(2)), focused: pane(2), zoomed: nil, title: "ordinary")
+
+        let c = manager.makeController(tabs: [special, ordinary], selectedIndex: 0,
+                                       frame: NSRect(x: 100, y: 100, width: 900, height: 600))
+        c.workspaceID = wsA.id
+
+        // Persisting the active window must not copy `special`'s handoff/wall/pin onto `ordinary`.
+        let saved = manager.buildLayout()
+        XCTAssertEqual(saved.windows.count, 1)
+        XCTAssertEqual(saved.windows[0].tabs.count, 2)
+        XCTAssertEqual(saved.windows[0].tabs[0].handoff, "handoff-42")
+        XCTAssertNotNil(saved.windows[0].tabs[0].wall)
+        XCTAssertEqual(saved.windows[0].tabs[0].pinned, true)
+        XCTAssertNil(saved.windows[0].tabs[1].handoff)
+        XCTAssertNil(saved.windows[0].tabs[1].wall)
+        XCTAssertNil(saved.windows[0].tabs[1].pinned)
+
+        // Parking wsA into background cache must likewise preserve `ordinary` as an ordinary tab.
+        manager.switchWorkspace(in: c, to: wsB)
+        XCTAssertEqual(wsA.hiddenTabs.count, 2)
+        XCTAssertEqual(wsA.hiddenTabs[0].handoff, "handoff-42")
+        XCTAssertNotNil(wsA.hiddenTabs[0].wall)
+        XCTAssertNil(wsA.hiddenTabs[1].handoff)
+        XCTAssertNil(wsA.hiddenTabs[1].wall)
+        XCTAssertNil(wsA.hiddenTabs[1].pinned)
+    }
+
+    func testParkedWorkspaceSelectionShiftsWhenEarlierCachedTabIsRemoved() throws {
+        let wsA = manager.makeWorkspace(name: "alpha")
+        let wsB = manager.makeWorkspace(name: "beta")
+        wsB.hiddenTabs = [TabLayout(title: "b", root: .pane(pane(90)), focused: 90, zoomed: nil)]
+
+        let c = makeSingleWindow(workspace: wsA, paneIDs: [1, 2, 3, 4])
+        let tab3 = c.tabs[2] // pane 3 (index 2)
+        c.selectTab(tab3)
+        manager.switchWorkspace(in: c, to: wsB)
+        XCTAssertEqual(wsA.hiddenSelectedTab, 2)
+
+        // Removing an earlier single-pane tab (pane 1 at index 0) must keep tab3 selected (now index 1).
+        XCTAssertFalse(wsA.removeSinglePaneTab(pane(1)))
+        XCTAssertEqual(wsA.hiddenSelectedTab, 1)
+        XCTAssertTrue(wsA.cachedTabs?[1] === tab3)
+
+        // Dropping another earlier tab via retainHiddenPanes (pane 2 at index 0) shifts tab3 to index 0.
+        wsA.retainHiddenPanes { $0 != pane(2) }
+        XCTAssertEqual(wsA.hiddenSelectedTab, 0)
+        XCTAssertTrue(wsA.cachedTabs?[0] === tab3)
+
+        // Switching back selects tab3 (pane 3).
+        manager.switchWorkspace(in: c, to: wsA)
+        XCTAssertTrue(c.selectedTab === tab3)
+        XCTAssertEqual(c.content.focusedPane, pane(3))
+    }
+
+    func testSingleTabWindowTogglesCleanlyBetweenSidebarAndNativeModes() throws {
+        let ws = manager.makeWorkspace(name: "solo")
+        let c = makeSingleWindow(workspace: ws, paneIDs: [1])
+        XCTAssertTrue(c.usesSingleWindowTabs)
+
+        manager.config.sidebarTabs = false
+        manager.applyConfigToUI()
+        XCTAssertFalse(c.usesSingleWindowTabs)
+        XCTAssertNil(c.tabSplit)
+        XCTAssertEqual(c.content.focusedPane, pane(1))
+
+        manager.config.sidebarTabs = true
+        manager.applyConfigToUI()
+        XCTAssertTrue(c.usesSingleWindowTabs)
+        XCTAssertNotNil(c.tabSplit)
+        XCTAssertEqual(c.content.focusedPane, pane(1))
     }
 }

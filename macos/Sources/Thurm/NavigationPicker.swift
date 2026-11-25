@@ -135,14 +135,21 @@ extension SessionManager {
                 focusPane(t.focusedPane, activate: true)
                 return
             }
+            // If the original tab was parked into a background workspace, check its surviving
+            // panes in the source workspace before scanning other tabs on the old window.
+            let sourceWS = target.tabWorkspaceID.flatMap { workspace($0) }
+            if target.tabItem?.windowController == nil, let ws = sourceWS, showHiddenTab(in: [ws]) {
+                return
+            }
             if let c = target.tabController, !c.isClosed,
+               target.tabWorkspaceID == nil || c.workspaceID == target.tabWorkspaceID,
                let t = c.tabs.first(where: { !$0.isClosed && ids.contains(where: $0.content.contains) }) {
                 focusPane(t.focusedPane, activate: true)
                 return
             }
             // Match surviving panes in the source workspace before a pane moved elsewhere.
             // The hidden tab's index can change when other tabs move or close.
-            if let ws = target.tabWorkspaceID.flatMap({ workspace($0) }), showHiddenTab(in: [ws]) {
+            if let ws = sourceWS, showHiddenTab(in: [ws]) {
                 return
             }
             if let t = ids.lazy.compactMap({ self.tab(for: $0) }).first {

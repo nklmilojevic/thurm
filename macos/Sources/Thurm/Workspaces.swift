@@ -105,10 +105,13 @@ final class Workspace {
         let before = hiddenTabs.count
         guard before > 0 else { return false }
         if let cached = cachedTabs, cached.count == hiddenTabs.count {
+            let selectedTab = cached.indices.contains(hiddenSelectedTab) ? cached[hiddenSelectedTab] : nil
             var keptCached: [TabItem] = []
             var keptLayouts: [TabLayout] = []
-            for (tab, layout) in zip(cached, hiddenTabs) {
+            var removedBeforeSelected = 0
+            for (index, (tab, layout)) in zip(cached, hiddenTabs).enumerated() {
                 if layout.panes == [pane] {
+                    if index < hiddenSelectedTab { removedBeforeSelected += 1 }
                     tab.content.detachAll()
                     tab.isClosed = true
                 } else {
@@ -120,12 +123,21 @@ final class Workspace {
                 syncingHiddenTabs = true
                 cachedTabs = keptCached.isEmpty ? nil : keptCached
                 hiddenTabs = keptLayouts
-                hiddenSelectedTab = min(hiddenSelectedTab, max(0, hiddenTabs.count - 1))
+                if keptCached.isEmpty {
+                    hiddenSelectedTab = 0
+                } else if let selectedTab, let idx = keptCached.firstIndex(where: { $0 === selectedTab }) {
+                    hiddenSelectedTab = idx
+                } else {
+                    hiddenSelectedTab = min(max(0, hiddenSelectedTab - removedBeforeSelected), keptCached.count - 1)
+                }
                 syncingHiddenTabs = false
             }
         } else {
+            let removedBeforeSelected = hiddenTabs.prefix(hiddenSelectedTab).filter { $0.panes == [pane] }.count
             hiddenTabs.removeAll { $0.panes == [pane] }
-            hiddenSelectedTab = min(hiddenSelectedTab, max(0, hiddenTabs.count - 1))
+            hiddenSelectedTab = hiddenTabs.isEmpty
+                ? 0
+                : min(max(0, hiddenSelectedTab - removedBeforeSelected), hiddenTabs.count - 1)
         }
         return before > 0 && hiddenTabs.isEmpty
     }
@@ -133,9 +145,11 @@ final class Workspace {
     /// Retains only panes matching `keep`, preserving cached live `TabItem`s whenever possible.
     func retainHiddenPanes(_ keep: (PaneKey) -> Bool) {
         if let cached = cachedTabs, cached.count == hiddenTabs.count {
+            let selectedTab = cached.indices.contains(hiddenSelectedTab) ? cached[hiddenSelectedTab] : nil
             var remaining: [TabItem] = []
+            var removedBeforeSelected = 0
             var changed = false
-            for tab in cached {
+            for (index, tab) in cached.enumerated() {
                 let toRemove = tab.content.paneIds.filter { !keep($0) }
                 if toRemove.isEmpty {
                     remaining.append(tab)
@@ -144,6 +158,7 @@ final class Workspace {
                     var empty = false
                     for id in toRemove { empty = tab.content.remove(pane: id) }
                     if empty {
+                        if index < hiddenSelectedTab { removedBeforeSelected += 1 }
                         tab.content.detachAll()
                         tab.isClosed = true
                     } else {
@@ -155,15 +170,26 @@ final class Workspace {
                 syncingHiddenTabs = true
                 cachedTabs = remaining.isEmpty ? nil : remaining
                 hiddenTabs = remaining.map { $0.tabLayout() }
-                hiddenSelectedTab = remaining.isEmpty ? 0 : min(max(0, hiddenSelectedTab), remaining.count - 1)
+                if remaining.isEmpty {
+                    hiddenSelectedTab = 0
+                } else if let selectedTab, let idx = remaining.firstIndex(where: { $0 === selectedTab }) {
+                    hiddenSelectedTab = idx
+                } else {
+                    hiddenSelectedTab = min(max(0, hiddenSelectedTab - removedBeforeSelected), remaining.count - 1)
+                }
                 syncingHiddenTabs = false
             }
         } else {
+            let removedBeforeSelected = hiddenTabs.prefix(hiddenSelectedTab).filter {
+                retainTabs([$0], keep).isEmpty
+            }.count
             let kept = retainTabs(hiddenTabs, keep)
             if kept != hiddenTabs {
                 hiddenTabs = kept
             }
-            hiddenSelectedTab = min(hiddenSelectedTab, max(0, hiddenTabs.count - 1))
+            hiddenSelectedTab = hiddenTabs.isEmpty
+                ? 0
+                : min(max(0, hiddenSelectedTab - removedBeforeSelected), hiddenTabs.count - 1)
         }
     }
 

@@ -9,7 +9,7 @@ use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{RecvTimeoutError, Sender, bounded, unbounded};
@@ -26,6 +26,27 @@ const WRITE_QUEUED: u8 = 0;
 const WRITE_STARTED: u8 = 1;
 const WRITE_CANCELLED: u8 = 2;
 
+/// Maximum total encoded frame bytes allowed in the outgoing writer queue (including the frame
+/// currently being written) so a stalled peer or tunnel cannot grow client memory without bound.
+pub const MAX_QUEUED_WRITE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum time `Client::drop` waits for already accepted writes to drain on a live connection
+/// before forcing socket shutdown so a stalled peer cannot hang teardown.
+const DROP_FLUSH_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Releases a queued-byte reservation automatically when a `WriteJob` finishes, is cancelled,
+/// or is dropped during teardown.
+struct QueueGuard {
+    counter: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 struct WriteJob {
     buf: Vec<u8>,
     deadline: Option<Instant>,
@@ -35,19 +56,24 @@ struct WriteJob {
     /// Coordinates pre-write cancellation when a caller's deadline expires while the job is
     /// still waiting in the queue behind an earlier write.
     state: Option<Arc<AtomicU8>>,
+    _guard: QueueGuard,
 }
 
 enum WriteCmd {
     Job(WriteJob),
+    Flush(Sender<()>),
+    FlushAndShutdown(Sender<()>),
     Shutdown,
 }
 
 pub struct Client {
     write_tx: Sender<WriteCmd>,
+    queued_bytes: Arc<AtomicUsize>,
     closer: UnixStream,
     pending: Pending,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
+    forced_close: AtomicBool,
     pub hello: Mutex<Option<Response>>,
 }
 
@@ -56,6 +82,7 @@ pub enum ClientError {
     Connect(String),
     Disconnected,
     Timeout,
+    QueueFull,
     Daemon(String),
     Io(std::io::Error),
 }
@@ -77,6 +104,7 @@ impl std::fmt::Display for ClientError {
             ClientError::Connect(e) => write!(f, "cannot connect to thurmd: {e}"),
             ClientError::Disconnected => write!(f, "connection to thurmd lost"),
             ClientError::Timeout => write!(f, "thurmd did not answer in time"),
+            ClientError::QueueFull => write!(f, "outgoing write queue to thurmd is full"),
             ClientError::Daemon(e) => write!(f, "{e}"),
             ClientError::Io(e) => write!(f, "{e}"),
         }
@@ -502,6 +530,7 @@ impl Client {
         let client_closer = stream.try_clone()?;
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
         let (write_tx, write_rx) = unbounded::<WriteCmd>();
 
         let writer_alive = alive.clone();
@@ -509,59 +538,75 @@ impl Client {
             .name("thurm-client-writer".into())
             .spawn(move || {
                 let mut stream = stream;
-                while let Ok(WriteCmd::Job(job)) = write_rx.recv() {
-                    if let Some(state) = &job.state {
-                        if job.deadline.is_some_and(|d| Instant::now() >= d) {
-                            let _ = state.compare_exchange(
-                                WRITE_QUEUED,
-                                WRITE_CANCELLED,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            );
-                            if let Some(done) = job.done {
-                                let _ = done.send(Err(ClientError::Timeout));
+                while let Ok(cmd) = write_rx.recv() {
+                    match cmd {
+                        WriteCmd::Shutdown => break,
+                        WriteCmd::Flush(done) => {
+                            let _ = stream.flush();
+                            let _ = done.send(());
+                        }
+                        WriteCmd::FlushAndShutdown(done) => {
+                            let _ = stream.flush();
+                            let _ = done.send(());
+                            break;
+                        }
+                        WriteCmd::Job(job) => {
+                            if let Some(state) = &job.state {
+                                if job.deadline.is_some_and(|d| Instant::now() >= d) {
+                                    let _ = state.compare_exchange(
+                                        WRITE_QUEUED,
+                                        WRITE_CANCELLED,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    );
+                                    if let Some(done) = job.done {
+                                        let _ = done.send(Err(ClientError::Timeout));
+                                    }
+                                    continue;
+                                }
+                                if state
+                                    .compare_exchange(
+                                        WRITE_QUEUED,
+                                        WRITE_STARTED,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_err()
+                                {
+                                    // Cancelled by caller while waiting in the queue.
+                                    continue;
+                                }
+                            } else if job.deadline.is_some_and(|d| Instant::now() >= d) {
+                                if let Some(done) = job.done {
+                                    let _ = done.send(Err(ClientError::Timeout));
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                        if state
-                            .compare_exchange(
-                                WRITE_QUEUED,
-                                WRITE_STARTED,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_err()
-                        {
-                            // Cancelled by caller while waiting in the queue.
-                            continue;
-                        }
-                    } else if job.deadline.is_some_and(|d| Instant::now() >= d) {
-                        if let Some(done) = job.done {
-                            let _ = done.send(Err(ClientError::Timeout));
-                        }
-                        continue;
-                    }
 
-                    let (res, broken) = write_frame(&mut stream, &job.buf, job.deadline);
-                    if broken {
-                        writer_alive.store(false, Ordering::Relaxed);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-                    }
-                    if let Some(done) = job.done {
-                        let _ = done.send(res);
-                    }
-                    if broken {
-                        break;
+                            let (res, broken) = write_frame(&mut stream, &job.buf, job.deadline);
+                            if broken {
+                                writer_alive.store(false, Ordering::Relaxed);
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                            }
+                            if let Some(done) = job.done {
+                                let _ = done.send(res);
+                            }
+                            if broken {
+                                break;
+                            }
+                        }
                     }
                 }
             })?;
 
         let client = Arc::new(Client {
             write_tx: write_tx.clone(),
+            queued_bytes,
             closer: client_closer,
             pending: pending.clone(),
             next_id: AtomicU64::new(1),
             alive: alive.clone(),
+            forced_close: AtomicBool::new(false),
             hello: Mutex::new(None),
         });
 
@@ -621,6 +666,7 @@ impl Client {
                 hello_timeout,
             )
             .inspect_err(|_| {
+                client.force_close();
                 let _ = closer.shutdown(std::net::Shutdown::Both);
             })?;
         if let Response::Hello {
@@ -630,6 +676,7 @@ impl Client {
         } = &hello
             && !thurm_proto::hello_compatible(*version, capabilities)
         {
+            client.force_close();
             let _ = closer.shutdown(std::net::Shutdown::Both);
             // Callers read the daemon's version from the "protocol mismatch: daemon N" form and
             // upgrade it in place, so an older build of this very version keeps it.
@@ -652,6 +699,71 @@ impl Client {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Bytes currently queued or in-flight in the outgoing writer thread.
+    pub fn queued_write_bytes(&self) -> usize {
+        self.queued_bytes.load(Ordering::Acquire)
+    }
+
+    /// Waits for every frame accepted before this call to finish writing to the socket.
+    pub fn flush(&self, timeout: Option<Duration>) -> Result<(), ClientError> {
+        if !self.is_alive() {
+            return Err(ClientError::Disconnected);
+        }
+        let (done_tx, done_rx) = bounded(1);
+        self.write_tx
+            .send(WriteCmd::Flush(done_tx))
+            .map_err(|_| ClientError::Disconnected)?;
+        match timeout {
+            None => done_rx.recv().map_err(|_| ClientError::Disconnected),
+            Some(limit) => match done_rx.recv_timeout(limit) {
+                Ok(()) => Ok(()),
+                Err(RecvTimeoutError::Timeout) => Err(ClientError::Timeout),
+                Err(RecvTimeoutError::Disconnected) => Err(ClientError::Disconnected),
+            },
+        }
+    }
+
+    /// Immediately shuts down the connection without waiting for queued writes to drain.
+    /// Useful when tearing down a connection whose peer has stalled.
+    pub fn force_close(&self) {
+        self.forced_close.store(true, Ordering::Release);
+        self.alive.store(false, Ordering::Relaxed);
+        let _ = self.write_tx.send(WriteCmd::Shutdown);
+        let _ = self.closer.shutdown(std::net::Shutdown::Both);
+    }
+
+    fn reserve_write_bytes(&self, bytes: usize) -> Result<QueueGuard, ClientError> {
+        // A single frame larger than `MAX_QUEUED_WRITE_BYTES` (e.g. a 32 MiB clipboard payload)
+        // is allowed when the queue is completely idle, up to the protocol's max frame size;
+        // once anything is in-flight or queued, total buffered bytes cannot exceed the cap.
+        if bytes > codec::MAX_MESSAGE.saturating_add(4) {
+            return Err(ClientError::QueueFull);
+        }
+        let mut cur = self.queued_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = cur.checked_add(bytes) else {
+                return Err(ClientError::QueueFull);
+            };
+            if cur > 0 && next > MAX_QUEUED_WRITE_BYTES {
+                return Err(ClientError::QueueFull);
+            }
+            match self.queued_bytes.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(QueueGuard {
+                        counter: self.queued_bytes.clone(),
+                        bytes,
+                    });
+                }
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     fn encode_checked(&self, env: &Envelope) -> Result<Vec<u8>, ClientError> {
@@ -697,6 +809,7 @@ impl Client {
         {
             return Err(ClientError::Timeout);
         }
+        let guard = self.reserve_write_bytes(buf.len())?;
         let (done_tx, done_rx) = bounded(1);
         let state = deadline.map(|_| Arc::new(AtomicU8::new(WRITE_QUEUED)));
         self.write_tx
@@ -705,6 +818,7 @@ impl Client {
                 deadline,
                 done: Some(done_tx),
                 state: state.clone(),
+                _guard: guard,
             }))
             .map_err(|_| ClientError::Disconnected)?;
         match deadline {
@@ -772,15 +886,18 @@ impl Client {
     }
 
     /// Fire and forget (id 0: the daemon sends no response). Enqueues onto the FIFO writer
-    /// thread without blocking the caller on socket I/O.
+    /// thread without blocking the caller on socket I/O, rejecting with [`ClientError::QueueFull`]
+    /// if the outgoing byte budget ([`MAX_QUEUED_WRITE_BYTES`]) is exhausted.
     pub fn send(&self, request: Request) -> Result<(), ClientError> {
         let buf = self.encode_checked(&Envelope { id: 0, request })?;
+        let guard = self.reserve_write_bytes(buf.len())?;
         self.write_tx
             .send(WriteCmd::Job(WriteJob {
                 buf,
                 deadline: None,
                 done: None,
                 state: None,
+                _guard: guard,
             }))
             .map_err(|_| ClientError::Disconnected)
     }
@@ -975,9 +1092,21 @@ fn write_frame(
 
 impl Drop for Client {
     fn drop(&mut self) {
-        // Closing both directions ends the reader and writer threads and tells the daemon we're
-        // gone without blocking on any stalled write.
-        let _ = self.write_tx.send(WriteCmd::Shutdown);
+        // On a normal disconnect of a live connection, let already accepted writes drain to the
+        // socket before closing it (bounded by `DROP_FLUSH_TIMEOUT` so a stalled peer cannot hang
+        // teardown). Forced or already-dead connections shut down immediately.
+        if !self.forced_close.load(Ordering::Acquire) && self.alive.load(Ordering::Relaxed) {
+            let (done_tx, done_rx) = bounded(1);
+            if self
+                .write_tx
+                .send(WriteCmd::FlushAndShutdown(done_tx))
+                .is_ok()
+            {
+                let _ = done_rx.recv_timeout(DROP_FLUSH_TIMEOUT);
+            }
+        } else {
+            let _ = self.write_tx.send(WriteCmd::Shutdown);
+        }
         let _ = self.closer.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -1729,6 +1858,191 @@ mod tests {
             drop_started.elapsed() < Duration::from_secs(1),
             "Drop blocked on stalled writer: {:?}",
             drop_started.elapsed()
+        );
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn send_followed_by_immediate_drop_delivers_frames() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let (rx_tx, rx_rx) = crossbeam_channel::unbounded();
+        let server = std::thread::spawn(move || {
+            let mut r = BufReader::new(peer.try_clone().unwrap());
+            while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut r) {
+                match env.request {
+                    Request::Hello { .. } => {
+                        codec::write_message(
+                            &mut peer,
+                            &ServerMessage::Response {
+                                id: env.id,
+                                result: Ok(Response::Hello {
+                                    version: PROTOCOL_VERSION,
+                                    daemon_pid: 1,
+                                    restored: false,
+                                    build: "test".into(),
+                                    capabilities: thurm_proto::CAPABILITIES
+                                        .iter()
+                                        .map(|c| (*c).to_owned())
+                                        .collect(),
+                                }),
+                            },
+                        )
+                        .unwrap();
+                    }
+                    Request::Input { pane, data } => {
+                        rx_tx.send((pane, data)).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let client = Client::from_stream(stream, "test", false, &[], |_| {}, || {}).unwrap();
+        for i in 1..=8u64 {
+            client
+                .send(Request::Input {
+                    pane: i,
+                    data: format!("payload-{i}").into_bytes(),
+                })
+                .unwrap();
+        }
+        // Immediately drop the last Client handle without waiting on a request/response:
+        // graceful Drop drains all accepted frames before shutting down the socket.
+        drop(client);
+        server.join().unwrap();
+
+        let received: Vec<(u64, Vec<u8>)> = rx_rx.try_iter().collect();
+        let expected: Vec<(u64, Vec<u8>)> = (1..=8u64)
+            .map(|i| (i, format!("payload-{i}").into_bytes()))
+            .collect();
+        assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn send_enforces_outgoing_byte_budget_on_stalled_peer() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let (resume_tx, resume_rx) = crossbeam_channel::bounded::<()>(1);
+        let (count_tx, count_rx) = crossbeam_channel::bounded::<usize>(1);
+        let server = std::thread::spawn(move || {
+            let hello: Envelope = codec::read_message(&mut peer).unwrap().unwrap();
+            codec::write_message(
+                &mut peer,
+                &ServerMessage::Response {
+                    id: hello.id,
+                    result: Ok(Response::Hello {
+                        version: PROTOCOL_VERSION,
+                        daemon_pid: 1,
+                        restored: false,
+                        build: "test".into(),
+                        capabilities: thurm_proto::CAPABILITIES
+                            .iter()
+                            .map(|c| (*c).to_owned())
+                            .collect(),
+                    }),
+                },
+            )
+            .unwrap();
+            // Stall reading until the client hits its outgoing byte budget.
+            let _ = resume_rx.recv();
+            let mut r = BufReader::new(peer);
+            let mut received = 0usize;
+            while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut r) {
+                if matches!(env.request, Request::Input { .. }) {
+                    received += 1;
+                }
+            }
+            let _ = count_tx.send(received);
+        });
+
+        let client = Client::from_stream(stream, "test", false, &[], |_| {}, || {}).unwrap();
+        let chunk = vec![b'x'; 2 * 1024 * 1024];
+        let started = Instant::now();
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for _ in 0..24 {
+            match client.send(Request::Input {
+                pane: 1,
+                data: chunk.clone(),
+            }) {
+                Ok(()) => accepted += 1,
+                Err(ClientError::QueueFull) => rejected += 1,
+                Err(other) => panic!("unexpected error while queue full: {other:?}"),
+            }
+            assert!(
+                client.queued_write_bytes() <= MAX_QUEUED_WRITE_BYTES,
+                "queued bytes {} exceeded cap {}",
+                client.queued_write_bytes(),
+                MAX_QUEUED_WRITE_BYTES
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded send() blocked: {:?}",
+            started.elapsed()
+        );
+        assert!(accepted >= 1, "at least one frame should be accepted");
+        assert!(
+            rejected >= 1,
+            "excess frames past byte budget must be rejected with QueueFull"
+        );
+
+        // Once the peer resumes reading, the queued frames drain, freeing the budget.
+        let _ = resume_tx.send(());
+        client.flush(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(client.queued_write_bytes(), 0);
+        client
+            .send(Request::Input {
+                pane: 1,
+                data: b"after-drain".to_vec(),
+            })
+            .unwrap();
+        accepted += 1;
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(count_rx.recv().unwrap(), accepted);
+    }
+
+    #[test]
+    fn force_close_unblocks_stalled_writer_immediately() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+        let server = std::thread::spawn(move || {
+            let hello: Envelope = codec::read_message(&mut peer).unwrap().unwrap();
+            codec::write_message(
+                &mut peer,
+                &ServerMessage::Response {
+                    id: hello.id,
+                    result: Ok(Response::Hello {
+                        version: PROTOCOL_VERSION,
+                        daemon_pid: 1,
+                        restored: false,
+                        build: "test".into(),
+                        capabilities: thurm_proto::CAPABILITIES
+                            .iter()
+                            .map(|c| (*c).to_owned())
+                            .collect(),
+                    }),
+                },
+            )
+            .unwrap();
+            let _ = stop_rx.recv();
+        });
+
+        let client = Client::from_stream(stream, "test", false, &[], |_| {}, || {}).unwrap();
+        for _ in 0..4 {
+            let _ = client.send(Request::Input {
+                pane: 1,
+                data: vec![b'z'; 2 * 1024 * 1024],
+            });
+        }
+        let started = Instant::now();
+        client.force_close();
+        drop(client);
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "force_close() + drop waited unexpectedly: {:?}",
+            started.elapsed()
         );
         let _ = stop_tx.send(());
         server.join().unwrap();

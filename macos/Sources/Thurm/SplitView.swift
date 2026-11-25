@@ -2041,12 +2041,17 @@ final class TabContentView: NSView {
 
     func tabLayout(title: String?, handoff: String? = nil, wall: [WallOrigin]? = nil,
                    pinned: Bool? = nil) -> TabLayout {
-        TabLayout(title: title, root: root.layoutNode, focused: focusedPane.id, zoomed: zoomedPane?.id,
-                  handoff: handoff ?? tab?.handoffID ?? controller?.handoffID,
-                  wall: wall ?? tab?.wall ?? controller?.wall,
-                  floating: floating.isEmpty ? nil : floating.map(\.saved),
-                  floatingHidden: floatingHidden ? true : nil,
-                  pinned: (pinned ?? tab?.pinned ?? controller?.pinned) == true ? true : nil)
+        // When owned by a `TabItem`, never fall through to `controller`'s metadata (which belongs
+        // to the window's *selected* tab, not an unselected background tab).
+        let resolvedHandoff = handoff ?? (tab != nil ? tab?.handoffID : controller?.handoffID)
+        let resolvedWall = wall ?? (tab != nil ? tab?.wall : controller?.wall)
+        let resolvedPinned = pinned ?? (tab != nil ? tab?.pinned : controller?.pinned)
+        return TabLayout(title: title, root: root.layoutNode, focused: focusedPane.id, zoomed: zoomedPane?.id,
+                         handoff: resolvedHandoff,
+                         wall: resolvedWall,
+                         floating: floating.isEmpty ? nil : floating.map(\.saved),
+                         floatingHidden: floatingHidden ? true : nil,
+                         pinned: resolvedPinned == true ? true : nil)
     }
 
     /// The host of this tab's panes.
