@@ -565,13 +565,13 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             let only = SidebarHosts.effectiveFilter(config.sidebarHost, hosts: hosts)
             title = only.map(SidebarHosts.title) ?? "All Hosts"
             if let state = only.flatMap(Self.hostState) { title += " · \(state)" }
-            symbol = only.map { $0 == localHost ? "laptopcomputer" : "globe" } ?? "square.stack.3d.up"
+            symbol = only.map { config.hostSymbol(for: $0) } ?? "square.stack.3d.up"
             tip = "Hosts"
             action = #selector(showHostsPopover(_:))
         } else {
             let host = shown?.host ?? controller?.host ?? localHost
             title = SidebarHosts.title(host)
-            symbol = host == localHost ? "laptopcomputer" : "globe"
+            symbol = config.hostSymbol(for: host)
             tip = shown.map { "Workspace \($0.name) · Workspaces (⌘⇧O)" } ?? "Workspaces (⌘⇧O)"
             action = #selector(showWorkspaceMenu(_:))
         }
@@ -1083,7 +1083,10 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         // A host's header stays without rows: it shows the host's state, or offers a workspace.
         order.removeAll { $0.host == nil && $0.tabs.isEmpty }
         let all = order.flatMap(\.flattened), leaves = all.filter { $0.host == nil }
-        let names = all.map { [$0.key, $0.name, $0.state ?? "", $0.newWorkspace?.host ?? "", $0.headless ? "-" : ""] }
+        let names = all.map {
+            [$0.key, $0.name, $0.host.map { config.hostSymbol(for: $0) } ?? "",
+             $0.state ?? "", $0.newWorkspace?.host ?? "", $0.headless ? "-" : ""]
+        }
         let tabs = leaves.map(\.tabs)
         let theme = SessionManager.shared.config.theme
         if let s = shown, s.names == names, s.theme == theme,
@@ -1381,7 +1384,7 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         if let g = item as? SidebarGroup {
             guard let host = g.host else { return SidebarHeadingView(g.name) }
-            return SidebarHeadingView(g.name, symbol: host == localHost ? "laptopcomputer" : "globe", detail: g.state)
+            return SidebarHeadingView(g.name, symbol: SessionManager.shared.config.hostSymbol(for: host), detail: g.state)
         }
         if let box = item as? NewWorkspaceBox {
             let view = NewWorkspaceRowView(box.title)
@@ -1457,8 +1460,37 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         sm.controller(for: pane)?.sidebar?.reload()
     }
 
-    private func rowMenu() -> NSMenu {
-        let menu = NSMenu()
+    private func clickedRemoteHost() -> HostId? {
+        let row = outline.clickedRow
+        guard row >= 0, let group = outline.item(atRow: row) as? SidebarGroup,
+              let host = group.host, host != localHost,
+              SessionManager.shared.config.remoteNames.contains(host) else { return nil }
+        return host
+    }
+
+    private func fillHostMenu(_ menu: NSMenu, for host: HostId) {
+        menu.removeAllItems()
+        let iconMenu = NSMenu(title: "Icon")
+        let activePreset = RemoteIcon.presetId(for: SessionManager.shared.config.remoteIcons[host])
+        for preset in RemoteIcon.presets {
+            let item = BlockMenuItem(preset.label) {
+                RemoteHosts.shared.set(host, "icon", preset.id)
+            }
+            item.image = NSImage(systemSymbolName: preset.symbol, accessibilityDescription: preset.label)
+            item.state = activePreset == preset.id ? .on : .off
+            iconMenu.addItem(item)
+        }
+        let iconItem = NSMenuItem(title: "Icon", action: nil, keyEquivalent: "")
+        iconItem.submenu = iconMenu
+        menu.addItem(iconItem)
+        menu.addItem(BlockMenuItem("Host Details\u{2026}") {
+            RemoteHosts.shared.show()
+            RemoteHosts.shared.showDetails(host)
+        })
+    }
+
+    private func fillTabMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
         let close = NSMenuItem(title: "Close Tab", action: #selector(closeClicked(_:)), keyEquivalent: "")
         close.target = self
         menu.addItem(close)
@@ -1475,6 +1507,11 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         let float = NSMenuItem(title: "Float Tab Here", action: #selector(floatClicked(_:)), keyEquivalent: "")
         float.target = self
         menu.addItem(float)
+    }
+
+    private func rowMenu() -> NSMenu {
+        let menu = NSMenu()
+        fillTabMenu(menu)
         menu.delegate = self
         return menu
     }
@@ -1590,7 +1627,12 @@ enum SidebarDrop {
 extension TabSidebarViewController: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === outline.menu {
-            menu.items.first { $0.submenu != nil }?.isHidden = clickedTabItem() == nil
+            if let host = clickedRemoteHost() {
+                fillHostMenu(menu, for: host)
+            } else {
+                fillTabMenu(menu)
+                menu.items.first { $0.submenu != nil }?.isHidden = clickedTabItem() == nil
+            }
         } else {
             SessionManager.shared.fillMoveTabMenu(menu, forTab: clickedTabItem())
         }
@@ -1674,7 +1716,8 @@ final class SidebarHeadingView: NSView {
         var left = max(0, Self.inset - x)
         if let icon {
             let s = icon.intrinsicContentSize
-            icon.frame = NSRect(x: left, y: ((bounds.height - s.height) / 2).rounded(), width: s.width, height: s.height)
+            let width = Self.hostLabelOffset - 5
+            icon.frame = NSRect(x: left, y: ((bounds.height - s.height) / 2).rounded(), width: width, height: s.height)
             left += Self.hostLabelOffset
         }
         let size = label.intrinsicContentSize

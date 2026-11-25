@@ -189,6 +189,31 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
         jsonUInt64(info[paneKey]).map { PaneKey((info[hostKey] as? String) ?? localHost, $0) }
     }
 
+    /// Handles a clicked notification (or its approve/deny action) on the main thread.
+    static func handleResponse(userInfo info: [AnyHashable: Any], action: String,
+                               openURL: (URL) -> Void = { NSWorkspace.shared.open($0) },
+                               answerPermission: (PaneKey, UInt64, Bool) -> Bool = { pane, permission, allow in
+                                   let resp = Core.shared.request(object: ["AnswerPermission": [
+                                       "pane": pane.number, "prompt": NSNumber(value: permission),
+                                       "allow": allow,
+                                   ]], host: pane.host)
+                                   return resp != nil && (resp as? [String: Any])?["error"] == nil
+                               },
+                               focusPane: (PaneKey) -> Void = { SessionManager.shared.focusPane($0, activate: true) }) {
+        guard action != UNNotificationDismissActionIdentifier else { return }
+        if let url = (info[Notifications.urlKey] as? String).flatMap(URL.init(string:)) {
+            openURL(url)
+            return
+        }
+        guard let pane = Notifications.pane(of: info) else { return }
+        if let permission = jsonUInt64(info[Notifications.permissionKey]),
+           action == Notifications.approveAction || action == Notifications.denyAction {
+            // Answered in the terminal meanwhile, or the agent moved on: show what it is at.
+            if answerPermission(pane, permission, action == Notifications.approveAction) { return }
+        }
+        focusPane(pane)
+    }
+
     // MARK: UNUserNotificationCenterDelegate
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
@@ -201,29 +226,10 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let info = response.notification.request.content.userInfo
-        let id = jsonUInt64(info[Notifications.paneKey])
-        let host = (info[Notifications.hostKey] as? String) ?? localHost
-        let permission = jsonUInt64(info[Notifications.permissionKey])
         let action = response.actionIdentifier
-        if let url = (info[Notifications.urlKey] as? String).flatMap(URL.init(string:)) {
-            DispatchQueue.main.async { NSWorkspace.shared.open(url) }
-            completionHandler()
-            return
-        }
         DispatchQueue.main.async {
-            guard let id else { return }
-            let pane = PaneKey(host, id)
-            if let permission = permission,
-               action == Notifications.approveAction || action == Notifications.denyAction {
-                let resp = Core.shared.request(object: ["AnswerPermission": [
-                    "pane": pane.number, "prompt": NSNumber(value: permission),
-                    "allow": action == Notifications.approveAction,
-                ]], host: pane.host)
-                // Answered in the terminal meanwhile, or the agent moved on: show what it is at.
-                if resp != nil && (resp as? [String: Any])?["error"] == nil { return }
-            }
-            SessionManager.shared.focusPane(pane, activate: true)
+            defer { completionHandler() }
+            Notifications.handleResponse(userInfo: info, action: action)
         }
-        completionHandler()
     }
 }

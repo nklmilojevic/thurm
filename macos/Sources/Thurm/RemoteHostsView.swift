@@ -91,6 +91,10 @@ private struct HostRow: View {
         } label: {
             HStack(spacing: 10) {
                 StatusDot(host: host.name)
+                Image(systemName: RemoteIcon.symbol(for: host.icon))
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(host.name)
                     Text(host.target.isEmpty ? host.tailnet ?? "" : host.target)
@@ -153,6 +157,10 @@ private struct HostDetails: View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 StatusDot(host: name)
+                Image(systemName: RemoteIcon.symbol(for: host?.icon))
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 26)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(name)
                         .font(.title2.weight(.semibold))
@@ -172,6 +180,9 @@ private struct HostDetails: View {
                     }
                 }
                 if let host {
+                    Section("Icon") {
+                        RemoteIconPicker(selected: host.icon) { save("icon", $0) }
+                    }
                     Section("Connection") {
                         Toggle("Connect", isOn: Binding(
                             get: { host.enabled },
@@ -355,6 +366,66 @@ private struct HostDetails: View {
             return
         }
         save("tailnet", trimmed)
+    }
+}
+
+/// Grid of selectable icons for a remote host.
+private struct RemoteIconPicker: View {
+    let selected: String?
+    let onSelect: (String) -> Void
+
+    private static let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 6)
+
+    private var activePreset: String? { RemoteIcon.presetId(for: selected) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            LazyVGrid(columns: Self.columns, spacing: 8) {
+                ForEach(RemoteIcon.presets) { preset in
+                    let isSelected = activePreset == preset.id
+                    Button {
+                        if !isSelected { onSelect(preset.id) }
+                    } label: {
+                        VStack(spacing: 4) {
+                            Image(systemName: preset.symbol)
+                                .font(.system(size: 16, weight: .regular))
+                                .frame(height: 20)
+                            Text(preset.label)
+                                .font(.caption2)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .padding(.horizontal, 4)
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(isSelected ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.04))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(isSelected ? Color.accentColor : Color.clear, lineWidth: 1.5)
+                        )
+                        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help(preset.label)
+                    .accessibilityLabel(preset.label)
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
+                }
+            }
+            if activePreset == nil, let custom = selected {
+                HStack(spacing: 6) {
+                    Image(systemName: RemoteIcon.symbol(for: custom))
+                        .foregroundStyle(.secondary)
+                    Text("Custom icon from config: \(custom)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.vertical, 2)
     }
 }
 

@@ -298,6 +298,18 @@ final class SidebarHostsTests: XCTestCase {
         XCTAssertEqual(rows.map(\.checked), [false, true, false, false])
     }
 
+    func testPopoverRowsUseConfiguredHostSymbols() {
+        let cfg = AppConfig()
+        cfg.remoteIcons = ["studio": "mac-studio", "mini": "mac-mini"]
+        let rows = SidebarHostsPopover.rows(
+            byHost: true, filter: nil, allWorkspaces: false,
+            hosts: [localHost, "studio", "mini", "box"],
+            symbol: { cfg.hostSymbol(for: $0) },
+            state: { _ in nil }
+        )
+        XCTAssertEqual(rows.map(\.symbol), ["macwindow", "square.stack.3d.up", "laptopcomputer", "macstudio", "macmini", "globe"])
+    }
+
     /// Past its height limit, the hosts list scrolls to its last host; a short list is as tall
     /// as its rows.
     func testPopoverListScrollsPastItsHeight() throws {

@@ -1,6 +1,64 @@
 import AppKit
 import CThurm
 
+/// Selectable icons for `[[remote]]` hosts. Preset names map to SF Symbols on macOS; any other
+/// valid SF Symbol name works too (as `[programs]` does), falling back to `"globe"`.
+enum RemoteIcon {
+    struct Preset: Equatable, Identifiable {
+        /// Value written to `[[remote]].icon` (`""` resets to the default globe).
+        let id: String
+        let label: String
+        let symbol: String
+    }
+
+    static let defaultSymbol = "globe"
+
+    static let presets: [Preset] = [
+        Preset(id: "", label: "Default", symbol: "globe"),
+        Preset(id: "mac-studio", label: "Mac Studio", symbol: "macstudio"),
+        Preset(id: "mac-mini", label: "Mac mini", symbol: "macmini"),
+        Preset(id: "macbook", label: "MacBook", symbol: "macbook"),
+        Preset(id: "imac", label: "iMac", symbol: "desktopcomputer"),
+        Preset(id: "mac-pro", label: "Mac Pro", symbol: "macpro.gen3"),
+        Preset(id: "pc", label: "PC", symbol: "pc"),
+        Preset(id: "server", label: "Server", symbol: "server.rack"),
+        Preset(id: "cloud", label: "Cloud", symbol: "cloud"),
+        Preset(id: "cpu", label: "Compute", symbol: "cpu"),
+        Preset(id: "drive", label: "Storage", symbol: "externaldrive"),
+        Preset(id: "terminal", label: "Terminal", symbol: "terminal"),
+    ]
+
+    private static let byId: [String: String] = Dictionary(
+        uniqueKeysWithValues: presets.filter { !$0.id.isEmpty }.map { ($0.id, $0.symbol) }
+    )
+
+    /// The preset id matching a saved `[[remote]].icon` value (`""` for default, `nil` for a
+    /// custom SF Symbol outside `presets`).
+    static func presetId(for raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return ""
+        }
+        if byId[trimmed] != nil { return trimmed }
+        if let match = presets.first(where: { !$0.id.isEmpty && $0.symbol == trimmed }) {
+            return match.id
+        }
+        if trimmed == defaultSymbol { return "" }
+        return nil
+    }
+
+    /// The SF Symbol name for a remote host's `icon` setting.
+    static func symbol(
+        for raw: String?,
+        symbolExists: (String) -> Bool = { NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil }
+    ) -> String {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return defaultSymbol
+        }
+        let candidate = byId[trimmed] ?? trimmed
+        return symbolExists(candidate) ? candidate : defaultSymbol
+    }
+}
+
 /// `config.window.option_as_alt`.
 enum OptionAsAlt: String {
     case none, left, right, both
@@ -259,6 +317,8 @@ final class AppConfig {
     var programMarks: [String: String] = [:]
     /// `[[remote]]` hosts, by name (connected in the background; see Remote.swift).
     var remoteNames: [String] = []
+    /// `[[remote]]` icons, by host name (preset id or SF Symbol; unset = default globe).
+    var remoteIcons: [HostId: String] = [:]
     var configPath = ""
     var loadError: String?
     /// Settings the config file has that this build doesn't know (ignored).
@@ -437,7 +497,19 @@ final class AppConfig {
         }
         if let remotes = c["remote"] as? [[String: Any]] {
             remoteNames = remotes.compactMap { jsonString($0["name"]) }
+            remoteIcons = Dictionary(uniqueKeysWithValues: remotes.compactMap { r in
+                guard let name = jsonString(r["name"]),
+                      let icon = jsonString(r["icon"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !icon.isEmpty else { return nil }
+                return (name, icon)
+            })
         }
+    }
+
+    /// The SF Symbol shown for `host` in the sidebar, popover, tab strip and pickers.
+    func hostSymbol(for host: HostId) -> String {
+        if host == localHost { return "laptopcomputer" }
+        return RemoteIcon.symbol(for: remoteIcons[host])
     }
 
     /// The sidebar's background (and the gutters between split cards): a step off the terminal

@@ -335,6 +335,63 @@ final class RemoteHostEntryTests: XCTestCase {
             RemoteHostEntry(name: "bastion", target: "", tailnet: "wss://bastion.tail2177a1.ts.net/v1/connect"),
         ])
     }
+
+    func testIconIsDecodedAndBlankIsDefault() {
+        let value = JSON.decode("""
+        [{"name": "studio", "host": "me@studio", "icon": "mac-studio"},
+         {"name": "mini", "host": "me@mini", "icon": "  "},
+         {"name": "box", "host": "me@box"}]
+        """)
+        XCTAssertEqual(RemoteHostEntry.entries(value), [
+            RemoteHostEntry(name: "studio", target: "me@studio", icon: "mac-studio"),
+            RemoteHostEntry(name: "mini", target: "me@mini", icon: nil),
+            RemoteHostEntry(name: "box", target: "me@box", icon: nil),
+        ])
+    }
+}
+
+final class RemoteIconTests: XCTestCase {
+    func testAllPresetSymbolsExistOnMacOS() {
+        for preset in RemoteIcon.presets {
+            XCTAssertNotNil(NSImage(systemSymbolName: preset.symbol, accessibilityDescription: nil),
+                            "missing SF Symbol \(preset.symbol) for preset \(preset.id)")
+        }
+    }
+
+    func testResolvesPresetsRawSymbolsAndFallback() {
+        XCTAssertEqual(RemoteIcon.symbol(for: nil), "globe")
+        XCTAssertEqual(RemoteIcon.symbol(for: ""), "globe")
+        XCTAssertEqual(RemoteIcon.symbol(for: "mac-studio"), "macstudio")
+        XCTAssertEqual(RemoteIcon.symbol(for: "mac-mini"), "macmini")
+        XCTAssertEqual(RemoteIcon.symbol(for: "server"), "server.rack")
+        XCTAssertEqual(RemoteIcon.symbol(for: "xserve"), "xserve")
+        XCTAssertEqual(RemoteIcon.symbol(for: "not.a.real.symbol.xyz", symbolExists: { _ in false }), "globe")
+
+        XCTAssertEqual(RemoteIcon.presetId(for: nil), "")
+        XCTAssertEqual(RemoteIcon.presetId(for: ""), "")
+        XCTAssertEqual(RemoteIcon.presetId(for: "globe"), "")
+        XCTAssertEqual(RemoteIcon.presetId(for: "mac-studio"), "mac-studio")
+        XCTAssertEqual(RemoteIcon.presetId(for: "macstudio"), "mac-studio")
+        XCTAssertNil(RemoteIcon.presetId(for: "xserve"))
+    }
+
+    func testConfigHostSymbolUsesRemoteIcon() {
+        let cfg = AppConfig()
+        cfg.apply([
+            "config": [
+                "remote": [
+                    ["name": "studio", "host": "studio", "icon": "mac-studio"],
+                    ["name": "mini", "host": "mini", "icon": "mac-mini"],
+                    ["name": "devbox", "host": "devbox"],
+                ],
+            ],
+        ])
+        XCTAssertEqual(cfg.hostSymbol(for: localHost), "laptopcomputer")
+        XCTAssertEqual(cfg.hostSymbol(for: "studio"), "macstudio")
+        XCTAssertEqual(cfg.hostSymbol(for: "mini"), "macmini")
+        XCTAssertEqual(cfg.hostSymbol(for: "devbox"), "globe")
+        XCTAssertEqual(cfg.hostSymbol(for: "unknown"), "globe")
+    }
 }
 
 final class HostNameSuggestionTests: XCTestCase {

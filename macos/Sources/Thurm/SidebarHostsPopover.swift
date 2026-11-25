@@ -23,6 +23,7 @@ final class SidebarHostsPopover: NSObject, NSPopoverDelegate {
     /// then every host, then each host, This Mac first. The current choice is checked; a filter
     /// naming a host that is gone counts as every host.
     static func rows(byHost: Bool, filter: HostId?, allWorkspaces: Bool, hosts: [HostId],
+                     symbol: (HostId) -> String = { $0 == localHost ? "laptopcomputer" : RemoteIcon.defaultSymbol },
                      state: (HostId) -> String?) -> [Row] {
         let current = SidebarHosts.effectiveFilter(filter, hosts: hosts)
         var rows = [Row(title: allWorkspaces ? "All Workspaces" : "This Workspace", symbol: "macwindow",
@@ -30,7 +31,7 @@ final class SidebarHostsPopover: NSObject, NSPopoverDelegate {
                     Row(title: "All Hosts", symbol: "square.stack.3d.up", choice: Choice(byHost: true, host: nil),
                         checked: byHost && current == nil)]
         for h in hosts {
-            rows.append(Row(title: SidebarHosts.title(h), symbol: h == localHost ? "laptopcomputer" : "globe",
+            rows.append(Row(title: SidebarHosts.title(h), symbol: symbol(h),
                             detail: state(h), choice: Choice(byHost: true, host: h), checked: byHost && current == h))
         }
         return rows
@@ -53,7 +54,8 @@ final class SidebarHostsPopover: NSObject, NSPopoverDelegate {
         let config = sm.config
         let hosts = SidebarHosts.hosts(remotes: config.remoteNames, workspaceHosts: sm.workspaces.map(\.host))
         let rows = Self.rows(byHost: config.sidebarByHost, filter: config.sidebarHost,
-                             allWorkspaces: config.sidebarAllWorkspaces, hosts: hosts, state: Self.state)
+                             allWorkspaces: config.sidebarAllWorkspaces, hosts: hosts,
+                             symbol: { config.hostSymbol(for: $0) }, state: Self.state)
         let p = NSPopover()
         p.behavior = .transient
         p.animates = false

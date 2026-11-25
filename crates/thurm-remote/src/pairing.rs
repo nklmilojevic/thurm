@@ -540,6 +540,7 @@ mod tests {
             tailnet: None,
             forward_links: true,
             daemon_id: None,
+            icon: None,
         };
         for file in [&known, &hashed] {
             let e = host_entry(&remote, &ssh_for(22, file));

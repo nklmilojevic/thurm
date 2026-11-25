@@ -93,6 +93,9 @@ enum RemoteCmd {
         /// this Mac's Tailscale.
         #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "PEER|URL")]
         tailnet: Option<String>,
+        /// Sidebar icon for this host (e.g. mac-studio, mac-mini, macbook, server, or an SF Symbol).
+        #[arg(long, value_name = "ICON")]
+        icon: Option<String>,
         /// Answer yes to every question.
         #[arg(long, short = 'y', conflicts_with = "no")]
         yes: bool,
@@ -106,13 +109,15 @@ enum RemoteCmd {
     /// Forget a host (its daemon and panes keep running there).
     #[command(alias = "rm")]
     Remove { name: String },
-    /// Change a host: give it an ssh target (a host added over the tailnet has none), used to
-    /// install, check and hand off.
+    /// Change a host's ssh target or sidebar icon.
     Edit {
         name: String,
         /// The ssh target: a Host alias, user@host, or ssh://user@host:port.
-        #[arg(long, value_name = "TARGET")]
-        ssh: String,
+        #[arg(long, value_name = "TARGET", required_unless_present = "icon")]
+        ssh: Option<String>,
+        /// Sidebar icon (e.g. mac-studio, mac-mini, macbook, server, an SF Symbol, or "" for default).
+        #[arg(long, value_name = "ICON", required_unless_present = "ssh")]
+        icon: Option<String>,
     },
     /// Connection state of one host (or all).
     Status { name: Option<String> },
@@ -1022,6 +1027,7 @@ fn run(cli: Cli) -> R {
                 address,
                 socket,
                 tailnet,
+                icon,
                 yes,
                 no,
             } => remote::add(remote::AddOptions {
@@ -1029,6 +1035,7 @@ fn run(cli: Cli) -> R {
                 address,
                 socket,
                 tailnet,
+                icon,
                 assume: if yes {
                     Some(true)
                 } else if no {
@@ -1039,7 +1046,9 @@ fn run(cli: Cli) -> R {
             }),
             RemoteCmd::List => remote::list(json),
             RemoteCmd::Remove { name } => remote::remove(&name),
-            RemoteCmd::Edit { name, ssh } => remote::edit(&name, &ssh),
+            RemoteCmd::Edit { name, ssh, icon } => {
+                remote::edit(&name, ssh.as_deref(), icon.as_deref())
+            }
             RemoteCmd::Status { name } => remote::status(name.as_deref(), json),
             RemoteCmd::Install { name, yes, no } => {
                 remote::install_cmd(&name, if yes { Some(true) } else { no.then_some(false) })
@@ -2697,6 +2706,9 @@ mod tests {
         assert!(parse(&["handoff", "--cleanup", "x", "--force"]).is_ok());
         assert!(parse(&["remote", "install", "box", "--no"]).is_ok());
         assert!(parse(&["remote", "install", "box", "--yes", "--no"]).is_err());
+        assert!(parse(&["remote", "edit", "box"]).is_err());
+        assert!(parse(&["remote", "edit", "box", "--icon", "mac-studio"]).is_ok());
+        assert!(parse(&["remote", "edit", "box", "--ssh", "me@box"]).is_ok());
     }
 
     #[test]

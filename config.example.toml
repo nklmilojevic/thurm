@@ -343,4 +343,5 @@ web = false
 # enabled = true
 # clipboard_read = "ask"   # "ask", "always" or "never"
 # forward_links = true     # cmd-click on a localhost link forwards that port here
+# icon = "mac-studio"      # sidebar icon: mac-studio, mac-mini, macbook, imac, mac-pro, pc, server, cloud, cpu, drive, terminal, or an SF Symbol
 # tailnet = "wss://devbox.YOUR-TAILNET.ts.net/v1/connect"   # over Tailscale instead of ssh
