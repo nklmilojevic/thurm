@@ -36,9 +36,11 @@ open macos/build/Thurm.app
 
 To work on the Swift code, build once with the script, then open `macos/Package.swift` in
 Xcode or run `swift build` in `macos/` (set `THURM_LIB_DIR` if the Rust library lives somewhere
-other than `../target/aarch64-apple-darwin/release`). A bare `swift run` works for rendering and input,
-but desktop notifications need the bundled app, and `thurmd` is only spawned when it sits
-next to the executable (or is named by `$THURM_DAEMON`).
+other than `../target/aarch64-apple-darwin/release`). A bare `swift run` works for rendering and
+input, but desktop notifications need the bundled app; the assembled `Thurm.app` spawns
+`Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd` (falling back to a flat
+`Contents/Helpers/thurmd`), while a bare `swift run` only spawns `thurmd` when `$THURM_DAEMON` is
+set (otherwise it connects to an already-running daemon).
 
 ## Releases and updates
 

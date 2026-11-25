@@ -31,9 +31,12 @@ final class Integrations: NSObject, NSMenuDelegate {
         if plist["AssociatedBundleIdentifiers"] == nil {
             plist["AssociatedBundleIdentifiers"] = [Bundle.main.bundleIdentifier ?? "com.thurm.terminal"]
         }
-        if let updated = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
-            try? updated.write(to: launchAgent, options: .atomic)
+        do {
+            let updated = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try updated.write(to: launchAgent, options: .atomic)
             tlog("migrated LaunchAgent \(launchAgent.lastPathComponent) to Thurm Daemon.app")
+        } catch {
+            tlog("could not migrate LaunchAgent \(launchAgent.lastPathComponent): \(error)")
         }
     }
     /// `~/.local/bin` when it exists (no password needed), else `/usr/local/bin`.
