@@ -10,6 +10,11 @@ final class FastWorkspaceSwitchTests: XCTestCase {
     private var savedPanes: [PaneKey: PaneInfo] = [:]
     private var savedSidebarTabs = true
     private var savedSidebarByHost = false
+    private var savedSidebarAllWorkspaces = false
+    private var savedSidebarHost: HostId?
+    private var savedSidebarActiveOnly = false
+    private var savedRemoteNames: [HostId] = []
+    private var savedIsConnected: (HostId) -> Bool = TabSidebarViewController.isConnected
     private var savedHistory = TabHistory()
 
     override func setUp() {
@@ -19,9 +24,18 @@ final class FastWorkspaceSwitchTests: XCTestCase {
         savedPanes = manager.panes
         savedSidebarTabs = manager.config.sidebarTabs
         savedSidebarByHost = manager.config.sidebarByHost
+        savedSidebarAllWorkspaces = manager.config.sidebarAllWorkspaces
+        savedSidebarHost = manager.config.sidebarHost
+        savedSidebarActiveOnly = manager.config.sidebarActiveOnly
+        savedRemoteNames = manager.config.remoteNames
+        savedIsConnected = TabSidebarViewController.isConnected
         savedHistory = manager.tabHistory
         manager.config.sidebarTabs = true
         manager.config.sidebarByHost = false
+        manager.config.sidebarAllWorkspaces = false
+        manager.config.sidebarHost = nil
+        manager.config.sidebarActiveOnly = false
+        manager.config.remoteNames = []
         manager.workspaces = []
         manager.panes = [:]
         manager.tabHistory = TabHistory()
@@ -35,6 +49,11 @@ final class FastWorkspaceSwitchTests: XCTestCase {
         }
         manager.config.sidebarTabs = savedSidebarTabs
         manager.config.sidebarByHost = savedSidebarByHost
+        manager.config.sidebarAllWorkspaces = savedSidebarAllWorkspaces
+        manager.config.sidebarHost = savedSidebarHost
+        manager.config.sidebarActiveOnly = savedSidebarActiveOnly
+        manager.config.remoteNames = savedRemoteNames
+        TabSidebarViewController.isConnected = savedIsConnected
         manager.workspaces = savedWorkspaces
         manager.panes = savedPanes
         manager.tabHistory = savedHistory
@@ -441,5 +460,184 @@ final class FastWorkspaceSwitchTests: XCTestCase {
         XCTAssertEqual(shownB.content.paneIds, [pane(12)])
         XCTAssertEqual(shownB.window?.frame.size, frame.size)
         XCTAssertTrue(wsB.hiddenTabs.isEmpty)
+    }
+
+    // MARK: - Remote workspace focus & cross-workspace Cmd+1…9 shortcuts
+
+    private func findOutline(in root: NSView) -> SidebarOutlineView? {
+        if let o = root as? SidebarOutlineView { return o }
+        for sub in root.subviews {
+            if let found = findOutline(in: sub) { return found }
+        }
+        return nil
+    }
+
+    private func cmdMenuItem(_ number: Int) -> NSMenuItem {
+        let item = NSMenuItem()
+        item.tag = number
+        return item
+    }
+
+    func testRemoteWorkspaceSwitchAndSidebarMouseDownRestoreTerminalFocus() throws {
+        manager.config.sidebarByHost = true
+        manager.config.remoteNames = ["devbox"]
+        TabSidebarViewController.isConnected = { _ in true }
+
+        let localWS = manager.makeWorkspace(name: "This Mac")
+        let remoteWS = manager.makeWorkspace(name: "devbox", host: "devbox")
+        remoteWS.hiddenTabs = [
+            TabLayout(title: "remote-1", root: .pane(pane(101, host: "devbox")), focused: 101, zoomed: nil),
+        ]
+
+        let c = makeSingleWindow(workspace: localWS, paneIDs: [1, 2])
+        let window = try XCTUnwrap(c.window)
+        let sidebar = try XCTUnwrap(c.sidebar)
+        sidebar.reload()
+        let outline = try XCTUnwrap(findOutline(in: sidebar.view))
+
+        // Cold switch from local -> remote via showHiddenTab focuses the remote pane immediately.
+        manager.showHiddenTab(HiddenTab(workspace: remoteWS.id, index: 0), from: c)
+        XCTAssertEqual(c.workspaceID, remoteWS.id)
+        XCTAssertTrue(window.firstResponder === c.content.focusedView,
+                      "cold switch to remote workspace must focus the remote terminal view")
+
+        // Simulate AppKit's NSTableView.mouseDown reclaiming first responder onto the sidebar
+        // outline after activating a non-draggable row (e.g. a remote/other workspace tab).
+        XCTAssertTrue(window.makeFirstResponder(outline))
+        XCTAssertTrue(window.firstResponder === outline)
+        outline.onMouseDownFinished?()
+        XCTAssertTrue(window.firstResponder === c.content.focusedView,
+                      "post-mouseDown hook must restore first responder from sidebar outline to active terminal")
+
+        // Keyboard focus on the sidebar (without mouseDown) stays untouched so Return/Space works.
+        XCTAssertTrue(window.makeFirstResponder(outline))
+        XCTAssertTrue(window.firstResponder === outline)
+
+        // Cached round-trip: switch remote -> local -> remote keeps terminal focus each time.
+        manager.showHiddenTab(HiddenTab(workspace: localWS.id, index: 1), from: c)
+        XCTAssertEqual(c.workspaceID, localWS.id)
+        XCTAssertEqual(c.selectedTabIndex, 1)
+        XCTAssertTrue(window.firstResponder === c.content.focusedView)
+
+        manager.showHiddenTab(HiddenTab(workspace: remoteWS.id, index: 0), from: c)
+        XCTAssertEqual(c.workspaceID, remoteWS.id)
+        XCTAssertTrue(window.firstResponder === c.content.focusedView,
+                      "warm switch back to remote workspace must focus the remote terminal view")
+    }
+
+    func testCmdNumberSwitchesAcrossAllHostsInSidebarOrder() throws {
+        manager.config.sidebarByHost = true
+        manager.config.remoteNames = ["devbox", "offlinebox"]
+        TabSidebarViewController.isConnected = { $0 == "devbox" }
+
+        let localWS = manager.makeWorkspace(name: "This Mac")
+        let remoteWS = manager.makeWorkspace(name: "devbox", host: "devbox")
+        remoteWS.hiddenTabs = [
+            TabLayout(title: "r1", root: .pane(pane(101, host: "devbox")), focused: 101, zoomed: nil),
+            TabLayout(title: "r2", root: .pane(pane(102, host: "devbox")), focused: 102, zoomed: nil),
+        ]
+        let offlineWS = manager.makeWorkspace(name: "offlinebox", host: "offlinebox")
+        offlineWS.hiddenTabs = [
+            TabLayout(title: "off", root: .pane(pane(201, host: "offlinebox")), focused: 201, zoomed: nil),
+        ]
+
+        let c = makeSingleWindow(workspace: localWS, paneIDs: [1, 2, 3, 4, 5, 6])
+        let window = try XCTUnwrap(c.window)
+        let sidebar = try XCTUnwrap(c.sidebar)
+        sidebar.reload()
+        let outline = try XCTUnwrap(findOutline(in: sidebar.view))
+
+        // All Hosts order: 6 local tabs (⌘1..⌘6), then 2 connected remote tabs (⌘7..⌘8).
+        // Disconnected host's hidden tabs are omitted from the sidebar and shortcuts.
+        XCTAssertEqual(TabSidebarViewController.shortcutTargets(for: c).count, 8)
+        let rowShortcuts = (0..<outline.numberOfRows).compactMap { row -> Int? in
+            (outline.item(atRow: row) as? TabBox)?.tab.shortcut
+        }
+        XCTAssertEqual(rowShortcuts, [1, 2, 3, 4, 5, 6, 7, 8])
+
+        // Cmd+7 switches directly to devbox's first tab and focuses its pane.
+        c.selectTabByNumber(cmdMenuItem(7))
+        XCTAssertEqual(c.workspaceID, remoteWS.id)
+        XCTAssertEqual(c.content.focusedPane, pane(101, host: "devbox"))
+        XCTAssertTrue(window.firstResponder === c.content.focusedView)
+
+        // Numbering stays identical after switching to devbox.
+        let shortcutsAfterSwitch = (0..<outline.numberOfRows).compactMap { row -> Int? in
+            (outline.item(atRow: row) as? TabBox)?.tab.shortcut
+        }
+        XCTAssertEqual(shortcutsAfterSwitch, [1, 2, 3, 4, 5, 6, 7, 8])
+
+        // Cmd+9 jumps to the last tab in All Hosts (devbox tab 2).
+        c.selectTabByNumber(cmdMenuItem(9))
+        XCTAssertEqual(c.workspaceID, remoteWS.id)
+        XCTAssertEqual(c.content.focusedPane, pane(102, host: "devbox"))
+        XCTAssertTrue(window.firstResponder === c.content.focusedView)
+
+        // While on devbox, Cmd+3 jumps straight back to This Mac's 3rd tab and focuses it.
+        c.selectTabByNumber(cmdMenuItem(3))
+        XCTAssertEqual(c.workspaceID, localWS.id)
+        XCTAssertEqual(c.content.focusedPane, pane(3))
+        XCTAssertTrue(window.firstResponder === c.content.focusedView)
+
+        // Activity filter (sidebarActiveOnly) does not scramble All Hosts Cmd+1…9 order.
+        manager.config.sidebarActiveOnly = true
+        sidebar.reload()
+        c.selectTabByNumber(cmdMenuItem(8))
+        XCTAssertEqual(c.workspaceID, remoteWS.id)
+        XCTAssertEqual(c.content.focusedPane, pane(102, host: "devbox"))
+        manager.config.sidebarActiveOnly = false
+
+        // Narrowing host filter to "devbox" scopes Cmd+1…9 to devbox's 2 tabs only.
+        manager.config.sidebarHost = "devbox"
+        sidebar.reload()
+        XCTAssertEqual(TabSidebarViewController.shortcutTargets(for: c).count, 2)
+        c.selectTabByNumber(cmdMenuItem(1))
+        XCTAssertEqual(c.workspaceID, remoteWS.id)
+        XCTAssertEqual(c.content.focusedPane, pane(101, host: "devbox"))
+        c.selectTabByNumber(cmdMenuItem(9))
+        XCTAssertEqual(c.content.focusedPane, pane(102, host: "devbox"))
+    }
+
+    func testCmdNumberSwitchesAcrossAllWorkspacesInSidebarOrder() throws {
+        manager.config.sidebarAllWorkspaces = true
+        manager.config.sidebarByHost = false
+
+        let ws1 = manager.makeWorkspace(name: "one")
+        let ws2 = manager.makeWorkspace(name: "two", host: "devbox")
+        ws2.hiddenTabs = [
+            TabLayout(title: "w2-1", root: .pane(pane(21, host: "devbox")), focused: 21, zoomed: nil),
+            TabLayout(title: "w2-2", root: .pane(pane(22, host: "devbox")), focused: 22, zoomed: nil),
+        ]
+        let ws3 = manager.makeWorkspace(name: "three")
+        ws3.hiddenTabs = [
+            TabLayout(title: "w3-1", root: .pane(pane(31)), focused: 31, zoomed: nil),
+        ]
+
+        let c = makeSingleWindow(workspace: ws1, paneIDs: [1, 2])
+        let window = try XCTUnwrap(c.window)
+        let sidebar = try XCTUnwrap(c.sidebar)
+        sidebar.reload()
+        let outline = try XCTUnwrap(findOutline(in: sidebar.view))
+
+        let rowShortcuts = (0..<outline.numberOfRows).compactMap { row -> Int? in
+            (outline.item(atRow: row) as? TabBox)?.tab.shortcut
+        }
+        XCTAssertEqual(rowShortcuts, [1, 2, 3, 4, 5])
+
+        // Cmd+4 -> ws2 tab 2, Cmd+5 / Cmd+9 -> ws3 tab 1, Cmd+1 -> ws1 tab 1.
+        c.selectTabByNumber(cmdMenuItem(4))
+        XCTAssertEqual(c.workspaceID, ws2.id)
+        XCTAssertEqual(c.content.focusedPane, pane(22, host: "devbox"))
+        XCTAssertTrue(window.firstResponder === c.content.focusedView)
+
+        c.selectTabByNumber(cmdMenuItem(9))
+        XCTAssertEqual(c.workspaceID, ws3.id)
+        XCTAssertEqual(c.content.focusedPane, pane(31))
+        XCTAssertTrue(window.firstResponder === c.content.focusedView)
+
+        c.selectTabByNumber(cmdMenuItem(1))
+        XCTAssertEqual(c.workspaceID, ws1.id)
+        XCTAssertEqual(c.content.focusedPane, pane(1))
+        XCTAssertTrue(window.firstResponder === c.content.focusedView)
     }
 }

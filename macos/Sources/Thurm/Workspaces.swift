@@ -341,13 +341,15 @@ extension SessionManager {
                     tab.isClosed = true
                 }
             }
-            target.lastActive = Date()
             prewarmWorkspaceTabs(targetTabs, excluding: c.selectedTab)
             c.window?.makeKeyAndOrderFront(nil)
-            recordTabVisit(c.selectedTab)
             c.sidebar?.reload()
-            focusChanged()
-            scheduleLayoutSave()
+            if let window = c.window, let view = c.content.focusedView,
+               !((window.firstResponder as? NSView)?.isDescendant(of: c.content) ?? false) {
+                window.makeFirstResponder(view)
+            }
+            c.content.focusedView?.reportFocus()
+            tabSelected(c.selectedTab, in: c)
             return
         }
 

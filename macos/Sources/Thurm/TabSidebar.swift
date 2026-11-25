@@ -452,6 +452,9 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             guard let self, self.outline.selectedRow >= 0 else { return }
             self.activate(row: self.outline.selectedRow)
         }
+        outline.onMouseDownFinished = { [weak self] in
+            self?.restoreTerminalFocusAfterClick()
+        }
         outline.menu = rowMenu()
         outline.registerForDraggedTypes([Self.dragType])
         outline.setDraggingSourceOperationMask(.move, forLocal: true)
@@ -915,20 +918,48 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
         return pane.host == localHost ? (root, name) : ("\(pane.host):\(root)", "\(pane.host) · \(name)")
     }
 
-    func reload() {
-        guard isViewLoaded, let controller, controller.window != nil else { return }
-        if holdReloads {
-            reloadHeld = true
-            return
+    /// One tab addressable by `Cmd+1…9` when the sidebar lists multiple workspaces or hosts.
+    enum ShortcutTarget: Equatable {
+        case live(TabItem)
+        case hidden(HiddenTab)
+
+        static func == (a: Self, b: Self) -> Bool {
+            switch (a, b) {
+            case (.live(let x), .live(let y)): return x === y
+            case (.hidden(let x), .hidden(let y)): return x == y
+            default: return false
+            }
         }
+    }
+
+    /// Tabs in the order `Cmd+1…9` selects them while `window.sidebar_by_host` or
+    /// `window.sidebar_all_workspaces` is enabled (matching the top-to-bottom sidebar listing,
+    /// before `window.sidebar_active_only` filtering).
+    static func shortcutTargets(for controller: TerminalWindowController) -> [ShortcutTarget] {
+        let sm = SessionManager.shared
+        let (order, _, _) = buildGroups(for: controller, config: sm.config, panes: sm.panes)
+        return order.flatMap(\.flattened)
+            .filter { $0.host == nil }
+            .flatMap(\.tabs)
+            .compactMap { row in
+                if let hidden = row.hidden { return .hidden(hidden) }
+                if let tab = row.tab ?? row.controller?.selectedTab { return .live(tab) }
+                return nil
+            }
+    }
+
+    /// Builds the ordered sidebar groups (before `sidebarActiveOnly` filtering) and stamps
+    /// `⌘1…9` shortcuts onto the rows. Shared by `reload()` and `shortcutTargets(for:)` so the
+    /// displayed shortcut badges always match `Cmd+1…9`.
+    private static func buildGroups(for controller: TerminalWindowController, config: AppConfig,
+                                    panes: [PaneKey: PaneInfo])
+        -> (order: [SidebarGroup], shownWorkspace: Workspace?, hostFilter: HostId?)
+    {
         let sm = SessionManager.shared
         let shownWorkspace = sm.workspace(controller.workspaceID)
-        let config = sm.config
-        syncTopRow(shownWorkspace, config: config)
-        usage.reload()
         let tabItems = controller.orderedTabItems
-        let panes = sm.panes
         let byRepo = Self.groupsByRepo(config)
+        let crossWorkspaceShortcuts = config.sidebarByHost || config.sidebarAllWorkspaces
         var byRoot: [String: SidebarGroup] = [:]
         var order: [SidebarGroup] = []
         let pinned = SidebarGroup(name: "Pinned", key: Self.pinnedKey)
@@ -940,7 +971,8 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             ? SidebarGroup(name: shownWorkspace.map(Self.heading) ?? "Tabs", key: shownWorkspace.map(Self.collapseKey))
             : SidebarGroup(name: "Terminals")
         for (index, t) in tabItems.enumerated() where !t.isClosed {
-            let tab = Self.row(t, shortcut: tabShortcut(index: index, count: tabItems.count),
+            let shortcut = crossWorkspaceShortcuts ? nil : tabShortcut(index: index, count: tabItems.count)
+            let tab = Self.row(t, shortcut: shortcut,
                                selected: t === controller.selectedTab, info: panes, config: config)
             if t.pinned {
                 pinned.tabs.append(tab)
@@ -1018,7 +1050,33 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
             order.append(other)
         }
         order.insert(pinned, at: 0)
-        if config.sidebarActiveOnly {
+        if crossWorkspaceShortcuts {
+            let leaves = order.flatMap(\.flattened).filter { $0.host == nil }
+            let total = leaves.reduce(0) { $0 + $1.tabs.count }
+            var pos = 0
+            for g in leaves {
+                for i in g.tabs.indices {
+                    g.tabs[i].shortcut = tabShortcut(index: pos, count: total)
+                    pos += 1
+                }
+            }
+        }
+        return (order, shownWorkspace, hostFilter)
+    }
+
+    func reload() {
+        guard isViewLoaded, let controller, controller.window != nil else { return }
+        if holdReloads {
+            reloadHeld = true
+            return
+        }
+        let sm = SessionManager.shared
+        let config = sm.config
+        let panes = sm.panes
+        var (order, shownWorkspace, hostFilter) = Self.buildGroups(for: controller, config: config, panes: panes)
+        syncTopRow(shownWorkspace, config: config)
+        usage.reload()
+        if config.sidebarActiveOnly, let pinned = order.first {
             let listed = order.flatMap(\.flattened).filter { $0 !== pinned && $0.host == nil }
             order = [pinned] + activityGroups(listed: listed, shown: shownWorkspace, host: hostFilter, panes: panes)
         }
@@ -1340,6 +1398,21 @@ final class TabSidebarViewController: NSViewController, NSOutlineViewDataSource,
     }
 
     // MARK: Actions
+
+    /// Returns keyboard focus to the active terminal pane if AppKit's `NSTableView.mouseDown`
+    /// left or reclaimed first responder on the sidebar (common for non-draggable rows such as
+    /// tabs in another/remote workspace). Keyboard navigation into the sidebar does not run
+    /// through `mouseDown` and stays untouched.
+    private func restoreTerminalFocusAfterClick() {
+        guard let controller, let window = controller.window,
+              let terminal = controller.content.focusedView,
+              window.attachedSheet == nil else { return }
+        let responder = window.firstResponder
+        let inSidebar = (responder as? NSView)?.isDescendant(of: view) == true
+        guard inSidebar || responder === window || responder == nil else { return }
+        window.makeFirstResponder(terminal)
+        terminal.reportFocus()
+    }
 
     @objc private func rowClicked(_ sender: Any?) {
         activate(row: outline.clickedRow >= 0 ? outline.clickedRow : outline.selectedRow)
@@ -1673,6 +1746,14 @@ final class NewWorkspaceRowView: NSView {
 /// The sidebar's outline: Return, Enter or Space opens the selected row, as a click does.
 final class SidebarOutlineView: NSOutlineView {
     var activate: (() -> Void)?
+    /// Runs right after `super.mouseDown(with:)` completes so post-click responder updates in
+    /// `NSTableView` cannot leave focus stranded on the sidebar instead of the active terminal.
+    var onMouseDownFinished: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        onMouseDownFinished?()
+    }
 
     override func keyDown(with event: NSEvent) {
         let keys: Set<UInt16> = [36, 76, 49] // Return, keypad Enter, Space

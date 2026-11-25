@@ -410,6 +410,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
         // tabs so its TerminalViews transition cleanly through viewDidMoveToWindow() -> unsubscribe
         // (parking into the warm LRU cache rather than tearing down).
         oldActive.content.removeFromSuperview()
+        oldActive.content.focusedView?.reportFocus()
         let newIDs = Set(newTabs.map(ObjectIdentifier.init))
         for tab in oldTabs where !newIDs.contains(ObjectIdentifier(tab)) {
             tab.windowController = nil
@@ -947,6 +948,30 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate {
     /// Cmd+1...9 (tag = number; 9 selects the last tab).
     @objc func selectTabByNumber(_ sender: Any?) {
         guard let item = sender as? NSMenuItem, window != nil else { return }
+        let config = SessionManager.shared.config
+        if !isQuick, config.sidebarTabs, config.sidebarByHost || config.sidebarAllWorkspaces {
+            let targets = TabSidebarViewController.shortcutTargets(for: self)
+            guard !targets.isEmpty else { return }
+            let index = item.tag >= 9 ? targets.count - 1 : item.tag - 1
+            guard index >= 0, index < targets.count else { return }
+            switch targets[index] {
+            case .hidden(let hidden):
+                SessionManager.shared.showHiddenTab(hidden, from: self)
+            case .live(let target):
+                if let host = target.windowController {
+                    if host.usesSingleWindowTabs && SessionManager.shared.group(of: host).count == 1 {
+                        host.selectTab(target, focus: true)
+                        host.window?.makeKeyAndOrderFront(nil)
+                    } else if let w = host.window {
+                        w.makeKeyAndOrderFront(nil)
+                        if let view = target.content.focusedView {
+                            w.makeFirstResponder(view)
+                        }
+                    }
+                }
+            }
+            return
+        }
         if usesSingleWindowTabs && SessionManager.shared.group(of: self).count == 1 {
             let ordered = orderedTabItems
             guard !ordered.isEmpty else { return }
