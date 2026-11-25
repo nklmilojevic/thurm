@@ -88,6 +88,43 @@ final class TabOrderTests: XCTestCase {
         XCTAssertEqual(order(shown), [9])
     }
 
+    func testBackgroundSplitStaysInItsHiddenTab() throws {
+        let hidden = manager.makeWorkspace()
+        hidden.hiddenTabs = [TabLayout(title: nil, root: .pane(pane(1)), focused: 1, zoomed: nil)]
+        let shown = tab(9, workspace: manager.makeWorkspace())
+        manager.controllerBecameKey(shown)
+
+        manager.coreDidReceiveEvent("Ui", payload: ["Open": [
+            "pane": UInt64(2), "target": UInt64(1), "split": "right", "percent": UInt64(70), "background": true
+        ]], host: localHost)
+
+        XCTAssertEqual(hidden.hiddenTabs.count, 1)
+        guard case .split(.right, let ratio, .pane(pane(1)), .pane(pane(2))) = hidden.hiddenTabs[0].root else {
+            return XCTFail("pane 1 is split, pane 2 on its right: \(hidden.hiddenTabs[0].root)")
+        }
+        XCTAssertEqual(ratio, 0.3, accuracy: 0.001)
+        XCTAssertEqual(hidden.hiddenTabs[0].focused, 1)
+        XCTAssertFalse(manager.isShown(hidden))
+        XCTAssertEqual(shown.content.paneIds, [pane(9)])
+    }
+
+    func testForegroundSplitRevealsItsHiddenTab() throws {
+        let hidden = manager.makeWorkspace()
+        hidden.hiddenTabs = [TabLayout(title: nil, root: .pane(pane(1)), focused: 1, zoomed: nil)]
+        let shown = tab(9, workspace: manager.makeWorkspace())
+        manager.controllerBecameKey(shown)
+
+        manager.coreDidReceiveEvent("Ui", payload: ["Split": [
+            "pane": UInt64(2), "target": UInt64(1), "dir": "down"
+        ]], host: localHost)
+
+        let revealed = try XCTUnwrap(manager.controller(for: pane(2)))
+        XCTAssertEqual(revealed.workspaceID, hidden.id)
+        XCTAssertEqual(revealed.content.paneIds, [pane(1), pane(2)])
+        XCTAssertEqual(revealed.content.focusedPane, pane(2))
+        XCTAssertNil(manager.controller(for: pane(9)), "the shown tab is not split")
+    }
+
     func testForegroundCommandTabsKeepCreationOrder() {
         let source = tab(1, workspace: manager.makeWorkspace())
         for id: UInt64 in [2, 3, 4] {

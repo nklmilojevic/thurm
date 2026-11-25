@@ -256,6 +256,29 @@ extension SessionManager {
         }
     }
 
+    /// Splits `target`, in a tab no window shows, with `pane` beside it. With `reveal`, select
+    /// that tab in `c`'s window, as `addHiddenTab` does. False when no hidden tab splits `target`.
+    func splitHiddenTab(at target: PaneKey, with pane: PaneKey, direction: SplitDirName, share: CGFloat?,
+                        in c: TerminalWindowController?, reveal: Bool) -> Bool {
+        guard let ws = workspaces.first(where: { $0.hiddenTabs.contains { $0.root.panes.contains(target) } }),
+              let i = ws.hiddenTabs.firstIndex(where: { $0.root.panes.contains(target) }) else { return false }
+        ws.hiddenTabs[i].root = SplitNode(layout: ws.hiddenTabs[i].root)
+            .inserting(pane, at: target, direction: direction, share: share ?? 0.5).layoutNode
+        if reveal {
+            ws.hiddenTabs[i].focused = pane.id
+            ws.hiddenSelectedTab = i
+            if let c {
+                switchWorkspace(in: c, to: ws)
+            } else {
+                openWorkspaceInNewWindow(ws)
+            }
+        } else {
+            refreshSidebars()
+            scheduleLayoutSave()
+        }
+        return true
+    }
+
     /// Moves `c`'s tab out of its window into a new workspace, in the background.
     func moveTabToNewWorkspace(_ c: TerminalWindowController) {
         guard !c.isQuick, group(of: c).count > 1 else {
