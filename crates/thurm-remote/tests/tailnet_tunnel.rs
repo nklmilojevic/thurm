@@ -55,6 +55,7 @@ fn remote(name: &str, tailnet: &str) -> RemoteConfig {
         tailnet: Some(tailnet.into()),
         forward_links: true,
         daemon_id: None,
+        icon: None,
     }
 }
 

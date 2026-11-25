@@ -902,6 +902,10 @@ fn remote_setting_literal(key: &str, value: &serde_json::Value) -> Result<String
         {
             Ok(value.to_string())
         }
+        ("icon", serde_json::Value::String(s)) => {
+            thurm_config::validate_remote_icon(s)?;
+            Ok(json!(s.trim()).to_string())
+        }
         _ => Err(format!("{key} can't be set to {value}")),
     }
 }
@@ -983,6 +987,7 @@ fn add_ssh(
         tailnet: None,
         forward_links: true,
         daemon_id: candidate.daemon_id,
+        icon: None,
     })?;
     Ok(json!({ "name": name, "host": host }))
 }
@@ -1014,6 +1019,7 @@ fn add_tailnet(
         tailnet: Some(checked.url.clone()),
         forward_links: true,
         daemon_id: candidate.daemon_id.clone(),
+        icon: None,
     })?;
     Ok(json!({ "name": name, "tailnet": checked }))
 }
@@ -1110,6 +1116,7 @@ mod tests {
             tailnet: None,
             forward_links: true,
             daemon_id: None,
+            icon: None,
         };
         let sup = Supervisor::start(
             remote("devbox"),
@@ -1144,6 +1151,7 @@ mod tests {
             tailnet: None,
             forward_links: true,
             daemon_id: None,
+            icon: None,
         };
         let cfg = |host: &str| {
             let mut c = Config::parse("").unwrap();
@@ -1265,7 +1273,7 @@ mod tests {
         assert!(
             moved(
                 &before,
-                &cfg("host = \"a\"\nforward_links = false\nclipboard_read = \"never\"")
+                &cfg("host = \"a\"\nforward_links = false\nclipboard_read = \"never\"\nicon = \"mac-studio\"")
             )
             .is_empty()
         );
@@ -1377,6 +1385,13 @@ mod tests {
             remote_setting_literal("forward_links", &json!(false)).unwrap(),
             "false"
         );
+        assert_eq!(
+            remote_setting_literal("icon", &json!(" mac-studio ")).unwrap(),
+            "\"mac-studio\""
+        );
+        assert_eq!(remote_setting_literal("icon", &json!("")).unwrap(), "\"\"");
+        assert!(remote_setting_literal("icon", &json!("bad\nicon")).is_err());
+        assert!(remote_setting_literal("icon", &json!(1)).is_err());
         assert!(remote_setting_literal("name", &json!("x")).is_err());
         assert_eq!(
             remote_setting_literal("tailnet", &json!("wss://bastion.tail1234.ts.net")).unwrap(),

@@ -540,6 +540,7 @@ mod tests {
             tailnet: tailnet.map(Into::into),
             forward_links: true,
             daemon_id: id.map(Into::into),
+            icon: None,
         }
     }
 

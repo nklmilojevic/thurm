@@ -408,26 +408,31 @@ struct RemoteHostEntry: Equatable, Identifiable {
     let tailnet: String?
     /// Its `localhost` links open through a forward (`forward_links`).
     let forwardLinks: Bool
+    /// Sidebar icon preset id or SF Symbol name (`nil` = default globe).
+    let icon: String?
 
     var id: String { name }
 
     static let clipboardChoices = ["ask", "always", "never"]
 
     init(name: String, target: String, enabled: Bool = true, clipboardRead: String = "ask", tailnet: String? = nil,
-         forwardLinks: Bool = true) {
+         forwardLinks: Bool = true, icon: String? = nil) {
         self.name = name
         self.target = target
         self.enabled = enabled
         self.clipboardRead = clipboardRead
         self.tailnet = tailnet
         self.forwardLinks = forwardLinks
+        self.icon = icon
     }
 
     init?(json: [String: Any]) {
         guard let name = jsonString(json["name"]) else { return nil }
+        let icon = jsonString(json["icon"])?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.init(name: name, target: jsonString(json["host"]) ?? "", enabled: jsonBool(json["enabled"]) ?? true,
                   clipboardRead: jsonString(json["clipboard_read"]) ?? "ask", tailnet: jsonString(json["tailnet"]),
-                  forwardLinks: jsonBool(json["forward_links"]) ?? true)
+                  forwardLinks: jsonBool(json["forward_links"]) ?? true,
+                  icon: (icon?.isEmpty == false) ? icon : nil)
     }
 
     /// The hosts of the `remote` setting's value (none when it is unset).

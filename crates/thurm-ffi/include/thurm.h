@@ -548,7 +548,7 @@ void thurm_remote_kick(const char *name, bool restart);
  *        daemon over the tailnet, not ssh; "" reaches the target's host by name)
  *   {"op":"remove","name":"devbox"}                       "Ok" (removes the [[remote]])
  *   {"op":"set","name":"devbox","key":"enabled","value":false}   "Ok" (key: "host", "enabled",
- *        "clipboard_read" or "tailnet")
+ *        "clipboard_read", "forward_links", "tailnet" or "icon")
  *   {"op":"doctor","name":"devbox","bins":"..."}          {"plan":{...},"checks":[{"id":...,
  *        "title":...,"state":"ok"|"warn"|"fail"|"skip","detail":...,"fix":{"label":...,
  *        "confirm":...|null}|null,"terminal":"<script>"|null}, ...]}

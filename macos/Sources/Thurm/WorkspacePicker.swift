@@ -191,7 +191,8 @@ final class WorkspacePicker: NSObject, NSTextFieldDelegate, NSWindowDelegate {
 
         let matches = Self.matching(sm.workspacesByRecency, query: search.stringValue)
         for (ws, shortcut) in matches {
-            row(ws.name, symbol: ws.id == current ? "checkmark" : ws.isRemote ? "globe" : "rectangle.stack",
+            row(ws.name,
+                symbol: ws.id == current ? "checkmark" : ws.isRemote ? sm.config.hostSymbol(for: ws.host) : "rectangle.stack",
                 shortcut: shortcut, current: ws.id == current) { [weak targetWindow] in
                 guard let workspace = sm.workspace(ws.id) else { return }
                 if let c = targetWindow?.windowController as? TerminalWindowController, !c.isClosed {

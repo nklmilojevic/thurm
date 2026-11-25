@@ -136,7 +136,7 @@ private final class WorkspaceBlock: NSView {
 
     func update(name text: String, host: HostId, fg: NSColor) {
         let remote = host != localHost
-        let symbol = remote ? "globe" : "laptopcomputer"
+        let symbol = SessionManager.shared.config.hostSymbol(for: host)
         if icon.image?.accessibilityDescription != symbol {
             icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol)
         }

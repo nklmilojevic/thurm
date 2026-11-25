@@ -390,3 +390,4 @@ animation_duration = 0.2
 # enabled = true
 # clipboard_read = "ask"   # OSC 52 reads by remote programs: "ask", "always" or "never"
 # forward_links = true     # open its localhost links through a forward to this Mac
+# icon = "mac-studio"      # sidebar icon: mac-studio, mac-mini, macbook, imac, mac-pro, pc, server, cloud, cpu, drive, terminal, or an SF Symbol

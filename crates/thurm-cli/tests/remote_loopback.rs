@@ -246,6 +246,7 @@ fn remote(name: &str, socket: Option<String>) -> RemoteConfig {
         tailnet: None,
         forward_links: true,
         daemon_id: None,
+        icon: None,
     }
 }
 

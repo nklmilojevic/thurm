@@ -414,10 +414,10 @@ impl Supervisor {
             // the lock `connect` takes its destination under: a connection never pairs the new
             // number with the old target.
             let mut cur = self.inner.remote.lock();
-            let changed = *cur != remote;
             let moved = cur.host != remote.host
                 || cur.socket != remote.socket
                 || cur.tailnet != remote.tailnet;
+            let changed = moved || cur.enabled != remote.enabled;
             if moved {
                 let mut current = self.inner.ssh.lock();
                 let extra = current.as_ref().map(|c| c.extra.clone());
@@ -1248,6 +1248,7 @@ mod tests {
             tailnet: None,
             forward_links: true,
             daemon_id: None,
+            icon: None,
         };
         let sup = Supervisor::start(
             remote("me@one"),
@@ -1297,6 +1298,7 @@ mod tests {
             tailnet: None,
             forward_links: true,
             daemon_id: None,
+            icon: None,
         };
         let sup = Supervisor::start(
             remote("me@one", ClipboardRead::Ask),
@@ -1405,6 +1407,7 @@ mod tests {
             tailnet: None,
             forward_links: true,
             daemon_id: None,
+            icon: None,
         };
         let s = Status::new(&r);
         let json = serde_json::to_string(&s).unwrap();

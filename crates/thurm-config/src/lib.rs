@@ -160,6 +160,11 @@ pub struct RemoteConfig {
     /// port to this Mac, instead of this Mac's own port.
     #[serde(default = "default_true")]
     pub forward_links: bool,
+    /// Icon shown for this host in the sidebar and pickers: a preset (`mac-studio`, `mac-mini`,
+    /// `macbook`, `imac`, `mac-pro`, `pc`, `server`, `cloud`, `cpu`, `drive`, `terminal`,
+    /// `globe`), or an SF Symbol name on macOS. Unset = the default globe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 impl RemoteConfig {
@@ -297,6 +302,22 @@ pub fn validate_remote_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Checks a `[[remote]]` icon (a preset name or an SF Symbol name; empty resets to default).
+pub fn validate_remote_icon(icon: &str) -> Result<(), String> {
+    let icon = icon.trim();
+    if icon.len() > 64 {
+        return Err(format!(
+            "remote icon {icon:?} must be at most 64 characters"
+        ));
+    }
+    if icon.chars().any(char::is_control) {
+        return Err(format!(
+            "remote icon {icon:?} must not contain control characters"
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn remote(&self, name: &str) -> Option<&RemoteConfig> {
         self.remote.iter().find(|r| r.name == name)
@@ -418,6 +439,9 @@ impl Config {
             }
             if !seen.insert(r.name.as_str()) {
                 return Err(format!("remote {:?} is defined twice", r.name));
+            }
+            if let Some(icon) = &r.icon {
+                validate_remote_icon(icon)?;
             }
         }
         Ok(())
@@ -2058,6 +2082,15 @@ pub fn with_remote_added(text: &str, remote: &RemoteConfig) -> Result<String, St
     if let Some(id) = &remote.daemon_id {
         t["daemon_id"] = toml_edit::value(id.as_str());
     }
+    if let Some(icon) = remote
+        .icon
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        validate_remote_icon(icon)?;
+        t["icon"] = toml_edit::value(icon);
+    }
     tables.push(t);
     let out = doc.to_string();
     check_edit(text, &out)?;
@@ -2112,7 +2145,11 @@ pub fn with_remote_setting(
     {
         table.remove("daemon_id");
     }
-    table[key] = toml_edit::Item::Value(value);
+    if key == "icon" && value.as_str().is_some_and(|s| s.trim().is_empty()) {
+        table.remove("icon");
+    } else {
+        table[key] = toml_edit::Item::Value(value);
+    }
     let out = doc.to_string();
     check_edit(text, &out)?;
     Ok(out)
@@ -2448,6 +2485,7 @@ clipboard_read = "always"
             tailnet: None,
             forward_links: true,
             daemon_id: None,
+            icon: None,
         };
         let added = with_remote_added(text, &r).unwrap();
         assert!(added.starts_with("# my config") && added.contains("# big"));
@@ -2459,7 +2497,15 @@ clipboard_read = "always"
             ClipboardRead::Always
         );
         assert!(with_remote_setting(&added, "devbox", "clipboard_read", "\"maybe\"").is_err());
-        let removed = with_remote_removed(&always, "devbox").unwrap();
+        let with_icon = with_remote_setting(&always, "devbox", "icon", "\"mac-studio\"").unwrap();
+        assert_eq!(
+            Config::parse(&with_icon).unwrap().remote[0].icon.as_deref(),
+            Some("mac-studio")
+        );
+        let cleared = with_remote_setting(&with_icon, "devbox", "icon", "\"\"").unwrap();
+        assert_eq!(Config::parse(&cleared).unwrap().remote[0].icon, None);
+        assert!(!cleared.contains("icon"), "{cleared}");
+        let removed = with_remote_removed(&cleared, "devbox").unwrap();
         assert!(Config::parse(&removed).unwrap().remote.is_empty());
         assert!(!removed.contains("[[remote]]"));
         assert!(with_remote_removed(&removed, "devbox").is_err());
@@ -2476,15 +2522,18 @@ clipboard_read = "always"
             tailnet: Some("wss://bastion.tail1234.ts.net/v1/connect".into()),
             forward_links: true,
             daemon_id: None,
+            icon: Some("mac-mini".into()),
         };
         let added = with_remote_added("", &r).unwrap();
         assert!(added.contains("tailnet = \"wss://bastion.tail1234.ts.net/v1/connect\""));
+        assert!(added.contains("icon = \"mac-mini\""));
         let (cfg, warnings) = Config::parse_with_warnings(&added).unwrap();
         assert_eq!(cfg.remote, vec![r]);
         assert!(warnings.is_empty(), "{warnings:?}");
         // Without it, an entry is the ssh remote it always was.
         let ssh = Config::parse("[[remote]]\nname = \"a\"\nhost = \"a\"\n").unwrap();
         assert_eq!(ssh.remote[0].tailnet, None);
+        assert_eq!(ssh.remote[0].icon, None);
     }
 
     #[test]
@@ -2498,6 +2547,7 @@ clipboard_read = "always"
             tailnet: Some("wss://bastion.tail2177a1.ts.net/v1/connect".into()),
             forward_links: true,
             daemon_id: Some("0123abcd".into()),
+            icon: None,
         };
         let added = with_remote_added("", &r).unwrap();
         assert!(!added.contains("host"), "{added}");
@@ -2520,6 +2570,7 @@ clipboard_read = "always"
         for (key, value) in [
             ("enabled", "false"),
             ("clipboard_read", "\"always\""),
+            ("icon", "\"mac-studio\""),
             ("tailnet", "\"wss://bastion.tail2177a1.ts.net/v1/connect\""),
             ("host", "\"\""),
         ] {

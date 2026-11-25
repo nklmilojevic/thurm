@@ -160,6 +160,8 @@ pub struct AddOptions {
     pub socket: Option<String>,
     /// `--tailnet`: `Some("")` without a value (the target is the peer's name).
     pub tailnet: Option<String>,
+    /// Sidebar icon for this host (`--icon`).
+    pub icon: Option<String>,
     /// Answer every question (`--yes` / `--no`), for scripts.
     pub assume: Option<bool>,
 }
@@ -171,6 +173,9 @@ fn failed(e: AddError) -> Box<dyn std::error::Error> {
 
 pub fn add(o: AddOptions) -> R {
     thurm_config::validate_remote_name(&o.name)?;
+    if let Some(icon) = &o.icon {
+        thurm_config::validate_remote_icon(icon)?;
+    }
     let cfg = Config::load()?;
     if cfg.remote(&o.name).is_some() {
         return Err(format!("a remote named {:?} exists already", o.name).into());
@@ -218,6 +223,7 @@ fn add_ssh(o: &AddOptions, target: &str, saved: &[RemoteConfig]) -> R {
         tailnet: None,
         forward_links: true,
         daemon_id: candidate.daemon_id,
+        icon: normalized_icon(o.icon.as_deref()),
     };
     let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
     println!("Added [[remote]] {} to {}", o.name, file.display());
@@ -267,6 +273,7 @@ fn add_tailnet_only(o: &AddOptions, address: &str, saved: &[RemoteConfig]) -> R 
         tailnet: Some(checked.url.clone()),
         forward_links: true,
         daemon_id: candidate.daemon_id,
+        icon: normalized_icon(o.icon.as_deref()),
     };
     let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
     println!("Added [[remote]] {} to {}", o.name, file.display());
@@ -307,6 +314,7 @@ fn add_tailnet(o: &AddOptions, tailnet: &str, saved: &[RemoteConfig]) -> R {
         tailnet: Some(checked.url.clone()),
         forward_links: true,
         daemon_id: candidate.daemon_id,
+        icon: normalized_icon(o.icon.as_deref()),
     };
     let file = thurm_config::edit_remotes(|text| thurm_config::with_remote_added(text, &entry))?;
     println!("Added [[remote]] {} to {}", o.name, file.display());
@@ -324,23 +332,57 @@ fn add_tailnet(o: &AddOptions, tailnet: &str, saved: &[RemoteConfig]) -> R {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `thurm remote edit NAME --ssh TARGET`: gives the host an ssh target (a host added over the
-/// tailnet has none), or another one.
-pub fn edit(name: &str, ssh: &str) -> R {
+fn normalized_icon(icon: Option<&str>) -> Option<String> {
+    icon.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// `thurm remote edit NAME [--ssh TARGET] [--icon ICON]`: changes the host's ssh target and/or
+/// sidebar icon.
+pub fn edit(name: &str, ssh: Option<&str>, icon: Option<&str>) -> R {
     remote_config(name)?;
-    let target = ssh.trim();
-    Ssh::new(target)?;
-    let candidate = Candidate {
-        ssh_target: Some(target.to_owned()),
-        ..Default::default()
+    let target = if let Some(ssh) = ssh {
+        let target = ssh.trim();
+        Ssh::new(target)?;
+        let candidate = Candidate {
+            ssh_target: Some(target.to_owned()),
+            ..Default::default()
+        };
+        add::check_edit(name, &candidate, &Config::load()?.remote).map_err(failed)?;
+        Some(target.to_owned())
+    } else {
+        None
     };
-    add::check_edit(name, &candidate, &Config::load()?.remote).map_err(failed)?;
-    let literal = serde_json::to_string(target)?;
+    let icon = if let Some(icon) = icon {
+        thurm_config::validate_remote_icon(icon)?;
+        Some(icon.trim().to_owned())
+    } else {
+        None
+    };
+    let host_literal = target.as_deref().map(serde_json::to_string).transpose()?;
+    let icon_literal = icon.as_deref().map(serde_json::to_string).transpose()?;
     thurm_config::edit_remotes(|text| {
-        thurm_config::with_remote_setting(text, name, "host", &literal)
+        let mut out = text.to_owned();
+        if let Some(lit) = &host_literal {
+            out = thurm_config::with_remote_setting(&out, name, "host", lit)?;
+        }
+        if let Some(lit) = &icon_literal {
+            out = thurm_config::with_remote_setting(&out, name, "icon", lit)?;
+        }
+        Ok(out)
     })?;
     reload_app();
-    println!("{name}'s ssh target is {target}.");
+    if let Some(target) = target {
+        println!("{name}'s ssh target is {target}.");
+    }
+    if let Some(icon) = icon {
+        if icon.is_empty() {
+            println!("{name}'s icon reset to default.");
+        } else {
+            println!("{name}'s icon is {icon}.");
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
