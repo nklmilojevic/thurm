@@ -642,9 +642,10 @@ fn spec_dirs() -> Vec<PathBuf> {
     }
     dirs.push(thurm_config::config_dir().join("completions"));
     if let Ok(exe) = std::env::current_exe()
-        && let Some(contents) = exe.parent().and_then(Path::parent)
+        && let Some(contents) = crate::bundle::app_contents(&exe)
     {
-        // Thurm.app/Contents/Helpers/thurmd → Thurm.app/Contents/Resources/completions
+        // Thurm.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd
+        // (or legacy Contents/Helpers/thurmd) → Thurm.app/Contents/Resources/completions
         dirs.push(contents.join("Resources/completions"));
     }
     dirs

@@ -1351,7 +1351,8 @@ impl Daemon {
 }
 
 /// Whether the peer on `stream` is the app this daemon belongs to. A daemon that runs from an
-/// app bundle (`Thurm.app/Contents/Helpers/thurmd`) takes only that bundle's own executable,
+/// app bundle (`Thurm.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd`) takes only
+/// that bundle's own executable,
 /// by the peer's pid: another program of the same user cannot pose as the app to read what
 /// plugins ask. A daemon outside a bundle (a development build, Linux) cannot tell the app
 /// apart, and takes none (see [`unverified_ui_allowed`]).
@@ -1391,18 +1392,13 @@ pub fn peer_is_our_app(stream: &std::os::unix::net::UnixStream) -> bool {
     }
 }
 
-/// The app executable of the bundle this daemon runs from (`Thurm.app/Contents/Helpers/thurmd`
-/// → `Contents/MacOS/Thurm`); `None` outside a bundle.
+/// The app executable of the bundle this daemon runs from
+/// (`Thurm.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd` or legacy
+/// `Thurm.app/Contents/Helpers/thurmd` → `Contents/MacOS/Thurm`); `None` outside a bundle.
 #[cfg(target_os = "macos")]
 fn bundle_app() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-    let helpers = exe.parent()?;
-    let contents = helpers.parent()?;
-    let bundle = contents.parent()?;
-    (helpers.file_name()? == "Helpers"
-        && contents.file_name()? == "Contents"
-        && bundle.extension()? == "app")
-        .then(|| contents.join("MacOS").join("Thurm"))
+    crate::bundle::bundle_app(&exe)
 }
 
 /// Whether this daemon can tell its own app from other clients ([`peer_is_our_app`]): it runs

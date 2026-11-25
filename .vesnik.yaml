@@ -10,3 +10,5 @@ packages:
     files:
       - file: macos/Resources/Info.plist
         regex: '<key>CFBundleShortVersionString</key>\s*<string>(?P<v>[^<]+)</string>'
+      - file: macos/Resources/Daemon-Info.plist
+        regex: '<key>CFBundleShortVersionString</key>\s*<string>(?P<v>[^<]+)</string>'

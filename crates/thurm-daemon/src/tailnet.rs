@@ -424,7 +424,8 @@ impl Tailnet {
             return Ok(PathBuf::from(p));
         }
         let exe = std::env::current_exe().map_err(|e| format!("locating thurmd: {e}"))?;
-        let path = exe.with_file_name("thurm-tailnet");
+        let path = crate::bundle::helper_path(&exe, "thurm-tailnet")
+            .unwrap_or_else(|| exe.with_file_name("thurm-tailnet"));
         if path.exists() {
             Ok(path)
         } else {

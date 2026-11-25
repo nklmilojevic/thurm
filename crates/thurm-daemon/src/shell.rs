@@ -336,8 +336,10 @@ fn exec_line(line: &str, shims: bool) -> String {
 /// Directory holding the `thurm` CLI next to this daemon (`Thurm.app/Contents/Helpers`).
 /// The shell integration appends it to PATH so agents in panes can drive the terminal.
 pub fn cli_dir() -> Option<PathBuf> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    dir.join("thurm").is_file().then_some(dir)
+    let exe = std::env::current_exe().ok()?;
+    crate::bundle::find_helper(&exe, "thurm")?
+        .parent()
+        .map(Path::to_path_buf)
 }
 
 pub fn shell_quote(s: &str) -> String {

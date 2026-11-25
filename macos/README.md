@@ -29,16 +29,18 @@ open macos/build/Thurm.app
 2. copies `thurm.h` into `Sources/CThurm/include/` (a copy, not a symlink, so SwiftPM sees it);
 3. runs `swift build -c release --arch arm64` (SwiftPM fetches Sparkle);
 4. assembles `macos/build/Thurm.app`: `Contents/MacOS/Thurm`,
-   `Contents/Helpers/{thurmd,thurm,thurm-nvim}`,
+   `Contents/Helpers/{Thurm Daemon.app,thurm,thurm-nvim}`,
    `Contents/Frameworks/Sparkle.framework`, resources, and `Info.plist` with the version,
    build number and (release builds only) the update feed;
 5. signs the bundle: ad hoc, or with `THURM_SIGN_IDENTITY` (inside out, hardened runtime).
 
 To work on the Swift code, build once with the script, then open `macos/Package.swift` in
 Xcode or run `swift build` in `macos/` (set `THURM_LIB_DIR` if the Rust library lives somewhere
-other than `../target/aarch64-apple-darwin/release`). A bare `swift run` works for rendering and input,
-but desktop notifications need the bundled app, and `thurmd` is only spawned when it sits
-next to the executable (or is named by `$THURM_DAEMON`).
+other than `../target/aarch64-apple-darwin/release`). A bare `swift run` works for rendering and
+input, but desktop notifications need the bundled app; the assembled `Thurm.app` spawns
+`Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd` (falling back to a flat
+`Contents/Helpers/thurmd`), while a bare `swift run` only spawns `thurmd` when `$THURM_DAEMON` is
+set (otherwise it connects to an already-running daemon).
 
 ## Releases and updates
 

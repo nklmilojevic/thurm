@@ -141,27 +141,98 @@ fn find_daemon_pid(socket: &Path) -> Option<u32> {
     }
     let uid = unsafe { libc::getuid() };
     let sock = socket.display().to_string();
+    // Ask ps for the short executable name alongside args so spaces or hyphens in
+    // argv[0] (e.g. `.../Thurm - Beta.app/.../Thurm Daemon.app/Contents/MacOS/thurmd`)
+    // cannot be confused with options or shell wrappers. On Linux `comm` is the short
+    // name; on macOS/BSD `comm` is the full path and `ucomm` is the short name.
+    #[cfg(target_os = "linux")]
+    let cols = "pid=,uid=,comm=,args=";
+    #[cfg(not(target_os = "linux"))]
+    let cols = "pid=,uid=,ucomm=,args=";
     let listed = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,uid=,args="])
+        .args(["-A", "-ww", "-o", cols])
         .output()
         .ok()
         .and_then(|out| {
             String::from_utf8_lossy(&out.stdout)
                 .lines()
-                .find_map(|line| {
-                    let mut f = line.split_whitespace();
-                    let pid: u32 = f.next()?.parse().ok()?;
-                    let owner: u32 = f.next()?.parse().ok()?;
-                    let args: Vec<&str> = f.collect();
-                    let is_daemon = args
-                        .first()
-                        .is_some_and(|a| a.ends_with("/thurmd") || *a == "thurmd");
-                    let same_socket = args.windows(2).any(|w| w[0] == "--socket" && w[1] == sock);
-                    (owner == uid && is_daemon && same_socket && pid != std::process::id())
-                        .then_some(pid)
-                })
+                .find_map(|line| parse_ps_daemon_pid(line, uid, &sock, std::process::id()))
         });
     listed.or_else(|| daemon_pid(socket).filter(|&p| alive(p)))
+}
+
+fn parse_ps_daemon_pid(line: &str, uid: u32, sock: &str, self_pid: u32) -> Option<u32> {
+    let rest = line.trim_start();
+    let (pid_str, rest) = rest.split_once(char::is_whitespace)?;
+    let pid: u32 = pid_str.parse().ok()?;
+    let rest = rest.trim_start();
+    let (owner_str, rest) = rest.split_once(char::is_whitespace)?;
+    let owner: u32 = owner_str.parse().ok()?;
+    let rest = rest.trim_start();
+    let (comm, rest) = rest.split_once(char::is_whitespace)?;
+    if owner != uid || pid == self_pid || comm != "thurmd" {
+        return None;
+    }
+    daemon_cmdline_has_socket(rest.trim_start(), sock).then_some(pid)
+}
+
+/// True when `cmdline` is a `thurmd` invocation whose options after the executable path
+/// include `--socket <sock>`. Handles spaces and dash-leading words in the executable path
+/// while rejecting non-daemon processes whose spaced `ucomm` merely started with `thurmd`.
+fn daemon_cmdline_has_socket(cmdline: &str, sock: &str) -> bool {
+    if sock.is_empty() {
+        return false;
+    }
+    if let Some(rest) = cmdline.strip_prefix("thurmd")
+        && rest.starts_with(char::is_whitespace)
+        && opts_have_socket(rest.trim_start(), sock)
+    {
+        return true;
+    }
+    let mut search_from = 0;
+    while let Some(rel) = cmdline[search_from..].find("/thurmd") {
+        let end = search_from + rel + "/thurmd".len();
+        search_from = end;
+        let exe = &cmdline[..end];
+        let rest = &cmdline[end..];
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        // A continuation token starting with `/`, `./`, or `../` indicates a second path
+        // argument to another executable rather than a single spaced executable path.
+        let single_path = exe
+            .split_whitespace()
+            .skip(1)
+            .all(|t| !t.starts_with('/') && !t.starts_with("./") && !t.starts_with("../"));
+        if single_path && opts_have_socket(rest.trim_start(), sock) {
+            return true;
+        }
+    }
+    false
+}
+
+fn opts_have_socket(opts: &str, sock: &str) -> bool {
+    // `thurmd` only accepts options (starting with `-`, length > 1), never positional args.
+    let first = opts.split_whitespace().next().unwrap_or("");
+    if !first.starts_with('-') || first.len() <= 1 {
+        return false;
+    }
+    let mut s = opts;
+    while !s.is_empty() {
+        s = s.trim_start();
+        let end = s.find(char::is_whitespace).unwrap_or(s.len());
+        let tok = &s[..end];
+        s = &s[end..];
+        if tok == "--socket" && s.starts_with(char::is_whitespace) {
+            let after_ws = s.trim_start();
+            if let Some(rest) = after_ws.strip_prefix(sock)
+                && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Stop the daemon on `socket` whatever protocol it speaks (e.g. one left over from an older
@@ -271,13 +342,32 @@ pub fn upgrade_daemon(socket: &Path, daemon: &Path) -> Result<u32, UpgradeError>
     }
 }
 
-/// Locate `thurmd`: next to the current executable, then on PATH.
+/// Bundled macOS helper app path for `thurmd` relative to `Contents/Helpers`.
+pub const BUNDLED_DAEMON: &str = "Thurm Daemon.app/Contents/MacOS/thurmd";
+
+/// Locate `thurmd` inside `dir`: the macOS helper bundle first, then a flat `thurmd`.
+pub fn find_daemon_in(dir: &Path) -> Option<PathBuf> {
+    let bundled = dir.join(BUNDLED_DAEMON);
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+    let flat = dir.join("thurmd");
+    flat.is_file().then_some(flat)
+}
+
+/// Locate `thurmd`: next to the current executable (or its symlink target), then on PATH.
 pub fn find_daemon() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let p = dir.join("thurmd");
-        if p.is_file() {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent()
+            && let Some(p) = find_daemon_in(dir)
+        {
+            return Some(p);
+        }
+        if let Ok(real) = std::fs::canonicalize(&exe)
+            && real != exe
+            && let Some(dir) = real.parent()
+            && let Some(p) = find_daemon_in(dir)
+        {
             return Some(p);
         }
     }
@@ -1185,5 +1275,188 @@ mod tests {
             Response::Panes(_)
         ));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_daemon_in_bundled_and_flat_layouts() {
+        let dir = std::env::temp_dir().join(format!("thurm-find-daemon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(find_daemon_in(&dir), None);
+
+        let flat = dir.join("thurmd");
+        std::fs::write(&flat, b"").unwrap();
+        assert_eq!(find_daemon_in(&dir), Some(flat));
+
+        let bundled = dir.join(BUNDLED_DAEMON);
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"").unwrap();
+        assert_eq!(find_daemon_in(&dir), Some(bundled));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ps_parser_handles_spaced_helper_bundle_path() {
+        let sock = "/tmp/thurm-501/thurmd.sock";
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "42 501 thurmd           /Applications/Thurm.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd --foreground --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "42 501 thurmd           /Applications/Thurm - Beta.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "42 501 thurmd           /Applications/Thurm -Beta.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd --daemonize --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "42 501 thurmd           /Applications/Thurm --beta 2.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "42 501 thurmd           /Applications/Thurm -d 2.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "42 501 thurmd           /Users/me/thurmd - test/Thurm Daemon.app/Contents/MacOS/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "43 501 thurmd           /usr/local/bin/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            Some(43)
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "43 501 thurmd           thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            Some(43)
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "43 501 thurmd           /Applications/Thurm - Beta.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd --socket /tmp/my dir/thurmd.sock --foreground",
+                501,
+                "/tmp/my dir/thurmd.sock",
+                99
+            ),
+            Some(43)
+        );
+        // Non-daemon wrappers and helpers must be rejected.
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "44 501 sh               /bin/sh -c /x/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            None
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "44 501 sh               /bin/sh -c x/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            None
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "45 501 thurm-tailnet    /Applications/Thurm.app/Contents/Helpers/thurm-tailnet --control-fd 3 --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            None
+        );
+        // A spaced ucomm whose first word is `thurmd` must not pass the cmdline check.
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "46 501 thurmd helper    /Applications/thurmd helper --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            None
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "47 501 thurmd           /usr/local/bin/thurmd --socket /tmp/thurm-501/thurmd.sock.other",
+                501,
+                sock,
+                99
+            ),
+            None
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "42 502 thurmd           /usr/local/bin/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            None
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "99 501 thurmd           /usr/local/bin/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            None
+        );
+        // Cmdline check also rejects shell/wrapper invocations on its own.
+        assert!(!daemon_cmdline_has_socket(
+            "/bin/sh -c /x/thurmd --socket /tmp/thurm-501/thurmd.sock",
+            sock
+        ));
+        assert!(!daemon_cmdline_has_socket(
+            "/bin/sh -c ./thurmd --socket /tmp/thurm-501/thurmd.sock",
+            sock
+        ));
+        assert!(!daemon_cmdline_has_socket(
+            "sudo /usr/local/bin/thurmd --socket /tmp/thurm-501/thurmd.sock",
+            sock
+        ));
     }
 }

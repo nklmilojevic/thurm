@@ -73,12 +73,34 @@ pub struct Plan {
     pub daemon: Option<DaemonState>,
 }
 
+/// Name of the macOS nested helper app bundle wrapping `thurmd`.
+const DAEMON_BUNDLE: &str = "Thurm Daemon.app";
+
 /// Where this process finds `thurm` and `thurmd` to copy (the app passes its
-/// `Contents/Helpers`, the CLI its own directory).
+/// `Contents/Helpers`, the CLI its own directory). On macOS the app wraps `thurmd` in
+/// `Thurm Daemon.app/Contents/MacOS/thurmd`; flat directories keep `thurmd` beside `thurm`.
 pub fn local_binaries(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let t = dir.join("thurm");
-    let d = dir.join("thurmd");
+    let bundled = dir.join(DAEMON_BUNDLE).join("Contents/MacOS/thurmd");
+    let d = if bundled.is_file() {
+        bundled
+    } else {
+        dir.join("thurmd")
+    };
     (t.is_file() && d.is_file()).then_some((t, d))
+}
+
+/// If `thurmd` lives inside `<dir>/Thurm Daemon.app/Contents/MacOS/thurmd`, returns
+/// `<dir>/Thurm Daemon.app`. A bundle-signed macOS binary must travel with its `Info.plist`
+/// and `_CodeSignature` or AMFI refuses to execute it.
+fn daemon_bundle_dir(thurmd: &Path) -> Option<PathBuf> {
+    let macos = thurmd.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.file_name()? == DAEMON_BUNDLE)
+        .then(|| bundle.to_path_buf())
 }
 
 /// The Tailscale helper `thurmd` runs beside itself to serve over Tailscale. Builds that have it
@@ -301,11 +323,15 @@ pub fn install(
             let (thurm, thurmd) = local_bins.and_then(local_binaries).ok_or_else(|| {
                 InstallError::Failed("this Thurm's binaries were not found".into())
             })?;
-            let tailnet = thurmd.with_file_name(TAILNET_HELPER);
+            let tailnet = thurm.with_file_name(TAILNET_HELPER);
             if tailnet.is_file() {
                 upload(ssh, TAILNET_HELPER, &read(&tailnet)?)?;
             }
-            upload(ssh, "thurmd", &read(&thurmd)?)?;
+            if let Some(bundle) = daemon_bundle_dir(&thurmd) {
+                upload_bundle(ssh, &pack_bundle(&bundle)?)?;
+            } else {
+                upload(ssh, "thurmd", &read(&thurmd)?)?;
+            }
             upload(ssh, "thurm", &read(&thurm)?)?;
         }
         Method::Download => {
@@ -330,7 +356,7 @@ pub fn install(
                 // Build first: a failed fetch or build must not cost the working install.
                 "$N build --no-link \"$1\" || exit $?; ",
                 "$N profile remove thurm >/dev/null 2>&1; ",
-                "$N profile install \"$1\" && rm -f \"$TH/.local/share/thurm/bin/thurm\" \"$TH/.local/share/thurm/bin/thurmd\""
+                "$N profile install \"$1\" && rm -rf \"$TH/.local/share/thurm/bin/thurm\" \"$TH/.local/share/thurm/bin/thurmd\" \"$TH/.local/share/thurm/bin/Thurm Daemon.app\""
             );
             ssh.run(NIX, &[&flake], None, Duration::from_secs(900))?;
         }
@@ -398,7 +424,62 @@ const UPLOAD: &str = concat!(
     "if [ $n -ne \"$2\" ]; then rm -f \"$N\"; echo \"upload of $1 incomplete: $n of $2 bytes\" >&2; exit 1; fi; ",
     "if command -v sha256sum >/dev/null 2>&1 && [ \"$(sha256sum < \"$N\" | cut -c1-64)\" != \"$3\" ]; then ",
     "rm -f \"$N\"; echo \"upload of $1 is corrupt (checksum mismatch)\" >&2; exit 1; fi; ",
-    "chmod 755 \"$N\" && mv -f \"$N\" \"$D/$1\""
+    "chmod 755 \"$N\" && mv -f \"$N\" \"$D/$1\" && { [ \"$1\" != thurmd ] || rm -rf \"$D/Thurm Daemon.app\"; }"
+);
+
+/// Archives `bundle` (`Thurm Daemon.app`) into a `.tar.gz` without AppleDouble metadata
+/// (`._*` files would invalidate the bundle's sealed code signature).
+fn pack_bundle(bundle: &Path) -> Result<Vec<u8>, InstallError> {
+    let parent = bundle
+        .parent()
+        .ok_or_else(|| InstallError::Failed(format!("invalid bundle path {}", bundle.display())))?;
+    let name = bundle
+        .file_name()
+        .ok_or_else(|| InstallError::Failed(format!("invalid bundle path {}", bundle.display())))?;
+    let out = std::process::Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
+        .args(["-czf", "-", "-C"])
+        .arg(parent)
+        .arg(name)
+        .output()
+        .map_err(|e| InstallError::Failed(format!("cannot run tar: {e}")))?;
+    if !out.status.success() {
+        return Err(InstallError::Failed(format!(
+            "packing {}: {}",
+            bundle.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// Uploads and unpacks `Thurm Daemon.app` into `~/.local/share/thurm/bin/Thurm Daemon.app`,
+/// checking length and SHA-256 before swapping it into place and removing any legacy flat `thurmd`.
+fn upload_bundle(ssh: &Ssh, archive: &[u8]) -> Result<(), SshError> {
+    let len = archive.len().to_string();
+    let sum = hex(&Sha256::digest(archive));
+    ssh.run(
+        UPLOAD_BUNDLE,
+        &[DAEMON_BUNDLE, &len, &sum],
+        Some(archive),
+        Duration::from_secs(600),
+    )
+    .map(|_| ())
+}
+
+/// `$1` the bundle name (`Thurm Daemon.app`), `$2` archive byte length, `$3` its SHA-256 (hex).
+const UPLOAD_BUNDLE: &str = concat!(
+    "TH=\"${THURM_HOME:-$HOME}\"; D=\"$TH/.local/share/thurm/bin\"; ",
+    "A=\"$D/.$1.tar.gz\"; S=\"$D/.$1.stage\"; O=\"$D/.$1.old\"; ",
+    "mkdir -p \"$D\" && cat > \"$A\" || exit 1; ",
+    "n=$(wc -c < \"$A\"); ",
+    "if [ $n -ne \"$2\" ]; then rm -f \"$A\"; echo \"upload of $1 incomplete: $n of $2 bytes\" >&2; exit 1; fi; ",
+    "if command -v sha256sum >/dev/null 2>&1; then got=\"$(sha256sum < \"$A\" | cut -c1-64)\"; ",
+    "elif command -v shasum >/dev/null 2>&1; then got=\"$(shasum -a 256 < \"$A\" | cut -c1-64)\"; else got=\"$3\"; fi; ",
+    "if [ \"$got\" != \"$3\" ]; then rm -f \"$A\"; echo \"upload of $1 is corrupt (checksum mismatch)\" >&2; exit 1; fi; ",
+    "rm -rf \"$S\" && mkdir -p \"$S\" && tar -xzf \"$A\" -C \"$S\" && [ -x \"$S/$1/Contents/MacOS/thurmd\" ] || { rm -rf \"$A\" \"$S\"; echo \"cannot unpack $1\" >&2; exit 1; }; ",
+    "rm -rf \"$O\" && { [ ! -e \"$D/$1\" ] || mv \"$D/$1\" \"$O\"; } && mv \"$S/$1\" \"$D/$1\" || { [ ! -e \"$O\" ] || [ -e \"$D/$1\" ] || mv \"$O\" \"$D/$1\"; rm -rf \"$A\" \"$S\"; exit 1; }; ",
+    "rm -rf \"$A\" \"$S\" \"$O\" \"$D/thurmd\""
 );
 
 /// The Linux build's `thurm` and `thurmd`, downloaded and checked, or taken from
@@ -620,6 +701,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn local_binaries_finds_nested_daemon_bundle() {
+        let dir = std::env::temp_dir().join(format!("thurm-local-bins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = dir.join("Thurm Daemon.app/Contents/MacOS/thurmd");
+        std::fs::create_dir_all(daemon.parent().unwrap()).unwrap();
+        let cli = dir.join("thurm");
+        std::fs::write(&cli, b"cli").unwrap();
+        std::fs::write(&daemon, b"daemon").unwrap();
+        assert_eq!(local_binaries(&dir), Some((cli, daemon)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]
@@ -707,6 +801,56 @@ mod tests {
     #[test]
     fn upload_script_is_safe_to_quote() {
         crate::ssh::quote(UPLOAD).unwrap();
+        crate::ssh::quote(UPLOAD_BUNDLE).unwrap();
+    }
+
+    #[test]
+    fn bundle_upload_replaces_existing_bundle_and_flat_daemon() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("thurm-bundle-upload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let bundle = src.join(DAEMON_BUNDLE);
+        let macos = bundle.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"<plist/>").unwrap();
+        let exe = macos.join("thurmd");
+        std::fs::write(&exe, b"#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(daemon_bundle_dir(&exe), Some(bundle.clone()));
+        assert_eq!(daemon_bundle_dir(&src.join("thurmd")), None);
+
+        let archive = pack_bundle(&bundle).unwrap();
+        let len = archive.len().to_string();
+        let sum = hex(&Sha256::digest(&archive));
+
+        let home = base.join("home");
+        let dest_bin = home.join(".local/share/thurm/bin");
+        std::fs::create_dir_all(&dest_bin).unwrap();
+        // Pre-existing legacy flat thurmd and older bundle.
+        std::fs::write(dest_bin.join("thurmd"), b"old flat").unwrap();
+        std::fs::create_dir_all(dest_bin.join(DAEMON_BUNDLE).join("Contents")).unwrap();
+        std::fs::write(dest_bin.join(DAEMON_BUNDLE).join("Contents/stale"), b"old").unwrap();
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", UPLOAD_BUNDLE, "thurm", DAEMON_BUNDLE, &len, &sum])
+            .env("THURM_HOME", &home)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&archive).unwrap();
+        assert!(child.wait().unwrap().success());
+
+        let installed = dest_bin.join(DAEMON_BUNDLE);
+        assert!(installed.join("Contents/MacOS/thurmd").is_file());
+        assert!(installed.join("Contents/Info.plist").is_file());
+        assert!(!installed.join("Contents/stale").exists());
+        assert!(!dest_bin.join("thurmd").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
