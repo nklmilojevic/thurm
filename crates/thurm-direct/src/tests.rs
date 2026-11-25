@@ -657,3 +657,90 @@ fn pick_wake_ip_prefers_current_then_same_family_then_nat64() {
     );
     assert_eq!(pick_wake_ip(v4_a.ip(), &[]), None);
 }
+
+#[test]
+fn race_candidates_waits_for_sibling_after_auth_error() {
+    let bad: SocketAddr = "192.0.2.1:22".parse().unwrap();
+    let good: SocketAddr = "192.0.2.2:22".parse().unwrap();
+    let won = Arc::new(AtomicBool::new(false));
+    let res = race_candidates(
+        "dual.example",
+        &[bad, good],
+        Duration::from_millis(5),
+        won,
+        move |addr| {
+            if addr == bad {
+                Err(SessionError::KeyRejected)
+            } else {
+                std::thread::sleep(Duration::from_millis(30));
+                Ok("connected-session")
+            }
+        },
+        |_| {},
+    );
+    assert_eq!(res.unwrap(), ("connected-session", good.ip()));
+
+    // When every candidate fails and one hit a non-transport auth error, surface the auth error.
+    let won = Arc::new(AtomicBool::new(false));
+    let key = TestKey::new(1);
+    let err = race_candidates::<&str, _, _>(
+        "dual.example",
+        &[bad, good],
+        Duration::from_millis(5),
+        won,
+        move |addr| {
+            if addr == bad {
+                Err(SessionError::KeyRejected)
+            } else {
+                // Force a real transport-level SessionError::Ssh against an unserved loopback port.
+                let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let closed_port = ln.local_addr().unwrap().port();
+                drop(ln);
+                let t = Target {
+                    host: "127.0.0.1".into(),
+                    port: closed_port,
+                    user: "u".into(),
+                    host_keys: vec![],
+                    socket: None,
+                };
+                match Session::connect_checked(&t, key.clone(), Duration::from_secs(1)) {
+                    Ok(_) => unreachable!(),
+                    Err(e) => Err(e),
+                }
+            }
+        },
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(matches!(err, DirectError::KeyRejected), "{err:?}");
+}
+
+#[test]
+fn delayed_reconnect_finishing_after_shutdown_is_discarded() {
+    let key = TestKey::new(1);
+    let server = ssh_server(&key);
+    let t = direct_target(&server, Mode::Ssh);
+    let (_stream, direct) = super::serve(t, key).unwrap();
+    // Drop the existing SSH session so `session()` must reconnect.
+    if let Some(old) = direct.inner.session.lock().current.take() {
+        old.disconnect();
+    }
+    let _delay = DELAY.lock();
+    super::RECONNECT_DELAY_MS.store(300, Ordering::Relaxed);
+    let inner = direct.inner.clone();
+    let reconnecting = std::thread::spawn(move || inner.session());
+    // Wait until the worker enters `connecting = true`.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !direct.inner.session.lock().connecting {
+        assert!(Instant::now() < deadline, "reconnect never started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    direct.inner.shutdown();
+    let outcome = reconnecting.join().unwrap();
+    super::RECONNECT_DELAY_MS.store(0, Ordering::Relaxed);
+    assert!(outcome.is_err(), "late reconnect must not succeed after shutdown");
+    assert!(
+        direct.inner.session.lock().current.is_none(),
+        "late reconnect must not remain installed after shutdown"
+    );
+}

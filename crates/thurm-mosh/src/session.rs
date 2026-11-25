@@ -4,6 +4,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -63,6 +64,8 @@ enum Cmd {
 /// timeout, as mosh-server does when a client goes away).
 pub struct MoshSession {
     tx: mpsc::UnboundedSender<Cmd>,
+    /// Last peer IP successfully bound by the driver's UDP socket.
+    peer: Arc<Mutex<IpAddr>>,
 }
 
 fn socket_for(addr: SocketAddr) -> io::Result<UdpSocket> {
@@ -97,8 +100,10 @@ impl MoshSession {
             width: size.0,
             height: size.1,
         });
+        let peer = Arc::new(Mutex::new(addr.ip()));
         let driver = Driver {
             addr,
+            peer: peer.clone(),
             socket,
             crypto: Crypto::new(&key),
             engine,
@@ -112,7 +117,13 @@ impl MoshSession {
             on_event: Box::new(on_event),
         };
         rt.spawn(driver.run(rx));
-        Ok(MoshSession { tx })
+        Ok(MoshSession { tx, peer })
+    }
+
+    /// The peer IP currently installed on the driver's UDP socket (updated only after `socket_for`
+    /// succeeds for a new address).
+    pub fn peer_ip(&self) -> IpAddr {
+        *self.peer.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn send_keys(&self, keys: &[u8]) {
@@ -150,6 +161,7 @@ impl Drop for MoshSession {
 
 struct Driver {
     addr: SocketAddr,
+    peer: Arc<Mutex<IpAddr>>,
     socket: UdpSocket,
     crypto: Crypto,
     engine: Engine,
@@ -192,6 +204,7 @@ impl Driver {
                                 match socket_for(next) {
                                     Ok(s) => {
                                         self.addr = next;
+                                        *self.peer.lock().unwrap_or_else(|e| e.into_inner()) = ip;
                                         self.socket = s;
                                         self.assembly = Assembly::default();
                                         self.last_resocket = Instant::now();

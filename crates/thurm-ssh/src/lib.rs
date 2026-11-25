@@ -562,6 +562,8 @@ impl Shell {
 #[derive(Debug)]
 pub enum ConnectError {
     Ssh(SshError),
+    /// The target has no pinned host keys yet; ask the user to trust the fingerprint shown.
+    UnknownHostKey(String),
     /// The host showed a key that does not match the pinned fingerprints from pairing.
     HostKeyChanged(String),
     /// The host does not accept the device's key yet: add it on the Mac, then try again.
@@ -575,6 +577,9 @@ impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnectError::Ssh(e) => write!(f, "{e}"),
+            ConnectError::UnknownHostKey(seen) => {
+                write!(f, "the host's key {seen} is not trusted yet")
+            }
             ConnectError::HostKeyChanged(seen) => write!(
                 f,
                 "the host's key ({seen}) is not the one paired with this device; \
@@ -621,9 +626,8 @@ pub fn connect(
 ) -> Result<Remote, ConnectError> {
     let session = Session::connect_checked(target, key, CONNECT_TIMEOUT).map_err(|e| match e {
         SessionError::KeyRejected => ConnectError::KeyRejected,
-        SessionError::HostKeyChanged(seen) | SessionError::UnknownHostKey(seen) => {
-            ConnectError::HostKeyChanged(seen)
-        }
+        SessionError::UnknownHostKey(seen) => ConnectError::UnknownHostKey(seen),
+        SessionError::HostKeyChanged(seen) => ConnectError::HostKeyChanged(seen),
         e => ConnectError::Ssh(e.into_ssh()),
     })?;
     let host = thurm_remote::probe(&session).map_err(ConnectError::Ssh)?;

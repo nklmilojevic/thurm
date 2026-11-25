@@ -110,6 +110,9 @@ const CREATING_TIMEOUT: Duration = Duration::from_secs(60);
 /// can come in it).
 #[cfg(test)]
 static SSH_START_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+/// Test hook: pause after `connect()` returns inside `Inner::session()` so `shutdown()` can race.
+#[cfg(test)]
+static RECONNECT_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 /// How long a new mosh session has to hear from its server over UDP (several startup probes)
 /// before the pane gives up on mosh: a firewall dropping UDP looks like nothing at all.
@@ -142,18 +145,14 @@ impl Direct {
         let spawned = std::thread::Builder::new()
             .name("thurm-direct-wake".into())
             .spawn(move || {
-                let current_ip = inner.session.lock().ip;
-                let resolved_ip = resolve_addrs(&inner.target.host, inner.target.port)
-                    .ok()
-                    .and_then(|addrs| pick_wake_ip(current_ip, &addrs));
-                if let Some(ip) = resolved_ip {
-                    inner.session.lock().ip = ip;
-                }
+                let addrs = resolve_addrs(&inner.target.host, inner.target.port).ok();
                 let panes: Vec<_> = inner.panes.lock().values().cloned().collect();
                 for pane in panes {
                     if let Backend::Mosh { session, .. } = &pane.lock().backend {
-                        match resolved_ip {
-                            Some(ip) if ip != current_ip => session.wake_at(ip),
+                        let actual_ip = session.peer_ip();
+                        let next_ip = addrs.as_deref().and_then(|a| pick_wake_ip(actual_ip, a));
+                        match next_ip {
+                            Some(ip) if ip != actual_ip => session.wake_at(ip),
                             _ => session.wake(),
                         }
                     }
@@ -286,6 +285,102 @@ impl DeviceKey for RacingKey {
     }
 }
 
+/// Races candidate addresses with Happy Eyeballs staggering. Prefers any winning connection;
+/// retains the first non-transport error (e.g. `KeyRejected`, `HostKeyChanged`) while draining
+/// remaining in-flight candidates rather than cancelling a valid sibling dial.
+fn race_candidates<S, F, D>(
+    host: &str,
+    addrs: &[SocketAddr],
+    stagger: Duration,
+    won: Arc<AtomicBool>,
+    dial: F,
+    disconnect: D,
+) -> Result<(S, IpAddr), DirectError>
+where
+    S: Send + 'static,
+    F: Fn(SocketAddr) -> Result<S, SessionError> + Send + Sync + 'static,
+    D: Fn(S) + Send + Sync + 'static,
+{
+    if addrs.is_empty() {
+        return Err(DirectError::Failed(format!("{host}: no address")));
+    }
+    let dial = Arc::new(dial);
+    let disconnect = Arc::new(disconnect);
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(S, IpAddr), SessionError>>();
+    let mut in_flight = 0usize;
+    let mut last = DirectError::Failed(format!("{host}: no address"));
+    let mut fatal: Option<DirectError> = None;
+
+    let spawn_one = |addr: SocketAddr| -> bool {
+        let tx = tx.clone();
+        let won = won.clone();
+        let dial = dial.clone();
+        let disconnect = disconnect.clone();
+        std::thread::Builder::new()
+            .name("thurm-direct-dial".into())
+            .spawn(move || match dial(addr) {
+                Ok(session) => {
+                    if won.swap(true, Ordering::AcqRel) {
+                        disconnect(session);
+                        return;
+                    }
+                    if let Err(std::sync::mpsc::SendError(Ok((session, _)))) =
+                        tx.send(Ok((session, addr.ip())))
+                    {
+                        disconnect(session);
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            })
+            .is_ok()
+    };
+
+    let mut idx = 0;
+    while idx < addrs.len() {
+        if spawn_one(addrs[idx]) {
+            in_flight += 1;
+        }
+        idx += 1;
+        if idx < addrs.len() {
+            match rx.recv_timeout(stagger) {
+                Ok(Ok(pair)) => return Ok(pair),
+                Ok(Err(SessionError::Ssh(e))) => {
+                    in_flight = in_flight.saturating_sub(1);
+                    last = DirectError::Failed(e.to_string());
+                }
+                Ok(Err(e)) => {
+                    in_flight = in_flight.saturating_sub(1);
+                    if fatal.is_none() {
+                        fatal = Some(e.into());
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        }
+    }
+    drop(tx);
+    while in_flight > 0 {
+        match rx.recv() {
+            Ok(Ok(pair)) => return Ok(pair),
+            Ok(Err(SessionError::Ssh(e))) => {
+                in_flight -= 1;
+                last = DirectError::Failed(e.to_string());
+            }
+            Ok(Err(e)) => {
+                in_flight -= 1;
+                if fatal.is_none() {
+                    fatal = Some(e.into());
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    Err(fatal.unwrap_or(last))
+}
+
 /// Connects over ssh by racing the host's resolved addresses (Happy Eyeballs). The winning
 /// address is kept: mosh-server listens on the address the ssh connection reached (`-s`), so
 /// mosh goes there.
@@ -314,84 +409,31 @@ fn connect(
 
     let won = Arc::new(AtomicBool::new(false));
     let sign_gate = Arc::new(Mutex::new(()));
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(Session, IpAddr), SessionError>>();
-    let mut in_flight = 0usize;
-    let mut last = DirectError::Failed(format!("{}: no address", target.host));
-
-    let spawn_one = |addr: SocketAddr| -> bool {
-        let t = Target {
-            host: addr.ip().to_string(),
-            port: target.port,
-            user: target.user.clone(),
-            host_keys: target.host_keys.clone(),
-            socket: None,
-        };
-        let key: Arc<dyn DeviceKey> = Arc::new(RacingKey {
-            inner: key.clone(),
-            sign_gate: sign_gate.clone(),
-            won: won.clone(),
-        });
-        let tx = tx.clone();
-        let won = won.clone();
-        std::thread::Builder::new()
-            .name("thurm-direct-dial".into())
-            .spawn(move || match Session::connect_checked(&t, key, CONNECT_TIMEOUT) {
-                Ok(session) => {
-                    if won.swap(true, Ordering::AcqRel) {
-                        session.disconnect();
-                        return;
-                    }
-                    if let Err(std::sync::mpsc::SendError(Ok((session, _)))) =
-                        tx.send(Ok((session, addr.ip())))
-                    {
-                        session.disconnect();
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                }
-            })
-            .is_ok()
-    };
-
-    let mut idx = 0;
-    while idx < addrs.len() {
-        if spawn_one(addrs[idx]) {
-            in_flight += 1;
-        }
-        idx += 1;
-        if idx < addrs.len() {
-            match rx.recv_timeout(HAPPY_EYEBALLS_DELAY) {
-                Ok(Ok(pair)) => return Ok(pair),
-                Ok(Err(SessionError::Ssh(e))) => {
-                    in_flight = in_flight.saturating_sub(1);
-                    last = DirectError::Failed(e.to_string());
-                }
-                Ok(Err(e)) => {
-                    won.store(true, Ordering::Release);
-                    return Err(e.into());
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            }
-        }
-    }
-    drop(tx);
-    while in_flight > 0 {
-        match rx.recv() {
-            Ok(Ok(pair)) => return Ok(pair),
-            Ok(Err(SessionError::Ssh(e))) => {
-                in_flight -= 1;
-                last = DirectError::Failed(e.to_string());
-            }
-            Ok(Err(e)) => {
-                won.store(true, Ordering::Release);
-                return Err(e.into());
-            }
-            Err(_) => break,
-        }
-    }
-    Err(last)
+    let target = target.clone();
+    let key = key.clone();
+    let won_for_dial = won.clone();
+    race_candidates(
+        &target.host.clone(),
+        &addrs,
+        HAPPY_EYEBALLS_DELAY,
+        won,
+        move |addr| {
+            let t = Target {
+                host: addr.ip().to_string(),
+                port: target.port,
+                user: target.user.clone(),
+                host_keys: target.host_keys.clone(),
+                socket: None,
+            };
+            let racing: Arc<dyn DeviceKey> = Arc::new(RacingKey {
+                inner: key.clone(),
+                sign_gate: sign_gate.clone(),
+                won: won_for_dial.clone(),
+            });
+            Session::connect_checked(&t, racing, CONNECT_TIMEOUT)
+        },
+        |session| session.disconnect(),
+    )
 }
 
 enum Backend {
@@ -613,11 +655,24 @@ impl Inner {
                 armed: true,
             };
             let res = connect(&self.target, &self.key);
+            #[cfg(test)]
+            {
+                let delay = RECONNECT_DELAY_MS.load(Ordering::Relaxed);
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+            }
             let mut slot = self.session.lock();
             slot.connecting = false;
             guard.armed = false;
             match res {
                 Ok((s, ip)) => {
+                    if self.closed.load(Ordering::SeqCst) {
+                        self.session_ready.notify_all();
+                        drop(slot);
+                        s.disconnect();
+                        return Err("the connection is closing".into());
+                    }
                     let s = Arc::new(s);
                     slot.current = Some(s.clone());
                     slot.ip = ip;
@@ -662,7 +717,12 @@ impl Inner {
     /// The app is gone, and with it the only holder of the mosh keys: end the host's shells,
     /// those still starting included (they end themselves once started, seeing `closed`).
     fn shutdown(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        {
+            // Sequence setting `closed` with `session` so any reconnect finishing concurrently
+            // either sees `closed == true` before storing or is taken and disconnected below.
+            let _slot = self.session.lock();
+            self.closed.store(true, Ordering::SeqCst);
+        }
         self.session_ready.notify_all();
         {
             let deadline = Instant::now() + CREATING_TIMEOUT;

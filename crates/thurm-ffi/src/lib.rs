@@ -484,22 +484,29 @@ unsafe impl Sync for Ctx {}
 
 /// Shared owner of the caller's opaque `ctx` pointer across the client handle, reader callbacks,
 /// and background sync-flush tasks. Runs the optional `on_drop` hook once when the last reference
-/// drops so callers never leak or prematurely free `ctx`.
+/// drops so callers never leak or prematurely free `ctx`. On a failed connection attempt,
+/// [`CallbackCtx::detach`] waits for any in-flight callback to exit and clears the pointer so
+/// lingering background threads can never invoke a callback with `ctx` after connect returns NULL.
 struct CallbackCtx {
-    raw: Ctx,
+    raw: parking_lot::RwLock<Option<Ctx>>,
     on_drop: Mutex<thurm_ctx_drop_cb>,
 }
 
 impl CallbackCtx {
     fn new(raw: *mut c_void) -> Arc<Self> {
         Arc::new(Self {
-            raw: Ctx(raw),
+            raw: parking_lot::RwLock::new(Some(Ctx(raw))),
             on_drop: Mutex::new(None),
         })
     }
 
-    fn ptr(&self) -> *mut c_void {
-        self.raw.0
+    fn with_ptr<R>(&self, f: impl FnOnce(*mut c_void) -> R) -> Option<R> {
+        let guard = self.raw.read();
+        guard.map(|c| f(c.0))
+    }
+
+    fn detach(&self) {
+        *self.raw.write() = None;
     }
 
     fn set_on_drop(&self, cb: thurm_ctx_drop_cb) {
@@ -509,15 +516,15 @@ impl CallbackCtx {
 
 impl Drop for CallbackCtx {
     fn drop(&mut self) {
-        if let Some(cb) = *self.on_drop.get_mut() {
-            unsafe { cb(self.raw.0) };
+        if let (Some(cb), Some(raw)) = (*self.on_drop.get_mut(), *self.raw.get_mut()) {
+            unsafe { cb(raw.0) };
         }
     }
 }
 
 fn emit_json(cb: thurm_event_cb, ctx: &CallbackCtx, json: &str) {
     if let (Some(cb), Ok(s)) = (cb, CString::new(json)) {
-        unsafe { cb(ctx.ptr(), s.as_ptr()) };
+        ctx.with_ptr(|ptr| unsafe { cb(ptr, s.as_ptr()) });
     }
 }
 
@@ -696,7 +703,13 @@ fn new_connection(
         disc_shared.locals.lock().clear();
         emit_json(on_event, &disc_ctx, "\"Disconnected\"");
     };
-    let (client, transport) = connect(Box::new(on_ev), Box::new(on_disc))?;
+    let (client, transport) = match connect(Box::new(on_ev), Box::new(on_disc)) {
+        Ok(pair) => pair,
+        Err(e) => {
+            ctx.detach();
+            return Err(e);
+        }
+    };
     Ok(Box::into_raw(Box::new(thurm_client {
         client,
         shared,
@@ -804,7 +817,7 @@ pub unsafe extern "C" fn thurm_set_local_appearance(client: *mut thurm_client, d
 
 fn fire_frame(on_frame: thurm_frame_cb, ctx: &CallbackCtx, pane: PaneId) {
     if let Some(cb) = on_frame {
-        unsafe { cb(ctx.ptr(), pane) };
+        ctx.with_ptr(|ptr| unsafe { cb(ptr, pane) });
     }
 }
 
@@ -1664,15 +1677,20 @@ unsafe fn grid_lock_inner(
         return false;
     }
     let mut out_info = guard.info;
-    if let Some(last_gen) = last_generation
-        && out_info.generation != last_gen
-    {
-        let skipped = last_gen != 0 && out_info.generation > last_gen.saturating_add(1);
-        let consumed_by_other = last_gen < guard.last_consumed_gen;
-        let missing_dirty = out_info.dirty_rows == 0;
-        if skipped || consumed_by_other || missing_dirty {
+    if let Some(last_gen) = last_generation {
+        if last_gen == 0 {
+            // A first-time reader has never drawn this grid, even if an incremental update's
+            // dirty bits are still unconsumed from another reader.
             out_info.dirty_rows = u64::MAX;
             out_info.shift = 0;
+        } else if out_info.generation != last_gen {
+            let skipped = out_info.generation > last_gen.saturating_add(1);
+            let consumed_by_other = last_gen < guard.last_consumed_gen;
+            let missing_dirty = out_info.dirty_rows == 0;
+            if skipped || consumed_by_other || missing_dirty {
+                out_info.dirty_rows = u64::MAX;
+                out_info.shift = 0;
+            }
         }
     }
     if !info.is_null() {
@@ -3246,6 +3264,18 @@ mod tests {
         let a3 = lock_for(a2.generation);
         assert_eq!(a3.generation, 2);
         assert_eq!(a3.dirty_rows, 0);
+
+        // Incremental update arrives (gen 3), leaving partial dirty bits unconsumed; a brand-new
+        // first-time Reader C locking with last_gen = 0 MUST still get a full grid (u64::MAX).
+        d.push(Event::Output {
+            pane: 1,
+            data: b"\r\nthird-line".to_vec(),
+        });
+        d.sync();
+        let c1 = lock_for(0);
+        assert_eq!(c1.generation, 3);
+        assert_eq!(c1.dirty_rows, u64::MAX);
+        assert_eq!(c1.shift, 0);
     }
 
     #[test]
@@ -3322,6 +3352,33 @@ mod tests {
         }
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_connect_detaches_ctx_before_returning() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let raw = Arc::into_raw(calls.clone()) as *mut c_void;
+        unsafe extern "C" fn on_ev(ctx: *mut c_void, _json: *const c_char) {
+            let counter = unsafe { &*(ctx as *const AtomicUsize) };
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<(Box<dyn Fn(Event) + Send>, Box<dyn FnOnce() + Send>)>();
+        let res = new_connection(Some(on_ev), None, raw, |ev, disc| {
+            tx.send((ev, disc)).unwrap();
+            Err("hello failed".into())
+        });
+        assert!(res.is_err());
+
+        // Caller can now treat `raw` as detached; even if a lingering reader thread fires
+        // callbacks later, `on_ev` MUST NOT be invoked with `raw`.
+        let (late_ev, late_disc) = rx.recv().unwrap();
+        late_ev(Event::ConfigReloaded);
+        late_disc();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        unsafe { drop(Arc::from_raw(raw as *const AtomicUsize)) };
     }
 
     #[test]

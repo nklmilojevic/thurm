@@ -64,7 +64,9 @@ thurm_client *thurm_connect_socket(const char *socket, const char *daemon_path,
 void thurm_disconnect(thurm_client *client);
 
 /* Optional teardown hook for `ctx`, invoked once when the last reference holding `ctx`
- * (including background reader and sync-flush tasks) drops. Safe to call with NULL. */
+ * (including background reader and sync-flush tasks) drops. Safe to call with NULL.
+ * When any connect function fails and returns NULL, any in-flight callback has completed and
+ * `ctx` is detached before returning, so the caller may immediately release `ctx`. */
 typedef void (*thurm_ctx_drop_cb)(void *ctx);
 void thurm_client_set_ctx_drop(thurm_client *client, thurm_ctx_drop_cb on_drop);
 
@@ -614,8 +616,9 @@ typedef struct {
  *    "socket":null}
  * Blocks while connecting: call it off the main thread. Returns NULL on failure with `err`
  * set (free it): JSON {"kind","message","fingerprint"?}, `kind` being "key_rejected" (the host
- * does not have the device's key yet), "not_installed" (no thurm there), "host_key_changed"
- * (with "fingerprint" set to the key the host presented), "protocol_mismatch" or "failed".
+ * does not have the device's key yet), "not_installed" (no thurm there), "unknown_host_key"
+ * (unpinned target; with "fingerprint" set), "host_key_changed" (with "fingerprint" set to the
+ * key the host presented), "protocol_mismatch" or "failed".
  * Otherwise a client used like thurm_connect's. thurm_disconnect also closes the ssh session. */
 thurm_client *thurm_ssh_connect(const char *target_json, thurm_device_key key,
                                 const char *client_name, thurm_event_cb on_event,
@@ -638,7 +641,9 @@ thurm_client *thurm_tailnet_connect(const char *url, const char *client_name,
 
 /* Like thurm_tailnet_connect, for a daemon's plain listener over the system Tailscale VPN.
  * Strictly requires a `ws://` URL whose host is a Tailscale IP literal (IPv4 CGNAT
- * 100.64.0.0/10 or IPv6 ULA fd7a:115c:a1e0::/48); hostnames and non-tailnet IPs are rejected. */
+ * 100.64.0.0/10 or IPv6 ULA fd7a:115c:a1e0::/48) AND an active system Tailscale tunnel interface;
+ * binds the socket directly to that tunnel interface (IP_BOUND_IF/IPV6_BOUND_IF/SO_BINDTODEVICE)
+ * and fails closed when the VPN is disconnected or ambiguous. */
 thurm_client *thurm_tailnet_connect_plain(const char *url, const char *client_name,
                                           thurm_event_cb on_event, thurm_frame_cb on_frame,
                                           void *ctx, char **err);

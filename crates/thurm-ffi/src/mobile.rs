@@ -112,6 +112,7 @@ fn ssh_failure(
 /// probe, daemon start, Hello), so call it off the main thread. NULL with `err` set on failure
 /// (free it): JSON `{"kind","message","fingerprint"?}`, `kind` being `"key_rejected"` (the host
 /// does not have the device's key yet), `"not_installed"` (no `thurm` there),
+/// `"unknown_host_key"` (unpinned target; with `"fingerprint"` set),
 /// `"host_key_changed"` (with `"fingerprint"` set), `"protocol_mismatch"` or `"failed"`.
 /// Otherwise a client like `thurm_connect`'s, freed with `thurm_disconnect`, which also closes the
 /// ssh session.
@@ -150,6 +151,9 @@ pub unsafe extern "C" fn thurm_ssh_connect(
             match &e {
                 thurm_ssh::ConnectError::KeyRejected => ssh_failure("key_rejected", &e, None),
                 thurm_ssh::ConnectError::NotInstalled => ssh_failure("not_installed", &e, None),
+                thurm_ssh::ConnectError::UnknownHostKey(fp) => {
+                    ssh_failure("unknown_host_key", &e, Some(fp))
+                }
                 thurm_ssh::ConnectError::HostKeyChanged(fp) => {
                     ssh_failure("host_key_changed", &e, Some(fp))
                 }
@@ -213,8 +217,10 @@ pub unsafe extern "C" fn thurm_tailnet_connect(
 }
 
 /// Like `thurm_tailnet_connect`, for a daemon's plain listener over the system Tailscale VPN.
-/// Strictly requires a `ws://` URL whose host is a Tailscale IP literal (IPv4 CGNAT
-/// `100.64.0.0/10` or IPv6 ULA `fd7a:115c:a1e0::/48`); hostnames and non-tailnet IPs are rejected.
+/// Strictly requires a `ws://` URL whose host is a Tailscale IP literal (`100.64.0.0/10` or
+/// `fd7a:115c:a1e0::/48`) AND an active system Tailscale tunnel interface (`utun*` on Apple /
+/// `tailscale*` on Linux), binding the socket directly to that tunnel interface (`IP_BOUND_IF` /
+/// `IPV6_BOUND_IF` / `SO_BINDTODEVICE`) and failing closed when the VPN is down or ambiguous.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_tailnet_connect_plain(
     url: *const c_char,

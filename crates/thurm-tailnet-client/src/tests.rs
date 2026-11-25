@@ -206,6 +206,100 @@ fn plain_tailnet_allows_only_ws_tailscale_ip_literals() {
 }
 
 #[test]
+fn plain_tailnet_fails_closed_without_active_tailscale_tunnel() {
+    use std::net::IpAddr;
+
+    let target_v4: IpAddr = "100.64.0.7".parse().unwrap();
+    let target_v6: IpAddr = "fd7a:115c:a1e0::7".parse().unwrap();
+
+    // VPN off: physical Wi-Fi and cellular CGNAT (100.64/10 on pdp_ip0) MUST fail closed.
+    let carrier_cgnat = [
+        InterfaceAddr {
+            name: "en0".into(),
+            index: 1,
+            addr: "192.168.1.5".parse().unwrap(),
+            point_to_point: false,
+        },
+        InterfaceAddr {
+            name: "pdp_ip0".into(),
+            index: 2,
+            addr: "100.64.5.10".parse().unwrap(),
+            point_to_point: true,
+        },
+    ];
+    assert!(matches!(
+        select_tailnet_interface(target_v4, &carrier_cgnat),
+        Err(ConnectError::Unreachable(_))
+    ));
+    assert!(matches!(
+        open_plain_with("ws://100.64.0.7:7297/v1/connect", SHORT, Some(&carrier_cgnat)),
+        Err(ConnectError::Unreachable(_))
+    ));
+    assert!(matches!(
+        open_plain_with("ws://100.64.0.7:7297/v1/connect", SHORT, Some(&[])),
+        Err(ConnectError::Unreachable(_))
+    ));
+
+    #[cfg(target_vendor = "apple")]
+    let (tun_a, tun_b) = ("utun4", "utun5");
+    #[cfg(target_os = "linux")]
+    let (tun_a, tun_b) = ("tailscale0", "tailscale1");
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    {
+        // Two tunnels hold 100.64/10, but only tun_a also carries Tailscale's unique ULA -> pick tun_a.
+        let disambiguated = [
+            InterfaceAddr {
+                name: tun_b.into(),
+                index: 10,
+                addr: "100.64.99.2".parse().unwrap(),
+                point_to_point: true,
+            },
+            InterfaceAddr {
+                name: tun_a.into(),
+                index: 11,
+                addr: "100.64.0.1".parse().unwrap(),
+                point_to_point: true,
+            },
+            InterfaceAddr {
+                name: tun_a.into(),
+                index: 11,
+                addr: "fd7a:115c:a1e0::1".parse().unwrap(),
+                point_to_point: true,
+            },
+        ];
+        let picked = select_tailnet_interface(target_v4, &disambiguated).unwrap();
+        assert_eq!(picked.name, tun_a);
+        assert_eq!(picked.index, 11);
+        assert_eq!(picked.local_ip, "100.64.0.1".parse::<IpAddr>().unwrap());
+
+        let picked_v6 = select_tailnet_interface(target_v6, &disambiguated).unwrap();
+        assert_eq!(picked_v6.name, tun_a);
+        assert_eq!(picked_v6.local_ip, "fd7a:115c:a1e0::1".parse::<IpAddr>().unwrap());
+
+        // Ambiguous: two 100.64/10 tunnels without Tailscale ULA -> fail closed.
+        let ambiguous = [
+            InterfaceAddr {
+                name: tun_a.into(),
+                index: 11,
+                addr: "100.64.0.1".parse().unwrap(),
+                point_to_point: true,
+            },
+            InterfaceAddr {
+                name: tun_b.into(),
+                index: 12,
+                addr: "100.64.99.2".parse().unwrap(),
+                point_to_point: true,
+            },
+        ];
+        assert!(matches!(
+            select_tailnet_interface(target_v4, &ambiguous),
+            Err(ConnectError::Unreachable(_))
+        ));
+    }
+}
+
+#[test]
 fn errors_tell_what_to_check() {
     let e = ConnectError::Unreachable("connection refused".into()).to_string();
     assert!(e.contains("Tailscale connected on this device"), "{e}");

@@ -2683,6 +2683,7 @@ name = "thurm-tailnet-client"
 version = "0.28.0"
 dependencies = [
  "futures-util",
+ "libc",
  "log",
  "rcgen",
  "rustls",

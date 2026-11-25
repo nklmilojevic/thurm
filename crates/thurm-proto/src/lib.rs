@@ -2177,7 +2177,18 @@ mod tests {
             }) if r == "Bash: git status"
         ));
 
-        // Existing Event::Notify wire encoding must remain unchanged.
+        // Existing Event::Notify wire encoding must remain byte-for-byte identical to the base
+        // protocol so older clients decode notices without breakage.
+        const EXPECTED_LEGACY_NOTIFY: &[u8] = &[
+            1,  // ServerMessage::Event
+            7,  // Event::Notify
+            7,  // pane = 7
+            11, b'C', b'l', b'a', b'u', b'd', b'e', b' ', b'C', b'o', b'd', b'e',
+            16, b'n', b'e', b'e', b'd', b's', b' ', b'p', b'e', b'r', b'm', b'i', b's', b's', b'i',
+            b'o', b'n',
+            1, 42, // permission = Some(42)
+            1, 5, b'G', b'l', b'a', b's', b's', // sound = Some("Glass")
+        ];
         let legacy = ServerMessage::Event(Event::Notify {
             pane: 7,
             title: "Claude Code".into(),
@@ -2186,15 +2197,17 @@ mod tests {
             sound: Some("Glass".into()),
         });
         let bytes = postcard::to_allocvec(&legacy).expect("encodes");
-        let back: ServerMessage = postcard::from_bytes(&bytes).expect("decodes");
+        assert_eq!(bytes.as_slice(), EXPECTED_LEGACY_NOTIFY);
+        let back: ServerMessage = postcard::from_bytes(EXPECTED_LEGACY_NOTIFY).expect("decodes");
         assert!(matches!(
             back,
             ServerMessage::Event(Event::Notify {
                 pane: 7,
+                ref title,
+                ref body,
                 permission: Some(42),
-                sound: Some(s),
-                ..
-            }) if s == "Glass"
+                sound: Some(ref s),
+            }) if title == "Claude Code" && body == "needs permission" && s == "Glass"
         ));
     }
 }
