@@ -1640,6 +1640,10 @@ final class SessionManager: NSObject, CoreDelegate {
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
             let dir = SplitDirName(rawValue: jsonString(d["dir"]) ?? "right") ?? .right
             let target = key("target")
+            if let target, splitHiddenTab(at: target, with: pane, direction: dir, share: nil,
+                                          in: currentRegularController, reveal: true) {
+                return
+            }
             let host = target.flatMap { controller(for: $0) }
                 ?? (currentController?.host == daemon ? currentController : nil)
             if let host = host {
@@ -1683,14 +1687,20 @@ final class SessionManager: NSObject, CoreDelegate {
             let share = jsonUInt64(d["percent"]).map { CGFloat(min(99, max(1, $0))) / 100 }
             if let dir = jsonString(d["split"]).flatMap(SplitDirName.init(rawValue:)) {
                 let target = key("target")
-                let host = target.flatMap { controller(for: $0) }
-                    ?? (currentController?.host == daemon ? currentController : nil)
-                if let host {
-                    host.content.split(target: target, newPane: pane, direction: dir, share: share,
-                                       takeFocus: !background)
-                    scheduleLayoutSave()
-                } else {
-                    newTab(from: currentController, pane: pane, background: background)
+                let splitHidden = target.map {
+                    splitHiddenTab(at: $0, with: pane, direction: dir, share: share,
+                                   in: currentRegularController, reveal: !background)
+                } ?? false
+                if !splitHidden {
+                    let host = target.flatMap { controller(for: $0) }
+                        ?? (currentController?.host == daemon ? currentController : nil)
+                    if let host {
+                        host.content.split(target: target, newPane: pane, direction: dir, share: share,
+                                           takeFocus: !background)
+                        scheduleLayoutSave()
+                    } else {
+                        newTab(from: currentController, pane: pane, background: background)
+                    }
                 }
             } else if jsonBool(d["new_window"]) ?? false {
                 newWindow(pane: pane, background: true)
