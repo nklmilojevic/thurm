@@ -48,10 +48,19 @@ final class Workspace {
     /// Parks live tabs when switching away from this workspace in sidebar mode while keeping
     /// `hiddenTabs` / `hiddenSelectedTab` synchronized for persistence, pickers, and the sidebar.
     func parkTabs(_ tabs: [TabItem], selected: Int) {
+        let selectedTab = tabs.indices.contains(selected) ? tabs[selected] : nil
+        let removedBeforeSelected = tabs.prefix(min(max(0, selected), tabs.count))
+            .filter { $0.content.isEmpty }.count
         let kept = tabs.filter { !$0.content.isEmpty }
         syncingHiddenTabs = true
         hiddenTabs = kept.map { $0.tabLayout() }
-        hiddenSelectedTab = kept.isEmpty ? 0 : min(max(0, selected), kept.count - 1)
+        if kept.isEmpty {
+            hiddenSelectedTab = 0
+        } else if let selectedTab, let idx = kept.firstIndex(where: { $0 === selectedTab }) {
+            hiddenSelectedTab = idx
+        } else {
+            hiddenSelectedTab = min(max(0, selected - removedBeforeSelected), kept.count - 1)
+        }
         cachedTabs = kept.isEmpty ? nil : kept
         syncingHiddenTabs = false
     }

@@ -724,6 +724,22 @@ final class FastWorkspaceSwitchTests: XCTestCase {
         XCTAssertEqual(c.content.focusedPane, pane(3))
     }
 
+    func testParkTabsShiftsSelectionWhenAnEarlierTabIsEmpty() throws {
+        let ws = manager.makeWorkspace(name: "alpha")
+        let empty = TabItem(root: .leaf(pane(1)), focused: pane(1), zoomed: nil, title: "empty")
+        let keptA = TabItem(root: .leaf(pane(2)), focused: pane(2), zoomed: nil, title: "keptA")
+        let keptB = TabItem(root: .leaf(pane(3)), focused: pane(3), zoomed: nil, title: "keptB")
+        XCTAssertTrue(empty.content.remove(pane: pane(1)))
+        XCTAssertTrue(empty.content.isEmpty)
+
+        ws.parkTabs([empty, keptA, keptB], selected: 1)
+        XCTAssertEqual(ws.hiddenTabs.count, 2)
+        XCTAssertEqual(ws.hiddenSelectedTab, 0)
+        let taken = try XCTUnwrap(ws.takeCachedTabs())
+        XCTAssertEqual(taken.selected, 0)
+        XCTAssertTrue(taken.tabs[taken.selected] === keptA)
+    }
+
     func testSingleTabWindowTogglesCleanlyBetweenSidebarAndNativeModes() throws {
         let ws = manager.makeWorkspace(name: "solo")
         let c = makeSingleWindow(workspace: ws, paneIDs: [1])
