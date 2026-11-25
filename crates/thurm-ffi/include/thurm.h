@@ -164,6 +164,16 @@ void thurm_send(thurm_client *client, const char *json);
 void thurm_subscribe(thurm_client *client, thurm_pane_id pane);
 void thurm_unsubscribe(thurm_client *client, thurm_pane_id pane);
 
+/* Keep up to `limit` recently unsubscribed panes subscribed in the background (LRU) so
+ * switching back paints immediately without re-attaching. Default 0 (unsubscribe at once).
+ * Setting a lower limit immediately evicts excess warm panes. */
+void thurm_set_warm_limit(thurm_client *client, uint32_t limit);
+/* Immediately drop `pane` from active and warm caches, unsubscribing if it was subscribed. */
+void thurm_evict_pane(thurm_client *client, thurm_pane_id pane);
+/* Subscribe `pane` into the warm cache (when the warm limit is > 0 and it is not already
+ * subscribed or active) without bumping its active refcount. */
+void thurm_prewarm_pane(thurm_client *client, thurm_pane_id pane);
+
 /* Raw bytes to the PTY. */
 void thurm_input(thurm_client *client, thurm_pane_id pane, const uint8_t *data, size_t len);
 
