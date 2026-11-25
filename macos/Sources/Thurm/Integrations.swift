@@ -11,6 +11,31 @@ final class Integrations: NSObject, NSMenuDelegate {
     /// `thurm-nvim`, linked next to the CLI.
     private var nvim: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/thurm-nvim") }
     private var launchAgent: URL { home.appendingPathComponent("Library/LaunchAgents/com.thurm.daemon.plist") }
+
+    /// Migrates an existing LaunchAgent that still points at this bundle's old flat
+    /// `Contents/Helpers/thurmd` to the nested `Thurm Daemon.app` executable and adds
+    /// `AssociatedBundleIdentifiers` for macOS Local Network Privacy. Only touches a plist
+    /// belonging to this app bundle; does not bootout (the running daemon upgrades in place).
+    func migrateLaunchAgentIfNeeded() {
+        let oldPath = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/thurmd").path
+        let newPath = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Helpers/\(Core.bundledDaemonRelativePath)").path
+        guard fm.isExecutableFile(atPath: newPath),
+              let data = fm.contents(atPath: launchAgent.path),
+              var plist = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any],
+              var args = plist["ProgramArguments"] as? [String],
+              args.first == oldPath
+        else { return }
+        args[0] = newPath
+        plist["ProgramArguments"] = args
+        if plist["AssociatedBundleIdentifiers"] == nil {
+            plist["AssociatedBundleIdentifiers"] = [Bundle.main.bundleIdentifier ?? "com.thurm.terminal"]
+        }
+        if let updated = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+            try? updated.write(to: launchAgent, options: .atomic)
+            tlog("migrated LaunchAgent \(launchAgent.lastPathComponent) to Thurm Daemon.app")
+        }
+    }
     /// `~/.local/bin` when it exists (no password needed), else `/usr/local/bin`.
     private var cliLinkCandidates: [URL] {
         [home.appendingPathComponent(".local/bin/thurm"), URL(fileURLWithPath: "/usr/local/bin/thurm")]

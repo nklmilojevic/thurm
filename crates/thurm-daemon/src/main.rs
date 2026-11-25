@@ -6,6 +6,7 @@
 mod agent_prompt;
 mod agents;
 mod ai;
+mod bundle;
 mod complete;
 mod daemon;
 mod git;

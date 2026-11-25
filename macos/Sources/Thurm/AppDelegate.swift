@@ -37,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         FontShaper.settings = { (SessionManager.shared.config, SessionManager.shared.effectiveFontSize) }
         FontShaper.registerBundledFonts()
+        Integrations.shared.migrateLaunchAgentIfNeeded()
         Notifications.shared.setup()
         SecureInput.shared.restoreUserPreference()
         // Queued URLs run once the session is restored; a failed start never restores them.

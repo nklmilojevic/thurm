@@ -1473,6 +1473,7 @@ fn systemd_quote(path: &std::path::Path) -> Result<String, String> {
 }
 
 const LAUNCHD_LABEL: &str = "com.thurm.daemon";
+const APP_BUNDLE_ID: &str = "com.thurm.terminal";
 
 unsafe extern "C" {
     #[link_name = "getuid"]
@@ -1506,6 +1507,10 @@ fn launchd_plist(
 <dict>
     <key>Label</key>
     <string>{LAUNCHD_LABEL}</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>{APP_BUNDLE_ID}</string>
+    </array>
     <key>ProgramArguments</key>
     <array>
         <string>{}</string>
@@ -2593,7 +2598,9 @@ mod tests {
 
     #[test]
     fn launchd_plist_is_valid() {
-        let daemon = std::path::Path::new("/Applications/Thurm & Co.app/Contents/Helpers/thurmd");
+        let daemon = std::path::Path::new(
+            "/Applications/Thurm & Co.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd",
+        );
         let log = std::path::Path::new("/tmp/log");
         let explicit = launchd_plist(daemon, Some(std::path::Path::new("/x/thurmd.sock")), log);
         assert!(explicit.contains("<string>--socket</string>"));
@@ -2604,6 +2611,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         for s in [explicit, default] {
             assert!(s.contains("Thurm &amp; Co.app"));
+            assert!(s.contains("Thurm Daemon.app/Contents/MacOS/thurmd"));
+            assert!(s.contains("<key>AssociatedBundleIdentifiers</key>"));
+            assert!(s.contains("<string>com.thurm.terminal</string>"));
             assert!(s.contains("<string>--foreground</string>"));
             let f = dir.join("x.plist");
             std::fs::write(&f, &s).unwrap();

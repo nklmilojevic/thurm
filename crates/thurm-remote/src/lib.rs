@@ -204,13 +204,14 @@ fn parse_probe(out: &str) -> HostInfo {
 /// once when the socket answers).
 /// Starts the daemon on `$1` unless one answers there (thurmd exits then). `thurmd` is looked for
 /// next to `thurm`, and next to what `thurm` links to (`~/.local/bin/thurm` → the Mac app's
-/// `Contents/Helpers`), then on PATH.
+/// `Contents/Helpers`, including `Thurm Daemon.app/Contents/MacOS/thurmd`), then on PATH.
 const START: &str = concat!(
     "TH=\"${THURM_HOME:-$HOME}\"; ",
     "PATH=\"$TH/.local/share/thurm/bin:$TH/.local/bin:${THURM_BASE_PATH:-$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:$PATH}\"; export PATH; ",
     "T=; P=\"$(command -v thurm)\"; ",
     "if [ -n \"$P\" ]; then R=\"$(readlink -f \"$P\" 2>/dev/null)\"; ",
     "for D in \"$(dirname \"$P\")\" \"$(dirname \"${R:-$P}\")\"; do ",
+    "if [ -x \"$D/Thurm Daemon.app/Contents/MacOS/thurmd\" ]; then T=\"$D/Thurm Daemon.app/Contents/MacOS/thurmd\"; break; fi; ",
     "if [ -x \"$D/thurmd\" ]; then T=\"$D/thurmd\"; break; fi; done; fi; ",
     "[ -n \"$T\" ] || T=\"$(command -v thurmd)\"; ",
     "[ -n \"$T\" ] || { echo \"thurmd is not installed\" >&2; exit 3; }; ",
@@ -273,6 +274,43 @@ mod tests {
             std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         symlink(helpers.join("thurm"), home.join(".local/bin/thurm")).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", START, "thurm", "/tmp/x.sock"])
+            .env("THURM_HOME", &home)
+            .env("THURM_BASE_PATH", "/usr/bin:/bin")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "--daemonize --socket /tmp/x.sock"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The Mac app's bundled daemon: `~/.local/bin/thurm` links into `Contents/Helpers`,
+    /// where `thurmd` sits inside `Thurm Daemon.app/Contents/MacOS/thurmd`.
+    #[test]
+    fn start_finds_bundled_thurmd_beside_a_linked_thurm() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let base = std::env::temp_dir().join(format!("thurm-start-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (home, helpers) = (base.join("home"), base.join("Thurm.app/Contents/Helpers"));
+        let daemon_dir = helpers.join("Thurm Daemon.app/Contents/MacOS");
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let marker = base.join("started");
+        let cli = helpers.join("thurm");
+        std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let daemon = daemon_dir.join("thurmd");
+        std::fs::write(
+            &daemon,
+            format!("#!/bin/sh\necho \"$@\" > {}\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&cli, home.join(".local/bin/thurm")).unwrap();
         let status = std::process::Command::new("/bin/sh")
             .args(["-c", START, "thurm", "/tmp/x.sock"])
             .env("THURM_HOME", &home)

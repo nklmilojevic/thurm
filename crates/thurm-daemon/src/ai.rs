@@ -83,7 +83,7 @@ impl Model {
             .map(PathBuf::from)
             .or_else(|| {
                 let exe = std::env::current_exe().ok()?;
-                Some(exe.parent()?.join("thurm-intelligence"))
+                crate::bundle::helper_path(&exe, "thurm-intelligence")
             });
         Self::with_helper(path)
     }

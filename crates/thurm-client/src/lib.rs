@@ -148,20 +148,29 @@ fn find_daemon_pid(socket: &Path) -> Option<u32> {
         .and_then(|out| {
             String::from_utf8_lossy(&out.stdout)
                 .lines()
-                .find_map(|line| {
-                    let mut f = line.split_whitespace();
-                    let pid: u32 = f.next()?.parse().ok()?;
-                    let owner: u32 = f.next()?.parse().ok()?;
-                    let args: Vec<&str> = f.collect();
-                    let is_daemon = args
-                        .first()
-                        .is_some_and(|a| a.ends_with("/thurmd") || *a == "thurmd");
-                    let same_socket = args.windows(2).any(|w| w[0] == "--socket" && w[1] == sock);
-                    (owner == uid && is_daemon && same_socket && pid != std::process::id())
-                        .then_some(pid)
-                })
+                .find_map(|line| parse_ps_daemon_pid(line, uid, &sock, std::process::id()))
         });
     listed.or_else(|| daemon_pid(socket).filter(|&p| alive(p)))
+}
+
+fn parse_ps_daemon_pid(line: &str, uid: u32, sock: &str, self_pid: u32) -> Option<u32> {
+    let mut f = line.split_whitespace();
+    let pid: u32 = f.next()?.parse().ok()?;
+    let owner: u32 = f.next()?.parse().ok()?;
+    let args: Vec<&str> = f.collect();
+    // argv[0] may contain spaces (e.g. `.../Thurm Daemon.app/Contents/MacOS/thurmd`),
+    // so check the executable basename at the end of the non-option prefix.
+    let cmd_end = args
+        .iter()
+        .position(|a| a.starts_with('-') && a.len() > 1)
+        .unwrap_or(args.len());
+    let is_daemon = cmd_end > 0
+        && args[cmd_end - 1]
+            .rsplit('/')
+            .next()
+            .is_some_and(|b| b == "thurmd");
+    let same_socket = args.windows(2).any(|w| w[0] == "--socket" && w[1] == sock);
+    (owner == uid && is_daemon && same_socket && pid != self_pid).then_some(pid)
 }
 
 /// Stop the daemon on `socket` whatever protocol it speaks (e.g. one left over from an older
@@ -271,13 +280,32 @@ pub fn upgrade_daemon(socket: &Path, daemon: &Path) -> Result<u32, UpgradeError>
     }
 }
 
-/// Locate `thurmd`: next to the current executable, then on PATH.
+/// Bundled macOS helper app path for `thurmd` relative to `Contents/Helpers`.
+pub const BUNDLED_DAEMON: &str = "Thurm Daemon.app/Contents/MacOS/thurmd";
+
+/// Locate `thurmd` inside `dir`: the macOS helper bundle first, then a flat `thurmd`.
+pub fn find_daemon_in(dir: &Path) -> Option<PathBuf> {
+    let bundled = dir.join(BUNDLED_DAEMON);
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+    let flat = dir.join("thurmd");
+    flat.is_file().then_some(flat)
+}
+
+/// Locate `thurmd`: next to the current executable (or its symlink target), then on PATH.
 pub fn find_daemon() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let p = dir.join("thurmd");
-        if p.is_file() {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent()
+            && let Some(p) = find_daemon_in(dir)
+        {
+            return Some(p);
+        }
+        if let Ok(real) = std::fs::canonicalize(&exe)
+            && real != exe
+            && let Some(dir) = real.parent()
+            && let Some(p) = find_daemon_in(dir)
+        {
             return Some(p);
         }
     }
@@ -1185,5 +1213,56 @@ mod tests {
             Response::Panes(_)
         ));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_daemon_in_bundled_and_flat_layouts() {
+        let dir = std::env::temp_dir().join(format!("thurm-find-daemon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(find_daemon_in(&dir), None);
+
+        let flat = dir.join("thurmd");
+        std::fs::write(&flat, b"").unwrap();
+        assert_eq!(find_daemon_in(&dir), Some(flat));
+
+        let bundled = dir.join(BUNDLED_DAEMON);
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"").unwrap();
+        assert_eq!(find_daemon_in(&dir), Some(bundled));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ps_parser_handles_spaced_helper_bundle_path() {
+        let sock = "/tmp/thurm-501/thurmd.sock";
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "42 501 /Applications/Thurm.app/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd --foreground --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "43 501 /usr/local/bin/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            Some(43)
+        );
+        assert_eq!(
+            parse_ps_daemon_pid(
+                "44 501 /bin/sh -c /x/thurmd --socket /tmp/thurm-501/thurmd.sock",
+                501,
+                sock,
+                99
+            ),
+            None
+        );
     }
 }

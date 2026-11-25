@@ -29,7 +29,7 @@ open macos/build/Thurm.app
 2. copies `thurm.h` into `Sources/CThurm/include/` (a copy, not a symlink, so SwiftPM sees it);
 3. runs `swift build -c release --arch arm64` (SwiftPM fetches Sparkle);
 4. assembles `macos/build/Thurm.app`: `Contents/MacOS/Thurm`,
-   `Contents/Helpers/{thurmd,thurm,thurm-nvim}`,
+   `Contents/Helpers/{Thurm Daemon.app,thurm,thurm-nvim}`,
    `Contents/Frameworks/Sparkle.framework`, resources, and `Info.plist` with the version,
    build number and (release builds only) the update feed;
 5. signs the bundle: ad hoc, or with `THURM_SIGN_IDENTITY` (inside out, hardened runtime).

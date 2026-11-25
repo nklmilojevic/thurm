@@ -80,6 +80,8 @@
 	<true/>
 	<key>SUScheduledCheckInterval</key>
 	<integer>3600</integer>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Thurm and programs running in its terminals use this to find and connect to devices on your local network.</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>A program running in Thurm wants to control another app.</string>
 	<key>NSCameraUsageDescription</key>

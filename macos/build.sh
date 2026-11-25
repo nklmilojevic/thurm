@@ -160,9 +160,17 @@ log "Assembling $APP"
 rm -rf "$APP"
 # The Rust binaries go to Contents/Helpers: `thurm` and `Thurm` are the same file name on
 # a case-insensitive volume, so the CLI must not share Contents/MacOS with the app.
+# `thurmd` lives inside a nested `Thurm Daemon.app` helper bundle so macOS Local Network
+# Privacy (TN3179) and TCC recognize it with a bound Info.plist and bundle identifier even
+# when it outlives Thurm.app or starts at login.
+DAEMON_APP="$APP/Contents/Helpers/Thurm Daemon.app"
+DAEMON_BIN="$DAEMON_APP/Contents/MacOS/thurmd"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
+mkdir -p "$DAEMON_APP/Contents/MacOS" "$DAEMON_APP/Contents/Resources"
 cp "$SWIFT_BIN" "$APP/Contents/MacOS/Thurm"
-for b in "${BINARIES[@]}"; do
+cp "$RUST_OUT/thurmd" "$DAEMON_BIN"
+chmod +x "$DAEMON_BIN"
+for b in thurm thurm-nvim; do
     cp "$RUST_OUT/$b" "$APP/Contents/Helpers/$b"
     chmod +x "$APP/Contents/Helpers/$b"
 done
@@ -175,7 +183,9 @@ cp "$INTELLIGENCE_BIN" "$APP/Contents/Helpers/thurm-intelligence"
 cp "$TAILNET_BIN" "$APP/Contents/Helpers/thurm-tailnet"
 # A Nix toolchain first on PATH links Nix's libiconv, which macOS refuses to load into a signed
 # app: an installed thurmd would never start (and a running daemon could not be upgraded).
-for f in "$APP/Contents/MacOS/Thurm" "$APP"/Contents/Helpers/*; do
+for f in "$APP/Contents/MacOS/Thurm" "$DAEMON_BIN" \
+    "$APP/Contents/Helpers/thurm" "$APP/Contents/Helpers/thurm-nvim" \
+    "$APP/Contents/Helpers/thurm-intelligence" "$APP/Contents/Helpers/thurm-tailnet"; do
     if otool -L "$f" | grep -q '/nix/store/'; then
         die "$(basename "$f") links libraries from /nix/store; build with /usr/bin first on PATH"
     fi
@@ -186,6 +196,12 @@ plist "Set :CFBundleShortVersionString $VERSION"
 plist "Set :CFBundleVersion $BUILD_NUMBER"
 plist "Add :ThurmBuild string $THURM_BUILD"
 plist "Add :ThurmChannel string $CHANNEL"
+cp "$HERE/Resources/Daemon-Info.plist" "$DAEMON_APP/Contents/Info.plist"
+daemon_plist() { /usr/libexec/PlistBuddy -c "$1" "$DAEMON_APP/Contents/Info.plist"; }
+daemon_plist "Set :CFBundleShortVersionString $VERSION"
+daemon_plist "Set :CFBundleVersion $BUILD_NUMBER"
+daemon_plist "Add :ThurmBuild string $THURM_BUILD"
+daemon_plist "Add :ThurmChannel string $CHANNEL"
 # A malformed feed (e.g. `https://owner.github.io//appcast.xml`) would strand every copy of
 # this build on it: no update could ever fix it.
 if [[ -n "${THURM_FEED_URL:-}" ]] \
@@ -199,6 +215,7 @@ elif [[ "$DISTRIBUTION" == 1 ]]; then
     die "Distribution builds need THURM_FEED_URL and THURM_SPARKLE_PUBLIC_KEY"
 fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+printf 'APPL????' > "$DAEMON_APP/Contents/PkgInfo"
 if [[ -d "$ROOT/shell-integration" ]]; then
     cp -R "$ROOT/shell-integration" "$APP/Contents/Resources/shell-integration"
 else
@@ -219,6 +236,8 @@ if [[ -d "$ROOT/skills" ]]; then
 fi
 # The Icon Composer icon: Assets.car for macOS 26 and later, AppIcon.icns for older systems.
 "$HERE/compile-icon.sh" "$APP/Contents/Resources"
+# Give Thurm Daemon.app the app icon so System Settings privacy lists show it cleanly.
+cp "$APP/Contents/Resources/AppIcon.icns" "$DAEMON_APP/Contents/Resources/AppIcon.icns"
 # Thurm's license and the notices of everything it includes.
 python3 "$ROOT/scripts/third-party-licenses.py" --with-go
 cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_LICENSES" "$APP/Contents/Resources/"
@@ -242,19 +261,17 @@ if [[ -n "$IDENTITY" ]]; then
     sign "$FW/Autoupdate"
     sign "$FW/Updater.app"
     sign "$APP/Contents/Frameworks/Sparkle.framework"
-    # thurmd too: started at login it is the process macOS holds responsible for the shells.
-    for b in "${BINARIES[@]}" thurm-intelligence thurm-tailnet; do
-        if [[ "$b" == thurmd ]]; then
-            sign --entitlements "$ENTITLEMENTS" "$APP/Contents/Helpers/$b"
-        else
-            sign "$APP/Contents/Helpers/$b"
-        fi
+    for b in thurm thurm-nvim thurm-intelligence thurm-tailnet; do
+        sign "$APP/Contents/Helpers/$b"
     done
+    # Thurm Daemon.app too: detached from Thurm.app or started at login, it is the process
+    # macOS holds responsible for the shells.
+    sign --entitlements "$ENTITLEMENTS" "$DAEMON_APP"
     sign --entitlements "$ENTITLEMENTS" "$APP"
 else
     log "codesign (ad-hoc; set THURM_SIGN_IDENTITY for grants that survive rebuilds)"
     codesign --force --deep -s - "$APP"
-    codesign --force -s - --entitlements "$ENTITLEMENTS" "$APP/Contents/Helpers/thurmd"
+    codesign --force -s - --entitlements "$ENTITLEMENTS" "$DAEMON_APP"
     codesign --force -s - --entitlements "$ENTITLEMENTS" "$APP"
 fi
 codesign --verify --deep --strict "$APP"
@@ -305,7 +322,7 @@ if [[ -L "$SKILL" ]] && [[ "$(readlink "$SKILL")" == *Thurm.app/* ]]; then
     ln -sfn "$DEST/Contents/Resources/skills/thurm" "$SKILL"
 fi
 PLIST="$HOME/Library/LaunchAgents/com.thurm.daemon.plist"
-if [[ -f "$PLIST" ]] && ! grep -q "$DEST/Contents/Helpers/thurmd" "$PLIST"; then
+if [[ -f "$PLIST" ]] && ! grep -qF "$DEST/Contents/Helpers/Thurm Daemon.app/Contents/MacOS/thurmd" "$PLIST"; then
     log "note: the login daemon runs another copy; redo Thurm > Integrations > Start Daemon at Login"
 fi
 

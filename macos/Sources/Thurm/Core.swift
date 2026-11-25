@@ -139,21 +139,41 @@ final class Core {
     /// Remote hosts with a live connection.
     var connectedRemotes: [HostId] { clients.keys.filter { $0 != localHost }.sorted() }
 
-    /// `thurmd` in the bundle's `Contents/Helpers` (not `Contents/MacOS`: the CLI `thurm`
-    /// would collide with `Thurm` on a case-insensitive volume), or `$THURM_DAEMON`.
+    /// Bundled `thurmd` inside `Contents/Helpers/Thurm Daemon.app` (a nested `.app` bundle so
+    /// macOS Local Network Privacy and TCC recognize the detached daemon and its shells), or
+    /// `$THURM_DAEMON`. Falls back to a flat `Contents/Helpers/thurmd`.
+    static let bundledDaemonRelativePath = "Thurm Daemon.app/Contents/MacOS/thurmd"
+
     static var daemonPath: String? {
         let fm = FileManager.default
         if let env = ProcessInfo.processInfo.environment["THURM_DAEMON"], fm.isExecutableFile(atPath: env) {
             return env
         }
-        let path = Bundle.main.bundleURL
-            .appendingPathComponent("Contents/Helpers/thurmd").path
-        return fm.isExecutableFile(atPath: path) ? path : nil
+        let helpers = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers")
+        let bundled = helpers.appendingPathComponent(bundledDaemonRelativePath).path
+        if fm.isExecutableFile(atPath: bundled) {
+            return bundled
+        }
+        let flat = helpers.appendingPathComponent("thurmd").path
+        return fm.isExecutableFile(atPath: flat) ? flat : nil
     }
 
-    /// Where `thurm` and `thurmd` are, to copy onto another Mac.
+    /// Where `thurm`, `Thurm Daemon.app` (or `thurmd`), and `thurm-tailnet` live, to copy onto
+    /// another Mac.
     static var helpersPath: String? {
-        daemonPath.map { ($0 as NSString).deletingLastPathComponent }
+        let fm = FileManager.default
+        if let env = ProcessInfo.processInfo.environment["THURM_DAEMON"], fm.isExecutableFile(atPath: env) {
+            let dir = (env as NSString).deletingLastPathComponent
+            if dir.hasSuffix("/Thurm Daemon.app/Contents/MacOS") {
+                return (((dir as NSString)
+                    .deletingLastPathComponent as NSString)
+                    .deletingLastPathComponent as NSString)
+                    .deletingLastPathComponent
+            }
+            return dir
+        }
+        let helpers = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers").path
+        return daemonPath != nil && fm.fileExists(atPath: helpers) ? helpers : nil
     }
 
     /// This build's identifier; a daemon reporting another one is replaced in place.
