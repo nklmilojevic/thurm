@@ -95,7 +95,49 @@ enum AiJob {
         screen: String,
         notify: (String, String),
         sound: String,
+        push_kind: Option<crate::push::NoticeKind>,
+        push_topic: Option<String>,
     },
+}
+
+/// An event queued for broadcast, with optional push-relay metadata computed while the pane lock
+/// was held (preserving pane-lock-before-client-lock order).
+struct Outgoing {
+    event: Event,
+    push_kind: Option<crate::push::NoticeKind>,
+    push_topic: Option<String>,
+}
+
+impl From<Event> for Outgoing {
+    fn from(event: Event) -> Self {
+        Self {
+            event,
+            push_kind: None,
+            push_topic: None,
+        }
+    }
+}
+
+fn push_notice_kind(state: NoticeState) -> Option<crate::push::NoticeKind> {
+    match state {
+        NoticeState::Blocked => Some(crate::push::NoticeKind::Permission),
+        NoticeState::Waiting => Some(crate::push::NoticeKind::NeedsInput),
+        NoticeState::Finished => Some(crate::push::NoticeKind::Done),
+        NoticeState::Failed => Some(crate::push::NoticeKind::Error),
+        NoticeState::Working | NoticeState::Idle => None,
+    }
+}
+
+fn push_notice_topic(st: &PaneState, agent: &AgentState) -> Option<String> {
+    agent
+        .topic
+        .as_deref()
+        .map(crate::push::clean_title)
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            let t = crate::push::clean_title(&st.info.title);
+            (!t.is_empty()).then_some(t)
+        })
 }
 
 /// Most of an unterminated escape sequence (or UTF-8 character) kept to replay after an
@@ -760,6 +802,15 @@ impl Daemon {
     /// pane locked, so they arrive in the order they happened. Pane lock, then client lock, never
     /// the other way round.
     fn broadcast(&self, event: Event, ui_only: bool) {
+        self.broadcast_outgoing(Outgoing::from(event), ui_only);
+    }
+
+    fn broadcast_outgoing(&self, out: Outgoing, ui_only: bool) {
+        let Outgoing {
+            event,
+            push_kind,
+            push_topic,
+        } = out;
         let clients: Vec<_> = self.clients.lock().values().cloned().collect();
         // A phone with the app open hears it live; otherwise its lock screen does.
         let open = || -> Vec<String> {
@@ -794,6 +845,8 @@ impl Daemon {
                             pane: *pane,
                             title: title.clone(),
                             permission: *permission,
+                            kind: push_kind,
+                            topic: push_topic.clone(),
                         },
                         &open(),
                     );
@@ -1449,7 +1502,7 @@ impl Daemon {
         }
         let cfg = self.config.read().notifications.clone();
         let mut info_changed = false;
-        let mut outgoing = Vec::new();
+        let mut outgoing: Vec<Outgoing> = Vec::new();
         {
             let mut st = pane.state.lock();
             for ev in events {
@@ -1464,13 +1517,15 @@ impl Daemon {
                             info_changed = true;
                         }
                     }
-                    TermEvent::Bell => outgoing.push(Event::Bell { pane: pane.id }),
-                    TermEvent::ClipboardStore(text) => outgoing.push(Event::ClipboardStore {
-                        pane: pane.id,
-                        text,
-                    }),
+                    TermEvent::Bell => outgoing.push(Outgoing::from(Event::Bell { pane: pane.id })),
+                    TermEvent::ClipboardStore(text) => {
+                        outgoing.push(Outgoing::from(Event::ClipboardStore {
+                            pane: pane.id,
+                            text,
+                        }))
+                    }
                     TermEvent::ClipboardLoad => {
-                        outgoing.push(Event::ClipboardRequest { pane: pane.id })
+                        outgoing.push(Outgoing::from(Event::ClipboardRequest { pane: pane.id }))
                     }
                     TermEvent::Notify { title, body } => {
                         st.agent.flag_attention();
@@ -1483,13 +1538,13 @@ impl Daemon {
                             } else {
                                 title
                             };
-                            outgoing.push(Event::Notify {
+                            outgoing.push(Outgoing::from(Event::Notify {
                                 pane: pane.id,
                                 title,
                                 body,
                                 permission: None,
                                 sound: None,
-                            });
+                            }));
                         }
                     }
                     TermEvent::Cwd(d) => {
@@ -1543,13 +1598,13 @@ impl Daemon {
                                     Some(0) | None => "finished".to_owned(),
                                     Some(c) => format!("failed (exit {c})"),
                                 };
-                                outgoing.push(Event::Notify {
+                                outgoing.push(Outgoing::from(Event::Notify {
                                     pane: pane.id,
                                     title: format!("{what} {status}"),
                                     body: format!("after {}s", start.elapsed().as_secs()),
                                     permission: None,
                                     sound: None,
-                                });
+                                }));
                             }
                         }
                         let secs = started.map_or(0, |s| s.elapsed().as_secs());
@@ -1585,10 +1640,10 @@ impl Daemon {
                 }
             }
             if info_changed {
-                outgoing.push(Event::PaneInfo(st.info.clone()));
+                outgoing.push(Outgoing::from(Event::PaneInfo(st.info.clone())));
             }
             for ev in outgoing {
-                self.broadcast(ev, true);
+                self.broadcast_outgoing(ev, true);
             }
         }
     }
@@ -1619,7 +1674,7 @@ impl Daemon {
                 let events = self.sync_programs(pane.id, &mut st, records);
                 self.broadcast(Event::PaneInfo(st.info.clone()), false);
                 for ev in events {
-                    self.broadcast(ev, true);
+                    self.broadcast_outgoing(ev, true);
                 }
             }
             if st.hold {
@@ -1764,6 +1819,8 @@ impl Daemon {
                     screen,
                     notify,
                     sound,
+                    push_kind,
+                    push_topic,
                 } => {
                     let ask = if done {
                         ai::summary(&agent, &screen)
@@ -1790,13 +1847,17 @@ impl Daemon {
                             (Some(d), false) => d.clone(),
                             (None, _) => body,
                         };
-                        vec![Event::NotifyPrompt {
-                            pane,
-                            title,
-                            body,
-                            permission,
-                            sound: Some(sound.clone()),
-                            request,
+                        vec![Outgoing {
+                            event: Event::NotifyPrompt {
+                                pane,
+                                title,
+                                body,
+                                permission,
+                                sound: Some(sound.clone()),
+                                request,
+                            },
+                            push_kind,
+                            push_topic,
                         }]
                     });
                 }
@@ -1812,7 +1873,7 @@ impl Daemon {
         pane: PaneId,
         st: &mut PaneState,
         records: Vec<ProgramRecord>,
-    ) -> Vec<Event> {
+    ) -> Vec<Outgoing> {
         let before = st.info.agent.clone();
         if !self.apply_programs(st, records) {
             return Vec::new();
@@ -1824,7 +1885,7 @@ impl Daemon {
         st.program_alerts
             .retain(|t| now.duration_since(*t) < PROGRAM_ALERT_WINDOW);
         events.retain(|ev| {
-            if !matches!(ev, Event::Notify { .. } | Event::NotifyPrompt { .. }) {
+            if !matches!(ev.event, Event::Notify { .. } | Event::NotifyPrompt { .. }) {
                 return true;
             }
             if st.program_alerts.len() >= PROGRAM_ALERTS {
@@ -1860,14 +1921,14 @@ impl Daemon {
             let events = self.sync_programs(pane, st, records);
             self.broadcast(Event::PaneInfo(st.info.clone()), false);
             for ev in events {
-                self.broadcast(ev, true);
+                self.broadcast_outgoing(ev, true);
             }
         }
     }
 
     /// Applies `f` to a pane's state, then re-derives its agent state and title and tells
     /// clients when they changed.
-    fn update_agent(&self, pane: PaneId, f: impl FnOnce(&mut PaneState) -> Vec<Event>) {
+    fn update_agent(&self, pane: PaneId, f: impl FnOnce(&mut PaneState) -> Vec<Outgoing>) {
         let Some(p) = self.pane(pane) else { return };
         let mut st = p.state.lock();
         let events = f(&mut st);
@@ -1877,7 +1938,7 @@ impl Daemon {
             self.broadcast(Event::PaneInfo(st.info.clone()), false);
         }
         for ev in events {
-            self.broadcast(ev, true);
+            self.broadcast_outgoing(ev, true);
         }
     }
 
@@ -1973,7 +2034,7 @@ impl Daemon {
             let defs = self.agent_defs.read().clone();
             let program_defs = self.program_defs.read().clone();
             for pane in self.all_panes() {
-                let mut events = Vec::new();
+                let mut events: Vec<Outgoing> = Vec::new();
                 {
                     let mut st = pane.state.lock();
                     if !st.info.alive {
@@ -2130,12 +2191,12 @@ impl Daemon {
                     let mut cmp = st.info.clone();
                     cmp.idle_ms = before.idle_ms;
                     if cmp != before || programs_changed || tick.is_multiple_of(4) {
-                        events.push(Event::PaneInfo(st.info.clone()));
+                        events.push(Outgoing::from(Event::PaneInfo(st.info.clone())));
                     }
                     // Under the pane's lock, as everywhere: a state taken before a hook's must
                     // not reach clients after it.
                     for ev in events {
-                        self.broadcast(ev, true);
+                        self.broadcast_outgoing(ev, true);
                     }
                 }
             }
@@ -2746,7 +2807,7 @@ impl Daemon {
         st: &PaneState,
         before: Option<&AgentState>,
         after: Option<&AgentState>,
-    ) -> Vec<Event> {
+    ) -> Vec<Outgoing> {
         let (n, ai_cfg) = {
             let c = self.config.read();
             (c.notifications.clone(), c.ai.clone())
@@ -2770,6 +2831,8 @@ impl Daemon {
             return Vec::new();
         }
         let done = matches!(state, NoticeState::Finished | NoticeState::Failed);
+        let push_kind = push_notice_kind(state);
+        let push_topic = push_notice_topic(st, a);
         let body = match state {
             NoticeState::Waiting | NoticeState::Blocked => a
                 .message
@@ -2802,6 +2865,8 @@ impl Daemon {
                 screen: agents::tail(&st.term.screen_text(), AI_SCREEN_LINES),
                 notify: notify.clone(),
                 sound: notice.sound.clone(),
+                push_kind,
+                push_topic: push_topic.clone(),
             };
             if self.ai_tx.try_send(job).is_ok() {
                 return Vec::new();
@@ -2810,13 +2875,17 @@ impl Daemon {
         let permission = a.permission.filter(|_| !done);
         let request = permission.and_then(|_| st.agent.permission_request());
         let (title, body) = notify;
-        vec![Event::NotifyPrompt {
-            pane,
-            title,
-            body,
-            permission,
-            sound: Some(notice.sound.clone()),
-            request,
+        vec![Outgoing {
+            event: Event::NotifyPrompt {
+                pane,
+                title,
+                body,
+                permission,
+                sound: Some(notice.sound.clone()),
+                request,
+            },
+            push_kind,
+            push_topic,
         }]
     }
 
@@ -3473,7 +3542,7 @@ impl Daemon {
                         st.info.title = pane_title(st, st.info.foreground.as_ref());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
                         for ev in events {
-                            self.broadcast(ev, true);
+                            self.broadcast_outgoing(ev, true);
                         }
                     }
                 })?;
@@ -3544,7 +3613,7 @@ impl Daemon {
                         st.info.title = pane_title(st, st.info.foreground.as_ref());
                         self.broadcast(Event::PaneInfo(st.info.clone()), false);
                         for ev in events {
-                            self.broadcast(ev, true);
+                            self.broadcast_outgoing(ev, true);
                         }
                     }
                     Ok(())
@@ -5436,6 +5505,118 @@ mod tests {
             Response::PendingPrompt(None)
         ));
 
+        daemon.close_pane(pane);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn notify_prompt_downgrades_for_legacy_clients_and_get_pending_prompt_answers() {
+        let dir = std::env::temp_dir().join(format!("thurm-pending-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (legacy, legacy_rx) = daemon.add_client();
+        legacy.ui.store(true, Ordering::Relaxed);
+        let (modern, modern_rx) = daemon.add_client();
+        modern.ui.store(true, Ordering::Relaxed);
+        modern.pending_prompt.store(true, Ordering::Relaxed);
+
+        // Hello advertises CAP_PENDING_PROMPT.
+        let hello = daemon
+            .dispatch(
+                &modern,
+                Request::Hello {
+                    client: "test".into(),
+                    version: PROTOCOL_VERSION,
+                    ui: true,
+                    capabilities: vec![thurm_proto::CAP_PENDING_PROMPT.into()],
+                },
+            )
+            .unwrap();
+        let Response::Hello { capabilities, .. } = hello else {
+            panic!("expected Hello");
+        };
+        assert!(capabilities.iter().any(|c| c == thurm_proto::CAP_PENDING_PROMPT));
+
+        // NotifyPrompt downgrades to Notify for clients without CAP_PENDING_PROMPT.
+        daemon.broadcast(
+            Event::NotifyPrompt {
+                pane: 3,
+                title: "Claude Code".into(),
+                body: "Bash: git status".into(),
+                permission: Some(7),
+                sound: Some("default".into()),
+                request: Some("Bash: git status".into()),
+            },
+            true,
+        );
+        assert!(matches!(
+            legacy_rx.try_recv(),
+            Ok(ServerMessage::Event(Event::Notify {
+                pane: 3,
+                permission: Some(7),
+                ..
+            }))
+        ));
+        assert!(matches!(
+            modern_rx.try_recv(),
+            Ok(ServerMessage::Event(Event::NotifyPrompt {
+                pane: 3,
+                permission: Some(7),
+                request: Some(ref r),
+                ..
+            })) if r == "Bash: git status"
+        ));
+
+        // GetPendingPrompt returns active prompt for a real pane, then None once cleared.
+        let pane = daemon
+            .create_pane(
+                CreatePane {
+                    command: Some(vec!["cat".into()]),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        {
+            let p = daemon.pane(pane).unwrap();
+            let mut st = p.state.lock();
+            st.agent.saw_foreground(Some(1));
+            st.agent.apply_hook(
+                Some(1),
+                "claude",
+                "Claude Code",
+                "permission-prompt",
+                Some("s1".into()),
+                Some("Bash: cargo check".into()),
+            );
+            st.agent.refresh();
+        }
+        let resp = daemon
+            .dispatch(&modern, Request::GetPendingPrompt { pane })
+            .unwrap();
+        let Response::PendingPrompt(Some(prompt)) = resp else {
+            panic!("expected PendingPrompt(Some)");
+        };
+        assert_eq!(prompt.pane, pane);
+        assert_eq!(prompt.request.as_deref(), Some("Bash: cargo check"));
+
+        {
+            let p = daemon.pane(pane).unwrap();
+            let mut st = p.state.lock();
+            st.agent.user_input();
+            st.agent.refresh();
+        }
+        assert!(matches!(
+            daemon
+                .dispatch(&modern, Request::GetPendingPrompt { pane })
+                .unwrap(),
+            Response::PendingPrompt(None)
+        ));
         daemon.close_pane(pane);
         let _ = std::fs::remove_dir_all(dir);
     }

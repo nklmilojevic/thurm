@@ -243,13 +243,14 @@ fn is_p256_blob(blob: &[u8]) -> bool {
     ok && rest.is_empty()
 }
 
-/// A device name goes to a remote shell as an argument: one word, no quotes or backslashes.
+/// A device name goes to a remote shell as an argument and into `authorized_keys`:
+/// 1–128 ASCII letters, digits, `.`, `_`, or `-` (aligned with Mac `PhonePairing.validDeviceKey`).
 pub fn validate_device_name(device: &str) -> Result<(), String> {
     if device.is_empty()
         || device.len() > 128
-        || device
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '\'' || c == '\\')
+        || !device
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     {
         return Err(format!("unsupported device name {device:?}"));
     }
@@ -282,15 +283,17 @@ impl std::error::Error for PairingError {}
 /// Exit status of [`EDIT`] when `authorized_keys` can't be written.
 const NOT_WRITABLE: i32 = 4;
 
-/// Replaces the device's key in `authorized_keys`: drops the lines Thurm wrote for device `$2`
-/// (exactly `restrict,port-forwarding ecdsa-sha2-nistp256 <blob> thurm-ios:$2`, nothing that only
-/// ends the same way), appends `$1` (when given) with Thurm's options, through a temporary file and `mv`. Every other
-/// line stays byte for byte, a last line without a newline included (one is put before the
-/// appended key only); a revoke that matches nothing leaves the file alone. A link (managed
+/// Replaces the device's key in `authorized_keys`: on revoke (`$1` empty), drops every line Thurm
+/// wrote for device `$2`; on authorize (`$1` non-empty), deduplicates generic names (`iPhone`,
+/// `iPad`) by matching both key blob and device name so pairing a second iPhone does not silently
+/// revoke the first, while deduplicating unique device names by name so key rotation replaces the
+/// old key. Appends `$1` (when given) with Thurm's options, through a temporary file and `mv`.
+/// Every other line stays byte for byte, a last line without a newline included (one is put before
+/// the appended key only); a revoke that matches nothing leaves the file alone. A link (managed
 /// elsewhere) or an unreadable file is not touched.
 const EDIT: &str = concat!(
-    // V: the device (`$2` inside `ours` would be the function's own argument).
-    "TH=\"${THURM_HOME:-$HOME}\"; D=\"$TH/.ssh\"; F=\"$D/authorized_keys\"; T=\"$F.thurm-$$\"; N=\"\n\"; V=\"$2\"; ",
+    // A/V/KB: the key, device and key blob (`$1`/`$2` inside `ours` would be the function's args).
+    "TH=\"${THURM_HOME:-$HOME}\"; D=\"$TH/.ssh\"; F=\"$D/authorized_keys\"; T=\"$F.thurm-$$\"; N=\"\n\"; A=\"$1\"; V=\"$2\"; KB=\"${A#ecdsa-sha2-nistp256 }\"; ",
     "nw() { [ -e /etc/NIXOS ] && echo nixos >&2; echo \"authorized_keys is not writable\" >&2; exit 4; }; ",
     "if [ -z \"$1\" ] && [ ! -e \"$F\" ] && [ ! -L \"$F\" ]; then exit 0; fi; ",
     "if [ -L \"$F\" ]; then nw; fi; ",
@@ -317,7 +320,10 @@ const EDIT: &str = concat!(
     "unlock() { [ \"$(readlink \"$K\" 2>/dev/null)\" = \"$$@$H\" ] && rm -f \"$K\"; }; ",
     "trap unlock EXIT; trap \"exit 1\" INT TERM HUP; ",
     "ours() { case \"$L\" in \"restrict,port-forwarding ecdsa-sha2-nistp256 \"?*) ;; *) return 1 ;; esac; ",
-    "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; [ \"$R\" = \"$B thurm-ios:$V\" ]; }; ",
+    "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; [ -n \"$B\" ] || return 1; ",
+    "C=\"${R#\"$B\" }\"; case \"$C\" in *\" \"*) return 1 ;; thurm-ios:?*) ;; *) return 1 ;; esac; ",
+    "D0=\"${C#thurm-ios:}\"; if [ -z \"$A\" ]; then [ \"$D0\" = \"$V\" ]; return $?; fi; ",
+    "case \"$V\" in iPhone|iPad) [ \"$D0\" = \"$V\" ] && [ \"$B\" = \"$KB\" ] ;; *) [ \"$D0\" = \"$V\" ] ;; esac; }; ",
     // E: the line read had no newline (the last one). P: the last line written has none. M: a
     // line of the device was dropped.
     "P=; M=; { if [ -f \"$F\" ]; then while :; do E=; IFS= read -r L || E=1; ",
@@ -633,7 +639,12 @@ mod tests {
     /// A device name can't end the Nix string or interpolate into the configuration.
     #[test]
     fn nixos_snippet_is_one_string_literal() {
-        let k = DeviceKey::parse(&KEY.replace("iPhone", "a\"${builtins.x}")).unwrap();
+        let base = DeviceKey::parse(KEY).unwrap();
+        assert!(DeviceKey::parse(&KEY.replace("iPhone", "a\"${builtins.x}")).is_err());
+        let k = DeviceKey {
+            key: base.key.clone(),
+            device: "a\"${builtins.x}".into(),
+        };
         let snippet = nixos_snippet(&k);
         assert!(
             snippet.ends_with(" thurm-ios:a\\\"\\${builtins.x}\"\n];"),
@@ -641,12 +652,63 @@ mod tests {
         );
         assert_eq!(nix_string("a\\b\"c${d}$e"), "\"a\\\\b\\\"c\\${d}$e\"");
         assert_eq!(
-            nixos_snippet(&DeviceKey::parse(KEY).unwrap()),
+            nixos_snippet(&base),
             format!(
                 "users.users.<name>.openssh.authorizedKeys.keys = [\n  \"{}\"\n];",
-                DeviceKey::parse(KEY).unwrap().line()
+                base.line()
             )
         );
+    }
+
+    #[test]
+    fn pairing_second_generic_iphone_keeps_first_key() {
+        let home = std::env::temp_dir().join(format!("thurm-pair-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let local = Local(home.clone(), vec![]);
+        let file = home.join(".ssh/authorized_keys");
+
+        let k1 = DeviceKey::parse(KEY).unwrap();
+        // Second distinct P-256 blob with the same generic device name ("iPhone").
+        let mut blob2 = base64::engine::general_purpose::STANDARD
+            .decode(KEY.split(' ').nth(1).unwrap())
+            .unwrap();
+        blob2[103] ^= 0x01;
+        let k2 = DeviceKey::parse(&format!(
+            "ecdsa-sha2-nistp256 {} thurm-ios:iPhone",
+            base64::engine::general_purpose::STANDARD.encode(&blob2)
+        ))
+        .unwrap();
+
+        authorize(&local, &k1).unwrap();
+        authorize(&local, &k2).unwrap();
+        // Re-pairing k1 deduplicates k1 without touching k2.
+        authorize(&local, &k1).unwrap();
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content.lines().count(), 2);
+        assert!(content.contains(&k1.line()));
+        assert!(content.contains(&k2.line()));
+
+        // Unique non-generic device name rotates by name.
+        let named1 = DeviceKey {
+            key: k1.key.clone(),
+            device: "iPhone-7f3a".into(),
+        };
+        let named2 = DeviceKey {
+            key: k2.key.clone(),
+            device: "iPhone-7f3a".into(),
+        };
+        authorize(&local, &named1).unwrap();
+        authorize(&local, &named2).unwrap();
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content.lines().count(), 3);
+        assert!(!content.contains(&named1.line()));
+        assert!(content.contains(&named2.line()));
+
+        // Revoke by name still removes matching entries.
+        revoke(&local, "iPhone").unwrap();
+        assert_eq!(devices(&local).unwrap(), ["iPhone-7f3a"]);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     const LINK: (&str, &str) = ("THURM_PAIR_LOCK", "link");

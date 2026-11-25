@@ -107,12 +107,26 @@ struct ActivityJob {
     end: bool,
 }
 
+/// Classification of an agent notification, used for alert copy and relay metadata.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    Permission,
+    NeedsInput,
+    Done,
+    Error,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Notice {
     pub pane: PaneId,
     pub title: String,
     /// The permission prompt to answer, when that is what the agent wants.
     pub permission: Option<u64>,
+    /// What kind of agent state triggered the notice (optional for older callers).
+    pub kind: Option<NoticeKind>,
+    /// Sanitized session topic or pane title (never terminal content).
+    pub topic: Option<String>,
 }
 
 /// Locks: `devices` before `follows`, never the other way round.
@@ -125,8 +139,8 @@ pub struct Pusher {
     /// Each pane's last notice since it was last read, and the devices it sent notices to (see
     /// `read`).
     notified: Mutex<std::collections::HashMap<PaneId, (u64, Vec<String>)>>,
-    /// The next notice's sequence number. Starts at the clock (milliseconds), so numbers keep
-    /// growing across daemon restarts.
+    /// The next notice's sequence number. Initialized from `max(persisted + 1, now_ms)` and
+    /// persisted on each sent notice so backward clock steps never break `seq <= upTo` read-sync.
     next_seq: std::sync::atomic::AtomicU64,
     /// Shared with the push thread, which forgets a device the relay no longer knows.
     devices: Arc<Mutex<Vec<Device>>>,
@@ -142,6 +156,7 @@ pub struct Pusher {
     sending: Arc<Mutex<()>>,
     path: PathBuf,
     follows_path: PathBuf,
+    seq_path: PathBuf,
     tx: Sender<Job>,
 }
 
@@ -157,6 +172,7 @@ impl Pusher {
     pub fn new(state_dir: &Path, enabled: bool) -> Pusher {
         let path = state_dir.join("push-devices.json");
         let follows_path = state_dir.join("push-activities.json");
+        let seq_path = state_dir.join("push-seq.json");
         let devices = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -165,17 +181,21 @@ impl Pusher {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let persisted_seq: u64 = std::fs::read(&seq_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(0);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1);
+        let initial_seq = now_ms.max(persisted_seq.saturating_add(1)).max(1);
         let (tx, rx) = bounded::<Job>(64);
         let pusher = Pusher {
             enabled: Arc::new(AtomicBool::new(enabled)),
             last_notice: Mutex::new(std::collections::HashMap::new()),
             notified: Mutex::new(std::collections::HashMap::new()),
-            next_seq: std::sync::atomic::AtomicU64::new(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(1),
-            ),
+            next_seq: std::sync::atomic::AtomicU64::new(initial_seq),
             devices: Arc::new(Mutex::new(devices)),
             follows: Arc::new(Mutex::new(follows)),
             activities: Arc::new(Mutex::new(Vec::new())),
@@ -183,6 +203,7 @@ impl Pusher {
             sending: Arc::new(Mutex::new(())),
             path,
             follows_path,
+            seq_path,
             tx,
         };
         let activities = Arc::clone(&pusher.activities);
@@ -241,7 +262,7 @@ impl Pusher {
                                 job.end,
                             );
                             let r = post(&agent, &job.device, "/v1/activity", &body);
-                            store.check(&job.device, "live activity", r);
+                            store.check_activity(&job.device, &job.token, r);
                         }
                         // Draining the queue may have taken the wake-up of what waits now.
                         if reads.lock().is_empty() && activities.lock().is_empty() {
@@ -273,13 +294,11 @@ impl Pusher {
             return Err("push registration needs a device id and a secret".into());
         }
         let mut devices = self.devices.lock();
-        // The same phone registering again (a new relay, a new code) replaces its old
-        // registration, so it is not notified twice.
+        // Deduplicate strictly by stable device ID so two devices reporting the same generic name
+        // (e.g. two iPhones both named "iPhone") stay registered independently.
         let replaced: Vec<String> = devices
             .iter()
-            .filter(|d| {
-                d.device == device.device || (d.host == device.host && d.name == device.name)
-            })
+            .filter(|d| d.device == device.device)
             .map(|d| d.device.clone())
             .collect();
         devices.retain(|d| !replaced.contains(&d.device));
@@ -315,13 +334,14 @@ impl Pusher {
     }
 
     /// Forgets every device registered under the phone name `name` (spaces as dashes, as its
-    /// device key's comment has it) and its activities. Returns their ids.
+    /// device key's comment has it) or matching `device` id directly, and its activities.
+    /// Returns their ids.
     pub fn revoke_named(&self, name: &str) -> Result<Vec<String>, String> {
         let gone: Vec<String> = self
             .devices
             .lock()
             .iter()
-            .filter(|d| d.name.replace(' ', "-") == name)
+            .filter(|d| d.name.replace(' ', "-") == name || d.device == name)
             .map(|d| d.device.clone())
             .collect();
         if !gone.is_empty() {
@@ -347,17 +367,21 @@ impl Pusher {
         if devices.is_empty() || !self.fresh(&notice) {
             return;
         }
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let pane = notice.pane;
         let ids: Vec<String> = devices.iter().map(|d| d.device.clone()).collect();
-        // Held across the send, so a read can't come between queueing and recording.
+        // Held across sequence allocation, enqueueing, persistence and recording so seqs stay
+        // strictly monotonic on disk and a read can't race between queueing and recording.
         let mut notified = self.notified.lock();
+        let seq = self.next_seq.load(Ordering::Relaxed);
         if self.tx.try_send(Job::Notice(notice, seq, devices)).is_err() {
             // Dropped: no device will see it, so no device has it to take down, and the next
             // notice may buzz at once.
             self.last_notice.lock().remove(&pane);
             return;
         }
+        self.next_seq
+            .store(seq.saturating_add(1), Ordering::Relaxed);
+        let _ = save_json(&self.seq_path, &seq);
         let (last, sent) = notified.entry(pane).or_default();
         *last = seq;
         for id in ids {
@@ -410,7 +434,9 @@ impl Pusher {
     }
 
     /// `device` follows `pane` in a Live Activity with push `token` (replacing an earlier one).
-    /// The current state goes out at once.
+    /// When `state` is `Some`, seeds `last` without posting an immediate update so the daemon does
+    /// not overwrite the richer state the app started the Live Activity with. When `state` is
+    /// `None` (the agent already exited), ends the activity immediately.
     pub fn follow(
         &self,
         device: &str,
@@ -434,11 +460,13 @@ impl Pusher {
                 device: device.to_owned(),
                 pane,
                 token,
-                last: None,
+                last: state.clone(),
             });
             save_json(&self.follows_path, &*follows)?;
         }
-        self.agent_changed(pane, state, &[]);
+        if state.is_none() {
+            self.agent_changed(pane, None, &[]);
+        }
         Ok(())
     }
 
@@ -577,6 +605,35 @@ impl Store {
         Ok(true)
     }
 
+    /// Forgets a single dead Live Activity follow without removing the device registration.
+    fn forget_follow(&self, device_id: &str, token: &str) -> Result<bool, String> {
+        let mut follows = self.follows.lock();
+        let before = follows.len();
+        follows.retain(|f| !(f.device == device_id && f.token == token));
+        if follows.len() == before {
+            return Ok(false);
+        }
+        save_json(&self.follows_path, &*follows)?;
+        Ok(true)
+    }
+
+    /// After a `/v1/activity` post: an `ActivityGone` error prunes only that dead follow token,
+    /// keeping the device and its other Live Activities registered.
+    fn check_activity(&self, device: &Device, token: &str, result: Result<(), PostError>) {
+        match result {
+            Err(PostError::ActivityGone) => match self.forget_follow(&device.device, token) {
+                Ok(true) => log::info!(
+                    "live activity to {}: activity token unknown for {}; pruned follow",
+                    device.relay,
+                    device.name
+                ),
+                Ok(false) => {}
+                Err(e) => log::warn!("prune live activity for {}: {e}", device.name),
+            },
+            other => self.check(device, "live activity", other),
+        }
+    }
+
     /// After a post for `device`: the relay no longer knowing it (the phone deleted it, turning
     /// notifications off) means it is gone for good, here too.
     fn check(&self, device: &Device, what: &str, result: Result<(), PostError>) {
@@ -591,6 +648,9 @@ impl Store {
                 Ok(false) => {}
                 Err(e) => log::warn!("forget push device {}: {e}", device.name),
             },
+            Err(PostError::ActivityGone) => {
+                log::warn!("{what} to {} for {}: activity token unknown", device.relay, device.name);
+            }
             Err(PostError::Other(e)) => {
                 log::warn!("{what} to {} for {}: {e}", device.relay, device.name);
             }
@@ -602,6 +662,9 @@ enum PostError {
     /// The relay has no such device: a 404 with `X-Thurm-Device: unknown`. Any other 404 (a
     /// proxy, a route an older relay lacks) is not that.
     Gone,
+    /// The relay/APNs rejected a single Live Activity token (HTTP 410 or
+    /// `X-Thurm-Activity: unknown`): drop only that follow, keep the device.
+    ActivityGone,
     Other(String),
 }
 
@@ -698,12 +761,17 @@ fn validate_relay(relay: &str) -> Result<(), String> {
 
 /// The request body the relay gets for `notice` (sequence number `seq`), for `device`.
 pub fn body(device: &Device, notice: &Notice, seq: u64) -> String {
-    let text = if notice.permission.is_some() {
-        "asks for permission"
-    } else {
-        "needs your attention"
+    let kind = notice
+        .kind
+        .or_else(|| notice.permission.map(|_| NoticeKind::Permission));
+    let text = match kind {
+        Some(NoticeKind::Permission) => "asks for permission",
+        Some(NoticeKind::NeedsInput) => "is waiting for input",
+        Some(NoticeKind::Done) => "finished",
+        Some(NoticeKind::Error) => "failed",
+        None => "needs your attention",
     };
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "device": device.device,
         "host": device.host,
         "pane": notice.pane,
@@ -711,8 +779,20 @@ pub fn body(device: &Device, notice: &Notice, seq: u64) -> String {
         "body": text,
         "permission": notice.permission,
         "seq": seq,
-    })
-    .to_string()
+        "thread_id": format!("{}/{}", device.host, notice.pane),
+    });
+    if let Some(k) = kind {
+        payload["kind"] = serde_json::json!(k);
+    }
+    if let Some(topic) = notice
+        .topic
+        .as_deref()
+        .map(clean_title)
+        .filter(|t| !t.is_empty())
+    {
+        payload["topic"] = serde_json::Value::String(topic);
+    }
+    payload.to_string()
 }
 
 /// The request body the relay gets when `pane` was read, up to its notice `seq`, for `device`.
@@ -751,13 +831,21 @@ fn post(agent: &ureq::Agent, device: &Device, path: &str, body: &str) -> Result<
         .map_err(|e| PostError::Other(e.to_string()))
         .and_then(|response| {
             let status = response.status();
-            let unknown = response
+            let unknown_device = response
                 .headers()
                 .get("X-Thurm-Device")
-                .is_some_and(|v| v == "unknown");
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("unknown"));
+            let unknown_activity = response
+                .headers()
+                .get("X-Thurm-Activity")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("unknown"));
             match status.as_u16() {
                 200..=299 => Ok(()),
-                404 if unknown => Err(PostError::Gone),
+                404 if unknown_device => Err(PostError::Gone),
+                410 if path == "/v1/activity" => Err(PostError::ActivityGone),
+                _ if path == "/v1/activity" && unknown_activity => Err(PostError::ActivityGone),
                 _ => Err(PostError::Other(format!("http status: {status}"))),
             }
         })
@@ -786,6 +874,8 @@ mod tests {
             pane,
             title: "Claude Code".into(),
             permission,
+            kind: None,
+            topic: None,
         };
         assert!(p.fresh(&n(1, None)));
         assert!(
@@ -822,6 +912,8 @@ mod tests {
             pane,
             title: "Claude Code".into(),
             permission: None,
+            kind: None,
+            topic: None,
         };
         p.notify(n(1), &[]);
         let _stuck = held.join().unwrap();
@@ -901,6 +993,8 @@ mod tests {
             pane,
             title: "Claude Code".into(),
             permission: None,
+            kind: None,
+            topic: None,
         };
         let wait = Duration::from_secs(10);
         p.notify(n(1), &[]);
@@ -996,14 +1090,42 @@ mod tests {
                 pane: 3,
                 title: "Claude Code".into(),
                 permission: Some(9),
+                kind: Some(NoticeKind::Permission),
+                topic: Some("⠴ Fix the sidebar".into()),
             },
             42,
         ))
         .unwrap();
         assert_eq!(b["body"], "asks for permission");
+        assert_eq!(b["kind"], "permission");
+        assert_eq!(b["topic"], "Fix the sidebar");
+        assert_eq!(b["thread_id"], "studio/3");
         assert_eq!(b["seq"], 42);
         assert_eq!(b["host"], "studio");
         assert_eq!(b["permission"], 9);
+
+        for (kind, expected_kind, expected_body) in [
+            (NoticeKind::NeedsInput, "needs_input", "is waiting for input"),
+            (NoticeKind::Done, "done", "finished"),
+            (NoticeKind::Error, "error", "failed"),
+        ] {
+            let b: serde_json::Value = serde_json::from_str(&body(
+                &d,
+                &Notice {
+                    pane: 5,
+                    title: "Codex".into(),
+                    permission: None,
+                    kind: Some(kind),
+                    topic: None,
+                },
+                99,
+            ))
+            .unwrap();
+            assert_eq!(b["body"], expected_body);
+            assert_eq!(b["kind"], expected_kind);
+            assert_eq!(b["thread_id"], "studio/5");
+            assert!(b.get("topic").is_none());
+        }
     }
 
     #[test]
@@ -1024,27 +1146,34 @@ mod tests {
         p.register(d.clone()).unwrap();
         let again = Pusher::new(&dir, true);
         assert_eq!(*again.devices.lock(), vec![d.clone()]);
-        // The same phone through another relay replaces it; another phone does not.
+        // Same device id through another relay replaces it; a second iPhone with a distinct
+        // device id and the same generic name ("iPhone") stays registered alongside it.
         let moved = Device {
-            device: "d2".into(),
             relay: "https://other.example.net".into(),
             ..d.clone()
         };
         p.register(moved.clone()).unwrap();
+        let second_iphone = Device {
+            device: "d2".into(),
+            ..d.clone()
+        };
+        p.register(second_iphone.clone()).unwrap();
         let ipad = Device {
             device: "d3".into(),
             name: "iPad".into(),
             ..d.clone()
         };
         p.register(ipad.clone()).unwrap();
-        assert_eq!(*p.devices.lock(), vec![moved, ipad]);
+        assert_eq!(*p.devices.lock(), vec![moved, second_iphone, ipad]);
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(dir.join("push-devices.json"))
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
-        p.unregister("d2").unwrap();
+        // Revoking by device id removes only that device; revoking by name removes matching names.
+        assert_eq!(p.revoke_named("d2").unwrap(), ["d2"]);
+        p.unregister("d1").unwrap();
         p.unregister("d3").unwrap();
         assert!(Pusher::new(&dir, true).devices.lock().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1087,6 +1216,8 @@ mod tests {
             pane,
             title: "Codex".into(),
             permission: None,
+            kind: None,
+            topic: None,
         };
         p.notify(notice(1), &[]);
         posts
@@ -1148,6 +1279,8 @@ mod tests {
             pane,
             title: "Codex".into(),
             permission: None,
+            kind: None,
+            topic: None,
         };
         p.notify(notice(1), &[]);
         posts
@@ -1155,7 +1288,14 @@ mod tests {
             .expect("the first notice");
         // Queued while the relay holds the first one: a notice and a Live Activity update.
         p.notify(notice(2), &[]);
-        p.follow("d1", 3, "aa".into(), Some(working)).unwrap();
+        p.follow("d1", 3, "aa".into(), Some(working.clone()))
+            .unwrap();
+        let asking = ActivityState {
+            status: "permission".into(),
+            permission: Some(7),
+            ..working
+        };
+        p.agent_changed(3, Some(asking), &[]);
         assert_eq!(p.revoke_named("iPhone").unwrap(), ["d1"]);
         // Settling waits for the post in flight, and only for it.
         let p = Arc::new(p);
@@ -1328,6 +1468,8 @@ mod tests {
                 pane: 1,
                 title: "Codex".into(),
                 permission: Some(1),
+                kind: Some(NoticeKind::Permission),
+                topic: None,
             },
             &["d2".to_owned()],
         );
@@ -1382,6 +1524,8 @@ mod tests {
                     pane,
                     title: "Codex".into(),
                     permission: Some(1),
+                    kind: Some(NoticeKind::Permission),
+                    topic: None,
                 },
                 &[],
             );
@@ -1482,7 +1626,19 @@ mod tests {
         };
         p.follow("d1", 4, "aa".into(), Some(working.clone()))
             .unwrap();
-        assert_eq!(next()["state"]["status"], "working");
+        // Following an active agent seeds `last` without posting an immediate update that could
+        // overwrite richer local Live Activity state (such as a verbatim permission request).
+        assert!(
+            posts.recv_timeout(Duration::from_millis(250)).is_err(),
+            "follow with Some(state) must not post an immediate /v1/activity overwrite"
+        );
+        // A real state transition does post an update when the app is not open.
+        let done = ActivityState {
+            status: "done".into(),
+            ..working.clone()
+        };
+        p.agent_changed(4, Some(done), &[]);
+        assert_eq!(next()["state"]["status"], "done");
         // The app is open and shows the prompt itself.
         let asking = ActivityState {
             status: "permission".into(),
@@ -1503,6 +1659,128 @@ mod tests {
         assert_eq!(end["event"], "end");
         assert_eq!(end["token"], "bb");
         assert!(p.follows.lock().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dead_activity_token_prunes_only_that_follow_and_keeps_device() {
+        use std::io::{BufRead, BufReader, Write};
+        for response in [
+            "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 404 Not Found\r\nX-Thurm-Activity: unknown\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ] {
+            let tag = if response.contains("410") { "410" } else { "hdr" };
+            let dir = std::env::temp_dir().join(format!(
+                "thurm-push-actgone-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let relay = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let resp = response.to_owned();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                        line.clear();
+                    }
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            let p = Pusher::new(&dir, true);
+            p.register(Device {
+                device: "d1".into(),
+                relay,
+                secret: "s".repeat(32),
+                host: "studio".into(),
+                name: "iPhone".into(),
+            })
+            .unwrap();
+            let working = ActivityState {
+                agent: "Codex".into(),
+                status: "working".into(),
+                title: "proj".into(),
+                since: 1,
+                permission: None,
+            };
+            p.follow("d1", 1, "aaaa".into(), Some(working.clone()))
+                .unwrap();
+            p.follow("d1", 2, "bbbb".into(), Some(working.clone()))
+                .unwrap();
+            let done = ActivityState {
+                status: "done".into(),
+                ..working
+            };
+            p.agent_changed(1, Some(done), &[]);
+            let start = std::time::Instant::now();
+            while p.follows.lock().len() != 1 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "dead activity token was not pruned ({tag})"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(p.devices.lock().len(), 1, "device must stay registered ({tag})");
+            assert_eq!(p.follows.lock()[0].token, "bbbb", "other follow must stay ({tag})");
+            let again = Pusher::new(&dir, true);
+            assert_eq!(again.devices.lock().len(), 1);
+            assert_eq!(again.follows.lock().len(), 1);
+            assert_eq!(again.follows.lock()[0].token, "bbbb");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn sequence_numbers_stay_monotonic_across_restarts_and_backward_clock_steps() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-seq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (relay, posts) = capturing_relay();
+        // Simulate a previously persisted seq far in the future (clock stepped backward).
+        let future_seq: u64 = 9_999_999_999_000;
+        save_json(&dir.join("push-seq.json"), &future_seq).unwrap();
+
+        let p = Pusher::new(&dir, true);
+        p.register(Device {
+            device: "d1".into(),
+            relay: relay.clone(),
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        })
+        .unwrap();
+        p.notify(
+            Notice {
+                pane: 1,
+                title: "Claude Code".into(),
+                permission: Some(1),
+                kind: Some(NoticeKind::Permission),
+                topic: None,
+            },
+            &[],
+        );
+        let first: serde_json::Value =
+            serde_json::from_str(&posts.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        let seq1 = first["seq"].as_u64().unwrap();
+        assert_eq!(seq1, future_seq + 1);
+
+        // Restart Pusher: next seq must continue strictly above seq1.
+        let p2 = Pusher::new(&dir, true);
+        p2.notify(
+            Notice {
+                pane: 2,
+                title: "Claude Code".into(),
+                permission: Some(2),
+                kind: Some(NoticeKind::Permission),
+                topic: None,
+            },
+            &[],
+        );
+        let second: serde_json::Value =
+            serde_json::from_str(&posts.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        let seq2 = second["seq"].as_u64().unwrap();
+        assert_eq!(seq2, seq1 + 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

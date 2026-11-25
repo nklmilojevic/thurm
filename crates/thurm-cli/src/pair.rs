@@ -46,7 +46,7 @@ pub fn run(c: &Client, name: Option<String>, link_only: bool, json: bool) -> sup
             .map(String::as_str)
             .collect();
         println!(
-            "The phone connects to {} and needs the tailnet's VPN (Tailscale, or your headscale client), signed in as {}.",
+            "The phone connects to {} and needs Tailscale (Tailscale in Thurm, the Tailscale app, or your headscale client), signed in as {}.",
             reach.join(", "),
             status
                 .account

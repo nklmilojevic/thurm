@@ -149,10 +149,15 @@ enum PhonePairing {
             .map(\.element)
     }
 
-    /// Whether there is a code to show: the phone needs this Mac's ssh address and host keys, or
-    /// its Tailscale address, which needs neither (as `PairingPayload` checks in the iOS app).
-    static func canPair(host: String, hostKeys: [String], tailnet: String?, plain: [String] = []) -> Bool {
-        (!host.isEmpty && !hostKeys.isEmpty) || !(tailnet ?? "").isEmpty || !plain.isEmpty
+    /// Whether there is a code to show: the phone needs this Mac's ssh address (with a valid port)
+    /// and host keys, or its Tailscale address, which needs neither (as `PairingPayload` checks in
+    /// the iOS app).
+    static func canPair(host: String, port: Int = 22, hostKeys: [String], tailnet: String?,
+                        plain: [String] = []) -> Bool {
+        let sshReady = !host.trimmingCharacters(in: .whitespaces).isEmpty
+            && (1...65535).contains(port)
+            && !hostKeys.isEmpty
+        return sshReady || !(tailnet ?? "").isEmpty || !plain.isEmpty
     }
 
     /// What the QR code carries (see `PairingPayload` in the iOS app). Remote hosts not checked
@@ -163,8 +168,12 @@ enum PhonePairing {
     static func payload(name: String, host: String, port: Int, user: String, hostKeys: [String],
                         relay: String?, code: String?, remotes: [RemoteHost] = [], tailnet: String? = nil,
                         plain: [String] = []) -> String {
-        var d: [String: Any] = ["v": 1, "name": name, "host": host, "port": port, "user": user,
-                                "host_keys": hostKeys]
+        let trimmedHost = host.trimmingCharacters(in: .whitespaces)
+        let validPort = (1...65535).contains(port)
+        let validSSH = !trimmedHost.isEmpty && validPort
+        var d: [String: Any] = ["v": 1, "name": name, "host": trimmedHost,
+                                "port": validPort ? port : 22, "user": user,
+                                "host_keys": validSSH ? hostKeys : []]
         if let tailnet, !tailnet.isEmpty { d["tailnet"] = ["url": tailnet] }
         if !plain.isEmpty { d["tailnet_plain"] = plain }
         if let relay, !relay.isEmpty { d["relay"] = relay }
@@ -176,6 +185,18 @@ enum PhonePairing {
             .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
         return "thurm://pair?d=" + b64
+    }
+
+    /// Valid device name characters matching `thurm-remote`'s `validate_device_name`:
+    /// 1–128 ASCII letters, digits, `.`, `_`, or `-`.
+    static func isValidDeviceName(_ device: String) -> Bool {
+        guard !device.isEmpty, device.utf8.count <= 128 else { return false }
+        return device.unicodeScalars.allSatisfy { s in
+            (s.value >= 0x30 && s.value <= 0x39)
+                || (s.value >= 0x41 && s.value <= 0x5A)
+                || (s.value >= 0x61 && s.value <= 0x7A)
+                || s == "." || s == "_" || s == "-"
+        }
     }
 
     /// A device key line from the iOS app, checked: only its P-256 keys with Thurm's comment, on
@@ -190,7 +211,9 @@ enum PhonePairing {
               let blob = Data(base64Encoded: String(parts[1])), isP256PublicKey(blob),
               parts[2].hasPrefix(commentPrefix), parts[2].count > commentPrefix.count
         else { return nil }
-        return ("\(parts[0]) \(parts[1])", String(parts[2].dropFirst(commentPrefix.count)))
+        let device = String(parts[2].dropFirst(commentPrefix.count))
+        guard isValidDeviceName(device) else { return nil }
+        return ("\(parts[0]) \(parts[1])", device)
     }
 
     /// An ssh `ecdsa-sha2-nistp256` public key blob: the algorithm, the curve and a point on it.
@@ -227,23 +250,41 @@ enum PhonePairing {
         }
     }
 
-    /// The device of a line Thurm wrote (exactly `restrict,port-forwarding ecdsa-sha2-nistp256
+    /// Parses a line Thurm wrote (exactly `restrict,port-forwarding ecdsa-sha2-nistp256
     /// <key> thurm-ios:<device>`); nil for any other line, even one ending the same way.
-    static func deviceName(ofLine line: Substring) -> String? {
+    static func parseDeviceLine(_ line: Substring) -> (key: String, device: String)? {
         let parts = line.split(separator: " ", omittingEmptySubsequences: false)
         guard parts.count == 4, parts[0] == keyOptions, parts[1] == "ecdsa-sha2-nistp256", !parts[2].isEmpty,
               parts[3].hasPrefix(commentPrefix), parts[3].count > commentPrefix.count
         else { return nil }
-        return String(parts[3].dropFirst(commentPrefix.count))
+        return ("\(parts[1]) \(parts[2])", String(parts[3].dropFirst(commentPrefix.count)))
     }
 
-    /// Adds (or replaces, by device name) a device key. Creates ~/.ssh (0700) and the file (0600).
+    /// The device of a line Thurm wrote (exactly `restrict,port-forwarding ecdsa-sha2-nistp256
+    /// <key> thurm-ios:<device>`); nil for any other line, even one ending the same way.
+    static func deviceName(ofLine line: Substring) -> String? {
+        parseDeviceLine(line)?.device
+    }
+
+    private static func isGenericDeviceName(_ device: String) -> Bool {
+        device == "iPhone" || device == "iPad"
+    }
+
+    /// Adds a device key, deduplicating by public key blob (and by unique non-generic device name
+    /// so key rotation replaces old keys without pairing a second "iPhone" revoking the first).
+    /// Creates ~/.ssh (0700) and the file (0600).
     static func add(key: String, device: String, to file: URL = authorizedKeys) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
                                attributes: [.posixPermissions: 0o700])
         var lines = try lines(of: file)
-        lines.removeAll { deviceName(ofLine: $0[...]) == device }
+        lines.removeAll { line in
+            guard let existing = parseDeviceLine(line[...]) else { return false }
+            if isGenericDeviceName(device) {
+                return existing.key == key && existing.device == device
+            }
+            return existing.key == key || existing.device == device
+        }
         lines.append("\(keyOptions) \(key) \(commentPrefix)\(device)")
         try write(lines, to: file)
     }
@@ -336,8 +377,10 @@ enum PhonePairing {
 struct PairPhoneSheet: View {
     @ObservedObject var remotes: RemoteHosts
     @State private var host = ""
+    @State private var loadingHost = true
     @State private var port = 22
     @State private var deviceKey = ""
+    @State private var showSSHKeyStep = false
     @State private var devices = PhonePairing.devices()
     @State private var message: String?
     @State private var remoteLogin: Bool?
@@ -375,9 +418,21 @@ struct PairPhoneSheet: View {
                              plain: tailscale.status?.pairingPlain ?? [])
     }
 
+    private var validPort: Bool {
+        (1...65535).contains(port)
+    }
+
     private var canPair: Bool {
-        PhonePairing.canPair(host: host, hostKeys: hostKeys, tailnet: tailscale.status?.pairingURL,
+        PhonePairing.canPair(host: host, port: port, hostKeys: hostKeys,
+                             tailnet: tailscale.status?.pairingURL,
                              plain: tailscale.status?.pairingPlain ?? [])
+    }
+
+    /// Whether the pairing code includes at least one SSH target (this Mac or a checked remote),
+    /// so Step 2 (pasting the phone's device key) is required rather than optional.
+    private var needsSSHKey: Bool {
+        let localSSH = !host.trimmingCharacters(in: .whitespaces).isEmpty && validPort && !hostKeys.isEmpty
+        return localSSH || !PhonePairing.keyHosts(remoteHosts).isEmpty
     }
 
     var body: some View {
@@ -392,14 +447,23 @@ struct PairPhoneSheet: View {
                       systemImage: "network")
                     .foregroundStyle(.secondary)
             }
-            if remoteLogin == false {
+            if !validPort {
+                Label("SSH port must be between 1 and 65535.", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
+            if remoteLogin == false && validPort {
                 Label(tailscale.status?.hasTailnetRoute != true
                       ? "Remote Login is off. Turn it on in System Settings › General › Sharing so the app can connect."
                       : "Remote Login is off: the app has no fallback when Tailscale is off on the phone.",
                       systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             }
-            if !canPair {
+            if loadingHost && host.isEmpty && !canPair {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Finding this Mac's address…").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if !canPair {
                 Label("Pairing over Tailscale needs HTTPS or a plain endpoint: set tailscale.host_listen, or "
                       + "tailscale.plain_listen for a tailnet without HTTPS, in the config.", systemImage: "info.circle")
                     .foregroundStyle(.secondary)
@@ -453,12 +517,19 @@ struct PairPhoneSheet: View {
             }
             remoteHostRows
             Divider()
-            Text("2. Paste the device key the app shows (Universal Clipboard or AirDrop).")
-            HStack {
-                TextField("ecdsa-sha2-nistp256 AAAA… thurm-ios:iPhone", text: $deviceKey)
-                    .font(.system(.caption, design: .monospaced))
-                Button("Add Device Key") { addKey() }
-                    .disabled(PhonePairing.validDeviceKey(deviceKey) == nil)
+            if needsSSHKey {
+                Text("2. Paste the device key the app shows (Universal Clipboard or AirDrop).")
+                deviceKeyInputRow
+            } else {
+                DisclosureGroup("2. Add device key (optional — not needed over Tailscale)",
+                                isExpanded: $showSSHKeyStep) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Only needed if you later add an SSH fallback address.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        deviceKeyInputRow
+                    }
+                    .padding(.top, 4)
+                }
             }
             if let message {
                 Text(message).font(.caption).foregroundStyle(.secondary)
@@ -473,15 +544,30 @@ struct PairPhoneSheet: View {
         }
         .padding(20)
         .frame(width: 640)
+        .onChange(of: port) { _, _ in
+            checkRemoteLogin()
+        }
         .onAppear {
             DispatchQueue.global(qos: .userInitiated).async {
                 let name = PhonePairing.defaultHostName()
-                DispatchQueue.main.async { if host.isEmpty { host = name } }
+                DispatchQueue.main.async {
+                    if host.isEmpty { host = name }
+                    loadingHost = false
+                }
             }
             checkRemoteLogin()
             checkCLI()
             loadRemoteHosts()
             tailscale.refresh()
+        }
+    }
+
+    private var deviceKeyInputRow: some View {
+        HStack {
+            TextField("ecdsa-sha2-nistp256 AAAA… thurm-ios:iPhone", text: $deviceKey)
+                .font(.system(.caption, design: .monospaced))
+            Button("Add Device Key") { addKey() }
+                .disabled(PhonePairing.validDeviceKey(deviceKey) == nil)
         }
     }
 
@@ -530,6 +616,9 @@ struct PairPhoneSheet: View {
     private func state(of h: PhonePairing.RemoteHost) -> String {
         if h.tailnet != nil {
             return h.hasSSH ? "Over Tailscale, ssh as the fallback" : "Over Tailscale"
+        }
+        if !h.plain.isEmpty {
+            return h.hasSSH ? "Over tailnet, ssh as the fallback" : "Over tailnet"
         }
         if let error = h.error {
             return error.hasPrefix("no known host key") ? "Connect to it from this Mac once" : error
@@ -735,8 +824,11 @@ struct PairPhoneSheet: View {
 
     /// Whether sshd answers on this Mac (Remote Login).
     private func checkRemoteLogin() {
-        let conn = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(integerLiteral: UInt16(clamping: port)),
-                                using: .tcp)
+        guard validPort, let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
+            remoteLogin = nil
+            return
+        }
+        let conn = NWConnection(host: "127.0.0.1", port: nwPort, using: .tcp)
         conn.stateUpdateHandler = { state in
             switch state {
             case .ready:

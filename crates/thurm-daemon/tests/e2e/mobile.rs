@@ -688,16 +688,27 @@ fn followed_agents_post_live_activity_updates_until_the_pane_closes() {
             }
         }
     };
-    let first = activity("first update");
-    assert_eq!(first["event"], "update");
-    assert_eq!(first["token"], "ab12cd");
-    assert_eq!(first["state"]["status"], "working");
-    assert_eq!(first["state"]["agent"], "Claude Code");
+    // Initial FollowAgent seeds last state without immediately pushing a request-less update
+    // (which would overwrite the phone's locally shown permission request / Allow button).
+    assert!(
+        posts.recv_timeout(Duration::from_millis(400)).is_err(),
+        "FollowAgent should not push an unsolicited initial update when state is unchanged"
+    );
 
     hook(&mac, pane, "permission-prompt", None);
     let asked = activity("permission update");
+    assert_eq!(asked["event"], "update");
+    assert_eq!(asked["token"], "ab12cd");
     assert_eq!(asked["state"]["status"], "permission");
+    assert_eq!(asked["state"]["agent"], "Claude Code");
     assert!(asked["state"]["permission"].is_u64());
+
+    hook(&mac, pane, "prompt-submit", None);
+    let resumed = activity("working update");
+    assert_eq!(resumed["event"], "update");
+    assert_eq!(resumed["token"], "ab12cd");
+    assert_eq!(resumed["state"]["status"], "working");
+    assert_eq!(resumed["state"]["agent"], "Claude Code");
 
     mac.request(Request::ClosePane { pane }).unwrap();
     let end = activity("end");
