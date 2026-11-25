@@ -1064,18 +1064,32 @@ final class SessionManager: NSObject, CoreDelegate {
         scheduleLayoutSave()
     }
 
-    /// Focuses a pane, bringing its tab to the front.
-    func focusPane(_ id: PaneKey, activate: Bool) {
+    /// Focuses a pane, bringing its workspace and tab to the front.
+    func focusPane(_ id: PaneKey, activate: Bool, from host: TerminalWindowController? = nil) {
+        if tab(for: id) == nil,
+           let ws = workspaces.first(where: { !isShown($0) && $0.hiddenTabs.contains { $0.panes.contains(id) } }),
+           let idx = ws.hiddenTabs.firstIndex(where: { $0.panes.contains(id) }) {
+            ws.hiddenSelectedTab = idx
+            if let target = host.flatMap({ $0.isClosed ? nil : $0 }) ?? currentRegularController {
+                switchWorkspace(in: target, to: ws)
+            } else {
+                openWorkspaceInNewWindow(ws)
+            }
+        }
         guard let t = tab(for: id), let c = t.windowController else { return }
         if c.isQuick {
             QuickTerminal.shared.show()
         } else {
             if c.usesSingleWindowTabs && !t.isSelected {
                 c.selectTab(t, focus: false)
+            } else if let w = c.window, w.tabGroup?.selectedWindow !== w {
+                w.tabGroup?.selectedWindow = w
             }
+            if c.window?.isMiniaturized == true { c.window?.deminiaturize(nil) }
             c.window?.makeKeyAndOrderFront(nil)
         }
         t.content.focus(id)
+        c.sidebar?.reload()
         if activate { NSApp.activate() }
     }
 

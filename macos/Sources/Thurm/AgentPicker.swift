@@ -55,14 +55,7 @@ extension SessionManager {
     /// Brings an agent's pane forward: its window and tab, its split, its workspace (shown in
     /// `host`'s window when no window shows it).
     func focusAgent(_ a: AgentPane, from host: TerminalWindowController?) {
-        if let ws = a.hidden {
-            if let c = host ?? currentController {
-                switchWorkspace(in: c, to: ws)
-            } else {
-                openWorkspaceInNewWindow(ws)
-            }
-        }
-        focusPane(a.pane, activate: true)
+        focusPane(a.pane, activate: true, from: host)
     }
 
     /// ⌘⇧A: pick a coding agent, the ones waiting for you first; or start a new one.
