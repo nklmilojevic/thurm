@@ -962,12 +962,12 @@ final class TerminalRenderer {
         // Cursor geometry.
         let cursorRow = Int(info.cursor_row)
         let cursorCol = Int(info.cursor_col)
+        var shape = p.cursorShapeOverride ?? info.cursor_shape
         let cursorShown = (info.modes & TermMode.showCursor) != 0
-            && info.cursor_shape != CursorShapeCode.hidden
+            && shape != CursorShapeCode.hidden
             && info.display_offset == 0
             && cursorRow < rows && cursorCol < cols
             && (p.cursorOn || !p.focused)
-        var shape = p.cursorShapeOverride ?? info.cursor_shape
         if !p.focused { shape = CursorShapeCode.hollowBlock }
         let blockCursor = cursorShown && shape == CursorShapeCode.block
 
@@ -1206,7 +1206,7 @@ final class TerminalRenderer {
             let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: Int(width),
                                                                 height: Int(height), mipmapped: false)
             desc.usage = [.shaderRead]
-            guard let made = device.makeTexture(descriptor: desc) else { return .invalid }
+            guard let made = device.makeTexture(descriptor: desc) else { return .missing }
             made.replace(region: MTLRegionMake2D(0, 0, Int(width), Int(height)), mipmapLevel: 0,
                          withBytes: src, bytesPerRow: Int(width) * 4)
             tex = made
@@ -1218,7 +1218,7 @@ final class TerminalRenderer {
             let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: dstW,
                                                                 height: dstH, mipmapped: false)
             desc.usage = [.shaderRead]
-            guard let made = device.makeTexture(descriptor: desc) else { return .invalid }
+            guard let made = device.makeTexture(descriptor: desc) else { return .missing }
             let srcW = Int(width)
             let srcH = Int(height)
             var downscaled = [UInt8](repeating: 0, count: dstW * dstH * 4)
