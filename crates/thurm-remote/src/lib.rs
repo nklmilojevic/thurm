@@ -215,6 +215,7 @@ const START: &str = concat!(
     "if [ -x \"$D/thurmd\" ]; then T=\"$D/thurmd\"; break; fi; done; fi; ",
     "[ -n \"$T\" ] || T=\"$(command -v thurmd)\"; ",
     "[ -n \"$T\" ] || { echo \"thurmd is not installed\" >&2; exit 3; }; ",
+    "unset SSH_CONNECTION SSH_CLIENT SSH_TTY SSH_ORIGINAL_COMMAND; ",
     "exec \"$T\" --daemonize --socket \"$1\" </dev/null >/dev/null 2>&1"
 );
 
@@ -321,6 +322,60 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap().trim(),
             "--daemonize --socket /tmp/x.sock"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn start_unsets_ssh_session_env_and_preserves_auth_sock() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(!START.contains("SSH_AUTH_SOCK"));
+        let base = std::env::temp_dir().join(format!("thurm-start-ssh-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let bin = base.join("home/.local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = base.join("env");
+        let daemon = bin.join("thurmd");
+        std::fs::write(
+            &daemon,
+            format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "{{\n",
+                    "  printf 'SSH_CONNECTION=%s\\n' \"${{SSH_CONNECTION-<unset>}}\"\n",
+                    "  printf 'SSH_CLIENT=%s\\n' \"${{SSH_CLIENT-<unset>}}\"\n",
+                    "  printf 'SSH_TTY=%s\\n' \"${{SSH_TTY-<unset>}}\"\n",
+                    "  printf 'SSH_ORIGINAL_COMMAND=%s\\n' \"${{SSH_ORIGINAL_COMMAND-<unset>}}\"\n",
+                    "  printf 'SSH_AUTH_SOCK=%s\\n' \"${{SSH_AUTH_SOCK-<unset>}}\"\n",
+                    "}} > {}\n",
+                ),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", START, "thurm", "/tmp/x.sock"])
+            .env("THURM_HOME", base.join("home"))
+            .env("THURM_BASE_PATH", "/usr/bin:/bin")
+            .env("SSH_CONNECTION", "10.0.0.1 54321 10.0.0.2 22")
+            .env("SSH_CLIENT", "10.0.0.1 54321 22")
+            .env("SSH_TTY", "/dev/pts/0")
+            .env("SSH_ORIGINAL_COMMAND", "thurmd")
+            .env("SSH_AUTH_SOCK", "/tmp/thurm-test-agent.sock")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            concat!(
+                "SSH_CONNECTION=<unset>\n",
+                "SSH_CLIENT=<unset>\n",
+                "SSH_TTY=<unset>\n",
+                "SSH_ORIGINAL_COMMAND=<unset>\n",
+                "SSH_AUTH_SOCK=/tmp/thurm-test-agent.sock\n",
+            )
         );
         let _ = std::fs::remove_dir_all(&base);
     }
