@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use ::thurm_client::{Client, ConnectOptions};
+use ::thurm_client::{Client, ClientError, ConnectOptions};
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use thurm_proto::{
     Event, Frame, ImagePlacement, Key, KeyAction, KeyEvent, MouseButton, MouseEvent, MouseKind,
@@ -376,7 +376,7 @@ impl Subscriptions {
                 if !had_local {
                     *self.discard_attach.entry(old).or_insert(0) += 1;
                 }
-                let _ = client.send(Request::Unsubscribe { pane: old });
+                send_checked(client, Request::Unsubscribe { pane: old });
             }
         }
     }
@@ -719,7 +719,7 @@ pub unsafe extern "C" fn thurm_clipboard_answer(
     let sent = std::thread::Builder::new()
         .name("clipboard-answer".into())
         .spawn(move || {
-            let _ = client.send(Request::ClipboardAnswer { id, data });
+            send_checked(&client, Request::ClipboardAnswer { id, data });
         });
     if let Err(e) = sent {
         log::warn!("cannot send a clipboard answer: {e}");
@@ -1054,7 +1054,7 @@ pub unsafe extern "C" fn thurm_send(client: *mut thurm_client, json: *const c_ch
     match serde_json::from_str::<Request>(json) {
         Ok(req) => {
             if let Err(req) = c.local_request(req) {
-                let _ = c.client.send(req);
+                send_checked(&c.client, req);
             }
         }
         Err(e) => log::warn!("thurm_send: bad request: {e}"),
@@ -1106,14 +1106,31 @@ impl thurm_client {
     /// Bytes the local copy encoded for the program (keys, mouse reports).
     fn input(&self, pane: PaneId, data: Vec<u8>) {
         if !data.is_empty() {
-            let _ = self.client.send(Request::Input { pane, data });
+            send_checked(&self.client, Request::Input { pane, data });
         }
+    }
+}
+
+/// Enqueues `req` onto `client`. If the bounded outgoing byte queue is full (peer/tunnel stalled),
+/// forces a disconnect immediately rather than silently discarding accepted UI input or control
+/// frames on an apparently live connection, allowing the UI to show offline state and resync.
+fn send_checked(client: &Client, req: Request) -> bool {
+    match client.send(req) {
+        Ok(()) => true,
+        Err(ClientError::QueueFull) => {
+            log::warn!(
+                "thurm-ffi: outgoing queue full; closing stalled connection to resynchronize"
+            );
+            client.force_close();
+            false
+        }
+        Err(_) => false,
     }
 }
 
 fn send(client: *mut thurm_client, req: Request) {
     if let Some(c) = unsafe { client_ref(client) } {
-        let _ = c.client.send(req);
+        send_checked(&c.client, req);
     }
 }
 
@@ -1124,14 +1141,19 @@ pub unsafe extern "C" fn thurm_subscribe(client: *mut thurm_client, pane: u64) {
     };
     let fire = {
         let mut subs = c.shared.subs.lock();
-        *subs.active.entry(pane).or_insert(0) += 1;
-        subs.remove_warm(pane);
         if subs.subscribed.contains(&pane) {
+            *subs.active.entry(pane).or_insert(0) += 1;
+            subs.remove_warm(pane);
             // Warm hit or overlapping active view: stay subscribed without re-attaching.
             c.shared.locals.lock().contains_key(&pane)
-        } else {
+        } else if send_checked(&c.client, Request::Subscribe { pane }) {
+            *subs.active.entry(pane).or_insert(0) += 1;
+            subs.remove_warm(pane);
             subs.subscribed.insert(pane);
-            let _ = c.client.send(Request::Subscribe { pane });
+            false
+        } else {
+            // Subscribe frame was not accepted (queue full -> disconnected, or already dead):
+            // do not leave local bookkeeping claiming the pane is subscribed.
             false
         }
     };
@@ -1165,7 +1187,7 @@ pub unsafe extern "C" fn thurm_unsubscribe(client: *mut thurm_client, pane: u64)
         if was_subscribed && !had_local {
             *subs.discard_attach.entry(pane).or_insert(0) += 1;
         }
-        let _ = c.client.send(Request::Unsubscribe { pane });
+        send_checked(&c.client, Request::Unsubscribe { pane });
     } else {
         c.shared.locals.lock().remove(&pane);
     }
@@ -1195,7 +1217,7 @@ pub unsafe extern "C" fn thurm_evict_pane(client: *mut thurm_client, pane: u64) 
         if !had_local {
             *subs.discard_attach.entry(pane).or_insert(0) += 1;
         }
-        let _ = c.client.send(Request::Unsubscribe { pane });
+        send_checked(&c.client, Request::Unsubscribe { pane });
     }
 }
 
@@ -1208,10 +1230,11 @@ pub unsafe extern "C" fn thurm_prewarm_pane(client: *mut thurm_client, pane: u64
     if subs.warm_limit == 0 || subs.subscribed.contains(&pane) || subs.active.contains_key(&pane) {
         return;
     }
-    subs.subscribed.insert(pane);
-    subs.warm_order.push_back(pane);
-    let _ = c.client.send(Request::Subscribe { pane });
-    subs.evict_excess(&c.shared, &c.client);
+    if send_checked(&c.client, Request::Subscribe { pane }) {
+        subs.subscribed.insert(pane);
+        subs.warm_order.push_back(pane);
+        subs.evict_excess(&c.shared, &c.client);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1393,7 +1416,7 @@ pub unsafe extern "C" fn thurm_key(
             c.input(pane, bytes);
         }
         None => {
-            let _ = c.client.send(Request::Key { pane, key });
+            send_checked(&c.client, Request::Key { pane, key });
         }
     }
 }
@@ -1435,7 +1458,7 @@ pub unsafe extern "C" fn thurm_mouse(
         return;
     };
     let Some(local) = c.shared.local(pane) else {
-        let _ = c.client.send(Request::Mouse { pane, event });
+        send_checked(&c.client, Request::Mouse { pane, event });
         return;
     };
     let (text, bytes) = {
@@ -1484,13 +1507,16 @@ pub unsafe extern "C" fn thurm_wheel(
             c.input(pane, bytes);
         }
         None => {
-            let _ = c.client.send(Request::Wheel {
-                pane,
-                lines,
-                col,
-                row,
-                mods,
-            });
+            send_checked(
+                &c.client,
+                Request::Wheel {
+                    pane,
+                    lines,
+                    col,
+                    row,
+                    mods,
+                },
+            );
         }
     }
 }
@@ -2856,5 +2882,142 @@ mod tests {
         assert!(subs.subscribed.is_empty());
         drop(subs);
         assert!(shared.locals.lock().is_empty());
+    }
+
+    fn start_stalled_ffi_client() -> (
+        *mut thurm_client,
+        Arc<MockCallbacks>,
+        *mut MockCallbacks,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::os::unix::net::UnixStream;
+        use thurm_proto::{Envelope, ServerMessage, codec};
+
+        let (client_stream, mut peer) = UnixStream::pair().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let hello: Envelope = codec::read_message(&mut peer).unwrap().unwrap();
+            codec::write_message(
+                &mut peer,
+                &ServerMessage::Response {
+                    id: hello.id,
+                    result: Ok(Response::Hello {
+                        version: thurm_proto::PROTOCOL_VERSION,
+                        daemon_pid: 1,
+                        restored: false,
+                        build: String::new(),
+                        capabilities: thurm_proto::CAPABILITIES
+                            .iter()
+                            .map(|c| (*c).to_owned())
+                            .collect(),
+                    }),
+                },
+            )
+            .unwrap();
+            // Stop reading so outgoing writes stall and exhaust the client's byte budget.
+            let _ = stop_rx.recv();
+        });
+
+        let callbacks = Arc::new(MockCallbacks {
+            frames: Mutex::new(Vec::new()),
+            disconnected: std::sync::atomic::AtomicBool::new(false),
+        });
+        let ctx_ptr = Arc::into_raw(callbacks.clone()) as *mut MockCallbacks;
+        unsafe extern "C" fn on_event(ctx: *mut c_void, json: *const c_char) {
+            let cbs = unsafe { &*(ctx as *const MockCallbacks) };
+            if let Ok(s) = unsafe { CStr::from_ptr(json) }.to_str()
+                && s == "\"Disconnected\""
+            {
+                cbs.disconnected.store(true, Ordering::Release);
+            }
+        }
+        unsafe extern "C" fn on_frame(ctx: *mut c_void, pane: u64) {
+            let cbs = unsafe { &*(ctx as *const MockCallbacks) };
+            cbs.frames.lock().push(pane);
+        }
+        let client = new_connection(
+            Some(on_event),
+            Some(on_frame),
+            ctx_ptr.cast(),
+            |on_ev, on_disc| {
+                Client::from_stream(client_stream, "test", true, &[], on_ev, on_disc)
+                    .map(|c| (c, None))
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        (client, callbacks, ctx_ptr, stop_tx, server)
+    }
+
+    fn wait_ffi_disconnected(callbacks: &MockCallbacks) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while !callbacks.disconnected.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Disconnected"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn stalled_peer_queue_full_on_input_disconnects_instead_of_silently_dropping() {
+        let (client, callbacks, ctx_ptr, stop_tx, server) = start_stalled_ffi_client();
+        let inner = unsafe { client_ref(client) }.unwrap();
+        inner.client.set_max_queued_bytes(256 * 1024);
+
+        // First input fills the Unix socket buffer and exceeds the configured byte budget for
+        // subsequent writes; the next keystroke must trigger a disconnect/resync rather than
+        // being silently dropped on an apparently live connection.
+        let filler = vec![b'a'; 2 * 1024 * 1024];
+        unsafe { thurm_input(client, 1, filler.as_ptr(), filler.len()) };
+        assert!(inner.client.is_alive());
+
+        let key = b"x";
+        unsafe { thurm_input(client, 1, key.as_ptr(), key.len()) };
+        assert!(!inner.client.is_alive());
+        wait_ffi_disconnected(&callbacks);
+
+        unsafe { thurm_disconnect(client) };
+        drop(unsafe { Arc::from_raw(ctx_ptr) });
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_peer_queue_full_does_not_mark_subscribe_or_prewarm_active() {
+        let (client, callbacks, ctx_ptr, stop_tx, server) = start_stalled_ffi_client();
+        let inner = unsafe { client_ref(client) }.unwrap();
+        inner.client.set_max_queued_bytes(256 * 1024);
+        unsafe { thurm_set_warm_limit(client, 4) };
+
+        let filler = vec![b'a'; 2 * 1024 * 1024];
+        unsafe { thurm_input(client, 1, filler.as_ptr(), filler.len()) };
+        assert!(inner.client.is_alive());
+
+        // Subscribe fails with QueueFull: must not record pane 42 as subscribed/active, and must
+        // close the stalled connection so the UI reconnects and resyncs.
+        unsafe { thurm_subscribe(client, 42) };
+        assert!(!inner.client.is_alive());
+        {
+            let subs = inner.shared.subs.lock();
+            assert!(!subs.subscribed.contains(&42));
+            assert!(!subs.active.contains_key(&42));
+        }
+
+        // Prewarm on the failed/disconnected client must likewise not record pane 43.
+        unsafe { thurm_prewarm_pane(client, 43) };
+        {
+            let subs = inner.shared.subs.lock();
+            assert!(!subs.subscribed.contains(&43));
+            assert!(!subs.is_warm(43));
+        }
+        wait_ffi_disconnected(&callbacks);
+
+        unsafe { thurm_disconnect(client) };
+        drop(unsafe { Arc::from_raw(ctx_ptr) });
+        let _ = stop_tx.send(());
+        server.join().unwrap();
     }
 }

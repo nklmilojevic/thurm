@@ -69,6 +69,7 @@ enum WriteCmd {
 pub struct Client {
     write_tx: Sender<WriteCmd>,
     queued_bytes: Arc<AtomicUsize>,
+    max_queued_bytes: AtomicUsize,
     closer: UnixStream,
     pending: Pending,
     next_id: AtomicU64,
@@ -602,6 +603,7 @@ impl Client {
         let client = Arc::new(Client {
             write_tx: write_tx.clone(),
             queued_bytes,
+            max_queued_bytes: AtomicUsize::new(MAX_QUEUED_WRITE_BYTES),
             closer: client_closer,
             pending: pending.clone(),
             next_id: AtomicU64::new(1),
@@ -706,6 +708,13 @@ impl Client {
         self.queued_bytes.load(Ordering::Acquire)
     }
 
+    /// Overrides the outgoing byte budget (test hook so stalled-peer backpressure tests do not
+    /// need to encode tens of megabytes in unoptimized debug builds).
+    #[doc(hidden)]
+    pub fn set_max_queued_bytes(&self, bytes: usize) {
+        self.max_queued_bytes.store(bytes, Ordering::Relaxed);
+    }
+
     /// Waits for every frame accepted before this call to finish writing to the socket.
     pub fn flush(&self, timeout: Option<Duration>) -> Result<(), ClientError> {
         if !self.is_alive() {
@@ -741,12 +750,13 @@ impl Client {
         if bytes > codec::MAX_MESSAGE.saturating_add(4) {
             return Err(ClientError::QueueFull);
         }
+        let cap = self.max_queued_bytes.load(Ordering::Relaxed);
         let mut cur = self.queued_bytes.load(Ordering::Acquire);
         loop {
             let Some(next) = cur.checked_add(bytes) else {
                 return Err(ClientError::QueueFull);
             };
-            if cur > 0 && next > MAX_QUEUED_WRITE_BYTES {
+            if cur > 0 && next > cap {
                 return Err(ClientError::QueueFull);
             }
             match self.queued_bytes.compare_exchange_weak(
@@ -1956,11 +1966,23 @@ mod tests {
         });
 
         let client = Client::from_stream(stream, "test", false, &[], |_| {}, || {}).unwrap();
-        let chunk = vec![b'x'; 2 * 1024 * 1024];
+        let cap = 2 * 1024 * 1024;
+        client.set_max_queued_bytes(cap);
+
+        // First frame (2 MiB) fills the Unix socket buffer and blocks the writer thread while
+        // saturating the 2 MiB queue budget; subsequent sends must immediately fail with QueueFull
+        // without blocking or growing queued memory past the budget.
         let started = Instant::now();
-        let mut accepted = 0usize;
+        client
+            .send(Request::Input {
+                pane: 1,
+                data: vec![b'x'; cap - 1024],
+            })
+            .unwrap();
+        let mut accepted = 1usize;
         let mut rejected = 0usize;
-        for _ in 0..24 {
+        let chunk = vec![b'y'; 256 * 1024];
+        for _ in 0..8 {
             match client.send(Request::Input {
                 pane: 1,
                 data: chunk.clone(),
@@ -1970,18 +1992,17 @@ mod tests {
                 Err(other) => panic!("unexpected error while queue full: {other:?}"),
             }
             assert!(
-                client.queued_write_bytes() <= MAX_QUEUED_WRITE_BYTES,
+                client.queued_write_bytes() <= cap,
                 "queued bytes {} exceeded cap {}",
                 client.queued_write_bytes(),
-                MAX_QUEUED_WRITE_BYTES
+                cap
             );
         }
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(2),
             "bounded send() blocked: {:?}",
             started.elapsed()
         );
-        assert!(accepted >= 1, "at least one frame should be accepted");
         assert!(
             rejected >= 1,
             "excess frames past byte budget must be rejected with QueueFull"
