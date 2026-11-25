@@ -5,10 +5,13 @@ import XCTest
 final class MoveTabTests: XCTestCase {
     private let manager = SessionManager.shared
     private var savedWorkspaces: [Workspace] = []
+    private var savedSidebarTabs = true
 
     override func setUp() {
         super.setUp()
         savedWorkspaces = manager.workspaces
+        savedSidebarTabs = manager.config.sidebarTabs
+        manager.config.sidebarTabs = true
         manager.workspaces = []
         Remotes.shared.pendingCloses = [:]
     }
@@ -18,6 +21,7 @@ final class MoveTabTests: XCTestCase {
             c.closingWithoutConfirmation = true
             c.window?.close()
         }
+        manager.config.sidebarTabs = savedSidebarTabs
         manager.workspaces = savedWorkspaces
         Remotes.shared.pendingCloses = [:]
         super.tearDown()
@@ -104,6 +108,25 @@ final class MoveTabTests: XCTestCase {
 
     func testLastTabTakesTheWindowToTheTarget() throws {
         let (tabs, shown, hidden) = setUp(shown: [.leaf(pane(1))])
+        let originalWindow = tabs[0].window
+
+        manager.moveTab(tabs[0], to: hidden)
+
+        XCTAssertFalse(tabs[0].isClosed, "single-window sidebar mode keeps the window open")
+        XCTAssertNil(manager.workspace(shown.id), "the emptied workspace goes")
+        let now = try XCTUnwrap(manager.controllerShowing(hidden))
+        XCTAssertTrue(now === tabs[0])
+        XCTAssertTrue(now.window === originalWindow)
+        XCTAssertEqual(now.content.paneIds, [pane(1)], "the window shows the moved tab")
+        XCTAssertEqual(manager.windowTabs(of: now).flatMap(\.content.paneIds).sorted { $0.id < $1.id },
+                       [pane(1), pane(9)])
+        XCTAssertTrue(hidden.hiddenTabs.isEmpty)
+        assertNoPaneClosed()
+    }
+
+    func testLastTabTakesTheWindowToTheTargetInNativeMode() throws {
+        manager.config.sidebarTabs = false
+        let (tabs, shown, hidden) = setUp(shown: [.leaf(pane(1))])
 
         manager.moveTab(tabs[0], to: hidden)
 
@@ -118,6 +141,21 @@ final class MoveTabTests: XCTestCase {
     }
 
     func testMovingThereAndBackLeavesOneCopy() throws {
+        let (tabs, shown, hidden) = setUp(shown: [.leaf(pane(1)), .leaf(pane(2))])
+        manager.moveTab(tabs[1], to: hidden)
+        manager.switchWorkspace(in: tabs[0], to: hidden)
+        let back = try XCTUnwrap(manager.tab(for: pane(2)))
+
+        manager.moveTab(back, to: shown)
+
+        XCTAssertEqual(shown.hiddenTabs.map(\.panes), [[pane(1)], [pane(2)]])
+        XCTAssertEqual(manager.controllerShowing(hidden)?.content.paneIds, [pane(9)])
+        XCTAssertEqual(manager.liveTabs.filter { $0.content.contains(pane(2)) }.count, 0)
+        assertNoPaneClosed()
+    }
+
+    func testMovingThereAndBackLeavesOneCopyInNativeMode() throws {
+        manager.config.sidebarTabs = false
         let (tabs, shown, hidden) = setUp(shown: [.leaf(pane(1)), .leaf(pane(2))])
         manager.moveTab(tabs[1], to: hidden)
         manager.switchWorkspace(in: tabs[0], to: hidden)

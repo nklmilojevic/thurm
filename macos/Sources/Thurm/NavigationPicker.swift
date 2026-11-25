@@ -13,14 +13,17 @@ struct NavigationTarget {
     let destination: Destination
     let tabWorkspaceID: UInt64?
     weak var tabController: TerminalWindowController?
+    weak var tabItem: TabItem?
 
     init(title: String, detail: String, searchText: String = "", destination: Destination,
-         tabController: TerminalWindowController? = nil, tabWorkspaceID: UInt64? = nil) {
+         tabController: TerminalWindowController? = nil, tabItem: TabItem? = nil,
+         tabWorkspaceID: UInt64? = nil) {
         self.title = title
         self.detail = detail
         self.searchText = [title, detail, searchText].joined(separator: " ")
         self.destination = destination
         self.tabController = tabController
+        self.tabItem = tabItem
         self.tabWorkspaceID = tabWorkspaceID
     }
 }
@@ -44,7 +47,7 @@ extension SessionManager {
                            info.agent?.name, info.agent?.topic])
         }
         func addTab(title: String?, panes ids: [PaneKey], focused: PaneKey?, workspace: Workspace?,
-                    controller: TerminalWindowController? = nil) {
+                    controller: TerminalWindowController? = nil, tabItem: TabItem? = nil) {
             guard let first = ids.first else { return }
             let selected = focused.flatMap { ids.contains($0) ? $0 : nil } ?? first
             let tabTitle = title.flatMap { $0.isEmpty ? nil : $0 } ?? paneTitle(selected)
@@ -54,7 +57,7 @@ extension SessionManager {
                 .map { ($0 as NSString).lastPathComponent })).sorted().joined(separator: ", ")
             targets.append(NavigationTarget(title: tabTitle, detail: joined(["Tab", location, repositories]),
                                             searchText: ids.map(metadata).joined(separator: " "),
-                                            destination: .tab(ids), tabController: controller,
+                                            destination: .tab(ids), tabController: controller, tabItem: tabItem,
                                             tabWorkspaceID: workspace?.id))
             for id in ids {
                 guard let info = panes[id] else { continue }
@@ -70,13 +73,15 @@ extension SessionManager {
             targets.append(NavigationTarget(title: ws.name, detail: "Workspace · " + ws.host,
                                             destination: .workspace(ws.id)))
             if let shown = controllerShowing(ws) {
-                let ordered = group(of: shown)
-                let others = liveControllers.filter { c in
-                    c.workspaceID == ws.id && !ordered.contains { $0 === c }
+                let ordered = windowTabs(of: shown)
+                let others = liveTabs.filter { t in
+                    t.workspaceID == ws.id && !ordered.contains { $0 === t }
                 }
-                for c in ordered + others {
-                    addTab(title: c.titleOverride ?? c.window?.title, panes: c.content.paneIds,
-                           focused: c.focusedPane, workspace: ws, controller: c)
+                for t in ordered + others {
+                    let c = t.windowController
+                    let title = t.titleOverride ?? (t.isSelected ? c?.window?.title : t.displayTitle(panes: panes))
+                    addTab(title: title, panes: t.content.paneIds, focused: t.focusedPane,
+                           workspace: ws, controller: c, tabItem: t)
                 }
             } else {
                 for tab in ws.hiddenTabs {
@@ -84,9 +89,11 @@ extension SessionManager {
                 }
             }
         }
-        for c in liveControllers where workspace(c.workspaceID) == nil {
-            addTab(title: c.titleOverride ?? c.window?.title, panes: c.content.paneIds,
-                   focused: c.focusedPane, workspace: nil, controller: c)
+        for t in liveTabs where workspace(t.workspaceID) == nil {
+            let c = t.windowController
+            let title = t.titleOverride ?? (t.isSelected ? c?.window?.title : t.displayTitle(panes: panes))
+            addTab(title: title, panes: t.content.paneIds, focused: t.focusedPane,
+                   workspace: nil, controller: c, tabItem: t)
         }
         return targets
     }
@@ -123,17 +130,30 @@ extension SessionManager {
                 focusPane(focused, activate: true)
                 return true
             }
-            if let c = target.tabController, !c.isClosed, ids.contains(where: { c.content.contains($0) }) {
-                focusPane(c.focusedPane, activate: true)
+            if let t = target.tabItem, !t.isClosed, t.windowController?.isClosed == false,
+               ids.contains(where: { t.content.contains($0) }) {
+                focusPane(t.focusedPane, activate: true)
+                return
+            }
+            // If the original tab was parked into a background workspace, check its surviving
+            // panes in the source workspace before scanning other tabs on the old window.
+            let sourceWS = target.tabWorkspaceID.flatMap { workspace($0) }
+            if target.tabItem?.windowController == nil, let ws = sourceWS, showHiddenTab(in: [ws]) {
+                return
+            }
+            if let c = target.tabController, !c.isClosed,
+               target.tabWorkspaceID == nil || c.workspaceID == target.tabWorkspaceID,
+               let t = c.tabs.first(where: { !$0.isClosed && ids.contains(where: $0.content.contains) }) {
+                focusPane(t.focusedPane, activate: true)
                 return
             }
             // Match surviving panes in the source workspace before a pane moved elsewhere.
             // The hidden tab's index can change when other tabs move or close.
-            if let ws = target.tabWorkspaceID.flatMap({ workspace($0) }), showHiddenTab(in: [ws]) {
+            if let ws = sourceWS, showHiddenTab(in: [ws]) {
                 return
             }
-            if let c = ids.lazy.compactMap({ self.controller(for: $0) }).first {
-                focusPane(c.focusedPane, activate: true)
+            if let t = ids.lazy.compactMap({ self.tab(for: $0) }).first {
+                focusPane(t.focusedPane, activate: true)
                 return
             }
             _ = showHiddenTab(in: workspaces)

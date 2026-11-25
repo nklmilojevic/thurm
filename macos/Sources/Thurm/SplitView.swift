@@ -249,7 +249,12 @@ indirect enum SplitNode {
 /// The content of one tab: terminal views laid out according to a split tree, with draggable
 /// dividers. Also hosts the find bar overlay.
 final class TabContentView: NSView {
-    weak var controller: TerminalWindowController?
+    weak var tab: TabItem?
+    private weak var _controller: TerminalWindowController?
+    var controller: TerminalWindowController? {
+        get { tab?.windowController ?? _controller }
+        set { _controller = newValue }
+    }
 
     private(set) var root: SplitNode {
         didSet { panesChanged(from: oldValue.panes + floating.map(\.pane)) }
@@ -1332,7 +1337,7 @@ final class TabContentView: NSView {
         if changed && (showsHeaders || !floating.isEmpty) { layoutPanes() }
         if changed && !showsHeaders { updateFocusRing(frames: visibleFrames, cards: false) }
         if changed {
-            controller?.focusedPaneChanged()
+            controller?.focusedPaneChanged(in: self)
         }
     }
 
@@ -1824,8 +1829,8 @@ final class TabContentView: NSView {
             }
         }
         sidebar?.showCardDrop(nil)
-        if let tabGap, !cancelled, let controller {
-            SessionManager.shared.moveCardToNewTab(pane, from: controller, next: tabGap)
+        if let tabGap, !cancelled, let source = tab ?? controller?.selectedTab {
+            SessionManager.shared.moveCardToNewTab(pane, from: source, next: tabGap)
             return true
         }
         // Dropped on the row of chips (the row it left, or another's): back into it.
@@ -1896,8 +1901,8 @@ final class TabContentView: NSView {
             focus(pane)
             return true
         }
-        if let tabGap, !cancelled, let controller {
-            SessionManager.shared.moveCardToNewTab(pane, from: controller, next: tabGap)
+        if let tabGap, !cancelled, let source = tab ?? controller?.selectedTab {
+            SessionManager.shared.moveCardToNewTab(pane, from: source, next: tabGap)
             return true
         }
         if let edge, moved, !cancelled {
@@ -1912,18 +1917,19 @@ final class TabContentView: NSView {
     }
 
     private var sidebar: TabSidebarViewController? {
-        controller.flatMap { SessionManager.shared.canMoveCards($0) ? $0.sidebar : nil }
+        guard let target = tab ?? controller?.selectedTab else { return nil }
+        return SessionManager.shared.canMoveCards(target) ? controller?.sidebar : nil
     }
 
     func centeredCardFrame(at point: CGPoint) -> CGRect {
         FloatingGeometry.centered(at: point, in: floatArea, index: floating.count)
     }
 
-    private func floatSource(_ info: NSDraggingInfo) -> TerminalWindowController? {
-        guard let controller,
-              let src = TabSidebarViewController.draggedWindow(info)?.windowController as? TerminalWindowController
+    private func floatSource(_ info: NSDraggingInfo) -> TabItem? {
+        guard let target = tab ?? controller?.selectedTab,
+              let src = TabSidebarViewController.draggedTabItem(info)
         else { return nil }
-        return SessionManager.shared.canFloat(src, into: controller) ? src : nil
+        return SessionManager.shared.canFloat(src, into: target) ? src : nil
     }
 
     private func showTabDrop(_ info: NSDraggingInfo) -> NSDragOperation {
@@ -1946,8 +1952,8 @@ final class TabContentView: NSView {
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         dockIndicator.show(nil)
-        guard let controller, let src = floatSource(sender) else { return false }
-        SessionManager.shared.floatTab(src, into: controller, at: convert(sender.draggingLocation, from: nil))
+        guard let target = tab ?? controller?.selectedTab, let src = floatSource(sender) else { return false }
+        SessionManager.shared.floatTab(src, into: target, at: convert(sender.draggingLocation, from: nil))
         return true
     }
 
@@ -2033,11 +2039,19 @@ final class TabContentView: NSView {
 
     // MARK: Persistence
 
-    func tabLayout(title: String?) -> TabLayout {
-        TabLayout(title: title, root: root.layoutNode, focused: focusedPane.id, zoomed: zoomedPane?.id,
-                  handoff: controller?.handoffID, wall: controller?.wall,
-                  floating: floating.isEmpty ? nil : floating.map(\.saved),
-                  floatingHidden: floatingHidden ? true : nil, pinned: controller?.pinned == true ? true : nil)
+    func tabLayout(title: String?, handoff: String? = nil, wall: [WallOrigin]? = nil,
+                   pinned: Bool? = nil) -> TabLayout {
+        // When owned by a `TabItem`, never fall through to `controller`'s metadata (which belongs
+        // to the window's *selected* tab, not an unselected background tab).
+        let resolvedHandoff = handoff ?? (tab != nil ? tab?.handoffID : controller?.handoffID)
+        let resolvedWall = wall ?? (tab != nil ? tab?.wall : controller?.wall)
+        let resolvedPinned = pinned ?? (tab != nil ? tab?.pinned : controller?.pinned)
+        return TabLayout(title: title, root: root.layoutNode, focused: focusedPane.id, zoomed: zoomedPane?.id,
+                         handoff: resolvedHandoff,
+                         wall: resolvedWall,
+                         floating: floating.isEmpty ? nil : floating.map(\.saved),
+                         floatingHidden: floatingHidden ? true : nil,
+                         pinned: resolvedPinned == true ? true : nil)
     }
 
     /// The host of this tab's panes.

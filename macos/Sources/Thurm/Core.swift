@@ -189,6 +189,9 @@ final class Core {
         return Unmanaged.passUnretained(token).toOpaque()
     }
 
+    /// Maximum number of recently hidden panes kept subscribed & warm per daemon connection.
+    static let warmPaneLimit: UInt32 = 24
+
     /// Connects to this Mac's daemon (spawning it when needed). Must be called on the main
     /// thread.
     @discardableResult
@@ -213,6 +216,7 @@ final class Core {
             tlog("connect failed: \(lastError ?? "unknown error")")
             return false
         }
+        thurm_set_warm_limit(c, Core.warmPaneLimit)
         clients[localHost] = c
         lastError = nil
         return true
@@ -233,6 +237,7 @@ final class Core {
             thurm_string_free(e)
         }
         guard let c = result else { return message ?? "cannot connect" }
+        thurm_set_warm_limit(c, Core.warmPaneLimit)
         clients[host] = c
         return nil
     }
@@ -375,6 +380,16 @@ final class Core {
     func unsubscribe(_ pane: PaneKey) {
         guard let c = clients[pane.host] else { return }
         thurm_unsubscribe(c, pane.id)
+    }
+
+    func evictPane(_ pane: PaneKey) {
+        guard let c = clients[pane.host] else { return }
+        thurm_evict_pane(c, pane.id)
+    }
+
+    func prewarm(_ pane: PaneKey) {
+        guard let c = clients[pane.host] else { return }
+        thurm_prewarm_pane(c, pane.id)
     }
 
     /// Raw UTF-8 text straight to the PTY.

@@ -6,9 +6,21 @@ final class Workspace {
     let id: UInt64
     var name: String
     var lastActive: Date
-    /// Its tabs while no window shows it.
-    var hiddenTabs: [TabLayout]
+    /// Its tabs while no window shows it. Assigning directly invalidates any cached live
+    /// `TabItem`s so external updates (restore, tests, layout mutations) stay authoritative.
+    var hiddenTabs: [TabLayout] {
+        didSet {
+            if !syncingHiddenTabs {
+                invalidateCachedTabs()
+            }
+        }
+    }
     var hiddenSelectedTab: Int
+    /// Live `TabItem`s parked while no window shows this workspace in sidebar mode, eliminating
+    /// `TabContentView` / `TerminalView` reconstruction on workspace switches. When non-nil, its
+    /// elements correspond 1:1 with `hiddenTabs`.
+    private(set) var cachedTabs: [TabItem]?
+    private var syncingHiddenTabs = false
     /// Whose panes it shows: this Mac's daemon, or a `[[remote]]` host's (a remote workspace).
     let host: HostId
 
@@ -27,7 +39,178 @@ final class Workspace {
                   hiddenTabs: l.tabs, hiddenSelectedTab: l.selectedTab, host: l.host ?? localHost)
     }
 
+    deinit {
+        invalidateCachedTabs()
+    }
+
     var isRemote: Bool { host != localHost }
+
+    /// Parks live tabs when switching away from this workspace in sidebar mode while keeping
+    /// `hiddenTabs` / `hiddenSelectedTab` synchronized for persistence, pickers, and the sidebar.
+    func parkTabs(_ tabs: [TabItem], selected: Int) {
+        let selectedTab = tabs.indices.contains(selected) ? tabs[selected] : nil
+        let removedBeforeSelected = tabs.prefix(min(max(0, selected), tabs.count))
+            .filter { $0.content.isEmpty }.count
+        let kept = tabs.filter { !$0.content.isEmpty }
+        syncingHiddenTabs = true
+        hiddenTabs = kept.map { $0.tabLayout() }
+        if kept.isEmpty {
+            hiddenSelectedTab = 0
+        } else if let selectedTab, let idx = kept.firstIndex(where: { $0 === selectedTab }) {
+            hiddenSelectedTab = idx
+        } else {
+            hiddenSelectedTab = min(max(0, selected - removedBeforeSelected), kept.count - 1)
+        }
+        cachedTabs = kept.isEmpty ? nil : kept
+        syncingHiddenTabs = false
+    }
+
+    /// Takes the cached live tabs when switching back to this workspace in sidebar mode,
+    /// honoring the current `hiddenSelectedTab`.
+    func takeCachedTabs() -> (tabs: [TabItem], selected: Int)? {
+        guard let cached = cachedTabs, cached.count == hiddenTabs.count, !cached.isEmpty else {
+            invalidateCachedTabs()
+            return nil
+        }
+        let sel = min(max(0, hiddenSelectedTab), cached.count - 1)
+        syncingHiddenTabs = true
+        cachedTabs = nil
+        hiddenTabs = []
+        hiddenSelectedTab = 0
+        syncingHiddenTabs = false
+        return (cached, sel)
+    }
+
+    /// Appends a live tab while preserving `cachedTabs` if already warm.
+    func appendParkedTab(_ tab: TabItem) {
+        let layout = tab.tabLayout()
+        if var cached = cachedTabs, cached.count == hiddenTabs.count {
+            cached.append(tab)
+            syncingHiddenTabs = true
+            cachedTabs = cached
+            hiddenTabs.append(layout)
+            syncingHiddenTabs = false
+        } else {
+            tab.content.detachAll()
+            tab.isClosed = true
+            hiddenTabs.append(layout)
+        }
+    }
+
+    /// Toggles pin at `index` in both `hiddenTabs` and `cachedTabs` without invalidating the cache.
+    func toggleHiddenPin(at index: Int) {
+        guard hiddenTabs.indices.contains(index) else { return }
+        let next = hiddenTabs[index].pinned != true
+        syncingHiddenTabs = true
+        hiddenTabs[index].pinned = next ? true : nil
+        if let cached = cachedTabs, cached.indices.contains(index) {
+            cached[index].pinned = next
+        }
+        syncingHiddenTabs = false
+    }
+
+    /// Removes any single-pane tab holding only `pane`, preserving `cachedTabs` for remaining tabs.
+    func removeSinglePaneTab(_ pane: PaneKey) -> Bool {
+        let before = hiddenTabs.count
+        guard before > 0 else { return false }
+        if let cached = cachedTabs, cached.count == hiddenTabs.count {
+            let selectedTab = cached.indices.contains(hiddenSelectedTab) ? cached[hiddenSelectedTab] : nil
+            var keptCached: [TabItem] = []
+            var keptLayouts: [TabLayout] = []
+            var removedBeforeSelected = 0
+            for (index, (tab, layout)) in zip(cached, hiddenTabs).enumerated() {
+                if layout.panes == [pane] {
+                    if index < hiddenSelectedTab { removedBeforeSelected += 1 }
+                    tab.content.detachAll()
+                    tab.isClosed = true
+                } else {
+                    keptCached.append(tab)
+                    keptLayouts.append(layout)
+                }
+            }
+            if keptLayouts.count != before {
+                syncingHiddenTabs = true
+                cachedTabs = keptCached.isEmpty ? nil : keptCached
+                hiddenTabs = keptLayouts
+                if keptCached.isEmpty {
+                    hiddenSelectedTab = 0
+                } else if let selectedTab, let idx = keptCached.firstIndex(where: { $0 === selectedTab }) {
+                    hiddenSelectedTab = idx
+                } else {
+                    hiddenSelectedTab = min(max(0, hiddenSelectedTab - removedBeforeSelected), keptCached.count - 1)
+                }
+                syncingHiddenTabs = false
+            }
+        } else {
+            let removedBeforeSelected = hiddenTabs.prefix(hiddenSelectedTab).filter { $0.panes == [pane] }.count
+            hiddenTabs.removeAll { $0.panes == [pane] }
+            hiddenSelectedTab = hiddenTabs.isEmpty
+                ? 0
+                : min(max(0, hiddenSelectedTab - removedBeforeSelected), hiddenTabs.count - 1)
+        }
+        return before > 0 && hiddenTabs.isEmpty
+    }
+
+    /// Retains only panes matching `keep`, preserving cached live `TabItem`s whenever possible.
+    func retainHiddenPanes(_ keep: (PaneKey) -> Bool) {
+        if let cached = cachedTabs, cached.count == hiddenTabs.count {
+            let selectedTab = cached.indices.contains(hiddenSelectedTab) ? cached[hiddenSelectedTab] : nil
+            var remaining: [TabItem] = []
+            var removedBeforeSelected = 0
+            var changed = false
+            for (index, tab) in cached.enumerated() {
+                let toRemove = tab.content.paneIds.filter { !keep($0) }
+                if toRemove.isEmpty {
+                    remaining.append(tab)
+                } else {
+                    changed = true
+                    var empty = false
+                    for id in toRemove { empty = tab.content.remove(pane: id) }
+                    if empty {
+                        if index < hiddenSelectedTab { removedBeforeSelected += 1 }
+                        tab.content.detachAll()
+                        tab.isClosed = true
+                    } else {
+                        remaining.append(tab)
+                    }
+                }
+            }
+            if changed {
+                syncingHiddenTabs = true
+                cachedTabs = remaining.isEmpty ? nil : remaining
+                hiddenTabs = remaining.map { $0.tabLayout() }
+                if remaining.isEmpty {
+                    hiddenSelectedTab = 0
+                } else if let selectedTab, let idx = remaining.firstIndex(where: { $0 === selectedTab }) {
+                    hiddenSelectedTab = idx
+                } else {
+                    hiddenSelectedTab = min(max(0, hiddenSelectedTab - removedBeforeSelected), remaining.count - 1)
+                }
+                syncingHiddenTabs = false
+            }
+        } else {
+            let removedBeforeSelected = hiddenTabs.prefix(hiddenSelectedTab).filter {
+                retainTabs([$0], keep).isEmpty
+            }.count
+            let kept = retainTabs(hiddenTabs, keep)
+            if kept != hiddenTabs {
+                hiddenTabs = kept
+            }
+            hiddenSelectedTab = hiddenTabs.isEmpty
+                ? 0
+                : min(max(0, hiddenSelectedTab - removedBeforeSelected), hiddenTabs.count - 1)
+        }
+    }
+
+    /// Drops cached live tabs and detaches their views.
+    func invalidateCachedTabs() {
+        guard let old = cachedTabs else { return }
+        cachedTabs = nil
+        for tab in old {
+            tab.content.detachAll()
+            tab.isClosed = true
+        }
+    }
 }
 
 /// Default workspace names ("quiet-otter"), like tty7's codenames.
@@ -82,16 +265,15 @@ extension SessionManager {
     /// Takes `pane`'s own tab out of the background workspaces; one left empty goes too.
     func takeHiddenTab(_ pane: PaneKey) {
         for ws in workspaces where !isShown(ws) {
-            let before = ws.hiddenTabs.count
-            ws.hiddenTabs.removeAll { $0.panes == [pane] }
-            ws.hiddenSelectedTab = min(ws.hiddenSelectedTab, max(0, ws.hiddenTabs.count - 1))
-            if before > 0 && ws.hiddenTabs.isEmpty { workspaces.removeAll { $0 === ws } }
+            if ws.removeSinglePaneTab(pane) {
+                workspaces.removeAll { $0 === ws }
+            }
         }
     }
 
     /// The workspace showing `pane`, or holding it in a hidden tab.
     func workspace(containing pane: PaneKey) -> Workspace? {
-        if let c = controller(for: pane) { return workspace(c.workspaceID) }
+        if let t = tab(for: pane) { return workspace(t.workspaceID) }
         return workspaces.first { $0.hiddenTabs.contains { $0.panes.contains(pane) } }
     }
 
@@ -119,6 +301,12 @@ extension SessionManager {
         return (w.tabGroup?.windows ?? [w])
             .compactMap { $0.windowController as? TerminalWindowController }
             .filter { !$0.isClosed }
+    }
+
+    /// Every live tab of `c`'s window (hosted `TabItem`s in sidebar mode, plus any sibling
+    /// native `tabGroup` controllers' tabs in native mode), in tab order.
+    func windowTabs(of c: TerminalWindowController) -> [TabItem] {
+        group(of: c).flatMap(\.tabs).filter { !$0.isClosed }
     }
 
     /// A controller of the window showing `ws`, preferring its selected tab.
@@ -153,54 +341,114 @@ extension SessionManager {
             return
         }
         guard let hostWindow = c.window else { return }
+
+        // Single-window sidebar mode: swap the active TabContentView in place on the same
+        // TerminalWindow / TabSplitViewController / TabSidebarViewController — zero NSWindow churn!
+        if c.usesSingleWindowTabs && group(of: c).count == 1 {
+            let targetTabs: [TabItem]
+            let targetSelected: Int
+            if let cached = target.takeCachedTabs() {
+                targetTabs = cached.tabs
+                targetSelected = cached.selected
+            } else {
+                var created = target.hiddenTabs.map { TabItem(layout: $0) }
+                if created.isEmpty {
+                    let size = gridSize(forPoints: c.content.bounds.size)
+                    if let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, host: target.host) {
+                        created.append(TabItem(root: .leaf(pane), focused: pane, zoomed: nil))
+                    }
+                }
+                guard !created.isEmpty else { return }
+                targetSelected = min(max(0, target.hiddenSelectedTab), created.count - 1)
+                target.hiddenTabs = []
+                target.hiddenSelectedTab = 0
+                targetTabs = created
+            }
+
+            let previousWorkspace = workspace(c.workspaceID)
+            let (oldTabs, oldSelected) = c.replaceTabs(targetTabs, selectedIndex: targetSelected, workspaceID: target.id)
+            if let previousWorkspace {
+                previousWorkspace.parkTabs(oldTabs, selected: oldSelected)
+            } else {
+                let keptIDs = Set(targetTabs.map(ObjectIdentifier.init))
+                for tab in oldTabs where !keptIDs.contains(ObjectIdentifier(tab)) {
+                    tab.content.detachAll()
+                    tab.isClosed = true
+                }
+            }
+            prewarmWorkspaceTabs(targetTabs, excluding: c.selectedTab)
+            c.window?.makeKeyAndOrderFront(nil)
+            c.sidebar?.reload()
+            if let window = c.window, let view = c.content.focusedView,
+               !((window.firstResponder as? NSView)?.isDescendant(of: c.content) ?? false) {
+                window.makeFirstResponder(view)
+            }
+            c.content.focusedView?.reportFocus()
+            tabSelected(c.selectedTab, in: c)
+            return
+        }
+
+        // Native-tab mode: batch window creation, tabGroup attachment, and old-window teardown
+        // under `isSwitchingWorkspace` to suppress KVO storms and redundant layout passes.
         let old = group(of: c)
         let selectedWindow = hostWindow.tabGroup?.selectedWindow ?? hostWindow
         if let current = workspace(c.workspaceID) {
-            let kept = old.filter { !$0.content.isEmpty }
-            current.hiddenTabs = kept.map { $0.content.tabLayout(title: $0.titleOverride) }
-            current.hiddenSelectedTab = kept.firstIndex { $0.window === selectedWindow } ?? 0
+            let kept = old.flatMap(\.tabs).filter { !$0.content.isEmpty }
+            let selController = selectedWindow.windowController as? TerminalWindowController
+            let selTab = selController?.selectedTab
+            current.hiddenTabs = kept.map { $0.tabLayout() }
+            current.hiddenSelectedTab = selTab.flatMap { st in kept.firstIndex { $0 === st } } ?? 0
         }
 
-        // The new tabs join this window's tab group (so position, size and full screen stay),
-        // then the old ones leave it.
         var created: [TerminalWindowController] = []
-        var anchor = selectedWindow
-        func add(_ nc: TerminalWindowController) {
-            nc.workspaceID = target.id
-            guard let w = nc.window else { return }
-            w.setFrame(selectedWindow.frame, display: false)
-            anchor.addTabbedWindow(w, ordered: .above)
-            anchor = w
-            created.append(nc)
-        }
-        for tab in target.hiddenTabs {
-            let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
-                                   title: tab.title, frame: nil, floating: tab.floating,
-                                   floatingHidden: tab.floatingHidden)
-            t.adopt(tab)
-            add(t)
-        }
-        if created.isEmpty {
-            let size = gridSize(forPoints: c.content.bounds.size)
-            if let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, host: target.host) {
-                add(makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil))
+        var selected: TerminalWindowController?
+        withWorkspaceSwitchBatch {
+            var anchor = selectedWindow
+            func add(_ nc: TerminalWindowController) {
+                nc.workspaceID = target.id
+                guard let w = nc.window else { return }
+                w.setFrame(selectedWindow.frame, display: false)
+                anchor.addTabbedWindow(w, ordered: .above)
+                anchor = w
+                created.append(nc)
+            }
+            for tab in target.hiddenTabs {
+                let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
+                                       title: tab.title, frame: nil, floating: tab.floating,
+                                       floatingHidden: tab.floatingHidden)
+                t.adopt(tab)
+                add(t)
+            }
+            if created.isEmpty {
+                let size = gridSize(forPoints: c.content.bounds.size)
+                if let pane = createPane(cols: size.cols, rows: size.rows, inheritFrom: nil, host: target.host) {
+                    add(makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil))
+                }
+            }
+            guard !created.isEmpty else { return }
+            let chosen = created[min(max(0, target.hiddenSelectedTab), created.count - 1)]
+            selected = chosen
+            target.hiddenTabs = []
+            target.hiddenSelectedTab = 0
+            target.lastActive = Date()
+            // The old tabs leave every listing now; only lay out `selected`'s sidebar eagerly
+            // (non-selected tabs defer until shown).
+            for o in old { o.isClosed = true }
+            let shownSplit = (selectedWindow.windowController as? TerminalWindowController)?.tabSplit
+            chosen.tabSplit?.match(shownSplit)
+            for n in created where n !== chosen {
+                n.pendingSidebarMatch = chosen.tabSplit ?? shownSplit
+            }
+            chosen.window?.makeKeyAndOrderFront(nil)
+            for o in old {
+                o.closingWithoutConfirmation = true
+                o.window?.close()
             }
         }
-        guard !created.isEmpty else { return }
-        let selected = created[min(max(0, target.hiddenSelectedTab), created.count - 1)]
-        target.hiddenTabs = []
-        target.hiddenSelectedTab = 0
-        target.lastActive = Date()
-        // The old tabs leave every listing now, and the new tabs' sidebars are laid out as the
-        // shown one: the first frame of the switch is already the last, with nothing redrawn.
-        for o in old { o.isClosed = true }
-        let shownSplit = (selectedWindow.windowController as? TerminalWindowController)?.tabSplit
-        for n in created { n.tabSplit?.match(shownSplit) }
-        selected.window?.makeKeyAndOrderFront(nil)
-        for o in old {
-            o.closingWithoutConfirmation = true
-            o.window?.close()
-        }
+        guard let selected else { return }
+        for n in created { n.updateTitle() }
+        (selected.window as? TerminalWindow)?.finishWorkspaceSwitchSync()
+        prewarmWorkspaceTabs(created.flatMap(\.tabs), excluding: selected.selectedTab)
         refreshSidebars()
         focusChanged()
         scheduleLayoutSave()
@@ -218,9 +466,13 @@ extension SessionManager {
         }
     }
 
-    func togglePin(_ c: TerminalWindowController) {
-        c.pinned.toggle()
+    func togglePin(_ tab: TabItem) {
+        tab.pinned.toggle()
         scheduleLayoutSave()
+    }
+
+    func togglePin(_ c: TerminalWindowController) {
+        togglePin(c.selectedTab)
     }
 
     func isPinned(_ tab: HiddenTab) -> Bool {
@@ -230,7 +482,7 @@ extension SessionManager {
 
     func togglePin(_ tab: HiddenTab) {
         guard let ws = workspace(tab.workspace), tab.index < ws.hiddenTabs.count else { return }
-        ws.hiddenTabs[tab.index].pinned = isPinned(tab) ? nil : true
+        ws.toggleHiddenPin(at: tab.index)
         refreshSidebars()
         scheduleLayoutSave()
     }
@@ -239,7 +491,13 @@ extension SessionManager {
     /// or open a window if there is none. Otherwise, keep the workspace hidden.
     func addHiddenTab(_ pane: PaneKey, handoff: String?, to ws: Workspace, in c: TerminalWindowController?,
                       reveal: Bool) {
-        ws.hiddenTabs.append(TabLayout(title: nil, root: .pane(pane), focused: pane.id, zoomed: nil, handoff: handoff))
+        if ws.cachedTabs != nil {
+            let tab = TabItem(root: .leaf(pane), focused: pane, zoomed: nil)
+            tab.handoffID = handoff
+            ws.appendParkedTab(tab)
+        } else {
+            ws.hiddenTabs.append(TabLayout(title: nil, root: .pane(pane), focused: pane.id, zoomed: nil, handoff: handoff))
+        }
         if reveal {
             ws.hiddenSelectedTab = ws.hiddenTabs.count - 1
             if let c {
@@ -256,40 +514,66 @@ extension SessionManager {
         }
     }
 
-    /// Moves `c`'s tab out of its window into a new workspace, in the background.
-    func moveTabToNewWorkspace(_ c: TerminalWindowController) {
-        guard !c.isQuick, group(of: c).count > 1 else {
+    /// Moves `tab` out of its window into a new workspace, in the background.
+    func moveTabToNewWorkspace(_ tab: TabItem) {
+        guard let c = tab.windowController, !c.isQuick, windowTabs(of: c).count > 1 else {
             NSSound.beep()
             return
         }
-        moveInBackground(c, to: makeWorkspace(host: workspace(c.workspaceID)?.host ?? c.host))
+        moveInBackground(tab, to: makeWorkspace(host: workspace(c.workspaceID)?.host ?? tab.host))
     }
 
-    private func moveInBackground(_ c: TerminalWindowController, to ws: Workspace) {
-        ws.hiddenTabs.append(c.content.tabLayout(title: c.titleOverride))
-        c.closingWithoutConfirmation = true
-        c.window?.close()
+    /// Moves `c`'s selected tab out of its window into a new workspace, in the background.
+    func moveTabToNewWorkspace(_ c: TerminalWindowController) {
+        moveTabToNewWorkspace(c.selectedTab)
+    }
+
+    private func moveInBackground(_ tab: TabItem, to ws: Workspace) {
+        guard let c = tab.windowController else { return }
+        if c.usesSingleWindowTabs && group(of: c).count == 1 && c.tabs.count > 1 {
+            _ = c.removeTab(tab, detach: false)
+            ws.appendParkedTab(tab)
+        } else {
+            ws.hiddenTabs.append(tab.tabLayout())
+            c.closingWithoutConfirmation = true
+            c.window?.close()
+        }
         currentRegularController?.content.focusedView?.showToast("Tab moved to workspace \(ws.name)", duration: 4)
         refreshSidebars()
         scheduleLayoutSave()
     }
 
-    func moveTargets(for c: TerminalWindowController) -> [Workspace] {
-        guard !c.isQuick, !c.isClosed, c.window != nil, c.wall == nil else { return [] }
-        let host = workspace(c.workspaceID)?.host ?? c.host
+    func moveTargets(for tab: TabItem) -> [Workspace] {
+        guard let c = tab.windowController, !c.isQuick, !c.isClosed, !tab.isClosed,
+              c.window != nil, tab.wall == nil else { return [] }
+        let host = workspace(c.workspaceID)?.host ?? tab.host
         return workspacesByRecency.filter { $0.id != c.workspaceID && $0.host == host && !isShown($0) }
     }
 
-    func moveTab(_ c: TerminalWindowController, to ws: Workspace) {
-        guard moveTargets(for: c).contains(where: { $0 === ws }) else {
+    func moveTargets(for c: TerminalWindowController) -> [Workspace] {
+        moveTargets(for: c.selectedTab)
+    }
+
+    func moveTab(_ tab: TabItem, to ws: Workspace) {
+        guard moveTargets(for: tab).contains(where: { $0 === ws }), let c = tab.windowController else {
             NSSound.beep()
             return
         }
-        if group(of: c).count > 1 {
-            moveInBackground(c, to: ws)
+        if windowTabs(of: c).count > 1 {
+            moveInBackground(tab, to: ws)
             return
         }
-        ws.hiddenTabs.append(c.content.tabLayout(title: c.titleOverride))
+        if c.usesSingleWindowTabs && group(of: c).count == 1 {
+            tab.content.removeFromSuperview()
+            ws.appendParkedTab(tab)
+            workspaces.removeAll { $0.id == c.workspaceID }
+            c.workspaceID = 0
+            ws.hiddenSelectedTab = ws.hiddenTabs.count - 1
+            switchWorkspace(in: c, to: ws)
+            currentController?.content.focusedView?.showToast("Tab moved to workspace \(ws.name)", duration: 4)
+            return
+        }
+        ws.hiddenTabs.append(tab.tabLayout())
         c.content.isHidden = true
         c.content.detachAll()
         workspaces.removeAll { $0.id == c.workspaceID }
@@ -299,13 +583,17 @@ extension SessionManager {
         currentController?.content.focusedView?.showToast("Tab moved to workspace \(ws.name)", duration: 4)
     }
 
-    func fillMoveTabMenu(_ menu: NSMenu, for c: TerminalWindowController?) {
+    func moveTab(_ c: TerminalWindowController, to ws: Workspace) {
+        moveTab(c.selectedTab, to: ws)
+    }
+
+    func fillMoveTabMenu(_ menu: NSMenu, forTab tab: TabItem?) {
         menu.removeAllItems()
-        let targets = c.map(moveTargets) ?? []
+        let targets = tab.map(moveTargets(for:)) ?? []
         for ws in targets {
-            menu.addItem(BlockMenuItem(TabSidebarViewController.heading(ws)) { [weak c] in
-                guard let c else { return }
-                SessionManager.shared.moveTab(c, to: ws)
+            menu.addItem(BlockMenuItem(TabSidebarViewController.heading(ws)) { [weak tab] in
+                guard let tab else { return }
+                SessionManager.shared.moveTab(tab, to: ws)
             })
         }
         if targets.isEmpty {
@@ -313,6 +601,10 @@ extension SessionManager {
             none.isEnabled = false
             menu.addItem(none)
         }
+    }
+
+    func fillMoveTabMenu(_ menu: NSMenu, for c: TerminalWindowController?) {
+        fillMoveTabMenu(menu, forTab: c?.selectedTab)
     }
 
     /// Thurm has one window. Another one (a tab dragged out of the tab bar) goes into a
@@ -326,12 +618,12 @@ extension SessionManager {
         guard groups.count > 1 else { return }
         let key = NSApp.keyWindow
         func rank(_ g: [TerminalWindowController]) -> (Int, Int) {
-            (g.count, g.contains { $0.window === key } ? 0 : 1)
+            (g.flatMap(\.tabs).count, g.contains { $0.window === key } ? 0 : 1)
         }
         let keep = groups.indices.max { rank(groups[$0]) < rank(groups[$1]) } ?? 0
         let keptWorkspace = groups[keep].first?.workspaceID
         for (i, g) in groups.enumerated() where i != keep {
-            let tabs = g.filter { !$0.content.isEmpty }
+            let tabs = g.flatMap(\.tabs).filter { !$0.content.isEmpty }
             var ws = g.first.flatMap { workspace($0.workspaceID) }
             if ws == nil || ws?.id == keptWorkspace {
                 ws = makeWorkspace(host: g.first?.host ?? localHost)
@@ -341,7 +633,7 @@ extension SessionManager {
                 c.window?.close()
             }
             guard let ws, !tabs.isEmpty else { continue }
-            ws.hiddenTabs += tabs.map { $0.content.tabLayout(title: $0.titleOverride) }
+            ws.hiddenTabs += tabs.map { $0.tabLayout() }
             groups[keep].first?.content.focusedView?.showToast(
                 "\(tabs.count == 1 ? "Tab" : "Tabs") moved to workspace \(ws.name)", duration: 4)
         }
@@ -351,22 +643,51 @@ extension SessionManager {
 
     /// Shows a hidden workspace in a new window (restore with no window left).
     func openWorkspaceInNewWindow(_ ws: Workspace, frame: NSRect? = nil) {
-        var previous: TerminalWindowController?
-        var created: [TerminalWindowController] = []
-        for tab in ws.hiddenTabs {
-            let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
-                                   title: tab.title, frame: frame, floating: tab.floating,
-                                   floatingHidden: tab.floatingHidden)
+        if config.sidebarTabs {
+            let items: [TabItem]
+            let selected: Int
+            if let cached = ws.takeCachedTabs() {
+                items = cached.tabs
+                selected = cached.selected
+            } else {
+                items = ws.hiddenTabs.map { TabItem(layout: $0) }
+                guard !items.isEmpty else { return }
+                selected = min(max(0, ws.hiddenSelectedTab), items.count - 1)
+                ws.hiddenTabs = []
+                ws.hiddenSelectedTab = 0
+            }
+            let c = makeController(tabs: items, selectedIndex: selected, frame: frame)
             c.workspaceID = ws.id
-            c.adopt(tab)
-            if let prev = previous { attachAsTab(c, to: prev) } else { showAsNewWindow(c, frame: frame) }
-            previous = c
-            created.append(c)
+            showAsNewWindow(c, frame: frame)
+            ws.lastActive = Date()
+            prewarmWorkspaceTabs(items, excluding: c.selectedTab)
+            scheduleLayoutSave()
+            return
+        }
+        var created: [TerminalWindowController] = []
+        withWorkspaceSwitchBatch {
+            var previous: TerminalWindowController?
+            for tab in ws.hiddenTabs {
+                let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
+                                       title: tab.title, frame: frame, floating: tab.floating,
+                                       floatingHidden: tab.floatingHidden)
+                c.workspaceID = ws.id
+                c.adopt(tab)
+                if let prev = previous { attachAsTab(c, to: prev) } else { showAsNewWindow(c, frame: frame) }
+                previous = c
+                created.append(c)
+            }
+            guard !created.isEmpty else { return }
+            created[min(max(0, ws.hiddenSelectedTab), created.count - 1)].window?.makeKeyAndOrderFront(nil)
+            ws.hiddenTabs = []
+            ws.lastActive = Date()
         }
         guard !created.isEmpty else { return }
-        created[min(max(0, ws.hiddenSelectedTab), created.count - 1)].window?.makeKeyAndOrderFront(nil)
-        ws.hiddenTabs = []
-        ws.lastActive = Date()
+        for c in created { c.updateTitle() }
+        if let sel = created.first(where: { $0.window?.tabGroup?.selectedWindow === $0.window }) ?? created.first {
+            (sel.window as? TerminalWindow)?.finishWorkspaceSwitchSync()
+        }
+        refreshSidebars()
         scheduleLayoutSave()
     }
 
@@ -378,6 +699,8 @@ extension SessionManager {
         }
         if let c = controllerShowing(ws) {
             c.window?.makeKeyAndOrderFront(nil)
+        } else if let c = currentRegularController {
+            switchWorkspace(in: c, to: ws)
         } else {
             openWorkspaceInNewWindow(ws)
         }
@@ -423,7 +746,7 @@ extension SessionManager {
     /// hidden workspace, or closes when there is none.
     func closeWorkspace(_ ws: Workspace) {
         let shownIn = controllerShowing(ws)
-        let tabs = shownIn.map { group(of: $0).count } ?? ws.hiddenTabs.count
+        let tabs = shownIn.map { windowTabs(of: $0).count } ?? ws.hiddenTabs.count
         let alert = NSAlert()
         alert.messageText = "Close workspace “\(ws.name)”?"
         alert.informativeText = "Its \(tabs) \(tabs == 1 ? "tab" : "tabs") and the programs running in them are closed."
@@ -432,9 +755,10 @@ extension SessionManager {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        let ids = shownIn.map { group(of: $0).flatMap { $0.content.paneIds } }
+        let ids = shownIn.map { windowTabs(of: $0).flatMap { $0.content.paneIds } }
             ?? ws.hiddenTabs.flatMap { $0.panes }
         for id in ids { sendClosePane(id) }
+        ws.invalidateCachedTabs()
         workspaces.removeAll { $0 === ws }
         if let c = shownIn {
             let old = group(of: c)
@@ -456,20 +780,20 @@ extension SessionManager {
     /// hidden workspace instead of closing (which would quit the app), and the emptied workspace
     /// goes. False when there is no other workspace to show.
     func showNextWorkspace(closing c: TerminalWindowController) -> Bool {
-        guard !isTerminating, !c.isQuick, !c.isClosed, group(of: c).count == 1,
+        guard !isTerminating, !c.isQuick, !c.isClosed, windowTabs(of: c).count == 1,
               let next = workspacesByRecency.first(where: { $0.id != c.workspaceID && !isShown($0) })
         else { return false }
         workspaces.removeAll { $0.id == c.workspaceID }
         c.workspaceID = 0
         switchWorkspace(in: c, to: next)
-        return c.isClosed
+        return c.isClosed || c.workspaceID == next.id
     }
 
     /// ⌘⇧O: pick a workspace by name.
     func showWorkspaceSwitcher() {
         let current = currentController?.workspaceID
         var items: [CommandPalette.Item] = workspacesByRecency.map { ws in
-            let tabs = isShown(ws) ? (controllerShowing(ws).map { group(of: $0).count } ?? 0) : ws.hiddenTabs.count
+            let tabs = isShown(ws) ? (controllerShowing(ws).map { windowTabs(of: $0).count } ?? 0) : ws.hiddenTabs.count
             var detail = "\(tabs) \(tabs == 1 ? "tab" : "tabs")"
             if ws.isRemote { detail = "\(ws.host) · \(Remotes.shared.phaseLabel(ws.host)) · " + detail }
             if ws.id == current {
@@ -545,7 +869,7 @@ extension SessionManager {
     /// gets a new workspace. The larger window keeps a shared workspace.
     func normalizeWorkspaces(groups: [[TerminalWindowController]], selected: [TerminalWindowController]) {
         var owner: [UInt64: Int] = [:]
-        let bySize = groups.indices.sorted { groups[$0].count > groups[$1].count }
+        let bySize = groups.indices.sorted { groups[$0].flatMap(\.tabs).count > groups[$1].flatMap(\.tabs).count }
         var assigned = [UInt64](repeating: 0, count: groups.count)
         for gi in bySize {
             var id = selected[gi].workspaceID
@@ -565,10 +889,9 @@ extension SessionManager {
         // Hidden workspaces lose panes that ended meanwhile, and go when none is left.
         for ws in workspaces where !shown.contains(ws.id) {
             // An offline host's panes are unknown until it is back: keep them.
-            ws.hiddenTabs = retainTabs(ws.hiddenTabs) { key in
+            ws.retainHiddenPanes { key in
                 panes[key] != nil || (key.isRemote && !Core.shared.isConnected(key.host))
             }
-            ws.hiddenSelectedTab = min(ws.hiddenSelectedTab, max(0, ws.hiddenTabs.count - 1))
         }
         workspaces.removeAll { !shown.contains($0.id) && $0.hiddenTabs.isEmpty }
         return workspaces.map { ws in

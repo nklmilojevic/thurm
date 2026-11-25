@@ -53,6 +53,16 @@ pub fn output_locked(cmd: &mut Command) -> io::Result<std::process::Output> {
     spawn_locked(cmd)?.wait_with_output()
 }
 
+/// SSH session variables `sshd` sets on the session that started `thurmd`. Panes are not
+/// SSH sessions — inheriting them causes prompts and tools to treat local or tailnet panes
+/// as SSH sessions. `SSH_AUTH_SOCK` is intentionally preserved so agent forwarding keeps working.
+const STRIPPED_SSH_ENV: &[&str] = &[
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+    "SSH_ORIGINAL_COMMAND",
+];
+
 impl Pty {
     pub fn spawn(opts: SpawnOptions) -> io::Result<Pty> {
         let mut master: RawFd = -1;
@@ -97,6 +107,9 @@ impl Pty {
         cmd.stdin(slave.try_clone()?);
         cmd.stdout(slave.try_clone()?);
         cmd.stderr(slave.try_clone()?);
+        for var in STRIPPED_SSH_ENV {
+            cmd.env_remove(var);
+        }
         for (k, v) in &opts.env {
             cmd.env(k, v);
         }
@@ -431,4 +444,124 @@ pub fn write_all(f: &mut File, mut data: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn run_pty_output(program: &str, args: &[&str], env: Vec<(String, String)>) -> String {
+        let mut pty = Pty::spawn(SpawnOptions {
+            program: program.into(),
+            args: args.iter().map(|s| (*s).into()).collect(),
+            argv0: None,
+            cwd: None,
+            env,
+            size: PaneSize::default(),
+        })
+        .expect("spawn pty");
+        let mut reader = pty.reader().expect("pty reader");
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("read pty: {e}"),
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pty.try_wait().is_none() {
+            assert!(Instant::now() < deadline, "pty child did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        String::from_utf8_lossy(&out).replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn spawn_strips_ssh_session_env_and_preserves_auth_sock() {
+        const SENTINEL: &str = "THURM_PTY_SSH_ENV_TEST";
+        if std::env::var_os(SENTINEL).is_none() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let test_name = format!(
+                "{}::spawn_strips_ssh_session_env_and_preserves_auth_sock",
+                module_path!().split_once("::").map_or("", |(_, rest)| rest)
+            );
+            let output = Command::new(exe)
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(SENTINEL, "1")
+                .env("SSH_CONNECTION", "10.0.0.1 54321 10.0.0.2 22")
+                .env("SSH_CLIENT", "10.0.0.1 54321 22")
+                .env("SSH_TTY", "/dev/pts/0")
+                .env("SSH_ORIGINAL_COMMAND", "thurmd")
+                .env("SSH_AUTH_SOCK", "/tmp/thurm-test-agent.sock")
+                .output()
+                .expect("run subprocess test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "subprocess test failed ({:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "expected subprocess to run test {test_name:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            return;
+        }
+
+        for var in STRIPPED_SSH_ENV {
+            assert!(std::env::var_os(var).is_some(), "parent env missing {var}");
+        }
+        assert_eq!(
+            std::env::var("SSH_AUTH_SOCK").ok().as_deref(),
+            Some("/tmp/thurm-test-agent.sock")
+        );
+
+        let script = concat!(
+            "printf 'SSH_CONNECTION=%s\\n' \"${SSH_CONNECTION-<unset>}\"; ",
+            "printf 'SSH_CLIENT=%s\\n' \"${SSH_CLIENT-<unset>}\"; ",
+            "printf 'SSH_TTY=%s\\n' \"${SSH_TTY-<unset>}\"; ",
+            "printf 'SSH_ORIGINAL_COMMAND=%s\\n' \"${SSH_ORIGINAL_COMMAND-<unset>}\"; ",
+            "printf 'SSH_AUTH_SOCK=%s\\n' \"${SSH_AUTH_SOCK-<unset>}\""
+        );
+
+        // Default spawn: strip leaked SSH session vars, keep SSH_AUTH_SOCK.
+        let out = run_pty_output("/bin/sh", &["-c", script], vec![]);
+        assert_eq!(
+            out,
+            concat!(
+                "SSH_CONNECTION=<unset>\n",
+                "SSH_CLIENT=<unset>\n",
+                "SSH_TTY=<unset>\n",
+                "SSH_ORIGINAL_COMMAND=<unset>\n",
+                "SSH_AUTH_SOCK=/tmp/thurm-test-agent.sock\n"
+            )
+        );
+
+        // Explicit opts.env (e.g. `[terminal.env]` or client `extra_env`) overrides removal.
+        let out = run_pty_output(
+            "/bin/sh",
+            &["-c", script],
+            vec![
+                ("SSH_CONNECTION".into(), "explicit-conn".into()),
+                ("SSH_TTY".into(), "/dev/pts/99".into()),
+            ],
+        );
+        assert_eq!(
+            out,
+            concat!(
+                "SSH_CONNECTION=explicit-conn\n",
+                "SSH_CLIENT=<unset>\n",
+                "SSH_TTY=/dev/pts/99\n",
+                "SSH_ORIGINAL_COMMAND=<unset>\n",
+                "SSH_AUTH_SOCK=/tmp/thurm-test-agent.sock\n"
+            )
+        );
+    }
 }

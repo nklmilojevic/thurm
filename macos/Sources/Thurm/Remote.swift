@@ -611,7 +611,7 @@ final class Remotes {
     /// An agent reached Done or NeedsInput: a handoff's committed work comes back.
     func agentSettled(_ key: PaneKey) {
         guard key.isRemote else { return }
-        let id = SessionManager.shared.controller(for: key)?.handoffID
+        let id = SessionManager.shared.tab(for: key)?.handoffID
             ?? handoffs.values.first { $0.host == key.host && $0.pane == key.id }?.id
         if let id { SessionManager.shared.fetchHandoff(id, quiet: true) }
     }
@@ -671,17 +671,16 @@ extension SessionManager {
         }
         // Tabs of panes the host no longer has close, with a notice.
         var gone = 0
-        for c in liveControllers {
-            for id in c.content.paneIds where id.host == host && !listed.contains(id) {
+        for t in liveTabs {
+            for id in t.content.paneIds where id.host == host && !listed.contains(id) {
                 removePaneFromUI(id)
                 gone += 1
             }
         }
         for ws in workspaces where !isShown(ws) {
             let before = ws.hiddenTabs.flatMap { $0.panes }.count
-            ws.hiddenTabs = retainTabs(ws.hiddenTabs) { $0.host != host || listed.contains($0) }
+            ws.retainHiddenPanes { $0.host != host || listed.contains($0) }
             gone += before - ws.hiddenTabs.flatMap { $0.panes }.count
-            ws.hiddenSelectedTab = min(ws.hiddenSelectedTab, max(0, ws.hiddenTabs.count - 1))
         }
         for info in infos {
             if panes[info.key] == nil { panes[info.key] = info }
@@ -692,7 +691,7 @@ extension SessionManager {
             view.resubscribe()
         }
         // Panes the layout doesn't know about: new tabs in the host's workspace.
-        var known = Set(liveControllers.flatMap { $0.content.paneIds })
+        var known = Set(liveTabs.flatMap { $0.content.paneIds })
         known.formUnion(workspaces.flatMap { $0.hiddenTabs.flatMap { $0.panes } })
         let unknown = infos.filter { !known.contains($0.key) }.map(\.key).sorted { $0.id < $1.id }
         if !unknown.isEmpty { adoptRemotePanes(unknown, host: host) }
@@ -718,6 +717,7 @@ extension SessionManager {
             }
         }
         runPendingHandoffCleanups(host)
+        prewarmHiddenWorkspaces(for: host)
         refreshSidebars()
         updateDockBadge()
         for c in liveControllers { c.updateTitle() }
@@ -741,19 +741,36 @@ extension SessionManager {
             ?? makeWorkspace(host: host)
         let handoffs = Remotes.shared.handoffs.values
         if let shownIn = controllerShowing(ws) {
-            var previous = group(of: shownIn).last ?? shownIn
-            let selected = shownIn.window?.tabGroup?.selectedWindow ?? shownIn.window
-            for key in keys {
-                let c = makeController(root: .leaf(key), focused: key, zoomed: nil, title: nil, frame: nil)
-                c.handoffID = handoffs.first { $0.host == host && $0.pane == key.id }?.id
-                attachAsTab(c, to: previous)
-                previous = c
+            if shownIn.usesSingleWindowTabs && group(of: shownIn).count == 1 {
+                for key in keys {
+                    let tab = TabItem(root: .leaf(key), focused: key, zoomed: nil)
+                    tab.handoffID = handoffs.first { $0.host == host && $0.pane == key.id }?.id
+                    shownIn.insertTab(tab, at: shownIn.tabs.count, select: false)
+                }
+            } else {
+                var previous = group(of: shownIn).last ?? shownIn
+                let selected = shownIn.window?.tabGroup?.selectedWindow ?? shownIn.window
+                withWorkspaceSwitchBatch {
+                    for key in keys {
+                        let c = makeController(root: .leaf(key), focused: key, zoomed: nil, title: nil, frame: nil)
+                        c.handoffID = handoffs.first { $0.host == host && $0.pane == key.id }?.id
+                        attachAsTab(c, to: previous)
+                        previous = c
+                    }
+                    if let selected { selected.tabGroup?.selectedWindow = selected }
+                }
             }
-            if let selected { selected.tabGroup?.selectedWindow = selected }
         } else {
             for key in keys {
-                ws.hiddenTabs.append(TabLayout(title: nil, root: .pane(key), focused: key.id, zoomed: nil,
-                                               handoff: handoffs.first { $0.host == host && $0.pane == key.id }?.id))
+                let handoff = handoffs.first { $0.host == host && $0.pane == key.id }?.id
+                if ws.cachedTabs != nil {
+                    let tab = TabItem(root: .leaf(key), focused: key, zoomed: nil)
+                    tab.handoffID = handoff
+                    ws.appendParkedTab(tab)
+                } else {
+                    ws.hiddenTabs.append(TabLayout(title: nil, root: .pane(key), focused: key.id, zoomed: nil,
+                                                   handoff: handoff))
+                }
             }
         }
     }
@@ -916,7 +933,7 @@ extension SessionManager {
             let v = Core.shared.remoteCall(["op": "handoff_fetch", "id": id])
             DispatchQueue.main.async {
                 let sm = SessionManager.shared
-                let view = sm.liveControllers.first { $0.handoffID == id }?.content.focusedView
+                let view = sm.liveTabs.first { $0.handoffID == id }?.content.focusedView
                 if let e = (v as? [String: Any])?["error"] as? String {
                     Remotes.shared.handoffErrors[id] = e
                     view?.showToast("Fetching the handoff failed: \(e.split(separator: "\n").first ?? "")", duration: 5)

@@ -9,14 +9,14 @@ mod remote;
 #[cfg(feature = "desktop")]
 mod transfer;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use ::thurm_client::{Client, ConnectOptions};
+use ::thurm_client::{Client, ClientError, ConnectOptions};
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use thurm_proto::{
     Event, Frame, ImagePlacement, Key, KeyAction, KeyEvent, MouseButton, MouseEvent, MouseKind,
@@ -327,12 +327,68 @@ impl Engine {
     }
 }
 
+#[derive(Default)]
+struct Subscriptions {
+    /// Refcount of active views currently showing each pane.
+    active: HashMap<PaneId, usize>,
+    /// Panes currently subscribed on the daemon (including in-flight before `Event::Attach`).
+    subscribed: HashSet<PaneId>,
+    /// Panes with `active == 0` kept subscribed & warm in LRU order (oldest at front).
+    warm_order: VecDeque<PaneId>,
+    /// Maximum number of parked warm panes (`0` = legacy immediate-unsubscribe behavior).
+    warm_limit: usize,
+    /// Number of cancelled in-flight `Subscribe`s per pane whose late `Event::Attach` must be
+    /// discarded rather than resurrecting a `LocalPane`.
+    discard_attach: HashMap<PaneId, usize>,
+}
+
+impl Subscriptions {
+    fn remove_warm(&mut self, pane: PaneId) {
+        self.warm_order.retain(|&p| p != pane);
+    }
+
+    fn is_warm(&self, pane: PaneId) -> bool {
+        self.warm_order.contains(&pane)
+    }
+
+    fn remove_pane(&mut self, pane: PaneId) {
+        self.active.remove(&pane);
+        self.remove_warm(pane);
+        self.subscribed.remove(&pane);
+        self.discard_attach.remove(&pane);
+    }
+
+    fn clear(&mut self) {
+        self.active.clear();
+        self.warm_order.clear();
+        self.subscribed.clear();
+        self.discard_attach.clear();
+    }
+
+    fn evict_excess(&mut self, shared: &Shared, client: &Client) {
+        while self.warm_order.len() > self.warm_limit {
+            let Some(old) = self.warm_order.pop_front() else {
+                break;
+            };
+            let was_subscribed = self.subscribed.remove(&old);
+            let had_local = shared.locals.lock().remove(&old).is_some();
+            if was_subscribed {
+                if !had_local {
+                    *self.discard_attach.entry(old).or_insert(0) += 1;
+                }
+                send_checked(client, Request::Unsubscribe { pane: old });
+            }
+        }
+    }
+}
+
 struct Shared {
     grids: Mutex<HashMap<PaneId, Arc<Mutex<Grid>>>>,
     locked: Mutex<HashMap<PaneId, ArcMutexGuard<RawMutex, Grid>>>,
     images: Mutex<HashMap<(PaneId, u32), Arc<ImageSlot>>>,
     locked_images: Mutex<HashMap<ImageKey, Vec<Arc<ImageSlot>>>>,
     locals: Mutex<HashMap<PaneId, Arc<Mutex<LocalPane>>>>,
+    subs: Mutex<Subscriptions>,
     engine: Mutex<Engine>,
     /// A wake-up is scheduled for panes inside a synchronized update (so its timeout shows).
     sync_timer: Mutex<HashSet<PaneId>>,
@@ -346,6 +402,7 @@ impl Default for Shared {
             images: Default::default(),
             locked_images: Default::default(),
             locals: Default::default(),
+            subs: Default::default(),
             engine: Mutex::new(Engine {
                 cfg: thurm_config::Config::load().unwrap_or_default(),
                 dark: true,
@@ -359,6 +416,10 @@ impl Default for Shared {
 impl Shared {
     fn local(&self, pane: PaneId) -> Option<Arc<Mutex<LocalPane>>> {
         self.locals.lock().get(&pane).cloned()
+    }
+
+    fn is_warm(&self, pane: PaneId) -> bool {
+        self.subs.lock().is_warm(pane)
     }
 
     /// Show the panes in the light or dark variant of the theme; whether it changed.
@@ -578,7 +639,12 @@ fn new_connection(
             log::error!("an event from the daemon panicked the app's handler");
         }
     };
-    let on_disc = move || emit_json(on_event, ctx, "\"Disconnected\"");
+    let disc_shared = shared.clone();
+    let on_disc = move || {
+        disc_shared.subs.lock().clear();
+        disc_shared.locals.lock().clear();
+        emit_json(on_event, ctx, "\"Disconnected\"");
+    };
     let (client, transport) = connect(Box::new(on_ev), Box::new(on_disc))?;
     Ok(Box::into_raw(Box::new(thurm_client {
         client,
@@ -653,7 +719,7 @@ pub unsafe extern "C" fn thurm_clipboard_answer(
     let sent = std::thread::Builder::new()
         .name("clipboard-answer".into())
         .spawn(move || {
-            let _ = client.send(Request::ClipboardAnswer { id, data });
+            send_checked(&client, Request::ClipboardAnswer { id, data });
         });
     if let Err(e) = sent {
         log::warn!("cannot send a clipboard answer: {e}");
@@ -721,7 +787,11 @@ fn schedule_sync_flush(
             };
             match next {
                 Some(d) => schedule_sync_flush(&shared, pane, d, on_frame, ctx),
-                None => fire_frame(on_frame, ctx, pane),
+                None => {
+                    if !shared.is_warm(pane) {
+                        fire_frame(on_frame, ctx, pane);
+                    }
+                }
             }
         });
     if spawned.is_err() {
@@ -738,22 +808,45 @@ fn handle_event(
 ) {
     match ev {
         Event::Attach { pane, size, state } => {
+            {
+                let mut subs = shared.subs.lock();
+                if let Some(n) = subs.discard_attach.get_mut(&pane) {
+                    *n -= 1;
+                    if *n == 0 {
+                        subs.discard_attach.remove(&pane);
+                    }
+                    return;
+                }
+            }
             let mut term = Terminal::new(size, shared.engine.lock().engine_config());
             // The daemon has read (and replaced) the pane's own transmissions; any left in the
             // stream (an older or hostile remote daemon) must not read this Mac's files.
             term.set_reads_media(false);
             term.replay(&state);
             let _ = term.drain_events();
-            shared.images.lock().retain(|(p, _), _| *p != pane);
             let local = LocalPane {
                 term,
                 view: ClientView::new(),
             };
-            shared
-                .locals
-                .lock()
-                .insert(pane, Arc::new(Mutex::new(local)));
-            fire_frame(on_frame, ctx, pane);
+            let should_fire = {
+                let mut subs = shared.subs.lock();
+                if let Some(n) = subs.discard_attach.get_mut(&pane) {
+                    *n -= 1;
+                    if *n == 0 {
+                        subs.discard_attach.remove(&pane);
+                    }
+                    return;
+                }
+                shared
+                    .locals
+                    .lock()
+                    .insert(pane, Arc::new(Mutex::new(local)));
+                !subs.is_warm(pane)
+            };
+            shared.images.lock().retain(|(p, _), _| *p != pane);
+            if should_fire {
+                fire_frame(on_frame, ctx, pane);
+            }
         }
         Event::Output { pane, data } => {
             let Some(local) = shared.local(pane) else {
@@ -767,7 +860,11 @@ fn handle_event(
             };
             match sync {
                 Some(deadline) => schedule_sync_flush(shared, pane, deadline, on_frame, ctx),
-                None => fire_frame(on_frame, ctx, pane),
+                None => {
+                    if !shared.is_warm(pane) {
+                        fire_frame(on_frame, ctx, pane);
+                    }
+                }
             }
         }
         Event::Resized { pane, size } => {
@@ -780,12 +877,17 @@ fn handle_event(
                 // The resized grid waits for the program's redraw (see `Terminal::resize`).
                 match held {
                     Some(deadline) => schedule_sync_flush(shared, pane, deadline, on_frame, ctx),
-                    None => fire_frame(on_frame, ctx, pane),
+                    None => {
+                        if !shared.is_warm(pane) {
+                            fire_frame(on_frame, ctx, pane);
+                        }
+                    }
                 }
             }
         }
         other => {
             if let Event::PaneClosed { pane } = &other {
+                shared.subs.lock().remove_pane(*pane);
                 shared.grids.lock().remove(pane);
                 shared.locals.lock().remove(pane);
                 shared.images.lock().retain(|(p, _), _| p != pane);
@@ -952,7 +1054,7 @@ pub unsafe extern "C" fn thurm_send(client: *mut thurm_client, json: *const c_ch
     match serde_json::from_str::<Request>(json) {
         Ok(req) => {
             if let Err(req) = c.local_request(req) {
-                let _ = c.client.send(req);
+                send_checked(&c.client, req);
             }
         }
         Err(e) => log::warn!("thurm_send: bad request: {e}"),
@@ -1004,29 +1106,135 @@ impl thurm_client {
     /// Bytes the local copy encoded for the program (keys, mouse reports).
     fn input(&self, pane: PaneId, data: Vec<u8>) {
         if !data.is_empty() {
-            let _ = self.client.send(Request::Input { pane, data });
+            send_checked(&self.client, Request::Input { pane, data });
         }
+    }
+}
+
+/// Enqueues `req` onto `client`. If the bounded outgoing byte queue is full (peer/tunnel stalled),
+/// forces a disconnect immediately rather than silently discarding accepted UI input or control
+/// frames on an apparently live connection, allowing the UI to show offline state and resync.
+fn send_checked(client: &Client, req: Request) -> bool {
+    match client.send(req) {
+        Ok(()) => true,
+        Err(ClientError::QueueFull) => {
+            log::warn!(
+                "thurm-ffi: outgoing queue full; closing stalled connection to resynchronize"
+            );
+            client.force_close();
+            false
+        }
+        Err(_) => false,
     }
 }
 
 fn send(client: *mut thurm_client, req: Request) {
     if let Some(c) = unsafe { client_ref(client) } {
-        let _ = c.client.send(req);
+        send_checked(&c.client, req);
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_subscribe(client: *mut thurm_client, pane: u64) {
-    send(client, Request::Subscribe { pane });
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return;
+    };
+    let fire = {
+        let mut subs = c.shared.subs.lock();
+        if subs.subscribed.contains(&pane) {
+            *subs.active.entry(pane).or_insert(0) += 1;
+            subs.remove_warm(pane);
+            // Warm hit or overlapping active view: stay subscribed without re-attaching.
+            c.shared.locals.lock().contains_key(&pane)
+        } else if send_checked(&c.client, Request::Subscribe { pane }) {
+            *subs.active.entry(pane).or_insert(0) += 1;
+            subs.remove_warm(pane);
+            subs.subscribed.insert(pane);
+            false
+        } else {
+            // Subscribe frame was not accepted (queue full -> disconnected, or already dead):
+            // do not leave local bookkeeping claiming the pane is subscribed.
+            false
+        }
+    };
+    if fire {
+        fire_frame(c.on_frame, c.ctx, pane);
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_unsubscribe(client: *mut thurm_client, pane: u64) {
-    // Its copy stops getting output; input goes through the daemon until the next Attach.
-    if let Some(c) = unsafe { client_ref(client) } {
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return;
+    };
+    let mut subs = c.shared.subs.lock();
+    if let Some(count) = subs.active.get_mut(&pane) {
+        *count = count.saturating_sub(1);
+        if *count > 0 {
+            return;
+        }
+        subs.active.remove(&pane);
+    }
+    if subs.warm_limit > 0 && subs.subscribed.contains(&pane) {
+        // Keep the local copy subscribed and warm in LRU order.
+        subs.remove_warm(pane);
+        subs.warm_order.push_back(pane);
+        subs.evict_excess(&c.shared, &c.client);
+    } else if subs.warm_limit == 0 {
+        // Legacy behavior: drop copy immediately and unsubscribe on the daemon.
+        let was_subscribed = subs.subscribed.remove(&pane);
+        let had_local = c.shared.locals.lock().remove(&pane).is_some();
+        if was_subscribed && !had_local {
+            *subs.discard_attach.entry(pane).or_insert(0) += 1;
+        }
+        send_checked(&c.client, Request::Unsubscribe { pane });
+    } else {
         c.shared.locals.lock().remove(&pane);
     }
-    send(client, Request::Unsubscribe { pane });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_set_warm_limit(client: *mut thurm_client, limit: u32) {
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return;
+    };
+    let mut subs = c.shared.subs.lock();
+    subs.warm_limit = limit as usize;
+    subs.evict_excess(&c.shared, &c.client);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_evict_pane(client: *mut thurm_client, pane: u64) {
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return;
+    };
+    let mut subs = c.shared.subs.lock();
+    subs.active.remove(&pane);
+    subs.remove_warm(pane);
+    let was_subscribed = subs.subscribed.remove(&pane);
+    let had_local = c.shared.locals.lock().remove(&pane).is_some();
+    if was_subscribed {
+        if !had_local {
+            *subs.discard_attach.entry(pane).or_insert(0) += 1;
+        }
+        send_checked(&c.client, Request::Unsubscribe { pane });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_prewarm_pane(client: *mut thurm_client, pane: u64) {
+    let Some(c) = (unsafe { client_ref(client) }) else {
+        return;
+    };
+    let mut subs = c.shared.subs.lock();
+    if subs.warm_limit == 0 || subs.subscribed.contains(&pane) || subs.active.contains_key(&pane) {
+        return;
+    }
+    if send_checked(&c.client, Request::Subscribe { pane }) {
+        subs.subscribed.insert(pane);
+        subs.warm_order.push_back(pane);
+        subs.evict_excess(&c.shared, &c.client);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1208,7 +1416,7 @@ pub unsafe extern "C" fn thurm_key(
             c.input(pane, bytes);
         }
         None => {
-            let _ = c.client.send(Request::Key { pane, key });
+            send_checked(&c.client, Request::Key { pane, key });
         }
     }
 }
@@ -1250,7 +1458,7 @@ pub unsafe extern "C" fn thurm_mouse(
         return;
     };
     let Some(local) = c.shared.local(pane) else {
-        let _ = c.client.send(Request::Mouse { pane, event });
+        send_checked(&c.client, Request::Mouse { pane, event });
         return;
     };
     let (text, bytes) = {
@@ -1299,13 +1507,16 @@ pub unsafe extern "C" fn thurm_wheel(
             c.input(pane, bytes);
         }
         None => {
-            let _ = c.client.send(Request::Wheel {
-                pane,
-                lines,
-                col,
-                row,
-                mods,
-            });
+            send_checked(
+                &c.client,
+                Request::Wheel {
+                    pane,
+                    lines,
+                    col,
+                    row,
+                    mods,
+                },
+            );
         }
     }
 }
@@ -2154,5 +2365,659 @@ mod tests {
             .unwrap(),
             r#"{"ClipboardWrite":{"pane":1,"id":7,"text":null}}"#
         );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum SubOp {
+        Sub(PaneId),
+        Unsub(PaneId),
+    }
+
+    struct MockCallbacks {
+        frames: Mutex<Vec<PaneId>>,
+        disconnected: std::sync::atomic::AtomicBool,
+    }
+
+    struct MockDaemon {
+        client: *mut thurm_client,
+        ops: Arc<Mutex<Vec<SubOp>>>,
+        server_writer: Arc<Mutex<std::os::unix::net::UnixStream>>,
+        callbacks: Arc<MockCallbacks>,
+        ctx_ptr: *mut MockCallbacks,
+    }
+
+    impl MockDaemon {
+        fn start(auto_attach: bool) -> Self {
+            use std::io::BufReader;
+            use std::os::unix::net::UnixStream;
+            use thurm_proto::{Envelope, ServerMessage, codec};
+
+            let (client_stream, server_stream) = UnixStream::pair().unwrap();
+            let ops = Arc::new(Mutex::new(Vec::<SubOp>::new()));
+            let log = ops.clone();
+            let server_writer = Arc::new(Mutex::new(server_stream.try_clone().unwrap()));
+            let resp_writer = server_writer.clone();
+
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(server_stream);
+                while let Ok(Some(env)) = codec::read_message::<_, Envelope>(&mut r) {
+                    let mut w = resp_writer.lock();
+                    let resp = match env.request {
+                        Request::Hello { .. } => Some(Response::Hello {
+                            version: thurm_proto::PROTOCOL_VERSION,
+                            daemon_pid: 1,
+                            restored: false,
+                            build: String::new(),
+                            capabilities: thurm_proto::CAPABILITIES
+                                .iter()
+                                .map(|c| (*c).to_owned())
+                                .collect(),
+                        }),
+                        Request::Subscribe { pane } => {
+                            log.lock().push(SubOp::Sub(pane));
+                            if auto_attach {
+                                let attach = Event::Attach {
+                                    pane,
+                                    size: PaneSize {
+                                        cols: 40,
+                                        rows: 10,
+                                        cell_width: 8,
+                                        cell_height: 16,
+                                    },
+                                    state: format!("pane-{pane}").into_bytes(),
+                                };
+                                let _ =
+                                    codec::write_message(&mut *w, &ServerMessage::Event(attach));
+                            }
+                            None
+                        }
+                        Request::Unsubscribe { pane } => {
+                            log.lock().push(SubOp::Unsub(pane));
+                            None
+                        }
+                        Request::ListPanes => Some(Response::Panes(vec![])),
+                        _ => (env.id != 0).then_some(Response::Ok),
+                    };
+                    if let Some(result) = resp {
+                        let _ = codec::write_message(
+                            &mut *w,
+                            &ServerMessage::Response {
+                                id: env.id,
+                                result: Ok(result),
+                            },
+                        );
+                    }
+                }
+            });
+
+            let callbacks = Arc::new(MockCallbacks {
+                frames: Mutex::new(Vec::new()),
+                disconnected: std::sync::atomic::AtomicBool::new(false),
+            });
+            let ctx_ptr = Arc::into_raw(callbacks.clone()) as *mut MockCallbacks;
+            unsafe extern "C" fn on_event(ctx: *mut c_void, json: *const c_char) {
+                let cbs = unsafe { &*(ctx as *const MockCallbacks) };
+                if let Ok(s) = unsafe { CStr::from_ptr(json) }.to_str()
+                    && s == "\"Disconnected\""
+                {
+                    cbs.disconnected.store(true, Ordering::Release);
+                }
+            }
+            unsafe extern "C" fn on_frame(ctx: *mut c_void, pane: u64) {
+                let cbs = unsafe { &*(ctx as *const MockCallbacks) };
+                cbs.frames.lock().push(pane);
+            }
+            let client = new_connection(
+                Some(on_event),
+                Some(on_frame),
+                ctx_ptr.cast(),
+                |on_ev, on_disc| {
+                    Client::from_stream(client_stream, "test", true, &[], on_ev, on_disc)
+                        .map(|c| (c, None))
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .unwrap();
+
+            Self {
+                client,
+                ops,
+                server_writer,
+                callbacks,
+                ctx_ptr,
+            }
+        }
+
+        /// Round-trips a synchronous request so all prior async `send()`s and server-side
+        /// events written before it have been processed in FIFO order.
+        fn sync(&self) {
+            let out = unsafe { thurm_request(self.client, c"\"ListPanes\"".as_ptr()) };
+            assert!(!out.is_null());
+            unsafe { thurm_string_free(out) };
+        }
+
+        fn push(&self, ev: Event) {
+            use thurm_proto::{ServerMessage, codec};
+            let mut w = self.server_writer.lock();
+            codec::write_message(&mut *w, &ServerMessage::Event(ev)).unwrap();
+        }
+
+        fn close_server(&self) {
+            let _ = self.server_writer.lock().shutdown(std::net::Shutdown::Both);
+        }
+
+        fn wait_disconnected(&self) {
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if self.callbacks.disconnected.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("timed out waiting for disconnect callback");
+        }
+
+        fn take_ops(&self) -> Vec<SubOp> {
+            self.sync();
+            std::mem::take(&mut *self.ops.lock())
+        }
+
+        fn take_frames(&self) -> Vec<PaneId> {
+            std::mem::take(&mut *self.callbacks.frames.lock())
+        }
+
+        fn read_row0(&self, pane: PaneId) -> Option<(u16, u16, String)> {
+            let mut info = thurm_grid_info::default();
+            let mut cells: *const thurm_cell = std::ptr::null();
+            if !unsafe { thurm_grid_lock(self.client, pane, &mut info, &mut cells) } {
+                return None;
+            }
+            let row0: String = (0..info.cols as usize)
+                .map(|c| {
+                    let ch = unsafe { (*cells.add(c)).ch };
+                    char::from_u32(ch).filter(|&c| c != '\0').unwrap_or(' ')
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_owned();
+            unsafe { thurm_grid_unlock(self.client, pane) };
+            Some((info.cols, info.rows, row0))
+        }
+    }
+
+    impl Drop for MockDaemon {
+        fn drop(&mut self) {
+            unsafe { thurm_disconnect(self.client) };
+            self.wait_disconnected();
+            unsafe { drop(Arc::from_raw(self.ctx_ptr)) };
+        }
+    }
+
+    #[test]
+    fn default_warm_limit_zero_preserves_legacy_unsubscribe() {
+        let d = MockDaemon::start(true);
+        unsafe { thurm_subscribe(d.client, 1) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(1)]);
+        assert_eq!(d.take_frames(), vec![1]);
+        assert!(
+            unsafe { client_ref(d.client) }
+                .unwrap()
+                .shared
+                .local(1)
+                .is_some()
+        );
+
+        unsafe { thurm_unsubscribe(d.client, 1) };
+        assert_eq!(d.take_ops(), vec![SubOp::Unsub(1)]);
+        assert!(
+            unsafe { client_ref(d.client) }
+                .unwrap()
+                .shared
+                .local(1)
+                .is_none()
+        );
+
+        // Re-subscribing sends Request::Subscribe again.
+        unsafe { thurm_subscribe(d.client, 1) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(1)]);
+        assert_eq!(d.take_frames(), vec![1]);
+    }
+
+    #[test]
+    fn warm_hit_skips_subscribe_and_fires_frame_immediately() {
+        let d = MockDaemon::start(true);
+        unsafe { thurm_set_warm_limit(d.client, 4) };
+
+        unsafe { thurm_subscribe(d.client, 7) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(7)]);
+        assert_eq!(d.take_frames(), vec![7]);
+
+        // Unsubscribing parks pane 7 warm without sending Request::Unsubscribe.
+        unsafe { thurm_unsubscribe(d.client, 7) };
+        assert_eq!(d.take_ops(), vec![]);
+        assert!(
+            unsafe { client_ref(d.client) }
+                .unwrap()
+                .shared
+                .local(7)
+                .is_some()
+        );
+
+        // Re-subscribing hits the warm cache: fires on_frame synchronously and sends nothing.
+        unsafe { thurm_subscribe(d.client, 7) };
+        assert_eq!(d.take_frames(), vec![7]);
+        assert_eq!(d.take_ops(), vec![]);
+        assert_eq!(d.read_row0(7), Some((40, 10, "pane-7".into())));
+    }
+
+    #[test]
+    fn parked_warm_pane_applies_live_output_and_resize() {
+        let d = MockDaemon::start(true);
+        unsafe { thurm_set_warm_limit(d.client, 4) };
+
+        unsafe { thurm_subscribe(d.client, 1) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(1)]);
+        assert_eq!(d.take_frames(), vec![1]);
+
+        // Park pane 1 warm.
+        unsafe { thurm_unsubscribe(d.client, 1) };
+        assert_eq!(d.take_ops(), vec![]);
+
+        // Push resize and live output while parked; warm pane should update silently.
+        d.push(Event::Resized {
+            pane: 1,
+            size: PaneSize {
+                cols: 60,
+                rows: 12,
+                cell_width: 8,
+                cell_height: 16,
+            },
+        });
+        d.push(Event::Output {
+            pane: 1,
+            data: b"\r\x1b[2Klive-while-warm".to_vec(),
+        });
+        // Wait for any short resize hold timer to flush so snapshot reflects the resized grid.
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while Instant::now() < deadline {
+            d.sync();
+            let in_sync = unsafe { client_ref(d.client) }
+                .unwrap()
+                .shared
+                .local(1)
+                .unwrap()
+                .lock()
+                .term
+                .in_sync();
+            if !in_sync {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            d.take_frames().is_empty(),
+            "parked warm pane should not spam on_frame"
+        );
+
+        // Re-subscribing immediately fires on_frame and shows the live-updated content & size.
+        unsafe { thurm_subscribe(d.client, 1) };
+        assert_eq!(d.take_frames(), vec![1]);
+        assert_eq!(d.take_ops(), vec![]);
+        assert_eq!(d.read_row0(1), Some((60, 12, "live-while-warm".into())));
+    }
+
+    #[test]
+    fn warm_lru_evicts_oldest_and_limit_reduction_evicts_excess() {
+        let d = MockDaemon::start(true);
+        unsafe { thurm_set_warm_limit(d.client, 2) };
+
+        for p in [1, 2] {
+            unsafe { thurm_subscribe(d.client, p) };
+            d.sync();
+            unsafe { thurm_unsubscribe(d.client, p) };
+        }
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(1), SubOp::Sub(2)]);
+
+        // Touch pane 1 so pane 2 becomes the oldest warm entry.
+        unsafe { thurm_subscribe(d.client, 1) };
+        unsafe { thurm_unsubscribe(d.client, 1) };
+        assert_eq!(d.take_ops(), vec![]);
+
+        // Parking pane 3 exceeds limit 2 -> pane 2 (oldest) is evicted.
+        unsafe { thurm_subscribe(d.client, 3) };
+        d.sync();
+        unsafe { thurm_unsubscribe(d.client, 3) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(3), SubOp::Unsub(2)]);
+        let shared = &unsafe { client_ref(d.client) }.unwrap().shared;
+        assert!(shared.local(1).is_some());
+        assert!(shared.local(2).is_none());
+        assert!(shared.local(3).is_some());
+
+        // Lowering limit to 1 immediately evicts oldest remaining warm pane (1).
+        unsafe { thurm_set_warm_limit(d.client, 1) };
+        assert_eq!(d.take_ops(), vec![SubOp::Unsub(1)]);
+        assert!(shared.local(1).is_none());
+        assert!(shared.local(3).is_some());
+
+        // Lowering limit to 0 evicts the last warm pane (3).
+        unsafe { thurm_set_warm_limit(d.client, 0) };
+        assert_eq!(d.take_ops(), vec![SubOp::Unsub(3)]);
+        assert!(shared.local(3).is_none());
+    }
+
+    #[test]
+    fn pane_closed_and_evict_pane_clean_up_immediately() {
+        let d = MockDaemon::start(true);
+        unsafe { thurm_set_warm_limit(d.client, 2) };
+
+        for p in [1, 2] {
+            unsafe { thurm_subscribe(d.client, p) };
+            d.sync();
+            unsafe { thurm_unsubscribe(d.client, p) };
+        }
+        let _ = d.take_ops();
+
+        // PaneClosed for warm pane 1 frees its warm slot without sending Unsubscribe.
+        d.push(Event::PaneClosed { pane: 1 });
+        assert_eq!(d.take_ops(), vec![]);
+        assert!(
+            unsafe { client_ref(d.client) }
+                .unwrap()
+                .shared
+                .local(1)
+                .is_none()
+        );
+
+        // Parking pane 3 now fits in the freed slot without evicting pane 2.
+        unsafe { thurm_subscribe(d.client, 3) };
+        d.sync();
+        unsafe { thurm_unsubscribe(d.client, 3) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(3)]);
+
+        // thurm_evict_pane drops parked pane 2 immediately and sends Unsubscribe.
+        unsafe { thurm_evict_pane(d.client, 2) };
+        assert_eq!(d.take_ops(), vec![SubOp::Unsub(2)]);
+        assert!(
+            unsafe { client_ref(d.client) }
+                .unwrap()
+                .shared
+                .local(2)
+                .is_none()
+        );
+
+        // thurm_evict_pane on an active pane also drops it immediately and unsubscribes.
+        unsafe { thurm_subscribe(d.client, 4) };
+        d.sync();
+        let _ = d.take_ops();
+        unsafe { thurm_evict_pane(d.client, 4) };
+        assert_eq!(d.take_ops(), vec![SubOp::Unsub(4)]);
+        assert!(
+            unsafe { client_ref(d.client) }
+                .unwrap()
+                .shared
+                .local(4)
+                .is_none()
+        );
+        // Calling evict again is a no-op (no duplicate Unsubscribe).
+        unsafe { thurm_evict_pane(d.client, 4) };
+        assert_eq!(d.take_ops(), vec![]);
+    }
+
+    #[test]
+    fn prewarm_pane_subscribes_silently_and_respects_lru_limit() {
+        let d = MockDaemon::start(true);
+        // With warm_limit == 0, prewarm is a no-op.
+        unsafe { thurm_prewarm_pane(d.client, 10) };
+        assert_eq!(d.take_ops(), vec![]);
+
+        unsafe { thurm_set_warm_limit(d.client, 2) };
+        unsafe { thurm_prewarm_pane(d.client, 10) };
+        unsafe { thurm_prewarm_pane(d.client, 11) };
+        // Prewarming an already-warm pane is a no-op.
+        unsafe { thurm_prewarm_pane(d.client, 10) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(10), SubOp::Sub(11)]);
+        // Prewarmed Attach did not spuriously fire on_frame.
+        assert!(d.take_frames().is_empty());
+
+        // Prewarming a 3rd pane evicts the oldest warm pane (10).
+        unsafe { thurm_prewarm_pane(d.client, 12) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(12), SubOp::Unsub(10)]);
+
+        // Subscribing to prewarmed pane 11 is an instant warm hit with no Subscribe sent.
+        unsafe { thurm_subscribe(d.client, 11) };
+        assert_eq!(d.take_frames(), vec![11]);
+        assert_eq!(d.take_ops(), vec![]);
+        assert_eq!(d.read_row0(11), Some((40, 10, "pane-11".into())));
+
+        // Prewarming an already-active pane is a no-op.
+        unsafe { thurm_prewarm_pane(d.client, 11) };
+        assert_eq!(d.take_ops(), vec![]);
+    }
+
+    #[test]
+    fn subscribe_refcount_handles_overlapping_views() {
+        let d = MockDaemon::start(true);
+        // Works with warm_limit == 0 too: old view unsubscribing must not tear down new view.
+        unsafe { thurm_subscribe(d.client, 5) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(5)]);
+        assert_eq!(d.take_frames(), vec![5]);
+
+        // Second view subscribes before first view unsubscribes.
+        unsafe { thurm_subscribe(d.client, 5) };
+        assert_eq!(d.take_frames(), vec![5]);
+        assert_eq!(d.take_ops(), vec![]);
+
+        // First view unsubscribes -> refcount 2 -> 1: stays subscribed & local stays alive.
+        unsafe { thurm_unsubscribe(d.client, 5) };
+        assert_eq!(d.take_ops(), vec![]);
+        assert!(
+            unsafe { client_ref(d.client) }
+                .unwrap()
+                .shared
+                .local(5)
+                .is_some()
+        );
+
+        // Second view unsubscribes -> refcount 1 -> 0: unsubscribes now (warm_limit == 0).
+        unsafe { thurm_unsubscribe(d.client, 5) };
+        assert_eq!(d.take_ops(), vec![SubOp::Unsub(5)]);
+        assert!(
+            unsafe { client_ref(d.client) }
+                .unwrap()
+                .shared
+                .local(5)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn late_attach_after_evict_does_not_leak_local_pane() {
+        let d = MockDaemon::start(false);
+        unsafe { thurm_subscribe(d.client, 9) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(9)]);
+
+        // Evict before Event::Attach arrives.
+        unsafe { thurm_evict_pane(d.client, 9) };
+        assert_eq!(d.take_ops(), vec![SubOp::Unsub(9)]);
+
+        // Late Event::Attach arrives from the cancelled Subscribe -> must be discarded.
+        d.push(Event::Attach {
+            pane: 9,
+            size: PaneSize {
+                cols: 40,
+                rows: 10,
+                cell_width: 8,
+                cell_height: 16,
+            },
+            state: b"stale".to_vec(),
+        });
+        d.sync();
+        assert!(
+            unsafe { client_ref(d.client) }
+                .unwrap()
+                .shared
+                .local(9)
+                .is_none()
+        );
+        assert!(d.take_frames().is_empty());
+    }
+
+    #[test]
+    fn disconnect_clears_warm_and_active_state() {
+        let d = MockDaemon::start(true);
+        unsafe { thurm_set_warm_limit(d.client, 4) };
+        unsafe { thurm_subscribe(d.client, 1) };
+        unsafe { thurm_subscribe(d.client, 2) };
+        d.sync();
+        unsafe { thurm_unsubscribe(d.client, 2) };
+        assert_eq!(d.take_ops(), vec![SubOp::Sub(1), SubOp::Sub(2)]);
+
+        d.close_server();
+        d.wait_disconnected();
+
+        let shared = &unsafe { client_ref(d.client) }.unwrap().shared;
+        let subs = shared.subs.lock();
+        assert!(subs.active.is_empty());
+        assert!(subs.warm_order.is_empty());
+        assert!(subs.subscribed.is_empty());
+        drop(subs);
+        assert!(shared.locals.lock().is_empty());
+    }
+
+    fn start_stalled_ffi_client() -> (
+        *mut thurm_client,
+        Arc<MockCallbacks>,
+        *mut MockCallbacks,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::os::unix::net::UnixStream;
+        use thurm_proto::{Envelope, ServerMessage, codec};
+
+        let (client_stream, mut peer) = UnixStream::pair().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let hello: Envelope = codec::read_message(&mut peer).unwrap().unwrap();
+            codec::write_message(
+                &mut peer,
+                &ServerMessage::Response {
+                    id: hello.id,
+                    result: Ok(Response::Hello {
+                        version: thurm_proto::PROTOCOL_VERSION,
+                        daemon_pid: 1,
+                        restored: false,
+                        build: String::new(),
+                        capabilities: thurm_proto::CAPABILITIES
+                            .iter()
+                            .map(|c| (*c).to_owned())
+                            .collect(),
+                    }),
+                },
+            )
+            .unwrap();
+            // Stop reading so outgoing writes stall and exhaust the client's byte budget.
+            let _ = stop_rx.recv();
+        });
+
+        let callbacks = Arc::new(MockCallbacks {
+            frames: Mutex::new(Vec::new()),
+            disconnected: std::sync::atomic::AtomicBool::new(false),
+        });
+        let ctx_ptr = Arc::into_raw(callbacks.clone()) as *mut MockCallbacks;
+        unsafe extern "C" fn on_event(ctx: *mut c_void, json: *const c_char) {
+            let cbs = unsafe { &*(ctx as *const MockCallbacks) };
+            if let Ok(s) = unsafe { CStr::from_ptr(json) }.to_str()
+                && s == "\"Disconnected\""
+            {
+                cbs.disconnected.store(true, Ordering::Release);
+            }
+        }
+        unsafe extern "C" fn on_frame(ctx: *mut c_void, pane: u64) {
+            let cbs = unsafe { &*(ctx as *const MockCallbacks) };
+            cbs.frames.lock().push(pane);
+        }
+        let client = new_connection(
+            Some(on_event),
+            Some(on_frame),
+            ctx_ptr.cast(),
+            |on_ev, on_disc| {
+                Client::from_stream(client_stream, "test", true, &[], on_ev, on_disc)
+                    .map(|c| (c, None))
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        (client, callbacks, ctx_ptr, stop_tx, server)
+    }
+
+    fn wait_ffi_disconnected(callbacks: &MockCallbacks) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while !callbacks.disconnected.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Disconnected"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn stalled_peer_queue_full_on_input_disconnects_instead_of_silently_dropping() {
+        let (client, callbacks, ctx_ptr, stop_tx, server) = start_stalled_ffi_client();
+        let inner = unsafe { client_ref(client) }.unwrap();
+        inner.client.set_max_queued_bytes(256 * 1024);
+
+        // First input fills the Unix socket buffer and exceeds the configured byte budget for
+        // subsequent writes; the next keystroke must trigger a disconnect/resync rather than
+        // being silently dropped on an apparently live connection.
+        let filler = vec![b'a'; 2 * 1024 * 1024];
+        unsafe { thurm_input(client, 1, filler.as_ptr(), filler.len()) };
+        assert!(inner.client.is_alive());
+
+        let key = b"x";
+        unsafe { thurm_input(client, 1, key.as_ptr(), key.len()) };
+        assert!(!inner.client.is_alive());
+        wait_ffi_disconnected(&callbacks);
+
+        unsafe { thurm_disconnect(client) };
+        drop(unsafe { Arc::from_raw(ctx_ptr) });
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_peer_queue_full_does_not_mark_subscribe_or_prewarm_active() {
+        let (client, callbacks, ctx_ptr, stop_tx, server) = start_stalled_ffi_client();
+        let inner = unsafe { client_ref(client) }.unwrap();
+        inner.client.set_max_queued_bytes(256 * 1024);
+        unsafe { thurm_set_warm_limit(client, 4) };
+
+        let filler = vec![b'a'; 2 * 1024 * 1024];
+        unsafe { thurm_input(client, 1, filler.as_ptr(), filler.len()) };
+        assert!(inner.client.is_alive());
+
+        // Subscribe fails with QueueFull: must not record pane 42 as subscribed/active, and must
+        // close the stalled connection so the UI reconnects and resyncs.
+        unsafe { thurm_subscribe(client, 42) };
+        assert!(!inner.client.is_alive());
+        {
+            let subs = inner.shared.subs.lock();
+            assert!(!subs.subscribed.contains(&42));
+            assert!(!subs.active.contains_key(&42));
+        }
+
+        // Prewarm on the failed/disconnected client must likewise not record pane 43.
+        unsafe { thurm_prewarm_pane(client, 43) };
+        {
+            let subs = inner.shared.subs.lock();
+            assert!(!subs.subscribed.contains(&43));
+            assert!(!subs.is_warm(43));
+        }
+        wait_ffi_disconnected(&callbacks);
+
+        unsafe { thurm_disconnect(client) };
+        drop(unsafe { Arc::from_raw(ctx_ptr) });
+        let _ = stop_tx.send(());
+        server.join().unwrap();
     }
 }

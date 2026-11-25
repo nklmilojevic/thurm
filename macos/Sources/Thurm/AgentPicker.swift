@@ -1,6 +1,6 @@
 import AppKit
 
-/// A pane running a coding agent, wherever it is: a window (`controller`) or a workspace no
+/// A pane running a coding agent, wherever it is: a window (`controller` / `tab`) or a workspace no
 /// window shows (`hidden`).
 struct AgentPane {
     let pane: PaneKey
@@ -8,6 +8,7 @@ struct AgentPane {
     let agent: AgentState
     let controller: TerminalWindowController?
     let hidden: Workspace?
+    var tab: TabItem? = nil
 
     /// What the agent works on: its session topic, the topic in the title it sets, or its name.
     var title: String { agent.title(paneTitle: info.title) }
@@ -32,15 +33,16 @@ extension SessionManager {
     /// Every agent pane: the tabs of `first`'s window first, then other windows, then hidden
     /// workspaces.
     func agentPanes(first: TerminalWindowController?) -> [AgentPane] {
-        let mine = first.map { group(of: $0) } ?? []
-        let others = liveControllers.filter { c in !mine.contains { $0 === c } }
+        let mine = first.map { windowTabs(of: $0) } ?? []
+        let others = liveTabs.filter { t in !mine.contains { $0 === t } }
         var out: [AgentPane] = []
-        func add(_ id: PaneKey, in c: TerminalWindowController?, hidden: Workspace?) {
+        func add(_ id: PaneKey, in tab: TabItem?, hidden: Workspace?) {
             guard let info = panes[id], let agent = info.agent else { return }
-            out.append(AgentPane(pane: id, info: info, agent: agent, controller: c, hidden: hidden))
+            out.append(AgentPane(pane: id, info: info, agent: agent,
+                                 controller: tab?.windowController, hidden: hidden, tab: tab))
         }
-        for c in mine + others {
-            for id in c.content.paneIds { add(id, in: c, hidden: nil) }
+        for t in mine + others {
+            for id in t.content.paneIds { add(id, in: t, hidden: nil) }
         }
         for ws in workspaces where !isShown(ws) {
             for tab in ws.hiddenTabs {
@@ -74,13 +76,16 @@ extension SessionManager {
             }
             .map(\.element)
         var items: [CommandPalette.Item] = agents.map { a in
-            let here = host.map { $0 === a.controller && $0.focusedPane == a.pane } ?? false
+            let here = host.map {
+                (a.tab != nil ? $0.selectedTab === a.tab : $0 === a.controller) && $0.focusedPane == a.pane
+            } ?? false
             let detail = [a.hostLabel, a.agent.name, a.place, a.hidden?.name, here ? "this pane" : a.statusDetail]
                 .compactMap { $0 }
                 .joined(separator: " · ")
             return CommandPalette.Item(title: a.title, detail: detail, liveShortcut: { now in
                 guard let info = SessionManager.shared.panes[a.pane], let agent = info.agent else { return "" }
-                return AgentPane(pane: a.pane, info: info, agent: agent, controller: a.controller, hidden: a.hidden)
+                return AgentPane(pane: a.pane, info: info, agent: agent, controller: a.controller,
+                                 hidden: a.hidden, tab: a.tab)
                     .activityAge(now: now) ?? ""
             }) {
                 SessionManager.shared.focusAgent(a, from: host)

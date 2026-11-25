@@ -36,18 +36,23 @@ final class TerminalView: NSView, NSTextInputClient {
     var needsRender = true {
         didSet { if needsRender { wakeLink() } }
     }
-    private var subscribed = false
+    private(set) var subscribed = false
     private var reportedSize: GridSize?
     private var reportedFocus: Bool?
-    private var waitingForResizeFrame = false
+    private(set) var waitingForResizeFrame = false
     /// A frame is on screen. Until then there is no last image to keep while a resize is
     /// waited for, so the drawable follows the bounds at once.
-    private var hasDrawn = false
+    private(set) var hasDrawn = false
     /// The daemon didn't answer a resize in time: draw the frame we have at the new size.
-    private var resizeTimedOut = false
+    private(set) var resizeTimedOut = false
     private var resizeFrameTimeout: DispatchWorkItem?
+    /// Counts delivered window notifications (used by tests to guard against duplicate observers).
+    private(set) var windowNotificationCount = 0
     private(set) var cols = 0
     private(set) var rows = 0
+
+    var hasActiveFrameLink: Bool { frameLink != nil }
+    var isFrameLinkPaused: Bool { frameLink?.isPaused ?? true }
 
     // Keyboard / IME state.
     private var markedText = NSMutableAttributedString()
@@ -137,6 +142,7 @@ final class TerminalView: NSView, NSTextInputClient {
     deinit {
         frameLink?.invalidate()
         blinkTimer?.invalidate()
+        resizeFrameTimeout?.cancel()
         NotificationCenter.default.removeObserver(self)
         endTransfers()
         if let previewURL { previewCache.release(previewURL) }
@@ -227,30 +233,16 @@ final class TerminalView: NSView, NSTextInputClient {
 
     // MARK: Window attachment
 
-    override func viewWillMove(toWindow newWindow: NSWindow?) {
-        if newWindow !== window, let panel = previewPanel {
-            previewURL = nil
-            panel.orderOut(nil)
-            panel.updateController()
-        }
-        super.viewWillMove(toWindow: newWindow)
-        if let old = window {
-            let nc = NotificationCenter.default
-            nc.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: old)
-            nc.removeObserver(self, name: NSWindow.didResignKeyNotification, object: old)
-            nc.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: old)
-            nc.removeObserver(self, name: NSWindow.didChangeScreenNotification, object: old)
-        }
+    private func removeWindowObservers() {
+        let nc = NotificationCenter.default
+        nc.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: nil)
+        nc.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
+        nc.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        nc.removeObserver(self, name: NSWindow.didChangeScreenNotification, object: nil)
     }
 
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        frameLink?.invalidate()
-        frameLink = nil
-        guard let window = window else {
-            updateSubscription()
-            return
-        }
+    private func installWindowObservers(for window: NSWindow) {
+        removeWindowObservers()
         let nc = NotificationCenter.default
         nc.addObserver(self, selector: #selector(windowKeyStateChanged(_:)),
                        name: NSWindow.didBecomeKeyNotification, object: window)
@@ -260,6 +252,30 @@ final class TerminalView: NSView, NSTextInputClient {
                        name: NSWindow.didChangeOcclusionStateNotification, object: window)
         nc.addObserver(self, selector: #selector(windowScreenChanged(_:)),
                        name: NSWindow.didChangeScreenNotification, object: window)
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow !== window, let panel = previewPanel {
+            previewURL = nil
+            panel.orderOut(nil)
+            panel.updateController()
+        }
+        super.viewWillMove(toWindow: newWindow)
+        removeWindowObservers()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        frameLink?.invalidate()
+        frameLink = nil
+        guard let window = window else {
+            removeWindowObservers()
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+            updateSubscription()
+            return
+        }
+        installWindowObservers(for: window)
 
         let link = displayLink(target: self, selector: #selector(displayTick(_:)))
         link.add(to: .main, forMode: .common)
@@ -268,7 +284,19 @@ final class TerminalView: NSView, NSTextInputClient {
 
         updateScale()
         updateSubscription()
-        needsRender = true
+        updateLinkState()
+    }
+
+    override func viewDidHide() {
+        super.viewDidHide()
+        updateSubscription()
+        updateLinkState()
+    }
+
+    override func viewDidUnhide() {
+        super.viewDidUnhide()
+        updateSubscription()
+        updateLinkState()
     }
 
     override func viewDidChangeBackingProperties() {
@@ -307,6 +335,13 @@ final class TerminalView: NSView, NSTextInputClient {
             subscribed = false
             Core.shared.unsubscribe(pane)
         }
+        resizeFrameTimeout?.cancel()
+        resizeFrameTimeout = nil
+        if !holdGridSize {
+            waitingForResizeFrame = false
+            resizeTimedOut = false
+        }
+        removeWindowObservers()
         frameLink?.invalidate()
         frameLink = nil
         blinkTimer?.invalidate()
@@ -314,10 +349,16 @@ final class TerminalView: NSView, NSTextInputClient {
         NSObject.cancelPreviousPerformRequests(withTarget: self)
     }
 
+    /// Re-evaluates daemon subscription and display-link state after container visibility or
+    /// single-window tab/workspace swaps.
+    func refreshSubscription() {
+        updateSubscription()
+        updateLinkState()
+    }
+
     /// Called by the container after layout (zoom changes hide panes).
     func visibilityChanged() {
-        updateSubscription()
-        wakeLink()
+        refreshSubscription()
     }
 
     /// After reconnecting to the daemon: subscribe and report the size again.
@@ -327,6 +368,7 @@ final class TerminalView: NSView, NSTextInputClient {
         reportedFocus = nil
         renderer.resetImages()
         updateSubscription()
+        updateLinkState()
         reportFocus()
     }
 
@@ -378,7 +420,7 @@ final class TerminalView: NSView, NSTextInputClient {
 
     private func updateGridSize() {
         guard !holdGridSize else { return }
-        guard let s = shaper, bounds.width > 1, bounds.height > 1, window != nil, !isHidden else { return }
+        guard let s = shaper, bounds.width > 1, bounds.height > 1, window != nil, !isHiddenOrHasHiddenAncestor else { return }
         let scale = backingScale
         let availW = bounds.width * scale - CGFloat(2 * padXPixels)
         let availH = bounds.height * scale - CGFloat(2 * padYPixels)
@@ -389,9 +431,18 @@ final class TerminalView: NSView, NSTextInputClient {
         let size = GridSize(cols: newCols, rows: newRows, cellWidth: s.cellWidth, cellHeight: s.cellHeight)
         if size != reportedSize && subscribed {
             reportedSize = size
-            waitingForResizeFrame = true
+            let alreadySized = renderer.snapshot.valid
+                && renderer.snapshot.cols == newCols && renderer.snapshot.rows == newRows
+            if alreadySized {
+                waitingForResizeFrame = false
+                resizeTimedOut = false
+                resizeFrameTimeout?.cancel()
+                resizeFrameTimeout = nil
+            } else {
+                waitingForResizeFrame = true
+                scheduleResizeFrameTimeout()
+            }
             Core.shared.resize(pane, cols: newCols, rows: newRows, cellWidth: s.cellWidth, cellHeight: s.cellHeight)
-            scheduleResizeFrameTimeout()
         }
     }
 
@@ -404,6 +455,7 @@ final class TerminalView: NSView, NSTextInputClient {
             guard let self, self.waitingForResizeFrame, !self.holdGridSize else { return }
             self.resizeTimedOut = true
             self.waitingForResizeFrame = false
+            self.resizeFrameTimeout = nil
             self.updateDrawableSize()
             self.needsRender = true
         }
@@ -420,26 +472,45 @@ final class TerminalView: NSView, NSTextInputClient {
             subscribed = true
             Core.shared.subscribe(pane)
             reportedSize = nil
+            if shaper == nil { updateScale() }
+            if renderer.snapshot.update(pane: pane) { accessibilityGridChanged() }
             updateGridSize()
+            updateDrawableSize()
             needsRender = true
             maybeShowRestoredToast()
+            let alreadySized = cols > 0 && rows > 0 && renderer.snapshot.valid
+                && renderer.snapshot.cols == cols && renderer.snapshot.rows == rows
+            if alreadySized, !holdGridSize, bounds.width > 1, bounds.height > 1, !inLiveResize, !Perf.tickRendering {
+                _ = Core.shared.takeDirty(pane)
+                renderNow()
+            } else {
+                wakeLink()
+            }
         } else if !visible && subscribed {
             subscribed = false
             Core.shared.unsubscribe(pane)
+            resizeFrameTimeout?.cancel()
+            resizeFrameTimeout = nil
+            if !holdGridSize {
+                waitingForResizeFrame = false
+                resizeTimedOut = false
+            }
         }
     }
 
     @objc private func windowKeyStateChanged(_ note: Notification) {
+        windowNotificationCount += 1
         reportFocus()
         needsRender = true
     }
 
     @objc private func windowOcclusionChanged(_ note: Notification) {
-        updateSubscription()
-        wakeLink()
+        windowNotificationCount += 1
+        refreshSubscription()
     }
 
     @objc private func windowScreenChanged(_ note: Notification) {
+        windowNotificationCount += 1
         updateFrameRate()
     }
 
@@ -497,7 +568,7 @@ final class TerminalView: NSView, NSTextInputClient {
 
     /// Resumes the display link for at least one tick.
     private func wakeLink() {
-        guard let link = frameLink, link.isPaused else { return }
+        guard let link = frameLink, link.isPaused, window != nil, subscribed, !isHiddenOrHasHiddenAncestor else { return }
         link.isPaused = false
     }
 
@@ -512,6 +583,12 @@ final class TerminalView: NSView, NSTextInputClient {
     /// a one-shot timer wakes it for the next cursor blink.
     private func updateLinkState() {
         guard let link = frameLink else { return }
+        guard window != nil, subscribed, !isHiddenOrHasHiddenAncestor else {
+            link.isPaused = true
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+            return
+        }
         if Perf.tickRendering || wantsTick {
             link.isPaused = false
             blinkTimer?.invalidate()
@@ -520,7 +597,7 @@ final class TerminalView: NSView, NSTextInputClient {
         }
         link.isPaused = true
         let blinking = config.cursorBlink || renderer.snapshot.info.cursor_blinking
-        guard blinking, isKeyFocused, window != nil, subscribed, !isHiddenOrHasHiddenAncestor else {
+        guard blinking, isKeyFocused else {
             blinkTimer?.invalidate()
             blinkTimer = nil
             return
@@ -630,8 +707,25 @@ final class TerminalView: NSView, NSTextInputClient {
         DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
             guard let self else { return }
             self.renderScheduled = false
+            guard self.window != nil, self.subscribed, !self.isHiddenOrHasHiddenAncestor else { return }
             if Core.shared.takeDirty(self.pane) { self.renderNow() }
         }
+    }
+
+    /// Whether `renderNow()` should hold the previous image on screen while waiting for a resized
+    /// frame from the daemon.
+    ///
+    /// - A held grid (`holdGridSize`) always draws its current snapshot at its held drawable size.
+    /// - Before any frame has been drawn (`!hasDrawn`), a valid snapshot paints immediately
+    ///   (pinned top-left) instead of blank-stalling up to 250 ms behind `waitingForResizeFrame`;
+    ///   an invalid snapshot still waits cleanly for the initial grid or timeout.
+    /// - Once a frame is on screen (`hasDrawn`), an in-flight resize suppresses mismatched frames
+    ///   until the resized snapshot arrives (`sized`) or times out (`resizeTimedOut`).
+    static func shouldSuppressRender(hasDrawn: Bool, snapshotValid: Bool, sized: Bool,
+                                     waitingForResizeFrame: Bool, resizeTimedOut: Bool,
+                                     holdGridSize: Bool) -> Bool {
+        if holdGridSize || !waitingForResizeFrame || sized || resizeTimedOut { return false }
+        return hasDrawn || !snapshotValid
     }
 
     func renderNow() {
@@ -653,15 +747,31 @@ final class TerminalView: NSView, NSTextInputClient {
         if sized { resizeTimedOut = false }
         // Only our own resize is waited for. A size another client set (the phone, while it is
         // the one in use) is drawn as it is, pinned top left, until this view is used again.
-        guard sized || resizeTimedOut || holdGridSize || !waitingForResizeFrame else {
+        if Self.shouldSuppressRender(hasDrawn: hasDrawn,
+                                     snapshotValid: renderer.snapshot.valid,
+                                     sized: sized,
+                                     waitingForResizeFrame: waitingForResizeFrame,
+                                     resizeTimedOut: resizeTimedOut,
+                                     holdGridSize: holdGridSize) {
             needsRender = true
             return
         }
         // A held grid keeps its drawable too: frames still draw (new output, the dim easing
         // in or out during a layout move) at the held size, pinned to the top left.
         if waitingForResizeFrame && !holdGridSize {
-            waitingForResizeFrame = false
-            updateDrawableSize()
+            if sized || resizeTimedOut {
+                waitingForResizeFrame = false
+                resizeFrameTimeout?.cancel()
+                resizeFrameTimeout = nil
+                updateDrawableSize()
+            } else {
+                // First paint with a valid mismatched snapshot while a resize is in flight:
+                // draw immediately pinned top-left so the pane never blank-stalls, while keeping
+                // `waitingForResizeFrame` set so subsequent mismatched frames hold this image
+                // until the resized frame arrives (or times out).
+                layer.contentsGravity = topLeftGravity
+                updateDrawableSize()
+            }
         }
         let perfDraw = Perf.enabled ? CACurrentMediaTime() : 0
 

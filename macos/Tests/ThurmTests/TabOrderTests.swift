@@ -5,11 +5,14 @@ import XCTest
 final class TabOrderTests: XCTestCase {
     private let manager = SessionManager.shared
     private var savedWorkspaces: [Workspace] = []
+    private var savedSidebarTabs = true
 
     override func setUp() {
         super.setUp()
         _ = NSApplication.shared
         savedWorkspaces = manager.workspaces
+        savedSidebarTabs = manager.config.sidebarTabs
+        manager.config.sidebarTabs = true
         manager.workspaces = []
     }
 
@@ -18,6 +21,7 @@ final class TabOrderTests: XCTestCase {
             c.closingWithoutConfirmation = true
             c.window?.close()
         }
+        manager.config.sidebarTabs = savedSidebarTabs
         manager.workspaces = savedWorkspaces
         Remotes.shared.pendingCloses = [:]
         super.tearDown()
@@ -33,7 +37,12 @@ final class TabOrderTests: XCTestCase {
     }
 
     private func order(_ c: TerminalWindowController) -> [UInt64] {
-        manager.group(of: c).map { $0.content.paneIds[0].id }
+        manager.windowTabs(of: c).map { $0.content.paneIds[0].id }
+    }
+
+    private func selectedPane(_ c: TerminalWindowController) -> UInt64 {
+        let active = (c.window?.tabGroup?.selectedWindow?.windowController as? TerminalWindowController) ?? c
+        return active.selectedTab.content.paneIds[0].id
     }
 
     func testBackgroundTabsKeepCreationOrderAndSelection() {
@@ -54,7 +63,7 @@ final class TabOrderTests: XCTestCase {
         let first = tab(1, workspace: manager.makeWorkspace())
         manager.newTab(from: first, pane: pane(2), background: true)
         XCTAssertEqual(order(first), [1, 2])
-        XCTAssertTrue(first.window?.tabGroup?.selectedWindow === first.window)
+        XCTAssertEqual(selectedPane(first), 1)
     }
 
     func testCommandTabsUseTheSourceWorkspace() {
@@ -70,7 +79,7 @@ final class TabOrderTests: XCTestCase {
 
         XCTAssertEqual(order(source), [1, 2, 3, 4])
         XCTAssertEqual(order(other), [9])
-        XCTAssertTrue(source.window?.tabGroup?.selectedWindow === source.window)
+        XCTAssertEqual(selectedPane(source), 1)
     }
 
     func testCommandTabsStayInAHiddenSourceWorkspace() {
@@ -94,7 +103,7 @@ final class TabOrderTests: XCTestCase {
             manager.newCommandTab(pane(id), target: pane(1), background: false)
         }
         XCTAssertEqual(order(source), [1, 2, 3, 4])
-        XCTAssertTrue(source.window?.tabGroup?.selectedWindow === manager.controller(for: pane(4))?.window)
+        XCTAssertEqual(selectedPane(source), 4)
     }
 
     func testForegroundCommandRevealsItsSourceWorkspace() throws {
@@ -108,7 +117,7 @@ final class TabOrderTests: XCTestCase {
         let selected = try XCTUnwrap(manager.controller(for: pane(2)))
         XCTAssertEqual(selected.workspaceID, hidden.id)
         XCTAssertEqual(order(selected), [1, 2])
-        XCTAssertTrue(selected.window?.tabGroup?.selectedWindow === selected.window)
+        XCTAssertEqual(selectedPane(selected), 2)
     }
 
     private func hiddenWorkspaces() -> (source: Workspace, recent: Workspace) {
@@ -130,7 +139,7 @@ final class TabOrderTests: XCTestCase {
         let selected = try XCTUnwrap(manager.controller(for: pane(2)))
         XCTAssertEqual(selected.workspaceID, source.id)
         XCTAssertEqual(order(selected), [1, 2])
-        XCTAssertTrue(selected.window?.tabGroup?.selectedWindow === selected.window)
+        XCTAssertEqual(selectedPane(selected), 2)
         XCTAssertTrue(source.hiddenTabs.isEmpty)
         XCTAssertFalse(manager.isShown(recent))
         XCTAssertEqual(recent.hiddenTabs.flatMap(\.panes), [pane(9)])
@@ -153,8 +162,30 @@ final class TabOrderTests: XCTestCase {
     func testManualTabsStillOpenNextToTheirSource() {
         let first = tab(1, workspace: manager.makeWorkspace())
         manager.newTab(from: first, pane: pane(2))
+        first.selectTab(first.tabs[0])
         manager.newTab(from: first, pane: pane(3))
         XCTAssertEqual(order(first), [1, 3, 2])
+        XCTAssertEqual(selectedPane(first), 3)
+    }
+
+    func testManualTabsOpenNextToTheirSourceInNativeMode() {
+        manager.config.sidebarTabs = false
+        let first = tab(1, workspace: manager.makeWorkspace())
+        manager.newTab(from: first, pane: pane(2))
+        manager.newTab(from: first, pane: pane(3))
+        XCTAssertEqual(order(first), [1, 3, 2])
+        XCTAssertEqual(manager.group(of: first).count, 3)
+    }
+
+    func testForegroundCommandTabsKeepCreationOrderInNativeMode() {
+        manager.config.sidebarTabs = false
+        let source = tab(1, workspace: manager.makeWorkspace())
+        for id: UInt64 in [2, 3, 4] {
+            manager.newCommandTab(pane(id), target: pane(1), background: false)
+        }
+        XCTAssertEqual(order(source), [1, 2, 3, 4])
+        XCTAssertEqual(manager.group(of: source).count, 4)
+        XCTAssertTrue(source.window?.tabGroup?.selectedWindow === manager.controller(for: pane(4))?.window)
     }
 
     func testOpeningAWindowPreservesHiddenTabOrder() throws {

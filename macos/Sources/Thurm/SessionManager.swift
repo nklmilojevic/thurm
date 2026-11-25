@@ -39,6 +39,74 @@ final class SessionManager: NSObject, CoreDelegate {
     private weak var lastRegularKeyController: TerminalWindowController?
 
     private(set) var isTerminating = false
+    /// Monotonically incremented whenever theme/font/config changes are applied to the UI, so
+    /// cached background `TabItem`s can refresh lazily when mounted.
+    private(set) var configGeneration: UInt64 = 0
+    /// Re-entrant guard suppressing native `NSWindowTabGroup` KVO storms during batch switches.
+    private var workspaceSwitchDepth = 0
+    var isSwitchingWorkspace: Bool { workspaceSwitchDepth > 0 }
+
+    func withWorkspaceSwitchBatch<T>(_ body: () -> T) -> T {
+        workspaceSwitchDepth += 1
+        defer { workspaceSwitchDepth -= 1 }
+        return body()
+    }
+
+    /// Drops `id` from the Rust core's warm pane LRU cache when a pane closes.
+    func evictWarmPane(_ id: PaneKey) {
+        Core.shared.evictPane(id)
+    }
+
+    /// Prewarms background tabs' visible panes into the Rust core's warm LRU cache (bounded per
+    /// host by `Core.warmPaneLimit`) so switching tabs paints on frame 0 without a daemon round-trip.
+    func prewarmWorkspaceTabs(_ tabs: [TabItem], excluding selected: TabItem?) {
+        let budget = Int(Core.warmPaneLimit)
+        guard budget > 0 else { return }
+        var remaining: [HostId: Int] = [:]
+        for tab in tabs where tab !== selected && !tab.isClosed {
+            for pane in tab.content.visiblePaneIds {
+                guard Core.shared.isConnected(pane.host) else { continue }
+                let left = remaining[pane.host] ?? budget
+                guard left > 0 else { continue }
+                Core.shared.prewarm(pane)
+                remaining[pane.host] = left - 1
+            }
+        }
+    }
+
+    /// Prewarms hidden workspaces' tabs (selected tab of each workspace first, ordered by recency)
+    /// for `host` (or all connected hosts when nil) so even the first switch to a local or remote
+    /// workspace paints immediately with zero RTT.
+    func prewarmHiddenWorkspaces(for host: HostId? = nil) {
+        let budget = Int(Core.warmPaneLimit)
+        guard budget > 0 else { return }
+        var remaining: [HostId: Int] = [:]
+        func warm(_ pane: PaneKey) {
+            guard Core.shared.isConnected(pane.host) else { return }
+            let left = remaining[pane.host] ?? budget
+            guard left > 0 else { return }
+            Core.shared.prewarm(pane)
+            remaining[pane.host] = left - 1
+        }
+        let targets = workspacesByRecency.filter { ws in
+            !isShown(ws) && (host == nil || ws.host == host)
+        }
+        // Pass 1: each hidden workspace's selected tab first so switching to any workspace is instant.
+        for ws in targets {
+            let tabs = ws.hiddenTabs
+            guard !tabs.isEmpty else { continue }
+            let idx = min(max(0, ws.hiddenSelectedTab), tabs.count - 1)
+            for pane in tabs[idx].panes { warm(pane) }
+        }
+        // Pass 2: remaining hidden tabs while budget allows.
+        for ws in targets {
+            let tabs = ws.hiddenTabs
+            let selectedIdx = min(max(0, ws.hiddenSelectedTab), max(0, tabs.count - 1))
+            for (i, tab) in tabs.enumerated() where i != selectedIdx {
+                for pane in tab.panes { warm(pane) }
+            }
+        }
+    }
     /// Layout saving starts only after the initial restore, so a failed start never
     /// overwrites the stored layout with an empty one.
     private var sessionReady = false
@@ -278,9 +346,13 @@ final class SessionManager: NSObject, CoreDelegate {
         guard let json = Core.shared.previewTheme(name),
               let t = JSON.decode(json) as? [String: Any] else { return }
         config.theme = Theme(json: t)
+        configGeneration &+= 1
         for c in liveControllers {
             c.applyConfig()
-            for view in c.content.views.values { view.needsRender = true }
+            for tab in c.tabs {
+                tab.appliedConfigGeneration = configGeneration
+                for view in tab.content.views.values { view.needsRender = true }
+            }
         }
     }
 
@@ -473,7 +545,7 @@ final class SessionManager: NSObject, CoreDelegate {
         // A pane shows in one place. Skip the ones a window already shows, and the ones an
         // earlier window of the layout claimed (a layout saved after a double restore lists
         // them twice).
-        var placed = Set(liveControllers.flatMap { $0.content.paneIds })
+        var placed = Set(liveTabs.flatMap { $0.content.paneIds })
         var layout = saved
         layout.retainPanes { key in
             !placed.contains(key) && (key.isRemote ? remotes.contains(key.host) : listed.contains(key))
@@ -516,6 +588,7 @@ final class SessionManager: NSObject, CoreDelegate {
             }
         }
         sessionReady = true
+        prewarmHiddenWorkspaces()
         TailscaleService.shared.refresh()
         saveLayoutNow(force: true)
         focusChanged()
@@ -538,28 +611,45 @@ final class SessionManager: NSObject, CoreDelegate {
         if let f = w.frame, f.count == 4, f[2] > 50, f[3] > 50 {
             frame = clampToScreens(NSRect(x: f[0], y: f[1], width: f[2], height: f[3]))
         }
-        var created: [TerminalWindowController] = []
         // Older layouts have no workspaces, and two windows can't show the same one.
         var ws = workspace(w.workspace)
         if ws == nil || (ws.map { isShown($0) } ?? false) {
             ws = makeWorkspace(host: w.tabs.first?.focusedKey.host ?? localHost)
         }
-        for tab in w.tabs {
-            let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
-                                   title: tab.title, frame: frame, floating: tab.floating,
-                                   floatingHidden: tab.floatingHidden)
+        if config.sidebarTabs {
+            let items = w.tabs.map { TabItem(layout: $0) }
+            guard !items.isEmpty else { return }
+            let selectedIndex = min(max(0, w.selectedTab), items.count - 1)
+            let c = makeController(tabs: items, selectedIndex: selectedIndex, frame: frame)
             c.workspaceID = ws?.id ?? 0
-            c.adopt(tab)
-            if let prev = created.last {
-                attachAsTab(c, to: prev)
-            } else {
-                showAsNewWindow(c, frame: frame)
+            showAsNewWindow(c, frame: frame)
+            prewarmWorkspaceTabs(items, excluding: c.selectedTab)
+            if w.fullscreen, let win = c.window, !win.styleMask.contains(.fullScreen) {
+                win.toggleFullScreen(nil)
             }
-            created.append(c)
+            return
+        }
+        var created: [TerminalWindowController] = []
+        withWorkspaceSwitchBatch {
+            for tab in w.tabs {
+                let c = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey, zoomed: tab.zoomedKey,
+                                       title: tab.title, frame: frame, floating: tab.floating,
+                                       floatingHidden: tab.floatingHidden)
+                c.workspaceID = ws?.id ?? 0
+                c.adopt(tab)
+                if let prev = created.last {
+                    attachAsTab(c, to: prev)
+                } else {
+                    showAsNewWindow(c, frame: frame)
+                }
+                created.append(c)
+            }
         }
         guard !created.isEmpty else { return }
         let selected = created[min(max(0, w.selectedTab), created.count - 1)]
         selected.window?.makeKeyAndOrderFront(nil)
+        for c in created { c.updateTitle() }
+        (selected.window as? TerminalWindow)?.finishWorkspaceSwitchSync()
         if w.fullscreen, let win = selected.window, !win.styleMask.contains(.fullScreen) {
             win.toggleFullScreen(nil)
         }
@@ -587,6 +677,16 @@ final class SessionManager: NSObject, CoreDelegate {
         liveControllers.filter { !$0.isQuick }
     }
 
+    /// Every live tab across all open windows (including hosted tabs in single-window sidebar mode).
+    var liveTabs: [TabItem] {
+        liveControllers.flatMap(\.tabs).filter { !$0.isClosed }
+    }
+
+    /// Every live regular tab (excluding the quick terminal).
+    var regularTabs: [TabItem] {
+        regularControllers.flatMap(\.tabs).filter { !$0.isClosed }
+    }
+
     /// The controller of the key window, else the last key one (the quick terminal only while
     /// it is on screen).
     var currentController: TerminalWindowController? {
@@ -606,17 +706,35 @@ final class SessionManager: NSObject, CoreDelegate {
         return regularControllers.last
     }
 
+    func tab(for pane: PaneKey) -> TabItem? {
+        liveTabs.first { $0.content.contains(pane) }
+    }
+
     func controller(for pane: PaneKey) -> TerminalWindowController? {
-        liveControllers.first { $0.content.contains(pane) }
+        tab(for: pane)?.windowController
     }
 
     func view(for pane: PaneKey) -> TerminalView? {
-        controller(for: pane)?.content.views[pane]
+        tab(for: pane)?.content.views[pane]
     }
 
-    /// Every view of `host`'s panes.
+    /// Every view of `host`'s panes (including cached background workspace tabs).
     func views(of host: HostId) -> [TerminalView] {
-        liveControllers.flatMap { $0.content.views.values.filter { $0.pane.host == host } }
+        let live = liveTabs.flatMap { $0.content.views.values.filter { $0.pane.host == host } }
+        let cached = workspaces.compactMap(\.cachedTabs).joined()
+            .flatMap { $0.content.views.values.filter { $0.pane.host == host } }
+        return live + cached
+    }
+
+    func makeController(tabs: [TabItem], selectedIndex: Int = 0, frame: NSRect?,
+                        quick: Bool = false) -> TerminalWindowController {
+        let c = TerminalWindowController(tabs: tabs, selectedIndex: selectedIndex,
+                                         contentSize: defaultContentSize(), quick: quick)
+        if let frame = frame {
+            c.window?.setFrame(frame, display: false)
+        }
+        controllers.append(c)
+        return c
     }
 
     func makeController(root: SplitNode, focused: PaneKey, zoomed: PaneKey?, title: String?,
@@ -705,17 +823,30 @@ final class SessionManager: NSObject, CoreDelegate {
         guard let pane = id else { return nil }
         if let host, host.window != nil {
             if (workspace(host.workspaceID)?.host ?? host.host) == pane.host {
-                let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
-                c.handoffID = handoff
-                let anchor = append || background ? group(of: host).last ?? host : host
-                if background {
-                    // Append in creation order and keep the selected tab.
-                    let selected = host.window?.tabGroup?.selectedWindow ?? host.window
-                    attachAsTab(c, to: anchor)
-                    if let selected { selected.tabGroup?.selectedWindow = selected }
+                if host.usesSingleWindowTabs && group(of: host).count == 1 {
+                    let tab = TabItem(root: .leaf(pane), focused: pane, zoomed: nil)
+                    tab.handoffID = handoff
+                    let insertIndex: Int
+                    if append || background {
+                        insertIndex = host.tabs.count
+                    } else {
+                        insertIndex = ordered == .below ? host.selectedTabIndex : host.selectedTabIndex + 1
+                    }
+                    host.insertTab(tab, at: insertIndex, select: !background)
+                    if !background { host.window?.makeKeyAndOrderFront(nil) }
                 } else {
-                    attachAsTab(c, to: anchor, ordered: ordered)
-                    c.window?.makeKeyAndOrderFront(nil)
+                    let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
+                    c.handoffID = handoff
+                    let anchor = append || background ? group(of: host).last ?? host : host
+                    if background {
+                        // Append in creation order and keep the selected tab.
+                        let selected = host.window?.tabGroup?.selectedWindow ?? host.window
+                        attachAsTab(c, to: anchor)
+                        if let selected { selected.tabGroup?.selectedWindow = selected }
+                    } else {
+                        attachAsTab(c, to: anchor, ordered: ordered)
+                        c.window?.makeKeyAndOrderFront(nil)
+                    }
                 }
             } else {
                 let ws = workspacesByRecency.first { $0.host == pane.host && !isShown($0) }
@@ -724,26 +855,49 @@ final class SessionManager: NSObject, CoreDelegate {
             }
         } else {
             // No window yet: this tab's workspace opens in the one window.
-            let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
-            c.handoffID = handoff
-            c.workspaceID = (workspacesByRecency.first { $0.host == pane.host && !isShown($0) }
-                ?? makeWorkspace(host: pane.host)).id
-            if let ws = workspace(c.workspaceID), !ws.hiddenTabs.isEmpty {
-                // Its hidden tabs come along.
-                let frame = currentRegularController?.window?.frame
-                showAsNewWindow(c, frame: frame)
-                var previous = c
-                for tab in ws.hiddenTabs {
-                    let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey,
-                                           zoomed: tab.zoomedKey, title: tab.title, frame: nil, floating: tab.floating)
-                    t.adopt(tab)
-                    attachAsTab(t, to: previous)
-                    previous = t
+            let ws = workspacesByRecency.first { $0.host == pane.host && !isShown($0) }
+                ?? makeWorkspace(host: pane.host)
+            if config.sidebarTabs {
+                let firstTab = TabItem(root: .leaf(pane), focused: pane, zoomed: nil)
+                firstTab.handoffID = handoff
+                let rest: [TabItem]
+                if let cached = ws.takeCachedTabs() {
+                    rest = cached.tabs
+                } else {
+                    rest = ws.hiddenTabs.map { TabItem(layout: $0) }
+                    ws.hiddenTabs = []
+                    ws.hiddenSelectedTab = 0
                 }
-                ws.hiddenTabs = []
-                c.window?.makeKeyAndOrderFront(nil)
+                let frame = rest.isEmpty ? nil : currentRegularController?.window?.frame
+                let c = makeController(tabs: [firstTab] + rest, selectedIndex: 0, frame: frame)
+                c.workspaceID = ws.id
+                ws.lastActive = Date()
+                showAsNewWindow(c, frame: frame)
             } else {
-                showAsNewWindow(c, frame: nil)
+                let c = makeController(root: .leaf(pane), focused: pane, zoomed: nil, title: nil, frame: nil)
+                c.handoffID = handoff
+                c.workspaceID = ws.id
+                if !ws.hiddenTabs.isEmpty {
+                    // Its hidden tabs come along.
+                    let frame = currentRegularController?.window?.frame
+                    withWorkspaceSwitchBatch {
+                        showAsNewWindow(c, frame: frame)
+                        var previous = c
+                        for tab in ws.hiddenTabs {
+                            let t = makeController(root: SplitNode(layout: tab.root), focused: tab.focusedKey,
+                                                   zoomed: tab.zoomedKey, title: tab.title, frame: nil, floating: tab.floating)
+                            t.adopt(tab)
+                            attachAsTab(t, to: previous)
+                            previous = t
+                        }
+                        ws.hiddenTabs = []
+                        c.window?.makeKeyAndOrderFront(nil)
+                    }
+                    (c.window as? TerminalWindow)?.finishWorkspaceSwitchSync()
+                    refreshSidebars()
+                } else {
+                    showAsNewWindow(c, frame: nil)
+                }
             }
         }
         scheduleLayoutSave()
@@ -784,11 +938,31 @@ final class SessionManager: NSObject, CoreDelegate {
         c.content.addNewFloating(id)
     }
 
+    /// Closes a specific tab (selected or background hosted tab), confirming when needed.
+    func closeTab(_ tab: TabItem) {
+        guard let c = tab.windowController, !c.isClosed, !tab.isClosed else { return }
+        if c.usesSingleWindowTabs && group(of: c).count == 1 {
+            if tab === c.selectedTab {
+                c.window?.performClose(nil)
+                return
+            }
+            let (confirmed, handoffRemove) = c.confirmClose(tab: tab)
+            guard confirmed else { return }
+            for id in tab.content.paneIds { sendClosePane(id) }
+            if let handoffRemove {
+                DispatchQueue.main.async { self.removeHandoffWorktree(handoffRemove) }
+            }
+            _ = c.removeTab(tab, detach: true)
+            return
+        }
+        c.window?.performClose(nil)
+    }
+
     /// Cmd+W: close the focused pane (confirming when a program is running).
     func userClosePane(_ id: PaneKey) {
         // A handoff tab's last pane: close the tab, which asks about the agent and its worktree.
-        if let c = controller(for: id), c.handoffID != nil, c.content.paneIds == [id] {
-            c.window?.performClose(nil)
+        if let t = tab(for: id), t.handoffID != nil, t.content.paneIds == [id] {
+            closeTab(t)
             return
         }
         if config.confirmClose, let info = panes[id], info.hasRunningProcess {
@@ -805,6 +979,7 @@ final class SessionManager: NSObject, CoreDelegate {
     }
 
     func sendClosePane(_ id: PaneKey) {
+        evictWarmPane(id)
         if Core.shared.isConnected(id.host) {
             Core.shared.send(object: ["ClosePane": ["pane": id.number]], host: id.host)
         } else {
@@ -816,17 +991,40 @@ final class SessionManager: NSObject, CoreDelegate {
 
     /// Removes a pane's view; closes the tab when it was the last pane.
     func removePaneFromUI(_ id: PaneKey) {
-        guard let c = controller(for: id) else { return }
-        let empty = c.content.remove(pane: id)
+        guard let t = tab(for: id), let c = t.windowController else {
+            removePaneFromBackgroundWorkspaces(id)
+            return
+        }
+        let empty = t.content.remove(pane: id)
         if empty {
-            guard !showNextWorkspace(closing: c) else { return }
-            c.closingWithoutConfirmation = true
-            c.window?.close()
-        } else {
+            if c.usesSingleWindowTabs && c.tabs.count > 1 {
+                _ = c.removeTab(t, detach: true)
+            } else {
+                guard !showNextWorkspace(closing: c) else { return }
+                c.closingWithoutConfirmation = true
+                c.window?.close()
+            }
+        } else if t.isSelected {
             c.updateTitle()
+        } else {
+            refreshSidebars()
         }
         focusChanged()
         scheduleLayoutSave()
+    }
+
+    private func removePaneFromBackgroundWorkspaces(_ id: PaneKey) {
+        var changed = false
+        for ws in workspaces where !isShown(ws) {
+            let before = ws.hiddenTabs
+            ws.retainHiddenPanes { $0 != id }
+            if ws.hiddenTabs != before { changed = true }
+        }
+        if changed {
+            workspaces.removeAll { !isShown($0) && $0.hiddenTabs.isEmpty }
+            refreshSidebars()
+            scheduleLayoutSave()
+        }
     }
 
     func controllerDidClose(_ c: TerminalWindowController) {
@@ -834,11 +1032,12 @@ final class SessionManager: NSObject, CoreDelegate {
         if c.isQuick { QuickTerminal.shared.controllerClosed(c) }
         refreshSidebars()
         if lastKeyController === c { lastKeyController = nil }
+        if lastRegularKeyController === c { lastRegularKeyController = nil }
         // Drop our reference after AppKit is done with the window delegate callbacks.
         DispatchQueue.main.async {
             SessionManager.shared.controllers.removeAll { $0 === c }
         }
-        if !isTerminating {
+        if !isTerminating && !isSwitchingWorkspace {
             scheduleLayoutSave()
             focusChanged()
         }
@@ -848,22 +1047,35 @@ final class SessionManager: NSObject, CoreDelegate {
         lastKeyController = c
         if !c.isQuick { lastRegularKeyController = c }
         workspace(c.workspaceID)?.lastActive = Date()
-        recordTabVisit(c)
+        recordTabVisit(c.selectedTab)
         focusChanged()
         scheduleLayoutSave()
         // A tab dragged out into its own window: after AppKit is done with the drag.
         if !c.isQuick { DispatchQueue.main.async { SessionManager.shared.foldExtraWindows() } }
     }
 
+    /// Called when a hosted tab becomes active inside a single-window controller.
+    func tabSelected(_ tab: TabItem, in c: TerminalWindowController) {
+        lastKeyController = c
+        if !c.isQuick { lastRegularKeyController = c }
+        workspace(c.workspaceID)?.lastActive = Date()
+        recordTabVisit(tab)
+        focusChanged()
+        scheduleLayoutSave()
+    }
+
     /// Focuses a pane, bringing its tab to the front.
     func focusPane(_ id: PaneKey, activate: Bool) {
-        guard let c = controller(for: id) else { return }
+        guard let t = tab(for: id), let c = t.windowController else { return }
         if c.isQuick {
             QuickTerminal.shared.show()
         } else {
+            if c.usesSingleWindowTabs && !t.isSelected {
+                c.selectTab(t, focus: false)
+            }
             c.window?.makeKeyAndOrderFront(nil)
         }
-        c.content.focus(id)
+        t.content.focus(id)
         if activate { NSApp.activate() }
     }
 
@@ -900,10 +1112,11 @@ final class SessionManager: NSObject, CoreDelegate {
     /// Reload every vertical tab sidebar and horizontal tab strip on the next main-loop turn
     /// (coalesced).
     func refreshSidebars() {
-        guard !sidebarRefreshPending else { return }
+        guard !isSwitchingWorkspace, !sidebarRefreshPending else { return }
         sidebarRefreshPending = true
         DispatchQueue.main.async {
             self.sidebarRefreshPending = false
+            guard !self.isSwitchingWorkspace else { return }
             for c in self.liveControllers {
                 c.sidebar?.reload()
                 (c.window as? TerminalWindow)?.tabStrip?.reload()
@@ -989,9 +1202,10 @@ final class SessionManager: NSObject, CoreDelegate {
     func refreshLockBadges() {
         let show = SecureInput.shared.isActive && config.secureInputIndicator
         let key = NSApp.keyWindow?.windowController as? TerminalWindowController
-        for c in liveControllers {
-            for (id, view) in c.content.views {
-                view.setLockBadgeVisible(show && c === key && id == c.content.focusedPane)
+        for t in liveTabs {
+            for (id, view) in t.content.views {
+                view.setLockBadgeVisible(show && t.windowController === key && t.isSelected
+                                         && id == t.content.focusedPane)
             }
         }
     }
@@ -1106,19 +1320,92 @@ final class SessionManager: NSObject, CoreDelegate {
         }
     }
 
-    private func applyConfigToUI() {
+    func applyConfigToUI() {
         FontShaper.invalidateAll()
+        configGeneration &+= 1
+        reconcileTabStyleMode()
         for c in liveControllers {
             c.applyConfig()
-            for view in c.content.views.values {
-                view.metricsChanged()
+            for tab in c.tabs {
+                tab.appliedConfigGeneration = configGeneration
+                for view in tab.content.views.values {
+                    view.metricsChanged()
+                }
+                tab.content.needsDisplay = true
             }
-            c.content.needsDisplay = true
             c.updateTitle()
         }
         refreshSidebars()
         updateDockBadge()
         updateSecureInput()
+    }
+
+    /// Converts multi-tab live windows cleanly between single-window hosted tabs
+    /// (`sidebarTabs == true`) and native `NSWindowTabGroup` tabs (`sidebarTabs == false`)
+    /// before `applyConfigToUI()` applies `applyTabStyle()` to every remaining window.
+    private func reconcileTabStyleMode() {
+        if config.sidebarTabs {
+            var groups: [[TerminalWindowController]] = []
+            for c in regularControllers where c.window != nil && !groups.contains(where: { $0.contains { $0 === c } }) {
+                let g = group(of: c)
+                if g.count > 1 { groups.append(g) }
+            }
+            guard !groups.isEmpty else { return }
+            withWorkspaceSwitchBatch {
+                for g in groups {
+                    let selected = g.first { $0.window?.tabGroup?.selectedWindow === $0.window } ?? g[0]
+                    let allTabs = g.flatMap(\.tabs).filter { !$0.isClosed }
+                    let selIdx = allTabs.firstIndex { $0 === selected.selectedTab } ?? 0
+                    for other in g where other !== selected {
+                        other.markTabsTransferred()
+                        other.window?.close()
+                    }
+                    selected.applyTabStyle()
+                    selected.adoptHostedTabs(allTabs, selectedIndex: selIdx)
+                    selected.window?.makeKeyAndOrderFront(nil)
+                }
+            }
+        } else {
+            for ws in workspaces { ws.invalidateCachedTabs() }
+            let multi = regularControllers.filter { $0.tabs.count > 1 }
+            guard !multi.isEmpty else { return }
+            var syncedWindows: [TerminalWindow] = []
+            withWorkspaceSwitchBatch {
+                for c in multi {
+                    let frame = c.window?.frame
+                    let wsID = c.workspaceID
+                    let (allTabs, selIdx) = c.keepOnlySelectedTab()
+                    c.applyTabStyle()
+                    guard let hostWindow = c.window else { continue }
+                    // Tabs before `selIdx`: inserting each `.below` `hostWindow` preserves order
+                    // `[t0, t1, ..., t_{selIdx-1}, sel]`.
+                    for tab in allTabs[0..<selIdx] {
+                        let nc = makeController(tabs: [tab], selectedIndex: 0, frame: frame)
+                        nc.workspaceID = wsID
+                        if let w = nc.window {
+                            w.setFrame(hostWindow.frame, display: false)
+                            hostWindow.addTabbedWindow(w, ordered: .below)
+                        }
+                    }
+                    var anchor = hostWindow
+                    if selIdx + 1 < allTabs.count {
+                        for tab in allTabs[(selIdx + 1)...] {
+                            let nc = makeController(tabs: [tab], selectedIndex: 0, frame: frame)
+                            nc.workspaceID = wsID
+                            if let w = nc.window {
+                                w.setFrame(hostWindow.frame, display: false)
+                                anchor.addTabbedWindow(w, ordered: .above)
+                                anchor = w
+                            }
+                        }
+                    }
+                    hostWindow.tabGroup?.selectedWindow = hostWindow
+                    hostWindow.makeKeyAndOrderFront(nil)
+                    if let tw = hostWindow as? TerminalWindow { syncedWindows.append(tw) }
+                }
+            }
+            for tw in syncedWindows { tw.finishWorkspaceSwitchSync() }
+        }
     }
 
     func changeFontSize(by delta: CGFloat) {
@@ -1256,13 +1543,17 @@ final class SessionManager: NSObject, CoreDelegate {
 
         var windows: [WindowLayout] = []
         for (g, selectedWindow) in zip(groups, selectedWindows) {
-            let tabs = g.map { $0.content.tabLayout(title: $0.titleOverride) }
-            let selected = g.firstIndex { $0.window === selectedWindow } ?? 0
+            let tabItems = g.flatMap(\.tabs).filter { !$0.isClosed && !$0.content.isEmpty }
+            guard !tabItems.isEmpty else { continue }
+            let selectedController = g.first { $0.window === selectedWindow } ?? g[0]
+            let selectedTab = selectedController.selectedTab
+            let selected = tabItems.firstIndex { $0 === selectedTab } ?? 0
+            let tabs = tabItems.map { $0.tabLayout() }
             let f = selectedWindow.frame
             windows.append(WindowLayout(frame: [Double(f.minX), Double(f.minY), Double(f.width), Double(f.height)],
                                         tabs: tabs, selectedTab: selected,
                                         fullscreen: selectedWindow.styleMask.contains(.fullScreen),
-                                        workspace: g[0].workspaceID))
+                                        workspace: selectedController.workspaceID))
         }
         return Layout(windows: windows, workspaces: workspaceLayouts(), quick: QuickTerminal.shared.tabLayout)
     }
@@ -1284,7 +1575,7 @@ final class SessionManager: NSObject, CoreDelegate {
 
     /// Debounced (500 ms) layout save.
     func scheduleLayoutSave() {
-        guard !isTerminating else { return }
+        guard !isTerminating, !isSwitchingWorkspace else { return }
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(debouncedSave), object: nil)
         perform(#selector(debouncedSave), with: nil, afterDelay: 0.5)
     }
@@ -1311,8 +1602,11 @@ final class SessionManager: NSObject, CoreDelegate {
         if config.quitTerminates {
             Core.shared.request(object: ["Shutdown": ["kill_panes": true]], timeout: 3)
         }
-        for c in liveControllers {
-            c.content.detachAll()
+        for t in liveTabs {
+            t.content.detachAll()
+        }
+        for ws in workspaces {
+            ws.invalidateCachedTabs()
         }
         // Remote daemons keep their panes; only the tunnels close.
         Remotes.shared.stop()
@@ -1361,10 +1655,13 @@ final class SessionManager: NSObject, CoreDelegate {
         }
         panes = panes.filter { $0.key.isRemote }
         for info in infos { panes[info.key] = info }
-        for c in liveControllers {
-            for id in c.content.paneIds where !id.isRemote && panes[id] == nil {
+        for t in liveTabs {
+            for id in t.content.paneIds where !id.isRemote && panes[id] == nil {
                 removePaneFromUI(id)
             }
+        }
+        for ws in workspaces where !isShown(ws) {
+            ws.retainHiddenPanes { $0.isRemote || panes[$0] != nil }
         }
         let live = liveControllers
         if live.isEmpty {
@@ -1372,12 +1669,19 @@ final class SessionManager: NSObject, CoreDelegate {
             restoreSession()
             return
         }
-        for c in live {
-            for view in c.content.views.values where !view.pane.isRemote {
+        for t in liveTabs {
+            for view in t.content.views.values where !view.pane.isRemote {
                 view.resubscribe()
             }
-            c.updateTitle()
         }
+        for ws in workspaces where !isShown(ws) {
+            for tab in ws.cachedTabs ?? [] {
+                for view in tab.content.views.values where !view.pane.isRemote {
+                    view.resubscribe()
+                }
+            }
+        }
+        for c in live { c.updateTitle() }
         currentController?.content.focusedView?.showToast("Reconnected")
         TailscaleService.shared.refresh()
         saveLayoutNow(force: true)
@@ -1401,6 +1705,7 @@ final class SessionManager: NSObject, CoreDelegate {
             }
         case "PaneClosed":
             if let id = key {
+                evictWarmPane(id)
                 Notifications.shared.withdraw(pane: id)
                 panes.removeValue(forKey: id)
                 removePaneFromUI(id)
@@ -1479,12 +1784,16 @@ final class SessionManager: NSObject, CoreDelegate {
         // its agent would hold the Dock badge with no tab to read it in.
         if old == nil && !info.alive { return }
         panes[key] = info
-        if let c = controller(for: key) {
-            c.updateTitle()
-            c.content.refreshHeaders()
-            c.content.views[key]?.maybeShowRestoredToast()
+        if let t = tab(for: key) {
+            if t.isSelected {
+                t.windowController?.updateTitle()
+            } else {
+                refreshSidebars()
+            }
+            t.content.refreshHeaders()
+            t.content.views[key]?.maybeShowRestoredToast()
             let progress = TerminalView.shownProgress(info)
-            if TerminalView.shownProgress(old) != progress { c.content.views[key]?.setProgress(progress) }
+            if TerminalView.shownProgress(old) != progress { t.content.views[key]?.setProgress(progress) }
         }
         // A handoff's agent finished or asks for something: bring its commits back.
         if let status = info.agent?.status, status == .done || status == .error || status == .needsInput,
@@ -1526,20 +1835,20 @@ final class SessionManager: NSObject, CoreDelegate {
 
     /// Commands sent by the `thurm` CLI through a daemon (`host`'s: its pane ids).
     func swapPanes(_ a: PaneKey, _ b: PaneKey) {
-        guard a != b, let ca = controller(for: a), let cb = controller(for: b) else { return }
-        if ca === cb {
-            ca.content.swap(a, b)
+        guard a != b, let ta = tab(for: a), let tb = tab(for: b) else { return }
+        if ta === tb {
+            ta.content.swap(a, b)
         } else {
             let history = tabHistory
-            ca.content.replace(a, with: b)
-            cb.content.replace(b, with: a)
+            ta.content.replace(a, with: b)
+            tb.content.replace(b, with: a)
             tabHistory = history
             tabHistory.swapPanes(a, b)
             // Each pane's old view let go of it after its new one took it.
-            ca.content.views[b]?.resubscribe()
-            cb.content.views[a]?.resubscribe()
-            ca.updateTitle()
-            cb.updateTitle()
+            ta.content.views[b]?.resubscribe()
+            tb.content.views[a]?.resubscribe()
+            if ta.isSelected { ta.windowController?.updateTitle() }
+            if tb.isSelected { tb.windowController?.updateTitle() }
             focusChanged()
         }
         scheduleLayoutSave()
@@ -1582,36 +1891,44 @@ final class SessionManager: NSObject, CoreDelegate {
                 failure = "layout was cancelled before installation"
                 return
             }
-            var emptied: [TerminalWindowController] = []
+            var emptied: [TabItem] = []
             for pane in tab.root.panes {
-                if let c = controller(for: pane) {
-                    if c.content.remove(pane: pane) { emptied.append(c) } else { c.updateTitle() }
+                if let t = self.tab(for: pane) {
+                    if t.content.remove(pane: pane) {
+                        emptied.append(t)
+                    } else if t.isSelected {
+                        t.windowController?.updateTitle()
+                    }
                 }
             }
             for ws in workspaces {
-                ws.hiddenTabs = retainTabs(ws.hiddenTabs) { !moved.contains($0) }
-                ws.hiddenSelectedTab = min(ws.hiddenSelectedTab, max(0, ws.hiddenTabs.count - 1))
+                ws.retainHiddenPanes { !moved.contains($0) }
             }
             let ws = makeWorkspace(name: tab.title, host: daemon)
             ws.hiddenTabs = [tab]
             openWorkspaceInNewWindow(ws)
             // Open the new window before closing an empty last window.
-            for c in emptied {
-                c.closingWithoutConfirmation = true
-                c.window?.close()
+            for t in emptied {
+                guard let c = t.windowController else { continue }
+                if c.usesSingleWindowTabs && c.tabs.count > 1 {
+                    _ = c.removeTab(t, detach: true)
+                } else {
+                    c.closingWithoutConfirmation = true
+                    c.window?.close()
+                }
             }
             scheduleLayoutSave()
-            if tab.root.panes.allSatisfy({ controller(for: $0)?.workspaceID == ws.id }) {
+            if tab.root.panes.allSatisfy({ self.tab(for: $0)?.workspaceID == ws.id }) {
                 failure = nil
             }
         case "NewTab":
             guard let pane = key("pane") else { return }
             let ownWorkspace = jsonBool(d["new_window"]) ?? false
-            if let c = controller(for: pane) {
+            if let t = tab(for: pane), let c = t.windowController {
                 // Adopted while the app started (this command launched it): `--window` still
                 // gets its own workspace, unless that would leave the window without a tab.
-                if ownWorkspace, c.content.paneIds.count == 1, group(of: c).count > 1 {
-                    moveTabToNewWorkspace(c)
+                if ownWorkspace, t.content.paneIds.count == 1, windowTabs(of: c).count > 1 {
+                    moveTabToNewWorkspace(t)
                 } else {
                     focusPane(pane, activate: true)
                 }
@@ -1633,15 +1950,15 @@ final class SessionManager: NSObject, CoreDelegate {
             }
         case "Split":
             guard let pane = key("pane") else { return }
-            if controller(for: pane) != nil {
+            if tab(for: pane) != nil {
                 focusPane(pane, activate: true)
                 return
             }
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
             let dir = SplitDirName(rawValue: jsonString(d["dir"]) ?? "right") ?? .right
             let target = key("target")
-            let host = target.flatMap { controller(for: $0) }
-                ?? (currentController?.host == daemon ? currentController : nil)
+            let host = target.flatMap { tab(for: $0) }
+                ?? (currentController?.host == daemon ? currentController?.selectedTab : nil)
             if let host = host {
                 host.content.split(target: target, newPane: pane, direction: dir)
                 scheduleLayoutSave()
@@ -1651,16 +1968,16 @@ final class SessionManager: NSObject, CoreDelegate {
         case "Focus":
             if let pane = key("pane") { focusPane(pane, activate: true) }
         case "Equalize":
-            if let pane = key("pane") { controller(for: pane)?.content.equalize() }
+            if let pane = key("pane") { tab(for: pane)?.content.equalize() }
         case "Scroll":
             // The viewport lives in the app's copy of the terminal.
             if let pane = key("pane"), let scroll = d["scroll"] {
                 Core.shared.send(object: ["Scroll": ["pane": pane.number, "scroll": scroll]], host: daemon)
             }
         case "SetTabTitle":
-            if let pane = key("pane"), let c = controller(for: pane) {
+            if let pane = key("pane"), let t = tab(for: pane) {
                 let title = jsonString(d["title"])
-                c.titleOverride = (title?.isEmpty ?? true) ? nil : title
+                t.titleOverride = (title?.isEmpty ?? true) ? nil : title
                 scheduleLayoutSave()
             }
         case "RenameWorkspace":
@@ -1674,7 +1991,7 @@ final class SessionManager: NSObject, CoreDelegate {
             // `thurm new-tab` / `split` with options (`--background`, `--size`).
             guard let pane = key("pane") else { return }
             let background = jsonBool(d["background"]) ?? false
-            if controller(for: pane) != nil {
+            if tab(for: pane) != nil {
                 if !background { focusPane(pane, activate: true) }
                 return
             }
@@ -1683,8 +2000,8 @@ final class SessionManager: NSObject, CoreDelegate {
             let share = jsonUInt64(d["percent"]).map { CGFloat(min(99, max(1, $0))) / 100 }
             if let dir = jsonString(d["split"]).flatMap(SplitDirName.init(rawValue:)) {
                 let target = key("target")
-                let host = target.flatMap { controller(for: $0) }
-                    ?? (currentController?.host == daemon ? currentController : nil)
+                let host = target.flatMap { tab(for: $0) }
+                    ?? (currentController?.host == daemon ? currentController?.selectedTab : nil)
                 if let host {
                     host.content.split(target: target, newPane: pane, direction: dir, share: share,
                                        takeFocus: !background)
@@ -1699,10 +2016,10 @@ final class SessionManager: NSObject, CoreDelegate {
             }
             if !background { NSApp.activate() }
         case "Zoom":
-            if let pane = key("pane") { controller(for: pane)?.content.zoom(pane, jsonBool(d["zoom"])) }
+            if let pane = key("pane") { tab(for: pane)?.content.zoom(pane, jsonBool(d["zoom"])) }
         case "MovePane":
             guard let pane = key("pane"), let target = key("target"), pane != target,
-                  let from = controller(for: pane), let to = controller(for: target),
+                  let from = tab(for: pane), let to = tab(for: target),
                   !from.isQuick, !to.isQuick,
                   let dir = SplitDirName(rawValue: jsonString(d["dir"]) ?? "right") else { return }
             let share = jsonUInt64(d["percent"]).map { CGFloat(min(99, max(1, $0))) / 100 }
@@ -1713,12 +2030,16 @@ final class SessionManager: NSObject, CoreDelegate {
                 // takes it; an emptied tab closes once the pane is in its new place.
                 let emptied = from.content.remove(pane: pane)
                 to.content.split(target: target, newPane: pane, direction: dir, share: share, takeFocus: false)
-                to.updateTitle()
-                if emptied {
-                    from.closingWithoutConfirmation = true
-                    from.window?.close()
-                } else {
-                    from.updateTitle()
+                if to.isSelected { to.windowController?.updateTitle() }
+                if emptied, let fc = from.windowController {
+                    if fc.usesSingleWindowTabs && fc.tabs.count > 1 {
+                        _ = fc.removeTab(from, detach: true)
+                    } else {
+                        fc.closingWithoutConfirmation = true
+                        fc.window?.close()
+                    }
+                } else if from.isSelected {
+                    from.windowController?.updateTitle()
                 }
                 focusChanged()
             }
@@ -1726,15 +2047,15 @@ final class SessionManager: NSObject, CoreDelegate {
         case "AgentWall":
             if let pane = key("pane"), let c = controller(for: pane) { toggleAgentWall(in: c, on: jsonBool(d["on"])) }
         case "Float":
-            guard let pane = key("pane"), let c = controller(for: pane), !c.isQuick || c.content.isFloating(pane) else { return }
-            c.content.setFloating(pane, jsonBool(d["on"]))
+            guard let pane = key("pane"), let t = tab(for: pane), !t.isQuick || t.content.isFloating(pane) else { return }
+            t.content.setFloating(pane, jsonBool(d["on"]))
         case "OpenFloating", "OpenFloatingAt":
             // `thurm new-float`, with `--frame` or `--cells` for `OpenFloatingAt`.
             guard let pane = key("pane") else { return }
             let background = jsonBool(d["background"]) ?? false
             let place = FloatPlace(json: d["place"])
-            if let c = controller(for: pane) {
-                if let place, !c.isQuick { c.content.placeFloating(pane, at: place) }
+            if let t = tab(for: pane) {
+                if let place, !t.isQuick { t.content.placeFloating(pane, at: place) }
                 if !background { focusPane(pane, activate: true) }
                 return
             }
@@ -1743,13 +2064,16 @@ final class SessionManager: NSObject, CoreDelegate {
             // Placed in cells, it goes on the tab of the pane it counts from.
             var anchor: UInt64? = nil
             if case let .cells(a, _, _, _) = place { anchor = a }
-            let host = anchor.flatMap { controller(for: PaneKey(daemon, $0)) }
-                ?? key("target").flatMap { controller(for: $0) }
-                ?? (currentController?.host == daemon ? currentController : nil)
-            if let host, !host.isQuick {
+            let host = anchor.flatMap { tab(for: PaneKey(daemon, $0)) }
+                ?? key("target").flatMap { tab(for: $0) }
+                ?? (currentController?.host == daemon ? currentController?.selectedTab : nil)
+            if let host, !host.isQuick, let hc = host.windowController {
                 host.content.addNewFloating(pane, place: place, takeFocus: !background)
-                host.updateTitle()
-                if !background { host.window?.makeKeyAndOrderFront(nil) }
+                if host.isSelected { hc.updateTitle() } else { refreshSidebars() }
+                if !background {
+                    if hc.usesSingleWindowTabs && !host.isSelected { hc.selectTab(host, focus: false) }
+                    hc.window?.makeKeyAndOrderFront(nil)
+                }
             } else {
                 newTab(from: currentController, pane: pane, background: background)
             }
@@ -1758,33 +2082,33 @@ final class SessionManager: NSObject, CoreDelegate {
             // `thurm new-float --minimized`: a chip from the start, that never takes the focus.
             guard let pane = key("pane") else { return }
             let place = FloatPlace(json: d["place"])
-            if let c = controller(for: pane) {
-                if !c.isQuick { c.content.minimize(pane, true, at: place) }
+            if let t = tab(for: pane) {
+                if !t.isQuick { t.content.minimize(pane, true, at: place) }
                 return
             }
             if panes[pane] == nil, let info = fetchPaneInfo(pane) { panes[pane] = info }
             takeHiddenTab(pane)
             var anchor: UInt64? = nil
             if case let .cells(a, _, _, _) = place { anchor = a }
-            let host = anchor.flatMap { controller(for: PaneKey(daemon, $0)) }
-                ?? key("target").flatMap { controller(for: $0) }
-                ?? (currentController?.host == daemon ? currentController : nil)
+            let host = anchor.flatMap { tab(for: PaneKey(daemon, $0)) }
+                ?? key("target").flatMap { tab(for: $0) }
+                ?? (currentController?.host == daemon ? currentController?.selectedTab : nil)
             if let host, !host.isQuick {
                 host.content.addNewFloating(pane, place: place, takeFocus: false, minimized: true)
-                host.updateTitle()
+                if host.isSelected { host.windowController?.updateTitle() } else { refreshSidebars() }
             } else {
                 newTab(from: currentController, pane: pane, background: true)
             }
         case "MinimizeFloating":
             // `thurm float --minimize/--restore`.
-            guard let pane = key("pane"), let c = controller(for: pane),
-                  !c.isQuick || c.content.isFloating(pane) else { return }
-            c.content.minimize(pane, jsonBool(d["minimized"]) ?? true, at: FloatPlace(json: d["place"]))
+            guard let pane = key("pane"), let t = tab(for: pane),
+                  !t.isQuick || t.content.isFloating(pane) else { return }
+            t.content.minimize(pane, jsonBool(d["minimized"]) ?? true, at: FloatPlace(json: d["place"]))
         case "PlaceFloating":
             // `thurm float --frame/--cells`.
             guard let pane = key("pane"), let place = FloatPlace(json: d["place"]),
-                  let c = controller(for: pane), !c.isQuick else { return }
-            c.content.placeFloating(pane, at: place)
+                  let t = tab(for: pane), !t.isQuick else { return }
+            t.content.placeFloating(pane, at: place)
         case "SwapPanes":
             guard let a = key("a"), let b = key("b") else { return }
             swapPanes(a, b)
