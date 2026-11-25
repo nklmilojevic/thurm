@@ -13,8 +13,6 @@ final class GlyphAtlas {
     private(set) var texture: MTLTexture
     private(set) var width: Int
     private(set) var height: Int
-    /// CPU copy of the texture contents, needed to re-upload after growing.
-    private var pixels: [UInt8]
 
     private var cursorX = 1
     private var cursorY = 1
@@ -23,7 +21,11 @@ final class GlyphAtlas {
     /// Incremented whenever the atlas had to be wiped; cached entries become invalid.
     private(set) var epoch = 0
 
+    #if os(iOS)
+    static let maxHeight = 4096
+    #else
     static let maxHeight = 8192
+    #endif
 
     init?(device: MTLDevice, pixelFormat: MTLPixelFormat, bytesPerPixel: Int, size: Int = 1024) {
         guard let tex = GlyphAtlas.makeTexture(device: device, format: pixelFormat, width: size, height: size) else {
@@ -35,7 +37,6 @@ final class GlyphAtlas {
         self.texture = tex
         self.width = size
         self.height = size
-        self.pixels = [UInt8](repeating: 0, count: size * size * bytesPerPixel)
     }
 
     private static func makeTexture(device: MTLDevice, format: MTLPixelFormat, width: Int, height: Int) -> MTLTexture? {
@@ -69,16 +70,6 @@ final class GlyphAtlas {
     func upload(x: Int, y: Int, width w: Int, height h: Int, bytes: [UInt8]) {
         let rowBytes = w * bytesPerPixel
         guard bytes.count >= rowBytes * h else { return }
-        let atlasRowBytes = width * bytesPerPixel
-        bytes.withUnsafeBufferPointer { src in
-            pixels.withUnsafeMutableBufferPointer { dst in
-                guard let s = src.baseAddress, let d = dst.baseAddress else { return }
-                for row in 0..<h {
-                    let dstOffset = (y + row) * atlasRowBytes + x * bytesPerPixel
-                    (d + dstOffset).update(from: s + row * rowBytes, count: rowBytes)
-                }
-            }
-        }
         // No wait for the GPU: frames in flight only sample regions uploaded before them, and
         // space is reused only after `wipe()`, which starts a new texture.
         bytes.withUnsafeBytes { raw in
@@ -93,25 +84,40 @@ final class GlyphAtlas {
         while newHeight < needed { newHeight *= 2 }
         newHeight = min(newHeight, GlyphAtlas.maxHeight)
         guard newHeight >= needed, newHeight > height,
-              let tex = GlyphAtlas.makeTexture(device: device, format: pixelFormat, width: width, height: newHeight)
+              let newTex = GlyphAtlas.makeTexture(device: device, format: pixelFormat, width: width, height: newHeight)
         else { return false }
-        // Rows are appended at the bottom, so the CPU copy keeps its layout.
-        pixels.append(contentsOf: [UInt8](repeating: 0, count: (newHeight - height) * width * bytesPerPixel))
-        height = newHeight
-        texture = tex
-        let rowBytes = width * bytesPerPixel
-        pixels.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            tex.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
-                        withBytes: base, bytesPerRow: rowBytes)
+        let oldTex = texture
+        let oldHeight = height
+        let sharedCtx = MetalContext.shared.flatMap { $0.device.registryID == device.registryID ? $0 : nil }
+        guard let queue = sharedCtx?.queue ?? device.makeCommandQueue(),
+              let commands = queue.makeCommandBuffer(),
+              let blit = commands.makeBlitCommandEncoder()
+        else { return false }
+        blit.copy(from: oldTex,
+                  sourceSlice: 0,
+                  sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: width, height: oldHeight, depth: 1),
+                  to: newTex,
+                  destinationSlice: 0,
+                  destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        if let ctx = sharedCtx {
+            // Serialized on the shared render queue ahead of subsequent render passes.
+            ctx.recordCommit(commands) { commands.commit() }
+        } else {
+            commands.commit()
+            commands.waitUntilCompleted()
         }
+        height = newHeight
+        texture = newTex
         return true
     }
 
     /// Clears everything (atlas full at max size). Callers drop their caches via `epoch`. A
     /// new texture keeps frames in flight sampling the old one intact.
     private func wipe() {
-        pixels = [UInt8](repeating: 0, count: pixels.count)
         cursorX = 1
         cursorY = 1
         shelfHeight = 0
@@ -157,39 +163,70 @@ struct GlyphEntry {
     static let empty = GlyphEntry(x: 0, y: 0, w: 0, h: 0, left: 0, top: 0, color: false)
 }
 
-/// Rasterizes glyphs with CoreGraphics into an R8 (coverage) atlas and a BGRA atlas for color
-/// (emoji) fonts.
+/// Rasterizes glyphs with CoreGraphics into an R8 (coverage) atlas and a lazily allocated BGRA
+/// atlas for color (emoji) fonts.
 final class GlyphCache {
+    private let device: MTLDevice
     let gray: GlyphAtlas
-    let color: GlyphAtlas
-    private var entries: [GlyphKey: GlyphEntry] = [:]
+    /// Allocated on the first color glyph so emoji-free sessions avoid the BGRA atlas upfront.
+    private(set) var color: GlyphAtlas?
+    private var grayEntries: [GlyphKey: GlyphEntry] = [:]
+    private var colorEntries: [GlyphKey: GlyphEntry] = [:]
     private var grayEpoch = 0
     private var colorEpoch = 0
     private let graySpace = CGColorSpace(name: CGColorSpace.linearGray) ?? CGColorSpaceCreateDeviceGray()
-    private let rgbSpace = CGColorSpaceCreateDeviceRGB()
+    private let rgbSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     /// Font smoothing strength (0...1) when thickening, nil = off.
     private let thicken: CGFloat?
 
     init?(device: MTLDevice, thicken: CGFloat?) {
+        self.device = device
         self.thicken = thicken
-        guard let g = GlyphAtlas(device: device, pixelFormat: .r8Unorm, bytesPerPixel: 1),
-              let c = GlyphAtlas(device: device, pixelFormat: .bgra8Unorm, bytesPerPixel: 4)
-        else { return nil }
+        guard let g = GlyphAtlas(device: device, pixelFormat: .r8Unorm, bytesPerPixel: 1) else {
+            return nil
+        }
         gray = g
+    }
+
+    private func syncEpochs() {
+        if gray.epoch != grayEpoch {
+            grayEntries.removeAll()
+            grayEpoch = gray.epoch
+        }
+        let currentColorEpoch = color?.epoch ?? 0
+        if currentColorEpoch != colorEpoch {
+            colorEntries.removeAll()
+            colorEpoch = currentColorEpoch
+        }
+    }
+
+    private func ensureColorAtlas() -> GlyphAtlas? {
+        if let color { return color }
+        guard let c = GlyphAtlas(device: device, pixelFormat: .bgra8Unorm, bytesPerPixel: 4) else {
+            return nil
+        }
         color = c
+        return c
     }
 
     func entry(for key: GlyphKey, font: CTFont, isColor: Bool, cell: CellBox? = nil) -> GlyphEntry {
-        if gray.epoch != grayEpoch || color.epoch != colorEpoch {
-            entries.removeAll()
-            grayEpoch = gray.epoch
-            colorEpoch = color.epoch
+        syncEpochs()
+        if isColor {
+            if let e = colorEntries[key] { return e }
+        } else {
+            if let e = grayEntries[key] { return e }
         }
-        if let e = entries[key] { return e }
         let box = key.span > 0 ? cell.map { CellBox(width: $0.width * Int(key.span), height: $0.height,
                                                      baseline: $0.baseline) } : nil
         let e = rasterize(glyph: key.glyph, font: font, isColor: isColor, fit: box)
-        entries[key] = e
+        // Rasterizing may wipe its atlas and bump its epoch; flush stale entries of that atlas
+        // before recording the freshly uploaded entry.
+        syncEpochs()
+        if isColor {
+            colorEntries[key] = e
+        } else {
+            grayEntries[key] = e
+        }
         return e
     }
 
@@ -226,7 +263,7 @@ final class GlyphCache {
         let h = Int(ceil(target.maxY)) - bottom + pad
         guard w > 0, h > 0, w < 2048, h < 2048 else { return .empty }
 
-        let atlas = isColor ? color : gray
+        guard let atlas = isColor ? ensureColorAtlas() : gray else { return .empty }
         let bpp = atlas.bytesPerPixel
         var buffer = [UInt8](repeating: 0, count: w * h * bpp)
         let drew: Bool = buffer.withUnsafeMutableBytes { raw -> Bool in

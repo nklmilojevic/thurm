@@ -170,7 +170,7 @@ fragment float4 fs_main(VOut in [[stage_in]],
 
 // MARK: - Shared Metal state
 
-final class MetalContext {
+final class MetalContext: @unchecked Sendable {
     static let shared: MetalContext? = MetalContext()
 
     let device: MTLDevice
@@ -181,13 +181,52 @@ final class MetalContext {
     let coverPipeline: MTLRenderPipelineState
     /// 1×1 transparent texture bound when a slot has nothing to show.
     let emptyTexture: MTLTexture
-    /// The most recently committed frame (all panes share this serial queue).
-    var lastCommitted: MTLCommandBuffer?
+
+    private let commitLock = NSLock()
+    /// The most recently committed in-flight frame (all panes share this serial queue). Released
+    /// automatically when the GPU completes it so idle views do not retain command buffers.
+    private var _lastCommitted: MTLCommandBuffer?
+    private var _commitCount: UInt64 = 0
+
+    var lastCommitted: MTLCommandBuffer? {
+        commitLock.lock()
+        defer { commitLock.unlock() }
+        return _lastCommitted
+    }
+
+    /// Monotonically incremented on every committed frame (used by tests to verify presentation).
+    var commitCount: UInt64 {
+        commitLock.lock()
+        defer { commitLock.unlock() }
+        return _commitCount
+    }
+
+    /// Records `commands` before committing, attaches a completion handler to release it once
+    /// the GPU finishes, and runs `commit`.
+    func recordCommit(_ commands: MTLCommandBuffer, commit: () -> Void) {
+        commitLock.lock()
+        _commitCount &+= 1
+        _lastCommitted = commands
+        commitLock.unlock()
+        commands.addCompletedHandler { [weak self] completed in
+            guard let self else { return }
+            self.commitLock.lock()
+            if (self._lastCommitted as AnyObject?) === (completed as AnyObject) {
+                self._lastCommitted = nil
+            }
+            self.commitLock.unlock()
+        }
+        commit()
+    }
 
     /// Blocks until the GPU finished every committed frame, before the CPU rewrites a texture
-    /// region those frames may still sample (a wiped glyph atlas that got no new texture).
+    /// region those frames may still sample (a wiped glyph atlas that got no new texture) or
+    /// before iOS suspends the process into the background.
     func waitForGPU() {
-        if let cb = lastCommitted, cb.status != .completed, cb.status != .error {
+        commitLock.lock()
+        let cb = _lastCommitted
+        commitLock.unlock()
+        if let cb, cb.status != .completed, cb.status != .error {
             cb.waitUntilCompleted()
         }
     }
@@ -265,7 +304,8 @@ final class GridSnapshot {
         let pane = key.id
         var newInfo = thurm_grid_info()
         var ptr: UnsafePointer<thurm_cell>? = nil
-        guard thurm_grid_lock(client, pane, &newInfo, &ptr) else { return false }
+        let lastGeneration: UInt64 = valid ? info.generation : 0
+        guard thurm_grid_lock_for(client, pane, lastGeneration, &newInfo, &ptr) else { return false }
         defer { thurm_grid_unlock(client, pane) }
         if valid && newInfo.generation == info.generation && newInfo.cols == info.cols && newInfo.rows == info.rows {
             return false
@@ -365,6 +405,18 @@ final class GridSnapshot {
         info = newInfo
         valid = true
         return true
+    }
+
+    /// Clears the cached grid so the next `update` fetches a full snapshot.
+    func reset() {
+        info = thurm_grid_info()
+        cells.removeAll(keepingCapacity: true)
+        rowClusters.removeAll(keepingCapacity: true)
+        links.removeAll(keepingCapacity: true)
+        images.removeAll(keepingCapacity: true)
+        peekCells.removeAll(keepingCapacity: true)
+        peekClusters.removeAll(keepingCapacity: true)
+        valid = false
     }
 
     /// Shows plain text rows, `cols` cells wide, in place of a daemon's grid (tests).
@@ -619,6 +671,8 @@ struct RenderParams {
     /// The macOS layer supplies the base background, including outside a resizing drawable.
     /// Leave the Metal clear transparent there; iOS keeps drawing its background in Metal.
     var backgroundInLayer = false
+    /// Optional cursor shape override (`CursorShapeCode.*`); nil uses the terminal's own shape.
+    var cursorShapeOverride: UInt8? = nil
 }
 
 private struct DrawSegment {
@@ -631,6 +685,20 @@ final class TerminalRenderer {
     let snapshot = GridSnapshot()
     private let colors = ColorAdjuster()
 
+    private struct CachedImage {
+        var serial: UInt64
+        var texture: MTLTexture
+        var origWidth: UInt32
+        var origHeight: UInt32
+        var lastUsed: CFTimeInterval
+    }
+
+    private enum ImageLookup {
+        case ready(CachedImage)
+        case missing
+        case invalid
+    }
+
     private var backgrounds: [QuadInstance] = []
     private var cursorUnder: [QuadInstance] = []
     private var glyphQuads: [QuadInstance] = []
@@ -639,7 +707,7 @@ final class TerminalRenderer {
     private var overlay: [QuadInstance] = []
     /// Uploaded kitty images by id, with the serial of the pixels they hold and when they
     /// were last drawn (textures of images scrolled off stay a moment in case they return).
-    private var imageTextures: [UInt32: (serial: UInt64, texture: MTLTexture, lastUsed: CFTimeInterval)] = [:]
+    private var imageTextures: [UInt32: CachedImage] = [:]
     private static let imageGrace: CFTimeInterval = 2
     /// Quad buffers reused round robin; `inFlight` keeps the CPU from rewriting one the GPU
     /// may still read.
@@ -655,6 +723,27 @@ final class TerminalRenderer {
     private let searchMatchBg: UInt32 = 0xD7BA5A
     private let searchFocusBg: UInt32 = 0xF0883E
     private let searchFg: UInt32 = 0x1B1B1B
+
+    /// Resets per-pane state (snapshot, cached image textures, scratch quad arrays) so the
+    /// renderer can show another pane without reallocating its `MTLBuffer`s.
+    func reset() {
+        snapshot.reset()
+        imageTextures.removeAll()
+        wantsAnotherFrame = false
+        backgrounds.removeAll(keepingCapacity: true)
+        cursorUnder.removeAll(keepingCapacity: true)
+        glyphQuads.removeAll(keepingCapacity: true)
+        decorations.removeAll(keepingCapacity: true)
+        cursorOver.removeAll(keepingCapacity: true)
+        overlay.removeAll(keepingCapacity: true)
+        allQuads.removeAll(keepingCapacity: true)
+        segments.removeAll(keepingCapacity: true)
+    }
+
+    /// Drops all uploaded Kitty image textures immediately (e.g. under iOS memory pressure).
+    func purgeImageTextures() {
+        imageTextures.removeAll(keepingCapacity: false)
+    }
 
     /// The base surface after the same dim and bell covers used by `buildQuads`.
     func surfaceColor(params p: RenderParams) -> SIMD4<Float> {
@@ -683,9 +772,9 @@ final class TerminalRenderer {
         wantsAnotherFrame = false
         // Rasterizing a glyph can wipe a full atlas; quads built before that point to stale
         // texels, so build again against the fresh atlas.
-        let epochs = (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color.epoch)
+        let epochs = (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color?.epoch ?? 0)
         buildQuads(p, device: ctx.device)
-        if epochs != (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color.epoch) {
+        if epochs != (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color?.epoch ?? 0) {
             buildQuads(p, device: ctx.device)
         }
 
@@ -729,7 +818,7 @@ final class TerminalRenderer {
         var displayP3: UInt32 = p.colors.displayP3 ? 1 : 0
         encoder.setFragmentBytes(&displayP3, length: MemoryLayout<UInt32>.stride, index: 0)
         encoder.setFragmentTexture(p.shaper.glyphs.gray.texture, index: 0)
-        encoder.setFragmentTexture(p.shaper.glyphs.color.texture, index: 1)
+        encoder.setFragmentTexture(p.shaper.glyphs.color?.texture ?? ctx.emptyTexture, index: 1)
         encoder.setFragmentTexture(ctx.emptyTexture, index: 2)
 
         if !allQuads.isEmpty {
@@ -760,18 +849,19 @@ final class TerminalRenderer {
             }
         }
         encoder.endEncoding()
-        if layer.presentsWithTransaction {
-            // AppKit's layout and backdrop updates must land with this image. Apple's
-            // transaction presentation contract requires presenting the drawable directly
-            // after scheduling the commands, rather than via MTLCommandBuffer.present.
-            commands.commit()
-            commands.waitUntilScheduled()
-            drawable.present()
-        } else {
-            commands.present(drawable)
-            commands.commit()
+        ctx.recordCommit(commands) {
+            if layer.presentsWithTransaction {
+                // AppKit's layout and backdrop updates must land with this image. Apple's
+                // transaction presentation contract requires presenting the drawable directly
+                // after scheduling the commands, rather than via MTLCommandBuffer.present.
+                commands.commit()
+                commands.waitUntilScheduled()
+                drawable.present()
+            } else {
+                commands.present(drawable)
+                commands.commit()
+            }
         }
-        ctx.lastCommitted = commands
         return true
     }
 
@@ -877,7 +967,7 @@ final class TerminalRenderer {
             && info.display_offset == 0
             && cursorRow < rows && cursorCol < cols
             && (p.cursorOn || !p.focused)
-        var shape = info.cursor_shape
+        var shape = p.cursorShapeOverride ?? info.cursor_shape
         if !p.focused { shape = CursorShapeCode.hollowBlock }
         let blockCursor = cursorShown && shape == CursorShapeCode.block
 
@@ -1051,22 +1141,33 @@ final class TerminalRenderer {
         let cw = Float(p.shaper.cellWidth)
         let ch = Float(p.shaper.cellHeight)
         for placement in snapshot.images {
-            guard let tex = texture(for: placement.image, pane: p.pane, device: device, now: now) else {
+            let cached: CachedImage
+            switch imageEntry(for: placement.image, pane: p.pane, device: device, now: now) {
+            case .ready(let entry):
+                cached = entry
+            case .missing:
                 wantsAnotherFrame = true
                 continue
+            case .invalid:
+                continue
             }
-            let srcW = placement.src_w > 0 ? Float(placement.src_w) : Float(tex.width)
-            let srcH = placement.src_h > 0 ? Float(placement.src_h) : Float(tex.height)
+            let tex = cached.texture
+            let origW = Float(max(1, cached.origWidth))
+            let origH = Float(max(1, cached.origHeight))
+            let scaleX = Float(tex.width) / origW
+            let scaleY = Float(tex.height) / origH
+            let srcW = placement.src_w > 0 ? Float(placement.src_w) : origW
+            let srcH = placement.src_h > 0 ? Float(placement.src_h) : origH
             let dstW = placement.dst_w > 0 ? Float(placement.dst_w)
                 : placement.cols > 0 ? Float(placement.cols) * cw : srcW
             let dstH = placement.dst_h > 0 ? Float(placement.dst_h)
                 : placement.rows > 0 ? Float(placement.rows) * ch : srcH
             let x = Float(p.padX) + Float(placement.col) * cw + Float(placement.x_offset)
             let y = Float(p.padY) + Float(placement.row) * ch + Float(placement.y_offset) + p.scrollY
-            let u0 = Float(placement.src_x)
-            let v0 = Float(placement.src_y)
+            let u0 = Float(placement.src_x) * scaleX
+            let v0 = Float(placement.src_y) * scaleY
             let quad = QuadInstance(rect: SIMD4<Float>(x, y, dstW, dstH),
-                                    uv: SIMD4<Float>(u0, v0, u0 + srcW, v0 + srcH),
+                                    uv: SIMD4<Float>(u0, v0, u0 + srcW * scaleX, v0 + srcH * scaleY),
                                     color: SIMD4<Float>(1, 1, 1, 1), kind: QuadKind.image)
             if placement.z < 0 {
                 below.append((quad, tex))
@@ -1077,29 +1178,77 @@ final class TerminalRenderer {
         return (below, above)
     }
 
-    private func texture(for image: UInt32, pane key: PaneKey, device: MTLDevice, now: CFTimeInterval) -> MTLTexture? {
-        guard let client = Core.shared.client(for: key.host) else { return nil }
+    private func imageEntry(for image: UInt32, pane key: PaneKey, device: MTLDevice, now: CFTimeInterval) -> ImageLookup {
+        guard let client = Core.shared.client(for: key.host) else { return .missing }
         let pane = key.id
         // The serial changes when the image is replaced under the same id.
         let serial = thurm_image_serial(client, pane, image)
-        if let cached = imageTextures[image], cached.serial == serial {
-            imageTextures[image]?.lastUsed = now
-            return cached.texture
+        if var cached = imageTextures[image], cached.serial == serial {
+            cached.lastUsed = now
+            imageTextures[image] = cached
+            return .ready(cached)
         }
         var width: UInt32 = 0
         var height: UInt32 = 0
         var pixels: UnsafePointer<UInt8>? = nil
-        guard thurm_image_lock(client, pane, image, &width, &height, &pixels) else { return nil }
+        guard thurm_image_lock(client, pane, image, &width, &height, &pixels) else { return .missing }
         defer { thurm_image_unlock(client, pane, image) }
-        guard let src = pixels, width > 0, height > 0, width <= 16384, height <= 16384 else { return nil }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: Int(width),
-                                                            height: Int(height), mipmapped: false)
-        desc.usage = [.shaderRead]
-        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
-        tex.replace(region: MTLRegionMake2D(0, 0, Int(width), Int(height)), mipmapLevel: 0,
-                    withBytes: src, bytesPerRow: Int(width) * 4)
-        imageTextures[image] = (serial, tex, now)
-        return tex
+        guard let src = pixels, width > 0, height > 0, width <= 16384, height <= 16384 else { return .invalid }
+
+        #if os(iOS)
+        let maxTexDim: UInt32 = 4096
+        #else
+        let maxTexDim: UInt32 = 16384
+        #endif
+
+        let tex: MTLTexture
+        if width <= maxTexDim && height <= maxTexDim {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: Int(width),
+                                                                height: Int(height), mipmapped: false)
+            desc.usage = [.shaderRead]
+            guard let made = device.makeTexture(descriptor: desc) else { return .invalid }
+            made.replace(region: MTLRegionMake2D(0, 0, Int(width), Int(height)), mipmapLevel: 0,
+                         withBytes: src, bytesPerRow: Int(width) * 4)
+            tex = made
+        } else {
+            // Downscale oversized Kitty images on iOS to stay within 4096×4096 GPU memory budgets.
+            let ratio = min(Double(maxTexDim) / Double(width), Double(maxTexDim) / Double(height))
+            let dstW = max(1, Int((Double(width) * ratio).rounded(.down)))
+            let dstH = max(1, Int((Double(height) * ratio).rounded(.down)))
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: dstW,
+                                                                height: dstH, mipmapped: false)
+            desc.usage = [.shaderRead]
+            guard let made = device.makeTexture(descriptor: desc) else { return .invalid }
+            let srcW = Int(width)
+            let srcH = Int(height)
+            var downscaled = [UInt8](repeating: 0, count: dstW * dstH * 4)
+            downscaled.withUnsafeMutableBufferPointer { dst in
+                guard let dstBase = dst.baseAddress else { return }
+                for y in 0..<dstH {
+                    let sy = min(srcH - 1, (y * srcH) / dstH)
+                    let srcRow = src + sy * srcW * 4
+                    let dstRow = dstBase + y * dstW * 4
+                    for x in 0..<dstW {
+                        let sx = min(srcW - 1, (x * srcW) / dstW)
+                        let s = srcRow + sx * 4
+                        let d = dstRow + x * 4
+                        d[0] = s[0]
+                        d[1] = s[1]
+                        d[2] = s[2]
+                        d[3] = s[3]
+                    }
+                }
+            }
+            downscaled.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                made.replace(region: MTLRegionMake2D(0, 0, dstW, dstH), mipmapLevel: 0,
+                             withBytes: base, bytesPerRow: dstW * 4)
+            }
+            tex = made
+        }
+        let entry = CachedImage(serial: serial, texture: tex, origWidth: width, origHeight: height, lastUsed: now)
+        imageTextures[image] = entry
+        return .ready(entry)
     }
 
     /// Forget cached image textures (e.g. after reconnecting).
