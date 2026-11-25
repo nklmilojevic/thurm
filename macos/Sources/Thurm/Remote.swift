@@ -717,6 +717,7 @@ extension SessionManager {
             }
         }
         runPendingHandoffCleanups(host)
+        prewarmHiddenWorkspaces(for: host)
         refreshSidebars()
         updateDockBadge()
         for c in liveControllers { c.updateTitle() }

@@ -557,17 +557,18 @@ final class FloatTabMenu: NSObject, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         let manager = SessionManager.shared
-        let sources = manager.currentRegularController.map { manager.floatSources(into: $0) } ?? []
+        let sources = manager.currentRegularController.map { manager.floatTabSources(into: $0.selectedTab) } ?? []
         guard menu.title == "Float Tab Here" else {
             menu.items.first { $0.submenu?.delegate === self }?.isHidden = sources.isEmpty
             return
         }
         menu.removeAllItems()
-        guard let c = manager.currentRegularController else { return }
+        guard let dst = manager.currentRegularController?.selectedTab else { return }
         for src in sources {
-            menu.addItem(BlockMenuItem(src.window?.title ?? "Tab") { [weak src, weak c] in
-                guard let src, let c else { return }
-                manager.floatTab(src, into: c)
+            let title = src.titleOverride ?? manager.panes[src.focusedPane]?.displayTitle ?? "Tab"
+            menu.addItem(BlockMenuItem(title) { [weak src, weak dst] in
+                guard let src, let dst else { return }
+                manager.floatTab(src, into: dst)
             })
         }
     }

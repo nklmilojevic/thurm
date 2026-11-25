@@ -52,16 +52,60 @@ final class SessionManager: NSObject, CoreDelegate {
         return body()
     }
 
-    /// Integration hook for warm pane cache eviction (called when a pane closes).
+    /// Drops `id` from the Rust core's warm pane LRU cache when a pane closes.
     func evictWarmPane(_ id: PaneKey) {
-        // INTEGRATION(@warm-panes): Core.shared.evictPane(id)
-        _ = id
+        Core.shared.evictPane(id)
     }
 
-    /// Integration hook for prewarming background tabs' panes after workspace switches/restores.
+    /// Prewarms background tabs' visible panes into the Rust core's warm LRU cache (bounded per
+    /// host by `Core.warmPaneLimit`) so switching tabs paints on frame 0 without a daemon round-trip.
     func prewarmWorkspaceTabs(_ tabs: [TabItem], excluding selected: TabItem?) {
-        // INTEGRATION(@warm-panes): call Core.shared.prewarm(pane) for background panes
-        _ = (tabs, selected)
+        let budget = Int(Core.warmPaneLimit)
+        guard budget > 0 else { return }
+        var remaining: [HostId: Int] = [:]
+        for tab in tabs where tab !== selected && !tab.isClosed {
+            for pane in tab.content.visiblePaneIds {
+                guard Core.shared.isConnected(pane.host) else { continue }
+                let left = remaining[pane.host] ?? budget
+                guard left > 0 else { continue }
+                Core.shared.prewarm(pane)
+                remaining[pane.host] = left - 1
+            }
+        }
+    }
+
+    /// Prewarms hidden workspaces' tabs (selected tab of each workspace first, ordered by recency)
+    /// for `host` (or all connected hosts when nil) so even the first switch to a local or remote
+    /// workspace paints immediately with zero RTT.
+    func prewarmHiddenWorkspaces(for host: HostId? = nil) {
+        let budget = Int(Core.warmPaneLimit)
+        guard budget > 0 else { return }
+        var remaining: [HostId: Int] = [:]
+        func warm(_ pane: PaneKey) {
+            guard Core.shared.isConnected(pane.host) else { return }
+            let left = remaining[pane.host] ?? budget
+            guard left > 0 else { return }
+            Core.shared.prewarm(pane)
+            remaining[pane.host] = left - 1
+        }
+        let targets = workspacesByRecency.filter { ws in
+            !isShown(ws) && (host == nil || ws.host == host)
+        }
+        // Pass 1: each hidden workspace's selected tab first so switching to any workspace is instant.
+        for ws in targets {
+            let tabs = ws.hiddenTabs
+            guard !tabs.isEmpty else { continue }
+            let idx = min(max(0, ws.hiddenSelectedTab), tabs.count - 1)
+            for pane in tabs[idx].panes { warm(pane) }
+        }
+        // Pass 2: remaining hidden tabs while budget allows.
+        for ws in targets {
+            let tabs = ws.hiddenTabs
+            let selectedIdx = min(max(0, ws.hiddenSelectedTab), max(0, tabs.count - 1))
+            for (i, tab) in tabs.enumerated() where i != selectedIdx {
+                for pane in tab.panes { warm(pane) }
+            }
+        }
     }
     /// Layout saving starts only after the initial restore, so a failed start never
     /// overwrites the stored layout with an empty one.
@@ -544,6 +588,7 @@ final class SessionManager: NSObject, CoreDelegate {
             }
         }
         sessionReady = true
+        prewarmHiddenWorkspaces()
         TailscaleService.shared.refresh()
         saveLayoutNow(force: true)
         focusChanged()
