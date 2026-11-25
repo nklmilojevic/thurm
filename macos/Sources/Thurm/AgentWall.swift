@@ -114,6 +114,11 @@ enum AgentWall {
     }
 
     /// A pane of the tab before `i` in `tabs`, for `WallOrigin.after`.
+    static func anchor(before i: Int, in tabs: [TabItem]) -> UInt64? {
+        i > 0 ? tabs[i - 1].content.paneIds.first?.id : nil
+    }
+
+    /// A pane of the tab before `i` in `tabs`, for `WallOrigin.after`.
     static func anchor(before i: Int, in tabs: [TerminalWindowController]) -> UInt64? {
         i > 0 ? tabs[i - 1].content.paneIds.first?.id : nil
     }
@@ -121,13 +126,23 @@ enum AgentWall {
 
 extension SessionManager {
     /// The wall tab of `c`'s window, if one is up.
+    func agentWallTab(near c: TerminalWindowController) -> TabItem? {
+        windowTabs(of: c).first { $0.wall != nil }
+    }
+
+    /// The wall tab's window controller, if one is up.
     func agentWall(near c: TerminalWindowController) -> TerminalWindowController? {
-        group(of: c).first { $0.wall != nil }
+        agentWallTab(near: c)?.windowController
+    }
+
+    func isWallOrigin(_ tab: TabItem) -> Bool {
+        guard let c = tab.windowController else { return false }
+        let here = Set(tab.content.paneIds)
+        return agentWallTab(near: c)?.wall?.contains { $0.tab.panes.contains(where: here.contains) } == true
     }
 
     func isWallOrigin(_ c: TerminalWindowController) -> Bool {
-        let here = Set(c.content.paneIds)
-        return agentWall(near: c)?.wall?.contains { $0.tab.panes.contains(where: here.contains) } == true
+        isWallOrigin(c.selectedTab)
     }
 
     /// Gathers the agents of `c`'s window into a wall (`on` true), puts them back (false), or
@@ -137,7 +152,7 @@ extension SessionManager {
             NSSound.beep()
             return
         }
-        if let wall = agentWall(near: c) {
+        if let wall = agentWallTab(near: c) {
             if on != true { putBackAgents(wall) }
         } else if on != false {
             gatherAgents(in: c)
@@ -154,15 +169,15 @@ extension SessionManager {
 
     private func gatherAgents(in c: TerminalWindowController) {
         // Handoff tabs stay: closing one asks about its worktree.
-        var taken: [(tab: TerminalWindowController, agents: [PaneKey])] = []
+        var taken: [(tab: TabItem, agents: [PaneKey])] = []
         var origins: [WallOrigin] = []
-        let tabs = group(of: c).filter { !$0.isQuick }
+        let tabs = windowTabs(of: c).filter { !$0.isQuick }
         for (i, t) in tabs.enumerated() where t.handoffID == nil {
             let agents = t.content.paneIds.filter(runsAgent)
             guard !agents.isEmpty else { continue }
             taken.append((t, agents))
             origins.append(WallOrigin(index: i, after: AgentWall.anchor(before: i, in: tabs),
-                                      tab: t.content.tabLayout(title: t.titleOverride)))
+                                      tab: t.tabLayout()))
         }
         let agents = taken.flatMap(\.agents)
         guard agents.count > 1, let first = taken.first?.tab,
@@ -175,28 +190,50 @@ extension SessionManager {
         let focused = agents.contains(c.focusedPane) ? c.focusedPane : agents[0]
         // Out of their tabs first, so their views there let go of the panes before the wall's
         // take them; emptied tabs close once the wall is in the window.
-        var emptied: [TerminalWindowController] = []
+        var emptied: [TabItem] = []
         for (t, panes) in taken {
             var empty = false
             for pane in panes { empty = t.content.remove(pane: pane) }
-            if empty { emptied.append(t) } else { t.updateTitle() }
+            if empty {
+                emptied.append(t)
+            } else if t.isSelected {
+                t.windowController?.updateTitle()
+            }
+        }
+        if c.usesSingleWindowTabs && group(of: c).count == 1 {
+            let wall = TabItem(root: root, focused: focused, zoomed: nil, title: "Agents")
+            wall.wall = origins
+            let at = c.tabs.firstIndex { $0 === first }.map { $0 + 1 } ?? c.tabs.count
+            c.insertTab(wall, at: at, select: true)
+            for t in emptied {
+                _ = c.removeTab(t, detach: true)
+            }
+            c.window?.makeKeyAndOrderFront(nil)
+            wall.content.focus(focused)
+            focusChanged()
+            scheduleLayoutSave()
+            return
         }
         let wall = makeController(root: root, focused: focused, zoomed: nil, title: "Agents", frame: nil)
         wall.wall = origins
-        attachAsTab(wall, to: first)
+        if let anchor = first.windowController {
+            attachAsTab(wall, to: anchor)
+        }
         wall.window?.makeKeyAndOrderFront(nil)
         for t in emptied {
-            t.closingWithoutConfirmation = true
-            t.window?.close()
+            if let wc = t.windowController {
+                wc.closingWithoutConfirmation = true
+                wc.window?.close()
+            }
         }
         wall.content.focus(focused)
         focusChanged()
         scheduleLayoutSave()
     }
 
-    private func putBackAgents(_ wall: TerminalWindowController) {
-        guard let origins = wall.wall else { return }
-        var tabs = group(of: wall).filter { $0 !== wall && !$0.isQuick }
+    private func putBackAgents(_ wall: TabItem) {
+        guard let origins = wall.wall, let host = wall.windowController else { return }
+        var tabs = windowTabs(of: host).filter { $0 !== wall && !$0.isQuick }
         let plan = AgentWall.returns(origins: origins, onWall: wall.content.paneIds,
                                      tabs: tabs.map(\.content.paneIds),
                                      floating: tabs.map { Set($0.content.floating.map(\.pane)) })
@@ -207,6 +244,7 @@ extension SessionManager {
         for r in plan {
             for pane in r.panes { wall.content.remove(pane: pane) }
         }
+        let singleWindow = host.usesSingleWindowTabs && group(of: host).count == 1
         for r in plan {
             if let i = r.into {
                 let t = existing[i]
@@ -217,30 +255,50 @@ extension SessionManager {
                     t.content.setFocusedPane(key)
                 }
                 if let z = r.origin.tab.zoomedKey, r.root.contains(z) { t.content.zoom(z, true) }
-                t.updateTitle()
+                if t.isSelected { t.windowController?.updateTitle() }
                 continue
             }
             let tab = r.origin.tab
             let pane = r.root.contains(tab.focusedKey) || r.floating.contains(where: { $0.pane == tab.focusedKey })
                 ? tab.focusedKey : r.root.panes[0]
             let zoomed = tab.zoomedKey.flatMap { r.root.contains($0) ? $0 : nil }
-            let t = makeController(root: r.root, focused: pane, zoomed: zoomed, title: tab.title, frame: nil,
-                                   floating: r.floating, floatingHidden: tab.floatingHidden)
-            t.workspaceID = wall.workspaceID
-            t.pinned = tab.pinned ?? false
-            // Back after the tab it followed.
             let at = AgentWall.position(after: r.origin.after, index: r.origin.index,
                                         in: tabs.map(\.content.paneIds))
-            let anchor = at < tabs.count ? tabs[at] : tabs.last ?? wall
-            if let w = t.window, let host = anchor.window {
-                w.setFrame(host.frame, display: false)
-                host.addTabbedWindow(w, ordered: at < tabs.count ? .below : .above)
+            if singleWindow {
+                let t = TabItem(root: r.root, focused: pane, zoomed: zoomed,
+                                floating: r.floating, floatingHidden: tab.floatingHidden ?? false,
+                                title: tab.title)
+                t.pinned = tab.pinned ?? false
+                let insertIdx: Int
+                if at < tabs.count, let hostIdx = host.tabs.firstIndex(where: { $0 === tabs[at] }) {
+                    insertIdx = hostIdx
+                } else if let last = tabs.last, let hostIdx = host.tabs.firstIndex(where: { $0 === last }) {
+                    insertIdx = hostIdx + 1
+                } else {
+                    insertIdx = host.tabs.count
+                }
+                host.insertTab(t, at: insertIdx, select: false)
+                tabs.insert(t, at: at)
+            } else {
+                let t = makeController(root: r.root, focused: pane, zoomed: zoomed, title: tab.title, frame: nil,
+                                       floating: r.floating, floatingHidden: tab.floatingHidden)
+                t.workspaceID = host.workspaceID
+                t.pinned = tab.pinned ?? false
+                let anchor = at < tabs.count ? tabs[at].windowController : tabs.last?.windowController ?? host
+                if let w = t.window, let anchorWindow = anchor?.window {
+                    w.setFrame(anchorWindow.frame, display: false)
+                    anchorWindow.addTabbedWindow(w, ordered: at < tabs.count ? .below : .above)
+                }
+                tabs.insert(t.selectedTab, at: at)
             }
-            tabs.insert(t, at: at)
         }
         if wall.content.isEmpty {
-            wall.closingWithoutConfirmation = true
-            wall.window?.close()
+            if singleWindow {
+                _ = host.removeTab(wall, detach: true)
+            } else {
+                host.closingWithoutConfirmation = true
+                host.window?.close()
+            }
         } else {
             // Agents with nowhere to go, or opened on the wall, stay as a tab of their own.
             wall.titleOverride = nil
@@ -254,24 +312,28 @@ extension SessionManager {
     /// back to its tab with the others. Not from a tab that already gave the wall agents: its
     /// layout there is already taken.
     func agentStarted(_ pane: PaneKey) {
-        guard let c = controller(for: pane), !c.isQuick, c.wall == nil, c.handoffID == nil,
-              let wall = agentWall(near: c), var origins = wall.wall, !isWallOrigin(c) else { return }
-        let tabs = group(of: wall).filter { $0 !== wall && !$0.isQuick }
-        let i = tabs.firstIndex { $0 === c } ?? tabs.count
+        guard let t = tab(for: pane), let c = t.windowController, !c.isQuick, t.wall == nil, t.handoffID == nil,
+              let wall = agentWallTab(near: c), var origins = wall.wall, !isWallOrigin(t) else { return }
+        let tabs = windowTabs(of: c).filter { $0 !== wall && !$0.isQuick }
+        let i = tabs.firstIndex { $0 === t } ?? tabs.count
         origins.append(WallOrigin(index: i, after: AgentWall.anchor(before: i, in: tabs),
-                                  tab: c.content.tabLayout(title: c.titleOverride)))
-        let watched = c.window.map { $0.tabGroup?.selectedWindow === $0 } ?? false
-        let emptied = c.content.remove(pane: pane)
+                                  tab: t.tabLayout()))
+        let watched = t.isSelected && (c.window.map { ($0.tabGroup?.selectedWindow ?? $0) === $0 } ?? false)
+        let emptied = t.content.remove(pane: pane)
         let agents = wall.content.paneIds + [pane]
-        let rows = AgentWall.rows(count: agents.count, in: wallArea(near: wall))
+        let rows = AgentWall.rows(count: agents.count, in: wallArea(near: c))
         guard let root = AgentWall.grid(agents, rows: rows) else { return }
         wall.wall = origins
         wall.content.setRoot(root)
-        wall.updateTitle()
+        if wall.isSelected { wall.windowController?.updateTitle() }
         if emptied {
-            c.closingWithoutConfirmation = true
-            c.window?.close()
-        } else {
+            if c.usesSingleWindowTabs && group(of: c).count == 1 {
+                _ = c.removeTab(t, detach: true)
+            } else {
+                c.closingWithoutConfirmation = true
+                c.window?.close()
+            }
+        } else if t.isSelected {
             c.updateTitle()
         }
         // Its tab was showing: the wall shows instead, the keys still going to it.

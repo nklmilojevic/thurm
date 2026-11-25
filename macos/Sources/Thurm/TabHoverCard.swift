@@ -444,7 +444,7 @@ final class TabHoverCard {
     private let panel: NSPanel
     private let card = HoverCardView()
     private weak var anchor: NSView?
-    private weak var controller: TerminalWindowController?
+    private weak var tab: TabItem?
     private var edge = Edge.right
     private var pending: DispatchWorkItem?
     /// When the last card went away: a tab entered soon after shows its card without waiting.
@@ -491,16 +491,21 @@ final class TabHoverCard {
 
     /// The pointer entered `anchor`, a row or pill for `controller`'s tab.
     func enter(_ anchor: NSView, controller: TerminalWindowController?, edge: Edge) {
+        enter(anchor, tab: controller?.selectedTab, edge: edge)
+    }
+
+    /// The pointer entered `anchor`, a row or pill for `tab`.
+    func enter(_ anchor: NSView, tab: TabItem?, edge: Edge) {
         pending?.cancel()
         pending = nil
-        guard let controller, !controller.isClosed, NSApp.isActive,
+        guard let tab, !tab.isClosed, tab.windowController?.isClosed == false, NSApp.isActive,
               // The selected tab is on screen already.
-              controller.window !== anchor.window else {
+              !(tab.windowController?.window === anchor.window && tab.isSelected) else {
             if self.anchor !== anchor { hide() }
             return
         }
         self.anchor = anchor
-        self.controller = controller
+        self.tab = tab
         self.edge = edge
         if panel.isVisible || CACurrentMediaTime() - hiddenAt < Self.warm {
             show()
@@ -563,14 +568,15 @@ final class TabHoverCard {
     }
 
     private func show() {
-        guard let anchor, let window = anchor.window, let controller, !controller.isClosed,
+        guard let anchor, let window = anchor.window, let tab, !tab.isClosed,
+              tab.windowController?.isClosed == false,
               let screen = window.screen ?? NSScreen.main else {
             hide()
             return
         }
-        let content = controller.content
+        let content = tab.content
         let model = HoverCardModel.make(root: content.root, focused: content.focusedPane, zoomed: content.zoomedPane,
-                                        titleOverride: controller.titleOverride, host: controller.host,
+                                        titleOverride: tab.titleOverride, host: tab.host,
                                         panes: SessionManager.shared.panes)
         let size = content.bounds.size
         let aspect = size.width > 0 ? size.height / size.width : 0.6

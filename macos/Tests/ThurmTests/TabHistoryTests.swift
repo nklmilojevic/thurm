@@ -6,11 +6,14 @@ final class TabHistoryTests: XCTestCase {
     private let manager = SessionManager.shared
     private var savedWorkspaces: [Workspace] = []
     private var savedHistory = TabHistory()
+    private var savedSidebarTabs = true
 
     override func setUp() {
         super.setUp()
         savedWorkspaces = manager.workspaces
         savedHistory = manager.tabHistory
+        savedSidebarTabs = manager.config.sidebarTabs
+        manager.config.sidebarTabs = true
         manager.workspaces = []
         manager.tabHistory = TabHistory()
         Remotes.shared.pendingCloses = [:]
@@ -21,6 +24,7 @@ final class TabHistoryTests: XCTestCase {
             c.closingWithoutConfirmation = true
             c.window?.close()
         }
+        manager.config.sidebarTabs = savedSidebarTabs
         manager.workspaces = savedWorkspaces
         manager.tabHistory = savedHistory
         Remotes.shared.pendingCloses = [:]
@@ -239,6 +243,33 @@ final class TabHistoryTests: XCTestCase {
     }
 
     func testBackToAHiddenTabSwitchesTheWindowToItsWorkspace() throws {
+        let hidden = manager.makeWorkspace(name: "hidden")
+        hidden.hiddenTabs = [
+            TabLayout(title: nil, root: .pane(pane(8)), focused: 8, zoomed: nil),
+            TabLayout(title: nil, root: .pane(pane(9)), focused: 9, zoomed: nil),
+        ]
+        let shown = manager.makeWorkspace(name: "shown")
+        let c = manager.makeController(root: .leaf(pane(1)), focused: pane(1), zoomed: nil, title: nil, frame: nil)
+        c.workspaceID = shown.id
+        let originalWindow = c.window
+        manager.tabHistory = history([tab(9), tab(1)])
+
+        manager.goBackInTabHistory()
+
+        let arrived = try XCTUnwrap(manager.controller(for: pane(9)))
+        XCTAssertEqual(arrived.workspaceID, hidden.id)
+        XCTAssertTrue(arrived === c, "single-window sidebar mode switches in place")
+        XCTAssertTrue(arrived.window === originalWindow)
+        XCTAssertFalse(c.isClosed)
+        XCTAssertEqual(arrived.content.paneIds, [pane(9)])
+        XCTAssertEqual(shown.hiddenTabs.map(\.panes), [tab(1)])
+        manager.recordTabVisit(arrived)
+        XCTAssertEqual(manager.tabHistory.entries, [tab(9), tab(1)])
+        XCTAssertEqual(manager.tabHistory.cursor, 0)
+    }
+
+    func testBackToAHiddenTabInNativeModeSwitchesTheWindowToItsWorkspace() throws {
+        manager.config.sidebarTabs = false
         let hidden = manager.makeWorkspace(name: "hidden")
         hidden.hiddenTabs = [
             TabLayout(title: nil, root: .pane(pane(8)), focused: 8, zoomed: nil),

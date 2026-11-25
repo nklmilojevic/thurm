@@ -4,12 +4,20 @@ import XCTest
 
 final class TabFloatTests: XCTestCase {
     private let manager = SessionManager.shared
+    private var savedSidebarTabs = true
+
+    override func setUp() {
+        super.setUp()
+        savedSidebarTabs = manager.config.sidebarTabs
+        manager.config.sidebarTabs = true
+    }
 
     override func tearDown() {
         for c in manager.liveControllers {
             c.closingWithoutConfirmation = true
             c.window?.close()
         }
+        manager.config.sidebarTabs = savedSidebarTabs
         Remotes.shared.pendingCloses = [:]
         super.tearDown()
     }
@@ -60,7 +68,7 @@ final class TabFloatTests: XCTestCase {
 
     func testOnlyOnePaneTabsOfTheSameHostCanFloat() {
         let shown = tab(.leaf(pane(1)))
-        let single = tab(.leaf(pane(2)), after: shown)
+        _ = tab(.leaf(pane(2)), after: shown)
         let splits = tab(SplitNode.leaf(pane(3)).inserting(pane(4), at: pane(3), direction: .right), after: shown)
         let wall = tab(.leaf(pane(5)), after: shown)
         wall.wall = []
@@ -117,6 +125,19 @@ final class TabFloatTests: XCTestCase {
     }
 
     func testMoveFloatingPaneToNewTabAddsItAfterItsTab() throws {
+        let first = tab(.leaf(pane(1)), floating: [card(3)])
+        first.content.focus(pane(3))
+        first.moveFloatingPaneToNewTab(nil)
+        XCTAssertEqual(manager.group(of: first).count, 1, "single-window sidebar mode reuses the window")
+        XCTAssertEqual(manager.windowTabs(of: first).map(\.content.paneIds), [[pane(1)], [pane(3)]])
+
+        let again = try XCTUnwrap(manager.controller(for: pane(3)))
+        again.moveFloatingPaneToNewTab(nil)
+        XCTAssertEqual(manager.windowTabs(of: first).count, 2, "a pane of the splits stays put")
+    }
+
+    func testMoveFloatingPaneToNewTabAddsItAfterItsTabInNativeMode() throws {
+        manager.config.sidebarTabs = false
         let first = tab(.leaf(pane(1)), floating: [card(3)])
         first.content.focus(pane(3))
         first.moveFloatingPaneToNewTab(nil)

@@ -79,21 +79,33 @@ struct TabHistory {
 extension SessionManager {
     enum TabTarget {
         case shown(TerminalWindowController)
+        case hosted(TabItem)
         case hidden(HiddenTab)
     }
 
+    func isHistoryTab(_ tab: TabItem) -> Bool {
+        guard let c = tab.windowController else { return false }
+        return !c.isClosed && !tab.isClosed && !c.isQuick && tab.wall == nil
+    }
+
     func isHistoryTab(_ c: TerminalWindowController) -> Bool {
-        !c.isClosed && !c.isQuick && c.wall == nil
+        isHistoryTab(c.selectedTab)
+    }
+
+    func recordTabVisit(_ tab: TabItem) {
+        guard isHistoryTab(tab) else { return }
+        tabHistory.visit(tab.content.paneIds)
     }
 
     func recordTabVisit(_ c: TerminalWindowController) {
-        guard isHistoryTab(c) else { return }
-        tabHistory.visit(c.content.paneIds)
+        recordTabVisit(c.selectedTab)
     }
 
     func tabTarget(_ panes: [PaneKey]) -> TabTarget? {
         for pane in panes {
-            if let c = controller(for: pane), isHistoryTab(c) { return .shown(c) }
+            if let t = tab(for: pane), isHistoryTab(t), let c = t.windowController {
+                return c.tabs.count > 1 ? .hosted(t) : .shown(c)
+            }
         }
         for ws in workspaces {
             if let i = ws.hiddenTabs.firstIndex(where: { $0.wall == nil && TabHistory.sameTab($0.panes, panes) }) {
@@ -137,6 +149,11 @@ extension SessionManager {
         switch target {
         case .shown(let c):
             c.window?.makeKeyAndOrderFront(nil)
+        case .hosted(let t):
+            if let c = t.windowController {
+                c.selectTab(t, focus: true)
+                c.window?.makeKeyAndOrderFront(nil)
+            }
         case .hidden(let tab):
             showHiddenTab(tab, from: currentRegularController)
         }

@@ -6,10 +6,13 @@ import XCTest
 final class LastTabCloseTests: XCTestCase {
     private let manager = SessionManager.shared
     private var savedWorkspaces: [Workspace] = []
+    private var savedSidebarTabs = true
 
     override func setUp() {
         super.setUp()
         savedWorkspaces = manager.workspaces
+        savedSidebarTabs = manager.config.sidebarTabs
+        manager.config.sidebarTabs = true
         manager.workspaces = []
     }
 
@@ -18,6 +21,7 @@ final class LastTabCloseTests: XCTestCase {
             c.closingWithoutConfirmation = true
             c.window?.close()
         }
+        manager.config.sidebarTabs = savedSidebarTabs
         manager.workspaces = savedWorkspaces
         Remotes.shared.pendingCloses = [:]
         super.tearDown()
@@ -36,12 +40,21 @@ final class LastTabCloseTests: XCTestCase {
         return (c, shown, hidden)
     }
 
-    private func assertSwitched(from c: TerminalWindowController, shown: Workspace, hidden: Workspace,
+    private func assertSwitched(from c: TerminalWindowController, originalWindow: NSWindow?,
+                                shown: Workspace, hidden: Workspace, expectSameWindow: Bool,
                                 file: StaticString = #filePath, line: UInt = #line) {
-        XCTAssertTrue(c.isClosed, file: file, line: line)
+        if expectSameWindow {
+            XCTAssertFalse(c.isClosed, "single-window sidebar mode reuses the window", file: file, line: line)
+        } else {
+            XCTAssertTrue(c.isClosed, file: file, line: line)
+        }
         XCTAssertNil(manager.workspace(shown.id), "the emptied workspace goes", file: file, line: line)
         let now = manager.controllerShowing(hidden)
         XCTAssertNotNil(now, "the hidden workspace is shown", file: file, line: line)
+        if expectSameWindow {
+            XCTAssertTrue(now === c, file: file, line: line)
+            XCTAssertTrue(now?.window === originalWindow, file: file, line: line)
+        }
         XCTAssertEqual(now?.content.paneIds, [pane(2)], file: file, line: line)
         XCTAssertTrue(hidden.hiddenTabs.isEmpty, file: file, line: line)
     }
@@ -50,13 +63,30 @@ final class LastTabCloseTests: XCTestCase {
         let (c, shown, hidden) = twoWorkspaces()
         let window = try XCTUnwrap(c.window)
         XCTAssertFalse(c.windowShouldClose(window))
-        assertSwitched(from: c, shown: shown, hidden: hidden)
+        assertSwitched(from: c, originalWindow: window, shown: shown, hidden: hidden, expectSameWindow: true)
     }
 
     func testLastPaneGoingShowsPreviousWorkspace() {
         let (c, shown, hidden) = twoWorkspaces()
+        let window = c.window
         manager.removePaneFromUI(pane(1))
-        assertSwitched(from: c, shown: shown, hidden: hidden)
+        assertSwitched(from: c, originalWindow: window, shown: shown, hidden: hidden, expectSameWindow: true)
+    }
+
+    func testClosingLastTabShowsPreviousWorkspaceInNativeMode() throws {
+        manager.config.sidebarTabs = false
+        let (c, shown, hidden) = twoWorkspaces()
+        let window = try XCTUnwrap(c.window)
+        XCTAssertFalse(c.windowShouldClose(window))
+        assertSwitched(from: c, originalWindow: window, shown: shown, hidden: hidden, expectSameWindow: false)
+    }
+
+    func testLastPaneGoingShowsPreviousWorkspaceInNativeMode() {
+        manager.config.sidebarTabs = false
+        let (c, shown, hidden) = twoWorkspaces()
+        let window = c.window
+        manager.removePaneFromUI(pane(1))
+        assertSwitched(from: c, originalWindow: window, shown: shown, hidden: hidden, expectSameWindow: false)
     }
 
     func testLastWorkspaceStillCloses() throws {

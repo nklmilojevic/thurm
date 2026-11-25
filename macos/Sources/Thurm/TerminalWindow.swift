@@ -267,7 +267,39 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
     /// to merge.
     override func moveTabToNewWindow(_ sender: Any?) {
         guard let c = windowController as? TerminalWindowController else { return }
-        SessionManager.shared.moveTabToNewWorkspace(c)
+        SessionManager.shared.moveTabToNewWorkspace(c.selectedTab)
+    }
+
+    override func selectNextTab(_ sender: Any?) {
+        if let c = windowController as? TerminalWindowController, c.usesSingleWindowTabs,
+           SessionManager.shared.group(of: c).count == 1 {
+            c.selectAdjacentTab(delta: 1)
+            return
+        }
+        super.selectNextTab(sender)
+    }
+
+    override func selectPreviousTab(_ sender: Any?) {
+        if let c = windowController as? TerminalWindowController, c.usesSingleWindowTabs,
+           SessionManager.shared.group(of: c).count == 1 {
+            c.selectAdjacentTab(delta: -1)
+            return
+        }
+        super.selectPreviousTab(sender)
+    }
+
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        if let c = windowController as? TerminalWindowController, c.usesSingleWindowTabs,
+           SessionManager.shared.group(of: c).count == 1 {
+            switch item.action {
+            case #selector(selectNextTab(_:)), #selector(selectPreviousTab(_:)),
+                 #selector(moveTabToNewWindow(_:)):
+                return c.tabs.count > 1
+            default:
+                break
+            }
+        }
+        return super.validateUserInterfaceItem(item)
     }
 
     override func mergeAllWindows(_ sender: Any?) {}
@@ -467,9 +499,11 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         guard let group = tabGroup, group !== observedTabGroup else { return }
         observedTabGroup = group
         tabGroupObservation = group.observe(\.windows) { [weak self] _, _ in
+            guard !SessionManager.shared.isSwitchingWorkspace else { return }
             DispatchQueue.main.async {
-                self?.syncTitlebar()
-                self?.setupTabBar()
+                guard let self, !SessionManager.shared.isSwitchingWorkspace else { return }
+                self.syncTitlebar()
+                self.setupTabBar()
                 // Tabs were added, closed or reordered: save the layout now (was a 3 s poll)
                 // and refresh the Cmd+N hints and sidebars.
                 SessionManager.shared.scheduleLayoutSave()
@@ -482,16 +516,28 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
         // Selecting a tab restyles the buttons over a short animation, recreating the glass
         // layers we neutralised; re-apply across it.
         tabSelectionObservation = group.observe(\.selectedWindow) { [weak self] _, _ in
+            guard !SessionManager.shared.isSwitchingWorkspace else { return }
             DispatchQueue.main.async {
+                guard let self, !SessionManager.shared.isSwitchingWorkspace else { return }
                 SessionManager.shared.refreshSidebars()
-                self?.syncTabBarBackground()
+                guard !self.hidesTabBar else { return }
+                self.syncTabBarBackground()
                 for ms in [50, 150, 300, 600] {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms)) {
-                        self?.syncTabBarBackground()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms)) { [weak self] in
+                        guard let self, !SessionManager.shared.isSwitchingWorkspace, !self.hidesTabBar else { return }
+                        self.syncTabBarBackground()
                     }
                 }
             }
         }
+    }
+
+    /// Runs a single titlebar/tab-bar synchronization pass after a batch native-tab switch.
+    func finishWorkspaceSwitchSync() {
+        observeTabGroup()
+        syncTitlebar()
+        setupTabBar()
+        scheduleTabBarBackgroundSync()
     }
 
     // MARK: Titlebar tint
@@ -523,10 +569,15 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
 
     /// AppKit restyles the tab bar after key/main transitions; re-apply on the next turns.
     private func scheduleTabBarBackgroundSync() {
+        guard !hidesTabBar, !SessionManager.shared.isSwitchingWorkspace else { return }
         syncTabBarBackground()
-        DispatchQueue.main.async { [weak self] in self?.syncTabBarBackground() }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.hidesTabBar, !SessionManager.shared.isSwitchingWorkspace else { return }
+            self.syncTabBarBackground()
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
-            self?.syncTabBarBackground()
+            guard let self, !self.hidesTabBar, !SessionManager.shared.isSwitchingWorkspace else { return }
+            self.syncTabBarBackground()
         }
     }
 
@@ -539,6 +590,7 @@ final class TerminalWindow: NSWindow, NSToolbarDelegate {
     /// bar often.
     private func syncTabBarBackground() {
         guard #available(macOS 27, *),
+              !hidesTabBar,
               let base = titlebarColor,
               let tabBar = titlebarView?.firstDescendant(className: "NSTabBar")
         else { return }
