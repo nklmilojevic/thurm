@@ -103,6 +103,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
 /// Happy Eyeballs stagger between resolved addresses when dialing multiple candidates.
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+/// Deadline for a single background DNS lookup triggered by `Direct::wake`.
+const WAKE_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard cap on concurrent blocking OS DNS lookups per `Direct` instance so repeated mobile wakes
+/// during a DNS blackout cannot accumulate unbounded threads, while still letting a newer
+/// network's wake bypass a stalled lookup from the previous network.
+const MAX_WAKE_DNS_IN_FLIGHT: usize = 4;
 /// How long ending the server waits for shells still starting (an ssh connection and a mosh
 /// bootstrap, each with its own timeout).
 const CREATING_TIMEOUT: Duration = Duration::from_secs(60);
@@ -128,20 +134,111 @@ pub struct Direct {
     inner: Arc<Inner>,
 }
 
+type WakeResolver =
+    dyn Fn(&str, u16) -> Result<Vec<SocketAddr>, DirectError> + Send + Sync + 'static;
+
+fn spawn_wake_lookup_locked(
+    dns: &mut WakeDnsState,
+    inner: &Arc<Inner>,
+    my_gen: u64,
+    resolve: Arc<WakeResolver>,
+    timeout: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(rt) = inner.mosh_rt.as_ref() else {
+        dns.in_flight = dns.in_flight.saturating_sub(1);
+        return None;
+    };
+    if let Some(prev) = dns.active_task.take() {
+        prev.abort();
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let blocking_inner = Arc::clone(inner);
+    let blocking_resolve = Arc::clone(&resolve);
+    rt.spawn_blocking(move || {
+        struct SlotGuard(Arc<Inner>);
+        impl Drop for SlotGuard {
+            fn drop(&mut self) {
+                let mut dns = self.0.wake_dns.lock();
+                dns.in_flight = dns.in_flight.saturating_sub(1);
+                if self.0.closed.load(Ordering::SeqCst) {
+                    dns.pending_resolve = None;
+                    return;
+                }
+                if dns.latest_gen > dns.started_gen
+                    && dns.in_flight < MAX_WAKE_DNS_IN_FLIGHT
+                    && let Some((next_resolve, next_timeout)) = dns.pending_resolve.take()
+                {
+                    dns.in_flight += 1;
+                    let next_gen = dns.latest_gen;
+                    dns.started_gen = next_gen;
+                    let _ = spawn_wake_lookup_locked(
+                        &mut dns,
+                        &self.0,
+                        next_gen,
+                        next_resolve,
+                        next_timeout,
+                    );
+                }
+            }
+        }
+        let _slot = SlotGuard(Arc::clone(&blocking_inner));
+        if blocking_inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let res = blocking_resolve(&blocking_inner.target.host, blocking_inner.target.port);
+        let _ = tx.send(res);
+    });
+    let waiter_inner = Arc::clone(inner);
+    let handle = rt.spawn(async move {
+        if let Ok(Ok(Ok(addrs))) = tokio::time::timeout(timeout, rx).await {
+            let current = {
+                let mut dns = waiter_inner.wake_dns.lock();
+                if dns.latest_gen == my_gen {
+                    dns.active_task = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if current && !waiter_inner.closed.load(Ordering::SeqCst) {
+                let panes: Vec<_> = waiter_inner.panes.lock().values().cloned().collect();
+                for pane in panes {
+                    if let Backend::Mosh { session, .. } = &pane.lock().backend {
+                        let actual_ip = session.peer_ip();
+                        if let Some(ip) =
+                            pick_wake_ip(actual_ip, &addrs).filter(|&ip| ip != actual_ip)
+                        {
+                            session.wake_at(ip);
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut dns = waiter_inner.wake_dns.lock();
+            if dns.latest_gen == my_gen {
+                dns.active_task = None;
+            }
+        }
+    });
+    dns.active_task = Some(handle.abort_handle());
+    Some(handle)
+}
+
 impl Direct {
     /// Every mosh session moves to a new socket at once (the network changed, or the app came
     /// back from the background). Existing sessions wake immediately so a stalled or failing DNS
-    /// lookup never delays UDP recovery; for hostnames, at most one background lookup thread runs
-    /// at a time (coalescing repeated wakes) and re-targets any session whose peer IP changed
-    /// (e.g. Wi-Fi IPv4 <-> cellular NAT64 IPv6).
+    /// lookup never delays UDP recovery; for hostnames, a deadline-bounded, generation-gated
+    /// lookup runs on the background runtime so a newer network's wake supersedes a previous
+    /// network's stalled lookup without waiting, while concurrency remains strictly bounded.
     pub fn wake(&self) {
-        let _ = self.wake_with(resolve_addrs);
+        let _ = self.wake_with(Arc::new(resolve_addrs), WAKE_DNS_TIMEOUT);
     }
 
-    fn wake_with<F>(&self, resolve: F) -> Option<std::thread::JoinHandle<()>>
-    where
-        F: Fn(&str, u16) -> Result<Vec<SocketAddr>, DirectError> + Send + 'static,
-    {
+    fn wake_with(
+        &self,
+        resolve: Arc<WakeResolver>,
+        timeout: Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let panes: Vec<_> = self.inner.panes.lock().values().cloned().collect();
         for pane in panes {
             if let Backend::Mosh { session, .. } = &pane.lock().backend {
@@ -153,75 +250,20 @@ impl Direct {
         {
             return None;
         }
-        {
-            let mut dns = self.inner.wake_dns.lock();
-            if dns.in_flight {
-                dns.pending = true;
-                return None;
+        let mut dns = self.inner.wake_dns.lock();
+        dns.latest_gen = dns.latest_gen.saturating_add(1);
+        let my_gen = dns.latest_gen;
+        if dns.in_flight < MAX_WAKE_DNS_IN_FLIGHT {
+            dns.in_flight += 1;
+            dns.started_gen = my_gen;
+            dns.pending_resolve = None;
+            spawn_wake_lookup_locked(&mut dns, &self.inner, my_gen, resolve, timeout)
+        } else {
+            if let Some(prev) = dns.active_task.take() {
+                prev.abort();
             }
-            dns.in_flight = true;
-            dns.pending = false;
-        }
-        let inner = self.inner.clone();
-        match std::thread::Builder::new()
-            .name("thurm-direct-wake".into())
-            .spawn(move || {
-                struct InFlightGuard<'a> {
-                    inner: &'a Inner,
-                    armed: bool,
-                }
-                impl Drop for InFlightGuard<'_> {
-                    fn drop(&mut self) {
-                        if self.armed {
-                            let mut dns = self.inner.wake_dns.lock();
-                            dns.in_flight = false;
-                            dns.pending = false;
-                        }
-                    }
-                }
-                let mut guard = InFlightGuard {
-                    inner: &inner,
-                    armed: true,
-                };
-                loop {
-                    if inner.closed.load(Ordering::SeqCst) {
-                        let mut dns = inner.wake_dns.lock();
-                        dns.in_flight = false;
-                        dns.pending = false;
-                        guard.armed = false;
-                        break;
-                    }
-                    if let Ok(addrs) = resolve(&inner.target.host, inner.target.port) {
-                        let panes: Vec<_> = inner.panes.lock().values().cloned().collect();
-                        for pane in panes {
-                            if let Backend::Mosh { session, .. } = &pane.lock().backend {
-                                let actual_ip = session.peer_ip();
-                                if let Some(ip) =
-                                    pick_wake_ip(actual_ip, &addrs).filter(|&ip| ip != actual_ip)
-                                {
-                                    session.wake_at(ip);
-                                }
-                            }
-                        }
-                    }
-                    let mut dns = inner.wake_dns.lock();
-                    if dns.pending && !inner.closed.load(Ordering::SeqCst) {
-                        dns.pending = false;
-                        continue;
-                    }
-                    dns.in_flight = false;
-                    dns.pending = false;
-                    guard.armed = false;
-                    break;
-                }
-            }) {
-            Ok(handle) => Some(handle),
-            Err(_) => {
-                let mut dns = self.inner.wake_dns.lock();
-                dns.in_flight = false;
-                dns.pending = false;
-                None
-            }
+            dns.pending_resolve = Some((resolve, timeout));
+            None
         }
     }
 }
@@ -248,9 +290,11 @@ pub fn serve(
         key,
         session: Mutex::new(SessionSlot {
             current: Some(Arc::new(session)),
+            session_id: 1,
             ip,
             connecting: false,
         }),
+        next_session_id: AtomicU64::new(2),
         session_ready: Condvar::new(),
         panes: Mutex::new(HashMap::new()),
         next_pane: AtomicU64::new(1),
@@ -258,10 +302,7 @@ pub fn serve(
         creating: Mutex::new(0),
         created: Condvar::new(),
         out: Mutex::new(theirs),
-        wake_dns: Mutex::new(WakeDnsState {
-            in_flight: false,
-            pending: false,
-        }),
+        wake_dns: Mutex::new(WakeDnsState::new()),
         mosh_rt: Some(mosh_rt),
     });
     let server = inner.clone();
@@ -661,6 +702,10 @@ enum Backend {
     Mosh {
         session: MoshSession,
         pid: Option<u32>,
+        /// The SSH session instance that launched `pid`. Cleanup only sends `kill <pid>` over this
+        /// exact session so a reconnect (possibly to a different host behind DNS, or after a
+        /// reboot) can never kill an unrelated process that happens to share the same PID.
+        origin_session_id: u64,
         /// The host state shown.
         current: u64,
         /// Acknowledged host states the server may diff from, as terminal state.
@@ -748,16 +793,22 @@ impl Pane {
     }
 }
 
-/// Ends what a pane runs; returns its mosh-server's pid, to end on the host.
-fn end_backend(backend: Backend) -> Option<u32> {
+/// Ends what a pane runs; returns its mosh-server's pid and originating SSH session ID, to end on
+/// the host only if that exact SSH session is still active.
+fn end_backend(backend: Backend) -> Option<(u32, u64)> {
     match backend {
         Backend::Ssh(shell) => {
             shell.close();
             None
         }
-        Backend::Mosh { session, pid, .. } => {
+        Backend::Mosh {
+            session,
+            pid,
+            origin_session_id,
+            ..
+        } => {
             session.close();
-            pid
+            pid.map(|p| (p, origin_session_id))
         }
         Backend::Starting | Backend::Ended => None,
     }
@@ -784,19 +835,36 @@ fn new_terminal(size: PaneSize) -> Terminal {
 
 struct SessionSlot {
     current: Option<Arc<Session>>,
+    session_id: u64,
     ip: IpAddr,
     connecting: bool,
 }
 
 struct WakeDnsState {
-    in_flight: bool,
-    pending: bool,
+    latest_gen: u64,
+    started_gen: u64,
+    in_flight: usize,
+    active_task: Option<tokio::task::AbortHandle>,
+    pending_resolve: Option<(Arc<WakeResolver>, Duration)>,
+}
+
+impl WakeDnsState {
+    fn new() -> Self {
+        Self {
+            latest_gen: 0,
+            started_gen: 0,
+            in_flight: 0,
+            active_task: None,
+            pending_resolve: None,
+        }
+    }
 }
 
 struct Inner {
     target: DirectTarget,
     key: Arc<dyn DeviceKey>,
     session: Mutex<SessionSlot>,
+    next_session_id: AtomicU64,
     session_ready: Condvar,
     panes: Mutex<HashMap<PaneId, Arc<Mutex<Pane>>>>,
     next_pane: AtomicU64,
@@ -806,7 +874,7 @@ struct Inner {
     creating: Mutex<usize>,
     created: Condvar,
     out: Mutex<UnixStream>,
-    /// Coalesces hostname DNS lookups triggered by repeated `Direct::wake` calls.
+    /// Generation-gated, bounded-concurrency state for hostname DNS lookups on `Direct::wake`.
     wake_dns: Mutex<WakeDnsState>,
     /// Always set; taken on drop.
     mosh_rt: Option<tokio::runtime::Runtime>,
@@ -844,14 +912,14 @@ impl Inner {
         self.panes.lock().get(&id).cloned()
     }
 
-    /// The ssh session and its current IP, reconnecting (with fresh DNS resolution and Happy
-    /// Eyeballs) when it has gone away. Never holds `self.session` across the network dial, so
-    /// `close()` and `shutdown()` never stall on a 20s reconnect.
-    fn session(&self) -> Result<(Arc<Session>, IpAddr), String> {
+    /// The ssh session, its monotonic session ID, and its current IP, reconnecting (with fresh DNS
+    /// resolution and Happy Eyeballs) when it has gone away. Never holds `self.session` across the
+    /// network dial, so `close()` and `shutdown()` never stall on a 20s reconnect.
+    fn session(&self) -> Result<(Arc<Session>, u64, IpAddr), String> {
         let mut slot = self.session.lock();
         loop {
             if let Some(session) = slot.current.as_ref().filter(|s| !s.is_closed()) {
-                return Ok((session.clone(), slot.ip));
+                return Ok((session.clone(), slot.session_id, slot.ip));
             }
             if self.closed.load(Ordering::SeqCst) {
                 return Err("the connection is closing".into());
@@ -899,10 +967,12 @@ impl Inner {
                         return Err("the connection is closing".into());
                     }
                     let s = Arc::new(s);
+                    let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
                     slot.current = Some(s.clone());
+                    slot.session_id = id;
                     slot.ip = ip;
                     self.session_ready.notify_all();
-                    return Ok((s, ip));
+                    return Ok((s, id, ip));
                 }
                 Err(e) => {
                     self.session_ready.notify_all();
@@ -948,6 +1018,13 @@ impl Inner {
             let _slot = self.session.lock();
             self.closed.store(true, Ordering::SeqCst);
         }
+        {
+            let mut dns = self.wake_dns.lock();
+            if let Some(task) = dns.active_task.take() {
+                task.abort();
+            }
+            dns.pending_resolve = None;
+        }
         self.session_ready.notify_all();
         {
             let deadline = Instant::now() + CREATING_TIMEOUT;
@@ -959,13 +1036,21 @@ impl Inner {
             }
         }
         let panes: Vec<_> = self.panes.lock().drain().map(|(_, p)| p).collect();
-        let pids: Vec<u32> = panes
+        let pids: Vec<(u32, u64)> = panes
             .iter()
             .filter_map(|p| end_backend(std::mem::replace(&mut p.lock().backend, Backend::Ended)))
             .collect();
         drop(panes);
-        if let Some(session) = self.session.lock().current.take() {
-            kill(&session, &pids);
+        let (session, session_id) = {
+            let mut slot = self.session.lock();
+            (slot.current.take(), slot.session_id)
+        };
+        if let Some(session) = session {
+            let matching: Vec<u32> = pids
+                .into_iter()
+                .filter_map(|(pid, origin_id)| (origin_id == session_id).then_some(pid))
+                .collect();
+            kill(&session, &matching);
             session.disconnect();
         }
     }
@@ -1103,16 +1188,20 @@ impl Inner {
         };
         // Still starting: its worker sees the pane gone and ends what it started.
         let backend = std::mem::replace(&mut pane.lock().backend, Backend::Ended);
-        if let Some(pid) = end_backend(backend) {
-            // Over the session there is now: reconnecting would hold up this request (the
-            // server exits by itself after its timeout).
-            if let Some(s) = self
-                .session
-                .lock()
-                .current
-                .clone()
-                .filter(|s| !s.is_closed())
-            {
+        if let Some((pid, origin_id)) = end_backend(backend) {
+            // Only kill over the exact SSH session that launched this mosh-server: if SSH dropped
+            // and reconnected (possibly to a different host behind DNS, or after a reboot),
+            // sending `kill <pid>` could hit an unrelated process; the server exits on its own
+            // after its timeout.
+            let session = {
+                let slot = self.session.lock();
+                if slot.session_id == origin_id {
+                    slot.current.clone().filter(|s| !s.is_closed())
+                } else {
+                    None
+                }
+            };
+            if let Some(s) = session {
                 std::thread::spawn(move || kill(&s, &[pid]));
             }
         }
@@ -1125,7 +1214,7 @@ impl Inner {
         }
         let id = self.next_pane.fetch_add(1, Ordering::Relaxed);
         let size = req.size;
-        let (session, ip) = self.session()?;
+        let (session, session_id, ip) = self.session()?;
         let pane = Arc::new(Mutex::new(Pane {
             id,
             term: new_terminal(size),
@@ -1139,9 +1228,9 @@ impl Inner {
         let started = match self.target.mode {
             Mode::Ssh => self.start_ssh(&session, &pane, size),
             Mode::MoshOnly => self
-                .start_mosh(&session, ip, &pane, size)
+                .start_mosh(&session, session_id, ip, &pane, size)
                 .map_err(|e| e.to_string()),
-            Mode::Mosh => match self.start_mosh(&session, ip, &pane, size) {
+            Mode::Mosh => match self.start_mosh(&session, session_id, ip, &pane, size) {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     let note = format!("\x1b[2m[mosh: {e}; using ssh]\x1b[0m\r\n");
@@ -1160,7 +1249,9 @@ impl Inner {
         if self.closed.load(Ordering::SeqCst) || !self.panes.lock().contains_key(&id) {
             self.panes.lock().remove(&id);
             let backend = std::mem::replace(&mut pane.lock().backend, Backend::Ended);
-            if let Some(pid) = end_backend(backend) {
+            if let Some((pid, origin_id)) = end_backend(backend)
+                && origin_id == session_id
+            {
                 kill(&session, &[pid]);
             }
             return Err("the pane was closed while it started".into());
@@ -1210,6 +1301,7 @@ impl Inner {
     fn start_mosh(
         self: &Arc<Self>,
         session: &Session,
+        session_id: u64,
         ip: IpAddr,
         pane: &Arc<Mutex<Pane>>,
         size: PaneSize,
@@ -1251,6 +1343,7 @@ impl Inner {
         p.backend = Backend::Mosh {
             session: mosh,
             pid: connect.pid,
+            origin_session_id: session_id,
             current: 0,
             snapshots: BTreeMap::from([(0, initial)]),
             status: Status::Connecting,
@@ -1261,7 +1354,9 @@ impl Inner {
             return Ok(());
         }
         let backend = std::mem::replace(&mut pane.lock().backend, Backend::Starting);
-        if let Some(pid) = end_backend(backend) {
+        if let Some((pid, origin_id)) = end_backend(backend)
+            && origin_id == session_id
+        {
             kill(session, &[pid]);
         }
         Err(BootstrapError::Failed(format!(

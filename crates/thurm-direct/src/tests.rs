@@ -989,9 +989,11 @@ fn wake_resockets_immediately_even_when_dns_stalls_or_fails() {
         key: TestKey::new(1),
         session: Mutex::new(SessionSlot {
             current: direct.inner.session.lock().current.clone(),
+            session_id: 1,
             ip: server_addr.ip(),
             connecting: false,
         }),
+        next_session_id: AtomicU64::new(2),
         session_ready: Condvar::new(),
         panes: Mutex::new(HashMap::from([(
             1,
@@ -1001,6 +1003,7 @@ fn wake_resockets_immediately_even_when_dns_stalls_or_fails() {
                 backend: Backend::Mosh {
                     session,
                     pid: None,
+                    origin_session_id: 1,
                     current: 0,
                     snapshots: BTreeMap::new(),
                     status: Status::Connecting,
@@ -1016,10 +1019,7 @@ fn wake_resockets_immediately_even_when_dns_stalls_or_fails() {
         creating: Mutex::new(0),
         created: Condvar::new(),
         out: Mutex::new(theirs),
-        wake_dns: Mutex::new(WakeDnsState {
-            in_flight: false,
-            pending: false,
-        }),
+        wake_dns: Mutex::new(WakeDnsState::new()),
         mosh_rt: Some(mosh_rt),
     });
     let _keep = ours;
@@ -1029,12 +1029,16 @@ fn wake_resockets_immediately_even_when_dns_stalls_or_fails() {
     // immediately before DNS returns (and survives DNS failing afterward).
     let (dns_started_tx, dns_started_rx) = mpsc::channel();
     let (release_dns_tx, release_dns_rx) = mpsc::channel();
+    let release_dns_rx = Mutex::new(release_dns_rx);
     let worker = host_direct
-        .wake_with(move |_host, _port| {
-            let _ = dns_started_tx.send(());
-            let _ = release_dns_rx.recv();
-            Err(DirectError::Failed("dns unavailable".into()))
-        })
+        .wake_with(
+            Arc::new(move |_host, _port| {
+                let _ = dns_started_tx.send(());
+                let _ = release_dns_rx.lock().recv();
+                Err(DirectError::Failed("dns unavailable".into()))
+            }),
+            WAKE_DNS_TIMEOUT,
+        )
         .expect("hostname wake should spawn background resolver");
 
     dns_started_rx
@@ -1056,20 +1060,30 @@ fn wake_resockets_immediately_even_when_dns_stalls_or_fails() {
     };
     assert_ne!(woken_src, initial_src);
 
-    // Unblock the stalled resolver so it fails; join and confirm clean completion.
+    // Unblock the stalled resolver so it fails; await completion cleanly.
     let _ = release_dns_tx.send(());
-    worker.join().unwrap();
+    host_direct
+        .inner
+        .mosh_rt
+        .as_ref()
+        .unwrap()
+        .block_on(worker)
+        .unwrap();
 
     // Unchanged DNS IP: wake() moves the socket once immediately, then the worker sees the peer
     // IP is unchanged and does not resocket a second time.
     let (unchanged_tx, unchanged_rx) = mpsc::channel();
     let (allow_unchanged_tx, allow_unchanged_rx) = mpsc::channel();
+    let allow_unchanged_rx = Mutex::new(allow_unchanged_rx);
     let worker = host_direct
-        .wake_with(move |_host, _port| {
-            let _ = unchanged_tx.send(());
-            let _ = allow_unchanged_rx.recv();
-            Ok(vec![server_addr])
-        })
+        .wake_with(
+            Arc::new(move |_host, _port| {
+                let _ = unchanged_tx.send(());
+                let _ = allow_unchanged_rx.lock().recv();
+                Ok(vec![server_addr])
+            }),
+            WAKE_DNS_TIMEOUT,
+        )
         .expect("hostname wake should spawn background resolver");
     unchanged_rx
         .recv_timeout(Duration::from_secs(2))
@@ -1083,14 +1097,20 @@ fn wake_resockets_immediately_even_when_dns_stalls_or_fails() {
         }
     };
     let _ = allow_unchanged_tx.send(());
-    worker.join().unwrap();
+    host_direct
+        .inner
+        .mosh_rt
+        .as_ref()
+        .unwrap()
+        .block_on(worker)
+        .unwrap();
     // Next datagram arrives from the same socket (unchanged DNS did not trigger a second wake).
     let (_, after_unchanged_src) = server_udp.recv_from(&mut buf).unwrap();
     assert_eq!(after_unchanged_src, second_src);
 }
 
 #[test]
-fn wake_coalesces_concurrent_dns_lookups_to_one_thread() {
+fn wake_supersedes_stalled_dns_without_waiting_and_bounds_concurrency() {
     use std::sync::atomic::AtomicUsize;
 
     let key = TestKey::new(1);
@@ -1099,6 +1119,11 @@ fn wake_coalesces_concurrent_dns_lookups_to_one_thread() {
     let (_stream, direct) = super::serve(t.clone(), key).unwrap();
     let server_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let server_addr = server_udp.local_addr().unwrap();
+    let alt_udp = std::net::UdpSocket::bind("[::1]:0")
+        .or_else(|_| std::net::UdpSocket::bind("127.0.0.2:0"))
+        .expect("alternate loopback socket");
+    let alt_ip = alt_udp.local_addr().unwrap().ip();
+    assert_ne!(alt_ip, server_addr.ip());
 
     let mosh_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -1108,16 +1133,18 @@ fn wake_coalesces_concurrent_dns_lookups_to_one_thread() {
     let session =
         MoshSession::start(mosh_rt.handle(), server_addr, [9u8; 16], (80, 24), |_| {}).unwrap();
 
-    t.host = "coalesce.example".into();
+    t.host = "roaming.example".into();
     let (ours, theirs) = UnixStream::pair().unwrap();
     let inner = Arc::new(Inner {
         target: t,
         key: TestKey::new(1),
         session: Mutex::new(SessionSlot {
             current: direct.inner.session.lock().current.clone(),
+            session_id: 1,
             ip: server_addr.ip(),
             connecting: false,
         }),
+        next_session_id: AtomicU64::new(2),
         session_ready: Condvar::new(),
         panes: Mutex::new(HashMap::from([(
             1,
@@ -1127,6 +1154,7 @@ fn wake_coalesces_concurrent_dns_lookups_to_one_thread() {
                 backend: Backend::Mosh {
                     session,
                     pid: None,
+                    origin_session_id: 1,
                     current: 0,
                     snapshots: BTreeMap::new(),
                     status: Status::Connecting,
@@ -1142,67 +1170,283 @@ fn wake_coalesces_concurrent_dns_lookups_to_one_thread() {
         creating: Mutex::new(0),
         created: Condvar::new(),
         out: Mutex::new(theirs),
-        wake_dns: Mutex::new(WakeDnsState {
-            in_flight: false,
-            pending: false,
-        }),
+        wake_dns: Mutex::new(WakeDnsState::new()),
         mosh_rt: Some(mosh_rt),
     });
     let _keep = ours;
     let host_direct = Direct { inner };
+    let peer_ip = || match &host_direct.inner.pane(1).unwrap().lock().backend {
+        Backend::Mosh { session, .. } => session.peer_ip(),
+        _ => unreachable!(),
+    };
 
-    let lookups = Arc::new(AtomicUsize::new(0));
-    let lookups_in_worker = lookups.clone();
-    let (started_tx, started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-
-    let worker = host_direct
-        .wake_with(move |_host, _port| {
-            let n = lookups_in_worker.fetch_add(1, Ordering::SeqCst) + 1;
-            if n == 1 {
-                let _ = started_tx.send(());
-                let _ = release_rx.recv();
-                Err(DirectError::Failed("dns stalled".into()))
-            } else {
+    // 1. Network A's DNS lookup stalls indefinitely; a second wake on Network B must immediately
+    // resolve and switch Mosh to `alt_ip` WITHOUT waiting for Network A's lookup to unblock, and
+    // Network A's stale return must NOT revert `peer_ip`.
+    let (old_started_tx, old_started_rx) = mpsc::channel();
+    let (release_old_tx, release_old_rx) = mpsc::channel::<()>();
+    let release_old_rx = Mutex::new(release_old_rx);
+    let old_waiter = host_direct
+        .wake_with(
+            Arc::new(move |_host, _port| {
+                let _ = old_started_tx.send(());
+                let _ = release_old_rx.lock().recv();
                 Ok(vec![server_addr])
-            }
-        })
-        .expect("first wake should spawn a single DNS worker");
-
-    started_rx
+            }),
+            WAKE_DNS_TIMEOUT,
+        )
+        .expect("wake #1 should start lookup");
+    old_started_rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("first lookup should start");
+        .expect("old lookup should be blocked in DNS");
 
-    // Repeated wakes while DNS is blocked must NOT spawn additional threads; they coalesce into
-    // a single pending follow-up lookup on the active worker.
-    for _ in 0..4 {
+    let new_addr = SocketAddr::new(alt_ip, server_addr.port());
+    let new_waiter = host_direct
+        .wake_with(
+            Arc::new(move |_host, _port| Ok(vec![new_addr])),
+            WAKE_DNS_TIMEOUT,
+        )
+        .expect("wake #2 must supersede without blocking behind wake #1");
+    host_direct
+        .inner
+        .mosh_rt
+        .as_ref()
+        .unwrap()
+        .block_on(new_waiter)
+        .unwrap();
+    // Wait for MoshSession driver to install the new peer IP while wake #1 is STILL blocked.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while peer_ip() != alt_ip {
+        assert!(
+            Instant::now() < deadline,
+            "wake #2 did not retarget Mosh while wake #1 was stalled (peer={})",
+            peer_ip()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Wake #1's async waiter was aborted when wake #2 superseded it.
+    let old_res = host_direct
+        .inner
+        .mosh_rt
+        .as_ref()
+        .unwrap()
+        .block_on(old_waiter);
+    assert!(old_res.is_err(), "superseded waiter should be cancelled");
+    // Now release the stalled old lookup returning `server_addr`; peer must stay on `alt_ip`.
+    let _ = release_old_tx.send(());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while host_direct.inner.wake_dns.lock().in_flight > 0 {
+        assert!(Instant::now() < deadline, "in_flight slot never released");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(peer_ip(), alt_ip, "stale DNS result must not overwrite newer peer");
+
+    // 2. Per-lookup deadline bounds how long the wake waiter stays pending on a hung lookup.
+    let (timeout_started_tx, timeout_started_rx) = mpsc::channel();
+    let (release_timeout_tx, release_timeout_rx) = mpsc::channel::<()>();
+    let release_timeout_rx = Mutex::new(release_timeout_rx);
+    let started = Instant::now();
+    let timeout_waiter = host_direct
+        .wake_with(
+            Arc::new(move |_host, _port| {
+                let _ = timeout_started_tx.send(());
+                let _ = release_timeout_rx.lock().recv();
+                Ok(vec![server_addr])
+            }),
+            Duration::from_millis(50),
+        )
+        .expect("timeout wake should start");
+    timeout_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("timed lookup should start");
+    host_direct
+        .inner
+        .mosh_rt
+        .as_ref()
+        .unwrap()
+        .block_on(timeout_waiter)
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let _ = release_timeout_tx.send(());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while host_direct.inner.wake_dns.lock().in_flight > 0 {
+        assert!(Instant::now() < deadline, "timed slot never released");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // 3. Concurrency cap + coalescing: saturate all `MAX_WAKE_DNS_IN_FLIGHT` slots, then fire 6
+    // rapid wakes; no more than `MAX_WAKE_DNS_IN_FLIGHT` blocking lookups run at once, and only
+    // ONE coalesced follow-up lookup executes once slots unblock.
+    let mut releases = Vec::new();
+    let (sat_started_tx, sat_started_rx) = mpsc::channel();
+    for _ in 0..MAX_WAKE_DNS_IN_FLIGHT {
+        let tx = sat_started_tx.clone();
+        let (rel_tx, rel_rx) = mpsc::channel::<()>();
+        let rel_rx = Mutex::new(rel_rx);
+        releases.push(rel_tx);
         assert!(
             host_direct
-                .wake_with(move |_host, _port| {
-                    panic!("coalesced wake must not spawn or invoke a second resolver");
-                })
-                .is_none()
+                .wake_with(
+                    Arc::new(move |_host, _port| {
+                        let _ = tx.send(());
+                        let _ = rel_rx.lock().recv();
+                        Err(DirectError::Failed("stalled".into()))
+                    }),
+                    WAKE_DNS_TIMEOUT,
+                )
+                .is_some()
         );
     }
-    assert_eq!(lookups.load(Ordering::SeqCst), 1);
-
-    let _ = release_tx.send(());
-    worker.join().unwrap();
+    for _ in 0..MAX_WAKE_DNS_IN_FLIGHT {
+        sat_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("slot lookup should start");
+    }
     assert_eq!(
-        lookups.load(Ordering::SeqCst),
-        2,
-        "4 coalesced wakes must run at most one follow-up lookup"
+        host_direct.inner.wake_dns.lock().in_flight,
+        MAX_WAKE_DNS_IN_FLIGHT
     );
 
-    // After the worker exits, a new wake starts cleanly again.
-    let next_lookups = Arc::new(AtomicUsize::new(0));
-    let next_in_worker = next_lookups.clone();
-    let worker2 = host_direct
-        .wake_with(move |_host, _port| {
-            next_in_worker.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![server_addr])
-        })
-        .expect("wake after worker completion should spawn a fresh lookup");
-    worker2.join().unwrap();
-    assert_eq!(next_lookups.load(Ordering::SeqCst), 1);
+    let coalesced_runs = Arc::new(AtomicUsize::new(0));
+    let (followup_done_tx, followup_done_rx) = mpsc::channel();
+    for i in 0..6 {
+        let runs = coalesced_runs.clone();
+        let done = followup_done_tx.clone();
+        let res = host_direct.wake_with(
+            Arc::new(move |_host, _port| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                let _ = done.send(i);
+                Ok(vec![new_addr])
+            }),
+            WAKE_DNS_TIMEOUT,
+        );
+        assert!(
+            res.is_none(),
+            "wake beyond MAX_WAKE_DNS_IN_FLIGHT must coalesce without spawning"
+        );
+    }
+    assert_eq!(coalesced_runs.load(Ordering::SeqCst), 0);
+
+    // Release all stalled slots: exactly one coalesced follow-up runs, and it is the latest one (5).
+    for tx in releases {
+        let _ = tx.send(());
+    }
+    let ran_idx = followup_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("coalesced follow-up should execute once a slot frees");
+    assert_eq!(ran_idx, 5, "only the latest coalesced wake should run");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while host_direct.inner.wake_dns.lock().in_flight > 0 {
+        assert!(Instant::now() < deadline, "all wake slots should drain");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        coalesced_runs.load(Ordering::SeqCst),
+        1,
+        "6 excess wakes must coalesce into at most one follow-up lookup"
+    );
+}
+
+#[test]
+fn close_and_shutdown_skip_old_mosh_pids_after_ssh_reconnect() {
+    struct ChildGuard(Option<std::process::Child>);
+    impl ChildGuard {
+        fn spawn() -> Self {
+            Self(Some(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .expect("spawn sleep"),
+            ))
+        }
+        fn id(&self) -> u32 {
+            self.0.as_ref().unwrap().id()
+        }
+        fn is_alive(&mut self) -> bool {
+            self.0.as_mut().unwrap().try_wait().unwrap().is_none()
+        }
+    }
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let key = TestKey::new(1);
+    let server = ssh_server(&key);
+    let t = direct_target(&server, Mode::Ssh);
+    let (_stream, direct) = super::serve(t, key).unwrap();
+    let server_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_addr = server_udp.local_addr().unwrap();
+    let rt = direct.inner.mosh_rt.as_ref().unwrap().handle().clone();
+
+    let mut old_close_child = ChildGuard::spawn();
+    let mut old_shutdown_child = ChildGuard::spawn();
+    let mut same_session_child = ChildGuard::spawn();
+
+    // Simulate SSH having reconnected to a new session (session_id = 2) while panes 1 & 2 still
+    // carry Mosh PIDs started under the previous SSH session (origin_session_id = 1).
+    let (reconnected, new_id, _) = {
+        if let Some(old) = direct.inner.session.lock().current.take() {
+            old.disconnect();
+        }
+        direct.inner.session().unwrap()
+    };
+    assert_eq!(new_id, 2);
+    drop(reconnected);
+
+    let insert_mosh_pane = |id: PaneId, pid: u32, origin_session_id: u64| {
+        let session = MoshSession::start(&rt, server_addr, [3u8; 16], (80, 24), |_| {}).unwrap();
+        direct.inner.panes.lock().insert(
+            id,
+            Arc::new(Mutex::new(Pane {
+                id,
+                term: new_terminal(size(80, 24)),
+                backend: Backend::Mosh {
+                    session,
+                    pid: Some(pid),
+                    origin_session_id,
+                    current: 0,
+                    snapshots: BTreeMap::new(),
+                    status: Status::Connected,
+                },
+                subscribed: false,
+                alive: true,
+                exit_code: None,
+                held_replies: Vec::new(),
+            })),
+        );
+    };
+    insert_mosh_pane(1, old_close_child.id(), 1);
+    insert_mosh_pane(2, old_shutdown_child.id(), 1);
+    insert_mosh_pane(3, same_session_child.id(), new_id);
+
+    // Closing pane 3 (same SSH session) kills its remote mosh PID cleanly.
+    direct.inner.close(3);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while same_session_child.is_alive() {
+        assert!(
+            Instant::now() < deadline,
+            "same-session mosh PID should be killed on close"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Closing pane 1 and shutting down pane 2 (origin_session_id = 1 != current session_id = 2)
+    // must NOT send `kill <pid>` to the reconnected SSH session.
+    direct.inner.close(1);
+    direct.inner.shutdown();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        old_close_child.is_alive(),
+        "close() must not kill an old-session PID on a reconnected SSH session"
+    );
+    assert!(
+        old_shutdown_child.is_alive(),
+        "shutdown() must not kill an old-session PID on a reconnected SSH session"
+    );
 }
