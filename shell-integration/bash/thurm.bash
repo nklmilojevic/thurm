@@ -79,13 +79,20 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
       builtin printf '\e]633;P;ThurmPath=%s:%s\a' "$_thurm_token" "${PATH//;/\\x3b}"
       _thurm_last_path=$PATH
     fi
-    if [[ -n "${_thurm_resume_ticket-}" && -n "${_thurm_resume_exec-}" ]]; then
+    # The ticket is a bearer secret: untraced under a `set -x` from .bashrc (tested by
+    # substitution, which a trace shows instead of the value).
+    if [[ -n "${_thurm_resume_ticket:+1}" && -n "${_thurm_resume_exec:+1}" ]]; then
+      local _thurm_x=""
+      if [[ $- == *x* ]]; then _thurm_x=1; fi
+      builtin set +x
       local _rt="$_thurm_resume_ticket" _re="$_thurm_resume_exec"
       _thurm_resume_ticket=""
       _thurm_resume_exec=""
       # A failed resume (gone program, unreachable daemon) must not end the shell under
       # `set -e`: the prompt still comes.
       command "$_re" --exec-resume "$_rt" || :
+      _rt=""
+      if [[ -n "$_thurm_x" ]]; then builtin set -x; fi
     fi
     builtin printf '\e]133;A\a'
     if [[ "$PS1" != *'133;B'* ]]; then

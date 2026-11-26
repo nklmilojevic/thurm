@@ -96,7 +96,10 @@ if status is-interactive; and set -q __thurm_resume_ticket; and test -n "$THURM_
     status is-full-job-control; and set jc full
     status job-control full
     printf '\e]133;C\a'
-    command $exec --exec-resume $ticket
+    # Its own evaluation: a job ended by Ctrl-C or Ctrl-\ cancels the rest of the evaluation
+    # it runs in, which must not be this one (the mark and the job-control mode after it).
+    # A fixed string, expanding the two variables only inside.
+    builtin eval 'command $exec --exec-resume $ticket'
     printf '\e]133;D;%s\a' $status
     status job-control $jc
 end

@@ -384,8 +384,16 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
                 env_dump.display()
             ),
         );
+        // Traced from the rc file on (as when debugging startup): the trace goes to the pane,
+        // and must not show the single-use ticket or the helper.
+        let (xtrace, untrace) = if shell_name == "zsh" {
+            ("setopt xtrace", "unsetopt xtrace")
+        } else {
+            ("set -x", "set +x")
+        };
         let rc_body = format!(
-            "export PATH=\"{}:$PATH\"\n\
+            "{xtrace}\n\
+             export PATH=\"{}:$PATH\"\n\
              export FROM_RC=yes\n\
              myresumeprog() {{ touch '{}'; }}\n\
              alias myresumeprog='touch {}'\n",
@@ -453,6 +461,10 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
         // it runs, which holds only a function's name.
         let shown = capture(&c2, pane);
         assert!(
+            shown.contains("FROM_RC=yes"),
+            "{shell_name}: no trace: {shown}"
+        );
+        assert!(
             !shown.contains("--exec-resume") && !shown.contains("thurmd"),
             "{shell_name}: {shown}"
         );
@@ -465,6 +477,9 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
         })
         .unwrap();
         std::thread::sleep(Duration::from_millis(250));
+        // Untraced from here: zsh's prompt hooks trace hundreds of lines, which would scroll
+        // the output below off the screen.
+        run_line(&c2, pane, untrace);
         // Only a shell running it prints the joined word (an echo of the typed line would not).
         run_line(&c2, pane, "printf 'SUSPENDED_%s\\n' BACK");
         wait_match(&c2, pane, "SUSPENDED_BACK");
@@ -479,7 +494,8 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
 
 /// zsh without its line editor has no first-prompt widget: started with `--no-zle` the daemon
 /// types the resume line, and with ZLE turned off by `.zshrc` the integration runs it from its
-/// hook. Either way the program runs in the foreground and reads the terminal.
+/// hook. Either way the program is looked up on the PATH `.zshrc`'s precmd hooks make, and runs
+/// in the foreground reading the terminal.
 #[test]
 fn zsh_without_zle_still_resumes() {
     if running_as_root() {
@@ -502,7 +518,11 @@ fn zsh_without_zle_still_resumes() {
         );
         std::fs::write(
             home.join(".zshrc"),
-            format!("export PATH=\"{}:$PATH\"\n{zshrc}", custom_bin.display()),
+            format!(
+                "_my_env_hook() {{ [[ :$PATH: == *:{0}:* ]] || export PATH=\"{0}:$PATH\"; }}\n\
+                 precmd_functions+=(_my_env_hook)\n{zshrc}",
+                custom_bin.display()
+            ),
         )
         .unwrap();
         let sep = if args.is_empty() { "" } else { ", " };
@@ -1184,6 +1204,80 @@ fn fish_integration_resume_uses_startup_path_and_bypasses_functions() {
     }
     run_line(&c2, pane, "typed");
     wait_match(&c2, pane, "FISH_GOT_typed_END");
+}
+
+/// A resumed job ended by Ctrl-C (which cancels the rest of fish's evaluation it runs in)
+/// leaves fish with the job-control mode config.fish chose, not the one it runs the job in.
+#[test]
+fn fish_resume_interrupted_keeps_the_configured_job_control() {
+    if running_as_root() {
+        return;
+    }
+    let Some(fish_path) = find_shell("fish") else {
+        return;
+    };
+    let env = Env::new("resume-fish-int");
+    let home = env.dir.join("home");
+    let custom_bin = env.dir.join("custom-bin");
+    std::fs::create_dir_all(home.join(".config/fish")).unwrap();
+    write_exec(
+        &custom_bin.join("fishintprog"),
+        "#!/bin/sh\necho FISH_INT_RUNNING\nsleep 30\n",
+    );
+    std::fs::write(
+        home.join(".config/fish/config.fish"),
+        format!(
+            "status job-control none\nfish_add_path -gp '{}'\n",
+            custom_bin.display()
+        ),
+    )
+    .unwrap();
+    write_config(
+        &env,
+        &format!(
+            "[terminal]\nshell = [\"{}\"]\nshell_integration = true\n\
+             [session]\nsnapshot_interval_secs = 60\nresume_programs = \"all\"\n",
+            fish_path.display()
+        ),
+    );
+    let reporter = env.dir.join("report.sh");
+    let enc = b64_argv(&["fishintprog"]);
+    write_exec(
+        &reporter,
+        &format!(
+            "#!/bin/sh\n{EMIT_SH}\nemit_7577 \"$$\" \"argv={enc}\"\necho FISH_INT_READY\nsleep 60\n"
+        ),
+    );
+
+    let mut daemon = env.start_clean(&[("HOME", &home)]);
+    let (c, _) = env.connect();
+    let pane = create(&c, &env.dir);
+    run_line(&c, pane, &format!("'{}'", reporter.display()));
+    wait_match(&c, pane, "FISH_INT_READY");
+    wait_records(&c, pane, "fish record", |r| r.len() == 1 && r[0].trusted);
+    c.request(Request::Shutdown { kill_panes: true }).unwrap();
+    daemon.wait_exit();
+    drop(c);
+
+    let _daemon2 = env.start_clean(&[("HOME", &home)]);
+    let (c2, _) = env.connect();
+    wait_match(&c2, pane, "FISH_INT_RUNNING");
+    std::thread::sleep(Duration::from_millis(150));
+    c2.request(Request::Input {
+        pane,
+        data: vec![0x03],
+    })
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    // Only a shell running it prints the joined word (an echo of the typed line would not).
+    run_line(
+        &c2,
+        pane,
+        "if status is-no-job-control; printf 'JC_%s\\n' KEPT; else; printf 'JC_%s\\n' CHANGED; end",
+    );
+    wait_match(&c2, pane, "JC_(KEPT|CHANGED)");
+    let shown = capture(&c2, pane);
+    assert!(shown.contains("JC_KEPT"), "{shown}");
 }
 
 #[test]
