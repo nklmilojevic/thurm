@@ -455,21 +455,44 @@ final class TerminalFirstPaintTests: XCTestCase {
         let initialCommits = ctx.commitCount
 
         let helperBuffer = try XCTUnwrap(ctx.queue.makeCommandBuffer())
-        ctx.recordCommit(helperBuffer, countsAsFrame: false) { helperBuffer.commit() }
+        ctx.commit(helperBuffer, countsAsFrame: false)
         XCTAssertEqual(ctx.commitCount, initialCommits, "non-frame command buffers must not increment commitCount")
         ctx.waitForGPU()
 
         let atlas = try XCTUnwrap(GlyphAtlas(device: ctx.device, pixelFormat: .r8Unorm, bytesPerPixel: 1, size: 64))
-        XCTAssertNotNil(atlas.reserve(width: 60, height: 60))
+        let region1 = try XCTUnwrap(atlas.reserve(width: 60, height: 60))
         XCTAssertEqual(atlas.height, 64)
+        let sentinel: UInt8 = 0xAB
+        atlas.upload(x: region1.x, y: region1.y, width: 60, height: 60, bytes: Array(repeating: sentinel, count: 60 * 60))
+
         XCTAssertNotNil(atlas.reserve(width: 60, height: 60))
         XCTAssertEqual(atlas.height, 128, "second 60x60 reservation should trigger atlas growth")
         XCTAssertEqual(ctx.commitCount, initialCommits, "glyph atlas growth blit must not count as a presented frame")
-        ctx.waitForGPU()
 
+        // Immediately submit a dependent command buffer (without calling waitForGPU first) that
+        // reads the preserved region from the grown atlas texture, verifying queue ordering.
+        let staging = try XCTUnwrap(ctx.device.makeBuffer(length: 60 * 60, options: .storageModeShared))
         let frameBuffer = try XCTUnwrap(ctx.queue.makeCommandBuffer())
-        ctx.recordCommit(frameBuffer) { frameBuffer.commit() }
+        let blit = try XCTUnwrap(frameBuffer.makeBlitCommandEncoder())
+        blit.copy(from: atlas.texture,
+                  sourceSlice: 0,
+                  sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: region1.x, y: region1.y, z: 0),
+                  sourceSize: MTLSize(width: 60, height: 60, depth: 1),
+                  to: staging,
+                  destinationOffset: 0,
+                  destinationBytesPerRow: 60,
+                  destinationBytesPerImage: 60 * 60)
+        blit.endEncoding()
+        ctx.commit(frameBuffer)
         XCTAssertEqual(ctx.commitCount, initialCommits + 1, "frame commits must increment commitCount")
         ctx.waitForGPU()
+
+        let readback = UnsafeBufferPointer(
+            start: staging.contents().assumingMemoryBound(to: UInt8.self),
+            count: 60 * 60
+        )
+        XCTAssertTrue(readback.allSatisfy { $0 == sentinel },
+                      "atlas growth blit must complete ahead of subsequent committed passes")
     }
 }

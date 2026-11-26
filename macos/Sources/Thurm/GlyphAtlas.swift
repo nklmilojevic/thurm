@@ -104,8 +104,8 @@ final class GlyphAtlas {
                   destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
         blit.endEncoding()
         if let ctx = sharedCtx {
-            // Serialized on the shared render queue ahead of subsequent render passes.
-            ctx.recordCommit(commands, countsAsFrame: false) { commands.commit() }
+            // Enqueued and committed under MetalContext's lock ahead of subsequent render passes.
+            ctx.commit(commands, countsAsFrame: false)
         } else {
             commands.commit()
             commands.waitUntilCompleted()

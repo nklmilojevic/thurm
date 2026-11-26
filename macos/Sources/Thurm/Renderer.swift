@@ -201,16 +201,11 @@ final class MetalContext: @unchecked Sendable {
         return _commitCount
     }
 
-    /// Records `commands` before committing, attaches a completion handler to release it once
-    /// the GPU finishes, and runs `commit`. Pass `countsAsFrame: false` for non-presenting helper
-    /// command buffers (such as glyph atlas growth blits) so `commitCount` reflects presented frames.
-    func recordCommit(_ commands: MTLCommandBuffer, countsAsFrame: Bool = true, commit: () -> Void) {
-        commitLock.lock()
-        if countsAsFrame {
-            _commitCount &+= 1
-        }
-        _lastCommitted = commands
-        commitLock.unlock()
+    /// Enqueues and commits `commands` under `commitLock` so Metal queue submission order strictly
+    /// matches `_lastCommitted` order (ensuring non-frame helper blits such as glyph atlas growth
+    /// always execute ahead of subsequent render passes). Pass `countsAsFrame: false` for
+    /// non-presenting helper command buffers so `commitCount` reflects presented frames.
+    func commit(_ commands: MTLCommandBuffer, countsAsFrame: Bool = true) {
         commands.addCompletedHandler { [weak self] completed in
             guard let self else { return }
             self.commitLock.lock()
@@ -219,7 +214,14 @@ final class MetalContext: @unchecked Sendable {
             }
             self.commitLock.unlock()
         }
-        commit()
+        commitLock.lock()
+        commands.enqueue()
+        commands.commit()
+        if countsAsFrame {
+            _commitCount &+= 1
+        }
+        _lastCommitted = commands
+        commitLock.unlock()
     }
 
     /// Blocks until the GPU finished every committed frame, before the CPU rewrites a texture
@@ -852,18 +854,16 @@ final class TerminalRenderer {
             }
         }
         encoder.endEncoding()
-        ctx.recordCommit(commands) {
-            if layer.presentsWithTransaction {
-                // AppKit's layout and backdrop updates must land with this image. Apple's
-                // transaction presentation contract requires presenting the drawable directly
-                // after scheduling the commands, rather than via MTLCommandBuffer.present.
-                commands.commit()
-                commands.waitUntilScheduled()
-                drawable.present()
-            } else {
-                commands.present(drawable)
-                commands.commit()
-            }
+        if layer.presentsWithTransaction {
+            // AppKit's layout and backdrop updates must land with this image. Apple's
+            // transaction presentation contract requires presenting the drawable directly
+            // after scheduling the commands, rather than via MTLCommandBuffer.present.
+            ctx.commit(commands)
+            commands.waitUntilScheduled()
+            drawable.present()
+        } else {
+            commands.present(drawable)
+            ctx.commit(commands)
         }
         return true
     }
