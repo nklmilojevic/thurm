@@ -189,28 +189,30 @@ impl Store {
             }
             None => return None,
         };
-        let mut value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| log::warn!("ignoring corrupt session snapshot: {e}"))
-            .ok()?;
-        // Each pane's sealed record is taken out before the snapshot is decoded, so one that
-        // does not open (or decode) costs only that record, never the panes and layout.
-        let sealed: Vec<Option<serde_json::Value>> = value
-            .get_mut("panes")
-            .and_then(serde_json::Value::as_array_mut)
-            .map(|panes| {
-                panes
-                    .iter_mut()
-                    .map(|p| p.as_object_mut()?.remove("program_resume"))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut snap: SessionSnapshot = serde_json::from_value(value)
+        // The snapshot is decoded without its records (an unknown field, skipped unread), and
+        // each pane's record is taken as raw text and opened apart: one that does not open, or
+        // is not even a value the snapshot could hold (`1e400`), costs only that record, never
+        // the panes and layout.
+        let mut snap: SessionSnapshot = serde_json::from_str(&text)
             .map_err(|e| log::warn!("ignoring corrupt session snapshot: {e}"))
             .ok()?;
         if snap.version != SNAPSHOT_VERSION {
             return None;
         }
-        let had_any = sealed.iter().any(Option::is_some);
+        #[derive(Deserialize)]
+        struct SealedPanes {
+            #[serde(default)]
+            panes: Vec<SealedPane>,
+        }
+        #[derive(Deserialize)]
+        struct SealedPane {
+            #[serde(default)]
+            program_resume: Option<Box<serde_json::value::RawValue>>,
+        }
+        let sealed = serde_json::from_str::<SealedPanes>(&text)
+            .map(|s| s.panes)
+            .unwrap_or_default();
+        let had_any = sealed.iter().any(|p| p.program_resume.is_some());
         if had_any && !trust_osc {
             log::warn!(
                 "discarding saved program resume records: {} is not private to current user",
@@ -222,10 +224,10 @@ impl Store {
                 log::warn!("discarding saved program resume records: no key to open them");
             }
             for (pane, record) in snap.panes.iter_mut().zip(sealed) {
-                let (Some(key), Some(record)) = (key.as_ref(), record) else {
+                let (Some(key), Some(record)) = (key.as_ref(), record.program_resume) else {
                     continue;
                 };
-                pane.program_resume = open_record(key, pane.id, &record)
+                pane.program_resume = open_record(key, pane.id, record.get())
                     .map_err(|e| {
                         log::warn!(
                             "discarding saved program resume record of pane {}: {e}",
@@ -263,14 +265,20 @@ impl Store {
                 let (Some(key), Some(record)) = (key.as_ref(), pane.program_resume.as_ref()) else {
                     continue;
                 };
-                // Never written unsealed: a record that cannot be sealed is left out.
-                match seal_record(key, pane.id, record) {
-                    Ok(sealed) => {
-                        if let Some(obj) = out.as_object_mut() {
-                            obj.insert("program_resume".into(), sealed.into());
-                        }
-                    }
-                    Err(e) => log::warn!("not saving program resume record of {}: {e}", pane.id),
+                // Never written unsealed. A record that cannot be sealed fails the save: the
+                // snapshot on disk (with the record as last sealed) stays, and the save is
+                // retried, rather than replaced by one without it.
+                let sealed = seal_record(key, pane.id, record).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "cannot seal the program resume record of pane {}: {e}",
+                            pane.id
+                        ),
+                    )
+                })?;
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert("program_resume".into(), sealed.into());
                 }
             }
         }
@@ -315,6 +323,10 @@ fn seal_record(
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use base64::Engine;
     use std::io::Read;
+    #[cfg(test)]
+    if tests::SEAL_FAILS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("no randomness"));
+    }
     let json = serde_json::to_vec(record).map_err(std::io::Error::other)?;
     let mut nonce = [0u8; RECORD_NONCE_LEN];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
@@ -334,16 +346,12 @@ fn seal_record(
 
 /// The record [`seal_record`] sealed for `pane` under `key`. Anything else (a plain record, one
 /// sealed under another key or for another pane, a tampered one) is refused.
-fn open_record(
-    key: &[u8; 32],
-    pane: PaneId,
-    value: &serde_json::Value,
-) -> Result<SavedProgramResume, String> {
+fn open_record(key: &[u8; 32], pane: PaneId, raw: &str) -> Result<SavedProgramResume, String> {
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use base64::Engine;
-    let data = value
-        .as_str()
-        .and_then(|s| s.strip_prefix(SEALED_RECORD_PREFIX))
+    let text = serde_json::from_str::<String>(raw).map_err(|_| "not sealed")?;
+    let data = text
+        .strip_prefix(SEALED_RECORD_PREFIX)
         .ok_or("not sealed")?;
     let data = base64::engine::general_purpose::STANDARD
         .decode(data)
@@ -502,6 +510,34 @@ mod tests {
 
     const KEY: [u8; 32] = [7; 32];
 
+    thread_local! {
+        /// Makes [`seal_record`] fail on this thread.
+        pub(super) static SEAL_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A record that cannot be sealed fails the save, and the snapshot already there (with the
+    /// record as last sealed) stays, for the retry, instead of one without the record.
+    #[test]
+    fn a_record_that_fails_to_seal_keeps_the_saved_snapshot() {
+        let dir = temp_dir("seal-fails");
+        let store = Store::with_key(dir.clone(), KEY);
+        let snap = sample();
+        store.save(&snap).unwrap();
+        let before = std::fs::read(store.session_path()).unwrap();
+        let mut newer = snap.clone();
+        newer.layout = Some("newer".into());
+        SEAL_FAILS.with(|f| f.set(true));
+        let saved = store.save(&newer);
+        SEAL_FAILS.with(|f| f.set(false));
+        assert!(saved.is_err());
+        assert_eq!(std::fs::read(store.session_path()).unwrap(), before);
+        assert_eq!(store.load().unwrap(), snap);
+        // The retry, once sealing works again, writes it.
+        store.save(&newer).unwrap();
+        assert_eq!(store.load().unwrap(), newer);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn sample() -> SessionSnapshot {
         SessionSnapshot {
             version: SNAPSHOT_VERSION,
@@ -592,11 +628,13 @@ mod tests {
         let store = Store::with_key(dir.clone(), KEY);
         let snap = sample();
         let rec = snap.panes[0].program_resume.as_ref().unwrap();
-        let write = |record: serde_json::Value| {
+        // The record's raw text in place of the sealed string.
+        let write = |record: &str| {
             let mut value = serde_json::to_value(&snap).unwrap();
-            value["panes"][0]["program_resume"] = record;
+            value["panes"][0]["program_resume"] = "@RECORD@".into();
+            let text = value.to_string().replace("\"@RECORD@\"", record);
             std::fs::create_dir_all(&dir).unwrap();
-            write_atomic(&store.session_path(), value.to_string().as_bytes()).unwrap();
+            write_atomic(&store.session_path(), text.as_bytes()).unwrap();
         };
         let mut no_uid = serde_json::to_value(rec).unwrap();
         no_uid.as_object_mut().unwrap().remove("uid");
@@ -612,14 +650,18 @@ mod tests {
         };
         tampered.replace_range(mid..=mid, flip);
         for record in [
-            no_uid,
-            plain_ok,
-            serde_json::json!(42),
-            serde_json::json!("sealed-v1:!!!"),
-            other_pane.into(),
-            tampered.into(),
+            no_uid.to_string(),
+            plain_ok.to_string(),
+            "42".into(),
+            // Valid JSON no `serde_json::Value` holds.
+            "1e400".into(),
+            "[1e400]".into(),
+            r#"{"argv":["nvim"],"uid":1e400}"#.into(),
+            serde_json::json!("sealed-v1:!!!").to_string(),
+            serde_json::Value::from(other_pane).to_string(),
+            serde_json::Value::from(tampered).to_string(),
         ] {
-            write(record.clone());
+            write(&record);
             let loaded = store.load().unwrap_or_else(|| panic!("{record}"));
             assert!(loaded.panes[0].program_resume.is_none(), "{record}");
             assert_eq!(loaded.layout, snap.layout);

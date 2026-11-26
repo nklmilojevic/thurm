@@ -16,18 +16,23 @@ impl Daemon {
             {
                 return Err("pane input belongs to an attached terminal".into());
             }
-            // The first input into a pane waiting to resume a program cancels it: not while an
-            // upgrade hands the pane over, after `typed` was captured (see `set_upgrading`).
-            // Read under the pane's lock, which `handoff` takes after setting the flag.
-            if !st.typed
-                && self.upgrading.load(Ordering::SeqCst)
-                && (st.pending_input.is_some()
-                    || self.resume_tickets.lock().iter().any(|t| t.pane == pane))
-            {
-                return Err("the daemon is restarting: try again".into());
-            }
             Ok(f(p, st))
         })?
+    }
+
+    /// Refuses typing (what sets `typed`) into a pane waiting to resume a program while an
+    /// upgrade hands the pane over: the first input would cancel the resume, after `typed` was
+    /// captured (see `set_upgrading`). Called under the pane's lock, which `handoff` takes
+    /// after setting the flag, before anything of the input takes effect.
+    pub(super) fn typing_frozen(&self, pane: PaneId, st: &PaneState) -> Result<(), String> {
+        if !st.typed
+            && self.upgrading.load(Ordering::SeqCst)
+            && (st.pending_input.is_some()
+                || self.resume_tickets.lock().iter().any(|t| t.pane == pane))
+        {
+            return Err("the daemon is restarting: try again".into());
+        }
+        Ok(())
     }
 
     pub(super) fn attach_terminal(

@@ -17,7 +17,7 @@ thurm-config.workspace = true
 thurm-term.workspace = true
 thurm-lua = { path = "../thurm-lua" }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 libc.workspace = true
 parking_lot.workspace = true
 crossbeam-channel.workspace = true
