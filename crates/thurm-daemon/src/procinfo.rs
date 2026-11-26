@@ -937,13 +937,19 @@ mod proc_tests {
 
     #[test]
     fn only_a_group_of_the_user_alone_is_private() {
-        let me = b"nkl".to_vec();
-        assert!(is_private_group(&me, &me, &[]));
-        assert!(is_private_group(&me, &me, std::slice::from_ref(&me)));
+        let me = b"alice".to_vec();
+        let only_me = std::slice::from_ref(&me);
+        assert!(is_private_group(&me, &me, &[], only_me));
+        assert!(is_private_group(&me, &me, only_me, only_me));
         // Another member, another name (`staff`, `users`), or no user name: shared.
-        assert!(!is_private_group(&me, &me, &[me.clone(), b"eve".to_vec()]));
-        assert!(!is_private_group(&me, b"staff", &[]));
-        assert!(!is_private_group(b"", b"", &[]));
+        let me_and_eve = [me.clone(), b"eve".to_vec()];
+        assert!(!is_private_group(&me, &me, &me_and_eve, only_me));
+        assert!(!is_private_group(&me, b"staff", &[], only_me));
+        assert!(!is_private_group(b"", b"", &[], &[]));
+        // Another account with it as its primary group is in it, though `gr_mem` doesn't say.
+        assert!(!is_private_group(&me, &me, &[], &me_and_eve));
+        // A listing of accounts that doesn't show the user is incomplete: not private.
+        assert!(!is_private_group(&me, &me, &[], &[]));
         // macOS gives every account `staff` as its primary group.
         if cfg!(target_os = "macos") {
             assert_eq!(private_group(unsafe { libc::geteuid() }, 20), None);
@@ -1962,10 +1968,13 @@ pub fn is_trusted_install(exe: &std::path::Path) -> bool {
     })
 }
 
-/// `gid` when it is `uid`'s own group, which nobody else is in: named after the user and
-/// listing no other member (a user-private group, which Linux distributions give each account
-/// and Linuxbrew's installer makes its prefix writable by). A shared primary group (macOS's
-/// `staff`, a `users` group) is not, nor one that cannot be read.
+/// `gid` when it is `uid`'s own group, which nobody else is in: named after the user, listing
+/// no other member, and no other account's primary group (a user-private group, which Linux
+/// distributions give each account and Linuxbrew's installer makes its prefix writable by).
+/// `gr_mem` lists only supplementary members, so the accounts are read too; if that listing
+/// does not even show the user (a directory service that doesn't enumerate), the group is
+/// not taken as private. A shared primary group (macOS's `staff`, a `users` group) is not,
+/// nor one that cannot be read.
 fn private_group(uid: u32, gid: u32) -> Option<u32> {
     use std::ffi::CStr;
     let mut buf = vec![0 as libc::c_char; 16384];
@@ -1994,11 +2003,34 @@ fn private_group(uid: u32, gid: u32) -> Option<u32> {
         }
         (CStr::from_ptr(gr.gr_name).to_bytes().to_vec(), members)
     };
-    is_private_group(&user, &group, &members).then_some(gid)
+    // Every account whose primary group this is. `getpwent` is not reentrant: this runs once
+    // (cached by the caller), and nothing else in the daemon walks the accounts.
+    let mut primary = Vec::new();
+    unsafe {
+        libc::setpwent();
+        loop {
+            let pw = libc::getpwent();
+            if pw.is_null() {
+                break;
+            }
+            if (*pw).pw_gid == gid && !(*pw).pw_name.is_null() {
+                primary.push(CStr::from_ptr((*pw).pw_name).to_bytes().to_vec());
+            }
+        }
+        libc::endpwent();
+    }
+    is_private_group(&user, &group, &members, &primary).then_some(gid)
 }
 
-fn is_private_group(user: &[u8], group: &[u8], members: &[Vec<u8>]) -> bool {
-    !user.is_empty() && group == user && members.iter().all(|m| m == user)
+/// `group` is `user`'s alone: named after them, with no other supplementary member, and the
+/// primary group of no other account (`primary`, which must show the user: a listing without
+/// them is incomplete).
+fn is_private_group(user: &[u8], group: &[u8], members: &[Vec<u8>], primary: &[Vec<u8>]) -> bool {
+    !user.is_empty()
+        && group == user
+        && members.iter().all(|m| m == user)
+        && primary.iter().any(|m| m == user)
+        && primary.iter().all(|m| m == user)
 }
 
 fn is_trusted_install_with(
