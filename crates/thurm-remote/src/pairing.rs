@@ -250,28 +250,16 @@ fn is_p256_blob(blob: &[u8]) -> bool {
     ok && rest.is_empty()
 }
 
-/// A device name goes to a remote shell as an argument and into `authorized_keys`:
-/// 1–128 ASCII letters, digits, `.`, `_`, or `-` (aligned with Mac `PhonePairing.validDeviceKey`).
+/// A device name goes to a remote shell as an argument, into `authorized_keys`, and into a Nix
+/// string ([`nixos_snippet`]): one word of 1–128 bytes, without control characters, quotes,
+/// backslashes, `$` or backticks (as Mac `PhonePairing.validDeviceKey` has it). Today's app names itself in `[A-Za-z0-9._-]`; builds before that used the phone's
+/// name with spaces as dashes (`Nikola’s-iPhone`, `iPhone+work`), and still pair.
 pub fn validate_device_name(device: &str) -> Result<(), String> {
     if device.is_empty()
         || device.len() > 128
-        || !device
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return Err(format!("unsupported device name {device:?}"));
-    }
-    Ok(())
-}
-
-/// Legacy shell-safe validation for revoking previously paired entries whose names predated the
-/// strict `[A-Za-z0-9._-]` whitelist (e.g. `iPhone+work`): one word, no quotes or backslashes.
-fn validate_legacy_device_name(device: &str) -> Result<(), String> {
-    if device.is_empty()
-        || device.len() > 128
-        || device
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '\'' || c == '\\')
+        || device.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"' | '\\' | '$' | '`')
+        })
     {
         return Err(format!("unsupported device name {device:?}"));
     }
@@ -290,6 +278,9 @@ pub enum PairingError {
     WouldReplace,
     /// Push-registration revocation required for SSH key replacement could not be completed.
     PushCleanup(String),
+    /// The key was added (nothing replaced), but an earlier replacement's cleanup is still
+    /// pending: not a failure of this add, retried by the next one.
+    CleanupPending(String),
     Ssh(SshError),
 }
 
@@ -301,7 +292,7 @@ impl std::fmt::Display for PairingError {
             PairingError::WouldReplace => {
                 f.write_str("an existing different key for this device would be replaced")
             }
-            PairingError::PushCleanup(m) => f.write_str(m),
+            PairingError::PushCleanup(m) | PairingError::CleanupPending(m) => f.write_str(m),
             PairingError::Ssh(e) => e.fmt(f),
         }
     }
@@ -392,11 +383,7 @@ fn edit_inner(
     device: &str,
     no_replace: bool,
 ) -> Result<bool, PairingError> {
-    if key.is_empty() {
-        validate_legacy_device_name(device).map_err(PairingError::Invalid)?;
-    } else {
-        validate_device_name(device).map_err(PairingError::Invalid)?;
-    }
+    validate_device_name(device).map_err(PairingError::Invalid)?;
     let guard = if no_replace { "no-replace" } else { "" };
     match ssh.run(EDIT, &[key, device, guard], None, Duration::from_secs(30)) {
         Ok(out) => Ok(out.lines().any(|l| l.trim() == "replaced")),
@@ -524,10 +511,8 @@ pub fn connect_remote_daemon(
 
     static NEXT_TUNNEL: AtomicU64 = AtomicU64::new(1);
     let seq = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
-    let local_sock = thurm_config::remote_dir().join(format!(
-        "pair-cleanup-{}-{seq}.sock",
-        std::process::id()
-    ));
+    let local_sock =
+        thurm_config::remote_dir().join(format!("pair-cleanup-{}-{seq}.sock", std::process::id()));
     let _ = std::fs::remove_file(&local_sock);
     let mut cmd = ssh.tunnel_command(&local_sock, &remote_socket);
     cmd.stdin(Stdio::null())
@@ -596,6 +581,7 @@ pub fn connect_remote_daemon(
 
 /// Phone names on hosts whose key was (or may have been) replaced but whose push cleanup has not
 /// been confirmed: written before the key edit, removed once the host's daemon has revoked.
+/// Entries are keyed by [`journal_host_key`], where the host's ssh config leads.
 /// Cleanup is a name-wide `RevokePhone`, harmless to repeat, so an entry for an edit that never
 /// happened costs nothing but a reconnect.
 #[derive(Clone, Debug)]
@@ -653,17 +639,21 @@ impl PendingPushRevokes {
         std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
     }
 
-    /// Whether cleanup is pending for `device` on `host_key`. An unreadable record counts as
-    /// pending: cleanup runs once more rather than being skipped.
-    pub fn contains(&self, host_key: &str, device: &str) -> bool {
+    /// Whether cleanup is pending for `device` on `host_key`. A record that exists but can't be
+    /// read is an error: the caller stops rather than guess (skipping a cleanup, or rewriting the
+    /// record and losing the other entries in it).
+    pub fn contains(&self, host_key: &str, device: &str) -> Result<bool, String> {
         let _guard = PENDING_REVOKES_LOCK.lock();
-        self.load_unlocked()
-            .map_or(true, |set| set.contains(&Self::entry(host_key, device)))
+        Ok(self
+            .load_unlocked()?
+            .contains(&Self::entry(host_key, device)))
     }
 
+    /// Records `device` on `host_key` as pending. Fails, leaving the record as it is, when it
+    /// can't be read.
     pub fn insert(&self, host_key: &str, device: &str) -> Result<(), String> {
         let _guard = PENDING_REVOKES_LOCK.lock();
-        let mut set = self.load_unlocked().unwrap_or_default();
+        let mut set = self.load_unlocked()?;
         if set.insert(Self::entry(host_key, device)) {
             self.save_unlocked(&set)?;
         }
@@ -672,11 +662,49 @@ impl PendingPushRevokes {
 
     pub fn remove(&self, host_key: &str, device: &str) -> Result<(), String> {
         let _guard = PENDING_REVOKES_LOCK.lock();
-        let mut set = self.load_unlocked().unwrap_or_default();
+        let mut set = self.load_unlocked()?;
         if set.remove(&Self::entry(host_key, device)) {
             self.save_unlocked(&set)?;
         }
         Ok(())
+    }
+}
+
+/// The journal key for a `[[remote]]` host: its name and where `ssh -G` says it leads, so a
+/// cleanup left pending for one host is not replayed on another the alias is later pointed at.
+pub fn journal_host_key(name: &str, ssh: &Ssh) -> Result<String, String> {
+    let e = parse_effective(&ssh.effective_config().map_err(|e| e.to_string())?, &home());
+    let alias = e.host_key_alias.as_deref().unwrap_or("");
+    Ok(format!(
+        "remote:{name}\0{}@{}:{}\0{alias}",
+        e.user, e.hostname, e.port
+    ))
+}
+
+/// Holds one host and device's replacement (pending check, key edit, revoke, journal removal)
+/// for its whole length: two overlapping replacements of the same phone would otherwise share
+/// one journal entry, and the first to finish would clear the second's.
+struct Transaction(String);
+
+static TRANSACTIONS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+static TRANSACTION_DONE: parking_lot::Condvar = parking_lot::Condvar::new();
+
+impl Transaction {
+    fn begin(host_key: &str, device: &str) -> Self {
+        let id = PendingPushRevokes::entry(host_key, device);
+        let mut running = TRANSACTIONS.lock();
+        while running.contains(&id) {
+            TRANSACTION_DONE.wait(&mut running);
+        }
+        running.insert(id.clone());
+        Transaction(id)
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        TRANSACTIONS.lock().remove(&self.0);
+        TRANSACTION_DONE.notify_all();
     }
 }
 
@@ -701,7 +729,14 @@ where
     F: FnOnce() -> Result<C, String>,
     C: PushCleanupClient,
 {
-    let was_pending = pending.contains(host_key, &key.device);
+    let _transaction = Transaction::begin(host_key, &key.device);
+    let was_pending = pending.contains(host_key, &key.device).map_err(|e| {
+        PairingError::PushCleanup(format!(
+            "{}'s key on {host_label} was not changed: the record of pending cleanups can't be \
+             read ({e})",
+            key.device
+        ))
+    })?;
     let cleanup_error = |e: String| {
         PairingError::PushCleanup(format!(
             "replaced {}'s key on {host_label}, but could not revoke the previous phone's \
@@ -714,8 +749,15 @@ where
             if !was_pending {
                 return Ok(false);
             }
-            let daemon = open_daemon().map_err(cleanup_error)?;
-            daemon.revoke_phone(&key.device).map_err(cleanup_error)?;
+            // The key is in; what is left is an earlier replacement's cleanup.
+            let still_pending = |e: String| {
+                PairingError::CleanupPending(format!(
+                    "added {}'s key on {host_label}; an earlier replacement still has to revoke                      the previous phone's notifications ({e}): add the key again to retry",
+                    key.device
+                ))
+            };
+            let daemon = open_daemon().map_err(still_pending)?;
+            daemon.revoke_phone(&key.device).map_err(still_pending)?;
             let _ = pending.remove(host_key, &key.device);
             Ok(true)
         }
@@ -1385,10 +1427,12 @@ mod tests {
             Err(PairingError::Invalid(_))
         ));
 
-        // Legacy paired device names accepted before the stricter whitelist (e.g. `iPhone+work`)
-        // are still rejected for new keys, listed by `devices()`, and revocable via `revoke()`.
+        // Names from older app builds (the phone's own name, spaces as dashes) pair, are
+        // listed by `devices()`, and revoke.
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(DeviceKey::parse(&KEY.replace("iPhone", "iPhone+work")).is_err());
+        assert!(DeviceKey::parse(&KEY.replace("iPhone", "iPhone+work")).is_ok());
+        assert!(DeviceKey::parse(&KEY.replace("iPhone", "Nikola’s-iPhone")).is_ok());
+        assert!(DeviceKey::parse(&KEY.replace("iPhone", "Nikola's-iPhone")).is_err());
         let legacy_line = format!("{KEY_OPTIONS} {} thurm-ios:iPhone+work\n", key.key);
         let keep_line = "ssh-ed25519 AAAA keep@laptop\n";
         std::fs::write(&file, format!("{keep_line}{legacy_line}")).unwrap();
@@ -1453,7 +1497,9 @@ mod tests {
         impl PushCleanupClient for FakeDaemon {
             fn revoke_phone(&self, device: &str) -> Result<(), String> {
                 if let Some((p, host)) = &self.probe {
-                    self.pending_seen.lock().push(p.contains(host, device));
+                    self.pending_seen
+                        .lock()
+                        .push(p.contains(host, device).unwrap());
                 }
                 if self.fail.load(Ordering::SeqCst) {
                     return Err("the daemon went away".into());
@@ -1466,7 +1512,9 @@ mod tests {
         let no_daemon = || -> Result<FakeDaemon, String> { panic!("no daemon needed") };
 
         // A new name needs no daemon.
-        assert!(!authorize_with_push_cleanup(&local, &k1, "devbox", &pending, host, no_daemon).unwrap());
+        assert!(
+            !authorize_with_push_cleanup(&local, &k1, "devbox", &pending, host, no_daemon).unwrap()
+        );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), k1.line() + "\n");
 
         // Replacing it with the daemon out of reach changes nothing.
@@ -1476,7 +1524,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, PairingError::PushCleanup(_)), "{err:?}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), k1.line() + "\n");
-        assert!(!pending.contains(host, "iPhone"));
+        assert!(!pending.contains(host, "iPhone").unwrap());
 
         // The key changes, the revoke fails: the cleanup stays recorded (it was before the edit).
         let fake = FakeDaemon {
@@ -1484,14 +1532,13 @@ mod tests {
             ..Default::default()
         };
         fake.fail.store(true, Ordering::SeqCst);
-        let err = authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, || {
-            Ok(fake.clone())
-        })
-        .unwrap_err();
+        let err =
+            authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, || Ok(fake.clone()))
+                .unwrap_err();
         assert!(matches!(err, PairingError::PushCleanup(_)), "{err:?}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), k2.line() + "\n");
         assert_eq!(*fake.pending_seen.lock(), [true]);
-        assert!(pending.contains(host, "iPhone"));
+        assert!(pending.contains(host, "iPhone").unwrap());
 
         // The same key again (nothing left to replace) finishes the cleanup.
         fake.fail.store(false, Ordering::SeqCst);
@@ -1500,10 +1547,12 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(*fake.revoked.lock(), ["iPhone"]);
-        assert!(!pending.contains(host, "iPhone"));
+        assert!(!pending.contains(host, "iPhone").unwrap());
 
         // Done: adding it once more needs no daemon.
-        assert!(!authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, no_daemon).unwrap());
+        assert!(
+            !authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, no_daemon).unwrap()
+        );
 
         // A replacement whose edit commits but whose reply is lost (an ssh error here) is
         // still cleaned up by the next attempt.
@@ -1515,6 +1564,58 @@ mod tests {
         );
         assert_eq!(*fake.revoked.lock(), ["iPhone", "iPhone"]);
 
+        // An earlier replacement's cleanup that still fails doesn't fail this add (nothing was
+        // replaced by it): it says so, and stays pending for the next one.
+        pending.insert(host, "iPhone").unwrap();
+        let away = authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, || {
+            Err::<FakeDaemon, _>("unreachable".into())
+        })
+        .unwrap_err();
+        assert!(matches!(away, PairingError::CleanupPending(_)), "{away:?}");
+        assert!(away.to_string().starts_with("added iPhone's key"), "{away}");
+        assert!(pending.contains(host, "iPhone").unwrap());
+        pending.remove(host, "iPhone").unwrap();
+
+        // A record that can't be read stops the next replacement before any key changes, and
+        // is left as it is (its other entries are not lost).
+        let journal = home.join("pending.json");
+        pending.insert(host, "iPad").unwrap();
+        std::fs::write(&journal, b"{not json").unwrap();
+        let err =
+            authorize_with_push_cleanup(&local, &k1, "devbox", &pending, host, || Ok(fake.clone()))
+                .unwrap_err();
+        assert!(matches!(err, PairingError::PushCleanup(_)), "{err:?}");
+        assert!(pending.insert(host, "iPhone").is_err());
+        assert!(pending.remove(host, "iPad").is_err());
+        assert_eq!(std::fs::read(&journal).unwrap(), b"{not json");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), k2.line() + "\n");
+
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn replacements_of_one_phone_on_one_host_run_one_at_a_time() {
+        use std::sync::atomic::AtomicUsize;
+        let inside = Arc::new(AtomicUsize::new(0));
+        let overlapped = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..4)
+            .map(|i| {
+                let (inside, overlapped) = (inside.clone(), overlapped.clone());
+                std::thread::spawn(move || {
+                    // Same host and phone: serialized. Another phone: not held up.
+                    let _t = Transaction::begin("remote:tx-test", "iPhone");
+                    let _other = Transaction::begin("remote:tx-test", &format!("iPad{i}"));
+                    if inside.fetch_add(1, Ordering::SeqCst) != 0 {
+                        overlapped.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(overlapped.load(Ordering::SeqCst), 0);
     }
 }

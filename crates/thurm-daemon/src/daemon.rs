@@ -361,7 +361,7 @@ pub struct Client {
     pub push_device: Mutex<Option<String>>,
     /// The connection, to drop it from outside its reader (a revoked phone).
     pub socket: Mutex<Option<std::os::unix::net::UnixStream>>,
-    /// Dropped by `RevokePhone`: a push registration still finishing on it is undone.
+    /// Dropped by `RevokePhone`: it may no longer register for push or follow an agent.
     pub revoked: AtomicBool,
     /// Its panes follow the active client's size ([`thurm_proto::CAP_ACTIVE_SIZE`]).
     pub active_size: AtomicBool,
@@ -650,6 +650,10 @@ pub struct Daemon {
     program_defs: RwLock<Vec<ProgramDef>>,
     panes: Mutex<HashMap<PaneId, Arc<Pane>>>,
     clients: Mutex<HashMap<u64, Arc<Client>>>,
+    /// Held while a push registration is admitted and while `RevokePhone` drops connections:
+    /// a connection is either revoked before its registration (which it then refuses) or
+    /// registers before the revocation (which then forgets it), never half of each.
+    push_admission: Mutex<()>,
     /// Byte streams: tickets not yet used, and the count open.
     pub streams: crate::streams::Streams,
     /// Watches the ports panes listen on while a client wants to hear of them.
@@ -732,6 +736,7 @@ impl Daemon {
             config: RwLock::new(config),
             panes: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
+            push_admission: Mutex::new(()),
             streams: Default::default(),
             ports: Default::default(),
             // On the state directory's disk: the socket's runtime directory is often a small
@@ -3322,6 +3327,10 @@ impl Daemon {
                 host,
                 name,
             } => {
+                let _admission = self.push_admission.lock();
+                if client.revoked.load(Ordering::SeqCst) {
+                    return Err("this connection was closed: a phone was revoked".into());
+                }
                 self.push.register(crate::push::Device {
                     device: device.clone(),
                     relay,
@@ -3329,12 +3338,6 @@ impl Daemon {
                     host,
                     name,
                 })?;
-                // `RevokePhone` dropped this connection while it registered (after it forgot
-                // the phone's registrations, or before): the registration must not outlive it.
-                if client.revoked.load(Ordering::SeqCst) {
-                    let _ = self.push.unregister(&device);
-                    return Err("this connection was closed: a phone was revoked".into());
-                }
                 *client.push_device.lock() = Some(device);
                 Ok(Response::Ok)
             }
@@ -3348,7 +3351,8 @@ impl Daemon {
                 // them all, tailnet ones included, whatever they claim to be. The others
                 // reconnect and register again; the revoked one can no longer sign in. Dropped
                 // first, so nothing the revoked phone sends re-registers it after the forgetting
-                // below (a registration in flight sees `revoked` and is undone).
+                // below; `push_admission` orders this against registrations in flight.
+                let _admission = self.push_admission.lock();
                 let clients: Vec<_> = self.clients.lock().values().cloned().collect();
                 for c in clients.iter().filter(|c| c.mobile.load(Ordering::Relaxed)) {
                     log::info!("client {}: a phone was revoked; dropping it", c.id);
@@ -3366,6 +3370,9 @@ impl Daemon {
                 pane,
                 token,
             } => {
+                if client.revoked.load(Ordering::SeqCst) {
+                    return Err("this connection was closed: a phone was revoked".into());
+                }
                 log::info!("pane {pane}: a live activity follows it (device {device:.6}…)");
                 // Under the pane's lock, which its agent's transitions take too: the state
                 // the follow starts from is the current one, and the next transition updates it.

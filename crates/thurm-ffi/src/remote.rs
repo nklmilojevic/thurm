@@ -808,6 +808,7 @@ fn call(c: Call) -> Result<Value, String> {
             let key = pairing::DeviceKey::parse(&key)?;
             let (r, ssh) = ssh_for(&name)?;
             let pending = pairing::PendingPushRevokes::default();
+            let journal_key = pairing::journal_host_key(&name, &ssh)?;
             // Cleanup goes to the daemon behind the same ssh target the key edit uses, not
             // through the remote's tunnel, which may lead elsewhere (its tailnet route).
             match pairing::authorize_with_push_cleanup(
@@ -815,10 +816,13 @@ fn call(c: Call) -> Result<Value, String> {
                 &key,
                 &name,
                 &pending,
-                &format!("remote:{name}"),
+                &journal_key,
                 || pairing::connect_remote_daemon(&ssh, &name, r.socket.as_deref()),
             ) {
                 Ok(replaced) => json!({ "device": key.device, "replaced": replaced }),
+                Err(e @ pairing::PairingError::CleanupPending(_)) => json!({
+                    "device": key.device, "replaced": false, "warning": e.to_string(),
+                }),
                 Err(e @ pairing::PairingError::NotWritable { nixos }) => json!({
                     "error": e.to_string(),
                     "not_writable": true,

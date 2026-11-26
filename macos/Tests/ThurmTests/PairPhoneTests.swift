@@ -174,17 +174,21 @@ final class PairPhoneTests: XCTestCase {
 
     func testRejectsInvalidDeviceNamesAndInvalidLocalSSHPorts() throws {
         let keyPrefix = deviceKey.split(separator: " ").prefix(2).joined(separator: " ") + " "
-        // Reject empty, overlong (>128), non-ASCII, and punctuation outside [A-Za-z0-9._-].
+        // Reject empty, overlong (>128 bytes), quotes, backslashes and control characters.
         for bad in [
             "",
             String(repeating: "a", count: 129),
-            "café",
-            "phone/name",
-            "phone:1",
-            "phone@home",
-            "phone$1",
+            "Nikola's-iPhone",
+            "phone\\name",
+            "phone\u{7}",
+            "a\"${x}",
+            "a`b`",
         ] {
             XCTAssertNil(PhonePairing.validDeviceKey("\(keyPrefix)thurm-ios:\(bad)"), "expected rejection for '\(bad)'")
+        }
+        // Names from older app builds (the phone's own name, spaces as dashes) still pair.
+        for old in ["Nikola’s-iPhone", "iPhone+work", "café"] {
+            XCTAssertEqual(PhonePairing.validDeviceKey("\(keyPrefix)thurm-ios:\(old)")?.device, old)
         }
         // Accept valid 128-char boundary and allowed punctuation.
         let maxValid = String(repeating: "a", count: 128)
@@ -469,29 +473,34 @@ final class PairPhoneTests: XCTestCase {
         guard case .failed(let why) = away else { return XCTFail("\(String(describing: away))") }
         XCTAssertTrue(why.contains("not connected"), why)
         XCTAssertEqual(PhonePairing.devices(in: file).map(\.line), [line(key1)])
-        XCTAssertFalse(store.contains(device))
+        XCTAssertFalse(try store.contains(device))
 
         // The key changes and the revoke fails: the cleanup was recorded before the edit, and stays.
         var revoked: [String] = []
         let failed = add(key2) { name, done in
-            XCTAssertTrue(store.contains(name), "recorded before the key file changed")
+            XCTAssertEqual(try? store.contains(name), true, "recorded before the key file changed")
             done(.failure("timeout"))
         }
         guard case .failed(let msg) = failed else { return XCTFail("\(String(describing: failed))") }
         XCTAssertTrue(msg.contains("timeout"), msg)
         XCTAssertEqual(PhonePairing.devices(in: file).map(\.line), [line(key2)])
-        XCTAssertTrue(store.contains(device))
+        XCTAssertTrue(try store.contains(device))
 
         // The same key again (nothing left to replace) finishes the cleanup.
         XCTAssertEqual(add(key2) { name, done in revoked.append(name); done(.success) },
                        .added(replaced: true))
         XCTAssertEqual(revoked, [device])
-        XCTAssertFalse(store.contains(device))
+        XCTAssertFalse(try store.contains(device))
         XCTAssertEqual(add(key2, daemonReady: ready) { _, _ in XCTFail("done already") },
                        .added(replaced: false))
 
-        // A record that can't be read counts as pending: cleanup runs once more.
-        try Data("not json".utf8).write(to: dir.appendingPathComponent("pending.json"))
-        XCTAssertTrue(store.contains(device))
+        // A record that can't be read stops the add, and is left as it is.
+        let garbage = Data("not json".utf8)
+        try garbage.write(to: dir.appendingPathComponent("pending.json"))
+        let unreadable = add(key1) { _, _ in XCTFail("nothing may run") }
+        guard case .failed(let why2) = unreadable else { return XCTFail("\(String(describing: unreadable))") }
+        XCTAssertTrue(why2.contains("can't be read"), why2)
+        XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent("pending.json")), garbage)
+        XCTAssertEqual(PhonePairing.devices(in: file).map(\.line), [line(key2)])
     }
 }

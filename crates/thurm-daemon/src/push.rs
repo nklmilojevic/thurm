@@ -150,6 +150,8 @@ pub struct Pusher {
     next_follow_gen: std::sync::atomic::AtomicU64,
     /// Shared with the push thread, which forgets a device the relay no longer knows.
     devices: Arc<Mutex<Vec<Device>>>,
+    /// See `Store::unsaved_gone`.
+    unsaved_gone: Arc<Mutex<Vec<Device>>>,
     follows: Arc<Mutex<Vec<Follow>>>,
     /// Live Activity updates not posted yet, the latest per activity. They wait here rather
     /// than in the bounded queue, so a busy relay delays them but never loses one (an end
@@ -214,6 +216,7 @@ impl Pusher {
             next_seq: std::sync::atomic::AtomicU64::new(initial_seq),
             next_follow_gen: std::sync::atomic::AtomicU64::new(next_follow_gen),
             devices: Arc::new(Mutex::new(devices)),
+            unsaved_gone: Arc::new(Mutex::new(Vec::new())),
             follows: Arc::new(Mutex::new(follows)),
             activities: Arc::new(Mutex::new(Vec::new())),
             reads: Arc::new(Mutex::new(Vec::new())),
@@ -311,17 +314,22 @@ impl Pusher {
             return Err("push registration needs a device id and a secret".into());
         }
         let mut devices = self.devices.lock();
-        // One registration per device id: registering again (another relay, a new secret)
-        // replaces it and its activities. Phones are told apart by id only: two phones may share
+        // One registration per device id: registering it with another relay or secret replaces
+        // it and drops its activities (their tokens went with the old relay identity). Phones are told apart by id only: two phones may share
         // a name (two "iPhone"s over the tailnet), and a name says nothing about which SSH key a
         // phone holds. A phone whose key was replaced is forgotten by `revoke_named`, which the
         // Mac sends after the key edit.
+        if devices.contains(&device) {
+            // The app registers on every connect: the same registration again changes nothing,
+            // and its activities go on.
+            return Ok(());
+        }
         let replaced = devices.iter().any(|d| d.device == device.device);
         let id = device.device.clone();
         let mut next: Vec<Device> = devices.iter().filter(|d| d.device != id).cloned().collect();
         next.push(device);
         // Saved before it takes effect: a failed write leaves the registrations as they were.
-        self.save(&next)?;
+        self.store().save_devices(&next)?;
         *devices = next;
         if replaced {
             let mut follows = self.follows.lock();
@@ -341,6 +349,7 @@ impl Pusher {
     fn store(&self) -> Store {
         Store {
             devices: Arc::clone(&self.devices),
+            unsaved_gone: Arc::clone(&self.unsaved_gone),
             follows: Arc::clone(&self.follows),
             path: self.path.clone(),
             follows_path: self.follows_path.clone(),
@@ -357,15 +366,21 @@ impl Pusher {
     /// Forgets every device registered under the phone name `name` (spaces as dashes, as its
     /// device key's comment has it), and its activities. Returns their ids. Use [`Self::unregister`]
     /// to remove a specific registration by device id.
+    ///
+    /// A revocation whose write fails still stops delivery to those devices at once; they stay
+    /// saved until a later write (a retry of this, or any other change) drops them.
     pub fn revoke_named(&self, name: &str) -> Result<Vec<String>, String> {
         let target = normalize_device_name(name);
-        let gone: Vec<String> = self
-            .devices
-            .lock()
-            .iter()
-            .filter(|d| normalize_device_name(&d.name) == target)
-            .map(|d| d.device.clone())
-            .collect();
+        let gone: Vec<String> = {
+            let devices = self.devices.lock();
+            let unsaved = self.unsaved_gone.lock();
+            devices
+                .iter()
+                .chain(unsaved.iter())
+                .filter(|d| normalize_device_name(&d.name) == target)
+                .map(|d| d.device.clone())
+                .collect()
+        };
         if !gone.is_empty() {
             self.store().forget(&gone)?;
         }
@@ -477,8 +492,11 @@ impl Pusher {
         if token.is_empty() || token.len() > 400 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err("bad activity token".into());
         }
-        let Some(registered) = self.devices.lock().iter().find(|d| d.device == device).cloned()
-        else {
+        // Held until the follow is saved and its update queued, as `register` holds it: a
+        // registration replaced meanwhile (another relay, a new secret) comes before or after
+        // this follow as a whole, never with this follow's update carrying the old one.
+        let devices = self.devices.lock();
+        let Some(registered) = devices.iter().find(|d| d.device == device).cloned() else {
             return Err("register the device for push first".into());
         };
         // While a permission prompt waits, the app started the activity showing the request
@@ -513,6 +531,8 @@ impl Pusher {
             });
         }
         save_json(&self.follows_path, &*follows)?;
+        drop(follows);
+        drop(devices);
         Ok(())
     }
 
@@ -588,14 +608,15 @@ impl Pusher {
         let _ = self.tx.try_send(Job::Waiting);
     }
 
-    fn save(&self, devices: &[Device]) -> Result<(), String> {
-        save_json(&self.path, devices)
-    }
 }
 
 /// The registered devices and their activities, as saved.
 struct Store {
     devices: Arc<Mutex<Vec<Device>>>,
+    /// Devices revoked (gone from `devices`, so nothing is sent to them) whose removal from the
+    /// file has not been written yet. The next successful write of `devices` drops them there
+    /// too. Locked after `devices`.
+    unsaved_gone: Arc<Mutex<Vec<Device>>>,
     follows: Arc<Mutex<Vec<Follow>>>,
     path: PathBuf,
     follows_path: PathBuf,
@@ -605,18 +626,32 @@ struct Store {
 }
 
 impl Store {
+    /// Writes `devices` as the registrations. Success also persists every revocation whose
+    /// own write failed (`unsaved_gone`): those devices are not in `devices`.
+    fn save_devices(&self, devices: &[Device]) -> Result<(), String> {
+        save_json(&self.path, devices)?;
+        self.unsaved_gone.lock().clear();
+        Ok(())
+    }
+
     /// Forgets the devices `gone` and their activities.
     ///
-    /// The devices are saved before they are forgotten here: when the write fails, they stay
-    /// registered (and a retry forgets them), rather than coming back at the next start.
+    /// Delivery to them stops here whether or not the write succeeds. When it fails, they are
+    /// kept in `unsaved_gone`: still in the file, so the error is returned and a retry (which
+    /// finds them there) writes it again.
     fn forget(&self, gone: &[String]) -> Result<(), String> {
         let mut devices = self.devices.lock();
-        let next: Vec<Device> =
-            devices.iter().filter(|d| !gone.contains(&d.device)).cloned().collect();
-        save_json(&self.path, &next)?;
+        let (removed, next): (Vec<Device>, Vec<Device>) =
+            devices.drain(..).partition(|d| gone.contains(&d.device));
         *devices = next;
         let mut follows = self.follows.lock();
         follows.retain(|f| !gone.contains(&f.device));
+        if let Err(e) = self.save_devices(&devices) {
+            let mut unsaved = self.unsaved_gone.lock();
+            unsaved.retain(|d| !gone.contains(&d.device));
+            unsaved.extend(removed);
+            return Err(e);
+        }
         save_json(&self.follows_path, &*follows)
     }
 
@@ -633,7 +668,7 @@ impl Store {
             return Ok(false);
         }
         let next: Vec<Device> = devices.iter().filter(|d| *d != device).cloned().collect();
-        save_json(&self.path, &next)?;
+        self.save_devices(&next)?;
         *devices = next;
         let mut follows = self.follows.lock();
         follows.retain(|f| f.device != device.device);
@@ -1366,30 +1401,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A revocation whose write fails changes nothing, here or on disk, so retrying it works.
+    /// A revocation whose write fails stops delivery at once and stays retryable: the device is
+    /// still on disk, and a retry (or any later write) drops it there too.
     #[test]
     fn a_revocation_that_cannot_be_saved_stays_retryable() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("thurm-push-unsaved-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let p = Pusher::new(&dir, true);
-        p.register(Device {
-            device: "d1".into(),
+        let device = |id: &str, name: &str| Device {
+            device: id.into(),
             relay: "https://push.example.net".into(),
             secret: "s".repeat(32),
             host: "studio".into(),
-            name: "iPhone".into(),
-        })
-        .unwrap();
-        // The state directory can't take the new file.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            name: name.into(),
+        };
+        p.register(device("d1", "iPhone")).unwrap();
+        // The write can't happen: a directory where its temporary file goes (which fails as
+        // root too, unlike a read-only directory).
+        let tmp = dir.join("push-devices.json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
         let failed = p.revoke_named("iPhone");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(failed.is_err(), "{failed:?}");
-        assert_eq!(p.devices.lock().len(), 1, "still registered: the write failed");
-        assert_eq!(Pusher::new(&dir, true).devices.lock().len(), 1);
+        assert!(p.devices.lock().is_empty(), "nothing more is sent to it");
+        assert_eq!(Pusher::new(&dir, true).devices.lock().len(), 1, "still saved");
+        std::fs::remove_dir(&tmp).unwrap();
         assert_eq!(p.revoke_named("iPhone").unwrap(), ["d1"]);
         assert!(Pusher::new(&dir, true).devices.lock().is_empty());
+
+        // Another write saves an earlier failed revocation too.
+        p.register(device("d2", "iPad")).unwrap();
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(p.revoke_named("iPad").is_err());
+        std::fs::remove_dir(&tmp).unwrap();
+        p.register(device("d3", "Phone")).unwrap();
+        let saved: Vec<_> =
+            Pusher::new(&dir, true).devices.lock().iter().map(|d| d.device.clone()).collect();
+        assert_eq!(saved, ["d3"]);
+        assert!(p.revoke_named("iPad").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -189,13 +189,15 @@ enum PhonePairing {
 
     /// Valid device name characters matching `thurm-remote`'s `validate_device_name`:
     /// 1–128 ASCII letters, digits, `.`, `_`, or `-`.
+    /// One word of 1–128 bytes, without control characters, quotes, backslashes, `$` or
+    /// backticks, as the remote side (`thurm_remote::pairing::validate_device_name`) has it. Today's app names itself in
+    /// `[A-Za-z0-9._-]`; older builds used the phone's name with spaces as dashes, and still pair.
     static func isValidDeviceName(_ device: String) -> Bool {
         guard !device.isEmpty, device.utf8.count <= 128 else { return false }
         return device.unicodeScalars.allSatisfy { s in
-            (s.value >= 0x30 && s.value <= 0x39)
-                || (s.value >= 0x41 && s.value <= 0x5A)
-                || (s.value >= 0x61 && s.value <= 0x7A)
-                || s == "." || s == "_" || s == "-"
+            !CharacterSet.whitespacesAndNewlines.contains(s)
+                && !CharacterSet.controlCharacters.contains(s)
+                && !"'\"\\$`".unicodeScalars.contains(s)
         }
     }
 
@@ -263,13 +265,13 @@ enum PhonePairing {
 
         init(file: URL) { self.file = file }
 
-        /// An unreadable record counts as everything pending: cleanup runs once more rather
-        /// than being skipped.
-        private func load() -> Set<String>? {
-            guard let data = try? Data(contentsOf: file) else {
-                return FileManager.default.fileExists(atPath: file.path) ? nil : []
-            }
-            return (try? JSONDecoder().decode([String].self, from: data)).map(Set.init)
+        var path: String { file.path }
+
+        /// Only a missing record is empty. One that can't be read or decoded is an error: it may
+        /// hold other phones' cleanups, so it is neither guessed at nor written over.
+        private func load() throws -> Set<String> {
+            guard FileManager.default.fileExists(atPath: file.path) else { return [] }
+            return Set(try JSONDecoder().decode([String].self, from: Data(contentsOf: file)))
         }
 
         private func save(_ names: Set<String>) throws {
@@ -280,23 +282,23 @@ enum PhonePairing {
             try JSONEncoder().encode(names.sorted()).write(to: file, options: [.atomic])
         }
 
-        func contains(_ device: String) -> Bool {
+        func contains(_ device: String) throws -> Bool {
             lock.lock()
             defer { lock.unlock() }
-            return load()?.contains(device) ?? true
+            return try load().contains(device)
         }
 
         func insert(_ device: String) throws {
             lock.lock()
             defer { lock.unlock() }
-            var names = load() ?? []
+            var names = try load()
             if names.insert(device).inserted { try save(names) }
         }
 
         func remove(_ device: String) {
             lock.lock()
             defer { lock.unlock() }
-            guard var names = load(), names.remove(device) != nil else { return }
+            guard var names = try? load(), names.remove(device) != nil else { return }
             try? save(names)
         }
     }
@@ -332,7 +334,13 @@ enum PhonePairing {
         revokePhone: @escaping (_ name: String, _ done: @escaping (CleanupResult) -> Void) -> Void,
         completion: @escaping (LocalKeyAddResult) -> Void
     ) {
-        let wasPending = pendingStore.contains(device)
+        let wasPending: Bool
+        do {
+            wasPending = try pendingStore.contains(device)
+        } catch {
+            completion(.failed("\(device)'s key was not changed: the record of pending cleanups at \(pendingStore.path) can't be read (\(error.localizedDescription)). Check it, or delete it if no key replacement is unfinished."))
+            return
+        }
         let willReplace: Bool
         do {
             willReplace = try willReplaceDifferentKey(key: key, device: device, in: file)
@@ -921,6 +929,7 @@ struct PairPhoneSheet: View {
             DispatchQueue.main.async {
                 if let r, r["error"] == nil {
                     keyResults[name] = .added
+                    if let warning = jsonString(r["warning"]) { message = warning }
                     loadDevices(on: name)
                 } else if let r, jsonBool(r["not_writable"]) == true {
                     if let nix = jsonString(r["nixos"]) {
