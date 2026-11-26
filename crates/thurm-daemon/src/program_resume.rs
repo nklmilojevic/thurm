@@ -475,16 +475,73 @@ pub struct OwnerSnapshot {
     pub uid: u32,
 }
 
+/// What the daemon knows about the pane a report arrived on, taken under the pane's lock.
+#[derive(Clone, Debug, Default)]
+pub struct PaneContext {
+    /// The pane's first process, only while it is verifiably the process the daemon started
+    /// (not reaped, same birth): once it is gone its pid may belong to anything.
+    pub leader: Option<u32>,
+    /// Device number of the pane's PTY slave.
+    pub tty_rdev: Option<u64>,
+    /// Session of the pane's terminal (Linux: from the PTY master), for the terminal fallback.
+    pub tty_session: Option<u32>,
+    /// Foreground process group of the pane when the report's bytes were read.
+    pub foreground_pgrp: Option<u32>,
+    pub has_explicit_command: bool,
+    /// Canonical paths of the shells the user configured (the pane's shell and the login
+    /// shell): trusted as shells wherever they are installed.
+    pub trusted_shells: Vec<PathBuf>,
+}
+
+impl PaneContext {
+    /// Canonical paths of the configured shell (`terminal.shell[0]`, a bare name looked up on
+    /// the daemon's `PATH`) and the user's login shell.
+    pub fn resolve_trusted_shells(configured: Option<&str>) -> Vec<PathBuf> {
+        let login = crate::shell::user_shell();
+        let mut out = Vec::new();
+        for prog in configured.into_iter().chain([login.as_str()]) {
+            let found = if prog.contains('/') {
+                Some(PathBuf::from(prog))
+            } else {
+                std::env::var_os("PATH").and_then(|path| {
+                    std::env::split_paths(&path)
+                        .filter(|d| d.is_absolute())
+                        .map(|d| d.join(prog))
+                        .find(|c| c.is_file())
+                })
+            };
+            if let Some(canon) = found.and_then(|f| std::fs::canonicalize(f).ok())
+                && !out.contains(&canon)
+            {
+                out.push(canon);
+            }
+        }
+        out
+    }
+}
+
+/// Whether `pid` is in the pane's foreground process group: OSC 7577 only proves a report came
+/// from the pane, so the pid it names must at least be in front when its bytes were read.
+fn in_foreground(pid: u32, foreground_pgrp: Option<u32>) -> bool {
+    in_foreground_with(pid, foreground_pgrp, |p| {
+        let g = unsafe { libc::getpgid(p as libc::pid_t) };
+        (g > 0).then_some(g as u32)
+    })
+}
+
+fn in_foreground_with(
+    pid: u32,
+    foreground_pgrp: Option<u32>,
+    pgrp_of: impl Fn(u32) -> Option<u32>,
+) -> bool {
+    foreground_pgrp.is_some_and(|fg| pgrp_of(pid) == Some(fg))
+}
+
 /// Validates that `pid` is alive, owned by the daemon's user, belongs to this pane, and shares
 /// the same root directory, returning a snapshot of its process metadata.
-pub fn inspect_owner(
-    pid: u32,
-    pane_pid: u32,
-    pane_tty_rdev: Option<u64>,
-    pane_has_explicit_command: bool,
-) -> Result<OwnerSnapshot, &'static str> {
+pub fn inspect_owner(pid: u32, pane: &PaneContext) -> Result<OwnerSnapshot, &'static str> {
     let my_euid = unsafe { libc::geteuid() };
-    let (birth, ancestors, is_descendant) = pane_member(pid, pane_pid, pane_tty_rdev)?;
+    let (birth, ancestors, is_descendant) = pane_member(pid, pane)?;
     let info = procinfo::process_info(pid);
     let process_name = info.as_ref().map(|p| p.name.clone()).unwrap_or_default();
     let process_argv = info.map(|p| p.argv).unwrap_or_default();
@@ -505,17 +562,18 @@ pub fn inspect_owner(
             None => process_argv.truncate(k),
         }
     }
-    let owner_is_shell =
-        !process_exe.is_empty() && procinfo::is_shell(thurm_config::executable_name(&process_exe));
+    let kind_of = |p: u32| classify_ancestor(p, &pane.trusted_shells);
+    let owner_is_shell = kind_of(pid) == AncestorKind::Shell;
 
     let (first_process, wrapped) = classify_lineage(
         pid,
-        pane_pid,
+        // No pid matches 0: without a verified leader there is no lineage to the pane.
+        pane.leader.unwrap_or(0),
         &ancestors,
         is_descendant,
-        pane_has_explicit_command,
+        pane.has_explicit_command,
         owner_is_shell,
-        classify_ancestor,
+        kind_of,
     );
 
     Ok(OwnerSnapshot {
@@ -532,33 +590,50 @@ pub fn inspect_owner(
     })
 }
 
-/// Checks that `pid` is alive, runs as the daemon's user, belongs to the pane (a descendant of
-/// its root or on its terminal) and shares the pane's root directory. Returns its birth time,
-/// its ancestors up to the pane root, and whether it descends from the pane root.
-fn pane_member(
-    pid: u32,
-    pane_pid: u32,
-    pane_tty_rdev: Option<u64>,
-) -> Result<(u64, Vec<u32>, bool), &'static str> {
+/// Checks that `pid` is alive (not a zombie), runs as the daemon's user, belongs to the pane (a
+/// descendant of its verified first process, or in the session of its terminal) and shares the
+/// daemon's root directory and mount namespace. Returns its birth time, its ancestors up to the
+/// pane's first process, and whether it descends from it.
+fn pane_member(pid: u32, pane: &PaneContext) -> Result<(u64, Vec<u32>, bool), &'static str> {
     let my_uid = unsafe { libc::getuid() };
     let my_euid = unsafe { libc::geteuid() };
     if my_uid == 0 || my_euid == 0 {
         return Err("running as root");
     }
-    let birth = procinfo::process_birth(pid).ok_or("owner process not alive")?;
+    let birth = procinfo::live_process_birth(pid).ok_or("owner process not alive")?;
     let (ruid, euid) = procinfo::process_uids(pid).ok_or("cannot read owner uid")?;
     if ruid != my_uid || euid != my_euid {
         return Err("owner uid differs");
     }
-    let (ancestors, is_descendant) = procinfo::ancestors(pid, pane_pid);
-    let on_pane_tty = pane_tty_rdev.is_some() && procinfo::controlling_tty(pid) == pane_tty_rdev;
-    if !is_descendant && !on_pane_tty {
+    let (ancestors, is_descendant) = match pane.leader {
+        Some(leader) => procinfo::ancestors(pid, leader),
+        None => (Vec::new(), false),
+    };
+    if !is_descendant && !on_pane_terminal(pid, pane) {
         return Err("owner does not belong to pane");
     }
-    if !procinfo::same_root(pid, pane_pid) {
+    // With the leader gone, compare with the daemon's own root.
+    if !procinfo::same_root(pid, pane.leader.unwrap_or_else(std::process::id)) {
         return Err("owner root directory differs");
     }
+    if !procinfo::same_mount_ns(pid) {
+        return Err("owner mount namespace differs");
+    }
     Ok((birth, ancestors, is_descendant))
+}
+
+/// The terminal fallback for a process outside the pane's tree: its controlling terminal is the
+/// pane's. On Linux two `devpts` instances can number their terminals alike, so the process must
+/// also be in the session that terminal belongs to; when that cannot be read, only ancestry
+/// counts.
+fn on_pane_terminal(pid: u32, pane: &PaneContext) -> bool {
+    if pane.tty_rdev.is_none() || procinfo::controlling_tty(pid) != pane.tty_rdev {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        return pane.tty_session.is_some() && procinfo::session_id(pid) == pane.tty_session;
+    }
+    true
 }
 
 /// What an ancestor of a reporting process is, judged by its OS executable path (a process
@@ -572,20 +647,32 @@ enum AncestorKind {
     Other,
 }
 
-fn classify_ancestor(pid: u32) -> AncestorKind {
+/// A shell or PTY proxy only counts when its executable is a trusted installation (see
+/// [`procinfo::is_trusted_install`]) or one of the user's configured shells: a basename is
+/// whatever whoever placed the file chose.
+fn classify_ancestor(pid: u32, trusted_shells: &[PathBuf]) -> AncestorKind {
     if let Some(exe) = procinfo::exe_path(pid) {
         let exe = exe.display().to_string();
-        let name = thurm_config::executable_name(&exe);
-        if procinfo::is_shell(name) {
-            return AncestorKind::Shell;
-        }
-        if procinfo::is_pty_proxy(name) {
-            return AncestorKind::PtyProxy;
-        }
+        // Linux marks an executable replaced on disk (a package upgrade) this way.
+        let exe = exe.strip_suffix(" (deleted)").unwrap_or(&exe);
+        // Exactly macOS login(1), before any name-based check.
         if cfg!(target_os = "macos") && exe == "/usr/bin/login" {
             return AncestorKind::Login;
         }
-        return AncestorKind::Other;
+        let name = thurm_config::executable_name(exe);
+        let shell = procinfo::is_shell_program(name);
+        let proxy = procinfo::is_pty_proxy(name);
+        if !shell && !proxy {
+            return AncestorKind::Other;
+        }
+        let canon = std::fs::canonicalize(exe).unwrap_or_else(|_| PathBuf::from(exe));
+        let verified =
+            procinfo::is_trusted_install(&canon) || (shell && trusted_shells.contains(&canon));
+        return match (verified, shell) {
+            (false, _) => AncestorKind::Other,
+            (true, true) => AncestorKind::Shell,
+            (true, false) => AncestorKind::PtyProxy,
+        };
     }
     // login(1) runs as root: its path may be unreadable, but a root-owned process named
     // `login` is not something the user's own programs can start.
@@ -747,14 +834,7 @@ impl ProgramResumeState {
 
     /// Processes a raw OSC 7577 report for this pane. Returns `true` if the stored records
     /// changed in a way worth persisting (a repeated identical report returns `false`).
-    pub fn handle_report(
-        &mut self,
-        body: &[u8],
-        total_len: usize,
-        pane_pid: u32,
-        pane_tty_rdev: Option<u64>,
-        pane_has_explicit_command: bool,
-    ) -> bool {
+    pub fn handle_report(&mut self, body: &[u8], total_len: usize, pane: &PaneContext) -> bool {
         if is_root() {
             return false;
         }
@@ -764,21 +844,31 @@ impl ProgramResumeState {
         let now = persist::now_secs();
         let outcome = parse_report(body, total_len, token, now, |pid| {
             let &(stored_birth, last_t) = self.last_times.get(&pid)?;
-            // If the PID was reused by a new process, its birth differs: do not carry over.
+            // If the PID was reused by a new process, its birth differs: do not carry over. An
+            // owner that is gone (in its exit grace) keeps its time, so an older report queued
+            // in the output cannot undo its newer one.
             let current_birth = procinfo::process_birth(pid);
-            (current_birth == Some(stored_birth)).then_some(last_t)
+            (current_birth.is_none() || current_birth == Some(stored_birth)).then_some(last_t)
         });
         match outcome {
             ParseOutcome::Ignore => false,
             ParseOutcome::Reject { pid, reason } => {
                 log::debug!("OSC 7577 rejected (pid={pid:?}): {reason}");
-                pid.is_some_and(|p| self.remove_owner(p))
+                // Only a process in front may take its own record down.
+                pid.is_some_and(|p| in_foreground(p, pane.foreground_pgrp) && self.remove_owner(p))
+            }
+            ParseOutcome::Accept(parsed) if !in_foreground(parsed.pid, pane.foreground_pgrp) => {
+                log::debug!(
+                    "OSC 7577 ignored: pid {} is not in the pane's foreground group",
+                    parsed.pid
+                );
+                false
             }
             ParseOutcome::Accept(parsed) => match parsed.kind {
                 ReportKind::Clear => {
                     // Remember the time for a live owner in this pane so replaying an earlier
                     // Set is ignored (nothing is kept for processes outside the pane).
-                    match pane_member(parsed.pid, pane_pid, pane_tty_rdev) {
+                    match pane_member(parsed.pid, pane) {
                         Ok((birth, ..)) => self.record_time(parsed.pid, birth, parsed.time, now),
                         Err(reason) => {
                             log::debug!("OSC 7577 clear for pid {}: {reason}", parsed.pid);
@@ -787,12 +877,7 @@ impl ProgramResumeState {
                     self.remove_owner(parsed.pid)
                 }
                 ReportKind::Set { argv, cwd } => {
-                    let owner = match inspect_owner(
-                        parsed.pid,
-                        pane_pid,
-                        pane_tty_rdev,
-                        pane_has_explicit_command,
-                    ) {
+                    let owner = match inspect_owner(parsed.pid, pane) {
                         Ok(o) => o,
                         Err(reason) => {
                             log::debug!("OSC 7577 rejected pid {}: {reason}", parsed.pid);
@@ -873,7 +958,7 @@ impl ProgramResumeState {
     /// Checks owning process liveness, expiring records whose owners have been gone longer than
     /// `EXIT_GRACE_MS`. `now_ms` is [`monotonic_ms`]. Returns `true` if any record was removed.
     pub fn poll_liveness(&mut self, now_ms: u64) -> bool {
-        self.poll_liveness_with(now_ms, procinfo::process_birth)
+        self.poll_liveness_with(now_ms, procinfo::live_process_birth)
     }
 
     fn poll_liveness_with(
@@ -1879,23 +1964,12 @@ fn exec_no_shell_fallback(
     denied.unwrap_or_else(not_found)
 }
 
-/// Whether `shell` (path or basename) can run a restored foreground job inside an interactive shell.
+/// Whether `shell` (path or basename) can run a restored foreground job inside an interactive
+/// shell: the POSIX-style shells among [`procinfo::is_shell_program`]'s, and fish.
 pub fn shell_supports_job_resume(shell: &str) -> bool {
     let name = shell.rsplit('/').next().unwrap_or(shell);
-    matches!(
-        name,
-        "zsh"
-            | "bash"
-            | "fish"
-            | "sh"
-            | "ash"
-            | "dash"
-            | "ksh"
-            | "mksh"
-            | "oksh"
-            | "pdksh"
-            | "yash"
-    )
+    let name = name.trim_start_matches('-');
+    procinfo::is_shell_program(name) && !matches!(name, "tcsh" | "csh" | "nu" | "xonsh" | "elvish")
 }
 
 #[cfg(test)]
@@ -2795,6 +2869,48 @@ mod tests {
     }
 
     #[test]
+    fn without_a_verified_leader_nothing_is_a_first_process() {
+        use AncestorKind::*;
+        // The leader was reaped (pid 0 stands in): a process whose numeric pid matches the old
+        // leader's, or whose ancestry the walk could not tie to the pane, is detached.
+        assert_eq!(
+            classify_lineage(42, 0, &[], false, false, false, |_| Shell),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn reports_need_the_claimed_pid_in_front() {
+        let pgrp_of = |p: u32| Some(if p < 100 { 7 } else { 8 });
+        assert!(in_foreground_with(5, Some(7), pgrp_of));
+        assert!(!in_foreground_with(150, Some(7), pgrp_of));
+        assert!(!in_foreground_with(5, None, pgrp_of));
+        assert!(!in_foreground_with(5, Some(7), |_| None));
+    }
+
+    #[test]
+    fn job_resume_shells_are_recognized_shells() {
+        for sh in [
+            "zsh",
+            "/bin/bash",
+            "fish",
+            "mksh",
+            "oksh",
+            "pdksh",
+            "yash",
+            "-sh",
+            "ash",
+        ] {
+            assert!(shell_supports_job_resume(sh), "{sh}");
+            let name = sh.rsplit('/').next().unwrap();
+            assert!(procinfo::is_shell_program(name), "{sh}");
+        }
+        for sh in ["nu", "elvish", "xonsh", "tcsh", "-csh", "login", "python3"] {
+            assert!(!shell_supports_job_resume(sh), "{sh}");
+        }
+    }
+
+    #[test]
     fn clear_for_a_process_outside_the_pane_keeps_no_state() {
         if is_root() {
             return;
@@ -2804,7 +2920,12 @@ mod tests {
         // PID 1 is alive but not ours and not in this pane.
         let body = sign(&format!("pid=1:time={now}:clear=1"), SPEC_TOKEN);
         let total = 2 + b"7577;".len() + body.len() + 2;
-        assert!(!state.handle_report(&body, total, std::process::id(), None, false));
+        let pane = PaneContext {
+            leader: Some(std::process::id()),
+            foreground_pgrp: Some(unsafe { libc::getpgrp() } as u32),
+            ..Default::default()
+        };
+        assert!(!state.handle_report(&body, total, &pane));
         assert!(state.last_times.is_empty());
     }
 }

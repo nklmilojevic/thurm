@@ -1517,7 +1517,15 @@ impl Daemon {
         if events.is_empty() {
             return;
         }
-        let cfg = self.config.read().notifications.clone();
+        let (cfg, configured_shell) = {
+            let c = self.config.read();
+            let shell = events
+                .iter()
+                .any(|e| matches!(e, TermEvent::ProgramResume { .. }))
+                .then(|| c.terminal.shell.as_ref().and_then(|s| s.first()).cloned())
+                .flatten();
+            (c.notifications.clone(), shell)
+        };
         let mut info_changed = false;
         let mut resume_changed = false;
         let mut outgoing = Vec::new();
@@ -1652,16 +1660,18 @@ impl Daemon {
                         info_changed = true;
                     }
                     TermEvent::ProgramResume { body, total_len } => {
-                        let pane_pid = st.pty.pid();
-                        let slave_rdev = st.pty.slave_rdev();
-                        let has_explicit_cmd = st.command.is_some();
-                        if st.resume.handle_report(
-                            &body,
-                            total_len,
-                            pane_pid,
-                            slave_rdev,
-                            has_explicit_cmd,
-                        ) {
+                        let ctx = program_resume::PaneContext {
+                            leader: st.pty.live_leader(),
+                            tty_rdev: st.pty.slave_rdev(),
+                            tty_session: st.pty.terminal_session(),
+                            // Who is in front when the report's bytes were read.
+                            foreground_pgrp: st.output_pgrp.or_else(|| st.pty.foreground_pgrp()),
+                            has_explicit_command: st.command.is_some(),
+                            trusted_shells: program_resume::PaneContext::resolve_trusted_shells(
+                                configured_shell.as_deref(),
+                            ),
+                        };
+                        if st.resume.handle_report(&body, total_len, &ctx) {
                             resume_changed = true;
                         }
                     }
