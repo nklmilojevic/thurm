@@ -26,6 +26,7 @@ use thurm_term::{ClientView, EngineConfig, MouseOutcome, TermEvent, Terminal};
 
 pub type thurm_event_cb = Option<unsafe extern "C" fn(ctx: *mut c_void, json: *const c_char)>;
 pub type thurm_frame_cb = Option<unsafe extern "C" fn(ctx: *mut c_void, pane: u64)>;
+pub type thurm_ctx_drop_cb = Option<unsafe extern "C" fn(ctx: *mut c_void)>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -117,6 +118,8 @@ struct Grid {
     links: Vec<CString>,
     images: Vec<thurm_image_placement>,
     has_frame: bool,
+    /// Generation at which a reader last locked and consumed `dirty_rows` / `shift`.
+    last_consumed_gen: u64,
     /// History line above the viewport (smooth scrolling); empty when there is none.
     peek: Vec<thurm_cell>,
     peek_clusters: HashMap<u16, CString>,
@@ -161,14 +164,16 @@ fn shift_dirty(mask: u64, shift: i32, rows: usize) -> u64 {
 impl Grid {
     fn apply(&mut self, f: Frame) {
         let (cols, rows) = (f.cols as usize, f.rows as usize);
-        if f.full || self.info.cols != f.cols || self.info.rows != f.rows {
+        let reset = f.full || self.info.cols != f.cols || self.info.rows != f.rows;
+        if reset {
             self.cells = vec![thurm_cell::default(); cols * rows];
             self.clusters.clear();
             self.info.dirty_rows = u64::MAX;
+            self.info.shift = 0;
         }
         self.info.cols = f.cols;
         self.info.rows = f.rows;
-        if f.shift != 0 && !f.full {
+        if f.shift != 0 && !reset {
             // Row r now shows what row r - shift showed; exposed rows follow in `lines`.
             let s = f.shift as i64;
             shift_rows(&mut self.cells, cols, rows, f.shift);
@@ -422,16 +427,25 @@ impl Shared {
         self.subs.lock().is_warm(pane)
     }
 
-    /// Show the panes in the light or dark variant of the theme; whether it changed.
-    fn set_dark(&self, dark: bool) -> bool {
-        let changed = std::mem::replace(&mut self.engine.lock().dark, dark) != dark;
-        if changed {
-            self.reload_engine(false);
-        }
-        changed
+    /// Active (non-warm) subscribed panes that currently have a local terminal copy.
+    fn active_panes(&self) -> Vec<PaneId> {
+        let subs = self.subs.lock();
+        self.locals
+            .lock()
+            .keys()
+            .copied()
+            .filter(|p| !subs.is_warm(*p))
+            .collect()
     }
 
-    fn reload_engine(&self, reload_file: bool) {
+    /// Show the panes in the light or dark variant of the theme, returning the active panes that
+    /// need repainting when it changed.
+    fn set_dark_panes(&self, dark: bool) -> Option<Vec<PaneId>> {
+        let changed = std::mem::replace(&mut self.engine.lock().dark, dark) != dark;
+        changed.then(|| self.reload_engine(false))
+    }
+
+    fn reload_engine(&self, reload_file: bool) -> Vec<PaneId> {
         let cfg = {
             let mut e = self.engine.lock();
             if reload_file && let Ok(c) = thurm_config::Config::load() {
@@ -446,6 +460,7 @@ impl Shared {
             l.term.set_config(cfg.clone());
             l.view.invalidate();
         }
+        self.active_panes()
     }
 }
 
@@ -454,7 +469,7 @@ pub struct thurm_client {
     shared: Arc<Shared>,
     on_event: thurm_event_cb,
     on_frame: thurm_frame_cb,
-    ctx: Ctx,
+    ctx: Arc<CallbackCtx>,
     /// The daemon's socket when the connection is a plain one: where its streams open.
     socket: Option<std::path::PathBuf>,
     /// What carries the connection when it is not a plain socket (the iOS app's ssh session);
@@ -467,9 +482,49 @@ struct Ctx(*mut c_void);
 unsafe impl Send for Ctx {}
 unsafe impl Sync for Ctx {}
 
-fn emit_json(cb: thurm_event_cb, ctx: Ctx, json: &str) {
+/// Shared owner of the caller's opaque `ctx` pointer across the client handle, reader callbacks,
+/// and background sync-flush tasks. Runs the optional `on_drop` hook once when the last reference
+/// drops so callers never leak or prematurely free `ctx`. On a failed connection attempt,
+/// [`CallbackCtx::detach`] waits for any in-flight callback to exit and clears the pointer so
+/// lingering background threads can never invoke a callback with `ctx` after connect returns NULL.
+struct CallbackCtx {
+    raw: parking_lot::RwLock<Option<Ctx>>,
+    on_drop: Mutex<thurm_ctx_drop_cb>,
+}
+
+impl CallbackCtx {
+    fn new(raw: *mut c_void) -> Arc<Self> {
+        Arc::new(Self {
+            raw: parking_lot::RwLock::new(Some(Ctx(raw))),
+            on_drop: Mutex::new(None),
+        })
+    }
+
+    fn with_ptr<R>(&self, f: impl FnOnce(*mut c_void) -> R) -> Option<R> {
+        let guard = self.raw.read();
+        guard.map(|c| f(c.0))
+    }
+
+    fn detach(&self) {
+        *self.raw.write() = None;
+    }
+
+    fn set_on_drop(&self, cb: thurm_ctx_drop_cb) {
+        *self.on_drop.lock() = cb;
+    }
+}
+
+impl Drop for CallbackCtx {
+    fn drop(&mut self) {
+        if let (Some(cb), Some(raw)) = (*self.on_drop.get_mut(), *self.raw.get_mut()) {
+            unsafe { cb(raw.0) };
+        }
+    }
+}
+
+fn emit_json(cb: thurm_event_cb, ctx: &CallbackCtx, json: &str) {
     if let (Some(cb), Ok(s)) = (cb, CString::new(json)) {
-        unsafe { cb(ctx.0, s.as_ptr()) };
+        ctx.with_ptr(|ptr| unsafe { cb(ptr, s.as_ptr()) });
     }
 }
 
@@ -584,6 +639,7 @@ unsafe fn connect_to(
         .to_owned();
     let mut capabilities = capabilities.to_vec();
     capabilities.push(thurm_proto::CAP_AGENT_ACTIVITY);
+    capabilities.push(thurm_proto::CAP_PENDING_PROMPT);
     let streams_on = socket.clone();
     let connected = new_connection(on_event, on_frame, ctx, |on_ev, on_disc| {
         Client::connect_with(
@@ -628,24 +684,32 @@ fn new_connection(
     ) -> Result<(Arc<Client>, Transport), String>,
 ) -> Result<*mut thurm_client, String> {
     let shared = Arc::new(Shared::default());
-    let ctx = Ctx(ctx);
+    let ctx = CallbackCtx::new(ctx);
     let events_shared = shared.clone();
+    let ev_ctx = ctx.clone();
     // A panic here would end the connection's reader thread (and with it the pane updates).
     let on_ev = move |ev: Event| {
         let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle_event(&events_shared, ev, on_event, on_frame, ctx)
+            handle_event(&events_shared, ev, on_event, on_frame, &ev_ctx)
         }));
         if handled.is_err() {
             log::error!("an event from the daemon panicked the app's handler");
         }
     };
     let disc_shared = shared.clone();
+    let disc_ctx = ctx.clone();
     let on_disc = move || {
         disc_shared.subs.lock().clear();
         disc_shared.locals.lock().clear();
-        emit_json(on_event, ctx, "\"Disconnected\"");
+        emit_json(on_event, &disc_ctx, "\"Disconnected\"");
     };
-    let (client, transport) = connect(Box::new(on_ev), Box::new(on_disc))?;
+    let (client, transport) = match connect(Box::new(on_ev), Box::new(on_disc)) {
+        Ok(pair) => pair,
+        Err(e) => {
+            ctx.detach();
+            return Err(e);
+        }
+    };
     Ok(Box::into_raw(Box::new(thurm_client {
         client,
         shared,
@@ -731,7 +795,9 @@ pub unsafe extern "C" fn thurm_clipboard_answer(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_reload_engine(client: *mut thurm_client) {
     if let Some(c) = unsafe { client_ref(client) } {
-        c.shared.reload_engine(true);
+        for pane in c.shared.reload_engine(true) {
+            fire_frame(c.on_frame, &c.ctx, pane);
+        }
     }
 }
 
@@ -740,14 +806,18 @@ pub unsafe extern "C" fn thurm_reload_engine(client: *mut thurm_client) {
 /// its panes) keep their appearance. The iPhone follows its own.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thurm_set_local_appearance(client: *mut thurm_client, dark: bool) {
-    if let Some(c) = unsafe { client_ref(client) } {
-        c.shared.set_dark(dark);
+    if let Some(c) = unsafe { client_ref(client) }
+        && let Some(panes) = c.shared.set_dark_panes(dark)
+    {
+        for pane in panes {
+            fire_frame(c.on_frame, &c.ctx, pane);
+        }
     }
 }
 
-fn fire_frame(on_frame: thurm_frame_cb, ctx: Ctx, pane: PaneId) {
+fn fire_frame(on_frame: thurm_frame_cb, ctx: &CallbackCtx, pane: PaneId) {
     if let Some(cb) = on_frame {
-        unsafe { cb(ctx.0, pane) };
+        ctx.with_ptr(|ptr| unsafe { cb(ptr, pane) });
     }
 }
 
@@ -758,7 +828,7 @@ fn schedule_sync_flush(
     pane: PaneId,
     deadline: Instant,
     on_frame: thurm_frame_cb,
-    ctx: Ctx,
+    ctx: Arc<CallbackCtx>,
 ) {
     if !shared.sync_timer.lock().insert(pane) {
         return;
@@ -789,7 +859,7 @@ fn schedule_sync_flush(
                 Some(d) => schedule_sync_flush(&shared, pane, d, on_frame, ctx),
                 None => {
                     if !shared.is_warm(pane) {
-                        fire_frame(on_frame, ctx, pane);
+                        fire_frame(on_frame, &ctx, pane);
                     }
                 }
             }
@@ -804,7 +874,7 @@ fn handle_event(
     ev: Event,
     on_event: thurm_event_cb,
     on_frame: thurm_frame_cb,
-    ctx: Ctx,
+    ctx: &Arc<CallbackCtx>,
 ) {
     match ev {
         Event::Attach { pane, size, state } => {
@@ -859,7 +929,9 @@ fn handle_event(
                 l.term.sync_deadline()
             };
             match sync {
-                Some(deadline) => schedule_sync_flush(shared, pane, deadline, on_frame, ctx),
+                Some(deadline) => {
+                    schedule_sync_flush(shared, pane, deadline, on_frame, ctx.clone())
+                }
                 None => {
                     if !shared.is_warm(pane) {
                         fire_frame(on_frame, ctx, pane);
@@ -876,7 +948,9 @@ fn handle_event(
                 };
                 // The resized grid waits for the program's redraw (see `Terminal::resize`).
                 match held {
-                    Some(deadline) => schedule_sync_flush(shared, pane, deadline, on_frame, ctx),
+                    Some(deadline) => {
+                        schedule_sync_flush(shared, pane, deadline, on_frame, ctx.clone())
+                    }
                     None => {
                         if !shared.is_warm(pane) {
                             fire_frame(on_frame, ctx, pane);
@@ -885,6 +959,27 @@ fn handle_event(
                 }
             }
         }
+        Event::NotifyPrompt {
+            pane,
+            title,
+            body,
+            permission,
+            sound,
+            request,
+        } => {
+            let mut obj = serde_json::json!({
+                "pane": pane,
+                "title": title,
+                "body": body,
+                "permission": permission,
+                "sound": sound,
+            });
+            if let Some(req) = request {
+                obj["request"] = serde_json::Value::String(req);
+            }
+            let json = serde_json::json!({ "Notify": obj }).to_string();
+            emit_json(on_event, ctx, &json);
+        }
         other => {
             if let Event::PaneClosed { pane } = &other {
                 shared.subs.lock().remove_pane(*pane);
@@ -892,12 +987,16 @@ fn handle_event(
                 shared.locals.lock().remove(pane);
                 shared.images.lock().retain(|(p, _), _| p != pane);
             }
-            if matches!(other, Event::ConfigReloaded) {
-                shared.reload_engine(true);
-            }
+            let reloaded = matches!(other, Event::ConfigReloaded)
+                .then(|| shared.reload_engine(true));
             match serde_json::to_string(&other) {
                 Ok(json) => emit_json(on_event, ctx, &json),
                 Err(e) => log::warn!("cannot encode event: {e}"),
+            }
+            if let Some(panes) = reloaded {
+                for pane in panes {
+                    fire_frame(on_frame, ctx, pane);
+                }
             }
         }
     }
@@ -907,6 +1006,16 @@ fn handle_event(
 pub unsafe extern "C" fn thurm_disconnect(client: *mut thurm_client) {
     if !client.is_null() {
         drop(unsafe { Box::from_raw(client) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_client_set_ctx_drop(
+    client: *mut thurm_client,
+    on_drop: thurm_ctx_drop_cb,
+) {
+    if let Some(c) = unsafe { client_ref(client) } {
+        c.ctx.set_on_drop(on_drop);
     }
 }
 
@@ -1072,7 +1181,11 @@ impl thurm_client {
             | Request::Search { pane, .. }
             | Request::Scroll { pane, .. } => *pane,
             Request::SetAppearance { dark } => {
-                self.shared.set_dark(*dark);
+                if let Some(panes) = self.shared.set_dark_panes(*dark) {
+                    for pane in panes {
+                        fire_frame(self.on_frame, &self.ctx, pane);
+                    }
+                }
                 return Err(req);
             }
             _ => return Err(req),
@@ -1099,7 +1212,7 @@ impl thurm_client {
             _ => unreachable!(),
         };
         drop(l);
-        fire_frame(self.on_frame, self.ctx, pane);
+        fire_frame(self.on_frame, &self.ctx, pane);
         Ok(resp)
     }
 
@@ -1158,7 +1271,7 @@ pub unsafe extern "C" fn thurm_subscribe(client: *mut thurm_client, pane: u64) {
         }
     };
     if fire {
-        fire_frame(c.on_frame, c.ctx, pane);
+        fire_frame(c.on_frame, &c.ctx, pane);
     }
 }
 
@@ -1260,7 +1373,7 @@ fn clear_local_selection(client: *mut thurm_client, pane: PaneId) {
         return;
     };
     if local.lock().term.clear_selection() {
-        fire_frame(c.on_frame, c.ctx, pane);
+        fire_frame(c.on_frame, &c.ctx, pane);
     }
 }
 
@@ -1411,7 +1524,7 @@ pub unsafe extern "C" fn thurm_key(
                 (bytes, had && !l.term.has_selection())
             };
             if cleared {
-                fire_frame(c.on_frame, c.ctx, pane);
+                fire_frame(c.on_frame, &c.ctx, pane);
             }
             c.input(pane, bytes);
         }
@@ -1469,7 +1582,7 @@ pub unsafe extern "C" fn thurm_mouse(
             && c.shared.engine.lock().cfg.terminal.copy_on_select;
         let cleared = had && !l.term.has_selection();
         if cleared || (outcome != MouseOutcome::None && outcome != MouseOutcome::Reported) {
-            fire_frame(c.on_frame, c.ctx, pane);
+            fire_frame(c.on_frame, &c.ctx, pane);
         }
         (copy.then(|| l.term.selection_text()), bytes)
     };
@@ -1478,7 +1591,7 @@ pub unsafe extern "C" fn thurm_mouse(
     if let Some(text) = text.filter(|t| !t.is_empty()) {
         let json =
             serde_json::json!({"ClipboardStore": {"pane": pane, "text": text, "user": true}});
-        emit_json(c.on_event, c.ctx, &json.to_string());
+        emit_json(c.on_event, &c.ctx, &json.to_string());
     }
 }
 
@@ -1502,7 +1615,7 @@ pub unsafe extern "C" fn thurm_wheel(
             let bytes = local.lock().term.wheel(lines, col, row, mods);
             if bytes.is_empty() {
                 // Scrolled the local viewport.
-                fire_frame(c.on_frame, c.ctx, pane);
+                fire_frame(c.on_frame, &c.ctx, pane);
             }
             c.input(pane, bytes);
         }
@@ -1525,10 +1638,10 @@ pub unsafe extern "C" fn thurm_wheel(
 // Grid access
 // ---------------------------------------------------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn thurm_grid_lock(
+unsafe fn grid_lock_inner(
     client: *mut thurm_client,
     pane: u64,
+    last_generation: Option<u64>,
     info: *mut thurm_grid_info,
     cells: *mut *const thurm_cell,
 ) -> bool {
@@ -1563,18 +1676,59 @@ pub unsafe extern "C" fn thurm_grid_lock(
     if !guard.has_frame {
         return false;
     }
+    let mut out_info = guard.info;
+    if let Some(last_gen) = last_generation {
+        if last_gen == 0 {
+            // A first-time reader has never drawn this grid, even if an incremental update's
+            // dirty bits are still unconsumed from another reader.
+            out_info.dirty_rows = u64::MAX;
+            out_info.shift = 0;
+        } else if out_info.generation != last_gen {
+            // Preserve zero dirty_rows on a consecutive metadata/cursor-only update when no other
+            // reader has already consumed that generation; force a full repaint only if the
+            // reader skipped/rewound generations or another reader already consumed the mask.
+            let jumped = out_info.generation != last_gen.saturating_add(1);
+            let consumed_by_other = last_gen < guard.last_consumed_gen;
+            if jumped || consumed_by_other {
+                out_info.dirty_rows = u64::MAX;
+                out_info.shift = 0;
+            }
+        }
+    }
     if !info.is_null() {
-        unsafe { *info = guard.info };
+        unsafe { *info = out_info };
     }
     if !cells.is_null() {
         unsafe { *cells = guard.cells.as_ptr() };
     }
     // The caller now has a consistent view; the next lock reports rows changed after this.
+    guard.last_consumed_gen = guard.info.generation;
     guard.info.dirty_rows = 0;
     guard.info.shift = 0;
     // Double lock without unlock: dropping the previous guard releases it to avoid a deadlock.
     c.shared.locked.lock().insert(pane, guard);
     true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_grid_lock(
+    client: *mut thurm_client,
+    pane: u64,
+    info: *mut thurm_grid_info,
+    cells: *mut *const thurm_cell,
+) -> bool {
+    unsafe { grid_lock_inner(client, pane, None, info, cells) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thurm_grid_lock_for(
+    client: *mut thurm_client,
+    pane: u64,
+    last_generation: u64,
+    info: *mut thurm_grid_info,
+    cells: *mut *const thurm_cell,
+) -> bool {
+    unsafe { grid_lock_inner(client, pane, Some(last_generation), info, cells) }
 }
 
 unsafe fn locked_grid<'a>(client: *mut thurm_client, pane: u64) -> Option<&'a Grid> {
@@ -1789,7 +1943,9 @@ pub unsafe extern "C" fn thurm_preview_theme(
         e.preview = theme;
         e.engine_config().theme
     };
-    c.shared.reload_engine(false);
+    for pane in c.shared.reload_engine(false) {
+        fire_frame(c.on_frame, &c.ctx, pane);
+    }
     into_c(serde_json::to_string(&shown).unwrap_or_default())
 }
 
@@ -1982,7 +2138,7 @@ mod tests {
             let tx = unsafe { Box::from_raw(ctx.cast::<std::sync::mpsc::Sender<()>>()) };
             let _ = tx.send(());
         }
-        let ctx = Ctx(Box::into_raw(Box::new(tx)).cast());
+        let ctx = CallbackCtx::new(Box::into_raw(Box::new(tx)).cast());
         schedule_sync_flush(&shared, 1, deadline, Some(frame), ctx);
         rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         let mut l = local.lock();
@@ -2020,9 +2176,9 @@ mod tests {
     fn local_appearance_changes_only_this_devices_engine() {
         let shared = Shared::default();
         assert!(shared.engine.lock().dark);
-        assert!(shared.set_dark(false));
+        assert!(shared.set_dark_panes(false).is_some());
         assert!(!shared.engine.lock().dark);
-        assert!(!shared.set_dark(false), "no change, no reload");
+        assert!(shared.set_dark_panes(false).is_none(), "no change, no reload");
         // Without a connection there is nothing to change.
         unsafe { thurm_set_local_appearance(std::ptr::null_mut(), true) };
     }
@@ -3019,5 +3175,300 @@ mod tests {
         drop(unsafe { Arc::from_raw(ctx_ptr) });
         let _ = stop_tx.send(());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn grid_apply_full_frame_resets_shift() {
+        let mut g = Grid::default();
+        let mk_row = |r: u16, ch: char| FrameRow {
+            row: r,
+            cells: vec![
+                Cell {
+                    ch,
+                    ..Default::default()
+                };
+                2
+            ],
+            clusters: vec![],
+        };
+        g.apply(Frame {
+            cols: 2,
+            rows: 3,
+            full: true,
+            lines: vec![mk_row(0, 'a'), mk_row(1, 'b'), mk_row(2, 'c')],
+            ..Default::default()
+        });
+        g.apply(Frame {
+            cols: 2,
+            rows: 3,
+            shift: 2,
+            lines: vec![mk_row(0, 'x')],
+            ..Default::default()
+        });
+        assert_eq!(g.info.shift, 2);
+        g.apply(Frame {
+            cols: 2,
+            rows: 3,
+            full: true,
+            shift: 5,
+            lines: vec![mk_row(0, 'q'), mk_row(1, 'w'), mk_row(2, 'e')],
+            ..Default::default()
+        });
+        assert_eq!(g.info.shift, 0, "full frame must reset shift to 0");
+        assert_eq!(g.info.dirty_rows, u64::MAX);
+    }
+
+    #[test]
+    fn grid_lock_for_multi_reader_preserves_dirty_rows() {
+        let d = MockDaemon::start(true);
+        unsafe { thurm_subscribe(d.client, 1) };
+        d.sync();
+
+        let lock_for = |last_gen: u64| -> thurm_grid_info {
+            let mut info = thurm_grid_info::default();
+            let mut cells: *const thurm_cell = std::ptr::null();
+            assert!(unsafe { thurm_grid_lock_for(d.client, 1, last_gen, &mut info, &mut cells) });
+            unsafe { thurm_grid_unlock(d.client, 1) };
+            info
+        };
+
+        // Reader A locks first -> gen 1, all rows dirty.
+        let a1 = lock_for(0);
+        assert_eq!(a1.generation, 1);
+        assert_eq!(a1.dirty_rows, u64::MAX);
+
+        // Reader B locks first after Reader A consumed gen 1 -> must still see all rows dirty!
+        let b1 = lock_for(0);
+        assert_eq!(b1.generation, 1);
+        assert_eq!(b1.dirty_rows, u64::MAX);
+        assert_eq!(b1.shift, 0);
+
+        // Incremental update arrives (row 1 changes).
+        d.push(Event::Output {
+            pane: 1,
+            data: b"\r\nsecond-line".to_vec(),
+        });
+        d.sync();
+
+        // Reader A locks with last_gen = 1 -> incremental dirty bits (not u64::MAX).
+        let a2 = lock_for(a1.generation);
+        assert_eq!(a2.generation, 2);
+        assert_ne!(a2.dirty_rows, 0);
+        assert_ne!(a2.dirty_rows, u64::MAX);
+
+        // Reader B locks with last_gen = 1 AFTER Reader A already consumed gen 2's dirty bits.
+        let b2 = lock_for(b1.generation);
+        assert_eq!(b2.generation, 2);
+        assert_eq!(b2.dirty_rows, u64::MAX);
+        assert_eq!(b2.shift, 0);
+
+        // Reader A locks again with no new frames -> generation unchanged, dirty_rows == 0.
+        let a3 = lock_for(a2.generation);
+        assert_eq!(a3.generation, 2);
+        assert_eq!(a3.dirty_rows, 0);
+
+        // Incremental update arrives (gen 3), leaving partial dirty bits unconsumed; a brand-new
+        // first-time Reader C locking with last_gen = 0 MUST still get a full grid (u64::MAX).
+        d.push(Event::Output {
+            pane: 1,
+            data: b"\r\nthird-line".to_vec(),
+        });
+        d.sync();
+        let c1 = lock_for(0);
+        assert_eq!(c1.generation, 3);
+        assert_eq!(c1.dirty_rows, u64::MAX);
+        assert_eq!(c1.shift, 0);
+
+        // Metadata/cursor-only update (gen 4, no dirty rows): the first consecutive reader keeps
+        // dirty_rows == 0 so it does not recopy the grid, while a second reader that missed or
+        // had the mask consumed still gets a full grid.
+        d.push(Event::Output {
+            pane: 1,
+            data: b"\x1b[?25l".to_vec(),
+        });
+        d.sync();
+        let c2 = lock_for(c1.generation);
+        assert_eq!(c2.generation, 4);
+        assert_eq!(c2.dirty_rows, 0);
+        assert_eq!(c2.shift, 0);
+        assert_eq!(c2.cursor_shape, 4);
+
+        let b3 = lock_for(b2.generation);
+        assert_eq!(b3.generation, 4);
+        assert_eq!(b3.dirty_rows, u64::MAX);
+        assert_eq!(b3.shift, 0);
+
+        // Second consecutive metadata-only update (gen 5): Reader B (at gen 4) gets dirty_rows == 0,
+        // and Reader C (also at gen 4) locking AFTER Reader B consumed gen 5 gets u64::MAX.
+        d.push(Event::Output {
+            pane: 1,
+            data: b"\x1b[?25h".to_vec(),
+        });
+        d.sync();
+        let b4 = lock_for(b3.generation);
+        assert_eq!(b4.generation, 5);
+        assert_eq!(b4.dirty_rows, 0);
+        assert_eq!(b4.shift, 0);
+        assert_ne!(b4.cursor_shape, 4);
+
+        let c3 = lock_for(c2.generation);
+        assert_eq!(c3.generation, 5);
+        assert_eq!(c3.dirty_rows, u64::MAX);
+        assert_eq!(c3.shift, 0);
+    }
+
+    #[test]
+    fn appearance_and_reload_fire_on_frame_for_active_panes() {
+        let d = MockDaemon::start(true);
+        unsafe { thurm_subscribe(d.client, 1) };
+        d.sync();
+        let _ = d.take_frames();
+
+        unsafe { thurm_set_local_appearance(d.client, false) };
+        assert_eq!(d.take_frames(), vec![1]);
+        // Setting same appearance again is a no-op (no spurious frame).
+        unsafe { thurm_set_local_appearance(d.client, false) };
+        assert!(d.take_frames().is_empty());
+
+        unsafe { thurm_reload_engine(d.client) };
+        assert_eq!(d.take_frames(), vec![1]);
+    }
+
+    #[test]
+    fn client_ctx_drop_runs_once_when_last_reference_drops() {
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::AtomicUsize;
+        use thurm_proto::{Envelope, ServerMessage, codec};
+
+        let (client_stream, mut peer) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let hello: Envelope = codec::read_message(&mut peer).unwrap().unwrap();
+            codec::write_message(
+                &mut peer,
+                &ServerMessage::Response {
+                    id: hello.id,
+                    result: Ok(Response::Hello {
+                        version: thurm_proto::PROTOCOL_VERSION,
+                        daemon_pid: 1,
+                        restored: false,
+                        build: String::new(),
+                        capabilities: thurm_proto::CAPABILITIES
+                            .iter()
+                            .map(|c| (*c).to_owned())
+                            .collect(),
+                    }),
+                },
+            )
+            .unwrap();
+            // Keep stream open until client disconnects.
+            while codec::read_message::<_, Envelope>(&mut peer)
+                .ok()
+                .flatten()
+                .is_some()
+            {}
+        });
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let raw = Arc::into_raw(drops.clone()) as *mut c_void;
+        unsafe extern "C" fn on_drop(ctx: *mut c_void) {
+            let counter = unsafe { Arc::from_raw(ctx as *const AtomicUsize) };
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        let client = new_connection(None, None, raw, |on_ev, on_disc| {
+            Client::from_stream(client_stream, "test", true, &[], on_ev, on_disc)
+                .map(|c| (c, None))
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        unsafe { thurm_client_set_ctx_drop(client, Some(on_drop)) };
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        unsafe { thurm_disconnect(client) };
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while drops.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "ctx_drop never ran");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_connect_detaches_ctx_before_returning() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let raw = Arc::into_raw(calls.clone()) as *mut c_void;
+        unsafe extern "C" fn on_ev(ctx: *mut c_void, _json: *const c_char) {
+            let counter = unsafe { &*(ctx as *const AtomicUsize) };
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<(Box<dyn Fn(Event) + Send>, Box<dyn FnOnce() + Send>)>();
+        let res = new_connection(Some(on_ev), None, raw, |ev, disc| {
+            tx.send((ev, disc)).unwrap();
+            Err("hello failed".into())
+        });
+        assert!(res.is_err());
+
+        // Caller can now treat `raw` as detached; even if a lingering reader thread fires
+        // callbacks later, `on_ev` MUST NOT be invoked with `raw`.
+        let (late_ev, late_disc) = rx.recv().unwrap();
+        late_ev(Event::ConfigReloaded);
+        late_disc();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        unsafe { drop(Arc::from_raw(raw as *const AtomicUsize)) };
+    }
+
+    #[test]
+    fn notify_prompt_translates_to_notify_json_with_optional_request() {
+        let shared = Arc::new(Shared::default());
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let raw = Arc::into_raw(events.clone()) as *mut c_void;
+        unsafe extern "C" fn on_ev(ctx: *mut c_void, json: *const c_char) {
+            let log = unsafe { &*(ctx as *const Mutex<Vec<String>>) };
+            let s = unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned();
+            log.lock().push(s);
+        }
+        let ctx = CallbackCtx::new(raw);
+        handle_event(
+            &shared,
+            Event::NotifyPrompt {
+                pane: 4,
+                title: "Claude Code".into(),
+                body: "Run command".into(),
+                permission: Some(9),
+                sound: Some("Glass".into()),
+                request: Some("Bash: git status".into()),
+            },
+            Some(on_ev),
+            None,
+            &ctx,
+        );
+        handle_event(
+            &shared,
+            Event::NotifyPrompt {
+                pane: 5,
+                title: "Claude Code".into(),
+                body: "waiting".into(),
+                permission: Some(10),
+                sound: Some("Glass".into()),
+                request: None,
+            },
+            Some(on_ev),
+            None,
+            &ctx,
+        );
+        let got = events.lock().clone();
+        assert_eq!(got.len(), 2);
+        let v0: serde_json::Value = serde_json::from_str(&got[0]).unwrap();
+        assert_eq!(v0["Notify"]["pane"], 4);
+        assert_eq!(v0["Notify"]["permission"], 9);
+        assert_eq!(v0["Notify"]["request"], "Bash: git status");
+        let v1: serde_json::Value = serde_json::from_str(&got[1]).unwrap();
+        assert_eq!(v1["Notify"]["pane"], 5);
+        assert!(v1["Notify"].get("request").is_none());
+        drop(ctx);
+        unsafe { drop(Arc::from_raw(raw as *const Mutex<Vec<String>>)) };
     }
 }

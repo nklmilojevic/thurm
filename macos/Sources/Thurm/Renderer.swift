@@ -170,7 +170,7 @@ fragment float4 fs_main(VOut in [[stage_in]],
 
 // MARK: - Shared Metal state
 
-final class MetalContext {
+final class MetalContext: @unchecked Sendable {
     static let shared: MetalContext? = MetalContext()
 
     let device: MTLDevice
@@ -181,13 +181,57 @@ final class MetalContext {
     let coverPipeline: MTLRenderPipelineState
     /// 1×1 transparent texture bound when a slot has nothing to show.
     let emptyTexture: MTLTexture
-    /// The most recently committed frame (all panes share this serial queue).
-    var lastCommitted: MTLCommandBuffer?
+
+    private let commitLock = NSLock()
+    /// The most recently committed in-flight frame (all panes share this serial queue). Released
+    /// automatically when the GPU completes it so idle views do not retain command buffers.
+    private var _lastCommitted: MTLCommandBuffer?
+    private var _commitCount: UInt64 = 0
+
+    var lastCommitted: MTLCommandBuffer? {
+        commitLock.lock()
+        defer { commitLock.unlock() }
+        return _lastCommitted
+    }
+
+    /// Monotonically incremented on every committed frame (used by tests to verify presentation).
+    var commitCount: UInt64 {
+        commitLock.lock()
+        defer { commitLock.unlock() }
+        return _commitCount
+    }
+
+    /// Enqueues and commits `commands` under `commitLock` so Metal queue submission order strictly
+    /// matches `_lastCommitted` order (ensuring non-frame helper blits such as glyph atlas growth
+    /// always execute ahead of subsequent render passes). Pass `countsAsFrame: false` for
+    /// non-presenting helper command buffers so `commitCount` reflects presented frames.
+    func commit(_ commands: MTLCommandBuffer, countsAsFrame: Bool = true) {
+        commands.addCompletedHandler { [weak self] completed in
+            guard let self else { return }
+            self.commitLock.lock()
+            if (self._lastCommitted as AnyObject?) === (completed as AnyObject) {
+                self._lastCommitted = nil
+            }
+            self.commitLock.unlock()
+        }
+        commitLock.lock()
+        commands.enqueue()
+        commands.commit()
+        if countsAsFrame {
+            _commitCount &+= 1
+        }
+        _lastCommitted = commands
+        commitLock.unlock()
+    }
 
     /// Blocks until the GPU finished every committed frame, before the CPU rewrites a texture
-    /// region those frames may still sample (a wiped glyph atlas that got no new texture).
+    /// region those frames may still sample (a wiped glyph atlas that got no new texture) or
+    /// before iOS suspends the process into the background.
     func waitForGPU() {
-        if let cb = lastCommitted, cb.status != .completed, cb.status != .error {
+        commitLock.lock()
+        let cb = _lastCommitted
+        commitLock.unlock()
+        if let cb, cb.status != .completed, cb.status != .error {
             cb.waitUntilCompleted()
         }
     }
@@ -265,7 +309,8 @@ final class GridSnapshot {
         let pane = key.id
         var newInfo = thurm_grid_info()
         var ptr: UnsafePointer<thurm_cell>? = nil
-        guard thurm_grid_lock(client, pane, &newInfo, &ptr) else { return false }
+        let lastGeneration: UInt64 = valid ? info.generation : 0
+        guard thurm_grid_lock_for(client, pane, lastGeneration, &newInfo, &ptr) else { return false }
         defer { thurm_grid_unlock(client, pane) }
         if valid && newInfo.generation == info.generation && newInfo.cols == info.cols && newInfo.rows == info.rows {
             return false
@@ -365,6 +410,18 @@ final class GridSnapshot {
         info = newInfo
         valid = true
         return true
+    }
+
+    /// Clears the cached grid so the next `update` fetches a full snapshot.
+    func reset() {
+        info = thurm_grid_info()
+        cells.removeAll(keepingCapacity: true)
+        rowClusters.removeAll(keepingCapacity: true)
+        links.removeAll(keepingCapacity: true)
+        images.removeAll(keepingCapacity: true)
+        peekCells.removeAll(keepingCapacity: true)
+        peekClusters.removeAll(keepingCapacity: true)
+        valid = false
     }
 
     /// Shows plain text rows, `cols` cells wide, in place of a daemon's grid (tests).
@@ -619,6 +676,8 @@ struct RenderParams {
     /// The macOS layer supplies the base background, including outside a resizing drawable.
     /// Leave the Metal clear transparent there; iOS keeps drawing its background in Metal.
     var backgroundInLayer = false
+    /// Optional cursor shape override (`CursorShapeCode.*`); nil uses the terminal's own shape.
+    var cursorShapeOverride: UInt8? = nil
 }
 
 private struct DrawSegment {
@@ -631,6 +690,39 @@ final class TerminalRenderer {
     let snapshot = GridSnapshot()
     private let colors = ColorAdjuster()
 
+    private struct CachedImage {
+        var serial: UInt64
+        var texture: MTLTexture
+        var origWidth: UInt32
+        var origHeight: UInt32
+        var lastUsed: CFTimeInterval
+    }
+
+    /// An oversized image's texture, filled `nextRow` rows so far, from a `srcWidth`×`srcHeight`
+    /// source first seen at serial `startSerial`. A replacement of the same size carries on in
+    /// the same texture (`mixed`): rows done are kept, so a stream of replacements can't keep
+    /// restarting it and nothing ever shows.
+    private struct PendingDownscale {
+        var startSerial: UInt64
+        var mixed: Bool
+        var srcWidth: UInt32
+        var srcHeight: UInt32
+        var texture: MTLTexture
+        var nextRow: Int
+        var lastUsed: CFTimeInterval
+    }
+
+    private enum ImageLookup {
+        case ready(CachedImage)
+        /// An earlier version, shown while the current one is still being prepared.
+        case stale(CachedImage)
+        case missing
+        /// A texture couldn't be had (allocation failed, or over the memory cap): retried after a
+        /// backoff, showing the earlier version meanwhile if there is one.
+        case retryLater(CachedImage?)
+        case invalid
+    }
+
     private var backgrounds: [QuadInstance] = []
     private var cursorUnder: [QuadInstance] = []
     private var glyphQuads: [QuadInstance] = []
@@ -639,7 +731,11 @@ final class TerminalRenderer {
     private var overlay: [QuadInstance] = []
     /// Uploaded kitty images by id, with the serial of the pixels they hold and when they
     /// were last drawn (textures of images scrolled off stay a moment in case they return).
-    private var imageTextures: [UInt32: (serial: UInt64, texture: MTLTexture, lastUsed: CFTimeInterval)] = [:]
+    private var imageTextures: [UInt32: CachedImage] = [:]
+    /// Oversized images part way through their downscale, by id (see `imageEntry`).
+    private var pendingDownscales: [UInt32: PendingDownscale] = [:]
+    /// Source pixels this draw may still box-filter.
+    private var downsampleBudgetLeft = 0
     private static let imageGrace: CFTimeInterval = 2
     /// Quad buffers reused round robin; `inFlight` keeps the CPU from rewriting one the GPU
     /// may still read.
@@ -649,12 +745,56 @@ final class TerminalRenderer {
     private let inFlight = DispatchSemaphore(value: bufferCount)
     private var allQuads: [QuadInstance] = []
     private var segments: [DrawSegment] = []
-    /// Set when an image was referenced but its pixels were not available yet.
-    private(set) var wantsAnotherFrame = false
+    /// Another frame right away: an image's pixels haven't arrived, or a downscale goes on.
+    private var immediateFrame = false
+    /// When to try again what failed to allocate (a glyph atlas, an image texture); backed off
+    /// so a device short of memory isn't redrawn every frame for it.
+    private(set) var retryAt: CFTimeInterval?
+    private var retryDelay: CFTimeInterval = TerminalRenderer.minRetryDelay
+    static let minRetryDelay: CFTimeInterval = 0.25
+    static let maxRetryDelay: CFTimeInterval = 4
+    /// Whether to draw again now. While a retry waits (`retryAt` not yet due) this is false; a
+    /// view keeps its display link ticking while `retryAt` is set, without drawing.
+    var wantsAnotherFrame: Bool {
+        immediateFrame || retryAt.map { CACurrentMediaTime() >= $0 } == true
+    }
+
+    private func retryLater(_ now: CFTimeInterval) {
+        let at = now + retryDelay
+        retryAt = retryAt.map { min($0, at) } ?? at
+    }
 
     private let searchMatchBg: UInt32 = 0xD7BA5A
     private let searchFocusBg: UInt32 = 0xF0883E
     private let searchFg: UInt32 = 0x1B1B1B
+
+    /// Resets per-pane state (snapshot, cached image textures, scratch quad arrays) so the
+    /// renderer can show another pane without reallocating its `MTLBuffer`s.
+    func reset() {
+        snapshot.reset()
+        imageTextures.removeAll()
+        pendingDownscales.removeAll()
+        immediateFrame = false
+        retryAt = nil
+        retryDelay = Self.minRetryDelay
+        backgrounds.removeAll(keepingCapacity: true)
+        cursorUnder.removeAll(keepingCapacity: true)
+        glyphQuads.removeAll(keepingCapacity: true)
+        decorations.removeAll(keepingCapacity: true)
+        cursorOver.removeAll(keepingCapacity: true)
+        overlay.removeAll(keepingCapacity: true)
+        allQuads.removeAll(keepingCapacity: true)
+        segments.removeAll(keepingCapacity: true)
+    }
+
+    /// Drops all uploaded Kitty image textures immediately (e.g. under iOS memory pressure).
+    func purgeImageTextures() {
+        imageTextures.removeAll(keepingCapacity: false)
+        pendingDownscales.removeAll(keepingCapacity: false)
+        // The last frame's segments hold the textures they drew; drop them too so an idle pane
+        // releases its images now rather than at the next draw.
+        segments.removeAll(keepingCapacity: true)
+    }
 
     /// The base surface after the same dim and bell covers used by `buildQuads`.
     func surfaceColor(params p: RenderParams) -> SIMD4<Float> {
@@ -680,12 +820,24 @@ final class TerminalRenderer {
     func draw(layer: CAMetalLayer, params p: RenderParams) -> Bool {
         guard let ctx = MetalContext.shared else { return false }
         guard p.viewportWidth > 0, p.viewportHeight > 0 else { return false }
-        wantsAnotherFrame = false
+        immediateFrame = false
+        let retrying = retryAt != nil
+        retryAt = nil
+        defer {
+            // Failing again after a retry backs off further; a draw without failures resets.
+            if retryAt == nil {
+                retryDelay = Self.minRetryDelay
+            } else if retrying {
+                retryDelay = min(retryDelay * 2, Self.maxRetryDelay)
+            }
+        }
+        // Shared by both `buildQuads` passes below: the bound is per draw.
+        downsampleBudgetLeft = Self.downsampleBudget
         // Rasterizing a glyph can wipe a full atlas; quads built before that point to stale
         // texels, so build again against the fresh atlas.
-        let epochs = (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color.epoch)
+        let epochs = (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color?.epoch ?? 0)
         buildQuads(p, device: ctx.device)
-        if epochs != (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color.epoch) {
+        if epochs != (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color?.epoch ?? 0) {
             buildQuads(p, device: ctx.device)
         }
 
@@ -729,7 +881,7 @@ final class TerminalRenderer {
         var displayP3: UInt32 = p.colors.displayP3 ? 1 : 0
         encoder.setFragmentBytes(&displayP3, length: MemoryLayout<UInt32>.stride, index: 0)
         encoder.setFragmentTexture(p.shaper.glyphs.gray.texture, index: 0)
-        encoder.setFragmentTexture(p.shaper.glyphs.color.texture, index: 1)
+        encoder.setFragmentTexture(p.shaper.glyphs.color?.texture ?? ctx.emptyTexture, index: 1)
         encoder.setFragmentTexture(ctx.emptyTexture, index: 2)
 
         if !allQuads.isEmpty {
@@ -764,14 +916,13 @@ final class TerminalRenderer {
             // AppKit's layout and backdrop updates must land with this image. Apple's
             // transaction presentation contract requires presenting the drawable directly
             // after scheduling the commands, rather than via MTLCommandBuffer.present.
-            commands.commit()
+            ctx.commit(commands)
             commands.waitUntilScheduled()
             drawable.present()
         } else {
             commands.present(drawable)
-            commands.commit()
+            ctx.commit(commands)
         }
-        ctx.lastCommitted = commands
         return true
     }
 
@@ -872,12 +1023,16 @@ final class TerminalRenderer {
         // Cursor geometry.
         let cursorRow = Int(info.cursor_row)
         let cursorCol = Int(info.cursor_col)
+        // The core reports Hidden for a hidden cursor and for one outside the viewport (with
+        // its row clamped): the user's shape setting restyles a shown cursor, never shows one.
+        var shape = info.cursor_shape == CursorShapeCode.hidden
+            ? CursorShapeCode.hidden
+            : (p.cursorShapeOverride ?? info.cursor_shape)
         let cursorShown = (info.modes & TermMode.showCursor) != 0
-            && info.cursor_shape != CursorShapeCode.hidden
+            && shape != CursorShapeCode.hidden
             && info.display_offset == 0
             && cursorRow < rows && cursorCol < cols
             && (p.cursorOn || !p.focused)
-        var shape = info.cursor_shape
         if !p.focused { shape = CursorShapeCode.hollowBlock }
         let blockCursor = cursorShown && shape == CursorShapeCode.block
 
@@ -921,9 +1076,16 @@ final class TerminalRenderer {
                     if blockCursor && r == cursorRow && g.col == cursorCol {
                         fg = (info.cursor_text_color & kNoColor) != 0 ? info.background : info.cursor_text_color
                     }
-                    let entry = shaper.glyphs.entry(for: GlyphKey(font: g.font, glyph: g.glyph, span: g.span),
-                                                    font: shaper.font(g.font), isColor: g.color,
-                                                    cell: CellBox(width: cw, height: ch, baseline: shaper.baseline))
+                    guard let entry = shaper.glyphs.lookup(
+                        for: GlyphKey(font: g.font, glyph: g.glyph, span: g.span),
+                        font: shaper.font(g.font), isColor: g.color,
+                        cell: CellBox(width: cw, height: ch, baseline: shaper.baseline))
+                    else {
+                        // Only an allocation failure is worth another try; empty glyphs stay
+                        // empty.
+                        retryLater(CACurrentMediaTime())
+                        continue
+                    }
                     if entry.isEmpty { continue }
                     let gx = (padX + Float(g.col) * fcw + g.x.rounded() + entry.left).rounded()
                     let gy = (baselineY - g.y.rounded() - entry.top).rounded()
@@ -1046,27 +1208,52 @@ final class TerminalRenderer {
         defer {
             // Evict textures of images not shown for a while.
             imageTextures = imageTextures.filter { now - $0.value.lastUsed < Self.imageGrace }
+            pendingDownscales = pendingDownscales.filter { now - $0.value.lastUsed < Self.imageGrace }
         }
         guard snapshot.valid, !snapshot.images.isEmpty else { return (below, above) }
         let cw = Float(p.shaper.cellWidth)
         let ch = Float(p.shaper.cellHeight)
+        // Everything placed this draw is in use before any texture is admitted, so making room
+        // for one never evicts another shown in the same frame.
         for placement in snapshot.images {
-            guard let tex = texture(for: placement.image, pane: p.pane, device: device, now: now) else {
-                wantsAnotherFrame = true
+            imageTextures[placement.image]?.lastUsed = now
+            pendingDownscales[placement.image]?.lastUsed = now
+        }
+        for placement in snapshot.images {
+            let cached: CachedImage
+            switch imageEntry(for: placement.image, pane: p.pane, device: device, now: now) {
+            case .ready(let entry):
+                cached = entry
+            case .stale(let entry):
+                cached = entry
+                immediateFrame = true
+            case .missing:
+                immediateFrame = true
+                continue
+            case .retryLater(let earlier):
+                retryLater(now)
+                guard let earlier else { continue }
+                cached = earlier
+            case .invalid:
                 continue
             }
-            let srcW = placement.src_w > 0 ? Float(placement.src_w) : Float(tex.width)
-            let srcH = placement.src_h > 0 ? Float(placement.src_h) : Float(tex.height)
+            let tex = cached.texture
+            let origW = Float(max(1, cached.origWidth))
+            let origH = Float(max(1, cached.origHeight))
+            let scaleX = Float(tex.width) / origW
+            let scaleY = Float(tex.height) / origH
+            let srcW = placement.src_w > 0 ? Float(placement.src_w) : origW
+            let srcH = placement.src_h > 0 ? Float(placement.src_h) : origH
             let dstW = placement.dst_w > 0 ? Float(placement.dst_w)
                 : placement.cols > 0 ? Float(placement.cols) * cw : srcW
             let dstH = placement.dst_h > 0 ? Float(placement.dst_h)
                 : placement.rows > 0 ? Float(placement.rows) * ch : srcH
             let x = Float(p.padX) + Float(placement.col) * cw + Float(placement.x_offset)
             let y = Float(p.padY) + Float(placement.row) * ch + Float(placement.y_offset) + p.scrollY
-            let u0 = Float(placement.src_x)
-            let v0 = Float(placement.src_y)
+            let u0 = Float(placement.src_x) * scaleX
+            let v0 = Float(placement.src_y) * scaleY
             let quad = QuadInstance(rect: SIMD4<Float>(x, y, dstW, dstH),
-                                    uv: SIMD4<Float>(u0, v0, u0 + srcW, v0 + srcH),
+                                    uv: SIMD4<Float>(u0, v0, u0 + srcW * scaleX, v0 + srcH * scaleY),
                                     color: SIMD4<Float>(1, 1, 1, 1), kind: QuadKind.image)
             if placement.z < 0 {
                 below.append((quad, tex))
@@ -1077,33 +1264,249 @@ final class TerminalRenderer {
         return (below, above)
     }
 
-    private func texture(for image: UInt32, pane key: PaneKey, device: MTLDevice, now: CFTimeInterval) -> MTLTexture? {
-        guard let client = Core.shared.client(for: key.host) else { return nil }
+    private func imageEntry(for image: UInt32, pane key: PaneKey, device: MTLDevice, now: CFTimeInterval) -> ImageLookup {
+        guard let client = Core.shared.client(for: key.host) else { return .missing }
         let pane = key.id
         // The serial changes when the image is replaced under the same id.
         let serial = thurm_image_serial(client, pane, image)
-        if let cached = imageTextures[image], cached.serial == serial {
-            imageTextures[image]?.lastUsed = now
-            return cached.texture
+        if var cached = imageTextures[image], cached.serial == serial {
+            cached.lastUsed = now
+            imageTextures[image] = cached
+            return .ready(cached)
         }
         var width: UInt32 = 0
         var height: UInt32 = 0
         var pixels: UnsafePointer<UInt8>? = nil
-        guard thurm_image_lock(client, pane, image, &width, &height, &pixels) else { return nil }
+        guard thurm_image_lock(client, pane, image, &width, &height, &pixels) else { return .missing }
         defer { thurm_image_unlock(client, pane, image) }
-        guard let src = pixels, width > 0, height > 0, width <= 16384, height <= 16384 else { return nil }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: Int(width),
-                                                            height: Int(height), mipmapped: false)
-        desc.usage = [.shaderRead]
-        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
-        tex.replace(region: MTLRegionMake2D(0, 0, Int(width), Int(height)), mipmapLevel: 0,
-                    withBytes: src, bytesPerRow: Int(width) * 4)
-        imageTextures[image] = (serial, tex, now)
-        return tex
+        guard let src = pixels, width > 0, height > 0, width <= 16384, height <= 16384 else { return .invalid }
+
+        let maxTexDim = UInt32(Self.maxImageTextureDim)
+
+        let tex: MTLTexture
+        if width <= maxTexDim && height <= maxTexDim {
+            // A downscale of an earlier, oversized version is moot now.
+            pendingDownscales[image] = nil
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: Int(width),
+                                                                height: Int(height), mipmapped: false)
+            desc.usage = [.shaderRead]
+            guard let made = device.makeTexture(descriptor: desc) else {
+                return .retryLater(imageTextures[image])
+            }
+            made.replace(region: MTLRegionMake2D(0, 0, Int(width), Int(height)), mipmapLevel: 0,
+                         withBytes: src, bytesPerRow: Int(width) * 4)
+            tex = made
+        } else {
+            // Downscale oversized Kitty images (iOS) to fit the GPU budget. The box filter reads
+            // every source pixel, so it runs a slice at a time: each draw spends at most
+            // `downsampleBudget` source pixels over all images, and the image is skipped (another
+            // frame requested) until its texture is complete. Rows go up in bands through one
+            // small buffer, never a destination-sized scratch image.
+            let ratio = min(Double(maxTexDim) / Double(width), Double(maxTexDim) / Double(height))
+            let dstW = max(1, Int((Double(width) * ratio).rounded(.down)))
+            let dstH = max(1, Int((Double(height) * ratio).rounded(.down)))
+            // An earlier version of this image, shown until this one is ready.
+            let stale: CachedImage? = imageTextures[image].map {
+                var s = $0
+                s.lastUsed = now
+                imageTextures[image] = s
+                return s
+            }
+            let waiting: ImageLookup = stale.map { .stale($0) } ?? .missing
+            var job: PendingDownscale
+            if var p = pendingDownscales[image], p.srcWidth == width, p.srcHeight == height {
+                if serial != p.startSerial { p.mixed = true }
+                job = p
+            } else {
+                pendingDownscales[image] = nil
+                // No texture for a job this draw can't start on: the next draw makes it.
+                guard downsampleBudgetLeft > 0 else { return waiting }
+                // Over the texture memory cap even after evicting what this draw doesn't show:
+                // tried again after a backoff (images shown less recently age out meanwhile).
+                guard admitImageTexture(bytes: dstW * dstH * 4, now: now) else {
+                    return .retryLater(stale)
+                }
+                let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: dstW,
+                                                                    height: dstH, mipmapped: false)
+                desc.usage = [.shaderRead]
+                guard let made = device.makeTexture(descriptor: desc) else { return .retryLater(stale) }
+                job = PendingDownscale(startSerial: serial, mixed: false, srcWidth: width, srcHeight: height,
+                                       texture: made, nextRow: 0, lastUsed: now)
+            }
+            job.lastUsed = now
+            let horizontal = Self.horizontalVisits(srcWidth: Int(width), dstWidth: dstW)
+            let bandRows = max(1, min(dstH, TerminalRenderer.downsampleBandBytes / (dstW * 4)))
+            var band: [UInt8] = []
+            while job.nextRow < dstH {
+                let (rows, cost) = Self.rowsWithin(budget: downsampleBudgetLeft, from: job.nextRow,
+                                                   maxRows: min(bandRows, dstH - job.nextRow),
+                                                   srcHeight: Int(height), dstHeight: dstH,
+                                                   horizontalVisits: horizontal)
+                guard rows > 0 else { break }
+                if band.isEmpty { band = [UInt8](repeating: 0, count: bandRows * dstW * 4) }
+                let y0 = job.nextRow
+                band.withUnsafeMutableBufferPointer { dst in
+                    guard let dstBase = dst.baseAddress else { return }
+                    TerminalRenderer.downsample(src, width: Int(width), height: Int(height),
+                                                toWidth: dstW, height: dstH, rows: y0..<(y0 + rows),
+                                                into: dstBase)
+                    job.texture.replace(region: MTLRegionMake2D(0, y0, dstW, rows), mipmapLevel: 0,
+                                        withBytes: dstBase, bytesPerRow: dstW * 4)
+                }
+                job.nextRow += rows
+                downsampleBudgetLeft -= cost
+            }
+            guard job.nextRow >= dstH else {
+                pendingDownscales[image] = job
+                return waiting
+            }
+            pendingDownscales[image] = nil
+            if job.mixed {
+                // Rows from more than one version: shown now, but filed under the version it
+                // started from, so the current one is prepared next (with this one showing).
+                let entry = CachedImage(serial: job.startSerial, texture: job.texture, origWidth: width,
+                                        origHeight: height, lastUsed: now)
+                imageTextures[image] = entry
+                return .ready(entry)
+            }
+            tex = job.texture
+        }
+        let entry = CachedImage(serial: serial, texture: tex, origWidth: width, origHeight: height, lastUsed: now)
+        imageTextures[image] = entry
+        return .ready(entry)
     }
 
     /// Forget cached image textures (e.g. after reconnecting).
     func resetImages() {
         imageTextures.removeAll()
+        pendingDownscales.removeAll()
+    }
+
+    /// Makes room for a new image texture of `bytes` under `imageTextureBudget`, evicting the
+    /// least recently drawn textures this draw doesn't use. False when it can't fit.
+    private func admitImageTexture(bytes: Int, now: CFTimeInterval) -> Bool {
+        // Keys: image id × 2, + 1 for a downscale in progress.
+        var resident: [(key: Int, bytes: Int, lastUsed: Double)] = []
+        for (id, c) in imageTextures {
+            resident.append((Int(id) * 2, c.texture.width * c.texture.height * 4, c.lastUsed))
+        }
+        for (id, j) in pendingDownscales {
+            resident.append((Int(id) * 2 + 1, j.texture.width * j.texture.height * 4, j.lastUsed))
+        }
+        guard let evict = Self.evictions(adding: bytes, resident: resident,
+                                         cap: Self.imageTextureBudget, now: now) else { return false }
+        for key in evict {
+            let id = UInt32(key / 2)
+            if key % 2 == 0 { imageTextures[id] = nil } else { pendingDownscales[id] = nil }
+        }
+        return true
+    }
+
+    /// The largest image texture side; bigger images are downscaled to fit.
+    #if os(iOS)
+    static let maxImageTextureDim = 4096
+    #else
+    static let maxImageTextureDim = 16384
+    #endif
+    /// The most texture memory images may hold when a downscale needs a new texture: room for
+    /// two of the largest (an image's earlier version and its replacement).
+    static let imageTextureBudget = 2 * maxImageTextureDim * maxImageTextureDim * 4
+
+    /// Which `resident` textures to evict so `bytes` more fit under `cap`: the least recently
+    /// drawn first, never one drawn this draw (`lastUsed == now`). Nil when it can't fit.
+    static func evictions(adding bytes: Int, resident: [(key: Int, bytes: Int, lastUsed: Double)],
+                          cap: Int, now: Double) -> [Int]? {
+        var total = resident.reduce(bytes) { $0 + $1.bytes }
+        var out: [Int] = []
+        for r in resident.filter({ $0.lastUsed < now }).sorted(by: { $0.lastUsed < $1.lastUsed }) {
+            if total <= cap { break }
+            total -= r.bytes
+            out.append(r.key)
+        }
+        return total <= cap ? out : nil
+    }
+
+    /// Source pixels one destination row reads along x: each output pixel's footprint, edge
+    /// pixels it shares with a neighbour counted for both (they are read twice).
+    static func horizontalVisits(srcWidth srcW: Int, dstWidth dstW: Int) -> Int {
+        var n = 0
+        for x in 0..<dstW {
+            let sx0 = x * srcW / dstW
+            let sx1 = min(srcW, ((x + 1) * srcW + dstW - 1) / dstW)
+            n += sx1 - sx0
+        }
+        return n
+    }
+
+    /// How many destination rows from `y0` (at most `maxRows`) `downsample` can do within
+    /// `budget` source-pixel reads, and what they cost: a row reads `horizontalVisits` times its
+    /// footprint's source rows. Stops before a row would exceed the budget. A row costs at most
+    /// (srcW + dstW) × (srcH / dstH + 2), well under `downsampleBudget` for any image up to
+    /// 16384² downscaled to 4096², so a fresh draw always makes progress.
+    static func rowsWithin(budget: Int, from y0: Int, maxRows: Int, srcHeight srcH: Int,
+                           dstHeight dstH: Int, horizontalVisits: Int) -> (rows: Int, cost: Int) {
+        var rows = 0, cost = 0
+        while rows < maxRows {
+            let y = y0 + rows
+            let sy0 = y * srcH / dstH
+            let sy1 = min(srcH, ((y + 1) * srcH + dstH - 1) / dstH)
+            let row = horizontalVisits * (sy1 - sy0)
+            if cost + row > budget { break }
+            cost += row
+            rows += 1
+        }
+        return (rows, cost)
+    }
+
+    /// The most scratch memory an oversized image's downscale holds at once.
+    static let downsampleBandBytes = 1 << 20
+    /// The most source pixels one draw box-filters, over all images (a few ms on a phone); a
+    /// larger image finishes over the next frames.
+    static let downsampleBudget = 2_000_000
+
+    /// Box-filters straight (non-premultiplied) RGBA `src` (`width`×`height`) down to
+    /// `toWidth`×`toHeight`, writing destination `rows` tightly packed into `dst`. Each output
+    /// pixel averages the source area it covers, partly covered edge pixels weighted by their
+    /// overlap, and colour weighted by alpha so transparent pixels don't darken it. That keeps
+    /// detail (fine stripes, thin lines) a point sample would drop, at any ratio, 3:2 included.
+    static func downsample(_ src: UnsafePointer<UInt8>, width srcW: Int, height srcH: Int,
+                           toWidth dstW: Int, height dstH: Int, rows: Range<Int>,
+                           into dst: UnsafeMutablePointer<UInt8>) {
+        // Exact integer geometry: along x, source pixel `sx` spans [sx·dstW, (sx+1)·dstW) and
+        // output pixel `x` spans [x·srcW, (x+1)·srcW); likewise along y. Overlaps are the weights,
+        // and an output pixel's whole footprint is srcW·srcH.
+        let area = UInt64(srcW) * UInt64(srcH)
+        for (i, y) in rows.enumerated() {
+            let fy0 = y * srcH, fy1 = (y + 1) * srcH
+            let sy0 = fy0 / dstH, sy1 = min(srcH, (fy1 + dstH - 1) / dstH)
+            let out = dst + i * dstW * 4
+            for x in 0..<dstW {
+                let fx0 = x * srcW, fx1 = (x + 1) * srcW
+                let sx0 = fx0 / dstW, sx1 = min(srcW, (fx1 + dstW - 1) / dstW)
+                var r: UInt64 = 0, g: UInt64 = 0, b: UInt64 = 0, a: UInt64 = 0
+                for sy in sy0..<sy1 {
+                    let wy = UInt64(min(fy1, (sy + 1) * dstH) - max(fy0, sy * dstH))
+                    var s = src + (sy * srcW + sx0) * 4
+                    for sx in sx0..<sx1 {
+                        let wx = UInt64(min(fx1, (sx + 1) * dstW) - max(fx0, sx * dstW))
+                        let wa = wx * wy * UInt64(s[3])
+                        r += UInt64(s[0]) * wa
+                        g += UInt64(s[1]) * wa
+                        b += UInt64(s[2]) * wa
+                        a += wa
+                        s += 4
+                    }
+                }
+                let d = out + x * 4
+                if a == 0 {
+                    d[0] = 0; d[1] = 0; d[2] = 0; d[3] = 0
+                } else {
+                    d[0] = UInt8((r + a / 2) / a)
+                    d[1] = UInt8((g + a / 2) / a)
+                    d[2] = UInt8((b + a / 2) / a)
+                    d[3] = UInt8((a + area / 2) / area)
+                }
+            }
+        }
     }
 }

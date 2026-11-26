@@ -2570,6 +2570,7 @@ dependencies = [
  "thurm-config",
  "thurm-mosh",
  "thurm-proto",
+ "thurm-remote",
  "thurm-ssh",
  "thurm-term",
  "tokio",
@@ -2683,6 +2684,7 @@ name = "thurm-tailnet-client"
 version = "0.28.0"
 dependencies = [
  "futures-util",
+ "libc",
  "log",
  "rcgen",
  "rustls",

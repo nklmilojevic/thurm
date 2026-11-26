@@ -19,4 +19,5 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
 thurm-client.workspace = true
+thurm-remote.workspace = true
 thurm-ssh = { workspace = true, features = ["testing"] }

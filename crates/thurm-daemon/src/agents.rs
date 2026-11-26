@@ -119,6 +119,8 @@ struct HookState {
     pgrp: Option<u32>,
     /// The permission prompt showing (see [`AgentTracker::permission_prompt`]).
     permission: Option<u64>,
+    /// Exact, un-summarized permission request text from the hook, when it carried real detail.
+    permission_request: Option<String>,
 }
 
 impl AgentTracker {
@@ -146,6 +148,7 @@ impl AgentTracker {
         // notification names is not certain to be showing as it was.
         if let Some(h) = &mut self.hook {
             h.permission = None;
+            h.permission_request = None;
         }
         self.ai.typed = true;
         self.acknowledge();
@@ -182,6 +185,31 @@ impl AgentTracker {
             .is_some_and(|s| s.hooked && s.kind == h.kind && s.status == AgentStatus::NeedsInput);
         h.permission
             .filter(|_| shown && h.status == AgentStatus::NeedsInput)
+    }
+
+    /// Exact un-summarized permission request text for the active untouched permission prompt,
+    /// when the agent hook provided real tool/command detail (never generic wording or AI text).
+    pub fn permission_request(&self) -> Option<String> {
+        self.permission_prompt()?;
+        self.hook.as_ref()?.permission_request.clone()
+    }
+
+    /// Snapshot of the pane's active untouched permission prompt, for
+    /// [`thurm_proto::Request::GetPendingPrompt`].
+    pub fn pending_prompt(&self, pane: thurm_proto::PaneId) -> Option<thurm_proto::PendingPrompt> {
+        let prompt = self.permission_prompt()?;
+        let state = self.current.as_ref()?;
+        let body = state
+            .message
+            .clone()
+            .unwrap_or_else(|| "is waiting for your input".into());
+        Some(thurm_proto::PendingPrompt {
+            pane,
+            prompt,
+            title: state.name.clone(),
+            body,
+            request: self.permission_request(),
+        })
     }
 
     /// Answer permission prompt `prompt` if it still shows: the bytes to type, Enter for the
@@ -343,10 +371,12 @@ impl AgentTracker {
                 answered: false,
                 pgrp: None,
                 permission: None,
+                permission_request: None,
             }),
         };
         h.answered = false;
         h.permission = None;
+        h.permission_request = None;
         if event != "stop" {
             self.stop_signal = None;
         }
@@ -400,6 +430,7 @@ impl AgentTracker {
             }
             "permission-prompt" => {
                 h.status = AgentStatus::NeedsInput;
+                h.permission_request = verbatim_permission_request(message.as_deref());
                 h.message = message;
                 h.permission = Some(next_prompt_id());
             }
@@ -873,6 +904,30 @@ pub fn tail(screen: &str, n: usize) -> String {
     let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+/// Returns the exact, un-summarized permission request text from an agent hook when `message`
+/// names the tool and what it would do (`Bash: rm -rf /tmp/foo`, optionally after Claude's
+/// `Claude needs your permission to use `), or `None` otherwise. The app offers Allow for this
+/// text, so anything else (generic wording from any agent, in any phrasing) is not a request.
+/// Never pass AI-paraphrased text here.
+pub fn verbatim_permission_request(message: Option<&str>) -> Option<String> {
+    let trimmed = message?.trim();
+    const PREFIX: &str = "claude needs your permission to use ";
+    let body = if trimmed.len() >= PREFIX.len()
+        && trimmed.is_char_boundary(PREFIX.len())
+        && trimmed[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+    {
+        &trimmed[PREFIX.len()..]
+    } else {
+        trimmed
+    };
+    let (tool, detail) = body.split_once(':')?;
+    let tool_ok = !tool.is_empty()
+        && tool.len() <= 64
+        && tool.starts_with(|c: char| c.is_ascii_alphabetic())
+        && tool.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    (tool_ok && !detail.trim().is_empty()).then(|| trimmed.to_owned())
 }
 
 #[cfg(test)]
@@ -2230,5 +2285,92 @@ mod tests {
     #[test]
     fn tail_lines() {
         assert_eq!(tail("a\n\nb\nc\n\n", 2), "b\nc");
+    }
+
+    #[test]
+    fn verbatim_permission_request_filters_generic_text() {
+        assert_eq!(
+            verbatim_permission_request(Some("  Bash: rm -rf /tmp/foo  ")),
+            Some("Bash: rm -rf /tmp/foo".into())
+        );
+        assert_eq!(
+            verbatim_permission_request(Some("Claude needs your permission to use Bash: git push")),
+            Some("Claude needs your permission to use Bash: git push".into())
+        );
+        assert_eq!(
+            verbatim_permission_request(Some("mcp__github__create_issue: {\"title\": \"x\"}")),
+            Some("mcp__github__create_issue: {\"title\": \"x\"}".into())
+        );
+        for generic in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("is waiting for your input"),
+            Some("needs your attention"),
+            Some("asks for permission"),
+            Some("Claude needs your permission"),
+            Some("Claude needs your permission to use Bash"),
+            Some("Claude needs your permission to use Edit."),
+            // Generic wording not on any list: not a request either.
+            Some("Codex needs your approval"),
+            Some("Claude is waiting for your input"),
+            Some("Bash:"),
+            Some("Bash:   "),
+        ] {
+            assert_eq!(
+                verbatim_permission_request(generic),
+                None,
+                "unexpectedly accepted generic text: {generic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_prompt_tracks_verbatim_request_and_ignores_ai_detail() {
+        let mut t = AgentTracker::default();
+        t.saw_foreground(Some(1));
+        t.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "permission-prompt",
+            Some("sess-1".into()),
+            Some("Bash: cargo test".into()),
+        );
+        t.refresh();
+        let p = t.pending_prompt(7).expect("active prompt");
+        assert_eq!(p.pane, 7);
+        assert_eq!(p.title, "Claude Code");
+        assert_eq!(p.request.as_deref(), Some("Bash: cargo test"));
+
+        // AI detail updates display body only, never replaces the verbatim request.
+        let ep = t.episode();
+        assert!(t.set_ai_detail(ep, "Wants to run tests".into()));
+        t.refresh();
+        let p2 = t.pending_prompt(7).expect("still active");
+        assert_eq!(p2.body, "Wants to run tests");
+        assert_eq!(p2.request.as_deref(), Some("Bash: cargo test"));
+
+        // Generic hook wording yields request = None (never falls back to body or AI text).
+        t.apply_hook(
+            Some(1),
+            "claude",
+            "Claude Code",
+            "permission-prompt",
+            Some("sess-1".into()),
+            Some("Claude needs your permission to use Bash".into()),
+        );
+        t.refresh();
+        let ep2 = t.episode();
+        assert!(t.set_ai_detail(ep2, "Run a shell command".into()));
+        t.refresh();
+        let p3 = t.pending_prompt(7).expect("generic prompt");
+        assert_eq!(p3.body, "Run a shell command");
+        assert_eq!(p3.request, None);
+
+        // Answering clears pending_prompt immediately.
+        assert!(t.answer_permission(p3.prompt, true).is_some());
+        t.refresh();
+        assert!(t.pending_prompt(7).is_none());
     }
 }

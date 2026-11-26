@@ -1177,6 +1177,9 @@ impl Daemon {
             Event::Bell { pane } => self.emit("bell", None, json!({ "id": pane })),
             Event::Notify {
                 pane, title, body, ..
+            }
+            | Event::NotifyPrompt {
+                pane, title, body, ..
             } => self.emit(
                 "notification",
                 None,

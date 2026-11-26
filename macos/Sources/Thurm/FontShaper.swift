@@ -77,6 +77,22 @@ final class FontShaper {
         instances.removeAll()
     }
 
+    /// Drops shaped-row and box-drawing caches across all shared shapers (e.g. under iOS memory
+    /// pressure) without reallocating the live glyph atlases.
+    static func purgeRowCaches() {
+        for shaper in instances.values {
+            shaper.purgeCaches()
+        }
+    }
+
+    /// Drops this shaper's shaped-row and box-drawing caches.
+    func purgeCaches() {
+        rowCache.removeAll(keepingCapacity: false)
+        oldRowCache.removeAll(keepingCapacity: false)
+        rowCacheBytes = 0
+        boxCache.removeAll(keepingCapacity: false)
+    }
+
     /// Family of the bundled icon font (Resources/fonts/SymbolsNerdFontMono-Regular.ttf).
     static let symbolsFamily = "Symbols Nerd Font Mono"
 

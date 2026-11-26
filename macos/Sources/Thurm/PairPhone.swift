@@ -149,10 +149,15 @@ enum PhonePairing {
             .map(\.element)
     }
 
-    /// Whether there is a code to show: the phone needs this Mac's ssh address and host keys, or
-    /// its Tailscale address, which needs neither (as `PairingPayload` checks in the iOS app).
-    static func canPair(host: String, hostKeys: [String], tailnet: String?, plain: [String] = []) -> Bool {
-        (!host.isEmpty && !hostKeys.isEmpty) || !(tailnet ?? "").isEmpty || !plain.isEmpty
+    /// Whether there is a code to show: the phone needs this Mac's ssh address (with a valid port)
+    /// and host keys, or its Tailscale address, which needs neither (as `PairingPayload` checks in
+    /// the iOS app).
+    static func canPair(host: String, port: Int = 22, hostKeys: [String], tailnet: String?,
+                        plain: [String] = []) -> Bool {
+        let sshReady = !host.trimmingCharacters(in: .whitespaces).isEmpty
+            && (1...65535).contains(port)
+            && !hostKeys.isEmpty
+        return sshReady || !(tailnet ?? "").isEmpty || !plain.isEmpty
     }
 
     /// What the QR code carries (see `PairingPayload` in the iOS app). Remote hosts not checked
@@ -163,8 +168,12 @@ enum PhonePairing {
     static func payload(name: String, host: String, port: Int, user: String, hostKeys: [String],
                         relay: String?, code: String?, remotes: [RemoteHost] = [], tailnet: String? = nil,
                         plain: [String] = []) -> String {
-        var d: [String: Any] = ["v": 1, "name": name, "host": host, "port": port, "user": user,
-                                "host_keys": hostKeys]
+        let trimmedHost = host.trimmingCharacters(in: .whitespaces)
+        let validPort = (1...65535).contains(port)
+        let validSSH = !trimmedHost.isEmpty && validPort
+        var d: [String: Any] = ["v": 1, "name": name, "host": trimmedHost,
+                                "port": validPort ? port : 22, "user": user,
+                                "host_keys": validSSH ? hostKeys : []]
         if let tailnet, !tailnet.isEmpty { d["tailnet"] = ["url": tailnet] }
         if !plain.isEmpty { d["tailnet_plain"] = plain }
         if let relay, !relay.isEmpty { d["relay"] = relay }
@@ -176,6 +185,20 @@ enum PhonePairing {
             .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
         return "thurm://pair?d=" + b64
+    }
+
+    /// Valid device name characters matching `thurm-remote`'s `validate_device_name`:
+    /// 1–128 ASCII letters, digits, `.`, `_`, or `-`.
+    /// One word of 1–128 bytes, without control characters, quotes, backslashes, `$` or
+    /// backticks, as the remote side (`thurm_remote::pairing::validate_device_name`) has it. Today's app names itself in
+    /// `[A-Za-z0-9._-]`; older builds used the phone's name with spaces as dashes, and still pair.
+    static func isValidDeviceName(_ device: String) -> Bool {
+        guard !device.isEmpty, device.utf8.count <= 128 else { return false }
+        return device.unicodeScalars.allSatisfy { s in
+            !CharacterSet.whitespacesAndNewlines.contains(s)
+                && !CharacterSet.controlCharacters.contains(s)
+                && !"'\"\\$`".unicodeScalars.contains(s)
+        }
     }
 
     /// A device key line from the iOS app, checked: only its P-256 keys with Thurm's comment, on
@@ -190,7 +213,9 @@ enum PhonePairing {
               let blob = Data(base64Encoded: String(parts[1])), isP256PublicKey(blob),
               parts[2].hasPrefix(commentPrefix), parts[2].count > commentPrefix.count
         else { return nil }
-        return ("\(parts[0]) \(parts[1])", String(parts[2].dropFirst(commentPrefix.count)))
+        let device = String(parts[2].dropFirst(commentPrefix.count))
+        guard isValidDeviceName(device) else { return nil }
+        return ("\(parts[0]) \(parts[1])", device)
     }
 
     /// An ssh `ecdsa-sha2-nistp256` public key blob: the algorithm, the curve and a point on it.
@@ -220,6 +245,142 @@ enum PhonePairing {
         var id: String { line }
     }
 
+    /// The outcome of a daemon cleanup step: done, or the reason it failed (shown to the user).
+    enum CleanupResult {
+        case success
+        case failure(String)
+    }
+
+    /// Phone names whose key on this Mac was (or may have been) replaced but whose push cleanup
+    /// (`RevokePhone`) has not been confirmed. Written durably before the key file changes,
+    /// removed once the daemon revoked. Cleanup is name-wide and harmless to repeat, so a name
+    /// left for an edit that never happened costs nothing but a reconnect.
+    final class PendingPushRevokesStore {
+        static let shared = PendingPushRevokesStore(
+            file: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config/thurm/pending-phone-revokes.json"))
+
+        private let file: URL
+        private let lock = NSLock()
+
+        init(file: URL) { self.file = file }
+
+        var path: String { file.path }
+
+        /// Only a missing record is empty. One that can't be read or decoded is an error: it may
+        /// hold other phones' cleanups, so it is neither guessed at nor written over.
+        private func load() throws -> Set<String> {
+            guard FileManager.default.fileExists(atPath: file.path) else { return [] }
+            return Set(try JSONDecoder().decode([String].self, from: Data(contentsOf: file)))
+        }
+
+        private func save(_ names: Set<String>) throws {
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            // `.atomic` writes a temporary file and renames it over; the rename is what a crash
+            // leaves either way.
+            try JSONEncoder().encode(names.sorted()).write(to: file, options: [.atomic])
+        }
+
+        func contains(_ device: String) throws -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return try load().contains(device)
+        }
+
+        func insert(_ device: String) throws {
+            lock.lock()
+            defer { lock.unlock() }
+            var names = try load()
+            if names.insert(device).inserted { try save(names) }
+        }
+
+        func remove(_ device: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard var names = try? load(), names.remove(device) != nil else { return }
+            try? save(names)
+        }
+    }
+
+    enum LocalKeyAddResult: Equatable {
+        case added(replaced: Bool)
+        case failed(String)
+    }
+
+    /// Whether `file` currently holds a different Thurm device key under `device`.
+    static func willReplaceDifferentKey(key: String, device: String, in file: URL = authorizedKeys) throws -> Bool {
+        let existingLines = try lines(of: file)
+        return existingLines.contains { line in
+            guard let existing = parseDeviceLine(line[...]) else { return false }
+            return existing.device == device && existing.key != key
+        }
+    }
+
+    /// Adds `key` for `device` to `file`. When that replaces another key under the name, this
+    /// Mac's daemon then revokes the name (`RevokePhone`): the phone that held the old key loses
+    /// its push registration and its open connections (the others reconnect and register again).
+    /// - A new name (or the same key again) needs no daemon, unless an earlier attempt's cleanup
+    ///   is still pending, which this finishes.
+    /// - Replacing a key needs the daemon connected and changes nothing when it isn't.
+    /// - The pending cleanup is written before the key file changes, so a quit or crash before
+    ///   the daemon confirmed is cleaned up by the next attempt with the same key.
+    static func addWithPushCleanup(
+        key: String,
+        device: String,
+        to file: URL = authorizedKeys,
+        pendingStore: PendingPushRevokesStore = .shared,
+        daemonReady: () -> String?,
+        revokePhone: @escaping (_ name: String, _ done: @escaping (CleanupResult) -> Void) -> Void,
+        completion: @escaping (LocalKeyAddResult) -> Void
+    ) {
+        let wasPending: Bool
+        do {
+            wasPending = try pendingStore.contains(device)
+        } catch {
+            completion(.failed("\(device)'s key was not changed: the record of pending cleanups at \(pendingStore.path) can't be read (\(error.localizedDescription)). Check it, or delete it if no key replacement is unfinished."))
+            return
+        }
+        let willReplace: Bool
+        do {
+            willReplace = try willReplaceDifferentKey(key: key, device: device, in: file)
+        } catch {
+            completion(.failed("Could not read ~/.ssh/authorized_keys: \(error.localizedDescription). The key was not added on any host."))
+            return
+        }
+        if willReplace {
+            if let why = daemonReady() {
+                completion(.failed("\(device)'s key was not replaced: \(why), and it has to revoke the previous phone."))
+                return
+            }
+            do {
+                try pendingStore.insert(device)
+            } catch {
+                completion(.failed("\(device)'s key was not replaced: could not record the cleanup (\(error.localizedDescription))."))
+                return
+            }
+        }
+        do {
+            _ = try add(key: key, device: device, to: file)
+        } catch {
+            completion(.failed("Could not write ~/.ssh/authorized_keys: \(error.localizedDescription). The key was not added on any host."))
+            return
+        }
+        guard willReplace || wasPending else {
+            completion(.added(replaced: false))
+            return
+        }
+        revokePhone(device) { result in
+            switch result {
+            case .success:
+                pendingStore.remove(device)
+                completion(.added(replaced: true))
+            case .failure(let why):
+                completion(.failed("Replaced \(device)'s key on this Mac, but could not revoke the previous phone's notifications (\(why)). Click Add Device Key again to finish."))
+            }
+        }
+    }
+
     static func devices(in file: URL = authorizedKeys) -> [Device] {
         guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [] }
         return text.split(separator: "\n").compactMap { line in
@@ -227,25 +388,44 @@ enum PhonePairing {
         }
     }
 
-    /// The device of a line Thurm wrote (exactly `restrict,port-forwarding ecdsa-sha2-nistp256
+    /// Parses a line Thurm wrote (exactly `restrict,port-forwarding ecdsa-sha2-nistp256
     /// <key> thurm-ios:<device>`); nil for any other line, even one ending the same way.
-    static func deviceName(ofLine line: Substring) -> String? {
+    static func parseDeviceLine(_ line: Substring) -> (key: String, device: String)? {
         let parts = line.split(separator: " ", omittingEmptySubsequences: false)
         guard parts.count == 4, parts[0] == keyOptions, parts[1] == "ecdsa-sha2-nistp256", !parts[2].isEmpty,
               parts[3].hasPrefix(commentPrefix), parts[3].count > commentPrefix.count
         else { return nil }
-        return String(parts[3].dropFirst(commentPrefix.count))
+        return ("\(parts[1]) \(parts[2])", String(parts[3].dropFirst(commentPrefix.count)))
     }
 
-    /// Adds (or replaces, by device name) a device key. Creates ~/.ssh (0700) and the file (0600).
-    static func add(key: String, device: String, to file: URL = authorizedKeys) throws {
+    /// The device of a line Thurm wrote (exactly `restrict,port-forwarding ecdsa-sha2-nistp256
+    /// <key> thurm-ios:<device>`); nil for any other line, even one ending the same way.
+    static func deviceName(ofLine line: Substring) -> String? {
+        parseDeviceLine(line)?.device
+    }
+
+    /// Adds a device key, deduplicating by public key blob (so renaming a phone never leaves an
+    /// unrevoked duplicate line) and by device name (so key rotation replaces old keys and each
+    /// device name maps 1:1 to `RevokePhone`). Returns `true` when an existing *different* public
+    /// key under the same device name was replaced. Creates ~/.ssh (0700) and the file (0600).
+    @discardableResult
+    static func add(key: String, device: String, to file: URL = authorizedKeys) throws -> Bool {
         let fm = FileManager.default
         try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
                                attributes: [.posixPermissions: 0o700])
         var lines = try lines(of: file)
-        lines.removeAll { deviceName(ofLine: $0[...]) == device }
+        var replacedDifferentKey = false
+        lines.removeAll { line in
+            guard let existing = parseDeviceLine(line[...]) else { return false }
+            if existing.device == device && existing.key != key {
+                replacedDifferentKey = true
+                return true
+            }
+            return existing.key == key || existing.device == device
+        }
         lines.append("\(keyOptions) \(key) \(commentPrefix)\(device)")
         try write(lines, to: file)
+        return replacedDifferentKey
     }
 
     static func revoke(_ device: Device, in file: URL = authorizedKeys) throws {
@@ -336,11 +516,16 @@ enum PhonePairing {
 struct PairPhoneSheet: View {
     @ObservedObject var remotes: RemoteHosts
     @State private var host = ""
+    @State private var loadingHost = true
     @State private var port = 22
     @State private var deviceKey = ""
+    @State private var addingLocalKey = false
+    @State private var showSSHKeyStep = false
     @State private var devices = PhonePairing.devices()
     @State private var message: String?
     @State private var remoteLogin: Bool?
+    @State private var remoteLoginProbe: NWConnection?
+    @State private var remoteLoginGeneration = 0
     /// Whether this Mac's `thurm` is found, and speaks our protocol, where sshd logins look.
     @State private var cliReady: Bool?
     /// The `[[remote]]` hosts (`pairing_hosts`), with what the sheet changed.
@@ -375,9 +560,21 @@ struct PairPhoneSheet: View {
                              plain: tailscale.status?.pairingPlain ?? [])
     }
 
+    private var validPort: Bool {
+        (1...65535).contains(port)
+    }
+
     private var canPair: Bool {
-        PhonePairing.canPair(host: host, hostKeys: hostKeys, tailnet: tailscale.status?.pairingURL,
+        PhonePairing.canPair(host: host, port: port, hostKeys: hostKeys,
+                             tailnet: tailscale.status?.pairingURL,
                              plain: tailscale.status?.pairingPlain ?? [])
+    }
+
+    /// Whether the pairing code includes at least one SSH target (this Mac or a checked remote),
+    /// so Step 2 (pasting the phone's device key) is required rather than optional.
+    private var needsSSHKey: Bool {
+        let localSSH = !host.trimmingCharacters(in: .whitespaces).isEmpty && validPort && !hostKeys.isEmpty
+        return localSSH || !PhonePairing.keyHosts(remoteHosts).isEmpty
     }
 
     var body: some View {
@@ -392,14 +589,23 @@ struct PairPhoneSheet: View {
                       systemImage: "network")
                     .foregroundStyle(.secondary)
             }
-            if remoteLogin == false {
+            if !validPort {
+                Label("SSH port must be between 1 and 65535.", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
+            if remoteLogin == false && validPort {
                 Label(tailscale.status?.hasTailnetRoute != true
                       ? "Remote Login is off. Turn it on in System Settings › General › Sharing so the app can connect."
                       : "Remote Login is off: the app has no fallback when Tailscale is off on the phone.",
                       systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             }
-            if !canPair {
+            if loadingHost && host.isEmpty && !canPair {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Finding this Mac's address…").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if !canPair {
                 Label("Pairing over Tailscale needs HTTPS or a plain endpoint: set tailscale.host_listen, or "
                       + "tailscale.plain_listen for a tailnet without HTTPS, in the config.", systemImage: "info.circle")
                     .foregroundStyle(.secondary)
@@ -453,12 +659,19 @@ struct PairPhoneSheet: View {
             }
             remoteHostRows
             Divider()
-            Text("2. Paste the device key the app shows (Universal Clipboard or AirDrop).")
-            HStack {
-                TextField("ecdsa-sha2-nistp256 AAAA… thurm-ios:iPhone", text: $deviceKey)
-                    .font(.system(.caption, design: .monospaced))
-                Button("Add Device Key") { addKey() }
-                    .disabled(PhonePairing.validDeviceKey(deviceKey) == nil)
+            if needsSSHKey {
+                Text("2. Paste the device key the app shows (Universal Clipboard or AirDrop).")
+                deviceKeyInputRow
+            } else {
+                DisclosureGroup("2. Add device key (optional — not needed over Tailscale)",
+                                isExpanded: $showSSHKeyStep) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Only needed if you later add an SSH fallback address.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        deviceKeyInputRow
+                    }
+                    .padding(.top, 4)
+                }
             }
             if let message {
                 Text(message).font(.caption).foregroundStyle(.secondary)
@@ -473,15 +686,35 @@ struct PairPhoneSheet: View {
         }
         .padding(20)
         .frame(width: 640)
+        .onChange(of: port) { _, _ in
+            checkRemoteLogin()
+        }
         .onAppear {
             DispatchQueue.global(qos: .userInitiated).async {
                 let name = PhonePairing.defaultHostName()
-                DispatchQueue.main.async { if host.isEmpty { host = name } }
+                DispatchQueue.main.async {
+                    if host.isEmpty { host = name }
+                    loadingHost = false
+                }
             }
             checkRemoteLogin()
             checkCLI()
             loadRemoteHosts()
             tailscale.refresh()
+        }
+        .onDisappear {
+            remoteLoginGeneration &+= 1
+            remoteLoginProbe?.cancel()
+            remoteLoginProbe = nil
+        }
+    }
+
+    private var deviceKeyInputRow: some View {
+        HStack {
+            TextField("ecdsa-sha2-nistp256 AAAA… thurm-ios:iPhone", text: $deviceKey)
+                .font(.system(.caption, design: .monospaced))
+            Button("Add Device Key") { addKey() }
+                .disabled(addingLocalKey || PhonePairing.validDeviceKey(deviceKey) == nil)
         }
     }
 
@@ -529,7 +762,10 @@ struct PairPhoneSheet: View {
 
     private func state(of h: PhonePairing.RemoteHost) -> String {
         if h.tailnet != nil {
-            return h.hasSSH ? "Over Tailscale, ssh as the fallback" : "Over Tailscale"
+            return h.phoneSSH ? "Over Tailscale, ssh as the fallback" : "Over Tailscale"
+        }
+        if !h.plain.isEmpty {
+            return h.phoneSSH ? "Over tailnet, ssh as the fallback" : "Over tailnet"
         }
         if let error = h.error {
             return error.hasPrefix("no known host key") ? "Connect to it from this Mac once" : error
@@ -639,23 +875,51 @@ struct PairPhoneSheet: View {
     // MARK: Keys
 
     private func addKey() {
-        guard let (key, device) = PhonePairing.validDeviceKey(deviceKey) else { return }
+        guard !addingLocalKey, let (key, device) = PhonePairing.validDeviceKey(deviceKey) else { return }
         let line = deviceKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        do {
-            try PhonePairing.add(key: key, device: device)
-            message = "Added \(device) on this Mac. The app can connect now."
-            deviceKey = ""
-        } catch {
-            // A failed pairing must not leave the key working on the remote hosts.
-            message = "Could not write ~/.ssh/authorized_keys: \(error.localizedDescription). "
-                + "The key was not added on any host."
-            devices = PhonePairing.devices()
-            return
-        }
-        devices = PhonePairing.devices()
-        for h in PhonePairing.keyHosts(remoteHosts) {
-            authorize(line, on: h.name)
-        }
+        let remotesToAuthorize = PhonePairing.keyHosts(remoteHosts)
+        addingLocalKey = true
+        PhonePairing.addWithPushCleanup(
+            key: key,
+            device: device,
+            daemonReady: {
+                Core.shared.isConnected(localHost) ? nil : "this Mac's Thurm daemon is not connected"
+            },
+            revokePhone: { name, done in
+                guard Core.shared.isConnected(localHost) else {
+                    done(.failure("this Mac's Thurm daemon is not connected"))
+                    return
+                }
+                Core.shared.requestAsync(object: ["RevokePhone": ["name": name]],
+                                         host: localHost, timeout: 20) { resp in
+                    if (resp as? String) == "Ok" {
+                        done(.success)
+                    } else {
+                        let why = ((resp as? [String: Any])?["error"] as? String)
+                            ?? "the daemon did not answer"
+                        done(.failure(why))
+                    }
+                }
+            },
+            completion: { result in
+                addingLocalKey = false
+                devices = PhonePairing.devices()
+                switch result {
+                case .added(let replaced):
+                    message = replaced
+                        ? "Replaced \(device) on this Mac. The app can connect now."
+                        : "Added \(device) on this Mac. The app can connect now."
+                    deviceKey = ""
+                    for h in remotesToAuthorize {
+                        authorize(line, on: h.name)
+                    }
+                case .failed(let why):
+                    // A failed local pairing or incomplete push cleanup must not leave the key
+                    // working on remote hosts; keep `deviceKey` populated so retrying works.
+                    message = why
+                }
+            }
+        )
     }
 
     private func authorize(_ line: String, on name: String) {
@@ -665,6 +929,7 @@ struct PairPhoneSheet: View {
             DispatchQueue.main.async {
                 if let r, r["error"] == nil {
                     keyResults[name] = .added
+                    if let warning = jsonString(r["warning"]) { message = warning }
                     loadDevices(on: name)
                 } else if let r, jsonBool(r["not_writable"]) == true {
                     if let nix = jsonString(r["nixos"]) {
@@ -733,18 +998,35 @@ struct PairPhoneSheet: View {
         }
     }
 
-    /// Whether sshd answers on this Mac (Remote Login).
+    /// Whether sshd answers on this Mac (Remote Login). Cancels any earlier probe so superseded
+    /// port checks cannot overwrite `remoteLogin` out of order.
     private func checkRemoteLogin() {
-        let conn = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(integerLiteral: UInt16(clamping: port)),
-                                using: .tcp)
+        remoteLoginProbe?.cancel()
+        remoteLoginProbe = nil
+        remoteLoginGeneration &+= 1
+        let gen = remoteLoginGeneration
+        guard validPort, let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
+            remoteLogin = nil
+            return
+        }
+        let conn = NWConnection(host: "127.0.0.1", port: nwPort, using: .tcp)
+        remoteLoginProbe = conn
         conn.stateUpdateHandler = { state in
             switch state {
             case .ready:
-                DispatchQueue.main.async { remoteLogin = true }
                 conn.cancel()
+                DispatchQueue.main.async {
+                    guard remoteLoginGeneration == gen else { return }
+                    remoteLogin = true
+                    remoteLoginProbe = nil
+                }
             case .failed, .waiting:
-                DispatchQueue.main.async { remoteLogin = false }
                 conn.cancel()
+                DispatchQueue.main.async {
+                    guard remoteLoginGeneration == gen else { return }
+                    remoteLogin = false
+                    remoteLoginProbe = nil
+                }
             default:
                 break
             }

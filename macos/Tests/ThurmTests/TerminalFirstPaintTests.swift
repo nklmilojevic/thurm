@@ -448,4 +448,66 @@ final class TerminalFirstPaintTests: XCTestCase {
         NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window2)
         XCTAssertEqual(view.windowNotificationCount, beforeReattachNote + 1)
     }
+
+    func testAtlasGrowthAndNonFrameCommitsDoNotIncrementCommitCount() throws {
+        try requireMetal()
+        let ctx = try XCTUnwrap(MetalContext.shared)
+        let initialCommits = ctx.commitCount
+
+        let helperBuffer = try XCTUnwrap(ctx.queue.makeCommandBuffer())
+        ctx.commit(helperBuffer, countsAsFrame: false)
+        XCTAssertEqual(ctx.commitCount, initialCommits, "non-frame command buffers must not increment commitCount")
+        ctx.waitForGPU()
+
+        let atlas = try XCTUnwrap(GlyphAtlas(device: ctx.device, pixelFormat: .r8Unorm, bytesPerPixel: 1, size: 64))
+        let region1 = try XCTUnwrap(atlas.reserve(width: 60, height: 60))
+        XCTAssertEqual(atlas.height, 64)
+        let sentinel: UInt8 = 0xAB
+        atlas.upload(x: region1.x, y: region1.y, width: 60, height: 60, bytes: Array(repeating: sentinel, count: 60 * 60))
+
+        let region2 = try XCTUnwrap(atlas.reserve(width: 60, height: 60))
+        XCTAssertEqual(atlas.height, 128, "second 60x60 reservation should trigger atlas growth")
+        XCTAssertEqual(ctx.commitCount, initialCommits, "glyph atlas growth blit must not count as a presented frame")
+        // The second region starts inside the old height (its first rows were copied by the
+        // growth blit): its upload must land after that copy, not be overwritten by old texels.
+        XCTAssertLessThan(region2.y, 64)
+        let sentinel2: UInt8 = 0xCD
+        atlas.upload(x: region2.x, y: region2.y, width: 60, height: 60,
+                     bytes: Array(repeating: sentinel2, count: 60 * 60))
+
+        // Immediately submit a dependent command buffer (without calling waitForGPU first) that
+        // reads both regions from the grown atlas texture, verifying queue ordering.
+        let staging = try XCTUnwrap(ctx.device.makeBuffer(length: 60 * 60, options: .storageModeShared))
+        let staging2 = try XCTUnwrap(ctx.device.makeBuffer(length: 60 * 60, options: .storageModeShared))
+        let frameBuffer = try XCTUnwrap(ctx.queue.makeCommandBuffer())
+        let blit = try XCTUnwrap(frameBuffer.makeBlitCommandEncoder())
+        for (origin, buffer) in [(region1, staging), (region2, staging2)] {
+            blit.copy(from: atlas.texture,
+                      sourceSlice: 0,
+                      sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: origin.x, y: origin.y, z: 0),
+                      sourceSize: MTLSize(width: 60, height: 60, depth: 1),
+                      to: buffer,
+                      destinationOffset: 0,
+                      destinationBytesPerRow: 60,
+                      destinationBytesPerImage: 60 * 60)
+        }
+        blit.endEncoding()
+        ctx.commit(frameBuffer)
+        XCTAssertEqual(ctx.commitCount, initialCommits + 1, "frame commits must increment commitCount")
+        ctx.waitForGPU()
+
+        let readback = UnsafeBufferPointer(
+            start: staging.contents().assumingMemoryBound(to: UInt8.self),
+            count: 60 * 60
+        )
+        XCTAssertTrue(readback.allSatisfy { $0 == sentinel },
+                      "atlas growth blit must complete ahead of subsequent committed passes")
+        let readback2 = UnsafeBufferPointer(
+            start: staging2.contents().assumingMemoryBound(to: UInt8.self),
+            count: 60 * 60
+        )
+        XCTAssertTrue(readback2.allSatisfy { $0 == sentinel2 },
+                      "an upload straddling the old atlas height must survive the growth copy")
+    }
 }

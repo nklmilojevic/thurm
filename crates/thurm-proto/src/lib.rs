@@ -199,6 +199,12 @@ pub const CAP_STATE_EVENTS: &str = "state-events";
 /// Older daemons ignore this capability and send the original messages.
 pub const CAP_AGENT_ACTIVITY: &str = "agent-activity";
 
+/// The daemon answers [`Request::GetPendingPrompt`] with [`Response::PendingPrompt`], and sends
+/// [`Event::NotifyPrompt`] (carrying the optional verbatim permission request) in place of
+/// [`Event::Notify`] to clients that advertise this capability. Older clients receive
+/// [`Event::Notify`]; older daemons ignore this capability and send [`Event::Notify`].
+pub const CAP_PENDING_PROMPT: &str = "pending-prompt";
+
 /// Sent only by remote clients (the iOS app over ssh or the tailnet, the web client): the daemon
 /// deflates the events it sends them, as [`Event::Compressed`] (see [`codec::encode_frame`]).
 pub const CAP_DEFLATE: &str = "deflate";
@@ -675,6 +681,12 @@ pub enum Request {
     /// The daemon's identifier ([`Response::Text`]), the same across its restarts and
     /// upgrades. Requires [`CAP_DAEMON_ID`].
     DaemonId,
+    /// The pane's current untouched permission prompt, if any (with its verbatim request text
+    /// when the agent provided one). Answers [`Response::PendingPrompt`]. Requires
+    /// [`CAP_PENDING_PROMPT`].
+    GetPendingPrompt {
+        pane: PaneId,
+    },
     /// Program Resume Protocol (OSC 7577) records held for `pane`, or every pane when `None`.
     /// Answers [`Response::ResumeRecords`]. Requires [`CAP_PROGRAM_RESUME`].
     ResumeRecords {
@@ -862,8 +874,25 @@ pub enum Response {
         expires_ms: u32,
         path: String,
     },
+    /// The answer to [`Request::GetPendingPrompt`]: the pane's active untouched permission
+    /// prompt, or `None` when none is waiting.
+    PendingPrompt(Option<PendingPrompt>),
     /// Program Resume Protocol (OSC 7577) records for one or more panes.
     ResumeRecords(Vec<PaneResumeRecords>),
+}
+
+/// An agent's untouched permission prompt in a pane, as returned by [`Request::GetPendingPrompt`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PendingPrompt {
+    pub pane: PaneId,
+    /// Prompt identifier for [`Request::AnswerPermission`].
+    pub prompt: u64,
+    pub title: String,
+    pub body: String,
+    /// Exact, un-summarized tool/command request text from the agent hook, when available.
+    /// Never populated from generic fallback strings or model paraphrases.
+    #[serde(default)]
+    pub request: Option<String>,
 }
 
 /// Program Resume Protocol (OSC 7577) records currently held for one pane.
@@ -1072,6 +1101,18 @@ pub enum Event {
         pane: PaneId,
         id: u64,
         text: Option<String>,
+    },
+    /// Like [`Event::Notify`], carrying the exact un-summarized permission `request` text when
+    /// available. Sent only to clients with [`CAP_PENDING_PROMPT`].
+    NotifyPrompt {
+        pane: PaneId,
+        title: String,
+        body: String,
+        permission: Option<u64>,
+        #[serde(default)]
+        sound: Option<String>,
+        #[serde(default)]
+        request: Option<String>,
     },
 }
 
@@ -2129,6 +2170,93 @@ mod tests {
                 pane: 3,
                 yours: true
             })
+        ));
+    }
+
+    #[test]
+    fn pending_prompt_postcard_and_json() {
+        let req = Request::GetPendingPrompt { pane: 7 };
+        assert_eq!(to_json(&req), r#"{"GetPendingPrompt":{"pane":7}}"#);
+        let env = Envelope { id: 9, request: req };
+        let bytes = postcard::to_allocvec(&env).expect("encodes");
+        let back: Envelope = postcard::from_bytes(&bytes).expect("decodes");
+        assert!(matches!(
+            back.request,
+            Request::GetPendingPrompt { pane: 7 }
+        ));
+
+        let prompt = PendingPrompt {
+            pane: 7,
+            prompt: 42,
+            title: "Claude Code".into(),
+            body: "Bash: rm -rf /tmp/foo".into(),
+            request: Some("Bash: rm -rf /tmp/foo".into()),
+        };
+        let msg = ServerMessage::Response {
+            id: 9,
+            result: Ok(Response::PendingPrompt(Some(prompt.clone()))),
+        };
+        let bytes = postcard::to_allocvec(&msg).expect("encodes");
+        let back: ServerMessage = postcard::from_bytes(&bytes).expect("decodes");
+        assert!(matches!(
+            back,
+            ServerMessage::Response {
+                id: 9,
+                result: Ok(Response::PendingPrompt(Some(p)))
+            } if p == prompt
+        ));
+
+        let ev = ServerMessage::Event(Event::NotifyPrompt {
+            pane: 7,
+            title: "Claude Code".into(),
+            body: "needs permission".into(),
+            permission: Some(42),
+            sound: Some("Glass".into()),
+            request: Some("Bash: git status".into()),
+        });
+        let bytes = postcard::to_allocvec(&ev).expect("encodes");
+        let back: ServerMessage = postcard::from_bytes(&bytes).expect("decodes");
+        assert!(matches!(
+            back,
+            ServerMessage::Event(Event::NotifyPrompt {
+                pane: 7,
+                permission: Some(42),
+                request: Some(r),
+                ..
+            }) if r == "Bash: git status"
+        ));
+
+        // Existing Event::Notify wire encoding must remain byte-for-byte identical to the base
+        // protocol so older clients decode notices without breakage.
+        const EXPECTED_LEGACY_NOTIFY: &[u8] = &[
+            1,  // ServerMessage::Event
+            7,  // Event::Notify
+            7,  // pane = 7
+            11, b'C', b'l', b'a', b'u', b'd', b'e', b' ', b'C', b'o', b'd', b'e',
+            16, b'n', b'e', b'e', b'd', b's', b' ', b'p', b'e', b'r', b'm', b'i', b's', b's', b'i',
+            b'o', b'n',
+            1, 42, // permission = Some(42)
+            1, 5, b'G', b'l', b'a', b's', b's', // sound = Some("Glass")
+        ];
+        let legacy = ServerMessage::Event(Event::Notify {
+            pane: 7,
+            title: "Claude Code".into(),
+            body: "needs permission".into(),
+            permission: Some(42),
+            sound: Some("Glass".into()),
+        });
+        let bytes = postcard::to_allocvec(&legacy).expect("encodes");
+        assert_eq!(bytes.as_slice(), EXPECTED_LEGACY_NOTIFY);
+        let back: ServerMessage = postcard::from_bytes(EXPECTED_LEGACY_NOTIFY).expect("decodes");
+        assert!(matches!(
+            back,
+            ServerMessage::Event(Event::Notify {
+                pane: 7,
+                ref title,
+                ref body,
+                permission: Some(42),
+                sound: Some(ref s),
+            }) if title == "Claude Code" && body == "needs permission" && s == "Glass"
         ));
     }
 }

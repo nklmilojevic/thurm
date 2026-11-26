@@ -3,7 +3,8 @@
 //! it hears from, which is how a session survives changing networks and the app's suspension.
 
 use std::io;
-use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -14,6 +15,9 @@ use crate::fragment::{self, Assembly};
 use crate::ssp::{Apply, Engine};
 use crate::wire::{self, HostEvent, UserEvent};
 
+/// How long a closed session goes on asking the host to end (resending on the retransmission
+/// timer) before it gives up; a host that is unreachable then is left to its idle timeout.
+pub const CLOSE_WAIT: Duration = Duration::from_secs(2);
 /// After this long without hearing from the server, move to a new socket.
 const RESOCKET_AFTER: Duration = Duration::from_secs(6);
 /// After this long, stop calling it reconnecting (it may come back; [`MoshSession::wake`]
@@ -55,7 +59,7 @@ pub enum MoshEvent {
 
 enum Cmd {
     Event(UserEvent),
-    Wake,
+    Wake(Option<IpAddr>),
     Close,
 }
 
@@ -63,6 +67,8 @@ enum Cmd {
 /// timeout, as mosh-server does when a client goes away).
 pub struct MoshSession {
     tx: mpsc::UnboundedSender<Cmd>,
+    /// Last peer IP successfully bound by the driver's UDP socket.
+    peer: Arc<Mutex<IpAddr>>,
 }
 
 fn socket_for(addr: SocketAddr) -> io::Result<UdpSocket> {
@@ -97,8 +103,10 @@ impl MoshSession {
             width: size.0,
             height: size.1,
         });
+        let peer = Arc::new(Mutex::new(addr.ip()));
         let driver = Driver {
             addr,
+            peer: peer.clone(),
             socket,
             crypto: Crypto::new(&key),
             engine,
@@ -112,7 +120,13 @@ impl MoshSession {
             on_event: Box::new(on_event),
         };
         rt.spawn(driver.run(rx));
-        Ok(MoshSession { tx })
+        Ok(MoshSession { tx, peer })
+    }
+
+    /// The peer IP currently installed on the driver's UDP socket (updated only after `socket_for`
+    /// succeeds for a new address).
+    pub fn peer_ip(&self) -> IpAddr {
+        *self.peer.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn send_keys(&self, keys: &[u8]) {
@@ -128,7 +142,13 @@ impl MoshSession {
 
     /// The network may have changed (or the app woke up): move to a new socket and say hello.
     pub fn wake(&self) {
-        let _ = self.tx.send(Cmd::Wake);
+        let _ = self.tx.send(Cmd::Wake(None));
+    }
+
+    /// Like [`wake`], also updating the peer IP address (e.g. Wi-Fi IPv4 <-> cellular NAT64 IPv6)
+    /// if a fresh socket can be opened to it.
+    pub fn wake_at(&self, ip: IpAddr) {
+        let _ = self.tx.send(Cmd::Wake(Some(ip)));
     }
 
     pub fn close(&self) {
@@ -144,6 +164,7 @@ impl Drop for MoshSession {
 
 struct Driver {
     addr: SocketAddr,
+    peer: Arc<Mutex<IpAddr>>,
     socket: UdpSocket,
     crypto: Crypto,
     engine: Engine,
@@ -162,9 +183,12 @@ impl Driver {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         (self.on_event)(MoshEvent::Status(Status::Connecting));
         let mut buf = vec![0u8; 65536];
+        // Set once closing: the shutdown exchange with the host ends by then at the latest.
+        let mut closing: Option<Instant> = None;
         loop {
             let deadline = self.engine.next_deadline(Instant::now());
             let check = Instant::now() + Duration::from_secs(1);
+            let check = closing.map_or(check, |c| check.min(c));
             tokio::select! {
                 r = self.socket.recv(&mut buf) => match r {
                     Ok(n) => self.datagram(&buf[..n]),
@@ -176,17 +200,56 @@ impl Driver {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 },
-                cmd = rx.recv() => match cmd {
-                    None | Some(Cmd::Close) => return,
+                cmd = rx.recv(), if closing.is_none() => match cmd {
+                    None | Some(Cmd::Close) => {
+                        if self.engine.shut_down() {
+                            return;
+                        }
+                        // End the host's side too, over this authenticated session: mosh-server
+                        // exits once it acknowledges, and its shell with it. Nothing else can
+                        // end it once the ssh session that started it is gone.
+                        self.engine.start_shutdown();
+                        closing = Some(Instant::now() + CLOSE_WAIT);
+                    }
                     Some(Cmd::Event(ev)) => self.engine.push(ev),
-                    Some(Cmd::Wake) => {
-                        self.resocket();
+                    Some(Cmd::Wake(ip)) => {
+                        if let Some(ip) = ip {
+                            let next = SocketAddr::new(ip, self.addr.port());
+                            if next != self.addr {
+                                match socket_for(next) {
+                                    Ok(s) => {
+                                        self.addr = next;
+                                        *self.peer.lock().unwrap_or_else(|e| e.into_inner()) = ip;
+                                        self.socket = s;
+                                        self.assembly = Assembly::default();
+                                        self.last_resocket = Instant::now();
+                                    }
+                                    Err(e) => {
+                                        log::debug!("mosh: new socket for {next}: {e}");
+                                        self.resocket();
+                                    }
+                                }
+                            } else {
+                                self.resocket();
+                            }
+                        } else {
+                            self.resocket();
+                        }
                         self.engine.force_send();
                     }
                 },
                 _ = tokio::time::sleep_until(deadline.min(check).into()) => {}
             }
             self.flush().await;
+            if let Some(until) = closing {
+                if self.engine.shutdown_acked() || self.engine.shut_down() {
+                    return;
+                }
+                if Instant::now() >= until {
+                    log::debug!("mosh: the host did not acknowledge the shutdown");
+                    return;
+                }
+            }
             if self.engine.shut_down() {
                 (self.on_event)(MoshEvent::Ended);
                 return;
