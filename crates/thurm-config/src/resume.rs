@@ -62,11 +62,13 @@ pub struct ResumeRule {
 }
 
 impl ResumeRule {
-    /// All flags referenced by either `flags` or `preserve_flags`.
+    /// All flags referenced by either `flags` or `preserve_flags`. A flag in both takes its
+    /// `preserve_flags` arity: a looser `flags` entry must not shorten a restriction (a `One`
+    /// entry would check only the first value of a preserved `Many` list).
     pub fn all_checked_flags(&self) -> BTreeMap<String, FlagArity> {
         let mut all = self.flags.clone();
         for (k, &v) in &self.preserve_flags {
-            all.entry(k.clone()).or_insert(v);
+            all.insert(k.clone(), v);
         }
         all
     }
@@ -139,11 +141,15 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
                 ("-w", Optional),
                 ("--worktree", Optional),
             ]),
+            // Launch options that restrict what Claude may do: a resume must carry each over.
             preserve_flags: flags(&[
                 ("--disallowed-tools", Many),
                 ("--disallowedTools", Many),
                 ("--mcp-config", Many),
+                ("--permission-mode", One),
+                ("--restricted", None),
                 ("--strict-mcp-config", None),
+                ("--tools", Many),
             ]),
             match_process: true,
         },
@@ -152,8 +158,24 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             enabled: true,
             command: s(&["codex", "resume", "<id>"]),
             dirs: Vec::new(),
-            flags: BTreeMap::new(),
-            preserve_flags: BTreeMap::new(),
+            flags: flags(&[
+                ("--dangerously-bypass-approvals-and-sandbox", None),
+                ("--full-auto", None),
+                ("--model", One),
+                ("-m", One),
+            ]),
+            // Sandbox and approval policy, given directly, through a config override or a
+            // profile: a resume must carry each over (short forms too, `-sread-only` included).
+            preserve_flags: flags(&[
+                ("--ask-for-approval", One),
+                ("--config", One),
+                ("--profile", One),
+                ("--sandbox", One),
+                ("-a", One),
+                ("-c", One),
+                ("-p", One),
+                ("-s", One),
+            ]),
             match_process: true,
         },
         ResumeRule {
@@ -264,6 +286,39 @@ mod tests {
             nvim.command,
             s(&["nvim", "-S", "<under:~/.local/state/nvim/sessions>"])
         );
+    }
+
+    #[test]
+    fn preserved_arity_wins_over_flags() {
+        let rule = ResumeRule {
+            command: s(&["x"]),
+            flags: flags(&[("--deny", FlagArity::One), ("--model", FlagArity::One)]),
+            preserve_flags: flags(&[("--deny", FlagArity::Many)]),
+            ..Default::default()
+        };
+        let all = rule.all_checked_flags();
+        assert_eq!(all["--deny"], FlagArity::Many);
+        assert_eq!(all["--model"], FlagArity::One);
+    }
+
+    #[test]
+    fn builtin_rules_preserve_launch_restrictions() {
+        let rules = builtin_resume_rules();
+        let claude = rules.iter().find(|r| r.name == "claude").unwrap();
+        for f in ["--tools", "--permission-mode", "--restricted"] {
+            assert!(claude.preserve_flags.contains_key(f), "{f}");
+        }
+        let codex = rules.iter().find(|r| r.name == "codex").unwrap();
+        for f in [
+            "--sandbox",
+            "-s",
+            "--ask-for-approval",
+            "-a",
+            "-c",
+            "--config",
+        ] {
+            assert!(codex.preserve_flags.contains_key(f), "{f}");
+        }
     }
 
     #[test]

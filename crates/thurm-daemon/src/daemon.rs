@@ -2538,6 +2538,13 @@ impl Daemon {
         // First pass: validate every saved OSC 7577 record against current config, UID, canonical
         // paths, directory existence, and shell support; mark accepted ones `attempted = true` on
         // disk BEFORE spawning so a crash or failed command never retries.
+        // Saved launch evidence is digested with this key: without it, rules fail closed.
+        let evidence_key = snap
+            .panes
+            .iter()
+            .any(|p| p.program_resume.is_some())
+            .then(program_resume::evidence_key)
+            .flatten();
         let mut plans: Vec<Option<PlannedResume>> = Vec::with_capacity(snap.panes.len());
         let mut marked_attempted = false;
         // Records an earlier start already tried: their pane gets a plain shell, since the
@@ -2601,7 +2608,10 @@ impl Daemon {
                     argv: &rec.argv,
                     cwd: resolved_cwd.as_deref(),
                     process_exe: &rec.process_exe,
-                    process_argv: &rec.process_argv,
+                    launch: program_resume::Launch::Saved {
+                        evidence: rec.launch.as_ref(),
+                        key: evidence_key.as_ref(),
+                    },
                     wrapped: rec.wrapped,
                 },
                 cfg.session.resume_programs,

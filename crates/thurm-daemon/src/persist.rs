@@ -5,10 +5,12 @@
 //! the daemon's memory. Older versions wrote it to `<state_dir>/scrollback/`, which
 //! [`remove_old_scrollback`] removes at every start, whether or not sessions are saved.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use thurm_config::FlagArity;
 use thurm_proto::{PaneId, PaneSize};
 
 pub const SNAPSHOT_VERSION: u32 = 1;
@@ -67,17 +69,42 @@ pub struct SavedProgramResume {
     pub process_name: String,
     #[serde(default)]
     pub process_exe: String,
-    /// Only the part of the owner's launch command line trust rules look at (program, an
-    /// interpreter's script, the rules' flags): see `program_resume::launch_evidence`. Other
-    /// launch arguments may hold credentials and are never saved.
-    #[serde(default)]
-    pub process_argv: Vec<String>,
+    /// What restore needs of the owner's launch command line to re-check trust: see
+    /// `program_resume::launch_evidence`. `None` (a snapshot from before it existed) fails
+    /// every rule closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<SavedLaunchEvidence>,
     /// Whether an ancestor between the shell and the owner was not a shell/login/proxy.
     #[serde(default)]
     pub wrapped: bool,
     /// True once restore has attempted this record, so crashes or failures never retry.
     #[serde(default)]
     pub attempted: bool,
+}
+
+/// The part of an owner's launch command line that trust rules look at, as saved. Other launch
+/// arguments may hold credentials and are never saved; the flag values saved are keyed digests
+/// (`program_resume::digest_value`), never the values themselves.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SavedLaunchEvidence {
+    /// The launch `argv[0]` (empty when the launch command line was unreadable).
+    pub program: String,
+    /// An interpreter's script operand, absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// One entry per distinct set of flags (with arities) a rule for this command checks.
+    #[serde(default)]
+    pub flags: Vec<SavedFlagEvidence>,
+}
+
+/// The launch occurrences of exactly the flags in `checked`, parsed with those arities.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SavedFlagEvidence {
+    /// The flags (and their arities) this evidence covers: a rule checking any other flag, or
+    /// one of these with another arity, finds no evidence here.
+    pub checked: BTreeMap<String, FlagArity>,
+    /// Each occurrence in launch order: the flag and the digests of its values.
+    pub occurrences: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -384,6 +411,14 @@ mod tests {
     }
 
     #[test]
+    fn record_saved_with_flat_launch_argv_loads_without_evidence() {
+        let old = r#"{"argv":["nvim"],"uid":501,"reported_at":1,"process_argv":["nvim","-S","x"]}"#;
+        let rec: SavedProgramResume = serde_json::from_str(old).unwrap();
+        assert_eq!(rec.argv, ["nvim"]);
+        assert!(rec.launch.is_none());
+    }
+
+    #[test]
     fn roundtrip_and_cleanup() {
         let dir = std::env::temp_dir().join(format!("thurm-persist-{}", std::process::id()));
         let store = Store::new(dir.clone());
@@ -408,7 +443,14 @@ mod tests {
                     reported_at: 1795543200,
                     process_name: "nvim".into(),
                     process_exe: "/usr/bin/nvim".into(),
-                    process_argv: vec!["nvim".into()],
+                    launch: Some(SavedLaunchEvidence {
+                        program: "nvim".into(),
+                        script: None,
+                        flags: vec![SavedFlagEvidence {
+                            checked: BTreeMap::from([("-S".to_owned(), FlagArity::One)]),
+                            occurrences: vec![("-S".into(), vec!["0f".into()])],
+                        }],
+                    }),
                     wrapped: false,
                     attempted: false,
                 }),

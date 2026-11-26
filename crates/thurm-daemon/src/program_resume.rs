@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use thurm_config::{FlagArity, ResumeProgramsMode, ResumeRule};
 use thurm_proto::ResumeRecordInfo;
 
-use crate::persist::{self, SavedProgramResume};
+use crate::persist::{self, SavedFlagEvidence, SavedLaunchEvidence, SavedProgramResume};
 use crate::procinfo;
 
 /// Maximum full OSC 7577 sequence length accepted (including `ESC ]`, `7577;`, body, BEL/ST).
@@ -660,9 +660,9 @@ pub struct ResumeRecord {
 }
 
 impl ResumeRecord {
-    /// The record as saved in `session.json`, with only the launch arguments `rules` need to
-    /// re-check trust on restore (see [`launch_evidence`]).
-    pub fn to_saved(&self, rules: &[ResumeRule]) -> SavedProgramResume {
+    /// The record as saved in `session.json`, with only what `rules` need of its launch to
+    /// re-check trust on restore (see [`launch_evidence`]), flag values digested with `key`.
+    pub fn to_saved(&self, rules: &[ResumeRule], key: &[u8; 32]) -> SavedProgramResume {
         SavedProgramResume {
             argv: self.argv.clone(),
             cwd: self.cwd.clone(),
@@ -672,7 +672,13 @@ impl ResumeRecord {
             reported_at: self.reported_at,
             process_name: self.process_name.clone(),
             process_exe: self.process_exe.clone(),
-            process_argv: launch_evidence(&self.process_argv, rules),
+            launch: Some(launch_evidence(
+                &self.process_exe,
+                &self.process_argv,
+                &self.argv,
+                rules,
+                key,
+            )),
             wrapped: self.wrapped,
             attempted: false,
         }
@@ -950,7 +956,7 @@ impl ProgramResumeState {
                         argv: &r.argv,
                         cwd: r.cwd.as_deref(),
                         process_exe: &r.process_exe,
-                        process_argv: &r.process_argv,
+                        launch: Launch::Live(&r.process_argv),
                         wrapped: r.wrapped,
                     },
                     mode,
@@ -994,7 +1000,7 @@ impl ProgramResumeState {
                 argv: &chosen.argv,
                 cwd: chosen.cwd.as_deref(),
                 process_exe: &chosen.process_exe,
-                process_argv: &chosen.process_argv,
+                launch: Launch::Live(&chosen.process_argv),
                 wrapped: chosen.wrapped,
             },
             mode,
@@ -1002,7 +1008,8 @@ impl ProgramResumeState {
             false,
         );
         match trust {
-            TrustVerdict::Trusted { .. } => Some(chosen.to_saved(rules)),
+            // Without the key, the evidence restore needs cannot be saved: nothing is.
+            TrustVerdict::Trusted { .. } => Some(chosen.to_saved(rules, &evidence_key()?)),
             TrustVerdict::Untrusted(_) => None,
         }
     }
@@ -1024,8 +1031,21 @@ pub struct TrustSubject<'a> {
     pub cwd: Option<&'a str>,
     /// Canonical executable path from the OS (empty when unknown).
     pub process_exe: &'a str,
-    pub process_argv: &'a [String],
+    pub launch: Launch<'a>,
     pub wrapped: bool,
+}
+
+/// The owner's launch command line, as trust rules see it.
+#[derive(Clone, Copy, Debug)]
+pub enum Launch<'a> {
+    /// The live record's full launch `argv`.
+    Live(&'a [String]),
+    /// The evidence saved with a record, and the key its flag values were digested with. Either
+    /// missing fails every rule that needs it.
+    Saved {
+        evidence: Option<&'a SavedLaunchEvidence>,
+        key: Option<&'a [u8; 32]>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1111,7 +1131,8 @@ fn pick_more_specific(prev: Option<&'static str>, next: &'static str) -> &'stati
         "flag_not_listed" => 4,
         "flag_value" => 5,
         "flags_differ" => 6,
-        "dir_not_allowed" => 7,
+        "evidence_missing" => 7,
+        "dir_not_allowed" => 8,
         _ => 1,
     };
     match prev {
@@ -1128,10 +1149,23 @@ fn evaluate_rule(
     if subject.wrapped {
         return Err("wrapped");
     }
-    if rule.match_process
-        && !process_matches_command(&rule.command[0], subject.process_exe, subject.process_argv)
-    {
-        return Err("program_differs");
+    if rule.match_process {
+        let (program, script) = match subject.launch {
+            Launch::Live(argv) => (
+                argv.first().map(String::as_str),
+                interpreter_script(subject.process_exe, argv).map(|k| argv[k].as_str()),
+            ),
+            Launch::Saved {
+                evidence: Some(e), ..
+            } => (
+                (!e.program.is_empty()).then_some(e.program.as_str()),
+                e.script.as_deref(),
+            ),
+            Launch::Saved { evidence: None, .. } => return Err("evidence_missing"),
+        };
+        if !process_matches_command(&rule.command[0], subject.process_exe, program, script) {
+            return Err("program_differs");
+        }
     }
     if subject.argv.len() < rule.command.len() {
         return Err("no_rule");
@@ -1146,11 +1180,38 @@ fn evaluate_rule(
     let reported = parse_reported_flags(extra, &allowed)?;
     // Restricting flags must be carried over even when the report adds no flags.
     if !reported.is_empty() || !rule.preserve_flags.is_empty() {
-        if subject.process_argv.is_empty() {
-            return Err("launch_unreadable");
-        }
-        let launch = extract_launch_flags(subject.process_argv, &allowed);
-        if !flags_match_launch(&reported, &launch, &rule.preserve_flags) {
+        let matched = match subject.launch {
+            Launch::Live(argv) => {
+                if argv.is_empty() {
+                    return Err("launch_unreadable");
+                }
+                let launch = extract_launch_flags(subject.process_exe, argv, &allowed);
+                flags_match_launch(&reported, &launch, &rule.preserve_flags)
+            }
+            Launch::Saved { evidence, key } => {
+                let Some(e) = evidence else {
+                    return Err("evidence_missing");
+                };
+                if e.program.is_empty() {
+                    return Err("launch_unreadable");
+                }
+                // Evidence parsed with exactly this rule's flags and arities, or none: what a
+                // rule did not check when it was saved is unknown, not absent.
+                let (Some(key), Some(saved)) = (key, e.flags.iter().find(|f| f.checked == allowed))
+                else {
+                    return Err("evidence_missing");
+                };
+                let reported: Vec<(String, Vec<String>)> = reported
+                    .into_iter()
+                    .map(|(flag, vals)| {
+                        let vals = vals.iter().map(|v| digest_value(key, v)).collect();
+                        (flag, vals)
+                    })
+                    .collect();
+                flags_match_launch(&reported, &saved.occurrences, &rule.preserve_flags)
+            }
+        };
+        if !matched {
             return Err("flags_differ");
         }
     }
@@ -1268,9 +1329,41 @@ fn path_within_dir(target: &str, allowed_dir: &str, allow_equal: bool, verify_fs
         let Some(canon_target) = canonicalize_maybe_missing(target_path) else {
             return false;
         };
-        return within(&canon_target, &canon_base);
+        return within(&canon_target, &canon_base)
+            && !others_can_retarget(&canon_base, &canon_target);
     }
     true
+}
+
+/// Whether another principal could change what `target` (canonical, inside `base`) resolves
+/// to: the base or an existing directory down to the target is owned by neither this user nor
+/// root, or is group or other writable. Such a path may be checked here and swapped before use.
+fn others_can_retarget(base: &Path, target: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::geteuid() };
+    let Ok(below) = target.strip_prefix(base) else {
+        return true;
+    };
+    let mut cur = base.to_path_buf();
+    let mut components = below.components();
+    loop {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.is_dir()
+                    && ((meta.uid() != uid && meta.uid() != 0) || meta.mode() & 0o022 != 0)
+                {
+                    return true;
+                }
+            }
+            // The rest does not exist yet: nothing below it to swap.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        }
+        match components.next() {
+            Some(c) => cur.push(c),
+            None => return false,
+        }
+    }
 }
 
 /// Canonicalizes `path`, whose last components may not exist yet: the nearest existing ancestor
@@ -1305,8 +1398,14 @@ fn canonicalize_maybe_missing(path: &Path) -> Option<PathBuf> {
 }
 
 /// Checks whether the owning OS process matches the rule's `command[0]`, by its OS executable
-/// path (never by its process name, which the process can change).
-fn process_matches_command(want: &str, process_exe: &str, process_argv: &[String]) -> bool {
+/// path (never by its process name, which the process can change). `program` is its launch
+/// `argv[0]`, `script` an interpreter's script operand (see [`interpreter_script`]).
+fn process_matches_command(
+    want: &str,
+    process_exe: &str,
+    program: Option<&str>,
+    script: Option<&str>,
+) -> bool {
     if process_exe.is_empty() {
         return false;
     }
@@ -1330,7 +1429,7 @@ fn process_matches_command(want: &str, process_exe: &str, process_argv: &[String
     // Versioned native binaries symlinked under a bare name (e.g. `~/.local/bin/claude` ->
     // `~/.local/share/claude/versions/2.1.332`): match when `argv[0]` names `want` and the
     // resolved exe lives under a directory segment named `want` (or matches `argv[0]` on disk).
-    if let Some(arg0) = process_argv.first()
+    if let Some(arg0) = program
         && thurm_config::executable_name(arg0) == want
     {
         if Path::new(process_exe)
@@ -1352,7 +1451,7 @@ fn process_matches_command(want: &str, process_exe: &str, process_argv: &[String
     // Interpreters (`node /opt/homebrew/bin/claude`, `python3 ...`): the script operand must be
     // an existing file named `want`, or one inside the program's known package.
     if is_interpreter(exe_base)
-        && let Some(script) = script_index(process_argv).map(|k| &process_argv[k])
+        && let Some(script) = script
         && script.starts_with('/')
         && let Ok(canon) = std::fs::canonicalize(script)
         && canon.is_file()
@@ -1363,18 +1462,163 @@ fn process_matches_command(want: &str, process_exe: &str, process_argv: &[String
     false
 }
 
-/// Where an interpreter's script operand is in its `argv`: the first argument after the
-/// interpreter's own options (or after `--`).
+/// Where an interpreter's script operand is in its `argv`, judged by `argv[0]` (see
+/// [`interpreter_script`]).
 fn script_index(argv: &[String]) -> Option<usize> {
+    interpreter_script("", argv)
+}
+
+/// Where the script operand of an interpreter launch is in `argv`: the interpreter is
+/// `process_exe`'s name, else `argv[0]`'s. Skips the interpreter's own options, with the
+/// values of those that take a separate one; `None` for a mode that runs no script file
+/// (`node -e`, `python -m`, `deno task`...), for an interpreter whose launches Thurm cannot
+/// parse (`npx`, `uv`), and when no script follows.
+fn interpreter_script(process_exe: &str, argv: &[String]) -> Option<usize> {
+    let exe_name = thurm_config::executable_name(process_exe);
+    let name = if is_interpreter(exe_name) {
+        exe_name
+    } else {
+        thurm_config::executable_name(argv.first()?)
+    };
+    // Options taking a separate value, and options that mean no script file runs.
+    let (with_value, no_script): (&[&str], &[&str]) = match name {
+        "node" | "nodejs" => (
+            &[
+                "-r",
+                "--require",
+                "--import",
+                "--loader",
+                "--experimental-loader",
+                "-C",
+                "--conditions",
+                "--input-type",
+                "--env-file",
+                "--env-file-if-exists",
+                "--inspect-port",
+                "--title",
+                "--redirect-warnings",
+                "--openssl-config",
+                "--icu-data-dir",
+                "--diagnostic-dir",
+                "--report-dir",
+                "--disable-warning",
+                "--watch-path",
+            ],
+            &[
+                "-e",
+                "--eval",
+                "-p",
+                "--print",
+                "-i",
+                "--interactive",
+                "-c",
+                "--check",
+                "--test",
+                "-v",
+                "--version",
+                "-h",
+                "--help",
+                "--run",
+            ],
+        ),
+        "bun" => (
+            &[
+                "--cwd",
+                "-c",
+                "--config",
+                "-r",
+                "--preload",
+                "--env-file",
+                "--tsconfig-override",
+                "--port",
+            ],
+            &["-e", "--eval", "-p", "--print"],
+        ),
+        "deno" => (
+            &[
+                "-c",
+                "--config",
+                "--import-map",
+                "--lock",
+                "--cert",
+                "--location",
+                "--seed",
+                "--env-file",
+                "-L",
+                "--log-level",
+            ],
+            &[],
+        ),
+        "ruby" => (
+            &["-r", "-I", "-C", "-E", "--encoding"],
+            &["-e", "-v", "--version", "-h", "--help"],
+        ),
+        "perl" => (&["-I"], &["-e", "-E", "-v", "-h"]),
+        "npx" | "uv" => return None,
+        n if n.starts_with("python") => (
+            &["-W", "-X", "-Q", "--check-hash-based-pycs"],
+            &["-c", "-m", "-V", "--version", "-h", "--help"],
+        ),
+        _ => (&[], &[]),
+    };
     let mut i = 1;
+    // `deno run [options] script`: anything else runs no script file of the user's.
+    if name == "deno" {
+        if argv.get(1).map(String::as_str) != Some("run") {
+            return None;
+        }
+        i = 2;
+    }
+    // `bun run script` or `bun script`; `bun x`, `bun install`... run none.
+    let bun_subcommands = [
+        "x", "install", "i", "add", "remove", "rm", "update", "test", "build", "create", "init",
+        "upgrade", "pm", "link", "unlink", "repl", "exec", "outdated", "publish", "patch",
+    ];
     while let Some(arg) = argv.get(i) {
         if arg == "--" {
             return (i + 1 < argv.len()).then_some(i + 1);
         }
+        if arg == "-" {
+            return None;
+        }
         if !arg.starts_with('-') {
+            if name == "bun" {
+                if arg == "run" {
+                    i += 1;
+                    continue;
+                }
+                if bun_subcommands.contains(&arg.as_str()) {
+                    return None;
+                }
+            }
             return Some(i);
         }
         i += 1;
+        if arg.starts_with("--") {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(f, _)| f);
+            if no_script.contains(&flag) {
+                return None;
+            }
+            if flag == arg && with_value.contains(&flag) {
+                i += 1;
+            }
+            continue;
+        }
+        // Short options, possibly grouped (`-uc code`, `-Ilib`): one taking a value ends the
+        // group, with the rest of it as the value or else the next argument.
+        for (pos, c) in arg.char_indices().skip(1) {
+            let mut buf = [0u8; 4];
+            let opt = format!("-{}", c.encode_utf8(&mut buf));
+            if no_script.contains(&opt.as_str()) {
+                return None;
+            }
+            if with_value.contains(&opt.as_str()) {
+                if pos + c.len_utf8() == arg.len() {
+                    i += 1;
+                }
+                break;
+            }
+        }
     }
     None
 }
@@ -1412,7 +1656,7 @@ fn parse_reported_flags(
         if tok == "--" || !tok.starts_with('-') || tok == "-" {
             return Err("flag_not_listed");
         }
-        let (flag, inline_val) = split_inline_flag(tok);
+        let (flag, inline_val) = split_flag(tok, allowed);
         let Some(&arity) = allowed.get(flag) else {
             return Err("flag_not_listed");
         };
@@ -1459,24 +1703,29 @@ fn parse_reported_flags(
     Ok(out)
 }
 
-/// Where an owner's own arguments start in its launch `argv`: after an interpreter's script.
-fn launch_args_start(process_argv: &[String]) -> usize {
-    match process_argv.first() {
-        Some(arg0) if is_interpreter(thurm_config::executable_name(arg0)) => {
-            script_index(process_argv).map_or(process_argv.len(), |k| k + 1)
-        }
-        _ => 1,
+/// Where an owner's own arguments start in its launch `argv`: after an interpreter's script
+/// (none at all when it ran no script file Thurm can find).
+fn launch_args_start(process_exe: &str, process_argv: &[String]) -> usize {
+    let interpreted = is_interpreter(thurm_config::executable_name(process_exe))
+        || process_argv
+            .first()
+            .is_some_and(|a| is_interpreter(thurm_config::executable_name(a)));
+    if interpreted {
+        interpreter_script(process_exe, process_argv).map_or(process_argv.len(), |k| k + 1)
+    } else {
+        1
     }
 }
 
 /// Occurrences of the listed flags on the owning process's launch `argv`, in order, each with
 /// its values (empty for a flag without one).
 fn extract_launch_flags(
+    process_exe: &str,
     process_argv: &[String],
     allowed: &BTreeMap<String, FlagArity>,
 ) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
-    let mut i = launch_args_start(process_argv);
+    let mut i = launch_args_start(process_exe, process_argv);
     while i < process_argv.len() {
         let tok = &process_argv[i];
         if tok == "--" {
@@ -1486,7 +1735,7 @@ fn extract_launch_flags(
         if !tok.starts_with('-') || tok == "-" {
             continue;
         }
-        let (flag, inline_val) = split_inline_flag(tok);
+        let (flag, inline_val) = split_flag(tok, allowed);
         let Some(&arity) = allowed.get(flag) else {
             continue;
         };
@@ -1525,59 +1774,177 @@ fn extract_launch_flags(
     out
 }
 
-/// Whether the reported flags agree with the launch: each reported occurrence (flag and its
-/// exact values) uses up a distinct identical launch occurrence, and no launch occurrence of a
-/// `preserve` flag is left over (the resume would drop a restriction).
+/// Whether the reported flags agree with the launch. The occurrences of `preserve` flags must
+/// be the launch's, in the same order with the same values (a program may let the last one win,
+/// so a reordered list is a different restriction); every other reported occurrence uses up a
+/// distinct identical launch occurrence, in any order, and those may be left out.
 fn flags_match_launch(
     reported: &[(String, Vec<String>)],
     launch: &[(String, Vec<String>)],
     preserve: &BTreeMap<String, FlagArity>,
 ) -> bool {
-    let mut unused: Vec<&(String, Vec<String>)> = launch.iter().collect();
-    for occ in reported {
+    let preserved = |occ: &&(String, Vec<String>)| preserve.contains_key(&occ.0);
+    if !reported
+        .iter()
+        .filter(preserved)
+        .eq(launch.iter().filter(preserved))
+    {
+        return false;
+    }
+    let mut unused: Vec<&(String, Vec<String>)> = launch.iter().filter(|o| !preserved(o)).collect();
+    for occ in reported.iter().filter(|o| !preserved(o)) {
         let Some(pos) = unused.iter().position(|l| *l == occ) else {
             return false;
         };
         unused.swap_remove(pos);
     }
-    !unused.iter().any(|(flag, _)| preserve.contains_key(flag))
+    true
 }
 
-/// The part of a launch `argv` that restore needs to re-check trust: the program, an
-/// interpreter's script, and the occurrences of flags that `rules` look at. Everything else
-/// (other arguments can hold credentials) stays out of `session.json`.
-pub fn launch_evidence(process_argv: &[String], rules: &[ResumeRule]) -> Vec<String> {
-    // The program, and an interpreter's script (its own options dropped).
-    let mut out: Vec<String> = process_argv.first().cloned().into_iter().collect();
-    if launch_args_start(process_argv) > 1
-        && let Some(k) = script_index(process_argv)
+/// What restore needs of a launch `argv` to re-check trust for the reported `argv`: the
+/// program, an interpreter's script, and for each distinct set of flags (with arities) an
+/// enabled rule for that command checks, the launch occurrences of those flags parsed with
+/// that rule's arities, their values digested with `key`. Everything else (other arguments can
+/// hold credentials) stays out of `session.json`.
+pub fn launch_evidence(
+    process_exe: &str,
+    process_argv: &[String],
+    argv: &[String],
+    rules: &[ResumeRule],
+    key: &[u8; 32],
+) -> SavedLaunchEvidence {
+    let script = interpreter_script(process_exe, process_argv)
+        .filter(|_| launch_args_start(process_exe, process_argv) > 1)
+        .map(|k| process_argv[k].clone());
+    let mut flags: Vec<SavedFlagEvidence> = Vec::new();
+    for rule in rules
+        .iter()
+        .filter(|r| r.enabled && r.command.first().is_some_and(|c| argv.first() == Some(c)))
     {
-        out.push(process_argv[k].clone());
-    }
-    let mut allowed = BTreeMap::new();
-    for rule in rules.iter().filter(|r| r.enabled) {
-        allowed.extend(rule.all_checked_flags());
-    }
-    for (flag, vals) in extract_launch_flags(process_argv, &allowed) {
-        match vals.as_slice() {
-            // `--flag=value` keeps a value that starts with `-` attached to its flag.
-            [v] if flag.starts_with("--") => out.push(format!("{flag}={v}")),
-            _ => {
-                out.push(flag);
-                out.extend(vals);
-            }
+        let checked = rule.all_checked_flags();
+        if checked.is_empty() || flags.iter().any(|f| f.checked == checked) {
+            continue;
         }
+        let occurrences = extract_launch_flags(process_exe, process_argv, &checked)
+            .into_iter()
+            .map(|(flag, vals)| (flag, vals.iter().map(|v| digest_value(key, v)).collect()))
+            .collect();
+        flags.push(SavedFlagEvidence {
+            checked,
+            occurrences,
+        });
     }
-    out
+    SavedLaunchEvidence {
+        program: process_argv.first().cloned().unwrap_or_default(),
+        script,
+        flags,
+    }
 }
 
-fn split_inline_flag(tok: &str) -> (&str, Option<&str>) {
-    if tok.starts_with("--")
-        && let Some((k, v)) = tok.split_once('=')
+/// Splits a flag token into the flag and an inline value: `--flag=value`, or a short option
+/// glued to its value (`-sread-only`) when `allowed` lists the short option with a value.
+fn split_flag<'t>(
+    tok: &'t str,
+    allowed: &BTreeMap<String, FlagArity>,
+) -> (&'t str, Option<&'t str>) {
+    if tok.starts_with("--") {
+        if let Some((k, v)) = tok.split_once('=') {
+            return (k, Some(v));
+        }
+        return (tok, None);
+    }
+    if tok.len() > 2
+        && !allowed.contains_key(tok)
+        && let Some(short) = tok.get(..2)
+        && allowed.get(short).is_some_and(|&a| a != FlagArity::None)
     {
-        return (k, Some(v));
+        return (short, Some(&tok[2..]));
     }
     (tok, None)
+}
+
+/// A keyed digest (HMAC-SHA256, hex) of a launch flag value, as saved in place of the value.
+pub fn digest_value(key: &[u8; 32], value: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("any key length");
+    mac.update(value.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The key saved launch evidence is digested with (see [`load_or_create_key`] in
+/// [`thurm_config::resume_key_dir`]). `None` when it can be neither read nor made: records are
+/// then not saved, and saved ones fail closed.
+pub fn evidence_key() -> Option<[u8; 32]> {
+    static KEY: std::sync::Mutex<Option<[u8; 32]>> = std::sync::Mutex::new(None);
+    let mut cached = KEY.lock().unwrap_or_else(|e| e.into_inner());
+    if cached.is_none() {
+        match load_or_create_key(&thurm_config::resume_key_dir()) {
+            Ok(key) => *cached = Some(key),
+            Err(e) => log::warn!("program resume evidence key unavailable: {e}"),
+        }
+    }
+    *cached
+}
+
+/// Reads the 32-byte key in `dir/resume-evidence.key`, creating the directory (0700) and the
+/// key (0600, random) when missing. Both must be private to this user, the key a regular file.
+fn load_or_create_key(dir: &Path) -> std::io::Result<[u8; 32]> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    let uid = unsafe { libc::geteuid() };
+    let private = |e: &str| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_owned());
+    if std::fs::symlink_metadata(dir).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        return Err(private("key directory is not private to current user"));
+    }
+    let path = dir.join("resume-evidence.key");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            let mut key = [0u8; 32];
+            let written = (|| {
+                std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
+                f.write_all(&key)?;
+                f.sync_all()?;
+                std::fs::File::open(dir)?.sync_all()
+            })();
+            if let Err(e) = written {
+                // A short key file would fail every later start.
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+            return Ok(key);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() || meta.uid() != uid || meta.mode() & 0o077 != 0 || meta.len() != 32 {
+        return Err(private(
+            "key file is not a private 32-byte file of current user",
+        ));
+    }
+    let mut key = [0u8; 32];
+    f.read_exact(&mut key)?;
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2261,7 +2628,7 @@ mod tests {
             argv: &claude_argv,
             cwd: Some("/tmp"),
             process_exe: "/Users/me/.local/share/claude/versions/2.1.332",
-            process_argv: &["claude".into(), "--model=opus".into()],
+            launch: Launch::Live(&["claude".into(), "--model=opus".into()]),
             wrapped: false,
         };
         assert_eq!(
@@ -2279,7 +2646,7 @@ mod tests {
 
         // Escalated flag not present at launch -> rejected (`flags_differ`)
         let escalated = TrustSubject {
-            process_argv: &["claude".into()],
+            launch: Launch::Live(&["claude".into()]),
             ..ok
         };
         assert_eq!(
@@ -2290,7 +2657,7 @@ mod tests {
         // Wrong process trying to claim claude -> `program_differs`
         let spoofed_proc = TrustSubject {
             process_exe: "/bin/bash",
-            process_argv: &["bash".into()],
+            launch: Launch::Live(&["bash".into()]),
             ..ok
         };
         assert_eq!(
@@ -2350,7 +2717,7 @@ mod tests {
             argv: &link_argv,
             cwd: Some("/tmp"),
             process_exe: "/usr/bin/nvim",
-            process_argv: &["nvim".into()],
+            launch: Launch::Live(&["nvim".into()]),
             wrapped: false,
         };
         // Lexical passes, canonical symlink check rejects!
@@ -2593,7 +2960,7 @@ mod tests {
                     argv: &argv,
                     cwd: Some("/tmp"),
                     process_exe: "/Users/me/.local/share/claude/versions/2.1.332",
-                    process_argv: &launch,
+                    launch: Launch::Live(&launch),
                     wrapped: false,
                 },
                 ResumeProgramsMode::Rules,
@@ -2647,7 +3014,7 @@ mod tests {
                     argv: &argv(&[]),
                     cwd: Some("/tmp"),
                     process_exe: "",
-                    process_argv: &[],
+                    launch: Launch::Live(&[]),
                     wrapped: false,
                 },
                 ResumeProgramsMode::Rules,
@@ -2665,7 +3032,7 @@ mod tests {
                     argv: &argv(&[]),
                     cwd: Some("/tmp"),
                     process_exe: "/usr/bin/python3",
-                    process_argv: &["claude".into()],
+                    launch: Launch::Live(&["claude".into()]),
                     wrapped: false,
                 },
                 ResumeProgramsMode::Rules,
@@ -2677,10 +3044,17 @@ mod tests {
         );
     }
 
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn saved_launch_evidence_keeps_only_what_rules_check() {
+    fn saved_launch_evidence_keeps_only_digests_of_what_rules_check() {
         let rules = thurm_config::builtin_resume_rules();
-        let launch: Vec<String> = [
+        let key = [7u8; 32];
+        let id = "4394937c-b07a-4bd5-b6d0-034e7091ff1f";
+        let exe = "/Users/me/.local/share/claude/versions/2.1.332";
+        let launch = strings(&[
             "claude",
             "--api-key",
             "sk-secret",
@@ -2690,45 +3064,292 @@ mod tests {
             "/a",
             "/b",
             "--strict-mcp-config",
+            "--mcp-config",
+            "{\"token\":\"secret\"}",
             "--permission-mode",
             "-weird",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let saved = launch_evidence(&launch, &rules);
-        assert!(!saved.iter().any(|a| a.contains("secret")), "{saved:?}");
+        ]);
+        let report = strings(&[
+            "claude",
+            "--resume",
+            id,
+            "--strict-mcp-config",
+            "--mcp-config",
+            "{\"token\":\"secret\"}",
+            "--permission-mode",
+            "-weird",
+        ]);
+        let saved = launch_evidence(exe, &launch, &report, &rules, &key);
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(!json.contains("secret") && !json.contains("opus"), "{json}");
+        assert_eq!(saved.program, "claude");
+        assert_eq!(saved.flags.len(), 1, "only the claude rule applies");
+        assert_eq!(saved.flags[0].checked, rules[0].all_checked_flags());
+
+        let subject = |argv: &'_ [String], evidence, key| -> TrustVerdict {
+            evaluate_trust_with_root(
+                &TrustSubject {
+                    argv,
+                    cwd: Some("/tmp"),
+                    process_exe: exe,
+                    launch: Launch::Saved { evidence, key },
+                    wrapped: false,
+                },
+                ResumeProgramsMode::Rules,
+                &rules,
+                false,
+                false,
+            )
+        };
+        // The saved digests check the same report the live launch did.
+        assert!(matches!(
+            subject(&report, Some(&saved), Some(&key)),
+            TrustVerdict::Trusted { .. }
+        ));
+        // A dropped restriction, a changed value, a different key, or no evidence: refused.
+        let dropped = strings(&["claude", "--resume", id, "--strict-mcp-config"]);
         assert_eq!(
-            saved,
-            [
-                "claude",
-                "--model=opus",
-                "--add-dir",
-                "/a",
-                "/b",
-                "--strict-mcp-config",
-                "--permission-mode=-weird"
-            ]
+            subject(&dropped, Some(&saved), Some(&key)),
+            TrustVerdict::Untrusted("flags_differ")
         );
-        // The saved evidence reads back as the same flags.
-        let all = rules[0].all_checked_flags();
         assert_eq!(
-            extract_launch_flags(&saved, &all),
-            extract_launch_flags(&launch, &all)
+            subject(&report, Some(&saved), Some(&[8u8; 32])),
+            TrustVerdict::Untrusted("flags_differ")
+        );
+        assert_eq!(
+            subject(&report, None, Some(&key)),
+            TrustVerdict::Untrusted("evidence_missing")
+        );
+        assert_eq!(
+            subject(&report, Some(&saved), None),
+            TrustVerdict::Untrusted("evidence_missing")
+        );
+        // A rule checking a flag the evidence did not cover (or with another arity) finds no
+        // evidence for it, rather than taking it as absent at launch.
+        let mut stricter = rules.clone();
+        stricter[0]
+            .preserve_flags
+            .insert("--sandbox-profile".into(), FlagArity::One);
+        assert_eq!(
+            evaluate_trust_with_root(
+                &TrustSubject {
+                    argv: &report,
+                    cwd: Some("/tmp"),
+                    process_exe: exe,
+                    launch: Launch::Saved {
+                        evidence: Some(&saved),
+                        key: Some(&key),
+                    },
+                    wrapped: false,
+                },
+                ResumeProgramsMode::Rules,
+                &stricter,
+                false,
+                false,
+            ),
+            TrustVerdict::Untrusted("evidence_missing")
         );
 
         // An interpreter keeps its script, not its own options.
-        let node: Vec<String> = [
+        let node = strings(&[
             "node",
             "--max-old-space-size=99",
             "/opt/cli.js",
             "--token",
             "x",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        assert_eq!(launch_evidence(&node, &rules), ["node", "/opt/cli.js"]);
+        ]);
+        let saved = launch_evidence("/usr/bin/node", &node, &report, &rules, &key);
+        assert_eq!(saved.program, "node");
+        assert_eq!(saved.script.as_deref(), Some("/opt/cli.js"));
+        assert!(saved.flags[0].occurrences.is_empty());
+    }
+
+    #[test]
+    fn evidence_is_parsed_with_each_rules_own_arities() {
+        let key = [1u8; 32];
+        let rule = |name: &str, arity| ResumeRule {
+            name: name.into(),
+            command: strings(&["tool", "<id>"]),
+            flags: BTreeMap::from([("--x".to_owned(), arity)]),
+            ..Default::default()
+        };
+        let rules = [rule("one", FlagArity::One), rule("none", FlagArity::None)];
+        let launch = strings(&["tool", "--x", "val"]);
+        let saved = launch_evidence("/bin/tool", &launch, &strings(&["tool", "a"]), &rules, &key);
+        assert_eq!(saved.flags.len(), 2);
+        assert_eq!(
+            saved.flags[0].occurrences,
+            [("--x".to_owned(), vec![digest_value(&key, "val")])]
+        );
+        assert_eq!(saved.flags[1].occurrences, [("--x".to_owned(), vec![])]);
+        // A rule for another command contributes nothing.
+        let other = [ResumeRule {
+            command: strings(&["other"]),
+            ..rule("o", FlagArity::One)
+        }];
+        assert!(
+            launch_evidence("/bin/tool", &launch, &strings(&["tool", "a"]), &other, &key)
+                .flags
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn preserved_flags_keep_their_launch_order() {
+        let preserve = BTreeMap::from([("--deny".to_owned(), FlagArity::One)]);
+        let occ = |f: &str, v: &str| (f.to_owned(), vec![v.to_owned()]);
+        let launch = [occ("--deny", "a"), occ("--model", "m"), occ("--deny", "b")];
+        // Same order: fine, with or without the optional flag.
+        assert!(flags_match_launch(
+            &[occ("--deny", "a"), occ("--deny", "b")],
+            &launch,
+            &preserve
+        ));
+        assert!(flags_match_launch(
+            &[occ("--model", "m"), occ("--deny", "a"), occ("--deny", "b")],
+            &launch,
+            &preserve
+        ));
+        // Reversed (the last one may win): a different restriction.
+        assert!(!flags_match_launch(
+            &[occ("--deny", "b"), occ("--deny", "a")],
+            &launch,
+            &preserve
+        ));
+        assert!(!flags_match_launch(
+            &[occ("--deny", "a")],
+            &launch,
+            &preserve
+        ));
+    }
+
+    #[test]
+    fn short_options_carry_glued_values() {
+        let rules = thurm_config::builtin_resume_rules();
+        let codex = rules.iter().find(|r| r.name == "codex").unwrap();
+        let all = codex.all_checked_flags();
+        let launch = strings(&["codex", "-sread-only", "--ask-for-approval=never"]);
+        assert_eq!(
+            extract_launch_flags("/bin/codex", &launch, &all),
+            [
+                ("-s".to_owned(), vec!["read-only".to_owned()]),
+                ("--ask-for-approval".to_owned(), vec!["never".to_owned()])
+            ]
+        );
+        let check = |report: &[&str]| {
+            let mut argv = strings(&["codex", "resume", "abc"]);
+            argv.extend(strings(report));
+            evaluate_trust_with_root(
+                &TrustSubject {
+                    argv: &argv,
+                    cwd: Some("/tmp"),
+                    process_exe: "/opt/homebrew/bin/codex",
+                    launch: Launch::Live(&launch),
+                    wrapped: false,
+                },
+                ResumeProgramsMode::Rules,
+                &rules,
+                false,
+                false,
+            )
+        };
+        assert_eq!(check(&[]), TrustVerdict::Untrusted("flags_differ"));
+        assert!(matches!(
+            check(&["-s", "read-only", "--ask-for-approval", "never"]),
+            TrustVerdict::Trusted { .. }
+        ));
+    }
+
+    #[test]
+    fn interpreter_options_and_modes() {
+        let idx = |exe: &str, v: &[&str]| interpreter_script(exe, &strings(v));
+        assert_eq!(
+            idx("/usr/bin/node", &["node", "--require", "/m.js", "/cli.js"]),
+            Some(3)
+        );
+        assert_eq!(
+            idx("/usr/bin/node", &["node", "-r", "/m.js", "/cli.js"]),
+            Some(3)
+        );
+        assert_eq!(
+            idx("/usr/bin/node", &["node", "--require=/m.js", "/cli.js"]),
+            Some(2)
+        );
+        assert_eq!(
+            idx("/usr/bin/node", &["node", "--no-warnings", "/cli.js"]),
+            Some(2)
+        );
+        assert_eq!(
+            idx("/usr/bin/node", &["node", "-e", "code", "/cli.js"]),
+            None
+        );
+        assert_eq!(idx("/usr/bin/node", &["node", "--eval=code"]), None);
+        assert_eq!(
+            idx("/usr/bin/python3", &["python3", "-W", "ignore", "/x.py"]),
+            Some(3)
+        );
+        assert_eq!(
+            idx("/usr/bin/python3", &["python3", "-Wignore", "/x.py"]),
+            Some(2)
+        );
+        assert_eq!(idx("/usr/bin/python3", &["python3", "-m", "mod"]), None);
+        assert_eq!(idx("/usr/bin/python3", &["python3", "-uc", "code"]), None);
+        assert_eq!(
+            idx("/usr/bin/ruby", &["ruby", "-I", "lib", "/x.rb"]),
+            Some(3)
+        );
+        assert_eq!(idx("/usr/bin/perl", &["perl", "-le", "print"]), None);
+        assert_eq!(idx("/bin/deno", &["deno", "run", "-A", "/x.ts"]), Some(3));
+        assert_eq!(idx("/bin/deno", &["deno", "task", "x"]), None);
+        assert_eq!(idx("/bin/bun", &["bun", "run", "/x.ts"]), Some(2));
+        assert_eq!(idx("/bin/bun", &["bun", "x", "pkg"]), None);
+        assert_eq!(idx("/bin/npx", &["npx", "pkg"]), None);
+        // The launch's own flags start after the script found the same way.
+        let launch = strings(&["node", "-r", "/m.js", "/cli.js", "--model", "x"]);
+        let allowed = BTreeMap::from([("--model".to_owned(), FlagArity::One)]);
+        assert_eq!(
+            extract_launch_flags("/usr/bin/node", &launch, &allowed),
+            [("--model".to_owned(), vec!["x".to_owned()])]
+        );
+    }
+
+    #[test]
+    fn writable_directories_are_not_trusted_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("thurm-resume-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shared = root.join("allowed/shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        for d in [&root, &root.join("allowed"), &shared] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let allowed = root.join("allowed").display().to_string();
+        let target = shared.join("s.vim").display().to_string();
+        assert!(path_within_dir(&target, &allowed, false, true));
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!path_within_dir(&target, &allowed, false, true));
+        // Lexical checks alone (live records) do not look at the filesystem.
+        assert!(path_within_dir(&target, &allowed, false, false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evidence_key_is_made_once_and_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("thurm-resume-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = load_or_create_key(&dir).unwrap();
+        assert_eq!(load_or_create_key(&dir).unwrap(), key);
+        let file = dir.join("resume-evidence.key");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_or_create_key(&dir).is_err());
+        assert_ne!(digest_value(&key, "a"), digest_value(&key, "b"));
+        assert_ne!(digest_value(&key, "a"), digest_value(&[0u8; 32], "a"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
