@@ -1205,6 +1205,20 @@ fn escape_resume_display(s: &str) -> String {
     out
 }
 
+/// One resume argument for display, its boundaries visible: quoted shell-style unless it is
+/// non-empty and plain, with control and invisible characters escaped inside.
+fn quote_resume_arg(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if plain {
+        arg.to_owned()
+    } else {
+        format!("'{}'", escape_resume_display(&arg.replace('\'', "'\\''")))
+    }
+}
+
 fn daemon_cmd(action: &str, json: bool) -> R {
     match action {
         "status" => match connect(false).and_then(|c| match c.request(Request::ListPanes) {
@@ -1964,7 +1978,8 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool, remote: Option<&str>) -> R {
                         .flatten()
                 })
             };
-            let Response::ResumeRecords(list) = c.request(Request::ResumeRecords { pane: target })?
+            let Response::ResumeRecords(list) =
+                c.request(Request::ResumeRecords { pane: target })?
             else {
                 return Err("unexpected response".into());
             };
@@ -1994,10 +2009,13 @@ fn run_connected(c: &Client, cmd: Cmd, json: bool, remote: Option<&str>) -> R {
                         let cmd = r
                             .argv
                             .iter()
-                            .map(|a| escape_resume_display(a))
+                            .map(|a| quote_resume_arg(a))
                             .collect::<Vec<_>>()
                             .join(" ");
-                        println!("{:<5} {:<7} {:<7} {:<18} {cmd}", p.pane, r.pid, chosen, trust);
+                        println!(
+                            "{:<5} {:<7} {:<7} {:<18} {cmd}",
+                            p.pane, r.pid, chosen, trust
+                        );
                     }
                 }
                 if !any {

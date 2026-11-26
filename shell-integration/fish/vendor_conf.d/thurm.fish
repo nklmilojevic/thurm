@@ -8,6 +8,15 @@ if set -q THURM_ORIG_XDG_DATA_DIRS
     set -e THURM_ORIG_XDG_DATA_DIRS
 end
 
+# One-shot program resume after a restart (Thurm session restore): taken out of the
+# environment before config.fish runs, so nothing started from it inherits the handoff.
+if set -q THURM_RESUME_FILE; and set -q THURM_RESUME_EXEC
+    set -g __thurm_resume_file "$THURM_RESUME_FILE"
+    set -g __thurm_resume_exec "$THURM_RESUME_EXEC"
+end
+set -e THURM_RESUME_FILE
+set -e THURM_RESUME_EXEC
+
 if status is-interactive; and not set -q __thurm_fish_loaded
     set -g __thurm_fish_loaded 1
     # Proves to Thurm that the $PATH report comes from this shell, not from program output.
@@ -37,6 +46,19 @@ if status is-interactive; and not set -q __thurm_fish_loaded
                 # finds nothing.
                 set -gx PATH $rest
             end
+        end
+    end
+
+    # The restored program runs at the first prompt, once config.fish is done; the shell runs
+    # it itself (nothing is typed into the terminal), and gets the terminal back when it ends.
+    if set -q __thurm_resume_file
+        function __thurm_resume --on-event fish_prompt
+            functions -e __thurm_resume
+            set -l file $__thurm_resume_file
+            set -l exec $__thurm_resume_exec
+            set -e __thurm_resume_file
+            set -e __thurm_resume_exec
+            command $exec --exec-resume $file
         end
     end
 

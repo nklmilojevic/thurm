@@ -78,6 +78,31 @@ fn read_snapshot(env: &Env) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(&path).expect("session.json")).unwrap()
 }
 
+/// Waits until `session.json` satisfies `pred` (the daemon writes it after updating the
+/// records the client sees, so it may lag them).
+fn wait_snapshot(env: &Env, what: &str, pred: impl Fn(&serde_json::Value) -> bool) {
+    let path = env.dir.join("state/session.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        if snap.as_ref().is_some_and(&pred) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what}: {snap:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(s.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 fn find_shell(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .chain([PathBuf::from("/bin"), PathBuf::from("/usr/bin")])
@@ -126,40 +151,44 @@ fn token_is_unique_per_pane_valid_and_never_inherited() {
         let Response::PaneCreated { pane } = resp else {
             panic!("{resp:?}");
         };
+        // The pane checks its token's shape and writes only that verdict and a digest: a live
+        // token never reaches a file or the test output.
         let out_file = env.dir.join(format!("tok-{i}"));
         run_line(
             &c,
             pane,
             &format!(
-                "printf '%s' \"$OSC7577_TOKEN\" > '{}'; printf 'TOK_%s_%d\\n' DONE {i}",
+                "t=\"$OSC7577_TOKEN\"; \
+                 if [ -z \"$t\" ]; then v=empty; \
+                 elif printf '%s' \"$t\" | LC_ALL=C grep -Eq '^[A-Za-z0-9_-]{{22,64}}$'; then v=valid; \
+                 else v=invalid; fi; \
+                 d=$(printf '%s' \"$t\" | {{ sha256sum 2>/dev/null || shasum -a 256; }} | cut -c1-64); \
+                 printf '%s %s' \"$v\" \"$d\" > '{}'; unset t d v; printf 'TOK_%s_%d\\n' DONE {i}",
                 out_file.display()
             ),
         );
         wait_match(&c, pane, &format!("TOK_DONE_{i}"));
-        let tok = std::fs::read_to_string(&out_file).unwrap();
+        let report = std::fs::read_to_string(&out_file).unwrap();
+        let (verdict, digest) = report.split_once(' ').unwrap();
         if running_as_root() {
-            assert!(
-                tok.is_empty(),
-                "OSC7577_TOKEN must be unset when running as root, got {tok:?}"
+            assert_eq!(
+                verdict, "empty",
+                "OSC7577_TOKEN must be unset when running as root"
             );
             continue;
         }
-        assert!(
-            (22..=64).contains(&tok.len()),
-            "token length out of range: {tok:?}"
-        );
-        assert!(
-            tok.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-            "invalid token charset: {tok:?}"
-        );
-        assert_ne!(tok, "parent-leaked-token-0123456789");
-        assert_ne!(tok, "config-must-not-override-token");
-        assert_ne!(tok, "client-must-not-override-token");
-        tokens.push(tok);
+        assert_eq!(verdict, "valid", "token length or charset out of spec");
+        for foreign in [
+            "parent-leaked-token-0123456789",
+            "config-must-not-override-token",
+            "client-must-not-override-token",
+        ] {
+            assert!(digest != sha256_hex(foreign), "pane token is {foreign}");
+        }
+        tokens.push(digest.to_owned());
     }
     if !running_as_root() {
-        assert_ne!(tokens[0], tokens[1], "panes must never share a token");
+        assert!(tokens[0] != tokens[1], "panes must never share a token");
     }
 }
 
@@ -233,12 +262,11 @@ fn report_persists_resumes_verbatim_without_shell_parsing_and_never_retries_twic
     assert!(recs[0].trusted);
     assert_eq!(recs[0].argv[3], adversarial);
 
-    // Persisted immediately (even with snapshot_interval_secs = 60).
-    let snap = read_snapshot(&env);
-    assert_eq!(
-        snap["panes"][0]["program_resume"]["argv"][0],
-        prog.display().to_string()
-    );
+    // Persisted on acceptance (not at the 60 s snapshot interval).
+    let want = prog.display().to_string();
+    wait_snapshot(&env, "record saved", |snap| {
+        snap["panes"][0]["program_resume"]["argv"][0] == want.as_str()
+    });
 
     // Cold restart.
     c.request(Request::Shutdown { kill_panes: true }).unwrap();
@@ -373,7 +401,8 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
         })
         .unwrap();
         std::thread::sleep(Duration::from_millis(250));
-        run_line(&c2, pane, "echo SUSPENDED_BACK");
+        // Only a shell running it prints the joined word (an echo of the typed line would not).
+        run_line(&c2, pane, "printf 'SUSPENDED_%s\\n' BACK");
         wait_match(&c2, pane, "SUSPENDED_BACK");
 
         // One-shot resume file was deleted on exec.
@@ -405,11 +434,17 @@ fn first_process_resumes_as_first_process() {
         "#,
     );
     let pid_file = env.dir.join("resumed-pid");
+    let runs = env.dir.join("resumed-runs");
+    let snap_at_start = env.dir.join("snapshot-at-start.json");
     let resumed_bin = env.dir.join("bin/resumed");
+    // What the snapshot said when the command started: it must already be marked tried.
     write_exec(
         &resumed_bin,
         &format!(
-            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\necho FIRST_RESUMED\nsleep 30\n",
+            "#!/bin/sh\ncp '{}' '{}'\necho x >> '{}'\nprintf '%s' \"$$\" > '{}'\necho FIRST_RESUMED\nsleep 30\n",
+            env.dir.join("state/session.json").display(),
+            snap_at_start.display(),
+            runs.display(),
             pid_file.display()
         ),
     );
@@ -450,7 +485,7 @@ fn first_process_resumes_as_first_process() {
     daemon.wait_exit();
     drop(c);
 
-    let _daemon2 = env.start();
+    let daemon2 = env.start();
     let (c2, _) = env.connect();
     wait_match(&c2, pane, "FIRST_RESUMED");
     let Response::PaneInfo(info) = c2.request(Request::PaneInfo { pane }).unwrap() else {
@@ -465,6 +500,23 @@ fn first_process_resumes_as_first_process() {
         info.pid,
         Some(resumed_pid),
         "resumed program must be the first process on the PTY"
+    );
+    let at_start: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snap_at_start).unwrap()).unwrap();
+    assert_eq!(
+        at_start["panes"][0]["program_resume"]["attempted"], true,
+        "the attempt was not on disk before the command ran"
+    );
+
+    // The daemon dies without saving again: the next start does not run the command again.
+    drop(c2);
+    drop(daemon2);
+    let _daemon3 = env.start();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        std::fs::read_to_string(&runs).unwrap().lines().count(),
+        1,
+        "resume ran again after a crash"
     );
 }
 
@@ -655,8 +707,9 @@ fn clear_reject_exit_grace_and_close_pane_remove_records() {
     wait_match(&c, pane, "EXIT_SOON");
     wait_records(&c, pane, "short-lived set", |r| r.len() == 1);
     wait_records(&c, pane, "expired after exit grace", |r| r.is_empty());
-    let snap = read_snapshot(&env);
-    assert!(snap["panes"][0]["program_resume"].is_null());
+    wait_snapshot(&env, "expired record removed from snapshot", |snap| {
+        snap["panes"][0]["program_resume"].is_null()
+    });
 
     // 4. Closing a pane discards its record immediately.
     let stay = env.dir.join("stay.sh");
@@ -750,8 +803,9 @@ fn trust_rules_enforce_allowlist_reload_and_wrapped_check() {
         r.len() == 1 && r[0].trusted
     });
     assert_eq!(recs[0].rule.as_deref(), Some("fakeeditor"));
-    let snap = read_snapshot(&env);
-    assert!(!snap["panes"][0]["program_resume"].is_null());
+    wait_snapshot(&env, "trusted record saved", |snap| {
+        !snap["panes"][0]["program_resume"].is_null()
+    });
 
     // Cold restart resumes it!
     c.request(Request::Shutdown { kill_panes: true }).unwrap();

@@ -810,7 +810,7 @@ impl Client {
                 if capabilities.iter().any(|c| c == thurm_proto::CAP_PROGRAM_RESUME))
         {
             return Err(ClientError::Daemon(
-                "this Thurm daemon does not support program resume yet; restart it with `thurm daemon upgrade`"
+                "this Thurm daemon does not support program resume yet; update Thurm on the host you connected to"
                     .into(),
             ));
         }

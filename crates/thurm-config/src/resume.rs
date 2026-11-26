@@ -53,8 +53,23 @@ pub struct ResumeRule {
     /// Extra flags allowed after `command`. When present, each reported flag must also appear
     /// with the same values on the owning process's launch command line.
     pub flags: BTreeMap<String, FlagArity>,
+    /// Restricting flags that must survive a resume: every launch occurrence of one of these
+    /// flags must be reported again with the same values, and the report may not add any. Also
+    /// allowed in reports (no need to repeat them in `flags`).
+    pub preserve_flags: BTreeMap<String, FlagArity>,
     /// Require the owning OS process to match `command[0]` (default: `true`).
     pub match_process: bool,
+}
+
+impl ResumeRule {
+    /// All flags referenced by either `flags` or `preserve_flags`.
+    pub fn all_checked_flags(&self) -> BTreeMap<String, FlagArity> {
+        let mut all = self.flags.clone();
+        for (k, &v) in &self.preserve_flags {
+            all.entry(k.clone()).or_insert(v);
+        }
+        all
+    }
 }
 
 impl Default for ResumeRule {
@@ -65,6 +80,7 @@ impl Default for ResumeRule {
             command: Vec::new(),
             dirs: Vec::new(),
             flags: BTreeMap::new(),
+            preserve_flags: BTreeMap::new(),
             match_process: true,
         }
     }
@@ -123,6 +139,12 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
                 ("-w", Optional),
                 ("--worktree", Optional),
             ]),
+            preserve_flags: flags(&[
+                ("--disallowed-tools", Many),
+                ("--disallowedTools", Many),
+                ("--mcp-config", Many),
+                ("--strict-mcp-config", None),
+            ]),
             match_process: true,
         },
         ResumeRule {
@@ -131,6 +153,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             command: s(&["codex", "resume", "<id>"]),
             dirs: Vec::new(),
             flags: BTreeMap::new(),
+            preserve_flags: BTreeMap::new(),
             match_process: true,
         },
         ResumeRule {
@@ -139,6 +162,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             command: s(&["opencode", "<oneof:--session|-s>", "<id>"]),
             dirs: Vec::new(),
             flags: BTreeMap::new(),
+            preserve_flags: BTreeMap::new(),
             match_process: true,
         },
         ResumeRule {
@@ -147,6 +171,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             command: s(&["pi", "--session", "<id>"]),
             dirs: Vec::new(),
             flags: BTreeMap::new(),
+            preserve_flags: BTreeMap::new(),
             match_process: true,
         },
         ResumeRule {
@@ -155,6 +180,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             command: s(&["agy", "--conversation", "<id>"]),
             dirs: Vec::new(),
             flags: BTreeMap::new(),
+            preserve_flags: BTreeMap::new(),
             match_process: true,
         },
     ]
@@ -163,8 +189,9 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
 /// Effective trust rules: built-ins (when `include_defaults`) merged with user rules.
 ///
 /// A user rule with the same `name` as a built-in rule disables it when `enabled = false`,
-/// restricts its `dirs` / `match_process` when `command` and `flags` are omitted, or replaces
-/// it wholesale when `command` or `flags` are provided.
+/// restricts its `dirs` / `match_process` when `command`, `flags` and `preserve_flags` are
+/// omitted, or replaces it when any of them is provided (keeping the built-in's `command` and
+/// `preserve_flags` where the user rule leaves them empty).
 pub fn resolve_resume_rules(include_defaults: bool, user: &[ResumeRule]) -> Vec<ResumeRule> {
     let mut rules = if include_defaults {
         builtin_resume_rules()
@@ -177,7 +204,7 @@ pub fn resolve_resume_rules(include_defaults: bool, user: &[ResumeRule]) -> Vec<
         {
             if !u.enabled {
                 rules.remove(idx);
-            } else if u.command.is_empty() && u.flags.is_empty() {
+            } else if u.command.is_empty() && u.flags.is_empty() && u.preserve_flags.is_empty() {
                 let existing = &mut rules[idx];
                 if !u.dirs.is_empty() {
                     existing.dirs = u.dirs.clone();
@@ -187,6 +214,9 @@ pub fn resolve_resume_rules(include_defaults: bool, user: &[ResumeRule]) -> Vec<
                 let mut replacement = u.clone();
                 if replacement.command.is_empty() {
                     replacement.command = rules[idx].command.clone();
+                }
+                if replacement.preserve_flags.is_empty() {
+                    replacement.preserve_flags = rules[idx].preserve_flags.clone();
                 }
                 rules[idx] = replacement;
             }

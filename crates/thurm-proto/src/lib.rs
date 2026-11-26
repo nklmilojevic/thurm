@@ -875,7 +875,7 @@ pub struct ResumeRecordInfo {
     pub cwd_from_report: bool,
     pub first_process: bool,
     pub reported_at: u64,
-    /// Whether this is the record a restart would select for this pane.
+    /// Whether this is the pane's current candidate, before trust and restore-time checks.
     pub chosen: bool,
     /// Whether current trust rules allow resuming this record.
     pub trusted: bool,

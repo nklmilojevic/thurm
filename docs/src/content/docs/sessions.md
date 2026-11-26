@@ -56,9 +56,23 @@ daemon restart or reboot.
 Each pane gets a unique random `OSC7577_TOKEN` in its initial environment (omitted when
 running as `root`). Programs prove they belong to the pane by signing reports with a
 SHA-256 `mac` over the report body and token, together with their owning `pid` and Unix
-timestamp (`time`, verified within a 60-second window). On restore, Thurm runs the
-command directly with `execvp` inside the user's shell environment (after startup files
-run) without shell parsing, and never retries a resume that failed or crashed.
+timestamp (`time`, verified within a 60-second window).
+
+On restore, Thurm runs the reported command itself, without shell parsing: a bare program
+name is looked up on the shell's `PATH`, and a file that is neither a binary nor a script
+with a `#!` line is refused rather than run by `/bin/sh`. How the command starts depends
+on where it ran:
+
+- A program that was the pane's first process (no shell) starts the same way again,
+  through a login shell command, without an interactive shell's startup files.
+- A job of zsh, bash or fish with shell integration runs from the shell's own hook at its
+  first prompt, after its startup files ran, and the shell takes over when it ends.
+- In other POSIX shells, and in zsh or fish started without startup files (`zsh -f`,
+  `fish --no-config`), Thurm types a fixed helper command (never the program's arguments)
+  a few seconds after the shell started.
+
+Thurm records each attempt before it starts the command and never retries a resume that
+failed or crashed; if it cannot record the attempt, it starts plain shells instead.
 
 By default (`session.resume_programs = "rules"`), Thurm only resumes commands that match
 a trust rule and whose owning process is not wrapped inside a sandbox or another
@@ -71,6 +85,13 @@ name = "nvim"
 command = ["nvim", "-S", "<under:~/.local/state/nvim/sessions>"]
 dirs = ["~/code"]
 ```
+
+A rule's `flags` lists options the report may add after `command`; each must have been
+given, with the same values, when the program was launched. `preserve_flags` lists
+restricting options (the Claude Code rule keeps `--disallowed-tools`, `--mcp-config` and
+`--strict-mcp-config`): when the program was launched with one, the report must carry it
+over unchanged, or the program is not resumed. Only those launch options are saved with
+the session, not the rest of the program's command line.
 
 To disable a built-in rule, add an entry with its `name` and `enabled = false`. Set
 `session.resume_programs = "all"` to trust any verified report from an unwrapped process,

@@ -3,11 +3,12 @@
 //!
 //! <https://www.superlogical.com/rex/docs/build/program-resume>
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::alphabet::STANDARD;
@@ -30,6 +31,9 @@ pub const MAX_ARGV: usize = 128;
 
 /// Maximum concurrent resume records kept per pane.
 pub const MAX_RECORDS_PER_PANE: usize = 64;
+
+/// Maximum replay timestamps remembered per pane (independent of the record count).
+const MAX_LAST_TIMES: usize = 256;
 
 /// Allowed clock skew between the report's `time` and the terminal's clock (spec SHOULD: 60 s).
 pub const TIME_WINDOW_SECS: u64 = 60;
@@ -61,12 +65,15 @@ pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 || libc::getuid() == 0 }
 }
 
-/// Current wall-clock time in milliseconds since Unix epoch.
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
-        .unwrap_or(0)
+/// Milliseconds on a monotonic clock local to this daemon process (for the exit grace period,
+/// which a wall-clock step must not stretch or cut short).
+pub fn monotonic_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 /// Cryptographically random per-pane `OSC7577_TOKEN`: 32 random bytes from `/dev/urandom`
@@ -456,7 +463,9 @@ pub fn parse_report(
 pub struct OwnerSnapshot {
     pub pid: u32,
     pub birth: u64,
+    /// For diagnostics only: on Linux the process can rename itself.
     pub process_name: String,
+    /// Canonical executable path from the OS; empty when unavailable.
     pub process_exe: String,
     pub process_argv: Vec<String>,
     pub process_cwd: Option<String>,
@@ -474,6 +483,63 @@ pub fn inspect_owner(
     pane_tty_rdev: Option<u64>,
     pane_has_explicit_command: bool,
 ) -> Result<OwnerSnapshot, &'static str> {
+    let my_euid = unsafe { libc::geteuid() };
+    let (birth, ancestors, is_descendant) = pane_member(pid, pane_pid, pane_tty_rdev)?;
+    let info = procinfo::process_info(pid);
+    let process_name = info.as_ref().map(|p| p.name.clone()).unwrap_or_default();
+    let process_argv = info.map(|p| p.argv).unwrap_or_default();
+    let process_exe = procinfo::exe_path(pid)
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p).display().to_string())
+        .unwrap_or_default();
+    let process_cwd = procinfo::cwd(pid);
+    let mut process_argv = process_argv;
+    // An interpreter's script, made absolute: restore re-checks it without the owner's cwd.
+    if is_interpreter(thurm_config::executable_name(&process_exe))
+        && let Some(k) = script_index(&process_argv)
+        && !process_argv[k].starts_with('/')
+    {
+        match &process_cwd {
+            Some(dir) => {
+                process_argv[k] = Path::new(dir).join(&process_argv[k]).display().to_string();
+            }
+            None => process_argv.truncate(k),
+        }
+    }
+    let owner_is_shell =
+        !process_exe.is_empty() && procinfo::is_shell(thurm_config::executable_name(&process_exe));
+
+    let (first_process, wrapped) = classify_lineage(
+        pid,
+        pane_pid,
+        &ancestors,
+        is_descendant,
+        pane_has_explicit_command,
+        owner_is_shell,
+        classify_ancestor,
+    );
+
+    Ok(OwnerSnapshot {
+        pid,
+        birth,
+        process_name,
+        process_exe,
+        process_argv,
+        process_cwd,
+        ancestors,
+        first_process,
+        wrapped,
+        uid: my_euid,
+    })
+}
+
+/// Checks that `pid` is alive, runs as the daemon's user, belongs to the pane (a descendant of
+/// its root or on its terminal) and shares the pane's root directory. Returns its birth time,
+/// its ancestors up to the pane root, and whether it descends from the pane root.
+fn pane_member(
+    pid: u32,
+    pane_pid: u32,
+    pane_tty_rdev: Option<u64>,
+) -> Result<(u64, Vec<u32>, bool), &'static str> {
     let my_uid = unsafe { libc::getuid() };
     let my_euid = unsafe { libc::geteuid() };
     if my_uid == 0 || my_euid == 0 {
@@ -492,36 +558,44 @@ pub fn inspect_owner(
     if !procinfo::same_root(pid, pane_pid) {
         return Err("owner root directory differs");
     }
-    let info = procinfo::process_info(pid);
-    let process_name = info.as_ref().map(|p| p.name.clone()).unwrap_or_default();
-    let process_argv = info.map(|p| p.argv).unwrap_or_default();
-    let process_exe = procinfo::exe_path(pid)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| process_name.clone());
-    let process_cwd = procinfo::cwd(pid);
+    Ok((birth, ancestors, is_descendant))
+}
 
-    let (first_process, wrapped) = classify_lineage(
-        pid,
-        pane_pid,
-        &ancestors,
-        is_descendant,
-        pane_has_explicit_command,
-        &process_name,
-        |anc| procinfo::process_info(anc).map(|p| p.name),
-    );
+/// What an ancestor of a reporting process is, judged by its OS executable path (a process
+/// name can be changed by the process itself).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AncestorKind {
+    Shell,
+    PtyProxy,
+    /// macOS `/usr/bin/login`, which Thurm starts the user's shell through.
+    Login,
+    Other,
+}
 
-    Ok(OwnerSnapshot {
-        pid,
-        birth,
-        process_name,
-        process_exe,
-        process_argv,
-        process_cwd,
-        ancestors,
-        first_process,
-        wrapped,
-        uid: my_euid,
-    })
+fn classify_ancestor(pid: u32) -> AncestorKind {
+    if let Some(exe) = procinfo::exe_path(pid) {
+        let exe = exe.display().to_string();
+        let name = thurm_config::executable_name(&exe);
+        if procinfo::is_shell(name) {
+            return AncestorKind::Shell;
+        }
+        if procinfo::is_pty_proxy(name) {
+            return AncestorKind::PtyProxy;
+        }
+        if cfg!(target_os = "macos") && exe == "/usr/bin/login" {
+            return AncestorKind::Login;
+        }
+        return AncestorKind::Other;
+    }
+    // login(1) runs as root: its path may be unreadable, but a root-owned process named
+    // `login` is not something the user's own programs can start.
+    if cfg!(target_os = "macos")
+        && procinfo::process_uids(pid) == Some((0, 0))
+        && procinfo::process_info(pid).is_some_and(|p| p.name == "login")
+    {
+        return AncestorKind::Login;
+    }
+    AncestorKind::Other
 }
 
 fn classify_lineage(
@@ -530,8 +604,8 @@ fn classify_lineage(
     ancestors: &[u32],
     is_descendant: bool,
     pane_has_explicit_command: bool,
-    owner_name: &str,
-    mut name_of: impl FnMut(u32) -> Option<String>,
+    owner_is_shell: bool,
+    mut kind_of: impl FnMut(u32) -> AncestorKind,
 ) -> (bool, bool) {
     if pid == pane_pid {
         return (true, false);
@@ -543,25 +617,18 @@ fn classify_lineage(
     // Check macOS `login(1) -> exec program` (the user ran `exec prog` replacing their shell).
     if !pane_has_explicit_command
         && ancestors == [pane_pid]
-        && !procinfo::is_shell(owner_name)
-        && name_of(pane_pid).as_deref() == Some("login")
+        && !owner_is_shell
+        && kind_of(pane_pid) == AncestorKind::Login
     {
         return (true, false);
     }
-    // Any ancestor between `pid` and `pane_pid` (inclusive) that is not a shell, login(1), or a
-    // known PTY proxy means `pid` runs under a wrapper (sandbox, sudo, nix develop, agent...).
-    let wrapped = ancestors.iter().any(|&anc| {
-        if anc == pane_pid && !pane_has_explicit_command {
-            // The pane root is our own shell or macOS login(1) (which may be unreadable as root).
-            return false;
-        }
-        match name_of(anc) {
-            Some(n) => {
-                let exe = thurm_config::executable_name(&n);
-                !procinfo::is_shell(exe) && !procinfo::is_pty_proxy(exe)
-            }
-            None => true,
-        }
+    // Every ancestor between `pid` and `pane_pid` (inclusive) must be a shell, a known PTY proxy,
+    // or the login(1) Thurm starts a shell pane with; anything else (sandbox, sudo, nix develop,
+    // an agent, or a non-shell the pane's shell `exec`ed) means `pid` runs under a wrapper.
+    let wrapped = ancestors.iter().any(|&anc| match kind_of(anc) {
+        AncestorKind::Shell | AncestorKind::PtyProxy => false,
+        AncestorKind::Login => anc != pane_pid || pane_has_explicit_command,
+        AncestorKind::Other => true,
     });
     (false, wrapped)
 }
@@ -584,7 +651,8 @@ pub struct ResumeRecord {
     pub process_argv: Vec<String>,
     pub ancestors: Vec<u32>,
     pub wrapped: bool,
-    /// Wall-clock ms when the daemon first observed the owning process dead; `None` while alive.
+    /// [`monotonic_ms`] when the daemon first observed the owning process dead; `None` while
+    /// alive. Local to one daemon process: cleared in the upgrade handoff.
     #[serde(default)]
     pub exited_at_ms: Option<u64>,
     /// Monotonic counter so ties prefer the most recently reported record.
@@ -592,7 +660,9 @@ pub struct ResumeRecord {
 }
 
 impl ResumeRecord {
-    pub fn to_saved(&self) -> SavedProgramResume {
+    /// The record as saved in `session.json`, with only the launch arguments `rules` need to
+    /// re-check trust on restore (see [`launch_evidence`]).
+    pub fn to_saved(&self, rules: &[ResumeRule]) -> SavedProgramResume {
         SavedProgramResume {
             argv: self.argv.clone(),
             cwd: self.cwd.clone(),
@@ -602,7 +672,7 @@ impl ResumeRecord {
             reported_at: self.reported_at,
             process_name: self.process_name.clone(),
             process_exe: self.process_exe.clone(),
-            process_argv: self.process_argv.clone(),
+            process_argv: launch_evidence(&self.process_argv, rules),
             wrapped: self.wrapped,
             attempted: false,
         }
@@ -645,7 +715,17 @@ impl ProgramResumeState {
 
     pub fn handoff(&self) -> ResumeHandoff {
         ResumeHandoff {
-            records: self.records.clone(),
+            // The next image's monotonic clock starts over: an exit seen here gets a fresh grace
+            // period there.
+            records: self
+                .records
+                .iter()
+                .cloned()
+                .map(|r| ResumeRecord {
+                    exited_at_ms: None,
+                    ..r
+                })
+                .collect(),
             last_times: self
                 .last_times
                 .iter()
@@ -696,9 +776,13 @@ impl ProgramResumeState {
             }
             ParseOutcome::Accept(parsed) => match parsed.kind {
                 ReportKind::Clear => {
-                    // Record timestamp for alive owner so replaying an earlier Set is ignored.
-                    if let Some(birth) = procinfo::process_birth(parsed.pid) {
-                        self.record_time(parsed.pid, birth, parsed.time, now);
+                    // Remember the time for a live owner in this pane so replaying an earlier
+                    // Set is ignored (nothing is kept for processes outside the pane).
+                    match pane_member(parsed.pid, pane_pid, pane_tty_rdev) {
+                        Ok((birth, ..)) => self.record_time(parsed.pid, birth, parsed.time, now),
+                        Err(reason) => {
+                            log::debug!("OSC 7577 clear for pid {}: {reason}", parsed.pid);
+                        }
                     }
                     self.remove_owner(parsed.pid)
                 }
@@ -749,6 +833,16 @@ impl ProgramResumeState {
     fn record_time(&mut self, pid: u32, birth: u64, report_time: u64, now_secs: u64) {
         self.last_times
             .retain(|_, &mut (_, t)| now_secs.abs_diff(t) <= TIME_WINDOW_SECS + 10);
+        if self.last_times.len() >= MAX_LAST_TIMES
+            && !self.last_times.contains_key(&pid)
+            && let Some(oldest) = self
+                .last_times
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(&p, _)| p)
+        {
+            self.last_times.remove(&oldest);
+        }
         self.last_times.insert(pid, (birth, report_time));
     }
 
@@ -767,7 +861,7 @@ impl ProgramResumeState {
     }
 
     /// Checks owning process liveness, expiring records whose owners have been gone longer than
-    /// `EXIT_GRACE_MS`. Returns `true` if any record was removed.
+    /// `EXIT_GRACE_MS`. `now_ms` is [`monotonic_ms`]. Returns `true` if any record was removed.
     pub fn poll_liveness(&mut self, now_ms: u64) -> bool {
         self.poll_liveness_with(now_ms, procinfo::process_birth)
     }
@@ -796,6 +890,14 @@ impl ProgramResumeState {
     /// - Among top-level records, one in the current foreground process group wins if present;
     ///   otherwise the most recently reported one wins.
     pub fn chosen(&self, foreground_pgrp: Option<u32>) -> Option<&ResumeRecord> {
+        self.chosen_with(foreground_pgrp, current_pgrp)
+    }
+
+    fn chosen_with(
+        &self,
+        foreground_pgrp: Option<u32>,
+        pgrp_of: impl Fn(&ResumeRecord) -> Option<u32>,
+    ) -> Option<&ResumeRecord> {
         if self.records.is_empty() {
             return None;
         }
@@ -814,7 +916,7 @@ impl ProgramResumeState {
         if let Some(fg) = foreground_pgrp
             && let Some(&r) = candidates
                 .iter()
-                .filter(|r| r.pid == fg)
+                .filter(|r| pgrp_of(r) == Some(fg))
                 .max_by_key(|r| r.order)
         {
             return Some(r);
@@ -837,7 +939,6 @@ impl ProgramResumeState {
                     &TrustSubject {
                         argv: &r.argv,
                         cwd: r.cwd.as_deref(),
-                        process_name: &r.process_name,
                         process_exe: &r.process_exe,
                         process_argv: &r.process_argv,
                         wrapped: r.wrapped,
@@ -882,7 +983,6 @@ impl ProgramResumeState {
             &TrustSubject {
                 argv: &chosen.argv,
                 cwd: chosen.cwd.as_deref(),
-                process_name: &chosen.process_name,
                 process_exe: &chosen.process_exe,
                 process_argv: &chosen.process_argv,
                 wrapped: chosen.wrapped,
@@ -892,10 +992,16 @@ impl ProgramResumeState {
             false,
         );
         match trust {
-            TrustVerdict::Trusted { .. } => Some(chosen.to_saved()),
+            TrustVerdict::Trusted { .. } => Some(chosen.to_saved(rules)),
             TrustVerdict::Untrusted(_) => None,
         }
     }
+}
+
+/// The current process group of a record's owner, if it is still the same process.
+fn current_pgrp(r: &ResumeRecord) -> Option<u32> {
+    let pgrp = unsafe { libc::getpgid(r.pid as libc::pid_t) };
+    (pgrp > 0 && procinfo::process_birth(r.pid) == Some(r.birth)).then_some(pgrp as u32)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -904,8 +1010,9 @@ impl ProgramResumeState {
 
 pub struct TrustSubject<'a> {
     pub argv: &'a [String],
+    /// The directory the command runs in: on restore, the one it will actually start in.
     pub cwd: Option<&'a str>,
-    pub process_name: &'a str,
+    /// Canonical executable path from the OS (empty when unknown).
     pub process_exe: &'a str,
     pub process_argv: &'a [String],
     pub wrapped: bool,
@@ -1003,12 +1110,7 @@ fn evaluate_rule(
         return Err("wrapped");
     }
     if rule.match_process
-        && !process_matches_command(
-            &rule.command[0],
-            subject.process_name,
-            subject.process_exe,
-            subject.process_argv,
-        )
+        && !process_matches_command(&rule.command[0], subject.process_exe, subject.process_argv)
     {
         return Err("program_differs");
     }
@@ -1021,17 +1123,15 @@ fn evaluate_rule(
         }
     }
     let extra = &subject.argv[rule.command.len()..];
-    if rule.flags.is_empty() {
-        if !extra.is_empty() {
-            return Err("flag_not_listed");
-        }
-    } else if !extra.is_empty() {
-        let reported_flags = parse_reported_flags(extra, &rule.flags)?;
+    let allowed = rule.all_checked_flags();
+    let reported = parse_reported_flags(extra, &allowed)?;
+    // Restricting flags must be carried over even when the report adds no flags.
+    if !reported.is_empty() || !rule.preserve_flags.is_empty() {
         if subject.process_argv.is_empty() {
             return Err("launch_unreadable");
         }
-        let launch_flags = extract_launch_flags(subject.process_argv, &rule.flags);
-        if !flags_subset_of(&reported_flags, &launch_flags) {
+        let launch = extract_launch_flags(subject.process_argv, &allowed);
+        if !flags_match_launch(&reported, &launch, &rule.preserve_flags) {
             return Err("flags_differ");
         }
     }
@@ -1146,28 +1246,7 @@ fn path_within_dir(target: &str, allowed_dir: &str, allow_equal: bool, verify_fs
         let Some(canon_base) = canon_base else {
             return false;
         };
-        let canon_target = std::fs::canonicalize(target_path).or_else(|_| {
-            // If the file itself does not exist yet, canonicalize its nearest existing ancestor
-            // and append the remaining lexical components.
-            let mut cur = target_path.to_path_buf();
-            let mut tail = Vec::new();
-            while !cur.exists() {
-                let name = cur
-                    .file_name()
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?
-                    .to_os_string();
-                tail.push(name);
-                if !cur.pop() {
-                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
-                }
-            }
-            let mut resolved = std::fs::canonicalize(&cur)?;
-            for seg in tail.into_iter().rev() {
-                resolved.push(seg);
-            }
-            Ok(resolved)
-        });
-        let Ok(canon_target) = canon_target else {
+        let Some(canon_target) = canonicalize_maybe_missing(target_path) else {
             return false;
         };
         return within(&canon_target, &canon_base);
@@ -1175,13 +1254,43 @@ fn path_within_dir(target: &str, allowed_dir: &str, allow_equal: bool, verify_fs
     true
 }
 
-/// Checks whether the owning OS process matches the rule's `command[0]`.
-fn process_matches_command(
-    want: &str,
-    process_name: &str,
-    process_exe: &str,
-    process_argv: &[String],
-) -> bool {
+/// Canonicalizes `path`, whose last components may not exist yet: the nearest existing ancestor
+/// is canonicalized and the missing components appended. Only components that are genuinely
+/// absent count as missing: a dangling symlink, or any other error, fails.
+fn canonicalize_maybe_missing(path: &Path) -> Option<PathBuf> {
+    let mut cur = path.to_path_buf();
+    let mut tail = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                // A symlink that is here but does not resolve is not a missing path.
+                if meta.file_type().is_symlink() && std::fs::metadata(&cur).is_err() {
+                    return None;
+                }
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tail.push(cur.file_name()?.to_os_string());
+                if !cur.pop() {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut resolved = std::fs::canonicalize(&cur).ok()?;
+    for seg in tail.into_iter().rev() {
+        resolved.push(seg);
+    }
+    Some(resolved)
+}
+
+/// Checks whether the owning OS process matches the rule's `command[0]`, by its OS executable
+/// path (never by its process name, which the process can change).
+fn process_matches_command(want: &str, process_exe: &str, process_argv: &[String]) -> bool {
+    if process_exe.is_empty() {
+        return false;
+    }
     if want.starts_with('/') {
         if process_exe == want {
             return true;
@@ -1196,8 +1305,7 @@ fn process_matches_command(
         return false;
     }
     let exe_base = thurm_config::executable_name(process_exe);
-    let name_base = thurm_config::executable_name(process_name);
-    if exe_base == want || name_base == want {
+    if exe_base == want {
         return true;
     }
     // Versioned native binaries symlinked under a bare name (e.g. `~/.local/bin/claude` ->
@@ -1222,25 +1330,34 @@ fn process_matches_command(
             return true;
         }
     }
-    // Interpreters (`node /opt/homebrew/bin/claude`, `python3 ...`): check script argument.
-    if is_interpreter(exe_base) || is_interpreter(name_base) {
-        for arg in process_argv.iter().skip(1) {
-            if arg == "--" {
-                break;
-            }
-            if arg.starts_with('-') {
-                continue;
-            }
-            if thurm_config::executable_name(arg) == want {
-                return true;
-            }
-            if known_interpreter_marker(want, arg) {
-                return true;
-            }
-            break;
-        }
+    // Interpreters (`node /opt/homebrew/bin/claude`, `python3 ...`): the script operand must be
+    // an existing file named `want`, or one inside the program's known package.
+    if is_interpreter(exe_base)
+        && let Some(script) = script_index(process_argv).map(|k| &process_argv[k])
+        && script.starts_with('/')
+        && let Ok(canon) = std::fs::canonicalize(script)
+        && canon.is_file()
+    {
+        return thurm_config::executable_name(script) == want
+            || known_interpreter_marker(want, &canon.display().to_string());
     }
     false
+}
+
+/// Where an interpreter's script operand is in its `argv`: the first argument after the
+/// interpreter's own options (or after `--`).
+fn script_index(argv: &[String]) -> Option<usize> {
+    let mut i = 1;
+    while let Some(arg) = argv.get(i) {
+        if arg == "--" {
+            return (i + 1 < argv.len()).then_some(i + 1);
+        }
+        if !arg.starts_with('-') {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn is_interpreter(exe: &str) -> bool {
@@ -1323,24 +1440,24 @@ fn parse_reported_flags(
     Ok(out)
 }
 
-/// Extracts occurrences of listed flags from the owning process's launch `argv`.
+/// Where an owner's own arguments start in its launch `argv`: after an interpreter's script.
+fn launch_args_start(process_argv: &[String]) -> usize {
+    match process_argv.first() {
+        Some(arg0) if is_interpreter(thurm_config::executable_name(arg0)) => {
+            script_index(process_argv).map_or(process_argv.len(), |k| k + 1)
+        }
+        _ => 1,
+    }
+}
+
+/// Occurrences of the listed flags on the owning process's launch `argv`, in order, each with
+/// its values (empty for a flag without one).
 fn extract_launch_flags(
     process_argv: &[String],
-    allowed: &std::collections::BTreeMap<String, FlagArity>,
-) -> HashMap<String, Vec<Option<String>>> {
-    let mut map: HashMap<String, Vec<Option<String>>> = HashMap::new();
-    let mut i = 1;
-    // If launched via an interpreter (`node /path/to/cli ...`), advance past the script arg.
-    if let Some(arg0) = process_argv.first()
-        && is_interpreter(thurm_config::executable_name(arg0))
-    {
-        while let Some(tok) = process_argv.get(i) {
-            i += 1;
-            if tok == "--" || !tok.starts_with('-') {
-                break;
-            }
-        }
-    }
+    allowed: &BTreeMap<String, FlagArity>,
+) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut i = launch_args_start(process_argv);
     while i < process_argv.len() {
         let tok = &process_argv[i];
         if tok == "--" {
@@ -1354,41 +1471,85 @@ fn extract_launch_flags(
         let Some(&arity) = allowed.get(flag) else {
             continue;
         };
-        let entry = map.entry(flag.to_owned()).or_default();
+        let mut vals = Vec::new();
         match (arity, inline_val) {
-            (FlagArity::None, None) => entry.push(None),
-            (FlagArity::None, Some(_)) => {}
-            (FlagArity::One, Some(v)) => entry.push(Some(v.to_owned())),
+            (FlagArity::None, Some(_)) => continue,
+            (FlagArity::None, None) => {}
+            (_, Some(v)) => vals.push(v.to_owned()),
             (FlagArity::One, None) => {
-                if let Some(v) = process_argv.get(i) {
-                    i += 1;
-                    entry.push(Some(v.clone()));
-                }
+                let Some(v) = process_argv.get(i) else {
+                    continue;
+                };
+                i += 1;
+                vals.push(v.clone());
             }
-            (FlagArity::Optional, Some(v)) => entry.push(Some(v.to_owned())),
             (FlagArity::Optional, None) => {
                 if let Some(v) = process_argv.get(i)
                     && !v.starts_with('-')
                 {
                     i += 1;
-                    entry.push(Some(v.clone()));
-                } else {
-                    entry.push(None);
+                    vals.push(v.clone());
                 }
             }
-            (FlagArity::Many, Some(v)) => entry.push(Some(v.to_owned())),
             (FlagArity::Many, None) => {
                 while let Some(v) = process_argv.get(i) {
                     if v.starts_with('-') {
                         break;
                     }
-                    entry.push(Some(v.clone()));
+                    vals.push(v.clone());
                     i += 1;
                 }
             }
         }
+        out.push((flag.to_owned(), vals));
     }
-    map
+    out
+}
+
+/// Whether the reported flags agree with the launch: each reported occurrence (flag and its
+/// exact values) uses up a distinct identical launch occurrence, and no launch occurrence of a
+/// `preserve` flag is left over (the resume would drop a restriction).
+fn flags_match_launch(
+    reported: &[(String, Vec<String>)],
+    launch: &[(String, Vec<String>)],
+    preserve: &BTreeMap<String, FlagArity>,
+) -> bool {
+    let mut unused: Vec<&(String, Vec<String>)> = launch.iter().collect();
+    for occ in reported {
+        let Some(pos) = unused.iter().position(|l| *l == occ) else {
+            return false;
+        };
+        unused.swap_remove(pos);
+    }
+    !unused.iter().any(|(flag, _)| preserve.contains_key(flag))
+}
+
+/// The part of a launch `argv` that restore needs to re-check trust: the program, an
+/// interpreter's script, and the occurrences of flags that `rules` look at. Everything else
+/// (other arguments can hold credentials) stays out of `session.json`.
+pub fn launch_evidence(process_argv: &[String], rules: &[ResumeRule]) -> Vec<String> {
+    // The program, and an interpreter's script (its own options dropped).
+    let mut out: Vec<String> = process_argv.first().cloned().into_iter().collect();
+    if launch_args_start(process_argv) > 1
+        && let Some(k) = script_index(process_argv)
+    {
+        out.push(process_argv[k].clone());
+    }
+    let mut allowed = BTreeMap::new();
+    for rule in rules.iter().filter(|r| r.enabled) {
+        allowed.extend(rule.all_checked_flags());
+    }
+    for (flag, vals) in extract_launch_flags(process_argv, &allowed) {
+        match vals.as_slice() {
+            // `--flag=value` keeps a value that starts with `-` attached to its flag.
+            [v] if flag.starts_with("--") => out.push(format!("{flag}={v}")),
+            _ => {
+                out.push(flag);
+                out.extend(vals);
+            }
+        }
+    }
+    out
 }
 
 fn split_inline_flag(tok: &str) -> (&str, Option<&str>) {
@@ -1398,32 +1559,6 @@ fn split_inline_flag(tok: &str) -> (&str, Option<&str>) {
         return (k, Some(v));
     }
     (tok, None)
-}
-
-fn flags_subset_of(
-    reported: &[(String, Vec<String>)],
-    launch: &HashMap<String, Vec<Option<String>>>,
-) -> bool {
-    for (flag, vals) in reported {
-        let Some(allowed_vals) = launch.get(flag) else {
-            return false;
-        };
-        if vals.is_empty() {
-            if !allowed_vals.iter().any(Option::is_none) {
-                return false;
-            }
-        } else {
-            for v in vals {
-                if !allowed_vals
-                    .iter()
-                    .any(|lv| lv.as_deref() == Some(v.as_str()))
-                {
-                    return false;
-                }
-            }
-        }
-    }
-    true
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1443,23 +1578,57 @@ fn resume_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("resume")
 }
 
-/// Removes leftover one-shot resume files from previous runs.
+/// Whether `dir` is a real directory (not a symlink) owned by the current user, with no group
+/// or other access.
+fn is_private_dir(dir: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(dir)?;
+    Ok(meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0)
+}
+
+/// Whether `name` is one [`write_resume_file`] makes: `resume-<32 lowercase hex>.json`.
+fn is_resume_file_name(name: &str) -> bool {
+    name.strip_prefix("resume-")
+        .and_then(|n| n.strip_suffix(".json"))
+        .is_some_and(|hex| {
+            hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+/// Removes leftover one-shot resume files from previous runs: only Thurm's own files, in its
+/// own private directory (never through a symlink, never anything else found there).
 pub fn prune_resume_files(state_dir: &Path) {
+    use std::os::unix::fs::MetadataExt;
     let dir = resume_dir(state_dir);
+    match is_private_dir(&dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            log::warn!(
+                "not cleaning {}: not a private directory of this user",
+                dir.display()
+            );
+            return;
+        }
+        Err(_) => return,
+    }
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
+    let uid = unsafe { libc::geteuid() };
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(300))
         .unwrap_or(UNIX_EPOCH);
     for entry in entries.flatten() {
-        let path = entry.path();
-        let stale = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t < cutoff);
-        if stale {
-            let _ = std::fs::remove_file(path);
+        if !entry.file_name().to_str().is_some_and(is_resume_file_name) {
+            continue;
+        }
+        // `DirEntry::metadata` does not follow symlinks.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let stale = meta.modified().is_ok_and(|t| t < cutoff);
+        if meta.file_type().is_file() && meta.uid() == uid && stale {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -1467,18 +1636,16 @@ pub fn prune_resume_files(state_dir: &Path) {
 /// Writes a private (`0600`) one-shot resume specification file under `<state_dir>/resume/`.
 pub fn write_resume_file(state_dir: &Path, spec: &ResumeExecSpec) -> std::io::Result<PathBuf> {
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     let dir = resume_dir(state_dir);
-    if !dir.exists() {
+    if std::fs::symlink_metadata(&dir).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&dir)?;
     }
-    let uid = unsafe { libc::geteuid() };
-    let dm = std::fs::metadata(&dir)?;
-    if !dm.is_dir() || dm.uid() != uid || (dm.mode() & 0o077) != 0 {
+    if !is_private_dir(&dir)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "resume directory is not private to current user",
@@ -1519,8 +1686,8 @@ pub fn consume_resume_file(path: &Path) -> Result<ResumeExecSpec, String> {
         .take((MAX_REPORT_BYTES * 2) as u64)
         .read_to_end(&mut raw)
         .map_err(|e| format!("cannot read resume file: {e}"))?;
-    // Strictly one-shot: delete immediately before exec.
-    let _ = std::fs::remove_file(path);
+    // Strictly one-shot: whoever unlinks the file runs it, nobody else.
+    std::fs::remove_file(path).map_err(|e| format!("cannot remove resume file: {e}"))?;
     let spec: ResumeExecSpec =
         serde_json::from_slice(&raw).map_err(|e| format!("invalid resume file: {e}"))?;
     if !validate_argv(&spec.argv) {
@@ -1534,11 +1701,12 @@ pub fn consume_resume_file(path: &Path) -> Result<ResumeExecSpec, String> {
     Ok(spec)
 }
 
-/// Executes the command in a one-shot resume file via `execvp` (never returns on success).
+/// Executes the command in a one-shot resume file (never returns on success).
 ///
-/// Zero shell parsing: `argv` elements are passed verbatim as `CString` pointers directly to
-/// `execvp`, bypassing shell aliases, functions, and builtins, while inheriting the shell's
-/// full environment (`PATH`, `direnv`, etc.).
+/// Zero shell parsing: `argv` elements are passed verbatim to `execv`, bypassing shell aliases,
+/// functions, and builtins, while inheriting the shell's full environment (`PATH`, `direnv`,
+/// etc.). A bare program name is looked up on `PATH` like `execvp` does, but a file the kernel
+/// cannot execute (no `#!` line) is refused instead of being run by `/bin/sh`.
 pub fn exec_resume_file(path: &Path) -> ! {
     let spec = match consume_resume_file(path) {
         Ok(s) => s,
@@ -1570,18 +1738,66 @@ pub fn exec_resume_file(path: &Path) -> ! {
     }
     let mut ptrs: Vec<*const libc::c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
-    unsafe { libc::execvp(cstrings[0].as_ptr(), ptrs.as_ptr()) };
-    let err = std::io::Error::last_os_error();
-    let code = if err.raw_os_error() == Some(libc::EACCES) {
-        126
+    let path = std::env::var_os("PATH");
+    let err = exec_no_shell_fallback(&spec.argv[0], path.as_deref(), |prog| {
+        unsafe { libc::execv(prog.as_ptr(), ptrs.as_ptr()) };
+        std::io::Error::last_os_error()
+    });
+    let code = match err.raw_os_error() {
+        Some(libc::EACCES | libc::ENOEXEC) => 126,
+        _ => 127,
+    };
+    let err = if err.raw_os_error() == Some(libc::ENOEXEC) {
+        "not an executable or a script with a #! line".to_owned()
     } else {
-        127
+        err.to_string()
     };
     eprintln!(
         "thurm: cannot resume {}: {err}",
         escape_display(&spec.argv[0])
     );
     std::process::exit(code);
+}
+
+/// `execvp`'s program lookup without its `/bin/sh` fallback for `ENOEXEC`: tries `program`
+/// itself when it holds a `/`, else each `PATH` entry (`/usr/bin:/bin` when unset, an empty
+/// entry being the current directory). `exec` runs one candidate and returns its error; the
+/// error that ends the search is returned.
+fn exec_no_shell_fallback(
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+    mut exec: impl FnMut(&CString) -> std::io::Error,
+) -> std::io::Error {
+    use std::os::unix::ffi::OsStrExt;
+    let not_found = || std::io::Error::from_raw_os_error(libc::ENOENT);
+    if program.contains('/') {
+        return match CString::new(program) {
+            Ok(c) => exec(&c),
+            Err(_) => not_found(),
+        };
+    }
+    let path = path.map_or(&b"/usr/bin:/bin"[..], |p| p.as_bytes());
+    let mut denied = None;
+    for dir in path.split(|&b| b == b':') {
+        let mut candidate = if dir.is_empty() {
+            b".".to_vec()
+        } else {
+            dir.to_vec()
+        };
+        candidate.push(b'/');
+        candidate.extend_from_slice(program.as_bytes());
+        let Ok(c) = CString::new(candidate) else {
+            continue;
+        };
+        let err = exec(&c);
+        match err.raw_os_error() {
+            // Not here: keep looking (as execvp does).
+            Some(libc::ENOENT | libc::ENOTDIR | libc::ENAMETOOLONG | libc::ELOOP) => {}
+            Some(libc::EACCES) => denied = Some(err),
+            _ => return err,
+        }
+    }
+    denied.unwrap_or_else(not_found)
 }
 
 /// Whether `shell` (path or basename) can run a restored foreground job inside an interactive shell.
@@ -1824,13 +2040,24 @@ mod tests {
             ));
         }
 
-        // Duplicate key rejected (including duplicate `mac` inside prefix).
+        // Duplicate key rejected, and so is a `mac` key inside the signed prefix.
         let dup = sign(
             "pid=42:time=1795543200:argv=bnZpbQ==:argv=bnZpbQ==",
             SPEC_TOKEN,
         );
         assert!(matches!(
             parse_default(&dup, SPEC_TIME),
+            ParseOutcome::Reject { pid: Some(42), .. }
+        ));
+        let inner_mac = sign(
+            &format!(
+                "pid=42:time=1795543200:mac={}:argv=bnZpbQ==",
+                "0".repeat(64)
+            ),
+            SPEC_TOKEN,
+        );
+        assert!(matches!(
+            parse_default(&inner_mac, SPEC_TIME),
             ParseOutcome::Reject { pid: Some(42), .. }
         ));
 
@@ -1930,15 +2157,29 @@ mod tests {
         };
         // Parent (100) and child (200, whose ancestors include 100): ancestor wins even if child
         // reported later and is in the foreground.
+        // Each owner leads its own process group here, except 400 (below).
+        let pgrp = |r: &ResumeRecord| Some(if r.pid == 400 { 4000 } else { r.pid });
         state.upsert(mk(100, vec![10], 1));
         state.upsert(mk(200, vec![100, 10], 2));
-        assert_eq!(state.chosen(Some(200)).map(|r| r.pid), Some(100));
+        assert_eq!(state.chosen_with(Some(200), pgrp).map(|r| r.pid), Some(100));
 
         // Sibling (300, not a descendant of 100): foreground wins; otherwise most recent wins.
         state.upsert(mk(300, vec![10], 3));
-        assert_eq!(state.chosen(Some(100)).map(|r| r.pid), Some(100));
-        assert_eq!(state.chosen(Some(300)).map(|r| r.pid), Some(300));
-        assert_eq!(state.chosen(None).map(|r| r.pid), Some(300));
+        assert_eq!(state.chosen_with(Some(100), pgrp).map(|r| r.pid), Some(100));
+        assert_eq!(state.chosen_with(Some(300), pgrp).map(|r| r.pid), Some(300));
+        assert_eq!(state.chosen_with(None, pgrp).map(|r| r.pid), Some(300));
+
+        // A foreground pipeline's reporter that is not its group leader (400 in group 4000)
+        // still beats a more recent background record (500).
+        state.upsert(mk(400, vec![10], 4));
+        state.upsert(mk(500, vec![10], 5));
+        assert_eq!(
+            state.chosen_with(Some(4000), pgrp).map(|r| r.pid),
+            Some(400)
+        );
+        assert_eq!(state.chosen_with(None, pgrp).map(|r| r.pid), Some(500));
+        state.remove_owner(400);
+        state.remove_owner(500);
 
         // Exit grace: owner 300 dies at t=1000 -> kept at t=2500 (<2s), removed at t=3000 (>=2s).
         let birth = |pid: u32| (pid != 300).then_some(pid as u64 * 10);
@@ -1965,7 +2206,6 @@ mod tests {
         let ok = TrustSubject {
             argv: &claude_argv,
             cwd: Some("/tmp"),
-            process_name: "2.1.332",
             process_exe: "/Users/me/.local/share/claude/versions/2.1.332",
             process_argv: &["claude".into(), "--model=opus".into()],
             wrapped: false,
@@ -1994,7 +2234,6 @@ mod tests {
 
         // Wrong process trying to claim claude -> `program_differs`
         let spoofed_proc = TrustSubject {
-            process_name: "bash",
             process_exe: "/bin/bash",
             process_argv: &["bash".into()],
             ..ok
@@ -2048,13 +2287,13 @@ mod tests {
             ],
             dirs: Vec::new(),
             flags: Default::default(),
+            preserve_flags: Default::default(),
             match_process: true,
         }];
         let link_argv = vec!["nvim".into(), "-S".into(), link.display().to_string()];
         let link_subj = TrustSubject {
             argv: &link_argv,
             cwd: Some("/tmp"),
-            process_name: "nvim",
             process_exe: "/usr/bin/nvim",
             process_argv: &["nvim".into()],
             wrapped: false,
@@ -2114,6 +2353,7 @@ mod tests {
 
     #[test]
     fn resume_file_roundtrip_is_one_shot_and_private() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("thurm-resume-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let spec = ResumeExecSpec {
@@ -2122,11 +2362,367 @@ mod tests {
             require_cwd: true,
         };
         let path = write_resume_file(&dir, &spec).unwrap();
+        // Private whatever the umask: the directory 0700, the file 0600.
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&resume_dir(&dir)), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert!(is_resume_file_name(
+            path.file_name().unwrap().to_str().unwrap()
+        ));
         let got = consume_resume_file(&path).unwrap();
         assert_eq!(got, spec);
         // Unlinked immediately on read.
         assert!(!path.exists());
         assert!(consume_resume_file(&path).is_err());
+
+        // A file others can read is refused (and left alone).
+        let open = write_resume_file(&dir, &spec).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(consume_resume_file(&open).is_err());
+        assert!(open.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_removes_only_own_stale_files_in_a_private_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let age = |p: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(old)
+                .unwrap()
+        };
+        let root = std::env::temp_dir().join(format!("thurm-resume-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Stale own file goes; an unrelated stale file stays.
+        let state = root.join("state");
+        let spec = ResumeExecSpec {
+            argv: vec!["true".into()],
+            cwd: None,
+            require_cwd: false,
+        };
+        let ours = write_resume_file(&state, &spec).unwrap();
+        let unrelated = resume_dir(&state).join("notes.txt");
+        std::fs::write(&unrelated, "keep").unwrap();
+        age(&ours);
+        age(&unrelated);
+        prune_resume_files(&state);
+        assert!(!ours.exists());
+        assert!(unrelated.exists());
+
+        // `resume` as a symlink to another directory: nothing in there is touched.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let victim = elsewhere.join(format!("resume-{}.json", "a".repeat(32)));
+        std::fs::write(&victim, "").unwrap();
+        age(&victim);
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, resume_dir(&linked)).unwrap();
+        prune_resume_files(&linked);
+        assert!(victim.exists());
+
+        // A resume directory others can write to is not cleaned either.
+        std::fs::set_permissions(resume_dir(&state), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        let shared = resume_dir(&state).join(format!("resume-{}.json", "b".repeat(32)));
+        std::fs::write(&shared, "").unwrap();
+        age(&shared);
+        prune_resume_files(&state);
+        assert!(shared.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exec_lookup_never_falls_back_to_a_shell() {
+        let err = |code| std::io::Error::from_raw_os_error(code);
+        // A text file without `#!`: the search stops with ENOEXEC, nothing else is tried.
+        let mut tried = Vec::new();
+        let e = exec_no_shell_fallback("prog", Some("/a:/b:/c".as_ref()), |c| {
+            tried.push(c.to_str().unwrap().to_owned());
+            if c.to_str().unwrap() == "/b/prog" {
+                err(libc::ENOEXEC)
+            } else {
+                err(libc::ENOENT)
+            }
+        });
+        assert_eq!(e.raw_os_error(), Some(libc::ENOEXEC));
+        assert_eq!(tried, ["/a/prog", "/b/prog"]);
+        // Not executable here, missing elsewhere: permission denied, as execvp reports it.
+        let e = exec_no_shell_fallback("prog", Some(":/x".as_ref()), |c| {
+            if c.to_str().unwrap() == "./prog" {
+                err(libc::EACCES)
+            } else {
+                err(libc::ENOENT)
+            }
+        });
+        assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+        // A path is tried as given, PATH unused.
+        let mut tried = Vec::new();
+        exec_no_shell_fallback("./bin/x", Some("/a".as_ref()), |c| {
+            tried.push(c.to_str().unwrap().to_owned());
+            err(libc::ENOENT)
+        });
+        assert_eq!(tried, ["./bin/x"]);
+
+        // For real: an executable text file without `#!` is refused, a shebang script runs.
+        let dir = std::env::temp_dir().join(format!("thurm-resume-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write("noshebang", "touch ran\n");
+        write("script", "#!/bin/sh\nexit 7\n");
+        let run = |name: &str| {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "program_resume::tests::exec_child",
+                    "--nocapture",
+                ])
+                .env("THURM_TEST_EXEC", dir.join(name))
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            status.code()
+        };
+        assert_eq!(run("script"), Some(7));
+        assert_ne!(run("noshebang"), Some(0));
+        assert!(!dir.join("ran").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Helper for `exec_lookup_never_falls_back_to_a_shell`: execs `$THURM_TEST_EXEC`.
+    #[test]
+    fn exec_child() {
+        let Some(prog) = std::env::var_os("THURM_TEST_EXEC") else {
+            return;
+        };
+        let prog = CString::new(prog.as_encoded_bytes()).unwrap();
+        let argv = [prog.as_ptr(), std::ptr::null()];
+        let e = exec_no_shell_fallback(prog.to_str().unwrap(), None, |c| {
+            unsafe { libc::execv(c.as_ptr(), argv.as_ptr()) };
+            std::io::Error::last_os_error()
+        });
+        assert_eq!(e.raw_os_error(), Some(libc::ENOEXEC));
+        std::process::exit(126);
+    }
+
+    #[test]
+    fn launch_flags_match_by_occurrence_and_keep_restrictions() {
+        let rules = thurm_config::builtin_resume_rules();
+        let id = "4394937c-b07a-4bd5-b6d0-034e7091ff1f";
+        let argv = |extra: &[&str]| -> Vec<String> {
+            ["claude", "--resume", id]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string())
+                .collect()
+        };
+        let check = |report: &[&str], launch: &[&str]| {
+            let argv = argv(report);
+            let launch: Vec<String> = launch.iter().map(|s| s.to_string()).collect();
+            evaluate_trust_with_root(
+                &TrustSubject {
+                    argv: &argv,
+                    cwd: Some("/tmp"),
+                    process_exe: "/Users/me/.local/share/claude/versions/2.1.332",
+                    process_argv: &launch,
+                    wrapped: false,
+                },
+                ResumeProgramsMode::Rules,
+                &rules,
+                false,
+                false,
+            )
+        };
+        let trusted = TrustVerdict::Trusted {
+            rule: Some("claude".into()),
+        };
+        let differ = TrustVerdict::Untrusted("flags_differ");
+
+        // Multi-value flags compare as whole, ordered lists.
+        let launch = ["claude", "--add-dir", "/a", "/b"];
+        assert_eq!(check(&["--add-dir", "/a", "/b"], &launch), trusted);
+        assert_eq!(check(&["--add-dir", "/b", "/a"], &launch), differ);
+        assert_eq!(check(&["--add-dir", "/a"], &launch), differ);
+        // One launch occurrence backs one reported occurrence.
+        assert_eq!(
+            check(
+                &["--model", "opus", "--model", "opus"],
+                &["claude", "--model", "opus"]
+            ),
+            differ
+        );
+
+        // Restrictions given at launch survive, even when the report adds no flags.
+        let strict = ["claude", "--strict-mcp-config", "--mcp-config", "/m.json"];
+        assert_eq!(check(&[], &strict), differ);
+        assert_eq!(check(&["--strict-mcp-config"], &strict), differ);
+        assert_eq!(
+            check(&["--strict-mcp-config", "--mcp-config", "/m.json"], &strict),
+            trusted
+        );
+        assert_eq!(
+            check(
+                &["--disallowed-tools", "Bash"],
+                &["claude", "--disallowed-tools", "Bash", "Edit"]
+            ),
+            differ
+        );
+        assert_eq!(check(&[], &["claude"]), trusted);
+        // Nothing to check restrictions against: refused.
+        let mut unmatched = rules.clone();
+        unmatched[0].match_process = false;
+        assert_eq!(
+            evaluate_trust_with_root(
+                &TrustSubject {
+                    argv: &argv(&[]),
+                    cwd: Some("/tmp"),
+                    process_exe: "",
+                    process_argv: &[],
+                    wrapped: false,
+                },
+                ResumeProgramsMode::Rules,
+                &unmatched,
+                false,
+                false,
+            ),
+            TrustVerdict::Untrusted("launch_unreadable")
+        );
+
+        // The process name is not evidence: only the executable path counts.
+        assert_eq!(
+            evaluate_trust_with_root(
+                &TrustSubject {
+                    argv: &argv(&[]),
+                    cwd: Some("/tmp"),
+                    process_exe: "/usr/bin/python3",
+                    process_argv: &["claude".into()],
+                    wrapped: false,
+                },
+                ResumeProgramsMode::Rules,
+                &rules,
+                false,
+                false,
+            ),
+            TrustVerdict::Untrusted("program_differs")
+        );
+    }
+
+    #[test]
+    fn saved_launch_evidence_keeps_only_what_rules_check() {
+        let rules = thurm_config::builtin_resume_rules();
+        let launch: Vec<String> = [
+            "claude",
+            "--api-key",
+            "sk-secret",
+            "--model=opus",
+            "positional-secret",
+            "--add-dir",
+            "/a",
+            "/b",
+            "--strict-mcp-config",
+            "--permission-mode",
+            "-weird",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let saved = launch_evidence(&launch, &rules);
+        assert!(!saved.iter().any(|a| a.contains("secret")), "{saved:?}");
+        assert_eq!(
+            saved,
+            [
+                "claude",
+                "--model=opus",
+                "--add-dir",
+                "/a",
+                "/b",
+                "--strict-mcp-config",
+                "--permission-mode=-weird"
+            ]
+        );
+        // The saved evidence reads back as the same flags.
+        let all = rules[0].all_checked_flags();
+        assert_eq!(
+            extract_launch_flags(&saved, &all),
+            extract_launch_flags(&launch, &all)
+        );
+
+        // An interpreter keeps its script, not its own options.
+        let node: Vec<String> = [
+            "node",
+            "--max-old-space-size=99",
+            "/opt/cli.js",
+            "--token",
+            "x",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(launch_evidence(&node, &rules), ["node", "/opt/cli.js"]);
+    }
+
+    #[test]
+    fn dangling_symlinks_are_not_missing_paths() {
+        let root = std::env::temp_dir().join(format!("thurm-resume-dangle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let allowed = root.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let allowed_s = allowed.display().to_string();
+        // A missing file under an existing allowed directory is fine.
+        let missing = allowed.join("new.vim").display().to_string();
+        assert!(path_within_dir(&missing, &allowed_s, false, true));
+        // A dangling link, or a missing path beneath one, is not.
+        let link = allowed.join("link");
+        std::os::unix::fs::symlink(root.join("outside/nowhere"), &link).unwrap();
+        assert!(!path_within_dir(
+            &link.display().to_string(),
+            &allowed_s,
+            false,
+            true
+        ));
+        let below = link.join("x.vim").display().to_string();
+        assert!(!path_within_dir(&below, &allowed_s, false, true));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn implicit_pane_root_must_still_be_a_shell() {
+        use AncestorKind::*;
+        let lineage = |root: AncestorKind, explicit: bool| {
+            classify_lineage(30, 10, &[20, 10], true, explicit, false, |pid| {
+                if pid == 10 { root } else { Shell }
+            })
+        };
+        assert_eq!(lineage(Shell, false), (false, false));
+        assert_eq!(lineage(Login, false), (false, false));
+        // The pane's shell `exec`ed a wrapper: its children are wrapped.
+        assert_eq!(lineage(Other, false), (false, true));
+        assert_eq!(lineage(Login, true), (false, true));
+    }
+
+    #[test]
+    fn clear_for_a_process_outside_the_pane_keeps_no_state() {
+        if is_root() {
+            return;
+        }
+        let mut state = ProgramResumeState::with_token(Some(SPEC_TOKEN.into()));
+        let now = persist::now_secs();
+        // PID 1 is alive but not ours and not in this pane.
+        let body = sign(&format!("pid=1:time={now}:clear=1"), SPEC_TOKEN);
+        let total = 2 + b"7577;".len() + body.len() + 2;
+        assert!(!state.handle_report(&body, total, std::process::id(), None, false));
+        assert!(state.last_times.is_empty());
     }
 }

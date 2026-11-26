@@ -543,9 +543,6 @@ pub struct PaneState {
     /// its end as text.
     forwarded_carry: Vec<u8>,
     pending_input: Option<(Instant, Vec<u8>)>,
-    /// Input sent strictly on the first `OSC 133;A` prompt mark (no fallback timer), used for
-    /// fish session resume so slow or interactive startup files are never interrupted.
-    pending_prompt_input: Option<Vec<u8>>,
     shell_integration_seen: bool,
     /// Last git probe: when, for which directory, and whether one is in flight.
     git_probe: Option<(Instant, String)>,
@@ -582,8 +579,12 @@ impl PaneState {
 /// How [`Daemon::create_pane_with_resume`] starts a restored pane with an OSC 7577 command.
 enum RestoreLaunch<'a> {
     Normal,
-    /// Interactive shell (`zsh` / `bash`) with shell integration running `--exec-resume` at prompt.
-    Hook { exec: &'a Path, file: &'a Path },
+    /// Interactive shell (zsh, bash, fish) whose integration runs `--exec-resume` at its first
+    /// prompt.
+    Hook {
+        exec: &'a Path,
+        file: &'a Path,
+    },
     /// Owning process was the PTY's first process: `exec thurmd --exec-resume <file>` via login shell.
     FirstProcess {
         exec: &'a Path,
@@ -651,6 +652,9 @@ pub struct Daemon {
     integration_dir: Option<PathBuf>,
     session_dirty: AtomicBool,
     restored: AtomicBool,
+    /// `restore_session` or `adopt` is still installing panes: a snapshot written now would
+    /// lack the rest of them and the layout, so saves wait (the session stays dirty).
+    loading: AtomicBool,
     pub shutdown: AtomicBool,
     /// SIGTERM/SIGINT arrived. Shells dying from here on are part of the teardown (quitting
     /// the app that spawned us signals its whole tree at once) and stay in the saved session.
@@ -730,6 +734,7 @@ impl Daemon {
             integration_dir,
             session_dirty: AtomicBool::new(false),
             restored: AtomicBool::new(false),
+            loading: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             stopping,
             just_exited: Mutex::new(Vec::new()),
@@ -1175,7 +1180,6 @@ impl Daemon {
                 carry: p.carry,
                 forwarded_carry: p.forwarded_carry,
                 pending_input: None,
-                pending_prompt_input: None,
                 shell_integration_seen: p.shell_integration_seen,
                 git_probe: None,
                 git_pending: false,
@@ -1536,9 +1540,6 @@ impl Daemon {
                             info_changed = true;
                         }
                         if let Some((_, input)) = st.pending_input.take() {
-                            pane.write(input);
-                        }
-                        if let Some(input) = st.pending_prompt_input.take() {
                             pane.write(input);
                         }
                     }
@@ -2018,12 +2019,16 @@ impl Daemon {
             let defs = self.agent_defs.read().clone();
             let program_defs = self.program_defs.read().clone();
             let mut resume_expired = false;
-            let resume_now_ms = program_resume::now_ms();
+            let resume_now_ms = program_resume::monotonic_ms();
             let daemon_stopping = self.stopping.load(Ordering::Relaxed);
             for pane in self.all_panes() {
                 let mut events = Vec::new();
                 {
                     let mut st = pane.state.lock();
+                    // Before skipping dead panes: a held pane's records expire too.
+                    if !daemon_stopping && st.resume.poll_liveness(resume_now_ms) {
+                        resume_expired = true;
+                    }
                     if !st.info.alive {
                         continue;
                     }
@@ -2048,9 +2053,6 @@ impl Daemon {
                     let before = st.info.clone();
                     if st.agent.invalidate_dead_report_owner() {
                         st.info.agent = st.agent.state().cloned();
-                    }
-                    if !daemon_stopping && st.resume.poll_liveness(resume_now_ms) {
-                        resume_expired = true;
                     }
                     let fg = st.pty.foreground_pgrp().and_then(procinfo::process_info);
                     st.info.password_input = st.pty.password_mode();
@@ -2230,6 +2232,10 @@ impl Daemon {
         let Some(store) = &self.store else {
             return Ok(());
         };
+        if self.loading.load(Ordering::Relaxed) {
+            self.session_dirty.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         let _saving = self.save_lock.lock();
         // Changes from here on (a hook during the save) make the session dirty again.
         let was_dirty = self.session_dirty.swap(false, Ordering::Relaxed);
@@ -2391,6 +2397,7 @@ impl Daemon {
 
     /// Takes over the panes of the image we replaced.
     pub fn adopt(self: &Arc<Self>, h: upgrade::Handoff) {
+        self.loading.store(true, Ordering::Relaxed);
         let mut adopted = 0;
         for p in h.panes {
             let mut size = sanitize_size(p.size.into());
@@ -2483,6 +2490,7 @@ impl Daemon {
         self.next_pane.fetch_max(h.next_pane_id, Ordering::Relaxed);
         *self.layout.lock() = h.layout;
         self.restored.store(h.restored, Ordering::Relaxed);
+        self.loading.store(false, Ordering::Relaxed);
         log::info!("adopted {adopted} panes from the previous daemon");
     }
 
@@ -2490,12 +2498,14 @@ impl Daemon {
     pub fn restore_session(self: &Arc<Self>) {
         let Some(store) = &self.store else { return };
         let Some(mut snap) = store.load() else { return };
+        self.loading.store(true, Ordering::Relaxed);
         let cfg = self.config.read().clone();
         let defs = cfg.agent_defs();
         let resume_rules = cfg.resume_rules();
         let my_uid = unsafe { libc::geteuid() };
-        let (shell_prog, _) = shell::interactive_shell(&cfg);
         let thurmd_exe = std::env::current_exe().ok();
+        let use_hook = shell::uses_hook_resume(&cfg, self.integration_dir.as_deref());
+        let (shell_prog, _) = shell::interactive_shell(&cfg);
 
         struct PlannedResume {
             spec: ResumeExecSpec,
@@ -2503,6 +2513,16 @@ impl Daemon {
             first_process: bool,
             program_label: String,
             rule: Option<String>,
+        }
+
+        // With OSC 7577 resume off, a saved record is as good as absent: the pane's command
+        // and `resume_agents` apply as if it had never been reported.
+        if program_resume::is_root()
+            || cfg.session.resume_programs == thurm_config::ResumeProgramsMode::Off
+        {
+            for p in &mut snap.panes {
+                p.program_resume = None;
+            }
         }
 
         // First pass: validate every saved OSC 7577 record against current config, UID, canonical
@@ -2520,19 +2540,14 @@ impl Daemon {
                 .first()
                 .map(|a| program_resume::escape_display(a))
                 .unwrap_or_default();
+            let skip = |reason: &str| {
+                log::info!(
+                    "pane {}: not resuming saved program {prog}, starting a shell (reason={reason})",
+                    p.id
+                );
+            };
             if rec.attempted {
-                log::info!(
-                    "pane {}: not resuming saved program {prog}, starting a shell (reason=already_tried)",
-                    p.id
-                );
-                plans.push(None);
-                continue;
-            }
-            if program_resume::is_root() || cfg.session.resume_programs == thurm_config::ResumeProgramsMode::Off {
-                log::info!(
-                    "pane {}: not resuming saved program {prog}, starting a shell (reason=program_resume_off)",
-                    p.id
-                );
+                skip("already_tried");
                 plans.push(None);
                 continue;
             }
@@ -2546,40 +2561,13 @@ impl Daemon {
                 plans.push(None);
                 continue;
             }
-            let trust = program_resume::evaluate_trust(
-                &TrustSubject {
-                    argv: &rec.argv,
-                    cwd: rec.cwd.as_deref(),
-                    process_name: &rec.process_name,
-                    process_exe: &rec.process_exe,
-                    process_argv: &rec.process_argv,
-                    wrapped: rec.wrapped,
-                },
-                cfg.session.resume_programs,
-                &resume_rules,
-                true,
-            );
-            let rule = match trust {
-                TrustVerdict::Trusted { rule } => rule,
-                TrustVerdict::Untrusted(reason) => {
-                    log::info!(
-                        "pane {}: not resuming saved program {prog}, starting a shell (reason=not_trusted trust_reason={reason})",
-                        p.id
-                    );
-                    plans.push(None);
-                    continue;
-                }
-            };
-            // Working directory resolution per spec: if `cwd` came from the report's `cwd` key and
-            // no longer exists, DO NOT resume. For other sources, fall back to a new shell's cwd.
+            // The directory the command will actually start in: the report's `cwd` (which must
+            // still exist), else the owner's directory if it still exists, else the pane's.
             let resolved_cwd = if rec.cwd_from_report {
                 match &rec.cwd {
                     Some(dir) if Path::new(dir).is_dir() => Some(dir.clone()),
                     _ => {
-                        log::info!(
-                            "pane {}: not resuming saved program {prog}, starting a shell (reason=dir_gone)",
-                            p.id
-                        );
+                        skip("dir_gone");
                         plans.push(None);
                         continue;
                     }
@@ -2591,11 +2579,47 @@ impl Daemon {
                     .cloned()
                     .or_else(|| p.cwd.clone())
             };
-            if !rec.first_process && !program_resume::shell_supports_job_resume(&shell_prog) {
-                log::info!(
-                    "pane {}: not resuming saved program {prog}, starting a shell (reason=shell_unsupported)",
-                    p.id
-                );
+            // A rule for this program limited to some directories applies to that directory,
+            // and the command may only start there.
+            let dir_restricted = resume_rules
+                .iter()
+                .any(|r| r.enabled && !r.dirs.is_empty() && r.command.first() == rec.argv.first());
+            if dir_restricted
+                && !resolved_cwd
+                    .as_deref()
+                    .is_some_and(|d| Path::new(d).is_dir())
+            {
+                skip("dir_gone");
+                plans.push(None);
+                continue;
+            }
+            let trust = program_resume::evaluate_trust(
+                &TrustSubject {
+                    argv: &rec.argv,
+                    cwd: resolved_cwd.as_deref(),
+                    process_exe: &rec.process_exe,
+                    process_argv: &rec.process_argv,
+                    wrapped: rec.wrapped,
+                },
+                cfg.session.resume_programs,
+                &resume_rules,
+                true,
+            );
+            let rule = match trust {
+                TrustVerdict::Trusted { rule } => rule,
+                TrustVerdict::Untrusted(reason) => {
+                    skip(&format!("not_trusted trust_reason={reason}"));
+                    plans.push(None);
+                    continue;
+                }
+            };
+            // A job of the shell runs from the shell's own first-prompt hook, or else is typed
+            // into a POSIX shell once its startup files had time to run.
+            if !rec.first_process
+                && !use_hook
+                && !program_resume::shell_supports_job_resume(&shell_prog)
+            {
+                skip("shell_unsupported");
                 plans.push(None);
                 continue;
             }
@@ -2617,12 +2641,10 @@ impl Daemon {
             plans.push(Some(PlannedResume {
                 spec: ResumeExecSpec {
                     argv: rec.argv.clone(),
-                    cwd: if rec.cwd_from_report {
-                        resolved_cwd.clone()
-                    } else {
-                        None
-                    },
-                    require_cwd: rec.cwd_from_report,
+                    // Entered by the helper itself, after the shell's startup files (which may
+                    // change directory) ran.
+                    cwd: resolved_cwd.clone(),
+                    require_cwd: rec.cwd_from_report || dir_restricted,
                 },
                 cwd: resolved_cwd,
                 first_process: rec.first_process,
@@ -2630,12 +2652,15 @@ impl Daemon {
                 rule,
             }));
         }
-        if marked_attempted {
-            let _ = store.save(&snap);
+        // Nothing runs unless the snapshot says it was tried: a crash afterwards must not run it
+        // again on the next start.
+        if marked_attempted && let Err(e) = store.save(&snap) {
+            log::warn!("not resuming saved programs: cannot record the attempt: {e}");
+            for plan in &mut plans {
+                *plan = None;
+            }
         }
 
-        let use_hook = shell::uses_hook_resume(&cfg, self.integration_dir.as_deref());
-        let is_fish = shell::is_fish_with_integration(&cfg, self.integration_dir.as_deref());
         let mut restored = 0;
         for (p, plan) in snap.panes.iter().zip(plans) {
             if let Some(plan) = plan {
@@ -2674,34 +2699,34 @@ impl Daemon {
                                     plan.program_label,
                                     plan.rule.as_deref().unwrap_or("all")
                                 );
-                                if !plan.first_process && !use_hook {
-                                    // Leading space avoids shell history in fish/zsh/bash when
-                                    // configured; only fixed paths are quoted, never `argv`.
+                                if !plan.first_process
+                                    && !use_hook
+                                    && let Some(pane) = self.pane(id)
+                                {
+                                    // No hook: typed like `resume_agents` does. A leading space
+                                    // keeps it out of history where configured; only fixed paths
+                                    // are typed, never `argv`.
                                     let line = format!(
                                         " {} --exec-resume {}\r",
                                         shell::shell_quote(&exe.display().to_string()),
                                         shell::shell_quote(&file.display().to_string()),
-                                    )
-                                    .into_bytes();
-                                    if let Some(pane) = self.pane(id) {
-                                        let mut st = pane.state.lock();
-                                        if is_fish {
-                                            st.pending_prompt_input = Some(line);
-                                        } else {
-                                            st.pending_input = Some((
-                                                Instant::now() + Duration::from_millis(2500),
-                                                line,
-                                            ));
-                                        }
-                                    }
+                                    );
+                                    pane.state.lock().pending_input = Some((
+                                        Instant::now() + Duration::from_millis(2500),
+                                        line.into_bytes(),
+                                    ));
                                 }
+                                continue;
                             }
                             Err(e) => {
                                 let _ = std::fs::remove_file(&file);
-                                log::warn!("failed to restore pane {}: {e}", p.id);
+                                log::warn!(
+                                    "pane {}: cannot resume {}, starting a shell: {e}",
+                                    p.id,
+                                    plan.program_label
+                                );
                             }
                         }
-                        continue;
                     }
                     Err(e) => {
                         log::warn!(
@@ -2714,8 +2739,9 @@ impl Daemon {
             }
 
             // If an OSC 7577 record existed for this pane but was not resumed (untrusted,
-            // dir_gone, already_tried, off, shell_unsupported), restore as a plain shell in
-            // the pane's saved cwd rather than falling back to `p.command` or `agent_resume`.
+            // dir_gone, already_tried, shell_unsupported, or its launch failed), restore a plain
+            // shell in the pane's saved cwd rather than falling back to `p.command` or
+            // `agent_resume`.
             if p.program_resume.is_some() {
                 let req = CreatePane {
                     command: None,
@@ -2823,6 +2849,7 @@ impl Daemon {
         self.next_pane
             .fetch_max(snap.next_pane_id, Ordering::Relaxed);
         *self.layout.lock() = snap.layout;
+        self.loading.store(false, Ordering::Relaxed);
         if restored > 0 {
             self.restored.store(true, Ordering::Relaxed);
             log::info!("restored {restored} panes from snapshot");

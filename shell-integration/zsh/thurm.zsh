@@ -76,9 +76,12 @@ _thurm_precmd_last() {
     local _rf="$_thurm_resume_file" _re="$_thurm_resume_exec"
     _thurm_resume_file=""
     _thurm_resume_exec=""
-    # Run common prompt environment hooks (direnv, mise) configured in .zshrc before resuming.
-    (( $+functions[_direnv_hook] )) && _direnv_hook
-    (( $+functions[_mise_hook] )) && _mise_hook
+    # This hook runs ahead of those .zshrc added: apply the usual environment hooks (direnv,
+    # mise) first, when they are registered for this prompt.
+    local _h
+    for _h in _direnv_hook _mise_hook; do
+      (( ${precmd_functions[(Ie)$_h]} && $+functions[$_h] )) && "$_h"
+    done
     command "$_re" --exec-resume "$_rf"
   fi
   _thurm_precmd

@@ -84,7 +84,8 @@ pub struct PaneLaunch<'a> {
     pub token: &'a str,
     /// Per-pane random token for the Program Resume Protocol (`OSC7577_TOKEN`), if enabled.
     pub resume_token: Option<&'a str>,
-    /// One-shot `(thurmd_exe, resume_file)` for zsh/bash integration to run at first prompt.
+    /// One-shot `(thurmd_exe, resume_file)` for the zsh/bash/fish integration to run at the
+    /// first prompt (see [`uses_hook_resume`]).
     pub resume_hook: Option<(&'a Path, &'a Path)>,
 }
 
@@ -96,25 +97,26 @@ pub fn interactive_shell(cfg: &Config) -> (String, Vec<String>) {
     }
 }
 
-/// Whether `cfg` launches zsh or bash with Thurm's shell integration active, so a restored
-/// foreground job can run directly from the shell's first-prompt hook (no echo, no history,
-/// full startup-file waiting).
+/// Whether `cfg` launches zsh, bash or fish with Thurm's shell integration loaded, so a
+/// restored foreground job can run from the shell's own first-prompt hook, once its startup
+/// files are done (nothing is typed into the terminal). Shells started with their startup
+/// files off (`zsh -f`, `fish --no-config`) never load the integration.
 pub fn uses_hook_resume(cfg: &Config, integration_dir: Option<&Path>) -> bool {
     if !cfg.terminal.shell_integration || integration_dir.is_none() {
         return false;
     }
     let (program, args) = interactive_shell(cfg);
-    let name = program.rsplit('/').next().unwrap_or(&program);
-    name == "zsh" || (name == "bash" && args.is_empty())
-}
-
-/// Whether `cfg` launches fish with Thurm's shell integration active.
-pub fn is_fish_with_integration(cfg: &Config, integration_dir: Option<&Path>) -> bool {
-    if !cfg.terminal.shell_integration || integration_dir.is_none() {
-        return false;
+    let short_flag = |c: char| {
+        args.iter()
+            .any(|a| a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a.contains(c))
+    };
+    let long_flag = |names: &[&str]| args.iter().any(|a| names.contains(&a.as_str()));
+    match program.rsplit('/').next().unwrap_or(&program) {
+        "zsh" => !short_flag('f') && !long_flag(&["--no-rcs", "--norcs", "--no_rcs"]),
+        "bash" => args.is_empty(),
+        "fish" => !short_flag('N') && !long_flag(&["--no-config"]),
+        _ => false,
     }
-    let (program, _) = interactive_shell(cfg);
-    program.rsplit('/').next().unwrap_or(&program) == "fish"
 }
 
 /// Ghostty release matching the pinned libghostty-vt (1.3.2-dev).
@@ -233,22 +235,18 @@ fn spawn_options_with(
     {
         env.push(("THURM_SHELL_INTEGRATION".into(), dir.display().to_string()));
         env.push(("THURM_SHELL_TOKEN".into(), l.token.to_owned()));
+        if let Some((exec, file)) = l.resume_hook {
+            env.push(("THURM_RESUME_EXEC".into(), exec.display().to_string()));
+            env.push(("THURM_RESUME_FILE".into(), file.display().to_string()));
+        }
         match name.as_str() {
             "zsh" => {
-                if let Some((exec, file)) = l.resume_hook {
-                    env.push(("THURM_RESUME_EXEC".into(), exec.display().to_string()));
-                    env.push(("THURM_RESUME_FILE".into(), file.display().to_string()));
-                }
                 if let Ok(orig) = std::env::var("ZDOTDIR") {
                     env.push(("THURM_ORIG_ZDOTDIR".into(), orig));
                 }
                 env.push(("ZDOTDIR".into(), dir.join("zsh").display().to_string()));
             }
             "bash" if args.is_empty() => {
-                if let Some((exec, file)) = l.resume_hook {
-                    env.push(("THURM_RESUME_EXEC".into(), exec.display().to_string()));
-                    env.push(("THURM_RESUME_FILE".into(), file.display().to_string()));
-                }
                 // bash ignores --rcfile for login shells; our rcfile emulates login startup.
                 if login {
                     env.push(("THURM_BASH_LOGIN".into(), "1".into()));
@@ -269,6 +267,16 @@ fn spawn_options_with(
                     orig
                 };
                 env.push(("XDG_DATA_DIRS".into(), format!("{}:{base}", dir.display())));
+                // A system-wide fish setup may replace XDG_DATA_DIRS before fish reads it: the
+                // resume hook must load regardless (a second load does nothing).
+                if l.resume_hook.is_some() {
+                    let script = dir.join("fish/vendor_conf.d/thurm.fish");
+                    args.push("-C".into());
+                    args.push(format!(
+                        "source {}",
+                        shell_quote(&script.display().to_string())
+                    ));
+                }
             }
             _ => {}
         }
@@ -470,6 +478,33 @@ mod tests {
             .rev()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn resume_hook_only_where_the_integration_loads() {
+        let dir = PathBuf::from("/integration");
+        let hook = |shell: &[&str], integration: bool| {
+            let mut cfg = Config::default();
+            cfg.terminal.shell = Some(shell.iter().map(|s| s.to_string()).collect());
+            cfg.terminal.shell_integration = integration;
+            uses_hook_resume(&cfg, Some(&dir))
+        };
+        assert!(hook(&["/bin/zsh"], true));
+        assert!(hook(&["/bin/zsh", "-l"], true));
+        assert!(hook(&["/usr/bin/fish"], true));
+        assert!(hook(&["/bin/bash"], true));
+        // Startup files off: Thurm's integration never runs.
+        assert!(!hook(&["/bin/zsh", "-f"], true));
+        assert!(!hook(&["/bin/zsh", "-lf"], true));
+        assert!(!hook(&["/bin/zsh", "--no-rcs"], true));
+        assert!(!hook(&["/usr/bin/fish", "--no-config"], true));
+        assert!(!hook(&["/usr/bin/fish", "-N"], true));
+        assert!(!hook(&["/bin/bash", "--norc"], true));
+        assert!(!hook(&["/bin/sh"], true));
+        assert!(!hook(&["/bin/zsh"], false));
+        let mut cfg = Config::default();
+        cfg.terminal.shell = Some(vec!["/bin/zsh".into()]);
+        assert!(!uses_hook_resume(&cfg, None));
     }
 
     #[test]

@@ -62,10 +62,14 @@ pub struct SavedProgramResume {
     /// Unix timestamp (seconds) from the report's `time` key.
     pub reported_at: u64,
     /// Owning process metadata captured at accept time so trust rules re-evaluate on restore.
+    /// The name is for diagnostics only; the executable is the OS's canonical path.
     #[serde(default)]
     pub process_name: String,
     #[serde(default)]
     pub process_exe: String,
+    /// Only the part of the owner's launch command line trust rules look at (program, an
+    /// interpreter's script, the rules' flags): see `program_resume::launch_evidence`. Other
+    /// launch arguments may hold credentials and are never saved.
     #[serde(default)]
     pub process_argv: Vec<String>,
     /// Whether an ancestor between the shell and the owner was not a shell/login/proxy.
@@ -129,22 +133,29 @@ impl Store {
     }
 
     pub fn load(&self) -> Option<SessionSnapshot> {
-        let path = self.session_path();
-        let text = std::fs::read_to_string(&path).ok()?;
+        // Saved resume records are as sensitive as a shell startup file: trust them only when
+        // the directory and the snapshot are private to this user, checked on the very handles
+        // the bytes are read through. Otherwise restore the layout without them.
+        let (text, trust_osc) = match read_private_session(&self.dir) {
+            Some(Ok(text)) => (text, true),
+            Some(Err(())) => {
+                let path = self.session_path();
+                (std::fs::read_to_string(&path).ok()?, false)
+            }
+            None => return None,
+        };
         let mut snap: SessionSnapshot = serde_json::from_str(&text)
             .map_err(|e| log::warn!("ignoring corrupt session snapshot: {e}"))
             .ok()?;
         if snap.version != SNAPSHOT_VERSION {
             return None;
         }
-        // Saved resume records are as sensitive as a shell startup file: ignore them if
-        // another user owns or can modify the snapshot or its directory.
-        if !private_to_self(&path, &self.dir) {
+        if !trust_osc {
             let had_any = snap.panes.iter().any(|p| p.program_resume.is_some());
             if had_any {
                 log::warn!(
                     "discarding saved program resume records: {} is not private to current user",
-                    path.display()
+                    self.session_path().display()
                 );
                 for p in &mut snap.panes {
                     p.program_resume = None;
@@ -210,21 +221,79 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Whether `file` and `dir` are owned by the current effective user and not writable by
-/// group or others (and `file` is a regular file with no group/other access).
-fn private_to_self(file: &Path, dir: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let uid = unsafe { libc::geteuid() };
-    let Ok(fm) = std::fs::symlink_metadata(file) else {
-        return false;
+/// Opens `dir`, then `session.json` relative to it without following a symlink, checks
+/// ownership and private permissions on those exact file descriptors, and reads the bytes from
+/// the verified one. (A symlink to the state directory is fine: the directory it opens is the
+/// one checked.)
+///
+/// Returns:
+/// - `None` if `session.json` does not exist;
+/// - `Some(Ok(text))` if both directory and file are verified private to the current user;
+/// - `Some(Err(()))` if the file exists or could not be verified private (caller may fall back to
+///   layout-only restore with `program_resume` stripped).
+fn read_private_session(dir: &Path) -> Option<Result<String, ()>> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir_c = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let dir_fd = unsafe {
+        libc::open(
+            dir_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
     };
-    if !fm.file_type().is_file() || fm.uid() != uid || (fm.mode() & 0o077) != 0 {
-        return false;
+    if dir_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return if err.kind() == std::io::ErrorKind::NotFound {
+            None
+        } else {
+            Some(Err(()))
+        };
     }
-    let Ok(dm) = std::fs::metadata(dir) else {
-        return false;
+    let dir_owned = unsafe { OwnedFd::from_raw_fd(dir_fd) };
+    let uid = unsafe { libc::geteuid() };
+    let mut dir_st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(dir_fd, &mut dir_st) } != 0 {
+        return Some(Err(()));
+    }
+    let dir_ok = (dir_st.st_mode & libc::S_IFMT) == libc::S_IFDIR
+        && dir_st.st_uid == uid
+        && (dir_st.st_mode & 0o022) == 0;
+
+    let file_fd = unsafe {
+        libc::openat(
+            dir_fd,
+            c"session.json".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
     };
-    dm.is_dir() && dm.uid() == uid && (dm.mode() & 0o022) == 0
+    drop(dir_owned);
+    if file_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return if err.kind() == std::io::ErrorKind::NotFound {
+            None
+        } else {
+            Some(Err(()))
+        };
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+    let mut file_st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file_fd, &mut file_st) } != 0 {
+        return Some(Err(()));
+    }
+    let file_ok = (file_st.st_mode & libc::S_IFMT) == libc::S_IFREG
+        && file_st.st_uid == uid
+        && (file_st.st_mode & 0o077) == 0;
+    if !dir_ok || !file_ok {
+        return Some(Err(()));
+    }
+    let mut text = String::new();
+    match file.read_to_string(&mut text) {
+        Ok(_) => Some(Ok(text)),
+        Err(_) => Some(Err(())),
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +398,15 @@ mod tests {
         };
         store.save(&snap).unwrap();
         assert_eq!(store.load().unwrap(), snap);
+
+        // Non-private permissions or symlinked session.json keep layout but drop program_resume.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(store.session_path(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.layout, snap.layout);
+        assert!(loaded.panes[0].program_resume.is_none());
+
         store.clear();
         assert!(store.load().is_none());
         let _ = std::fs::remove_dir_all(dir);
