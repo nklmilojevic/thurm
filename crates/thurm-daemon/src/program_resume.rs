@@ -1953,14 +1953,17 @@ pub fn digest_value(key: &[u8; 32], value: &str) -> String {
         .collect()
 }
 
-/// The key saved launch evidence is digested with (see [`load_or_create_key`] in
-/// [`thurm_config::resume_key_dir`]). `None` when it can be neither read nor made: records are
-/// then not saved, and saved ones fail closed.
+/// The key saved launch evidence is digested with, and saved records sealed under (see
+/// [`load_or_create_key`] in [`thurm_config::resume_key_dir`]). `None` when it can be neither
+/// read nor made: records are then not saved, and saved ones fail closed.
 pub fn evidence_key() -> Option<[u8; 32]> {
     static KEY: std::sync::Mutex<Option<[u8; 32]>> = std::sync::Mutex::new(None);
     let mut cached = KEY.lock().unwrap_or_else(|e| e.into_inner());
     if cached.is_none() {
-        match load_or_create_key(&thurm_config::resume_key_dir()) {
+        match thurm_config::resume_key_dir()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+            .and_then(|dir| load_or_create_key(&dir))
+        {
             Ok(key) => *cached = Some(key),
             Err(e) => log::warn!("program resume evidence key unavailable: {e}"),
         }
@@ -1968,8 +1971,12 @@ pub fn evidence_key() -> Option<[u8; 32]> {
     *cached
 }
 
+const KEY_FILE: &str = "resume-evidence.key";
+
 /// Reads the 32-byte key in `dir/resume-evidence.key`, creating the directory (0700) and the
 /// key (0600, random) when missing. Both must be private to this user, the key a regular file.
+/// A new key is written and synced under a temporary name and only then linked to its own
+/// (never replacing one another daemon made meanwhile), so a crash never leaves a short key.
 fn load_or_create_key(dir: &Path) -> std::io::Result<[u8; 32]> {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -1985,30 +1992,33 @@ fn load_or_create_key(dir: &Path) -> std::io::Result<[u8; 32]> {
     if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
         return Err(private("key directory is not private to current user"));
     }
-    let path = dir.join("resume-evidence.key");
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            let mut key = [0u8; 32];
-            let written = (|| {
-                std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
-                f.write_all(&key)?;
-                f.sync_all()?;
-                std::fs::File::open(dir)?.sync_all()
-            })();
-            if let Err(e) = written {
-                // A short key file would fail every later start.
-                let _ = std::fs::remove_file(&path);
-                return Err(e);
+    let path = dir.join(KEY_FILE);
+    if std::fs::symlink_metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        let mut key = [0u8; 32];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
+        let mut tag = [0u8; 8];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut tag)?;
+        let tag: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+        let tmp = dir.join(format!(".{KEY_FILE}.{}-{tag}", std::process::id()));
+        let published = (|| {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(&key)?;
+            f.sync_all()?;
+            // A link never replaces: when another daemon published first, its key is read.
+            match std::fs::hard_link(&tmp, &path) {
+                Ok(()) => std::fs::File::open(dir)?.sync_all().map(|()| true),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(e) => Err(e),
             }
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        if published? {
             return Ok(key);
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
     }
     let mut f = std::fs::OpenOptions::new()
         .read(true)
@@ -3456,6 +3466,34 @@ mod tests {
         assert!(load_or_create_key(&dir).is_err());
         assert_ne!(digest_value(&key, "a"), digest_value(&key, "b"));
         assert_ne!(digest_value(&key, "a"), digest_value(&[0u8; 32], "a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn racing_daemons_publish_one_whole_key() {
+        let dir =
+            std::env::temp_dir().join(format!("thurm-resume-key-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let keys: Vec<[u8; 32]> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || load_or_create_key(&dir).unwrap())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        assert!(keys.iter().all(|k| *k == keys[0]));
+        // Only the key is left: no temporary file under any name.
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [KEY_FILE]);
+        // A short file under the name (never published by this code) is refused, not used.
+        std::fs::write(dir.join(KEY_FILE), b"short").unwrap();
+        assert!(load_or_create_key(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

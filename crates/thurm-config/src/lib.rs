@@ -1363,11 +1363,6 @@ pub fn state_dir() -> PathBuf {
     }
 }
 
-/// Where the daemon keeps the key that digests saved program resume evidence: outside the
-/// state directory, so `session.json` and a copy of it never carry what reverses the digests.
-/// `THURM_KEY_DIR` overrides it; with `THURM_STATE_DIR` set it is that directory's `-keys`
-/// sibling, else `~/Library/Application Support/Thurm Keys` on macOS and
-/// `~/.local/share/thurm/keys` elsewhere (the data directory, not the state or config one).
 /// `<state>-keys`, next to the state directory `state` and never inside it: a trailing
 /// separator (`/srv/thurm/state/`) would otherwise make it `<state>/-keys`, which copies of the
 /// state directory carry along with the evidence the key signs.
@@ -1377,26 +1372,104 @@ fn keys_beside(state: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-pub fn resume_key_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("THURM_KEY_DIR") {
-        return PathBuf::from(dir);
+/// Where the daemon keeps the key that digests and seals saved program resume records: outside
+/// the state directory, so `session.json` and a copy of it never carry what opens them.
+/// `THURM_KEY_DIR` overrides it; with `THURM_STATE_DIR` set it is that directory's `-keys`
+/// sibling, else `~/Library/Application Support/Thurm Keys` on macOS and
+/// `~/.local/share/thurm/keys` elsewhere (the data directory, not the state or config one).
+/// A default that falls inside the state directory (`XDG_DATA_HOME` and `XDG_STATE_HOME` the
+/// same directory) gives way to the `-keys` sibling; an override inside it is an error.
+pub fn resume_key_dir() -> Result<PathBuf, String> {
+    let state = state_dir();
+    let over = std::env::var_os("THURM_KEY_DIR").map(PathBuf::from);
+    let default = if std::env::var_os("THURM_STATE_DIR").is_some() {
+        keys_beside(&state)
+    } else {
+        default_key_dir()
+    };
+    key_dir_outside(&state, over, default)
+}
+
+#[cfg(target_vendor = "apple")]
+fn default_key_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Thurm Keys")
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn default_key_dir() -> PathBuf {
+    dirs::data_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("thurm")
+        .join("keys")
+}
+
+/// `over` (or else `default`, or else `state`'s `-keys` sibling) unless it resolves to `state`
+/// or a directory in it, symlinks followed as far as the paths exist.
+fn key_dir_outside(
+    state: &Path,
+    over: Option<PathBuf>,
+    default: PathBuf,
+) -> Result<PathBuf, String> {
+    let inside_state = {
+        let state = resolve_existing(state);
+        move |dir: &Path| resolve_existing(dir).starts_with(&state)
+    };
+    if let Some(dir) = over {
+        if inside_state(&dir) {
+            return Err(format!(
+                "THURM_KEY_DIR {} is inside the state directory {}",
+                dir.display(),
+                state.display()
+            ));
+        }
+        return Ok(dir);
     }
-    if let Some(dir) = std::env::var_os("THURM_STATE_DIR") {
-        return keys_beside(Path::new(&dir));
+    if !inside_state(&default) {
+        return Ok(default);
     }
-    #[cfg(target_vendor = "apple")]
-    {
-        dirs::data_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("Thurm Keys")
+    let beside = keys_beside(state);
+    if inside_state(&beside) {
+        return Err(format!(
+            "no key directory outside the state directory {}",
+            state.display()
+        ));
     }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        dirs::data_dir()
-            .or_else(dirs::data_local_dir)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("thurm")
-            .join("keys")
+    Ok(beside)
+}
+
+/// `path` made absolute, with its longest existing ancestor canonicalized (symlinks followed)
+/// and the rest appended, `.` and `..` in it resolved lexically.
+fn resolve_existing(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut abs = std::env::current_dir().unwrap_or_default();
+    abs.push(path);
+    let mut lexical = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            c => lexical.push(c),
+        }
+    }
+    let mut rest = Vec::new();
+    let mut base = lexical.as_path();
+    loop {
+        if let Ok(mut out) = std::fs::canonicalize(base) {
+            out.extend(rest.iter().rev());
+            return out;
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                base = parent;
+            }
+            _ => return lexical,
+        }
     }
 }
 
@@ -2457,6 +2530,43 @@ fn migrate_config(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_key_directory_is_never_inside_the_state_directory() {
+        let base = std::env::temp_dir().join(format!("thurm-keydir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("share/thurm")).unwrap();
+        let base = std::fs::canonicalize(base).unwrap();
+        let state = base.join("share/thurm");
+        // XDG_STATE_HOME and XDG_DATA_HOME the same directory: the default gives way.
+        assert_eq!(
+            key_dir_outside(&state, None, state.join("keys")).unwrap(),
+            base.join("share/thurm-keys")
+        );
+        // A state directory not made yet, under a symlinked parent.
+        std::os::unix::fs::symlink(base.join("share"), base.join("alias")).unwrap();
+        let new_state = base.join("alias/new/state");
+        assert_eq!(
+            key_dir_outside(&new_state, None, base.join("share/new/state/k")).unwrap(),
+            base.join("alias/new/state-keys")
+        );
+        // An override inside it, through an alias or `..`, is refused; one beside it is kept.
+        for over in ["alias/thurm/keys", "share/thurm", "share/x/../thurm/keys"] {
+            assert!(
+                key_dir_outside(&state, Some(base.join(over)), base.join("d")).is_err(),
+                "{over}"
+            );
+        }
+        assert_eq!(
+            key_dir_outside(&state, Some(base.join("share/thurm-k")), base.join("d")).unwrap(),
+            base.join("share/thurm-k")
+        );
+        assert_eq!(
+            key_dir_outside(&state, None, base.join("d")).unwrap(),
+            base.join("d")
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn the_key_directory_is_beside_the_state_directory() {
