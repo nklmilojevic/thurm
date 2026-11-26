@@ -1323,7 +1323,10 @@ fn evaluate_rule(
     // file in the directory the program was launched in, which nothing records: the same text
     // proves nothing, so such a report isn't trusted.
     let relative_path = reported.iter().any(|(flag, vals)| {
-        rule.path_flags.iter().any(|f| f == flag) && vals.iter().any(|v| !absolute_or_inline(v))
+        rule.path_flags.iter().any(|f| f == flag) && {
+            let json = rule.json_flags.iter().any(|f| f == flag);
+            vals.iter().any(|v| !absolute_or_inline(v, json))
+        }
     });
     if relative_path {
         return Err("flags_relative_path");
@@ -1971,11 +1974,14 @@ fn extract_launch_flags(
 /// be the launch's, in the same order with the same values (a program may let the last one win,
 /// so a reordered list is a different restriction); every other reported occurrence uses up a
 /// distinct identical launch occurrence, in any order, and those may be left out.
-/// A file flag's value that means the same wherever the program starts: an absolute path, or
-/// the content itself (inline JSON, as Claude's `--settings` and `--mcp-config` take).
-fn absolute_or_inline(value: &str) -> bool {
-    let v = value.trim_start();
-    v.starts_with('/') || v.starts_with('{') || v.starts_with('[')
+/// A file flag's value that means the same wherever the program starts: an absolute path,
+/// exactly as given, or for a flag that takes it (`json`) the content itself, an inline JSON
+/// object or array (as Claude's `--settings` and `--mcp-config` take).
+fn absolute_or_inline(value: &str, json: bool) -> bool {
+    value.starts_with('/')
+        || (json
+            && serde_json::from_str::<serde_json::Value>(value)
+                .is_ok_and(|v| v.is_object() || v.is_array()))
 }
 
 fn flags_match_launch(
@@ -3085,6 +3091,7 @@ mod tests {
             flags: Default::default(),
             preserve_flags: Default::default(),
             path_flags: Vec::new(),
+            json_flags: Vec::new(),
             match_process: true,
         }];
         let link_argv = vec!["nvim".into(), "-S".into(), link.display().to_string()];
@@ -3576,9 +3583,15 @@ mod tests {
         assert_eq!(check(&["--settings", "./s.json"]), relative);
         assert_eq!(check(&["--settings", "s.json"]), relative);
         assert_eq!(check(&["--mcp-config", "/m.json", "m2.json"]), relative);
+        // Looks like JSON but isn't (a file named so), or an absolute path after spaces the
+        // program keeps: relative files too.
+        assert_eq!(check(&["--settings", "{s.json"]), relative);
+        assert_eq!(check(&["--settings", "[1"]), relative);
+        assert_eq!(check(&["--settings", " /s.json"]), relative);
         let trusted = |v| matches!(v, TrustVerdict::Trusted { .. });
         assert!(trusted(check(&["--settings", "/s.json"])));
         assert!(trusted(check(&["--settings", r#"{"permissions":{}}"#])));
+        assert!(trusted(check(&["--mcp-config", r#" {"mcpServers":{}}"#])));
         assert!(trusted(check(&["--setting-sources", "user"])));
     }
 

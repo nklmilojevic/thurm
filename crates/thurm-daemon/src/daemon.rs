@@ -2976,6 +2976,10 @@ impl Daemon {
                     .cloned()
                     .or_else(|| p.cwd.clone())
             };
+            // Resolved once, here: the rules check the directory the ticket pins below, not one
+            // a symlink swapped in between could lead elsewhere.
+            let resolved_cwd = resolved_cwd
+                .map(|dir| std::fs::canonicalize(&dir).map_or(dir, |c| c.display().to_string()));
             let trust = program_resume::evaluate_trust(
                 &TrustSubject {
                     argv: &rec.argv,
@@ -3047,12 +3051,14 @@ impl Daemon {
             }
             let require_cwd = rec.cwd_from_report || dir_restricted;
             // A directory it must start in is pinned to the one checked here: its canonical
-            // path, entered only while it is still the same directory.
+            // path (as checked: one that resolves elsewhere now is not it), entered only while
+            // it is still the same directory.
             let (spec_cwd, cwd_id) = match resolved_cwd.as_deref() {
                 Some(dir) if require_cwd => {
                     let canon = std::fs::canonicalize(dir)
                         .ok()
-                        .map(|d| d.display().to_string());
+                        .map(|d| d.display().to_string())
+                        .filter(|c| c == dir);
                     let id = canon.as_deref().and_then(program_resume::dir_identity);
                     match (canon, id) {
                         (Some(canon), Some(id)) => (Some(canon), Some(id)),

@@ -59,8 +59,11 @@ pub struct ResumeRule {
     pub preserve_flags: BTreeMap<String, FlagArity>,
     /// Flags among these whose value names a file (Claude's `--settings`): a relative path is
     /// only the same file in the directory the program was launched in, which cannot be
-    /// known, so a report with one is not trusted (an absolute path or inline JSON is).
+    /// known, so a report with one is not trusted; an absolute path, exactly as given, is.
     pub path_flags: Vec<String>,
+    /// Those of `path_flags` that also take the content itself as inline JSON (an object or an
+    /// array), which means the same wherever the program starts.
+    pub json_flags: Vec<String>,
     /// Require the owning OS process to match `command[0]` (default: `true`).
     pub match_process: bool,
 }
@@ -97,6 +100,7 @@ impl Default for ResumeRule {
             flags: BTreeMap::new(),
             preserve_flags: BTreeMap::new(),
             path_flags: Vec::new(),
+            json_flags: Vec::new(),
             match_process: true,
         }
     }
@@ -168,6 +172,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
                 ("--tools", Many),
             ]),
             path_flags: s(&["--mcp-config", "--settings"]),
+            json_flags: s(&["--mcp-config", "--settings"]),
             match_process: true,
         },
         ResumeRule {
@@ -194,6 +199,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
                 ("-s", One),
             ]),
             path_flags: Vec::new(),
+            json_flags: Vec::new(),
             match_process: true,
         },
         ResumeRule {
@@ -204,6 +210,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             flags: BTreeMap::new(),
             preserve_flags: BTreeMap::new(),
             path_flags: Vec::new(),
+            json_flags: Vec::new(),
             match_process: true,
         },
         ResumeRule {
@@ -214,6 +221,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             flags: BTreeMap::new(),
             preserve_flags: BTreeMap::new(),
             path_flags: Vec::new(),
+            json_flags: Vec::new(),
             match_process: true,
         },
         ResumeRule {
@@ -224,6 +232,7 @@ pub fn builtin_resume_rules() -> Vec<ResumeRule> {
             flags: BTreeMap::new(),
             preserve_flags: BTreeMap::new(),
             path_flags: Vec::new(),
+            json_flags: Vec::new(),
             match_process: true,
         },
     ]
@@ -253,6 +262,13 @@ fn merge_resume_rules(include_defaults: bool, user: &[ResumeRule]) -> Vec<Resume
                     existing.dirs = u.dirs.clone();
                 }
                 existing.match_process = u.match_process;
+                // More flags that name a file: only ever more restrictions. Inline JSON stays
+                // as the built-in allows it.
+                for flag in &u.path_flags {
+                    if !existing.path_flags.contains(flag) {
+                        existing.path_flags.push(flag.clone());
+                    }
+                }
             } else {
                 let mut replacement = u.clone();
                 if replacement.command.is_empty() {
@@ -261,10 +277,21 @@ fn merge_resume_rules(include_defaults: bool, user: &[ResumeRule]) -> Vec<Resume
                 if replacement.preserve_flags.is_empty() {
                     replacement.preserve_flags = rules[idx].preserve_flags.clone();
                 }
-                // Never fewer: what names a file in the built-in still does.
+                // Never fewer: what names a file in the built-in still does. Inline JSON only
+                // where the built-in takes it (an override can't widen it for those flags).
                 for flag in &rules[idx].path_flags {
                     if !replacement.path_flags.contains(flag) {
                         replacement.path_flags.push(flag.clone());
+                    }
+                }
+                let builtin_json = rules[idx].json_flags.clone();
+                let builtin_paths = rules[idx].path_flags.clone();
+                replacement
+                    .json_flags
+                    .retain(|f| !builtin_paths.contains(f) || builtin_json.contains(f));
+                for flag in builtin_json {
+                    if !replacement.json_flags.contains(&flag) {
+                        replacement.json_flags.push(flag);
                     }
                 }
                 rules[idx] = replacement;
@@ -322,6 +349,21 @@ mod tests {
         let claude = rules.iter().find(|r| r.name == "claude").unwrap();
         assert!(claude.path_flags.iter().any(|f| f == "--settings"));
         assert!(claude.path_flags.iter().any(|f| f == "--mcp-config"));
+        // Inline JSON stays as the built-in takes it.
+        assert!(claude.json_flags.iter().any(|f| f == "--settings"));
+
+        // An override that only adds a file flag adds it, keeping the rest of the built-in.
+        let more = ResumeRule {
+            name: "claude".into(),
+            path_flags: vec!["--plugin-dir".into()],
+            ..Default::default()
+        };
+        let rules = merge_resume_rules(true, std::slice::from_ref(&more));
+        let claude = rules.iter().find(|r| r.name == "claude").unwrap();
+        assert!(claude.path_flags.iter().any(|f| f == "--plugin-dir"));
+        assert!(claude.path_flags.iter().any(|f| f == "--settings"));
+        assert!(!claude.flags.is_empty() && !claude.preserve_flags.is_empty());
+        assert!(!claude.json_flags.iter().any(|f| f == "--plugin-dir"));
     }
 
     #[test]
