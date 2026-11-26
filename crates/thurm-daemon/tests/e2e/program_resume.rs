@@ -552,9 +552,25 @@ fn bash_resume_interrupted_keeps_xtrace() {
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(250));
-    // Traced, the command shows as `+ printf ...` before its output. Typed again if it came
-    // before bash read input again after the interrupt (the traced prompt hook is slow).
-    send_until(&c2, pane, b"printf 'TRACED_%s\\n' STILL\r", "TRACED_STILL");
+    // Traced, the command shows as `+ printf ...` before its output. Searched in the
+    // scrollback (the traced prompt hook after it scrolls it off the screen), and typed again
+    // if it came before bash read input again after the interrupt.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    'typed: loop {
+        run_line(&c2, pane, "printf 'TRACED_%s\\n' STILL");
+        let retype = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < retype {
+            if capture(&c2, pane).contains("\nTRACED_STILL") {
+                break 'typed;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            Instant::now() < deadline,
+            "command never ran: {}",
+            capture(&c2, pane)
+        );
+    }
     let shown = capture(&c2, pane);
     assert!(
         shown.contains("+ printf 'TRACED_%s\\n' STILL"),
