@@ -45,8 +45,6 @@ const OUTPUT_BACKLOG: usize = 4096;
 /// Bytes of output queued for a client before its subscriptions switch to re-sync (an
 /// `Output` can be 256 KiB: counting messages alone let a stalled client pin a gigabyte).
 const OUTPUT_BACKLOG_BYTES: usize = 16 * 1024 * 1024;
-/// The longest a handed-over resume ticket may still wait (see `program_resume::TICKET_TTL`).
-const TICKET_TTL_MS: u64 = program_resume::TICKET_TTL.as_millis() as u64;
 /// The most record bytes one [`Request::ResumeRecords`] answer holds: every pane's records
 /// fit when a pane is named, a list of all panes past it is refused.
 const RESUME_LIST_BYTES: usize = 8 * 1024 * 1024;
@@ -803,6 +801,10 @@ pub struct Daemon {
     resume_save_due: AtomicBool,
     /// Restored panes' saved programs waiting for their shell (see [`ResumeTicket`]).
     resume_tickets: Mutex<Vec<ResumeTicket>>,
+    /// An in-place upgrade has captured the panes for the next image, which does not resume
+    /// what is still pending: until the exec, or until the upgrade gives up, no resume line is
+    /// typed and no ticket redeemed (see [`Daemon::set_handing_over`]).
+    handing_over: AtomicBool,
     restored: AtomicBool,
     /// `restore_session` or `adopt` is still installing panes: a snapshot written now would
     /// lack the rest of them and the layout, so saves wait (the session stays dirty).
@@ -885,6 +887,7 @@ impl Daemon {
             integration_dir,
             session_dirty: AtomicBool::new(false),
             resume_save_due: AtomicBool::new(false),
+            handing_over: AtomicBool::new(false),
             resume_tickets: Mutex::new(Vec::new()),
             restored: AtomicBool::new(false),
             loading: AtomicBool::new(false),
@@ -2556,8 +2559,13 @@ impl Daemon {
         true
     }
 
-    /// Types a restored pane's pending resume line once it is due (see `pending_input`).
+    /// Types a restored pane's pending resume line once it is due (see `pending_input`). Not
+    /// while an upgrade hands the panes over (the next image resumes nothing pending); it
+    /// stays for this monitor if the upgrade gives up.
     fn type_pending_input(&self, pane: &Arc<Pane>, st: &mut PaneState) {
+        if self.handing_over.load(Ordering::SeqCst) {
+            return;
+        }
         if let Some((due, _)) = &st.pending_input
             && Instant::now() >= *due
             && let Some((_, input)) = st.pending_input.take()
@@ -2590,9 +2598,9 @@ impl Daemon {
     }
 
     /// Whether a restored pane still waits to resume its program: a resume line not yet typed,
-    /// or a ticket its shell has not redeemed. An upgrade waits for these (see
-    /// [`Daemon::drop_pending_resumes`]). They come only from restoring, which is done before
-    /// the daemon serves or upgrades, so none appear later.
+    /// or a ticket its shell has not redeemed. An upgrade waits a little for these, then hands
+    /// the panes over without them (see [`Daemon::handoff`]). They come only from restoring,
+    /// which is done before the daemon serves or upgrades, so none appear later.
     pub fn resumes_pending(&self) -> bool {
         let now = Instant::now();
         !self.resume_tickets.lock().iter().all(|t| t.expires <= now)
@@ -2602,27 +2610,32 @@ impl Daemon {
                 .any(|p| p.state.lock().pending_input.is_some())
     }
 
-    /// Cancels the resumes still pending, as typing would, before an upgrade hands the panes
-    /// over. A pending resume is never handed over: input that should cancel it could reach
-    /// this image and end with it, unseen (keystrokes get no reply), while the next image
-    /// resumes the program anyway. Not resuming a program is the safe side of that race.
-    pub fn drop_pending_resumes(&self) {
-        let mut tickets = std::mem::take(&mut *self.resume_tickets.lock());
-        for pane in self.all_panes() {
-            let mut st = pane.state.lock();
-            let had_ticket = tickets.iter().any(|t| t.pane == pane.id);
-            if st.pending_input.take().is_some() || had_ticket {
-                st.term
-                    .print("\r\n[automatic resume skipped: the daemon was upgraded]\r\n");
-            }
-        }
-        tickets.clear();
+    /// Set before [`Daemon::handoff`] captures the panes, and cleared if the upgrade gives up:
+    /// meanwhile nothing pending resumes here (see `handing_over`). Ticket redemptions wait
+    /// for the outcome; the helper sees it either way (its request gets a reply).
+    pub fn set_handing_over(&self, on: bool) {
+        self.handing_over.store(on, Ordering::SeqCst);
     }
 
+    /// What the next image takes over. Resumes still pending are left out, and stay pending
+    /// here in case the upgrade gives up: input that should cancel one could end with this
+    /// image, unseen (keystrokes get no reply), while the next resumed the program anyway. The
+    /// next image only notes them as skipped in their panes (`resumes_skipped`).
     pub fn handoff(&self, listener_fd: RawFd, log_to_file: bool) -> upgrade::Handoff {
+        let now = Instant::now();
+        let mut resumes_skipped: Vec<PaneId> = self
+            .resume_tickets
+            .lock()
+            .iter()
+            .filter(|t| t.expires > now)
+            .map(|t| t.pane)
+            .collect();
         let mut panes = Vec::new();
         for pane in self.all_panes() {
             let mut st = pane.state.lock();
+            if st.pending_input.is_some() && !resumes_skipped.contains(&pane.id) {
+                resumes_skipped.push(pane.id);
+            }
             let exited = st.pty.try_wait().or(st.pty.exit_status());
             let state = st.term.serialize_state();
             panes.push(upgrade::PaneHandoff {
@@ -2651,31 +2664,10 @@ impl Daemon {
                 slave_rdev: st.pty.slave_rdev(),
                 resume_token: st.resume.token().map(str::to_owned),
                 resume_state: Some(st.resume.handoff()),
-                pending_input: st.pending_input.as_ref().map(|(due, input)| {
-                    (
-                        due.saturating_duration_since(Instant::now()).as_millis() as u64,
-                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, input),
-                    )
-                }),
-                pending_waits: st.pending_waits,
                 typed: st.typed,
                 osc_7577_discard: st.term.osc_7577_discard(),
             });
         }
-        let now = Instant::now();
-        let resume_tickets = self
-            .resume_tickets
-            .lock()
-            .iter()
-            .filter(|t| t.expires > now)
-            .map(|t| upgrade::TicketHandoff {
-                ticket: t.ticket.clone(),
-                pane: t.pane,
-                spec: t.spec.clone(),
-                remaining_ms: (t.expires - now).as_millis() as u64,
-                policy: t.policy.clone(),
-            })
-            .collect();
         upgrade::Handoff {
             version: upgrade::HANDOFF_VERSION,
             listener_fd,
@@ -2686,7 +2678,7 @@ impl Daemon {
             restored: self.restored.load(Ordering::Relaxed),
             panes,
             tailnet: self.tailnet.handoff(),
-            resume_tickets,
+            resumes_skipped,
         }
     }
 
@@ -2709,21 +2701,6 @@ impl Daemon {
     /// Takes over the panes of the image we replaced.
     pub fn adopt(self: &Arc<Self>, h: upgrade::Handoff) {
         self.loading.store(true, Ordering::Relaxed);
-        // Before the panes: a shell that redeems its ticket right away finds it.
-        let now = Instant::now();
-        *self.resume_tickets.lock() = h
-            .resume_tickets
-            .into_iter()
-            .filter(|t| program_resume::is_ticket(&t.ticket))
-            .map(|t| ResumeTicket {
-                ticket: t.ticket,
-                pane: t.pane,
-                spec: t.spec,
-                expires: now + Duration::from_millis(t.remaining_ms.min(TICKET_TTL_MS)),
-                // Checked against this image's configuration when redeemed.
-                policy: t.policy,
-            })
-            .collect();
         let mut adopted = 0;
         for p in h.panes {
             let mut size = sanitize_size(p.size.into());
@@ -2755,6 +2732,9 @@ impl Daemon {
             // Last, after the replay: the rest of an oversized OSC 7577 is still discarded.
             term.restore_osc_7577_discard(p.osc_7577_discard);
             term.restore_program_status(p.programs.clone());
+            if h.resumes_skipped.contains(&p.id) {
+                term.print("\r\n[automatic resume skipped: the daemon was upgraded]\r\n");
+            }
             let alive = p.exited.is_none();
             let info = PaneInfo {
                 id: p.id,
@@ -2772,12 +2752,6 @@ impl Daemon {
             if let Some(rs) = p.resume_state {
                 resume.restore_handoff(rs);
             }
-            // Before the reader starts: the shell's first prompt may already wait in the PTY.
-            let pending_input = p.pending_input.and_then(|(ms, b64)| {
-                let input =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()?;
-                Some((Instant::now() + Duration::from_millis(ms), input))
-            });
             let installed = self.install_pane(
                 InstallPane {
                     term,
@@ -2792,8 +2766,8 @@ impl Daemon {
                     forwarded_carry,
                     programs_pgrp: p.programs_pgrp,
                     resume,
-                    pending_input,
-                    pending_waits: p.pending_waits,
+                    pending_input: None,
+                    pending_waits: 0,
                     typed: p.typed,
                 },
                 alive,
@@ -4583,6 +4557,16 @@ impl Daemon {
                 // Only this user's own processes on this machine (the pane's shell).
                 if !client.is_local_peer() {
                     return Err("not allowed".into());
+                }
+                // Not while an upgrade hands the panes over without it: redeemed here if the
+                // upgrade gives up; if it goes ahead, the helper's connection ends and it
+                // starts the shell, as the next image notes.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while self.handing_over.load(Ordering::SeqCst) {
+                    if Instant::now() >= deadline {
+                        return Err("the daemon is restarting".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 let spec = {
                     let mut tickets = self.resume_tickets.lock();
@@ -6635,78 +6619,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The shell's first prompt can already wait in the PTY when the next image adopts the
-    /// pane: the line to type is in place before its reader sees it, and its waits so far
-    /// come along.
-    #[test]
-    fn an_adopted_pane_types_its_line_at_a_prompt_already_waiting() {
-        let dir = test_dir("adopt-pending");
-        let old = Daemon::new(
-            Config::default(),
-            dir.join("a.sock"),
-            dir.join("a"),
-            Arc::new(AtomicBool::new(false)),
-        );
-        let id = cat_pane(&old);
-        {
-            let pane = old.pane(id).unwrap();
-            let mut st = pane.state.lock();
-            // Due long after the test: only the prompt can take it.
-            st.pending_input = Some((
-                Instant::now() + Duration::from_secs(600),
-                b"RESUMED\n".to_vec(),
-            ));
-            st.pending_waits = 7;
-        }
-        assert!(old.quiesce_readers(Duration::from_secs(2), Duration::from_secs(5)));
-        let mut h = old.handoff(-1, false);
-        assert_eq!(h.panes[0].pending_waits, 7);
-        // The new image's own copy of the PTY.
-        let fd = unsafe { libc::dup(h.panes[0].fd) };
-        assert!(fd >= 0);
-        h.panes[0].fd = fd;
-        // The prompt (`cat` prints it back, without the terminal's echo) waits unread.
-        unsafe {
-            let mut t: libc::termios = std::mem::zeroed();
-            assert_eq!(libc::tcgetattr(fd, &mut t), 0);
-            t.c_lflag &= !libc::ECHO;
-            assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &t), 0);
-        }
-        let prompt = b"\x1b]133;A\x07\n";
-        assert_eq!(
-            unsafe { libc::write(fd, prompt.as_ptr().cast(), prompt.len()) },
-            prompt.len() as isize
-        );
-        let mut poll = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
-
-        let new = Daemon::new(
-            Config::default(),
-            dir.join("b.sock"),
-            dir.join("b"),
-            Arc::new(AtomicBool::new(false)),
-        );
-        new.adopt(h);
-        let pane = new.pane(id).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pane.state.lock().pending_input.is_some() {
-            assert!(
-                Instant::now() < deadline,
-                "the prompt waiting in the PTY did not type the line"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(pane.state.lock().pending_waits, 7);
-        new.close_pane(id);
-        old.resume_readers();
-        old.close_pane(id);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     /// A ticket is redeemed only under the resume settings it was issued under: a reload that
     /// changes them forgets it (and its line to type), and one from another configuration (an
     /// upgrade's previous image) is refused.
@@ -6768,11 +6680,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// An upgrade hands over no pending resume: those left after its short wait are cancelled
-    /// (as typing would), so input meant to cancel one can never end with the old image while
-    /// the new one resumes the program.
+    /// An upgrade hands over no pending resume: the next image only notes it as skipped. They
+    /// stay pending here, untouched while the panes are handed over, so an upgrade that gives
+    /// up after capturing them leaves them to resume as before.
     #[test]
-    fn pending_resumes_are_cancelled_before_an_upgrade() {
+    fn pending_resumes_stay_here_and_are_not_handed_over() {
         let dir = test_dir("upgrade-resumes");
         let daemon = Daemon::new(
             Config::default(),
@@ -6789,23 +6701,38 @@ mod tests {
         stale.expires = Instant::now();
         daemon.resume_tickets.lock().push(stale);
         assert!(!daemon.resumes_pending());
-        daemon.pane(waiting).unwrap().state.lock().pending_input =
-            Some((Instant::now() + Duration::from_secs(600), b"x\r".to_vec()));
-        assert!(daemon.resumes_pending());
-        daemon.pane(waiting).unwrap().state.lock().pending_input = None;
+        let due = Instant::now();
+        daemon.pane(waiting).unwrap().state.lock().pending_input = Some((due, b"x\r".to_vec()));
         daemon
             .resume_tickets
             .lock()
             .push(ticket_for(ticketed, &"d4".repeat(16), String::new()));
         assert!(daemon.resumes_pending());
-        daemon.pane(waiting).unwrap().state.lock().pending_input =
-            Some((Instant::now() + Duration::from_secs(600), b"x\r".to_vec()));
 
-        daemon.drop_pending_resumes();
-        assert!(!daemon.resumes_pending());
-        assert!(daemon.resume_tickets.lock().is_empty());
-        let waiting_pane = daemon.pane(waiting).unwrap();
-        assert!(waiting_pane.state.lock().pending_input.is_none());
+        daemon.set_handing_over(true);
+        let h = daemon.handoff(-1, false);
+        let mut skipped = h.resumes_skipped.clone();
+        skipped.sort_unstable();
+        assert_eq!(skipped, vec![waiting, ticketed]);
+        // Nothing resumes here meanwhile: the due line stays untyped.
+        let pane = daemon.pane(waiting).unwrap();
+        daemon.type_pending_input(&pane, &mut pane.state.lock());
+        let line = Some((due, b"x\r".to_vec()));
+        assert_eq!(pane.state.lock().pending_input, line);
+
+        // The upgrade gave up: everything is still pending, and serviced again.
+        daemon.set_handing_over(false);
+        assert!(daemon.resumes_pending());
+        let tickets = daemon.resume_tickets.lock();
+        assert!(tickets.iter().any(|t| t.pane == ticketed));
+        drop(tickets);
+        daemon.type_pending_input(&pane, &mut pane.state.lock());
+        {
+            // `cat` is no shell: the line waits for one.
+            let st = pane.state.lock();
+            assert_eq!(st.pending_waits, 1);
+            assert!(st.pending_input.as_ref().is_some_and(|(d, _)| *d > due));
+        }
         for id in [waiting, ticketed, plain] {
             daemon.close_pane(id);
         }

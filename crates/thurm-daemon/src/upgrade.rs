@@ -60,23 +60,10 @@ pub struct Handoff {
     /// The Tailscale helper's pid and control socket, which stay open across the exec.
     #[serde(default)]
     pub tailnet: Option<(i32, RawFd)>,
-    /// Restored panes' saved programs their shell has not redeemed yet (sealed inside the
-    /// encrypted hand-off file, like the panes' tokens).
+    /// Panes whose program was still waiting to resume: not handed over (see
+    /// `Daemon::handoff`), only noted as skipped in the pane.
     #[serde(default)]
-    pub resume_tickets: Vec<TicketHandoff>,
-}
-
-/// A [`crate::daemon::ResumeTicket`] across the exec: how long it has left, not when it ends.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct TicketHandoff {
-    pub ticket: String,
-    pub pane: PaneId,
-    pub spec: crate::program_resume::ResumeExecSpec,
-    pub remaining_ms: u64,
-    /// `daemon::resume_policy` of the configuration it was issued under (empty from images
-    /// that didn't write it: never redeemed).
-    #[serde(default)]
-    pub policy: String,
+    pub resumes_skipped: Vec<PaneId>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -133,13 +120,6 @@ pub struct PaneHandoff {
     /// Accepted Program Resume Protocol (OSC 7577) state for this pane.
     #[serde(default)]
     pub resume_state: Option<crate::program_resume::ResumeHandoff>,
-    /// A line still to be typed into the shell: in how many milliseconds, and base64 of it.
-    #[serde(default)]
-    pub pending_input: Option<(u64, String)>,
-    /// How many times `pending_input` already waited for a slow shell (see
-    /// `PaneState::pending_waits`): the new image doesn't give it a fresh budget.
-    #[serde(default)]
-    pub pending_waits: u32,
     /// A client typed or pasted into the pane.
     #[serde(default)]
     pub typed: bool,
@@ -280,16 +260,13 @@ pub fn perform(
             return;
         }
     };
-    // No pending resume crosses the upgrade (the caller waited a little for them to finish):
-    // input that should cancel one could end with this image, unseen, and the next would
-    // resume the program anyway. Cancelled even if the upgrade then gives up.
-    daemon.drop_pending_resumes();
     // Stop reading the PTYs and parse what was read: the terminals are then serialized with
     // nothing lost, and the output that follows stays in the kernel for the new image. Readers
     // resume if we return (the upgrade didn't happen).
     struct Resume<'a>(&'a Daemon);
     impl Drop for Resume<'_> {
         fn drop(&mut self) {
+            self.0.set_handing_over(false);
             self.0.resume_readers();
         }
     }
@@ -305,6 +282,8 @@ pub fn perform(
         // The handoff carries the panes; the snapshot is only the fallback after a crash.
         log::warn!("upgrade: session snapshot not saved: {e}");
     }
+    // From here nothing pending resumes in this image (the next one doesn't take it over).
+    daemon.set_handing_over(true);
     let mut handoff = daemon.handoff(listener_fd, log_to_file);
     handoff.version = version;
     handoff.lock_fd = lock_fd;
@@ -483,14 +462,12 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// Reads (and deletes) the hand-off file given to `--adopt`, opening it with the key in
 /// `key_fd` (`--handoff-key-fd`) when it is sealed.
 /// A plain hand-off (from an image older than sealing) is not authenticated: nothing in it
-/// may decide what runs unattended, so the program resume state goes (records, tokens,
-/// tickets and lines waiting to be typed).
+/// may decide what runs unattended, so the program resume state goes (records and tokens).
+/// Pending resumes are never handed over (see `Daemon::handoff`).
 fn strip_resume(h: &mut Handoff) {
-    h.resume_tickets.clear();
     for p in &mut h.panes {
         p.resume_token = None;
         p.resume_state = None;
-        p.pending_input = None;
     }
 }
 
@@ -565,7 +542,7 @@ mod tests {
             restored: false,
             panes: Vec::new(),
             tailnet: None,
-            resume_tickets: Vec::new(),
+            resumes_skipped: Vec::new(),
         }
     }
 
@@ -641,37 +618,21 @@ mod tests {
         let mut old = sample();
         old.version = 1;
         // Nothing resume-related survives an unauthenticated file.
-        old.resume_tickets.push(TicketHandoff {
-            ticket: "ab".repeat(16),
-            pane: 1,
-            spec: crate::program_resume::ResumeExecSpec {
-                argv: vec!["/bin/sh".into()],
-                cwd: None,
-                require_cwd: false,
-                cwd_id: None,
-                exe_dirs: Vec::new(),
-            },
-            remaining_ms: 1000,
-            policy: String::new(),
-        });
-        // A pane with a line waiting to be typed into its shell, and a resume token.
+        // A pane with a resume token and its accepted records.
         let mut value = serde_json::to_value(&old).unwrap();
         value["panes"] = serde_json::json!([{
             "id": 1, "fd": 9, "pid": 42,
             "size": {"cols": 80, "rows": 24, "cell_width": 0, "cell_height": 0},
             "title": "zsh", "cwd": "/tmp", "command": null, "hold": false, "restored": true,
             "exited": null, "osc_cwd": null, "shell_integration_seen": true, "state": "",
-            "pending_input": [500, "dG91Y2ggL3RtcC9wbGFpbi1oYW5kb2ZmLW1hcmtlcg=="],
             "resume_token": "cd".repeat(32),
         }]);
         write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
         let h = load(&path, None).unwrap();
         assert_eq!(h.version, 1);
-        assert!(h.resume_tickets.is_empty());
-        // The pane stays; what it would have typed or redeemed does not.
+        // The pane stays; its resume state does not.
         assert_eq!(h.panes.len(), 1);
         assert_eq!((h.panes[0].id, h.panes[0].title.as_str()), (1, "zsh"));
-        assert!(h.panes[0].pending_input.is_none());
         assert!(h.panes[0].resume_token.is_none());
     }
 }
