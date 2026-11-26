@@ -1407,70 +1407,64 @@ fn default_key_dir() -> PathBuf {
 }
 
 /// `over` (or else `default`, or else `state`'s `-keys` sibling) unless it resolves to `state`
-/// or a directory in it, symlinks followed as far as the paths exist.
+/// or a directory in it, symlinks followed as far as the paths exist. What it returns is the
+/// resolved path, the one that was checked.
 fn key_dir_outside(
     state: &Path,
     over: Option<PathBuf>,
     default: PathBuf,
 ) -> Result<PathBuf, String> {
-    let inside_state = {
+    // A path that does not resolve (a dangling symlink on it) counts as inside.
+    let outside = {
         let state = resolve_existing(state);
-        move |dir: &Path| resolve_existing(dir).starts_with(&state)
+        move |dir: &Path| {
+            resolve_existing(dir).filter(|d| state.as_ref().is_some_and(|s| !d.starts_with(s)))
+        }
     };
     if let Some(dir) = over {
-        if inside_state(&dir) {
-            return Err(format!(
-                "THURM_KEY_DIR {} is inside the state directory {}",
+        return outside(&dir).ok_or_else(|| {
+            format!(
+                "THURM_KEY_DIR {} is inside the state directory {} or does not resolve",
                 dir.display(),
                 state.display()
-            ));
-        }
+            )
+        });
+    }
+    if let Some(dir) = outside(&default) {
         return Ok(dir);
     }
-    if !inside_state(&default) {
-        return Ok(default);
-    }
-    let beside = keys_beside(state);
-    if inside_state(&beside) {
-        return Err(format!(
+    outside(&keys_beside(state)).ok_or_else(|| {
+        format!(
             "no key directory outside the state directory {}",
             state.display()
-        ));
-    }
-    Ok(beside)
+        )
+    })
 }
 
-/// `path` made absolute, with its longest existing ancestor canonicalized (symlinks followed)
-/// and the rest appended, `.` and `..` in it resolved lexically.
-fn resolve_existing(path: &Path) -> PathBuf {
+/// `path` made absolute and resolved component by component the way the system does: each
+/// symlink is followed before a `..` after it applies, and the part that does not exist yet is
+/// appended as named. `None` when a dangling symlink is on it (where it leads is not known).
+fn resolve_existing(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
     let mut abs = std::env::current_dir().unwrap_or_default();
     abs.push(path);
-    let mut lexical = PathBuf::new();
+    let mut out = PathBuf::new();
     for c in abs.components() {
         match c {
-            Component::CurDir => {}
+            Component::CurDir => continue,
             Component::ParentDir => {
-                lexical.pop();
+                out.pop();
             }
-            c => lexical.push(c),
+            c => out.push(c),
+        }
+        match std::fs::canonicalize(&out) {
+            Ok(real) => out = real,
+            // Missing, not a dangling symlink: the rest is made as named.
+            Err(_) if std::fs::symlink_metadata(&out).is_err() => {}
+            Err(_) => return None,
         }
     }
-    let mut rest = Vec::new();
-    let mut base = lexical.as_path();
-    loop {
-        if let Ok(mut out) = std::fs::canonicalize(base) {
-            out.extend(rest.iter().rev());
-            return out;
-        }
-        match (base.parent(), base.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name);
-                base = parent;
-            }
-            _ => return lexical,
-        }
-    }
+    Some(out)
 }
 
 /// The dial socket's file name, beside the daemon's socket.
@@ -1835,7 +1829,7 @@ impl Config {
         let overlay_path = overlay::path_beside(&path);
         // Whether program resume settings in the overlay may have been lost: it could not be
         // read or parsed, or one of them was left out.
-        let (text, mut warnings, resume_lost) = match overlay::read(&overlay_path) {
+        let (text, mut warnings, resume_lost) = match overlay::read_for_load(&overlay_path) {
             Ok(overlay) => {
                 let merged = overlay::merge(&text, &overlay).map_err(fail)?;
                 let lost = merged
@@ -2543,15 +2537,33 @@ mod tests {
             key_dir_outside(&state, None, state.join("keys")).unwrap(),
             base.join("share/thurm-keys")
         );
-        // A state directory not made yet, under a symlinked parent.
+        // A state directory not made yet, under a symlinked parent: the path that was checked.
         std::os::unix::fs::symlink(base.join("share"), base.join("alias")).unwrap();
         let new_state = base.join("alias/new/state");
         assert_eq!(
             key_dir_outside(&new_state, None, base.join("share/new/state/k")).unwrap(),
-            base.join("alias/new/state-keys")
+            base.join("share/new/state-keys")
         );
+        // A symlink into a directory of the state one, then `..`: the system follows the
+        // symlink first, and so does the check.
+        std::fs::create_dir_all(base.join("share/thurm/subdir")).unwrap();
+        std::fs::create_dir_all(base.join("config")).unwrap();
+        std::os::unix::fs::symlink(base.join("share/thurm/subdir"), base.join("config/link"))
+            .unwrap();
+        std::os::unix::fs::symlink("../share/thurm/subdir", base.join("config/rel")).unwrap();
+        // A dangling symlink: where it leads is not known.
+        std::os::unix::fs::symlink(base.join("nowhere"), base.join("config/dangling")).unwrap();
         // An override inside it, through an alias or `..`, is refused; one beside it is kept.
-        for over in ["alias/thurm/keys", "share/thurm", "share/x/../thurm/keys"] {
+        for over in [
+            "alias/thurm/keys",
+            "share/thurm",
+            "share/x/../thurm/keys",
+            "config/link/../keys",
+            "config/link/../../thurm/keys",
+            "config/rel/../keys",
+            "config/rel/../new/../keys",
+            "config/dangling/../keys",
+        ] {
             assert!(
                 key_dir_outside(&state, Some(base.join(over)), base.join("d")).is_err(),
                 "{over}"
@@ -2560,6 +2572,15 @@ mod tests {
         assert_eq!(
             key_dir_outside(&state, Some(base.join("share/thurm-k")), base.join("d")).unwrap(),
             base.join("share/thurm-k")
+        );
+        assert_eq!(
+            key_dir_outside(
+                &state,
+                Some(base.join("config/link/../../k")),
+                base.join("d")
+            )
+            .unwrap(),
+            base.join("share/k")
         );
         assert_eq!(
             key_dir_outside(&state, None, base.join("d")).unwrap(),
@@ -3104,6 +3125,18 @@ clipboard_read = "always"
         std::fs::remove_file(&overlay).unwrap();
         std::fs::create_dir(&overlay).unwrap();
         assert_eq!(mode(), ResumeProgramsMode::Off);
+        // A symlink to a file that is not there (yet): not the same as no overlay.
+        std::fs::remove_dir(&overlay).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere.toml"), &overlay).unwrap();
+        let (cfg, warnings) = load();
+        assert_eq!(cfg.session.resume_programs, ResumeProgramsMode::Off);
+        assert!(
+            warnings.iter().any(|w| w.contains("program resume is off")),
+            "{warnings:?}"
+        );
+        // No overlay at all: the base's value.
+        std::fs::remove_file(&overlay).unwrap();
+        assert_eq!(mode(), ResumeProgramsMode::All);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

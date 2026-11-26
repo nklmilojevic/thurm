@@ -32,6 +32,24 @@ pub fn read(overlay: &Path) -> io::Result<String> {
     }
 }
 
+/// Like [`read`], but only a missing file is empty: a symlink to a file that is missing (a
+/// volume not mounted, a dotfiles checkout not there yet) is an error, since the settings it
+/// points to may be ones the load must not go without. Writes still go through such a link
+/// (see [`crate::replace_file`]).
+pub fn read_for_load(overlay: &Path) -> io::Result<String> {
+    match std::fs::read_to_string(overlay) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match std::fs::symlink_metadata(overlay) {
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "links to a file that does not exist",
+            )),
+            Err(_) => Ok(String::new()),
+        },
+        Err(e) => Err(e),
+    }
+}
+
 /// Whether the overlay text sets `key` (a dotted path such as `font.size`).
 pub fn holds(overlay: &str, key: &str) -> bool {
     toml::from_str::<Table>(overlay)
