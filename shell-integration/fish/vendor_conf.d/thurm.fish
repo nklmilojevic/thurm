@@ -10,7 +10,7 @@ end
 
 # One-shot program resume after a restart (Thurm session restore): taken out of the
 # environment before config.fish runs, so nothing started from it inherits the handoff.
-if set -q THURM_RESUME_FILE; and set -q THURM_RESUME_EXEC
+if test -n "$THURM_RESUME_FILE"; and test -n "$THURM_RESUME_EXEC"
     set -g __thurm_resume_file "$THURM_RESUME_FILE"
     set -g __thurm_resume_exec "$THURM_RESUME_EXEC"
 end

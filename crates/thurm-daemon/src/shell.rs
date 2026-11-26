@@ -119,6 +119,9 @@ pub fn uses_hook_resume(cfg: &Config, integration_dir: Option<&Path>) -> bool {
     }
 }
 
+const ENV_RESUME_EXEC: &str = "THURM_RESUME_EXEC";
+const ENV_RESUME_FILE: &str = "THURM_RESUME_FILE";
+
 /// Ghostty release matching the pinned libghostty-vt (1.3.2-dev).
 const GHOSTTY_VERSION: &str = "1.3.2";
 
@@ -193,6 +196,17 @@ fn spawn_options_with(
     if let Some(tok) = l.resume_token {
         env.push((ENV_OSC7577_TOKEN.into(), tok.to_owned()));
     }
+    // The resume handoff the shell integration runs at its first prompt: only ever this
+    // daemon's, for a pane it restores. Always set (empty otherwise), so a value inherited from
+    // the daemon's environment, `[terminal.env]` or a client never reaches the shell.
+    env.retain(|(k, _)| k != ENV_RESUME_EXEC && k != ENV_RESUME_FILE);
+    let (resume_exec, resume_file) = l
+        .resume_hook
+        .filter(|_| cfg.terminal.shell_integration && l.integration_dir.is_some())
+        .map(|(exec, file)| (exec.display().to_string(), file.display().to_string()))
+        .unwrap_or_default();
+    env.push((ENV_RESUME_EXEC.into(), resume_exec));
+    env.push((ENV_RESUME_FILE.into(), resume_file));
     // Last: on the PATH and display the pane ends up with, `[terminal.env]` and the client's
     // variables included.
     let shims = add_clip_shims(&mut env, shims, inherited);
@@ -235,10 +249,6 @@ fn spawn_options_with(
     {
         env.push(("THURM_SHELL_INTEGRATION".into(), dir.display().to_string()));
         env.push(("THURM_SHELL_TOKEN".into(), l.token.to_owned()));
-        if let Some((exec, file)) = l.resume_hook {
-            env.push(("THURM_RESUME_EXEC".into(), exec.display().to_string()));
-            env.push(("THURM_RESUME_FILE".into(), file.display().to_string()));
-        }
         match name.as_str() {
             "zsh" => {
                 if let Ok(orig) = std::env::var("ZDOTDIR") {
@@ -478,6 +488,52 @@ mod tests {
             .rev()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn resume_handoff_is_never_inherited() {
+        let sock = PathBuf::from("/tmp/s.sock");
+        let integ = PathBuf::from("/integration");
+        let mut cfg = Config::default();
+        cfg.terminal.shell = Some(vec!["/bin/zsh".into()]);
+        cfg.terminal
+            .env
+            .insert("THURM_RESUME_EXEC".into(), "/tmp/evil".into());
+        let launch = |hook: Option<(&Path, &Path)>| {
+            spawn_options_with(
+                PaneLaunch {
+                    id: 1,
+                    command: None,
+                    cwd: None,
+                    extra_env: vec![("THURM_RESUME_FILE".into(), "/tmp/evil.json".into())],
+                    size: PaneSize::default(),
+                    config: &cfg,
+                    socket: &sock,
+                    integration_dir: Some(&integ),
+                    token: "abc",
+                    resume_token: None,
+                    resume_hook: hook,
+                },
+                None,
+                |_| None,
+            )
+            .env
+        };
+        let values = |env: &[(String, String)], key: &str| {
+            env.iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>()
+        };
+        let plain = launch(None);
+        assert_eq!(values(&plain, "THURM_RESUME_EXEC"), [""]);
+        assert_eq!(values(&plain, "THURM_RESUME_FILE"), [""]);
+        let restored = launch(Some((
+            Path::new("/bin/thurmd"),
+            Path::new("/s/resume-x.json"),
+        )));
+        assert_eq!(values(&restored, "THURM_RESUME_EXEC"), ["/bin/thurmd"]);
+        assert_eq!(values(&restored, "THURM_RESUME_FILE"), ["/s/resume-x.json"]);
     }
 
     #[test]
