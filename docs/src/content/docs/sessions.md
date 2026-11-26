@@ -71,10 +71,11 @@ one Thurm checked. How the command starts depends on where it ran:
   through a login shell command, without an interactive shell's startup files.
 - A job of zsh, bash or fish with shell integration runs from the shell's own hook at its
   first prompt, after its startup files ran, and the shell takes over when it ends.
-- In other POSIX shells, and in zsh or fish started without startup files (`zsh -f`,
-  `fish --no-config`), Thurm types a fixed helper command (never the program's arguments)
-  a few seconds after the shell started, but only while that shell waits in the
-  foreground and nothing was typed into the pane; otherwise it skips the resume.
+- Without a shell integration hook (other POSIX shells, Bash with custom arguments,
+  `zsh -f`, `fish --no-config`), Thurm types a fixed helper command (never the program's
+  arguments) at the shell's first detected prompt, or after about 2.5 seconds when no
+  prompt is detected and the shell waits in the foreground. If anything was typed into
+  the pane first, it skips the resume.
 
 If `config.toml` fails to load when the daemon starts, program resume stays off until it
 loads again. Thurm records each attempt before it starts the command and never retries a resume that
@@ -89,10 +90,15 @@ Code, Codex, OpenCode, Pi, and Antigravity. Add your own rules in `config.toml`:
 
 ```toml
 [[session.resume_rules]]
-name = "nvim"
-command = ["nvim", "-S", "<under:~/.local/state/nvim/sessions>"]
+name = "mytool"
+command = ["mytool", "resume", "<id>"]
 dirs = ["~/code"]
 ```
+
+Prefer placeholders that admit only an identifier (`<id>`, `<uuid>`, `<oneof:…>`). A
+`<under:DIR>` path is checked as a path, not for what the program does with it: don't use
+it for an argument the program interprets as commands (Neovim's `-S` builds an Ex
+`:source` command from its operand, so a reported name can carry extra commands).
 
 A rule's `flags` lists options the report may add after `command`; each must have been
 given, with the same values, when the program was launched. `preserve_flags` lists
@@ -103,8 +109,11 @@ Code rule keeps `--disallowed-tools`, `--tools`, `--permission-mode`, `--restric
 settings (`--sandbox`/`-s`, `--ask-for-approval`/`-a`, `--config`/`-c`, `--profile`/`-p`).
 A flag listed in both takes its `preserve_flags` arity.
 
-Only those launch options are saved with the session, not the rest of the program's command
-line, and only as keyed digests of their values (HMAC-SHA256), never the values themselves.
+`session.json` holds the full reported resume command as the program reported it, in plain
+text (the file is private to you, but it is still on disk and in backups). Programs should
+not put credentials in reported arguments. From the original launch command line, only the
+options rules check are saved, and only as keyed digests of their values (HMAC-SHA256),
+never the values themselves.
 The key lives outside the state directory: in `~/Library/Application Support/Thurm Keys` on
 macOS and `~/.local/share/thurm/keys` elsewhere (`THURM_KEY_DIR` overrides it). Without it,
 programs are not saved for resumption. A saved program whose rule now checks an option the

@@ -469,6 +469,20 @@ mod tests {
         assert_eq!(loaded.layout, snap.layout);
         assert!(loaded.panes[0].program_resume.is_none());
 
+        // A symlinked session.json, even to a private snapshot in the same private directory.
+        store.save(&snap).unwrap();
+        let real = dir.join("real.json");
+        std::fs::rename(store.session_path(), &real).unwrap();
+        std::os::unix::fs::symlink(&real, store.session_path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.layout, snap.layout);
+        assert!(loaded.panes[0].program_resume.is_none());
+        std::fs::remove_file(&real).unwrap();
+
         store.clear();
         assert!(store.load().is_none());
 

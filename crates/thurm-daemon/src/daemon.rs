@@ -1591,7 +1591,16 @@ impl Daemon {
                             info_changed = true;
                         }
                         if let Some((_, input)) = st.pending_input.take() {
-                            pane.write(input);
+                            // At its prompt the shell reads it, unless someone started typing
+                            // a line it would join.
+                            if st.typed {
+                                self.resume_tickets.lock().retain(|t| t.pane != pane.id);
+                                st.term.print(
+                                    "\r\n[automatic resume skipped: the terminal was busy]\r\n",
+                                );
+                            } else {
+                                pane.write(input);
+                            }
                         }
                     }
                     TermEvent::CommandStart => {

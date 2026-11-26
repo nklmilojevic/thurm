@@ -517,7 +517,8 @@ enum Cmd {
     },
     /// Show Program Resume Protocol (OSC 7577) records held for panes and their trust status.
     Resume {
-        /// Pane to inspect (defaults to `$THURM_PANE_ID`, or all panes if unset).
+        /// Pane to inspect (defaults to the local `$THURM_PANE_ID`, except with `--remote`;
+        /// otherwise lists all panes).
         #[arg(short, long)]
         pane: Option<PaneId>,
         /// Show records for every pane.

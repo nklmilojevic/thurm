@@ -165,6 +165,13 @@ fn token_is_unique_per_pane_valid_and_never_inherited() {
         wait_match(&c, pane, &format!("TOK_DONE_{i}"));
         let report = std::fs::read_to_string(&out_file).unwrap();
         let (verdict, digest) = report.split_once(' ').unwrap();
+        // A failed hash would leave nothing to compare: the uniqueness check below would
+        // prove nothing.
+        assert!(
+            running_as_root()
+                || (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())),
+            "no SHA-256 digest of the token: {digest:?}"
+        );
         if running_as_root() {
             assert_eq!(
                 verdict, "empty",
@@ -249,6 +256,8 @@ fn report_persists_resumes_verbatim_without_shell_parsing_and_never_retries_twic
     let mut daemon = env.start();
     let (c, _) = env.connect();
     let pane = create(&c, &env.dir);
+    // The new pane made the session dirty: saved now, so only the report can save it again.
+    c.request(Request::SaveSnapshot).unwrap();
     run_line(&c, pane, &format!("'{}'", reporter.display()));
     wait_match(&c, pane, "REPORTED");
 
@@ -563,8 +572,12 @@ fn cwd_from_report_requires_directory_while_os_cwd_falls_back() {
     let rep_gone = make_reporter("gone", &hit_gone, Some(&dir_gone));
     let rep_keep = make_reporter("keep", &hit_keep, Some(&dir_keep));
     let rep_os = make_reporter("os", &hit_os, None);
+    // With both its directories gone, the OS-cwd record starts where a pane without a
+    // directory does: the daemon's home.
+    let home = env.dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
 
-    let mut daemon = env.start();
+    let mut daemon = env.start_with(&[("HOME", &home)]);
     let (c, _) = env.connect();
     let p_gone = create(&c, &env.dir);
     let p_keep = create(&c, &env.dir);
@@ -594,7 +607,7 @@ fn cwd_from_report_requires_directory_while_os_cwd_falls_back() {
     std::fs::remove_dir_all(&dir_gone).unwrap();
     std::fs::remove_dir_all(&dir_os_gone).unwrap();
 
-    let _daemon2 = env.start();
+    let _daemon2 = env.start_with(&[("HOME", &home)]);
     let (c2, _) = env.connect();
     wait_match(&c2, p_keep, "MARKED");
     wait_match(&c2, p_os, "MARKED");
@@ -608,9 +621,11 @@ fn cwd_from_report_requires_directory_while_os_cwd_falls_back() {
     let keep_pwd =
         std::fs::canonicalize(std::fs::read_to_string(&hit_keep).unwrap().trim()).unwrap();
     assert_eq!(keep_pwd, std::fs::canonicalize(&dir_keep).unwrap());
-    assert!(
-        hit_os.exists(),
-        "record whose cwd came from OS (not `cwd` key) should resume in fallback dir"
+    let os_pwd = std::fs::read_to_string(&hit_os)
+        .expect("record whose cwd came from OS (not `cwd` key) should resume in fallback dir");
+    assert_eq!(
+        std::fs::canonicalize(os_pwd.trim()).unwrap(),
+        std::fs::canonicalize(&home).unwrap()
     );
 }
 

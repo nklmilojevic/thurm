@@ -229,7 +229,9 @@ pub const ENV_CLIP_SHIMS: &str = "THURM_CLIP_SHIMS";
 pub const ENV_PANE_ID: &str = "THURM_PANE_ID";
 /// Environment variable exported into every pane with the daemon socket path.
 pub const ENV_SOCKET: &str = "THURM_SOCKET";
-/// Per-pane random token exported into every pane for the Program Resume Protocol (OSC 7577).
+/// Per-pane random token for the Program Resume Protocol (OSC 7577), set when the pane is
+/// created by a daemon not running as root (absent there, and in panes adopted from a daemon
+/// that predates OSC 7577).
 pub const ENV_OSC7577_TOKEN: &str = "OSC7577_TOKEN";
 
 pub type PaneId = u64;

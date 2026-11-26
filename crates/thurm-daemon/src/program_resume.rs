@@ -2415,12 +2415,19 @@ mod tests {
             parse_default(b"pid=74877:time=1795543200:argv=bnZpbQ==", SPEC_TIME),
             ParseOutcome::Ignore
         );
-        // Ignored: MAC is not last
+        // Ignored: MAC is not last, even a valid one (accepted at the end, below).
+        let body = "pid=74877:time=1795543200:argv=bnZpbQ==";
+        let signed = sign(body, SPEC_TOKEN);
+        assert!(matches!(
+            parse_default(&signed, SPEC_TIME),
+            ParseOutcome::Accept(_)
+        ));
+        let signed = String::from_utf8(signed).unwrap();
+        let mac_pair = signed.rsplit(':').next().unwrap();
+        assert!(mac_pair.starts_with("mac="));
+        let moved = format!("{mac_pair}:{body}");
         assert_eq!(
-            parse_default(
-                b"mac=0000000000000000000000000000000000000000000000000000000000000000:pid=74877:time=1795543200:argv=bnZpbQ==",
-                SPEC_TIME
-            ),
+            parse_default(moved.as_bytes(), SPEC_TIME),
             ParseOutcome::Ignore
         );
         // Ignored: time too far from terminal clock
