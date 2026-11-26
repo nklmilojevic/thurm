@@ -346,6 +346,9 @@ pub struct Client {
     pub state_events: AtomicBool,
     /// Accepts pane snapshots with activity times.
     pub agent_activity: AtomicBool,
+    /// Accepts `Event::NotifyPrompt` (carrying optional verbatim permission request) in place of
+    /// `Event::Notify` ([`thurm_proto::CAP_PENDING_PROMPT`]).
+    pub pending_prompt: AtomicBool,
     /// A UI that carries out the newer UI commands ([`thurm_proto::CAP_UI_LAYOUT`]).
     pub ui_layout: AtomicBool,
     /// A UI that gathers agents into a wall ([`thurm_proto::CAP_AGENT_WALL`]).
@@ -400,6 +403,25 @@ pub struct Client {
 
 impl Client {
     pub fn send(&self, msg: ServerMessage) {
+        let msg = match msg {
+            ServerMessage::Event(Event::NotifyPrompt {
+                pane,
+                title,
+                body,
+                permission,
+                sound,
+                ..
+            }) if !self.pending_prompt.load(Ordering::Relaxed) => {
+                ServerMessage::Event(Event::Notify {
+                    pane,
+                    title,
+                    body,
+                    permission,
+                    sound,
+                })
+            }
+            other => other,
+        };
         let msg = if self.agent_activity.load(Ordering::Relaxed) {
             match msg {
                 ServerMessage::Event(Event::PaneInfo(info)) => {
@@ -757,6 +779,13 @@ impl Daemon {
                 permission,
                 sound,
                 ..
+            }
+            | Event::NotifyPrompt {
+                pane,
+                title,
+                permission,
+                sound,
+                ..
             } => {
                 self.unread.lock().insert(*pane);
                 if sound.is_some() {
@@ -879,6 +908,7 @@ impl Daemon {
             pane_owner: AtomicBool::new(false),
             state_events: AtomicBool::new(false),
             agent_activity: AtomicBool::new(false),
+            pending_prompt: AtomicBool::new(false),
             ui_layout: AtomicBool::new(false),
             agent_wall: AtomicBool::new(false),
             floating: AtomicBool::new(false),
@@ -1743,7 +1773,10 @@ impl Daemon {
                     let detail = self.ai.ask(&ask).ok().and_then(|t| ai::clean_detail(&t));
                     self.update_agent(pane, |st| {
                         let current = st.agent.episode() == episode;
-                        let permission = st.agent.permission_prompt();
+                        let permission = st.agent.permission_prompt().filter(|_| !done);
+                        // Verbatim permission request comes strictly from the agent hook, never
+                        // from the model's paraphrase (`detail`).
+                        let request = permission.and_then(|_| st.agent.permission_request());
                         if let Some(d) = &detail {
                             st.agent.set_ai_detail(episode, d.clone());
                         }
@@ -1757,12 +1790,13 @@ impl Daemon {
                             (Some(d), false) => d.clone(),
                             (None, _) => body,
                         };
-                        vec![Event::Notify {
+                        vec![Event::NotifyPrompt {
                             pane,
                             title,
                             body,
                             permission,
                             sound: Some(sound.clone()),
+                            request,
                         }]
                     });
                 }
@@ -1790,7 +1824,7 @@ impl Daemon {
         st.program_alerts
             .retain(|t| now.duration_since(*t) < PROGRAM_ALERT_WINDOW);
         events.retain(|ev| {
-            if !matches!(ev, Event::Notify { .. }) {
+            if !matches!(ev, Event::Notify { .. } | Event::NotifyPrompt { .. }) {
                 return true;
             }
             if st.program_alerts.len() >= PROGRAM_ALERTS {
@@ -2773,13 +2807,16 @@ impl Daemon {
                 return Vec::new();
             }
         }
+        let permission = a.permission.filter(|_| !done);
+        let request = permission.and_then(|_| st.agent.permission_request());
         let (title, body) = notify;
-        vec![Event::Notify {
+        vec![Event::NotifyPrompt {
             pane,
             title,
             body,
-            permission: a.permission.filter(|_| !done),
+            permission,
             sound: Some(notice.sound.clone()),
+            request,
         }]
     }
 
@@ -2830,6 +2867,9 @@ impl Daemon {
                 }
                 if has(thurm_proto::CAP_AGENT_ACTIVITY) {
                     client.agent_activity.store(true, Ordering::Relaxed);
+                }
+                if has(thurm_proto::CAP_PENDING_PROMPT) {
+                    client.pending_prompt.store(true, Ordering::Relaxed);
                 }
                 if has(thurm_proto::CAP_UI_LAYOUT) {
                     client.ui_layout.store(true, Ordering::Relaxed);
@@ -2926,7 +2966,9 @@ impl Daemon {
                     build: thurm_proto::BUILD.to_owned(),
                     capabilities: thurm_proto::CAPABILITIES
                         .iter()
-                        .map(|c| (*c).to_owned())
+                        .copied()
+                        .chain(std::iter::once(thurm_proto::CAP_PENDING_PROMPT))
+                        .map(str::to_owned)
                         .collect(),
                 })
             }
@@ -4897,6 +4939,7 @@ mod tests {
             pane_owner: AtomicBool::new(false),
             state_events: AtomicBool::new(false),
             agent_activity: AtomicBool::new(false),
+            pending_prompt: AtomicBool::new(false),
             ui_layout: AtomicBool::new(false),
             agent_wall: AtomicBool::new(false),
             floating: AtomicBool::new(false),
@@ -5322,6 +5365,56 @@ mod tests {
         assert_eq!(prompt.pane, pane);
         assert_eq!(prompt.title, "Claude Code");
         assert_eq!(prompt.body, "Bash: cargo check");
+        assert_eq!(prompt.request.as_deref(), Some("Bash: cargo check"));
+
+        // Verify Hello advertises CAP_PENDING_PROMPT and NotifyPrompt downgrades for legacy clients.
+        let (legacy, legacy_rx) = daemon.add_client();
+        legacy.ui.store(true, Ordering::Relaxed);
+        let (modern, modern_rx) = daemon.add_client();
+        modern.ui.store(true, Ordering::Relaxed);
+        let hello = daemon
+            .dispatch(
+                &modern,
+                Request::Hello {
+                    client: "test".into(),
+                    version: PROTOCOL_VERSION,
+                    ui: true,
+                    capabilities: vec![thurm_proto::CAP_PENDING_PROMPT.into()],
+                },
+            )
+            .unwrap();
+        let Response::Hello { capabilities, .. } = hello else {
+            panic!("expected Hello");
+        };
+        assert!(capabilities.iter().any(|c| c == thurm_proto::CAP_PENDING_PROMPT));
+        daemon.broadcast(
+            Event::NotifyPrompt {
+                pane,
+                title: "Claude Code".into(),
+                body: "Bash: cargo check".into(),
+                permission: Some(prompt.prompt),
+                sound: Some("default".into()),
+                request: Some("Bash: cargo check".into()),
+            },
+            true,
+        );
+        assert!(matches!(
+            legacy_rx.try_recv(),
+            Ok(ServerMessage::Event(Event::Notify {
+                pane: p,
+                permission: Some(id),
+                ..
+            })) if p == pane && id == prompt.prompt
+        ));
+        assert!(matches!(
+            modern_rx.try_recv(),
+            Ok(ServerMessage::Event(Event::NotifyPrompt {
+                pane: p,
+                permission: Some(id),
+                request: Some(ref r),
+                ..
+            })) if p == pane && id == prompt.prompt && r == "Bash: cargo check"
+        ));
 
         assert!(matches!(
             daemon
