@@ -230,6 +230,9 @@ pub struct StreamFilter {
     /// A chunked file / shared memory transmission is being taken out: its continuation
     /// chunks are too.
     media_more: bool,
+    /// Longest `buf` an intercepted OSC body reached (see [`StreamFilter::osc_append`]).
+    #[cfg(test)]
+    osc_peak: usize,
 }
 
 impl Default for StreamFilter {
@@ -250,6 +253,18 @@ impl StreamFilter {
             mouse_format: None,
             all_apc: false,
             media_more: false,
+            #[cfg(test)]
+            osc_peak: 0,
+        }
+    }
+
+    /// Appends to the body of the intercepted OSC being buffered (tests watch how long it gets
+    /// before a terminator clears it).
+    fn osc_append(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        #[cfg(test)]
+        {
+            self.osc_peak = self.osc_peak.max(self.buf.len());
         }
     }
 
@@ -475,7 +490,7 @@ impl StreamFilter {
                             if is_7577 {
                                 self.buf.clear();
                             } else {
-                                self.buf.extend_from_slice(&input[i..i + off]);
+                                self.osc_append(&input[i..i + off]);
                                 let mut raw = b"\x1b]".to_vec();
                                 raw.append(&mut self.buf);
                                 out.push(Chunk::Pass(Cow::Owned(raw)));
@@ -495,7 +510,7 @@ impl StreamFilter {
                                 };
                                 i += 1;
                             } else {
-                                self.buf.extend_from_slice(&input[i..i + off]);
+                                self.osc_append(&input[i..i + off]);
                                 i += off;
                                 if input[i] == 0x07 {
                                     self.osc_bel = true;
@@ -515,7 +530,7 @@ impl StreamFilter {
                                 self.state = State::DiscardOsc;
                                 i = input.len();
                             } else {
-                                self.buf.extend_from_slice(&input[i..]);
+                                self.osc_append(&input[i..]);
                                 i = input.len();
                             }
                         }
@@ -1122,10 +1137,12 @@ mod tests {
             let mut f = StreamFilter::new();
             let mut out = Vec::new();
             f.feed(&huge, &mut out);
+            // Checked where the body is copied: the terminator clears the buffer, so its size
+            // afterwards would not show a copy of the whole body made first.
             assert!(
-                f.buf.capacity() <= MAX_OSC_7577 + 16,
-                "oversized OSC 7577 grew buffer beyond cap: {}",
-                f.buf.capacity()
+                f.osc_peak <= MAX_OSC_7577,
+                "oversized OSC 7577 was buffered beyond the cap: {}",
+                f.osc_peak
             );
             let mut pass = Vec::new();
             let mut resumes = 0;

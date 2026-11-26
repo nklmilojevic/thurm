@@ -449,6 +449,13 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
         );
         let dumped = std::fs::read_to_string(&env_dump).unwrap();
         assert_eq!(dumped, "RTICKET=\nREXEC=\nRC_VAR=yes\n", "{shell_name}");
+        // Neither the single-use ticket nor the helper shows in the pane: zsh redraws the line
+        // it runs, which holds only a function's name.
+        let shown = capture(&c2, pane);
+        assert!(
+            !shown.contains("--exec-resume") && !shown.contains("thurmd"),
+            "{shell_name}: {shown}"
+        );
 
         // Ctrl-Z suspends the resumed foreground job and returns to the interactive shell.
         std::thread::sleep(Duration::from_millis(150));
@@ -467,6 +474,70 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
             !env.dir.join("state/resume").exists(),
             "{shell_name}: a resume file was written"
         );
+    }
+}
+
+/// zsh without its line editor has no first-prompt widget: started with `--no-zle` the daemon
+/// types the resume line, and with ZLE turned off by `.zshrc` the integration runs it from its
+/// hook. Either way the program runs in the foreground and reads the terminal.
+#[test]
+fn zsh_without_zle_still_resumes() {
+    if running_as_root() {
+        return;
+    }
+    let Some(zsh) = find_shell("zsh") else {
+        return;
+    };
+    for (name, args, zshrc) in [
+        ("flag", "\"--no-zle\"", ""),
+        ("zshrc", "", "unsetopt zle\n"),
+    ] {
+        let env = Env::new(&format!("resume-nozle-{name}"));
+        let home = env.dir.join("home");
+        let custom_bin = env.dir.join("custom-bin");
+        std::fs::create_dir_all(&home).unwrap();
+        write_exec(
+            &custom_bin.join("nozleprog"),
+            "#!/bin/sh\necho NOZLE_RESUMED\nread line\necho \"GOT_${line}_END\"\nsleep 30\n",
+        );
+        std::fs::write(
+            home.join(".zshrc"),
+            format!("export PATH=\"{}:$PATH\"\n{zshrc}", custom_bin.display()),
+        )
+        .unwrap();
+        let sep = if args.is_empty() { "" } else { ", " };
+        write_config(
+            &env,
+            &format!(
+                "[terminal]\nshell = [\"{}\"{sep}{args}]\nshell_integration = true\n\
+                 [session]\nsnapshot_interval_secs = 60\nresume_programs = \"all\"\n",
+                zsh.display()
+            ),
+        );
+        let reporter = env.dir.join("report.sh");
+        let enc = b64_argv(&["nozleprog"]);
+        write_exec(
+            &reporter,
+            &format!(
+                "#!/bin/sh\n{EMIT_SH}\nemit_7577 \"$$\" \"argv={enc}\"\necho NOZLE_READY\nsleep 60\n"
+            ),
+        );
+
+        let mut daemon = env.start_clean(&[("HOME", &home)]);
+        let (c, _) = env.connect();
+        let pane = create(&c, &env.dir);
+        run_line(&c, pane, &format!("'{}'", reporter.display()));
+        wait_match(&c, pane, "NOZLE_READY");
+        wait_records(&c, pane, "no-zle record", |r| r.len() == 1 && r[0].trusted);
+        c.request(Request::Shutdown { kill_panes: true }).unwrap();
+        daemon.wait_exit();
+        drop(c);
+
+        let _daemon2 = env.start_clean(&[("HOME", &home)]);
+        let (c2, _) = env.connect();
+        wait_match(&c2, pane, "NOZLE_RESUMED");
+        run_line(&c2, pane, "typed");
+        wait_match(&c2, pane, "GOT_typed_END");
     }
 }
 
@@ -1037,13 +1108,19 @@ fn fish_integration_resume_uses_startup_path_and_bypasses_functions() {
     std::fs::create_dir_all(&custom_bin).unwrap();
 
     let prog = custom_bin.join("fishresumeprog");
-    write_exec(&prog, "#!/bin/sh\necho FISH_RESUMED_OK\n");
+    // It reads the terminal: fish must hand the resumed job the terminal, in full job control
+    // too (where a job an event handler starts gets its own process group, not the terminal).
+    write_exec(
+        &prog,
+        "#!/bin/sh\necho FISH_RESUMED_OK\nread line\necho \"FISH_GOT_${line}_END\"\nsleep 30\n",
+    );
     // The program is on PATH only once a prompt handler config.fish registered ran (as
     // direnv's does): the resume must come after it.
     std::fs::write(
         home.join(".config/fish/config.fish"),
         format!(
-            "function __my_env --on-event fish_prompt; fish_add_path -gp '{}'; end\n\
+            "status job-control full\n\
+             function __my_env --on-event fish_prompt; fish_add_path -gp '{}'; end\n\
              function fishresumeprog; touch '{}'; end\n",
             custom_bin.display(),
             fn_marker.display(),
@@ -1086,6 +1163,27 @@ fn fish_integration_resume_uses_startup_path_and_bypasses_functions() {
         !fn_marker.exists(),
         "fish function ran instead of PATH lookup"
     );
+    // The program's output is not a prompt fish redraws: resizing keeps it.
+    for cols in [60, 100] {
+        c2.request(Request::Resize {
+            pane,
+            size: PaneSize {
+                cols,
+                rows: 24,
+                cell_width: 8,
+                cell_height: 16,
+            },
+        })
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let shown = capture(&c2, pane);
+        assert!(
+            shown.contains("FISH_RESUMED_OK"),
+            "after resize to {cols}: {shown}"
+        );
+    }
+    run_line(&c2, pane, "typed");
+    wait_match(&c2, pane, "FISH_GOT_typed_END");
 }
 
 #[test]
