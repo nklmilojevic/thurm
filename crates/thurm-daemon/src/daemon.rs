@@ -803,8 +803,12 @@ pub struct Daemon {
     resume_tickets: Mutex<Vec<ResumeTicket>>,
     /// An in-place upgrade has captured the panes for the next image, which does not resume
     /// what is still pending: until the exec, or until the upgrade gives up, no resume line is
-    /// typed and no ticket redeemed (see [`Daemon::set_handing_over`]).
+    /// typed and no ticket redeemed (see [`Daemon::set_handing_over`]). Changed only under
+    /// `resume_tickets`' lock, which redemption holds while it checks it.
     handing_over: AtomicBool,
+    /// Signalled (with `resume_tickets`' lock) when an upgrade gives up: redemptions waiting
+    /// for its outcome go on.
+    handover_ended: parking_lot::Condvar,
     restored: AtomicBool,
     /// `restore_session` or `adopt` is still installing panes: a snapshot written now would
     /// lack the rest of them and the layout, so saves wait (the session stays dirty).
@@ -888,6 +892,7 @@ impl Daemon {
             session_dirty: AtomicBool::new(false),
             resume_save_due: AtomicBool::new(false),
             handing_over: AtomicBool::new(false),
+            handover_ended: parking_lot::Condvar::new(),
             resume_tickets: Mutex::new(Vec::new()),
             restored: AtomicBool::new(false),
             loading: AtomicBool::new(false),
@@ -2611,10 +2616,16 @@ impl Daemon {
     }
 
     /// Set before [`Daemon::handoff`] captures the panes, and cleared if the upgrade gives up:
-    /// meanwhile nothing pending resumes here (see `handing_over`). Ticket redemptions wait
-    /// for the outcome; the helper sees it either way (its request gets a reply).
+    /// meanwhile nothing pending resumes here (see `handing_over`). Under the tickets' lock,
+    /// so a redemption either took its ticket before (and the hand-off doesn't list its pane
+    /// as skipped) or waits for the outcome: redeemed if the upgrade gives up; if it goes
+    /// ahead, the helper's connection ends with this image and it starts the shell.
     pub fn set_handing_over(&self, on: bool) {
+        let _tickets = self.resume_tickets.lock();
         self.handing_over.store(on, Ordering::SeqCst);
+        if !on {
+            self.handover_ended.notify_all();
+        }
     }
 
     /// What the next image takes over. Resumes still pending are left out, and stay pending
@@ -4558,18 +4569,13 @@ impl Daemon {
                 if !client.is_local_peer() {
                     return Err("not allowed".into());
                 }
-                // Not while an upgrade hands the panes over without it: redeemed here if the
-                // upgrade gives up; if it goes ahead, the helper's connection ends and it
-                // starts the shell, as the next image notes.
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while self.handing_over.load(Ordering::SeqCst) {
-                    if Instant::now() >= deadline {
-                        return Err("the daemon is restarting".into());
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
                 let spec = {
                     let mut tickets = self.resume_tickets.lock();
+                    // Not while an upgrade hands the panes over without it: waits for the
+                    // outcome, with no deadline of its own (see `set_handing_over`).
+                    while self.handing_over.load(Ordering::SeqCst) {
+                        self.handover_ended.wait(&mut tickets);
+                    }
                     let now = Instant::now();
                     let pos = tickets.iter().position(|t| {
                         t.expires > now && program_resume::ticket_eq(&t.ticket, &ticket)
@@ -6703,10 +6709,11 @@ mod tests {
         assert!(!daemon.resumes_pending());
         let due = Instant::now();
         daemon.pane(waiting).unwrap().state.lock().pending_input = Some((due, b"x\r".to_vec()));
+        let policy = resume_policy(&daemon.config.read());
         daemon
             .resume_tickets
             .lock()
-            .push(ticket_for(ticketed, &"d4".repeat(16), String::new()));
+            .push(ticket_for(ticketed, &"d4".repeat(16), policy));
         assert!(daemon.resumes_pending());
 
         daemon.set_handing_over(true);
@@ -6720,12 +6727,32 @@ mod tests {
         let line = Some((due, b"x\r".to_vec()));
         assert_eq!(pane.state.lock().pending_input, line);
 
-        // The upgrade gave up: everything is still pending, and serviced again.
-        daemon.set_handing_over(false);
-        assert!(daemon.resumes_pending());
+        // A redemption meanwhile waits for the outcome, however long the hand-off takes.
+        let (client, _rx) = daemon.add_client();
+        std::thread::scope(|s| {
+            let redeem = s.spawn(|| {
+                daemon.dispatch(
+                    &client,
+                    Request::TakeResume {
+                        ticket: "d4".repeat(16),
+                    },
+                )
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!redeem.is_finished());
+            let tickets = daemon.resume_tickets.lock();
+            assert!(tickets.iter().any(|t| t.pane == ticketed));
+            drop(tickets);
+
+            // The upgrade gave up: the redemption goes on, and the rest is serviced again.
+            daemon.set_handing_over(false);
+            let got = redeem.join().unwrap();
+            assert!(matches!(&got, Ok(Response::Text(_))), "{got:?}");
+        });
         let tickets = daemon.resume_tickets.lock();
-        assert!(tickets.iter().any(|t| t.pane == ticketed));
+        assert!(!tickets.iter().any(|t| t.pane == ticketed));
         drop(tickets);
+        assert!(daemon.resumes_pending());
         daemon.type_pending_input(&pane, &mut pane.state.lock());
         {
             // `cat` is no shell: the line waits for one.
