@@ -2,10 +2,10 @@
 #
 # Capture and remove one-shot program resume handoff variables before user startup files run
 # so subshells or multiplexers launched from startup files never inherit them.
-if [[ -n "${THURM_RESUME_FILE-}" && -n "${THURM_RESUME_EXEC-}" ]]; then
-  _thurm_resume_file="$THURM_RESUME_FILE"
+if [[ -n "${THURM_RESUME_TICKET-}" && -n "${THURM_RESUME_EXEC-}" ]]; then
+  _thurm_resume_ticket="$THURM_RESUME_TICKET"
   _thurm_resume_exec="$THURM_RESUME_EXEC"
-  builtin unset THURM_RESUME_FILE THURM_RESUME_EXEC
+  builtin unset THURM_RESUME_TICKET THURM_RESUME_EXEC
 fi
 #
 # Bash is started as `bash --rcfile <this file> -i`. Emulate the usual startup files first.
@@ -79,11 +79,11 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
       builtin printf '\e]633;P;ThurmPath=%s:%s\a' "$_thurm_token" "${PATH//;/\\x3b}"
       _thurm_last_path=$PATH
     fi
-    if [[ -n "${_thurm_resume_file-}" && -n "${_thurm_resume_exec-}" ]]; then
-      local _rf="$_thurm_resume_file" _re="$_thurm_resume_exec"
-      _thurm_resume_file=""
+    if [[ -n "${_thurm_resume_ticket-}" && -n "${_thurm_resume_exec-}" ]]; then
+      local _rt="$_thurm_resume_ticket" _re="$_thurm_resume_exec"
+      _thurm_resume_ticket=""
       _thurm_resume_exec=""
-      command "$_re" --exec-resume "$_rf"
+      command "$_re" --exec-resume "$_rt"
     fi
     builtin printf '\e]133;A\a'
     if [[ "$PS1" != *'133;B'* ]]; then

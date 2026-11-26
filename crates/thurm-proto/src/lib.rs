@@ -678,6 +678,12 @@ pub enum Request {
     ResumeRecords {
         pane: Option<PaneId>,
     },
+    /// Redeems the single-use ticket a restored pane got for its saved program (OSC 7577):
+    /// the command to run, as JSON in [`Response::Text`]. Only `thurmd --exec-resume` sends
+    /// it, from the daemon's own build; the command never touches the disk.
+    TakeResume {
+        ticket: String,
+    },
 }
 
 /// The most files a batch of [`Request::UploadBegin`] holds (its `count`).

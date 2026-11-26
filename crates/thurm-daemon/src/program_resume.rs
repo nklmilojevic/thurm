@@ -8,7 +8,7 @@ use std::ffi::CString;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::alphabet::STANDARD;
@@ -1581,9 +1581,11 @@ fn split_inline_flag(tok: &str) -> (&str, Option<&str>) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// One-shot resume file & shell-safe executor (`thurmd --exec-resume <file>`)
+// Single-use resume ticket & shell-safe executor (`thurmd --exec-resume <ticket>`)
 // ---------------------------------------------------------------------------------------------
 
+/// What a restored pane runs, held by the daemon until `thurmd --exec-resume` redeems the
+/// pane's ticket ([`thurm_proto::Request::TakeResume`]): never written to disk.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ResumeExecSpec {
     pub argv: Vec<String>,
@@ -1591,124 +1593,104 @@ pub struct ResumeExecSpec {
     pub cwd: Option<String>,
     #[serde(default)]
     pub require_cwd: bool,
+    /// The `(device, inode)` `cwd` had when restore checked it: the helper enters the directory
+    /// only if it still is that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_id: Option<(u64, u64)>,
+    /// Canonical directories the program must resolve into (the rule that trusted it matched
+    /// the owner's executable): the helper runs only a program found there. Empty: any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exe_dirs: Vec<String>,
 }
 
-fn resume_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("resume")
-}
+/// How long a restored pane's ticket waits for its shell to redeem it.
+pub const TICKET_TTL: Duration = Duration::from_secs(600);
 
-/// Whether `dir` is a real directory (not a symlink) owned by the current user, with no group
-/// or other access.
-fn is_private_dir(dir: &Path) -> std::io::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(dir)?;
-    Ok(meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0)
-}
-
-/// Whether `name` is one [`write_resume_file`] makes: `resume-<32 lowercase hex>.json`.
-fn is_resume_file_name(name: &str) -> bool {
-    name.strip_prefix("resume-")
-        .and_then(|n| n.strip_suffix(".json"))
-        .is_some_and(|hex| {
-            hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        })
-}
-
-/// Removes leftover one-shot resume files from previous runs: only Thurm's own files, in its
-/// own private directory (never through a symlink, never anything else found there).
-pub fn prune_resume_files(state_dir: &Path) {
-    use std::os::unix::fs::MetadataExt;
-    let dir = resume_dir(state_dir);
-    match is_private_dir(&dir) {
-        Ok(true) => {}
-        Ok(false) => {
-            log::warn!(
-                "not cleaning {}: not a private directory of this user",
-                dir.display()
-            );
-            return;
-        }
-        Err(_) => return,
-    }
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
-    };
-    let uid = unsafe { libc::geteuid() };
-    let cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(300))
-        .unwrap_or(UNIX_EPOCH);
-    for entry in entries.flatten() {
-        if !entry.file_name().to_str().is_some_and(is_resume_file_name) {
-            continue;
-        }
-        // `DirEntry::metadata` does not follow symlinks.
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let stale = meta.modified().is_ok_and(|t| t < cutoff);
-        if meta.file_type().is_file() && meta.uid() == uid && stale {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// Writes a private (`0600`) one-shot resume specification file under `<state_dir>/resume/`.
-pub fn write_resume_file(state_dir: &Path, spec: &ResumeExecSpec) -> std::io::Result<PathBuf> {
-    use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-
-    let dir = resume_dir(state_dir);
-    if std::fs::symlink_metadata(&dir).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)?;
-    }
-    if !is_private_dir(&dir)? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "resume directory is not private to current user",
-        ));
-    }
+/// A fresh single-use ticket: 32 lowercase hex characters from the OS random source.
+pub fn generate_ticket() -> std::io::Result<String> {
     let mut rnd = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut rnd)?;
-    let hex: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
-    let path = dir.join(format!("resume-{hex}.json"));
-    let json = serde_json::to_vec(spec).map_err(std::io::Error::other)?;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
-    f.write_all(&json)?;
-    f.sync_all()?;
-    Ok(path)
+    Ok(rnd.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Reads and immediately unlinks a one-shot resume file, verifying ownership and permissions.
-pub fn consume_resume_file(path: &Path) -> Result<ResumeExecSpec, String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| format!("cannot open resume file: {e}"))?;
-    let meta = f
-        .metadata()
-        .map_err(|e| format!("cannot stat resume file: {e}"))?;
-    let uid = unsafe { libc::geteuid() };
-    if !meta.is_file() || meta.uid() != uid || (meta.mode() & 0o077) != 0 {
-        return Err("resume file is not a private regular file owned by current user".into());
+/// Whether `s` has the shape [`generate_ticket`] makes.
+pub fn is_ticket(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Compares two tickets in constant time.
+pub fn ticket_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The `(device, inode)` of the directory at `path`, following symlinks.
+pub fn dir_identity(path: &str) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    meta.is_dir().then(|| (meta.dev(), meta.ino()))
+}
+
+/// The canonical directories holding the owner's executable and, for an interpreter, its
+/// script: a program a rule trusted by its executable must still be found in one of them
+/// (an update that replaces the file, or adds a version beside it, stays there).
+pub fn pin_dirs(process_exe: &str, script: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for file in std::iter::once(process_exe).chain(script) {
+        if !file.starts_with('/') {
+            continue;
+        }
+        let Some(parent) = Path::new(file).parent() else {
+            continue;
+        };
+        if let Ok(dir) = std::fs::canonicalize(parent) {
+            let dir = dir.display().to_string();
+            if !out.contains(&dir) {
+                out.push(dir);
+            }
+        }
     }
-    let mut raw = Vec::new();
-    f.by_ref()
-        .take((MAX_REPORT_BYTES * 2) as u64)
-        .read_to_end(&mut raw)
-        .map_err(|e| format!("cannot read resume file: {e}"))?;
-    // Strictly one-shot: whoever unlinks the file runs it, nobody else.
-    std::fs::remove_file(path).map_err(|e| format!("cannot remove resume file: {e}"))?;
+    out
+}
+
+/// The interpreter script recorded in saved launch evidence ([`launch_evidence`]): its second
+/// element, when the program is an interpreter.
+pub fn saved_script<'a>(_process_exe: &str, evidence: &'a [String]) -> Option<&'a str> {
+    let arg0 = evidence.first()?;
+    if !is_interpreter(thurm_config::executable_name(arg0)) {
+        return None;
+    }
+    evidence
+        .get(1)
+        .map(String::as_str)
+        .filter(|s| s.starts_with('/'))
+}
+
+/// Asks the daemon for the command behind `ticket`; it answers once.
+fn take_resume(ticket: &str) -> Result<ResumeExecSpec, String> {
+    use thurm_proto::{Request, Response};
+    if !is_ticket(ticket) {
+        return Err("invalid resume ticket".into());
+    }
+    let client = thurm_client::Client::connect(
+        thurm_client::ConnectOptions {
+            client_name: "thurmd-resume",
+            ..Default::default()
+        },
+        |_| {},
+        || {},
+    )
+    .map_err(|e| format!("cannot reach the daemon: {e}"))?;
+    let answer = client.request(Request::TakeResume {
+        ticket: ticket.to_owned(),
+    });
+    drop(client);
+    let json = match answer {
+        Ok(Response::Text(json)) => json,
+        Ok(_) => return Err("unexpected answer from the daemon".into()),
+        Err(e) => return Err(e.to_string()),
+    };
     let spec: ResumeExecSpec =
-        serde_json::from_slice(&raw).map_err(|e| format!("invalid resume file: {e}"))?;
+        serde_json::from_str(&json).map_err(|e| format!("invalid resume command: {e}"))?;
     if !validate_argv(&spec.argv) {
         return Err("invalid resume argv".into());
     }
@@ -1720,14 +1702,78 @@ pub fn consume_resume_file(path: &Path) -> Result<ResumeExecSpec, String> {
     Ok(spec)
 }
 
-/// Executes the command in a one-shot resume file (never returns on success).
+/// Enters `dir`; with `id`, only if it still is the directory restore checked, through the
+/// handle that was verified.
+fn enter_dir(dir: &str, id: Option<(u64, u64)>) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let Some((dev, ino)) = id else {
+        return std::env::set_current_dir(dir);
+    };
+    let c = CString::new(dir).map_err(std::io::Error::other)?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if st.st_dev as u64 != dev || st.st_ino as u64 != ino {
+        return Err(std::io::Error::other("it changed since it was checked"));
+    }
+    if unsafe { libc::fchdir(fd.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The program to run when it must be found in `exe_dirs`: the first `program` on the absolute
+/// entries of `PATH` (or `program` itself when it holds a `/`), canonical, and only if it is
+/// in one of `exe_dirs`. A same-named program found first elsewhere is refused, never skipped.
+fn pinned_program(
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+    exe_dirs: &[String],
+) -> Result<String, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let check = |candidate: &Path| -> Result<String, String> {
+        let canon = std::fs::canonicalize(candidate).map_err(|e| e.to_string())?;
+        let dir = canon.parent().map(|d| d.display().to_string());
+        if dir.is_some_and(|d| exe_dirs.contains(&d)) {
+            Ok(canon.display().to_string())
+        } else {
+            Err(format!(
+                "{} is not the program that was trusted",
+                escape_display(&candidate.display().to_string())
+            ))
+        }
+    };
+    if program.contains('/') {
+        return check(Path::new(program));
+    }
+    let path = path.map_or(&b"/usr/bin:/bin"[..], |p| p.as_bytes());
+    for dir in path.split(|&b| b == b':') {
+        // A relative entry would resolve against the directory just entered.
+        if !dir.starts_with(b"/") {
+            continue;
+        }
+        let candidate = Path::new(std::ffi::OsStr::from_bytes(dir)).join(program);
+        if std::fs::symlink_metadata(&candidate).is_ok() {
+            return check(&candidate);
+        }
+    }
+    Err("not found".into())
+}
+
+/// Runs the command behind a restored pane's ticket (never returns on success).
 ///
 /// Zero shell parsing: `argv` elements are passed verbatim to `execv`, bypassing shell aliases,
 /// functions, and builtins, while inheriting the shell's full environment (`PATH`, `direnv`,
 /// etc.). A bare program name is looked up on `PATH` like `execvp` does, but a file the kernel
 /// cannot execute (no `#!` line) is refused instead of being run by `/bin/sh`.
-pub fn exec_resume_file(path: &Path) -> ! {
-    let spec = match consume_resume_file(path) {
+pub fn exec_resume(ticket: &str) -> ! {
+    let spec = match take_resume(ticket) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("thurm: resume failed: {e}");
@@ -1735,7 +1781,7 @@ pub fn exec_resume_file(path: &Path) -> ! {
         }
     };
     if let Some(dir) = &spec.cwd
-        && let Err(e) = std::env::set_current_dir(dir)
+        && let Err(e) = enter_dir(dir, spec.cwd_id)
         && spec.require_cwd
     {
         eprintln!(
@@ -1758,7 +1804,21 @@ pub fn exec_resume_file(path: &Path) -> ! {
     let mut ptrs: Vec<*const libc::c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     let path = std::env::var_os("PATH");
-    let err = exec_no_shell_fallback(&spec.argv[0], path.as_deref(), |prog| {
+    let program = if spec.exe_dirs.is_empty() {
+        spec.argv[0].clone()
+    } else {
+        match pinned_program(&spec.argv[0], path.as_deref(), &spec.exe_dirs) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "thurm: cannot resume {}: {e}",
+                    escape_display(&spec.argv[0])
+                );
+                std::process::exit(127);
+            }
+        }
+    };
+    let err = exec_no_shell_fallback(&program, path.as_deref(), |prog| {
         unsafe { libc::execv(prog.as_ptr(), ptrs.as_ptr()) };
         std::io::Error::last_os_error()
     });
@@ -2409,89 +2469,53 @@ mod tests {
     }
 
     #[test]
-    fn resume_file_roundtrip_is_one_shot_and_private() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("thurm-resume-file-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let spec = ResumeExecSpec {
-            argv: vec!["echo".into(), "$(touch /tmp/nope); a; b".into(), "".into()],
-            cwd: Some("/tmp".into()),
-            require_cwd: true,
-        };
-        let path = write_resume_file(&dir, &spec).unwrap();
-        // Private whatever the umask: the directory 0700, the file 0600.
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&resume_dir(&dir)), 0o700);
-        assert_eq!(mode(&path), 0o600);
-        assert!(is_resume_file_name(
-            path.file_name().unwrap().to_str().unwrap()
-        ));
-        let got = consume_resume_file(&path).unwrap();
-        assert_eq!(got, spec);
-        // Unlinked immediately on read.
-        assert!(!path.exists());
-        assert!(consume_resume_file(&path).is_err());
-
-        // A file others can read is refused (and left alone).
-        let open = write_resume_file(&dir, &spec).unwrap();
-        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(consume_resume_file(&open).is_err());
-        assert!(open.exists());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn tickets_are_random_hex_and_compare_exactly() {
+        let a = generate_ticket().unwrap();
+        let b = generate_ticket().unwrap();
+        assert!(is_ticket(&a) && is_ticket(&b) && a != b);
+        assert!(ticket_eq(&a, &a.clone()));
+        assert!(!ticket_eq(&a, &b));
+        assert!(!ticket_eq(&a, &a[..31]));
+        assert!(!is_ticket("/tmp/resume-x.json"));
+        assert!(!is_ticket(&a.to_uppercase()));
     }
 
     #[test]
-    fn prune_removes_only_own_stale_files_in_a_private_dir() {
-        use std::os::unix::fs::PermissionsExt;
-        let old = SystemTime::now() - Duration::from_secs(3600);
-        let age = |p: &Path| {
-            std::fs::File::options()
-                .write(true)
-                .open(p)
-                .unwrap()
-                .set_modified(old)
-                .unwrap()
-        };
-        let root = std::env::temp_dir().join(format!("thurm-resume-prune-{}", std::process::id()));
+    fn resume_enters_only_the_checked_directory() {
+        let root = std::env::temp_dir().join(format!("thurm-enter-{}", std::process::id()));
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let a_str = a.display().to_string();
+        let id_b = dir_identity(&b.display().to_string()).unwrap();
+        // Swapped since the check: refused, the process stays where it was.
+        let here = std::env::current_dir().unwrap();
+        assert!(enter_dir(&a_str, Some(id_b)).is_err());
+        assert_eq!(std::env::current_dir().unwrap(), here);
         let _ = std::fs::remove_dir_all(&root);
+    }
 
-        // Stale own file goes; an unrelated stale file stays.
-        let state = root.join("state");
-        let spec = ResumeExecSpec {
-            argv: vec!["true".into()],
-            cwd: None,
-            require_cwd: false,
-        };
-        let ours = write_resume_file(&state, &spec).unwrap();
-        let unrelated = resume_dir(&state).join("notes.txt");
-        std::fs::write(&unrelated, "keep").unwrap();
-        age(&ours);
-        age(&unrelated);
-        prune_resume_files(&state);
-        assert!(!ours.exists());
-        assert!(unrelated.exists());
-
-        // `resume` as a symlink to another directory: nothing in there is touched.
-        let elsewhere = root.join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let victim = elsewhere.join(format!("resume-{}.json", "a".repeat(32)));
-        std::fs::write(&victim, "").unwrap();
-        age(&victim);
-        let linked = root.join("linked");
-        std::fs::create_dir_all(&linked).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, resume_dir(&linked)).unwrap();
-        prune_resume_files(&linked);
-        assert!(victim.exists());
-
-        // A resume directory others can write to is not cleaned either.
-        std::fs::set_permissions(resume_dir(&state), std::fs::Permissions::from_mode(0o777))
-            .unwrap();
-        let shared = resume_dir(&state).join(format!("resume-{}.json", "b".repeat(32)));
-        std::fs::write(&shared, "").unwrap();
-        age(&shared);
-        prune_resume_files(&state);
-        assert!(shared.exists());
+    #[test]
+    fn pinned_program_must_resolve_into_the_trusted_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("thurm-pin-{}", std::process::id()));
+        let (good, evil) = (root.join("good"), root.join("evil"));
+        for d in [&good, &evil] {
+            std::fs::create_dir_all(d).unwrap();
+            let f = d.join("prog");
+            std::fs::write(&f, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pins = pin_dirs(&good.join("prog").display().to_string(), None);
+        assert_eq!(pins.len(), 1);
+        let path = format!("{}:{}", good.display(), evil.display());
+        let got = pinned_program("prog", Some(path.as_ref()), &pins).unwrap();
+        assert!(got.ends_with("/good/prog"), "{got}");
+        // A same-named program earlier on PATH is refused, not skipped.
+        let path = format!("{}:{}", evil.display(), good.display());
+        assert!(pinned_program("prog", Some(path.as_ref()), &pins).is_err());
+        // Relative entries are never searched.
+        assert!(pinned_program("prog", Some("good".as_ref()), &pins).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

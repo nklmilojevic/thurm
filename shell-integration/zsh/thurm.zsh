@@ -72,9 +72,9 @@ _thurm_precmd_last() {
     fi
     export PATH
   fi
-  if [[ -n "${_thurm_resume_file-}" && -n "${_thurm_resume_exec-}" ]]; then
-    local _rf="$_thurm_resume_file" _re="$_thurm_resume_exec"
-    _thurm_resume_file=""
+  if [[ -n "${_thurm_resume_ticket-}" && -n "${_thurm_resume_exec-}" ]]; then
+    local _rt="$_thurm_resume_ticket" _re="$_thurm_resume_exec"
+    _thurm_resume_ticket=""
     _thurm_resume_exec=""
     # This hook runs ahead of those .zshrc added: apply the usual environment hooks (direnv,
     # mise) first, when they are registered for this prompt.
@@ -82,7 +82,7 @@ _thurm_precmd_last() {
     for _h in _direnv_hook _mise_hook; do
       (( ${precmd_functions[(Ie)$_h]} && $+functions[$_h] )) && "$_h"
     done
-    command "$_re" --exec-resume "$_rf"
+    command "$_re" --exec-resume "$_rt"
   fi
   _thurm_precmd
 }

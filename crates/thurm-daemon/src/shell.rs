@@ -84,9 +84,9 @@ pub struct PaneLaunch<'a> {
     pub token: &'a str,
     /// Per-pane random token for the Program Resume Protocol (`OSC7577_TOKEN`), if enabled.
     pub resume_token: Option<&'a str>,
-    /// One-shot `(thurmd_exe, resume_file)` for the zsh/bash/fish integration to run at the
-    /// first prompt (see [`uses_hook_resume`]).
-    pub resume_hook: Option<(&'a Path, &'a Path)>,
+    /// `(thurmd_exe, ticket)` for the zsh/bash/fish integration to redeem at the first prompt
+    /// (see [`uses_hook_resume`]): the single-use ticket, never the command.
+    pub resume_hook: Option<(&'a Path, &'a str)>,
 }
 
 /// The shell program and args configured for interactive panes (with login shell fallback).
@@ -120,7 +120,7 @@ pub fn uses_hook_resume(cfg: &Config, integration_dir: Option<&Path>) -> bool {
 }
 
 const ENV_RESUME_EXEC: &str = "THURM_RESUME_EXEC";
-const ENV_RESUME_FILE: &str = "THURM_RESUME_FILE";
+const ENV_RESUME_TICKET: &str = "THURM_RESUME_TICKET";
 
 /// Ghostty release matching the pinned libghostty-vt (1.3.2-dev).
 const GHOSTTY_VERSION: &str = "1.3.2";
@@ -199,14 +199,14 @@ fn spawn_options_with(
     // The resume handoff the shell integration runs at its first prompt: only ever this
     // daemon's, for a pane it restores. Always set (empty otherwise), so a value inherited from
     // the daemon's environment, `[terminal.env]` or a client never reaches the shell.
-    env.retain(|(k, _)| k != ENV_RESUME_EXEC && k != ENV_RESUME_FILE);
-    let (resume_exec, resume_file) = l
+    env.retain(|(k, _)| k != ENV_RESUME_EXEC && k != ENV_RESUME_TICKET);
+    let (resume_exec, resume_ticket) = l
         .resume_hook
         .filter(|_| cfg.terminal.shell_integration && l.integration_dir.is_some())
-        .map(|(exec, file)| (exec.display().to_string(), file.display().to_string()))
+        .map(|(exec, ticket)| (exec.display().to_string(), ticket.to_owned()))
         .unwrap_or_default();
     env.push((ENV_RESUME_EXEC.into(), resume_exec));
-    env.push((ENV_RESUME_FILE.into(), resume_file));
+    env.push((ENV_RESUME_TICKET.into(), resume_ticket));
     // Last: on the PATH and display the pane ends up with, `[terminal.env]` and the client's
     // variables included.
     let shims = add_clip_shims(&mut env, shims, inherited);
@@ -499,13 +499,13 @@ mod tests {
         cfg.terminal
             .env
             .insert("THURM_RESUME_EXEC".into(), "/tmp/evil".into());
-        let launch = |hook: Option<(&Path, &Path)>| {
+        let launch = |hook: Option<(&Path, &str)>| {
             spawn_options_with(
                 PaneLaunch {
                     id: 1,
                     command: None,
                     cwd: None,
-                    extra_env: vec![("THURM_RESUME_FILE".into(), "/tmp/evil.json".into())],
+                    extra_env: vec![("THURM_RESUME_TICKET".into(), "0".repeat(32))],
                     size: PaneSize::default(),
                     config: &cfg,
                     socket: &sock,
@@ -527,13 +527,10 @@ mod tests {
         };
         let plain = launch(None);
         assert_eq!(values(&plain, "THURM_RESUME_EXEC"), [""]);
-        assert_eq!(values(&plain, "THURM_RESUME_FILE"), [""]);
-        let restored = launch(Some((
-            Path::new("/bin/thurmd"),
-            Path::new("/s/resume-x.json"),
-        )));
+        assert_eq!(values(&plain, "THURM_RESUME_TICKET"), [""]);
+        let restored = launch(Some((Path::new("/bin/thurmd"), "ab".repeat(16).as_str())));
         assert_eq!(values(&restored, "THURM_RESUME_EXEC"), ["/bin/thurmd"]);
-        assert_eq!(values(&restored, "THURM_RESUME_FILE"), ["/s/resume-x.json"]);
+        assert_eq!(values(&restored, "THURM_RESUME_TICKET"), ["ab".repeat(16)]);
     }
 
     #[test]

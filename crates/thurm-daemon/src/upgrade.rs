@@ -60,6 +60,19 @@ pub struct Handoff {
     /// The Tailscale helper's pid and control socket, which stay open across the exec.
     #[serde(default)]
     pub tailnet: Option<(i32, RawFd)>,
+    /// Restored panes' saved programs their shell has not redeemed yet (sealed inside the
+    /// encrypted hand-off file, like the panes' tokens).
+    #[serde(default)]
+    pub resume_tickets: Vec<TicketHandoff>,
+}
+
+/// A [`crate::daemon::ResumeTicket`] across the exec: how long it has left, not when it ends.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TicketHandoff {
+    pub ticket: String,
+    pub pane: PaneId,
+    pub spec: crate::program_resume::ResumeExecSpec,
+    pub remaining_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -116,6 +129,12 @@ pub struct PaneHandoff {
     /// Accepted Program Resume Protocol (OSC 7577) state for this pane.
     #[serde(default)]
     pub resume_state: Option<crate::program_resume::ResumeHandoff>,
+    /// A line still to be typed into the shell: in how many milliseconds, and base64 of it.
+    #[serde(default)]
+    pub pending_input: Option<(u64, String)>,
+    /// A client typed or pasted into the pane.
+    #[serde(default)]
+    pub typed: bool,
 }
 
 impl PaneHandoff {
@@ -510,6 +529,7 @@ mod tests {
             restored: false,
             panes: Vec::new(),
             tailnet: None,
+            resume_tickets: Vec::new(),
         }
     }
 

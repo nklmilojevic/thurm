@@ -72,11 +72,11 @@ fn parse_args() -> Args {
                 std::process::exit(0);
             }
             "--exec-resume" => {
-                let Some(path) = it.next() else {
-                    eprintln!("thurmd: --exec-resume requires a path");
+                let Some(ticket) = it.next() else {
+                    eprintln!("thurmd: --exec-resume requires a ticket");
                     std::process::exit(2);
                 };
-                program_resume::exec_resume_file(Path::new(&path));
+                program_resume::exec_resume(&ticket);
             }
             "--socket" => args.socket = it.next().map(PathBuf::from),
             "--no-restore" => args.no_restore = true,
@@ -107,7 +107,11 @@ fn main() {
     let args = parse_args();
     let (config, config_warnings) = Config::load_with_warnings().unwrap_or_else(|e| {
         eprintln!("thurmd: config error, using defaults: {e}");
-        (Config::default(), Vec::new())
+        // The broken file may be the one that turned program resume (or a rule) off: the
+        // defaults must not run a saved command the user meant to stop.
+        let mut config = Config::default();
+        config.session.resume_programs = thurm_config::ResumeProgramsMode::Off;
+        (config, Vec::new())
     });
     let args_socket_default = args.socket.is_none() && std::env::var_os("THURM_SOCKET").is_none();
     let socket = args.socket.unwrap_or_else(thurm_config::socket_path);

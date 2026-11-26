@@ -45,6 +45,11 @@ const OUTPUT_BACKLOG: usize = 4096;
 /// Bytes of output queued for a client before its subscriptions switch to re-sync (an
 /// `Output` can be 256 KiB: counting messages alone let a stalled client pin a gigabyte).
 const OUTPUT_BACKLOG_BYTES: usize = 16 * 1024 * 1024;
+/// The longest a handed-over resume ticket may still wait (see `program_resume::TICKET_TTL`).
+const TICKET_TTL_MS: u64 = program_resume::TICKET_TTL.as_millis() as u64;
+/// The most record bytes one [`Request::ResumeRecords`] answer holds: every pane's records
+/// fit when a pane is named, a list of all panes past it is refused.
+const RESUME_LIST_BYTES: usize = 8 * 1024 * 1024;
 
 /// PTY output read ahead of the parser. A macOS PTY buffers only a few KiB, so a program that
 /// writes faster than we parse would stall on every chunk; with the read-ahead it keeps
@@ -488,8 +493,25 @@ pub fn message_weight(msg: &ServerMessage) -> usize {
     match msg {
         ServerMessage::Event(Event::Output { data, .. }) => data.len(),
         ServerMessage::Event(Event::Attach { state, .. }) => state.len(),
+        ServerMessage::Response {
+            result: Ok(Response::ResumeRecords(list)),
+            ..
+        } => resume_records_weight(list),
         _ => 256,
     }
+}
+
+/// About what a [`Response::ResumeRecords`] answer takes in memory and on the wire.
+fn resume_records_weight(list: &[thurm_proto::PaneResumeRecords]) -> usize {
+    list.iter()
+        .flat_map(|p| &p.records)
+        .map(|r| {
+            256 + r.process_name.len()
+                + r.cwd.as_ref().map_or(0, String::len)
+                + r.argv.iter().map(|a| a.len() + 8).sum::<usize>()
+        })
+        .sum::<usize>()
+        .max(256)
 }
 
 pub struct Pane {
@@ -542,7 +564,12 @@ pub struct PaneState {
     /// the state, so the output that follows finishes the sequence there instead of showing
     /// its end as text.
     forwarded_carry: Vec<u8>,
+    /// A line to type into the shell once it is up (an agent or program resume in a shell
+    /// without the integration hook): at the shell's first prompt, or when due if the shell
+    /// is in the foreground and nobody `typed`.
     pending_input: Option<(Instant, Vec<u8>)>,
+    /// A client typed or pasted into the pane.
+    typed: bool,
     shell_integration_seen: bool,
     /// Last git probe: when, for which directory, and whether one is in flight.
     git_probe: Option<(Instant, String)>,
@@ -581,16 +608,23 @@ enum RestoreLaunch<'a> {
     Normal,
     /// Interactive shell (zsh, bash, fish) whose integration runs `--exec-resume` at its first
     /// prompt.
-    Hook {
-        exec: &'a Path,
-        file: &'a Path,
-    },
-    /// Owning process was the PTY's first process: `exec thurmd --exec-resume <file>` via login shell.
+    Hook { exec: &'a Path, ticket: &'a str },
+    /// Owning process was the PTY's first process: `exec thurmd --exec-resume <ticket>` via
+    /// login shell.
     FirstProcess {
         exec: &'a Path,
-        file: &'a Path,
+        ticket: &'a str,
         title: String,
     },
+}
+
+/// A restored pane's saved program, waiting for the pane's shell to redeem `ticket`
+/// ([`Request::TakeResume`]).
+pub(crate) struct ResumeTicket {
+    pub ticket: String,
+    pub pane: PaneId,
+    pub spec: ResumeExecSpec,
+    pub expires: Instant,
 }
 
 /// What [`Daemon::install_pane`] needs: a new pane, or one handed over by the previous daemon.
@@ -648,12 +682,13 @@ pub struct Daemon {
     save_lock: Mutex<()>,
     readers: ReaderGate,
     pub socket: PathBuf,
-    state_dir: PathBuf,
     integration_dir: Option<PathBuf>,
     session_dirty: AtomicBool,
     /// An OSC 7577 record was set or removed, or a pane closed: the monitor saves on its next
     /// tick, off the thread that parses output.
     resume_save_due: AtomicBool,
+    /// Restored panes' saved programs waiting for their shell (see [`ResumeTicket`]).
+    resume_tickets: Mutex<Vec<ResumeTicket>>,
     restored: AtomicBool,
     /// `restore_session` or `adopt` is still installing panes: a snapshot written now would
     /// lack the rest of them and the layout, so saves wait (the session stays dirty).
@@ -694,7 +729,6 @@ impl Daemon {
             .map_err(|e| log::warn!("shell integration unavailable: {e}"))
             .ok();
         persist::remove_old_scrollback(&state_dir);
-        program_resume::prune_resume_files(&state_dir);
         let store = config
             .session
             .persist
@@ -733,10 +767,10 @@ impl Daemon {
             save_lock: Mutex::new(()),
             readers: ReaderGate::new().expect("reader gate pipe"),
             socket,
-            state_dir,
             integration_dir,
             session_dirty: AtomicBool::new(false),
             resume_save_due: AtomicBool::new(false),
+            resume_tickets: Mutex::new(Vec::new()),
             restored: AtomicBool::new(false),
             loading: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
@@ -1079,12 +1113,16 @@ impl Daemon {
             .transpose()?;
         let (spawn_command, resume_hook, title_override) = match resume_launch {
             RestoreLaunch::Normal => (command.clone(), None, None),
-            RestoreLaunch::Hook { exec, file } => (None, Some((exec, file)), None),
-            RestoreLaunch::FirstProcess { exec, file, title } => (
+            RestoreLaunch::Hook { exec, ticket } => (None, Some((exec, ticket)), None),
+            RestoreLaunch::FirstProcess {
+                exec,
+                ticket,
+                title,
+            } => (
                 Some(vec![
                     exec.display().to_string(),
                     "--exec-resume".into(),
-                    file.display().to_string(),
+                    ticket.to_owned(),
                 ]),
                 None,
                 Some(title),
@@ -1184,6 +1222,7 @@ impl Daemon {
                 carry: p.carry,
                 forwarded_carry: p.forwarded_carry,
                 pending_input: None,
+                typed: false,
                 shell_integration_seen: p.shell_integration_seen,
                 git_probe: None,
                 git_pending: false,
@@ -1746,6 +1785,7 @@ impl Daemon {
             return false;
         };
         self.just_exited.lock().retain(|(p, _)| p.id != id);
+        self.resume_tickets.lock().retain(|t| t.pane != id);
         self.session_dirty.store(true, Ordering::Relaxed);
         // Under the pane's lock, as `pane_exited` broadcasts: its exit's PaneInfo comes before
         // PaneClosed or not at all.
@@ -2184,7 +2224,22 @@ impl Daemon {
                         && Instant::now() >= *due
                         && let Some((_, input)) = st.pending_input.take()
                     {
-                        pane.write(input);
+                        // Typed only into the pane's own shell, waiting in the foreground, and
+                        // never after someone typed: a startup job would read it as input, and
+                        // a half-typed line would run with it.
+                        let shell_waits = st.info.foreground.as_ref().is_some_and(|p| {
+                            procinfo::is_shell(&p.name)
+                                && (st.info.pid == Some(p.pid)
+                                    || procinfo::parent(p.pid) == st.info.pid)
+                        });
+                        if shell_waits && !st.typed {
+                            pane.write(input);
+                        } else {
+                            self.resume_tickets.lock().retain(|t| t.pane != pane.id);
+                            st.term.print(
+                                "\r\n[automatic resume skipped: the terminal was busy]\r\n",
+                            );
+                        }
                     }
                     // idle_ms changes every tick; only report it along with other changes, or
                     // every 2 s for clients that display it.
@@ -2201,6 +2256,10 @@ impl Daemon {
                 }
             }
             let resume_due = self.resume_save_due.swap(false, Ordering::Relaxed);
+            {
+                let now = Instant::now();
+                self.resume_tickets.lock().retain(|t| t.expires > now);
+            }
             if self.store.is_some()
                 && (resume_expired
                     || resume_due
@@ -2374,8 +2433,28 @@ impl Daemon {
                 slave_rdev: st.pty.slave_rdev(),
                 resume_token: st.resume.token().map(str::to_owned),
                 resume_state: Some(st.resume.handoff()),
+                pending_input: st.pending_input.as_ref().map(|(due, input)| {
+                    (
+                        due.saturating_duration_since(Instant::now()).as_millis() as u64,
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, input),
+                    )
+                }),
+                typed: st.typed,
             });
         }
+        let now = Instant::now();
+        let resume_tickets = self
+            .resume_tickets
+            .lock()
+            .iter()
+            .filter(|t| t.expires > now)
+            .map(|t| upgrade::TicketHandoff {
+                ticket: t.ticket.clone(),
+                pane: t.pane,
+                spec: t.spec.clone(),
+                remaining_ms: (t.expires - now).as_millis() as u64,
+            })
+            .collect();
         upgrade::Handoff {
             version: upgrade::HANDOFF_VERSION,
             listener_fd,
@@ -2386,6 +2465,7 @@ impl Daemon {
             restored: self.restored.load(Ordering::Relaxed),
             panes,
             tailnet: self.tailnet.handoff(),
+            resume_tickets,
         }
     }
 
@@ -2408,6 +2488,19 @@ impl Daemon {
     /// Takes over the panes of the image we replaced.
     pub fn adopt(self: &Arc<Self>, h: upgrade::Handoff) {
         self.loading.store(true, Ordering::Relaxed);
+        // Before the panes: a shell that redeems its ticket right away finds it.
+        let now = Instant::now();
+        *self.resume_tickets.lock() = h
+            .resume_tickets
+            .into_iter()
+            .filter(|t| program_resume::is_ticket(&t.ticket))
+            .map(|t| ResumeTicket {
+                ticket: t.ticket,
+                pane: t.pane,
+                spec: t.spec,
+                expires: now + Duration::from_millis(t.remaining_ms.min(TICKET_TTL_MS)),
+            })
+            .collect();
         let mut adopted = 0;
         for p in h.panes {
             let mut size = sanitize_size(p.size.into());
@@ -2488,6 +2581,15 @@ impl Daemon {
                         if let Some(prompt) = p.agent_prompt {
                             st.agent.restore_pending_prompt(prompt);
                         }
+                        st.typed = p.typed;
+                        st.pending_input = p.pending_input.and_then(|(ms, b64)| {
+                            let input = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                b64,
+                            )
+                            .ok()?;
+                            Some((Instant::now() + Duration::from_millis(ms), input))
+                        });
                         st.info.agent = st.agent.state().cloned();
                         // Old news: notified by the image we replaced.
                         let records = st.term.program_status();
@@ -2648,6 +2750,46 @@ impl Daemon {
                 plans.push(None);
                 continue;
             }
+            let require_cwd = rec.cwd_from_report || dir_restricted;
+            // A directory it must start in is pinned to the one checked here: its canonical
+            // path, entered only while it is still the same directory.
+            let (spec_cwd, cwd_id) = match resolved_cwd.as_deref() {
+                Some(dir) if require_cwd => {
+                    let canon = std::fs::canonicalize(dir)
+                        .ok()
+                        .map(|d| d.display().to_string());
+                    let id = canon.as_deref().and_then(program_resume::dir_identity);
+                    match (canon, id) {
+                        (Some(canon), Some(id)) => (Some(canon), Some(id)),
+                        _ => {
+                            skip("dir_gone");
+                            plans.push(None);
+                            continue;
+                        }
+                    }
+                }
+                _ => (resolved_cwd.clone(), None),
+            };
+            // A rule that trusted the owner by its executable also decides which program runs:
+            // only one found where that executable (or its script) is.
+            let exe_dirs = match rule
+                .as_deref()
+                .and_then(|n| resume_rules.iter().find(|r| r.enabled && r.name == n))
+            {
+                Some(r) if r.match_process => {
+                    let dirs = program_resume::pin_dirs(
+                        &rec.process_exe,
+                        program_resume::saved_script(&rec.process_exe, &rec.process_argv),
+                    );
+                    if dirs.is_empty() {
+                        skip("program_gone");
+                        plans.push(None);
+                        continue;
+                    }
+                    dirs
+                }
+                _ => Vec::new(),
+            };
             rec.attempted = true;
             marked_attempted = true;
             let title = rec
@@ -2660,8 +2802,10 @@ impl Daemon {
                     argv: rec.argv.clone(),
                     // Entered by the helper itself, after the shell's startup files (which may
                     // change directory) ran.
-                    cwd: resolved_cwd.clone(),
-                    require_cwd: rec.cwd_from_report || dir_restricted,
+                    cwd: spec_cwd,
+                    require_cwd,
+                    cwd_id,
+                    exe_dirs,
                 },
                 cwd: resolved_cwd,
                 first_process: rec.first_process,
@@ -2682,75 +2826,82 @@ impl Daemon {
         for ((p, plan), tried_before) in snap.panes.iter().zip(plans).zip(tried_before) {
             if let Some(plan) = plan {
                 let exe = thurmd_exe.as_ref().expect("checked above");
-                match program_resume::write_resume_file(&self.state_dir, &plan.spec) {
-                    Ok(file) => {
-                        let req = CreatePane {
-                            command: if plan.first_process {
-                                p.command.clone()
-                            } else {
-                                None
-                            },
-                            cwd: plan.cwd.clone(),
-                            size: p.size.into(),
-                            ..Default::default()
-                        };
-                        let launch = if plan.first_process {
-                            RestoreLaunch::FirstProcess {
-                                exec: exe,
-                                file: &file,
-                                title: plan.program_label.clone(),
-                            }
-                        } else if use_hook {
-                            RestoreLaunch::Hook {
-                                exec: exe,
-                                file: &file,
-                            }
-                        } else {
-                            RestoreLaunch::Normal
-                        };
-                        match self.create_pane_with_resume(req, Some(p.id), launch) {
-                            Ok(id) => {
-                                restored += 1;
-                                log::info!(
-                                    "pane {id}: resuming saved program {} (rule={})",
-                                    plan.program_label,
-                                    plan.rule.as_deref().unwrap_or("all")
-                                );
-                                if !plan.first_process
-                                    && !use_hook
-                                    && let Some(pane) = self.pane(id)
-                                {
-                                    // No hook: typed like `resume_agents` does. A leading space
-                                    // keeps it out of history where configured; only fixed paths
-                                    // are typed, never `argv`.
-                                    let line = format!(
-                                        " {} --exec-resume {}\r",
-                                        shell::shell_quote(&exe.display().to_string()),
-                                        shell::shell_quote(&file.display().to_string()),
-                                    );
-                                    pane.state.lock().pending_input = Some((
-                                        Instant::now() + Duration::from_millis(2500),
-                                        line.into_bytes(),
-                                    ));
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                let _ = std::fs::remove_file(&file);
-                                log::warn!(
-                                    "pane {}: cannot resume {}, starting a shell: {e}",
-                                    p.id,
-                                    plan.program_label
-                                );
-                            }
-                        }
-                    }
+                // The pane's shell redeems the ticket for the command; the command itself
+                // stays in this process. In place before the shell starts.
+                let ticket = match program_resume::generate_ticket() {
+                    Ok(t) => t,
                     Err(e) => {
-                        log::warn!(
-                            "pane {}: failed to write resume file for {}: {e}",
-                            p.id,
-                            plan.program_label
-                        );
+                        log::warn!("pane {}: cannot resume {}: {e}", p.id, plan.program_label);
+                        String::new()
+                    }
+                };
+                if !ticket.is_empty() {
+                    self.resume_tickets.lock().push(ResumeTicket {
+                        ticket: ticket.clone(),
+                        pane: p.id,
+                        spec: plan.spec.clone(),
+                        expires: Instant::now() + program_resume::TICKET_TTL,
+                    });
+                    let req = CreatePane {
+                        command: if plan.first_process {
+                            p.command.clone()
+                        } else {
+                            None
+                        },
+                        cwd: plan.cwd.clone(),
+                        size: p.size.into(),
+                        ..Default::default()
+                    };
+                    let launch = if plan.first_process {
+                        RestoreLaunch::FirstProcess {
+                            exec: exe,
+                            ticket: &ticket,
+                            title: plan.program_label.clone(),
+                        }
+                    } else if use_hook {
+                        RestoreLaunch::Hook {
+                            exec: exe,
+                            ticket: &ticket,
+                        }
+                    } else {
+                        RestoreLaunch::Normal
+                    };
+                    match self.create_pane_with_resume(req, Some(p.id), launch) {
+                        Ok(id) => {
+                            restored += 1;
+                            log::info!(
+                                "pane {id}: resuming saved program {} (rule={})",
+                                plan.program_label,
+                                plan.rule.as_deref().unwrap_or("all")
+                            );
+                            if !plan.first_process
+                                && !use_hook
+                                && let Some(pane) = self.pane(id)
+                            {
+                                // No hook: typed like `resume_agents` does, once the shell
+                                // holds the terminal and nobody typed (see `pending_input`). A
+                                // leading space keeps it out of history where configured; only
+                                // the helper's path and the ticket are typed, never `argv`.
+                                let line = format!(
+                                    " {} --exec-resume {}\r",
+                                    shell::shell_quote(&exe.display().to_string()),
+                                    ticket,
+                                );
+                                pane.state.lock().pending_input = Some((
+                                    Instant::now() + Duration::from_millis(2500),
+                                    line.into_bytes(),
+                                ));
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            self.resume_tickets.lock().retain(|t| t.pane != p.id);
+                            log::warn!(
+                                "pane {}: cannot resume {}, starting a shell: {e}",
+                                p.id,
+                                plan.program_label
+                            );
+                        }
                     }
                 }
             }
@@ -3435,6 +3586,7 @@ impl Daemon {
                 self.with_input_pane(client.id, pane, |p, st| {
                     self.used_by(client, st);
                     if !data.is_empty() {
+                        st.typed = true;
                         st.agent.prompt.interrupted();
                     }
                     st.agent.user_answer(&data);
@@ -3457,6 +3609,7 @@ impl Daemon {
                     self.used_by(client, st);
                     let bytes = st.term.key(&key);
                     if !bytes.is_empty() {
+                        st.typed = true;
                         st.agent.prompt.interrupted();
                         st.agent.user_answer(&bytes);
                         self.acknowledge_programs(pane, st);
@@ -4120,17 +4273,51 @@ impl Daemon {
                     Some(id) => vec![self.pane(id).ok_or_else(|| format!("unknown pane {id}"))?],
                     None => self.all_panes(),
                 };
-                let list = targets
-                    .into_iter()
-                    .map(|p| {
+                // A client still reading earlier answers gets no more (each can be large).
+                if client.queued.load(Ordering::Relaxed) > OUTPUT_BACKLOG_BYTES {
+                    return Err("busy: read the previous answers first".into());
+                }
+                let all = pane.is_none();
+                let mut list = Vec::with_capacity(targets.len());
+                let mut bytes = 0;
+                for p in targets {
+                    let records = {
                         let st = p.state.lock();
-                        thurm_proto::PaneResumeRecords {
-                            pane: p.id,
-                            records: st.resume.inspect(st.pty.foreground_pgrp(), mode, &rules),
-                        }
-                    })
-                    .collect();
+                        st.resume.inspect(st.pty.foreground_pgrp(), mode, &rules)
+                    };
+                    let entry = thurm_proto::PaneResumeRecords {
+                        pane: p.id,
+                        records,
+                    };
+                    bytes += resume_records_weight(std::slice::from_ref(&entry));
+                    if all && bytes > RESUME_LIST_BYTES {
+                        return Err(
+                            "too many program resume records to list at once: ask for one pane \
+                             (thurm resume --pane ID)"
+                                .into(),
+                        );
+                    }
+                    list.push(entry);
+                }
                 Ok(Response::ResumeRecords(list))
+            }
+            Request::TakeResume { ticket } => {
+                // Only this user's own processes on this machine (the pane's shell).
+                if !client.is_local_peer() {
+                    return Err("not allowed".into());
+                }
+                let spec = {
+                    let mut tickets = self.resume_tickets.lock();
+                    let now = Instant::now();
+                    let pos = tickets.iter().position(|t| {
+                        t.expires > now && program_resume::ticket_eq(&t.ticket, &ticket)
+                    });
+                    pos.map(|i| tickets.swap_remove(i).spec)
+                };
+                let spec = spec.ok_or("unknown or used resume ticket")?;
+                serde_json::to_string(&spec)
+                    .map(Response::Text)
+                    .map_err(|e| e.to_string())
             }
         }
     }
@@ -4181,6 +4368,7 @@ impl Daemon {
     ) {
         self.used_by(client, st);
         if !text.is_empty() {
+            st.typed = true;
             st.agent.prompt.interrupted();
         }
         st.agent.user_input();

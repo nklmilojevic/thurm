@@ -328,7 +328,7 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
             &prog,
             &format!(
                 "#!/bin/sh\n\
-                 printf 'RFILE=%s\\nREXEC=%s\\nRC_VAR=%s\\n' \"${{THURM_RESUME_FILE-}}\" \"${{THURM_RESUME_EXEC-}}\" \"${{FROM_RC-}}\" > '{}'\n\
+                 printf 'RTICKET=%s\\nREXEC=%s\\nRC_VAR=%s\\n' \"${{THURM_RESUME_TICKET-}}\" \"${{THURM_RESUME_EXEC-}}\" \"${{FROM_RC-}}\" > '{}'\n\
                  echo HOOK_RUNNING\n\
                  sleep 30\n",
                 env_dump.display()
@@ -386,7 +386,7 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
             "{shell_name}: shell function/alias ran instead of PATH lookup"
         );
         let dumped = std::fs::read_to_string(&env_dump).unwrap();
-        assert_eq!(dumped, "RFILE=\nREXEC=\nRC_VAR=yes\n", "{shell_name}");
+        assert_eq!(dumped, "RTICKET=\nREXEC=\nRC_VAR=yes\n", "{shell_name}");
 
         // Ctrl-Z suspends the resumed foreground job and returns to the interactive shell.
         std::thread::sleep(Duration::from_millis(150));
@@ -400,14 +400,10 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
         run_line(&c2, pane, "printf 'SUSPENDED_%s\\n' BACK");
         wait_match(&c2, pane, "SUSPENDED_BACK");
 
-        // One-shot resume file was deleted on exec.
-        let leftover: Vec<_> = std::fs::read_dir(env.dir.join("state/resume"))
-            .unwrap()
-            .flatten()
-            .collect();
+        // The command went from the daemon to the helper over the socket, never to disk.
         assert!(
-            leftover.is_empty(),
-            "{shell_name}: leftover resume files: {leftover:?}"
+            !env.dir.join("state/resume").exists(),
+            "{shell_name}: a resume file was written"
         );
     }
 }
