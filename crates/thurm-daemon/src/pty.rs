@@ -26,6 +26,9 @@ pub struct Pty {
     exited: Option<Option<i32>>,
     /// Device number (`st_rdev`) of the PTY slave, for verifying controlling terminals.
     slave_rdev: Option<u64>,
+    /// Birth of the child the daemon started, read while it could not have been reaped: tells
+    /// it from a later process that reuses its pid.
+    birth: Option<u64>,
 }
 
 fn winsize(size: PaneSize) -> libc::winsize {
@@ -160,11 +163,14 @@ impl Pty {
             io::Error::new(e.kind(), format!("failed to spawn {:?}: {e}", opts.program))
         })?;
         drop(slave);
+        // Our unreaped child: its pid cannot belong to anything else yet.
+        let birth = crate::procinfo::process_birth(child.id());
         Ok(Pty {
             master: File::from(master),
             pid: child.id() as libc::pid_t,
             exited: None,
             slave_rdev,
+            birth,
         })
     }
 
@@ -181,11 +187,17 @@ impl Pty {
         }
         set_cloexec(fd, true)?;
         let slave_rdev = slave_rdev.or_else(|| master_slave_rdev(fd));
+        // Still our unreaped child (exec keeps it ours) unless the old image collected it.
+        let birth = exited
+            .is_none()
+            .then(|| crate::procinfo::process_birth(pid))
+            .flatten();
         Ok(Pty {
             master: unsafe { File::from_raw_fd(fd) },
             pid: pid as libc::pid_t,
             exited,
             slave_rdev,
+            birth,
         })
     }
 
@@ -195,6 +207,21 @@ impl Pty {
 
     pub fn slave_rdev(&self) -> Option<u64> {
         self.slave_rdev
+    }
+
+    /// The child's pid while it is verifiably the process the daemon started: not reaped yet
+    /// (so its pid cannot have been reused) and with the birth it had at start.
+    pub fn live_leader(&self) -> Option<u32> {
+        let pid = self.pid as u32;
+        (self.exited.is_none()
+            && self.birth.is_some()
+            && crate::procinfo::process_birth(pid) == self.birth)
+            .then_some(pid)
+    }
+
+    /// Session of the pane's terminal (Linux reads it through the master).
+    pub fn terminal_session(&self) -> Option<u32> {
+        crate::procinfo::terminal_session(self.master.as_raw_fd())
     }
 
     pub fn master_fd(&self) -> RawFd {
