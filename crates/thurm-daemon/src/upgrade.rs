@@ -280,13 +280,16 @@ pub fn perform(
             return;
         }
     };
+    // No pending resume crosses the upgrade (the caller waited a little for them to finish):
+    // input that should cancel one could end with this image, unseen, and the next would
+    // resume the program anyway. Cancelled even if the upgrade then gives up.
+    daemon.drop_pending_resumes();
     // Stop reading the PTYs and parse what was read: the terminals are then serialized with
     // nothing lost, and the output that follows stays in the kernel for the new image. Readers
     // resume if we return (the upgrade didn't happen).
     struct Resume<'a>(&'a Daemon);
     impl Drop for Resume<'_> {
         fn drop(&mut self) {
-            self.0.set_upgrading(false);
             self.0.resume_readers();
         }
     }
@@ -302,8 +305,6 @@ pub fn perform(
         // The handoff carries the panes; the snapshot is only the fallback after a crash.
         log::warn!("upgrade: session snapshot not saved: {e}");
     }
-    // From here, what the hand-off says about input (`typed`) is final for this image.
-    daemon.set_upgrading(true);
     let mut handoff = daemon.handoff(listener_fd, log_to_file);
     handoff.version = version;
     handoff.lock_fd = lock_fd;
@@ -368,17 +369,6 @@ pub fn perform(
     }
     args.push("--handoff-key-fd".to_owned());
     args.push(key_fd.to_string());
-    // Input that would cancel a resume the hand-off still has pending is waiting: it would end
-    // with this image, unseen (keystrokes get no reply), and the next one would resume the
-    // program anyway. Give up instead: the input goes through, and the upgrade can be asked
-    // for again.
-    if daemon.typing_held() {
-        log::warn!("upgrade aborted: input is waiting to cancel a resume");
-        restore_cloexec(&fds);
-        close_key();
-        let _ = std::fs::remove_file(&path);
-        return;
-    }
     let err = exec(&exe, &args);
     log::warn!("upgrade failed: exec {}: {err}", exe.display());
     restore_cloexec(&fds);

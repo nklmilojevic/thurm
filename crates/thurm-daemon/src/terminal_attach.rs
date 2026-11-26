@@ -2,11 +2,6 @@
 
 use super::*;
 
-/// [`Daemon::typing_frozen`]'s error: input held back while an upgrade captures the panes.
-const TYPING_FROZEN: &str = "typing waits for the upgrade";
-/// Longest a held-back input waits for the upgrade (which takes milliseconds) before failing.
-const TYPING_FROZEN_LIMIT: Duration = Duration::from_secs(10);
-
 impl Daemon {
     pub(super) fn with_input_pane<T>(
         &self,
@@ -23,55 +18,6 @@ impl Daemon {
             }
             Ok(f(p, st))
         })?
-    }
-
-    /// Holds back typing (what sets `typed`) into a pane waiting to resume a program while an
-    /// upgrade hands the pane over: the first input would cancel the resume, after `typed` was
-    /// captured (see `set_upgrading`). Called under the pane's lock, which `handoff` takes
-    /// after setting the flag, before anything of the input takes effect. The caller drops the
-    /// lock and retries through [`Daemon::typing_after_upgrade`].
-    pub(super) fn typing_frozen(&self, pane: PaneId, st: &PaneState) -> Result<(), String> {
-        if !st.typed
-            && self.upgrading.load(Ordering::SeqCst)
-            && (st.pending_input.is_some()
-                || self.resume_tickets.lock().iter().any(|t| t.pane == pane))
-        {
-            // Counted under the pane's lock: the upgrade's last check before the exec sees
-            // every input the freeze holds (`typing_after_upgrade` uncounts it).
-            self.typing_held.fetch_add(1, Ordering::SeqCst);
-            return Err(TYPING_FROZEN.into());
-        }
-        Ok(())
-    }
-
-    /// Runs `typing` (input under the pane's lock that checks [`Daemon::typing_frozen`]) and,
-    /// while an upgrade holds it back, waits for the upgrade outside the lock and tries again.
-    /// The input is never refused for the hand-off: keystrokes come without waiting for a
-    /// reply, so an error would drop them unseen. Nor does it end with this image: the upgrade
-    /// gives up while any input waits (see [`Daemon::typing_held`]), and the input then goes
-    /// through here and cancels the resume.
-    pub(super) fn typing_after_upgrade<T>(
-        &self,
-        mut typing: impl FnMut() -> Result<T, String>,
-    ) -> Result<T, String> {
-        let deadline = Instant::now() + TYPING_FROZEN_LIMIT;
-        loop {
-            match typing() {
-                Err(e) if e == TYPING_FROZEN => {}
-                other => return other,
-            }
-            let waited = loop {
-                if !self.upgrading.load(Ordering::SeqCst) {
-                    break Ok(());
-                }
-                if Instant::now() >= deadline {
-                    break Err("the daemon is restarting: try again".to_owned());
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            };
-            self.typing_held.fetch_sub(1, Ordering::SeqCst);
-            waited?;
-        }
     }
 
     pub(super) fn attach_terminal(

@@ -85,7 +85,8 @@ failed or crashed: a pane whose record was already tried starts a plain shell. I
 record the attempt, it resumes nothing. A pane whose record is not resumed for that or
 another reason (not trusted, its directory is gone, or the shell cannot run it) restores as
 it would without one: its command, or `resume_agents`. Changing the resume settings while a
-restored pane's shell is still starting cancels its resume.
+restored pane's shell is still starting cancels its resume. So does an in-place upgrade: it
+waits up to 5 seconds for restored programs to resume, then cancels those still waiting.
 
 By default (`session.resume_programs = "rules"`), Thurm only resumes commands that match
 a trust rule and whose owning process is not wrapped inside a sandbox or another

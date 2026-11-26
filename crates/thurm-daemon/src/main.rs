@@ -33,7 +33,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thurm_config::Config;
 
@@ -110,6 +110,10 @@ fn parse_args() -> Args {
     }
     args
 }
+
+/// How long a requested upgrade waits for restored programs to resume before cancelling the
+/// rest (well within the 15 s `thurm daemon upgrade` waits for the new daemon).
+const UPGRADE_RESUME_WAIT: Duration = Duration::from_secs(5);
 
 fn main() {
     let args = parse_args();
@@ -262,6 +266,7 @@ fn main() {
     }
 
     // Main thread: wait for a shutdown request or a signal.
+    let mut upgrade_waiting: Option<Instant> = None;
     loop {
         std::thread::sleep(Duration::from_millis(100));
         if term.load(Ordering::Relaxed) {
@@ -274,7 +279,14 @@ fn main() {
             daemon.wait_clients_flushed(Duration::from_millis(500));
             break;
         }
-        if upgrade_requested.swap(false, Ordering::Relaxed) {
+        // A restored program still waiting to resume gets a moment to (its shell starting);
+        // what is left then is cancelled by the upgrade.
+        let resumes_wait = upgrade_requested.load(Ordering::Relaxed)
+            && daemon.resumes_pending()
+            && *upgrade_waiting.get_or_insert_with(Instant::now) + UPGRADE_RESUME_WAIT
+                > Instant::now();
+        if !resumes_wait && upgrade_requested.swap(false, Ordering::Relaxed) {
+            upgrade_waiting = None;
             // Returns only when the upgrade could not happen; we carry on as before.
             upgrade::perform(
                 &daemon,

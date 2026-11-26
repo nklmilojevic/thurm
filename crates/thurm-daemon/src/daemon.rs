@@ -801,13 +801,6 @@ pub struct Daemon {
     /// An OSC 7577 record was set or removed, or a pane closed: the monitor saves on its next
     /// tick, off the thread that parses output.
     resume_save_due: AtomicBool,
-    /// An in-place upgrade is capturing the panes for the next image: input that would
-    /// cancel a pending resume (`PaneState::typed`) waits until the upgrade gives up (see
-    /// [`Daemon::set_upgrading`]).
-    upgrading: AtomicBool,
-    /// Inputs waiting for the upgrade (see [`Daemon::typing_after_upgrade`]): the upgrade
-    /// gives up rather than end them with the image, so they go through and cancel the resume.
-    typing_held: std::sync::atomic::AtomicUsize,
     /// Restored panes' saved programs waiting for their shell (see [`ResumeTicket`]).
     resume_tickets: Mutex<Vec<ResumeTicket>>,
     restored: AtomicBool,
@@ -892,8 +885,6 @@ impl Daemon {
             integration_dir,
             session_dirty: AtomicBool::new(false),
             resume_save_due: AtomicBool::new(false),
-            upgrading: AtomicBool::new(false),
-            typing_held: std::sync::atomic::AtomicUsize::new(0),
             resume_tickets: Mutex::new(Vec::new()),
             restored: AtomicBool::new(false),
             loading: AtomicBool::new(false),
@@ -2565,14 +2556,8 @@ impl Daemon {
         true
     }
 
-    /// Types a restored pane's pending resume line once it is due (see `pending_input`). Not
-    /// while an upgrade hands the panes over: the hand-off may already carry the line, for the
-    /// next image to type; it stays for this monitor if the upgrade gives up. Read under the
-    /// pane's lock, which `handoff` takes after setting the flag.
+    /// Types a restored pane's pending resume line once it is due (see `pending_input`).
     fn type_pending_input(&self, pane: &Arc<Pane>, st: &mut PaneState) {
-        if self.upgrading.load(Ordering::SeqCst) {
-            return;
-        }
         if let Some((due, _)) = &st.pending_input
             && Instant::now() >= *due
             && let Some((_, input)) = st.pending_input.take()
@@ -2604,19 +2589,34 @@ impl Daemon {
         self.readers.resume();
     }
 
-    /// Set before [`Daemon::handoff`] captures the panes, and cleared if the upgrade doesn't
-    /// happen: meanwhile the first input into a pane with a resume pending waits (see
-    /// [`Daemon::typing_after_upgrade`]), so the `typed` the next image gets is final (the
-    /// bytes would reach the shell, but the image that would cancel the resume for them is not
-    /// the one that types it).
-    pub fn set_upgrading(&self, on: bool) {
-        self.upgrading.store(on, Ordering::SeqCst);
+    /// Whether a restored pane still waits to resume its program: a resume line not yet typed,
+    /// or a ticket its shell has not redeemed. An upgrade waits for these (see
+    /// [`Daemon::drop_pending_resumes`]). They come only from restoring, which is done before
+    /// the daemon serves or upgrades, so none appear later.
+    pub fn resumes_pending(&self) -> bool {
+        let now = Instant::now();
+        !self.resume_tickets.lock().iter().all(|t| t.expires <= now)
+            || self
+                .all_panes()
+                .iter()
+                .any(|p| p.state.lock().pending_input.is_some())
     }
 
-    /// Whether some input waits for the upgrade (it would cancel a resume the hand-off still
-    /// has pending). Checked by the upgrade just before its exec, which it then gives up.
-    pub fn typing_held(&self) -> bool {
-        self.typing_held.load(Ordering::SeqCst) > 0
+    /// Cancels the resumes still pending, as typing would, before an upgrade hands the panes
+    /// over. A pending resume is never handed over: input that should cancel it could reach
+    /// this image and end with it, unseen (keystrokes get no reply), while the next image
+    /// resumes the program anyway. Not resuming a program is the safe side of that race.
+    pub fn drop_pending_resumes(&self) {
+        let mut tickets = std::mem::take(&mut *self.resume_tickets.lock());
+        for pane in self.all_panes() {
+            let mut st = pane.state.lock();
+            let had_ticket = tickets.iter().any(|t| t.pane == pane.id);
+            if st.pending_input.take().is_some() || had_ticket {
+                st.term
+                    .print("\r\n[automatic resume skipped: the daemon was upgraded]\r\n");
+            }
+        }
+        tickets.clear();
     }
 
     pub fn handoff(&self, listener_fd: RawFd, log_to_file: bool) -> upgrade::Handoff {
@@ -3842,43 +3842,29 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::Input { pane, data } => {
-                let mut data = Some(data);
-                self.typing_after_upgrade(|| {
-                    self.with_input_pane(client.id, pane, |p, st| {
-                        let typing = data.as_ref().is_some_and(|d| !d.is_empty());
-                        if typing {
-                            self.typing_frozen(pane, st)?;
-                        }
-                        let data = data.take().unwrap_or_default();
-                        self.used_by(client, st);
-                        if typing {
-                            st.typed = true;
-                            st.agent.prompt.interrupted();
-                        }
-                        st.agent.user_answer(&data);
-                        self.acknowledge_programs(pane, st);
-                        if typing {
-                            self.pane_read(pane);
-                        }
-                        p.write(data);
-                        Ok::<_, String>(())
-                    })?
+                self.with_input_pane(client.id, pane, |p, st| {
+                    self.used_by(client, st);
+                    if !data.is_empty() {
+                        st.typed = true;
+                        st.agent.prompt.interrupted();
+                    }
+                    st.agent.user_answer(&data);
+                    self.acknowledge_programs(pane, st);
+                    if !data.is_empty() {
+                        self.pane_read(pane);
+                    }
+                    p.write(data);
                 })?;
                 Ok(Response::Ok)
             }
             Request::Paste { pane, text } => {
-                self.typing_after_upgrade(|| {
-                    self.with_input_pane(client.id, pane, |p, st| {
-                        self.paste_text(client, pane, p, st, &text)
-                    })?
+                self.with_input_pane(client.id, pane, |p, st| {
+                    self.paste_text(client, pane, p, st, &text)
                 })?;
                 Ok(Response::Ok)
             }
-            Request::Key { pane, key } => self.typing_after_upgrade(|| {
+            Request::Key { pane, key } => {
                 self.with_input_pane(client.id, pane, |p, st| {
-                    // Before encoding it (which scrolls and clears the selection): even a key
-                    // that types nothing waits out the hand-off.
-                    self.typing_frozen(pane, st)?;
                     let bytes = st.term.key(&key);
                     self.used_by(client, st);
                     if !bytes.is_empty() {
@@ -3889,10 +3875,9 @@ impl Daemon {
                         self.pane_read(pane);
                         p.write(bytes);
                     }
-                    Ok::<_, String>(())
-                })?
-            })
-            .map(|()| Response::Ok),
+                })?;
+                Ok(Response::Ok)
+            }
             Request::Mouse { pane, event } => {
                 let copy_on_select = self.config.read().terminal.copy_on_select;
                 let text = self.with_input_pane(client.id, pane, |p, st| {
@@ -4664,15 +4649,14 @@ impl Daemon {
             return Err(gone());
         }
         between();
-        self.typing_after_upgrade(|| {
-            self.with_input_pane(client, pane, |p, st| {
-                // A program that ended while its files came has nothing to type them to.
-                if !st.info.alive {
-                    return Err("This terminal has closed.".to_owned());
-                }
-                self.paste_text(&asker, pane, p, st, text)
-            })?
-        })
+        self.with_input_pane(client, pane, |p, st| {
+            // A program that ended while its files came has nothing to type them to.
+            if !st.info.alive {
+                return Err("This terminal has closed.".to_owned());
+            }
+            self.paste_text(&asker, pane, p, st, text);
+            Ok(())
+        })?
     }
 
     /// Types `text` into pane `pane` as a paste for `client`: what [`Request::Paste`] and the
@@ -4684,10 +4668,7 @@ impl Daemon {
         p: &Arc<Pane>,
         st: &mut PaneState,
         text: &str,
-    ) -> Result<(), String> {
-        if !text.is_empty() {
-            self.typing_frozen(pane, st)?;
-        }
+    ) {
         self.used_by(client, st);
         if !text.is_empty() {
             st.typed = true;
@@ -4699,7 +4680,6 @@ impl Daemon {
             self.pane_read(pane);
         }
         p.write(st.term.paste(text));
-        Ok(())
     }
 
     /// [`Request::Ext`]: a method of the extension API, its parameters and result as JSON text.
@@ -6788,49 +6768,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// While an upgrade hands the panes over, a resume line that comes due stays pending (the
-    /// hand-off may carry it for the next image to type); if the upgrade gives up, this
-    /// image services it again.
+    /// An upgrade hands over no pending resume: those left after its short wait are cancelled
+    /// (as typing would), so input meant to cancel one can never end with the old image while
+    /// the new one resumes the program.
     #[test]
-    fn a_resume_line_due_during_an_upgrade_stays_pending() {
-        let dir = test_dir("upgrade-pending");
-        let daemon = Daemon::new(
-            Config::default(),
-            dir.join("s.sock"),
-            dir.join("state"),
-            Arc::new(AtomicBool::new(false)),
-        );
-        let id = cat_pane(&daemon);
-        let pane = daemon.pane(id).unwrap();
-        let due = Instant::now();
-        pane.state.lock().pending_input = Some((due, b"x\r".to_vec()));
-        daemon.set_upgrading(true);
-        daemon.type_pending_input(&pane, &mut pane.state.lock());
-        {
-            let st = pane.state.lock();
-            assert_eq!(st.pending_input, Some((due, b"x\r".to_vec())));
-            assert_eq!(st.pending_waits, 0);
-        }
-        // Serviced again (`cat` is no shell: it waits for one).
-        daemon.set_upgrading(false);
-        daemon.type_pending_input(&pane, &mut pane.state.lock());
-        {
-            let st = pane.state.lock();
-            assert_eq!(st.pending_waits, 1);
-            assert!(st.pending_input.as_ref().is_some_and(|(d, _)| *d > due));
-        }
-        daemon.close_pane(id);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// While an upgrade hands the panes over, the first input into a pane waiting to resume
-    /// waits for it, so the `typed` the hand-off carries stays true to what the shell got. It
-    /// is not refused: keystrokes come without waiting for a reply (request ID 0), so a refusal
-    /// would drop them unseen. When the upgrade gives up, the input goes through and cancels
-    /// the resume.
-    #[test]
-    fn input_that_would_cancel_a_resume_waits_out_an_upgrade() {
-        let dir = test_dir("upgrade-input");
+    fn pending_resumes_are_cancelled_before_an_upgrade() {
+        let dir = test_dir("upgrade-resumes");
         let daemon = Daemon::new(
             Config::default(),
             dir.join("s.sock"),
@@ -6838,89 +6781,32 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         let waiting = cat_pane(&daemon);
-        let plain = cat_pane(&daemon);
         let ticketed = cat_pane(&daemon);
+        let plain = cat_pane(&daemon);
+        assert!(!daemon.resumes_pending());
+        // An expired ticket waits for nothing.
+        let mut stale = ticket_for(plain, &"e5".repeat(16), String::new());
+        stale.expires = Instant::now();
+        daemon.resume_tickets.lock().push(stale);
+        assert!(!daemon.resumes_pending());
         daemon.pane(waiting).unwrap().state.lock().pending_input =
             Some((Instant::now() + Duration::from_secs(600), b"x\r".to_vec()));
+        assert!(daemon.resumes_pending());
+        daemon.pane(waiting).unwrap().state.lock().pending_input = None;
         daemon
             .resume_tickets
             .lock()
             .push(ticket_for(ticketed, &"d4".repeat(16), String::new()));
-        let (client, _rx) = daemon.add_client();
-        let input = |pane| {
-            daemon.dispatch(
-                &client,
-                Request::Input {
-                    pane,
-                    data: b"a".to_vec(),
-                },
-            )
-        };
-        let key = thurm_proto::KeyEvent {
-            key: thurm_proto::Key::Char('a'),
-            mods: 0,
-            action: thurm_proto::KeyAction::Press,
-            text: "a".into(),
-            shifted: None,
-            base_layout: None,
-        };
-        daemon.set_upgrading(true);
-        std::thread::scope(|s| {
-            let held = [
-                s.spawn(|| input(waiting)),
-                s.spawn(|| input(ticketed)),
-                s.spawn(|| {
-                    daemon.dispatch(
-                        &client,
-                        Request::Paste {
-                            pane: waiting,
-                            text: "a".into(),
-                        },
-                    )
-                }),
-                s.spawn(|| {
-                    daemon.dispatch(
-                        &client,
-                        Request::Key {
-                            pane: ticketed,
-                            key: key.clone(),
-                        },
-                    )
-                }),
-            ];
-            std::thread::sleep(Duration::from_millis(200));
-            assert!(held.iter().all(|h| !h.is_finished()));
-            // What makes the upgrade give up just before its exec.
-            assert!(daemon.typing_held());
-            assert!(!daemon.pane(waiting).unwrap().state.lock().typed);
-            assert!(!daemon.pane(ticketed).unwrap().state.lock().typed);
-            // Nothing to cancel in the others.
-            assert!(input(plain).is_ok());
-            // A resize types nothing: it goes through.
-            let size = PaneSize {
-                cols: 91,
-                rows: 27,
-                ..PaneSize::default()
-            };
-            for pane in [waiting, ticketed] {
-                let resized = daemon.dispatch(&client, Request::Resize { pane, size });
-                assert!(resized.is_ok(), "{resized:?}");
-                let p = daemon.pane(pane).unwrap();
-                let st = p.state.lock();
-                assert_eq!(st.info.size.cols, 91);
-                assert!(!st.typed);
-            }
-            // The upgrade gave up: the held input goes through, and cancels the resume.
-            daemon.set_upgrading(false);
-            for h in held {
-                let done = h.join().unwrap();
-                assert!(done.is_ok(), "{done:?}");
-            }
-        });
-        assert!(!daemon.typing_held());
-        assert!(daemon.pane(waiting).unwrap().state.lock().typed);
-        assert!(daemon.pane(ticketed).unwrap().state.lock().typed);
-        for id in [waiting, plain, ticketed] {
+        assert!(daemon.resumes_pending());
+        daemon.pane(waiting).unwrap().state.lock().pending_input =
+            Some((Instant::now() + Duration::from_secs(600), b"x\r".to_vec()));
+
+        daemon.drop_pending_resumes();
+        assert!(!daemon.resumes_pending());
+        assert!(daemon.resume_tickets.lock().is_empty());
+        let waiting_pane = daemon.pane(waiting).unwrap();
+        assert!(waiting_pane.state.lock().pending_input.is_none());
+        for id in [waiting, ticketed, plain] {
             daemon.close_pane(id);
         }
         let _ = std::fs::remove_dir_all(dir);
