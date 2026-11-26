@@ -426,6 +426,20 @@ fn concealed_copy_across_pages() {
     }
 }
 
+/// A concealed space with a combining mark is a blank cell, as the formatter copies it: the
+/// plain text and the cells still line up.
+#[test]
+fn concealed_cluster_starting_with_a_blank() {
+    let mut t = term(20, 2);
+    t.advance("a\x1b[8m \u{301}x\x1b[mb".as_bytes());
+    t.selection(SelectionOp::SelectAll);
+    assert!(
+        t.vt.selection_copies().1.is_some(),
+        "plain and cells line up"
+    );
+    assert_eq!(t.selection_text(), "a  b");
+}
+
 /// Concealed spaces other than the ASCII one are text: blanked by their cells.
 #[test]
 fn concealed_unicode_spaces_are_blanked() {

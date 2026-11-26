@@ -1230,8 +1230,10 @@ impl Vt {
                 } else {
                     char::from_u32(c.codepoint).into_iter().collect()
                 };
-                // Blank cells: the formatter's text has ASCII blanks there (or nothing).
-                if text.iter().all(|c| matches!(c, '\0' | ' ')) {
+                // Blank cells: the formatter's text has ASCII blanks there (or nothing). A cell
+                // whose character is a space is one, marks on it and all: the formatter blanks
+                // it by its first character.
+                if matches!(text.first(), None | Some('\0' | ' ')) {
                     continue;
                 }
                 let hidden = c.has_styling
@@ -2262,14 +2264,9 @@ impl Blanker<'_> {
         let mut cells = 0;
         let mut rest = &self.hidden[..];
         while !rest.is_empty() {
-            // An ASCII blank (a written space, or the formatter's own for an empty cell) is
-            // one cell and none of the grid's cells with text.
-            if rest[0] == u32::from(' ') {
-                cells += 1;
-                rest = &rest[1..];
-                continue;
-            }
             match self.grid.split_first() {
+                // The grid's next concealed cell (none starts with a blank: a cell whose
+                // character is a space is a blank one, marks and all).
                 Some(((text, w), next))
                     if rest.len() >= text.len()
                         && text.iter().zip(rest).all(|(&c, &h)| c as u32 == h) =>
@@ -2277,6 +2274,12 @@ impl Blanker<'_> {
                     cells += w;
                     rest = &rest[text.len()..];
                     self.grid = next;
+                }
+                // An ASCII blank (a written space, or the formatter's own for an empty cell)
+                // is one cell and none of the grid's cells with text.
+                _ if rest[0] == u32::from(' ') => {
+                    cells += 1;
+                    rest = &rest[1..];
                 }
                 _ => {
                     // Off the grid's cells: measure the rest, and leave the grid be.
