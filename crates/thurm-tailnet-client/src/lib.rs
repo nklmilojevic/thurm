@@ -492,7 +492,10 @@ fn select_tailnet_interface(
         }
         std::net::IpAddr::V4(_) => {
             // Tailscale's fd7a:115c:a1e0::/48 ULA uniquely identifies a Tailscale tunnel over
-            // generic CGNAT VPNs.
+            // generic CGNAT VPNs. On Apple, every VPN creates a `utun*` interface, so require the
+            // Tailscale ULA to prove the interface belongs to Tailscale rather than another VPN
+            // using 100.64.0.0/10. On Linux, the interface name (`tailscale*`) already identifies
+            // Tailscale's TUN interface.
             let ula_confirmed: Vec<&Candidate> =
                 matching.iter().copied().filter(|c| c.v6.is_some()).collect();
             if ula_confirmed.len() == 1 {
@@ -502,14 +505,27 @@ fn select_tailnet_interface(
                     "multiple active Tailscale tunnel interfaces; refusing ambiguous plain route"
                         .into(),
                 ));
-            } else if matching.len() == 1 {
-                matching[0]
             } else {
-                return Err(ConnectError::Unreachable(
-                    "multiple tunnel interfaces hold 100.64.0.0/10 addresses; \
-                     refusing ambiguous plain route"
-                        .into(),
-                ));
+                #[cfg(target_os = "linux")]
+                {
+                    if matching.len() == 1 {
+                        matching[0]
+                    } else {
+                        return Err(ConnectError::Unreachable(
+                            "multiple tailscale* interfaces hold 100.64.0.0/10 addresses; \
+                             refusing ambiguous plain route"
+                                .into(),
+                        ));
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(ConnectError::Unreachable(
+                        "no utun interface confirmed as Tailscale (missing fd7a:115c:a1e0::/48 ULA); \
+                         refusing unverified 100.64.0.0/10 plain route"
+                            .into(),
+                    ));
+                }
             }
         }
     };

@@ -296,6 +296,28 @@ fn plain_tailnet_fails_closed_without_active_tailscale_tunnel() {
             select_tailnet_interface(target_v4, &ambiguous),
             Err(ConnectError::Unreachable(_))
         ));
+
+        // On Apple, a lone utun* carrying only 100.64/10 (without Tailscale's unique ULA) could
+        // be an unrelated corporate/CGNAT VPN, so it must fail closed; on Linux, `tailscale0`
+        // identifies Tailscale by interface name.
+        let lone_v4_only = [InterfaceAddr {
+            name: tun_a.into(),
+            index: 11,
+            addr: "100.64.0.1".parse().unwrap(),
+            point_to_point: true,
+        }];
+        #[cfg(target_vendor = "apple")]
+        assert!(matches!(
+            select_tailnet_interface(target_v4, &lone_v4_only),
+            Err(ConnectError::Unreachable(_))
+        ));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            select_tailnet_interface(target_v4, &lone_v4_only)
+                .unwrap()
+                .name,
+            tun_a
+        );
     }
 }
 
