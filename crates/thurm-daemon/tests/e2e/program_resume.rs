@@ -344,7 +344,19 @@ fn zsh_and_bash_integration_resume_uses_startup_path_bypasses_aliases_and_suspen
             alias_marker.display(),
         );
         if shell_name == "zsh" {
-            std::fs::write(home.join(".zshrc"), &rc_body).unwrap();
+            // The program is on PATH only once a precmd hook (not one Thurm knows by name)
+            // ran: the resume must come after it.
+            let zshrc = rc_body.replacen(
+                &format!("export PATH=\"{}:$PATH\"\n", custom_bin.display()),
+                &format!(
+                    "_my_env_hook() {{ [[ :$PATH: == *:{0}:* ]] || export PATH=\"{0}:$PATH\"; }}\n\
+                     precmd_functions+=(_my_env_hook)\n",
+                    custom_bin.display()
+                ),
+                1,
+            );
+            assert_ne!(zshrc, rc_body);
+            std::fs::write(home.join(".zshrc"), &zshrc).unwrap();
         } else {
             std::fs::write(home.join(".bashrc"), &rc_body).unwrap();
             std::fs::write(home.join(".bash_profile"), "source ~/.bashrc\n").unwrap();
@@ -882,10 +894,13 @@ fn fish_integration_resume_uses_startup_path_and_bypasses_functions() {
 
     let prog = custom_bin.join("fishresumeprog");
     write_exec(&prog, "#!/bin/sh\necho FISH_RESUMED_OK\n");
+    // The program is on PATH only once a prompt handler config.fish registered ran (as
+    // direnv's does): the resume must come after it.
     std::fs::write(
         home.join(".config/fish/config.fish"),
         format!(
-            "fish_add_path -p '{}'\nfunction fishresumeprog; touch '{}'; end\n",
+            "function __my_env --on-event fish_prompt; fish_add_path -gp '{}'; end\n\
+             function fishresumeprog; touch '{}'; end\n",
             custom_bin.display(),
             fn_marker.display(),
         ),

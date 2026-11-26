@@ -83,7 +83,9 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
       local _rt="$_thurm_resume_ticket" _re="$_thurm_resume_exec"
       _thurm_resume_ticket=""
       _thurm_resume_exec=""
-      command "$_re" --exec-resume "$_rt"
+      # A failed resume (gone program, unreachable daemon) must not end the shell under
+      # `set -e`: the prompt still comes.
+      command "$_re" --exec-resume "$_rt" || :
     fi
     builtin printf '\e]133;A\a'
     if [[ "$PS1" != *'133;B'* ]]; then
