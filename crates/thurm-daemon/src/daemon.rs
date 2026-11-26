@@ -3016,10 +3016,7 @@ impl Daemon {
             // only one found where that executable (or its script) is. Taken from the verdict,
             // not looked up by the rule's name: a rule need not have one.
             let exe_dirs = if pin_exe {
-                let dirs = program_resume::pin_dirs(
-                    &rec.process_exe,
-                    rec.launch.as_ref().and_then(|l| l.script.as_deref()),
-                );
+                let dirs = program_resume::saved_pin_dirs(&rec.process_exe, rec.launch.as_ref());
                 if dirs.is_empty() {
                     skip("program_gone");
                     plans.push(None);

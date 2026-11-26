@@ -93,6 +93,11 @@ pub struct SavedLaunchEvidence {
     /// An interpreter's script operand, absolute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
+    /// The canonical file `script` named when the report was accepted: restore pins the
+    /// program to its directory (`program_resume::saved_pin_dirs`) without following the
+    /// launcher again. `None` with a `script` pins nothing, so nothing is resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_target: Option<String>,
     /// One entry per distinct set of flags (with arities) a rule for this command checks.
     #[serde(default)]
     pub flags: Vec<SavedFlagEvidence>,
@@ -563,6 +568,7 @@ mod tests {
                     launch: Some(SavedLaunchEvidence {
                         program: "nvim".into(),
                         script: None,
+                        script_target: None,
                         flags: vec![SavedFlagEvidence {
                             checked: BTreeMap::from([("-S".to_owned(), FlagArity::One)]),
                             occurrences: vec![("-S".into(), vec!["0f".into()])],

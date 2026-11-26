@@ -936,6 +936,21 @@ mod proc_tests {
     }
 
     #[test]
+    fn only_a_group_of_the_user_alone_is_private() {
+        let me = b"nkl".to_vec();
+        assert!(is_private_group(&me, &me, &[]));
+        assert!(is_private_group(&me, &me, std::slice::from_ref(&me)));
+        // Another member, another name (`staff`, `users`), or no user name: shared.
+        assert!(!is_private_group(&me, &me, &[me.clone(), b"eve".to_vec()]));
+        assert!(!is_private_group(&me, b"staff", &[]));
+        assert!(!is_private_group(b"", b"", &[]));
+        // macOS gives every account `staff` as its primary group.
+        if cfg!(target_os = "macos") {
+            assert_eq!(private_group(unsafe { libc::geteuid() }, 20), None);
+        }
+    }
+
+    #[test]
     fn trusted_install_requires_a_chain_nobody_else_can_change() {
         use std::path::Path;
         const ME: u32 = 501;
@@ -953,7 +968,7 @@ mod proc_tests {
         let check = |exe: &str, dir: Ownership, file: Ownership| {
             let exe = Path::new(exe);
             let parent = exe.parent().unwrap().to_path_buf();
-            is_trusted_install_with(exe, ME, MY_GID, |p| {
+            is_trusted_install_with(exe, ME, Some(MY_GID), |p| {
                 Some(if p == exe {
                     file
                 } else if p == parent {
@@ -981,6 +996,33 @@ mod proc_tests {
         // Nix's store: root's, group-writable by its build users, sticky.
         let store = entry(0, 30000, 0o41775, true);
         assert!(check("/nix/store/fish", store, root_exe));
+        // Root's but writable by another group: not without the sticky bit, never a file.
+        let unsticky = entry(0, 30000, 0o40775, true);
+        assert!(!check("/nix/store/fish", unsticky, root_exe));
+        assert!(!check("/usr/local/share/fish", store, root_exe));
+        let group_exe = entry(0, 100, 0o100775, false);
+        assert!(!check("/nix/store/fish", root_dir, group_exe));
+        assert!(!check("/opt/homebrew/bin/fish", root_dir, group_exe));
+        // The user's primary group when it is shared (macOS's `staff`): not trusted to write.
+        let staff_exe = entry(ME, MY_GID, 0o100775, false);
+        let staff_dir = entry(ME, MY_GID, 0o40775, true);
+        let shared_primary = |exe: &str, dir: Ownership, file: Ownership| {
+            let exe = Path::new(exe);
+            let parent = exe.parent().unwrap().to_path_buf();
+            is_trusted_install_with(exe, ME, None, |p| {
+                Some(if p == exe {
+                    file
+                } else if p == parent {
+                    dir
+                } else {
+                    root_dir
+                })
+            })
+        };
+        assert!(check("/usr/local/bin/fish", mine_dir, staff_exe));
+        assert!(!shared_primary("/usr/local/bin/fish", mine_dir, staff_exe));
+        assert!(!shared_primary("/usr/local/bin/fish", staff_dir, mine_exe));
+        assert!(shared_primary("/usr/local/bin/fish", mine_dir, mine_exe));
         // Under a package prefix, another account's tree or file is not trusted...
         let theirs_dir = entry(1001, 1001, 0o40755, true);
         let theirs_exe = entry(1001, 1001, 0o100755, false);
@@ -999,7 +1041,7 @@ mod proc_tests {
         assert!(!check("/usr/local/bin/zsh", mine_dir, shared_exe));
         // A higher directory counts too.
         let exe = Path::new("/opt/homebrew/Cellar/fish/4.0/bin/fish");
-        assert!(!is_trusted_install_with(exe, ME, MY_GID, |p| {
+        assert!(!is_trusted_install_with(exe, ME, Some(MY_GID), |p| {
             Some(if p == exe {
                 mine_exe
             } else if p == Path::new("/opt/homebrew/Cellar") {
@@ -1013,7 +1055,7 @@ mod proc_tests {
         assert!(!is_trusted_install_with(
             Path::new("/bin/sh"),
             ME,
-            MY_GID,
+            Some(MY_GID),
             |_| None
         ));
         // On disk: a file in a private directory of the user's, and the system shell.
@@ -1080,6 +1122,22 @@ mod proc_tests {
         // Nothing read proves nothing.
         assert!(!roots_agree(None, Some(daemon), None));
         assert!(!roots_agree(Some(daemon), None, None));
+        // The same directory reached through another mount (a bind mount of `/` without the
+        // mounts under it) is not the same root.
+        let (root, bind) = ((64769u64, 2u64, 1u64), (64769u64, 2u64, 731u64));
+        assert!(!roots_agree(Some(bind), Some(root), None));
+        assert!(!roots_agree(Some(root), Some(root), Some(Some(bind))));
+        assert_eq!(
+            fdinfo_mnt_id("pos:\t0\nflags:\t012100000\nmnt_id:\t731\nino:\t2\n"),
+            Some(731)
+        );
+        assert_eq!(fdinfo_mnt_id("pos:\t0\nflags:\t012100000\n"), None);
+        assert_eq!(fdinfo_mnt_id("mnt_id:\tx\n"), None);
+        #[cfg(target_os = "linux")]
+        {
+            let own = root_identity("/proc/self/root").expect("own root identity");
+            assert_eq!(root_identity(&format!("/proc/{me}/root")), Some(own));
+        }
         assert!(same_mount_ns(me));
         assert!(
             !same_root(u32::MAX - 7, me),
@@ -1679,13 +1737,46 @@ pub fn controlling_tty(pid: u32) -> Option<u64> {
 /// (setuid `login(1)` on macOS cannot).
 #[cfg(target_os = "linux")]
 pub fn same_root(pid: u32, reference_pid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let id = |p: String| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
     roots_agree(
-        id(format!("/proc/{pid}/root")),
-        id("/proc/self/root".to_owned()),
-        id(format!("/proc/{reference_pid}/root")).map(Some),
+        root_identity(&format!("/proc/{pid}/root")),
+        root_identity("/proc/self/root"),
+        root_identity(&format!("/proc/{reference_pid}/root")).map(Some),
     )
+}
+
+/// The identity of the directory a procfs `root` link leads to: its device and inode, and the
+/// mount it is reached through (a bind mount of `/` that leaves out the mounts under it has
+/// the same device and inode, but not the same view). Read from one handle on it; `None` when
+/// any of it cannot be read.
+#[cfg(target_os = "linux")]
+fn root_identity(link: &str) -> Option<(u64, u64, u64)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let c = std::ffi::CString::new(link).ok()?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return None;
+    }
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).ok()?;
+    let mnt_id = fdinfo_mnt_id(&info)?;
+    Some((st.st_dev as u64, st.st_ino as u64, mnt_id))
+}
+
+/// The `mnt_id:` field of a `/proc/<pid>/fdinfo/<fd>` file.
+#[cfg(any(target_os = "linux", test))]
+fn fdinfo_mnt_id(info: &str) -> Option<u64> {
+    info.lines()
+        .find_map(|l| l.strip_prefix("mnt_id:"))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// The rule [`same_root`] applies: the reporter's root must be read and be the daemon's (an
@@ -1829,6 +1920,9 @@ fn ancestors_with(
 /// user on some systems (Homebrew's prefix is its admin's, group-writable by `admin`; a
 /// single-user Nix store is the user's), so they are trusted when only root, the daemon's user
 /// or a group standing for those can change them, rather than only when root owns them.
+/// Those groups are root's, macOS's `admin` (whose members can become root anyway) and the
+/// user's private group; any other group may only write to the Nix store, a sticky directory
+/// of root's where its build users cannot replace what they do not own.
 const PACKAGE_PREFIXES: &[&str] = &[
     "/opt/homebrew",
     "/usr/local",
@@ -1854,8 +1948,10 @@ struct Ownership {
 /// one the user put somewhere outside a package prefix is not either.
 pub fn is_trusted_install(exe: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
+    static PRIVATE_GID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    is_trusted_install_with(exe, uid, gid, |p| {
+    let private_gid = *PRIVATE_GID.get_or_init(|| private_group(uid, gid));
+    is_trusted_install_with(exe, uid, private_gid, |p| {
         std::fs::metadata(p).ok().map(|m| Ownership {
             uid: m.uid(),
             gid: m.gid(),
@@ -1866,10 +1962,49 @@ pub fn is_trusted_install(exe: &std::path::Path) -> bool {
     })
 }
 
+/// `gid` when it is `uid`'s own group, which nobody else is in: named after the user and
+/// listing no other member (a user-private group, which Linux distributions give each account
+/// and Linuxbrew's installer makes its prefix writable by). A shared primary group (macOS's
+/// `staff`, a `users` group) is not, nor one that cannot be read.
+fn private_group(uid: u32, gid: u32) -> Option<u32> {
+    use std::ffi::CStr;
+    let mut buf = vec![0 as libc::c_char; 16384];
+    let user = unsafe {
+        let mut pw: libc::passwd = std::mem::zeroed();
+        let mut out = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out);
+        if rc != 0 || out.is_null() || pw.pw_name.is_null() {
+            return None;
+        }
+        CStr::from_ptr(pw.pw_name).to_bytes().to_vec()
+    };
+    let mut gbuf = vec![0 as libc::c_char; 65536];
+    let (group, members) = unsafe {
+        let mut gr: libc::group = std::mem::zeroed();
+        let mut out = std::ptr::null_mut();
+        let rc = libc::getgrgid_r(gid, &mut gr, gbuf.as_mut_ptr(), gbuf.len(), &mut out);
+        if rc != 0 || out.is_null() || gr.gr_name.is_null() {
+            return None;
+        }
+        let mut members = Vec::new();
+        let mut m = gr.gr_mem;
+        while !m.is_null() && !(*m).is_null() {
+            members.push(CStr::from_ptr(*m).to_bytes().to_vec());
+            m = m.add(1);
+        }
+        (CStr::from_ptr(gr.gr_name).to_bytes().to_vec(), members)
+    };
+    is_private_group(&user, &group, &members).then_some(gid)
+}
+
+fn is_private_group(user: &[u8], group: &[u8], members: &[Vec<u8>]) -> bool {
+    !user.is_empty() && group == user && members.iter().all(|m| m == user)
+}
+
 fn is_trusted_install_with(
     exe: &std::path::Path,
     my_uid: u32,
-    my_gid: u32,
+    private_gid: Option<u32>,
     meta: impl Fn(&std::path::Path) -> Option<Ownership>,
 ) -> bool {
     if !exe.is_absolute() {
@@ -1879,21 +2014,27 @@ fn is_trusted_install_with(
         .iter()
         .any(|p| exe.starts_with(p) && exe != std::path::Path::new(p));
     let root_only = |m: &Ownership| m.uid == 0 && m.mode & 0o022 == 0;
-    // The group may write when it is root's, macOS's `admin` (who can become root anyway), the
-    // user's own, or one root gave a directory it owns to (Nix's build users).
+    // The group may write when it is root's, macOS's `admin` (who can become root anyway) or
+    // the user's private one; any other only to the Nix store, root's and sticky: its build
+    // users can add entries there, but not replace root's (each checked in turn).
     let admin_gid = if cfg!(target_os = "macos") { 80 } else { 0 };
-    let package_owned = |m: &Ownership| {
+    let group_may_write = |path: &std::path::Path, m: &Ownership| {
+        m.gid == 0
+            || m.gid == admin_gid
+            || private_gid == Some(m.gid)
+            || (m.uid == 0
+                && m.is_dir
+                && m.mode & 0o1000 != 0
+                && path == std::path::Path::new("/nix/store"))
+    };
+    let package_owned = |path: &std::path::Path, m: &Ownership| {
         (m.uid == 0 || m.uid == my_uid)
             && m.mode & 0o002 == 0
-            && (m.mode & 0o020 == 0
-                || m.gid == 0
-                || m.gid == admin_gid
-                || m.gid == my_gid
-                || m.uid == 0)
+            && (m.mode & 0o020 == 0 || group_may_write(path, m))
     };
-    let ok = |m: &Ownership| {
+    let ok = |path: &std::path::Path, m: &Ownership| {
         if packaged {
-            package_owned(m)
+            package_owned(path, m)
         } else {
             root_only(m)
         }
@@ -1901,12 +2042,12 @@ fn is_trusted_install_with(
     let Some(file) = meta(exe) else {
         return false;
     };
-    if !file.is_file || !ok(&file) {
+    if !file.is_file || !ok(exe, &file) {
         return false;
     }
     exe.ancestors()
         .skip(1)
-        .all(|dir| meta(dir).is_some_and(|m| m.is_dir && ok(&m)))
+        .all(|dir| meta(dir).is_some_and(|m| m.is_dir && ok(dir, &m)))
 }
 
 /// The foreground group of the pane's terminal (`pgrp`), seen through PTY proxies. While a
