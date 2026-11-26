@@ -748,6 +748,9 @@ final class TerminalRenderer {
     /// Drops all uploaded Kitty image textures immediately (e.g. under iOS memory pressure).
     func purgeImageTextures() {
         imageTextures.removeAll(keepingCapacity: false)
+        // The last frame's segments hold the textures they drew; drop them too so an idle pane
+        // releases its images now rather than at the next draw.
+        segments.removeAll(keepingCapacity: true)
     }
 
     /// The base surface after the same dim and bell covers used by `buildQuads`.
@@ -1014,13 +1017,16 @@ final class TerminalRenderer {
                     if blockCursor && r == cursorRow && g.col == cursorCol {
                         fg = (info.cursor_text_color & kNoColor) != 0 ? info.background : info.cursor_text_color
                     }
-                    let entry = shaper.glyphs.entry(for: GlyphKey(font: g.font, glyph: g.glyph, span: g.span),
-                                                    font: shaper.font(g.font), isColor: g.color,
-                                                    cell: CellBox(width: cw, height: ch, baseline: shaper.baseline))
-                    if entry.isEmpty {
-                        if g.color && shaper.glyphs.color == nil { wantsAnotherFrame = true }
+                    guard let entry = shaper.glyphs.lookup(
+                        for: GlyphKey(font: g.font, glyph: g.glyph, span: g.span),
+                        font: shaper.font(g.font), isColor: g.color,
+                        cell: CellBox(width: cw, height: ch, baseline: shaper.baseline))
+                    else {
+                        // Only an allocation failure is worth another frame; empty glyphs stay empty.
+                        wantsAnotherFrame = true
                         continue
                     }
+                    if entry.isEmpty { continue }
                     let gx = (padX + Float(g.col) * fcw + g.x.rounded() + entry.left).rounded()
                     let gy = (baselineY - g.y.rounded() - entry.top).rounded()
                     glyphQuads.append(QuadInstance(
@@ -1225,30 +1231,22 @@ final class TerminalRenderer {
                                                                 height: dstH, mipmapped: false)
             desc.usage = [.shaderRead]
             guard let made = device.makeTexture(descriptor: desc) else { return .missing }
-            let srcW = Int(width)
-            let srcH = Int(height)
-            var downscaled = [UInt8](repeating: 0, count: dstW * dstH * 4)
-            downscaled.withUnsafeMutableBufferPointer { dst in
-                guard let dstBase = dst.baseAddress else { return }
-                for y in 0..<dstH {
-                    let sy = min(srcH - 1, (y * srcH) / dstH)
-                    let srcRow = src + sy * srcW * 4
-                    let dstRow = dstBase + y * dstW * 4
-                    for x in 0..<dstW {
-                        let sx = min(srcW - 1, (x * srcW) / dstW)
-                        let s = srcRow + sx * 4
-                        let d = dstRow + x * 4
-                        d[0] = s[0]
-                        d[1] = s[1]
-                        d[2] = s[2]
-                        d[3] = s[3]
-                    }
+            // Uploaded in bands through one small reusable buffer: a destination-sized scratch
+            // image would add up to 64 MiB on top of the texture and the FFI's source pixels.
+            let bandRows = max(1, min(dstH, TerminalRenderer.downsampleBandBytes / (dstW * 4)))
+            var band = [UInt8](repeating: 0, count: bandRows * dstW * 4)
+            var y0 = 0
+            while y0 < dstH {
+                let rows = min(bandRows, dstH - y0)
+                band.withUnsafeMutableBufferPointer { dst in
+                    guard let dstBase = dst.baseAddress else { return }
+                    TerminalRenderer.downsample(src, width: Int(width), height: Int(height),
+                                                toWidth: dstW, height: dstH, rows: y0..<(y0 + rows),
+                                                into: dstBase)
+                    made.replace(region: MTLRegionMake2D(0, y0, dstW, rows), mipmapLevel: 0,
+                                 withBytes: dstBase, bytesPerRow: dstW * 4)
                 }
-            }
-            downscaled.withUnsafeBytes { raw in
-                guard let base = raw.baseAddress else { return }
-                made.replace(region: MTLRegionMake2D(0, 0, dstW, dstH), mipmapLevel: 0,
-                             withBytes: base, bytesPerRow: dstW * 4)
+                y0 += rows
             }
             tex = made
         }
@@ -1260,5 +1258,48 @@ final class TerminalRenderer {
     /// Forget cached image textures (e.g. after reconnecting).
     func resetImages() {
         imageTextures.removeAll()
+    }
+
+    /// The most scratch memory an oversized image's downscale holds at once.
+    static let downsampleBandBytes = 1 << 20
+
+    /// Box-filters straight (non-premultiplied) RGBA `src` (`width`×`height`) down to
+    /// `toWidth`×`toHeight`, writing destination `rows` tightly packed into `dst`. Each output
+    /// pixel averages every source pixel it covers, weighted by alpha so transparent pixels don't
+    /// darken the colour, which keeps detail (fine stripes, thin lines) a point sample would drop.
+    static func downsample(_ src: UnsafePointer<UInt8>, width srcW: Int, height srcH: Int,
+                           toWidth dstW: Int, height dstH: Int, rows: Range<Int>,
+                           into dst: UnsafeMutablePointer<UInt8>) {
+        for (i, y) in rows.enumerated() {
+            let sy0 = y * srcH / dstH
+            let sy1 = max(sy0 + 1, min(srcH, (y + 1) * srcH / dstH))
+            let out = dst + i * dstW * 4
+            for x in 0..<dstW {
+                let sx0 = x * srcW / dstW
+                let sx1 = max(sx0 + 1, min(srcW, (x + 1) * srcW / dstW))
+                var r: UInt64 = 0, g: UInt64 = 0, b: UInt64 = 0, a: UInt64 = 0
+                for sy in sy0..<sy1 {
+                    var s = src + (sy * srcW + sx0) * 4
+                    for _ in sx0..<sx1 {
+                        let pa = UInt64(s[3])
+                        r += UInt64(s[0]) * pa
+                        g += UInt64(s[1]) * pa
+                        b += UInt64(s[2]) * pa
+                        a += pa
+                        s += 4
+                    }
+                }
+                let d = out + x * 4
+                let count = UInt64((sy1 - sy0) * (sx1 - sx0))
+                if a == 0 {
+                    d[0] = 0; d[1] = 0; d[2] = 0; d[3] = 0
+                } else {
+                    d[0] = UInt8((r + a / 2) / a)
+                    d[1] = UInt8((g + a / 2) / a)
+                    d[2] = UInt8((b + a / 2) / a)
+                    d[3] = UInt8((a + count / 2) / count)
+                }
+            }
+        }
     }
 }

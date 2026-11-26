@@ -108,8 +108,14 @@ final class GlyphAtlas {
             ctx.commit(commands, countsAsFrame: false)
         } else {
             commands.commit()
-            commands.waitUntilCompleted()
         }
+        // Waited for either way: `upload` writes the new texture from the CPU right after this
+        // returns, and a glyph reserved across the old height would otherwise land in rows the
+        // copy then overwrites with old texels. Growth is rare (the height doubles).
+        commands.waitUntilCompleted()
+        // A failed copy is not published: glyphs cached against the old texture would be missing
+        // from the new one with no epoch change. Returning false makes `reserve` wipe instead.
+        guard commands.status == .completed else { return false }
         height = newHeight
         texture = newTex
         return true
@@ -210,6 +216,13 @@ final class GlyphCache {
     }
 
     func entry(for key: GlyphKey, font: CTFont, isColor: Bool, cell: CellBox? = nil) -> GlyphEntry {
+        lookup(for: key, font: font, isColor: isColor, cell: cell) ?? .empty
+    }
+
+    /// Like `entry`, but nil when the glyph hit a transient atlas allocation failure and is
+    /// worth retrying on a later frame. A glyph that is permanently empty (no bounds, nothing to
+    /// draw) comes back as a cached `.empty`, so callers don't keep redrawing for it.
+    func lookup(for key: GlyphKey, font: CTFont, isColor: Bool, cell: CellBox? = nil) -> GlyphEntry? {
         syncEpochs()
         if isColor {
             if let e = colorEntries[key] { return e }
@@ -220,7 +233,7 @@ final class GlyphCache {
                                                      baseline: $0.baseline) } : nil
         guard let e = rasterize(glyph: key.glyph, font: font, isColor: isColor, fit: box) else {
             // Transient atlas allocation failure: leave uncached so later frames retry.
-            return .empty
+            return nil
         }
         // Rasterizing may wipe its atlas and bump its epoch; flush stale entries of that atlas
         // before recording the freshly uploaded entry.
