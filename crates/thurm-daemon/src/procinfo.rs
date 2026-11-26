@@ -30,8 +30,8 @@ pub fn executable(p: &ProcessInfo) -> String {
 
 #[cfg(target_os = "linux")]
 fn name(pid: u32) -> Option<String> {
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    Some(comm.trim_end().to_owned())
+    let comm = std::fs::read(format!("/proc/{pid}/comm")).ok()?;
+    Some(String::from_utf8_lossy(&comm).trim_end().to_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -787,11 +787,113 @@ mod proc_tests {
 
     #[test]
     fn zombie_and_dead_states_are_not_live() {
-        assert!(stat_state_is_live(" S 1 2 3"));
-        assert!(stat_state_is_live(" R 1 2 3"));
-        assert!(!stat_state_is_live(" Z 1 2 3"));
-        assert!(!stat_state_is_live(" X 1 2 3"));
-        assert!(!stat_state_is_live(""));
+        assert!(stat_state_is_live(Some("S")));
+        assert!(stat_state_is_live(Some("R")));
+        assert!(!stat_state_is_live(Some("Z")));
+        assert!(!stat_state_is_live(Some("X")));
+        assert!(!stat_state_is_live(None));
+    }
+
+    #[test]
+    fn procfs_records_parse_whatever_the_process_name() {
+        // A name with non-UTF-8 bytes, spaces and a `)` of its own.
+        let stat = b"4242 (we\xffird) n) S 1 4242 4242 34816 4242 4194560 0 0 0 0 0 0 0 0 20 0 1 0 98765 0";
+        let f = stat_fields(stat).unwrap();
+        assert_eq!(f[0], "S");
+        assert_eq!(f[1], "1");
+        assert_eq!(f[19], "98765");
+        assert_eq!(stat_fields(b"no name"), None);
+        let status = b"Name:\tst\xfe\xffrange\nUmask:\t0022\nState:\tS (sleeping)\nUid:\t501\t502\t502\t502\nGid:\t20\n";
+        assert_eq!(status_uids(status), Some((501, 502)));
+        assert_eq!(status_uids(b"Name:\tx\n"), None);
+    }
+
+    /// A program whose executable name is not UTF-8 is still alive, born and owned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_utf8_process_name_is_still_inspected() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = PrivateDir::new();
+        let exe = dir.path().join(std::ffi::OsStr::from_bytes(b"sl\xffeep"));
+        let Ok(sleep) = std::fs::canonicalize("/bin/sleep") else {
+            return;
+        };
+        std::fs::copy(sleep, &exe).unwrap();
+        // Another test forking while the copy was open can leave it busy for a moment.
+        let mut tries = 0;
+        let mut child = loop {
+            match std::process::Command::new(&exe).arg("30").spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                spawned => break spawned.unwrap(),
+            }
+        };
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Until the exec, the child still has the test's name.
+        while std::fs::read(format!("/proc/{pid}/comm")).is_ok_and(|c| !c.contains(&0xff)) {
+            assert!(std::time::Instant::now() < deadline, "child never ran");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(live_process_birth(pid).is_some());
+        assert!(process_birth(pid).is_some());
+        assert_eq!(parent(pid), Some(std::process::id()));
+        let me = unsafe { (libc::getuid(), libc::geteuid()) };
+        assert_eq!(process_uids(pid), Some(me));
+        assert!(job(pid).is_some());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// A program whose main thread ended while a worker runs on is alive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_leader_zombie_with_a_live_worker_is_alive() {
+        extern "C" fn worker(_: *mut libc::c_void) -> *mut libc::c_void {
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // The child's only thread is its leader: start a worker, then end the leader
+            // alone (what `pthread_exit` comes to, without unwinding through Rust frames).
+            unsafe {
+                let mut t: libc::pthread_t = std::mem::zeroed();
+                if libc::pthread_create(&mut t, std::ptr::null(), worker, std::ptr::null_mut()) != 0
+                {
+                    libc::_exit(1);
+                }
+                libc::syscall(libc::SYS_exit, 0);
+                libc::_exit(1);
+            }
+        }
+        let pid = pid as u32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while proc_stat(format!("/proc/{pid}/stat"))
+            .is_some_and(|f| f.first().map(String::as_str) != Some("Z"))
+        {
+            assert!(std::time::Instant::now() < deadline, "leader never ended");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let alive = live_process_birth(pid).is_some();
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // With every thread gone, the zombie left is not alive.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut exited = false;
+        while std::time::Instant::now() < deadline {
+            if live_process_birth(pid).is_none() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), 0) };
+        assert!(alive, "a running worker keeps the process alive");
+        assert!(exited, "an exited thread group is not alive");
     }
 
     #[test]
@@ -826,29 +928,103 @@ mod proc_tests {
         // A cycle that never reaches the pane is not descent.
         let cyclic = |p: u32| Some(if p == 10 { 11 } else { 10 });
         assert!(!ancestors_with(10, 5, cyclic).1);
-        // Reaching pid 1 without the pane is not descent.
-        assert!(!ancestors_with(50, 900, parent_of).1);
+        // Reaching pid 1 stops the walk, even where a parent lookup would go on to the pane.
+        let parent_through_init = |p: u32| Some(if p == 1 { 900 } else { p - 1 });
+        let (chain, reached) = ancestors_with(50, 900, parent_through_init);
+        assert_eq!(chain.last(), Some(&1));
+        assert!(!reached);
     }
 
     #[test]
-    fn trusted_install_requires_root_owned_chain_or_package_prefix() {
-        assert!(is_trusted_install(std::path::Path::new(
-            "/nix/store/abc-bash/bin/bash"
-        )));
-        assert!(is_trusted_install(std::path::Path::new(
-            "/opt/homebrew/Cellar/fish/4.0/bin/fish"
-        )));
-        assert!(!is_trusted_install(std::path::Path::new("bin/sh")));
-        // A file the user owns is not a trusted install, wherever it is.
-        let dir = std::env::temp_dir().join(format!("thurm-trust-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fake = dir.join("zsh");
+    fn trusted_install_requires_a_chain_nobody_else_can_change() {
+        use std::path::Path;
+        const ME: u32 = 501;
+        const MY_GID: u32 = 20;
+        let entry = |uid, gid, mode, is_dir| Ownership {
+            uid,
+            gid,
+            mode,
+            is_dir,
+            is_file: !is_dir,
+        };
+        let root_dir = entry(0, 0, 0o40755, true);
+        let root_exe = entry(0, 0, 0o100755, false);
+        // `exe` is `file`, its parent `dir`, every directory above root's.
+        let check = |exe: &str, dir: Ownership, file: Ownership| {
+            let exe = Path::new(exe);
+            let parent = exe.parent().unwrap().to_path_buf();
+            is_trusted_install_with(exe, ME, MY_GID, |p| {
+                Some(if p == exe {
+                    file
+                } else if p == parent {
+                    dir
+                } else {
+                    root_dir
+                })
+            })
+        };
+        // Root's all the way: trusted anywhere.
+        assert!(check("/bin/zsh", root_dir, root_exe));
+        assert!(check("/nix/store/abc-bash/bin/bash", root_dir, root_exe));
+        // The user's own file outside a package prefix: not trusted.
+        let mine_dir = entry(ME, MY_GID, 0o40755, true);
+        let mine_exe = entry(ME, MY_GID, 0o100755, false);
+        assert!(!check("/home/me/bin/zsh", mine_dir, mine_exe));
+        // A Homebrew tree the user administers (group-writable by `admin` on macOS).
+        let admin = if cfg!(target_os = "macos") {
+            80
+        } else {
+            MY_GID
+        };
+        let brew_dir = entry(ME, admin, 0o40775, true);
+        assert!(check("/opt/homebrew/bin/fish", brew_dir, mine_exe));
+        // Nix's store: root's, group-writable by its build users, sticky.
+        let store = entry(0, 30000, 0o41775, true);
+        assert!(check("/nix/store/fish", store, root_exe));
+        // Under a package prefix, another account's tree or file is not trusted...
+        let theirs_dir = entry(1001, 1001, 0o40755, true);
+        let theirs_exe = entry(1001, 1001, 0o100755, false);
+        assert!(!check(
+            "/home/linuxbrew/.linuxbrew/bin/bash",
+            theirs_dir,
+            root_exe
+        ));
+        assert!(!check("/opt/homebrew/bin/atuin", mine_dir, theirs_exe));
+        // ...nor one anyone can write, nor one a group of others can.
+        let open_dir = entry(ME, MY_GID, 0o40777, true);
+        assert!(!check("/opt/homebrew/bin/zsh", open_dir, mine_exe));
+        let shared_dir = entry(ME, 100, 0o40775, true);
+        assert!(!check("/usr/local/bin/zsh", shared_dir, mine_exe));
+        let shared_exe = entry(ME, 100, 0o100775, false);
+        assert!(!check("/usr/local/bin/zsh", mine_dir, shared_exe));
+        // A higher directory counts too.
+        let exe = Path::new("/opt/homebrew/Cellar/fish/4.0/bin/fish");
+        assert!(!is_trusted_install_with(exe, ME, MY_GID, |p| {
+            Some(if p == exe {
+                mine_exe
+            } else if p == Path::new("/opt/homebrew/Cellar") {
+                open_dir
+            } else {
+                mine_dir
+            })
+        }));
+        // A relative path and an unreadable file are not installs.
+        assert!(!check("bin/sh", root_dir, root_exe));
+        assert!(!is_trusted_install_with(
+            Path::new("/bin/sh"),
+            ME,
+            MY_GID,
+            |_| None
+        ));
+        // On disk: a file in a private directory of the user's, and the system shell.
+        let dir = PrivateDir::new();
+        let fake = dir.path().join("zsh");
         std::fs::write(&fake, "#!/bin/sh\n").unwrap();
         let canon = std::fs::canonicalize(&fake).unwrap();
-        if !canon.starts_with("/usr/local") && unsafe { libc::geteuid() } != 0 {
+        if !PACKAGE_PREFIXES.iter().any(|p| canon.starts_with(p)) && unsafe { libc::geteuid() } != 0
+        {
             assert!(!is_trusted_install(&canon));
         }
-        let _ = std::fs::remove_dir_all(&dir);
         // The system shell is root's (skipped where it is not, e.g. a Nix-only system).
         if let Ok(sh) = std::fs::canonicalize("/bin/sh")
             && sh.starts_with("/bin")
@@ -857,10 +1033,53 @@ mod proc_tests {
         }
     }
 
+    /// A directory made atomically, private to the test (mode 0700), removed when dropped.
+    struct PrivateDir(std::path::PathBuf);
+
+    impl PrivateDir {
+        fn new() -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            let template = std::env::temp_dir().join("thurm-test-XXXXXX");
+            let mut buf = std::ffi::CString::new(template.as_os_str().as_bytes())
+                .unwrap()
+                .into_bytes_with_nul();
+            let made = unsafe { libc::mkdtemp(buf.as_mut_ptr().cast()) };
+            assert!(!made.is_null(), "{}", std::io::Error::last_os_error());
+            buf.pop();
+            Self(std::path::PathBuf::from(std::ffi::OsString::from(
+                std::ffi::OsStr::from_bytes(&buf),
+            )))
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for PrivateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn same_root_and_namespace_for_self() {
         let me = std::process::id();
         assert!(same_root(me, me));
+        // The pane leader's own report, from a root that is not the daemon's: refused even
+        // though the reporter is its own reference.
+        let (daemon, other) = ((1u64, 2u64), (1u64, 99u64));
+        assert!(!roots_agree(Some(other), Some(daemon), Some(Some(other))));
+        assert!(roots_agree(Some(daemon), Some(daemon), Some(Some(daemon))));
+        // An uninspectable reference (macOS login) leaves the daemon's root to compare with.
+        assert!(roots_agree(Some(daemon), Some(daemon), None));
+        assert!(!roots_agree(Some(other), Some(daemon), None));
+        // A reference read but elsewhere, or not resolvable, is not a match.
+        assert!(!roots_agree(Some(daemon), Some(daemon), Some(Some(other))));
+        assert!(!roots_agree(Some(daemon), Some(daemon), Some(None)));
+        // Nothing read proves nothing.
+        assert!(!roots_agree(None, Some(daemon), None));
+        assert!(!roots_agree(Some(daemon), None, None));
         assert!(same_mount_ns(me));
         assert!(
             !same_root(u32::MAX - 7, me),
@@ -1253,14 +1472,36 @@ mod proc_tests {
 /// The pid of `pid`'s parent.
 #[cfg(target_os = "linux")]
 pub fn parent(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The first field after the name is field 3; ppid is field 4.
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+    proc_stat(format!("/proc/{pid}/stat"))?.get(1)?.parse().ok()
+}
+
+/// The fields of a `/proc/<pid>/stat` record after the process name, the state first. The
+/// name is whatever bytes the process chose (not necessarily UTF-8, and may hold `)` or
+/// spaces), so the record is split after its last `)` before anything is decoded.
+#[cfg(target_os = "linux")]
+fn proc_stat(path: impl AsRef<std::path::Path>) -> Option<Vec<String>> {
+    stat_fields(&std::fs::read(path).ok()?)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn stat_fields(stat: &[u8]) -> Option<Vec<String>> {
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    let rest = std::str::from_utf8(&stat[close + 1..]).ok()?;
+    Some(rest.split_ascii_whitespace().map(str::to_owned).collect())
+}
+
+/// Real and effective uid from the `Uid:` line of a `/proc/<pid>/status` record, read without
+/// decoding the rest (its `Name:` line holds the process name's bytes).
+#[cfg(any(target_os = "linux", test))]
+fn status_uids(status: &[u8]) -> Option<(u32, u32)> {
+    let line = status
+        .split(|&b| b == b'\n')
+        .find_map(|l| l.strip_prefix(b"Uid:"))?;
+    let mut parts = std::str::from_utf8(line).ok()?.split_ascii_whitespace();
+    let ruid = parts.next()?.parse().ok()?;
+    let euid = parts.next()?.parse().ok()?;
+    Some((ruid, euid))
 }
 
 #[cfg(target_os = "macos")]
@@ -1282,36 +1523,46 @@ pub fn parent(pid: u32) -> Option<u32> {
 /// Process birth, used to distinguish a reused PID from its previous process.
 #[cfg(target_os = "linux")]
 pub fn process_birth(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The first field after the name is field 3; starttime is field 22.
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
+    proc_stat(format!("/proc/{pid}/stat"))?
+        .get(19)?
         .parse()
         .ok()
 }
 
 /// Like [`process_birth`], but `None` for a process that has exited and not been reaped yet
-/// (a zombie keeps its pid and birth until its parent collects it).
+/// (a zombie keeps its pid and birth until its parent collects it). A thread-group leader that
+/// ended with `pthread_exit` shows as a zombie too while its other threads run on: the process
+/// is alive as long as one of them is.
 #[cfg(target_os = "linux")]
 pub fn live_process_birth(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields = stat.rsplit_once(')')?.1;
-    if !stat_state_is_live(fields) {
+    let fields = proc_stat(format!("/proc/{pid}/stat"))?;
+    if !stat_state_is_live(fields.first().map(String::as_str)) && !other_thread_live(pid) {
         return None;
     }
-    fields.split_whitespace().nth(19)?.parse().ok()
+    fields.get(19)?.parse().ok()
+}
+
+/// Whether a thread of `pid` other than its leader is still running. Once the whole thread
+/// group has exited, only the (zombie) leader is listed.
+#[cfg(target_os = "linux")]
+fn other_thread_live(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    let leader = pid.to_string();
+    tasks.flatten().any(|t| {
+        t.file_name() != leader.as_str()
+            && proc_stat(t.path().join("stat"))
+                .is_some_and(|f| stat_state_is_live(f.first().map(String::as_str)))
+    })
 }
 
 /// Whether the state field (the first after the name) of `/proc/<pid>/stat` is a live one:
 /// not a zombie (`Z`) or dead (`X`, `x`).
 #[cfg(any(target_os = "linux", test))]
-fn stat_state_is_live(after_name: &str) -> bool {
-    !matches!(
-        after_name.split_whitespace().next(),
-        Some("Z" | "X" | "x") | None
-    )
+fn stat_state_is_live(state: Option<&str>) -> bool {
+    !matches!(state, Some("Z" | "X" | "x") | None)
 }
 
 #[cfg(target_os = "macos")]
@@ -1371,16 +1622,7 @@ pub fn is_pty_proxy(name: &str) -> bool {
 /// Real and effective user IDs of `pid`.
 #[cfg(target_os = "linux")]
 pub fn process_uids(pid: u32) -> Option<(u32, u32)> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Uid:") {
-            let mut parts = rest.split_whitespace();
-            let ruid = parts.next()?.parse().ok()?;
-            let euid = parts.next()?.parse().ok()?;
-            return Some((ruid, euid));
-        }
-    }
-    None
+    status_uids(&std::fs::read(format!("/proc/{pid}/status")).ok()?)
 }
 
 #[cfg(target_os = "macos")]
@@ -1432,20 +1674,32 @@ pub fn controlling_tty(pid: u32) -> Option<u64> {
     job(pid).and_then(|j| j.tty)
 }
 
-/// Whether `pid` shares the same root directory as `reference_pid` (or the daemon itself when
-/// `reference_pid`'s root cannot be inspected, e.g. setuid `login(1)` on macOS).
+/// Whether `pid` has the daemon's root directory (what it reported is resolved and run in the
+/// daemon's view of the filesystem), and `reference_pid`'s too when that one can be inspected
+/// (setuid `login(1)` on macOS cannot).
 #[cfg(target_os = "linux")]
 pub fn same_root(pid: u32, reference_pid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let Ok(m1) = std::fs::metadata(format!("/proc/{pid}/root")) else {
-        return false;
-    };
-    let m2 = std::fs::metadata(format!("/proc/{reference_pid}/root"))
-        .or_else(|_| std::fs::metadata("/proc/self/root"));
-    // Neither comparison root is readable: nothing was compared, so nothing is proven.
-    match m2 {
-        Ok(m2) => m1.dev() == m2.dev() && m1.ino() == m2.ino(),
-        Err(_) => false,
+    let id = |p: String| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    roots_agree(
+        id(format!("/proc/{pid}/root")),
+        id("/proc/self/root".to_owned()),
+        id(format!("/proc/{reference_pid}/root")).map(Some),
+    )
+}
+
+/// The rule [`same_root`] applies: the reporter's root must be read and be the daemon's (an
+/// unreadable one proves nothing), and a readable reference root (`Some(None)`: read, but not
+/// one the daemon can resolve) must be that same root too.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn roots_agree<T: PartialEq>(
+    reporter: Option<T>,
+    daemon: Option<T>,
+    reference: Option<Option<T>>,
+) -> bool {
+    match (reporter, daemon) {
+        (Some(r), Some(d)) if r == d => reference.is_none_or(|x| x.as_ref() == Some(&r)),
+        _ => false,
     }
 }
 
@@ -1515,13 +1769,11 @@ pub fn same_root(pid: u32, reference_pid: u32) -> bool {
         }
     };
     let resolve = |id: Option<(u64, u64)>| id.or_else(system_root);
-    let Some(r1) = root_id(pid).and_then(resolve) else {
-        return false;
-    };
-    let r2 = root_id(reference_pid)
-        .or_else(|| root_id(std::process::id()))
-        .and_then(resolve);
-    r2 == Some(r1)
+    roots_agree(
+        root_id(pid).and_then(resolve),
+        root_id(std::process::id()).and_then(resolve),
+        root_id(reference_pid).map(resolve),
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1573,8 +1825,10 @@ fn ancestors_with(
     (chain, false)
 }
 
-/// Directories a package manager installs shells and tools into (owned by the user on some
-/// systems, so the root-ownership check below cannot vouch for them).
+/// Directories a package manager installs shells and tools into. Their trees belong to the
+/// user on some systems (Homebrew's prefix is its admin's, group-writable by `admin`; a
+/// single-user Nix store is the user's), so they are trusted when only root, the daemon's user
+/// or a group standing for those can change them, rather than only when root owns them.
 const PACKAGE_PREFIXES: &[&str] = &[
     "/opt/homebrew",
     "/usr/local",
@@ -1583,30 +1837,76 @@ const PACKAGE_PREFIXES: &[&str] = &[
     "/run/current-system",
 ];
 
-/// Whether the canonical executable `exe` is a trusted installation: under a package-manager
-/// prefix, or owned by root with every directory up to `/` owned by root and writable by
-/// nobody else. A program the user (or a project) put somewhere writable is not.
+/// What [`is_trusted_install`] looks at in a file or directory.
+#[derive(Clone, Copy, Debug)]
+struct Ownership {
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    is_dir: bool,
+    is_file: bool,
+}
+
+/// Whether the canonical executable `exe` is a trusted installation: owned by root with every
+/// directory up to `/` owned by root and writable by nobody else, or, under a package-manager
+/// prefix, with the executable and every directory up to `/` changeable by nobody but root and
+/// the daemon's user. A program another account (or anyone) can replace is not, wherever it is;
+/// one the user put somewhere outside a package prefix is not either.
 pub fn is_trusted_install(exe: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    is_trusted_install_with(exe, uid, gid, |p| {
+        std::fs::metadata(p).ok().map(|m| Ownership {
+            uid: m.uid(),
+            gid: m.gid(),
+            mode: m.mode(),
+            is_dir: m.is_dir(),
+            is_file: m.is_file(),
+        })
+    })
+}
+
+fn is_trusted_install_with(
+    exe: &std::path::Path,
+    my_uid: u32,
+    my_gid: u32,
+    meta: impl Fn(&std::path::Path) -> Option<Ownership>,
+) -> bool {
     if !exe.is_absolute() {
         return false;
     }
-    if PACKAGE_PREFIXES
+    let packaged = PACKAGE_PREFIXES
         .iter()
-        .any(|p| exe.starts_with(p) && exe != std::path::Path::new(p))
-    {
-        return true;
-    }
-    let root_only = |m: &std::fs::Metadata| m.uid() == 0 && m.mode() & 0o022 == 0;
-    let Ok(meta) = std::fs::metadata(exe) else {
+        .any(|p| exe.starts_with(p) && exe != std::path::Path::new(p));
+    let root_only = |m: &Ownership| m.uid == 0 && m.mode & 0o022 == 0;
+    // The group may write when it is root's, macOS's `admin` (who can become root anyway), the
+    // user's own, or one root gave a directory it owns to (Nix's build users).
+    let admin_gid = if cfg!(target_os = "macos") { 80 } else { 0 };
+    let package_owned = |m: &Ownership| {
+        (m.uid == 0 || m.uid == my_uid)
+            && m.mode & 0o002 == 0
+            && (m.mode & 0o020 == 0
+                || m.gid == 0
+                || m.gid == admin_gid
+                || m.gid == my_gid
+                || m.uid == 0)
+    };
+    let ok = |m: &Ownership| {
+        if packaged {
+            package_owned(m)
+        } else {
+            root_only(m)
+        }
+    };
+    let Some(file) = meta(exe) else {
         return false;
     };
-    if !meta.is_file() || !root_only(&meta) {
+    if !file.is_file || !ok(&file) {
         return false;
     }
     exe.ancestors()
         .skip(1)
-        .all(|dir| std::fs::metadata(dir).is_ok_and(|m| m.is_dir() && root_only(&m)))
+        .all(|dir| meta(dir).is_some_and(|m| m.is_dir && ok(&m)))
 }
 
 /// The foreground group of the pane's terminal (`pgrp`), seen through PTY proxies. While a
@@ -1723,14 +2023,8 @@ struct Job {
 
 #[cfg(target_os = "linux")]
 fn job(pid: u32) -> Option<Job> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // After the name: state ppid pgrp session tty_nr tpgid.
-    let f: Vec<&str> = stat
-        .rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .take(6)
-        .collect();
+    let f = proc_stat(format!("/proc/{pid}/stat"))?;
     let num = |i: usize| f.get(i)?.parse::<i64>().ok();
     Some(Job {
         pgrp: num(2)? as u32,
