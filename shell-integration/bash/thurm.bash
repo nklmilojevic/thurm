@@ -19,14 +19,15 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
   _thurm_executing=""
   _thurm_in_prompt=""
   _thurm_ret=0
-  # Turns tracing off, the toggle itself unseen where it can be: restricted bash (`set -r`)
-  # refuses the redirection, and tracing must go off all the same (the toggle shows, the
-  # token never does).
+  # Turns tracing off, the toggle itself unseen where it can be. Tracing must go off even when
+  # the redirection fails (restricted bash refuses it, `/dev/null` may not open): the toggle
+  # then shows, the token never does. Restricted bash skips the redirection, not to print
+  # its refusal at every prompt.
   _thurm_untrace() {
     if [[ $- == *r* ]]; then
       builtin set +x
     else
-      { builtin set +x; } 2>/dev/null
+      { builtin set +x; } 2>/dev/null || builtin set +x
     fi
   }
 
