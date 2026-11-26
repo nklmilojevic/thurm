@@ -3175,6 +3175,39 @@ mod tests {
             differ
         );
         assert_eq!(check(&[], &["claude"]), trusted);
+        // Explicit settings and the settings sources supply permission and sandbox rules: a
+        // report must carry them over, unchanged.
+        let settings = [
+            "claude",
+            "--settings",
+            "/s.json",
+            "--setting-sources",
+            "user",
+        ];
+        assert_eq!(check(&[], &settings), differ);
+        assert_eq!(check(&["--settings", "/s.json"], &settings), differ);
+        assert_eq!(check(&["--setting-sources", "user"], &settings), differ);
+        assert_eq!(
+            check(
+                &["--settings", "/other.json", "--setting-sources", "user"],
+                &settings
+            ),
+            differ
+        );
+        assert_eq!(
+            check(
+                &["--settings", "/s.json", "--setting-sources", "user,project"],
+                &settings
+            ),
+            differ
+        );
+        assert_eq!(
+            check(
+                &["--settings", "/s.json", "--setting-sources", "user"],
+                &settings
+            ),
+            trusted
+        );
         // Nothing to check restrictions against: refused.
         let mut unmatched = rules.clone();
         unmatched[0].match_process = false;
