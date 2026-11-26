@@ -467,6 +467,9 @@ pub struct OwnerSnapshot {
     /// Canonical executable path from the OS; empty when unavailable.
     pub process_exe: String,
     pub process_argv: Vec<String>,
+    /// The canonical file an interpreter's script operand named when the report was accepted:
+    /// restore pins the program to its directory, not to wherever the launcher points by then.
+    pub script_target: Option<String>,
     pub process_cwd: Option<String>,
     pub ancestors: Vec<u32>,
     pub first_process: bool,
@@ -561,6 +564,11 @@ pub fn inspect_owner(pid: u32, pane: &PaneContext) -> Result<OwnerSnapshot, &'st
             None => process_argv.truncate(k),
         }
     }
+    let script_target = interpreter_script(&process_exe, &process_argv)
+        .map(|k| process_argv[k].as_str())
+        .filter(|s| s.starts_with('/'))
+        .and_then(|s| std::fs::canonicalize(s).ok())
+        .map(|p| p.display().to_string());
     let kind_of = |p: u32| classify_ancestor(p, &pane.trusted_shells);
     let owner_is_shell = kind_of(pid) == AncestorKind::Shell;
 
@@ -581,6 +589,7 @@ pub fn inspect_owner(pid: u32, pane: &PaneContext) -> Result<OwnerSnapshot, &'st
         process_name,
         process_exe,
         process_argv,
+        script_target,
         process_cwd,
         ancestors,
         first_process,
@@ -735,6 +744,9 @@ pub struct ResumeRecord {
     pub process_name: String,
     pub process_exe: String,
     pub process_argv: Vec<String>,
+    /// See [`OwnerSnapshot::script_target`].
+    #[serde(default)]
+    pub script_target: Option<String>,
     pub ancestors: Vec<u32>,
     pub wrapped: bool,
     /// [`monotonic_ms`] when the daemon first observed the owning process dead; `None` while
@@ -758,13 +770,17 @@ impl ResumeRecord {
             reported_at: self.reported_at,
             process_name: self.process_name.clone(),
             process_exe: self.process_exe.clone(),
-            launch: Some(launch_evidence(
-                &self.process_exe,
-                &self.process_argv,
-                &self.argv,
-                rules,
-                key,
-            )),
+            launch: Some({
+                let mut launch = launch_evidence(
+                    &self.process_exe,
+                    &self.process_argv,
+                    &self.argv,
+                    rules,
+                    key,
+                );
+                launch.script_target = launch.script.as_ref().and(self.script_target.clone());
+                launch
+            }),
             wrapped: self.wrapped,
             attempted: false,
         }
@@ -912,6 +928,7 @@ impl ProgramResumeState {
                         process_name: owner.process_name,
                         process_exe: owner.process_exe,
                         process_argv: owner.process_argv,
+                        script_target: owner.script_target,
                         ancestors: owner.ancestors,
                         wrapped: owner.wrapped,
                         exited_at_ms: None,
@@ -2004,6 +2021,7 @@ pub fn launch_evidence(
     SavedLaunchEvidence {
         program: process_argv.first().cloned().unwrap_or_default(),
         script,
+        script_target: None,
         flags,
     }
 }
@@ -2174,19 +2192,33 @@ pub fn dir_identity(path: &str) -> Option<(u64, u64)> {
     meta.is_dir().then(|| (meta.dev(), meta.ino()))
 }
 
+/// The directories a program a rule trusted by the owner's executable must still be found in
+/// on restore (see [`pin_dirs`]), from what was saved: the script's directory is the one its
+/// launcher resolved to when the report was accepted, never followed again. Empty (no pin can
+/// hold) when an interpreter's script was saved without that target.
+pub fn saved_pin_dirs(process_exe: &str, launch: Option<&SavedLaunchEvidence>) -> Vec<String> {
+    let script = launch.and_then(|l| l.script.as_ref());
+    let target = launch.and_then(|l| l.script_target.as_deref());
+    if script.is_some() && target.is_none() {
+        return Vec::new();
+    }
+    pin_dirs(process_exe, target)
+}
+
 /// The canonical directories holding the owner's executable and, for an interpreter, its
 /// script: a program a rule trusted by its executable must still be found in one of them
-/// (an update that replaces the file, or adds a version beside it, stays there). The script is
-/// resolved first: a launcher symlinked into a `bin` directory is found again as its target.
-pub fn pin_dirs(process_exe: &str, script: Option<&str>) -> Vec<String> {
+/// (an update that replaces the file, or adds a version beside it, stays there).
+/// `script_target` is the script's canonical path as resolved when the report was accepted (a
+/// launcher symlinked into a `bin` directory is found again as that target): it is not
+/// resolved again, so a launcher pointed elsewhere since does not move the pin.
+pub fn pin_dirs(process_exe: &str, script_target: Option<&str>) -> Vec<String> {
     let exe_dir = Path::new(process_exe)
         .parent()
         .filter(|_| process_exe.starts_with('/'))
         .and_then(|d| std::fs::canonicalize(d).ok());
-    let script_dir = script
+    let script_dir = script_target
         .filter(|s| s.starts_with('/'))
-        .and_then(|s| std::fs::canonicalize(s).ok())
-        .and_then(|f| f.parent().map(Path::to_path_buf));
+        .and_then(|f| Path::new(f).parent().map(Path::to_path_buf));
     let mut out: Vec<String> = Vec::new();
     for dir in exe_dir.into_iter().chain(script_dir) {
         let dir = dir.display().to_string();
@@ -2816,6 +2848,7 @@ mod tests {
             process_name: format!("prog{pid}"),
             process_exe: format!("/usr/bin/prog{pid}"),
             process_argv: vec![format!("prog{pid}")],
+            script_target: None,
             ancestors,
             wrapped: false,
             exited_at_ms: None,
@@ -2853,6 +2886,7 @@ mod tests {
             process_name: format!("prog{pid}"),
             process_exe: format!("/usr/bin/prog{pid}"),
             process_argv: vec![format!("prog{pid}")],
+            script_target: None,
             ancestors: vec![10],
             wrapped: false,
             exited_at_ms: None,
@@ -2891,6 +2925,7 @@ mod tests {
             process_name: format!("prog{pid}"),
             process_exe: format!("/usr/bin/prog{pid}"),
             process_argv: vec![format!("prog{pid}")],
+            script_target: None,
             ancestors,
             wrapped: false,
             exited_at_ms: None,
@@ -3258,13 +3293,55 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let launcher = bin.join("tool");
         std::os::unix::fs::symlink(&script, &launcher).unwrap();
-        // `node <bin>/tool`: the script operand is the launcher as invoked.
-        let pins = pin_dirs("/usr/bin/node", Some(&launcher.display().to_string()));
+        // `node <bin>/tool`: the script operand is the launcher as invoked, and the record
+        // keeps the file it resolved to then.
+        let launch = strings(&["node", &launcher.display().to_string()]);
+        let target = std::fs::canonicalize(&script).unwrap();
+        let rec = ResumeRecord {
+            pid: 1,
+            birth: 1,
+            reported_at: SPEC_TIME,
+            argv: strings(&["tool"]),
+            cwd: None,
+            cwd_from_report: false,
+            first_process: false,
+            uid: 0,
+            process_name: "node".into(),
+            process_exe: "/usr/bin/node".into(),
+            process_argv: launch,
+            script_target: Some(target.display().to_string()),
+            ancestors: Vec::new(),
+            wrapped: false,
+            exited_at_ms: None,
+            order: 0,
+        };
+        let saved = rec.to_saved(&[], &[0; 32]);
+        let pins = saved_pin_dirs(&saved.process_exe, saved.launch.as_ref());
         let pkg_dir = std::fs::canonicalize(&pkg).unwrap().display().to_string();
         assert!(pins.contains(&pkg_dir), "{pins:?}");
         let path = bin.display().to_string();
         let got = pinned_program("tool", Some(path.as_ref()), &pins).unwrap();
         assert!(got.ends_with("/dist/cli.js"), "{got}");
+
+        // Pointed into another directory before the restore: the pin stays where the trusted
+        // script was, and the launcher now leads out of it.
+        let other = root.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        let evil = other.join("cli.js");
+        std::fs::write(&evil, "#!/usr/bin/env node\n").unwrap();
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_file(&launcher).unwrap();
+        std::os::unix::fs::symlink(&evil, &launcher).unwrap();
+        let pins = saved_pin_dirs(&saved.process_exe, saved.launch.as_ref());
+        assert!(pins.contains(&pkg_dir), "{pins:?}");
+        let other_dir = std::fs::canonicalize(&other).unwrap().display().to_string();
+        assert!(!pins.contains(&other_dir), "{pins:?}");
+        assert!(pinned_program("tool", Some(path.as_ref()), &pins).is_err());
+
+        // A script saved without the file it resolved to pins nothing.
+        let mut old = saved.launch.clone().unwrap();
+        old.script_target = None;
+        assert!(saved_pin_dirs(&saved.process_exe, Some(&old)).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
