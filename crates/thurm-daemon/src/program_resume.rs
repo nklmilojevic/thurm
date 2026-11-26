@@ -789,6 +789,9 @@ pub struct ProgramResumeState {
     /// `pid -> (birth, last_accepted_time_secs)` to block out-of-order replays within the window.
     last_times: HashMap<u32, (u64, u64)>,
     next_order: u64,
+    /// `(pid, birth)` of the record [`Self::chosen_for_save`] last picked (`None` when it
+    /// picked none): a repeated report that changes the pick is still worth saving.
+    saved_winner: Option<(u32, u64)>,
 }
 
 impl ProgramResumeState {
@@ -798,6 +801,7 @@ impl ProgramResumeState {
             records: Vec::new(),
             last_times: HashMap::new(),
             next_order: 1,
+            saved_winner: None,
         }
     }
 
@@ -913,7 +917,7 @@ impl ProgramResumeState {
                         exited_at_ms: None,
                         order,
                     };
-                    self.upsert(rec)
+                    self.accept(rec, pane.foreground_pgrp)
                 }
             },
         }
@@ -939,6 +943,35 @@ impl ProgramResumeState {
         let before = self.records.len();
         self.records.retain(|r| r.pid != pid);
         self.records.len() != before
+    }
+
+    /// Stores an accepted report: `true` when it is worth saving, a new record or one that
+    /// changes which record the pane's save would pick (an owner back in front repeating
+    /// itself after a sibling's record was saved).
+    fn accept(&mut self, rec: ResumeRecord, foreground_pgrp: Option<u32>) -> bool {
+        self.accept_with(rec, foreground_pgrp, current_pgrp)
+    }
+
+    fn accept_with(
+        &mut self,
+        rec: ResumeRecord,
+        foreground_pgrp: Option<u32>,
+        pgrp_of: impl Fn(&ResumeRecord) -> Option<u32>,
+    ) -> bool {
+        let changed = self.upsert(rec);
+        changed || self.winner_unsaved(foreground_pgrp, pgrp_of)
+    }
+
+    /// Whether the record chosen now differs from the one the last save picked.
+    fn winner_unsaved(
+        &self,
+        foreground_pgrp: Option<u32>,
+        pgrp_of: impl Fn(&ResumeRecord) -> Option<u32>,
+    ) -> bool {
+        let now = self
+            .chosen_with(foreground_pgrp, pgrp_of)
+            .map(|r| (r.pid, r.birth));
+        now != self.saved_winner
     }
 
     /// Stores `rec` as its owner's newest record. Returns `false` when it only repeats the
@@ -1070,11 +1103,12 @@ impl ProgramResumeState {
 
     /// Returns the chosen record as a [`SavedProgramResume`] if currently trusted for persistence.
     pub fn chosen_for_save(
-        &self,
+        &mut self,
         foreground_pgrp: Option<u32>,
         mode: ResumeProgramsMode,
         rules: &[ResumeRule],
     ) -> Option<SavedProgramResume> {
+        self.saved_winner = self.chosen(foreground_pgrp).map(|r| (r.pid, r.birth));
         if mode == ResumeProgramsMode::Off || is_root() {
             return None;
         }
@@ -2298,7 +2332,10 @@ fn is_executable_file(path: &Path) -> bool {
 /// functions, and builtins, while inheriting the shell's full environment (`PATH`, `direnv`,
 /// etc.). A bare program name is looked up on `PATH` like `execvp` does, but a file the kernel
 /// cannot execute (no `#!` line) is refused instead of being run by `/bin/sh`.
-pub fn exec_resume(ticket: &str, fallback_shell: Option<&str>) -> ! {
+///
+/// `fallback_shell` (the configured shell's program and arguments, empty for none) starts
+/// instead when the resume fails.
+pub fn exec_resume(ticket: &str, fallback_shell: &[String]) -> ! {
     let fail = |code: i32| -> ! { resume_failed(code, fallback_shell) };
     let spec = match take_resume(ticket) {
         Ok(s) => s,
@@ -2369,14 +2406,20 @@ pub fn exec_resume(ticket: &str, fallback_shell: Option<&str>) -> ! {
 }
 
 /// A resume that failed: ends with `code`, or, for a pane whose only process this is
-/// (`fallback_shell`), starts that shell instead so the pane and the reason above stay.
-fn resume_failed(code: i32, fallback_shell: Option<&str>) -> ! {
-    if let Some(shell) = fallback_shell
-        && let Ok(prog) = CString::new(shell.as_bytes())
+/// (`fallback_shell`: program and arguments), starts that shell instead so the pane and the
+/// reason above stay.
+fn resume_failed(code: i32, fallback_shell: &[String]) -> ! {
+    let argv: Option<Vec<CString>> = fallback_shell
+        .iter()
+        .map(|a| CString::new(a.as_bytes()).ok())
+        .collect();
+    if let Some(shell) = fallback_shell.first()
+        && let Some(argv) = argv
     {
         eprintln!("thurm: starting {} instead", escape_display(shell));
-        let argv = [prog.as_ptr(), std::ptr::null()];
-        unsafe { libc::execvp(prog.as_ptr(), argv.as_ptr()) };
+        let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+        ptrs.push(std::ptr::null());
+        unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };
         eprintln!(
             "thurm: cannot start {}: {}",
             escape_display(shell),
@@ -2791,6 +2834,46 @@ mod tests {
             argv: vec!["prog100".into(), "-x".into()],
             ..mk(100, vec![10], 5)
         }));
+    }
+
+    /// Two sibling owners: the older one was in front at the last save, then the newest comes
+    /// back to the front and repeats itself. The repeat changes what a save picks: it is saved.
+    #[test]
+    fn repeated_report_that_changes_the_winner_is_saved() {
+        let mut state = ProgramResumeState::with_token(Some(SPEC_TOKEN.into()));
+        let mk = |pid: u32, order: u64| ResumeRecord {
+            pid,
+            birth: pid as u64 * 10,
+            reported_at: SPEC_TIME,
+            argv: vec![format!("prog{pid}")],
+            cwd: None,
+            cwd_from_report: false,
+            first_process: false,
+            uid: 1000,
+            process_name: format!("prog{pid}"),
+            process_exe: format!("/usr/bin/prog{pid}"),
+            process_argv: vec![format!("prog{pid}")],
+            ancestors: vec![10],
+            wrapped: false,
+            exited_at_ms: None,
+            order,
+        };
+        // Each owner leads its own process group.
+        let pgrp = |r: &ResumeRecord| Some(r.pid);
+        assert!(state.accept_with(mk(100, 1), Some(100), pgrp));
+        assert!(state.accept_with(mk(200, 2), Some(200), pgrp));
+        // Saved while 100 was in front: 100 was picked.
+        state.saved_winner = state.chosen_with(Some(100), pgrp).map(|r| (r.pid, r.birth));
+        assert_eq!(state.saved_winner, Some((100, 1000)));
+        // 200 is in front again and repeats its report: not a new record, but a new pick.
+        let repeat = ResumeRecord {
+            reported_at: SPEC_TIME + 5,
+            ..mk(200, 3)
+        };
+        assert!(state.accept_with(repeat.clone(), Some(200), pgrp));
+        // Once that pick is saved, the same repeat is nothing new.
+        state.saved_winner = Some((200, 2000));
+        assert!(!state.accept_with(ResumeRecord { order: 4, ..repeat }, Some(200), pgrp));
     }
 
     #[test]
@@ -3926,17 +4009,32 @@ mod tests {
         if is_root() {
             return;
         }
-        let mut state = ProgramResumeState::with_token(Some(SPEC_TOKEN.into()));
         let now = persist::now_secs();
-        // PID 1 is alive but not ours and not in this pane.
-        let body = sign(&format!("pid=1:time={now}:clear=1"), SPEC_TOKEN);
+        // This process claims the report: it is in front (its own group is the pane's
+        // foreground group), so only pane membership can turn it away.
+        let me = std::process::id();
+        let body = sign(&format!("pid={me}:time={now}:clear=1"), SPEC_TOKEN);
         let total = 2 + b"7577;".len() + body.len() + 2;
-        let pane = PaneContext {
-            leader: Some(std::process::id()),
-            foreground_pgrp: Some(unsafe { libc::getpgrp() } as u32),
+        let foreground_pgrp = Some(unsafe { libc::getpgrp() } as u32);
+        // Outside the pane: no leader it descends from, and no pane terminal to fall back on.
+        let outside = PaneContext {
+            leader: None,
+            tty_rdev: None,
+            foreground_pgrp,
             ..Default::default()
         };
-        assert!(!state.handle_report(&body, total, &pane));
+        let mut state = ProgramResumeState::with_token(Some(SPEC_TOKEN.into()));
+        assert!(!state.handle_report(&body, total, &outside));
         assert!(state.last_times.is_empty());
+        // The same report from inside the pane (this process leads it) keeps its time: the
+        // membership check, not anything before it, turned the outsider away.
+        let inside = PaneContext {
+            leader: Some(me),
+            foreground_pgrp,
+            ..Default::default()
+        };
+        let mut state = ProgramResumeState::with_token(Some(SPEC_TOKEN.into()));
+        state.handle_report(&body, total, &inside);
+        assert!(state.last_times.contains_key(&me));
     }
 }

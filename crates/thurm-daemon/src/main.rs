@@ -76,12 +76,15 @@ fn parse_args() -> Args {
                     eprintln!("thurmd: --exec-resume requires a ticket");
                     std::process::exit(2);
                 };
-                // `--or-shell PATH`: what to start when the resume fails, for a pane whose only
-                // process this is (it would close, with the reason, otherwise).
-                let fallback = (it.next().as_deref() == Some("--or-shell"))
-                    .then(|| it.next())
-                    .flatten();
-                program_resume::exec_resume(&ticket, fallback.as_deref());
+                // `--or-shell PROGRAM [ARGS...]` (the rest of the arguments): what to start
+                // when the resume fails, for a pane whose only process this is (it would close,
+                // with the reason, otherwise).
+                let fallback: Vec<String> = if it.next().as_deref() == Some("--or-shell") {
+                    it.collect()
+                } else {
+                    Vec::new()
+                };
+                program_resume::exec_resume(&ticket, &fallback);
             }
             "--socket" => args.socket = it.next().map(PathBuf::from),
             "--no-restore" => args.no_restore = true,

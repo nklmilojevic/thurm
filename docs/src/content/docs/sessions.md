@@ -61,8 +61,9 @@ timestamp (`time`, verified within a 60-second window).
 On restore, Thurm runs the reported command itself, without shell parsing: a bare program
 name is looked up on the shell's `PATH`, and a file that is neither a binary nor a script
 with a `#!` line is refused rather than run by `/bin/sh`. The restored shell gets only a
-single-use ticket, which Thurm's helper redeems with the daemon for the command, so the
-command is never written to a file. When a rule trusted the program by its executable,
+single-use ticket, which Thurm's helper redeems with the daemon over its socket for the
+command, so no separate file hands the command over (the saved record itself is in the
+session snapshot, described below). When a rule trusted the program by its executable,
 only a program found in that executable's directory runs (relative `PATH` entries are not
 searched), and a directory the command must start in is entered only while it is still the
 one Thurm checked. How the command starts depends on where it ran:
@@ -75,13 +76,16 @@ one Thurm checked. How the command starts depends on where it ran:
   `zsh -f`, `fish --no-config`), Thurm types a fixed helper command (never the program's
   arguments) at the shell's first detected prompt, or after about 2.5 seconds when no
   prompt is detected and the shell waits in the foreground. If anything was typed into
-  the pane first, it skips the resume.
+  the pane first, it skips the resume. A startup file still reading from the terminal by
+  then (a `read` in `.profile`) gets the line instead, and the program is not resumed.
 
 If `config.toml` fails to load when the daemon starts, program resume stays off until it
 loads again. Thurm records each attempt before it starts the command and never retries a resume that
-failed or crashed; if it cannot record the attempt, it starts plain shells instead. A pane
-whose record is not resumed for another reason (not trusted, its directory is gone, or the
-shell cannot run it) restores as it would without one: its command, or `resume_agents`.
+failed or crashed: a pane whose record was already tried starts a plain shell. If it cannot
+record the attempt, it resumes nothing. A pane whose record is not resumed for that or
+another reason (not trusted, its directory is gone, or the shell cannot run it) restores as
+it would without one: its command, or `resume_agents`. Changing the resume settings while a
+restored pane's shell is still starting cancels its resume.
 
 By default (`session.resume_programs = "rules"`), Thurm only resumes commands that match
 a trust rule and whose owning process is not wrapped inside a sandbox or another
