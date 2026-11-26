@@ -1186,6 +1186,80 @@ fn fish_integration_resume_uses_startup_path_and_bypasses_functions() {
     wait_match(&c2, pane, "FISH_GOT_typed_END");
 }
 
+/// A resumed job ended by Ctrl-C (which cancels the rest of fish's evaluation it runs in)
+/// leaves fish with the job-control mode config.fish chose, not the one it runs the job in.
+#[test]
+fn fish_resume_interrupted_keeps_the_configured_job_control() {
+    if running_as_root() {
+        return;
+    }
+    let Some(fish_path) = find_shell("fish") else {
+        return;
+    };
+    let env = Env::new("resume-fish-int");
+    let home = env.dir.join("home");
+    let custom_bin = env.dir.join("custom-bin");
+    std::fs::create_dir_all(home.join(".config/fish")).unwrap();
+    write_exec(
+        &custom_bin.join("fishintprog"),
+        "#!/bin/sh\necho FISH_INT_RUNNING\nsleep 30\n",
+    );
+    std::fs::write(
+        home.join(".config/fish/config.fish"),
+        format!(
+            "status job-control none\nfish_add_path -gp '{}'\n",
+            custom_bin.display()
+        ),
+    )
+    .unwrap();
+    write_config(
+        &env,
+        &format!(
+            "[terminal]\nshell = [\"{}\"]\nshell_integration = true\n\
+             [session]\nsnapshot_interval_secs = 60\nresume_programs = \"all\"\n",
+            fish_path.display()
+        ),
+    );
+    let reporter = env.dir.join("report.sh");
+    let enc = b64_argv(&["fishintprog"]);
+    write_exec(
+        &reporter,
+        &format!(
+            "#!/bin/sh\n{EMIT_SH}\nemit_7577 \"$$\" \"argv={enc}\"\necho FISH_INT_READY\nsleep 60\n"
+        ),
+    );
+
+    let mut daemon = env.start_clean(&[("HOME", &home)]);
+    let (c, _) = env.connect();
+    let pane = create(&c, &env.dir);
+    run_line(&c, pane, &format!("'{}'", reporter.display()));
+    wait_match(&c, pane, "FISH_INT_READY");
+    wait_records(&c, pane, "fish record", |r| r.len() == 1 && r[0].trusted);
+    c.request(Request::Shutdown { kill_panes: true }).unwrap();
+    daemon.wait_exit();
+    drop(c);
+
+    let _daemon2 = env.start_clean(&[("HOME", &home)]);
+    let (c2, _) = env.connect();
+    wait_match(&c2, pane, "FISH_INT_RUNNING");
+    std::thread::sleep(Duration::from_millis(150));
+    c2.request(Request::Input {
+        pane,
+        data: vec![0x03],
+    })
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    // Only a shell running it prints the joined word (an echo of the typed line would not).
+    run_line(
+        &c2,
+        pane,
+        "if status is-no-job-control; printf 'JC_%s\\n' KEPT; else; printf 'JC_%s\\n' CHANGED; end",
+    );
+    wait_match(&c2, pane, "JC_(KEPT|CHANGED)");
+    let shown = capture(&c2, pane);
+    assert!(shown.contains("JC_KEPT"), "{shown}");
+}
+
 #[test]
 fn records_and_token_survive_in_place_upgrade() {
     if running_as_root() {
