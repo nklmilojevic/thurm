@@ -237,6 +237,54 @@ fn last_command_output() {
     assert_eq!(t.last_command(2).as_deref(), Some("out1.3\nout1.4"));
 }
 
+/// Concealed text (SGR 8, e.g. a password a program echoes hidden) is not shown, so it is not
+/// copied either: its cells copy as blanks, wherever the selection reaches.
+#[test]
+fn concealed_text_is_not_copied() {
+    let mut t = term(30, 3);
+    t.advance(b"pw: \x1b[8mhunter2\x1b[28m ok\r\n\x1b[38;5;8mgray\x1b[0m \x1b[8msecret\x1b[m");
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 0,
+        right_half: false,
+        kind: SelectionKind::Line,
+    });
+    assert_eq!(t.selection_text(), "pw:         ok");
+    // Color 8 is not concealment, and a concealed line end is trimmed like blanks.
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 1,
+        right_half: false,
+        kind: SelectionKind::Line,
+    });
+    assert_eq!(t.selection_text(), "gray");
+    // Text with nothing concealed copies exactly as before.
+    t.advance(b"\r\nplain  text");
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 2,
+        right_half: false,
+        kind: SelectionKind::Line,
+    });
+    assert_eq!(t.selection_text().trim_end(), "plain  text");
+}
+
+#[test]
+fn blank_concealed_parses_sgr() {
+    use crate::vt::blank_concealed;
+    assert_eq!(blank_concealed("a \x1b[1mb\x1b[0m"), None);
+    assert_eq!(blank_concealed("\x1b[38;5;8mx\x1b[48;2;8;8;8my"), None);
+    assert_eq!(blank_concealed("\x1b[38:2::8:8:8mx"), None);
+    assert_eq!(
+        blank_concealed("a\x1b[0m\x1b[8mbc\x1b[0md\r\n\x1b[8mzz\x1b[28m"),
+        Some("a  d\r\n".into())
+    );
+    assert_eq!(
+        blank_concealed("\x1b]8;;https://e.x\x1b\\\x1b[8mpw\x1b[0m!"),
+        Some("  !".into())
+    );
+}
+
 #[test]
 fn selection_and_copy() {
     let mut t = term(20, 3);
@@ -1631,6 +1679,25 @@ mod encoding {
         assert_eq!(kitty(&named(NamedKey::F(3), 0), D), "\x1b[13~");
         assert_eq!(kitty(&named(NamedKey::F(13), 0), D), "\x1b[57376u");
         assert_eq!(kitty(&named(NamedKey::Kp1, 0), D), "\x1b[57400u");
+        // Clients send keypad keys with their text (legacy encoding needs it); kitty mode must
+        // still report them as keypad keys.
+        assert_eq!(
+            kitty(&key(Key::Named(NamedKey::Kp5), 0, "5"), D),
+            "\x1b[57404u"
+        );
+        assert_eq!(
+            kitty(&key(Key::Named(NamedKey::KpAdd), 0, "+"), D),
+            "\x1b[57413u"
+        );
+        assert_eq!(
+            kitty(&key(Key::Named(NamedKey::KpEnter), 0, "\r"), D),
+            "\x1b[57414u"
+        );
+        // Reporting all keys with their text keeps the text as associated text.
+        assert_eq!(
+            kitty(&key(Key::Named(NamedKey::Kp5), 0, "5"), ALL | TEXT),
+            "\x1b[57404;;53u"
+        );
         assert_eq!(kitty(&named(NamedKey::LeftShift, mods::SHIFT), D), "");
         assert_eq!(kitty(&ch('a', mods::CAPS_LOCK, "A"), D), "A");
         assert_eq!(

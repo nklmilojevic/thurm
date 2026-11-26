@@ -89,11 +89,17 @@ impl Encoders {
             _ => 0,
         };
         // The key's text as the encoder wants it: the character itself where the app sends
-        // none or a control character (Ctrl combinations).
+        // none or a control character (Ctrl combinations). Keypad keys carry their text for
+        // the legacy encoding ("5" from keypad 5); under the kitty protocol they are reported
+        // as keypad keys, which the encoder only does without text (with "report all keys as
+        // escape codes" every key is one already, and the text goes along as associated text).
+        let flags = if kitty { vt.kitty_flags() } else { 0 };
+        let kitty_active = flags != 0 && flags & KITTY_REPORT_ALL == 0;
         let text = match ev.key {
             Key::Char(c) if ev.text.is_empty() || ev.text.chars().all(char::is_control) => {
                 c.to_string()
             }
+            Key::Named(k) if kitty_active && is_keypad(k) => String::new(),
             _ => ev.text.clone(),
         };
         let action = match ev.action {
@@ -419,6 +425,46 @@ fn physical_key(c: char) -> ffi::Key::Type {
         ' ' => K::SPACE,
         _ => K::UNIDENTIFIED,
     }
+}
+
+/// The kitty keyboard flag "report all keys as escape codes".
+const KITTY_REPORT_ALL: u8 = 8;
+
+/// Keys on the numeric keypad (digits, operators, Enter and its navigation keys).
+fn is_keypad(k: NamedKey) -> bool {
+    use NamedKey as N;
+    matches!(
+        k,
+        N::Kp0
+            | N::Kp1
+            | N::Kp2
+            | N::Kp3
+            | N::Kp4
+            | N::Kp5
+            | N::Kp6
+            | N::Kp7
+            | N::Kp8
+            | N::Kp9
+            | N::KpDecimal
+            | N::KpDivide
+            | N::KpMultiply
+            | N::KpSubtract
+            | N::KpAdd
+            | N::KpEnter
+            | N::KpEqual
+            | N::KpSeparator
+            | N::KpLeft
+            | N::KpRight
+            | N::KpUp
+            | N::KpDown
+            | N::KpPageUp
+            | N::KpPageDown
+            | N::KpHome
+            | N::KpEnd
+            | N::KpInsert
+            | N::KpDelete
+            | N::KpBegin
+    )
 }
 
 fn named_key(k: NamedKey) -> ffi::Key::Type {

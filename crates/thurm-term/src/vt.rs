@@ -1094,6 +1094,18 @@ impl Vt {
         if r != ffi::Result::SUCCESS {
             return String::new();
         }
+        // Concealed cells (SGR 8, e.g. a password echoed hidden) are not shown, so they are not
+        // copied either. The plain formatter has no notion of them; the styled output does.
+        let styled = self.format_raw(
+            ffi::FormatterFormat::VT,
+            true,
+            true,
+            ffi::FORMATTER_EXTRAS_NONE,
+            Some(&sel),
+        );
+        if let Some(text) = blank_concealed(&String::from_utf8_lossy(&styled)) {
+            return text;
+        }
         let text = self.format_raw(
             ffi::FormatterFormat::PLAIN,
             true,
@@ -1824,4 +1836,82 @@ mod kitty_ffi {
     ) -> ffi::Result::Type {
         ffi::Result::NO_VALUE
     }
+}
+
+/// The text of the formatter's styled (VT) output with concealed characters (SGR 8) turned
+/// into blanks and the escape sequences dropped, trailing blanks of each line trimmed; `None`
+/// when nothing in it is concealed (the plain output is then the text as is).
+pub(crate) fn blank_concealed(styled: &str) -> Option<String> {
+    let mut out = String::with_capacity(styled.len());
+    let mut concealed = false;
+    let mut any = false;
+    let mut chars = styled.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if c == '\n' || c == '\r' {
+                let kept = out.trim_end_matches(' ').len();
+                out.truncate(kept);
+                out.push(c);
+            } else if concealed {
+                out.push(' ');
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                let mut params = String::new();
+                let mut fin = None;
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        fin = Some(c);
+                        break;
+                    }
+                    params.push(c);
+                }
+                if fin == Some('m') {
+                    let mut ps = params.split(';');
+                    while let Some(p) = ps.next() {
+                        // Only the first `:` field names the attribute.
+                        match p.split(':').next().unwrap_or("") {
+                            "" | "0" | "28" => concealed = false,
+                            "8" => {
+                                concealed = true;
+                                any = true;
+                            }
+                            // Extended colors: skip their arguments (`38;5;8` is not SGR 8).
+                            "38" | "48" | "58" if !p.contains(':') => match ps.next() {
+                                Some("5") => {
+                                    ps.next();
+                                }
+                                Some("2") => {
+                                    ps.next();
+                                    ps.next();
+                                    ps.next();
+                                }
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // OSC (hyperlinks): up to BEL or ST.
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !any {
+        return None;
+    }
+    let kept = out.trim_end_matches(' ').len();
+    out.truncate(kept);
+    Some(out)
 }
