@@ -74,6 +74,24 @@ final class PairPhoneTests: XCTestCase {
         devices = PhonePairing.devices(in: file)
         XCTAssertTrue(devices.isEmpty)
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "ssh-ed25519 AAAA other@laptop\n")
+
+        // Pairing the same public key under a unique name and then a generic name (and vice versa)
+        // must deduplicate by key blob so revoking removes all access for that key.
+        XCTAssertFalse(try PhonePairing.add(key: key, device: "iPhone-7f3a", to: file))
+        XCTAssertFalse(try PhonePairing.add(key: key, device: "iPhone", to: file))
+        devices = PhonePairing.devices(in: file)
+        XCTAssertEqual(devices.map(\.name), ["iPhone"])
+        XCTAssertFalse(try PhonePairing.add(key: key, device: "iPhone-7f3a", to: file))
+        devices = PhonePairing.devices(in: file)
+        XCTAssertEqual(devices.map(\.name), ["iPhone-7f3a"])
+        // Replacing a different key under the same device name reports replacement so push
+        // registrations for the previous phone are revoked.
+        let otherKey = "ecdsa-sha2-nistp256 AAAAotherKeyBlobForSameNamePhone"
+        XCTAssertTrue(try PhonePairing.add(key: otherKey, device: "iPhone-7f3a", to: file))
+        devices = PhonePairing.devices(in: file)
+        XCTAssertEqual(devices.map(\.name), ["iPhone-7f3a"])
+        try PhonePairing.revoke(devices[0], in: file)
+        XCTAssertTrue(PhonePairing.devices(in: file).isEmpty)
     }
 
     func testAFailedWriteChangesNothing() throws {
@@ -152,6 +170,50 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertTrue(PhonePairing.canPair(host: "studio", hostKeys: [],
                                            tailnet: "wss://thurm.tail1234.ts.net/v1/connect"))
         XCTAssertFalse(PhonePairing.canPair(host: "studio", hostKeys: [], tailnet: ""))
+    }
+
+    func testRejectsInvalidDeviceNamesAndInvalidLocalSSHPorts() throws {
+        let keyPrefix = deviceKey.split(separator: " ").prefix(2).joined(separator: " ") + " "
+        // Reject empty, overlong (>128 bytes), quotes, backslashes and control characters.
+        for bad in [
+            "",
+            String(repeating: "a", count: 129),
+            "Nikola's-iPhone",
+            "phone\\name",
+            "phone\u{7}",
+            "a\"${x}",
+            "a`b`",
+        ] {
+            XCTAssertNil(PhonePairing.validDeviceKey("\(keyPrefix)thurm-ios:\(bad)"), "expected rejection for '\(bad)'")
+        }
+        // Names from older app builds (the phone's own name, spaces as dashes) still pair.
+        for old in ["Nikola’s-iPhone", "iPhone+work", "café"] {
+            XCTAssertEqual(PhonePairing.validDeviceKey("\(keyPrefix)thurm-ios:\(old)")?.device, old)
+        }
+        // Accept valid 128-char boundary and allowed punctuation.
+        let maxValid = String(repeating: "a", count: 128)
+        XCTAssertEqual(PhonePairing.validDeviceKey("\(keyPrefix)thurm-ios:\(maxValid)")?.device, maxValid)
+        XCTAssertEqual(PhonePairing.validDeviceKey("\(keyPrefix)thurm-ios:iPhone-15_Pro.local")?.device,
+                       "iPhone-15_Pro.local")
+
+        // Local SSH port validation boundaries in canPair.
+        XCTAssertFalse(PhonePairing.canPair(host: "studio", port: 0, hostKeys: ["SHA256:abc"], tailnet: nil))
+        XCTAssertTrue(PhonePairing.canPair(host: "studio", port: 1, hostKeys: ["SHA256:abc"], tailnet: nil))
+        XCTAssertTrue(PhonePairing.canPair(host: "studio", port: 65535, hostKeys: ["SHA256:abc"], tailnet: nil))
+        XCTAssertFalse(PhonePairing.canPair(host: "studio", port: 65536, hostKeys: ["SHA256:abc"], tailnet: nil))
+        XCTAssertTrue(PhonePairing.canPair(host: "studio", port: 0, hostKeys: ["SHA256:abc"],
+                                           tailnet: "wss://thurm.tail1234.ts.net/v1/connect"))
+
+        // Invalid local SSH ports must strip host_keys from payload even when a tailnet route exists.
+        for badPort in [0, -1, 65536] {
+            let link = PhonePairing.payload(name: "studio", host: "studio.tail.ts.net", port: badPort,
+                                            user: "me", hostKeys: ["SHA256:abc"], relay: nil, code: nil,
+                                            tailnet: "wss://thurm.tail1234.ts.net/v1/connect")
+            let d = try decode(link)
+            XCTAssertEqual(d["host_keys"] as? [String], [], "invalid port \(badPort) must omit SSH host_keys")
+            XCTAssertEqual(d["port"] as? Int, 22)
+            XCTAssertNotNil(d["tailnet"])
+        }
     }
 
     func testTailscaleStatusPairsOnlyOnceServingHTTPS() throws {
@@ -377,5 +439,68 @@ final class PairPhoneTests: XCTestCase {
                                         hostKeys: ["SHA256:abc"], relay: "https://push.example", code: "x",
                                         remotes: hosts)
         XCTAssertNotNil(PhonePairing.qrImage(link, remotes: hosts.count))
+    }
+
+    func testLocalReplacementRecordsCleanupFirstFailsClosedAndRetries() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let file = dir.appendingPathComponent(".ssh/authorized_keys")
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = PhonePairing.PendingPushRevokesStore(file: dir.appendingPathComponent("pending.json"))
+
+        let (key1, device) = try XCTUnwrap(PhonePairing.validDeviceKey(deviceKey))
+        let key2 = "ecdsa-sha2-nistp256 AAAAotherKeyBlobForReplacementPhone"
+        let line = { (key: String) in "\(PhonePairing.keyOptions) \(key) \(PhonePairing.commentPrefix)\(device)" }
+        let ready: () -> String? = { nil }
+        func add(_ key: String, daemonReady: () -> String? = { nil },
+                 revoke: @escaping (String, @escaping (PhonePairing.CleanupResult) -> Void) -> Void)
+            -> PhonePairing.LocalKeyAddResult? {
+            var result: PhonePairing.LocalKeyAddResult?
+            PhonePairing.addWithPushCleanup(key: key, device: device, to: file, pendingStore: store,
+                                            daemonReady: daemonReady, revokePhone: revoke,
+                                            completion: { result = $0 })
+            return result
+        }
+
+        // A new name needs no daemon.
+        XCTAssertEqual(add(key1, daemonReady: { XCTFail("no daemon needed"); return nil },
+                           revoke: { _, _ in XCTFail("nothing to revoke") }),
+                       .added(replaced: false))
+
+        // Replacing it with the daemon away changes nothing.
+        let away = add(key2, daemonReady: { "this Mac's Thurm daemon is not connected" },
+                       revoke: { _, _ in XCTFail("nothing to revoke") })
+        guard case .failed(let why) = away else { return XCTFail("\(String(describing: away))") }
+        XCTAssertTrue(why.contains("not connected"), why)
+        XCTAssertEqual(PhonePairing.devices(in: file).map(\.line), [line(key1)])
+        XCTAssertFalse(try store.contains(device))
+
+        // The key changes and the revoke fails: the cleanup was recorded before the edit, and stays.
+        var revoked: [String] = []
+        let failed = add(key2) { name, done in
+            XCTAssertEqual(try? store.contains(name), true, "recorded before the key file changed")
+            done(.failure("timeout"))
+        }
+        guard case .failed(let msg) = failed else { return XCTFail("\(String(describing: failed))") }
+        XCTAssertTrue(msg.contains("timeout"), msg)
+        XCTAssertEqual(PhonePairing.devices(in: file).map(\.line), [line(key2)])
+        XCTAssertTrue(try store.contains(device))
+
+        // The same key again (nothing left to replace) finishes the cleanup.
+        XCTAssertEqual(add(key2) { name, done in revoked.append(name); done(.success) },
+                       .added(replaced: true))
+        XCTAssertEqual(revoked, [device])
+        XCTAssertFalse(try store.contains(device))
+        XCTAssertEqual(add(key2, daemonReady: ready) { _, _ in XCTFail("done already") },
+                       .added(replaced: false))
+
+        // A record that can't be read stops the add, and is left as it is.
+        let garbage = Data("not json".utf8)
+        try garbage.write(to: dir.appendingPathComponent("pending.json"))
+        let unreadable = add(key1) { _, _ in XCTFail("nothing may run") }
+        guard case .failed(let why2) = unreadable else { return XCTFail("\(String(describing: unreadable))") }
+        XCTAssertTrue(why2.contains("can't be read"), why2)
+        XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent("pending.json")), garbage)
+        XCTAssertEqual(PhonePairing.devices(in: file).map(\.line), [line(key2)])
     }
 }

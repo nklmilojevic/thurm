@@ -558,3 +558,154 @@ fn only_a_valid_instruction_counts_as_connected() {
     send(2, &wire::compress(&inst.encode()));
     assert!(connected(Duration::from_secs(5)));
 }
+
+#[test]
+fn a_client_ending_the_session_resends_shutdown_until_acknowledged() {
+    let t0 = Instant::now();
+    let mut e = Engine::new(t0);
+    e.poll(t0);
+    e.receive(t0, host(0, 1, 1, 0, b"screen")).unwrap();
+    e.push(UserEvent::Keys(b"q".to_vec()));
+    e.start_shutdown();
+    assert_eq!(e.next_deadline(t0), t0);
+    let bye = e.poll(t0).unwrap();
+    assert_eq!((bye.old_num, bye.new_num, bye.ack_num), (1, SHUTDOWN, 1));
+    assert_eq!(keys(&bye.diff), [UserEvent::Keys(b"q".to_vec())]);
+    assert!(!e.shutdown_acked());
+    // Not acknowledged: resent on the retransmission timer, not just the heartbeat.
+    assert_eq!(e.poll(t0), None);
+    assert_eq!(e.next_deadline(t0), t0 + MIN_RTO);
+    let again = e.poll(t0 + MIN_RTO).unwrap();
+    assert_eq!((again.old_num, again.new_num), (1, SHUTDOWN));
+    // The host acknowledges it (and exits).
+    e.receive(t0 + MIN_RTO, host(1, 1, SHUTDOWN, 0, b""))
+        .unwrap();
+    assert!(e.shutdown_acked());
+}
+
+/// What a fake host gets from the client, decoded.
+fn client_instruction(crypto: &Crypto, datagram: &[u8]) -> Instruction {
+    let packet = crypto.open(0, datagram).unwrap();
+    let mut assembly = Assembly::default();
+    let whole = assembly.add(&packet.payload).unwrap().unwrap();
+    Instruction::decode(&wire::decompress(&whole).unwrap()).unwrap()
+}
+
+/// Closing asks the host to end; the session's driver goes once the host acknowledges, and
+/// gives up after `CLOSE_WAIT` when it never does.
+#[test]
+fn closing_ends_the_host_side_then_the_driver() {
+    for acknowledge in [true, false] {
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let key = [5u8; 16];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session =
+            MoshSession::start(rt.handle(), server.local_addr().unwrap(), key, (80, 24), |_| {})
+                .unwrap();
+        let crypto = Crypto::new(&key);
+        let mut buf = [0u8; 2048];
+        let (n, client) = server.recv_from(&mut buf).unwrap();
+        let hello = client_instruction(&crypto, &buf[..n]);
+        let reply = |seq: u64, inst: &Instruction| {
+            let frag = split(seq, &wire::compress(&inst.encode())).remove(0);
+            server
+                .send_to(&crypto.seal(TO_CLIENT, &packet(seq, &frag)), client)
+                .unwrap();
+        };
+        reply(1, &host(0, 1, hello.new_num, 0, b"screen"));
+        // The client has the screen once it acknowledges it.
+        loop {
+            let (n, _) = server.recv_from(&mut buf).expect("an ack of the screen");
+            if client_instruction(&crypto, &buf[..n]).ack_num == 1 {
+                break;
+            }
+        }
+
+        let closed = Instant::now();
+        session.close();
+        let bye = loop {
+            let (n, _) = server.recv_from(&mut buf).expect("a shutdown state");
+            let inst = client_instruction(&crypto, &buf[..n]);
+            if inst.new_num == SHUTDOWN {
+                break inst;
+            }
+        };
+        assert_eq!(bye.ack_num, 1);
+        if acknowledge {
+            reply(2, &host(1, 1, SHUTDOWN, 0, b""));
+        }
+        let deadline = Instant::now() + crate::session::CLOSE_WAIT + Duration::from_secs(2);
+        while rt.metrics().num_alive_tasks() > 0 {
+            assert!(Instant::now() < deadline, "the driver outlived the close");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let took = closed.elapsed();
+        if acknowledge {
+            assert!(took < crate::session::CLOSE_WAIT, "{took:?}");
+        } else {
+            assert!(took >= crate::session::CLOSE_WAIT, "{took:?}");
+        }
+    }
+}
+
+/// Against the real `mosh-server`, when there is one: closing the session ends the server (and
+/// its shell) without anything else signalling it.
+#[test]
+fn closing_ends_a_real_mosh_server() {
+    use std::process::Command;
+    let Ok(out) = Command::new("mosh-server")
+        .args(["new", "-i", "127.0.0.1", "-c", "256", "-l", "LANG=en_US.UTF-8", "--", "/bin/sh"])
+        .env("LANG", "en_US.UTF-8")
+        .output()
+    else {
+        eprintln!("no mosh-server here; skipped");
+        return;
+    };
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let connect = bootstrap::parse_connect(&text)
+        .unwrap_or_else(|| panic!("no MOSH CONNECT in: {text}"))
+        .unwrap();
+    let pid: u32 = text
+        .split("pid = ")
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no pid in: {text}"));
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let session = MoshSession::start(
+        rt.handle(),
+        format!("127.0.0.1:{}", connect.port).parse().unwrap(),
+        connect.key,
+        (80, 24),
+        move |ev| {
+            let _ = tx.send(ev);
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(MoshEvent::Status(Status::Connected)) => break,
+            Ok(_) => {}
+            Err(_) => panic!("never connected"),
+        }
+    }
+    assert!(alive());
+    session.close();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive() {
+        assert!(Instant::now() < deadline, "mosh-server {pid} still runs after close");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

@@ -572,10 +572,11 @@ final class TerminalView: NSView, NSTextInputClient {
         link.isPaused = false
     }
 
-    /// True while the next refresh has work: a pending draw, scroll or animation.
+    /// True while the next refresh has work: a pending draw, scroll or animation, or a renderer
+    /// retry waiting to come due (ticks without drawing until then).
     private var wantsTick: Bool {
         needsRender || pendingScroll != nil || smoothActive || flashStart > 0 || renderer.wantsAnotherFrame
-            || !dimTween.isFinished(at: CACurrentMediaTime())
+            || renderer.retryAt != nil || !dimTween.isFinished(at: CACurrentMediaTime())
     }
 
     /// Pauses the display link when nothing animates, so an idle pane costs no wakeups. New

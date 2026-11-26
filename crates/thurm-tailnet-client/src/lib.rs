@@ -51,17 +51,17 @@ impl std::fmt::Display for ConnectError {
             ConnectError::BadUrl(e) => write!(f, "not a Thurm tailnet address: {e}"),
             ConnectError::Unreachable(e) => write!(
                 f,
-                "can't reach the Mac over Tailscale ({e}): is Tailscale connected on this device, \
-                 and is Serve over Tailscale on on the Mac?"
+                "can't reach the host over Tailscale ({e}): is Tailscale connected on this \
+                 device, and is Serve over Tailscale on on the host?"
             ),
             ConnectError::Forbidden(e) => write!(
                 f,
-                "the Mac doesn't let this device's Tailscale account in: {e}"
+                "the host doesn't let this device's Tailscale account in: {e}"
             ),
             ConnectError::DaemonUnavailable => {
                 write!(
                     f,
-                    "the Mac answered over Tailscale, but Thurm's daemon isn't running there"
+                    "the host answered over Tailscale, but Thurm's daemon isn't running there"
                 )
             }
             ConnectError::Protocol(e) => write!(f, "{e}"),
@@ -107,7 +107,7 @@ const LIMITS: Limits = Limits {
 };
 
 /// Connects to the daemon at `url` and says Hello (with `capabilities`, e.g. `CAP_MOBILE`),
-/// within [`CONNECT_TIMEOUT`] in all.
+/// within [`CONNECT_TIMEOUT`] in all. A `ws://` address goes through [`connect_plain`].
 pub fn connect(
     url: &str,
     client_name: &str,
@@ -115,11 +115,43 @@ pub fn connect(
     on_event: impl Fn(Event) + Send + 'static,
     on_disconnect: impl FnOnce() + Send + 'static,
 ) -> Result<Remote, ConnectError> {
+    // Apps built before `connect_plain` existed pass their plain tailnet route (`ws://100.x`)
+    // here: it goes the plain way, checked and bound to the VPN interface, not refused.
+    if url.starts_with("ws://") {
+        return connect_plain(url, client_name, capabilities, on_event, on_disconnect);
+    }
+    check_wss_url(url)?;
     connect_with(
         url,
         client_name,
         capabilities,
         LIMITS,
+        on_event,
+        on_disconnect,
+    )
+}
+
+/// Connects to a daemon's plain tailnet listener over the device's system Tailscale VPN.
+/// Strictly requires `ws://`, a Tailscale IP literal host (`100.64.0.0/10` IPv4 CGNAT or
+/// `fd7a:115c:a1e0::/48` IPv6 ULA), AND an active system Tailscale tunnel interface (`utun*` on
+/// Apple / `tailscale*` on Linux). The TCP socket is bound directly to that tunnel interface
+/// (`IP_BOUND_IF` / `IPV6_BOUND_IF` / `SO_BINDTODEVICE`) and its Tailscale source address,
+/// failing closed whenever the VPN is down or ambiguous so cleartext traffic never reaches a
+/// physical or carrier CGNAT route.
+pub fn connect_plain(
+    url: &str,
+    client_name: &str,
+    capabilities: &[&str],
+    on_event: impl Fn(Event) + Send + 'static,
+    on_disconnect: impl FnOnce() + Send + 'static,
+) -> Result<Remote, ConnectError> {
+    let deadline = std::time::Instant::now() + LIMITS.connect;
+    let opened = open_plain_with(url, LIMITS, None)?;
+    hello(
+        opened,
+        deadline,
+        client_name,
+        capabilities,
         on_event,
         on_disconnect,
     )
@@ -220,15 +252,31 @@ fn hello(
     Ok(Remote { client, session })
 }
 
-/// Opens the WebSocket at `url` and relays it to one end of a socket pair, returned with the
-/// session that keeps the relay running.
+/// Opens the `wss://` WebSocket at `url` and relays it to one end of a socket pair, returned with
+/// the session that keeps the relay running.
 pub fn open(url: &str, timeout: Duration) -> Result<(UnixStream, Session), ConnectError> {
+    check_wss_url(url)?;
     open_with(
         url,
         Limits {
             connect: timeout,
             ..LIMITS
         },
+    )
+}
+
+/// Opens a plain `ws://` WebSocket to a Tailscale IP literal (`100.64.0.0/10` or
+/// `fd7a:115c:a1e0::/48`) bound directly to the device's active Tailscale VPN tunnel interface,
+/// and relays it to one end of a socket pair. Fails closed when the system Tailscale VPN is down
+/// or its route is ambiguous.
+pub fn open_plain(url: &str, timeout: Duration) -> Result<(UnixStream, Session), ConnectError> {
+    open_plain_with(
+        url,
+        Limits {
+            connect: timeout,
+            ..LIMITS
+        },
+        None,
     )
 }
 
@@ -254,6 +302,446 @@ fn check_url(url: &str) -> Result<(), ConnectError> {
     } else {
         Err(ConnectError::BadUrl(url.to_owned()))
     }
+}
+
+fn check_wss_url(url: &str) -> Result<(), ConnectError> {
+    if url.starts_with("wss://") {
+        Ok(())
+    } else {
+        Err(ConnectError::BadUrl(format!(
+            "{url}: expected a wss:// address"
+        )))
+    }
+}
+
+/// Extracts the bare host and port from a `ws://` URL, rejecting userinfo (`@`).
+fn extract_ws_host_port(url: &str) -> Option<(&str, u16)> {
+    let rest = url.strip_prefix("ws://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let (host, tail) = after_open.split_once(']')?;
+        let port = if tail.is_empty() {
+            80
+        } else {
+            let p = tail.strip_prefix(':')?;
+            if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let parsed: u16 = p.parse().ok()?;
+            if parsed == 0 {
+                return None;
+            }
+            parsed
+        };
+        (!host.is_empty()).then_some((host, port))
+    } else {
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((h, p)) => {
+                if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let parsed: u16 = p.parse().ok()?;
+                if parsed == 0 {
+                    return None;
+                }
+                (h, parsed)
+            }
+            None => (authority, 80),
+        };
+        (!host.is_empty()).then_some((host, port))
+    }
+}
+
+fn is_tailnet_v4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 100 && (64..=127).contains(&b)
+}
+
+fn is_tailnet_v6(ip: std::net::Ipv6Addr) -> bool {
+    let s = ip.segments();
+    s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+}
+
+fn is_tailnet_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_tailnet_v4(v4),
+        std::net::IpAddr::V6(v6) => is_tailnet_v6(v6),
+    }
+}
+
+fn check_plain_tailnet_url(url: &str) -> Result<std::net::SocketAddr, ConnectError> {
+    let (host, port) = extract_ws_host_port(url).ok_or_else(|| {
+        ConnectError::BadUrl(format!(
+            "{url}: plain tailnet connect requires a ws:// URL with a Tailscale IP literal"
+        ))
+    })?;
+    let ip: std::net::IpAddr = host.parse().map_err(|_| {
+        ConnectError::BadUrl(format!(
+            "{url}: plain tailnet connect requires a Tailscale IP literal host"
+        ))
+    })?;
+    if !is_tailnet_ip(ip) {
+        return Err(ConnectError::BadUrl(format!(
+            "{url}: {ip} is not a Tailscale IP address"
+        )));
+    }
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
+/// An active (`IFF_UP | IFF_RUNNING`, non-loopback) OS network interface address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InterfaceAddr {
+    name: String,
+    index: u32,
+    addr: std::net::IpAddr,
+    point_to_point: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectedTailnetIface {
+    name: String,
+    index: u32,
+    local_ip: std::net::IpAddr,
+}
+
+fn is_tailnet_tunnel_iface(name: &str, point_to_point: bool) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        name.starts_with("utun") && point_to_point
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = point_to_point;
+        name.starts_with("tailscale")
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    {
+        let _ = (name, point_to_point);
+        false
+    }
+}
+
+/// Selects the unique active Tailscale VPN tunnel interface that owns a local Tailscale address
+/// in `target`'s family. Never selects physical or cellular interfaces (e.g. `en0`, `pdp_ip0`),
+/// prefers interfaces carrying Tailscale's globally unique ULA (`fd7a:115c:a1e0::/48`), and fails
+/// closed if no tunnel is active or multiple tunnels ambiguously claim `100.64.0.0/10`.
+fn select_tailnet_interface(
+    target: std::net::IpAddr,
+    ifaces: &[InterfaceAddr],
+) -> Result<SelectedTailnetIface, ConnectError> {
+    struct Candidate {
+        name: String,
+        index: u32,
+        v4: Option<std::net::Ipv4Addr>,
+        v6: Option<std::net::Ipv6Addr>,
+    }
+    let mut by_iface: Vec<Candidate> = Vec::new();
+    for entry in ifaces {
+        if entry.index == 0 || !is_tailnet_tunnel_iface(&entry.name, entry.point_to_point) {
+            continue;
+        }
+        let cand = match by_iface
+            .iter_mut()
+            .find(|c| c.index == entry.index && c.name == entry.name)
+        {
+            Some(c) => c,
+            None => {
+                by_iface.push(Candidate {
+                    name: entry.name.clone(),
+                    index: entry.index,
+                    v4: None,
+                    v6: None,
+                });
+                by_iface.last_mut().expect("just pushed")
+            }
+        };
+        match entry.addr {
+            std::net::IpAddr::V4(v4) if is_tailnet_v4(v4) && cand.v4.is_none() => {
+                cand.v4 = Some(v4);
+            }
+            std::net::IpAddr::V6(v6) if is_tailnet_v6(v6) && cand.v6.is_none() => {
+                cand.v6 = Some(v6);
+            }
+            _ => {}
+        }
+    }
+
+    let matching: Vec<&Candidate> = by_iface
+        .iter()
+        .filter(|c| match target {
+            std::net::IpAddr::V4(_) => c.v4.is_some(),
+            std::net::IpAddr::V6(_) => c.v6.is_some(),
+        })
+        .collect();
+
+    if matching.is_empty() {
+        return Err(ConnectError::Unreachable(
+            "no active Tailscale VPN tunnel interface for plain tailnet connection; \
+             use wss:// or embedded Tailscale"
+                .into(),
+        ));
+    }
+
+    let chosen = match target {
+        std::net::IpAddr::V6(_) => {
+            if matching.len() != 1 {
+                return Err(ConnectError::Unreachable(
+                    "multiple active Tailscale IPv6 tunnel interfaces; refusing ambiguous plain route"
+                        .into(),
+                ));
+            }
+            matching[0]
+        }
+        std::net::IpAddr::V4(_) => {
+            // Tailscale's fd7a:115c:a1e0::/48 ULA uniquely identifies a Tailscale tunnel over
+            // generic CGNAT VPNs. On Apple, every VPN creates a `utun*` interface, so require the
+            // Tailscale ULA to prove the interface belongs to Tailscale rather than another VPN
+            // using 100.64.0.0/10. On Linux, the interface name (`tailscale*`) already identifies
+            // Tailscale's TUN interface.
+            let ula_confirmed: Vec<&Candidate> =
+                matching.iter().copied().filter(|c| c.v6.is_some()).collect();
+            if ula_confirmed.len() == 1 {
+                ula_confirmed[0]
+            } else if ula_confirmed.len() > 1 {
+                return Err(ConnectError::Unreachable(
+                    "multiple active Tailscale tunnel interfaces; refusing ambiguous plain route"
+                        .into(),
+                ));
+            } else {
+                #[cfg(target_os = "linux")]
+                {
+                    if matching.len() == 1 {
+                        matching[0]
+                    } else {
+                        return Err(ConnectError::Unreachable(
+                            "multiple tailscale* interfaces hold 100.64.0.0/10 addresses; \
+                             refusing ambiguous plain route"
+                                .into(),
+                        ));
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // Another VPN may use 100.64.0.0/10 too: without Tailscale's IPv6 address on
+                    // the same interface, a plaintext connection could go to it.
+                    return Err(ConnectError::Unreachable(
+                        "no VPN interface is confirmed as Tailscale (none has a fd7a:115c:a1e0::/48 \
+                         address), so the plain route is refused; a tailnet without IPv6 (headscale \
+                         with no v6 prefix) needs IPv6 turned on, or a wss:// route"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    };
+
+    let local_ip = match target {
+        std::net::IpAddr::V4(_) => std::net::IpAddr::V4(chosen.v4.expect("filtered")),
+        std::net::IpAddr::V6(_) => std::net::IpAddr::V6(chosen.v6.expect("filtered")),
+    };
+    Ok(SelectedTailnetIface {
+        name: chosen.name.clone(),
+        index: chosen.index,
+        local_ip,
+    })
+}
+
+#[cfg(unix)]
+fn list_active_interfaces() -> std::io::Result<Vec<InterfaceAddr>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    struct Guard(*mut libc::ifaddrs);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { libc::freeifaddrs(self.0) };
+            }
+        }
+    }
+    let _guard = Guard(head);
+    let required = (libc::IFF_UP | libc::IFF_RUNNING) as u32;
+    let loopback = libc::IFF_LOOPBACK as u32;
+    let ptp = libc::IFF_POINTOPOINT as u32;
+    let mut out = Vec::new();
+    let mut cur = head;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        let flags = ifa.ifa_flags;
+        if (flags & required) != required || (flags & loopback) != 0 {
+            continue;
+        }
+        if ifa.ifa_name.is_null() || ifa.ifa_addr.is_null() {
+            continue;
+        }
+        let family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
+        let addr = match family {
+            libc::AF_INET => {
+                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                std::net::IpAddr::V4(ip)
+            }
+            libc::AF_INET6 => {
+                let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                std::net::IpAddr::V6(ip)
+            }
+            _ => continue,
+        };
+        let index = unsafe { libc::if_nametoindex(ifa.ifa_name) };
+        if index == 0 {
+            continue;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        out.push(InterfaceAddr {
+            name,
+            index,
+            addr,
+            point_to_point: (flags & ptp) != 0,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(not(unix))]
+fn list_active_interfaces() -> std::io::Result<Vec<InterfaceAddr>> {
+    Ok(Vec::new())
+}
+
+/// Hard-binds `socket` to the verified Tailscale tunnel interface and its local Tailscale IP so
+/// the kernel refuses to route packets over physical or carrier CGNAT interfaces even if the VPN
+/// disconnects mid-dial.
+fn bind_to_tailnet_interface(
+    socket: &tokio::net::TcpSocket,
+    iface: &SelectedTailnetIface,
+) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        let raw = socket.as_raw_fd();
+        let idx: libc::c_uint = iface.index;
+        let (level, opt) = match iface.local_ip {
+            std::net::IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_BOUND_IF),
+            std::net::IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF),
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                raw,
+                level,
+                opt,
+                (&idx as *const libc::c_uint).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let raw = socket.as_raw_fd();
+        let cname = std::ffi::CString::new(iface.name.as_str()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid interface name")
+        })?;
+        let rc = unsafe {
+            libc::setsockopt(
+                raw,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                cname.as_ptr().cast::<libc::c_void>(),
+                cname.as_bytes_with_nul().len() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    {
+        let _ = (socket, iface);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "interface-bound plain tailnet sockets are not supported on this platform",
+        ));
+    }
+    socket.bind(std::net::SocketAddr::new(iface.local_ip, 0))
+}
+
+fn open_plain_with(
+    url: &str,
+    limits: Limits,
+    override_ifaces: Option<&[InterfaceAddr]>,
+) -> Result<(UnixStream, Session), ConnectError> {
+    open_plain_via(
+        url,
+        limits,
+        override_ifaces,
+        bind_to_tailnet_interface,
+        |socket, addr| async move { socket.connect(addr).await },
+    )
+}
+
+fn open_plain_via<Bind, Dial, DialFut>(
+    url: &str,
+    limits: Limits,
+    override_ifaces: Option<&[InterfaceAddr]>,
+    bind: Bind,
+    dial: Dial,
+) -> Result<(UnixStream, Session), ConnectError>
+where
+    Bind: FnOnce(&tokio::net::TcpSocket, &SelectedTailnetIface) -> std::io::Result<()>,
+    Dial: FnOnce(tokio::net::TcpSocket, std::net::SocketAddr) -> DialFut,
+    DialFut: std::future::Future<Output = std::io::Result<tokio::net::TcpStream>>,
+{
+    let target_addr = check_plain_tailnet_url(url)?;
+    let owned_ifaces;
+    let ifaces = match override_ifaces {
+        Some(list) => list,
+        None => {
+            owned_ifaces = list_active_interfaces()
+                .map_err(|e| ConnectError::Unreachable(format!("inspecting interfaces: {e}")))?;
+            &owned_ifaces
+        }
+    };
+    let selected = select_tailnet_interface(target_addr.ip(), ifaces)?;
+    let session = runtime()?;
+    let rt = session.rt.as_ref().expect("just made");
+    let deadline = std::time::Instant::now() + limits.connect;
+    let ws = rt.block_on(async {
+        let socket = match target_addr {
+            std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+            std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+        }
+        .map_err(|e| ConnectError::Unreachable(format!("creating socket: {e}")))?;
+        bind(&socket, &selected).map_err(|e| {
+            ConnectError::Unreachable(format!(
+                "binding plain tailnet socket to {}: {e}",
+                selected.name
+            ))
+        })?;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let tcp = match tokio::time::timeout(left, dial(socket, target_addr)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(ConnectError::Unreachable(e.to_string())),
+            Err(_) => {
+                return Err(ConnectError::Unreachable(format!(
+                    "no answer within {} seconds",
+                    limits.connect.as_secs()
+                )));
+            }
+        };
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        handshake_within(left, tokio_tungstenite::client_async(url, tcp)).await
+    })?;
+    start(ws, session, limits)
 }
 
 fn runtime() -> Result<Session, ConnectError> {

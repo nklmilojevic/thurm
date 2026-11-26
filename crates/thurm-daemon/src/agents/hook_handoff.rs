@@ -87,6 +87,7 @@ impl AgentTracker {
             answered: saved.answered,
             pgrp: Some(saved.pgrp),
             permission: None,
+            permission_request: None,
         });
         // Published now: a snapshot before the next monitor tick must have the session.
         if !self.public_report_active() {

@@ -101,6 +101,17 @@ impl From<SessionError> for DirectError {
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const EXEC_TIMEOUT: Duration = Duration::from_secs(20);
+/// Happy Eyeballs stagger between resolved addresses when dialing multiple candidates.
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+/// How long the other dials of a race may still win after one got a host-key or key-rejected
+/// answer, before that answer is shown.
+const FATAL_GRACE: Duration = Duration::from_secs(1);
+/// Deadline for a single background DNS lookup triggered by `Direct::wake`.
+const WAKE_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard cap on concurrent blocking OS DNS lookups per `Direct` instance so repeated mobile wakes
+/// during a DNS blackout cannot accumulate unbounded threads, while still letting a newer
+/// network's wake bypass a stalled lookup from the previous network.
+const MAX_WAKE_DNS_IN_FLIGHT: usize = 4;
 /// How long ending the server waits for shells still starting (an ssh connection and a mosh
 /// bootstrap, each with its own timeout).
 const CREATING_TIMEOUT: Duration = Duration::from_secs(60);
@@ -108,6 +119,9 @@ const CREATING_TIMEOUT: Duration = Duration::from_secs(60);
 /// can come in it).
 #[cfg(test)]
 static SSH_START_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+/// Test hook: pause after `connect()` returns inside `Inner::session()` so `shutdown()` can race.
+#[cfg(test)]
+static RECONNECT_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 /// How long a new mosh session has to hear from its server over UDP (several startup probes)
 /// before the pane gives up on mosh: a firewall dropping UDP looks like nothing at all.
@@ -123,14 +137,155 @@ pub struct Direct {
     inner: Arc<Inner>,
 }
 
+type WakeResolver =
+    dyn Fn(&str, u16) -> Result<Vec<SocketAddr>, DirectError> + Send + Sync + 'static;
+
+fn spawn_wake_lookup_locked(
+    dns: &mut WakeDnsState,
+    inner: &Arc<Inner>,
+    my_gen: u64,
+    resolve: Arc<WakeResolver>,
+    timeout: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(rt) = inner.mosh_rt.as_ref() else {
+        dns.in_flight = dns.in_flight.saturating_sub(1);
+        return None;
+    };
+    if let Some(prev) = dns.active_task.take() {
+        prev.abort();
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let blocking_inner = Arc::clone(inner);
+    let blocking_resolve = Arc::clone(&resolve);
+    rt.spawn_blocking(move || {
+        struct SlotGuard(Arc<Inner>);
+        impl Drop for SlotGuard {
+            fn drop(&mut self) {
+                let mut dns = self.0.wake_dns.lock();
+                dns.in_flight = dns.in_flight.saturating_sub(1);
+                if self.0.closed.load(Ordering::SeqCst) {
+                    dns.pending_resolve = None;
+                    return;
+                }
+                if dns.latest_gen > dns.started_gen
+                    && dns.in_flight < MAX_WAKE_DNS_IN_FLIGHT
+                    && let Some((next_resolve, next_timeout)) = dns.pending_resolve.take()
+                {
+                    dns.in_flight += 1;
+                    let next_gen = dns.latest_gen;
+                    dns.started_gen = next_gen;
+                    let _ = spawn_wake_lookup_locked(
+                        &mut dns,
+                        &self.0,
+                        next_gen,
+                        next_resolve,
+                        next_timeout,
+                    );
+                }
+            }
+        }
+        let _slot = SlotGuard(Arc::clone(&blocking_inner));
+        if blocking_inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let res = blocking_resolve(&blocking_inner.target.host, blocking_inner.target.port);
+        let _ = tx.send(res);
+    });
+    let waiter_inner = Arc::clone(inner);
+    let handle = rt.spawn(async move {
+        if let Ok(Ok(Ok(addrs))) = tokio::time::timeout(timeout, rx).await {
+            let current = {
+                let mut dns = waiter_inner.wake_dns.lock();
+                if dns.latest_gen == my_gen {
+                    dns.active_task = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if current && !waiter_inner.closed.load(Ordering::SeqCst) {
+                let panes: Vec<_> = waiter_inner.panes.lock().values().cloned().collect();
+                for pane in panes {
+                    if let Backend::Mosh { session, .. } = &pane.lock().backend {
+                        let actual_ip = session.peer_ip();
+                        if let Some(ip) =
+                            pick_wake_ip(actual_ip, &addrs).filter(|&ip| ip != actual_ip)
+                        {
+                            // A newer wake (the network changed again) may have registered
+                            // since this lookup was judged current; its address wins. The
+                            // generation is rechecked and the nonblocking retarget queued under
+                            // `wake_dns`, which `wake_with` holds to register a generation, so
+                            // the two cannot interleave. Lock order: pane, then `wake_dns`.
+                            let dns = waiter_inner.wake_dns.lock();
+                            if dns.latest_gen != my_gen
+                                || waiter_inner.closed.load(Ordering::SeqCst)
+                            {
+                                return;
+                            }
+                            session.wake_at(ip);
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut dns = waiter_inner.wake_dns.lock();
+            if dns.latest_gen == my_gen {
+                dns.active_task = None;
+            }
+        }
+    });
+    dns.active_task = Some(handle.abort_handle());
+    Some(handle)
+}
+
 impl Direct {
     /// Every mosh session moves to a new socket at once (the network changed, or the app came
-    /// back from the background).
+    /// back from the background). Existing sessions wake immediately so a stalled or failing DNS
+    /// lookup never delays UDP recovery; for hostnames, a deadline-bounded, generation-gated
+    /// lookup runs on the background runtime so a newer network's wake supersedes a previous
+    /// network's stalled lookup without waiting, while concurrency remains strictly bounded.
     pub fn wake(&self) {
-        for pane in self.inner.panes.lock().values() {
+        let _ = self.wake_with(Arc::new(resolve_addrs), WAKE_DNS_TIMEOUT);
+    }
+
+    fn wake_with(
+        &self,
+        resolve: Arc<WakeResolver>,
+        timeout: Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let hostname = self.inner.target.host.parse::<IpAddr>().is_err()
+            && !self.inner.closed.load(Ordering::SeqCst);
+        // Register this wake's generation before the immediate wakes go out, so an older
+        // lookup that has not queued its retarget yet sees it is superseded and cannot point a
+        // session back at the previous network's address after this wake.
+        let my_gen = hostname.then(|| {
+            let mut dns = self.inner.wake_dns.lock();
+            dns.latest_gen = dns.latest_gen.saturating_add(1);
+            dns.latest_gen
+        });
+        let panes: Vec<_> = self.inner.panes.lock().values().cloned().collect();
+        for pane in panes {
             if let Backend::Mosh { session, .. } = &pane.lock().backend {
                 session.wake();
             }
+        }
+        let my_gen = my_gen?;
+        let mut dns = self.inner.wake_dns.lock();
+        if dns.latest_gen != my_gen || self.inner.closed.load(Ordering::SeqCst) {
+            // A newer wake registered meanwhile and starts (or queues) its own lookup.
+            return None;
+        }
+        if dns.in_flight < MAX_WAKE_DNS_IN_FLIGHT {
+            dns.in_flight += 1;
+            dns.started_gen = my_gen;
+            dns.pending_resolve = None;
+            spawn_wake_lookup_locked(&mut dns, &self.inner, my_gen, resolve, timeout)
+        } else {
+            if let Some(prev) = dns.active_task.take() {
+                prev.abort();
+            }
+            dns.pending_resolve = Some((resolve, timeout));
+            None
         }
     }
 }
@@ -155,14 +310,21 @@ pub fn serve(
     let inner = Arc::new(Inner {
         target,
         key,
-        ip,
-        session: Mutex::new(Some(Arc::new(session))),
+        session: Mutex::new(SessionSlot {
+            current: Some(Arc::new(session)),
+            session_id: 1,
+            ip,
+            connecting: false,
+        }),
+        next_session_id: AtomicU64::new(2),
+        session_ready: Condvar::new(),
         panes: Mutex::new(HashMap::new()),
         next_pane: AtomicU64::new(1),
         closed: AtomicBool::new(false),
         creating: Mutex::new(0),
         created: Condvar::new(),
         out: Mutex::new(theirs),
+        wake_dns: Mutex::new(WakeDnsState::new()),
         mosh_rt: Some(mosh_rt),
     });
     let server = inner.clone();
@@ -173,32 +335,464 @@ pub fn serve(
     Ok((ours, Direct { inner }))
 }
 
-/// Connects over ssh to the first of the host's addresses that answers. The address is kept:
-/// mosh-server listens on the address the ssh connection reached (`-s`), so mosh goes there.
+/// Deduplicates resolved addresses and interleaves address families (RFC 8305 Happy Eyeballs),
+/// preserving the OS's preferred family for the first entry.
+fn interleave_addrs(raw: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut unique = Vec::with_capacity(raw.len());
+    for a in raw {
+        if !unique.contains(&a) {
+            unique.push(a);
+        }
+    }
+    let Some(&first) = unique.first() else {
+        return unique;
+    };
+    let (mut primary, mut secondary): (Vec<SocketAddr>, Vec<SocketAddr>) = unique
+        .into_iter()
+        .partition(|a| a.is_ipv6() == first.is_ipv6());
+    let mut out = Vec::with_capacity(primary.len() + secondary.len());
+    let mut p = primary.drain(..);
+    let mut s = secondary.drain(..);
+    loop {
+        match (p.next(), s.next()) {
+            (Some(a), Some(b)) => {
+                out.push(a);
+                out.push(b);
+            }
+            (Some(a), None) => out.push(a),
+            (None, Some(b)) => out.push(b),
+            (None, None) => break,
+        }
+    }
+    out
+}
+
+fn resolve_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, DirectError> {
+    let raw: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| DirectError::Failed(format!("{host}: {e}")))?
+        .collect();
+    Ok(interleave_addrs(raw))
+}
+
+/// Picks the best peer IP on network wake: keep `current` if still advertised, else prefer the
+/// same address family (mosh-server binds the family it started on), else fall back to another
+/// family (e.g. Wi-Fi IPv4 -> cellular NAT64 IPv6).
+fn pick_wake_ip(current: IpAddr, addrs: &[SocketAddr]) -> Option<IpAddr> {
+    if addrs.iter().any(|a| a.ip() == current) {
+        return Some(current);
+    }
+    if let Some(same_family) = addrs.iter().find(|a| a.is_ipv4() == current.is_ipv4()) {
+        return Some(same_family.ip());
+    }
+    addrs.first().map(SocketAddr::ip)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum AuthState {
+    Idle,
+    InFlight,
+    Won,
+    /// The local device key declined or failed to sign (e.g. user cancelled biometrics): stop
+    /// sibling candidates from re-prompting and preserve the original signing error.
+    SignRefused(String),
+    /// No more signing in this attempt: it ended (the race returned), or the host rejected the
+    /// key (another address would reject the same key, after another prompt).
+    Closed,
+}
+
+/// Serializes SSH authentication across concurrent Happy Eyeballs dials from `sign()` through
+/// `Session::connect_checked` completion so overlapping dials never trigger duplicate biometric
+/// prompts while an earlier candidate is awaiting `USERAUTH_SUCCESS` or after signing is declined.
+struct AuthGate {
+    state: Mutex<AuthState>,
+    cv: Condvar,
+    /// Close instead of going back to Idle when the signer in flight fails.
+    close_on_release: AtomicBool,
+}
+
+impl AuthGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AuthState::Idle),
+            cv: Condvar::new(),
+            close_on_release: AtomicBool::new(false),
+        }
+    }
+
+    /// Waits for the turn to sign. A dial whose connection was given up meanwhile (`abandoned`:
+    /// its own timeout ran out) leaves instead of prompting for a connection that is gone.
+    fn acquire_for_sign(&self, won: &AtomicBool, abandoned: &AtomicBool) -> Result<(), String> {
+        let mut state = self.state.lock();
+        loop {
+            if abandoned.load(Ordering::Acquire) {
+                return Err("cancelled".into());
+            }
+            match &*state {
+                AuthState::Won | AuthState::Closed => return Err("cancelled".into()),
+                AuthState::SignRefused(msg) => return Err(msg.clone()),
+                AuthState::Idle => {
+                    if won.load(Ordering::Acquire) {
+                        return Err("cancelled".into());
+                    }
+                    *state = AuthState::InFlight;
+                    return Ok(());
+                }
+                AuthState::InFlight => {
+                    if won.load(Ordering::Acquire) {
+                        return Err("cancelled".into());
+                    }
+                    self.cv.wait(&mut state);
+                }
+            }
+        }
+    }
+
+    fn release_failed(&self) {
+        let mut state = self.state.lock();
+        if matches!(*state, AuthState::InFlight) {
+            *state = if self.close_on_release.load(Ordering::Acquire) {
+                AuthState::Closed
+            } else {
+                AuthState::Idle
+            };
+            // All waiters recheck: an abandoned one must not be the only one woken.
+            self.cv.notify_all();
+        }
+    }
+
+    /// No more signing: now if nobody signs, else once the signer in flight is done (it may
+    /// still win). Waiters leave.
+    fn close(&self) {
+        let mut state = self.state.lock();
+        self.close_on_release.store(true, Ordering::Release);
+        if matches!(*state, AuthState::Idle) {
+            *state = AuthState::Closed;
+        }
+        self.cv.notify_all();
+    }
+
+    /// Wakes the waiters to recheck (a dial was abandoned).
+    fn nudge(&self) {
+        let _state = self.state.lock();
+        self.cv.notify_all();
+    }
+
+    fn signing(&self) -> bool {
+        matches!(*self.state.lock(), AuthState::InFlight)
+    }
+
+    fn mark_won(&self) {
+        let mut state = self.state.lock();
+        *state = AuthState::Won;
+        self.cv.notify_all();
+    }
+
+    fn mark_sign_refused(&self, err: String) {
+        let mut state = self.state.lock();
+        if matches!(*state, AuthState::Idle | AuthState::InFlight) {
+            *state = AuthState::SignRefused(err);
+            self.cv.notify_all();
+        }
+    }
+
+    fn sign_refused(&self) -> Option<String> {
+        match &*self.state.lock() {
+            AuthState::SignRefused(msg) => Some(msg.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Wraps `DeviceKey` across concurrent Happy Eyeballs dials so only one candidate authenticates
+/// at a time and losing or declined dials abort before invoking `sign()`.
+struct RacingKey {
+    inner: Arc<dyn DeviceKey>,
+    gate: Arc<AuthGate>,
+    won: Arc<AtomicBool>,
+    holding: AtomicBool,
+    /// This dial's connection attempt is over: a `sign()` still waiting must not prompt.
+    abandoned: AtomicBool,
+}
+
+impl RacingKey {
+    fn new(inner: Arc<dyn DeviceKey>, gate: Arc<AuthGate>, won: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            gate,
+            won,
+            holding: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
+        }
+    }
+
+    fn finish(&self, succeeded: bool) {
+        self.abandoned.store(true, Ordering::Release);
+        if succeeded {
+            self.holding.store(false, Ordering::Release);
+            self.gate.mark_won();
+        } else if self.holding.swap(false, Ordering::AcqRel) {
+            self.gate.release_failed();
+        } else {
+            self.gate.nudge();
+        }
+    }
+}
+
+impl Drop for RacingKey {
+    fn drop(&mut self) {
+        if self.holding.swap(false, Ordering::AcqRel) {
+            self.gate.release_failed();
+        }
+    }
+}
+
+impl DeviceKey for RacingKey {
+    fn public_sec1(&self) -> Vec<u8> {
+        self.inner.public_sec1()
+    }
+
+    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        if !self.holding.load(Ordering::Acquire) {
+            self.gate.acquire_for_sign(&self.won, &self.abandoned)?;
+            self.holding.store(true, Ordering::Release);
+        }
+        match self.inner.sign(data) {
+            Ok(sig) => Ok(sig),
+            Err(e) => {
+                // Signing refusal comes from the local device key (e.g. cancelled biometric
+                // prompt), not the remote address: cancel sibling dials instead of re-prompting.
+                self.holding.store(false, Ordering::Release);
+                self.gate.mark_sign_refused(e.clone());
+                Err(e)
+            }
+        }
+    }
+}
+
+fn sign_refused_error(err: Option<SessionError>, msg: &str) -> DirectError {
+    if let Some(SessionError::Ssh(s)) = err {
+        let text = s.to_string();
+        if text.contains(msg) {
+            return DirectError::Failed(text);
+        }
+    }
+    DirectError::Failed(format!("ssh: signing: {msg}"))
+}
+
+/// Races candidate addresses with Happy Eyeballs staggering. Prefers any winning connection. A
+/// host's answer that likely holds for every address (`UnknownHostKey`, `HostKeyChanged`,
+/// `KeyRejected`) gives the other dials [`FATAL_GRACE`] to win, then ends the attempt with it
+/// (not after their full connect timeout); a dial signing when that runs out is waited for.
+/// The local device key refusing to sign ends the attempt with the signing error. When this
+/// returns, dials still running can no longer prompt.
+fn race_candidates<S, F, D>(
+    host: &str,
+    addrs: &[SocketAddr],
+    stagger: Duration,
+    won: Arc<AtomicBool>,
+    gate: Arc<AuthGate>,
+    dial: F,
+    disconnect: D,
+) -> Result<(S, IpAddr), DirectError>
+where
+    S: Send + 'static,
+    F: Fn(SocketAddr) -> Result<S, SessionError> + Send + Sync + 'static,
+    D: Fn(S) + Send + Sync + 'static,
+{
+    if addrs.is_empty() {
+        return Err(DirectError::Failed(format!("{host}: no address")));
+    }
+    let dial = Arc::new(dial);
+    let disconnect = Arc::new(disconnect);
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(S, IpAddr), SessionError>>();
+    let mut in_flight = 0usize;
+    let mut last = DirectError::Failed(format!("{host}: no address"));
+    let mut fatal: Option<DirectError> = None;
+    struct CloseOnReturn<'a>(&'a AuthGate);
+    impl Drop for CloseOnReturn<'_> {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _closed = CloseOnReturn(&gate);
+    // When a host-key or key-rejected answer came, plus FATAL_GRACE.
+    let mut fatal_until: Option<Instant> = None;
+    // A failed dial: the error to end the attempt with now (the key refused to sign), if any.
+    let failed = |e: SessionError,
+                  fatal: &mut Option<DirectError>,
+                  fatal_until: &mut Option<Instant>,
+                  last: &mut DirectError| {
+        if let Some(msg) = gate.sign_refused() {
+            return Some(sign_refused_error(Some(e), &msg));
+        }
+        match e {
+            SessionError::Ssh(s) => *last = DirectError::Failed(s.to_string()),
+            other => {
+                if fatal.is_none() {
+                    *fatal = Some(other.into());
+                    *fatal_until = Some(Instant::now() + FATAL_GRACE);
+                }
+            }
+        }
+        None
+    };
+    // The grace after a fatal answer ran out, and nobody is signing: end with it.
+    let grace_over = |fatal_until: &Option<Instant>| {
+        fatal_until.is_some_and(|t| Instant::now() >= t) && !gate.signing()
+    };
+
+    let spawn_one = |addr: SocketAddr| -> bool {
+        let tx = tx.clone();
+        let won = won.clone();
+        let dial = dial.clone();
+        let disconnect = disconnect.clone();
+        std::thread::Builder::new()
+            .name("thurm-direct-dial".into())
+            .spawn(move || match dial(addr) {
+                Ok(session) => {
+                    if won.swap(true, Ordering::AcqRel) {
+                        disconnect(session);
+                        return;
+                    }
+                    if let Err(std::sync::mpsc::SendError(Ok((session, _)))) =
+                        tx.send(Ok((session, addr.ip())))
+                    {
+                        disconnect(session);
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            })
+            .is_ok()
+    };
+
+    let mut idx = 0;
+    while idx < addrs.len() {
+        if let Some(msg) = gate.sign_refused() {
+            return Err(sign_refused_error(None, &msg));
+        }
+        if spawn_one(addrs[idx]) {
+            in_flight += 1;
+        }
+        idx += 1;
+        if idx < addrs.len() {
+            match rx.recv_timeout(stagger) {
+                Ok(Ok(pair)) => return Ok(pair),
+                Ok(Err(e)) => {
+                    in_flight = in_flight.saturating_sub(1);
+                    if let Some(err) = failed(e, &mut fatal, &mut fatal_until, &mut last) {
+                        return Err(err);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+            if grace_over(&fatal_until) {
+                break;
+            }
+        }
+    }
+    drop(tx);
+    while in_flight > 0 && !grace_over(&fatal_until) {
+        let got = match fatal_until {
+            // Woken at the end of the grace (and every 50ms after, while someone signs).
+            Some(t) => rx.recv_timeout(
+                t.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(50)),
+            ),
+            None => rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+        };
+        match got {
+            Ok(Ok(pair)) => return Ok(pair),
+            Ok(Err(e)) => {
+                in_flight -= 1;
+                if let Some(err) = failed(e, &mut fatal, &mut fatal_until, &mut last) {
+                    return Err(err);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if let Some(msg) = gate.sign_refused() {
+        return Err(sign_refused_error(None, &msg));
+    }
+    Err(fatal.unwrap_or(last))
+}
+
+/// Connects over ssh by racing the host's resolved addresses (Happy Eyeballs). The winning
+/// address is kept: mosh-server listens on the address the ssh connection reached (`-s`), so
+/// mosh goes there.
 fn connect(
     target: &DirectTarget,
     key: &Arc<dyn DeviceKey>,
 ) -> Result<(Session, IpAddr), DirectError> {
-    let addrs: Vec<SocketAddr> = (target.host.as_str(), target.port)
-        .to_socket_addrs()
-        .map_err(|e| DirectError::Failed(format!("{}: {e}", target.host)))?
-        .collect();
-    let mut last = DirectError::Failed(format!("{}: no address", target.host));
-    for addr in addrs {
+    let addrs = resolve_addrs(&target.host, target.port)?;
+    connect_addrs_with_stagger(target, &addrs, key, HAPPY_EYEBALLS_DELAY)
+}
+
+fn connect_addrs_with_stagger(
+    target: &DirectTarget,
+    addrs: &[SocketAddr],
+    key: &Arc<dyn DeviceKey>,
+    stagger: Duration,
+) -> Result<(Session, IpAddr), DirectError> {
+    if addrs.is_empty() {
+        return Err(DirectError::Failed(format!("{}: no address", target.host)));
+    }
+    if addrs.len() == 1 {
+        let addr = addrs[0];
         let t = Target {
             host: addr.ip().to_string(),
-            port: target.port,
+            port: addr.port(),
             user: target.user.clone(),
             host_keys: target.host_keys.clone(),
             socket: None,
         };
-        match Session::connect_checked(&t, key.clone(), CONNECT_TIMEOUT) {
-            Ok(s) => return Ok((s, addr.ip())),
-            Err(SessionError::Ssh(e)) => last = DirectError::Failed(e.to_string()),
-            Err(e) => return Err(e.into()),
-        }
+        return match Session::connect_checked(&t, key.clone(), CONNECT_TIMEOUT) {
+            Ok(s) => Ok((s, addr.ip())),
+            Err(e) => Err(e.into()),
+        };
     }
-    Err(last)
+
+    let won = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(AuthGate::new());
+    let target = target.clone();
+    let key = key.clone();
+    let won_for_dial = won.clone();
+    let gate_for_dial = gate.clone();
+    race_candidates(
+        &target.host.clone(),
+        addrs,
+        stagger,
+        won,
+        gate,
+        move |addr| {
+            let t = Target {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                user: target.user.clone(),
+                host_keys: target.host_keys.clone(),
+                socket: None,
+            };
+            let racing = Arc::new(RacingKey::new(
+                key.clone(),
+                gate_for_dial.clone(),
+                won_for_dial.clone(),
+            ));
+            let res = Session::connect_checked(&t, racing.clone(), CONNECT_TIMEOUT);
+            // A rejected key stops further prompts before this dial lets another sign: the
+            // other addresses would reject the same key.
+            if matches!(res, Err(SessionError::KeyRejected)) {
+                gate_for_dial.close();
+            }
+            racing.finish(res.is_ok());
+            res
+        },
+        |session| session.disconnect(),
+    )
 }
 
 enum Backend {
@@ -208,6 +802,10 @@ enum Backend {
     Mosh {
         session: MoshSession,
         pid: Option<u32>,
+        /// The SSH session instance that launched `pid`. Cleanup only sends `kill <pid>` over this
+        /// exact session so a reconnect (possibly to a different host behind DNS, or after a
+        /// reboot) can never kill an unrelated process that happens to share the same PID.
+        origin_session_id: u64,
         /// The host state shown.
         current: u64,
         /// Acknowledged host states the server may diff from, as terminal state.
@@ -295,16 +893,22 @@ impl Pane {
     }
 }
 
-/// Ends what a pane runs; returns its mosh-server's pid, to end on the host.
-fn end_backend(backend: Backend) -> Option<u32> {
+/// Ends what a pane runs; returns its mosh-server's pid and originating SSH session ID, to end on
+/// the host only if that exact SSH session is still active.
+fn end_backend(backend: Backend) -> Option<(u32, u64)> {
     match backend {
         Backend::Ssh(shell) => {
             shell.close();
             None
         }
-        Backend::Mosh { session, pid, .. } => {
+        Backend::Mosh {
+            session,
+            pid,
+            origin_session_id,
+            ..
+        } => {
             session.close();
-            pid
+            pid.map(|p| (p, origin_session_id))
         }
         Backend::Starting | Backend::Ended => None,
     }
@@ -329,11 +933,39 @@ fn new_terminal(size: PaneSize) -> Terminal {
     term
 }
 
+struct SessionSlot {
+    current: Option<Arc<Session>>,
+    session_id: u64,
+    ip: IpAddr,
+    connecting: bool,
+}
+
+struct WakeDnsState {
+    latest_gen: u64,
+    started_gen: u64,
+    in_flight: usize,
+    active_task: Option<tokio::task::AbortHandle>,
+    pending_resolve: Option<(Arc<WakeResolver>, Duration)>,
+}
+
+impl WakeDnsState {
+    fn new() -> Self {
+        Self {
+            latest_gen: 0,
+            started_gen: 0,
+            in_flight: 0,
+            active_task: None,
+            pending_resolve: None,
+        }
+    }
+}
+
 struct Inner {
     target: DirectTarget,
     key: Arc<dyn DeviceKey>,
-    ip: IpAddr,
-    session: Mutex<Option<Arc<Session>>>,
+    session: Mutex<SessionSlot>,
+    next_session_id: AtomicU64,
+    session_ready: Condvar,
     panes: Mutex<HashMap<PaneId, Arc<Mutex<Pane>>>>,
     next_pane: AtomicU64,
     /// The app closed its end: shells that finish starting now end at once.
@@ -342,6 +974,8 @@ struct Inner {
     creating: Mutex<usize>,
     created: Condvar,
     out: Mutex<UnixStream>,
+    /// Generation-gated, bounded-concurrency state for hostname DNS lookups on `Direct::wake`.
+    wake_dns: Mutex<WakeDnsState>,
     /// Always set; taken on drop.
     mosh_rt: Option<tokio::runtime::Runtime>,
 }
@@ -351,7 +985,31 @@ impl Drop for Inner {
         // The last reference may be a mosh callback's, on the runtime itself: dropping it
         // there would block (and panic).
         if let Some(rt) = self.mosh_rt.take() {
-            rt.shutdown_background();
+            // Closed mosh sessions are still asking their hosts to end (`CLOSE_WAIT` at most):
+            // with the ssh session gone (or a newer one that never started them), that is the
+            // only way their shells end. Let the runtime finish them off this thread.
+            let (tx, rx) = std::sync::mpsc::channel::<tokio::runtime::Runtime>();
+            let spawned = std::thread::Builder::new()
+                .name("thurm-mosh-close".into())
+                .spawn(move || {
+                    let Ok(rt) = rx.recv() else { return };
+                    let deadline = Instant::now() + thurm_mosh::session::CLOSE_WAIT * 2;
+                    while rt.metrics().num_alive_tasks() > 0 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    rt.shutdown_background();
+                });
+            match spawned {
+                Ok(_) => {
+                    if let Err(std::sync::mpsc::SendError(rt)) = tx.send(rt) {
+                        rt.shutdown_background();
+                    }
+                }
+                Err(e) => {
+                    log::debug!("mosh: no thread to finish closing sessions: {e}");
+                    rt.shutdown_background();
+                }
+            }
         }
     }
 }
@@ -378,25 +1036,74 @@ impl Inner {
         self.panes.lock().get(&id).cloned()
     }
 
-    /// The ssh session, connecting again when it has gone away (the app was suspended).
-    fn session(&self) -> Result<Arc<Session>, String> {
-        let mut s = self.session.lock();
-        if let Some(session) = s.as_ref().filter(|s| !s.is_closed()) {
-            return Ok(session.clone());
+    /// The ssh session, its monotonic session ID, and its current IP, reconnecting (with fresh DNS
+    /// resolution and Happy Eyeballs) when it has gone away. Never holds `self.session` across the
+    /// network dial, so `close()` and `shutdown()` never stall on a 20s reconnect.
+    fn session(&self) -> Result<(Arc<Session>, u64, IpAddr), String> {
+        let mut slot = self.session.lock();
+        loop {
+            if let Some(session) = slot.current.as_ref().filter(|s| !s.is_closed()) {
+                return Ok((session.clone(), slot.session_id, slot.ip));
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return Err("the connection is closing".into());
+            }
+            if slot.connecting {
+                self.session_ready.wait(&mut slot);
+                continue;
+            }
+            slot.connecting = true;
+            drop(slot);
+            struct ConnectingGuard<'a> {
+                inner: &'a Inner,
+                armed: bool,
+            }
+            impl Drop for ConnectingGuard<'_> {
+                fn drop(&mut self) {
+                    if self.armed {
+                        let mut slot = self.inner.session.lock();
+                        slot.connecting = false;
+                        self.inner.session_ready.notify_all();
+                    }
+                }
+            }
+            let mut guard = ConnectingGuard {
+                inner: self,
+                armed: true,
+            };
+            let res = connect(&self.target, &self.key);
+            #[cfg(test)]
+            {
+                let delay = RECONNECT_DELAY_MS.load(Ordering::Relaxed);
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+            }
+            let mut slot = self.session.lock();
+            slot.connecting = false;
+            guard.armed = false;
+            match res {
+                Ok((s, ip)) => {
+                    if self.closed.load(Ordering::SeqCst) {
+                        self.session_ready.notify_all();
+                        drop(slot);
+                        s.disconnect();
+                        return Err("the connection is closing".into());
+                    }
+                    let s = Arc::new(s);
+                    let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+                    slot.current = Some(s.clone());
+                    slot.session_id = id;
+                    slot.ip = ip;
+                    self.session_ready.notify_all();
+                    return Ok((s, id, ip));
+                }
+                Err(e) => {
+                    self.session_ready.notify_all();
+                    return Err(e.to_string());
+                }
+            }
         }
-        let t = Target {
-            host: self.ip.to_string(),
-            port: self.target.port,
-            user: self.target.user.clone(),
-            host_keys: self.target.host_keys.clone(),
-            socket: None,
-        };
-        let session = Arc::new(
-            Session::connect_checked(&t, self.key.clone(), CONNECT_TIMEOUT)
-                .map_err(|e| e.to_string())?,
-        );
-        *s = Some(session.clone());
-        Ok(session)
     }
 
     fn run(self: Arc<Self>, mut reader: UnixStream) {
@@ -429,7 +1136,20 @@ impl Inner {
     /// The app is gone, and with it the only holder of the mosh keys: end the host's shells,
     /// those still starting included (they end themselves once started, seeing `closed`).
     fn shutdown(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        {
+            // Sequence setting `closed` with `session` so any reconnect finishing concurrently
+            // either sees `closed == true` before storing or is taken and disconnected below.
+            let _slot = self.session.lock();
+            self.closed.store(true, Ordering::SeqCst);
+        }
+        {
+            let mut dns = self.wake_dns.lock();
+            if let Some(task) = dns.active_task.take() {
+                task.abort();
+            }
+            dns.pending_resolve = None;
+        }
+        self.session_ready.notify_all();
         {
             let deadline = Instant::now() + CREATING_TIMEOUT;
             let mut creating = self.creating.lock();
@@ -440,13 +1160,21 @@ impl Inner {
             }
         }
         let panes: Vec<_> = self.panes.lock().drain().map(|(_, p)| p).collect();
-        let pids: Vec<u32> = panes
+        let pids: Vec<(u32, u64)> = panes
             .iter()
             .filter_map(|p| end_backend(std::mem::replace(&mut p.lock().backend, Backend::Ended)))
             .collect();
         drop(panes);
-        if let Some(session) = self.session.lock().take() {
-            kill(&session, &pids);
+        let (session, session_id) = {
+            let mut slot = self.session.lock();
+            (slot.current.take(), slot.session_id)
+        };
+        if let Some(session) = session {
+            let matching: Vec<u32> = pids
+                .into_iter()
+                .filter_map(|(pid, origin_id)| (origin_id == session_id).then_some(pid))
+                .collect();
+            kill(&session, &matching);
             session.disconnect();
         }
     }
@@ -584,10 +1312,20 @@ impl Inner {
         };
         // Still starting: its worker sees the pane gone and ends what it started.
         let backend = std::mem::replace(&mut pane.lock().backend, Backend::Ended);
-        if let Some(pid) = end_backend(backend) {
-            // Over the session there is now: reconnecting would hold up this request (the
-            // server exits by itself after its timeout).
-            if let Some(s) = self.session.lock().clone().filter(|s| !s.is_closed()) {
+        if let Some((pid, origin_id)) = end_backend(backend) {
+            // Only kill over the exact SSH session that launched this mosh-server: if SSH dropped
+            // and reconnected (possibly to a different host behind DNS, or after a reboot),
+            // sending `kill <pid>` could hit an unrelated process; the server exits on its own
+            // after its timeout.
+            let session = {
+                let slot = self.session.lock();
+                if slot.session_id == origin_id {
+                    slot.current.clone().filter(|s| !s.is_closed())
+                } else {
+                    None
+                }
+            };
+            if let Some(s) = session {
                 std::thread::spawn(move || kill(&s, &[pid]));
             }
         }
@@ -600,7 +1338,7 @@ impl Inner {
         }
         let id = self.next_pane.fetch_add(1, Ordering::Relaxed);
         let size = req.size;
-        let session = self.session()?;
+        let (session, session_id, ip) = self.session()?;
         let pane = Arc::new(Mutex::new(Pane {
             id,
             term: new_terminal(size),
@@ -614,9 +1352,9 @@ impl Inner {
         let started = match self.target.mode {
             Mode::Ssh => self.start_ssh(&session, &pane, size),
             Mode::MoshOnly => self
-                .start_mosh(&session, &pane, size)
+                .start_mosh(&session, session_id, ip, &pane, size)
                 .map_err(|e| e.to_string()),
-            Mode::Mosh => match self.start_mosh(&session, &pane, size) {
+            Mode::Mosh => match self.start_mosh(&session, session_id, ip, &pane, size) {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     let note = format!("\x1b[2m[mosh: {e}; using ssh]\x1b[0m\r\n");
@@ -635,7 +1373,9 @@ impl Inner {
         if self.closed.load(Ordering::SeqCst) || !self.panes.lock().contains_key(&id) {
             self.panes.lock().remove(&id);
             let backend = std::mem::replace(&mut pane.lock().backend, Backend::Ended);
-            if let Some(pid) = end_backend(backend) {
+            if let Some((pid, origin_id)) = end_backend(backend)
+                && origin_id == session_id
+            {
                 kill(&session, &[pid]);
             }
             return Err("the pane was closed while it started".into());
@@ -685,6 +1425,8 @@ impl Inner {
     fn start_mosh(
         self: &Arc<Self>,
         session: &Session,
+        session_id: u64,
+        ip: IpAddr,
         pane: &Arc<Mutex<Pane>>,
         size: PaneSize,
     ) -> Result<(), BootstrapError> {
@@ -701,7 +1443,7 @@ impl Inner {
         let initial = p.term.serialize_state();
         let started = MoshSession::start(
             self.mosh_rt.as_ref().expect("the mosh runtime").handle(),
-            SocketAddr::new(self.ip, connect.port),
+            SocketAddr::new(ip, connect.port),
             connect.key,
             (size.cols, size.rows),
             move |ev| {
@@ -725,6 +1467,7 @@ impl Inner {
         p.backend = Backend::Mosh {
             session: mosh,
             pid: connect.pid,
+            origin_session_id: session_id,
             current: 0,
             snapshots: BTreeMap::from([(0, initial)]),
             status: Status::Connecting,
@@ -735,7 +1478,9 @@ impl Inner {
             return Ok(());
         }
         let backend = std::mem::replace(&mut pane.lock().backend, Backend::Starting);
-        if let Some(pid) = end_backend(backend) {
+        if let Some((pid, origin_id)) = end_backend(backend)
+            && origin_id == session_id
+        {
             kill(session, &[pid]);
         }
         Err(BootstrapError::Failed(format!(
