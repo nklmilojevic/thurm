@@ -1122,6 +1122,22 @@ mod proc_tests {
         // Nothing read proves nothing.
         assert!(!roots_agree(None, Some(daemon), None));
         assert!(!roots_agree(Some(daemon), None, None));
+        // The same directory reached through another mount (a bind mount of `/` without the
+        // mounts under it) is not the same root.
+        let (root, bind) = ((64769u64, 2u64, 1u64), (64769u64, 2u64, 731u64));
+        assert!(!roots_agree(Some(bind), Some(root), None));
+        assert!(!roots_agree(Some(root), Some(root), Some(Some(bind))));
+        assert_eq!(
+            fdinfo_mnt_id("pos:\t0\nflags:\t012100000\nmnt_id:\t731\nino:\t2\n"),
+            Some(731)
+        );
+        assert_eq!(fdinfo_mnt_id("pos:\t0\nflags:\t012100000\n"), None);
+        assert_eq!(fdinfo_mnt_id("mnt_id:\tx\n"), None);
+        #[cfg(target_os = "linux")]
+        {
+            let own = root_identity("/proc/self/root").expect("own root identity");
+            assert_eq!(root_identity(&format!("/proc/{me}/root")), Some(own));
+        }
         assert!(same_mount_ns(me));
         assert!(
             !same_root(u32::MAX - 7, me),
@@ -1721,13 +1737,46 @@ pub fn controlling_tty(pid: u32) -> Option<u64> {
 /// (setuid `login(1)` on macOS cannot).
 #[cfg(target_os = "linux")]
 pub fn same_root(pid: u32, reference_pid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let id = |p: String| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
     roots_agree(
-        id(format!("/proc/{pid}/root")),
-        id("/proc/self/root".to_owned()),
-        id(format!("/proc/{reference_pid}/root")).map(Some),
+        root_identity(&format!("/proc/{pid}/root")),
+        root_identity("/proc/self/root"),
+        root_identity(&format!("/proc/{reference_pid}/root")).map(Some),
     )
+}
+
+/// The identity of the directory a procfs `root` link leads to: its device and inode, and the
+/// mount it is reached through (a bind mount of `/` that leaves out the mounts under it has
+/// the same device and inode, but not the same view). Read from one handle on it; `None` when
+/// any of it cannot be read.
+#[cfg(target_os = "linux")]
+fn root_identity(link: &str) -> Option<(u64, u64, u64)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let c = std::ffi::CString::new(link).ok()?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return None;
+    }
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).ok()?;
+    let mnt_id = fdinfo_mnt_id(&info)?;
+    Some((st.st_dev as u64, st.st_ino as u64, mnt_id))
+}
+
+/// The `mnt_id:` field of a `/proc/<pid>/fdinfo/<fd>` file.
+#[cfg(any(target_os = "linux", test))]
+fn fdinfo_mnt_id(info: &str) -> Option<u64> {
+    info.lines()
+        .find_map(|l| l.strip_prefix("mnt_id:"))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// The rule [`same_root`] applies: the reporter's root must be read and be the daemon's (an
