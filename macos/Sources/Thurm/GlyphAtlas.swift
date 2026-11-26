@@ -105,7 +105,7 @@ final class GlyphAtlas {
         blit.endEncoding()
         if let ctx = sharedCtx {
             // Serialized on the shared render queue ahead of subsequent render passes.
-            ctx.recordCommit(commands) { commands.commit() }
+            ctx.recordCommit(commands, countsAsFrame: false) { commands.commit() }
         } else {
             commands.commit()
             commands.waitUntilCompleted()

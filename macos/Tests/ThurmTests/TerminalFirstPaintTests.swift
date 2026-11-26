@@ -448,4 +448,28 @@ final class TerminalFirstPaintTests: XCTestCase {
         NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window2)
         XCTAssertEqual(view.windowNotificationCount, beforeReattachNote + 1)
     }
+
+    func testAtlasGrowthAndNonFrameCommitsDoNotIncrementCommitCount() throws {
+        try requireMetal()
+        let ctx = try XCTUnwrap(MetalContext.shared)
+        let initialCommits = ctx.commitCount
+
+        let helperBuffer = try XCTUnwrap(ctx.queue.makeCommandBuffer())
+        ctx.recordCommit(helperBuffer, countsAsFrame: false) { helperBuffer.commit() }
+        XCTAssertEqual(ctx.commitCount, initialCommits, "non-frame command buffers must not increment commitCount")
+        ctx.waitForGPU()
+
+        let atlas = try XCTUnwrap(GlyphAtlas(device: ctx.device, pixelFormat: .r8Unorm, bytesPerPixel: 1, size: 64))
+        XCTAssertNotNil(atlas.reserve(width: 60, height: 60))
+        XCTAssertEqual(atlas.height, 64)
+        XCTAssertNotNil(atlas.reserve(width: 60, height: 60))
+        XCTAssertEqual(atlas.height, 128, "second 60x60 reservation should trigger atlas growth")
+        XCTAssertEqual(ctx.commitCount, initialCommits, "glyph atlas growth blit must not count as a presented frame")
+        ctx.waitForGPU()
+
+        let frameBuffer = try XCTUnwrap(ctx.queue.makeCommandBuffer())
+        ctx.recordCommit(frameBuffer) { frameBuffer.commit() }
+        XCTAssertEqual(ctx.commitCount, initialCommits + 1, "frame commits must increment commitCount")
+        ctx.waitForGPU()
+    }
 }

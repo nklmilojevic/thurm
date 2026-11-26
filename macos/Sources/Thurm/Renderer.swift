@@ -202,10 +202,13 @@ final class MetalContext: @unchecked Sendable {
     }
 
     /// Records `commands` before committing, attaches a completion handler to release it once
-    /// the GPU finishes, and runs `commit`.
-    func recordCommit(_ commands: MTLCommandBuffer, commit: () -> Void) {
+    /// the GPU finishes, and runs `commit`. Pass `countsAsFrame: false` for non-presenting helper
+    /// command buffers (such as glyph atlas growth blits) so `commitCount` reflects presented frames.
+    func recordCommit(_ commands: MTLCommandBuffer, countsAsFrame: Bool = true, commit: () -> Void) {
         commitLock.lock()
-        _commitCount &+= 1
+        if countsAsFrame {
+            _commitCount &+= 1
+        }
         _lastCommitted = commands
         commitLock.unlock()
         commands.addCompletedHandler { [weak self] completed in
