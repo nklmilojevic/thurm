@@ -361,6 +361,8 @@ pub struct Client {
     pub push_device: Mutex<Option<String>>,
     /// The connection, to drop it from outside its reader (a revoked phone).
     pub socket: Mutex<Option<std::os::unix::net::UnixStream>>,
+    /// Dropped by `RevokePhone`: a push registration still finishing on it is undone.
+    pub revoked: AtomicBool,
     /// Its panes follow the active client's size ([`thurm_proto::CAP_ACTIVE_SIZE`]).
     pub active_size: AtomicBool,
     /// Shows one pane at a time and holds the size of the one it shows
@@ -936,6 +938,7 @@ impl Daemon {
             mobile: AtomicBool::new(false),
             push_device: Mutex::new(None),
             socket: Mutex::new(None),
+            revoked: AtomicBool::new(false),
             active_size: AtomicBool::new(false),
             pane_pager: AtomicBool::new(false),
             pane_owner: AtomicBool::new(false),
@@ -2574,9 +2577,7 @@ impl Daemon {
         let result = match req {
             // Answered once no post to the forgotten devices can still be on its way, which can
             // take the relay's timeout: off this client's request thread.
-            req @ (Request::UnregisterPushDevice { .. }
-            | Request::RevokePhone { .. }
-            | Request::RevokePushRegistrations { .. }) => {
+            req @ (Request::UnregisterPushDevice { .. } | Request::RevokePhone { .. }) => {
                 let daemon = self.clone();
                 let client = client.clone();
                 std::thread::spawn(move || {
@@ -3321,21 +3322,19 @@ impl Daemon {
                 host,
                 name,
             } => {
-                let transport = match client.principal.lock().as_ref().map(|p| p.kind) {
-                    Some(thurm_proto::PrincipalKind::Tailscale) => {
-                        crate::push::DeviceTransport::Tailscale
-                    }
-                    _ => crate::push::DeviceTransport::Peer,
-                };
                 self.push.register(crate::push::Device {
                     device: device.clone(),
                     relay,
                     secret,
                     host,
                     name,
-                    generation: 0,
-                    transport,
                 })?;
+                // `RevokePhone` dropped this connection while it registered (after it forgot
+                // the phone's registrations, or before): the registration must not outlive it.
+                if client.revoked.load(Ordering::SeqCst) {
+                    let _ = self.push.unregister(&device);
+                    return Err("this connection was closed: a phone was revoked".into());
+                }
                 *client.push_device.lock() = Some(device);
                 Ok(Response::Ok)
             }
@@ -3344,17 +3343,21 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::RevokePhone { name } => {
-                let gone = self.push.revoke_named(&name)?;
-                // Revoking its key leaves an ssh session already open, and which phone a
-                // connection is (the key it came in with) is not known here: drop them all. The
-                // others reconnect; the revoked one can no longer sign in.
+                // Revoking its key (or replacing it) leaves an ssh session already open, and
+                // which phone a connection is (the key it came in with) is not known here: drop
+                // them all, tailnet ones included, whatever they claim to be. The others
+                // reconnect and register again; the revoked one can no longer sign in. Dropped
+                // first, so nothing the revoked phone sends re-registers it after the forgetting
+                // below (a registration in flight sees `revoked` and is undone).
                 let clients: Vec<_> = self.clients.lock().values().cloned().collect();
                 for c in clients.iter().filter(|c| c.mobile.load(Ordering::Relaxed)) {
                     log::info!("client {}: a phone was revoked; dropping it", c.id);
+                    c.revoked.store(true, Ordering::SeqCst);
                     if let Some(s) = c.socket.lock().as_ref() {
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 }
+                let gone = self.push.revoke_named(&name)?;
                 log::info!("revoked {name}: {} push device(s) forgotten", gone.len());
                 Ok(Response::Ok)
             }
@@ -3363,9 +3366,13 @@ impl Daemon {
                 pane,
                 token,
             } => {
-                let state = self.with_pane(pane, |_, st| crate::push::activity_state(&st.info))?;
                 log::info!("pane {pane}: a live activity follows it (device {device:.6}…)");
-                self.push.follow(&device, pane, token, state)?;
+                // Under the pane's lock, which its agent's transitions take too: the state
+                // the follow starts from is the current one, and the next transition updates it.
+                self.with_pane(pane, |_, st| {
+                    self.push
+                        .follow(&device, pane, token, crate::push::activity_state(&st.info))
+                })??;
                 *client.push_device.lock() = Some(device);
                 Ok(Response::Ok)
             }
@@ -3828,45 +3835,6 @@ impl Daemon {
             Request::GetPendingPrompt { pane } => self.with_pane(pane, |_, st| {
                 Response::PendingPrompt(st.agent.pending_prompt(pane))
             }),
-            Request::ListPushRegistrations { name } => Ok(Response::PushRegistrations(
-                self.push.ssh_registrations_named(&name),
-            )),
-            Request::RevokePushRegistrations {
-                registrations,
-                drop_unregistered_ssh,
-            } => {
-                let gone = self.push.revoke_registrations(&registrations)?;
-                let clients: Vec<_> = self.clients.lock().values().cloned().collect();
-                for c in clients.iter().filter(|c| c.mobile.load(Ordering::Relaxed)) {
-                    let is_tailscale = c
-                        .principal
-                        .lock()
-                        .as_ref()
-                        .is_some_and(|p| p.kind == thurm_proto::PrincipalKind::Tailscale);
-                    if is_tailscale {
-                        continue;
-                    }
-                    let dev = c.push_device.lock().clone();
-                    let drop_client = match dev.as_deref() {
-                        Some(id) => gone.iter().any(|g| g == id),
-                        None => drop_unregistered_ssh,
-                    };
-                    if drop_client {
-                        log::info!(
-                            "client {}: replaced phone push registration revoked; dropping it",
-                            c.id
-                        );
-                        if let Some(s) = c.socket.lock().as_ref() {
-                            let _ = s.shutdown(std::net::Shutdown::Both);
-                        }
-                    }
-                }
-                log::info!(
-                    "scoped push replacement cleanup: {} registration(s) forgotten",
-                    gone.len()
-                );
-                Ok(Response::Ok)
-            }
         }
     }
 
@@ -5027,6 +4995,7 @@ mod tests {
             mobile: AtomicBool::new(false),
             push_device: Mutex::new(None),
             socket: Mutex::new(None),
+            revoked: AtomicBool::new(false),
             active_size: AtomicBool::new(false),
             pane_pager: AtomicBool::new(false),
             pane_owner: AtomicBool::new(false),
@@ -5331,7 +5300,6 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "iPhone".into(),
-                ..Default::default()
             })
             .unwrap();
         let notify = |pane, sound: Option<&str>| Event::Notify {
@@ -5693,7 +5661,6 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "iPhone-7f3a".into(),
-                ..Default::default()
             })
             .unwrap();
 
@@ -5745,123 +5712,6 @@ mod tests {
         assert_eq!(json["body"], "asks for permission");
 
         daemon.close_pane(pane);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn list_and_revoke_push_registrations_scopes_to_precaptured_ssh_devices() {
-        let dir = std::env::temp_dir().join(format!("thurm-push-scope-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut cfg = Config::default();
-        cfg.push.relay = "https://push.example.net".into();
-        let daemon = Daemon::new(
-            cfg,
-            dir.join("s.sock"),
-            dir.join("state"),
-            Arc::new(AtomicBool::new(false)),
-        );
-
-        let (ssh_old, _rx1) = daemon.add_client();
-        ssh_old.mobile.store(true, Ordering::Relaxed);
-        *ssh_old.principal.lock() = Some(thurm_proto::Principal {
-            kind: thurm_proto::PrincipalKind::Peer,
-            ..Default::default()
-        });
-        daemon
-            .dispatch(
-                &ssh_old,
-                Request::RegisterPushDevice {
-                    device: "d-old".into(),
-                    relay: "https://push.example.net".into(),
-                    secret: "s".repeat(32),
-                    host: "studio".into(),
-                    name: "iPhone".into(),
-                },
-            )
-            .unwrap();
-
-        let (tailnet_phone, _rx2) = daemon.add_client();
-        tailnet_phone.mobile.store(true, Ordering::Relaxed);
-        *tailnet_phone.principal.lock() = Some(thurm_proto::Principal {
-            kind: thurm_proto::PrincipalKind::Tailscale,
-            ..Default::default()
-        });
-        daemon
-            .dispatch(
-                &tailnet_phone,
-                Request::RegisterPushDevice {
-                    device: "d-tailnet".into(),
-                    relay: "https://push.example.net".into(),
-                    secret: "t".repeat(32),
-                    host: "studio".into(),
-                    name: "iPhone".into(),
-                },
-            )
-            .unwrap();
-
-        let (mac, _rx3) = daemon.add_client();
-        let Response::PushRegistrations(captured) = daemon
-            .dispatch(
-                &mac,
-                Request::ListPushRegistrations {
-                    name: "iPhone".into(),
-                },
-            )
-            .unwrap()
-        else {
-            panic!("expected PushRegistrations");
-        };
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].device, "d-old");
-
-        // Replacement phone registers over SSH before delayed cleanup runs.
-        let (ssh_new, _rx4) = daemon.add_client();
-        ssh_new.mobile.store(true, Ordering::Relaxed);
-        *ssh_new.principal.lock() = Some(thurm_proto::Principal {
-            kind: thurm_proto::PrincipalKind::Peer,
-            ..Default::default()
-        });
-        daemon
-            .dispatch(
-                &ssh_new,
-                Request::RegisterPushDevice {
-                    device: "d-new".into(),
-                    relay: "https://push.example.net".into(),
-                    secret: "u".repeat(32),
-                    host: "studio".into(),
-                    name: "iPhone".into(),
-                },
-            )
-            .unwrap();
-
-        daemon
-            .dispatch(
-                &mac,
-                Request::RevokePushRegistrations {
-                    registrations: captured,
-                    drop_unregistered_ssh: true,
-                },
-            )
-            .unwrap();
-
-        let Response::PushRegistrations(remaining_ssh) = daemon
-            .dispatch(
-                &mac,
-                Request::ListPushRegistrations {
-                    name: "iPhone".into(),
-                },
-            )
-            .unwrap()
-        else {
-            panic!("expected PushRegistrations");
-        };
-        assert_eq!(remaining_ssh.len(), 1);
-        assert_eq!(remaining_ssh[0].device, "d-new");
-
-        // Tailnet phone also survived intact (still registered, visible via revoke_named).
-        let mut left = daemon.push.revoke_named("iPhone").unwrap();
-        left.sort();
-        assert_eq!(left, ["d-new", "d-tailnet"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

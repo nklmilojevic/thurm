@@ -4,7 +4,7 @@
 //! Host keys come from this machine's own known hosts, never from the network: the Mac already
 //! trusts them, and the phone checks the host against exactly those fingerprints.
 
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use thurm_client::{Client, ConnectOptions};
+use thurm_client::Client;
 use thurm_config::RemoteConfig;
-use thurm_proto::{PushRegistrationRef, Request, Response};
+use thurm_proto::{Request, Response};
 
 use crate::ssh::{RemoteExec, Ssh, SshError};
 
@@ -427,23 +427,16 @@ pub fn authorize_with_status(ssh: &dyn RemoteExec, key: &DeviceKey) -> Result<bo
     edit(ssh, &key.key, &key.device)
 }
 
-/// Daemon operations used by [`authorize_with_push_cleanup`] to snapshot and revoke only the
-/// displaced phone's push registration instances when replacing a same-name SSH key.
+/// What [`authorize_with_push_cleanup`] asks of the host's daemon.
 pub trait PushCleanupClient {
-    fn list_ssh_registrations(
-        &self,
-        device_name: &str,
-    ) -> Result<Vec<PushRegistrationRef>, String>;
-
-    fn revoke_registrations(
-        &self,
-        registrations: &[PushRegistrationRef],
-        drop_unregistered_ssh: bool,
-    ) -> Result<(), String>;
+    /// `RevokePhone`: drops every phone connection and forgets the push registrations (and Live
+    /// Activities) under the phone name `device`. The phones that still hold a key reconnect
+    /// and register again; the one whose key went cannot.
+    fn revoke_phone(&self, device: &str) -> Result<(), String>;
 }
 
-/// A live connection to a host's `thurmd` (either reusing an already-connected tunnel socket or
-/// backed by a short-lived `ssh -N -L` tunnel that is torn down on drop).
+/// A connection to a host's `thurmd` over a short-lived `ssh -N -L` tunnel through the same
+/// [`Ssh`] target the key edit goes through, torn down on drop.
 pub struct RemoteDaemonSession {
     client: Arc<Client>,
     tunnel: Option<(Child, PathBuf)>,
@@ -461,48 +454,22 @@ impl Drop for RemoteDaemonSession {
 }
 
 impl RemoteDaemonSession {
-    /// Wraps an already-connected daemon client (verifying `CAP_PUSH_REPLACE`).
-    pub fn from_client(client: Arc<Client>, host_label: &str) -> Result<Self, String> {
-        if !client.has_capability(thurm_proto::CAP_PUSH_REPLACE) {
-            return Err(format!(
-                "Thurm on {host_label} is too old to revoke only the replaced phone; upgrade it in Settings › Remotes first"
-            ));
-        }
-        Ok(Self {
+    /// Wraps a connected daemon client (for tests and callers that opened one themselves).
+    pub fn from_client(client: Arc<Client>) -> Self {
+        Self {
             client,
             tunnel: None,
-        })
+        }
     }
 }
 
 impl PushCleanupClient for RemoteDaemonSession {
-    fn list_ssh_registrations(
-        &self,
-        device_name: &str,
-    ) -> Result<Vec<PushRegistrationRef>, String> {
+    fn revoke_phone(&self, device: &str) -> Result<(), String> {
         match self.client.request_timeout(
-            Request::ListPushRegistrations {
-                name: device_name.to_owned(),
+            Request::RevokePhone {
+                name: device.to_owned(),
             },
-            Some(Duration::from_secs(15)),
-        ) {
-            Ok(Response::PushRegistrations(list)) => Ok(list),
-            Ok(other) => Err(format!("unexpected daemon response: {other:?}")),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
-    fn revoke_registrations(
-        &self,
-        registrations: &[PushRegistrationRef],
-        drop_unregistered_ssh: bool,
-    ) -> Result<(), String> {
-        match self.client.request_timeout(
-            Request::RevokePushRegistrations {
-                registrations: registrations.to_vec(),
-                drop_unregistered_ssh,
-            },
-            Some(Duration::from_secs(20)),
+            Some(CLEANUP_TIMEOUT),
         ) {
             Ok(Response::Ok) => Ok(()),
             Ok(other) => Err(format!("unexpected daemon response: {other:?}")),
@@ -511,31 +478,33 @@ impl PushCleanupClient for RemoteDaemonSession {
     }
 }
 
-/// Connects to a remote host's `thurmd` for push-registration cleanup: reuses
-/// `existing_local_socket` when it answers, otherwise probes the remote socket over `ssh`,
-/// starts `thurmd` if stopped (so persisted registrations are loaded), and opens a short-lived
-/// `ssh -N -L` tunnel independent of any active Mac daemon client.
+/// The most a cleanup step (the tunnel coming up, the daemon's Hello, a request) may take.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Opens a daemon client on `socket` with a bounded Hello: a socket that accepts but never
+/// answers must not hang pairing.
+fn cleanup_client(socket: &Path) -> Result<Arc<Client>, String> {
+    let stream = thurm_client::connect_daemon(socket).map_err(|e| e.to_string())?;
+    Client::from_stream_timeout(
+        stream,
+        "thurm-pair-cleanup",
+        false,
+        &[],
+        Some(CLEANUP_TIMEOUT),
+        |_| {},
+        || {},
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Connects to the `thurmd` that `ssh` reaches, for push cleanup: through `ssh` itself (never a
+/// tunnel or tailnet route the remote may also have, which can lead to another daemon), starting
+/// the daemon first if it is stopped so its saved registrations are loaded.
 pub fn connect_remote_daemon(
     ssh: &Ssh,
     host_label: &str,
     configured_socket: Option<&str>,
-    existing_local_socket: Option<&Path>,
 ) -> Result<RemoteDaemonSession, String> {
-    if let Some(sock) = existing_local_socket
-        && let Ok(client) = Client::connect(
-            ConnectOptions {
-                socket: sock.to_path_buf(),
-                spawn_daemon: None,
-                client_name: "thurm-pair-cleanup",
-                ui: false,
-            },
-            |_| {},
-            || {},
-        )
-    {
-        return RemoteDaemonSession::from_client(client, host_label);
-    }
-
     crate::ssh::prepare_dir().map_err(|e| e.to_string())?;
     let effective = ssh.effective_config().map_err(|e| e.to_string())?;
     crate::ssh::check_forwards(&effective)?;
@@ -586,70 +555,49 @@ pub fn connect_remote_daemon(
             }
         });
     }
+    let give_up = |child: &mut Child, why: String| {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&local_sock);
+        let detail = stderr.lock().trim().to_owned();
+        if detail.is_empty() {
+            why
+        } else {
+            format!("{why} ({detail})")
+        }
+    };
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut last_err = String::from("timed out waiting for remote daemon tunnel");
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    let mut last_err = String::from("timed out waiting for the remote daemon tunnel");
     loop {
         if local_sock.exists() {
-            match Client::connect(
-                ConnectOptions {
-                    socket: local_sock.clone(),
-                    spawn_daemon: None,
-                    client_name: "thurm-pair-cleanup",
-                    ui: false,
-                },
-                |_| {},
-                || {},
-            ) {
+            match cleanup_client(&local_sock) {
                 Ok(client) => {
-                    let mut session = match RemoteDaemonSession::from_client(client, host_label) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            let _ = std::fs::remove_file(&local_sock);
-                            return Err(e);
-                        }
-                    };
-                    session.tunnel = Some((child, local_sock));
-                    return Ok(session);
+                    return Ok(RemoteDaemonSession {
+                        client,
+                        tunnel: Some((child, local_sock)),
+                    });
                 }
-                Err(e) => last_err = e.to_string(),
+                Err(e) => last_err = e,
             }
         }
         if let Ok(Some(status)) = child.try_wait() {
-            let _ = std::fs::remove_file(&local_sock);
-            let detail = stderr.lock().trim().to_owned();
-            return Err(if detail.is_empty() {
-                format!("ssh tunnel to {host_label} exited ({status})")
-            } else {
-                format!("ssh tunnel to {host_label} failed: {detail}")
-            });
+            return Err(give_up(
+                &mut child,
+                format!("ssh tunnel to {host_label} exited ({status})"),
+            ));
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_file(&local_sock);
-            let detail = stderr.lock().trim().to_owned();
-            return Err(if detail.is_empty() {
-                last_err
-            } else {
-                format!("{last_err} ({detail})")
-            });
+            return Err(give_up(&mut child, last_err));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// Persisted push revocations whose SSH key replacement already succeeded but whose daemon
-/// cleanup RPC failed transiently, so retrying key authorization completes cleanup even though
-/// `authorized_keys` already holds the new key.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-pub struct PendingRevocation {
-    pub registrations: Vec<PushRegistrationRef>,
-    pub drop_unregistered_ssh: bool,
-}
-
+/// Phone names on hosts whose key was (or may have been) replaced but whose push cleanup has not
+/// been confirmed: written before the key edit, removed once the host's daemon has revoked.
+/// Cleanup is a name-wide `RevokePhone`, harmless to repeat, so an entry for an edit that never
+/// happened costs nothing but a reconnect.
 #[derive(Clone, Debug)]
 pub struct PendingPushRevokes {
     path: PathBuf,
@@ -669,18 +617,20 @@ impl PendingPushRevokes {
         Self { path }
     }
 
-    fn entry_key(host_key: &str, device: &str) -> String {
+    fn entry(host_key: &str, device: &str) -> String {
         format!("{host_key}\0{device}")
     }
 
-    fn load_unlocked(&self) -> HashMap<String, PendingRevocation> {
-        std::fs::read(&self.path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+    fn load_unlocked(&self) -> Result<BTreeSet<String>, String> {
+        match std::fs::read(&self.path) {
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| e.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
-    fn save_unlocked(&self, map: &HashMap<String, PendingRevocation>) -> Result<(), String> {
+    /// Writes durably (fsync, then rename): an entry must survive a crash right after.
+    fn save_unlocked(&self, set: &BTreeSet<String>) -> Result<(), String> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         if let Some(dir) = self.path.parent() {
@@ -697,69 +647,53 @@ impl PendingPushRevokes {
             .mode(0o600)
             .open(&tmp)
             .map_err(|e| e.to_string())?;
-        f.write_all(&serde_json::to_vec(map).map_err(|e| e.to_string())?)
+        f.write_all(&serde_json::to_vec(set).map_err(|e| e.to_string())?)
+            .and_then(|()| f.sync_all())
             .map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
     }
 
-    pub fn get(&self, host_key: &str, device: &str) -> Option<PendingRevocation> {
+    /// Whether cleanup is pending for `device` on `host_key`. An unreadable record counts as
+    /// pending: cleanup runs once more rather than being skipped.
+    pub fn contains(&self, host_key: &str, device: &str) -> bool {
         let _guard = PENDING_REVOKES_LOCK.lock();
         self.load_unlocked()
-            .remove(&Self::entry_key(host_key, device))
+            .map_or(true, |set| set.contains(&Self::entry(host_key, device)))
     }
 
-    pub fn set(
-        &self,
-        host_key: &str,
-        device: &str,
-        entry: PendingRevocation,
-    ) -> Result<(), String> {
+    pub fn insert(&self, host_key: &str, device: &str) -> Result<(), String> {
         let _guard = PENDING_REVOKES_LOCK.lock();
-        let mut map = self.load_unlocked();
-        map.insert(Self::entry_key(host_key, device), entry);
-        self.save_unlocked(&map)
+        let mut set = self.load_unlocked().unwrap_or_default();
+        if set.insert(Self::entry(host_key, device)) {
+            self.save_unlocked(&set)?;
+        }
+        Ok(())
     }
 
     pub fn remove(&self, host_key: &str, device: &str) -> Result<(), String> {
         let _guard = PENDING_REVOKES_LOCK.lock();
-        let mut map = self.load_unlocked();
-        if map.remove(&Self::entry_key(host_key, device)).is_some() {
-            self.save_unlocked(&map)?;
+        let mut set = self.load_unlocked().unwrap_or_default();
+        if set.remove(&Self::entry(host_key, device)) {
+            self.save_unlocked(&set)?;
         }
         Ok(())
     }
 }
 
-fn merge_registrations(
-    a: &[PushRegistrationRef],
-    b: &[PushRegistrationRef],
-) -> Vec<PushRegistrationRef> {
-    let mut out = a.to_vec();
-    for item in b {
-        if !out.contains(item) {
-            out.push(item.clone());
-        }
-    }
-    out
-}
-
-/// Authorizes `key` on `ssh`, guaranteeing that replacing an existing *different* SSH key under
-/// the same device name atomically captures and revokes ONLY the displaced phone's push
-/// registration `(device, generation)` — never an independent Tailscale phone or a replacement
-/// phone that registered before or after the key edit.
+/// Authorizes `key` on `ssh`; when that replaces another key under the same device name, the
+/// host's daemon then revokes the name (`RevokePhone`), so the phone that held the old key loses
+/// its push registration and its open connections. Returns whether a key was replaced.
 ///
-/// - Adding a new name (or re-adding/renaming the same key) with no pending cleanup completes in
-///   one SSH edit without needing the remote daemon.
-/// - Replacing a different key fails closed BEFORE modifying `authorized_keys` if the host's
-///   daemon cannot be reached or lacks `CAP_PUSH_REPLACE`.
-/// - If the daemon revocation RPC fails after `authorized_keys` already changed, the pre-captured
-///   targets are durably saved in `pending_store` and an error is returned; retrying the same key
-///   finishes revoking only those captured targets without re-capturing newer registrations.
+/// - A new name (or the same key again) needs no daemon, unless an earlier attempt's cleanup is
+///   still pending, which this finishes.
+/// - Replacing a key reaches the daemon first and changes nothing when it can't.
+/// - The pending cleanup is recorded durably before the key edit, so an edit whose reply was
+///   lost, or a crash after it, is cleaned up by the next attempt with the same key.
 pub fn authorize_with_push_cleanup<F, C>(
     ssh: &dyn RemoteExec,
     key: &DeviceKey,
     host_label: &str,
-    pending_store: &PendingPushRevokes,
+    pending: &PendingPushRevokes,
     host_key: &str,
     open_daemon: F,
 ) -> Result<bool, PairingError>
@@ -767,84 +701,42 @@ where
     F: FnOnce() -> Result<C, String>,
     C: PushCleanupClient,
 {
-    let prior_pending = pending_store.get(host_key, &key.device);
+    let was_pending = pending.contains(host_key, &key.device);
+    let cleanup_error = |e: String| {
+        PairingError::PushCleanup(format!(
+            "replaced {}'s key on {host_label}, but could not revoke the previous phone's \
+             notifications ({e}); add the key again to finish",
+            key.device
+        ))
+    };
     match edit_inner(ssh, &key.key, &key.device, true) {
         Ok(_) => {
-            // `authorized_keys` did not replace a different key. If an earlier attempt left
-            // pending push revocations for this host/device, finish revoking ONLY those exact
-            // pre-captured targets without re-capturing any newly registered phone.
-            let Some(pending) = prior_pending else {
+            if !was_pending {
                 return Ok(false);
-            };
-            let daemon = open_daemon().map_err(|e| {
-                PairingError::PushCleanup(format!(
-                    "could not finish revoking the previous {} phone's push access on {host_label}: {e}",
-                    key.device
-                ))
-            })?;
-            daemon
-                .revoke_registrations(&pending.registrations, pending.drop_unregistered_ssh)
-                .map_err(|e| {
-                    PairingError::PushCleanup(format!(
-                        "could not finish revoking the previous {} phone's push access on {host_label}: {e}",
-                        key.device
-                    ))
-                })?;
-            let _ = pending_store.remove(host_key, &key.device);
+            }
+            let daemon = open_daemon().map_err(cleanup_error)?;
+            daemon.revoke_phone(&key.device).map_err(cleanup_error)?;
+            let _ = pending.remove(host_key, &key.device);
             Ok(true)
         }
         Err(PairingError::WouldReplace) => {
-            // A different key exists under `key.device` (`authorized_keys` is still untouched).
-            // Reach the host's daemon and capture the retired non-Tailscale registrations BEFORE
-            // writing the new SSH key so a replacement phone registering right after the edit is
-            // never evicted.
             let daemon = open_daemon().map_err(|e| {
                 PairingError::PushCleanup(format!(
-                    "cannot replace {}'s key on {host_label} without revoking the previous phone's push access: {e}",
+                    "{}'s key on {host_label} was not replaced: its Thurm could not be reached \
+                     to revoke the previous phone ({e})",
                     key.device
                 ))
             })?;
-            let captured = daemon
-                .list_ssh_registrations(&key.device)
-                .map_err(|e| {
-                    PairingError::PushCleanup(format!(
-                        "cannot replace {}'s key on {host_label}: could not inspect push registrations ({e})",
-                        key.device
-                    ))
-                })?;
-            let combined = PendingRevocation {
-                registrations: match &prior_pending {
-                    Some(prev) => merge_registrations(&prev.registrations, &captured),
-                    None => captured,
-                },
-                drop_unregistered_ssh: true,
-            };
-
-            let replaced = edit_inner(ssh, &key.key, &key.device, false)?;
-            if !replaced && prior_pending.is_none() {
-                return Ok(false);
-            }
-
-            // Persist before revoking so even a process crash or network drop mid-RPC can be
-            // retried after `authorized_keys` has already moved to the new key.
-            pending_store
-                .set(host_key, &key.device, combined.clone())
-                .map_err(|e| {
-                    PairingError::PushCleanup(format!(
-                        "replaced {}'s key on {host_label}, but could not record pending push cleanup: {e}",
-                        key.device
-                    ))
-                })?;
-
-            daemon
-                .revoke_registrations(&combined.registrations, combined.drop_unregistered_ssh)
-                .map_err(|e| {
-                    PairingError::PushCleanup(format!(
-                        "replaced {}'s key on {host_label}, but could not revoke the previous phone's push access ({e}); retry adding the key to finish cleanup",
-                        key.device
-                    ))
-                })?;
-            let _ = pending_store.remove(host_key, &key.device);
+            pending.insert(host_key, &key.device).map_err(|e| {
+                PairingError::PushCleanup(format!(
+                    "{}'s key on {host_label} was not replaced: could not record the cleanup \
+                     ({e})",
+                    key.device
+                ))
+            })?;
+            edit_inner(ssh, &key.key, &key.device, false)?;
+            daemon.revoke_phone(&key.device).map_err(cleanup_error)?;
+            let _ = pending.remove(host_key, &key.device);
             Ok(true)
         }
         Err(e) => Err(e),
@@ -1529,11 +1421,10 @@ mod tests {
     }
 
     #[test]
-    fn authorize_with_push_cleanup_precaptures_fails_closed_and_retries_safely() {
+    fn authorize_with_push_cleanup_fails_closed_records_first_and_retries() {
         use std::sync::atomic::AtomicBool;
 
-        let home =
-            std::env::temp_dir().join(format!("thurm-pair-cleanup-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("thurm-pair-cleanup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let local = Local(home.clone(), vec![]);
@@ -1551,127 +1442,78 @@ mod tests {
         ))
         .unwrap();
 
-        #[derive(Clone)]
+        #[derive(Clone, Default)]
         struct FakeDaemon {
-            ssh_regs: Arc<Mutex<Vec<PushRegistrationRef>>>,
-            revoked: Arc<Mutex<Vec<Vec<PushRegistrationRef>>>>,
-            fail_revoke: Arc<AtomicBool>,
-            /// Simulate a replacement phone registering over SSH right after `list` and before
-            /// `revoke` runs.
-            inject_on_list: Arc<Mutex<Option<PushRegistrationRef>>>,
+            revoked: Arc<Mutex<Vec<String>>>,
+            fail: Arc<AtomicBool>,
+            /// What `pending` held when `RevokePhone` came: it is recorded before the edit.
+            pending_seen: Arc<Mutex<Vec<bool>>>,
+            probe: Option<(PendingPushRevokes, String)>,
         }
-
         impl PushCleanupClient for FakeDaemon {
-            fn list_ssh_registrations(
-                &self,
-                _device_name: &str,
-            ) -> Result<Vec<PushRegistrationRef>, String> {
-                let snap = self.ssh_regs.lock().clone();
-                if let Some(new_phone) = self.inject_on_list.lock().take() {
-                    self.ssh_regs.lock().push(new_phone);
+            fn revoke_phone(&self, device: &str) -> Result<(), String> {
+                if let Some((p, host)) = &self.probe {
+                    self.pending_seen.lock().push(p.contains(host, device));
                 }
-                Ok(snap)
-            }
-
-            fn revoke_registrations(
-                &self,
-                registrations: &[PushRegistrationRef],
-                _drop_unregistered_ssh: bool,
-            ) -> Result<(), String> {
-                if self.fail_revoke.load(Ordering::SeqCst) {
-                    return Err("transient daemon disconnect".into());
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err("the daemon went away".into());
                 }
-                self.revoked.lock().push(registrations.to_vec());
-                self.ssh_regs
-                    .lock()
-                    .retain(|r| !registrations.contains(r));
+                self.revoked.lock().push(device.to_owned());
                 Ok(())
             }
         }
+        let host = "remote:devbox";
+        let no_daemon = || -> Result<FakeDaemon, String> { panic!("no daemon needed") };
 
-        // 1. Initial authorization of k1 does not replace any key -> succeeds without opening
-        // the remote daemon at all.
-        let replaced = authorize_with_push_cleanup(
-            &local,
-            &k1,
-            "devbox",
-            &pending,
-            "remote:devbox",
-            || -> Result<FakeDaemon, String> { panic!("daemon must not be opened for new key") },
-        )
-        .unwrap();
-        assert!(!replaced);
+        // A new name needs no daemon.
+        assert!(!authorize_with_push_cleanup(&local, &k1, "devbox", &pending, host, no_daemon).unwrap());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), k1.line() + "\n");
 
-        // 2. Replacing k1 with k2 when the remote daemon is unreachable MUST fail closed BEFORE
-        // modifying authorized_keys.
-        let err = authorize_with_push_cleanup(
-            &local,
-            &k2,
-            "devbox",
-            &pending,
-            "remote:devbox",
-            || -> Result<FakeDaemon, String> { Err("daemon unreachable".into()) },
-        )
+        // Replacing it with the daemon out of reach changes nothing.
+        let err = authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, || {
+            Err::<FakeDaemon, _>("unreachable".into())
+        })
         .unwrap_err();
         assert!(matches!(err, PairingError::PushCleanup(_)), "{err:?}");
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            k1.line() + "\n",
-            "authorized_keys must stay unchanged when daemon is unreachable"
-        );
-        assert!(pending.get("remote:devbox", "iPhone").is_none());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), k1.line() + "\n");
+        assert!(!pending.contains(host, "iPhone"));
 
-        // 3. Replacing k1 with k2 when revocation fails after authorized_keys changed persists
-        // ONLY the pre-captured old registration, while a new phone registers in the meantime.
-        // Retrying k2 (even though authorized_keys already has k2!) finishes revoking ONLY the
-        // pre-captured old phone without touching the replacement phone.
-        let old_ref = PushRegistrationRef {
-            device: "d-old".into(),
-            generation: 1,
-        };
-        let new_ref = PushRegistrationRef {
-            device: "d-new".into(),
-            generation: 2,
-        };
+        // The key changes, the revoke fails: the cleanup stays recorded (it was before the edit).
         let fake = FakeDaemon {
-            ssh_regs: Arc::new(Mutex::new(vec![old_ref.clone()])),
-            revoked: Arc::new(Mutex::new(Vec::new())),
-            fail_revoke: Arc::new(AtomicBool::new(true)),
-            inject_on_list: Arc::new(Mutex::new(Some(new_ref.clone()))),
+            probe: Some((pending.clone(), host.to_owned())),
+            ..Default::default()
         };
-        let err = authorize_with_push_cleanup(
-            &local,
-            &k2,
-            "devbox",
-            &pending,
-            "remote:devbox",
-            || Ok(fake.clone()),
-        )
+        fake.fail.store(true, Ordering::SeqCst);
+        let err = authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, || {
+            Ok(fake.clone())
+        })
         .unwrap_err();
         assert!(matches!(err, PairingError::PushCleanup(_)), "{err:?}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), k2.line() + "\n");
-        let saved = pending
-            .get("remote:devbox", "iPhone")
-            .expect("pending cleanup must be persisted for retry");
-        assert_eq!(saved.registrations, vec![old_ref.clone()]);
+        assert_eq!(*fake.pending_seen.lock(), [true]);
+        assert!(pending.contains(host, "iPhone"));
 
-        // Retry with daemon now healthy: authorized_keys already has k2 (no replacement), yet
-        // pending cleanup runs and removes ONLY `d-old`, leaving `d-new` registered.
-        fake.fail_revoke.store(false, Ordering::SeqCst);
-        let replaced = authorize_with_push_cleanup(
-            &local,
-            &k2,
-            "devbox",
-            &pending,
-            "remote:devbox",
-            || Ok(fake.clone()),
-        )
-        .unwrap();
-        assert!(replaced);
-        assert!(pending.get("remote:devbox", "iPhone").is_none());
-        assert_eq!(*fake.revoked.lock(), vec![vec![old_ref]]);
-        assert_eq!(*fake.ssh_regs.lock(), vec![new_ref]);
+        // The same key again (nothing left to replace) finishes the cleanup.
+        fake.fail.store(false, Ordering::SeqCst);
+        assert!(
+            authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, || Ok(fake.clone()))
+                .unwrap()
+        );
+        assert_eq!(*fake.revoked.lock(), ["iPhone"]);
+        assert!(!pending.contains(host, "iPhone"));
+
+        // Done: adding it once more needs no daemon.
+        assert!(!authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, no_daemon).unwrap());
+
+        // A replacement whose edit commits but whose reply is lost (an ssh error here) is
+        // still cleaned up by the next attempt.
+        let lossy = Local(home.clone(), vec![]);
+        pending.insert(host, "iPhone").unwrap();
+        assert!(
+            authorize_with_push_cleanup(&lossy, &k2, "devbox", &pending, host, || Ok(fake.clone()))
+                .unwrap()
+        );
+        assert_eq!(*fake.revoked.lock(), ["iPhone", "iPhone"]);
 
         let _ = std::fs::remove_dir_all(&home);
     }

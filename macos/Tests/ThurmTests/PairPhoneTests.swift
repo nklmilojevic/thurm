@@ -437,112 +437,61 @@ final class PairPhoneTests: XCTestCase {
         XCTAssertNotNil(PhonePairing.qrImage(link, remotes: hosts.count))
     }
 
-    func testLocalReplacementPreCapturesAndProtectsTailnetAndNewerPhones() throws {
+    func testLocalReplacementRecordsCleanupFirstFailsClosedAndRetries() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let file = dir.appendingPathComponent(".ssh/authorized_keys")
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-
-        let suiteName = "thurm.test.pending.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let store = PhonePairing.PendingPushRevokesStore(defaults: defaults)
+        let store = PhonePairing.PendingPushRevokesStore(file: dir.appendingPathComponent("pending.json"))
 
         let (key1, device) = try XCTUnwrap(PhonePairing.validDeviceKey(deviceKey))
         let key2 = "ecdsa-sha2-nistp256 AAAAotherKeyBlobForReplacementPhone"
-
-        // 1. Adding a new device name succeeds without hitting the daemon.
-        var initialResult: PhonePairing.LocalKeyAddResult?
-        PhonePairing.addWithPushCleanup(
-            key: key1, device: device, to: file, pendingStore: store,
-            listSSHRegistrations: { _, _ in XCTFail("new device must not list registrations") },
-            revokeRegistrations: { _, _, _ in XCTFail("new device must not revoke registrations") },
-            completion: { initialResult = $0 }
-        )
-        XCTAssertEqual(initialResult, .added(replaced: false))
-
-        // 2. Replacing with key2 when local daemon is unreachable fails closed without changing
-        // authorized_keys.
-        var unreachableResult: PhonePairing.LocalKeyAddResult?
-        PhonePairing.addWithPushCleanup(
-            key: key2, device: device, to: file, pendingStore: store,
-            listSSHRegistrations: { _, done in done(.failure("daemon disconnected")) },
-            revokeRegistrations: { _, _, _ in XCTFail("must not revoke when list failed") },
-            completion: { unreachableResult = $0 }
-        )
-        if case .failed(let msg) = unreachableResult {
-            XCTAssertTrue(msg.contains("daemon disconnected"), msg)
-        } else {
-            XCTFail("expected failure, got \(String(describing: unreachableResult))")
+        let line = { (key: String) in "\(PhonePairing.keyOptions) \(key) \(PhonePairing.commentPrefix)\(device)" }
+        let ready: () -> String? = { nil }
+        func add(_ key: String, daemonReady: () -> String? = { nil },
+                 revoke: @escaping (String, @escaping (PhonePairing.CleanupResult) -> Void) -> Void)
+            -> PhonePairing.LocalKeyAddResult? {
+            var result: PhonePairing.LocalKeyAddResult?
+            PhonePairing.addWithPushCleanup(key: key, device: device, to: file, pendingStore: store,
+                                            daemonReady: daemonReady, revokePhone: revoke,
+                                            completion: { result = $0 })
+            return result
         }
-        XCTAssertEqual(PhonePairing.devices(in: file).map(\.line),
-                       ["\(PhonePairing.keyOptions) \(key1) \(PhonePairing.commentPrefix)\(device)"])
 
-        // 3. Simulate:
-        //    - old SSH phone (d-old, gen 1) exists
-        //    - replacement phone (d-tailnet, gen 2) ALREADY registered over Tailscale before SSH key
-        //      was pasted (excluded from `listSSHRegistrations`)
-        //    - another SSH phone (d-new-ssh, gen 3) connects and registers AFTER `authorized_keys` is
-        //      written and BEFORE delayed cleanup runs
-        //    - first revocation attempt fails transiently; retrying key2 (even though key2 is
-        //      already in authorized_keys!) revokes ONLY (d-old, gen 1) and preserves both d-tailnet
-        //      and d-new-ssh.
-        let oldRef = PhonePairing.PushRegistrationRef(device: "d-old", generation: 1)
-        let tailnetRef = PhonePairing.PushRegistrationRef(device: "d-tailnet", generation: 2)
-        let newSSHRef = PhonePairing.PushRegistrationRef(device: "d-new-ssh", generation: 3)
-        var allRegistered: [PhonePairing.PushRegistrationRef] = [oldRef, tailnetRef]
-        var revokedCalls: [[PhonePairing.PushRegistrationRef]] = []
-        var failRevoke = true
+        // A new name needs no daemon.
+        XCTAssertEqual(add(key1, daemonReady: { XCTFail("no daemon needed"); return nil },
+                           revoke: { _, _ in XCTFail("nothing to revoke") }),
+                       .added(replaced: false))
 
-        var firstReplaceResult: PhonePairing.LocalKeyAddResult?
-        PhonePairing.addWithPushCleanup(
-            key: key2, device: device, to: file, pendingStore: store,
-            listSSHRegistrations: { _, done in
-                // Server returns only non-Tailscale registrations (d-old), never d-tailnet.
-                done(.success(allRegistered.filter { $0.device != "d-tailnet" }))
-            },
-            revokeRegistrations: { regs, dropUnreg, done in
-                XCTAssertTrue(dropUnreg)
-                // Replacement SSH phone connects right after authorized_keys changed.
-                if !allRegistered.contains(newSSHRef) {
-                    allRegistered.append(newSSHRef)
-                }
-                if failRevoke {
-                    done(.failure("timeout"))
-                } else {
-                    revokedCalls.append(regs)
-                    allRegistered.removeAll { regs.contains($0) }
-                    done(.success(()))
-                }
-            },
-            completion: { firstReplaceResult = $0 }
-        )
-        if case .failed(let msg) = firstReplaceResult {
-            XCTAssertTrue(msg.contains("timeout"), msg)
-        } else {
-            XCTFail("expected failure on first revoke attempt, got \(String(describing: firstReplaceResult))")
+        // Replacing it with the daemon away changes nothing.
+        let away = add(key2, daemonReady: { "this Mac's Thurm daemon is not connected" },
+                       revoke: { _, _ in XCTFail("nothing to revoke") })
+        guard case .failed(let why) = away else { return XCTFail("\(String(describing: away))") }
+        XCTAssertTrue(why.contains("not connected"), why)
+        XCTAssertEqual(PhonePairing.devices(in: file).map(\.line), [line(key1)])
+        XCTAssertFalse(store.contains(device))
+
+        // The key changes and the revoke fails: the cleanup was recorded before the edit, and stays.
+        var revoked: [String] = []
+        let failed = add(key2) { name, done in
+            XCTAssertTrue(store.contains(name), "recorded before the key file changed")
+            done(.failure("timeout"))
         }
-        XCTAssertEqual(store.get(device)?.registrations, [oldRef])
-        XCTAssertTrue(allRegistered.contains(newSSHRef))
+        guard case .failed(let msg) = failed else { return XCTFail("\(String(describing: failed))") }
+        XCTAssertTrue(msg.contains("timeout"), msg)
+        XCTAssertEqual(PhonePairing.devices(in: file).map(\.line), [line(key2)])
+        XCTAssertTrue(store.contains(device))
 
-        // Retry adding key2: authorized_keys already has key2, so list must NOT be re-run (which
-        // would capture d-new-ssh); pending revocation removes ONLY (d-old, gen 1).
-        failRevoke = false
-        var retryResult: PhonePairing.LocalKeyAddResult?
-        PhonePairing.addWithPushCleanup(
-            key: key2, device: device, to: file, pendingStore: store,
-            listSSHRegistrations: { _, _ in XCTFail("retry must not re-capture newer SSH phones") },
-            revokeRegistrations: { regs, dropUnreg, done in
-                XCTAssertTrue(dropUnreg)
-                revokedCalls.append(regs)
-                allRegistered.removeAll { regs.contains($0) }
-                done(.success(()))
-            },
-            completion: { retryResult = $0 }
-        )
-        XCTAssertEqual(retryResult, .added(replaced: true))
-        XCTAssertNil(store.get(device))
-        XCTAssertEqual(revokedCalls, [[oldRef]])
-        XCTAssertEqual(allRegistered, [tailnetRef, newSSHRef])
+        // The same key again (nothing left to replace) finishes the cleanup.
+        XCTAssertEqual(add(key2) { name, done in revoked.append(name); done(.success) },
+                       .added(replaced: true))
+        XCTAssertEqual(revoked, [device])
+        XCTAssertFalse(store.contains(device))
+        XCTAssertEqual(add(key2, daemonReady: ready) { _, _ in XCTFail("done already") },
+                       .added(replaced: false))
+
+        // A record that can't be read counts as pending: cleanup runs once more.
+        try Data("not json".utf8).write(to: dir.appendingPathComponent("pending.json"))
+        XCTAssertTrue(store.contains(device))
     }
 }

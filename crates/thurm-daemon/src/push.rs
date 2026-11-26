@@ -24,19 +24,6 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thurm_proto::PaneId;
 
-/// How a push device registered with the daemon.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DeviceTransport {
-    /// Persisted by an older daemon before transport tracking.
-    #[default]
-    Unknown,
-    /// Registered through a local Unix socket peer (including SSH streamlocal forwarding).
-    Peer,
-    /// Registered through the Tailscale listener (no SSH key required).
-    Tailscale,
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Device {
     pub device: String,
@@ -45,15 +32,6 @@ pub struct Device {
     /// What the app calls this daemon.
     pub host: String,
     pub name: String,
-    /// Monotonic registration generation assigned on each [`Pusher::register`], so a delayed
-    /// SSH key-replacement cleanup targeting an earlier `(device, generation)` never evicts a
-    /// newer registration for the same name or device ID.
-    #[serde(default)]
-    pub generation: u64,
-    /// Transport on which the device registered (`Tailscale` registrations do not depend on
-    /// `authorized_keys` and are not evicted by SSH key replacement).
-    #[serde(default)]
-    pub transport: DeviceTransport,
 }
 
 /// A Live Activity following a pane's agent.
@@ -168,9 +146,6 @@ pub struct Pusher {
     /// The next notice's sequence number. Initialized from `max(persisted + 1, now_ms)` and
     /// persisted on each sent notice so backward clock steps never break `seq <= upTo` read-sync.
     next_seq: std::sync::atomic::AtomicU64,
-    /// Monotonic generation assigned to each [`Device`] registration. Seeded like `next_seq`, so a
-    /// generation is never reused after a restart that found no devices.
-    next_device_gen: std::sync::atomic::AtomicU64,
     /// Monotonic generation assigned to each new [`Follow`].
     next_follow_gen: std::sync::atomic::AtomicU64,
     /// Shared with the push thread, which forgets a device the relay no longer knows.
@@ -208,16 +183,10 @@ impl Pusher {
         let path = state_dir.join("push-devices.json");
         let follows_path = state_dir.join("push-activities.json");
         let seq_path = state_dir.join("push-seq.json");
-        let devices: Vec<Device> = std::fs::read(&path)
+        let devices = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        let next_device_gen = devices
-            .iter()
-            .map(|d| d.generation)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
         let follows: Vec<Follow> = std::fs::read(&follows_path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -243,7 +212,6 @@ impl Pusher {
             last_notice: Mutex::new(std::collections::HashMap::new()),
             notified: Mutex::new(std::collections::HashMap::new()),
             next_seq: std::sync::atomic::AtomicU64::new(initial_seq),
-            next_device_gen: std::sync::atomic::AtomicU64::new(now_ms.max(next_device_gen)),
             next_follow_gen: std::sync::atomic::AtomicU64::new(next_follow_gen),
             devices: Arc::new(Mutex::new(devices)),
             follows: Arc::new(Mutex::new(follows)),
@@ -334,7 +302,7 @@ impl Pusher {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    pub fn register(&self, mut device: Device) -> Result<(), String> {
+    pub fn register(&self, device: Device) -> Result<(), String> {
         if !self.enabled() {
             return Err("push notifications are off on this host ([push] relay is empty)".into());
         }
@@ -343,20 +311,22 @@ impl Pusher {
             return Err("push registration needs a device id and a secret".into());
         }
         let mut devices = self.devices.lock();
-        // Deduplicate ordinary registrations strictly by stable device ID so independent phones
-        // (such as two Tailscale-paired iPhones sharing a display name) never evict each other.
-        // Displacing a different device on SSH key replacement is handled explicitly via
-        // `ssh_registrations_named` + `revoke_registrations`.
-        device.generation = self.next_device_gen.fetch_add(1, Ordering::Relaxed);
-        let replaced_id = devices.iter().any(|d| d.device == device.device);
-        let device_id = device.device.clone();
-        devices.retain(|d| d.device != device_id);
-        devices.push(device);
-        self.save(&devices)?;
-        if replaced_id {
+        // One registration per device id: registering again (another relay, a new secret)
+        // replaces it and its activities. Phones are told apart by id only: two phones may share
+        // a name (two "iPhone"s over the tailnet), and a name says nothing about which SSH key a
+        // phone holds. A phone whose key was replaced is forgotten by `revoke_named`, which the
+        // Mac sends after the key edit.
+        let replaced = devices.iter().any(|d| d.device == device.device);
+        let id = device.device.clone();
+        let mut next: Vec<Device> = devices.iter().filter(|d| d.device != id).cloned().collect();
+        next.push(device);
+        // Saved before it takes effect: a failed write leaves the registrations as they were.
+        self.save(&next)?;
+        *devices = next;
+        if replaced {
             let mut follows = self.follows.lock();
             let before = follows.len();
-            follows.retain(|f| f.device != device_id);
+            follows.retain(|f| f.device != id);
             if follows.len() != before {
                 save_json(&self.follows_path, &*follows)?;
             }
@@ -386,8 +356,7 @@ impl Pusher {
 
     /// Forgets every device registered under the phone name `name` (spaces as dashes, as its
     /// device key's comment has it), and its activities. Returns their ids. Use [`Self::unregister`]
-    /// to remove a specific registration by device id, or [`Self::revoke_registrations`] for
-    /// generation-scoped SSH key-replacement cleanup.
+    /// to remove a specific registration by device id.
     pub fn revoke_named(&self, name: &str) -> Result<Vec<String>, String> {
         let target = normalize_device_name(name);
         let gone: Vec<String> = self
@@ -401,41 +370,6 @@ impl Pusher {
             self.store().forget(&gone)?;
         }
         Ok(gone)
-    }
-
-    /// Snapshots non-Tailscale push registrations matching normalized phone `name`
-    /// (`thurm-ios:<name>`), captured BEFORE replacing that name's SSH key so cleanup targets
-    /// only the displaced registration instances and leaves Tailscale-paired or later-registered
-    /// phones untouched.
-    pub fn ssh_registrations_named(&self, name: &str) -> Vec<thurm_proto::PushRegistrationRef> {
-        let target = normalize_device_name(name);
-        if target.is_empty() {
-            return Vec::new();
-        }
-        self.devices
-            .lock()
-            .iter()
-            .filter(|d| {
-                d.transport != DeviceTransport::Tailscale
-                    && normalize_device_name(&d.name) == target
-            })
-            .map(|d| thurm_proto::PushRegistrationRef {
-                device: d.device.clone(),
-                generation: d.generation,
-            })
-            .collect()
-    }
-
-    /// Forgets only the exact `(device, generation)` registrations in `targets` and their
-    /// Live Activity follows. A newer registration for the same device ID or display name stays.
-    pub fn revoke_registrations(
-        &self,
-        targets: &[thurm_proto::PushRegistrationRef],
-    ) -> Result<Vec<String>, String> {
-        if targets.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.store().forget_matching(targets)
     }
 
     /// Queues `notice` for every registered device but those in `open` (phones with the app
@@ -527,13 +461,9 @@ impl Pusher {
     }
 
     /// `device` follows `pane` in a Live Activity with push `token` (replacing an earlier one).
-    ///
-    /// When `state` is `Some` with an active permission prompt (`permission.is_some()`), seeds
-    /// `last` without posting an immediate update so the daemon does not overwrite the phone's
-    /// locally shown verbatim permission request and Allow button with a request-less relay
-    /// payload. For any non-permission state (`working`, `needs_input`, `done`, `error`, `idle`)
-    /// or when the agent already exited (`None`), posts immediately so a permission prompt or
-    /// earlier state resolved before `FollowAgent` arrived is never left stale on the Lock Screen.
+    /// When `state` is `Some`, seeds `last` without posting an immediate update so the daemon does
+    /// not overwrite the richer state the app started the Live Activity with. When `state` is
+    /// `None` (the agent already exited), ends the activity immediately.
     pub fn follow(
         &self,
         device: &str,
@@ -544,33 +474,45 @@ impl Pusher {
         if !self.enabled() {
             return Err("push notifications are off on this host ([push] relay is empty)".into());
         }
-        if !self.devices.lock().iter().any(|d| d.device == device) {
-            return Err("register the device for push first".into());
-        }
         if token.is_empty() || token.len() > 400 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err("bad activity token".into());
         }
-        let seed_without_post = state.as_ref().is_some_and(|s| s.permission.is_some());
-        {
-            let generation = self.next_follow_gen.fetch_add(1, Ordering::Relaxed);
-            let mut follows = self.follows.lock();
-            follows.retain(|f| !(f.device == device && f.pane == pane));
+        let Some(registered) = self.devices.lock().iter().find(|d| d.device == device).cloned()
+        else {
+            return Err("register the device for push first".into());
+        };
+        // While a permission prompt waits, the app started the activity showing the request
+        // verbatim, with its Allow button: an update from here (which has no request) would
+        // replace that, so the state is only recorded. Any other state goes out at once, so an
+        // activity started on an older state (a prompt answered meanwhile) catches up. Only this
+        // activity gets it: the pane's other activities have theirs already. The caller holds
+        // the pane's lock, so `state` is current until the next transition updates this follow.
+        let post = state.as_ref().is_none_or(|s| s.permission.is_none());
+        let generation = self.next_follow_gen.fetch_add(1, Ordering::Relaxed);
+        let mut follows = self.follows.lock();
+        follows.retain(|f| !(f.device == device && f.pane == pane));
+        if post {
+            let (shown, end) = shown_state(None, state.as_ref());
+            self.queue_activity(ActivityJob {
+                device: registered,
+                token: token.clone(),
+                pane,
+                generation,
+                state: shown,
+                end,
+            });
+        }
+        // An agent already gone: its activity ends with that update, and is not followed.
+        if state.is_some() {
             follows.push(Follow {
                 device: device.to_owned(),
                 pane,
                 token,
-                last: if seed_without_post {
-                    state.clone()
-                } else {
-                    None
-                },
+                last: state,
                 generation,
             });
-            save_json(&self.follows_path, &*follows)?;
         }
-        if !seed_without_post {
-            self.agent_changed(pane, state, &[]);
-        }
+        save_json(&self.follows_path, &*follows)?;
         Ok(())
     }
 
@@ -617,23 +559,7 @@ impl Pusher {
                 changed = true;
                 return false;
             };
-            // An ending activity keeps showing its last state, as ended; one that never had a
-            // state (the agent was gone when it was followed) still ends.
-            let (shown, end) = match &state {
-                Some(s) => (s.clone(), false),
-                None => {
-                    let mut s = f.last.clone().unwrap_or(ActivityState {
-                        agent: String::new(),
-                        status: String::new(),
-                        title: String::new(),
-                        since: 0,
-                        permission: None,
-                    });
-                    s.status = "ended".into();
-                    s.since = now_secs();
-                    (s, true)
-                }
-            };
+            let (shown, end) = shown_state(f.last.as_ref(), state.as_ref());
             self.queue_activity(ActivityJob {
                 device: device.clone(),
                 token: f.token.clone(),
@@ -680,43 +606,18 @@ struct Store {
 
 impl Store {
     /// Forgets the devices `gone` and their activities.
+    ///
+    /// The devices are saved before they are forgotten here: when the write fails, they stay
+    /// registered (and a retry forgets them), rather than coming back at the next start.
     fn forget(&self, gone: &[String]) -> Result<(), String> {
         let mut devices = self.devices.lock();
-        devices.retain(|d| !gone.contains(&d.device));
-        save_json(&self.path, &*devices)?;
+        let next: Vec<Device> =
+            devices.iter().filter(|d| !gone.contains(&d.device)).cloned().collect();
+        save_json(&self.path, &next)?;
+        *devices = next;
         let mut follows = self.follows.lock();
         follows.retain(|f| !gone.contains(&f.device));
         save_json(&self.follows_path, &*follows)
-    }
-
-    /// Atomically forgets only registered devices matching an exact `(device, generation)` pair
-    /// in `targets`, plus their Live Activity follows. Returns the removed device ids.
-    fn forget_matching(
-        &self,
-        targets: &[thurm_proto::PushRegistrationRef],
-    ) -> Result<Vec<String>, String> {
-        let mut devices = self.devices.lock();
-        let mut gone = Vec::new();
-        devices.retain(|d| {
-            let matched = targets
-                .iter()
-                .any(|t| t.device == d.device && t.generation == d.generation);
-            if matched {
-                gone.push(d.device.clone());
-            }
-            !matched
-        });
-        if gone.is_empty() {
-            return Ok(gone);
-        }
-        save_json(&self.path, &*devices)?;
-        let mut follows = self.follows.lock();
-        let before = follows.len();
-        follows.retain(|f| !gone.contains(&f.device));
-        if follows.len() != before {
-            save_json(&self.follows_path, &*follows)?;
-        }
-        Ok(gone)
     }
 
     /// `device` is registered as it is (not revoked, not registered again since).
@@ -728,12 +629,12 @@ impl Store {
     /// made since (another relay, a new secret) stays. Returns whether it was forgotten.
     fn forget_registration(&self, device: &Device) -> Result<bool, String> {
         let mut devices = self.devices.lock();
-        let before = devices.len();
-        devices.retain(|d| d != device);
-        if devices.len() == before {
+        if !devices.contains(device) {
             return Ok(false);
         }
-        save_json(&self.path, &*devices)?;
+        let next: Vec<Device> = devices.iter().filter(|d| *d != device).cloned().collect();
+        save_json(&self.path, &next)?;
+        *devices = next;
         let mut follows = self.follows.lock();
         follows.retain(|f| f.device != device.device);
         save_json(&self.follows_path, &*follows)?;
@@ -845,6 +746,27 @@ fn save_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String
         f.write_all(&serde_json::to_vec(value).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    }
+}
+
+/// What an activity shows for the agent's `state`, and whether that ends it. An ending activity
+/// keeps showing its `last` state, as ended; one that never had a state (the agent was gone when
+/// it was followed) still ends.
+fn shown_state(last: Option<&ActivityState>, state: Option<&ActivityState>) -> (ActivityState, bool) {
+    match state {
+        Some(s) => (s.clone(), false),
+        None => {
+            let mut s = last.cloned().unwrap_or(ActivityState {
+                agent: String::new(),
+                status: String::new(),
+                title: String::new(),
+                since: 0,
+                permission: None,
+            });
+            s.status = "ended".into();
+            s.since = now_secs();
+            (s, true)
+        }
     }
 }
 
@@ -1052,7 +974,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         })
         .unwrap();
         let n = |pane| Notice {
@@ -1133,7 +1054,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         })
         .unwrap();
         let n = |pane| Notice {
@@ -1229,7 +1149,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         };
         let b: serde_json::Value = serde_json::from_str(&body(
             &d,
@@ -1284,26 +1203,13 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            transport: DeviceTransport::Peer,
-            ..Default::default()
         };
         assert!(p.register(d.clone()).is_err());
         d.relay = "https://push.example.net".into();
         p.register(d.clone()).unwrap();
-        let first = p.devices.lock()[0].generation;
         p.register(d.clone()).unwrap();
         let again = Pusher::new(&dir, true);
-        assert_eq!(again.devices.lock().len(), 1);
-        assert_eq!(again.devices.lock()[0].device, "d1");
-        let second = again.devices.lock()[0].generation;
-        assert!(second > first, "registering again takes a newer generation");
-        // A daemon that restarts with no devices left still never hands out an earlier generation.
-        let empty = std::env::temp_dir().join(format!("thurm-push-gen-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&empty);
-        let fresh = Pusher::new(&empty, true);
-        fresh.register(d.clone()).unwrap();
-        assert!(fresh.devices.lock()[0].generation > second);
-        let _ = std::fs::remove_dir_all(&empty);
+        assert_eq!(*again.devices.lock(), vec![d.clone()]);
         // Same device id through another relay replaces it; a second iPhone with a distinct
         // device id stays registered alongside it, even with the same display name.
         let moved = Device {
@@ -1368,8 +1274,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "My iPhone".into(),
-            transport: DeviceTransport::Tailscale,
-            ..Default::default()
         })
         .unwrap();
         let asking = ActivityState {
@@ -1390,8 +1294,6 @@ mod tests {
             secret: "t".repeat(32),
             host: "work-mac".into(),
             name: "My-iPhone".into(),
-            transport: DeviceTransport::Tailscale,
-            ..Default::default()
         })
         .unwrap();
         p.follow("tailnet-2", 7, "bbbb".into(), Some(asking.clone()))
@@ -1425,148 +1327,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Pre-captured `(device, generation)` SSH key-replacement cleanup revokes ONLY the displaced
-    /// SSH phone and its follows, preserving:
-    /// 1. a replacement phone that registered over Tailscale BEFORE its fallback SSH key was added,
-    /// 2. a replacement phone that registered over SSH BEFORE delayed cleanup arrived (different ID
-    ///    or even the same ID at a newer generation).
+    /// `RevokePhone` (a phone's key revoked or replaced) forgets every registration under that
+    /// name and its activities, whichever way it registered; other names stay. The phones that
+    /// still hold a key register again when they reconnect.
     #[test]
-    fn scoped_replacement_revokes_only_precaptured_ssh_registration() {
-        let dir = std::env::temp_dir().join(format!("thurm-push-replace-{}", std::process::id()));
+    fn revoking_a_name_forgets_all_its_registrations_and_follows() {
+        let dir = std::env::temp_dir().join(format!("thurm-push-revoke-name-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (relay_old, posts_old) = capturing_relay();
-        let (relay_tailnet, posts_tailnet) = capturing_relay();
-        let (relay_new_ssh, posts_new_ssh) = capturing_relay();
         let p = Pusher::new(&dir, true);
-
-        // Old SSH-paired phone registered and following pane 7.
-        p.register(Device {
-            device: "d-old".into(),
-            relay: relay_old,
+        let device = |id: &str, name: &str| Device {
+            device: id.into(),
+            relay: "https://push.example.net".into(),
             secret: "s".repeat(32),
             host: "studio".into(),
-            name: "iPhone".into(),
-            transport: DeviceTransport::Peer,
-            ..Default::default()
-        })
-        .unwrap();
+            name: name.into(),
+        };
+        p.register(device("d-ssh", "iPhone")).unwrap();
+        p.register(device("d-tailnet", "iPhone")).unwrap();
+        p.register(device("d-ipad", "iPad")).unwrap();
         let asking = ActivityState {
             agent: "Claude Code".into(),
             status: "permission".into(),
-            title: "private-task".into(),
+            title: "t".into(),
             since: 1,
             permission: Some(1),
         };
-        p.follow("d-old", 7, "1111".into(), Some(asking.clone()))
-            .unwrap();
-
-        // Replacement phone registers over Tailscale BEFORE its SSH fallback key is pasted.
-        p.register(Device {
-            device: "d-tailnet".into(),
-            relay: relay_tailnet,
-            secret: "t".repeat(32),
-            host: "studio".into(),
-            name: "iPhone".into(),
-            transport: DeviceTransport::Tailscale,
-            ..Default::default()
-        })
-        .unwrap();
-        p.follow("d-tailnet", 7, "2222".into(), Some(asking.clone()))
-            .unwrap();
-
-        // Snapshot non-Tailscale registrations matching "iPhone" BEFORE writing the new SSH key:
-        // captures ONLY `d-old`, NOT `d-tailnet`.
-        let captured = p.ssh_registrations_named("iPhone");
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].device, "d-old");
-
-        // Before delayed cleanup runs, another SSH replacement phone connects and registers.
-        p.register(Device {
-            device: "d-new-ssh".into(),
-            relay: relay_new_ssh,
-            secret: "u".repeat(32),
-            host: "studio".into(),
-            name: "iPhone".into(),
-            transport: DeviceTransport::Peer,
-            ..Default::default()
-        })
-        .unwrap();
-        p.follow("d-new-ssh", 7, "3333".into(), Some(asking.clone()))
-            .unwrap();
-
-        // Delayed cleanup revokes ONLY the pre-captured `(d-old, gen)` registration.
-        let gone = p.revoke_registrations(&captured).unwrap();
-        assert_eq!(gone, ["d-old"]);
-
-        p.notify(
-            Notice {
-                pane: 7,
-                title: "Claude Code".into(),
-                permission: Some(2),
-                kind: Some(NoticeKind::Permission),
-            },
-            &[],
-        );
-        p.agent_changed(
-            7,
-            Some(ActivityState {
-                status: "done".into(),
-                permission: None,
-                ..asking.clone()
-            }),
-            &[],
-        );
-
-        let t1: serde_json::Value =
-            serde_json::from_str(&posts_tailnet.recv_timeout(Duration::from_secs(10)).unwrap())
-                .unwrap();
-        let t2: serde_json::Value =
-            serde_json::from_str(&posts_tailnet.recv_timeout(Duration::from_secs(10)).unwrap())
-                .unwrap();
-        assert_eq!(t1["device"], "d-tailnet");
-        assert_eq!(t2["device"], "d-tailnet");
-        let n1: serde_json::Value =
-            serde_json::from_str(&posts_new_ssh.recv_timeout(Duration::from_secs(10)).unwrap())
-                .unwrap();
-        let n2: serde_json::Value =
-            serde_json::from_str(&posts_new_ssh.recv_timeout(Duration::from_secs(10)).unwrap())
-                .unwrap();
-        assert_eq!(n1["device"], "d-new-ssh");
-        assert_eq!(n2["device"], "d-new-ssh");
-        assert!(
-            posts_old.recv_timeout(Duration::from_millis(300)).is_err(),
-            "displaced SSH phone must receive neither notices nor Live Activity updates"
-        );
-
-        // Even if the SAME device ID re-registered at a higher generation before stale cleanup
-        // arrived, revoking the old generation must leave the new registration and follow intact.
-        let before_rereg = p.ssh_registrations_named("iPhone");
-        assert_eq!(before_rereg.len(), 1);
-        assert_eq!(before_rereg[0].device, "d-new-ssh");
-        p.register(Device {
-            device: "d-new-ssh".into(),
-            relay: "https://push.example.net".into(),
-            secret: "v".repeat(32),
-            host: "studio".into(),
-            name: "iPhone".into(),
-            transport: DeviceTransport::Peer,
-            ..Default::default()
-        })
-        .unwrap();
-        p.follow("d-new-ssh", 9, "4444".into(), Some(asking)).unwrap();
-        assert!(p.revoke_registrations(&before_rereg).unwrap().is_empty());
-        assert!(p.devices.lock().iter().any(|d| d.device == "d-new-ssh"));
-        assert!(p.follows.lock().iter().any(|f| f.device == "d-new-ssh" && f.pane == 9));
-
+        for (d, token) in [("d-ssh", "aa"), ("d-tailnet", "bb"), ("d-ipad", "cc")] {
+            p.follow(d, 7, token.into(), Some(asking.clone())).unwrap();
+        }
+        let mut gone = p.revoke_named("iPhone").unwrap();
+        gone.sort();
+        assert_eq!(gone, ["d-ssh", "d-tailnet"]);
         let reloaded = Pusher::new(&dir, true);
-        let mut ids: Vec<String> = reloaded
-            .devices
-            .lock()
-            .iter()
-            .map(|d| d.device.clone())
-            .collect();
-        ids.sort();
-        assert_eq!(ids, ["d-new-ssh", "d-tailnet"]);
+        let ids: Vec<_> = reloaded.devices.lock().iter().map(|d| d.device.clone()).collect();
+        assert_eq!(ids, ["d-ipad"]);
+        let follows: Vec<_> = reloaded.follows.lock().iter().map(|f| f.device.clone()).collect();
+        assert_eq!(follows, ["d-ipad"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A revocation whose write fails changes nothing, here or on disk, so retrying it works.
+    #[test]
+    fn a_revocation_that_cannot_be_saved_stays_retryable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("thurm-push-unsaved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Pusher::new(&dir, true);
+        p.register(Device {
+            device: "d1".into(),
+            relay: "https://push.example.net".into(),
+            secret: "s".repeat(32),
+            host: "studio".into(),
+            name: "iPhone".into(),
+        })
+        .unwrap();
+        // The state directory can't take the new file.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = p.revoke_named("iPhone");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(p.devices.lock().len(), 1, "still registered: the write failed");
+        assert_eq!(Pusher::new(&dir, true).devices.lock().len(), 1);
+        assert_eq!(p.revoke_named("iPhone").unwrap(), ["d1"]);
+        assert!(Pusher::new(&dir, true).devices.lock().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1601,7 +1424,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         })
         .unwrap();
         let notice = |pane| Notice {
@@ -1657,7 +1479,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         })
         .unwrap();
         let working = ActivityState {
@@ -1724,7 +1545,6 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: name.into(),
-                ..Default::default()
             })
             .unwrap();
         }
@@ -1790,7 +1610,6 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "Nikola's iPhone".into(),
-                ..Default::default()
             },
             Device {
                 device: "d2".into(),
@@ -1798,7 +1617,6 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "laptop".into(),
                 name: "Nikola's iPhone".into(),
-                ..Default::default()
             },
             Device {
                 device: "d3".into(),
@@ -1806,7 +1624,6 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "iPad".into(),
-                ..Default::default()
             },
             // Unrelated device whose device ID happens to match the revoked phone's name.
             Device {
@@ -1815,7 +1632,6 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "Work Phone".into(),
-                ..Default::default()
             },
         ];
         save_json(&dir.join("push-devices.json"), &seeded).unwrap();
@@ -1879,7 +1695,6 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: id.into(),
-                ..Default::default()
             })
             .unwrap();
         }
@@ -1937,7 +1752,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         })
         .unwrap();
         for pane in 1..=2 {
@@ -1976,7 +1790,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         };
         p.register(old.clone()).unwrap();
         let stored_old = p.devices.lock()[0].clone();
@@ -2036,7 +1849,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         })
         .unwrap();
         let next = || -> serde_json::Value {
@@ -2149,7 +1961,6 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "iPhone".into(),
-                ..Default::default()
             })
             .unwrap();
             let working = ActivityState {
@@ -2212,7 +2023,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         })
         .unwrap();
         let working = ActivityState {
@@ -2289,7 +2099,6 @@ mod tests {
                 secret: "s".repeat(32),
                 host: "studio".into(),
                 name: "iPhone".into(),
-                ..Default::default()
             };
             p.register(dev1.clone()).unwrap();
             let working = ActivityState {
@@ -2358,7 +2167,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         })
         .unwrap();
         p.notify(
@@ -2447,7 +2255,6 @@ mod tests {
             secret: "s".repeat(32),
             host: "studio".into(),
             name: "iPhone".into(),
-            ..Default::default()
         };
         p.register(d.clone()).unwrap();
         let working = ActivityState {

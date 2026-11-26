@@ -243,91 +243,62 @@ enum PhonePairing {
         var id: String { line }
     }
 
-    /// Identifies one push registration instance `(device, generation)` on a daemon so delayed
-    /// SSH key-replacement cleanup never revokes a Tailscale-only or newer registration.
-    struct PushRegistrationRef: Codable, Equatable, Hashable {
-        var device: String
-        var generation: UInt64
-
-        var json: [String: Any] { ["device": device, "generation": generation] }
-
-        init(device: String, generation: UInt64) {
-            self.device = device
-            self.generation = generation
-        }
-
-        init?(json: Any?) {
-            guard let d = json as? [String: Any],
-                  let device = jsonString(d["device"]),
-                  let genNum = d["generation"] as? NSNumber
-            else { return nil }
-            self.device = device
-            self.generation = genNum.uint64Value
-        }
+    /// The outcome of a daemon cleanup step: done, or the reason it failed (shown to the user).
+    enum CleanupResult {
+        case success
+        case failure(String)
     }
 
-    struct PendingPushRevocation: Codable, Equatable {
-        var registrations: [PushRegistrationRef]
-        var dropUnregisteredSSH: Bool
-    }
-
-    /// Durable store for pre-captured local push revocations whose `~/.ssh/authorized_keys`
-    /// replacement succeeded while the daemon cleanup RPC failed, so retrying completes cleanup.
+    /// Phone names whose key on this Mac was (or may have been) replaced but whose push cleanup
+    /// (`RevokePhone`) has not been confirmed. Written durably before the key file changes,
+    /// removed once the daemon revoked. Cleanup is name-wide and harmless to repeat, so a name
+    /// left for an edit that never happened costs nothing but a reconnect.
     final class PendingPushRevokesStore {
-        static let shared = PendingPushRevokesStore(defaults: .standard, key: "thurm.pendingLocalPushRevokes")
+        static let shared = PendingPushRevokesStore(
+            file: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config/thurm/pending-phone-revokes.json"))
 
-        private let defaults: UserDefaults
-        private let key: String
+        private let file: URL
         private let lock = NSLock()
 
-        init(defaults: UserDefaults, key: String = "thurm.pendingLocalPushRevokes") {
-            self.defaults = defaults
-            self.key = key
-        }
+        init(file: URL) { self.file = file }
 
-        private func loadUnlocked() -> [String: PendingPushRevocation] {
-            guard let data = defaults.data(forKey: key),
-                  let map = try? JSONDecoder().decode([String: PendingPushRevocation].self, from: data)
-            else { return [:] }
-            return map
-        }
-
-        private func saveUnlocked(_ map: [String: PendingPushRevocation]) {
-            if map.isEmpty {
-                defaults.removeObject(forKey: key)
-            } else if let data = try? JSONEncoder().encode(map) {
-                defaults.set(data, forKey: key)
+        /// An unreadable record counts as everything pending: cleanup runs once more rather
+        /// than being skipped.
+        private func load() -> Set<String>? {
+            guard let data = try? Data(contentsOf: file) else {
+                return FileManager.default.fileExists(atPath: file.path) ? nil : []
             }
+            return (try? JSONDecoder().decode([String].self, from: data)).map(Set.init)
         }
 
-        func get(_ device: String) -> PendingPushRevocation? {
-            lock.lock()
-            defer { lock.unlock() }
-            return loadUnlocked()[device]
+        private func save(_ names: Set<String>) throws {
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            // `.atomic` writes a temporary file and renames it over; the rename is what a crash
+            // leaves either way.
+            try JSONEncoder().encode(names.sorted()).write(to: file, options: [.atomic])
         }
 
-        func set(_ device: String, _ entry: PendingPushRevocation) {
+        func contains(_ device: String) -> Bool {
             lock.lock()
             defer { lock.unlock() }
-            var map = loadUnlocked()
-            map[device] = entry
-            saveUnlocked(map)
+            return load()?.contains(device) ?? true
+        }
+
+        func insert(_ device: String) throws {
+            lock.lock()
+            defer { lock.unlock() }
+            var names = load() ?? []
+            if names.insert(device).inserted { try save(names) }
         }
 
         func remove(_ device: String) {
             lock.lock()
             defer { lock.unlock() }
-            var map = loadUnlocked()
-            if map.removeValue(forKey: device) != nil {
-                saveUnlocked(map)
-            }
+            guard var names = load(), names.remove(device) != nil else { return }
+            try? save(names)
         }
-    }
-
-    /// The outcome of a daemon cleanup step: a value, or the reason it failed (shown to the user).
-    enum CleanupResult<Value> {
-        case success(Value)
-        case failure(String)
     }
 
     enum LocalKeyAddResult: Equatable {
@@ -344,24 +315,24 @@ enum PhonePairing {
         }
     }
 
-    /// Adds `key` for `device` to `file` with pre-captured, generation-scoped push cleanup:
-    /// - Adding a brand-new name (or re-adding/renaming the same key) with no pending cleanup
-    ///   writes `authorized_keys` directly without needing a daemon RPC.
-    /// - Replacing a different key captures existing non-Tailscale `(device, generation)` push
-    ///   registrations BEFORE editing `authorized_keys` and fails closed if the daemon cannot be
-    ///   reached, so Tailscale-paired or later-registered phones are never revoked.
-    /// - If revocation fails after `authorized_keys` already changed, pending targets stay in
-    ///   `pendingStore` so retrying the same key completes cleanup without capturing newer phones.
+    /// Adds `key` for `device` to `file`. When that replaces another key under the name, this
+    /// Mac's daemon then revokes the name (`RevokePhone`): the phone that held the old key loses
+    /// its push registration and its open connections (the others reconnect and register again).
+    /// - A new name (or the same key again) needs no daemon, unless an earlier attempt's cleanup
+    ///   is still pending, which this finishes.
+    /// - Replacing a key needs the daemon connected and changes nothing when it isn't.
+    /// - The pending cleanup is written before the key file changes, so a quit or crash before
+    ///   the daemon confirmed is cleaned up by the next attempt with the same key.
     static func addWithPushCleanup(
         key: String,
         device: String,
         to file: URL = authorizedKeys,
         pendingStore: PendingPushRevokesStore = .shared,
-        listSSHRegistrations: (_ name: String, _ done: @escaping (CleanupResult<[PushRegistrationRef]>) -> Void) -> Void,
-        revokeRegistrations: @escaping (_ regs: [PushRegistrationRef], _ dropUnregisteredSSH: Bool, _ done: @escaping (CleanupResult<Void>) -> Void) -> Void,
+        daemonReady: () -> String?,
+        revokePhone: @escaping (_ name: String, _ done: @escaping (CleanupResult) -> Void) -> Void,
         completion: @escaping (LocalKeyAddResult) -> Void
     ) {
-        let priorPending = pendingStore.get(device)
+        let wasPending = pendingStore.contains(device)
         let willReplace: Bool
         do {
             willReplace = try willReplaceDifferentKey(key: key, device: device, in: file)
@@ -369,68 +340,35 @@ enum PhonePairing {
             completion(.failed("Could not read ~/.ssh/authorized_keys: \(error.localizedDescription). The key was not added on any host."))
             return
         }
-
-        if !willReplace {
+        if willReplace {
+            if let why = daemonReady() {
+                completion(.failed("\(device)'s key was not replaced: \(why), and it has to revoke the previous phone."))
+                return
+            }
             do {
-                _ = try add(key: key, device: device, to: file)
+                try pendingStore.insert(device)
             } catch {
-                completion(.failed("Could not write ~/.ssh/authorized_keys: \(error.localizedDescription). The key was not added on any host."))
+                completion(.failed("\(device)'s key was not replaced: could not record the cleanup (\(error.localizedDescription))."))
                 return
             }
-            guard let pending = priorPending else {
-                completion(.added(replaced: false))
-                return
-            }
-            revokeRegistrations(pending.registrations, pending.dropUnregisteredSSH) { res in
-                switch res {
-                case .success:
-                    pendingStore.remove(device)
-                    completion(.added(replaced: true))
-                case .failure(let why):
-                    completion(.failed("Replaced \(device)'s key on this Mac, but could not finish revoking the previous phone's push access (\(why)). Click Add Device Key again to finish cleanup."))
-                }
-            }
+        }
+        do {
+            _ = try add(key: key, device: device, to: file)
+        } catch {
+            completion(.failed("Could not write ~/.ssh/authorized_keys: \(error.localizedDescription). The key was not added on any host."))
             return
         }
-
-        // Replacing an existing different key: capture non-Tailscale registrations BEFORE writing
-        // `~/.ssh/authorized_keys` so a replacement phone cannot be revoked by delayed cleanup.
-        listSSHRegistrations(device) { listRes in
-            let captured: [PushRegistrationRef]
-            switch listRes {
-            case .success(let list):
-                captured = list
+        guard willReplace || wasPending else {
+            completion(.added(replaced: false))
+            return
+        }
+        revokePhone(device) { result in
+            switch result {
+            case .success:
+                pendingStore.remove(device)
+                completion(.added(replaced: true))
             case .failure(let why):
-                completion(.failed("Could not replace \(device)'s key on this Mac without revoking the previous phone's push access: \(why). The key was not changed."))
-                return
-            }
-
-            var merged = priorPending?.registrations ?? []
-            for item in captured where !merged.contains(item) {
-                merged.append(item)
-            }
-            let pending = PendingPushRevocation(registrations: merged, dropUnregisteredSSH: true)
-
-            let replaced: Bool
-            do {
-                replaced = try add(key: key, device: device, to: file)
-            } catch {
-                completion(.failed("Could not write ~/.ssh/authorized_keys: \(error.localizedDescription). The key was not added on any host."))
-                return
-            }
-            guard replaced || priorPending != nil else {
-                completion(.added(replaced: false))
-                return
-            }
-            pendingStore.set(device, pending)
-            revokeRegistrations(pending.registrations, pending.dropUnregisteredSSH) { revokeRes in
-                switch revokeRes {
-                case .success:
-                    pendingStore.remove(device)
-                    completion(.added(replaced: true))
-                case .failure(let why):
-                    completion(.failed("Replaced \(device)'s key on this Mac, but could not revoke the previous phone's push access (\(why)). Click Add Device Key again to finish cleanup."))
-                }
+                completion(.failed("Replaced \(device)'s key on this Mac, but could not revoke the previous phone's notifications (\(why)). Click Add Device Key again to finish."))
             }
         }
     }
@@ -936,43 +874,18 @@ struct PairPhoneSheet: View {
         PhonePairing.addWithPushCleanup(
             key: key,
             device: device,
-            listSSHRegistrations: { name, done in
-                guard Core.shared.isConnected(localHost) else {
-                    done(.failure("this Mac's Thurm daemon is not connected"))
-                    return
-                }
-                guard Core.shared.hasCapability(localHost, "push-replace") else {
-                    done(.failure("this Mac's Thurm daemon needs to be restarted to support scoped push cleanup"))
-                    return
-                }
-                Core.shared.requestAsync(object: ["ListPushRegistrations": ["name": name]],
-                                         host: localHost, timeout: 15) { resp in
-                    guard let v = JSON.variant(resp), v.name == "PushRegistrations",
-                          let raw = v.payload as? [Any]
-                    else {
-                        let why = ((resp as? [String: Any])?["error"] as? String)
-                            ?? "the daemon did not answer"
-                        done(.failure(why))
-                        return
-                    }
-                    done(.success(raw.compactMap(PhonePairing.PushRegistrationRef.init(json:))))
-                }
+            daemonReady: {
+                Core.shared.isConnected(localHost) ? nil : "this Mac's Thurm daemon is not connected"
             },
-            revokeRegistrations: { regs, dropUnregisteredSSH, done in
+            revokePhone: { name, done in
                 guard Core.shared.isConnected(localHost) else {
                     done(.failure("this Mac's Thurm daemon is not connected"))
                     return
                 }
-                Core.shared.requestAsync(
-                    object: ["RevokePushRegistrations": [
-                        "registrations": regs.map(\.json),
-                        "drop_unregistered_ssh": dropUnregisteredSSH,
-                    ]],
-                    host: localHost,
-                    timeout: 20
-                ) { resp in
+                Core.shared.requestAsync(object: ["RevokePhone": ["name": name]],
+                                         host: localHost, timeout: 20) { resp in
                     if (resp as? String) == "Ok" {
-                        done(.success(()))
+                        done(.success)
                     } else {
                         let why = ((resp as? [String: Any])?["error"] as? String)
                             ?? "the daemon did not answer"

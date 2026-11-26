@@ -1695,7 +1695,7 @@ fn oversized_claim_lists_are_refused() {
 
 /// Replacing a remote host's SSH phone key revokes the retired phone's push registration and
 /// active Live Activity follow through the remote host's daemon even when no Mac daemon client is
-/// connected, while preserving a replacement phone that registered before delayed cleanup.
+/// connected, and drops the retired phone's open connection; the replacement registers after.
 #[test]
 fn remote_key_replacement_revokes_old_push_and_follow_without_mac_client() {
     use thurm_remote::pairing::{
@@ -1744,19 +1744,17 @@ fn remote_key_replacement_revokes_old_push_and_follow_without_mac_client() {
         hook(&setup, pane, "permission-prompt", None);
         pane
     };
-    // Old SSH-paired phone registers and follows the pane's active permission prompt, then
-    // disconnects (no Mac daemon client is connected to the remote host either).
-    {
-        let (old_phone, _) = mobile(&env);
-        register(&old_phone, "dev-old", &relay_old, "iPhone");
-        old_phone
-            .request(Request::FollowAgent {
-                device: "dev-old".into(),
-                pane,
-                token: "aa11bb".into(),
-            })
-            .unwrap();
-    }
+    // Old SSH-paired phone registers and follows the pane's active permission prompt, and stays
+    // connected (no Mac daemon client is connected to the remote host).
+    let (old_phone, _old_events) = mobile(&env);
+    register(&old_phone, "dev-old", &relay_old, "iPhone");
+    old_phone
+        .request(Request::FollowAgent {
+            device: "dev-old".into(),
+            pane,
+            token: "aa11bb".into(),
+        })
+        .unwrap();
 
     let remote_home = env.dir.join("remote-home");
     std::fs::create_dir_all(&remote_home).unwrap();
@@ -1787,8 +1785,8 @@ fn remote_key_replacement_revokes_old_push_and_follow_without_mac_client() {
     );
 
     // Replace k1 -> k2 with NO Mac daemon client connected: `authorize_with_push_cleanup`
-    // opens a fresh daemon session, pre-captures `dev-old`, replaces authorized_keys, and revokes
-    // `dev-old` + its Live Activity follow.
+    // opens a daemon session, replaces authorized_keys, and revokes the name: `dev-old`, its Live
+    // Activity follow and its open connection go.
     let sock = env.socket.clone();
     let replaced = authorize_with_push_cleanup(
         &ssh,
@@ -1808,11 +1806,15 @@ fn remote_key_replacement_revokes_old_push_and_follow_without_mac_client() {
                 || {},
             )
             .map_err(|e| e.to_string())?;
-            RemoteDaemonSession::from_client(client, "devbox")
+            Ok(RemoteDaemonSession::from_client(client))
         },
     )
     .unwrap();
     assert!(replaced);
+    assert!(
+        old_phone.request(Request::Ping).is_err(),
+        "the retired phone's open connection is dropped"
+    );
 
     // Register the replacement phone and follow the pane, then transition agent state:
     // ONLY the replacement phone gets updates; the retired phone gets neither notices nor
