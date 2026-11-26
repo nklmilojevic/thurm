@@ -885,7 +885,31 @@ impl Drop for Inner {
         // The last reference may be a mosh callback's, on the runtime itself: dropping it
         // there would block (and panic).
         if let Some(rt) = self.mosh_rt.take() {
-            rt.shutdown_background();
+            // Closed mosh sessions are still asking their hosts to end (`CLOSE_WAIT` at most):
+            // with the ssh session gone (or a newer one that never started them), that is the
+            // only way their shells end. Let the runtime finish them off this thread.
+            let (tx, rx) = std::sync::mpsc::channel::<tokio::runtime::Runtime>();
+            let spawned = std::thread::Builder::new()
+                .name("thurm-mosh-close".into())
+                .spawn(move || {
+                    let Ok(rt) = rx.recv() else { return };
+                    let deadline = Instant::now() + thurm_mosh::session::CLOSE_WAIT * 2;
+                    while rt.metrics().num_alive_tasks() > 0 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    rt.shutdown_background();
+                });
+            match spawned {
+                Ok(_) => {
+                    if let Err(std::sync::mpsc::SendError(rt)) = tx.send(rt) {
+                        rt.shutdown_background();
+                    }
+                }
+                Err(e) => {
+                    log::debug!("mosh: no thread to finish closing sessions: {e}");
+                    rt.shutdown_background();
+                }
+            }
         }
     }
 }

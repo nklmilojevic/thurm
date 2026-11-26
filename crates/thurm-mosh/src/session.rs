@@ -16,6 +16,9 @@ use crate::ssp::{Apply, Engine};
 use crate::wire::{self, HostEvent, UserEvent};
 
 /// After this long without hearing from the server, move to a new socket.
+/// How long a closed session goes on asking the host to end (resending on the retransmission
+/// timer) before it gives up; a host that is unreachable then is left to its idle timeout.
+pub const CLOSE_WAIT: Duration = Duration::from_secs(2);
 const RESOCKET_AFTER: Duration = Duration::from_secs(6);
 /// After this long, stop calling it reconnecting (it may come back; [`MoshSession::wake`]
 /// tries again at once).
@@ -180,9 +183,12 @@ impl Driver {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         (self.on_event)(MoshEvent::Status(Status::Connecting));
         let mut buf = vec![0u8; 65536];
+        // Set once closing: the shutdown exchange with the host ends by then at the latest.
+        let mut closing: Option<Instant> = None;
         loop {
             let deadline = self.engine.next_deadline(Instant::now());
             let check = Instant::now() + Duration::from_secs(1);
+            let check = closing.map_or(check, |c| check.min(c));
             tokio::select! {
                 r = self.socket.recv(&mut buf) => match r {
                     Ok(n) => self.datagram(&buf[..n]),
@@ -194,8 +200,17 @@ impl Driver {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 },
-                cmd = rx.recv() => match cmd {
-                    None | Some(Cmd::Close) => return,
+                cmd = rx.recv(), if closing.is_none() => match cmd {
+                    None | Some(Cmd::Close) => {
+                        if self.engine.shut_down() {
+                            return;
+                        }
+                        // End the host's side too, over this authenticated session: mosh-server
+                        // exits once it acknowledges, and its shell with it. Nothing else can
+                        // end it once the ssh session that started it is gone.
+                        self.engine.start_shutdown();
+                        closing = Some(Instant::now() + CLOSE_WAIT);
+                    }
                     Some(Cmd::Event(ev)) => self.engine.push(ev),
                     Some(Cmd::Wake(ip)) => {
                         if let Some(ip) = ip {
@@ -226,6 +241,15 @@ impl Driver {
                 _ = tokio::time::sleep_until(deadline.min(check).into()) => {}
             }
             self.flush().await;
+            if let Some(until) = closing {
+                if self.engine.shutdown_acked() || self.engine.shut_down() {
+                    return;
+                }
+                if Instant::now() >= until {
+                    log::debug!("mosh: the host did not acknowledge the shutdown");
+                    return;
+                }
+            }
             if self.engine.shut_down() {
                 (self.on_event)(MoshEvent::Ended);
                 return;
