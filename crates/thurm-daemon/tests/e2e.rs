@@ -1644,31 +1644,44 @@ fn completion_uses_only_the_path_the_shell_reported() {
 /// the user's commands after startup and after the prompt hook.
 #[test]
 fn traced_shells_keep_the_token_out_and_still_report_path() {
-    let fish = [
-        "/run/current-system/sw/bin/fish",
-        "/opt/homebrew/bin/fish",
-        "/usr/local/bin/fish",
-    ]
-    .into_iter()
-    .map(String::from)
-    .chain(
-        std::env::var("HOME")
-            .ok()
-            .map(|h| format!("{h}/.nix-profile/bin/fish")),
-    )
-    .find(|p| Path::new(p).exists());
-    let mut shells = vec![
-        ("bash", "/bin/bash".to_owned()),
-        ("rbash", "/bin/bash".to_owned()),
-        ("zsh", "/bin/zsh".to_owned()),
-    ];
-    if let Some(fish) = fish {
-        shells.push(("fish", fish));
+    // Each shell where it is installed: the system's first, then where package managers put
+    // it, then anywhere on PATH.
+    let find = |shell: &str| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        [
+            "/bin",
+            "/usr/bin",
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/run/current-system/sw/bin",
+        ]
+        .map(String::from)
+        .into_iter()
+        .chain([format!("{home}/.nix-profile/bin")])
+        .chain(
+            std::env::var("PATH")
+                .unwrap_or_default()
+                .split(':')
+                .filter(|d| d.starts_with('/'))
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        )
+        .map(|d| format!("{d}/{shell}"))
+        .find(|p| Path::new(p).is_file())
+    };
+    let mut shells = Vec::new();
+    for (name, shell) in [
+        ("bash", "bash"),
+        ("rbash", "bash"),
+        ("zsh", "zsh"),
+        ("fish", "fish"),
+    ] {
+        match find(shell) {
+            Some(path) => shells.push((name, path)),
+            None => eprintln!("{shell} not installed; skipping {name}"),
+        }
     }
     for (name, shell) in shells {
-        if !Path::new(&shell).exists() {
-            continue;
-        }
         let env = Env::new(&format!("token-trace-{name}"));
         let home = env.dir.join("home");
         let bin = env.dir.join("bin");
