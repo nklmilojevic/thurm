@@ -19,11 +19,22 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
   _thurm_executing=""
   _thurm_in_prompt=""
   _thurm_ret=0
+  # Turns tracing off, the toggle itself unseen where it can be: restricted bash (`set -r`)
+  # refuses the redirection, and tracing must go off all the same (the toggle shows, the
+  # token never does).
+  _thurm_untrace() {
+    if [[ $- == *r* ]]; then
+      builtin set +x
+    else
+      { builtin set +x; } 2>/dev/null
+    fi
+  }
+
   # Proves to Thurm that the $PATH report comes from this shell, not from program output.
   # Kept out of the environment of the programs the shell runs.
   # Untraced: under `set -x` (or `bash -x`) the trace would print the token.
   _thurm_token_xtrace=""
-  if [[ $- == *x* ]]; then _thurm_token_xtrace=1; { builtin set +x; } 2>/dev/null; fi
+  if [[ $- == *x* ]]; then _thurm_token_xtrace=1; _thurm_untrace; fi
   _thurm_token=${THURM_SHELL_TOKEN-}
   builtin unset THURM_SHELL_TOKEN
   if [[ -n $_thurm_token_xtrace ]]; then builtin set -x; fi
@@ -68,7 +79,7 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
   # $PATH for Thurm's tab completion (only when it changed). Untraced, like the token's capture.
   _thurm_report_path() {
     local xtrace=""
-    if [[ $- == *x* ]]; then xtrace=1; { builtin set +x; } 2>/dev/null; fi
+    if [[ $- == *x* ]]; then xtrace=1; _thurm_untrace; fi
     if [[ -n "$_thurm_token" && "$PATH" != "${_thurm_last_path-}" ]]; then
       builtin printf '\e]633;P;ThurmPath=%s:%s\a' "$_thurm_token" "${PATH//;/\\x3b}"
       _thurm_last_path=$PATH
