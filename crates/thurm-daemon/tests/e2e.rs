@@ -1640,6 +1640,213 @@ fn completion_uses_only_the_path_the_shell_reported() {
     }
 }
 
+/// With tracing on before the integration captures the token (`set -x` in `.bashrc`, which
+/// Thurm's rc file runs first, also in restricted bash; `setopt xtrace` in `.zshenv`, before the
+/// bootstrap loads the integration; `fish_trace` in fish's environment), the trace never shows
+/// the shell token: not at the capture, nor in a prompt's `$PATH` report. The report still reaches Thurm, and tracing stays on for
+/// the user's commands after startup and after the prompt hook.
+#[test]
+fn traced_shells_keep_the_token_out_and_still_report_path() {
+    // Each shell where it is installed: the system's first, then where package managers put
+    // it, then anywhere on PATH.
+    let find = |shell: &str| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        [
+            "/bin",
+            "/usr/bin",
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/run/current-system/sw/bin",
+        ]
+        .map(String::from)
+        .into_iter()
+        .chain([format!("{home}/.nix-profile/bin")])
+        .chain(
+            std::env::var("PATH")
+                .unwrap_or_default()
+                .split(':')
+                .filter(|d| d.starts_with('/'))
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        )
+        .map(|d| format!("{d}/{shell}"))
+        .find(|p| Path::new(p).is_file())
+    };
+    let mut shells = Vec::new();
+    for (name, shell) in [
+        ("bash", "bash"),
+        ("rbash", "bash"),
+        ("zsh", "zsh"),
+        ("fish", "fish"),
+    ] {
+        match find(shell) {
+            Some(path) => shells.push((name, path)),
+            None => eprintln!("{shell} not installed; skipping {name}"),
+        }
+    }
+    for (name, shell) in shells {
+        let env = Env::new(&format!("token-trace-{name}"));
+        let home = env.dir.join("home");
+        let bin = env.dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("thurmzzcmd");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // `TRACEV` makes the traced command differ from the typed one: `echo SENT_on` shows
+        // only in a trace.
+        match name {
+            "bash" | "rbash" => {
+                std::fs::create_dir_all(&home).unwrap();
+                // Restricted bash can't change PATH: it gets the tool's directory up front.
+                let rc = if name == "rbash" {
+                    format!(
+                        "TRACEV=on\nexport PATH=\"{}:$PATH\"\nset -x\nset -r\n",
+                        bin.display()
+                    )
+                } else {
+                    "TRACEV=on\nset -x\n".to_owned()
+                };
+                std::fs::write(home.join(".bashrc"), rc).unwrap();
+                std::fs::write(home.join(".bash_profile"), "source ~/.bashrc\n").unwrap();
+            }
+            "zsh" => {
+                std::fs::create_dir_all(&home).unwrap();
+                // Without the system's rc files (one may build a completion dump, traced).
+                std::fs::write(
+                    home.join(".zshenv"),
+                    "TRACEV=on\nsetopt no_global_rcs xtrace\n",
+                )
+                .unwrap();
+            }
+            _ => {
+                let conf = home.join(".config/fish");
+                std::fs::create_dir_all(&conf).unwrap();
+                std::fs::write(
+                    conf.join("config.fish"),
+                    "set -g TRACEV on\nfunction fish_greeting; end\n",
+                )
+                .unwrap();
+            }
+        }
+        // A system config may set XDG_DATA_DIRS afresh (nix-darwin's does, when the variable
+        // saying it ran is not inherited, as here), dropping the directory Thurm loads fish's
+        // integration from: fish also sources it itself (a no-op once loaded).
+        let command = if name == "fish" {
+            let snippet = env
+                .dir
+                .join("state/shell-integration/fish/vendor_conf.d/thurm.fish");
+            format!(
+                "{shell:?}, \"-C\", {:?}",
+                format!("source {}", snippet.display())
+            )
+        } else {
+            format!("{shell:?}")
+        };
+        std::fs::write(
+            env.dir.join("config/config.toml"),
+            format!(
+                "[terminal]\nshell = [{command}]\nshell_integration = true\n\
+                 scrollback = 1000000\n\
+                 [session]\nsnapshot_interval_secs = 60\n"
+            ),
+        )
+        .unwrap();
+        // fish traces from its first line, the integration's vendor snippet included.
+        let fish_trace = [("fish_trace", Path::new("all"))];
+        let mut vars = vec![("HOME", home.as_path())];
+        if name == "fish" {
+            vars.extend(fish_trace);
+        }
+        let _daemon = env.start_clean(&vars);
+        let (c, _events) = env.connect();
+        // Wide: a wrapped line would split the token the check looks for.
+        let pane = match c
+            .request(Request::CreatePane(CreatePane {
+                cwd: Some(env.dir.display().to_string()),
+                size: PaneSize {
+                    cols: 1000,
+                    rows: 50,
+                    cell_width: 8,
+                    cell_height: 16,
+                },
+                ..Default::default()
+            }))
+            .unwrap()
+        {
+            Response::PaneCreated { pane } => pane,
+            other => panic!("{other:?}"),
+        };
+        // Typed until `needle` shows, searched in the scrollback too: a traced prompt hook prints
+        // dozens of lines after each command. What is typed during startup may be lost.
+        let type_until = |line: &str, needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                c.request(Request::Input {
+                    pane,
+                    data: format!("{line}\r").into_bytes(),
+                })
+                .unwrap();
+                let retype = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < retype {
+                    if capture(&c, pane).contains(needle) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{name}: waiting for {needle:?}\n{}",
+                    capture(&c, pane)
+                );
+            }
+        };
+        type_until("echo READY_$TRACEV", "\nREADY_on");
+        // Traced after startup and after the prompt hook; on the same line as the PATH change
+        // (restricted bash has it from the start), so the trace shows that ran too.
+        let set_path = match name {
+            "rbash" => String::new(),
+            "fish" => format!("set -gx PATH {} $PATH; ", bin.display()),
+            _ => format!("export PATH={}:$PATH; ", bin.display()),
+        };
+        type_until(&format!("{set_path}echo SENT_$TRACEV"), "echo SENT_on");
+        // And again after the prompt that reports the new PATH.
+        type_until("echo AGAIN_$TRACEV", "echo AGAIN_on");
+        // The prompt's report reached Thurm: completion offers what is on the reported PATH.
+        c.request(Request::Input {
+            pane,
+            data: b"thurmzz".to_vec(),
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match c.request(Request::Complete { pane }).unwrap() {
+                Response::Completions(comp)
+                    if comp.items.iter().any(|i| i.text == "thurmzzcmd") =>
+                {
+                    break;
+                }
+                other => assert!(
+                    Instant::now() < deadline,
+                    "{name}: no completion: {other:?}\n{}",
+                    capture(&c, pane)
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_no_token(name, &capture(&c, pane));
+    }
+}
+
+/// The shell token is 32 hex digits; nothing else these shells print is.
+fn assert_no_token(name: &str, shown: &str) {
+    let leaked = shown
+        .as_bytes()
+        .split(|b| !b.is_ascii_hexdigit())
+        .any(|run| run.len() >= 32);
+    assert!(!leaked, "{name}: token in the trace:\n{shown}");
+}
+
 #[test]
 fn unknown_requests_are_answered_not_dropped() {
     use std::io::Write;

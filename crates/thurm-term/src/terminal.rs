@@ -2438,8 +2438,16 @@ impl Terminal {
             let row = self.read_row(line);
             let wrapped = row.wrapped;
             let mut text = String::new();
+            let mut blanked = false;
             for c in &row.cells[..exported_cells(&row)] {
                 if c.is_spacer() {
+                    continue;
+                }
+                // Concealed text (SGR 8) is not shown, so plain text has a blank per cell of
+                // it; the styled export keeps it, concealed, for the copy it rebuilds.
+                if !ansi && c.pen.attrs & A_HIDDEN != 0 {
+                    text.push_str(if c.wide == Width::Wide { "  " } else { " " });
+                    blanked = true;
                     continue;
                 }
                 if ansi {
@@ -2447,6 +2455,10 @@ impl Terminal {
                 }
                 text.push(c.ch);
                 text.extend(c.zw.iter());
+            }
+            if blanked && !wrapped {
+                let kept = text.trim_end_matches(' ').len();
+                text.truncate(kept);
             }
             if ansi && !wrapped && sgr.has_bg() {
                 // Don't let a background color bleed into the next line on replay.

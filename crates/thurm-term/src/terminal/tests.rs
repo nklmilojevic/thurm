@@ -237,6 +237,285 @@ fn last_command_output() {
     assert_eq!(t.last_command(2).as_deref(), Some("out1.3\nout1.4"));
 }
 
+/// Concealed text (SGR 8, e.g. a password a program echoes hidden) is not shown, so it is not
+/// copied either: its cells copy as blanks, wherever the selection reaches.
+#[test]
+fn concealed_text_is_not_copied() {
+    let mut t = term(30, 3);
+    t.advance(b"pw: \x1b[8mhunter2\x1b[28m ok\r\n\x1b[38;5;8mgray\x1b[0m \x1b[8msecret\x1b[m");
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 0,
+        right_half: false,
+        kind: SelectionKind::Line,
+    });
+    assert_eq!(t.selection_text(), "pw:         ok");
+    // Color 8 is not concealment, and a concealed line end is trimmed like blanks.
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 1,
+        right_half: false,
+        kind: SelectionKind::Line,
+    });
+    assert_eq!(t.selection_text(), "gray");
+    // Text with nothing concealed copies exactly as before.
+    t.advance(b"\r\nplain  text");
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 2,
+        right_half: false,
+        kind: SelectionKind::Line,
+    });
+    assert_eq!(t.selection_text().trim_end(), "plain  text");
+}
+
+/// Concealed text copies as one blank per cell: wide characters and clusters included.
+#[test]
+fn concealed_text_copies_cell_wide_blanks() {
+    let mut t = term(40, 3);
+    t.advance("id: \x1b[8m秘密\x1b[28m | ok\r\n".as_bytes());
+    t.advance("e: \x1b[8m👍🏽\x1b[m|\r\nm: \x1b[8me\u{301}x\x1b[m|".as_bytes());
+    let line = |t: &mut Terminal, row| {
+        t.selection(SelectionOp::Start {
+            col: 0,
+            row,
+            right_half: false,
+            kind: SelectionKind::Line,
+        });
+        t.selection_text()
+    };
+    assert_eq!(line(&mut t, 0), "id:      | ok");
+    // Without grapheme clustering (the default) the emoji and its modifier take two cells
+    // each.
+    assert_eq!(line(&mut t, 1), "e:     |");
+    assert_eq!(line(&mut t, 2), "m:   |");
+    // Several lines copy with LF line ends, concealed text or not.
+    t.selection(SelectionOp::SelectAll);
+    assert_eq!(t.selection_text(), "id:      | ok\ne:     |\nm:   |");
+    // With it, they are one cluster two cells wide.
+    t.advance("\x1b[?2027h\r\n\x1b[8m👍🏽\x1b[m|".as_bytes());
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 2,
+        right_half: false,
+        kind: SelectionKind::Line,
+    });
+    assert_eq!(t.selection_text(), "  |");
+    // Cells skipped by a tab copy as blanks there too.
+    t.advance("\r\nt:\t\x1b[8mx\x1b[m|".as_bytes());
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 2,
+        right_half: false,
+        kind: SelectionKind::Line,
+    });
+    assert_eq!(t.selection_text(), format!("t:{}|", " ".repeat(7)));
+}
+
+/// Plain exports (the last command's output, the screen text agents read) blank concealed
+/// text too.
+#[test]
+fn concealed_text_is_not_exported() {
+    let mut t = term(30, 3);
+    t.advance("pw: \x1b[8mhunter2 秘\x1b[28m ok\r\nx \x1b[8mtail\x1b[m".as_bytes());
+    let screen = t.screen_text();
+    assert!(!screen.contains("hunter2"), "{screen:?}");
+    assert!(screen.starts_with("pw:            ok\nx\n"), "{screen:?}");
+}
+
+/// Concealed text blanks as wide as its cells were laid out, whatever grapheme clustering
+/// is when copying.
+#[test]
+fn concealed_blanks_keep_the_cells_laid_out() {
+    let mut t = term(20, 2);
+    t.advance("\x1b[8m👍🏽\x1b[m|".as_bytes());
+    t.advance(b"\x1b[?2027h");
+    t.selection(SelectionOp::SelectAll);
+    assert_eq!(t.selection_text(), "    |");
+    // The styled fallback too.
+    crate::vt::FALLBACK.with(|f| f.set(true));
+    let text = t.selection_text();
+    crate::vt::FALLBACK.with(|f| f.set(false));
+    assert_eq!(text, "    |");
+}
+
+/// A concealed wide character reflowed onto the next row, selected up to the spacer it left
+/// at the row's end, is not copied.
+#[test]
+fn concealed_wide_character_past_the_selection_end() {
+    let mut t = term(6, 3);
+    t.advance("abcd\x1b[8m秘\x1b[m".as_bytes());
+    t.resize(PaneSize {
+        cols: 5,
+        rows: 3,
+        cell_width: 10,
+        cell_height: 20,
+    });
+    // Row 0: "abcd" and the spacer; row 1: the concealed character.
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 0,
+        right_half: false,
+        kind: SelectionKind::Simple,
+    });
+    t.selection(SelectionOp::Update {
+        col: 4,
+        row: 0,
+        right_half: true,
+    });
+    // The formatter copies the character past the spacer (the plain copy has it).
+    assert!(t.vt.selection_copies().0.contains('秘'));
+    let text = t.selection_text();
+    assert!(!text.contains('秘'), "{text:?}");
+    assert_eq!(text.trim_end(), "abcd");
+}
+
+/// A block beside concealed text copies as the plain text.
+#[test]
+fn block_beside_concealed_text_is_plain() {
+    let mut t = term(20, 3);
+    t.advance(b"left  \x1b[8msecret\x1b[m\r\nmore  \x1b[8mhidden\x1b[m");
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 0,
+        right_half: false,
+        kind: SelectionKind::Block,
+    });
+    t.selection(SelectionOp::Update {
+        col: 3,
+        row: 1,
+        right_half: true,
+    });
+    assert_eq!(t.selection_text(), "left\nmore");
+    assert_eq!(t.selection_text(), t.vt.selection_copies().0);
+}
+
+/// Rows erased with a background color after concealed text copy as nothing, like plain.
+#[test]
+fn concealed_copy_drops_trailing_background_rows() {
+    let mut t = term(10, 5);
+    t.advance(b"pw: \x1b[8mx\x1b[m ok\r\n\x1b[44m\x1b[K\r\n\x1b[K\x1b[m");
+    t.selection(SelectionOp::SelectAll);
+    let (plain, _) = t.vt.selection_copies();
+    assert_eq!(t.selection_text(), plain.replace('x', " "));
+    assert!(!t.selection_text().ends_with('\n'));
+    // The styled fallback drops them all too.
+    crate::vt::FALLBACK.with(|f| f.set(true));
+    let text = t.selection_text();
+    crate::vt::FALLBACK.with(|f| f.set(false));
+    assert_eq!(text, "pw:   ok");
+}
+
+/// A concealed copy over scrollback spanning many pages finds every row's cells.
+#[test]
+fn concealed_copy_across_pages() {
+    let mut t = term(20, 5);
+    for i in 0..3000 {
+        t.advance(format!("{i} \x1b[8ms{i}\x1b[m!\r\n").as_bytes());
+    }
+    let node = |y| t.vt.screen_ref(0, y).unwrap().node;
+    assert_ne!(node(0), node(2999), "the rows should span pages");
+    t.selection(SelectionOp::SelectAll);
+    let text = t.selection_text();
+    assert!(!text.contains('s'), "concealed text copied");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3000);
+    for (i, line) in lines.iter().enumerate() {
+        let n = i.to_string();
+        assert_eq!(*line, format!("{n} {}!", " ".repeat(n.len() + 1)));
+    }
+}
+
+/// A concealed space with a combining mark is a blank cell, as the formatter copies it: the
+/// plain text and the cells still line up.
+#[test]
+fn concealed_cluster_starting_with_a_blank() {
+    let mut t = term(20, 2);
+    t.advance("a\x1b[8m \u{301}x\x1b[mb".as_bytes());
+    t.selection(SelectionOp::SelectAll);
+    assert!(
+        t.vt.selection_copies().1.is_some(),
+        "plain and cells line up"
+    );
+    assert_eq!(t.selection_text(), "a  b"); // The styled fallback too: the VT formatter writes the mark with the space.
+    crate::vt::FALLBACK.with(|f| f.set(true));
+    let text = t.selection_text();
+    crate::vt::FALLBACK.with(|f| f.set(false));
+    assert_eq!(text, "a  b");
+}
+
+/// Concealed spaces other than the ASCII one are text: blanked by their cells.
+#[test]
+fn concealed_unicode_spaces_are_blanked() {
+    let mut t = term(20, 2);
+    t.advance("a\x1b[8m\u{3000}\x1b[mb c\x1b[8m\u{a0}x\x1b[md".as_bytes());
+    t.selection(SelectionOp::SelectAll);
+    assert_eq!(t.selection_text(), "a  b c  d");
+    // Only a concealed U+3000: still blanked.
+    let mut t = term(20, 2);
+    t.advance("a\x1b[8m\u{3000}\x1b[mb".as_bytes());
+    t.selection(SelectionOp::SelectAll);
+    assert_eq!(t.selection_text(), "a  b");
+}
+
+/// Should the styled pass fail, nothing says the plain text is safe: nothing is copied.
+#[test]
+fn copy_fails_closed_without_the_styled_pass() {
+    use crate::vt::FAIL_FORMAT;
+    let mut t = term(20, 2);
+    t.advance(b"pw: \x1b[8mhunter2\x1b[m");
+    t.selection(SelectionOp::SelectAll);
+    FAIL_FORMAT.with(|f| f.set(Some(ghostty_vt_rs_sys::FormatterFormat::VT)));
+    let text = t.selection_text();
+    FAIL_FORMAT.with(|f| f.set(None));
+    assert_eq!(text, "");
+    assert_eq!(t.selection_text(), "pw:");
+}
+
+#[test]
+fn styled_text_parses_escapes() {
+    use crate::vt::styled_text;
+    let s = |v: &str| styled_text(v, true, &[]);
+    assert_eq!(s("a \x1b[1mb\x1b[0m"), "a b");
+    assert_eq!(s("\x1b[38;5;8mx\x1b[48;2;8;8;8my"), "xy");
+    assert_eq!(s("\x1b[38:2::8:8:8mx"), "x");
+    assert_eq!(
+        s("a\x1b[0m\x1b[8mbc\x1b[0md\r\n\x1b[8mzz\x1b[28m"),
+        "a  d\n"
+    );
+    assert_eq!(s("\x1b]8;;https://e.x\x1b\\\x1b[8mpw\x1b[0m!"), "  !");
+    // Other escapes are dropped whole: charsets, strings, private CSI.
+    assert_eq!(s("\x1b(0q\x1b(B\x1b)A-"), "q-");
+    assert_eq!(
+        s("\x1bP1$r0m\x1b\\a\x1b_Gx=1\x1b\\b\x1b^pm\x1b\\c\x1bXs\x1b\\d"),
+        "abcd"
+    );
+    assert_eq!(s("\x1b[>4;8mx\x1b[?8m y"), "x y");
+    // Skipped cells are blanks, trimmed at a line end.
+    assert_eq!(s("a\x1b[3Cb\x1b[Cc\x1b[4C\r\nd"), "a   b c\nd");
+    // A cluster split by a color change still counts once.
+    assert_eq!(s("\x1b[8m👍\x1b[31m🏽\x1b[28m|"), "  |");
+    // Without grapheme clustering every codepoint counts on its own.
+    assert_eq!(styled_text("\x1b[8m👍🏽\x1b[28m|", false, &[]), "    |");
+    // The grid's widths win over clustering's.
+    let grid = [(vec!['👍'], 2), (vec!['🏽'], 2)];
+    assert_eq!(styled_text("\x1b[8m👍🏽\x1b[28m|", true, &grid), "    |");
+    // A concealed ASCII blank is one cell of its own: the grid's cells still line up after it.
+    let grid = [(vec!['a'], 1), (vec!['👍'], 2), (vec!['🏽'], 2)];
+    assert_eq!(styled_text("\x1b[8ma 👍🏽\x1b[28m|", true, &grid), "      |");
+    // Marks on a concealed blank are part of its one cell: the grid's cells still line up.
+    let grid = [(vec!['👍'], 2), (vec!['🏽'], 2)];
+    assert_eq!(
+        styled_text("\x1b[8m \u{301}👍🏽\x1b[28m|", true, &grid),
+        "     |"
+    );
+    // Every trailing row without written cells is dropped, its blanks too.
+    assert_eq!(s("a\r\n\x1b[44m\x1b[K\r\n\x1b[K\r\n\x1b[5C\x1b[m"), "a");
+    // Skipped cells before a written one stay; a row of written blanks keeps its line.
+    assert_eq!(s("a\r\n\x1b[2Cb"), "a\n  b");
+    assert_eq!(s("a\r\n  \r\n\x1b[K"), "a\n");
+}
+
 #[test]
 fn selection_and_copy() {
     let mut t = term(20, 3);
@@ -1631,6 +1910,21 @@ mod encoding {
         assert_eq!(kitty(&named(NamedKey::F(3), 0), D), "\x1b[13~");
         assert_eq!(kitty(&named(NamedKey::F(13), 0), D), "\x1b[57376u");
         assert_eq!(kitty(&named(NamedKey::Kp1, 0), D), "\x1b[57400u");
+        // Keypad keys that make text send it under "disambiguate" (only keypad keys without
+        // text are reported as keypad keys there); ones that make none are reported, even
+        // when the client sends Enter's "\r" along.
+        assert_eq!(kitty(&key(Key::Named(NamedKey::Kp5), 0, "5"), D), "5");
+        assert_eq!(kitty(&key(Key::Named(NamedKey::KpAdd), 0, "+"), D), "+");
+        assert_eq!(kitty(&key(Key::Named(NamedKey::KpDecimal), 0, "."), D), ".");
+        assert_eq!(
+            kitty(&key(Key::Named(NamedKey::KpEnter), 0, "\r"), D),
+            "\x1b[57414u"
+        );
+        // Reporting all keys with their text keeps the text as associated text.
+        assert_eq!(
+            kitty(&key(Key::Named(NamedKey::Kp5), 0, "5"), ALL | TEXT),
+            "\x1b[57404;;53u"
+        );
         assert_eq!(kitty(&named(NamedKey::LeftShift, mods::SHIFT), D), "");
         assert_eq!(kitty(&ch('a', mods::CAPS_LOCK, "A"), D), "A");
         assert_eq!(
@@ -2278,4 +2572,92 @@ fn a_title_does_not_settle_a_resize_redraw() {
     t.advance(b"\x1b]0;title\x07");
     assert_eq!(t.sync_deadline(), deadline);
     assert!(t.in_sync());
+}
+
+/// Random styled output selected in every shape: the selected cells line up with the plain
+/// formatter's copy, so blanking concealed cells by them leaves the rest exactly as it is.
+#[test]
+fn selected_cells_line_up_with_plain_copy() {
+    let pieces: &[&str] = &[
+        "word",
+        " ",
+        "  ",
+        "\t",
+        "\r\n",
+        "漢",
+        "e\u{301}",
+        "👍🏽",
+        "\x1b[1m",
+        "\x1b[0m",
+        "\x1b[31m",
+        "\x1b[48;5;4m",
+        "\x1b[38;2;1;2;3m",
+        "\x1b[4:3m",
+        "\x1b[7m",
+        "\x1b[m",
+        "\x1b[5C",
+        "\x1b[2D",
+        "\x1b]8;;https://e.x\x1b\\",
+        "\x1b]8;;\x1b\\",
+        "\x1b(0q\x1b(B",
+        "\x1b[K",
+        "longerwordthatwraps",
+        "\x1b[3G",
+        "\x1b[?2027h",
+        "\x1b[?2027l",
+        "\x1b[2X",
+    ];
+    let mut seed = 0x2545_f491_u32;
+    let mut rand = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as usize % n
+    };
+    for round in 0..2000 {
+        let mut t = term(17, 6);
+        let mut input = String::new();
+        for _ in 0..60 {
+            input.push_str(pieces[rand(pieces.len())]);
+        }
+        t.advance(input.as_bytes());
+        if rand(4) == 0 {
+            // Reflow: wide characters move to the next row, leaving spacers.
+            t.resize(PaneSize {
+                cols: 9 + rand(8) as u16,
+                rows: 6,
+                cell_width: 10,
+                cell_height: 20,
+            });
+        }
+        let cols = t.cols;
+        let start = SelectionOp::Start {
+            col: rand(cols) as u16,
+            row: rand(6) as u16,
+            right_half: rand(2) == 0,
+            kind: [
+                SelectionKind::Simple,
+                SelectionKind::Block,
+                SelectionKind::Word,
+                SelectionKind::Line,
+            ][rand(4)],
+        };
+        for op in [SelectionOp::SelectAll, start] {
+            t.selection(op);
+            if let SelectionOp::Start { .. } = op {
+                t.selection(SelectionOp::Update {
+                    col: rand(cols) as u16,
+                    row: rand(6) as u16,
+                    right_half: rand(2) == 0,
+                });
+            }
+            let (plain, blanked) = t.vt.selection_copies();
+            assert_eq!(
+                blanked.as_ref(),
+                Some(&plain),
+                "round {round}: {input:?} {op:?}"
+            );
+            assert_eq!(t.selection_text(), plain);
+        }
+    }
 }
