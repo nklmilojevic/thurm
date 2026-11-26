@@ -1097,19 +1097,33 @@ impl Vt {
         let format = |emit| {
             let bytes =
                 self.try_format(emit, true, true, ffi::FORMATTER_EXTRAS_NONE, Some(&sel))?;
-            Some(String::from_utf8_lossy(&bytes).into_owned())
-        };
-        let Some(plain) = format(ffi::FormatterFormat::PLAIN) else {
-            return String::new();
+            // Valid UTF-8 (always, from the formatter) becomes the string without a copy.
+            Some(
+                String::from_utf8(bytes)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+            )
         };
         // Concealed cells (SGR 8, e.g. a password echoed hidden) are not shown, so they are not
         // copied either. The plain formatter has no notion of them; the styled one marks them,
         // over exactly the cells the copy has, in one pass along the pages. Without it, nothing
-        // says the plain text is safe to copy: nothing is copied.
-        let Some(styled) = format(ffi::FormatterFormat::VT) else {
+        // says the plain text is safe to copy: nothing is copied. The styled text is read in the
+        // formatter's buffer and freed before the plain one is made, so a large copy holds one
+        // of the two at a time.
+        let concealed = self.try_format_with(
+            ffi::FormatterFormat::VT,
+            true,
+            true,
+            ffi::FORMATTER_EXTRAS_NONE,
+            Some(&sel),
+            |b| conceals(&String::from_utf8_lossy(b)),
+        );
+        let Some(concealed) = concealed else {
             return String::new();
         };
-        if !conceals(&styled) {
+        let Some(plain) = format(ffi::FormatterFormat::PLAIN) else {
+            return String::new();
+        };
+        if !concealed {
             return plain;
         }
         // The plain text with each concealed character blanked as wide as its cells; should the
@@ -1125,6 +1139,11 @@ impl Vt {
         if let Some(out) = cells.as_deref().and_then(|c| blank_concealed(c, &plain)) {
             return out;
         }
+        // The fallback (rare: the two did not line up) formats the styled text again.
+        drop(plain);
+        let Some(styled) = format(ffi::FormatterFormat::VT) else {
+            return String::new();
+        };
         let hidden: Vec<(Vec<char>, usize)> = cells
             .unwrap_or_default()
             .into_iter()
@@ -1478,6 +1497,19 @@ impl Vt {
         extras: ffi::FormatterExtras,
         sel: Option<&ffi::Selection>,
     ) -> Option<Vec<u8>> {
+        self.try_format_with(emit, unwrap, trim, extras, sel, <[u8]>::to_vec)
+    }
+
+    /// `try_format`, handing `read` the formatter's own buffer rather than a copy of it.
+    fn try_format_with<R>(
+        &self,
+        emit: ffi::FormatterFormat::Type,
+        unwrap: bool,
+        trim: bool,
+        extras: ffi::FormatterExtras,
+        sel: Option<&ffi::Selection>,
+        read: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
         #[cfg(test)]
         if FAIL_FORMAT.with(|f| f.get()) == Some(emit) {
             return None;
@@ -1504,16 +1536,16 @@ impl Vt {
         }
         let (mut out, mut len): (*mut u8, usize) = (ptr::null_mut(), 0);
         let r = unsafe { ffi::ghostty_formatter_format_alloc(f, ptr::null(), &mut out, &mut len) };
-        let bytes = (r == ffi::Result::SUCCESS).then(|| {
+        let res = (r == ffi::Result::SUCCESS).then(|| {
             if out.is_null() {
-                return Vec::new();
+                return read(&[]);
             }
-            let v = unsafe { std::slice::from_raw_parts(out, len) }.to_vec();
+            let res = read(unsafe { std::slice::from_raw_parts(out, len) });
             unsafe { ffi::ghostty_free(ptr::null(), out, len) };
-            v
+            res
         });
         unsafe { ffi::ghostty_formatter_free(f) };
-        bytes
+        res
     }
 }
 
