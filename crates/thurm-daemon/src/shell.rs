@@ -97,38 +97,72 @@ pub fn interactive_shell(cfg: &Config) -> (String, Vec<String>) {
     }
 }
 
-/// Whether zsh `args` turn its startup files off by name: `--no-rcs` (any spelling zsh
-/// accepts: case, `_` and `-` ignored), `-o no_rcs`, or `+o rcs`.
-fn zsh_rcs_off(args: &[String]) -> bool {
-    let norm = |s: &str| {
-        s.chars()
+/// Whether zsh `args` leave its startup files on (`rcs`) and its line editor on (`zle`), as zsh
+/// reads its options: letters in `-`/`+` clusters (`-f` is `NO_RCS`, `+Z` turns ZLE off),
+/// `-o name`/`+o name` (separate or attached: `-onorcs`, `+ozle`) and `--name`, with names in any
+/// spelling zsh accepts (case, `_` and `-` ignored, a `no` prefix inverting), the last one
+/// winning. Options end at `--`, `-` or the first operand (a script).
+fn zsh_rcs_and_zle(args: &[String]) -> (bool, bool) {
+    let (mut rcs, mut zle) = (true, true);
+    let mut set = |name: &str, on: bool| {
+        let name: String = name
+            .chars()
             .filter(|c| *c != '_' && *c != '-')
             .flat_map(char::to_lowercase)
-            .collect::<String>()
+            .collect();
+        let (name, on) = match name.strip_prefix("no") {
+            Some(rest) => (rest, !on),
+            None => (name.as_str(), on),
+        };
+        match name {
+            "rcs" => rcs = on,
+            "zle" => zle = on,
+            _ => {}
+        }
     };
-    let mut it = args.iter().peekable();
+    let mut it = args.iter();
     while let Some(a) = it.next() {
+        if a == "--" || a == "-" {
+            break;
+        }
         if let Some(long) = a.strip_prefix("--") {
-            if norm(long) == "norcs" {
-                return true;
-            }
+            set(long, true);
             continue;
         }
-        if a == "-o" || a == "+o" {
-            let Some(name) = it.next() else { break };
-            let name = norm(name);
-            if (a == "-o" && name == "norcs") || (a == "+o" && name == "rcs") {
-                return true;
+        let (on, letters) = match (a.strip_prefix('-'), a.strip_prefix('+')) {
+            (Some(l), _) => (true, l),
+            (_, Some(l)) => (false, l),
+            _ => break,
+        };
+        for (i, c) in letters.char_indices() {
+            match c {
+                // The rest of the cluster names the option, else the next argument does.
+                'o' => {
+                    let rest = &letters[i + 1..];
+                    let name = if rest.is_empty() {
+                        it.next().map(String::as_str)
+                    } else {
+                        Some(rest)
+                    };
+                    if let Some(name) = name {
+                        set(name, on);
+                    }
+                    break;
+                }
+                'f' => set("rcs", !on),
+                'Z' => set("zle", on),
+                _ => {}
             }
         }
     }
-    false
+    (rcs, zle)
 }
 
 /// Whether `cfg` launches zsh, bash or fish with Thurm's shell integration loaded, so a
 /// restored foreground job can run from the shell's own first-prompt hook, once its startup
 /// files are done (nothing is typed into the terminal). Shells started with their startup
-/// files off (`zsh -f`, `fish --no-config`) never load the integration.
+/// files off (`zsh -f`, `fish --no-config`) never load the integration, and zsh without its
+/// line editor (`zsh --no-zle`) never runs the hook's widget: they get the typed line.
 pub fn uses_hook_resume(cfg: &Config, integration_dir: Option<&Path>) -> bool {
     if !cfg.terminal.shell_integration || integration_dir.is_none() {
         return false;
@@ -140,7 +174,7 @@ pub fn uses_hook_resume(cfg: &Config, integration_dir: Option<&Path>) -> bool {
     };
     let long_flag = |names: &[&str]| args.iter().any(|a| names.contains(&a.as_str()));
     match program.rsplit('/').next().unwrap_or(&program) {
-        "zsh" => !short_flag('f') && !zsh_rcs_off(&args),
+        "zsh" => zsh_rcs_and_zle(&args) == (true, true),
         "bash" => args.is_empty(),
         "fish" => !short_flag('N') && !long_flag(&["--no-config"]),
         _ => false,
@@ -669,6 +703,27 @@ mod tests {
         assert!(!hook(&["/bin/zsh", "-o", "NoRcs"], true));
         assert!(hook(&["/bin/zsh", "-o", "rcs"], true));
         assert!(hook(&["/bin/zsh", "+o", "no_rcs"], true));
+        // Attached option names, and the last setting winning.
+        assert!(!hook(&["/bin/zsh", "-onorcs"], true));
+        assert!(!hook(&["/bin/zsh", "+orcs"], true));
+        assert!(!hook(&["/bin/zsh", "-lonorcs"], true));
+        assert!(!hook(&["/bin/zsh", "-lo", "norcs"], true));
+        assert!(hook(&["/bin/zsh", "-orcs"], true));
+        assert!(hook(&["/bin/zsh", "-f", "+f"], true));
+        assert!(hook(&["/bin/zsh", "-onoflowcontrol"], true));
+        // After the options: a script's own arguments.
+        assert!(hook(&["/bin/zsh", "-l", "--", "-f"], true));
+        // No line editor: no first-prompt widget to run the hook from.
+        assert!(!hook(&["/bin/zsh", "--no-zle"], true));
+        assert!(!hook(&["/bin/zsh", "--NOZLE"], true));
+        assert!(!hook(&["/bin/zsh", "+Z"], true));
+        assert!(!hook(&["/bin/zsh", "+lZ"], true));
+        assert!(!hook(&["/bin/zsh", "-o", "no_zle"], true));
+        assert!(!hook(&["/bin/zsh", "+o", "zle"], true));
+        assert!(!hook(&["/bin/zsh", "-onozle"], true));
+        assert!(!hook(&["/bin/zsh", "+ozle"], true));
+        assert!(hook(&["/bin/zsh", "-Z"], true));
+        assert!(hook(&["/bin/zsh", "+Z", "--zle"], true));
         assert!(!hook(&["/usr/bin/fish", "--no-config"], true));
         assert!(!hook(&["/usr/bin/fish", "-N"], true));
         assert!(!hook(&["/bin/bash", "--norc"], true));
