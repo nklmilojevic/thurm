@@ -80,19 +80,22 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
       _thurm_last_path=$PATH
     fi
     # The ticket is a bearer secret: untraced under a `set -x` from .bashrc (tested by
-    # substitution, which a trace shows instead of the value).
+    # substitution, which a trace shows instead of the value). The helper runs in a subshell
+    # that turns tracing off for itself, so this shell's own xtrace is never touched: Ctrl-C
+    # on the resumed job unwinds this function, and nothing after the job would run to turn
+    # tracing back on. The ticket is marked used before the job starts; an interrupt leaves
+    # the clearing to the next prompt, which never tries it again.
     if [[ -n "${_thurm_resume_ticket:+1}" && -n "${_thurm_resume_exec:+1}" ]]; then
-      local _thurm_x=""
-      if [[ $- == *x* ]]; then _thurm_x=1; fi
-      builtin set +x
-      local _rt="$_thurm_resume_ticket" _re="$_thurm_resume_exec"
-      _thurm_resume_ticket=""
-      _thurm_resume_exec=""
-      # A failed resume (gone program, unreachable daemon) must not end the shell under
-      # `set -e`: the prompt still comes.
-      command "$_re" --exec-resume "$_rt" || :
-      _rt=""
-      if [[ -n "$_thurm_x" ]]; then builtin set -x; fi
+      if [[ -z "${_thurm_resume_started-}" ]]; then
+        _thurm_resume_started=1
+        # A failed resume (gone program, unreachable daemon) must not end the shell under
+        # `set -e`: the prompt still comes.
+        (
+          builtin set +x
+          builtin exec "$_thurm_resume_exec" --exec-resume "$_thurm_resume_ticket"
+        ) || :
+      fi
+      builtin unset _thurm_resume_ticket _thurm_resume_exec _thurm_resume_started
     fi
     builtin printf '\e]133;A\a'
     if [[ "$PS1" != *'133;B'* ]]; then
