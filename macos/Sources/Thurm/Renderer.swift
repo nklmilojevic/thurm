@@ -698,6 +698,14 @@ final class TerminalRenderer {
         var lastUsed: CFTimeInterval
     }
 
+    /// An oversized image's texture, filled `nextRow` rows so far for pixels of `serial`.
+    private struct PendingDownscale {
+        var serial: UInt64
+        var texture: MTLTexture
+        var nextRow: Int
+        var lastUsed: CFTimeInterval
+    }
+
     private enum ImageLookup {
         case ready(CachedImage)
         case missing
@@ -713,6 +721,10 @@ final class TerminalRenderer {
     /// Uploaded kitty images by id, with the serial of the pixels they hold and when they
     /// were last drawn (textures of images scrolled off stay a moment in case they return).
     private var imageTextures: [UInt32: CachedImage] = [:]
+    /// Oversized images part way through their downscale, by id (see `imageEntry`).
+    private var pendingDownscales: [UInt32: PendingDownscale] = [:]
+    /// Source pixels this draw may still box-filter.
+    private var downsampleBudgetLeft = 0
     private static let imageGrace: CFTimeInterval = 2
     /// Quad buffers reused round robin; `inFlight` keeps the CPU from rewriting one the GPU
     /// may still read.
@@ -734,6 +746,7 @@ final class TerminalRenderer {
     func reset() {
         snapshot.reset()
         imageTextures.removeAll()
+        pendingDownscales.removeAll()
         wantsAnotherFrame = false
         backgrounds.removeAll(keepingCapacity: true)
         cursorUnder.removeAll(keepingCapacity: true)
@@ -748,6 +761,7 @@ final class TerminalRenderer {
     /// Drops all uploaded Kitty image textures immediately (e.g. under iOS memory pressure).
     func purgeImageTextures() {
         imageTextures.removeAll(keepingCapacity: false)
+        pendingDownscales.removeAll(keepingCapacity: false)
         // The last frame's segments hold the textures they drew; drop them too so an idle pane
         // releases its images now rather than at the next draw.
         segments.removeAll(keepingCapacity: true)
@@ -778,6 +792,8 @@ final class TerminalRenderer {
         guard let ctx = MetalContext.shared else { return false }
         guard p.viewportWidth > 0, p.viewportHeight > 0 else { return false }
         wantsAnotherFrame = false
+        // Shared by both `buildQuads` passes below: the bound is per draw.
+        downsampleBudgetLeft = Self.downsampleBudget
         // Rasterizing a glyph can wipe a full atlas; quads built before that point to stale
         // texels, so build again against the fresh atlas.
         let epochs = (p.shaper.glyphs.gray.epoch, p.shaper.glyphs.color?.epoch ?? 0)
@@ -1148,6 +1164,7 @@ final class TerminalRenderer {
         defer {
             // Evict textures of images not shown for a while.
             imageTextures = imageTextures.filter { now - $0.value.lastUsed < Self.imageGrace }
+            pendingDownscales = pendingDownscales.filter { now - $0.value.lastUsed < Self.imageGrace }
         }
         guard snapshot.valid, !snapshot.images.isEmpty else { return (below, above) }
         let cw = Float(p.shaper.cellWidth)
@@ -1223,32 +1240,51 @@ final class TerminalRenderer {
                          withBytes: src, bytesPerRow: Int(width) * 4)
             tex = made
         } else {
-            // Downscale oversized Kitty images on iOS to stay within 4096×4096 GPU memory budgets.
+            // Downscale oversized Kitty images (iOS) to fit the GPU budget. The box filter reads
+            // every source pixel, so it runs a slice at a time: each draw spends at most
+            // `downsampleBudget` source pixels over all images, and the image is skipped (another
+            // frame requested) until its texture is complete. Rows go up in bands through one
+            // small buffer, never a destination-sized scratch image.
             let ratio = min(Double(maxTexDim) / Double(width), Double(maxTexDim) / Double(height))
             let dstW = max(1, Int((Double(width) * ratio).rounded(.down)))
             let dstH = max(1, Int((Double(height) * ratio).rounded(.down)))
-            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: dstW,
-                                                                height: dstH, mipmapped: false)
-            desc.usage = [.shaderRead]
-            guard let made = device.makeTexture(descriptor: desc) else { return .missing }
-            // Uploaded in bands through one small reusable buffer: a destination-sized scratch
-            // image would add up to 64 MiB on top of the texture and the FFI's source pixels.
+            var job: PendingDownscale
+            if let p = pendingDownscales[image], p.serial == serial,
+               p.texture.width == dstW, p.texture.height == dstH {
+                job = p
+            } else {
+                let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: dstW,
+                                                                    height: dstH, mipmapped: false)
+                desc.usage = [.shaderRead]
+                guard let made = device.makeTexture(descriptor: desc) else { return .missing }
+                job = PendingDownscale(serial: serial, texture: made, nextRow: 0, lastUsed: now)
+            }
+            job.lastUsed = now
+            // Source pixels one destination row reads (its footprint, partly covered rows included).
+            let rowCost = Int(width) * (Int(height) / dstH + 2)
             let bandRows = max(1, min(dstH, TerminalRenderer.downsampleBandBytes / (dstW * 4)))
-            var band = [UInt8](repeating: 0, count: bandRows * dstW * 4)
-            var y0 = 0
-            while y0 < dstH {
-                let rows = min(bandRows, dstH - y0)
+            var band: [UInt8] = []
+            while job.nextRow < dstH, downsampleBudgetLeft > 0 {
+                let rows = min(bandRows, dstH - job.nextRow, max(1, downsampleBudgetLeft / rowCost))
+                if band.isEmpty { band = [UInt8](repeating: 0, count: bandRows * dstW * 4) }
+                let y0 = job.nextRow
                 band.withUnsafeMutableBufferPointer { dst in
                     guard let dstBase = dst.baseAddress else { return }
                     TerminalRenderer.downsample(src, width: Int(width), height: Int(height),
                                                 toWidth: dstW, height: dstH, rows: y0..<(y0 + rows),
                                                 into: dstBase)
-                    made.replace(region: MTLRegionMake2D(0, y0, dstW, rows), mipmapLevel: 0,
-                                 withBytes: dstBase, bytesPerRow: dstW * 4)
+                    job.texture.replace(region: MTLRegionMake2D(0, y0, dstW, rows), mipmapLevel: 0,
+                                        withBytes: dstBase, bytesPerRow: dstW * 4)
                 }
-                y0 += rows
+                job.nextRow += rows
+                downsampleBudgetLeft -= rows * rowCost
             }
-            tex = made
+            guard job.nextRow >= dstH else {
+                pendingDownscales[image] = job
+                return .missing
+            }
+            pendingDownscales[image] = nil
+            tex = job.texture
         }
         let entry = CachedImage(serial: serial, texture: tex, origWidth: width, origHeight: height, lastUsed: now)
         imageTextures[image] = entry
@@ -1258,46 +1294,56 @@ final class TerminalRenderer {
     /// Forget cached image textures (e.g. after reconnecting).
     func resetImages() {
         imageTextures.removeAll()
+        pendingDownscales.removeAll()
     }
 
     /// The most scratch memory an oversized image's downscale holds at once.
     static let downsampleBandBytes = 1 << 20
+    /// The most source pixels one draw box-filters, over all images (a few ms on a phone); a
+    /// larger image finishes over the next frames.
+    static let downsampleBudget = 2_000_000
 
     /// Box-filters straight (non-premultiplied) RGBA `src` (`width`×`height`) down to
     /// `toWidth`×`toHeight`, writing destination `rows` tightly packed into `dst`. Each output
-    /// pixel averages every source pixel it covers, weighted by alpha so transparent pixels don't
-    /// darken the colour, which keeps detail (fine stripes, thin lines) a point sample would drop.
+    /// pixel averages the source area it covers, partly covered edge pixels weighted by their
+    /// overlap, and colour weighted by alpha so transparent pixels don't darken it. That keeps
+    /// detail (fine stripes, thin lines) a point sample would drop, at any ratio, 3:2 included.
     static func downsample(_ src: UnsafePointer<UInt8>, width srcW: Int, height srcH: Int,
                            toWidth dstW: Int, height dstH: Int, rows: Range<Int>,
                            into dst: UnsafeMutablePointer<UInt8>) {
+        // Exact integer geometry: along x, source pixel `sx` spans [sx·dstW, (sx+1)·dstW) and
+        // output pixel `x` spans [x·srcW, (x+1)·srcW); likewise along y. Overlaps are the weights,
+        // and an output pixel's whole footprint is srcW·srcH.
+        let area = UInt64(srcW) * UInt64(srcH)
         for (i, y) in rows.enumerated() {
-            let sy0 = y * srcH / dstH
-            let sy1 = max(sy0 + 1, min(srcH, (y + 1) * srcH / dstH))
+            let fy0 = y * srcH, fy1 = (y + 1) * srcH
+            let sy0 = fy0 / dstH, sy1 = min(srcH, (fy1 + dstH - 1) / dstH)
             let out = dst + i * dstW * 4
             for x in 0..<dstW {
-                let sx0 = x * srcW / dstW
-                let sx1 = max(sx0 + 1, min(srcW, (x + 1) * srcW / dstW))
+                let fx0 = x * srcW, fx1 = (x + 1) * srcW
+                let sx0 = fx0 / dstW, sx1 = min(srcW, (fx1 + dstW - 1) / dstW)
                 var r: UInt64 = 0, g: UInt64 = 0, b: UInt64 = 0, a: UInt64 = 0
                 for sy in sy0..<sy1 {
+                    let wy = UInt64(min(fy1, (sy + 1) * dstH) - max(fy0, sy * dstH))
                     var s = src + (sy * srcW + sx0) * 4
-                    for _ in sx0..<sx1 {
-                        let pa = UInt64(s[3])
-                        r += UInt64(s[0]) * pa
-                        g += UInt64(s[1]) * pa
-                        b += UInt64(s[2]) * pa
-                        a += pa
+                    for sx in sx0..<sx1 {
+                        let wx = UInt64(min(fx1, (sx + 1) * dstW) - max(fx0, sx * dstW))
+                        let wa = wx * wy * UInt64(s[3])
+                        r += UInt64(s[0]) * wa
+                        g += UInt64(s[1]) * wa
+                        b += UInt64(s[2]) * wa
+                        a += wa
                         s += 4
                     }
                 }
                 let d = out + x * 4
-                let count = UInt64((sy1 - sy0) * (sx1 - sx0))
                 if a == 0 {
                     d[0] = 0; d[1] = 0; d[2] = 0; d[3] = 0
                 } else {
                     d[0] = UInt8((r + a / 2) / a)
                     d[1] = UInt8((g + a / 2) / a)
                     d[2] = UInt8((b + a / 2) / a)
-                    d[3] = UInt8((a + count / 2) / count)
+                    d[3] = UInt8((a + area / 2) / area)
                 }
             }
         }

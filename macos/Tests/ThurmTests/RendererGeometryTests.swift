@@ -39,6 +39,25 @@ final class ImageDownsampleTests: XCTestCase {
         }
     }
 
+    /// At a 3:2 reduction each output pixel covers 1.5 source pixels. Repeating black-white-black
+    /// columns put the same third of white in every footprint, so the result is a uniform grey
+    /// (85), not alternating black and grey from rounding the footprints to whole pixels.
+    func testNonIntegerReductionWeighsPartlyCoveredPixels() {
+        let w = 6, h = 3
+        var src = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 0..<h {
+            for x in 0..<w {
+                let v: UInt8 = x % 3 == 1 ? 255 : 0
+                let i = (y * w + x) * 4
+                src[i] = v; src[i + 1] = v; src[i + 2] = v; src[i + 3] = 255
+            }
+        }
+        let out = downsample(src, w, h, to: 4, 2)
+        for p in stride(from: 0, to: out.count, by: 4) {
+            XCTAssertEqual(Array(out[p..<(p + 4)]), [85, 85, 85, 255], "pixel \(p / 4)")
+        }
+    }
+
     /// A transparent pixel's colour doesn't bleed into its opaque neighbour's.
     func testTransparentPixelsDoNotDarkenColor() {
         // Red opaque next to black fully transparent.
