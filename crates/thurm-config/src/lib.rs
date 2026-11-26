@@ -1362,6 +1362,36 @@ pub fn state_dir() -> PathBuf {
     }
 }
 
+/// Where the daemon keeps the key that digests saved program resume evidence: outside the
+/// state directory, so `session.json` and a copy of it never carry what reverses the digests.
+/// `THURM_KEY_DIR` overrides it; with `THURM_STATE_DIR` set it is that directory's `-keys`
+/// sibling, else `~/Library/Application Support/Thurm Keys` on macOS and
+/// `~/.local/share/thurm/keys` elsewhere (the data directory, not the state or config one).
+pub fn resume_key_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("THURM_KEY_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = std::env::var_os("THURM_STATE_DIR") {
+        let mut name = PathBuf::from(dir).into_os_string();
+        name.push("-keys");
+        return PathBuf::from(name);
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        dirs::data_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Thurm Keys")
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        dirs::data_dir()
+            .or_else(dirs::data_local_dir)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("thurm")
+            .join("keys")
+    }
+}
+
 /// The dial socket's file name, beside the daemon's socket.
 pub const TAILNET_DIAL_SOCKET: &str = "tailnet-dial.sock";
 

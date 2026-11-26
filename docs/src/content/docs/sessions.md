@@ -90,10 +90,19 @@ dirs = ["~/code"]
 
 A rule's `flags` lists options the report may add after `command`; each must have been
 given, with the same values, when the program was launched. `preserve_flags` lists
-restricting options (the Claude Code rule keeps `--disallowed-tools`, `--mcp-config` and
-`--strict-mcp-config`): when the program was launched with one, the report must carry it
-over unchanged, or the program is not resumed. Only those launch options are saved with
-the session, not the rest of the program's command line.
+restricting options: when the program was launched with one, the report must carry every
+occurrence over unchanged and in the same order, or the program is not resumed. The Claude
+Code rule keeps `--disallowed-tools`, `--tools`, `--permission-mode`, `--restricted`,
+`--mcp-config` and `--strict-mcp-config`; the Codex rule keeps its sandbox and approval
+settings (`--sandbox`/`-s`, `--ask-for-approval`/`-a`, `--config`/`-c`, `--profile`/`-p`).
+A flag listed in both takes its `preserve_flags` arity.
+
+Only those launch options are saved with the session, not the rest of the program's command
+line, and only as keyed digests of their values (HMAC-SHA256), never the values themselves.
+The key lives outside the state directory: in `~/Library/Application Support/Thurm Keys` on
+macOS and `~/.local/share/thurm/keys` elsewhere (`THURM_KEY_DIR` overrides it). Without it,
+programs are not saved for resumption. A saved program whose rule now checks an option the
+session did not record is not resumed.
 
 To disable a built-in rule, add an entry with its `name` and `enabled = false`. Set
 `session.resume_programs = "all"` to trust any verified report from an unwrapped process,
