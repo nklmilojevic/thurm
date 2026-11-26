@@ -36,6 +36,9 @@ impl Daemon {
             && (st.pending_input.is_some()
                 || self.resume_tickets.lock().iter().any(|t| t.pane == pane))
         {
+            // Counted under the pane's lock: the upgrade's last check before the exec sees
+            // every input the freeze holds (`typing_after_upgrade` uncounts it).
+            self.typing_held.fetch_add(1, Ordering::SeqCst);
             return Err(TYPING_FROZEN.into());
         }
         Ok(())
@@ -44,10 +47,9 @@ impl Daemon {
     /// Runs `typing` (input under the pane's lock that checks [`Daemon::typing_frozen`]) and,
     /// while an upgrade holds it back, waits for the upgrade outside the lock and tries again.
     /// The input is never refused for the hand-off: keystrokes come without waiting for a
-    /// reply, so an error would drop them unseen. If the upgrade gives up, the input goes
-    /// through here (and cancels the resume); if it goes ahead, this image ends before the
-    /// input reached the shell, as for any request in flight at the exec, and the next image
-    /// resumes the program with nothing typed: what the hand-off said.
+    /// reply, so an error would drop them unseen. Nor does it end with this image: the upgrade
+    /// gives up while any input waits (see [`Daemon::typing_held`]), and the input then goes
+    /// through here and cancels the resume.
     pub(super) fn typing_after_upgrade<T>(
         &self,
         mut typing: impl FnMut() -> Result<T, String>,
@@ -58,12 +60,17 @@ impl Daemon {
                 Err(e) if e == TYPING_FROZEN => {}
                 other => return other,
             }
-            while self.upgrading.load(Ordering::SeqCst) {
+            let waited = loop {
+                if !self.upgrading.load(Ordering::SeqCst) {
+                    break Ok(());
+                }
                 if Instant::now() >= deadline {
-                    return Err("the daemon is restarting: try again".into());
+                    break Err("the daemon is restarting: try again".to_owned());
                 }
                 std::thread::sleep(Duration::from_millis(2));
-            }
+            };
+            self.typing_held.fetch_sub(1, Ordering::SeqCst);
+            waited?;
         }
     }
 

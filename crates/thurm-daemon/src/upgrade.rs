@@ -368,6 +368,17 @@ pub fn perform(
     }
     args.push("--handoff-key-fd".to_owned());
     args.push(key_fd.to_string());
+    // Input that would cancel a resume the hand-off still has pending is waiting: it would end
+    // with this image, unseen (keystrokes get no reply), and the next one would resume the
+    // program anyway. Give up instead: the input goes through, and the upgrade can be asked
+    // for again.
+    if daemon.typing_held() {
+        log::warn!("upgrade aborted: input is waiting to cancel a resume");
+        restore_cloexec(&fds);
+        close_key();
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
     let err = exec(&exe, &args);
     log::warn!("upgrade failed: exec {}: {err}", exe.display());
     restore_cloexec(&fds);

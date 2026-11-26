@@ -802,9 +802,12 @@ pub struct Daemon {
     /// tick, off the thread that parses output.
     resume_save_due: AtomicBool,
     /// An in-place upgrade is capturing the panes for the next image: input that would
-    /// cancel a pending resume (`PaneState::typed`) is refused until the exec, or until the
-    /// upgrade gives up (see [`Daemon::set_upgrading`]).
+    /// cancel a pending resume (`PaneState::typed`) waits until the upgrade gives up (see
+    /// [`Daemon::set_upgrading`]).
     upgrading: AtomicBool,
+    /// Inputs waiting for the upgrade (see [`Daemon::typing_after_upgrade`]): the upgrade
+    /// gives up rather than end them with the image, so they go through and cancel the resume.
+    typing_held: std::sync::atomic::AtomicUsize,
     /// Restored panes' saved programs waiting for their shell (see [`ResumeTicket`]).
     resume_tickets: Mutex<Vec<ResumeTicket>>,
     restored: AtomicBool,
@@ -890,6 +893,7 @@ impl Daemon {
             session_dirty: AtomicBool::new(false),
             resume_save_due: AtomicBool::new(false),
             upgrading: AtomicBool::new(false),
+            typing_held: std::sync::atomic::AtomicUsize::new(0),
             resume_tickets: Mutex::new(Vec::new()),
             restored: AtomicBool::new(false),
             loading: AtomicBool::new(false),
@@ -2607,6 +2611,12 @@ impl Daemon {
     /// the one that types it).
     pub fn set_upgrading(&self, on: bool) {
         self.upgrading.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether some input waits for the upgrade (it would cancel a resume the hand-off still
+    /// has pending). Checked by the upgrade just before its exec, which it then gives up.
+    pub fn typing_held(&self) -> bool {
+        self.typing_held.load(Ordering::SeqCst) > 0
     }
 
     pub fn handoff(&self, listener_fd: RawFd, log_to_file: bool) -> upgrade::Handoff {
@@ -6880,6 +6890,8 @@ mod tests {
             ];
             std::thread::sleep(Duration::from_millis(200));
             assert!(held.iter().all(|h| !h.is_finished()));
+            // What makes the upgrade give up just before its exec.
+            assert!(daemon.typing_held());
             assert!(!daemon.pane(waiting).unwrap().state.lock().typed);
             assert!(!daemon.pane(ticketed).unwrap().state.lock().typed);
             // Nothing to cancel in the others.
@@ -6905,6 +6917,7 @@ mod tests {
                 assert!(done.is_ok(), "{done:?}");
             }
         });
+        assert!(!daemon.typing_held());
         assert!(daemon.pane(waiting).unwrap().state.lock().typed);
         assert!(daemon.pane(ticketed).unwrap().state.lock().typed);
         for id in [waiting, plain, ticketed] {
