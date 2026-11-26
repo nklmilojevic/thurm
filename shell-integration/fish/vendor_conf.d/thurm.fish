@@ -12,8 +12,13 @@ if status is-interactive; and not set -q __thurm_fish_loaded
     set -g __thurm_fish_loaded 1
     # Proves to Thurm that the $PATH report comes from this shell, not from program output.
     # Kept out of the environment of the programs the shell runs.
-    set -g __thurm_token "$THURM_SHELL_TOKEN"
-    set -e THURM_SHELL_TOKEN
+    # Untraced: with $fish_trace set the trace would print the token (an empty local turns
+    # tracing off for this block only).
+    begin
+        set -l fish_trace
+        set -g __thurm_token "$THURM_SHELL_TOKEN"
+        set -e THURM_SHELL_TOKEN
+    end
 
     # Make the bundled `thurm` CLI reachable (appended, so an installed one wins).
     if set -q THURM_BIN_DIR; and not contains -- $THURM_BIN_DIR $PATH
@@ -42,11 +47,15 @@ if status is-interactive; and not set -q __thurm_fish_loaded
 
     function __thurm_prompt --on-event fish_prompt
         printf '\e]7;file://%s%s\a' $hostname (string escape --style=url -- $PWD)
-        # $PATH for Thurm's tab completion (only when it changed).
-        set -l path (string join : -- $PATH)
-        if test -n "$__thurm_token"; and test "$path" != "$__thurm_last_path"
-            printf '\e]633;P;ThurmPath=%s:%s\a' $__thurm_token (string replace -a ';' '\\x3b' -- $path)
-            set -g __thurm_last_path $path
+        # $PATH for Thurm's tab completion (only when it changed). Untraced, like the token's
+        # capture.
+        begin
+            set -l fish_trace
+            set -l path (string join : -- $PATH)
+            if test -n "$__thurm_token"; and test "$path" != "$__thurm_last_path"
+                printf '\e]633;P;ThurmPath=%s:%s\a' $__thurm_token (string replace -a ';' '\\x3b' -- $path)
+                set -g __thurm_last_path $path
+            end
         end
         # fish redraws its prompt on resize: Thurm clears the old one first (no copies).
         printf '\e]133;A;redraw=1\a'

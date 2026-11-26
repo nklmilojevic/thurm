@@ -4,8 +4,12 @@ typeset -g _THURM_ZSH_LOADED=1
 typeset -g _thurm_executing=""
 # Proves to Thurm that the $PATH report comes from this shell, not from program output.
 # Kept out of the environment of the programs the shell runs.
-typeset -g _thurm_token="${THURM_SHELL_TOKEN-}"
-builtin unset THURM_SHELL_TOKEN
+# Untraced: under xtrace (`zsh -x`, `setopt xtrace`) the trace would print the token.
+() {
+  builtin setopt LOCAL_OPTIONS NO_XTRACE
+  typeset -g _thurm_token="${THURM_SHELL_TOKEN-}"
+  builtin unset THURM_SHELL_TOKEN
+}
 
 # Make the bundled `thurm` CLI reachable (appended, so an installed one wins).
 if [[ -n "${THURM_BIN_DIR-}" && ":$PATH:" != *":$THURM_BIN_DIR:"* ]]; then
@@ -24,6 +28,15 @@ _thurm_urlencode() {
   print -rn -- "$out"
 }
 
+# $PATH for Thurm's tab completion (only when it changed). Untraced, like the token's capture.
+_thurm_report_path() {
+  builtin setopt LOCAL_OPTIONS NO_XTRACE
+  if [[ -n "$_thurm_token" && "$PATH" != "${_thurm_last_path-}" ]]; then
+    builtin printf '\e]633;P;ThurmPath=%s:%s\a' "$_thurm_token" "${PATH//;/\\x3b}"
+    _thurm_last_path=$PATH
+  fi
+}
+
 _thurm_precmd() {
   local ret=$?
   if [[ -n "$_thurm_executing" ]]; then
@@ -31,11 +44,7 @@ _thurm_precmd() {
   fi
   _thurm_executing=""
   builtin printf '\e]7;file://%s%s\a' "${HOST}" "$(_thurm_urlencode "$PWD")"
-  # $PATH for Thurm's tab completion (only when it changed).
-  if [[ -n "$_thurm_token" && "$PATH" != "${_thurm_last_path-}" ]]; then
-    builtin printf '\e]633;P;ThurmPath=%s:%s\a' "$_thurm_token" "${PATH//;/\\x3b}"
-    _thurm_last_path=$PATH
-  fi
+  _thurm_report_path
   builtin printf '\e]133;A\a'
   # Mark the end of the prompt (prompt themes may rebuild PS1 every time).
   if [[ "$PS1" != *'133;B'* ]]; then

@@ -21,8 +21,13 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
   _thurm_ret=0
   # Proves to Thurm that the $PATH report comes from this shell, not from program output.
   # Kept out of the environment of the programs the shell runs.
+  # Untraced: under `set -x` (or `bash -x`) the trace would print the token.
+  _thurm_token_xtrace=""
+  if [[ $- == *x* ]]; then _thurm_token_xtrace=1; { builtin set +x; } 2>/dev/null; fi
   _thurm_token=${THURM_SHELL_TOKEN-}
   builtin unset THURM_SHELL_TOKEN
+  if [[ -n $_thurm_token_xtrace ]]; then builtin set -x; fi
+  builtin unset _thurm_token_xtrace
 
   # Make the bundled `thurm` CLI reachable (appended, so an installed one wins).
   if [[ -n "${THURM_BIN_DIR-}" && ":$PATH:" != *":$THURM_BIN_DIR:"* ]]; then
@@ -60,17 +65,24 @@ if [[ -z "${_THURM_BASH_LOADED-}" ]]; then
     return "$_thurm_ret"
   }
 
+  # $PATH for Thurm's tab completion (only when it changed). Untraced, like the token's capture.
+  _thurm_report_path() {
+    local xtrace=""
+    if [[ $- == *x* ]]; then xtrace=1; { builtin set +x; } 2>/dev/null; fi
+    if [[ -n "$_thurm_token" && "$PATH" != "${_thurm_last_path-}" ]]; then
+      builtin printf '\e]633;P;ThurmPath=%s:%s\a' "$_thurm_token" "${PATH//;/\\x3b}"
+      _thurm_last_path=$PATH
+    fi
+    if [[ -n $xtrace ]]; then builtin set -x; fi
+  }
+
   _thurm_prompt_end() {
     if [[ -n "$_thurm_executing" ]]; then
       builtin printf '\e]133;D;%s\a' "$_thurm_ret"
     fi
     _thurm_executing=""
     builtin printf '\e]7;file://%s%s\a' "$HOSTNAME" "${PWD// /%20}"
-    # $PATH for Thurm's tab completion (only when it changed).
-    if [[ -n "$_thurm_token" && "$PATH" != "${_thurm_last_path-}" ]]; then
-      builtin printf '\e]633;P;ThurmPath=%s:%s\a' "$_thurm_token" "${PATH//;/\\x3b}"
-      _thurm_last_path=$PATH
-    fi
+    _thurm_report_path
     builtin printf '\e]133;A\a'
     if [[ "$PS1" != *'133;B'* ]]; then
       PS1="${PS1}"'\[\e]133;B\a\]'
