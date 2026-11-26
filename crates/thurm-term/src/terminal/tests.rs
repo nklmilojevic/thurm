@@ -332,6 +332,11 @@ fn concealed_blanks_keep_the_cells_laid_out() {
     t.advance(b"\x1b[?2027h");
     t.selection(SelectionOp::SelectAll);
     assert_eq!(t.selection_text(), "    |");
+    // The styled fallback too.
+    crate::vt::FALLBACK.with(|f| f.set(true));
+    let text = t.selection_text();
+    crate::vt::FALLBACK.with(|f| f.set(false));
+    assert_eq!(text, "    |");
 }
 
 /// A concealed wide character reflowed onto the next row, selected up to the spacer it left
@@ -394,6 +399,31 @@ fn concealed_copy_drops_trailing_background_rows() {
     let (plain, _) = t.vt.selection_copies();
     assert_eq!(t.selection_text(), plain.replace('x', " "));
     assert!(!t.selection_text().ends_with('\n'));
+    // The styled fallback drops them all too.
+    crate::vt::FALLBACK.with(|f| f.set(true));
+    let text = t.selection_text();
+    crate::vt::FALLBACK.with(|f| f.set(false));
+    assert_eq!(text, "pw:   ok");
+}
+
+/// A concealed copy over scrollback spanning many pages finds every row's cells.
+#[test]
+fn concealed_copy_across_pages() {
+    let mut t = term(20, 5);
+    for i in 0..3000 {
+        t.advance(format!("{i} \x1b[8ms{i}\x1b[m!\r\n").as_bytes());
+    }
+    let node = |y| t.vt.screen_ref(0, y).unwrap().node;
+    assert_ne!(node(0), node(2999), "the rows should span pages");
+    t.selection(SelectionOp::SelectAll);
+    let text = t.selection_text();
+    assert!(!text.contains('s'), "concealed text copied");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3000);
+    for (i, line) in lines.iter().enumerate() {
+        let n = i.to_string();
+        assert_eq!(*line, format!("{n} {}!", " ".repeat(n.len() + 1)));
+    }
 }
 
 /// Concealed spaces other than the ASCII one are text: blanked by their cells.
@@ -427,7 +457,7 @@ fn copy_fails_closed_without_the_styled_pass() {
 #[test]
 fn styled_text_parses_escapes() {
     use crate::vt::styled_text;
-    let s = |v: &str| styled_text(v, true);
+    let s = |v: &str| styled_text(v, true, &[]);
     assert_eq!(s("a \x1b[1mb\x1b[0m"), "a b");
     assert_eq!(s("\x1b[38;5;8mx\x1b[48;2;8;8;8my"), "xy");
     assert_eq!(s("\x1b[38:2::8:8:8mx"), "x");
@@ -448,7 +478,15 @@ fn styled_text_parses_escapes() {
     // A cluster split by a color change still counts once.
     assert_eq!(s("\x1b[8m👍\x1b[31m🏽\x1b[28m|"), "  |");
     // Without grapheme clustering every codepoint counts on its own.
-    assert_eq!(styled_text("\x1b[8m👍🏽\x1b[28m|", false), "    |");
+    assert_eq!(styled_text("\x1b[8m👍🏽\x1b[28m|", false, &[]), "    |");
+    // The grid's widths win over clustering's.
+    let grid = [(vec!['👍'], 2), (vec!['🏽'], 2)];
+    assert_eq!(styled_text("\x1b[8m👍🏽\x1b[28m|", true, &grid), "    |");
+    // Every trailing row without written cells is dropped, its blanks too.
+    assert_eq!(s("a\r\n\x1b[44m\x1b[K\r\n\x1b[K\r\n\x1b[5C\x1b[m"), "a");
+    // Skipped cells before a written one stay; a row of written blanks keeps its line.
+    assert_eq!(s("a\r\n\x1b[2Cb"), "a\n  b");
+    assert_eq!(s("a\r\n  \r\n\x1b[K"), "a\n");
 }
 
 #[test]
