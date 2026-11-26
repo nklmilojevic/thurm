@@ -60,8 +60,12 @@ timestamp (`time`, verified within a 60-second window).
 
 On restore, Thurm runs the reported command itself, without shell parsing: a bare program
 name is looked up on the shell's `PATH`, and a file that is neither a binary nor a script
-with a `#!` line is refused rather than run by `/bin/sh`. How the command starts depends
-on where it ran:
+with a `#!` line is refused rather than run by `/bin/sh`. The restored shell gets only a
+single-use ticket, which Thurm's helper redeems with the daemon for the command, so the
+command is never written to a file. When a rule trusted the program by its executable,
+only a program found in that executable's directory runs (relative `PATH` entries are not
+searched), and a directory the command must start in is entered only while it is still the
+one Thurm checked. How the command starts depends on where it ran:
 
 - A program that was the pane's first process (no shell) starts the same way again,
   through a login shell command, without an interactive shell's startup files.
@@ -69,9 +73,11 @@ on where it ran:
   first prompt, after its startup files ran, and the shell takes over when it ends.
 - In other POSIX shells, and in zsh or fish started without startup files (`zsh -f`,
   `fish --no-config`), Thurm types a fixed helper command (never the program's arguments)
-  a few seconds after the shell started.
+  a few seconds after the shell started, but only while that shell waits in the
+  foreground and nothing was typed into the pane; otherwise it skips the resume.
 
-Thurm records each attempt before it starts the command and never retries a resume that
+If `config.toml` fails to load when the daemon starts, program resume stays off until it
+loads again. Thurm records each attempt before it starts the command and never retries a resume that
 failed or crashed; if it cannot record the attempt, it starts plain shells instead. A pane
 whose record is not resumed for another reason (not trusted, its directory is gone, or the
 shell cannot run it) restores as it would without one: its command, or `resume_agents`.

@@ -552,7 +552,7 @@ pub fn inspect_owner(pid: u32, pane: &PaneContext) -> Result<OwnerSnapshot, &'st
     let mut process_argv = process_argv;
     // An interpreter's script, made absolute: restore re-checks it without the owner's cwd.
     if is_interpreter(thurm_config::executable_name(&process_exe))
-        && let Some(k) = script_index(&process_argv)
+        && let Some(k) = interpreter_script(&process_exe, &process_argv)
         && !process_argv[k].starts_with('/')
     {
         match &process_cwd {
@@ -1547,12 +1547,6 @@ fn process_matches_command(
     false
 }
 
-/// Where an interpreter's script operand is in its `argv`, judged by `argv[0]` (see
-/// [`interpreter_script`]).
-fn script_index(argv: &[String]) -> Option<usize> {
-    interpreter_script("", argv)
-}
-
 /// Where the script operand of an interpreter launch is in `argv`: the interpreter is
 /// `process_exe`'s name, else `argv[0]`'s. Skips the interpreter's own options, with the
 /// values of those that take a separate one; `None` for a mode that runs no script file
@@ -2102,19 +2096,6 @@ pub fn pin_dirs(process_exe: &str, script: Option<&str>) -> Vec<String> {
         }
     }
     out
-}
-
-/// The interpreter script recorded in saved launch evidence ([`launch_evidence`]): its second
-/// element, when the program is an interpreter.
-pub fn saved_script<'a>(_process_exe: &str, evidence: &'a [String]) -> Option<&'a str> {
-    let arg0 = evidence.first()?;
-    if !is_interpreter(thurm_config::executable_name(arg0)) {
-        return None;
-    }
-    evidence
-        .get(1)
-        .map(String::as_str)
-        .filter(|s| s.starts_with('/'))
 }
 
 /// Asks the daemon for the command behind `ticket`; it answers once.

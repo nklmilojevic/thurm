@@ -2799,7 +2799,7 @@ impl Daemon {
                 Some(r) if r.match_process => {
                     let dirs = program_resume::pin_dirs(
                         &rec.process_exe,
-                        program_resume::saved_script(&rec.process_exe, &rec.process_argv),
+                        rec.launch.as_ref().and_then(|l| l.script.as_deref()),
                     );
                     if dirs.is_empty() {
                         skip("program_gone");
