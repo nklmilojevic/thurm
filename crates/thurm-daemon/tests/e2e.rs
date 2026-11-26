@@ -1637,9 +1637,10 @@ fn completion_uses_only_the_path_the_shell_reported() {
     }
 }
 
-/// With tracing on from the startup files (`set -x`, also in restricted bash; `setopt xtrace`;
-/// `fish_trace`), the trace never shows the shell token: not when the integration captures it,
-/// nor in a prompt's `$PATH` report. The report still reaches Thurm, and tracing stays on for
+/// With tracing on before the integration captures the token (`set -x` in `.bashrc`, which
+/// Thurm's rc file runs first, also in restricted bash; `setopt xtrace` in `.zshenv`, before the
+/// bootstrap loads the integration; `fish_trace` in fish's environment), the trace never shows
+/// the shell token: not at the capture, nor in a prompt's `$PATH` report. The report still reaches Thurm, and tracing stays on for
 /// the user's commands after startup and after the prompt hook.
 #[test]
 fn traced_shells_keep_the_token_out_and_still_report_path() {
@@ -1695,29 +1696,71 @@ fn traced_shells_keep_the_token_out_and_still_report_path() {
             }
             "zsh" => {
                 std::fs::create_dir_all(&home).unwrap();
-                std::fs::write(home.join(".zshrc"), "TRACEV=on\nsetopt xtrace\n").unwrap();
+                // Without the system's rc files (one may build a completion dump, traced).
+                std::fs::write(
+                    home.join(".zshenv"),
+                    "TRACEV=on\nsetopt no_global_rcs xtrace\n",
+                )
+                .unwrap();
             }
             _ => {
                 let conf = home.join(".config/fish");
                 std::fs::create_dir_all(&conf).unwrap();
                 std::fs::write(
                     conf.join("config.fish"),
-                    "set -g TRACEV on\nfunction fish_greeting; end\nset -g fish_trace all\n",
+                    "set -g TRACEV on\nfunction fish_greeting; end\n",
                 )
                 .unwrap();
             }
         }
+        // A system config may set XDG_DATA_DIRS afresh (nix-darwin's does, when the variable
+        // saying it ran is not inherited, as here), dropping the directory Thurm loads fish's
+        // integration from: fish also sources it itself (a no-op once loaded).
+        let command = if name == "fish" {
+            let snippet = env
+                .dir
+                .join("state/shell-integration/fish/vendor_conf.d/thurm.fish");
+            format!(
+                "{shell:?}, \"-C\", {:?}",
+                format!("source {}", snippet.display())
+            )
+        } else {
+            format!("{shell:?}")
+        };
         std::fs::write(
             env.dir.join("config/config.toml"),
             format!(
-                "[terminal]\nshell = [{shell:?}]\nshell_integration = true\n\
+                "[terminal]\nshell = [{command}]\nshell_integration = true\n\
+                 scrollback = 1000000\n\
                  [session]\nsnapshot_interval_secs = 60\n"
             ),
         )
         .unwrap();
-        let _daemon = env.start_clean(&[("HOME", &home)]);
+        // fish traces from its first line, the integration's vendor snippet included.
+        let fish_trace = [("fish_trace", Path::new("all"))];
+        let mut vars = vec![("HOME", home.as_path())];
+        if name == "fish" {
+            vars.extend(fish_trace);
+        }
+        let _daemon = env.start_clean(&vars);
         let (c, _events) = env.connect();
-        let pane = create(&c, &env.dir);
+        // Wide: a wrapped line would split the token the check looks for.
+        let pane = match c
+            .request(Request::CreatePane(CreatePane {
+                cwd: Some(env.dir.display().to_string()),
+                size: PaneSize {
+                    cols: 1000,
+                    rows: 50,
+                    cell_width: 8,
+                    cell_height: 16,
+                },
+                ..Default::default()
+            }))
+            .unwrap()
+        {
+            Response::PaneCreated { pane } => pane,
+            other => panic!("{other:?}"),
+        };
         // Typed until `needle` shows, searched in the scrollback too: a traced prompt hook prints
         // dozens of lines after each command. What is typed during startup may be lost.
         let type_until = |line: &str, needle: &str| {
@@ -1754,12 +1797,6 @@ fn traced_shells_keep_the_token_out_and_still_report_path() {
         // And again after the prompt that reports the new PATH.
         type_until("echo AGAIN_$TRACEV", "echo AGAIN_on");
         // The prompt's report reached Thurm: completion offers what is on the reported PATH.
-        // Not checked for fish, whose report doesn't reach completion here even untraced (a
-        // separate issue).
-        if name == "fish" {
-            assert_no_token(name, &capture(&c, pane));
-            continue;
-        }
         c.request(Request::Input {
             pane,
             data: b"thurmzz".to_vec(),
