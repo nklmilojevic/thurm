@@ -717,6 +717,9 @@ final class TerminalRenderer {
         /// An earlier version, shown while the current one is still being prepared.
         case stale(CachedImage)
         case missing
+        /// A texture couldn't be had (allocation failed, or over the memory cap): retried after a
+        /// backoff, showing the earlier version meanwhile if there is one.
+        case retryLater(CachedImage?)
         case invalid
     }
 
@@ -742,8 +745,24 @@ final class TerminalRenderer {
     private let inFlight = DispatchSemaphore(value: bufferCount)
     private var allQuads: [QuadInstance] = []
     private var segments: [DrawSegment] = []
-    /// Set when an image was referenced but its pixels were not available yet.
-    private(set) var wantsAnotherFrame = false
+    /// Another frame right away: an image's pixels haven't arrived, or a downscale goes on.
+    private var immediateFrame = false
+    /// When to try again what failed to allocate (a glyph atlas, an image texture); backed off
+    /// so a device short of memory isn't redrawn every frame for it.
+    private(set) var retryAt: CFTimeInterval?
+    private var retryDelay: CFTimeInterval = TerminalRenderer.minRetryDelay
+    static let minRetryDelay: CFTimeInterval = 0.25
+    static let maxRetryDelay: CFTimeInterval = 4
+    /// Whether to draw again now. While a retry waits (`retryAt` not yet due) this is false; a
+    /// view keeps its display link ticking while `retryAt` is set, without drawing.
+    var wantsAnotherFrame: Bool {
+        immediateFrame || retryAt.map { CACurrentMediaTime() >= $0 } == true
+    }
+
+    private func retryLater(_ now: CFTimeInterval) {
+        let at = now + retryDelay
+        retryAt = retryAt.map { min($0, at) } ?? at
+    }
 
     private let searchMatchBg: UInt32 = 0xD7BA5A
     private let searchFocusBg: UInt32 = 0xF0883E
@@ -755,7 +774,9 @@ final class TerminalRenderer {
         snapshot.reset()
         imageTextures.removeAll()
         pendingDownscales.removeAll()
-        wantsAnotherFrame = false
+        immediateFrame = false
+        retryAt = nil
+        retryDelay = Self.minRetryDelay
         backgrounds.removeAll(keepingCapacity: true)
         cursorUnder.removeAll(keepingCapacity: true)
         glyphQuads.removeAll(keepingCapacity: true)
@@ -799,7 +820,17 @@ final class TerminalRenderer {
     func draw(layer: CAMetalLayer, params p: RenderParams) -> Bool {
         guard let ctx = MetalContext.shared else { return false }
         guard p.viewportWidth > 0, p.viewportHeight > 0 else { return false }
-        wantsAnotherFrame = false
+        immediateFrame = false
+        let retrying = retryAt != nil
+        retryAt = nil
+        defer {
+            // Failing again after a retry backs off further; a draw without failures resets.
+            if retryAt == nil {
+                retryDelay = Self.minRetryDelay
+            } else if retrying {
+                retryDelay = min(retryDelay * 2, Self.maxRetryDelay)
+            }
+        }
         // Shared by both `buildQuads` passes below: the bound is per draw.
         downsampleBudgetLeft = Self.downsampleBudget
         // Rasterizing a glyph can wipe a full atlas; quads built before that point to stale
@@ -992,7 +1023,11 @@ final class TerminalRenderer {
         // Cursor geometry.
         let cursorRow = Int(info.cursor_row)
         let cursorCol = Int(info.cursor_col)
-        var shape = p.cursorShapeOverride ?? info.cursor_shape
+        // The core reports Hidden for a hidden cursor and for one outside the viewport (with
+        // its row clamped): the user's shape setting restyles a shown cursor, never shows one.
+        var shape = info.cursor_shape == CursorShapeCode.hidden
+            ? CursorShapeCode.hidden
+            : (p.cursorShapeOverride ?? info.cursor_shape)
         let cursorShown = (info.modes & TermMode.showCursor) != 0
             && shape != CursorShapeCode.hidden
             && info.display_offset == 0
@@ -1046,8 +1081,9 @@ final class TerminalRenderer {
                         font: shaper.font(g.font), isColor: g.color,
                         cell: CellBox(width: cw, height: ch, baseline: shaper.baseline))
                     else {
-                        // Only an allocation failure is worth another frame; empty glyphs stay empty.
-                        wantsAnotherFrame = true
+                        // Only an allocation failure is worth another try; empty glyphs stay
+                        // empty.
+                        retryLater(CACurrentMediaTime())
                         continue
                     }
                     if entry.isEmpty { continue }
@@ -1177,6 +1213,12 @@ final class TerminalRenderer {
         guard snapshot.valid, !snapshot.images.isEmpty else { return (below, above) }
         let cw = Float(p.shaper.cellWidth)
         let ch = Float(p.shaper.cellHeight)
+        // Everything placed this draw is in use before any texture is admitted, so making room
+        // for one never evicts another shown in the same frame.
+        for placement in snapshot.images {
+            imageTextures[placement.image]?.lastUsed = now
+            pendingDownscales[placement.image]?.lastUsed = now
+        }
         for placement in snapshot.images {
             let cached: CachedImage
             switch imageEntry(for: placement.image, pane: p.pane, device: device, now: now) {
@@ -1184,10 +1226,14 @@ final class TerminalRenderer {
                 cached = entry
             case .stale(let entry):
                 cached = entry
-                wantsAnotherFrame = true
+                immediateFrame = true
             case .missing:
-                wantsAnotherFrame = true
+                immediateFrame = true
                 continue
+            case .retryLater(let earlier):
+                retryLater(now)
+                guard let earlier else { continue }
+                cached = earlier
             case .invalid:
                 continue
             }
@@ -1239,10 +1285,14 @@ final class TerminalRenderer {
 
         let tex: MTLTexture
         if width <= maxTexDim && height <= maxTexDim {
+            // A downscale of an earlier, oversized version is moot now.
+            pendingDownscales[image] = nil
             let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: Int(width),
                                                                 height: Int(height), mipmapped: false)
             desc.usage = [.shaderRead]
-            guard let made = device.makeTexture(descriptor: desc) else { return .missing }
+            guard let made = device.makeTexture(descriptor: desc) else {
+                return .retryLater(imageTextures[image])
+            }
             made.replace(region: MTLRegionMake2D(0, 0, Int(width), Int(height)), mipmapLevel: 0,
                          withBytes: src, bytesPerRow: Int(width) * 4)
             tex = made
@@ -1272,14 +1322,14 @@ final class TerminalRenderer {
                 // No texture for a job this draw can't start on: the next draw makes it.
                 guard downsampleBudgetLeft > 0 else { return waiting }
                 // Over the texture memory cap even after evicting what this draw doesn't show:
-                // not retried every frame, only when something else frees room.
+                // tried again after a backoff (images shown less recently age out meanwhile).
                 guard admitImageTexture(bytes: dstW * dstH * 4, now: now) else {
-                    return stale.map { .ready($0) } ?? .invalid
+                    return .retryLater(stale)
                 }
                 let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: dstW,
                                                                     height: dstH, mipmapped: false)
                 desc.usage = [.shaderRead]
-                guard let made = device.makeTexture(descriptor: desc) else { return waiting }
+                guard let made = device.makeTexture(descriptor: desc) else { return .retryLater(stale) }
                 job = PendingDownscale(startSerial: serial, mixed: false, srcWidth: width, srcHeight: height,
                                        texture: made, nextRow: 0, lastUsed: now)
             }
