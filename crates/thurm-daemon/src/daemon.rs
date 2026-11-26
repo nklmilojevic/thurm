@@ -506,18 +506,32 @@ impl Client {
     /// executable is named `thurm`. What only the CLI asks for and carries programs' arguments
     /// ([`Request::ResumeRecords`]) is for it alone: a same-user socket forward over SSH comes
     /// from `sshd`, whose caller may have no shell here. (A process of the user here could pose
-    /// as the CLI, but it can already type into the panes.) Unknown: not the CLI. A daemon
-    /// started with `THURM_TRUST_UI_CLIENTS=1` (tests) takes any local peer.
+    /// as the CLI, but it can already type into the panes.) Unknown: not the CLI. A debug
+    /// build started with `THURM_TRUST_UI_CLIENTS=1` (the tests' daemon) takes any local peer;
+    /// a release build ignores that, so no setting opens the records to a forward.
     pub fn is_local_cli(&self) -> bool {
         if !self.is_local_peer() {
             return false;
         }
-        if crate::daemon::ext::unverified_ui_allowed() {
+        if cfg!(debug_assertions) && crate::daemon::ext::unverified_ui_allowed() {
             return true;
         }
         let pid = *self.peer_pid.lock();
         pid.and_then(crate::procinfo::exe_path)
             .is_some_and(|exe| is_cli_executable(&exe))
+    }
+
+    /// Whether the connecting process runs on the terminal whose slave device is `rdev` (a
+    /// pane's): its controlling terminal is that one. Unknown: no. The helper that redeems a
+    /// pane's resume ticket runs in the pane's shell; a same-user socket forward over SSH has
+    /// no such terminal, so a ticket seen elsewhere (the typed line shows in the pane) can
+    /// only be redeemed in the pane itself.
+    pub fn runs_on_terminal(&self, rdev: Option<u64>) -> bool {
+        let pid = *self.peer_pid.lock();
+        let (Some(pid), Some(rdev)) = (pid, rdev) else {
+            return false;
+        };
+        crate::procinfo::controlling_tty(pid) == Some(rdev)
     }
 
     /// `n` clipboard bytes left the queue. Never below zero: after [`Client::writer_ended`]
@@ -4601,6 +4615,23 @@ impl Daemon {
                 if !client.is_local_peer() {
                     return Err("not allowed".into());
                 }
+                // Only from the ticket's own pane (see `Client::runs_on_terminal`), checked
+                // before anything of the ticket is used. The pane's lock is not taken under
+                // the tickets' (the monitor takes them the other way round).
+                let ticket_pane = {
+                    let now = Instant::now();
+                    self.resume_tickets
+                        .lock()
+                        .iter()
+                        .find(|t| t.expires > now && program_resume::ticket_eq(&t.ticket, &ticket))
+                        .map(|t| t.pane)
+                };
+                let pane_tty = ticket_pane
+                    .and_then(|id| self.pane(id))
+                    .and_then(|p| p.state.lock().pty.slave_rdev());
+                if ticket_pane.is_some() && !client.runs_on_terminal(pane_tty) {
+                    return Err("not allowed".into());
+                }
                 let spec = {
                     let mut tickets = self.resume_tickets.lock();
                     // Not while an upgrade hands the panes over without it: waits for the
@@ -6692,7 +6723,9 @@ mod tests {
         daemon.apply_config(off.clone());
         assert!(daemon.resume_tickets.lock().is_empty());
         assert!(pane.state.lock().pending_input.is_none());
+        // Redeemed from the pane itself: its `cat` stands for the shell's helper.
         let (client, _rx) = daemon.add_client();
+        *client.peer_pid.lock() = pane.state.lock().info.pid;
         let got = daemon.dispatch(&client, Request::TakeResume { ticket: t1 });
         assert!(got.is_err(), "{got:?}");
 
@@ -6716,6 +6749,56 @@ mod tests {
         let got = daemon.dispatch(&client, Request::TakeResume { ticket: t3 });
         assert!(matches!(&got, Ok(Response::Text(_))), "{got:?}");
         daemon.close_pane(id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A resume ticket is redeemed only from its own pane: a process on another terminal, one
+    /// on none (a socket forwarded over SSH comes from `sshd`) or an unknown one is refused,
+    /// and the ticket stays for the pane's shell.
+    #[test]
+    fn a_resume_ticket_is_redeemed_only_from_its_pane() {
+        let dir = test_dir("ticket-pane");
+        let daemon = Daemon::new(
+            Config::default(),
+            dir.join("s.sock"),
+            dir.join("state"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let id = cat_pane(&daemon);
+        let other = cat_pane(&daemon);
+        let ticket = "f6".repeat(16);
+        let policy = resume_policy(&daemon.config.read());
+        daemon
+            .resume_tickets
+            .lock()
+            .push(ticket_for(id, &ticket, policy));
+        let take = |client: &Arc<Client>| {
+            daemon.dispatch(
+                client,
+                Request::TakeResume {
+                    ticket: ticket.clone(),
+                },
+            )
+        };
+        let refused = |got: &Result<Response, String>| matches!(got, Err(e) if e == "not allowed");
+        let (unknown, _rx) = daemon.add_client();
+        assert!(refused(&take(&unknown)));
+        let (elsewhere, _rx2) = daemon.add_client();
+        *elsewhere.peer_pid.lock() = daemon.pane(other).unwrap().state.lock().info.pid;
+        assert!(refused(&take(&elsewhere)));
+        let (no_terminal, _rx3) = daemon.add_client();
+        *no_terminal.peer_pid.lock() = Some(std::process::id());
+        if crate::procinfo::controlling_tty(std::process::id()).is_none() {
+            assert!(refused(&take(&no_terminal)));
+        }
+        assert_eq!(daemon.resume_tickets.lock().len(), 1);
+        let (in_pane, _rx4) = daemon.add_client();
+        *in_pane.peer_pid.lock() = daemon.pane(id).unwrap().state.lock().info.pid;
+        let got = take(&in_pane);
+        assert!(matches!(&got, Ok(Response::Text(_))), "{got:?}");
+        for p in [id, other] {
+            daemon.close_pane(p);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6803,6 +6886,7 @@ mod tests {
 
         // A redemption meanwhile waits for the outcome, however long the hand-off takes.
         let (client, _rx) = daemon.add_client();
+        *client.peer_pid.lock() = daemon.pane(ticketed).unwrap().state.lock().info.pid;
         std::thread::scope(|s| {
             let redeem = s.spawn(|| {
                 daemon.dispatch(
