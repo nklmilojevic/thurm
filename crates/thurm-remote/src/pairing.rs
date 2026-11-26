@@ -4,13 +4,20 @@
 //! Host keys come from this machine's own known hosts, never from the network: the Mac already
 //! trusts them, and the phone checks the host against exactly those fingerprints.
 
-use std::path::Path;
-use std::process::Command;
-use std::time::Duration;
+use std::collections::BTreeSet;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use thurm_client::Client;
 use thurm_config::RemoteConfig;
+use thurm_proto::{Request, Response};
 
 use crate::ssh::{RemoteExec, Ssh, SshError};
 
@@ -243,13 +250,16 @@ fn is_p256_blob(blob: &[u8]) -> bool {
     ok && rest.is_empty()
 }
 
-/// A device name goes to a remote shell as an argument: one word, no quotes or backslashes.
+/// A device name goes to a remote shell as an argument, into `authorized_keys`, and into a Nix
+/// string ([`nixos_snippet`]): one word of 1–128 bytes, without control characters, quotes,
+/// backslashes, `$` or backticks (as Mac `PhonePairing.validDeviceKey` has it). Today's app names itself in `[A-Za-z0-9._-]`; builds before that used the phone's
+/// name with spaces as dashes (`Nikola’s-iPhone`, `iPhone+work`), and still pair.
 pub fn validate_device_name(device: &str) -> Result<(), String> {
     if device.is_empty()
         || device.len() > 128
-        || device
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '\'' || c == '\\')
+        || device.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"' | '\\' | '$' | '`')
+        })
     {
         return Err(format!("unsupported device name {device:?}"));
     }
@@ -264,6 +274,13 @@ pub enum PairingError {
     NotWritable {
         nixos: bool,
     },
+    /// `no-replace` guard rejected overwriting an existing different key for the same device name.
+    WouldReplace,
+    /// Push-registration revocation required for SSH key replacement could not be completed.
+    PushCleanup(String),
+    /// The key was added (nothing replaced), but an earlier replacement's cleanup is still
+    /// pending: not a failure of this add, retried by the next one.
+    CleanupPending(String),
     Ssh(SshError),
 }
 
@@ -272,6 +289,10 @@ impl std::fmt::Display for PairingError {
         match self {
             PairingError::Invalid(m) => f.write_str(m),
             PairingError::NotWritable { .. } => f.write_str("authorized_keys is not writable"),
+            PairingError::WouldReplace => {
+                f.write_str("an existing different key for this device would be replaced")
+            }
+            PairingError::PushCleanup(m) | PairingError::CleanupPending(m) => f.write_str(m),
             PairingError::Ssh(e) => e.fmt(f),
         }
     }
@@ -281,16 +302,21 @@ impl std::error::Error for PairingError {}
 
 /// Exit status of [`EDIT`] when `authorized_keys` can't be written.
 const NOT_WRITABLE: i32 = 4;
+/// Exit status of [`EDIT`] when `$3` (`no-replace`) is set and a different key for `$2` exists.
+const WOULD_REPLACE: i32 = 6;
 
-/// Replaces the device's key in `authorized_keys`: drops the lines Thurm wrote for device `$2`
-/// (exactly `restrict,port-forwarding ecdsa-sha2-nistp256 <blob> thurm-ios:$2`, nothing that only
-/// ends the same way), appends `$1` (when given) with Thurm's options, through a temporary file and `mv`. Every other
-/// line stays byte for byte, a last line without a newline included (one is put before the
-/// appended key only); a revoke that matches nothing leaves the file alone. A link (managed
+/// Replaces the device's key in `authorized_keys`: on revoke (`$1` empty), drops every line Thurm
+/// wrote for device `$2`; on authorize (`$1` non-empty), drops any existing Thurm line matching
+/// either device `$2` (key rotation) or key blob `$1` (device rename), so renaming a phone never
+/// leaves an unrevoked duplicate line behind. Appends `$1` (when given) with Thurm's options,
+/// through a temporary file and `mv`.
+/// Every other line stays byte for byte, a last line without a newline included (one is put before
+/// the appended key only); a revoke that matches nothing leaves the file alone. A link (managed
 /// elsewhere) or an unreadable file is not touched.
 const EDIT: &str = concat!(
-    // V: the device (`$2` inside `ours` would be the function's own argument).
-    "TH=\"${THURM_HOME:-$HOME}\"; D=\"$TH/.ssh\"; F=\"$D/authorized_keys\"; T=\"$F.thurm-$$\"; N=\"\n\"; V=\"$2\"; ",
+    // A/V/KB/NR: the key, device, key blob and optional "no-replace" guard (`$1`/`$2` inside
+    // `ours` would be the function's args).
+    "TH=\"${THURM_HOME:-$HOME}\"; D=\"$TH/.ssh\"; F=\"$D/authorized_keys\"; T=\"$F.thurm-$$\"; N=\"\n\"; A=\"$1\"; V=\"$2\"; NR=\"$3\"; KB=\"${A#ecdsa-sha2-nistp256 }\"; ",
     "nw() { [ -e /etc/NIXOS ] && echo nixos >&2; echo \"authorized_keys is not writable\" >&2; exit 4; }; ",
     "if [ -z \"$1\" ] && [ ! -e \"$F\" ] && [ ! -L \"$F\" ]; then exit 0; fi; ",
     "if [ -L \"$F\" ]; then nw; fi; ",
@@ -317,10 +343,14 @@ const EDIT: &str = concat!(
     "unlock() { [ \"$(readlink \"$K\" 2>/dev/null)\" = \"$$@$H\" ] && rm -f \"$K\"; }; ",
     "trap unlock EXIT; trap \"exit 1\" INT TERM HUP; ",
     "ours() { case \"$L\" in \"restrict,port-forwarding ecdsa-sha2-nistp256 \"?*) ;; *) return 1 ;; esac; ",
-    "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; [ \"$R\" = \"$B thurm-ios:$V\" ]; }; ",
+    "R=\"${L#restrict,port-forwarding ecdsa-sha2-nistp256 }\"; B=\"${R%% *}\"; [ -n \"$B\" ] || return 1; ",
+    "C=\"${R#\"$B\" }\"; case \"$C\" in *\" \"*) return 1 ;; thurm-ios:?*) ;; *) return 1 ;; esac; ",
+    "D0=\"${C#thurm-ios:}\"; if [ -z \"$A\" ]; then [ \"$D0\" = \"$V\" ]; return $?; fi; ",
+    "if [ \"$D0\" = \"$V\" ] && [ \"$B\" != \"$KB\" ]; then RK=1; return 0; fi; ",
+    "[ \"$D0\" = \"$V\" ] || [ \"$B\" = \"$KB\" ]; }; ",
     // E: the line read had no newline (the last one). P: the last line written has none. M: a
-    // line of the device was dropped.
-    "P=; M=; { if [ -f \"$F\" ]; then while :; do E=; IFS= read -r L || E=1; ",
+    // line of the device was dropped. RK: an existing different key for the same device was replaced.
+    "P=; M=; RK=; { if [ -f \"$F\" ]; then while :; do E=; IFS= read -r L || E=1; ",
     "if [ -n \"$E\" ] && [ -z \"$L\" ]; then break; fi; ",
     "if ours; then M=1; ",
     "elif [ -n \"$E\" ]; then printf \"%s\" \"$L\"; P=1; else printf \"%s$N\" \"$L\"; fi; ",
@@ -328,8 +358,10 @@ const EDIT: &str = concat!(
     "if [ -n \"$1\" ]; then [ -z \"$P\" ] || printf \"$N\"; ",
     "printf \"%s$N\" \"restrict,port-forwarding $1 thurm-ios:$2\"; fi; ",
     "} > \"$T\" || { rm -f \"$T\"; nw; }; ",
+    "if [ -n \"$NR\" ] && [ -n \"$RK\" ]; then rm -f \"$T\"; exit 6; fi; ",
     "if [ -z \"$1\" ] && [ -z \"$M\" ]; then rm -f \"$T\"; exit 0; fi; ",
-    "chmod 600 \"$T\" && mv -f \"$T\" \"$F\" || { rm -f \"$T\"; nw; }"
+    "chmod 600 \"$T\" && mv -f \"$T\" \"$F\" || { rm -f \"$T\"; nw; }; ",
+    "if [ -n \"$RK\" ]; then printf \"replaced$N\"; fi"
 );
 
 /// Prints the device names of the keys Thurm wrote in `authorized_keys` (the lines [`EDIT`] would
@@ -345,27 +377,417 @@ const LIST: &str = concat!(
     "case \"$C\" in *\" \"*) ;; thurm-ios:?*) printf \"%s$N\" \"${C#thurm-ios:}\" ;; esac; done < \"$F\""
 );
 
-fn edit(ssh: &dyn RemoteExec, key: &str, device: &str) -> Result<(), PairingError> {
+fn edit_inner(
+    ssh: &dyn RemoteExec,
+    key: &str,
+    device: &str,
+    no_replace: bool,
+) -> Result<bool, PairingError> {
     validate_device_name(device).map_err(PairingError::Invalid)?;
-    match ssh.run(EDIT, &[key, device], None, Duration::from_secs(30)) {
-        Ok(_) => Ok(()),
+    let guard = if no_replace { "no-replace" } else { "" };
+    match ssh.run(EDIT, &[key, device, guard], None, Duration::from_secs(30)) {
+        Ok(out) => Ok(out.lines().any(|l| l.trim() == "replaced")),
         Err(SshError::Remote { code, stderr }) if code == NOT_WRITABLE => {
             Err(PairingError::NotWritable {
                 nixos: stderr.lines().any(|l| l.trim() == "nixos"),
             })
         }
+        Err(SshError::Remote { code, .. }) if code == WOULD_REPLACE => {
+            Err(PairingError::WouldReplace)
+        }
         Err(e) => Err(PairingError::Ssh(e)),
     }
 }
 
+fn edit(ssh: &dyn RemoteExec, key: &str, device: &str) -> Result<bool, PairingError> {
+    edit_inner(ssh, key, device, false)
+}
+
 /// Adds the device key (or replaces the device's earlier one) in the host's `authorized_keys`.
 pub fn authorize(ssh: &dyn RemoteExec, key: &DeviceKey) -> Result<(), PairingError> {
+    authorize_with_status(ssh, key).map(|_| ())
+}
+
+/// Like [`authorize`], also reporting whether an existing *different* public key under the same
+/// device name was replaced (so callers can revoke the replaced phone's push registration).
+pub fn authorize_with_status(ssh: &dyn RemoteExec, key: &DeviceKey) -> Result<bool, PairingError> {
     edit(ssh, &key.key, &key.device)
+}
+
+/// What [`authorize_with_push_cleanup`] asks of the host's daemon.
+pub trait PushCleanupClient {
+    /// `RevokePhone`: drops every phone connection and forgets the push registrations (and Live
+    /// Activities) under the phone name `device`. The phones that still hold a key reconnect
+    /// and register again; the one whose key went cannot.
+    fn revoke_phone(&self, device: &str) -> Result<(), String>;
+}
+
+/// A connection to a host's `thurmd` over a short-lived `ssh -N -L` tunnel through the same
+/// [`Ssh`] target the key edit goes through, torn down on drop.
+pub struct RemoteDaemonSession {
+    client: Arc<Client>,
+    tunnel: Option<(Child, PathBuf)>,
+}
+
+impl Drop for RemoteDaemonSession {
+    fn drop(&mut self) {
+        self.client.force_close();
+        if let Some((mut child, sock)) = self.tunnel.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(sock);
+        }
+    }
+}
+
+impl RemoteDaemonSession {
+    /// Wraps a connected daemon client (for tests and callers that opened one themselves).
+    pub fn from_client(client: Arc<Client>) -> Self {
+        Self {
+            client,
+            tunnel: None,
+        }
+    }
+}
+
+impl PushCleanupClient for RemoteDaemonSession {
+    fn revoke_phone(&self, device: &str) -> Result<(), String> {
+        match self.client.request_timeout(
+            Request::RevokePhone {
+                name: device.to_owned(),
+            },
+            Some(CLEANUP_TIMEOUT),
+        ) {
+            Ok(Response::Ok) => Ok(()),
+            Ok(other) => Err(format!("unexpected daemon response: {other:?}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// The most a cleanup step (the tunnel coming up, the daemon's Hello, a request) may take.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Opens a daemon client on `socket` with a bounded Hello: a socket that accepts but never
+/// answers must not hang pairing.
+fn cleanup_client(socket: &Path) -> Result<Arc<Client>, String> {
+    let stream = thurm_client::connect_daemon(socket).map_err(|e| e.to_string())?;
+    Client::from_stream_timeout(
+        stream,
+        "thurm-pair-cleanup",
+        false,
+        &[],
+        Some(CLEANUP_TIMEOUT),
+        |_| {},
+        || {},
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Connects to the `thurmd` that `ssh` reaches, for push cleanup: through `ssh` itself (never a
+/// tunnel or tailnet route the remote may also have, which can lead to another daemon), starting
+/// the daemon first if it is stopped so its saved registrations are loaded.
+pub fn connect_remote_daemon(
+    ssh: &Ssh,
+    host_label: &str,
+    configured_socket: Option<&str>,
+) -> Result<RemoteDaemonSession, String> {
+    crate::ssh::prepare_dir().map_err(|e| e.to_string())?;
+    let effective = ssh.effective_config().map_err(|e| e.to_string())?;
+    crate::ssh::check_forwards(&effective)?;
+    let remote_socket = match configured_socket {
+        Some(s) => s.to_owned(),
+        None => {
+            let host = crate::probe(ssh).map_err(|e| e.to_string())?;
+            if host.thurm.is_none() {
+                return Err(format!("Thurm is not installed on {host_label}"));
+            }
+            host.info
+                .map(|i| i.socket)
+                .ok_or_else(|| format!("Thurm on {host_label} is too old; upgrade it first"))?
+        }
+    };
+    crate::start_daemon(ssh, &remote_socket).map_err(|e| e.to_string())?;
+
+    static NEXT_TUNNEL: AtomicU64 = AtomicU64::new(1);
+    let seq = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
+    let local_sock =
+        thurm_config::remote_dir().join(format!("pair-cleanup-{}-{seq}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&local_sock);
+    let mut cmd = ssh.tunnel_command(&local_sock, &remote_socket);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot start ssh tunnel to {host_label}: {e}"))?;
+    let stderr = Arc::new(Mutex::new(String::new()));
+    if let Some(mut pipe) = child.stderr.take() {
+        let sink = stderr.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let mut s = sink.lock();
+                s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if s.len() > 8 * 1024 {
+                    let cut = s.len() - 4 * 1024;
+                    let cut = (cut..s.len()).find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+                    s.drain(..cut);
+                }
+            }
+        });
+    }
+    let give_up = |child: &mut Child, why: String| {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&local_sock);
+        let detail = stderr.lock().trim().to_owned();
+        if detail.is_empty() {
+            why
+        } else {
+            format!("{why} ({detail})")
+        }
+    };
+
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    let mut last_err = String::from("timed out waiting for the remote daemon tunnel");
+    loop {
+        if local_sock.exists() {
+            match cleanup_client(&local_sock) {
+                Ok(client) => {
+                    return Ok(RemoteDaemonSession {
+                        client,
+                        tunnel: Some((child, local_sock)),
+                    });
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(give_up(
+                &mut child,
+                format!("ssh tunnel to {host_label} exited ({status})"),
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(give_up(&mut child, last_err));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Phone names on hosts whose key was (or may have been) replaced but whose push cleanup has not
+/// been confirmed: written before the key edit, removed once the host's daemon has revoked.
+/// Entries are keyed by [`journal_host_key`], where the host's ssh config leads.
+/// Cleanup is a name-wide `RevokePhone`, harmless to repeat, so an entry for an edit that never
+/// happened costs nothing but a reconnect.
+#[derive(Clone, Debug)]
+pub struct PendingPushRevokes {
+    path: PathBuf,
+}
+
+impl Default for PendingPushRevokes {
+    fn default() -> Self {
+        Self::new(thurm_config::remote_dir().join("pending-push-revokes.json"))
+    }
+}
+
+static PENDING_REVOKES_LOCK: Mutex<()> = Mutex::new(());
+static PENDING_REVOKES_TMP: AtomicU64 = AtomicU64::new(1);
+
+impl PendingPushRevokes {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn entry(host_key: &str, device: &str) -> String {
+        format!("{host_key}\0{device}")
+    }
+
+    fn load_unlocked(&self) -> Result<BTreeSet<String>, String> {
+        match std::fs::read(&self.path) {
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| e.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Writes durably (fsync, then rename): an entry must survive a crash right after.
+    fn save_unlocked(&self, set: &BTreeSet<String>) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let seq = PENDING_REVOKES_TMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| e.to_string())?;
+        f.write_all(&serde_json::to_vec(set).map_err(|e| e.to_string())?)
+            .and_then(|()| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
+    }
+
+    /// Whether cleanup is pending for `device` on `host_key`. A record that exists but can't be
+    /// read is an error: the caller stops rather than guess (skipping a cleanup, or rewriting the
+    /// record and losing the other entries in it).
+    pub fn contains(&self, host_key: &str, device: &str) -> Result<bool, String> {
+        let _guard = PENDING_REVOKES_LOCK.lock();
+        Ok(self
+            .load_unlocked()?
+            .contains(&Self::entry(host_key, device)))
+    }
+
+    /// Records `device` on `host_key` as pending. Fails, leaving the record as it is, when it
+    /// can't be read.
+    pub fn insert(&self, host_key: &str, device: &str) -> Result<(), String> {
+        let _guard = PENDING_REVOKES_LOCK.lock();
+        let mut set = self.load_unlocked()?;
+        if set.insert(Self::entry(host_key, device)) {
+            self.save_unlocked(&set)?;
+        }
+        Ok(())
+    }
+
+    pub fn remove(&self, host_key: &str, device: &str) -> Result<(), String> {
+        let _guard = PENDING_REVOKES_LOCK.lock();
+        let mut set = self.load_unlocked()?;
+        if set.remove(&Self::entry(host_key, device)) {
+            self.save_unlocked(&set)?;
+        }
+        Ok(())
+    }
+}
+
+/// The journal key for a `[[remote]]` host: its name and where `ssh -G` says it leads, so a
+/// cleanup left pending for one host is not replayed on another the alias is later pointed at.
+pub fn journal_host_key(name: &str, ssh: &Ssh) -> Result<String, String> {
+    let e = parse_effective(&ssh.effective_config().map_err(|e| e.to_string())?, &home());
+    let alias = e.host_key_alias.as_deref().unwrap_or("");
+    Ok(format!(
+        "remote:{name}\0{}@{}:{}\0{alias}",
+        e.user, e.hostname, e.port
+    ))
+}
+
+/// Holds one host and device's replacement (pending check, key edit, revoke, journal removal)
+/// for its whole length: two overlapping replacements of the same phone would otherwise share
+/// one journal entry, and the first to finish would clear the second's.
+struct Transaction(String);
+
+static TRANSACTIONS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+static TRANSACTION_DONE: parking_lot::Condvar = parking_lot::Condvar::new();
+
+impl Transaction {
+    fn begin(host_key: &str, device: &str) -> Self {
+        let id = PendingPushRevokes::entry(host_key, device);
+        let mut running = TRANSACTIONS.lock();
+        while running.contains(&id) {
+            TRANSACTION_DONE.wait(&mut running);
+        }
+        running.insert(id.clone());
+        Transaction(id)
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        TRANSACTIONS.lock().remove(&self.0);
+        TRANSACTION_DONE.notify_all();
+    }
+}
+
+/// Authorizes `key` on `ssh`; when that replaces another key under the same device name, the
+/// host's daemon then revokes the name (`RevokePhone`), so the phone that held the old key loses
+/// its push registration and its open connections. Returns whether a key was replaced.
+///
+/// - A new name (or the same key again) needs no daemon, unless an earlier attempt's cleanup is
+///   still pending, which this finishes.
+/// - Replacing a key reaches the daemon first and changes nothing when it can't.
+/// - The pending cleanup is recorded durably before the key edit, so an edit whose reply was
+///   lost, or a crash after it, is cleaned up by the next attempt with the same key.
+pub fn authorize_with_push_cleanup<F, C>(
+    ssh: &dyn RemoteExec,
+    key: &DeviceKey,
+    host_label: &str,
+    pending: &PendingPushRevokes,
+    host_key: &str,
+    open_daemon: F,
+) -> Result<bool, PairingError>
+where
+    F: FnOnce() -> Result<C, String>,
+    C: PushCleanupClient,
+{
+    let _transaction = Transaction::begin(host_key, &key.device);
+    let was_pending = pending.contains(host_key, &key.device).map_err(|e| {
+        PairingError::PushCleanup(format!(
+            "{}'s key on {host_label} was not changed: the record of pending cleanups can't be \
+             read ({e})",
+            key.device
+        ))
+    })?;
+    let cleanup_error = |e: String| {
+        PairingError::PushCleanup(format!(
+            "replaced {}'s key on {host_label}, but could not revoke the previous phone's \
+             notifications ({e}); add the key again to finish",
+            key.device
+        ))
+    };
+    match edit_inner(ssh, &key.key, &key.device, true) {
+        Ok(_) => {
+            if !was_pending {
+                return Ok(false);
+            }
+            // The key is in; what is left is an earlier replacement's cleanup.
+            let still_pending = |e: String| {
+                PairingError::CleanupPending(format!(
+                    "added {}'s key on {host_label}; an earlier replacement still has to revoke                      the previous phone's notifications ({e}): add the key again to retry",
+                    key.device
+                ))
+            };
+            let daemon = open_daemon().map_err(still_pending)?;
+            daemon.revoke_phone(&key.device).map_err(still_pending)?;
+            let _ = pending.remove(host_key, &key.device);
+            Ok(true)
+        }
+        Err(PairingError::WouldReplace) => {
+            let daemon = open_daemon().map_err(|e| {
+                PairingError::PushCleanup(format!(
+                    "{}'s key on {host_label} was not replaced: its Thurm could not be reached \
+                     to revoke the previous phone ({e})",
+                    key.device
+                ))
+            })?;
+            pending.insert(host_key, &key.device).map_err(|e| {
+                PairingError::PushCleanup(format!(
+                    "{}'s key on {host_label} was not replaced: could not record the cleanup \
+                     ({e})",
+                    key.device
+                ))
+            })?;
+            edit_inner(ssh, &key.key, &key.device, false)?;
+            daemon.revoke_phone(&key.device).map_err(cleanup_error)?;
+            let _ = pending.remove(host_key, &key.device);
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Removes the device's keys from the host's `authorized_keys`.
 pub fn revoke(ssh: &dyn RemoteExec, device: &str) -> Result<(), PairingError> {
-    edit(ssh, "", device)
+    edit(ssh, "", device).map(|_| ())
 }
 
 /// The devices with a key in the host's `authorized_keys`.
@@ -633,7 +1055,12 @@ mod tests {
     /// A device name can't end the Nix string or interpolate into the configuration.
     #[test]
     fn nixos_snippet_is_one_string_literal() {
-        let k = DeviceKey::parse(&KEY.replace("iPhone", "a\"${builtins.x}")).unwrap();
+        let base = DeviceKey::parse(KEY).unwrap();
+        assert!(DeviceKey::parse(&KEY.replace("iPhone", "a\"${builtins.x}")).is_err());
+        let k = DeviceKey {
+            key: base.key.clone(),
+            device: "a\"${builtins.x}".into(),
+        };
         let snippet = nixos_snippet(&k);
         assert!(
             snippet.ends_with(" thurm-ios:a\\\"\\${builtins.x}\"\n];"),
@@ -641,12 +1068,59 @@ mod tests {
         );
         assert_eq!(nix_string("a\\b\"c${d}$e"), "\"a\\\\b\\\"c\\${d}$e\"");
         assert_eq!(
-            nixos_snippet(&DeviceKey::parse(KEY).unwrap()),
+            nixos_snippet(&base),
             format!(
                 "users.users.<name>.openssh.authorizedKeys.keys = [\n  \"{}\"\n];",
-                DeviceKey::parse(KEY).unwrap().line()
+                base.line()
             )
         );
+    }
+
+    #[test]
+    fn renaming_device_deduplicates_key_and_revokes_cleanly() {
+        let home = std::env::temp_dir().join(format!("thurm-pair-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let local = Local(home.clone(), vec![]);
+        let file = home.join(".ssh/authorized_keys");
+
+        let k1 = DeviceKey::parse(KEY).unwrap();
+        // Second distinct P-256 blob for a second uniquely-named phone.
+        let mut blob2 = base64::engine::general_purpose::STANDARD
+            .decode(KEY.split(' ').nth(1).unwrap())
+            .unwrap();
+        blob2[103] ^= 0x01;
+        let k2 = DeviceKey::parse(&format!(
+            "ecdsa-sha2-nistp256 {} thurm-ios:iPhone-9c04",
+            base64::engine::general_purpose::STANDARD.encode(&blob2)
+        ))
+        .unwrap();
+
+        authorize(&local, &k1).unwrap();
+        authorize(&local, &k2).unwrap();
+        assert_eq!(devices(&local).unwrap(), ["iPhone", "iPhone-9c04"]);
+
+        // Renaming k1 from generic "iPhone" to unique "iPhone-7f3a" removes the old "iPhone" line
+        // so revoking "iPhone-7f3a" leaves zero entries for k1.
+        let renamed = DeviceKey {
+            key: k1.key.clone(),
+            device: "iPhone-7f3a".into(),
+        };
+        authorize(&local, &renamed).unwrap();
+        let content = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(!lines.contains(&k1.line().as_str()));
+        assert!(lines.contains(&renamed.line().as_str()));
+        assert!(lines.contains(&k2.line().as_str()));
+
+        // Revoking "iPhone-7f3a" removes only k1, preserving k2 ("iPhone-9c04").
+        revoke(&local, "iPhone-7f3a").unwrap();
+        assert_eq!(devices(&local).unwrap(), ["iPhone-9c04"]);
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(!content.contains(&k1.key));
+        assert!(content.contains(&k2.line()));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     const LINK: (&str, &str) = ("THURM_PAIR_LOCK", "link");
@@ -685,7 +1159,15 @@ mod tests {
                     } else {
                         vec![LINK]
                     };
-                    let k = DeviceKey::parse(&KEY.replace("iPhone", name)).unwrap();
+                    let mut blob = base64::engine::general_purpose::STANDARD
+                        .decode(KEY.split(' ').nth(1).unwrap())
+                        .unwrap();
+                    blob[103] ^= (i as u8) + 1;
+                    let k = DeviceKey::parse(&format!(
+                        "ecdsa-sha2-nistp256 {} thurm-ios:{name}",
+                        base64::engine::general_purpose::STANDARD.encode(&blob)
+                    ))
+                    .unwrap();
                     std::thread::spawn(move || authorize(&Local(home, env), &k).unwrap())
                 })
                 .collect();
@@ -812,8 +1294,10 @@ mod tests {
         assert_eq!(mode(&file), 0o600);
         assert_eq!(mode(&home.join(".ssh")), 0o700);
 
-        // Other lines (no trailing newline, odd characters) stay as they are.
-        let old = format!("{KEY_OPTIONS} {} thurm-ios:iPhone-old", key.key);
+        // Other lines (no trailing newline, odd characters) stay as they are; a distinct key
+        // under another device name is preserved.
+        let other_key = "ecdsa-sha2-nistp256 AAAAotherKeyBlobForDistinctPhone";
+        let old = format!("{KEY_OPTIONS} {other_key} thurm-ios:iPhone-old");
         let other = format!(
             "command=\"echo \\\"hi\\\" %s\",no-pty ssh-ed25519 AAAA  me@laptop\n  # a comment\n\n{old}"
         );
@@ -822,6 +1306,17 @@ mod tests {
         authorize(&local, &key).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         assert_eq!(text, format!("{other}\n{}\n", key.line()));
+        assert_eq!(devices(&local).unwrap(), ["iPhone-old", "iPhone"]);
+
+        // Re-authorizing the SAME key under a new device name replaces the old line so revoking
+        // the new name does not leave the same key authorized under its previous name.
+        let renamed = DeviceKey {
+            key: key.key.clone(),
+            device: "iPhone-7f3a".into(),
+        };
+        authorize(&local, &renamed).unwrap();
+        assert_eq!(devices(&local).unwrap(), ["iPhone-old", "iPhone-7f3a"]);
+        authorize(&local, &key).unwrap();
         assert_eq!(devices(&local).unwrap(), ["iPhone-old", "iPhone"]);
 
         // Another device of a similar name is not this one.
@@ -927,6 +1422,200 @@ mod tests {
             revoke(&local, "a b"),
             Err(PairingError::Invalid(_))
         ));
+        assert!(matches!(
+            revoke(&local, "a'b"),
+            Err(PairingError::Invalid(_))
+        ));
+
+        // Names from older app builds (the phone's own name, spaces as dashes) pair, are
+        // listed by `devices()`, and revoke.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(DeviceKey::parse(&KEY.replace("iPhone", "iPhone+work")).is_ok());
+        assert!(DeviceKey::parse(&KEY.replace("iPhone", "Nikola’s-iPhone")).is_ok());
+        assert!(DeviceKey::parse(&KEY.replace("iPhone", "Nikola's-iPhone")).is_err());
+        let legacy_line = format!("{KEY_OPTIONS} {} thurm-ios:iPhone+work\n", key.key);
+        let keep_line = "ssh-ed25519 AAAA keep@laptop\n";
+        std::fs::write(&file, format!("{keep_line}{legacy_line}")).unwrap();
+        assert_eq!(devices(&local).unwrap(), ["iPhone+work"]);
+        revoke(&local, "iPhone+work").unwrap();
+        assert!(devices(&local).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), keep_line);
+
+        // `authorize_with_status` reports `true` only when a *different* key under the same name
+        // is replaced (not on initial add, re-add of the same key, or renaming the same key).
+        let mut blob2 = base64::engine::general_purpose::STANDARD
+            .decode(KEY.split(' ').nth(1).unwrap())
+            .unwrap();
+        blob2[103] ^= 0x02;
+        let other_same_name = DeviceKey::parse(&format!(
+            "ecdsa-sha2-nistp256 {} thurm-ios:iPhone",
+            base64::engine::general_purpose::STANDARD.encode(&blob2)
+        ))
+        .unwrap();
+        assert!(!authorize_with_status(&local, &key).unwrap());
+        assert!(!authorize_with_status(&local, &key).unwrap());
+        let renamed_same = DeviceKey {
+            key: key.key.clone(),
+            device: "iPhone-new".into(),
+        };
+        assert!(!authorize_with_status(&local, &renamed_same).unwrap());
+        assert!(!authorize_with_status(&local, &key).unwrap());
+        assert!(authorize_with_status(&local, &other_same_name).unwrap());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn authorize_with_push_cleanup_fails_closed_records_first_and_retries() {
+        use std::sync::atomic::AtomicBool;
+
+        let home = std::env::temp_dir().join(format!("thurm-pair-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let local = Local(home.clone(), vec![]);
+        let pending = PendingPushRevokes::new(home.join("pending.json"));
+        let file = home.join(".ssh/authorized_keys");
+
+        let k1 = DeviceKey::parse(KEY).unwrap();
+        let mut blob2 = base64::engine::general_purpose::STANDARD
+            .decode(KEY.split(' ').nth(1).unwrap())
+            .unwrap();
+        blob2[103] ^= 0x05;
+        let k2 = DeviceKey::parse(&format!(
+            "ecdsa-sha2-nistp256 {} thurm-ios:iPhone",
+            base64::engine::general_purpose::STANDARD.encode(&blob2)
+        ))
+        .unwrap();
+
+        #[derive(Clone, Default)]
+        struct FakeDaemon {
+            revoked: Arc<Mutex<Vec<String>>>,
+            fail: Arc<AtomicBool>,
+            /// What `pending` held when `RevokePhone` came: it is recorded before the edit.
+            pending_seen: Arc<Mutex<Vec<bool>>>,
+            probe: Option<(PendingPushRevokes, String)>,
+        }
+        impl PushCleanupClient for FakeDaemon {
+            fn revoke_phone(&self, device: &str) -> Result<(), String> {
+                if let Some((p, host)) = &self.probe {
+                    self.pending_seen
+                        .lock()
+                        .push(p.contains(host, device).unwrap());
+                }
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err("the daemon went away".into());
+                }
+                self.revoked.lock().push(device.to_owned());
+                Ok(())
+            }
+        }
+        let host = "remote:devbox";
+        let no_daemon = || -> Result<FakeDaemon, String> { panic!("no daemon needed") };
+
+        // A new name needs no daemon.
+        assert!(
+            !authorize_with_push_cleanup(&local, &k1, "devbox", &pending, host, no_daemon).unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), k1.line() + "\n");
+
+        // Replacing it with the daemon out of reach changes nothing.
+        let err = authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, || {
+            Err::<FakeDaemon, _>("unreachable".into())
+        })
+        .unwrap_err();
+        assert!(matches!(err, PairingError::PushCleanup(_)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), k1.line() + "\n");
+        assert!(!pending.contains(host, "iPhone").unwrap());
+
+        // The key changes, the revoke fails: the cleanup stays recorded (it was before the edit).
+        let fake = FakeDaemon {
+            probe: Some((pending.clone(), host.to_owned())),
+            ..Default::default()
+        };
+        fake.fail.store(true, Ordering::SeqCst);
+        let err =
+            authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, || Ok(fake.clone()))
+                .unwrap_err();
+        assert!(matches!(err, PairingError::PushCleanup(_)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), k2.line() + "\n");
+        assert_eq!(*fake.pending_seen.lock(), [true]);
+        assert!(pending.contains(host, "iPhone").unwrap());
+
+        // The same key again (nothing left to replace) finishes the cleanup.
+        fake.fail.store(false, Ordering::SeqCst);
+        assert!(
+            authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, || Ok(fake.clone()))
+                .unwrap()
+        );
+        assert_eq!(*fake.revoked.lock(), ["iPhone"]);
+        assert!(!pending.contains(host, "iPhone").unwrap());
+
+        // Done: adding it once more needs no daemon.
+        assert!(
+            !authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, no_daemon).unwrap()
+        );
+
+        // A replacement whose edit commits but whose reply is lost (an ssh error here) is
+        // still cleaned up by the next attempt.
+        let lossy = Local(home.clone(), vec![]);
+        pending.insert(host, "iPhone").unwrap();
+        assert!(
+            authorize_with_push_cleanup(&lossy, &k2, "devbox", &pending, host, || Ok(fake.clone()))
+                .unwrap()
+        );
+        assert_eq!(*fake.revoked.lock(), ["iPhone", "iPhone"]);
+
+        // An earlier replacement's cleanup that still fails doesn't fail this add (nothing was
+        // replaced by it): it says so, and stays pending for the next one.
+        pending.insert(host, "iPhone").unwrap();
+        let away = authorize_with_push_cleanup(&local, &k2, "devbox", &pending, host, || {
+            Err::<FakeDaemon, _>("unreachable".into())
+        })
+        .unwrap_err();
+        assert!(matches!(away, PairingError::CleanupPending(_)), "{away:?}");
+        assert!(away.to_string().starts_with("added iPhone's key"), "{away}");
+        assert!(pending.contains(host, "iPhone").unwrap());
+        pending.remove(host, "iPhone").unwrap();
+
+        // A record that can't be read stops the next replacement before any key changes, and
+        // is left as it is (its other entries are not lost).
+        let journal = home.join("pending.json");
+        pending.insert(host, "iPad").unwrap();
+        std::fs::write(&journal, b"{not json").unwrap();
+        let err =
+            authorize_with_push_cleanup(&local, &k1, "devbox", &pending, host, || Ok(fake.clone()))
+                .unwrap_err();
+        assert!(matches!(err, PairingError::PushCleanup(_)), "{err:?}");
+        assert!(pending.insert(host, "iPhone").is_err());
+        assert!(pending.remove(host, "iPad").is_err());
+        assert_eq!(std::fs::read(&journal).unwrap(), b"{not json");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), k2.line() + "\n");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn replacements_of_one_phone_on_one_host_run_one_at_a_time() {
+        use std::sync::atomic::AtomicUsize;
+        let inside = Arc::new(AtomicUsize::new(0));
+        let overlapped = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..4)
+            .map(|i| {
+                let (inside, overlapped) = (inside.clone(), overlapped.clone());
+                std::thread::spawn(move || {
+                    // Same host and phone: serialized. Another phone: not held up.
+                    let _t = Transaction::begin("remote:tx-test", "iPhone");
+                    let _other = Transaction::begin("remote:tx-test", &format!("iPad{i}"));
+                    if inside.fetch_add(1, Ordering::SeqCst) != 0 {
+                        overlapped.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(overlapped.load(Ordering::SeqCst), 0);
     }
 }

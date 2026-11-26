@@ -688,16 +688,59 @@ fn followed_agents_post_live_activity_updates_until_the_pane_closes() {
             }
         }
     };
-    let first = activity("first update");
-    assert_eq!(first["event"], "update");
-    assert_eq!(first["token"], "ab12cd");
-    assert_eq!(first["state"]["status"], "working");
-    assert_eq!(first["state"]["agent"], "Claude Code");
+    // Following a non-permission state immediately posts the current daemon state so a permission
+    // prompt (or earlier state) resolved before FollowAgent arrived is cleared on the Lock Screen.
+    let started = activity("initial working update");
+    assert_eq!(started["event"], "update");
+    assert_eq!(started["token"], "ab12cd");
+    assert_eq!(started["state"]["status"], "working");
+    assert_eq!(started["state"]["agent"], "Claude Code");
 
     hook(&mac, pane, "permission-prompt", None);
     let asked = activity("permission update");
+    assert_eq!(asked["event"], "update");
+    assert_eq!(asked["token"], "ab12cd");
     assert_eq!(asked["state"]["status"], "permission");
+    assert_eq!(asked["state"]["agent"], "Claude Code");
     assert!(asked["state"]["permission"].is_u64());
+
+    // Re-following while a permission prompt is active seeds `last` without posting a request-less
+    // overwrite (preserving the phone's locally rendered verbatim request and Allow button).
+    let r = mac.request(Request::FollowAgent {
+        device: "dev-1".into(),
+        pane,
+        token: "ef3456".into(),
+    });
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+    let quiet_until = Instant::now() + Duration::from_millis(400);
+    while let Ok((head, body)) =
+        posts.recv_timeout(quiet_until.saturating_duration_since(Instant::now()))
+    {
+        assert!(
+            !head.starts_with("POST /v1/activity "),
+            "FollowAgent must not push a request-less activity overwrite while a permission prompt is active: {body}"
+        );
+    }
+
+    hook(&mac, pane, "prompt-submit", None);
+    let resumed = activity("working update");
+    assert_eq!(resumed["event"], "update");
+    assert_eq!(resumed["token"], "ef3456");
+    assert_eq!(resumed["state"]["status"], "working");
+    assert_eq!(resumed["state"]["agent"], "Claude Code");
+
+    // Following with a fresh token after the permission prompt already resolved immediately sends
+    // the resolved working state so a stale Lock Screen prompt is never left behind.
+    let r = mac.request(Request::FollowAgent {
+        device: "dev-1".into(),
+        pane,
+        token: "99aa88".into(),
+    });
+    assert!(matches!(r, Ok(Response::Ok)), "{r:?}");
+    let synced = activity("resolved-state sync update");
+    assert_eq!(synced["event"], "update");
+    assert_eq!(synced["token"], "99aa88");
+    assert_eq!(synced["state"]["status"], "working");
 
     mac.request(Request::ClosePane { pane }).unwrap();
     let end = activity("end");
@@ -1648,4 +1691,167 @@ fn oversized_claim_lists_are_refused() {
     assert_eq!(pane_size(&mac, pane), (50, 30));
     disown(&ipad, &[pane, pane, pane]);
     assert_eq!(pane_size(&mac, pane), (100, 40));
+}
+
+/// Replacing a remote host's SSH phone key revokes the retired phone's push registration and
+/// active Live Activity follow through the remote host's daemon even when no Mac daemon client is
+/// connected, and drops the retired phone's open connection; the replacement registers after.
+#[test]
+fn remote_key_replacement_revokes_old_push_and_follow_without_mac_client() {
+    use thurm_remote::pairing::{
+        DeviceKey, PendingPushRevokes, RemoteDaemonSession, authorize_with_push_cleanup,
+    };
+    use thurm_remote::{RemoteExec, SshError};
+
+    struct LocalRemote(PathBuf);
+    impl RemoteExec for LocalRemote {
+        fn run(
+            &self,
+            script: &str,
+            args: &[&str],
+            _input: Option<&[u8]>,
+            _timeout: Duration,
+        ) -> Result<String, SshError> {
+            let out = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .arg("thurm")
+                .args(args)
+                .env("THURM_HOME", &self.0)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            match out.status.code() {
+                Some(0) => Ok(stdout),
+                code => Err(SshError::Remote {
+                    code: code.unwrap_or(-1),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                }),
+            }
+        }
+    }
+
+    let env = push_env("remote-key-replace");
+    let _daemon = env.start();
+    let (relay_old, posts_old) = fake_relay();
+    let (relay_new, posts_new) = fake_relay();
+
+    let pane = {
+        let (setup, _) = env.connect();
+        let pane = create(&setup, &env.dir);
+        run_cat(&setup, pane);
+        hook(&setup, pane, "prompt-submit", None);
+        hook(&setup, pane, "permission-prompt", None);
+        pane
+    };
+    // Old SSH-paired phone registers and follows the pane's active permission prompt, and stays
+    // connected (no Mac daemon client is connected to the remote host).
+    let (old_phone, _old_events) = mobile(&env);
+    register(&old_phone, "dev-old", &relay_old, "iPhone");
+    old_phone
+        .request(Request::FollowAgent {
+            device: "dev-old".into(),
+            pane,
+            token: "aa11bb".into(),
+        })
+        .unwrap();
+
+    let remote_home = env.dir.join("remote-home");
+    std::fs::create_dir_all(&remote_home).unwrap();
+    let ssh = LocalRemote(remote_home.clone());
+    let pending = PendingPushRevokes::new(env.dir.join("pending.json"));
+
+    let k1 = DeviceKey::parse(
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCX3gCbaYfg5u9YLs2Wl/JueENke93ZHXviQRq40gOlkHjaEa1MveakIBTyg0/VVXe/fFWxV3pteMd9Pe1sUf8g= thurm-ios:iPhone",
+    )
+    .unwrap();
+    // Second valid P-256 public key (different point) under the same device name `iPhone`.
+    let k2 = DeviceKey::parse(
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCX3gCbaYfg5u9YLs2Wl/JueENke93ZHXviQRq40gOlkHjaEa1MveakIBTyg0/VVXe/fFWxV3pteMd9Pe1sVf8g= thurm-ios:iPhone",
+    )
+    .unwrap();
+
+    // Initial authorization writes k1 without needing the daemon.
+    assert!(
+        !authorize_with_push_cleanup(
+            &ssh,
+            &k1,
+            "devbox",
+            &pending,
+            "remote:devbox",
+            || -> Result<RemoteDaemonSession, String> { panic!("unexpected daemon open") },
+        )
+        .unwrap()
+    );
+
+    // Replace k1 -> k2 with NO Mac daemon client connected: `authorize_with_push_cleanup`
+    // opens a daemon session, replaces authorized_keys, and revokes the name: `dev-old`, its Live
+    // Activity follow and its open connection go.
+    let sock = env.socket.clone();
+    let replaced = authorize_with_push_cleanup(
+        &ssh,
+        &k2,
+        "devbox",
+        &pending,
+        "remote:devbox",
+        move || {
+            let client = Client::connect(
+                ConnectOptions {
+                    socket: sock,
+                    spawn_daemon: None,
+                    client_name: "thurm-pair-cleanup",
+                    ui: false,
+                },
+                |_| {},
+                || {},
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(RemoteDaemonSession::from_client(client))
+        },
+    )
+    .unwrap();
+    assert!(replaced);
+    assert!(
+        old_phone.request(Request::Ping).is_err(),
+        "the retired phone's open connection is dropped"
+    );
+
+    // Register the replacement phone and follow the pane, then transition agent state:
+    // ONLY the replacement phone gets updates; the retired phone gets neither notices nor
+    // Live Activity updates.
+    {
+        let (new_phone, _) = mobile(&env);
+        register(&new_phone, "dev-new", &relay_new, "iPhone");
+        new_phone
+            .request(Request::FollowAgent {
+                device: "dev-new".into(),
+                pane,
+                token: "cc22dd".into(),
+            })
+            .unwrap();
+    }
+    let (driver, _) = env.connect();
+    hook(&driver, pane, "prompt-submit", None);
+    hook(&driver, pane, "permission-prompt", None);
+
+    let mut saw_new_notice = false;
+    let mut saw_new_activity = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(saw_new_notice && saw_new_activity) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let (head, body) = posts_new
+            .recv_timeout(left)
+            .expect("replacement phone should receive both notice and activity update");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["device"], "dev-new");
+        if head.starts_with("POST /v1/push ") {
+            saw_new_notice = true;
+        } else if head.starts_with("POST /v1/activity ") {
+            saw_new_activity = true;
+        }
+    }
+    assert!(
+        posts_old.recv_timeout(Duration::from_millis(500)).is_err(),
+        "retired phone must receive neither notices nor Live Activity updates after remote key replacement"
+    );
 }
