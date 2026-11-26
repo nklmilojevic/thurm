@@ -73,6 +73,10 @@ pub struct TicketHandoff {
     pub pane: PaneId,
     pub spec: crate::program_resume::ResumeExecSpec,
     pub remaining_ms: u64,
+    /// `daemon::resume_policy` of the configuration it was issued under (empty from images
+    /// that didn't write it: never redeemed).
+    #[serde(default)]
+    pub policy: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -132,6 +136,10 @@ pub struct PaneHandoff {
     /// A line still to be typed into the shell: in how many milliseconds, and base64 of it.
     #[serde(default)]
     pub pending_input: Option<(u64, String)>,
+    /// How many times `pending_input` already waited for a slow shell (see
+    /// `PaneState::pending_waits`): the new image doesn't give it a fresh budget.
+    #[serde(default)]
+    pub pending_waits: u32,
     /// A client typed or pasted into the pane.
     #[serde(default)]
     pub typed: bool,
@@ -278,6 +286,7 @@ pub fn perform(
     struct Resume<'a>(&'a Daemon);
     impl Drop for Resume<'_> {
         fn drop(&mut self) {
+            self.0.set_upgrading(false);
             self.0.resume_readers();
         }
     }
@@ -293,6 +302,8 @@ pub fn perform(
         // The handoff carries the panes; the snapshot is only the fallback after a crash.
         log::warn!("upgrade: session snapshot not saved: {e}");
     }
+    // From here, what the hand-off says about input (`typed`) is final for this image.
+    daemon.set_upgrading(true);
     let mut handoff = daemon.handoff(listener_fd, log_to_file);
     handoff.version = version;
     handoff.lock_fd = lock_fd;
@@ -640,6 +651,7 @@ mod tests {
                 exe_dirs: Vec::new(),
             },
             remaining_ms: 1000,
+            policy: String::new(),
         });
         write_private(&path, &serde_json::to_vec(&old).unwrap()).unwrap();
         let h = load(&path, None).unwrap();

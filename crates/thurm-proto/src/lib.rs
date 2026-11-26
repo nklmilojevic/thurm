@@ -692,9 +692,10 @@ pub enum Request {
     ResumeRecords {
         pane: Option<PaneId>,
     },
-    /// Redeems the single-use ticket a restored pane got for its saved program (OSC 7577):
-    /// the command to run, as JSON in [`Response::Text`]. Only `thurmd --exec-resume` sends
-    /// it, from the daemon's own build; the command never touches the disk.
+    /// Redeems the unexpired, single-use ticket a restored pane got for its saved program
+    /// (OSC 7577), for a local peer of the daemon's own user: the command to run, as JSON in
+    /// [`Response::Text`]. Holding the ticket is what authorizes it; the caller's executable
+    /// is not checked. `thurmd --exec-resume` sends it.
     TakeResume {
         ticket: String,
     },
