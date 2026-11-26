@@ -1095,16 +1095,20 @@ impl Vt {
             return String::new();
         }
         // Concealed cells (SGR 8, e.g. a password echoed hidden) are not shown, so they are not
-        // copied either. The plain formatter has no notion of them; the styled output does.
-        let styled = self.format_raw(
-            ffi::FormatterFormat::VT,
-            true,
-            true,
-            ffi::FORMATTER_EXTRAS_NONE,
-            Some(&sel),
-        );
-        if let Some(text) = blank_concealed(&String::from_utf8_lossy(&styled)) {
-            return text;
+        // copied either. The plain formatter has no notion of them; where the selection has
+        // some, the text comes from the styled output, which does.
+        if self.rows_conceal(&sel) {
+            let styled = self.format_raw(
+                ffi::FormatterFormat::VT,
+                true,
+                true,
+                ffi::FORMATTER_EXTRAS_NONE,
+                Some(&sel),
+            );
+            return styled_text(
+                &String::from_utf8_lossy(&styled),
+                self.mode(mode(2027, false)),
+            );
         }
         let text = self.format_raw(
             ffi::FormatterFormat::PLAIN,
@@ -1114,6 +1118,46 @@ impl Vt {
             Some(&sel),
         );
         String::from_utf8_lossy(&text).into_owned()
+    }
+
+    /// Whether any cell of the rows `sel` spans is concealed (SGR 8).
+    fn rows_conceal(&self, sel: &ffi::Selection) -> bool {
+        let (Some((_, a)), Some((_, b))) = (
+            self.screen_point_of(&sel.start),
+            self.screen_point_of(&sel.end),
+        ) else {
+            return false;
+        };
+        let cols = self.cols();
+        for y in a.min(b)..=a.max(b) {
+            let Some(r0) = self.screen_ref(0, y) else {
+                continue;
+            };
+            if !row_styled(&r0) {
+                continue;
+            }
+            // Whether each style of the row seen so far conceals (style ids are per page).
+            let mut styles: Vec<(u16, bool)> = Vec::new();
+            for x in 0..cols {
+                let r = GridRef { x, ..r0 };
+                let c = cell(&r);
+                if !c.has_styling {
+                    continue;
+                }
+                let hidden = match styles.iter().find(|(id, _)| *id == c.style_id) {
+                    Some(&(_, h)) => h,
+                    None => {
+                        let h = style(&r).flags & ffi::STYLE_FLAG_INVISIBLE != 0;
+                        styles.push((c.style_id, h));
+                        h
+                    }
+                };
+                if hidden {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// A mouse press starting a selection (`by`: what a click selects), with word boundaries.
@@ -1372,6 +1416,17 @@ pub fn from_rgb(c: ColorRgb) -> u32 {
 /// Row-level data.
 pub fn row_wrapped(r: &GridRef) -> bool {
     row_flag(r, ffi::RowData::WRAP)
+}
+
+/// Whether any cell of the row `r` is in has styling (may be a false positive).
+fn row_styled(r: &GridRef) -> bool {
+    let mut row: ffi::Row = 0;
+    if unsafe { ffi::ghostty_grid_ref_row(r, &mut row) } != ffi::Result::SUCCESS {
+        return true;
+    }
+    let mut v = true;
+    unsafe { ffi::ghostty_row_get(row, ffi::RowData::STYLED, (&mut v as *mut bool).cast()) };
+    v
 }
 
 /// Whether the row has prompt cells (OSC 133): `PROMPT` for a prompt's first line,
@@ -1838,80 +1893,143 @@ mod kitty_ffi {
     }
 }
 
-/// The text of the formatter's styled (VT) output with concealed characters (SGR 8) turned
-/// into blanks and the escape sequences dropped, trailing blanks of each line trimmed; `None`
-/// when nothing in it is concealed (the plain output is then the text as is).
-pub(crate) fn blank_concealed(styled: &str) -> Option<String> {
+/// The text of the formatter's styled (VT) output: escape sequences dropped, concealed
+/// characters (SGR 8) turned into one blank per cell they cover, trailing blanks of each line
+/// trimmed and lines ending in `\n`, as the plain formatter has them. `clustered`: grapheme
+/// clustering (mode 2027) is on, which decides how wide concealed text is.
+pub(crate) fn styled_text(styled: &str, clustered: bool) -> String {
     let mut out = String::with_capacity(styled.len());
     let mut concealed = false;
-    let mut any = false;
+    // Concealed characters waiting to be blanked: measured together, so a cluster split by
+    // a color change still counts once.
+    let mut hidden: Vec<u32> = Vec::new();
+    // Whether the line being read has written cells (blanks too, but not the skipped ones): a
+    // line break with none after it is not part of the text.
+    let mut cells = false;
     let mut chars = styled.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\x1b' {
             if c == '\n' || c == '\r' {
+                cells = false;
+                blank(&mut out, &mut hidden, clustered);
                 let kept = out.trim_end_matches(' ').len();
                 out.truncate(kept);
-                out.push(c);
+                // CRLF (the VT formatter's line end) copies as LF.
+                if c == '\r' && chars.next_if_eq(&'\n').is_none() {
+                    out.push('\r');
+                } else {
+                    out.push('\n');
+                }
             } else if concealed {
-                out.push(' ');
+                cells = true;
+                hidden.push(c as u32);
             } else {
+                cells = true;
+                blank(&mut out, &mut hidden, clustered);
                 out.push(c);
             }
             continue;
         }
         match chars.next() {
+            // CSI: parameters, intermediates, final byte.
             Some('[') => {
                 let mut params = String::new();
+                let mut intermediates = false;
                 let mut fin = None;
                 for c in chars.by_ref() {
-                    if ('\x40'..='\x7e').contains(&c) {
-                        fin = Some(c);
-                        break;
-                    }
-                    params.push(c);
-                }
-                if fin == Some('m') {
-                    let mut ps = params.split(';');
-                    while let Some(p) = ps.next() {
-                        // Only the first `:` field names the attribute.
-                        match p.split(':').next().unwrap_or("") {
-                            "" | "0" | "28" => concealed = false,
-                            "8" => {
-                                concealed = true;
-                                any = true;
-                            }
-                            // Extended colors: skip their arguments (`38;5;8` is not SGR 8).
-                            "38" | "48" | "58" if !p.contains(':') => match ps.next() {
-                                Some("5") => {
-                                    ps.next();
-                                }
-                                Some("2") => {
-                                    ps.next();
-                                    ps.next();
-                                    ps.next();
-                                }
-                                _ => {}
-                            },
-                            _ => {}
+                    match c {
+                        '\x40'..='\x7e' => {
+                            fin = Some(c);
+                            break;
                         }
+                        '\x20'..='\x2f' => intermediates = true,
+                        _ => params.push(c),
                     }
                 }
+                // Private (`<=>?`-led) and intermediate forms are not SGR.
+                let private = params.starts_with(['<', '=', '>', '?']);
+                match fin {
+                    _ if intermediates || private => {}
+                    Some('m') => {
+                        let now = sgr_conceals(&params, concealed);
+                        if concealed && !now {
+                            blank(&mut out, &mut hidden, clustered);
+                        }
+                        concealed = now;
+                    }
+                    // Cells never written are skipped with cursor forward; plain text has
+                    // blanks there.
+                    Some('C') => {
+                        blank(&mut out, &mut hidden, clustered);
+                        let n = params.parse::<u16>().unwrap_or(1).max(1) as usize;
+                        out.extend(std::iter::repeat_n(' ', n));
+                    }
+                    _ => {}
+                }
             }
-            // OSC (hyperlinks): up to BEL or ST.
-            Some(']') => {
+            // OSC (hyperlinks): up to BEL or ST. DCS, SOS, PM, APC: up to ST.
+            Some(k @ (']' | 'P' | 'X' | '^' | '_')) => {
                 while let Some(c) = chars.next() {
-                    if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                    if (k == ']' && c == '\x07')
+                        || (c == '\x1b' && chars.next_if_eq(&'\\').is_some())
+                    {
                         break;
                     }
                 }
             }
+            // nF (`ESC ( B` and the like): intermediates, then the final byte.
+            Some('\x20'..='\x2f') => {
+                while chars.next_if(|c| ('\x20'..='\x2f').contains(c)).is_some() {}
+                chars.next();
+            }
+            // Two-character escapes.
             _ => {}
         }
     }
-    if !any {
-        return None;
-    }
+    blank(&mut out, &mut hidden, clustered);
     let kept = out.trim_end_matches(' ').len();
     out.truncate(kept);
-    Some(out)
+    if !cells && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Whether text is concealed after the SGR sequence with these parameters.
+fn sgr_conceals(params: &str, mut concealed: bool) -> bool {
+    let mut ps = params.split(';');
+    while let Some(p) = ps.next() {
+        // Only the first `:` field names the attribute.
+        match p.split(':').next().unwrap_or("") {
+            "" | "0" | "28" => concealed = false,
+            "8" => concealed = true,
+            // Extended colors: skip their arguments (`38;5;8` is not SGR 8).
+            "38" | "48" | "58" if !p.contains(':') => match ps.next() {
+                Some("5") => {
+                    ps.next();
+                }
+                Some("2") => {
+                    ps.next();
+                    ps.next();
+                    ps.next();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    concealed
+}
+
+/// Append one blank per cell the concealed characters in `hidden` cover, and clear it.
+fn blank(out: &mut String, hidden: &mut Vec<u32>, clustered: bool) {
+    let mut cells = 0;
+    let mut rest = &hidden[..];
+    while !rest.is_empty() {
+        let (n, w) = cluster_width(rest, clustered);
+        cells += w;
+        rest = &rest[n..];
+    }
+    out.extend(std::iter::repeat_n(' ', cells));
+    hidden.clear();
 }

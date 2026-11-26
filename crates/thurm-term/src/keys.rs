@@ -89,17 +89,17 @@ impl Encoders {
             _ => 0,
         };
         // The key's text as the encoder wants it: the character itself where the app sends
-        // none or a control character (Ctrl combinations). Keypad keys carry their text for
-        // the legacy encoding ("5" from keypad 5); under the kitty protocol they are reported
-        // as keypad keys, which the encoder only does without text (with "report all keys as
-        // escape codes" every key is one already, and the text goes along as associated text).
+        // none or a control character (Ctrl combinations). Keypad keys that make no text
+        // (Enter's "\r", the navigation keys) are reported as keypad keys under the kitty
+        // protocol, which the encoder only does without text; keypad keys that make text
+        // ("5" with NumLock on) send it, until "report all keys as escape codes", where every
+        // key is an escape code already and the text goes along as associated text.
         let flags = if kitty { vt.kitty_flags() } else { 0 };
         let kitty_active = flags != 0 && flags & KITTY_REPORT_ALL == 0;
+        let no_text = ev.text.is_empty() || ev.text.chars().all(char::is_control);
         let text = match ev.key {
-            Key::Char(c) if ev.text.is_empty() || ev.text.chars().all(char::is_control) => {
-                c.to_string()
-            }
-            Key::Named(k) if kitty_active && is_keypad(k) => String::new(),
+            Key::Char(c) if no_text => c.to_string(),
+            Key::Named(k) if kitty_active && no_text && is_keypad(k) => String::new(),
             _ => ev.text.clone(),
         };
         let action = match ev.action {

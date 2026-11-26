@@ -269,20 +269,85 @@ fn concealed_text_is_not_copied() {
     assert_eq!(t.selection_text().trim_end(), "plain  text");
 }
 
+/// Concealed text copies as one blank per cell: wide characters and clusters included.
 #[test]
-fn blank_concealed_parses_sgr() {
-    use crate::vt::blank_concealed;
-    assert_eq!(blank_concealed("a \x1b[1mb\x1b[0m"), None);
-    assert_eq!(blank_concealed("\x1b[38;5;8mx\x1b[48;2;8;8;8my"), None);
-    assert_eq!(blank_concealed("\x1b[38:2::8:8:8mx"), None);
+fn concealed_text_copies_cell_wide_blanks() {
+    let mut t = term(40, 3);
+    t.advance("id: \x1b[8m秘密\x1b[28m | ok\r\n".as_bytes());
+    t.advance("e: \x1b[8m👍🏽\x1b[m|\r\nm: \x1b[8me\u{301}x\x1b[m|".as_bytes());
+    let line = |t: &mut Terminal, row| {
+        t.selection(SelectionOp::Start {
+            col: 0,
+            row,
+            right_half: false,
+            kind: SelectionKind::Line,
+        });
+        t.selection_text()
+    };
+    assert_eq!(line(&mut t, 0), "id:      | ok");
+    // Without grapheme clustering (the default) the emoji and its modifier take two cells
+    // each.
+    assert_eq!(line(&mut t, 1), "e:     |");
+    assert_eq!(line(&mut t, 2), "m:   |");
+    // Several lines copy with LF line ends, concealed text or not.
+    t.selection(SelectionOp::SelectAll);
+    assert_eq!(t.selection_text(), "id:      | ok\ne:     |\nm:   |");
+    // With it, they are one cluster two cells wide.
+    t.advance("\x1b[?2027h\r\n\x1b[8m👍🏽\x1b[m|".as_bytes());
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 2,
+        right_half: false,
+        kind: SelectionKind::Line,
+    });
+    assert_eq!(t.selection_text(), "  |");
+    // Cells skipped by a tab copy as blanks there too.
+    t.advance("\r\nt:\t\x1b[8mx\x1b[m|".as_bytes());
+    t.selection(SelectionOp::Start {
+        col: 0,
+        row: 2,
+        right_half: false,
+        kind: SelectionKind::Line,
+    });
+    assert_eq!(t.selection_text(), format!("t:{}|", " ".repeat(7)));
+}
+
+/// Plain exports (the last command's output, the screen text agents read) blank concealed
+/// text too.
+#[test]
+fn concealed_text_is_not_exported() {
+    let mut t = term(30, 3);
+    t.advance("pw: \x1b[8mhunter2 秘\x1b[28m ok\r\nx \x1b[8mtail\x1b[m".as_bytes());
+    let screen = t.screen_text();
+    assert!(!screen.contains("hunter2"), "{screen:?}");
+    assert!(screen.starts_with("pw:            ok\nx\n"), "{screen:?}");
+}
+
+#[test]
+fn styled_text_parses_escapes() {
+    use crate::vt::styled_text;
+    let s = |v: &str| styled_text(v, true);
+    assert_eq!(s("a \x1b[1mb\x1b[0m"), "a b");
+    assert_eq!(s("\x1b[38;5;8mx\x1b[48;2;8;8;8my"), "xy");
+    assert_eq!(s("\x1b[38:2::8:8:8mx"), "x");
     assert_eq!(
-        blank_concealed("a\x1b[0m\x1b[8mbc\x1b[0md\r\n\x1b[8mzz\x1b[28m"),
-        Some("a  d\r\n".into())
+        s("a\x1b[0m\x1b[8mbc\x1b[0md\r\n\x1b[8mzz\x1b[28m"),
+        "a  d\n"
     );
+    assert_eq!(s("\x1b]8;;https://e.x\x1b\\\x1b[8mpw\x1b[0m!"), "  !");
+    // Other escapes are dropped whole: charsets, strings, private CSI.
+    assert_eq!(s("\x1b(0q\x1b(B\x1b)A-"), "q-");
     assert_eq!(
-        blank_concealed("\x1b]8;;https://e.x\x1b\\\x1b[8mpw\x1b[0m!"),
-        Some("  !".into())
+        s("\x1bP1$r0m\x1b\\a\x1b_Gx=1\x1b\\b\x1b^pm\x1b\\c\x1bXs\x1b\\d"),
+        "abcd"
     );
+    assert_eq!(s("\x1b[>4;8mx\x1b[?8m y"), "x y");
+    // Skipped cells are blanks, trimmed at a line end.
+    assert_eq!(s("a\x1b[3Cb\x1b[Cc\x1b[4C\r\nd"), "a   b c\nd");
+    // A cluster split by a color change still counts once.
+    assert_eq!(s("\x1b[8m👍\x1b[31m🏽\x1b[28m|"), "  |");
+    // Without grapheme clustering every codepoint counts on its own.
+    assert_eq!(styled_text("\x1b[8m👍🏽\x1b[28m|", false), "    |");
 }
 
 #[test]
@@ -1679,16 +1744,12 @@ mod encoding {
         assert_eq!(kitty(&named(NamedKey::F(3), 0), D), "\x1b[13~");
         assert_eq!(kitty(&named(NamedKey::F(13), 0), D), "\x1b[57376u");
         assert_eq!(kitty(&named(NamedKey::Kp1, 0), D), "\x1b[57400u");
-        // Clients send keypad keys with their text (legacy encoding needs it); kitty mode must
-        // still report them as keypad keys.
-        assert_eq!(
-            kitty(&key(Key::Named(NamedKey::Kp5), 0, "5"), D),
-            "\x1b[57404u"
-        );
-        assert_eq!(
-            kitty(&key(Key::Named(NamedKey::KpAdd), 0, "+"), D),
-            "\x1b[57413u"
-        );
+        // Keypad keys that make text send it under "disambiguate" (only keypad keys without
+        // text are reported as keypad keys there); ones that make none are reported, even
+        // when the client sends Enter's "\r" along.
+        assert_eq!(kitty(&key(Key::Named(NamedKey::Kp5), 0, "5"), D), "5");
+        assert_eq!(kitty(&key(Key::Named(NamedKey::KpAdd), 0, "+"), D), "+");
+        assert_eq!(kitty(&key(Key::Named(NamedKey::KpDecimal), 0, "."), D), ".");
         assert_eq!(
             kitty(&key(Key::Named(NamedKey::KpEnter), 0, "\r"), D),
             "\x1b[57414u"
