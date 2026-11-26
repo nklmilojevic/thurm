@@ -217,26 +217,39 @@ enum BoxDrawing {
         let qy0 = down ? ly - half : ccy
         let qy1 = down ? ccy : ly + half
         var out: [BoxRect] = []
-        let x0 = Int(floor(qx0)), y0 = Int(floor(qy0))
-        let x1 = Int(ceil(qx1)), y1 = Int(ceil(qy1))
-        out.append(BoxRect(x: x0, y: y0, w: x1 - x0, h: y1 - y0, alpha: 1,
-                           arc: SIMD4<Float>(r, Float(t), ccx - Float(x0), ccy - Float(y0))))
+        func add(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int) {
+            let x = max(0, min(W, min(x0, x1)))
+            let y = max(0, min(H, min(y0, y1)))
+            let xe = max(0, min(W, max(x0, x1)))
+            let ye = max(0, min(H, max(y0, y1)))
+            if xe > x && ye > y {
+                out.append(BoxRect(x: x, y: y, w: xe - x, h: ye - y, alpha: 1))
+            }
+        }
+        let x0 = max(0, min(W, Int(floor(qx0))))
+        let y0 = max(0, min(H, Int(floor(qy0))))
+        let x1 = max(0, min(W, Int(ceil(qx1))))
+        let y1 = max(0, min(H, Int(ceil(qy1))))
+        if x1 > x0 && y1 > y0 {
+            out.append(BoxRect(x: x0, y: y0, w: x1 - x0, h: y1 - y0, alpha: 1,
+                               arc: SIMD4<Float>(r, Float(t), ccx - Float(x0), ccy - Float(y0))))
+        }
         // Straight arms from the arc's ends to the cell edges.
         let hy = cy - t / 2
         let vx = cx - t / 2
         if right {
             let s = Int(ccx.rounded())
-            if s < W { out.append(BoxRect(x: s, y: hy, w: W - s, h: t, alpha: 1)) }
+            if s < W { add(s, hy, W, hy + t) }
         } else {
             let e = Int(ccx.rounded())
-            if e > 0 { out.append(BoxRect(x: 0, y: hy, w: e, h: t, alpha: 1)) }
+            if e > 0 { add(0, hy, e, hy + t) }
         }
         if down {
             let s = Int(ccy.rounded())
-            if s < H { out.append(BoxRect(x: vx, y: s, w: t, h: H - s, alpha: 1)) }
+            if s < H { add(vx, s, vx + t, H) }
         } else {
             let e = Int(ccy.rounded())
-            if e > 0 { out.append(BoxRect(x: vx, y: 0, w: t, h: e, alpha: 1)) }
+            if e > 0 { add(vx, 0, vx + t, e) }
         }
         return out
     }
